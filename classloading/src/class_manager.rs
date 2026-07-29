@@ -9222,6 +9222,22 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/nio/channels/DatagramChannel" => instance_fields(5),
         // MulticastSocket = 5 (port=0, closed=1, timeout=2, fd_id=3, ttl=4)
         "java/net/MulticastSocket" => instance_fields(5),
+        // DatagramSocket = 4 (port=0, closed=1, timeout=2, fd_id=3), matching
+        // the slot indices `phases_late::net_channels`'s phase-72 set reads.
+        //
+        // There was NO entry at all, so a synthetic instance fell to the
+        // `_ => vec![]` arm and got ZERO slots — the real JDK 17+ class has one
+        // field (`delegate`), and the padding path below is driven by this same
+        // table, so nothing widened it. Every slot write in that set, including
+        // the constructor's fd store, was therefore dropped in silence, which
+        // is why `net_phase_e::register_re7_datagram_socket` keeps its own
+        // ObjectRef-keyed side table instead (see its note about the layout).
+        //
+        // Third instance of this exact trap found on 2026-07-28, after
+        // `HttpExchange` (8 vs 9) and `HttpServer` (5 vs 6). `set_field` past
+        // the end of an object DISCARDS the write rather than erroring, so the
+        // natives look implemented and store nothing.
+        "java/net/DatagramSocket" => instance_fields(4),
         // DatagramPacket = 5 (buf=0, length=1, address=2, port=3, offset=4) per
         // `net_channels::register_p72_datagram`, and Preferences = 5 (backing
         // map=0, name=1, parent=2, children=3, removed=4) per
@@ -9262,13 +9278,30 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // Process = 4 (exit, stdout, stderr, pid / native process id).
         "java/lang/ProcessBuilder" | "java/lang/Process" => instance_fields(4),
         "java/lang/ProcessHandle" | "java/lang/ProcessHandleImpl" => instance_fields(1),
-        // HttpServer (com.sun.net.httpserver) = 5 (address, started, contexts,
-        // server_id, port) per `net_phase_e::HS_*` constants.
-        "com/sun/net/httpserver/HttpServer" | "com/sun/net/httpserver/HttpServerImpl" => {
-            instance_fields(5)
-        }
-        // HttpExchange = 9 (method, uri, reqHeaders, respHeaders, reqBody,
-        // statusCode, owner_socket, response_chunks, principal)
+        // HttpServer = 6 (address, started, contexts, server_id, port,
+        // executor) per `net_phase_e::HS_*`, where `HS_EXECUTOR = 5`.
+        //
+        // Two bugs fixed here together, both the silent-drop shape:
+        //
+        // 1. This said 5 while `HS_EXECUTOR = 5` needs a 6th slot, so
+        //    `setExecutor` wrote past the end and the write was DISCARDED
+        //    rather than erroring.
+        // 2. The impl class was keyed `com/sun/net/httpserver/HttpServerImpl`,
+        //    but `net_phase_e::HS_IMPL_CLASS` is
+        //    `sun/net/httpserver/HttpServerImpl` — a DIFFERENT package. The
+        //    name the allocator actually passes had no entry at all and fell
+        //    to the `_ => vec![]` arm; it only survived because
+        //    `alloc_concurrent_synthetic` requests an explicit slot count and
+        //    falls back to `ensure_synthetic_class`. Both spellings are listed
+        //    now so the `new` opcode path is covered too.
+        //
+        // Keep in lock-step with the `HS_*` constants in `net_phase_e.rs`.
+        "com/sun/net/httpserver/HttpServer"
+        | "com/sun/net/httpserver/HttpServerImpl"
+        | "sun/net/httpserver/HttpServerImpl" => instance_fields(6),
+        // HttpExchange = 11 (method, uri, reqHeaders, respHeaders, reqBody,
+        // statusCode, owner_socket, response_chunks, principal, localAddress,
+        // remoteAddress)
         //
         // This read 8 while `net_phase_e.rs` has used `HEX_NUM_FIELDS = 9`
         // with `HEX_PRINCIPAL = 8`, so the last slot did not exist and every
@@ -9277,7 +9310,12 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // loudly here; the store is simply dropped, which is why the
         // off-by-one survived. If you add a slot in `net_phase_e.rs`, add it
         // here in the same change.
-        "com/sun/net/httpserver/HttpExchange" => instance_fields(9),
+        //
+        // Now 11: `HEX_LOCAL_ADDR = 9` / `HEX_REMOTE_ADDR = 10` carry the
+        // connection endpoints `HttpExchange.getLocalAddress()` /
+        // `getRemoteAddress()` return, captured from the accepted `TcpStream`
+        // in `net_phase_e::re10_dispatch_pending`.
+        "com/sun/net/httpserver/HttpExchange" => instance_fields(11),
         // HttpExchange$ResponseBody = 2 (owner exchange, dummy)
         "com/sun/net/httpserver/HttpExchange$ResponseBody" => instance_fields(2),
         // HttpContext = 2 (path, handler)

@@ -1609,7 +1609,7 @@ fn t9b_inline_constant_native_census() {
     per_file.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
     // Ceiling: the measured actual. 669 -> 462 -> 350 -> 332 across the
-    // 2026-07-27/28 sweeps. Lower it whenever you convert a constant into a
+    // 2026-07-27/29 sweeps (669 -> 462 -> 350 -> 332 -> 326). Lower it whenever you convert a constant into a
     // real implementation; raising it requires a justification comment at the
     // registration site, in the same change.
     //
@@ -1622,7 +1622,7 @@ fn t9b_inline_constant_native_census() {
     // spec-correct constants that are deliberately counted, because the cheap
     // reliable thing to measure is "how much of the native surface is
     // constant-valued", not "how much of it is wrong".
-    const CEILING: usize = 332;
+    const CEILING: usize = 326;
 
     eprintln!("[t9b] Constant-valued native registrations: {total} (ceiling {CEILING})");
     for (f, n) in per_file.iter().take(15) {

@@ -13018,15 +13018,38 @@ fn re10_read_headers(ctx: &mut dyn NativeContext, map: ObjectRef) -> Vec<(String
 ///
 /// Slots 0..=7 are all taken by the dispatcher (method, URI, request headers,
 /// response headers, request body, status, response chunks, response-length
-/// hint), so the principal takes a ninth. That is safe here because
-/// `re10_dispatch_pending` is the ONLY place an `HttpExchange` is allocated and
-/// `alloc_concurrent_synthetic` sizes the instance from `max(requested, real)` —
-/// `class_manager`'s `instance_fields(8)` is a floor for the class, not a cap on
-/// the instance. Readers still bounds-check with `object_num_fields` so an
-/// exchange minted anywhere else simply reports "no principal" instead of
-/// running off the end of the object.
+/// hint), so the principal takes a ninth. `re10_dispatch_pending` is the ONLY
+/// place an `HttpExchange` is allocated, and readers still bounds-check with
+/// `object_num_fields` so an exchange minted anywhere else simply reports "no
+/// principal" instead of running off the end of the object.
 const HEX_PRINCIPAL: usize = 8;
-const HEX_NUM_FIELDS: usize = 9;
+
+/// Slots holding the connection's local and remote endpoints as
+/// `java/net/InetSocketAddress` objects, captured from the accepted
+/// `TcpStream` in `re10_dispatch_pending` (the one place that still holds it).
+/// `HttpExchange.getLocalAddress()` / `getRemoteAddress()` are plain reads of
+/// these. Null only if the socket is already torn down when the exchange is
+/// minted (`peer_addr()`/`local_addr()` failing) — never fabricated, because a
+/// caller that logs or rate-limits by peer must not attribute every request to
+/// one invented host.
+///
+/// `pub(crate)` because the two getters that read them are registered in
+/// `phases_late::net_channels`, and a hard-coded `9`/`10` over there is exactly
+/// the kind of drift this slot map keeps producing.
+pub(crate) const HEX_LOCAL_ADDR: usize = 9;
+pub(crate) const HEX_REMOTE_ADDR: usize = 10;
+
+/// Number of slots `re10_dispatch_pending` asks `alloc_concurrent_synthetic`
+/// for when it mints an exchange.
+///
+/// KEEP IN LOCK-STEP with the `"com/sun/net/httpserver/HttpExchange"` entry in
+/// `classloading/src/class_manager.rs` `synthetic_stub_fields` — it declares
+/// the class's instance-field count, and a class that declares FEWER fields
+/// than the index being written makes `set_field` DROP the write silently
+/// rather than error. The natives then look implemented while storing nothing;
+/// that is exactly how `HEX_PRINCIPAL` sat dead behind an `instance_fields(8)`
+/// entry. If you add a slot here, add it there in the SAME change.
+const HEX_NUM_FIELDS: usize = 11;
 
 /// The three `Authenticator.Result` subclasses the `com.sun.net.httpserver`
 /// contract defines. None of them is `final` in the JDK, so results are
@@ -13251,6 +13274,49 @@ fn re10_dispatch_pending(
                 // No principal until an `Authenticator.Success` supplies one;
                 // `HttpExchange.getPrincipal` reads this slot.
                 ctx.set_field(ex, HEX_PRINCIPAL, Value::Object(None));
+
+                // Connection endpoints. This is the last point at which the
+                // accepted `TcpStream` and the exchange coexist (`req.stream`
+                // is moved into the responder at the bottom of the loop), so
+                // the addresses must be captured here or not at all. Both are
+                // built as fully-resolved `InetSocketAddress`es the same way
+                // `HttpServer.getAddress()` builds its bound-address echo: the
+                // host string is the IP literal, matching the real
+                // `com.sun.net.httpserver`, whose exchange addresses come
+                // straight off the socket and are never reverse-resolved.
+                //
+                // GC discipline: `alloc_inet_socket_address_resolved` allocates
+                // (holder + InetAddress + strings), so `ex` is re-read from its
+                // pin after each one, and each freshly-built address is stored
+                // immediately (no allocation between its creation and its
+                // `set_field`) so the address itself needs no pin — the same
+                // rule the field writes above follow. Storing local first also
+                // makes it reachable from the pinned exchange before the remote
+                // allocation can move it.
+                let local_sa = req.stream.local_addr().ok();
+                let remote_sa = req.stream.peer_addr().ok();
+                let local_val = match local_sa {
+                    Some(sa) => {
+                        let ip = sa.ip().to_string();
+                        let isa =
+                            alloc_inet_socket_address_resolved(ctx, &ip, &ip, sa.port() as i32);
+                        Value::Object(Some(isa))
+                    }
+                    None => Value::Object(None),
+                };
+                let ex = ctx.read_native_pin(ex_pin, ex0);
+                ctx.set_field(ex, HEX_LOCAL_ADDR, local_val);
+                let remote_val = match remote_sa {
+                    Some(sa) => {
+                        let ip = sa.ip().to_string();
+                        let isa =
+                            alloc_inet_socket_address_resolved(ctx, &ip, &ip, sa.port() as i32);
+                        Value::Object(Some(isa))
+                    }
+                    None => Value::Object(None),
+                };
+                let ex = ctx.read_native_pin(ex_pin, ex0);
+                ctx.set_field(ex, HEX_REMOTE_ADDR, remote_val);
 
                 // com.sun.net.httpserver contract: a context with an
                 // Authenticator attached authenticates BEFORE the handler runs,

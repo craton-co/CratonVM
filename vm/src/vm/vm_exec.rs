@@ -11044,6 +11044,42 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     }
 }
 
+/// Native-library indices retired by `NativeContext::unload_native_library`
+/// (`RawNativeLibraries.unload0`), keyed by `(NativeRealm address, index)`.
+///
+/// `SharedVm.natives.native_libraries` is an append-only `Vec<Library>`: the
+/// index IS the handle (`find_native_symbol` indexes it positionally and
+/// `RawNativeLibraries.load0` hands out `index + 1` as the opaque Java-side
+/// handle), so an element can never be removed without renumbering every live
+/// handle. Unload is therefore recorded out-of-band as a tombstone, and
+/// `find_native_symbol` refuses tombstoned indices — the library stays mapped
+/// (see the `unload_native_library` contract: pointers handed out earlier may
+/// still be live) but is no longer reachable through its handle.
+///
+/// Keying by the realm's address rather than the bare index keeps concurrently
+/// live VMs in one process from seeing each other's tombstones. An address can
+/// be reused by a *later* VM, so `load_native_library` clears the tombstone for
+/// every index it hands out; since indices are assigned densely from 0, any
+/// index a new realm can observe has been cleared by the load that created it.
+/// The set is bounded by the number of unloaded libraries (typically zero).
+fn unloaded_native_libraries() -> &'static std::sync::Mutex<std::collections::HashSet<(usize, i64)>>
+{
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static UNLOADED: OnceLock<Mutex<HashSet<(usize, i64)>>> = OnceLock::new();
+    UNLOADED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+impl<'a> NativeContextImpl<'a> {
+    /// Identity of this VM's [`NativeRealm`](crate::vm::realms::native_realm::NativeRealm)
+    /// for [`unloaded_native_libraries`] keying. The realm is owned by the
+    /// `SharedVm` and never moves while the VM is alive, so its address is a
+    /// stable per-VM key for the lifetime of any handle derived from it.
+    fn native_realm_key(&self) -> usize {
+        std::ptr::from_ref(&self.shared.natives) as usize
+    }
+}
+
 impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     // See the `NativeContext::refresh_root_snapshot` doc comment
     // (native-api/src/registry.rs) for the full rationale — this closes the
@@ -11653,7 +11689,50 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         let mut libs = self.shared.natives.native_libraries.lock();
         let index = libs.len() as i64;
         libs.push(lib);
+        drop(libs);
+        // Clear any stale tombstone for this index. Live realms never recycle an
+        // index, so this only matters when a previous VM's realm was dropped and
+        // a new one landed at the same address — see `unloaded_native_libraries`.
+        let key = (self.native_realm_key(), index);
+        unloaded_native_libraries()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
         Ok(index)
+    }
+
+    /// Logical unload for `RawNativeLibraries.unload0`.
+    ///
+    /// Tombstones the index instead of dropping the `libloading::Library`:
+    /// `native_libraries` is append-only and positional (see
+    /// [`unloaded_native_libraries`]), and dropping the library would `dlclose`
+    /// code that already-issued function pointers (bound FFM downcall stubs,
+    /// cached `findEntry0` results) may still be executing from. After this call
+    /// [`find_native_symbol`](NativeSystemAccess::find_native_symbol) refuses the
+    /// index, which is what the Java-side contract observes.
+    ///
+    /// NOTE: JNI-convention resolution (`resolve_jni_native_in_libraries`)
+    /// iterates the whole table and does not consult the tombstone set — a
+    /// library loaded through `System.loadLibrary` and unloaded through the
+    /// unrelated `RawNativeLibraries` path can still satisfy a `Java_*` symbol
+    /// lookup. That mirrors the current coupling of those two paths and is not
+    /// changed here.
+    fn unload_native_library(&mut self, lib_index: i64) -> bool {
+        if lib_index < 0 {
+            return false;
+        }
+        let live = {
+            let libs = self.shared.natives.native_libraries.lock();
+            (lib_index as usize) < libs.len()
+        };
+        if !live {
+            return false;
+        }
+        let key = (self.native_realm_key(), lib_index);
+        unloaded_native_libraries()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key)
     }
 
     fn register_upcall(&mut self, entry: crate::native::ffi::UpcallEntry) -> usize {
@@ -11720,6 +11799,23 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 
     fn find_native_symbol(&self, lib_index: i64, name: &str) -> Option<usize> {
+        // Indices retired by `unload_native_library` resolve nothing, exactly as
+        // a dlclosed handle would. Snapshot them BEFORE taking the library lock
+        // so the tombstone mutex is never nested inside it. The set is empty in
+        // every run that never unloads, which is the overwhelming majority.
+        let unloaded: Vec<i64> = {
+            let realm = self.native_realm_key();
+            let set = unloaded_native_libraries()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            set.iter()
+                .filter(|(r, _)| *r == realm)
+                .map(|(_, idx)| *idx)
+                .collect()
+        };
+        if lib_index >= 0 && unloaded.contains(&lib_index) {
+            return None;
+        }
         let libs = self.shared.natives.native_libraries.lock();
         let c_name = std::ffi::CString::new(name).ok()?;
 
@@ -11732,8 +11828,13 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
                     .map(|sym| *sym as usize)
             }
         } else {
-            // Default/system lookup вЂ” try all loaded libraries
-            for lib in libs.iter() {
+            // Default/system lookup — try all loaded libraries, skipping any
+            // that were unloaded (their symbols are no longer reachable through
+            // this VM's library table).
+            for (idx, lib) in libs.iter().enumerate() {
+                if unloaded.contains(&(idx as i64)) {
+                    continue;
+                }
                 if let Ok(sym) = unsafe { lib.get::<*const ()>(c_name.as_bytes_with_nul()) } {
                     return Some(*sym as usize);
                 }

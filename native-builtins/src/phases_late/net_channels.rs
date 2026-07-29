@@ -3020,16 +3020,49 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    // ESCALATED (wave 4): `connect` above is now real, so this no-op is now a
-    // genuine gap rather than a vacuous one — it needs an
-    // `fd_table::udp_disconnect(FdId)` primitive doing the POSIX
-    // `connect(AF_UNSPEC)` that dissolves the association. Neither
-    // `std::net::UdpSocket` nor socket2's `SockRef` exposes it, and this file
-    // cannot add it (native-api crate). Everything else is already here: the
-    // fd is in slot 3 and `DatagramChannel.disconnect` in this same file has
-    // the identical hole. `disconnect()` is specified never to throw, so a
-    // no-op is the least-wrong placeholder until the primitive lands.
-    r.register(ds, "disconnect", "()V", |_ctx, _args| Ok(None));
+    // The escalated primitive landed: `FdTable::udp_disconnect(FdId)`
+    // (native-api/src/fd_table.rs) issues the POSIX `connect(AF_UNSPEC)` that
+    // dissolves the association, treating the `EAFNOSUPPORT`/`WSAEAFNOSUPPORT`
+    // both platforms report for that form as success. So this is no longer a
+    // no-op: the fd is resolved exactly the way the sibling `connect` above
+    // resolves it, and the kernel-side association is really undone. Without
+    // it the socket stayed connected — still dropping datagrams from every
+    // peer but the old one — while the Java object claimed to be disconnected.
+    //
+    // There is NO Java-side `connected` state to clear here: this class's
+    // layout is port/closed/timeout/fd_id and has no such flag, `connect`
+    // above sets none, and no `isConnected`/`getInetAddress`/`getPort` native
+    // is registered for `java/net/DatagramSocket` to read one. The fd IS the
+    // state, so the two halves agree once the fd is disconnected.
+    //
+    // `DatagramSocket.disconnect()` is specified never to throw and to be a
+    // no-op on a socket that was never connected (the AF_UNSPEC form is itself
+    // a no-op on an unassociated socket), so the result is deliberately
+    // swallowed.
+    //
+    // CAVEAT — read before trusting this at runtime: slot 3 is very probably
+    // out of bounds for a real `new java.net.DatagramSocket()`. There is no
+    // `"java/net/DatagramSocket"` arm in `classloading/src/class_manager.rs`
+    // `synthetic_stub_fields`, so a synthetic-mode instance falls to that
+    // function's `_ => vec![]` arm and gets ZERO slots, and the real JDK 17+
+    // class has a single `delegate` field (which is the documented reason
+    // `net_phase_e::register_re7_datagram_socket` keeps its state in a
+    // `DsSide` side table keyed by ObjectRef instead of in slots). That makes
+    // the whole 4-slot `ds` set here — `<init>`, `send`, `close`, `connect`
+    // and now `disconnect` — inert in the same silent way wave 4 found for
+    // `DatagramPacket.getOffset`: `set_field` past the end DROPS the write.
+    // Fixing that is a cross-crate change (add
+    // `"java/net/DatagramSocket" => instance_fields(4)` there, or better, move
+    // this set onto the RE.7 side table); the call below is correct the moment
+    // the fd is actually stored, and no worse than the old no-op until then.
+    r.register(ds, "disconnect", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+        if fd_id >= 0 {
+            let _ = ctx.fd_table().udp_disconnect(fd_id as u32);
+        }
+        Ok(None)
+    });
     r.register(ds, "setBroadcast", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
@@ -3484,6 +3517,78 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         Some(id)
     }
 
+    /// POSIX `connect(AF_UNSPEC)` — dissolve a UDP socket's peer association.
+    ///
+    /// `FdTable::udp_disconnect` (native-api/src/fd_table.rs) does exactly
+    /// this, but it is keyed by `FdId` and a `DatagramChannel`'s socket is NOT
+    /// in the fd table: `ensure_bound` above binds a bare
+    /// `std::net::UdpSocket` into `servlet::SocketRegistry::dgrams` and slot 4
+    /// holds that registry id, not an fd. There is therefore no `FdId` to hand
+    /// the primitive, and moving the channel onto the fd table would drag
+    /// send/receive/read/write and the Selector's `poll` registration with it.
+    /// The syscall is issued against the registry socket instead — the same
+    /// way `setOption`/`getOption` below already reach under it through
+    /// `socket2::SockRef`.
+    ///
+    /// Neither `std::net::UdpSocket` nor `socket2` exposes the AF_UNSPEC form,
+    /// so it goes through the raw handle. Both platforms report an error for
+    /// it even when it works (Linux `EAFNOSUPPORT`, Winsock
+    /// `WSAEAFNOSUPPORT`); the disassociation still happens, so that one code
+    /// is treated as success. Kept byte-for-byte in step with
+    /// `FdTable::udp_disconnect` — if one changes, change both.
+    fn udp_dissolve_association(sock: &std::net::UdpSocket) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };
+            addr.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
+            let rc = unsafe {
+                libc::connect(
+                    sock.as_raw_fd(),
+                    &addr as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
+                return Ok(());
+            }
+            Err(err)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            const WSAEAFNOSUPPORT: i32 = 10047;
+
+            // Declared locally, matching the `#[link(name = "ws2_32")]` block
+            // in `FdTable::udp_disconnect`. `clashing_extern_declarations` is
+            // denied workspace-wide, so these signatures must not diverge from
+            // any other declaration of the same symbol in THIS crate — there
+            // is currently no other `connect`/`WSAGetLastError` in
+            // native-builtins, and this pair matches native-api's.
+            #[link(name = "ws2_32")]
+            unsafe extern "system" {
+                fn connect(s: usize, name: *const u8, namelen: i32) -> i32;
+                fn WSAGetLastError() -> i32;
+            }
+
+            // `sockaddr` is 16 bytes; all-zero gives sa_family = AF_UNSPEC (0).
+            let addr = [0u8; 16];
+            let rc = unsafe { connect(sock.as_raw_socket() as usize, addr.as_ptr(), 16) };
+            if rc == 0 {
+                return Ok(());
+            }
+            let code = unsafe { WSAGetLastError() };
+            if code == WSAEAFNOSUPPORT {
+                return Ok(());
+            }
+            Err(std::io::Error::from_raw_os_error(code))
+        }
+    }
+
     r.register(
         dc,
         "bind",
@@ -3578,15 +3683,45 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/channels/DatagramChannel;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Was: clear slot 2 and leave the socket alone, with a comment
+            // calling that "a portable proxy". It was not a proxy for
+            // anything — `connect` above really does associate the socket, so
+            // the kernel kept filtering datagrams to the old peer while
+            // `isConnected()` answered false and `receive` was documented to
+            // accept from anyone again. `udp_dissolve_association` (defined
+            // next to `ensure_bound` above) now issues the AF_UNSPEC connect
+            // that std::net does not expose. Note it takes the registry socket
+            // directly, NOT an `FdId`: `FdTable::udp_disconnect` cannot be
+            // used here because this channel's socket lives in
+            // `servlet::SocketRegistry::dgrams` and never enters the fd table.
+            if ctx.get_field(this, 2).as_int().unwrap_or(0) == 0 {
+                // Never connected — the JDK specifies disconnect() as a no-op
+                // in that case, and the AF_UNSPEC form is pointless anyway.
+                return Ok(Some(Value::Object(Some(this))));
+            }
             let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
             if sid >= 0 {
-                let reg = crate::servlet::s2_registry().lock();
-                if let Some(sock) = reg.dgrams.get(&sid) {
-                    // Reset to unspecified address per POSIX semantics by
-                    // connecting to (AF_UNSPEC, 0, 0). Rust's std::net doesn't
-                    // expose this directly; as a portable proxy, the socket
-                    // remains bound but the `connected` flag is cleared.
-                    let _ = sock;
+                // Scoped so the registry lock is released before the field
+                // write below; nothing inside blocks.
+                let outcome = {
+                    let reg = crate::servlet::s2_registry().lock();
+                    match reg.dgrams.get(&sid) {
+                        Some(sock) => udp_dissolve_association(sock),
+                        // Connected flag set but the socket is gone: nothing
+                        // left to disassociate, so fall through and clear it.
+                        None => Ok(()),
+                    }
+                };
+                if let Err(e) = outcome {
+                    // `DatagramChannel.disconnect()` is declared `throws
+                    // IOException`, and the flag deliberately stays SET: the
+                    // peer association is still in place, so answering
+                    // "disconnected" would recreate the exact Java/kernel
+                    // disagreement this change removes.
+                    return Err(RuntimeError::IOException {
+                        message: format!("DatagramChannel.disconnect failed: {e}"),
+                    }
+                    .into());
                 }
             }
             ctx.set_field(this, 2, Value::Int(0));
@@ -4512,31 +4647,54 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // OutputStreams and never wrote a response — that broke real-server probes.
     // We keep only the ancillary getters Phase E does not register.
     let hex = "com/sun/net/httpserver/HttpExchange";
-    // ESCALATED (wave 4) — blocked on state this file cannot create, NOT on a
-    // missing answer. The exchange object is allocated by
-    // `net_phase_e::re10_dispatch_pending`, the one place that holds the
-    // accepted `TcpStream`; `stream.peer_addr()` / `stream.local_addr()` are
-    // right there. What is needed, all inside `native-builtins/src/net_phase_e.rs`:
-    //   * `HEX_NUM_FIELDS` 9 -> 11, adding `HEX_LOCAL_ADDR` / `HEX_REMOTE_ADDR`
-    //     next to `HEX_PRINCIPAL` (and the matching bump of
-    //     `classloading/src/class_manager.rs` `synthetic_stub_fields`, which
-    //     still says `instance_fields(8)` for this class — already one short of
-    //     today's 9);
-    //   * `re10_dispatch_pending` storing an `InetSocketAddress` in each.
-    // These two getters then become plain slot reads. Left as null rather than
-    // fabricated: a caller logging or rate-limiting by peer must not silently
-    // attribute every request to one invented host.
+    // The escalated producer side landed in `net_phase_e.rs`, so these two are
+    // now plain slot reads rather than constant nulls:
+    // `re10_dispatch_pending` — the one place an `HttpExchange` is minted, and
+    // the last point at which it and the accepted `TcpStream` coexist —
+    // captures `local_addr()` / `peer_addr()` into `HEX_LOCAL_ADDR` /
+    // `HEX_REMOTE_ADDR`, `HEX_NUM_FIELDS` is 11, and the matching
+    // `classloading/src/class_manager.rs` entry is `instance_fields(11)` (a
+    // short entry would make `set_field` drop the write silently, which is how
+    // `HEX_PRINCIPAL` sat dead behind `instance_fields(8)`). All three
+    // verified in the tree rather than taken on trust.
+    //
+    // The slots are referenced by symbol, not as literal 9/10 — that is why
+    // they are `pub(crate)`. A null here still means "the endpoint could not
+    // be read off the socket", never a fabricated host: a caller that logs or
+    // rate-limits by peer must not attribute every request to one invented
+    // address.
+    //
+    // Both getters bound-check against the HIGHER of the two indices, matching
+    // the `getPrincipal` reader in `net_phase_e.rs`, so an exchange minted by
+    // some future path with fewer slots reports "unknown" instead of reading
+    // off the end of the object.
     r.register(
         hex,
         "getLocalAddress",
         "()Ljava/net/InetSocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) <= crate::net_phase_e::HEX_REMOTE_ADDR {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(
+                ctx.get_field(this, crate::net_phase_e::HEX_LOCAL_ADDR),
+            ))
+        },
     );
     r.register(
         hex,
         "getRemoteAddress",
         "()Ljava/net/InetSocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) <= crate::net_phase_e::HEX_REMOTE_ADDR {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(
+                ctx.get_field(this, crate::net_phase_e::HEX_REMOTE_ADDR),
+            ))
+        },
     );
     // `getAttribute` was constant-null only because its partner did not exist:
     // no `HttpExchange.setAttribute` was registered anywhere in the tree, so
