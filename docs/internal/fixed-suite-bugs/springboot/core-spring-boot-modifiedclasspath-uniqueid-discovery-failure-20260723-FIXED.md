@@ -23,8 +23,8 @@ nested JUnit discovery, generic reflection, and annotation values.
 ## Validation
 
 Fixture: `C:\sbmcu28` at `55a520e`; executable:
-`cratonvm-modifiedclasspath-uniqueid-20260728-019fa9-r14-release-no-lto.exe`
-(SHA-256 `57C97AA02A2865910AA5A1BA4A62B1355D889CD7F0D8465DD73558DB7074200D`).
+`cratonvm-modifiedclasspath-uniqueid-20260728-019fa9-r15-merged-release-no-lto.exe`
+(SHA-256 `F79F168AAE65CE4FE9971C08FDE1144FFF23444245AD9065C682F0216307532A`).
 
 The authoritative 28-class closure manifest
 `apps/spring-boot-suite-runner/modifiedclasspath-uniqueid-closure-20260728-019fa9.tsv`
