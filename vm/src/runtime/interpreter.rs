@@ -19714,6 +19714,17 @@ fn execute_ldc2w(shared: &SharedVm, frame: &mut Frame, index: u16) -> Result<(),
 /// namespaces below are delegated to the parent by ~every real custom loader, so
 /// global resolution already yields the loader-correct answer. Short-circuiting
 /// them keeps the re-entrant `loadClass` invocation off the common hot path.
+/// The object component type of an array descriptor, or `None` when `name`
+/// is not an array or its element type is primitive. `[[Lcom/x/Y;` yields
+/// `com/x/Y` -- the nesting depth is irrelevant, only the element class needs
+/// loader-faithful resolution.
+#[inline]
+fn array_component_class_name(name: &str) -> Option<&str> {
+    let element = name.strip_prefix('[')?.trim_start_matches('[');
+    let inner = element.strip_prefix('L')?.strip_suffix(';')?;
+    if inner.is_empty() { None } else { Some(inner) }
+}
+
 #[inline]
 fn is_global_resolution_namespace(name: &str) -> bool {
     name.starts_with("java/")
@@ -20023,6 +20034,35 @@ pub(crate) fn resolve_class_loader_aware(
     referencing_class_id: ClassId,
     name: &str,
 ) -> Result<ClassId, MethodCallFailed> {
+    // (0) An array reference resolves its COMPONENT type with the same
+    //     initiating loader as the array reference itself (JVMS 5.3.3: the
+    //     array class is synthesised from the resolved component; no class
+    //     file is consulted). Every loader-faithful branch below keys on
+    //     `name` itself, and `drive_defining_loader_load` declines `[` names
+    //     outright -- so an array name fell straight through to the flat
+    //     global `load_class_concurrent`, which fabricated a synthetic stub
+    //     for a component that exists only behind a custom loader AND
+    //     registered that stub globally under `Application`, permanently
+    //     poisoning the component for the real loader (a stub has no `Code`,
+    //     so the first real `new` of it fails with
+    //     "<init> ... has no Code attribute").
+    //     Found on the Keycloak 26.6.1 / Quarkus fast-jar boot: an
+    //     `ldc` of `[Lorg/jboss/threads/EnhancedQueueExecutor$TaskNode;`
+    //     from `EnhancedQueueExecutor.<clinit>`, whose jar is reachable only
+    //     through Quarkus's `RunnerClassLoader`.
+    //     Strictly additive: it only pre-resolves a component whose global
+    //     answer was going to be fabricated anyway.
+    if let Some(component) = array_component_class_name(name) {
+        if cratonvm_native_builtins::classloader::any_defining_loader_registered()
+            && shared
+                .classes
+                .class_manager
+                .read()
+                .would_fabricate_synthetic_stub(component)
+        {
+            let _ = drive_defining_loader_load(shared, thread, referencing_class_id, component);
+        }
+    }
     // (1) Gate / built-in / JDK-name fast paths + already-known loader-local
     //     answer — none of which need a re-entrant call.
     let direct_loader = shared
@@ -20284,6 +20324,25 @@ pub(crate) fn resolve_class_loader_aware(
             if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name)
             {
                 return Ok(id);
+            }
+            // An array resolution fails when its COMPONENT cannot be resolved
+            // globally, and `drive_defining_loader_load` declines `[` names --
+            // so offer the component to the referencing class's own loader and
+            // re-synthesise. The (0) pre-pass above only covers a component the
+            // global path would answer with a fabricated STUB; a component that
+            // is simply absent from the process class path lands here instead.
+            // Keycloak 26.6.1 / Quarkus fast-jar:
+            // `[Lorg/antlr/v4/runtime/atn/ATNConfig;` from
+            // `ATNConfigSet$AbstractConfigHashSet.createBuckets`, whose jar is
+            // reachable only through the `RunnerClassLoader`.
+            if let Some(component) = array_component_class_name(name) {
+                if drive_defining_loader_load(shared, thread, referencing_class_id, component)
+                    .is_some()
+                {
+                    if let Ok(id) = shared.load_class_concurrent(name) {
+                        return Ok(id);
+                    }
+                }
             }
             Err(MethodCallFailed::from(e))
         }

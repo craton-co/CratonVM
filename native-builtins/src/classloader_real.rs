@@ -512,14 +512,21 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         cl,
         "getUnnamedModule",
         "()Ljava/lang/Module;",
-        |ctx, _args| {
+        |ctx, args| {
             // Return the ONE canonical unnamed-module mirror rather than a fresh
             // allocation per call: the JDK compares Modules by identity, so
             // `Foo.class.getModule() == loader.getUnnamedModule()` (and Mockito's
             // `assureCanReadMockito` / ResourceBundle's caller-module checks) must
             // see the same object. It also carries a non-null `loader`, matching
             // HotSpot. See `lang_class::canonical_unnamed_module`.
-            let m = crate::lang_class::canonical_unnamed_module(ctx);
+            // Per-loader for user-defined loaders (HotSpot: every loader has
+            // its own unnamed module and `Module.getClassLoader()` answers
+            // that loader); built-in loaders keep the single canonical one.
+            let this = match args.first() {
+                Some(Value::Object(o)) => *o,
+                _ => None,
+            };
+            let m = crate::lang_class::unnamed_module_for_loader(ctx, this);
             Ok(Some(Value::Object(Some(m))))
         },
     );

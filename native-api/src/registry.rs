@@ -674,6 +674,14 @@ pub trait NativeClassAccess {
         None
     }
 
+    /// For a synthetic lambda-proxy `ClassId`, return the resolved `ClassId`
+    /// of its functional (SAM) interface when the invokedynamic bootstrap
+    /// recorded one.  This preserves defining-loader identity for reflection
+    /// paths that must not re-resolve a potentially ambiguous interface name.
+    fn lambda_functional_interface_id(&self, _class_id: ClassId) -> Option<ClassId> {
+        None
+    }
+
     /// For a synthetic lambda-proxy `ClassId`, return the internal name of the
     /// lambda's *defining* class (the class that owns the implementation method,
     /// e.g. `Refl6` for a `() -> {}` whose body compiles to `Refl6.lambda$..`).
