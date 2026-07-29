@@ -99,11 +99,23 @@ const SF_DECL_INTERNAL: usize = 5;
 ///
 /// The real `ClassFrameInfo(StackWalker)` constructor copies it out of the
 /// walker; `populate_sfi` does the same via [`walker_retains_class_ref`].
-/// It occupies bit 0 and therefore does not collide with the
-/// `java.lang.reflect.Modifier` bits the rest of this file already reads out
-/// of the same word (`flags & 0x100` = `Modifier.NATIVE`, used by
-/// `isNativeMethod` / `getLineNumber` / `getByteCodeIndex`).
-const SF_FLAG_RETAIN_CLASS_REF: i32 = 0x01;
+/// JDK 25's `ClassFrameInfo.RETAIN_CLASS_REF_BIT` is `1 << 27`. The low
+/// 24 bits are reserved for the member-info flags, including
+/// `Modifier.NATIVE` (`0x100`).
+pub(crate) const SF_FLAG_RETAIN_CLASS_REF: i32 = 0x0800_0000;
+
+/// Return the real-JDK carrier's RETAIN_CLASS_REFERENCE state when the
+/// receiver has a `ClassFrameInfo.flags` field. Synthetic StackFrame carriers
+/// do not have that field and return `None`.
+pub(crate) fn class_frame_retains_class_ref(
+    ctx: &mut dyn NativeContext,
+    frame: cratonvm_types::ObjectRef,
+) -> Option<bool> {
+    match ctx.get_field_by_name(frame, "flags") {
+        Value::Int(flags) => Some((flags & SF_FLAG_RETAIN_CLASS_REF) != 0),
+        _ => None,
+    }
+}
 
 /// Read the `RETAIN_CLASS_REFERENCE` setting of the `StackWalker` that owns an
 /// `AbstractStackWalker` receiver, so `populate_sfi` can record it in each
@@ -827,14 +839,12 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             // requested RETAIN_CLASS_REFERENCE.  `populate_sfi` records that
             // option on every frame, so do not let the native override bypass
             // the JDK guard that the bytecode normally executes first.
-            if let Value::Int(flags) = ctx.get_field_by_name(this, "flags") {
-                if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
-                    return Err(MethodCallFailed::from(
-                        RuntimeError::UnsupportedOperationException {
-                            message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-                        },
-                    ));
-                }
+            if matches!(class_frame_retains_class_ref(ctx, this), Some(false)) {
+                return Err(MethodCallFailed::from(
+                    RuntimeError::UnsupportedOperationException {
+                        message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+                    },
+                ));
             }
             let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -1072,14 +1082,12 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         // Keep the package-private bridge aligned with the public accessor:
         // callers that arrive through ClassFrameInfo must not bypass the
         // RETAIN_CLASS_REFERENCE contract either.
-        if let Value::Int(flags) = ctx.get_field_by_name(this, "flags") {
-            if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
-                return Err(MethodCallFailed::from(
-                    RuntimeError::UnsupportedOperationException {
-                        message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-                    },
-                ));
-            }
+        if matches!(class_frame_retains_class_ref(ctx, this), Some(false)) {
+            return Err(MethodCallFailed::from(
+                RuntimeError::UnsupportedOperationException {
+                    message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+                },
+            ));
         }
         // Prefer the internal-name slot we always populate.
         if let Value::Object(Some(s)) = ctx.get_field(this, SF_DECL_INTERNAL) {
@@ -1290,11 +1298,11 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            let Value::Int(flags) = ctx.get_field_by_name(this, "flags") else {
+            let Some(retains_class_ref) = class_frame_retains_class_ref(ctx, this) else {
                 // No `flags` field on this carrier — fail open.
                 return Ok(None);
             };
-            if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
+            if !retains_class_ref {
                 return Err(MethodCallFailed::from(
                     RuntimeError::UnsupportedOperationException {
                         message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
@@ -1316,6 +1324,12 @@ mod tests {
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
+
+    #[test]
+    fn retain_class_reference_bit_matches_jdk_25_class_frame_info_layout() {
+        assert_eq!(SF_FLAG_RETAIN_CLASS_REF, 1 << 27);
+        assert_eq!(SF_FLAG_RETAIN_CLASS_REF & 0x00ff_ffff, 0);
+    }
 
     #[test]
     fn register_lang_stackwalker_adds_natives() {
