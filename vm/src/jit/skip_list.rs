@@ -1864,23 +1864,22 @@ fn should_skip_jit_internal(
         // regression witness for the currently-tested (BigInteger-still-
         // banned) configuration only.
 
-        // HIB-BYTEBUDDY -- REMOVED 2026-07-28. Provisional blanket ban since
-        // 2026-06-13 for ByteBuddy's runtime class-build chain
-        // (`net/bytebuddy/`) after `SimpleEnhancerTests` hung (rc=124) with the
-        // stack spinning in `TypeDefinition$Sort.describe` /
-        // `TypeDescription.represents` once those type-description methods
-        // were JIT-compiled -- believed to be the same "JIT'd build-chain
-        // receiver corruption / loop never returns" miscompile as HIB-PROXY.
-        // Re-tested 2026-07-28 against the general JIT correctness fixes that
-        // have landed since (loader_id decode fix, atomic-array RMW, and
-        // others): `SimpleEnhancerTests` (the named regression witness) now
-        // passes cleanly and FASTER than interpreted (1762ms vs. 2511ms
-        // baseline), and a 15-class A/B sample across
-        // `org/hibernate/orm/test/bytecode/enhancement/**` (lazy loading,
-        // proxies, merge, batching) came back byte-identical
-        // found/started/ok/failed counts in both arms -- 0 hangs, 0 new
-        // failures. Full evidence:
-        // `docs/known-issues/hibernate/hib-bytebuddy-removed-20260728.md`.
+        // HIB-BYTEBUDDY -- FULLY REMOVED 2026-07-29. The initial 2026-07-28
+        // removal used only a 15-class Hibernate sample. A later no-ban run
+        // from the older 77389fa06 runtime crashed in 302 classes; its exact
+        // witness was an instruction-fetch fault in the middle of
+        // `ModifierReviewable$AbstractBase.matchesMask`.
+        //
+        // That signature was not a ByteBuddy-specific miscompile. The runtime
+        // predated the JIT code-ownership fixes that stop tier-up publication
+        // from unmapping a body while another thread is still executing it
+        // (3fe14734a, ac300e6f6, and 463bd32e2). Current dev, with no
+        // `net/bytebuddy/` guard, passes the exact 302-class crash manifest in
+        // both JIT and --nojit modes: 1281 found, 1275 started/ok, 0 failed,
+        // 0 aborted, and the same 6 fixture-declared skips in each mode.
+        // Full root-cause and marker accounting:
+        // `docs/internal/fixed-suite-bugs/hibernate/`
+        // `hib-bytebuddy-reinstated-20260729-FIXED.md`.
         // TEST-HARNESS BLANKET BANS -- REMOVED 2026-07-27. Four blanket
         // package bans lived here together:
         //
@@ -4380,6 +4379,36 @@ mod tests {
     // behind a private, default-off gate for weeks before being deleted
     // 2026-07-27 (docs/internal/is-known-miscompile-block-retired-20260727.md).
     // =================================================================
+
+    #[test]
+    fn bytebuddy_package_is_jit_eligible_after_full_hibernate_closure() {
+        // The first entry is the exact method named by the historical
+        // mid-body instruction-fetch crash. The other two are the original
+        // 2026-06-13 hang witnesses. None may be hidden by a blanket package
+        // guard again.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            for (class, method) in [
+                (
+                    "net/bytebuddy/description/ModifierReviewable$AbstractBase",
+                    "matchesMask",
+                ),
+                (
+                    "net/bytebuddy/description/type/TypeDescription",
+                    "represents",
+                ),
+                (
+                    "net/bytebuddy/description/type/TypeDefinition$Sort",
+                    "describe",
+                ),
+            ] {
+                assert_eq!(
+                    check(class, method, false, true, policy),
+                    None,
+                    "HIB-BYTEBUDDY closure gate: {class}.{method} must remain JIT-eligible"
+                );
+            }
+        }
+    }
 
     #[test]
     fn tier1_skip_list_no_blanket_java_util_ban() {
