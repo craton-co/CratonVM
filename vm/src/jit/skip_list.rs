@@ -1259,6 +1259,35 @@ fn should_skip_jit_internal(
     // in BOTH arms (ban active AND lifted) -- ruled OUT as evidence for or
     // against this ban; it is not a JIT regression at all. Full evidence:
     // `docs/known-issues/h2/h2-jitban-longtail1-residuals-20260728.md`.
+    //
+    // 2026-07-28, THIRD pass: all three of those regressions were ONE bug, and
+    // it is fixed. The generated MIC/PIC cascade called its cached compiled
+    // callee and never inspected the result, so a callee that trapped handed
+    // its `i64::MIN` deopt sentinel to the caller as if the CALLER had
+    // deopted, and left its reconstructed frame in the thread's single stash
+    // slot for an unrelated sink to mis-attribute -- which de-speculated the
+    // wrong method and then, correctly, refused to resume a frame that was not
+    // its own. That refusal IS the `InternalError` above; `TestRunscript`'s
+    // script diff is the same escape landing somewhere that did not refuse,
+    // which is why its stack carried no `RowDataType` frames and it read as a
+    // separate defect. Both direct-call sites now service the sentinel through
+    // `jit_service_callee_deopt`. `RowDataType.read`'s frame map was ALSO
+    // imprecise (a reused local slot voted `Ambiguous` whole-method); that is
+    // fixed too, by a per-bci reaching-kind dataflow, but it was not
+    // sufficient on its own.
+    //
+    // The ban nevertheless STAYS, now for exactly ONE class. A full 218-class
+    // A/B (one arm at a time) makes lifting worth +7 PASS -- 155/18/45 banned
+    // vs 162/22/31 lifted, nine classes recovering -- and every per-class
+    // change was re-run in isolation. Only `org.h2.test.jdbc.TestMetaData` is
+    // a real regression (PASS 3/3 banned, FAIL 3/3 lifted), and it is
+    // PRE-EXISTING: the pre-fix binary fails it identically. It is not an H2
+    // bug either -- bisected to `org/h2/command/query/SelectGroups`, whose
+    // `new TreeMap<>(session)` loses its comparator once the allocating method
+    // is compiled, and reproduced in 60 lines of pure JDK code by
+    // `apps/h2database-suite-runner/probes/TreeMapCmpProbe.java` (HotSpot
+    // 40000/40000, CratonVM fails from iteration ~503). LIFT THIS BAN once
+    // that is fixed; everything else is already in place.
     if class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages) {
         return Some(SkipReason::RustJvmTestFixture);
     }

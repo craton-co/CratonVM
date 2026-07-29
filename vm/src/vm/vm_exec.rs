@@ -13197,6 +13197,7 @@ fn invoke_special_shared_impl(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    dbg_dispatch_tally("invoke_special_shared", class_name, method_name, descriptor);
     // Native override always wins -- same priority order as invoke_or_native.
     // EXCEPT for SyntheticStub-tagged natives on real-protected classes with
     // loaded bytecode: invokespecial is how constructors and super-calls
