@@ -4102,8 +4102,29 @@ pub(crate) fn coerce_arg_strict(
                                         let near_name = near
                                             .and_then(|n| ctx.class_name_of_id(n))
                                             .unwrap_or_default();
+                                        // The superclass chain is the actual
+                                        // evidence: a rejected value whose
+                                        // chain contains the expected NAME but
+                                        // under a different ClassId is a
+                                        // loader split, not a type error.
+                                        let mut chain = String::new();
+                                        let mut cur = Some(arg_cid);
+                                        let mut hops = 0;
+                                        while let Some(c) = cur {
+                                            if hops > 16 {
+                                                chain.push_str(" -> ...");
+                                                break;
+                                            }
+                                            hops += 1;
+                                            let n = ctx.class_name_of_id(c).unwrap_or_default();
+                                            chain.push_str(&format!(
+                                                " -> {n}(cid={c:?},loader={:?})",
+                                                ctx.loader_id_of_class(c)
+                                            ));
+                                            cur = ctx.superclass_of(c);
+                                        }
                                         eprintln!(
-                                            "[DBG_COERCE] {context}: rejecting -- expected={internal} (cid={expected_cid:?}, loader={:?}) arg_class={arg_name} (cid={arg_cid:?}, loader={:?}) near={near:?}/{near_name} (loader={:?})",
+                                            "[DBG_COERCE] {context}: rejecting -- expected={internal} (cid={expected_cid:?}, loader={:?}) arg_class={arg_name} (cid={arg_cid:?}, loader={:?}) near={near:?}/{near_name} (loader={:?}) chain:{chain}",
                                             ctx.loader_id_of_class(expected_cid),
                                             ctx.loader_id_of_class(arg_cid),
                                             near.map(|n| ctx.loader_id_of_class(n)),
