@@ -100,8 +100,8 @@ fn aio_remove(id: i32) {
 }
 
 /// BUG FIX (2026-07-17, found while investigating `WebSocketIntegrationTests`
-/// `TomcatWebSocketClient` timeouts — see `docs/known-issues/
-/// CRATONVM-SPRING-GENUINE-BUGLIST.md`): `aio_asc_close`/`aio_assc_close`
+/// `TomcatWebSocketClient` timeouts — see `
+/// CRATONVM-SPRING-GENUINE-BUGLIST`): `aio_asc_close`/`aio_assc_close`
 /// used to call only `aio_remove`, which drops the *registry's*
 /// `Arc<Mutex<TcpStream>>` — but any in-flight handler-form read
 /// (`aio_asc_read` -> `Job::ReadFd`) is blocked in a worker thread on its OWN

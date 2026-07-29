@@ -588,7 +588,7 @@ pub fn object_total_size(header: &ObjectHeader) -> usize {
         // the copy_nonoverlapping() length, desyncing every subsequent
         // object's stride through the region from its actual body size.
         // Root-caused via the JavaPoet LineWrapper NPE
-        // (docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md): LineWrapper
+        // (CRATONVM-SPRING-GENUINE-BUGLIST): LineWrapper
         // mixes ref/primitive fields with its LAST field (nextFlush, a ref)
         // landing at a compact byte offset the legacy formula never accounted
         // for. Mirrors the already-correct gen_heap.rs::gen_object_total_size.

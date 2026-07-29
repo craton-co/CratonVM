@@ -1948,6 +1948,40 @@ impl GenerationalHeap {
         v
     }
 
+    /// Lock-free `[min_base, max_end)` envelope over every arena this heap
+    /// can hold an object in (young-from, young-to, old-gen).
+    ///
+    /// Conservative stack scanning tests one word at a time and the
+    /// overwhelming majority of those words are not heap addresses at all.
+    /// [`Self::is_object_address`] already rejects them, but only after an
+    /// out-of-line call through [`crate::vm_heap::VmHeap`]'s backend dispatch
+    /// and three pairs of `Acquire` loads. Hoisting this envelope out of the
+    /// scan loop lets the caller reject those words with a single compare,
+    /// calling the full validator only for words that could plausibly be
+    /// object headers. Returns `None` when no arena is published yet, which
+    /// callers must read as "no fast filter available" (scan everything).
+    ///
+    /// Only valid while the bounds are stable — they are republished under
+    /// STW at GC start/end, which is exactly when no scan is in flight.
+    pub fn conservative_addr_span(&self) -> Option<(usize, usize)> {
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for (base, end) in self.region_bounds.iter() {
+            let b = base.load(Ordering::Acquire);
+            let e = end.load(Ordering::Acquire);
+            if b == 0 || e <= b {
+                continue;
+            }
+            lo = lo.min(b);
+            hi = hi.max(e);
+        }
+        if hi > lo {
+            Some((lo, hi))
+        } else {
+            None
+        }
+    }
+
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
         // Reject obvious garbage.
         if addr == 0 {
@@ -12351,47 +12385,86 @@ mod tests {
     /// still produce an empty pointer_map, exactly like
     /// `non_moving_sweep_when_jit_active` — this fix must not start
     /// recording every survivor, only watched ones (bounded cost).
+    ///
+    /// The contract is a property of the NON-MOVING sweep, so the sweep has to
+    /// be selected explicitly. This test used to select it by proxy: a live JIT
+    /// frame (`gc_quiescence::enter()`) forced the non-moving path, full stop.
+    /// That stopped being true when `DEFAULT_MOVING_YOUNG` flipped to `true`
+    /// (`67de5400a`, 2026-07-28) — under moving-young a live JIT frame that HAS
+    /// proved a complete rewritable root map runs the moving (Cheney) cycle,
+    /// which is the whole point of the feature. The test then failed on
+    /// "survivor must not move", which reads like a GC relocation bug and is
+    /// really a collector-selection change; the behaviour it guards was intact
+    /// throughout (`CRATONVM_NO_MOVING_YOUNG=1` passed the whole time).
+    ///
+    /// So publish the gate explicitly, the way every sibling here does, and
+    /// cover BOTH production routes into the non-moving sweep: moving-young off
+    /// (the legacy rule), and moving-young on but with this cycle's coverage
+    /// proof incomplete — which is the actual shape of the original bug, a live
+    /// JIT frame whose roots can be marked but not rewritten. The
+    /// `objects_copied` assertion goes first on purpose: if a future gate change
+    /// steers this away from the non-moving sweep again, it should say so
+    /// instead of reporting a moved survivor.
     #[test]
     fn non_moving_sweep_records_identity_map_for_watched_survivor() {
-        let heap = small_gen_heap();
-        let monitors = NoOpMonitors;
+        for moving_young in [false, true] {
+            let heap = small_gen_heap();
+            let monitors = NoOpMonitors;
 
-        let obj_a = heap.alloc_object(ClassId::new(1), 1);
-        let obj_unwatched = heap.alloc_object(ClassId::new(2), 1);
-        heap.set_field(obj_a, 0, Value::Int(7));
-        heap.set_field(obj_unwatched, 0, Value::Int(9));
+            let obj_a = heap.alloc_object(ClassId::new(1), 1);
+            let obj_unwatched = heap.alloc_object(ClassId::new(2), 1);
+            heap.set_field(obj_a, 0, Value::Int(7));
+            heap.set_field(obj_unwatched, 0, Value::Int(9));
 
-        let a_ptr = obj_a.as_ptr();
-        let unwatched_ptr = obj_unwatched.as_ptr();
+            let a_ptr = obj_a.as_ptr();
+            let unwatched_ptr = obj_unwatched.as_ptr();
 
-        // Watch `obj_a`'s address only (simulating a live WeakReference whose
-        // referent is this object) — mirrors what
-        // `weakref_null_referents_pre_gc` publishes before a real collection.
-        crate::gc_quiescence::set_watched_referents(&[a_ptr as usize]);
+            crate::gc_quiescence::publish_moving_young_enabled(moving_young);
+            crate::gc_quiescence::begin_moving_young_coverage_cycle();
+            crate::gc_quiescence::clear_force_non_moving_jit_roots();
+            crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+            if moving_young {
+                // A live JIT frame that could not prove a complete rewritable
+                // root map — must be marked AFTER
+                // `begin_moving_young_coverage_cycle`, which clears the verdict.
+                crate::gc_quiescence::mark_moving_young_coverage_incomplete();
+            }
 
-        crate::gc_quiescence::enter();
-        assert!(crate::gc_quiescence::is_active());
+            // Watch `obj_a`'s address only (simulating a live WeakReference whose
+            // referent is this object) — mirrors what
+            // `weakref_null_referents_pre_gc` publishes before a real collection.
+            crate::gc_quiescence::set_watched_referents(&[a_ptr as usize]);
 
-        // Both objects are roots (so both survive as kept-in-place,
-        // non-promoted survivors); only `obj_a` is watched.
-        let mut roots = vec![obj_a, obj_unwatched];
-        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+            crate::gc_quiescence::enter();
+            assert!(crate::gc_quiescence::is_active());
 
-        crate::gc_quiescence::leave();
-        crate::gc_quiescence::set_watched_referents(&[]);
+            // Both objects are roots (so both survive as kept-in-place,
+            // non-promoted survivors); only `obj_a` is watched.
+            let mut roots = vec![obj_a, obj_unwatched];
+            let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
 
-        assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
-        assert_eq!(roots[1].as_ptr(), unwatched_ptr, "survivor must not move");
+            crate::gc_quiescence::leave();
+            crate::gc_quiescence::set_watched_referents(&[]);
+            crate::gc_quiescence::publish_moving_young_enabled(false);
 
-        assert_eq!(
-            result.pointer_map.get(&(a_ptr as usize)),
-            Some(&(a_ptr as usize)),
-            "watched survivor must get an identity pointer_map entry"
-        );
-        assert!(
-            !result.pointer_map.contains_key(&(unwatched_ptr as usize)),
-            "unwatched survivor must NOT get a pointer_map entry (bounded cost)"
-        );
+            assert_eq!(
+                result.stats.objects_copied, 0,
+                "this contract is about the non-moving sweep; the collector \
+                 copied instead (moving_young={moving_young})"
+            );
+            assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
+            assert_eq!(roots[1].as_ptr(), unwatched_ptr, "survivor must not move");
+
+            assert_eq!(
+                result.pointer_map.get(&(a_ptr as usize)),
+                Some(&(a_ptr as usize)),
+                "watched survivor must get an identity pointer_map entry"
+            );
+            assert!(
+                !result.pointer_map.contains_key(&(unwatched_ptr as usize)),
+                "unwatched survivor must NOT get a pointer_map entry (bounded cost)"
+            );
+        }
     }
 
     /// A5 fix regression, **strengthened for moving-young**: the

@@ -468,6 +468,23 @@ impl VmHeap {
         }
     }
 
+    /// `[lo, hi)` envelope containing every address [`Self::is_object_address`]
+    /// can possibly accept, or `None` when the backend cannot cheaply supply
+    /// one (ZGC keeps live bases in a registry, not a contiguous arena).
+    ///
+    /// Purely an optimization hint for conservative stack scanning: a word
+    /// outside the envelope is definitely not an object address, so the
+    /// caller can skip the full per-word validator. A word inside it still
+    /// has to go through `is_object_address`.
+    pub fn conservative_addr_span(&self) -> Option<(usize, usize)> {
+        match self {
+            VmHeap::Generational(h) => h.conservative_addr_span(),
+            VmHeap::G1(h) => h.conservative_addr_span(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
+        }
+    }
+
     /// BUG-03 — whether this heap backend supports the cross-thread STW JIT
     /// TLAB skip-region protocol, i.e. it can collect safely while a frozen
     /// in-JIT peer holds an un-retired TLAB:

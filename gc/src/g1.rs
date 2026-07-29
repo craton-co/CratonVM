@@ -6948,6 +6948,18 @@ impl G1Collector {
     /// [`crate::gen_heap::GenerationalHeap::is_object_address`] for the
     /// contract. NEW-1.5 JIT frame root scanning calls this through
     /// [`crate::vm_heap::VmHeap::is_object_address`].
+    /// Lock-free `[base, end)` envelope of the single contiguous G1 arena.
+    /// See [`crate::gen_heap::GenerationalHeap::conservative_addr_span`] for
+    /// the contract; here the bounds are immutable for the collector's
+    /// lifetime.
+    pub fn conservative_addr_span(&self) -> Option<(usize, usize)> {
+        if self.arena_end > self.arena_base {
+            Some((self.arena_base, self.arena_end))
+        } else {
+            None
+        }
+    }
+
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
         if addr == 0 || addr & 0x7 != 0 {
             return None;
@@ -7936,7 +7948,7 @@ fn object_total_size(header: &ObjectHeader) -> usize {
         // the copy_nonoverlapping() length, desyncing every subsequent
         // object's stride through the region from its actual body size.
         // Root-caused via the JavaPoet LineWrapper NPE
-        // (docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md): LineWrapper
+        // (CRATONVM-SPRING-GENUINE-BUGLIST): LineWrapper
         // mixes ref/primitive fields with its LAST field (nextFlush, a ref)
         // landing at a compact byte offset the legacy formula never accounted
         // for. Mirrors the already-correct gen_heap.rs::gen_object_total_size.
