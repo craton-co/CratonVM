@@ -2382,10 +2382,15 @@ fn ext_opt_set(args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
     let (Some(id), Some(value)) = ext_opt_int_args(args) else {
         return Err(ext_opt_unsupported(opt.label()));
     };
-    let (Some((level, name)), Some(fd)) =
-        (ext_opt_sys::level_and_name(opt), ext_opt_sys::raw_fd(id))
-    else {
+    let Some((level, name)) = ext_opt_sys::level_and_name(opt) else {
         return Err(ext_opt_unsupported(opt.label()));
+    };
+    let Some(fd) = ext_opt_sys::raw_fd(id) else {
+        // The JDK's blocking Socket path can hand us its private descriptor
+        // rather than a CratonVM NIO-handle id. Keepalive tuning is advisory;
+        // accept it just as the JDK does when the platform socket is already
+        // configured, instead of failing an otherwise valid HTTP connection.
+        return Ok(());
     };
     ext_opt_sys::set_int(fd, level, name, value).map_err(|e| net_err(opt.label(), e))
 }
