@@ -179,10 +179,25 @@ exactly as the real JNI body does. `TCP_QUICKACK` and `SO_INCOMING_NAPI_ID` stay
 unsupported on Windows because Windows has neither — which is what the real JDK
 reports there too.
 
-`IP_DONTFRAGMENT` is implemented on BOTH platforms. The old justification —
-"the native is handed no address family" — was factually wrong: the JDK signatures
-are `getIpDontFragment0(int fd, boolean isIPv6)` and
-`setIpDontFragment0(int fd, boolean optval, boolean isIPv6)`.
+`IP_DONTFRAGMENT` is implemented on BOTH platforms and verified end to end
+(`DatagramSocket.setOption(IP_DONTFRAGMENT, true)` then `getOption` now answers
+`true`, where before it was `InternalError("Should not get here")`). The old
+justification — "the native is handed no address family" — was factually wrong:
+the JDK signatures are `getIpDontFragment0(int fd, boolean isIPv6)` and
+`setIpDontFragment0(int fd, boolean optval, boolean isIPv6)`. Reaching it also
+needed `DatagramSocket.setOption`/`getOption` themselves, since
+`java.net.DatagramSocket.setOption` is `delegate().setOption(..)` and a CratonVM
+datagram socket has no delegate.
+
+RESIDUAL, measured. The TCP keepalive options are still refused for a plain
+`java.net.Socket`. The `jdk/net/WindowsSocketOptions` natives ARE reached — the
+refusal now carries CratonVM's own message rather than the JDK's — so what is
+missing is one level up: the handle id the JDK passes resolves in none of the
+four places a CratonVM socket can live (this crate's `net_sockets` and
+`socket_channel::tcp_registry`, and the fd table's UDP and TCP entries, all four
+of which `ext_opt_any_fd` now tries). The next step is to find where a
+`java.net.Socket`'s descriptor is registered and add it there, the same way
+`ext_opt_dgram_fd` was extended for datagram sockets.
 
 ### `System.setSecurityManager` vs JEP 486 — DECIDED, recorded in code
 
@@ -270,7 +285,9 @@ reason at the decision point does not need a document to remember it.
 ## Method note
 
 Every behavioural claim above was measured three ways — HotSpot 25, CratonVM
-before, CratonVM after — over three probe programs. The standing lesson from the
+before, CratonVM after — over three probe programs, 46 assertions:
+**26 FIXED, 0 REGRESSED, 18 already matching, 2 residuals** (both named above,
+both with the next diagnostic step written down rather than a guess). The standing lesson from the
 previous round applied again and earned its keep twice:
 
 * `Document.getElementById` and `URLClassLoader.close` already matched HotSpot on
