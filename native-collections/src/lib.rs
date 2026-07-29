@@ -10488,7 +10488,14 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // would route through native_hs_remove on the synthetic KeySet, which
     // chains to native_map_remove on the underlying map. Either way the
     // entry actually disappears from the source collection.
-    let _ = native_hs_remove(ctx, &[Value::Object(Some(backing)), key])?;
+    // `native_hs_remove` can dispatch equality/hashCode and allocate. Keep the
+    // iterator itself rooted across that nested native call: its `lastRet`
+    // update below must use the post-GC address, not a from-space reference.
+    let this_pin = ctx.pin_native_root(this);
+    let removed = native_hs_remove(ctx, &[Value::Object(Some(backing)), key]);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    let _ = removed?;
     ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
     Ok(None)
 }
