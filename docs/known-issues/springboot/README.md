@@ -124,6 +124,10 @@ allocation size). Full before/after table and reproduce instructions in
 `apps/spring-boot-suite-runner/RESULTS-20260728.md`.
 
 **Follow-up triage (same round):** investigated all 20 residual FAIL
+
+Update: the `BasicErrorControllerIntegrationTests` comparator crash was fixed
+and retired on 2026-07-29. Its 26/26 JIT and `--nojit` validation record is
+under `docs/internal/fixed-suite-bugs/springboot/`.
 classes plus the 2 CRASHes. 9 of the 20 FAIL classes matched existing
 docs (several already marked FIXED/RESOLVED by concurrent sessions —
 confirmation/regression notes added rather than re-filing); the remaining
