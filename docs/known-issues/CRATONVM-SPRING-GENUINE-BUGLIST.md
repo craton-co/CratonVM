@@ -2,9 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **3 residual classes**, all AOT (was 9 after the third session, 19 before it, 57 before that, 127 before that). Thirteen VM bugs closed in the third session, seven more in the fourth; every one has a standalone HotSpot-vs-CratonVM probe. |
+| **Status** | OPEN — **1 residual class** (was 3 after the fourth session, 9 after the third, 19 before it, 57 before that, 127 before that). Thirteen VM bugs closed in the third session, seven in the fourth, three in the fifth; every one has a standalone HotSpot-vs-CratonVM probe. |
 | **Captured** | 2026-07-27 (third session), branch `fix/spring-buglist-final-20260727` merged into `origin/dev` at `1f538bf76`, Azure host `20.83.144.174`, real JDK 25, worktree `/data/data/wt-sprbuglist-20260727`, binaries `localbin/cratonvm-sprfinal-v*.bin`. Every number below was measured with the class run **in isolation** (`apps/spring-suite-runner/onea.sh <fqcn>`), not from a sharded batch — the shared host runs at load 25–100 and batch runs emit spurious FAIL/TIMEOUT rows. |
 | **Fourth session** | 2026-07-28, branch `fix/spring-nonaot-20260727` merged into `origin/dev`, worktree `/data/data/wt-spr-nonaot-20260727`, binaries `localbin/cratonvm-nonaot-v*.bin`. Took the five non-AOT residuals from LOADERR/0/2/2/6/26-27/165-170 to **fully green**, and turned the sixth (`RequestMappingMessageConversionIntegrationTests`) out to be a heap-sizing artifact rather than a linkage bug. See *Closed in the fourth session* below. |
+| **Fifth session** | 2026-07-29, branch `fix/spring-aot-final-20260728` merged into `origin/dev` at `9a2fc262b`, worktree `/data/data/wt-spraot-20260728`, binaries `localbin/cratonvm-spraot-v*.bin`. Closed two of the three AOT residuals — **both were SIGSEGVs mis-filed as timeouts**, not throughput — and narrowed the third from "8 sub-failures" to three named items with a one-minute repro each. See *Closed in the fifth session* below. |
 | **History** | Everything before the third session is archived in [`../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-GENUINE-BUGLIST-history-20260727.md`](../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-GENUINE-BUGLIST-history-20260727.md). Its conclusions are superseded by the entries below wherever the two disagree. |
 
 ## Closed this session
@@ -268,40 +269,159 @@ Every later use then raises a fresh `NoClassDefFoundError` from
 can show — it names the consumer, never the original failure. It paid for
 itself immediately on the `ExceptionUtils` mystery below.
 
-## What is left (3 classes)
+## Closed in the fifth session (2026-07-29)
 
-All three are AOT. Verified in isolation against
-`localbin/cratonvm-nonaot-v12.bin` (branch `fix/spring-nonaot-20260727`,
-merged to `origin/dev`).
+| class | before | after |
+|---|--:|--:|
+| `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT (no `RESULT` at 1500 s) | **40/40** in 395 s |
+| `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT (no `RESULT` at 5400 s) | **14/14** in 10327 s |
 
-| class | state | note |
+**Neither was a timeout.** Both classes were SIGSEGVing partway through and the
+runner, seeing no `RESULT` line, reported the wall-clock ceiling. Two distinct
+crashes were behind it, and a third fix came out of the AOT residual below.
+
+### The three fixes
+
+1. **The moving-young verifier dereferenced a shadow-stack pointer read out of
+   the WRONG JIT frame.** `shadow_window_from_frame` recovers a thread's
+   published shadow window by reading `[rbp - cm.shadow_thread_slot_off]` and
+   following the `JvmThread` pointer it finds there. That slot only holds a
+   thread pointer when `cm` actually describes the frame standing at `rbp` —
+   and it does not when an unguarded JIT→JIT call has published the callee's
+   (deeper) frame base into the chain entry. `scan_one_frame_precise` already
+   declines to publish an oop map under exactly that condition
+   (`chain_entry_rbp_is_foreign`); the verifier did not check it at all. The
+   only validation was `base != 0 && top >= base && (top - base) % 8 == 0`,
+   which a spilled `long` or a `Value` discriminant clears constantly.
+   `ApplicationContextAotGeneratorTests.processAheadOfTimeWithPropertySource`
+   faulted on `addr=0xefc` about three minutes into every run. Now the verifier
+   skips foreign-`rbp` entries (fail-closed: it forces the non-moving sweep for
+   that cycle), and the window must satisfy the exact `#[repr(C)]` invariant
+   `ShadowStack::ensure_allocated` establishes — three 8-aligned addresses,
+   `base < end`, `end - base` exactly the fixed buffer size, `top` inside
+   `[base, end]`. A concurrent session landed an equivalent fix on `dev` while
+   this one was in flight; the merged result keeps the stricter checks of both.
+
+2. **A retired JIT code buffer was unmapped while a frame was executing it.**
+   Signature: a SIGSEGV whose `pc == addr` — an instruction-fetch fault, not a
+   bad data access. Reproduced on
+   `BeanRegistrationsAotContributionTests.applyToWithLessThanAThousandBeanDefinitionsDoesNotCreateSlices` at roughly one run in three; with
+   `CRATONVM_DBG=jit-names` the crash handler names the faulting body as
+   `com/sun/tools/javac/tree/TreeScanner.visitApply`, i.e. javac was running it
+   while its in-process compilation of the AOT-generated sources kept defining
+   classes and invalidating the JIT cache. Same family as the `NodeConnections`
+   retired-code jump closed on 2026-07-27, different hole: that one was a caller
+   holding a bare entry address, this one is a live frame — `JitEntryGuard::enter_with_compiled` records only a raw `*const CompiledMethod`, and its doc
+   comment's claim that "the compiled method itself is kept alive by the JIT
+   cache's Arc holding" is exactly the assumption `JitCache::put` breaks.
+   **Landed on `dev` by a concurrent session** (the `defer_jit_owner`
+   retirement queue plus `CRATONVM_DBG_JIT_UNMAP` / `CRATONVM_JIT_NEVER_FREE_CODE` diagnostics); this session's independent implementation was dropped in
+   the merge in its favour after confirming it fixes the repro — **8/8 clean
+   runs against 3 crashes in the 8 comparable runs before**.
+
+3. **A type parameter whose bound is used by an EARLIER one lost its own
+   bound.** `Base.class.getTypeParameters()[1].getBounds()` answered `[Object]`
+   where HotSpot answers `[Something]`, for the shape
+   `<T extends Thing<S>, S extends Something>` — and only for that shape;
+   `<T extends Thing, S extends Something>` and `<T extends Thing<Something>>`
+   were both already correct (`probes/TypeVarProbe2.java` prints all three side
+   by side). Building `T` resolves the nested `S`;
+   `resolve_declared_type_variable` will not re-enter `getTypeParameters()`
+   while that list is under construction, so the fallback publishes an
+   `Object`-bounded stand-in for `S` — correct as a placeholder, but nothing
+   distinguished it from a finished parameter, so `getTypeParameters()` served
+   it verbatim when the loop reached `S` and the declared bound was never built.
+   Placeholders are now marked; `type_param_to_java` reuses and PATCHES the
+   stand-in in place, which also repairs the reference already baked into `T`'s
+   bound and preserves the object identity `com.sun.beans.TypeResolver`'s
+   self-mapping check depends on. Found through `AotIntegrationTests` (below):
+   Spring resolves a type-variable field to its bound via
+   `ResolvableType.forField(field, testClass).resolve()`, got `null`, and
+   `@MockitoBean S something` therefore matched every bean in the context —
+   *"Unable to select a bean to override: found 17 beans of type ?"*.
+
+**On the throughput residual.** Both closed classes are green but slow:
+`ApplicationContextAotGeneratorTests` 395 s vs HotSpot's 31.6 s, and
+`BeanRegistrationsAotContributionTests` 10327 s vs 26.9 s, of which
+`applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles` (10 001 bean
+definitions through in-process javac) alone is 9446 s. A `perf` profile of that
+run is flat — the largest single item is ~4% — and 2166 of the 3045 methods the
+JIT compiles during the run are javac's own, so this is the separately tracked
+interpreter-throughput gap and not a discrete defect. One profile-driven change
+did land here: the conservative JIT-frame root scan walked the innermost frames
+once per chain entry (all entries share `scanner_sp` as their low bound, so K
+entries meant O(K·depth) work for a root set that is by construction the union)
+and re-read the arena bounds through a backend dispatch for every stack word.
+Scanning the union once, with the heap's address envelope hoisted out of the
+loop, removed the profile's top three symbols —
+`GenerationalHeap::is_object_address` (12.7%), `VmHeap::is_object_address`
+(4.9%) and `scan_active_jit_frames_with_sp` (4.9%) — none of which appears in
+the top twenty afterwards.
+
+## What is left (1 class)
+
+`test.context.aot.AotIntegrationTests`, and specifically
+`endToEndTestsForBeanOverrides`. It does **not** complete in 3 h on this host
+(RSS climbs past 5.4 GB at `--Xmx 8g` and the AOT phase is silent), so it was
+characterised instead with the per-chunk probe described under *Reproducing*
+below: 150 classes grouped by top-level class into 20 chunks, run through
+`AotE2EProbe` on HotSpot first and then on CratonVM.
+
+**18 of the 20 chunks match HotSpot exactly**, including the six failures
+HotSpot itself produces (all probe artefacts: the TestNG engine's
+`ServiceConfigurationError` under the forked TCCL, and
+`non-public interface is not defined by the given loader` from a proxy). Three
+concrete items are left.
+
+| item | where | state |
 |---|---|---|
-| `test.context.aot.AotIntegrationTests` | 1/4 (1 fail, 2 skipped) | **Not a hang — the 1500 s ceiling was simply too low.** Re-measured at 3600 s: it completes. The array-identity `IllegalArgumentException` that used to end it at ~589 s is gone; what is left is `endToEndTestsForBeanOverrides`, which drives 175 test classes through a forked loader and reports `MultipleFailuresError` with **8** sub-failures — four bare `AssertionFailedError`s and four `BeanCreationException: Could not inject field …MockitoSpyBeanAndSpring…`. That is the same bean-override family the archived history tracks (13 failures at follow-up 10, Family A fixed at follow-up 11), now down to 8. Give it a ceiling above 1500 s or it reports a spurious TIMEOUT |
-| `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT | measured: no `RESULT` line at a 1500 s ceiling |
-| `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT | no `RESULT` line at a **5400 s** ceiling with a 6 GB heap, and none at 2400 s / 3000 s across three earlier builds (HotSpot: 14/14 in 25.8 s, so ≥209×). This is the separately tracked interpreter-throughput defect, not a discrete bug. The JIT-cache fix above removed the one algorithmic hotspot it had — a re-profile is now flat: interpreter execution ~9%, jimage/classpath resource lookup ~9%, allocator ~8%, nothing above 6.3%. It SIGSEGV'd under batch load earlier, so treat a crash there as a symptom of the slowness rather than a second bug |
+| `Field.set` rejects a Spring CGLIB AOP proxy | `mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests` | **4/4 fail** (HotSpot 4/4 pass). `BeanCreationException: Could not inject field … dateService`, caused by `IllegalArgumentException: argument type mismatch`. `CRATONVM_DBG_COERCE=1` names it exactly: `expected=…$DateService (cid=1899, loader=3)` vs `arg_class=…$DateService$$SpringCGLIB$$1 (cid=7650, loader=7)` — the CGLIB subclass is defined in a different loader namespace and `is_subclass` cannot walk from it to the `DateService` the test class sees. The same reject fires for log4j's own plugin reflection (`expected=…/log4j/Level (loader=2)` vs `arg_class=…/log4j/Level (loader=3)`), which is why every AOT log is full of `Could not create plugin of type … LoggerConfig` — probably one root cause, not two |
+| AssertJ soft assertions cannot build their ByteBuddy proxy | `bean.override.BeanOverrideHandlerTests.forTestClassWith{SingleField,MultipleFields,MultipleFieldsWithIdenticalMetadata}` | **3 fail** in AOT replay only — the class passes **19/19** run normally. `IllegalArgumentException: Could not create type` from `net.bytebuddy.TypeCache.findOrInsert`, reached from `SoftProxies.createSoftAssertionProxyClass` |
+| chunk 4 does not finish | `mockito.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests` and neighbours | AOT processing completes (`PROBE aot-processing OK`) and then the replay hangs; killed at the 2400 s ceiling on three separate runs. HotSpot: 25 found, 24 succeeded, 1 failed (a probe artefact) |
 
-`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests`
-is **off this list**: it passes **160/160** at a 6 GB heap. The long-standing
-`NoClassDefFoundError: org/junit/platform/commons/util/ExceptionUtils` — "a
-core JUnit-Platform class that is unconditionally on the classpath" — was an
-`OutOfMemoryError` inside that class's `<clinit>`, which parked the class in
-`InitializationError` so every later use raised `NoClassDefFoundError` from
-`ensure_class_initialized_shared`. `CRATONVM_DBG_CLINIT_FAIL=1` named it in one
-run. The archived history's guess of memory pressure was right after all; what
-was wrong was ruling it out. The residual question is footprint, not linkage:
-HotSpot runs this class under its default heap and CratonVM needs ~3× the
-runner's 2 GB default.
+The first two reproduce in **about a minute each** — see below. That is the
+whole reason this section can name them instead of quoting a
+`MultipleFailuresError` count.
 
 ## Reproducing
 
+Whole classes, from a copy of the suite runner:
+
 ```bash
-cd /data/data/spr-nonaot-runner   # a copy of apps/spring-suite-runner
-CRATONVM_BIN=/data/data/wt-spr-nonaot-20260727/localbin/cratonvm-nonaot-v12.bin ./onea.sh <fqcn>
+cd /data/data/spraot-runner
+CRATONVM_BIN=/data/data/wt-spraot-20260728/localbin/cratonvm-spraot-v7.bin   CRATONVM_DEFAULT_HEAP_MAX_MB=6144 ./onea.sh <fqcn>
 ```
 
 `onea.sh` runs one class and prints every failure (`KRUN_STACK=1` adds stacks);
-`onem.sh <fqcn> <method>` runs a single method, `onep.sh <fqcn> <m1,m2,…>` a
-subset (the two-method form is what isolates cross-test contamination), and
-`hs.sh` / `hsm.sh` are the HotSpot equivalents — **always check HotSpot in this
-same checkout before calling a failure a VM bug**. `seqrun.sh <listfile> <outdir>`
-runs a list sequentially in isolation.
+`onet.sh <fqcn> [method]` is the same thing with per-test `START`/`DONE`
+timings, which is what turns "TIMEOUT" into "test 13 of 14 took 9446 s";
+`onem.sh` / `onep.sh` run a single method or a subset, and `hs.sh` / `hst.sh`
+are the HotSpot equivalents — **always check HotSpot in this same checkout
+before calling a failure a VM bug**.
+
+`AotIntegrationTests#endToEndTestsForBeanOverrides` is not usable as a
+debugging loop; use the per-class AOT probe instead:
+
+```bash
+cd /data/data/aot20260726
+# one class (add its @Nested classes explicitly), ~1 minute
+CP=$(tr -d '' < …/spring-test/build/cratonvm-testcp.txt)
+PROBE_STACK=1 <cratonvm> --java-home /home/victor/jdk25 --Xmx 3g   -cp "build2:build:$CP"   org.springframework.core.test.tools.ForkedProbeMain AotE2EProbe2 <Test…>
+# all 150 classes, grouped by top-level class into 20 chunks
+./bochunks2.sh hs                       # HotSpot baseline first
+CRATONVM_BIN=<cratonvm> ./bochunks2.sh cv
+```
+
+`AotE2EProbe` is `AotIntegrationTests.runEndToEndTests` cut down to the named
+classes; `AotE2EProbe2` is the same with `PROBE_STACK=1` support. The
+`ForkedProbeMain` wrapper is mandatory (the generated
+`__TestContext001_BeanDefinitions` classes touch package-private members of the
+test class), and chunks **must** be grouped so a class and its `@Nested`
+children stay together — splitting them fails on HotSpot too.
+
+Levers that earned their keep this session: `CRATONVM_DBG=jit-names` (names the
+compiled method a SIGSEGV faulted in — `pc == addr` means the code was
+unmapped), `CRATONVM_DBG_COERCE=1` (prints the exact expected/actual ClassId and
+loader behind an `argument type mismatch`), `CRATONVM_DBG_DUMP_JIT=LIST` (what
+actually got compiled), and `CRATONVM_DBG_CLINIT_FAIL=1` from the fourth
+session.
