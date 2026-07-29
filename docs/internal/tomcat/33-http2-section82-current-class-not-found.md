@@ -26,21 +26,25 @@ queue processing held `RefProcessor` (L7) and then queried `ClassManager`
   and verifies that unloading one leaves the other live.
 - Reference-next-slot lookup now happens before the reference-processor lock
   is acquired. Synthetic two-field references still use slot zero.
+- `HashMap$KeyItr.remove()` now pins and refreshes its iterator receiver across
+  the nested, GC-capable HashSet removal. This removes the stale-address
+  out-of-bounds write found while auditing the no-JIT HTTP/2 matrix.
 - `RunMethods` accepts `--range <first-index> <last-index>`, and
-  `run-section82-shards.ps1` executes bounded ranges with lock-order checking
-  and verifies each JUnit summary.
+  `run-section82-shards.ps1` executes bounded ranges in either JIT mode or
+  `-NoJit` mode with lock-order checking and verifies each JUnit summary.
 
 ## Validation
 
-Built the release candidate from the fixing branch and ran
-`org.apache.coyote.http2.TestHttp2Section_8_2` with JIT and
-`CRATONVM_LOCK_ORDER_CHECK=1` through the real Tomcat suite fixture.
+Built a fresh release candidate from the fixing branch and ran
+`org.apache.coyote.http2.TestHttp2Section_8_2` through the real Tomcat suite
+fixture with `CRATONVM_LOCK_ORDER_CHECK=1`.
 
 | coverage | result |
 |---|---|
-| parameter indexes 0 through 6657 | 6,658 run, 0 failures |
-| contiguous bounded ranges | 34/34 passed |
-| error scan | no `current class not found`, lock-order violation, panic, `InternalError`, or JUnit failure |
+| JIT indexes 0 through 6657 | 6,658 run, 0 failures, 34/34 bounded ranges passed |
+| no-JIT indexes 0 through 6657 | 6,658 run, 0 failures, 34/34 bounded ranges passed |
+| patched stale-reference range 2600 through 2799 | JIT 200/200 and no-JIT 200/200, each with zero failures |
+| invariant scan | no `current class not found`, lock-order violation, panic, `InternalError`, `RESID-DIAG WRITE`, or JUnit failure in the patched focused runs |
 
 The current Tomcat data provider exposes 6,658 cases (indexes 0-6657); the
 earlier 7,682 estimate was not the fixture's actual cardinality.
@@ -50,6 +54,10 @@ earlier 7,682 estimate was not the fixture's actual cardinality.
 ```powershell
 apps\tomcat-suite-runner\run-section82-shards.ps1 `
   -Exe <cratonvm.exe> -ProbeDir <compiled RunMethods directory>
+
+# Repeat the complete matrix without JIT
+apps\tomcat-suite-runner\run-section82-shards.ps1 `
+  -Exe <cratonvm.exe> -ProbeDir <compiled RunMethods directory> -NoJit
 ```
 
 The helper defaults to the complete current range and rejects a shard unless
