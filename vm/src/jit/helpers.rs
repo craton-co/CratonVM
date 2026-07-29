@@ -547,6 +547,16 @@ pub fn is_jit_thread_set() -> bool {
     JIT_THREAD.with(|t| !t.get().is_null())
 }
 
+/// The `*mut JvmThread` installed for this OS thread, or null when none is.
+///
+/// Unlike [`jit_get_current_thread`] this does **no** JIT-boundary bookkeeping
+/// (`note_jit_boundary`), so GC-side verification code can consult it without
+/// perturbing the per-thread scan cache it is in the middle of using.
+#[inline(always)]
+pub fn current_jit_thread_ptr() -> *mut JvmThread {
+    JIT_THREAD.with(|t| t.get())
+}
+
 /// Restore a previously saved JIT thread scope. Used to support re-entrant
 /// JIT calls (e.g. JIT put() → jit_invoke_dispatch → interpreter::execute hash()
 /// which may JIT-compile hash() and call set_jit_thread again). Re-installs the
@@ -702,6 +712,17 @@ pub(crate) fn stash_jit_pending_exception(exc: ObjectRef) {
 /// against it. See `JitSignals::athrow_bci`.
 pub(crate) fn clear_jit_athrow_bci() {
     JIT_SIGNALS.with(|s| s.athrow_bci.set(-1));
+}
+
+/// Read the `athrow` bci without consuming it.
+///
+/// Exists for the one consumer that must see the bci BEFORE
+/// [`clear_jit_athrow_bci`] runs: `route_implicit_exc_through_callee` routes
+/// through the CALLEE's own exception table, and the stamped bci is that
+/// callee's own throw site — precisely the pc that lookup needs. See the
+/// capture at that function's entry.
+pub(crate) fn peek_jit_athrow_bci() -> i64 {
+    JIT_SIGNALS.with(|s| s.athrow_bci.get())
 }
 
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
@@ -1649,6 +1670,23 @@ unsafe fn route_implicit_exc_through_callee(
     // (which regenerates the exception) or hands the sentinel to the compiled
     // CALLER, whose drain would treat that bci as its own. See
     // `clear_jit_athrow_bci`.
+    //
+    // CAPTURE IT FIRST. Being the callee's own bci is exactly what makes it
+    // right for the KCFULL-13 branch below, which routes through THAT callee's
+    // own exception table — the one lookup in this function for which the pc is
+    // not foreign at all. Clearing it before the branch read it left
+    // `throw_pc = usize::MAX`, so `find_jit_exception_handler` took its
+    // pc-unknown path, which deliberately skips a catch-all whose region does
+    // not span the whole method — i.e. every javac `finally`. The resume-at-
+    // handler fix (`run_jit_callee_handler`) could then never fire: measured
+    // 4213 entries to the branch and 0 handlers found, with the fall-through
+    // re-running the callee from entry and leaking one increment per throw
+    // (`CallPathProbe` IFACE-class-delegating, `FinallyBalanceProbe`).
+    //
+    // The clear itself stays, so every path that propagates outward or re-runs
+    // the callee behaves exactly as before; only the branch that consumes the
+    // bci for the callee's OWN table sees it.
+    let callee_throw_bci = peek_jit_athrow_bci();
     clear_jit_athrow_bci();
     if rbc6_dbg() {
         eprintln!(
@@ -1726,8 +1764,17 @@ unsafe fn route_implicit_exc_through_callee(
                 // (docs/known-issues/repros/jitban-remaining-20260726/).
                 let signals = take_all_jit_signals();
                 if let Some(exc) = signals.exception {
-                    let throw_pc = if signals.athrow_bci >= 0 {
-                        signals.athrow_bci as usize
+                    // `signals.athrow_bci` is always -1 here: the entry clear
+                    // above ran before this drain. Fall back to the value
+                    // captured before it — the callee's own throw site, which
+                    // is what this lookup against the callee's own table needs.
+                    let stamped_bci = if signals.athrow_bci >= 0 {
+                        signals.athrow_bci
+                    } else {
+                        callee_throw_bci
+                    };
+                    let throw_pc = if stamped_bci >= 0 {
+                        stamped_bci as usize
                     } else {
                         usize::MAX
                     };
@@ -7026,13 +7073,11 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
     )
 }
 
-/// Direct compact-Latin1 lowercase helper. The registered Java helper is
-/// correct for interpreter execution, but its generic native-dispatch round
-/// trip dominates repeated charset lookups. This preserves the same cached
-/// immutable result and pending-return root contracts without that overhead.
-/// Direct receiver-typed `String.toLowerCase(Locale)` entry. The ASCII
-/// compact helper below owns the implementation; Locale is currently unused
-/// by the VM's existing ASCII fast path.
+/// Direct receiver-typed `String.toLowerCase(Locale)` entry — the thin
+/// direct-call form the JIT emits instead of a generic native-dispatch round
+/// trip, which dominates repeated case folding.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_string_locale_to_lower_direct(
     vm_ptr: i64,
     source: i64,
@@ -7041,11 +7086,22 @@ pub unsafe extern "C" fn jit_string_locale_to_lower_direct(
     jit_string_latin1_to_lower_direct(vm_ptr, source, 0, locale)
 }
 
+/// Compact-Latin1 sibling: `StringLatin1.toLowerCase(String, byte[], Locale)`,
+/// so `value` is the receiver's backing array (unused — the implementation
+/// reads the String) and `locale` the third argument.
+///
+/// Both entries delegate to `lang_string::jit_string_to_lower_case`, the same
+/// implementation the interpreted native uses. They used to carry a private copy
+/// of the ASCII/Unicode fold that ignored `locale` entirely, so a
+/// `toLowerCase(TURKISH)` call silently changed its answer when its caller
+/// tiered up — the interpreter said `tıtle`, the compiled code `title`.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     vm_ptr: i64,
     source: i64,
     _value: i64,
-    _locale: i64,
+    locale: i64,
 ) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
@@ -7056,6 +7112,13 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     let Some(source) = vm.mem.heap.is_object_address(source as usize) else {
         return 0;
     };
+    // A null / non-heap Locale means "default locale", exactly as the
+    // interpreted native treats a missing argument.
+    let locale_obj = if locale == 0 {
+        None
+    } else {
+        vm.mem.heap.is_object_address(locale as usize)
+    };
     let Some((thread, _guard)) = jit_thread_mut() else {
         return 0;
     };
@@ -7063,28 +7126,10 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
         shared: vm,
         thread: &mut *thread,
     };
-    let result = if let Some(cached) = ctx.get_ascii_case_string_cached(source, false) {
-        cached
-    } else {
-        let mut lower = ctx.read_string(source).unwrap_or_default();
-        let changed = if lower.is_ascii() {
-            let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
-            lower.make_ascii_lowercase();
-            changed
-        } else {
-            let folded = lower.to_lowercase();
-            if folded == lower {
-                false
-            } else {
-                lower = folded;
-                true
-            }
-        };
-        if changed {
-            ctx.create_ascii_case_string_cached(source, &lower, false)
-        } else {
-            source
-        }
+    let Some(result) = cratonvm_native_builtins::lang_string::jit_string_to_lower_case(
+        &mut ctx, source, locale_obj,
+    ) else {
+        return 0;
     };
     thread.native_pending_return = Some(result);
     result.as_ptr() as i64
@@ -7985,6 +8030,23 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
 
     let receiver_class_id = vm.mem.heap.class_id_of(receiver_ref);
     let receiver_cid = receiver_class_id.as_u32();
+    // A reference array stores its COMPONENT class id in
+    // `ObjectHeader.class_id` — the same invariant the KC26 array.clone() note
+    // further down calls out — so `receiver_cid` alone cannot tell a `Foo[]`
+    // from a `Foo`. Per JVMS §4.4.1 an array class inherits `Object`'s method
+    // table, not its component's, so every class-id-keyed fast path below must
+    // refuse array receivers and let the resolving miss path (which asks
+    // `virtual_dispatch_target_for_receiver`, and gets `java/lang/Object`)
+    // handle them. Without this a MIC warmed on a `Foo` receiver called
+    // straight into compiled `Foo.equals` with a `Foo[]` as `this`, and its
+    // first `checkcast Foo` threw
+    // `ClassCastException: class [LFoo; cannot be cast to class Foo` — the
+    // `ResolvableType[]`/`ResolvableType` Spring Boot failure this was found
+    // as. The inline machine-code cascades in `jit/src/x64.rs`,
+    // `jit/src/ir_lower.rs` and `jit/src/runtime_lowering.rs` carry the same
+    // guard against `ObjectHeader.kind`.
+    let receiver_is_plain_object =
+        vm.mem.heap.kind_of(receiver_ref) == cratonvm_types::ObjectKind::Object;
 
     // Real-layout Matcher methods are registered natives, so they can never
     // publish a compiled entry into the ordinary MIC/PIC. Without this leaf
@@ -8146,6 +8208,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // a bounded secondary target cache so those misses still avoid repeated
     // class hierarchy resolution and compile-cache probing.
     if cached_cid != receiver_cid
+        && receiver_is_plain_object
         && pic_ptr != 0
         && direct_virtual_compiled_callee_entry_enabled()
         && !redefine_jit_quiesced
@@ -8170,7 +8233,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // If the receiver ClassId matches the cached value AND we have a cached
     // entry pointer, dispatch directly without any class_manager lookup or
     // method resolution.  This is the zero-overhead dispatch path.
-    if cached_cid == receiver_cid && cached_cid != 0 {
+    if cached_cid == receiver_cid && cached_cid != 0 && receiver_is_plain_object {
         mic.record_hit();
 
         // Try the cached compiled entry pointer (true inline cache hit)
@@ -9923,17 +9986,6 @@ mod tests {
             "post-GC alloc_array must produce an int[] of the requested length",
         );
     }
-}
-
-/// The `JIT_THREAD` TLS slot as a plain address, with none of the
-/// `jit_get_current_thread` side effects (that one also invalidates the
-/// per-thread JIT-scan cache, which must not happen from a GC root walk).
-///
-/// Zero when this thread is not currently inside a JIT invocation. Callers use
-/// it to CHECK a thread pointer recovered from a raw frame slot, never to
-/// dereference one.
-pub fn current_jit_thread_ptr() -> usize {
-    JIT_THREAD.with(|t| t.get()) as usize
 }
 
 /// Return the current thread's `JvmThread` pointer for the JIT inline

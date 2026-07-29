@@ -606,6 +606,26 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
     // sites and re-run `KafkaRaftServer.initializeLogDirs`; the expected
     // failure if the bug IS fixed and this is left in place is silence, which
     // is exactly why it must not be left in place.
+    //
+    // WAVE 4 — the probe now has a named suspect, which is where to look first.
+    // `phases_late/collections.rs::register_p60_abstract_map` registers
+    // `java/util/AbstractMap.isEmpty()Z` (and `toString`/`hashCode`) reading
+    // `ctx.get_field(this, 1)` as the entry count. That is the 3-slot synthetic
+    // map layout (buckets, size, capacity); on a REAL-JDK map slot 1 is not
+    // `size`, so the native answers from an unrelated field. `AbstractMap` is a
+    // CLASS, so this intercepts every Map that does not override `isEmpty`
+    // itself. `java.util.HashMap` DOES override it, so a plain HashMap receiver
+    // should resolve to `HashMap.isEmpty` and miss this native — which is
+    // exactly the part of the premise that needs the probe: find out what
+    // `logDirProps` actually is at the `verify` call (a `Collections
+    // .unmodifiableMap` wrapper and `TreeMap` both inherit `isEmpty` from
+    // `AbstractMap` and WOULD be intercepted).
+    //
+    // ESCALATION (not fixable from this file): if the probe confirms it, the
+    // repair is in `collections.rs` — make `AbstractMap.isEmpty`/`size` dispatch
+    // to the receiver's own `size()` instead of reading slot 1 — and only then
+    // delete this registration together with its `check_override` allow-list
+    // entry in `vm/src/vm/vm_exec.rs`.
     registry.register(
         "org/apache/kafka/metadata/properties/MetaPropertiesEnsemble",
         "verify",

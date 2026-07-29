@@ -1338,6 +1338,25 @@ pub(crate) fn t19_h10_alloc_byte_array_input_stream(
 ///     and the Class-mirror path is unchanged from prior behaviour).
 ///
 /// Called with args[0] = this (Class mirror), args[1] = name (String).
+/// `CRATONVM_DBG_CLASS_RESOURCE=<substring>` -- trace every
+/// `Class.getResourceAsStream` whose resolved resource name contains the
+/// substring: the requesting class, the `ClassLoader` the lookup was routed
+/// through, and whether it produced bytes.
+///
+/// A resource lookup that silently answers `null` is invisible at the VM
+/// level and surfaces only as a distant, misleading application default --
+/// Infinispan reporting its version as `0.0.0-SNAPSHOT` (and then failing to
+/// match its own XML namespace), Keycloak's `Version.VERSION` NPE, a
+/// `MissingResourceException` for a bundle that is plainly in a jar. This
+/// names the loader that answered, which is the fact those investigations
+/// actually needed.
+fn dbg_class_resource_filter() -> Option<&'static str> {
+    static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FILTER
+        .get_or_init(|| std::env::var("CRATONVM_DBG_CLASS_RESOURCE").ok())
+        .as_deref()
+}
+
 pub(crate) fn native_class_get_resource_as_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1365,25 +1384,57 @@ pub(crate) fn native_class_get_resource_as_stream(
     // custom loader itself) silently resolves to null. Mirrors the
     // identical delegation `cl_get_resource_as_stream` already performs
     // when ClassLoader.getResourceAsStream is called directly.
+    let dbg = match dbg_class_resource_filter() {
+        Some(f) => !f.is_empty() && resource_name.contains(f),
+        None => false,
+    };
+    if dbg {
+        let requester = mirror_class_name(ctx, this).unwrap_or_default();
+        eprintln!("[CLASS-RES] {requester}.getResourceAsStream({resource_name})");
+    }
     if let Ok(Some(Value::Object(Some(loader)))) =
         native_class_get_class_loader(ctx, &[Value::Object(Some(this))])
     {
         let loader_class_id = ctx.class_id_of_object(loader);
         let loader_class_name = ctx.class_name_of_id(loader_class_id).unwrap_or_default();
-        if crate::classloader::object_extends(ctx, loader, "java/net/URLClassLoader")
-            || !crate::classloader::is_builtin_loader_class(&loader_class_name)
-        {
+        let delegates = crate::classloader::object_extends(ctx, loader, "java/net/URLClassLoader")
+            || !crate::classloader::is_builtin_loader_class(&loader_class_name);
+        if dbg {
+            eprintln!("[CLASS-RES]   loader={loader_class_name} delegates={delegates}");
+        }
+        if delegates {
             let pin = ctx.pin_native_root(loader);
             let name_arg = Value::Object(Some(ctx.create_string(&resource_name)));
             let loader = ctx.read_native_pin(pin, loader);
             ctx.unpin_native_roots(pin);
-            return ctx.invoke_virtual(
+            let result = ctx.invoke_virtual(
                 loader,
                 "getResourceAsStream",
                 "(Ljava/lang/String;)Ljava/io/InputStream;",
                 &[name_arg],
             );
+            if dbg {
+                match &result {
+                    Ok(Some(Value::Object(Some(stream)))) => {
+                        let stream = *stream;
+                        let cls = ctx
+                            .class_name_of_id(ctx.class_id_of_object(stream))
+                            .unwrap_or_default();
+                        let avail =
+                            match ctx.invoke_virtual(stream, "available", "()I", &[]) {
+                                Ok(Some(Value::Int(n))) => n.to_string(),
+                                other => format!("{other:?}"),
+                            };
+                        eprintln!("[CLASS-RES]   delegated -> stream {cls} available={avail}");
+                    }
+                    Ok(_) => eprintln!("[CLASS-RES]   delegated -> NULL"),
+                    Err(_) => eprintln!("[CLASS-RES]   delegated -> threw"),
+                }
+            }
+            return result;
         }
+    } else if dbg {
+        eprintln!("[CLASS-RES]   loader=<bootstrap/null>");
     }
     // A package-directory resource has a URL but no byte content to read.
     // In particular, `SomeClass.class.getResourceAsStream("")` resolves to
@@ -1394,6 +1445,15 @@ pub(crate) fn native_class_get_resource_as_stream(
     let bytes = ctx
         .find_resource(&resource_name)
         .or_else(|| (!ctx.find_all_resource_urls(&resource_name).is_empty()).then(Vec::new));
+    if dbg {
+        eprintln!(
+            "[CLASS-RES]   classpath scan -> {}",
+            match &bytes {
+                Some(b) => format!("{} bytes", b.len()),
+                None => "NULL".to_string(),
+            }
+        );
+    }
     match bytes {
         None => Ok(Some(Value::Object(None))),
         Some(bytes) => {
@@ -9988,9 +10048,8 @@ pub(crate) fn native_class_get_constructor(
 
 // --- Class.getInterfaces / Class.getModifiers ---
 
-/// Resolve a lambda proxy's functional-interface NAME to a `ClassId`,
-/// scoped to the lambda's own host (defining/enclosing) class's loader
-/// rather than the flat global store.
+/// Resolve a lambda proxy's functional interface to a `ClassId`, preserving
+/// the bootstrap's exact resolved identity before any host-scoped fallback.
 ///
 /// Residual 4 follow-up (2026-07-20, docs/known-issues/springboot/
 /// core-spring-boot-test-config-data-and-classpath-scan-cluster.md): both
@@ -10012,6 +10071,14 @@ fn lambda_functional_interface_id_loader_aware(
     class_id: ClassId,
     iface_name: &str,
 ) -> Option<ClassId> {
+    // The invokedynamic bootstrap resolves the SAM through the defining
+    // class's loader and retains that ClassId on the call site.  Use that
+    // authoritative identity first: host names are not unique under forked
+    // loaders, so resolving the host by name can lose the exact loader and
+    // make both the scoped and global fallbacks ambiguous.
+    if let Some(iface_id) = ctx.lambda_functional_interface_id(class_id) {
+        return Some(iface_id);
+    }
     let host_id = ctx
         .lambda_proxy_host(class_id)
         .and_then(|host_name| ctx.class_id_by_name(&host_name));
@@ -11178,9 +11245,16 @@ fn resolve_annotation_class_via_loader(
     loader: ObjectRef,
     class_name: &str,
 ) -> Result<ObjectRef, Option<ObjectRef>> {
+    // Loading through a user-defined loader can allocate and re-enter Java.
+    // Keep the loader and the freshly-created class-name String visible to a
+    // moving collector until the virtual call has consumed them.
+    let loader_pin = ctx.pin_native_root(loader);
     let dotted = class_name.replace('/', ".");
     let name_obj = ctx.create_string(&dotted);
-    match ctx.invoke_virtual(
+    let name_pin = ctx.pin_native_root(name_obj);
+    let loader = ctx.read_native_pin(loader_pin, loader);
+    let name_obj = ctx.read_native_pin(name_pin, name_obj);
+    let result = match ctx.invoke_virtual(
         loader,
         "loadClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
@@ -11192,7 +11266,10 @@ fn resolve_annotation_class_via_loader(
         Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => Err(Some(exc)),
         // Internal VM error вЂ” don't synthesize; let the caller fall back.
         Err(_) => Err(None),
-    }
+    };
+    ctx.unpin_native_roots(name_pin);
+    ctx.unpin_native_roots(loader_pin);
+    result
 }
 
 /// Create an annotation proxy object from annotation data.
@@ -11597,7 +11674,12 @@ pub(crate) fn annotation_element_to_java_typed(
                     Err(_) => None,
                 }
             });
-            let enum_cid_opt = via_loader.or_else(|| {
+            // An application-loaded annotation can lack an ObjectRef for its
+            // defining loader while its ClassId still carries the correct
+            // namespace. Prefer that scoped lookup to the global table.
+            let via_container_scope = container_class_id
+                .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
+            let enum_cid_opt = via_loader.or(via_container_scope).or_else(|| {
                 ctx.class_id_by_name(class_name).or_else(|| {
                     let _ = ctx.load_class(class_name);
                     ctx.class_id_by_name(class_name)
@@ -11949,6 +12031,10 @@ pub(crate) fn annotation_element_to_java_typed(
                         Ok(mirror) => ctx.class_id_from_mirror(mirror),
                         Err(_) => None,
                     }
+                })
+                .or_else(|| {
+                    container_class_id
+                        .and_then(|holder| ctx.class_id_by_name_near(&comp_name_owned, holder))
                 })
                 .or_else(|| ctx.class_id_by_name(&comp_name_owned))
                 .or_else(|| {
@@ -13628,8 +13714,13 @@ pub(crate) fn native_class_get_generic_interfaces(
                         eprintln!("[LAMBDA-GENERIC] typesig_to_real_type -> {val:?}");
                     }
                     if let Value::Object(Some(pt)) = val {
+                        // Building the result array can move the newly-created
+                        // ParameterizedTypeImpl before it is published.
+                        let pt_pin = ctx.pin_native_root(pt);
                         let arr = ctx.new_ref_array(ClassId::new(0), 1);
+                        let pt = ctx.read_native_pin(pt_pin, pt);
                         ctx.set_array_element(arr, 0, Value::Object(Some(pt)));
+                        ctx.unpin_native_roots(pt_pin);
                         return Ok(Some(Value::Object(Some(arr))));
                     }
                 }
@@ -15226,6 +15317,86 @@ pub(crate) fn canonical_unnamed_module(ctx: &mut dyn NativeContext) -> ObjectRef
     // mirror as a permanent GC root.
     ctx.cache_module_mirror(None, m);
     m
+}
+
+/// The unnamed `java.lang.Module` of `loader`.
+///
+/// HotSpot gives EVERY `ClassLoader` its own unnamed module -- that is what
+/// `ClassLoader.getUnnamedModule()` returns and what `Class.getModule()`
+/// reports for a class the loader defined -- and `Module.getClassLoader()`
+/// answers that loader. CratonVM had ONE process-wide unnamed module whose
+/// `loader` was always the application loader, so every caller-sensitive JDK
+/// API that derives a `ClassLoader` from the *caller's module* looked in the
+/// wrong place.
+///
+/// `ResourceBundle.getBundle(String)` is the canonical victim:
+/// `getBundleImpl` resolves the search loader as
+/// `getLoader(caller.getModule())`, so a class defined by a custom loader
+/// searched the APPLICATION classpath for its bundle and threw
+/// `MissingResourceException` even though its own loader could serve the
+/// resource. Found on the Keycloak 26.6.1 boot -- Liquibase's
+/// `ResourceBundle.getBundle("liquibase/i18n/liquibase-core")` runs from
+/// classes defined by Quarkus's `RunnerClassLoader`, whose jars are not on
+/// the CratonVM process classpath at all.
+///
+/// Built-in loaders keep the single [`canonical_unnamed_module`] so the
+/// identity contract it documents (Mockito's `assureCanReadMockito`,
+/// `Throwable.validateSuppressedExceptionsList`, the `java.lang.Package`
+/// builders) is untouched; only genuinely user-defined loaders get their own.
+pub(crate) fn unnamed_module_for_loader(
+    ctx: &mut dyn NativeContext,
+    loader: Option<ObjectRef>,
+) -> ObjectRef {
+    let Some(loader) = loader else {
+        return canonical_unnamed_module(ctx);
+    };
+    // The application loader keeps the ONE canonical unnamed module, so every
+    // identity contract `canonical_unnamed_module` documents is untouched for
+    // ordinary classpath classes.
+    let app = crate::classloader::get_or_create_app_loader(ctx);
+    if app.as_ptr() == loader.as_ptr() {
+        return canonical_unnamed_module(ctx);
+    }
+    // Memoise on the loader's OWN `java.lang.ClassLoader.unnamedModule` field --
+    // the JDK's own storage. Identity is then exact per loader, the module is
+    // GC-rooted by the loader that owns it, and a real `ClassLoader` whose
+    // constructor already built its unnamed module hands back THAT object.
+    if let Value::Object(Some(existing)) = ctx.get_field_by_name(loader, "unnamedModule") {
+        if ctx
+            .class_name_of_id(ctx.class_id_of_object(existing))
+            .as_deref()
+            == Some("java/lang/Module")
+        {
+            return existing;
+        }
+    }
+    let loader_pin = ctx.pin_native_root(loader);
+    let m = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+    let pin = ctx.pin_native_root(m);
+    // Unnamed: slot 0 AND the real `name` field stay null -- see
+    // `canonical_unnamed_module` for why both shapes must be written.
+    ctx.set_field(m, 0, Value::Object(None));
+    ctx.set_field_by_name(m, "name", Value::Object(None));
+    let loader = ctx.read_native_pin(loader_pin, loader);
+    let m = ctx.read_native_pin(pin, m);
+    ctx.set_field_by_name(m, "loader", Value::Object(Some(loader)));
+    let m = ctx.read_native_pin(pin, m);
+    let loader = ctx.read_native_pin(loader_pin, loader);
+    ctx.set_field_by_name(loader, "unnamedModule", Value::Object(Some(m)));
+    // `set_field_by_name` no-ops when the field is absent (the synthetic
+    // ClassLoader shape). Without somewhere to memoise we would mint a fresh
+    // Module per call and break identity outright, so degrade to the canonical
+    // one instead -- exactly the pre-fix behaviour for those loaders.
+    let stored = match ctx.get_field_by_name(loader, "unnamedModule") {
+        Value::Object(Some(x)) => x.as_ptr() == m.as_ptr(),
+        _ => false,
+    };
+    ctx.unpin_native_roots(loader_pin);
+    if stored {
+        m
+    } else {
+        canonical_unnamed_module(ctx)
+    }
 }
 
 /// Internal helper: synthesise a `java/lang/Package` whose `name` slot is

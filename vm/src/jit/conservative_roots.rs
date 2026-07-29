@@ -604,9 +604,6 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         n
     });
     GLOBAL_JIT_DEPTH.fetch_add(1, Ordering::Release);
-    // Mirror into the JIT crate so `retire_executable` can tell whether
-    // unmapping a dropped code buffer could hit a frame that is running it.
-    cratonvm_jit::note_live_jit_frame_delta(1);
     cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
     // compaction whenever any thread is inside a JIT call. NEW-12's
@@ -648,7 +645,6 @@ pub fn pop_jit_entry() -> Option<usize> {
     });
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
-        cratonvm_jit::note_live_jit_frame_delta(-1);
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
         Some(entry.entry_sp)
@@ -701,7 +697,6 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
     }
     for _ in 0..pruned {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
-        cratonvm_jit::note_live_jit_frame_delta(-1);
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
     }
@@ -1262,6 +1257,19 @@ fn shadow_window_from_frame(
     if thread_ptr == 0 || thread_ptr & 0x7 != 0 {
         return None;
     }
+    // That word is only a thread pointer when `cm` really describes the frame
+    // at `rbp`. Callers are expected to have excluded the mis-attribution case
+    // (`chain_entry_rbp_is_foreign`), but a wrong `cm` turns this into an
+    // arbitrary aligned stack word and the two loads below would dereference
+    // it — which is exactly how the band verifier SIGSEGV'd on a `base` of
+    // `0x5555_0000_0004`. Every compiled frame on this thread caches THIS
+    // thread's `JvmThread`, so reject anything else whenever a thread is
+    // installed (it is null only in unit tests and on threads that never
+    // entered JIT code, where there is no frame to mis-attribute).
+    let current = crate::jit::helpers::current_jit_thread_ptr() as usize;
+    if current != 0 && thread_ptr != current {
+        return None;
+    }
     let ss = thread_ptr.checked_add(cm.shadow_off_in_thread as usize)?;
     if ss & 0x7 != 0 {
         return None;
@@ -1296,16 +1304,6 @@ fn shadow_window_from_frame(
         Some(unsafe { (at as *const usize).read() })
     };
     if thread_ptr < 0x1_0000 {
-        return None;
-    }
-    // Cheapest and sharpest of the checks when it is available: this thread
-    // entered JIT code with exactly one `JvmThread`, so a frame slot claiming
-    // any other address is a misread. Zero means the TLS is not set (a GC
-    // reached from interpreter code), which leaves only the structural checks
-    // below — deliberately not treated as a failure, so behaviour on that path
-    // is unchanged.
-    let expected = crate::jit::helpers::current_jit_thread_ptr();
-    if expected != 0 && thread_ptr != expected {
         return None;
     }
     let top = read_word(cratonvm_gc::shadow_stack::ShadowStack::TOP_OFFSET)?;
@@ -1383,15 +1381,18 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
             }
             if chain_entry_rbp_is_foreign(rbp, entry_sp, scanner_sp) {
                 // `info.compiled_method` does NOT describe the frame now
-                // standing at `exact_rbp` — an unguarded JIT->JIT call
-                // published its own (deeper) base there. Every offset this
-                // loop reads (`shadow_thread_slot_off`, `osr_frame_size`, the
-                // band bounds) belongs to the wrong method, so nothing here
-                // can be verified. `scan_one_frame_precise` already declines
-                // to publish an oop map under the same condition; declining to
-                // VERIFY is the fail-closed counterpart — it forces the
-                // non-moving sweep for this cycle instead of trusting a band
-                // read out of the wrong frame.
+                // standing at `exact_rbp` -- an unguarded JIT->JIT call, or the
+                // inline MIC/PIC cascade, published its own (deeper) base
+                // there. This is the case
+                // `refresh_moving_young_coverage_for_current_thread` reports as
+                // FOREIGN_INNERMOST_RBP. Every offset this loop reads
+                // (`shadow_thread_slot_off`, `osr_frame_size`, the band bounds)
+                // belongs to the wrong method, so nothing here can be verified.
+                // `scan_one_frame_precise` already declines to publish an oop
+                // map under the same condition; declining to VERIFY is the
+                // fail-closed counterpart -- it forces the non-moving sweep for
+                // this cycle instead of trusting a band read out of the wrong
+                // frame.
                 unverified = true;
                 continue;
             }
@@ -3596,6 +3597,42 @@ mod tests {
         f.cm.shadow_thread_slot_off = 8;
         f.cm.shadow_off_in_thread = 0;
         assert!(shadow_window_from_frame(f.rbp, &f.cm).is_none());
+    }
+
+    /// A frame whose `CompiledMethod` does not describe it (the
+    /// FOREIGN_INNERMOST_RBP case: an RBP published by a compiled callee
+    /// reached through the inline MIC/PIC cascade) hands
+    /// `shadow_window_from_frame` an arbitrary aligned stack word in place of
+    /// the cached `*mut JvmThread`, so `base`/`top` are read out of something
+    /// that is not a `ShadowStack`. The verifier SIGSEGV'd walking such a
+    /// window from a `base` of `0x5555_0000_0004`; an unaligned `base` cannot
+    /// address 8-byte shadow slots and must be rejected, not walked.
+    #[test]
+    fn shadow_window_rejects_an_unaligned_base() {
+        let mut f = fake_shadow_thread(&[0x1111, 0x2222], false);
+        let ss = 24 / 8; // SHADOW_OFF_IN_THREAD / 8, BASE_OFFSET = 16
+        f._thread[ss + 2] += 4;
+        assert!(
+            shadow_window_from_frame(f.rbp, &f.cm).is_none(),
+            "an unaligned base is not a shadow window",
+        );
+    }
+
+    /// Same failure mode, caught by size instead of alignment: the shadow
+    /// buffer never holds more than `DEFAULT_SHADOW_SLOTS` slots, so a wider
+    /// `[base, top)` proves the pair did not come from a `ShadowStack`.
+    /// Clamping the walk (which is all `published_shadow_values` used to do)
+    /// still reads up to 2 MiB from an address that was never mapped.
+    #[test]
+    fn shadow_window_rejects_a_window_wider_than_the_backing_buffer() {
+        let mut f = fake_shadow_thread(&[0x1111], false);
+        let ss = 24 / 8; // SHADOW_OFF_IN_THREAD / 8, TOP_OFFSET = 0
+        f._thread[ss] = f._thread[ss + 2]
+            + (cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS + 1) * 8;
+        assert!(
+            shadow_window_from_frame(f.rbp, &f.cm).is_none(),
+            "a window wider than the buffer is not a shadow window",
+        );
     }
 
     /// The verifier must impose no verdict (and no cost) while moving-young is

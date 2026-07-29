@@ -1085,6 +1085,39 @@ impl ThreadRegistry {
         self.threads.read().get(&thread_id).map(|e| e.name.clone())
     }
 
+    /// The Java-side `Thread.tid` for a registry id, or `None` when this entry
+    /// has no Java mirror yet (see [`ThreadEntry::java_tid`], 0 = unknown).
+    ///
+    /// Needed because `ThreadJmxSnapshot::thread_id` carries the JAVA tid
+    /// while monitor ownership is keyed by the registry `ThreadId`. Putting a
+    /// registry id in `lock_owner_id` would mix two numbering schemes in one
+    /// field, and `findDeadlockedThreads` matches `lock_owner_id` against
+    /// other threads' `thread_id` to build its wait-for graph — so the
+    /// mismatch would silently yield no edges rather than a visible error.
+    pub fn java_tid_of(&self, thread_id: ThreadId) -> Option<u64> {
+        self.threads
+            .read()
+            .get(&thread_id)
+            .map(|e| e.java_tid)
+            .filter(|tid| *tid != 0)
+    }
+
+    /// The OS-level thread id for a registry id, or `None` if this entry has
+    /// not published one yet (0 = unset).
+    ///
+    /// This is what an ARBITRARY-thread CPU-time read needs — `GetThreadTimes`
+    /// after `OpenThread` on Windows, `/proc/self/task/<tid>/stat` on Linux.
+    /// `ThreadMXBean.isThreadCpuTimeSupported()` answered false purely because
+    /// this was not reachable from a native, not because the VM lacked the
+    /// datum: `set_os_tid_current` has been publishing it all along.
+    pub fn os_tid_of(&self, thread_id: ThreadId) -> Option<u32> {
+        self.threads
+            .read()
+            .get(&thread_id)
+            .map(|e| e.os_tid.load(Ordering::Acquire))
+            .filter(|tid| *tid != 0)
+    }
+
     /// Publish a monitor acquisition attempt before it can block. The object
     /// is rooted by this registry entry until the acquire completes.
     pub fn set_jmx_contended_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {

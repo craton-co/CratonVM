@@ -56,7 +56,14 @@ const MAX_PROPS_PER_OBJECT: usize = 10_000;
 
 /// Total tracked Properties object cap.  Prevents accidental memory
 /// leaks from short-lived Properties accumulating in the side-table.
-const MAX_TOTAL_OBJECTS: usize = 10_000;
+const MAX_TOTAL_OBJECTS: usize = 262_144;
+// Raised from 10_000 (2026-07-28). A real application boot blows through that
+// long before it stops creating `Properties`: the Keycloak 26.6.1 / Quarkus
+// boot had 24_016 tracked objects by the time Infinispan loaded
+// `META-INF/infinispan-version.properties`, so EVERY later `load` /
+// `setProperty` on a not-yet-tracked object was refused -- silently. The cap
+// is a runaway-growth backstop, not a working-set limit, and the entries it
+// bounds are small; `drain_reclaimed` returns slots as objects die.
 
 /// Max bytes accepted by `Properties.load(InputStream)`.  16 MiB is
 /// far above any real `.properties` file.
@@ -913,6 +920,13 @@ fn put_kv(ctx: &mut dyn NativeContext, obj: ObjectRef, key: &str, value: &str) {
         };
     }
     if at_cap {
+        // Silently dropping a real `Properties.load` result is how a whole
+        // configuration file disappears with no error anywhere -- make it
+        // visible under CRATONVM_DIAG_PROPERTIES at least.
+        props_diag_eprintln!(
+            "[PROPS-DBG] put_kv DROPPED key={key} — side-table at capacity ({} objects)",
+            table().lock().len()
+        );
         ctx.unpin_native_roots(obj_pin);
         return;
     }
@@ -1272,17 +1286,27 @@ fn store_parsed_entries(ctx: &mut dyn NativeContext, this: ObjectRef, parsed: &[
     let is_exact = ctx
         .class_name_of_id(cid)
         .is_none_or(|n| n == "java/util/Properties");
+    // GC-safety (both branches): `put_kv` can force a collection and
+    // `mirror_loaded_entries_to_properties_backend` runs real `put` bytecode,
+    // so the receiver can be relocated MID-LOOP. The side-table is keyed off
+    // the receiver's identity/address, so continuing with a stale reference
+    // scatters the file's entries across two keys -- and the later
+    // `getProperty` reads the live one and finds nothing. The exact-class
+    // branch had no pin at all.
+    let this_pin = ctx.pin_native_root(this);
     if is_exact {
         for (k, v) in parsed {
-            put_kv(ctx, this, k, v);
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            put_kv(ctx, this_cur, k, v);
         }
-        mirror_loaded_entries_to_properties_backend(ctx, this, parsed);
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        mirror_loaded_entries_to_properties_backend(ctx, this_cur, parsed);
+        ctx.unpin_native_roots(this_pin);
         return;
     }
     // Subclass: every invoke below can trigger a moving GC, so re-read the
     // receiver (and the key string, which is allocated before the value
     // string) through pins on each iteration.
-    let this_pin = ctx.pin_native_root(this);
     for (k, v) in parsed {
         let k_obj = ctx.create_string(k);
         let k_pin = ctx.pin_native_root(k_obj);
@@ -1322,14 +1346,16 @@ fn native_properties_load(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             return Ok(None);
         }
     };
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
     if bytes.len() > MAX_LOAD_BYTES {
+        ctx.unpin_native_roots(this_pin);
         return Ok(None);
     }
     let parsed = match parse_properties_strict(&bytes) {
         Ok(parsed) => parsed,
-        Err(()) => return Err(throw_malformed_unicode_escape(ctx)),
+        Err(()) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(throw_malformed_unicode_escape(ctx));
+        }
     };
     props_diag_eprintln!(
         "[PROPS-DBG] native_properties_load: parsed {} entries from {} bytes",
@@ -1347,12 +1373,15 @@ fn native_properties_load(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             );
         }
     }
+    let this = ctx.read_native_pin(this_pin, this);
     store_parsed_entries(ctx, this, &parsed);
+    let this = ctx.read_native_pin(this_pin, this);
     props_diag_eprintln!(
         "[PROPS-DBG] native_properties_load: side-table now has {} entries for obj {:?}",
         count_kv(ctx, this),
         this
     );
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -1538,6 +1567,42 @@ fn props_defaults(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef>
 /// (JDK: `(sval == null && defaults != null) ? defaults.getProperty(key) : sval`)
 /// and is checked BEFORE the system-property fallback so a Properties' own
 /// defaults win over any same-named system property.
+/// Read one key out of the receiver's REAL `java.util.Properties` backing --
+/// the private `map` `ConcurrentHashMap` the JDK bytecode itself uses.
+///
+/// The side-table is not the only place an entry can live. Anything that
+/// reached the object through real bytecode (a `Properties` SUBCLASS's own
+/// `put`, `Hashtable` methods we do not override) lands only in that map, as
+/// does a `load` whose side-table insert was refused at capacity. Returns the
+/// value's `toString` form, or `None` when there is no backing map / no entry.
+fn chm_get(ctx: &mut dyn NativeContext, this: ObjectRef, key_obj: ObjectRef) -> Option<String> {
+    let chm = match ctx.get_field_by_name(this, "map") {
+        Value::Object(Some(m)) => m,
+        _ => return None,
+    };
+    let chm_pin = ctx.pin_native_root(chm);
+    let key_pin = ctx.pin_native_root(key_obj);
+    let chm_cur = ctx.read_native_pin(chm_pin, chm);
+    let key_cur = ctx.read_native_pin(key_pin, key_obj);
+    let got = ctx.invoke_virtual(
+        chm_cur,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(Some(key_cur))],
+    );
+    let value = match got {
+        Ok(Some(Value::Object(Some(v)))) => {
+            let v_pin = ctx.pin_native_root(v);
+            let v_cur = ctx.read_native_pin(v_pin, v);
+            ctx.read_string(v_cur)
+        }
+        _ => None,
+    };
+    // `chm_pin` is the base of every pin taken here, so this releases them all.
+    ctx.unpin_native_roots(chm_pin);
+    value
+}
+
 fn native_properties_get_property_1(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1556,6 +1621,31 @@ fn native_properties_get_property_1(
             target: "cratonvm_vm::props_sidetable",
             ?this, key = %key, bytes = v.len(),
             "PROPS-GET sidetable hit"
+        );
+        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+    }
+    // Then the object's REAL backing map, BEFORE the `defaults` chain -- the
+    // same order the JDK uses (own entries, then defaults). Reading only the
+    // side-table made every entry that reached the object through real
+    // bytecode invisible. On the Keycloak 26.6.1 boot the side-table was
+    // already at its object cap when Infinispan loaded
+    // `META-INF/infinispan-version.properties`, so
+    // `getProperty("infinispan.version", "0.0.0-SNAPSHOT")` answered the
+    // DEFAULT -- and Infinispan then rejected its own
+    // `urn:infinispan:config:16.0` namespace as unparseable.
+    let pin = ctx.pin_native_root(this);
+    let key_pin = ctx.pin_native_root(key_obj);
+    let this_cur = ctx.read_native_pin(pin, this);
+    let key_cur = ctx.read_native_pin(key_pin, key_obj);
+    let backing = chm_get(ctx, this_cur, key_cur);
+    let this = ctx.read_native_pin(pin, this);
+    let key_obj = ctx.read_native_pin(key_pin, key_obj);
+    ctx.unpin_native_roots(pin);
+    if let Some(v) = backing {
+        tracing::debug!(
+            target: "cratonvm_vm::props_sidetable",
+            ?this, key = %key, bytes = v.len(),
+            "PROPS-GET real-backing hit"
         );
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
     }

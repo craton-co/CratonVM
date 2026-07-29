@@ -599,14 +599,73 @@ pub fn register(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // <init>(InputStream) — read all bytes, then parse DER.  We don't
-    // hit this path in the probe but downstream KeyStore-loading flows
-    // do, so include it for completeness.
-    r.register(cls, "<init>", "(Ljava/io/InputStream;)V", |_ctx, _args| {
-        // Without a real InputStream pump we cannot actually slurp
-        // the bytes; the caller will see an empty principal and
-        // every comparison fails.  Returning Ok keeps probes that
-        // never pass through this constructor unaffected.
+    // <init>(InputStream) — read all bytes, then parse DER.
+    //
+    // STUB-REMOVAL (wave 3): this was a no-op whose own comment admitted the
+    // consequence — "the caller will see an empty principal and every
+    // comparison fails". A principal with no name silently equals nothing and
+    // matches nothing, so every downstream identity check against it (KeyStore
+    // alias lookup, cert subject/issuer comparison) quietly answers "no" rather
+    // than failing loudly. There IS a stream pump: drain the argument with a
+    // virtual `readAllBytes()` exactly like `phases_early::
+    // scanner_drain_input_stream` and `locale_resources` already do, then hand
+    // the bytes to the same `init_from_der` the `([B)V` ctor uses.
+    r.register(cls, "<init>", "(Ljava/io/InputStream;)V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("X500Principal: this is null".into()),
+                }
+                .into())
+            }
+        };
+        let stream = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            // Real JDK dereferences the stream immediately, so a null argument
+            // NPEs there too. Do NOT build an empty principal instead.
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("X500Principal: null InputStream".into()),
+                }
+                .into())
+            }
+        };
+        // `readAllBytes` runs arbitrary Java and can move the heap: pin both
+        // refs and re-read them afterwards.
+        let pin = ctx.pin_native_root(this);
+        let _ = ctx.pin_native_root(stream);
+        let read = ctx.invoke_virtual(stream, "readAllBytes", "()[B", &[]);
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        let der = match read? {
+            Some(Value::Object(Some(arr))) => {
+                let len = ctx.array_length(arr);
+                let mut buf = vec![0u8; len];
+                let n = ctx.read_byte_array_into(arr, 0, &mut buf);
+                buf.truncate(n);
+                buf
+            }
+            _ => Vec::new(),
+        };
+        // `X500Principal(InputStream)` is specified to throw
+        // IllegalArgumentException when the stream does not hold a valid DER
+        // Name encoding. Report that instead of populating a nameless
+        // principal — `init_from_der` alone would fall back to an empty
+        // canonical string and hide the failure.
+        if der.is_empty() {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "X500Principal: empty DER stream".to_string(),
+            }
+            .into());
+        }
+        if let Err(e) = decode_rdns(&der) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("X500Principal: invalid DER encoding: {e:?}"),
+            }
+            .into());
+        }
+        init_from_der(ctx, this, &der);
         Ok(None)
     });
 

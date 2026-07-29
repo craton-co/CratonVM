@@ -759,13 +759,32 @@ fn native_fc_position0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
 }
 
+/// The host's mmap allocation granularity, i.e. what
+/// `GetSystemInfo().dwAllocationGranularity` / `sysconf(_SC_PAGESIZE)` report.
+/// `FileChannelImpl.map` rounds the mapping offset down to a multiple of this
+/// value and hands the remainder back as the buffer's start offset, so the
+/// number is load-bearing rather than cosmetic: reporting 64 KiB on a 4 KiB
+/// page host makes every mapping start up to 60 KiB earlier than it needs to.
+fn host_allocation_granularity() -> i64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `sysconf` is a pure query — no pointers, no out-parameters.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page > 0 {
+            return page as i64;
+        }
+    }
+    // Windows' allocation granularity is 64 KiB on every supported release;
+    // also the conservative fallback if `sysconf` fails.
+    65536
+}
+
 /// `allocationGranularity0() -> long` — page size for mmap alignment.
 fn native_fc_allocation_granularity0(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    // Windows: 64 KiB. Unix: page size (typ. 4 KiB). 64 KiB is safe on both.
-    Ok(Some(Value::Long(65536)))
+    Ok(Some(Value::Long(host_allocation_granularity())))
 }
 
 // ---------------------------------------------------------------------------
@@ -996,7 +1015,13 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
         "()J",
         native_fc_allocation_granularity0,
     );
-    r.register(fci, "initIDs", "()J", |_c, _a| Ok(Some(Value::Long(65536))));
+    // NOT an `initIDs()V` no-op despite the name: `FileChannelImpl.<clinit>`
+    // does `allocationGranularity = initIDs();` — the JNI body returns the
+    // host's mmap granularity. Answer it from the host instead of a hardcoded
+    // 64 KiB (wrong on every 4 KiB-page Unix).
+    r.register(fci, "initIDs", "()J", |_c, _a| {
+        Ok(Some(Value::Long(host_allocation_granularity())))
+    });
 
     // --- NativeThread ---
     let nt = "sun/nio/ch/NativeThread";

@@ -1011,13 +1011,50 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, SF_METHODNAME)))
         },
     );
-    // expandStackFrameInfo is a private native on StackFrameInfo that
-    // populates `name`/`type`/`bci` from a HotSpot intrinsic. We
-    // pre-populate everything our getters need, so this is a no-op.
+    // PARTIAL no-op. The wave-3 justification ("populate_sfi writes all six
+    // fields eagerly, so expanding recomputes identical values") is FACTUALLY
+    // WRONG and is corrected here.
+    //
+    // `expandStackFrameInfo` is the lazy filler for the three private
+    // `StackFrameInfo` fields `name`, `type`, `bci` (jdk-25 — `javap -c
+    // java.lang.StackFrameInfo` shows the call sites). `populate_sfi` DOES
+    // write `name` and `bci` up front, so `getMethodName()` and
+    // `getByteCodeIndex()` are correct with this as a no-op; that much of the
+    // old claim holds. It does NOT write `type`, so the two public
+    // `StackWalker.StackFrame` accessors that lazily need it —
+    // `getMethodType()` and `getDescriptor()` — still find `type == null` after
+    // the "expansion" and fail.
+    //
+    // ESCALATION: `type` is a `MethodType` (or its descriptor) and
+    // `NativeContext::capture_stack_trace` does not carry one —
+    // `cratonvm_native_api::StackTraceEntry` has class/method/file/line/bci and
+    // no method DESCRIPTOR. Add `StackTraceEntry::descriptor` (the interpreter
+    // has the resolved method in hand at capture time) and this native becomes
+    // a real implementation: build the MethodType from it and store `type`.
     registry.register(sfi, "expandStackFrameInfo", "()V", |_ctx, _args| Ok(None));
-    // ensureRetainClassRefEnabled is package-private on ClassFrameInfo
-    // and asserts the walker had RETAIN_CLASS_REFERENCE. We always
-    // populate the class mirror, so this is also a no-op.
+    // No-op, deliberately permissive — but the wave-3 note that CratonVM "does
+    // not model StackWalker options at all" understates what is available.
+    //
+    // Real `ClassFrameInfo.ensureRetainClassRefEnabled()` throws
+    // UnsupportedOperationException unless the `RETAIN_CLASS_REF_BIT` is set in
+    // the frame's `flags` field, which `ClassFrameInfo(StackWalker)` copies from
+    // the walker. `populate_sfi` writes `flags = 0` unconditionally, so a
+    // faithful implementation would throw for EVERY frame — strictly worse than
+    // being lax, hence the no-op stays.
+    //
+    // REACHABILITY (checked against jdk-25 bytecode): only ONE live caller.
+    // `ClassFrameInfo.getDeclaringClass()` calls it first, but that method is
+    // itself natively shadowed above, so that path is dead. The surviving
+    // caller is `StackFrameInfo.getMethodType()` — which is already broken for
+    // the separate `type`-field reason documented on `expandStackFrameInfo`.
+    //
+    // ESCALATION (land the two together, and only with a StackWalker suite
+    // run): `native_call_stack_walk` already receives the AbstractStackWalker as
+    // `args[0]`, whose `walker` field holds the `StackWalker` and its
+    // `retainClassRef` boolean. Thread that into `populate_sfi` and OR
+    // `RETAIN_CLASS_REF_BIT` into `flags`; then this native can read `flags` and
+    // throw. `native_fetch_stack_frames` populates frames too and must default
+    // to "enabled" when it cannot see a walker, or legitimate callers regress.
     registry.register(
         "java/lang/ClassFrameInfo",
         "ensureRetainClassRefEnabled",

@@ -560,7 +560,7 @@ export inherited from a parent shell.
 | `proxy-strict` | `CRATONVM_REAL_PROXY_STRICT` |
 | `proxy-super` | `CRATONVM_REAL_PROXY_SUPER` |
 | `quarkus-arc` | `CRATONVM_SYNTHETIC_QUARKUS_ARC` |
-| `quarkus-start` | `CRATONVM_REAL_QUARKUS_START` |
+| `quarkus-start` | `CRATONVM_REAL_QUARKUS_START / CRATONVM_SYNTHETIC_QUARKUS_START` |
 | `raf` | `CRATONVM_SYNTHETIC_RAF` |
 | `rsa` | `CRATONVM_SYNTHETIC_RSA` |
 | `stax-factory` | `CRATONVM_REAL_STAX_FACTORY` |

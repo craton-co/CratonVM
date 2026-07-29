@@ -670,6 +670,40 @@ fn char_chunk_parts(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectR
     Some((buff, start, end))
 }
 
+/// The `isSet` half of `AbstractChunk.isNull()` (`end > 0 ? false : !isSet`).
+///
+/// The "no data" state is NOT the same as "no buffer". `AbstractChunk
+/// ::recycle()` clears `isSet`/`start`/`end` but deliberately keeps `buff`
+/// alive for reuse, so a recycled chunk still has a non-null buffer while
+/// being `isNull()`. Any native reproducing a Tomcat method's null-vs-empty
+/// contract must consult this rather than the `buff == null` test in
+/// [`char_chunk_parts`].
+///
+/// Callers must short-circuit on `end > 0` themselves before calling this, so
+/// that the extra field read stays off the non-empty (hot) path — see
+/// [`native_char_chunk_to_string`].
+fn char_chunk_is_set(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.get_field_by_name(this, "isSet").as_int().unwrap_or(0) != 0
+}
+
+/// Whether the chunk's `buff` field is non-null.
+///
+/// `CharChunk`'s comparison methods all start with `char[] c = buff;` and
+/// treat `c == null` as "no match" — a weaker condition than `isNull()`, and
+/// the one that decides whether a null String argument reaches `s.length()`.
+fn char_chunk_has_buffer(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(ctx.get_field_by_name(this, "buff"), Value::Object(Some(_)))
+}
+
+fn char_chunk_null_arg_npe(method: &str) -> MethodCallFailed {
+    RuntimeError::NullPointerException {
+        message: Some(format!(
+            "Cannot invoke \"String.length()\" because \"s\" is null (CharChunk.{method})"
+        )),
+    }
+    .into()
+}
+
 fn char_chunk_char_at(ctx: &dyn NativeContext, buff: ObjectRef, index: usize) -> u16 {
     ctx.get_array_element(buff, index).as_int().unwrap_or(0) as u16
 }
@@ -853,6 +887,15 @@ fn mapping_match_static(ctx: &mut dyn NativeContext, name: &str) -> Option<Objec
     }
 }
 
+/// Per-char lowercase exactly as `Mapper.compareIgnoreCase` does it:
+/// `c > 0xFF ? Character.toLowerCase(c) : Ascii.toLower(c)`, decided
+/// independently for each side of the comparison. `Ascii.toLower` is an
+/// ASCII-only table (`A`-`Z` only), so Latin-1 letters like `À` are
+/// deliberately left alone.
+///
+/// NOTE: `CharChunk.equalsIgnoreCase`/`startsWithIgnoreCase` use a *paired*
+/// branch instead (`if (c1 > 0xFF || c2 > 0xFF)`), which is not the same
+/// function — use [`char_chunk_chars_equal_ignore_case`] for those.
 fn ascii_lower_char(ch: u16) -> u16 {
     if ch <= 0xff {
         let b = ch as u8;
@@ -862,10 +905,36 @@ fn ascii_lower_char(ch: u16) -> u16 {
             ch
         }
     } else {
-        char::from_u32(ch as u32)
-            .and_then(|c| c.to_lowercase().next())
-            .map(|c| c as u32 as u16)
-            .unwrap_or(ch)
+        unicode_lower_char(ch)
+    }
+}
+
+/// `Character.toLowerCase(char)` for a single UTF-16 unit.
+fn unicode_lower_char(ch: u16) -> u16 {
+    char::from_u32(ch as u32)
+        .and_then(|c| c.to_lowercase().next())
+        .map(|c| c as u32 as u16)
+        .unwrap_or(ch)
+}
+
+/// Case-insensitive char equality as `CharChunk.equalsIgnoreCase` and
+/// `CharChunk.startsWithIgnoreCase` define it:
+///
+/// ```java
+/// if (c1 > 0xFF || c2 > 0xFF) {
+///     if (Character.toLowerCase(c1) != Character.toLowerCase(c2)) { return false; }
+/// } else if (Ascii.toLower(c1) != Ascii.toLower(c2)) { return false; }
+/// ```
+///
+/// The `||` matters: one side being non-Latin-1 pulls the *other* side onto
+/// `Character.toLowerCase` too. Lowering each side independently (the
+/// `Mapper` rule, [`ascii_lower_char`]) makes e.g. `U+212B ANGSTROM SIGN`
+/// vs `U+00C5 Å` compare unequal, where Tomcat folds both to `U+00E5 å`.
+fn char_chunk_chars_equal_ignore_case(c1: u16, c2: u16) -> bool {
+    if c1 > 0xff || c2 > 0xff {
+        unicode_lower_char(c1) == unicode_lower_char(c2)
+    } else {
+        ascii_lower_char(c1) == ascii_lower_char(c2)
     }
 }
 
@@ -885,7 +954,7 @@ fn char_chunk_equals_string(
     for (i, expected) in units.iter().enumerate() {
         let actual = char_chunk_char_at(ctx, buff, start + i);
         if ignore_case {
-            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
+            if !char_chunk_chars_equal_ignore_case(actual, *expected) {
                 return false;
             }
         } else if actual != *expected {
@@ -912,7 +981,7 @@ fn char_chunk_starts_with(
     for (i, expected) in units.iter().enumerate() {
         let actual = char_chunk_char_at(ctx, buff, start + pos + i);
         if ignore_case {
-            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
+            if !char_chunk_chars_equal_ignore_case(actual, *expected) {
                 return false;
             }
         } else if actual != *expected {
@@ -1034,20 +1103,63 @@ fn native_response_to_absolute(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// The method is already listed as a force-native hot path, but previously
 /// had no matching registration and consequently paid StringCache plus Java
 /// bytecode dispatch for every response URL. Dynamic output stays uninterned.
+///
+/// The Java body this replaces is a three-way decision, not a two-way one:
+///
+/// ```java
+/// if (isNull()) { return null; }
+/// else if (end - start == 0) { return ""; }
+/// return StringCache.toString(this);
+/// ```
+///
+/// and `isNull()` is `end > 0 ? false : !isSet` — a *state* test, not a
+/// buffer-null test. `recycle()` clears `isSet`/`start`/`end` but keeps
+/// `buff`, so keying "null" off `buff == null` alone reported a recycled
+/// chunk as empty-but-set and returned `""` where Tomcat returns `null`
+/// (`TestCharChunk.testToString`,
+/// `docs/internal/fixed-suite-bugs/tomcat/25-charchunk-tostring-null-vs-empty.md`).
+///
+/// PERF: `end` is tested first and `isSet` is read **only** when `end == 0`,
+/// so the ordinary non-empty path still performs exactly three
+/// `get_field_by_name` lookups (`end`, `buff`, `start`) — the same count as
+/// before the null-vs-empty fix. This method is hot enough (every response
+/// URL) that adding an unconditional fourth name-keyed field lookup here
+/// would be a measurable regression, so do not hoist the `isSet` read.
 fn native_char_chunk_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let Some((buff, start, end)) = char_chunk_parts(ctx, this) else {
-        return Ok(Some(Value::Object(None)));
+    let end = ctx
+        .get_field_by_name(this, "end")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
+    if end == 0 {
+        // `isNull()` reduces to `!isSet` here. A never-set or recycled chunk
+        // is null; a chunk that IS set but holds no characters is "".
+        return Ok(Some(if char_chunk_is_set(ctx, this) {
+            Value::Object(Some(ctx.create_string("")))
+        } else {
+            Value::Object(None)
+        }));
+    }
+    // `end > 0` => not `isNull()`, so from here every outcome is a String.
+    let buff = match ctx.get_field_by_name(this, "buff") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
     };
-    let mut units = Vec::with_capacity(end.saturating_sub(start));
+    let start = ctx
+        .get_field_by_name(this, "start")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
+    if end <= start {
+        return Ok(Some(Value::Object(Some(ctx.create_string("")))));
+    }
+    let mut units = Vec::with_capacity(end - start);
     for i in start..end {
         units.push(ctx.get_array_element(buff, i).as_int().unwrap_or(0) as u16);
-    }
-    if units.is_empty() {
-        return Ok(Some(Value::Object(Some(ctx.create_string("")))));
     }
     let text = String::from_utf16_lossy(&units);
     Ok(Some(Value::Object(Some(ctx.create_string_uninterned_gc_safe(&text)))))
@@ -1063,7 +1175,18 @@ fn native_char_chunk_equals_string(
     };
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        // `equals(String)` computes `len` from the chunk first and then
+        // short-circuits on `c == null || len != s.length()`: a null
+        // argument is silently `false` when there is no buffer, but an NPE
+        // once there is one. Returning `false` unconditionally swallowed a
+        // real NPE the Tomcat bytecode raises.
+        _ => {
+            return if char_chunk_has_buffer(ctx, this) {
+                Err(char_chunk_null_arg_npe("equals"))
+            } else {
+                Ok(Some(Value::Int(0)))
+            }
+        }
     };
     Ok(Some(Value::Int(
         if char_chunk_equals_string(ctx, this, &s, false) {
@@ -1084,7 +1207,14 @@ fn native_char_chunk_equals_ignore_case(
     };
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        // Same short-circuit shape as `equals(String)` above.
+        _ => {
+            return if char_chunk_has_buffer(ctx, this) {
+                Err(char_chunk_null_arg_npe("equalsIgnoreCase"))
+            } else {
+                Ok(Some(Value::Int(0)))
+            }
+        }
     };
     Ok(Some(Value::Int(
         if char_chunk_equals_string(ctx, this, &s, true) {
@@ -1102,7 +1232,10 @@ fn native_char_chunk_starts_with(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        // Unlike `equals`, `startsWith` reads `s.length()` into a local
+        // BEFORE the `c == null` test, so a null argument always NPEs —
+        // buffer or no buffer.
+        _ => return Err(char_chunk_null_arg_npe("startsWith")),
     };
     Ok(Some(Value::Int(
         if char_chunk_starts_with(ctx, this, &s, 0, false) {
@@ -1123,7 +1256,8 @@ fn native_char_chunk_starts_with_ignore_case(
     };
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        // Same pre-null-check `s.length()` as `startsWith` above.
+        _ => return Err(char_chunk_null_arg_npe("startsWithIgnoreCase")),
     };
     let pos = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
     Ok(Some(Value::Int(
@@ -4099,6 +4233,7 @@ fn native_wildfly_security_manager_get_property_privileged(
     }
 }
 
+pub mod case_map;
 pub mod lang_class;
 pub mod lang_string;
 // WP2.1: java.lang.reflect full coverage — supplements lang_class.rs with
@@ -6960,6 +7095,65 @@ fn thread_default_name(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.create_string(&format!("Thread-{n}"))
 }
 
+/// True when `obj` is one of CratonVM's *fabricated* instances: allocated
+/// against a real class id by a post-clinit fixup (`vm/src/vm/vm_util.rs`,
+/// e.g. `InitialConfigurator.DELAYED_HANDLER`) without ever running a
+/// constructor, so every field slot is still at its default value.
+///
+/// Any genuinely constructed object has at least one non-default slot — a
+/// `java.util.logging.Handler` subclass, for instance, always leaves
+/// `logLevel` non-null. Natives that exist only to serve a fabricated
+/// receiver use this to decide "answer here" vs. "let the real bytecode run",
+/// which is what keeps a class-level registration from silently disabling the
+/// method for every real subclass (see the logging-handler block).
+fn is_fabricated_blank_instance(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    let field_count = ctx.object_num_fields(obj);
+    for index in 0..field_count {
+        match ctx.get_field(obj, index) {
+            Value::Object(None) | Value::Uninitialized => {}
+            Value::Int(0) | Value::Long(0) => {}
+            Value::Float(f) if f.to_bits() == 0 => {}
+            Value::Double(d) if d.to_bits() == 0 => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Best-effort rename of the *calling* OS thread (`Thread.setNativeName`).
+///
+/// Only the current thread can be renamed portably, and only on platforms
+/// where libc exposes the call; everywhere else this is a silent no-op. Never
+/// fails — a rejected rename only costs us a nicer label in `top -H`, gdb and
+/// the crash handler.
+fn set_current_os_thread_name(name: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        // Linux `comm` is capped at 16 bytes INCLUDING the NUL; a longer name
+        // makes pthread_setname_np fail with ERANGE, so truncate first. The cut
+        // may land mid-UTF-8 sequence, which the kernel does not care about.
+        let mut buf: Vec<u8> = name.as_bytes().iter().copied().take(15).collect();
+        buf.push(0);
+        unsafe {
+            libc::pthread_setname_np(libc::pthread_self(), buf.as_ptr() as *const libc::c_char);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf: Vec<u8> = name.as_bytes().iter().copied().take(63).collect();
+        buf.push(0);
+        unsafe {
+            libc::pthread_setname_np(buf.as_ptr() as *const libc::c_char);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // Windows needs `SetThreadDescription` from kernel32, which `libc`
+        // does not expose and we do not bind.
+        let _ = name;
+    }
+}
+
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     register_essential_natives_with_shims(registry, app_shims::ShimSelection::ALL);
 }
@@ -7074,31 +7268,6 @@ pub fn register_essential_natives_with_shims(
     // incubator Vector API shims remain synthetic-only overrides.
     crate::vector_api::register_vector_support_natives(registry);
     crate::lang_system::register_runtime_natives(registry);
-    registry.register(
-        "java/util/concurrent/Executors",
-        "defaultThreadFactory",
-        "()Ljava/util/concurrent/ThreadFactory;",
-        |ctx, _args| {
-            let factory = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadFactory", 1);
-            ctx.set_field(factory, 0, Value::Object(None));
-            Ok(Some(Value::Object(Some(factory))))
-        },
-    );
-    registry.register(
-        "java/util/concurrent/ThreadFactory",
-        "newThread",
-        "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
-        |ctx, args| {
-            let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
-            let thread = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
-            let name = ctx.create_string("pool-thread");
-            ctx.set_field(thread, 0, Value::Object(Some(name)));
-            ctx.set_field(thread, 1, Value::Int(5));
-            ctx.set_field(thread, 3, runnable);
-            ctx.set_field(thread, 4, Value::Int(0));
-            Ok(Some(Value::Object(Some(thread))))
-        },
-    );
 
     // Synthetic-stream `spliterator()` natives — synthetic stream objects
     // (stamped with the bare `java/util/stream/*Stream` interface) are produced
@@ -7756,11 +7925,25 @@ pub fn register_essential_natives_with_shims(
     // bytecode does `synchronized (assertionLock)` and NPEs. Full
     // `register_classloader_natives` (which installs the Rust no-op) runs only in
     // synthetic-JDK mode — real-JDK mode uses `register_essential_natives` only.
+    // We do the assignment the bytecode would have done (`defaultAssertionStatus
+    // = enabled`) directly on the receiver, minus the `synchronized
+    // (assertionLock)` that NPEs, so a later `ClassLoader.clearAssertionStatus`
+    // / reflective read observes the value instead of a silently dropped write.
     registry.register(
         "java/lang/ClassLoader",
         "setDefaultAssertionStatus",
         "(Z)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first() else {
+                return Ok(None);
+            };
+            let enabled = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            ctx.set_field_by_name(*this, "defaultAssertionStatus", Value::Int(enabled));
+            Ok(None)
+        },
     );
 
     // RKC16N.6 RECON-STUB (Session 94): layout-neutral `java/lang/String`
@@ -7829,93 +8012,34 @@ pub fn register_essential_natives_with_shims(
             Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
         },
     );
+    // All four overloads share `lang_string::native_string_to_{lower,upper}_case`,
+    // which honours the `Locale` argument (`args[1]`, absent here for the no-arg
+    // forms → the default locale). Inlining the mapping here is what made
+    // `"TITLE".toLowerCase(Locale.forLanguageTag("tr"))` return `"title"` instead
+    // of HotSpot's `"tıtle"`.
     registry.register(
         "java/lang/String",
         "toLowerCase",
         "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let mut lower = ctx.read_string(this).unwrap_or_default();
-            let changed = if lower.is_ascii() {
-                let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
-                lower.make_ascii_lowercase();
-                changed
-            } else {
-                let folded = lower.to_lowercase();
-                if folded == lower { false } else { lower = folded; true }
-            };
-            let out = if changed { ctx.create_string_uninterned_gc_safe(&lower) } else { this };
-            Ok(Some(Value::Object(Some(out))))
-        },
+        lang_string::native_string_to_lower_case_uncached,
     );
     registry.register(
         "java/lang/String",
         "toUpperCase",
         "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let mut upper = ctx.read_string(this).unwrap_or_default();
-            let changed = if upper.is_ascii() {
-                let changed = upper.bytes().any(|byte| byte.is_ascii_lowercase());
-                upper.make_ascii_uppercase();
-                changed
-            } else {
-                let folded = upper.to_uppercase();
-                if folded == upper { false } else { upper = folded; true }
-            };
-            let out = if changed { ctx.create_string_uninterned_gc_safe(&upper) } else { this };
-            Ok(Some(Value::Object(Some(out))))
-        },
+        lang_string::native_string_to_upper_case_uncached,
     );
     registry.register(
         "java/lang/String",
         "toLowerCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let mut lower = ctx.read_string(this).unwrap_or_default();
-            let changed = if lower.is_ascii() {
-                let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
-                lower.make_ascii_lowercase();
-                changed
-            } else {
-                let folded = lower.to_lowercase();
-                if folded == lower { false } else { lower = folded; true }
-            };
-            let out = if changed { ctx.create_string_uninterned_gc_safe(&lower) } else { this };
-            Ok(Some(Value::Object(Some(out))))
-        },
+        lang_string::native_string_to_lower_case_uncached,
     );
     registry.register(
         "java/lang/String",
         "toUpperCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let mut upper = ctx.read_string(this).unwrap_or_default();
-            let changed = if upper.is_ascii() {
-                let changed = upper.bytes().any(|byte| byte.is_ascii_lowercase());
-                upper.make_ascii_uppercase();
-                changed
-            } else {
-                let folded = upper.to_uppercase();
-                if folded == upper { false } else { upper = folded; true }
-            };
-            let out = if changed { ctx.create_string_uninterned_gc_safe(&upper) } else { this };
-            Ok(Some(Value::Object(Some(out))))
-        },
+        lang_string::native_string_to_upper_case_uncached,
     );
     // String.hashCode — use the layout-aware CACHING implementation (reads and
     // writes the JDK `hash` field) rather than recomputing from scratch on every
@@ -8060,14 +8184,22 @@ pub fn register_essential_natives_with_shims(
         Ok(Some(Value::Int(-1)))
     });
 
-    // RKC16N.9 RECON-STUB: JDKSpecific.addInternalPackages no-op.
-    // org/jboss/modules/Module.<clinit> PC 154 invokes
-    // JDKSpecific.addInternalPackages(list). JDKSpecific.<clinit> uses
-    // heavy MethodHandle reflection and likely half-fails on cratonvm,
-    // so its static `hack` field is null and the inner call NPEs.
-    // No-op mirrors HotSpot when --add-modules adds nothing extra:
-    // KC16 advances and resolves packages via its other paths.
-    // Drop when a proper JDKSpecific shim lands.
+    // KEEP (W3), with the risk bounded rather than hand-waved.
+    // RKC16N.9: org/jboss/modules/Module.<clinit> PC 154 invokes
+    // JDKSpecific.addInternalPackages(list). JDKSpecific.<clinit> uses heavy
+    // MethodHandle reflection and half-fails on cratonvm, so its static `hack`
+    // field is null and the inner call NPEs — the class cannot run its own
+    // body here at all.
+    // The argument is jboss-modules' list of package prefixes that a
+    // ModuleClassLoader must delegate to the platform rather than resolve
+    // itself, and `Module.<clinit>` has ALREADY seeded it with the base
+    // `java./javax./sun./com.sun.` set before this call; this native only
+    // drops the *extra*, JDK-version-specific internal prefixes. Skipping them
+    // costs delegation fidelity for `jdk.internal.*`-style names, never the
+    // base JDK surface. The other `JDKSpecific` boot natives that CratonVM
+    // does implement live in `native-builtins/src/jboss_jdkspecific.rs`; if a
+    // ground-truth list for this method ever becomes available, that is where
+    // the real implementation belongs.
     registry.register(
         "org/jboss/modules/JDKSpecific",
         "addInternalPackages",
@@ -8749,8 +8881,15 @@ pub fn register_essential_natives_with_shims(
     // CI smoke tests, container entrypoints). The Console object then
     // initialises in its "no-tty" mode and downstream callers (e.g.
     // `System.console()`) gracefully return null without further error.
+    // W3: answer from the host instead of hard-coding "never a tty". HotSpot's
+    // `Java_java_io_Console_istty` is `isatty(stdin) && isatty(stdout)`; the
+    // std `IsTerminal` impl is the same syscall (`isatty` / `GetConsoleMode`).
+    // Redirected/piped/daemon launches still get `false` — but an interactive
+    // launch now gets the truthful answer.
     registry.register("java/io/Console", "istty", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+        use std::io::IsTerminal;
+        let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        Ok(Some(Value::Int(i32::from(tty))))
     });
 
     // JDK 25 residual (docs/known-issues/springboot/classutils-forname-platform-loader-false-positive.md):
@@ -8772,8 +8911,22 @@ pub fn register_essential_natives_with_shims(
     // always-non-interactive embedding, and lets `DefaultLogbackConfigurationTests
     // .consoleLogCharsetShouldUseConsoleCharsetIfConsoleAvailable` (which mocks
     // `Console` directly, forcing real `<clinit>` to run) initialize cleanly.
+    // W3: same treatment as `istty()` above — report the real per-stream state.
+    // Bit layout matches `java.io.Console`: 0b001 stdin, 0b010 stdout,
+    // 0b100 stderr (TTY_STDIN_MASK / TTY_STDOUT_MASK / TTY_STDERR_MASK).
     registry.register("java/io/Console", "ttyStatus", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+        use std::io::IsTerminal;
+        let mut status = 0i32;
+        if std::io::stdin().is_terminal() {
+            status |= 0b001;
+        }
+        if std::io::stdout().is_terminal() {
+            status |= 0b010;
+        }
+        if std::io::stderr().is_terminal() {
+            status |= 0b100;
+        }
+        Ok(Some(Value::Int(status)))
     });
 
     // nontty-console: companion to `Console.istty()` for the modern
@@ -10012,16 +10165,33 @@ pub fn register_essential_natives_with_shims(
         native_system_identity_hash_code,
     );
     registry.register("java/lang/System", "exit", "(I)V", native_system_exit);
-    // KEEP: correct constant for this VM. `Console.istty()`/`ttyStatus()`
-    // (registered above) report no controlling terminal, and
-    // `System.console()` returning null is the spec'd answer when there is
-    // no console. Callers null-check it; a fabricated Console would not
-    // have working readLine/readPassword anyway.
+    // W3: derive the answer from the host instead of hard-coding null, so this
+    // agrees with the now-truthful `Console.istty()`/`ttyStatus()` above.
+    // No controlling terminal -> null, which is the spec'd "no console"
+    // answer. On an interactive launch, hand back whatever the JDK's own
+    // Console bootstrap already published in `java.io.Console.cons`; we do
+    // NOT force <clinit> here, because the spec lets us answer null and a
+    // throwing `System.console()` is worse than a null one.
     registry.register(
         "java/lang/System",
         "console",
         "()Ljava/io/Console;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| {
+            use std::io::IsTerminal;
+            if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+                return Ok(Some(Value::Object(None)));
+            }
+            let Some(class_id) = ctx.class_id_by_name("java/io/Console") else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(index) = ctx.static_field_index_by_name(class_id, "cons") else {
+                return Ok(Some(Value::Object(None)));
+            };
+            match ctx.get_static_field(class_id, index) {
+                Value::Object(Some(console)) => Ok(Some(Value::Object(Some(console)))),
+                _ => Ok(Some(Value::Object(None))),
+            }
+        },
     );
 
     // T14: Real-JDK-safe System.getProperty/setProperty/clearProperty.
@@ -10359,15 +10529,10 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/io/File;)V",
         native_surefire_system_property_manager_set_system_properties,
     );
-    // Surefire fork bootstrap hardening: if setup fails before jvmTerminator
-    // is initialized, ForkedBooter.launchLastDitchDaemonShutdownThread can NPE
-    // and hide the original cause. Keep it a no-op so the real failure surfaces.
-    registry.register(
-        "org/apache/maven/surefire/booter/ForkedBooter",
-        "launchLastDitchDaemonShutdownThread",
-        "(I)V",
-        native_noop,
-    );
+    // (`ForkedBooter.launchLastDitchDaemonShutdownThread(I)V` used to be
+    // registered here too; the identical registration further down in this
+    // same function always won, so the duplicate was removed. See it there
+    // for the rationale.)
     registry.register(
         "org/apache/maven/surefire/booter/ForkedBooter",
         "lookupDecoderFactory",
@@ -10575,9 +10740,11 @@ pub fn register_essential_natives_with_shims(
     // throw before `System.exit(1)` executes, masking the real test failure
     // with a booter-side NPE.
     //
-    // Keep the explicit process exit semantics and skip the auxiliary
-    // terminator thread; if `System.exit` is ignored, surefire already treats
-    // that as a fork failure.
+    // KEEP (deliberate harness hardening, not an unimplemented stub): keep the
+    // explicit process exit semantics and skip the auxiliary terminator thread;
+    // if `System.exit` is ignored, surefire already treats that as a fork
+    // failure. Suppressing the watchdog only costs us a forced kill we do not
+    // need, and it stops a booter-side NPE from masking the real test failure.
     registry.register(
         "org/apache/maven/surefire/booter/ForkedBooter",
         "launchLastDitchDaemonShutdownThread",
@@ -11848,7 +12015,19 @@ pub fn register_essential_natives_with_shims(
             // `Module.getClassLoader()` bytecode answers the AppClassLoader like
             // HotSpot instead of null. See `lang_class::canonical_unnamed_module`.
             if module_name.is_none() {
-                let m = crate::lang_class::canonical_unnamed_module(ctx);
+                // ... but the unnamed module is PER-LOADER in HotSpot, and
+                // caller-sensitive JDK APIs derive a search ClassLoader from
+                // it (`ResourceBundle.getBundle(String)` above all). Route a
+                // class defined by a user loader to THAT loader's unnamed
+                // module; built-in loaders keep the single canonical one.
+                // Reuse the authoritative `Class.getClassLoader()` resolution
+                // rather than a second, narrower side-table probe -- the two
+                // must never disagree about which loader owns a class.
+                let loader = match crate::lang_class::native_class_get_class_loader(ctx, args) {
+                    Ok(Some(Value::Object(o))) => o,
+                    _ => None,
+                };
+                let m = crate::lang_class::unnamed_module_for_loader(ctx, loader);
                 return Ok(Some(Value::Object(Some(m))));
             }
 
@@ -12334,16 +12513,41 @@ pub fn register_essential_natives_with_shims(
     );
     // Class.hasRealParameterData() — package-private method on java.lang.Class
     // in newer JDKs, used by reflection (e.g. Spring/Method.getParameters) to
-    // check whether MethodParameters attribute data is available. Returning
-    // false matches the safe default (no parameter data) and unblocks
-    // Spring Boot 4.0.6 (demo) and 2.0.3 (sportme) which throw
-    // NoSuchMethodError on java/lang/Class.hasRealParameterData()Z.
+    // check whether MethodParameters attribute data is available. Spring Boot
+    // 4.0.6 (demo) and 2.0.3 (sportme) throw NoSuchMethodError without it.
+    //
+    // W3: answer from the class file instead of hard-coding "no parameter
+    // data". A constant `false` makes every `-parameters`-compiled class look
+    // unannotated, so Spring's constructor/`@RequestParam` name binding
+    // silently degrades to `arg0`, `arg1`, … . Report true as soon as any
+    // declared method actually carries a `MethodParameters` attribute.
     registry.register(
         "java/lang/Class",
         "hasRealParameterData",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| {
+            let Some(Value::Object(Some(mirror))) = args.first() else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let Some(class_id) = ctx.class_id_from_mirror(*mirror) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let methods = ctx.declared_methods(class_id);
+            let mut has_data = false;
+            for m in &methods {
+                if !ctx
+                    .method_parameters(class_id, &m.name, &m.descriptor)
+                    .is_empty()
+                {
+                    has_data = true;
+                    break;
+                }
+            }
+            Ok(Some(Value::Int(i32::from(has_data))))
+        },
     );
+    // KEEP (application-level workaround with a documented root cause, not an
+    // unimplemented native — see below).
     // Round 63: Keycloak start-dev re-augmentation no-op.
     //
     // `start-dev` invokes `AbstractAutoBuildCommand.runReAugmentation` which
@@ -12980,12 +13184,18 @@ pub fn register_essential_natives_with_shims(
             _ => Ok(Some(Value::Object(None))),
         },
     );
-    // ProtectionDomain.implies(Permission) → true (AllPermission for bootstrap)
+    // W4: was a hard `true`. CratonVM does have a policy core — the parsed
+    // `java.policy` grant table in `security_manager.rs` that backs both
+    // `SecurityManager.checkPermission` and `Policy.implies(pd, perm)` — so
+    // ask the same question those two ask and keep the three in lock-step.
+    // With no `-Djava.security.policy` loaded the core is allow-all, i.e.
+    // exactly the old constant; with one loaded the answer now reflects the
+    // grants instead of rubber-stamping them.
     registry.register(
         "java/security/ProtectionDomain",
         "implies",
         "(Ljava/security/Permission;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        native_protection_domain_implies,
     );
     // CodeSource.getLocation() → return field 0 (our synthetic URL)
     registry.register(
@@ -13742,18 +13952,39 @@ pub fn register_essential_natives_with_shims(
         },
     );
     registry.register("java/lang/Thread", "setPriority0", "(I)V", |_ctx, _args| {
-        // Thread priority is a scheduler hint. On our cooperative model, priority
-        // adjustments are advisory and not propagated to the OS scheduler. Silently accept.
+        // KEEP: genuine no-op, and the same one HotSpot performs. The Java-visible
+        // state (`Thread.holder.priority`, what `getPriority()` returns) is written
+        // by the `setPriority(int)` bytecode BEFORE this call; `setPriority0`'s only
+        // job is the OS scheduler hint. HotSpot on Linux likewise drops it unless it
+        // runs as root with `-XX:ThreadPriorityPolicy=1`, so "accept and ignore" is
+        // the mainstream platform behaviour, not an unimplemented stub.
         Ok(None)
     });
     registry.register(
         "java/lang/Thread",
         "setNativeName",
         "(Ljava/lang/String;)V",
-        |_ctx, _args| {
-            // Setting the OS thread name requires pthread_setname_np / SetThreadDescription,
-            // which we don't expose from native code. The Java-side Thread.name field is
-            // still updated by the caller. Documented no-op.
+        |ctx, args| {
+            // W3: actually rename the OS thread. HotSpot's `set_native_thread_name`
+            // is what makes `top -H` / gdb / the crash handler show Java thread
+            // names, and the STW-census work depends on being able to name the
+            // holdout thread. Only the CALLING thread can be renamed portably
+            // (pthread_setname_np on another thread needs its pthread_t, which we
+            // do not surface), so a rename of some *other* live thread stays a
+            // no-op — the Java-side `Thread.name` field is written by the caller
+            // either way.
+            let Some(Value::Object(Some(this))) = args.first().copied() else {
+                return Ok(None);
+            };
+            let Some(Value::Object(Some(name_obj))) = args.get(1).copied() else {
+                return Ok(None);
+            };
+            let Some(name) = ctx.read_string(name_obj) else {
+                return Ok(None);
+            };
+            if ctx.current_thread_object() == this {
+                set_current_os_thread_name(&name);
+            }
             Ok(None)
         },
     );
@@ -13771,6 +14002,10 @@ pub fn register_essential_natives_with_shims(
             Ok(Some(Value::Long(thread_next_tid_offset() as i64)))
         },
     );
+    // KEEP (the `BootLoader.loadLibrary` no-op): CratonVM has no JNI library
+    // to load for any boot-loader library name — it implements the Java-visible
+    // natives of `net`/`nio`/`zip` itself — so the load has nothing to do, and
+    // short-circuiting it also avoids the JDK's native-library lock.
     // C11: `NativeLibraries.findBuiltinLib(name)` — HotSpot returns the
     // absolute path of a library statically linked into libjvm (e.g. "zip",
     // "net"). We don't statically link any native libraries, so return null,
@@ -13862,8 +14097,16 @@ pub fn register_essential_natives_with_shims(
         "setCurrentThread",
         "(Ljava/lang/Thread;)V",
         |_ctx, _args| {
-            // The "current thread" is managed by the VM via thread-local state, not
-            // settable from native code. JDK uses this only for virtual-thread mount/unmount.
+            // KEEP: genuine no-op for this VM, and the state it would write is
+            // not the state anything here reads. `Thread.setCurrentThread` is
+            // the JDK's Continuation-based virtual-thread mount/unmount hook —
+            // it re-points the carrier's `currentThread` at the mounted
+            // VThread. CratonVM does not run the JDK's Continuation machinery:
+            // virtual threads are VM-managed (`is_current_virtual`, `vt_pin`,
+            // `vt_park_for`), and `Thread.currentThread()` is answered from
+            // `NativeContext::current_thread_object`, which the VM keeps
+            // authoritative on its own. Honouring this call would let JDK
+            // bytecode overwrite the VM's own notion of the current thread.
             Ok(None)
         },
     );
@@ -13891,8 +14134,12 @@ pub fn register_essential_natives_with_shims(
         "setScopedValueCache",
         "([Ljava/lang/Object;)V",
         |_ctx, _args| {
-            // Scoped values (JEP 446) use a per-thread cache. We don't optimise this path;
-            // the Java-side lookup falls back to walking bindings directly.
+            // KEEP: genuine no-op, paired with the null-returning
+            // `scopedValueCache` above. Scoped values (JEP 446) use a
+            // per-thread cache purely as a lookup accelerator; dropping the
+            // write means the getter keeps reporting a miss and the Java-side
+            // lookup walks the bindings directly. Costs a little speed, never
+            // correctness — and the two halves stay consistent.
             Ok(None)
         },
     );
@@ -13901,8 +14148,12 @@ pub fn register_essential_natives_with_shims(
         "ensureMaterializedForStackWalk",
         "(Ljava/lang/Object;)V",
         |_ctx, _args| {
-            // Stack walker hint — ensures a local is materialised on the stack for reflection.
-            // Our stack walker reads live VM frames directly, so nothing to materialise.
+            // KEEP: genuine no-op. This is a HotSpot escape-analysis hint —
+            // it forces a scalar-replaced local back onto the real stack so a
+            // StackWalker can see it. CratonVM's stack walker reads live
+            // interpreter/JIT frames directly and the JIT never scalar-replaces
+            // an object out of a frame it then has to expose, so there is
+            // nothing to materialise.
             Ok(None)
         },
     );
@@ -14218,15 +14469,19 @@ pub fn register_essential_natives_with_shims(
             Ok(Some(Value::Long(handle)))
         },
     );
-    // KEEP: correct for this VM. `getAppend(fd)` reports whether the fd
-    // carries O_APPEND. CratonVM's FileOutputStream/RandomAccessFile do
-    // their appending in the Rust I/O layer rather than through an
-    // O_APPEND descriptor, so no fd we hand out is in append mode.
+    // W4: was a hard `false` on the (incorrect) grounds that CratonVM never
+    // opens an O_APPEND descriptor — `FileDescriptorTable::open_write` passes
+    // `.append(true)` straight to the OS. Ask the host for the three standard
+    // descriptors, which are the only `fd` values that are real OS descriptors
+    // here (same 0..=2 range the `getHandle` native above maps through) and
+    // the only ones the JDK's sole caller, `FileDescriptor(int)`, asks about.
+    // See `native_file_descriptor_get_append` for the escalation covering the
+    // remaining, table-id-only descriptors.
     registry.register(
         "java/io/FileDescriptor",
         "getAppend",
         "(I)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_file_descriptor_get_append,
     );
     // FileDescriptor.sync0()V — fsync. `this` carries the fd id that `open0`
     // stored in the Windows `handle` long / POSIX `fd` int slot.
@@ -14726,9 +14981,16 @@ pub fn register_essential_natives_with_shims(
         "(Z)V",
         lang_reflect::native_accessible_set_accessible,
     );
-    // T15: Field.getRoot/getGenericSignature etc. — our synthetic Field
-    // is already the "root" (no chain of shared copies), so always return
-    // null to pass the `copyField` "non-root" check in ReflectionFactory.
+    // KEEP on `AccessibleObject.getRoot()` only: that one is literally
+    // `return null;` in the JDK — the base class has no `root` field.
+    // The three subclass overrides return the receiver's `root` field, so W4
+    // reads the field instead of hard-coding null (see
+    // `native_reflect_get_root`). In practice the answer is unchanged — our
+    // `copy()` natives below hand back the SAME object rather than minting a
+    // linked copy, so `root` stays unset and `ReflectionFactory`'s "must be a
+    // root" check still passes — but a reflective object that did acquire a
+    // root now reports it instead of lying.
+    // T15: Field.getRoot/getGenericSignature etc.
     registry.register(
         "java/lang/reflect/AccessibleObject",
         "getRoot",
@@ -14739,19 +15001,19 @@ pub fn register_essential_natives_with_shims(
         "java/lang/reflect/Field",
         "getRoot",
         "()Ljava/lang/reflect/Field;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_reflect_get_root,
     );
     registry.register(
         "java/lang/reflect/Method",
         "getRoot",
         "()Ljava/lang/reflect/Method;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_reflect_get_root,
     );
     registry.register(
         "java/lang/reflect/Constructor",
         "getRoot",
         "()Ljava/lang/reflect/Constructor;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_reflect_get_root,
     );
     // Our synthetic Field doesn't need a separate "copy" — reuse the same object.
     registry.register(
@@ -15101,6 +15363,8 @@ pub fn register_essential_natives_with_shims(
             ctx.invoke_virtual(exec, "getParameterTypes", "()[Ljava/lang/Class;", &[])
         },
     );
+    // KEEP: correct constant (the null-vs-empty-array distinction below is
+    // load-bearing, not incidental).
     // Same for the newer getExecutableTypeAnnotationBytes — most bootstrap
     // code that touches annotations on an Executable ends up here. Return
     // NULL (not an empty byte[]) when no RuntimeVisibleTypeAnnotations are
@@ -15118,8 +15382,13 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/reflect/Executable;)[B",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
-    // getConstantPool — returns null (we don't expose ConstantPool to
-    // reflection users; callers fall back to the bytecode path).
+    // KEEP: `null` is the JDK's own "no constant pool available" answer and
+    // every caller null-checks it. CratonVM answers reflective annotation and
+    // signature queries from its own class-file store (`class_annotations` /
+    // `method_annotations` / `class_signature` on `NativeContext`), so the
+    // `ConstantPool`-walking parser path is never the one that runs;
+    // materialising a real `jdk.internal.reflect.ConstantPool` would buy
+    // nothing that surface does not already answer.
     registry.register(
         "jdk/internal/reflect/ReflectionFactory",
         "getConstantPool",
@@ -16367,23 +16636,32 @@ pub fn register_essential_natives_with_shims(
     // constructor (e.g. RandomizedRunner's synthetic `__randomizedtesting.
     // SeedInfo.seed(...)` frame) leave `declaringClassObject` null, so when the
     // trace is formatted the whole `getStackTrace()` NPEs — failing ~every
-    // Elasticsearch ESTestCase. Override computeFormat as a null-safe no-op:
-    // `format` stays 0, so toString renders plain `class.method(file:line)`
-    // (no module/loader prefix). Correct output, never a crash; covers every
-    // element-creation path, not just the VM-fill one.
+    // Elasticsearch ESTestCase. W4 keeps the null guard but stops being a
+    // no-op: when `declaringClassObject` IS present the two suppression bits
+    // are computed for real from the class's loader id and module name — see
+    // `native_stack_trace_element_compute_format`. Both bits only ever DROP a
+    // rendering prefix, so the null-`declaringClassObject` elements this fix
+    // was written for still render plain `class.method(file:line)`.
     registry.register(
         "java/lang/StackTraceElement",
         "computeFormat",
         "()V",
-        native_noop_with_this,
+        native_stack_trace_element_compute_format,
     );
 
     // --- java/lang/reflect/Executable + Field ---
+    // W4: was a hard `null`. Now answers with a real `Parameter[]` built from
+    // the class file's `MethodParameters` attribute when there is one, and
+    // `null` — the JDK's own "attribute absent" encoding — when there is not.
+    // Returning null in the absent case is deliberate, not a leftover:
+    // `privateGetParameters` flips `hasRealParameterData` to true for ANY
+    // non-null result, and that is what `Parameter.isNamePresent()` reports.
+    // See `native_executable_get_parameters0`.
     registry.register(
         "java/lang/reflect/Executable",
         "getParameters0",
         "()[Ljava/lang/reflect/Parameter;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_executable_get_parameters0,
     );
     // KEEP x2: correct constant. `null` (NOT an empty byte[]) is the JDK's
     // "no RuntimeVisibleTypeAnnotations" encoding —
@@ -17128,73 +17406,207 @@ pub fn register_essential_natives_with_shims(
     // whose fields are all null. Do not register these on java.util.logging.Handler:
     // native lookup is inherited by real FileHandler subclasses, where it would
     // suppress their publish/flush bytecode and silently drop JULI output.
+    //
+    // W3 FIX: `ExtHandler` is jboss-logmanager's BASE handler class, so these
+    // registrations were intercepting every real subclass that does not
+    // override the method (ConsoleHandler, the rotating FileHandlers, …) —
+    // exactly the hazard the paragraph above warns about for
+    // `java.util.logging.Handler`. `publish` and `isLoggable` as constants
+    // meant every jboss-logmanager handler silently dropped its output. Keep
+    // the constants ONLY for the fabricated receiver they were written for
+    // (`is_fabricated_blank_instance`: a fixup-allocated object that never ran
+    // a constructor, so every slot is still null/zero) and hand any genuinely
+    // constructed handler to its real bytecode.
     for handler_class in &[
         "org/jboss/logmanager/ExtHandler",
         "io/quarkus/bootstrap/logging/QuarkusDelayedHandler",
     ] {
-        registry.register(handler_class, "close", "()V", |_ctx, _args| Ok(None));
-        registry.register(handler_class, "flush", "()V", |_ctx, _args| Ok(None));
+        registry.register(handler_class, "close", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if !is_fabricated_blank_instance(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[]);
+            }
+            Ok(None)
+        });
+        registry.register(handler_class, "flush", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if !is_fabricated_blank_instance(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(this, "flush", "()V", &[]);
+            }
+            Ok(None)
+        });
         registry.register(
             handler_class,
             "publish",
             "(Ljava/util/logging/LogRecord;)V",
-            |_ctx, _args| Ok(None),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                if !is_fabricated_blank_instance(ctx, this) {
+                    return ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "publish",
+                        "(Ljava/util/logging/LogRecord;)V",
+                        args.get(1..).unwrap_or(&[]),
+                    );
+                }
+                Ok(None)
+            },
         );
         registry.register(
             handler_class,
             "setLevel",
             "(Ljava/util/logging/Level;)V",
-            |_ctx, _args| Ok(None),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                if !is_fabricated_blank_instance(ctx, this) {
+                    return ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "setLevel",
+                        "(Ljava/util/logging/Level;)V",
+                        args.get(1..).unwrap_or(&[]),
+                    );
+                }
+                Ok(None)
+            },
         );
         registry.register(
             handler_class,
             "getLevel",
             "()Ljava/util/logging/Level;",
-            |_ctx, _args| Ok(Some(Value::Object(None))),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                if !is_fabricated_blank_instance(ctx, this) {
+                    return ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "getLevel",
+                        "()Ljava/util/logging/Level;",
+                        &[],
+                    );
+                }
+                Ok(Some(Value::Object(None)))
+            },
         );
         registry.register(
             handler_class,
             "setFormatter",
             "(Ljava/util/logging/Formatter;)V",
-            |_ctx, _args| Ok(None),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                if !is_fabricated_blank_instance(ctx, this) {
+                    return ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "setFormatter",
+                        "(Ljava/util/logging/Formatter;)V",
+                        args.get(1..).unwrap_or(&[]),
+                    );
+                }
+                Ok(None)
+            },
         );
         registry.register(
             handler_class,
             "getFormatter",
             "()Ljava/util/logging/Formatter;",
-            |_ctx, _args| Ok(Some(Value::Object(None))),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                if !is_fabricated_blank_instance(ctx, this) {
+                    return ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "getFormatter",
+                        "()Ljava/util/logging/Formatter;",
+                        &[],
+                    );
+                }
+                Ok(Some(Value::Object(None)))
+            },
         );
         registry.register(
             handler_class,
             "isLoggable",
             "(Ljava/util/logging/LogRecord;)Z",
-            |_ctx, _args| Ok(Some(Value::Int(0))),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                if !is_fabricated_blank_instance(ctx, this) {
+                    return ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "isLoggable",
+                        "(Ljava/util/logging/LogRecord;)Z",
+                        args.get(1..).unwrap_or(&[]),
+                    );
+                }
+                Ok(Some(Value::Int(0)))
+            },
         );
     }
-    // QuarkusDelayedHandler-specific
+    // Same W3 guard as the block above: the nested-handler mutators are the
+    // ones that actually wire a ConsoleHandler/FileHandler under a delegating
+    // handler, so a blanket no-op on the `ExtHandler` base class dropped the
+    // whole downstream chain for every real subclass.
     registry.register(
         "io/quarkus/bootstrap/logging/QuarkusDelayedHandler",
         "addHandler",
         "(Ljava/util/logging/Handler;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if !is_fabricated_blank_instance(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "addHandler",
+                    "(Ljava/util/logging/Handler;)V",
+                    args.get(1..).unwrap_or(&[]),
+                );
+            }
+            Ok(None)
+        },
     );
     registry.register(
         "io/quarkus/bootstrap/logging/QuarkusDelayedHandler",
         "setHandlers",
         "([Ljava/util/logging/Handler;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if !is_fabricated_blank_instance(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "setHandlers",
+                    "([Ljava/util/logging/Handler;)V",
+                    args.get(1..).unwrap_or(&[]),
+                );
+            }
+            Ok(None)
+        },
     );
     registry.register(
         "org/jboss/logmanager/ExtHandler",
         "addHandler",
         "(Ljava/util/logging/Handler;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if !is_fabricated_blank_instance(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "addHandler",
+                    "(Ljava/util/logging/Handler;)V",
+                    args.get(1..).unwrap_or(&[]),
+                );
+            }
+            Ok(None)
+        },
     );
     registry.register(
         "org/jboss/logmanager/ExtHandler",
         "setHandlers",
         "([Ljava/util/logging/Handler;)[Ljava/util/logging/Handler;",
-        |ctx, _args| {
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if !is_fabricated_blank_instance(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "setHandlers",
+                    "([Ljava/util/logging/Handler;)[Ljava/util/logging/Handler;",
+                    args.get(1..).unwrap_or(&[]),
+                );
+            }
             use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
@@ -18236,14 +18648,25 @@ pub fn register_essential_natives_with_shims(
     // `m.getClassLoader()`. Two layered overrides:
     //
     //   1. `LazyLoggers.getLogger(String, Module)` — short-circuit by
-    //      returning a synthetic `System$Logger` instance (no-op
-    //      logger). KC16 only needs the return value to be non-null
-    //      for `JmxProperties.<clinit>` to populate its static fields.
+    //      returning a CratonVM-minted `System.Logger` (W5: a working one,
+    //      see `register_system_logger_methods`; it used to be an inert
+    //      instance of the interface itself). KC16 only needs the return
+    //      value to be non-null for `JmxProperties.<clinit>` to populate
+    //      its static fields.
     //   2. `DefaultLoggerFinder.isSystem(Module)` — defensive: if any
     //      caller path bypasses (1) and reaches isSystem with null,
     //      return true (system-loader semantics for boot frames).
     //   3. `System.getLogger(String)` — same shape as (1), invoked by
     //      classes that don't pre-resolve `module`.
+    //
+    // KEEP (W3) on the two `isSystem` constants below. The JDK body is
+    // `m.getClassLoader() == null || == platformClassLoader()` — a null-hostile
+    // read of exactly the field that is unreliable here (that NPE is why (1)
+    // and (2) exist), and its only effect is choosing between the system and
+    // the application logger *dispatch path*. CratonVM has no SecurityManager
+    // and no module-scoped logging isolation, so both paths end in the same
+    // handler set; answering "system" keeps the boot frames alive instead of
+    // NPE-ing on a module we synthesized.
     registry.register(
         "jdk/internal/logger/DefaultLoggerFinder",
         "isSystem",
@@ -18260,134 +18683,28 @@ pub fn register_essential_natives_with_shims(
         "jdk/internal/logger/LazyLoggers",
         "getLogger",
         "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/System$Logger;",
-        |ctx, args| {
-            let name_obj = args.first().copied().unwrap_or(Value::Object(None));
-            let cid = ctx
-                .ensure_class_initialized("java/lang/System$Logger")
-                .or_else(|_| ctx.ensure_class_initialized("java/lang/Object"))?;
-            let logger = ctx.alloc_object(cid, 1);
-            ctx.set_field(logger, 0, name_obj);
-            Ok(Some(Value::Object(Some(logger))))
-        },
+        native_system_get_logger,
     );
     registry.register(
         "java/lang/System",
         "getLogger",
         "(Ljava/lang/String;)Ljava/lang/System$Logger;",
-        |ctx, args| {
-            let name_obj = args.first().copied().unwrap_or(Value::Object(None));
-            let cid = ctx
-                .ensure_class_initialized("java/lang/System$Logger")
-                .or_else(|_| ctx.ensure_class_initialized("java/lang/Object"))?;
-            let logger = ctx.alloc_object(cid, 1);
-            ctx.set_field(logger, 0, name_obj);
-            Ok(Some(Value::Object(Some(logger))))
-        },
+        native_system_get_logger,
     );
     registry.register(
         "java/lang/System",
         "getLogger",
         "(Ljava/lang/String;Ljava/util/ResourceBundle;)Ljava/lang/System$Logger;",
-        |ctx, args| {
-            let name_obj = args.first().copied().unwrap_or(Value::Object(None));
-            let cid = ctx
-                .ensure_class_initialized("java/lang/System$Logger")
-                .or_else(|_| ctx.ensure_class_initialized("java/lang/Object"))?;
-            let logger = ctx.alloc_object(cid, 1);
-            ctx.set_field(logger, 0, name_obj);
-            Ok(Some(Value::Object(Some(logger))))
-        },
+        native_system_get_logger,
     );
 
-    // T19_H11_SYSTEM_LOGGER_INTERFACE — `System$Logger` is an interface;
-    // our synthetic instance has no bytecode for its methods. Register
-    // no-op natives for `getName`, `isLoggable`, and the various `log`
-    // overloads so JmxProperties.<clinit> + Keycloak's own logging
-    // emitters don't NPE on a missing Code attribute.
-    // KEEP (the constant answers in the `System$Logger` block below): this
-    // interface native serves ONLY the deliberate no-op logger that
-    // `LazyLoggers.getLogger` / `System.getLogger` mint above — a synthetic
-    // receiver whose declaring class IS the interface. A real user
-    // implementation declares its own methods and is never intercepted.
-    // `isLoggable` -> false and `log` -> no-op are mutually consistent:
-    // callers skip building messages that would only be dropped.
-    let logger_iface = "java/lang/System$Logger";
-    registry.register(
-        logger_iface,
-        "getName",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // Field 0 holds the requested logger name (set by getLogger above).
-            let name = ctx.get_field(this, 0);
-            Ok(Some(name))
-        },
-    );
-    registry.register(
-        logger_iface,
-        "isLoggable",
-        "(Ljava/lang/System$Logger$Level;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    // log(Level, String) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, Supplier<String>) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/util/function/Supplier;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, Object) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, String, Throwable) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;Ljava/lang/Throwable;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, Supplier<String>, Throwable) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/util/function/Supplier;Ljava/lang/Throwable;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, String, Object...) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;[Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, ResourceBundle, String, Throwable) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/util/ResourceBundle;Ljava/lang/String;Ljava/lang/Throwable;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, ResourceBundle, String, Object...) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/util/ResourceBundle;Ljava/lang/String;[Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
-    );
+    // T19_H11_SYSTEM_LOGGER_INTERFACE — the instance side of the logger the
+    // three registrations above mint. See `register_system_logger_methods`
+    // (and the block comment above it) for what the receiver is, why it is no
+    // longer stamped with the `java/lang/System$Logger` INTERFACE, and why the
+    // same method set stays registered on the interface name as well.
+    register_system_logger_methods(registry, CRATON_SYSTEM_LOGGER_CLASS);
+    register_system_logger_methods(registry, "java/lang/System$Logger");
 
     // T19_H14_OPENMBEAN — JMX OpenType / MXBean introspector translation
     // natives. Filters `java.lang.Object` methods out of
@@ -19310,15 +19627,35 @@ pub fn register_essential_natives_with_shims(
             Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
         },
     );
-    // Safety net: short-circuit ZoneInfoFile.getZoneInfo0 to return null
-    // for direct callers (the higher-level TimeZone.getTimeZone is now
-    // native so this is unlikely to be hit, but keep it for defensive
-    // coverage of frameworks that call it reflectively).
+    // W4: was an unconditional `null`, justified as "synthesizing a real
+    // ZoneInfo layout is work nothing needs". That work already exists —
+    // `alloc_synth_timezone` (below) builds a `sun/util/calendar/ZoneInfo`
+    // with its `ID`/`rawOffset`/`dstSavings` slots populated from the same
+    // tzdb this file parses, and the sibling public `ZoneInfoFile.getZoneInfo`
+    // native is registered against exactly that. So answer the private entry
+    // point the same way, and keep `null` for its real meaning: an id tzdb
+    // does not know. (`getZoneInfo` clones the result and re-stamps the id, so
+    // a fresh object per call is what the JDK expects here.)
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
         "getZoneInfo0",
         "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let Some(Value::Object(Some(id_obj))) = args.first().copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(id) = ctx.read_string(id_obj) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            // JDK contract: null for an unknown zone id — the caller
+            // (`getZoneInfo`) turns that into "no such TimeZone".
+            if crate::tzdb::canonical_zone_id(ctx, &id).is_none()
+                && tz_standard_offset_seconds(&id).is_none()
+            {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(alloc_synth_timezone(ctx, &id)))
+        },
     );
     // TZDB-OFFSET (2026-07-22): java.util.TimeZone offset queries backed by
     // the real IANA tzdb data (`native_builtins::tzdb`, parsed from
@@ -19706,125 +20043,17 @@ pub fn register_essential_natives_with_shims(
     // real-JDK path picks them up too.
     crate::phases_late::register_p62_char_buffer(registry);
 
-    // `jdk/net/LinuxSocketOptions.incomingNapiIdSupported0()Z` — a
-    // Linux-only extended-socket-options probe (`jdk.net.Sockets
-    // .optionSets()` calls it while building the supported-options set,
-    // reached the first time ANY code touches `ExtendedSocketOptions` on a
-    // Linux JDK — e.g. Apache HttpClient 5's connection-pool setup). With
-    // no native registered, real-JDK mode threw UnsatisfiedLinkError,
-    // which — since this runs during `PoolingHttpClientConnectionManager`
-    // construction — left `DefaultHttpClientConnectionOperator` in the
-    // JVM's permanent "erroneous class" state, so every LATER reference
-    // anywhere in the run threw `NoClassDefFoundError` instead of the real
-    // cause. `false` (NAPI ID busy-poll steering unsupported) is always a
-    // safe, conservative answer — HotSpot itself returns false on any
-    // kernel/NIC lacking the feature, and callers already handle that.
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "incomingNapiIdSupported0",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    // Same rationale as `incomingNapiIdSupported0` above: a Linux-only
-    // extended-socket-options probe reached via the same
-    // `jdk.net.Sockets.optionSets()` walk. `false` (quick-ACK toggling
-    // unsupported) is a safe conservative default.
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "quickAckSupported0",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    // Full `jdk/net/LinuxSocketOptions` native surface (`ExtendedSocketOptions`'s
-    // Linux `PlatformSocketOptions` implementation). Same rationale as the two
-    // "supported0" probes above: reached via `jdk.net.Sockets.optionSets()`'s
-    // static init walk on ANY code touching a real `java.net.Socket`'s
-    // `SocketImpl` (e.g. Apache HttpClient5's `DefaultHttpClientConnectionOperator`).
-    // The remaining "supportedX0" probes report the feature absent (safe,
-    // conservative — real callers already handle an unsupported option); the
-    // actual get/set natives are stubbed defensively in case any code path
-    // still reaches them despite the "unsupported" answer above (shouldn't
-    // happen in practice, since JDK code checks the "supported" flag first,
-    // but a hard crash here would be far worse than a silently-ignored
-    // TCP-keepalive/quick-ACK/NAPI-ID tuning knob our tests don't exercise).
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "keepAliveOptionsSupported0",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "setTcpKeepAliveProbes0",
-        "(II)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "setTcpKeepAliveTime0",
-        "(II)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "setTcpKeepAliveIntvl0",
-        "(II)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "getTcpKeepAliveProbes0",
-        "(I)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "getTcpKeepAliveTime0",
-        "(I)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "getTcpKeepAliveIntvl0",
-        "(I)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "setIpDontFragment0",
-        "(IZZ)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "getIpDontFragment0",
-        "(IZ)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "setQuickAck0",
-        "(IZ)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "getQuickAck0",
-        "(I)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "getSoPeerCred0",
-        "(I)J",
-        |_ctx, _args| Ok(Some(Value::Long(-1))),
-    );
-    registry.register(
-        "jdk/net/LinuxSocketOptions",
-        "getIncomingNapiId0",
-        "(I)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
+    // DELETED (W3): the `jdk/net/LinuxSocketOptions` family used to be
+    // registered here as well, byte-identical to the copy in
+    // `native-io/src/net.rs` (`register_sun_nio_ch_net`). That copy always won:
+    // `vm/src/vm/vm_init.rs` calls `register_essential_natives_with_shims`
+    // (this function) BEFORE `register_io_natives` on every path - the
+    // synthetic arm (~L1252/1253), the real-JDK arm (~L1338/1523) and the third
+    // arm (~L1768/1953) - and registration is last-write-wins. Keeping a second,
+    // silently-dead copy only sets a trap for the next reordering, so
+    // `native-io/src/net.rs` is now the single owner: it reports the capability
+    // probes false and throws UnsupportedOperationException from the get/set
+    // natives rather than swallowing them.
 
     // `sun/nio/ch/Net.shouldShutdownWriteBeforeClose0()Z` — queried once
     // during `NioSocketImpl.<clinit>` (same static-init chain as the
@@ -23101,15 +23330,27 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     #[cfg(feature = "experimental-serialization")]
     serialization::register_serialization_natives(registry);
 
-    // `ByteArrayOutputStream` intrinsic is registered unconditionally (NOT
-    // gated behind `experimental-serialization`). It must always win over the
-    // real bytecode: the interpreter mis-resolves inherited `getfield`/
-    // `putfield` slots for `ByteArrayOutputStream` *subclasses* (e.g.
-    // `sun.security.util.DerOutputStream`), so real `write`/`toByteArray`
+    // `ByteArrayOutputStream` intrinsic. The interpreter mis-resolves inherited
+    // `getfield`/`putfield` slots for `ByteArrayOutputStream` *subclasses*
+    // (e.g. `sun.security.util.DerOutputStream`), so real `write`/`toByteArray`
     // bytecode silently drops bytes — which produced empty DER output and broke
     // ECDSA signature encoding under real JCA. The intrinsic addresses `buf`/
     // `count` by name (consistent with reflection), so it is correct for any
     // subclass.
+    //
+    // W4 CORRECTION — reachability. This call used to be annotated "registered
+    // unconditionally (NOT gated behind `experimental-serialization`) … must
+    // always win over the real bytecode". Only the first half is true: it is
+    // free of the `experimental-serialization` gate, but it sits inside
+    // `register_synthetic_overrides`, which is `#[cfg(feature =
+    // "synthetic-jdk")]` — and `synthetic-jdk` is NOT a default feature of
+    // either `cratonvm-vm` or `cratonvm-cli`. So this intrinsic is compiled out
+    // of the default real-JDK build entirely and cannot be what fixes real-JCA
+    // DER output there; on that path the `java/io/ByteArrayOutputStream` family
+    // comes from `cratonvm_native_io::register_io_natives` instead. Verifying
+    // (or re-fixing) the DerOutputStream case on the real-JDK path is a
+    // separate job — see the wave-4 report; do not "restore" the claim by
+    // moving this call without checking which registrar actually wins.
     serialization::register_byte_array_output_stream(registry);
 
     // --- Phase 14.1: CDS/AppCDS ---
@@ -23166,11 +23407,20 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // so they are always available regardless of synthetic-jdk feature flag.
 
     // --- Quarkus bootstrap: RunnerClassLoader.close() ---
-    // The close() method iterates resourceDirectoryMap entries and calls
-    // arraylength on each value.  If the map has entries with null values
-    // (which can happen when HashMap treeify or invokedynamic are broken),
-    // close() throws NPE that masks the real exception from doRun.
-    // This no-op native prevents that masking.
+    // KEEP: correct no-op *for this mode only*, and NOT a duplicate of the
+    // real implementation. This registrar is `#[cfg(feature = "synthetic-jdk")]`
+    // and is reached only through `register_builtins`, which `vm_init.rs`
+    // calls under `if config.use_synthetic_jdk`. In that mode
+    // `RunnerClassLoader` is a ONE-slot synthetic placeholder holding just
+    // `parent` (`classloading/src/class_manager.rs`, the
+    // "RunnerClassLoader = 1-slot placeholder" arm) — there is no
+    // `resourceDirectoryMap` and no jar handle, so there is genuinely nothing
+    // to close.
+    // The real-JDK branch is the sibling `else`, and it registers the real
+    // `quarkus_runner_class_loader_close` (see `vm/src/vm/vm_init.rs`), which
+    // walks `resourceDirectoryMap` and closes the jar resources while skipping
+    // the null holes that used to NPE and mask `doRun`'s real exception.
+    // The two never coexist; do not "deduplicate" them.
     registry.register(
         "io/quarkus/bootstrap/runner/RunnerClassLoader",
         "close",
@@ -23465,6 +23715,224 @@ fn jul_convenience_log(
     // Nothing allocates between the reads above and this call, so `level`,
     // `this` and `payload` are all still current.
     ctx.invoke_virtual(this, "log", desc, &[Value::Object(Some(level)), payload])?;
+    Ok(None)
+}
+
+/// `java.security.ProtectionDomain.implies(Permission)`.
+///
+/// Evaluated against the same parsed-policy core that backs
+/// `SecurityManager.checkPermission` and the `Policy.implies(pd, perm)`
+/// native (`security_manager::policy_allows_full_generic`), using the
+/// currently-active privileged frame's codeBase + signer digests so
+/// `grant codeBase "…"` / `grant signedBy "…"` clauses match the same way in
+/// all three places. When no policy file is installed the core is allow-all,
+/// so the common case still answers `true`.
+///
+/// Permission layout convention (shared with `security_manager.rs`):
+/// field 0 = name/target, field 1 = actions.
+fn native_protection_domain_implies(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Instance method: [this(ProtectionDomain), permission]. A call shape with
+    // no permission argument has nothing to evaluate — keep the historical
+    // permissive answer rather than inventing a denial.
+    if args.len() < 2 {
+        return Ok(Some(Value::Int(1)));
+    }
+    // A null permission carries no grant to satisfy: deny, matching the
+    // `Policy.implies` native's null handling (security_manager.rs).
+    let perm = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(perm))
+        .unwrap_or_default();
+    let target = match ctx.get_field(perm, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let actions = match ctx.get_field(perm, 1) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let code_base = crate::security_manager::current_privileged_code_base_arc();
+    let cert_digests = crate::security_manager::current_privileged_cert_digests_arc();
+    let allowed = crate::security_manager::policy_allows_full_generic(
+        &class_name,
+        &target,
+        &actions,
+        code_base.as_deref(),
+        &cert_digests,
+    );
+    Ok(Some(Value::Int(allowed as i32)))
+}
+
+/// Whether the given **OS** descriptor carries `O_APPEND`.
+///
+/// Only ever called for 0/1/2 — see `native_file_descriptor_get_append`.
+#[cfg(unix)]
+fn os_fd_is_append(fd: i32) -> bool {
+    // SAFETY: `F_GETFL` only reads the descriptor's status flags; it touches
+    // no memory and returns -1 (with errno set) for a closed/invalid fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && (flags & libc::O_APPEND) != 0
+}
+
+#[cfg(not(unix))]
+fn os_fd_is_append(_fd: i32) -> bool {
+    // Windows has no `O_APPEND` status flag on a HANDLE; the JDK's own Windows
+    // build tracks append mode on the stream, not on the descriptor.
+    false
+}
+
+/// `java.io.FileDescriptor.getAppend(int fd)` — static.
+///
+/// W4: was a hard `false` justified as "CratonVM never opens an O_APPEND
+/// descriptor". That was wrong — `FileDescriptorTable::open_write(path, true)`
+/// passes `.append(true)` straight to the OS. What is true is that the `fd`
+/// value handed to this native is a `fd_table` id, NOT an OS descriptor, for
+/// everything except 0/1/2 (see the `getHandle` native above, which maps
+/// exactly that range through and answers -1 otherwise). Handing a table id to
+/// `fcntl` would report the flags of an unrelated real descriptor, so only the
+/// three standard streams are queried for real — and they are the only ones
+/// the JDK asks about anyway: `FileDescriptor(int)` is the sole caller and it
+/// runs for in/out/err, where a shell's `>>` genuinely does hand us O_APPEND.
+///
+/// ESCALATION (reported, not worked around here): a faithful answer for the
+/// remaining descriptors needs `FileDescriptorTable` to record the `append`
+/// flag `open_write` already receives and expose it as
+/// `fd_table().is_append(fd) -> Option<bool>` (`native-api/src/fd_table.rs`).
+fn native_file_descriptor_get_append(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let fd = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let append = (0..=2).contains(&fd) && os_fd_is_append(fd);
+    Ok(Some(Value::Int(append as i32)))
+}
+
+/// `Field/Method/Constructor.getRoot()` — the receiver's own `root` field.
+///
+/// W4: was a hard `null` for all three. Null is still the normal answer (our
+/// `copy()` natives hand back the SAME object rather than minting a linked
+/// copy, so nothing sets `root`), but reading the field means a reflective
+/// object that *did* acquire a root — e.g. real `AccessibleObject.copy()`
+/// bytecode running in a configuration where the `copy` native is not the
+/// winner — reports it instead of lying. `get_field_by_name` answers
+/// `Object(None)` for a layout with no such field, so synthetic Field/Method
+/// objects keep the old behaviour exactly.
+///
+/// `AccessibleObject.getRoot()` deliberately keeps its literal `null`: that IS
+/// the JDK body for the base class.
+fn native_reflect_get_root(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    match ctx.get_field_by_name(this, "root") {
+        root @ Value::Object(Some(_)) => Ok(Some(root)),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `java.lang.reflect.Executable.getParameters0()`.
+///
+/// W4: was a hard `null`. Now returns a real `Parameter[]` whenever the
+/// declaring class file actually carries a `MethodParameters` attribute
+/// (JVMS 4.7.24), and `null` otherwise.
+///
+/// The null half is load-bearing rather than a leftover stub:
+/// `Executable.privateGetParameters` sets `hasRealParameterData = true` for
+/// ANY non-null result, and that flag is what `Parameter.isNamePresent()`
+/// reports. Synthesizing `arg0`/`arg1`/… here would make `isNamePresent()`
+/// lie; returning null makes the JDK synthesize the very same names itself
+/// and correctly report them as absent.
+fn native_executable_get_parameters0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let class_id = match ctx.get_field_by_name(this, "clazz") {
+        Value::Object(Some(mirror)) => crate::lang_class::mirror_class_id(ctx, mirror),
+        _ => None,
+    };
+    let Some(class_id) = class_id else {
+        return Ok(Some(Value::Object(None)));
+    };
+    // Constructor reflection objects carry no `name` field — the JDK uses
+    // `<init>` implicitly (same convention as `lang_reflect`).
+    let name = match ctx.get_field_by_name(this, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "<init>".to_string()),
+        _ => "<init>".to_string(),
+    };
+    // Method-style descriptor first, then Constructor-style (same order as
+    // `lang_reflect::native_executable_get_parameters`).
+    let descriptor = match crate::lang_class::read_method_descriptor(ctx, this) {
+        Some(d) => d,
+        None => crate::lang_class::read_constructor_descriptor(ctx, this).unwrap_or_default(),
+    };
+    if descriptor.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let meta = ctx.method_parameters(class_id, &name, &descriptor);
+    // Empty vec = no attribute; all-empty names = `name_index == 0` for every
+    // entry, which the JDK also treats as "no real parameter data".
+    if meta.is_empty() || meta.iter().all(|(n, _)| n.is_empty()) {
+        return Ok(Some(Value::Object(None)));
+    }
+    crate::lang_reflect::native_executable_get_parameters(ctx, args)
+}
+
+/// `java.lang.StackTraceElement.computeFormat()`.
+///
+/// W4: was a null-safe no-op (ES-FAIL-06 — the JDK body dereferences
+/// `declaringClassObject` with no null guard, and elements built by the public
+/// 4-arg constructor leave it null). Keep the null guard, but compute the real
+/// bits when the class object IS present:
+///
+/// * `0x1 BUILTIN_CLASS_LOADER` — `toString()` drops the class-loader name.
+///   Set for the bootstrap/platform/application loaders, which are exactly
+///   `loader_id_of_class` 0/1/2 (`ClassLoaderId::to_native_id`); a user-defined
+///   loader gets an id >= 3 and keeps its name in the rendering.
+/// * `0x2 JDK_NON_UPGRADEABLE_MODULE` — `toString()` drops the module version.
+///   Set for the `java.*` / `jdk.*` boot-layer modules.
+///
+/// Both bits only ever SUPPRESS a prefix, so an element whose
+/// `classLoaderName`/`moduleName` are null renders identically either way —
+/// this cannot regress the ES-FAIL-06 case it replaces.
+fn native_stack_trace_element_compute_format(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let class_id = match ctx.get_field_by_name(this, "declaringClassObject") {
+        Value::Object(Some(mirror)) => crate::lang_class::mirror_class_id(ctx, mirror),
+        _ => None,
+    };
+    let mut format = 0i32;
+    if let Some(class_id) = class_id {
+        if (0..=2).contains(&ctx.loader_id_of_class(class_id)) {
+            format |= 0x1;
+        }
+        if let Some(module) = ctx.module_name_of_class(class_id) {
+            if module.starts_with("java.") || module.starts_with("jdk.") {
+                format |= 0x2;
+            }
+        }
+    }
+    // No-op when the layout has no `format` field (synthetic elements).
+    ctx.set_field_by_name(this, "format", Value::Int(format));
     Ok(None)
 }
 
@@ -24703,6 +25171,69 @@ pub(crate) fn locale_data_get(obj: ObjectRef) -> (String, String, String) {
     locale_data().lock().get(&obj).cloned().unwrap_or_default()
 }
 
+/// The ISO-639 language of `locale` (or of the default locale when `None`),
+/// normalised for [`case_map`].
+///
+/// A `java.util.Locale` reaches the String natives in one of three shapes, and
+/// all three have to be understood or `toLowerCase(Locale.forLanguageTag("tr"))`
+/// silently falls back to the root rules:
+///
+/// 1. one of *our* synthetic Locales — the language lives in a Rust side table
+///    (`locale_data`, or `locale_bootstrap`'s own for the cached default),
+///    because writing Strings into a real `Locale`'s instance slots would
+///    poison its real-JDK field layout (see [`locale_data`]);
+/// 2. a real-JDK `Locale` — the language is `baseLocale.language`;
+/// 3. absent (the no-arg `toLowerCase()`), which the JDK defines as
+///    `Locale.getDefault()`. Rather than *calling* `getDefault()` from inside a
+///    String native — it can allocate and run `<clinit>` — we read the
+///    `user.language` system property that seeds it, so `-Duser.language=tr`
+///    behaves as it does on HotSpot.
+pub(crate) fn locale_language_for_case_mapping(
+    ctx: &mut dyn NativeContext,
+    locale: Option<ObjectRef>,
+) -> std::borrow::Cow<'static, str> {
+    let Some(obj) = locale else {
+        return std::borrow::Cow::Borrowed(default_case_mapping_language(ctx));
+    };
+    let (lang, _, _) = locale_data_get(obj);
+    let raw = if !lang.is_empty() {
+        lang
+    } else if let Some(l) = locale_bootstrap::synthetic_language(obj) {
+        l
+    } else {
+        real_locale_language(ctx, obj)
+    };
+    std::borrow::Cow::Owned(case_map::normalize_language(&raw))
+}
+
+/// The default locale's language, resolved once.
+///
+/// `String.toLowerCase()` is one of the hottest natives in the VM; a
+/// system-property lookup plus two `String` allocations per call would be a
+/// visible regression there. The value cannot change during a run — our
+/// `Locale.getDefault()` hands back a fixed synthetic locale seeded from
+/// `user.language` — so it is resolved on first use and reused.
+fn default_case_mapping_language(ctx: &mut dyn NativeContext) -> &'static str {
+    static LANG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LANG.get_or_init(|| {
+        case_map::normalize_language(
+            &ctx.get_system_property("user.language")
+                .unwrap_or_else(|| "en".to_string()),
+        )
+    })
+    .as_str()
+}
+
+/// `baseLocale.language` of a real-JDK `Locale`, or the empty string.
+fn real_locale_language(ctx: &mut dyn NativeContext, locale: ObjectRef) -> String {
+    if let Value::Object(Some(base)) = ctx.get_field_by_name(locale, "baseLocale") {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(base, "language") {
+            return ctx.read_string(s).unwrap_or_default();
+        }
+    }
+    String::new()
+}
+
 /// GC root scan for all process-global Locale caches (this module's
 /// `locale_default` + `locale_data`, plus the `locale_bootstrap` caches). These
 /// hold live synthetic `java/util/Locale` objects reachable only from Rust-side
@@ -25183,6 +25714,478 @@ thread_local! {
 /// carries an exception.  Calling `printStackTrace` here would bypass the
 /// capture stream on some JDK paths; `toString` is sufficient for framework
 /// diagnostics and remains part of the same captured record.
+// ---------------------------------------------------------------------------
+// java.lang.System.Logger — the receiver CratonVM's `System.getLogger` mints
+// ---------------------------------------------------------------------------
+//
+// W5 STUB REMOVAL. `System.getLogger(String)`, its `ResourceBundle` overload
+// and `jdk.internal.logger.LazyLoggers.getLogger(String, Module)` used to mint
+// a receiver whose CLASS was the `java/lang/System$Logger` INTERFACE itself
+// (`alloc_object(<interface ClassId>, 1)`). That object was inert in both
+// directions:
+//
+//   * the interface declares no instance fields, so the `set_field(logger, 0,
+//     name)` meant to record the logger name wrote past the class's declared
+//     layout (the "undersized object layout" hazard `alloc_concurrent_synthetic`
+//     documents), and
+//   * both instance-dispatch sites — `vm_exec::invoke_on_class_shared`'s
+//     `override_cb` and `interpreter::try_stackless_invoke` step 6 — DROP a
+//     registered native when `declaring_is_interface && !is_static` unless the
+//     triple is force-listed, and `java/lang/System$Logger` is in no force list
+//     (those lists live in `vm/`, not here). So the natives registered on the
+//     interface could not reliably serve it either.
+//
+// Measured against HotSpot 25: `System.getLogger("x").isLoggable(Level.ERROR)`
+// answered false (HotSpot: true), while `getName()` and the 4-arg `log`
+// overload resolved to the ABSTRACT interface declarations, so the JDK's
+// default `log(Level,String)` body — which delegates to
+// `log(level, (ResourceBundle) null, msg, (Object[]) null)` — threw
+// `AbstractMethodError`.
+//
+// The receiver is now stamped with a CONCRETE class of our own,
+// [`CRATON_SYSTEM_LOGGER_CLASS`]. It is never present on any classpath, so it
+// is always a plain synthetic stub — in real-JDK mode as well as synthetic-jdk
+// mode — which means:
+//
+//   * nothing drops a native registered on it (it is not an interface), and
+//   * `invoke_on_class_shared` checks the exact-class native FIRST for the
+//     `cratonvm/internal/*` namespace, and its method-not-found arm walks the
+//     receiver's class chain through the native registry, so every dispatch
+//     route lands on the natives below.
+//
+// The same method set stays registered on the `java/lang/System$Logger`
+// interface name: when a call site resolves to the abstract interface
+// declaration, `invoke_on_class_shared` looks the native up under the DECLARING
+// class before it tries the receiver's own class, and any receiver still
+// stamped with the interface (e.g. one minted by an older cached path) keeps
+// working. Registering there can never shadow a genuine `System.Logger`
+// implementation: a concrete implementation declares these methods itself, so
+// dispatch resolves to its own class and never consults the interface entry —
+// and for the one method with a body in the interface (the default
+// `log(Level,String)`) the interface-native drop rule above still applies, so
+// real bytecode wins.
+//
+// NOT fixed by deleting the shadow and letting the real JDK chain run:
+// `System.getLogger` first needs `Reflection.getCallerClass()` (which returns
+// null on CratonVM boot frames — the resulting `IllegalCallerException` /
+// `DefaultLoggerFinder.isSystem` NPE is precisely why this shim exists), then
+// the `LoggerFinderLoader` → `ServiceLoader` → `BootstrapLogger` chain, of
+// which this crate has not one native or shim, i.e. it has never been
+// exercised under CratonVM.
+
+/// Binary name of the concrete class CratonVM stamps onto the `System.Logger`
+/// instances `System.getLogger` / `LazyLoggers.getLogger` hand out.
+pub(crate) const CRATON_SYSTEM_LOGGER_CLASS: &str = "cratonvm/internal/SystemLogger";
+/// Slot 0 — the requested logger name (`getName()`).
+const SYSTEM_LOGGER_SLOT_NAME: usize = 0;
+/// Slot 1 — the severity threshold this logger publishes at, as an int.
+const SYSTEM_LOGGER_SLOT_THRESHOLD: usize = 1;
+const SYSTEM_LOGGER_SLOTS: usize = 2;
+/// `System.Logger.Level.INFO`'s severity, and the default threshold — matching
+/// a stock JDK, whose `DefaultLoggerFinder`/`SimpleConsoleLogger` publishes at
+/// INFO with no logging configuration. `jdk.internal.event.EventHelper`'s
+/// `isLoggable(DEBUG)` readout (see `jca/provider_chain.rs`) documents the same
+/// default from the other side: DEBUG is NOT loggable on a stock JDK.
+const SYSTEM_LOGGER_SEVERITY_INFO: i32 = 800;
+
+/// `System.Logger.Level` severities, by enum constant name.
+fn system_logger_severity_of(name: &str) -> Option<i32> {
+    Some(match name {
+        "ALL" => i32::MIN,
+        "TRACE" => 400,
+        "DEBUG" => 500,
+        "INFO" => SYSTEM_LOGGER_SEVERITY_INFO,
+        "WARNING" => 900,
+        "ERROR" => 1000,
+        "OFF" => i32::MAX,
+        _ => return None,
+    })
+}
+
+/// Bounds-checked slot read: a receiver minted by an older path (or the
+/// interface-stamped shape this file used to produce) can have fewer slots
+/// than we expect.
+fn system_logger_slot(ctx: &mut dyn NativeContext, obj: ObjectRef, slot: usize) -> Value {
+    if ctx.object_num_fields(obj) > slot {
+        ctx.get_field(obj, slot)
+    } else {
+        Value::Object(None)
+    }
+}
+
+fn system_logger_this(args: &[Value]) -> Option<ObjectRef> {
+    match args.first() {
+        Some(Value::Object(Some(obj))) => Some(*obj),
+        _ => None,
+    }
+}
+
+/// Read a `System.Logger.Level`'s constant name: the `name` field on a real
+/// JDK enum, slot 0 on the synthetic one `p57_alloc_enum` builds.
+fn system_logger_level_name(ctx: &mut dyn NativeContext, level: Option<&Value>) -> Option<String> {
+    let level = match level {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return None,
+    };
+    let by_name = match ctx.get_field_by_name(level, "name") {
+        Value::Object(Some(text)) => ctx.read_string(text),
+        _ => None,
+    };
+    by_name.or_else(|| match system_logger_slot(ctx, level, 0) {
+        Value::Object(Some(text)) => ctx.read_string(text),
+        _ => None,
+    })
+}
+
+fn system_logger_threshold(ctx: &mut dyn NativeContext, this: Option<ObjectRef>) -> i32 {
+    let this = match this {
+        Some(this) => this,
+        None => return SYSTEM_LOGGER_SEVERITY_INFO,
+    };
+    match system_logger_slot(ctx, this, SYSTEM_LOGGER_SLOT_THRESHOLD) {
+        Value::Int(severity) => severity,
+        _ => SYSTEM_LOGGER_SEVERITY_INFO,
+    }
+}
+
+/// `System.Logger.isLoggable(Level)`: never true for `OFF`, otherwise true iff
+/// the level is at least as severe as this logger's threshold.
+fn system_logger_is_loggable(
+    ctx: &mut dyn NativeContext,
+    this: Option<ObjectRef>,
+    level: Option<&Value>,
+) -> bool {
+    let name = system_logger_level_name(ctx, level);
+    if name.as_deref() == Some("OFF") {
+        return false;
+    }
+    let severity = name
+        .as_deref()
+        .and_then(system_logger_severity_of)
+        .unwrap_or(SYSTEM_LOGGER_SEVERITY_INFO);
+    severity >= system_logger_threshold(ctx, this)
+}
+
+fn system_logger_name_of(ctx: &mut dyn NativeContext, this: Option<ObjectRef>) -> String {
+    let this = match this {
+        Some(this) => this,
+        None => return String::new(),
+    };
+    match system_logger_slot(ctx, this, SYSTEM_LOGGER_SLOT_NAME) {
+        Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Render a message argument: a `String` directly, anything else through its
+/// own `toString()`.
+fn system_logger_text(ctx: &mut dyn NativeContext, value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Object(Some(obj))) => {
+            let obj = *obj;
+            ctx.read_string(obj).or_else(|| {
+                match ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
+                    _ => None,
+                }
+            })
+        }
+        Some(Value::Object(None)) => Some("null".to_string()),
+        _ => None,
+    }
+}
+
+/// `Supplier<String>.get()`, evaluated only once the record is known loggable
+/// (the JDK's default `log(Level, Supplier)` bodies make the same promise).
+fn system_logger_supplier_text(
+    ctx: &mut dyn NativeContext,
+    supplier: Option<&Value>,
+) -> Option<String> {
+    let supplier = match supplier {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[]) {
+        Ok(Some(value)) => system_logger_text(ctx, Some(&value)),
+        _ => None,
+    }
+}
+
+/// `{0}`-style parameter substitution for the `Object...` overloads.
+fn system_logger_format(
+    ctx: &mut dyn NativeContext,
+    message: &str,
+    params: Option<&Value>,
+) -> String {
+    let params = match params {
+        Some(Value::Object(Some(array))) => *array,
+        _ => return message.to_string(),
+    };
+    let len = ctx.array_length(params);
+    let mut rendered = message.to_string();
+    for index in 0..len {
+        let element = ctx.get_array_element(params, index);
+        let text = system_logger_text(ctx, Some(&element)).unwrap_or_default();
+        rendered = rendered.replace(&format!("{{{index}}}"), &text);
+    }
+    rendered
+}
+
+/// Publish one record through the same console sink every other logging shim
+/// in this crate uses (`record_printed_line` + the `System.out` override).
+fn system_logger_emit(
+    ctx: &mut dyn NativeContext,
+    this: Option<ObjectRef>,
+    level: Option<&Value>,
+    message: Option<String>,
+    throwable: Option<&Value>,
+) {
+    let message = match message {
+        Some(message) => message,
+        None => return,
+    };
+    if !system_logger_is_loggable(ctx, this, level) {
+        return;
+    }
+    let level_name = system_logger_level_name(ctx, level).unwrap_or_else(|| "INFO".to_string());
+    let logger_name = system_logger_name_of(ctx, this);
+    emit_framework_log_with_throwable(
+        ctx,
+        &level_name,
+        &format!("[{logger_name}] {message}"),
+        throwable,
+    );
+}
+
+/// Allocate a `System.Logger` receiver named `name`.
+pub(crate) fn craton_alloc_system_logger(ctx: &mut dyn NativeContext, name: Value) -> ObjectRef {
+    // Native stale-local family: `name` must survive the class registration
+    // and the allocation below, both of which can move the young generation.
+    let name_pin = match name {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let class_id = ctx.class_id_by_name(CRATON_SYSTEM_LOGGER_CLASS).unwrap_or_else(|| {
+        ctx.ensure_synthetic_class(CRATON_SYSTEM_LOGGER_CLASS, SYSTEM_LOGGER_SLOTS)
+    });
+    let slots = SYSTEM_LOGGER_SLOTS.max(ctx.class_num_total_fields(class_id));
+    let logger = ctx
+        .try_alloc_object_gc_safe(class_id, slots)
+        .unwrap_or_else(|| ctx.alloc_object(class_id, slots));
+    let name = match name_pin {
+        Some((handle, obj)) => Value::Object(Some(ctx.read_native_pin(handle, obj))),
+        None => Value::Object(None),
+    };
+    ctx.set_field(logger, SYSTEM_LOGGER_SLOT_NAME, name);
+    ctx.set_field(
+        logger,
+        SYSTEM_LOGGER_SLOT_THRESHOLD,
+        Value::Int(SYSTEM_LOGGER_SEVERITY_INFO),
+    );
+    if let Some((handle, _)) = name_pin {
+        ctx.unpin_native_roots(handle);
+    }
+    logger
+}
+
+/// `System.getLogger(String)`, `System.getLogger(String, ResourceBundle)` and
+/// `LazyLoggers.getLogger(String, Module)` — all static, all with the requested
+/// name in `args[0]`.
+pub(crate) fn native_system_get_logger(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let name = args.first().copied().unwrap_or(Value::Object(None));
+    let logger = craton_alloc_system_logger(ctx, name);
+    Ok(Some(Value::Object(Some(logger))))
+}
+
+fn native_system_logger_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match system_logger_this(args) {
+        Some(this) => this,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(system_logger_slot(ctx, this, SYSTEM_LOGGER_SLOT_NAME)))
+}
+
+fn native_system_logger_is_loggable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let loggable = system_logger_is_loggable(ctx, system_logger_this(args), args.get(1));
+    Ok(Some(Value::Int(i32::from(loggable))))
+}
+
+/// `log(Level, String)`
+fn native_system_logger_log_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    let message = system_logger_text(ctx, args.get(2));
+    system_logger_emit(ctx, this, args.get(1), message, None);
+    Ok(None)
+}
+
+/// `log(Level, Object)`
+fn native_system_logger_log_object(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_system_logger_log_string(ctx, args)
+}
+
+/// `log(Level, String, Throwable)`
+fn native_system_logger_log_string_throwable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    let message = system_logger_text(ctx, args.get(2));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(3));
+    Ok(None)
+}
+
+/// `log(Level, String, Object...)`
+fn native_system_logger_log_params(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    let message = system_logger_text(ctx, args.get(2))
+        .map(|message| system_logger_format(ctx, &message, args.get(3)));
+    system_logger_emit(ctx, this, args.get(1), message, None);
+    Ok(None)
+}
+
+/// `log(Level, Supplier<String>)`
+fn native_system_logger_log_supplier(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    if !system_logger_is_loggable(ctx, this, args.get(1)) {
+        return Ok(None);
+    }
+    let message = system_logger_supplier_text(ctx, args.get(2));
+    system_logger_emit(ctx, this, args.get(1), message, None);
+    Ok(None)
+}
+
+/// `log(Level, Supplier<String>, Throwable)`
+fn native_system_logger_log_supplier_throwable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    if !system_logger_is_loggable(ctx, this, args.get(1)) {
+        return Ok(None);
+    }
+    let message = system_logger_supplier_text(ctx, args.get(2));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(3));
+    Ok(None)
+}
+
+/// `log(Level, ResourceBundle, String, Throwable)` — the resource bundle is
+/// ignored (CratonVM has no logger-scoped bundle lookup); the key is published
+/// as the message, which is what the JDK does for an absent bundle.
+fn native_system_logger_log_bundle_throwable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    let message = system_logger_text(ctx, args.get(3));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(4));
+    Ok(None)
+}
+
+/// `log(Level, ResourceBundle, String, Object...)` — this is the overload the
+/// JDK's own default `log(Level, String)` body delegates to, so it is the one
+/// that must work for `System.getLogger("x").log(ERROR, "msg")` to emit.
+fn native_system_logger_log_bundle_params(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    let message = system_logger_text(ctx, args.get(3))
+        .map(|message| system_logger_format(ctx, &message, args.get(4)));
+    system_logger_emit(ctx, this, args.get(1), message, None);
+    Ok(None)
+}
+
+/// Register the full `System.Logger` instance surface under `class_name`.
+///
+/// Called for [`CRATON_SYSTEM_LOGGER_CLASS`] (the receiver's real class, which
+/// every dispatch route reaches) and for `java/lang/System$Logger` (the
+/// declaring class a call site resolves to when it lands on the abstract
+/// interface declaration). See the block comment above for why both are needed
+/// and why the interface registration cannot shadow a real implementation.
+pub(crate) fn register_system_logger_methods(
+    registry: &mut NativeMethodRegistry,
+    class_name: &str,
+) {
+    registry.register(
+        class_name,
+        "getName",
+        "()Ljava/lang/String;",
+        native_system_logger_get_name,
+    );
+    registry.register(
+        class_name,
+        "isLoggable",
+        "(Ljava/lang/System$Logger$Level;)Z",
+        native_system_logger_is_loggable,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;)V",
+        native_system_logger_log_string,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/util/function/Supplier;)V",
+        native_system_logger_log_supplier,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/lang/Object;)V",
+        native_system_logger_log_object,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;Ljava/lang/Throwable;)V",
+        native_system_logger_log_string_throwable,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/util/function/Supplier;Ljava/lang/Throwable;)V",
+        native_system_logger_log_supplier_throwable,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;[Ljava/lang/Object;)V",
+        native_system_logger_log_params,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/util/ResourceBundle;Ljava/lang/String;Ljava/lang/Throwable;)V",
+        native_system_logger_log_bundle_throwable,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/util/ResourceBundle;Ljava/lang/String;[Ljava/lang/Object;)V",
+        native_system_logger_log_bundle_params,
+    );
+}
+
 fn emit_framework_log_with_throwable(
     ctx: &mut dyn NativeContext,
     level: &str,

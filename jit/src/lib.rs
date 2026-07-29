@@ -342,6 +342,12 @@ pub struct ExecutableBuffer {
     /// emit hot path records overflow here and the compile driver bails to
     /// the interpreter (returns `None`) after codegen.
     overflowed: bool,
+    /// Total bytes codegen ASKED to emit, counted whether or not the write
+    /// fit. `len` freezes at the first overflow, so it cannot answer "how big
+    /// should this buffer have been?" — and without that number an overflow
+    /// bail is indistinguishable from a method the JIT declined for any other
+    /// reason. See [`wanted`](Self::wanted).
+    wanted: usize,
 }
 
 // Safety: ExecutableBuffer is effectively a unique owned allocation, like Vec<u8>.
@@ -368,6 +374,7 @@ impl ExecutableBuffer {
             len: 0,
             capacity,
             overflowed: false,
+            wanted: 0,
         })
     }
 
@@ -385,6 +392,7 @@ impl ExecutableBuffer {
     /// bytes in past the gap left by the dropped instruction and produce a
     /// silently misaligned code stream.
     pub fn emit(&mut self, bytes: &[u8]) {
+        self.wanted += bytes.len();
         if self.overflowed || self.len + bytes.len() > self.capacity {
             self.overflowed = true;
             return;
@@ -416,6 +424,7 @@ impl ExecutableBuffer {
     /// already overflowed.
     #[inline]
     pub fn emit_byte(&mut self, b: u8) {
+        self.wanted += 1;
         if self.overflowed || self.len >= self.capacity {
             self.overflowed = true;
             return;
@@ -450,6 +459,15 @@ impl ExecutableBuffer {
     #[inline]
     pub fn pos(&self) -> usize {
         self.len
+    }
+
+    /// Total bytes codegen asked to emit, including writes dropped after an
+    /// overflow. On an overflowed buffer this is the capacity the compile
+    /// actually needed (a lower bound: a dropped write still advances it, and
+    /// `rewind_to` does not take bytes back off it).
+    #[inline]
+    pub fn wanted(&self) -> usize {
+        self.wanted
     }
 
     /// Rewind the write position back to a previously recorded `pos()`.
@@ -673,72 +691,17 @@ fn jit_code_cache_at_capacity() -> bool {
     true
 }
 
-/// Number of JIT frames live process-wide, mirrored here from the VM's own
-/// `GLOBAL_JIT_DEPTH` (this crate cannot see that counter -- `vm` depends on
-/// `jit`, not the other way round).
-///
-/// Only [`retire_executable`] reads it, and only to decide whether unmapping a
-/// retired code buffer right now could pull the ground out from under a frame
-/// that is executing it.
-pub static LIVE_JIT_FRAMES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Mirror one JIT chain push/pop into [`LIVE_JIT_FRAMES`].
-#[inline]
-pub fn note_live_jit_frame_delta(delta: isize) {
-    if delta > 0 {
-        LIVE_JIT_FRAMES.fetch_add(delta as usize, std::sync::atomic::Ordering::Release);
-    } else if delta < 0 {
-        // Saturating: a stray pop must not wrap the counter to `usize::MAX` and
-        // pin every retired buffer for the rest of the process.
-        let _ = LIVE_JIT_FRAMES.fetch_update(
-            std::sync::atomic::Ordering::Release,
-            std::sync::atomic::Ordering::Acquire,
-            |v| Some(v.saturating_sub((-delta) as usize)),
-        );
-    }
-}
-
-/// Code buffers whose last owner has dropped but which could not be unmapped
-/// yet because JIT frames were live. Drained by [`retire_executable`].
-fn retired_code() -> &'static Mutex<Vec<(usize, usize)>> {
-    static RETIRED: OnceLock<Mutex<Vec<(usize, usize)>>> = OnceLock::new();
-    RETIRED.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Hand a dropped code buffer back to the OS -- but only when no JIT frame is
-/// live anywhere in the process.
-///
-/// `JitCache::put` REPLACES the artifact stored under a key, and
-/// `invalidate_matching` removes artifacts outright on a class define. Either
-/// can drop the last `Arc<CompiledMethod>` for a body that a thread is
-/// currently EXECUTING: `JitEntryGuard::enter_with_compiled` records only a raw
-/// `*const CompiledMethod`, and its doc comment's claim that "the compiled
-/// method itself is kept alive by the JIT cache's Arc holding" is exactly the
-/// assumption `put` breaks. Unmapping there turns the next instruction fetch in
-/// the running method into a SIGSEGV whose `pc == addr` -- observed on
-/// `BeanRegistrationsAotContributionTests` at roughly one run in three, faulting
-/// inside `com/sun/tools/javac/tree/TreeScanner.visitApply` while javac was
-/// running it.
-///
-/// So: deregister immediately (the address must stop validating as JIT code the
-/// moment it is retired), but defer the `munmap` until `LIVE_JIT_FRAMES` hits
-/// zero, then drain everything that accumulated. The committed-bytes accounting
-/// moves with the actual unmap so the code-cache cap keeps tracking real
-/// mappings.
-fn retire_executable(ptr: *mut u8, capacity: usize) {
-    let mut pending = match retired_code().lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    };
-    pending.push((ptr as usize, capacity));
-    if LIVE_JIT_FRAMES.load(std::sync::atomic::Ordering::Acquire) != 0 {
-        return;
-    }
-    for (addr, size) in pending.drain(..) {
-        COMMITTED_JIT_CODE_BYTES.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
-        platform::free_executable(addr as *mut u8, size);
-    }
+/// Whether to trace code-buffer unmaps (`CRATONVM_DBG_JIT_UNMAP`). Read once and
+/// cached: `Drop` runs on compile threads and during teardown, where a
+/// per-call environment read would be both hot and needlessly fallible.
+fn dbg_jit_unmap_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_UNMAP")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
 }
 
 impl Drop for ExecutableBuffer {
@@ -749,8 +712,121 @@ impl Drop for ExecutableBuffer {
         if let Ok(mut regions) = jit_code_regions().lock() {
             regions.deregister(self.ptr);
         }
-        retire_executable(self.ptr, self.capacity);
+        COMMITTED_JIT_CODE_BYTES.fetch_sub(self.capacity, std::sync::atomic::Ordering::Relaxed);
+        // DIAG: `CRATONVM_DBG_JIT_UNMAP=1` names every code buffer as it is
+        // unmapped. Paired with `CRATONVM_DBG=jitc` (which prints each
+        // artifact's `entry=0x..`) and the crash handler's `pc=` line, it
+        // answers "did this SIGSEGV jump into a body that had just been
+        // retired?" in a single run — the question each round of the
+        // retired-JIT-code family previously needed a bespoke LD_PRELOAD shim
+        // for. It is what identified the unrooted OSR direct-call targets
+        // (`osr_direct_callee_entries` in the interpreter's
+        // `compile_osr_artifact`).
+        if dbg_jit_unmap_enabled() {
+            eprintln!(
+                "[jit-unmap] ptr=0x{:x} cap={} tid={:?}",
+                self.ptr as usize,
+                self.capacity,
+                std::thread::current().id()
+            );
+        }
+        // Record the unmap BEFORE it happens, so a thread that faults inside
+        // this range can be told it was executing freed code (see
+        // `recent_code_free_covering`, which the crash handler prints). The
+        // active-execution count is what makes the report actionable: a
+        // non-zero value means the buffer was released while at least one
+        // thread was inside compiled code — which is precisely the bug the
+        // `defer_jit_owner` retirement queue above exists to prevent, so a
+        // non-zero value here means some release path is still bypassing it.
+        record_code_free(
+            self.ptr as usize,
+            self.capacity,
+            ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire),
+        );
+        if never_free_code_enabled() {
+            return;
+        }
+        platform::free_executable(self.ptr, self.capacity);
     }
+}
+
+/// DIAG: `CRATONVM_JIT_NEVER_FREE_CODE=1` never unmaps an executable buffer,
+/// for ANY owner — unlike [`jit_leak_code_enabled`], which only defers the
+/// owners routed through [`defer_jit_owner`]. If a SIGSEGV vanishes under this
+/// flag but survives `CRATONVM_JIT_LEAK_CODE=1`, the use-after-free is on a
+/// release path the retirement queue does not cover. Leaks every retired body;
+/// diagnosis only, never a shipping mode.
+fn never_free_code_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_NEVER_FREE_CODE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Ring of the most recently unmapped executable buffers.
+///
+/// Exists so the crash handler can answer the one question a bare
+/// `SIGSEGV at pc=X, addr=X` cannot: was `X` inside a code buffer this process
+/// had just released? `lookup_jit_method_name` cannot — it answers from the
+/// range registry, which a *recycled* address also satisfies, and which is
+/// still populated when the fault is taken. Plain atomics, no locks and no
+/// allocation, so the lookup is safe from a signal handler.
+const RECENT_CODE_FREES: usize = 4096;
+static RECENT_FREE_BASE: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
+static RECENT_FREE_LEN: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
+static RECENT_FREE_ACTIVE: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
+static RECENT_FREE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn record_code_free(base: usize, len: usize, active_executions: usize) {
+    use std::sync::atomic::Ordering;
+    // DIAG (`CRATONVM_DBG_JIT_CODE_FREE=1`): name the release site. Executable
+    // buffers are unmapped a handful of times per process, so capturing a
+    // backtrace here is free in practice and it is the only way to tell WHICH
+    // owner dropped last — the crash it explains reports only an address.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_CODE_FREE").is_some() {
+        eprintln!(
+            "[jit-code-free] base={base:#x} len={len:#x} active_jit_executions={active_executions}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+    let i = RECENT_FREE_SEQ.fetch_add(1, Ordering::Relaxed) % RECENT_CODE_FREES;
+    // Publish base last: a reader that sees a non-zero base sees the matching
+    // length and count, and a torn slot reads as "empty" rather than as a wrong
+    // range.
+    RECENT_FREE_BASE[i].store(0, Ordering::Relaxed);
+    RECENT_FREE_LEN[i].store(len, Ordering::Relaxed);
+    RECENT_FREE_ACTIVE[i].store(active_executions, Ordering::Relaxed);
+    RECENT_FREE_BASE[i].store(base, Ordering::Release);
+}
+
+/// Total executable buffers unmapped by this process. Async-signal-safe.
+pub fn code_frees_total() -> usize {
+    RECENT_FREE_SEQ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Was `addr` inside one of the last [`RECENT_CODE_FREES`] executable buffers
+/// this process unmapped? Returns `(base, len, active_jit_executions_at_free)`.
+///
+/// Async-signal-safe: atomic loads only.
+pub fn recent_code_free_covering(addr: usize) -> Option<(usize, usize, usize)> {
+    use std::sync::atomic::Ordering;
+    for i in 0..RECENT_CODE_FREES {
+        let base = RECENT_FREE_BASE[i].load(Ordering::Acquire);
+        if base == 0 {
+            continue;
+        }
+        let len = RECENT_FREE_LEN[i].load(Ordering::Relaxed);
+        if addr >= base && addr < base.saturating_add(len) {
+            return Some((base, len, RECENT_FREE_ACTIVE[i].load(Ordering::Relaxed)));
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -5599,13 +5675,28 @@ pub static UNROOTED_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
 
 /// `CRATONVM_JIT_STRICT_CALLEE_ROOTS=1` refuses to publish a compiled body whose
 /// baked direct-call targets cannot all be kept alive.
+/// Whether an unrootable baked direct-call target blocks publication.
+///
+/// DEFAULT-ON since 2026-07-28. It arrived default-OFF with the diagnostic that
+/// found the retired-JIT-code family (e4b848394), which only *counted* the
+/// event — so the common case was to publish anyway, exactly the use-after-free
+/// `prepare_for_publication`'s doc comment says must not happen. Observed on
+/// the `JitOsrLoopProgress` fixture: `step`'s C2 compile baked a CALL to
+/// `maybeThrow`'s live entry, a concurrent `maybeThrow` recompile replaced it
+/// and unmapped the old body BEFORE `step` reached publication, and the
+/// published `step` then jumped into the freed page (SIGSEGV, `pc == addr`).
+///
+/// Refusing publication costs one wasted compile: the method stays interpreted
+/// and is recompiled on a later invocation, by which point the callee has a
+/// live body. `CRATONVM_JIT_STRICT_CALLEE_ROOTS=0` restores the historical
+/// publish-anyway behaviour for bisection.
 fn strict_callee_roots_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_STRICT_CALLEE_ROOTS")
             .map(|v| v != "0")
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -5838,8 +5929,19 @@ impl JitCache {
             .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
         let shard = &self.shards[Self::shard_index(h)];
         let mut next = (**shard.methods.load()).clone();
-        next.insert(h, (key, arc));
+        let superseded = next.insert(h, (key, arc));
         shard.methods.store(Arc::new(next));
+        // The artifact this publication replaces may still be EXECUTING: a
+        // mutator inside its body, or inside a callee it roots via
+        // `_direct_callee_roots`. Dropping it here runs
+        // `ExecutableBuffer::drop`, which unmaps the code under that thread —
+        // observed as a SIGSEGV with `pc == addr` MID-body (offset 0x553 of a
+        // 1732-byte `maybeThrow`) immediately after this site's `[jit-unmap]`
+        // line for the same page. Hand it to the same quiescence queue the
+        // inline caches use: `defer_jit_owner` drops immediately when no JIT
+        // execution is in flight (the common case, so no retention change) and
+        // otherwise holds the `Arc` until `ACTIVE_JIT_EXECUTIONS` reaches zero.
+        defer_jit_owner(superseded.map(|(_, cm)| cm));
         // T2.2 — bump on EVERY publication, not just replacements. A first-time
         // insertion is exactly the event the interpreter's negative
         // "no compiled body for this method" memo
@@ -5911,8 +6013,11 @@ impl JitCache {
             .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
         let shard = &self.shards[Self::shard_index(h)];
         let mut next = (**shard.osr_methods.load()).clone();
-        next.insert(h, (key, arc));
+        let superseded = next.insert(h, (key, arc));
         shard.osr_methods.store(Arc::new(next));
+        // Same reasoning as `put` — an OSR body is, if anything, more likely to
+        // be mid-execution when it is replaced.
+        defer_jit_owner(superseded.map(|(_, cm)| cm));
         // T2.2 — unconditional, for the same reason as `put` above.
         JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -6078,20 +6183,39 @@ impl JitCache {
         for shard in self.shards.iter() {
             let current = shard.methods.load();
             if doomed(&current) {
+                // Retire through the quiescence queue — see `put`. An
+                // invalidation is exactly the case where a body is likely to be
+                // running (a redefine racing live code).
+                let evicted: Vec<Arc<CompiledMethod>> = current
+                    .values()
+                    .filter(|(_, cm)| remove_entries.contains(&(cm.entry_ptr() as usize)))
+                    .map(|(_, cm)| cm.clone())
+                    .collect();
                 let mut next = (**current).clone();
                 let old_len = next.len();
                 next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
                 removed += old_len - next.len();
                 shard.methods.store(Arc::new(next));
+                for cm in evicted {
+                    defer_jit_owner(Some(cm));
+                }
             }
 
             let current = shard.osr_methods.load();
             if doomed(&current) {
+                let evicted: Vec<Arc<CompiledMethod>> = current
+                    .values()
+                    .filter(|(_, cm)| remove_entries.contains(&(cm.entry_ptr() as usize)))
+                    .map(|(_, cm)| cm.clone())
+                    .collect();
                 let mut next = (**current).clone();
                 let old_len = next.len();
                 next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
                 removed += old_len - next.len();
                 shard.osr_methods.store(Arc::new(next));
+                for cm in evicted {
+                    defer_jit_owner(Some(cm));
+                }
             }
         }
         if removed != 0 {
@@ -6116,8 +6240,21 @@ impl JitCache {
                 }
             }
             count += shard.methods.load().len() + shard.osr_methods.load().len();
+            // Retire through the quiescence queue — see `put`. `clear_all` runs
+            // on JVMTI redefine, which does not stop the world here, so every
+            // body it drops may be live.
+            let evicted: Vec<Arc<CompiledMethod>> = [
+                shard.methods.load(),
+                shard.osr_methods.load(),
+            ]
+            .iter()
+            .flat_map(|map| map.values().map(|(_, cm)| cm.clone()).collect::<Vec<_>>())
+            .collect();
             shard.methods.store(Arc::new(FxHashMap::default()));
             shard.osr_methods.store(Arc::new(FxHashMap::default()));
+            for cm in evicted {
+                defer_jit_owner(Some(cm));
+            }
         }
         if count != 0 {
             JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -13306,6 +13443,79 @@ mod tests {
         assert!(
             lookup_jit_code_range(old_entry).is_none(),
             "the replaced artifact must unregister after its last Arc is released"
+        );
+        if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
+            unregister_jit_code_range(new_cm.entry_ptr() as usize);
+        }
+    }
+
+    /// A thread executing compiled code holds NO `Arc` — only a return address
+    /// on its stack. So a tier-up `put` that displaces the body it is running
+    /// would drop the last strong reference and `munmap` the mapping out from
+    /// under it (`SIGSEGV at pc=X, addr=X`, the PC landing in a hole between
+    /// core-dump segments, ~10% of runs under load). `put` therefore hands the
+    /// superseded artifact to [`defer_jit_owner`], which holds it until
+    /// `ACTIVE_JIT_EXECUTIONS` reaches zero.
+    #[test]
+    fn replaced_body_survives_until_jit_execution_is_quiescent() {
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("RetireWhileRunningClass");
+        let method: Arc<str> = Arc::from("m");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(1);
+
+        let mut old_buf = ExecutableBuffer::new(64).expect("alloc failed");
+        old_buf.emit(&[0xC3]); // RET
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            CompiledMethod::new(old_buf),
+        );
+        let old = cache
+            .get(&class, &method, &desc, cid)
+            .expect("old compiled method");
+        let old_entry = old.entry_ptr() as usize;
+        register_jit_code_range(old_entry, old.code_len(), Arc::as_ptr(&old) as usize);
+        // Release the reader: the shard snapshot is now the ONLY strong owner,
+        // exactly as it is for a body that is merely being executed.
+        drop(old);
+        assert!(lookup_jit_code_range(old_entry).is_some());
+
+        jit_execution_enter();
+        let mut new_buf = ExecutableBuffer::new(64).expect("alloc failed");
+        new_buf.emit(&[0xC3]); // RET
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            CompiledMethod::new(new_buf),
+        );
+        assert!(
+            lookup_jit_code_range(old_entry).is_some(),
+            "a tier-up must not release the body a thread is executing"
+        );
+        jit_execution_leave();
+
+        // `ACTIVE_JIT_EXECUTIONS` is process-global and this suite runs tests in
+        // parallel, so a sibling test's execution epoch can hold the drain off
+        // for a moment. Poll (each probe re-runs the quiescence check) instead
+        // of asserting on the first observation.
+        let mut released = false;
+        for _ in 0..500 {
+            if lookup_jit_code_range(old_entry).is_none() {
+                released = true;
+                break;
+            }
+            jit_execution_enter();
+            jit_execution_leave();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            released,
+            "the retired body must be released once JIT execution is quiescent"
         );
         if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
             unregister_jit_code_range(new_cm.entry_ptr() as usize);

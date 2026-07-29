@@ -89,7 +89,11 @@ diagnostics. See [Profiling](../performance/profiling.md).
 ## Detailed NPE messages
 
 Helpful `NullPointerException` messages (JEP 358) are on by default; toggle with
-`--XX:ShowCodeDetailsInExceptionMessages`.
+`--XX:ShowCodeDetailsInExceptionMessages` (the HotSpot
+`-XX:+`/`-XX:-ShowCodeDetailsInExceptionMessages` spellings work too). Turning it
+off matches HotSpot exactly: `getMessage()` returns `null` for an NPE the VM
+raised from a null dereference. Messages that library code passed explicitly —
+`Objects.requireNonNull(x, "…")` — are unaffected either way.
 
 ## Filing a useful bug report
 

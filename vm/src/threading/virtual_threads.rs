@@ -1531,6 +1531,25 @@ impl VirtualThreadManager {
         self.threads.lock().contains_key(&vt_id)
     }
 
+    /// `(pool_size, mounted, queued)` for `VirtualThreadSchedulerMXBean`.
+    ///
+    /// One call rather than three separate accessors so the bean's
+    /// `getPoolSize` / `getMountedVirtualThreadCount` /
+    /// `getQueuedVirtualThreadCount` cannot sample the scheduler at three
+    /// different instants and report a self-contradicting snapshot (more
+    /// mounted than the pool holds).
+    ///
+    /// "Mounted" is carriers currently RUNNING a virtual thread, i.e.
+    /// `busy_carriers` — not `live_carriers`, which counts the base pool plus
+    /// any compensating carriers whether or not they are executing anything.
+    pub fn scheduler_counters(&self) -> (usize, usize, usize) {
+        (
+            self.scheduler.live_carriers(),
+            self.scheduler.busy_carriers(),
+            self.scheduler.queued_len(),
+        )
+    }
+
     /// Access the scheduler stats.
     pub fn scheduler_stats(&self) -> SchedulerStatsSnapshot {
         let s = self.scheduler.stats();

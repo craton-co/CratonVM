@@ -1324,13 +1324,16 @@ fn t9_stub_audit_counts_match_census() {
         "aot.rs",
         "classfile_api.rs",
         "lang_string.rs",
-        // NOTE: `tests_extracted.rs` is DEAD SOURCE — there is no
-        // `mod tests_extracted;` anywhere in the tree, so it is never
-        // compiled and its registrations never run. It is deliberately still
-        // counted here (conservatively) so that wiring it back in cannot
-        // smuggle in uncounted stubs; the census records why its ~9 remaining
-        // hits are not real.
-        "tests_extracted.rs",
+        // NOTE: `tests_extracted.rs` used to be listed here. It was DEAD
+        // SOURCE — no `mod tests_extracted;` existed anywhere in the tree, so
+        // its 5918 lines were never compiled and none of its registrations
+        // ever ran. Listing it padded the census with phantoms that could
+        // never be fixed, which both overstated the count and gave a sweep
+        // nothing actionable to do with them. Deleted outright in the wave-3
+        // sweep (2026-07-28) rather than left as a trap. If it is ever
+        // restored it needs a `mod` declaration AND a re-add here in the same
+        // change; the t9b gate below counts the whole tree, so a restored file
+        // cannot smuggle in uncounted stubs regardless.
     ];
 
     let mut total_noop = 0usize;
@@ -1412,28 +1415,35 @@ fn t9_stub_audit_counts_match_census() {
     // Direction: counts should only go DOWN (stubs replaced with real
     // impls) or STAY THE SAME (no change). A count going UP means a
     // new stub was added, which this test should flag for review.
-    // Ceilings tightened to the exact post-sweep actuals (2026-07-27), down
-    // from total<=250 / noop<=65 / ret_false<=15. Every category is now
-    // capped — `native_noop_with_this`, `native_return_null` and
-    // `native_return_zero` were previously uncapped, which is how
-    // `with_this` reached 92 unremarked.
+    // Ceilings tightened to the exact post-sweep actuals (2026-07-28, wave 3),
+    // down from total<=67 / noop<=47 / with_this<=14 / ret_false<=4 /
+    // ret_zero<=1; and before that from total<=250 / noop<=65 / ret_false<=15.
+    // Every category is capped — `native_noop_with_this`,
+    // `native_return_null` and `native_return_zero` were once uncapped,
+    // which is how `with_this` reached 92 unremarked.
+    //
+    // Remember what this gate does NOT see: only these six NAMED helpers,
+    // and only in the file list above. The same no-op written as an inline
+    // closure is invisible here, and that form is ~86% of the real surface.
+    // `t9b_inline_constant_native_census` below is the whole-tree
+    // counterpart; do not read this total as "stubs left in CratonVM".
     assert!(
-        total <= 67,
-        "T9 GATE: total stub count ({total}) exceeds census ceiling (67). \
+        total <= 53,
+        "T9 GATE: total stub count ({total}) exceeds census ceiling (53). \
          If you added a new stub, justify it in docs/stub-census.md. \
          If you converted stubs to real impls, LOWER the ceiling."
     );
     assert!(
-        total_noop <= 47,
-        "T9 GATE: native_noop count ({total_noop}) exceeds ceiling (47)"
+        total_noop <= 38,
+        "T9 GATE: native_noop count ({total_noop}) exceeds ceiling (38)"
     );
     assert!(
-        total_with_this <= 14,
-        "T9 GATE: native_noop_with_this count ({total_with_this}) exceeds ceiling (14)"
+        total_with_this <= 11,
+        "T9 GATE: native_noop_with_this count ({total_with_this}) exceeds ceiling (11)"
     );
     assert!(
-        total_ret_false <= 4,
-        "T9 GATE: native_return_false count ({total_ret_false}) exceeds ceiling (4)"
+        total_ret_false <= 3,
+        "T9 GATE: native_return_false count ({total_ret_false}) exceeds ceiling (3)"
     );
     assert!(
         total_ret_null == 0,
@@ -1441,8 +1451,8 @@ fn t9_stub_audit_counts_match_census() {
          every site was replaced with a real implementation on 2026-07-27"
     );
     assert!(
-        total_ret_zero <= 1,
-        "T9 GATE: native_return_zero count ({total_ret_zero}) exceeds ceiling (1)"
+        total_ret_zero == 0,
+        "T9 GATE: native_return_zero count ({total_ret_zero}) must stay 0 — the last site was replaced with a real implementation in the wave-3 sweep"
     );
     assert!(
         total_ret_true <= 1,
@@ -1454,6 +1464,416 @@ fn t9_stub_audit_counts_match_census() {
          ret_false={total_ret_false}, ret_null={total_ret_null}, \
          ret_zero={total_ret_zero}, ret_true={total_ret_true}, TOTAL={total}"
     );
+}
+
+/// T9.2 — Repo-wide constant-valued-native census.
+///
+/// The older `t9_stub_audit_counts_match_census` gate counts only the six
+/// NAMED stub helpers, and only across 13 hand-listed files. That is a small
+/// fraction of the real surface: the same no-op ships just as often as an
+/// INLINE CLOSURE whose entire body is a constant `Ok(..)`, e.g.
+///
+///     r.register(cls, "m", "()V", |_ctx, _args| Ok(None));
+///
+/// On 2026-07-28 that inline form accounted for 525 of the 609 constant-valued
+/// registrations in the tree — the named-helper gate saw 84 of them, so the
+/// census understated the surface by ~7x. This gate closes that blind spot: it
+/// parses every `.register*(...)` call across every Rust source file in the
+/// workspace and classifies the handler argument.
+///
+/// Direction is the same as T9: counts may only go DOWN or stay the same.
+/// A registered native SHADOWS that class+method+descriptor's real bytecode,
+/// so every constant here is a method that silently does nothing.
+#[test]
+fn t9b_inline_constant_native_census() {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    files.sort();
+    assert!(
+        files.len() > 100,
+        "T9B GATE: only found {} .rs files under {} — the walker is broken, \
+         not the tree",
+        files.len(),
+        root.display()
+    );
+
+    let mut total = 0usize;
+    let mut per_file: Vec<(String, usize)> = Vec::new();
+
+    for path in &files {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // Comments only. An earlier draft also blanked `#[cfg(test)]` bodies,
+        // reasoning that a test fixture registering a constant native on a
+        // throwaway registry is not a shipping stub. That is true, but it is
+        // rare — one site in the whole tree — and the exclusion needs
+        // brace-matching that is string-literal aware to be safe. Without
+        // that it silently swallowed ~100 REAL registrations in
+        // native-builtins/src/lib.rs alone by running past a module's closing
+        // brace. Over-counting one fixture is a visible, harmless nuisance;
+        // under-counting a hundred live stubs defeats the whole gate. Keep it
+        // simple and count everything.
+        let src = strip_comments(&raw);
+        let n = count_constant_registrations(&src);
+        if n > 0 {
+            total += n;
+            per_file.push((
+                path.strip_prefix(root).unwrap_or(path).display().to_string(),
+                n,
+            ));
+        }
+    }
+
+    per_file.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    // Ceiling: the post-sweep actual, measured 2026-07-28, down from 669
+    // before the wave-3 sweep. Lower it whenever you convert a constant into a
+    // real implementation; raising it requires a justification comment at the
+    // registration site AND an entry in docs/stub-census.md, in the same
+    // change.
+    //
+    // Cross-checked against an independently written scanner (Python), which
+    // measured 462 and agrees with this one on every per-file count. The
+    // one-site gap is a parser edge case in one of the two. That is fine for a
+    // ceiling, but read this number as "approximately this many" rather than
+    // as an exact inventory — and note that a CONSTANT here is not
+    // automatically a defect: `HTTP_OK == 200` and `Types.INTEGER == 4` are
+    // spec-correct constants that are deliberately counted, because the cheap
+    // reliable thing to measure is "how much of the native surface is
+    // constant-valued", not "how much of it is wrong".
+    const CEILING: usize = 332;
+
+    eprintln!("[t9b] Constant-valued native registrations: {total} (ceiling {CEILING})");
+    for (f, n) in per_file.iter().take(15) {
+        eprintln!("[t9b]   {n:5}  {f}");
+    }
+
+    assert!(
+        total <= CEILING,
+        "T9B GATE: constant-valued native registrations ({total}) exceed the \
+         census ceiling ({CEILING}).\n\
+         A registered native SHADOWS that method's real bytecode, so a \
+         constant-returning handler silently disables a working method.\n\
+         Implement it, throw the spec'd exception, or — if the constant is \
+         genuinely spec-correct — justify it in docs/stub-census.md and raise \
+         this ceiling in the same change.\n\
+         Top files: {:?}",
+        per_file.iter().take(10).collect::<Vec<_>>()
+    );
+}
+
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            // Skip build output, VCS, vendored deps and test fixtures — none
+            // of them register natives into the running VM.
+            if matches!(
+                name.as_ref(),
+                "target" | ".git" | "vendor" | "node_modules" | "test_classes" | "apps"
+            ) {
+                continue;
+            }
+            collect_rs_files(&path, out);
+        } else if name.ends_with(".rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Blank out `//` and `/* */` comments so a commented-out registration or a
+/// `//` note above the `Ok(..)` cannot change the classification.
+/// Comment bytes are overwritten with spaces IN PLACE rather than removed, so
+/// every byte offset in the result still matches the original file. An earlier
+/// draft rebuilt the string with `b[i] as char`, which re-encodes any byte
+/// >= 0x80 as two UTF-8 bytes — silently shifting every subsequent offset in
+/// a file containing a single non-ASCII character.
+fn strip_comments(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = b.to_vec();
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        if in_str {
+            if b[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b[i] == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b[i] == b'"' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            let end = (i + 2..b.len())
+                .find(|&j| b[j] == b'*' && j + 1 < b.len() && b[j + 1] == b'/')
+                .map_or(b.len(), |j| j + 2);
+            for byte in out.iter_mut().take(end).skip(i) {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+const NAMED_HELPERS: &[&str] = &[
+    "native_noop",
+    "native_noop_with_this",
+    "native_noop_return_this",
+    "native_noop_void",
+    "native_return_false",
+    "native_return_null",
+    "native_return_zero",
+    "native_return_true",
+];
+
+fn count_constant_registrations(src: &str) -> usize {
+    let b = src.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0;
+    while let Some(rel) = src[i..].find(".register") {
+        let start = i + rel + ".register".len();
+        // accept `.register(` and `.register_some_name(`
+        let mut j = start;
+        while j < b.len() && (b[j] == b'_' || b[j].is_ascii_lowercase()) {
+            j += 1;
+        }
+        if j >= b.len() || b[j] != b'(' {
+            i = start;
+            continue;
+        }
+        let open = j + 1;
+        let Some(close) = matching_paren(b, open) else {
+            i = start;
+            continue;
+        };
+        if let Some(handler) = last_top_level_arg(&src[open..close]) {
+            if is_constant_handler(handler.trim()) {
+                count += 1;
+            }
+        }
+        i = close;
+    }
+    count
+}
+
+fn matching_paren(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut i = open;
+    let mut in_str: Option<u8> = None;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_str = Some(b'"'),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split on top-level commas and return the final argument. Commas inside a
+/// closure's `|a, b|` parameter list are NOT separators — missing this splits
+/// `|_ctx, _args| Ok(None)` in half and the whole census reads as zero.
+fn last_top_level_arg(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut in_pipe = false;
+    let mut in_str: Option<u8> = None;
+    let mut last = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_str = Some(b'"'),
+            b'|' if depth == 0 => {
+                if i + 1 < b.len() && b[i + 1] == b'|' {
+                    i += 2; // `||` = empty closure params
+                    continue;
+                }
+                in_pipe = !in_pipe;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 && !in_pipe => last = i + 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    // A rustfmt-wrapped call ends with a TRAILING COMMA:
+    //
+    //     r.register(
+    //         cls, "m", "()V",
+    //         |_ctx, _args| Ok(None),
+    //     );
+    //
+    // so "everything after the last top-level comma" is whitespace, not the
+    // handler. Walking back over one empty trailing segment is the difference
+    // between counting 111 constant registrations in native-builtins/src/lib.rs
+    // and counting 6 — heavily wrapped files are exactly the ones that would
+    // have gone unpoliced.
+    let tail = s.get(last..).unwrap_or("");
+    if !tail.trim().is_empty() {
+        return Some(tail);
+    }
+    let head = s.get(..last.saturating_sub(1)).unwrap_or("");
+    let prev = last_top_level_arg_end(head)?;
+    Some(&head[prev..])
+}
+
+/// Index just past the last top-level comma in `s`, for recovering the real
+/// final argument when the call had a trailing comma.
+fn last_top_level_arg_end(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut in_pipe = false;
+    let mut in_str = false;
+    let mut last = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'|' if depth == 0 => {
+                if i + 1 < b.len() && b[i + 1] == b'|' {
+                    i += 2;
+                    continue;
+                }
+                in_pipe = !in_pipe;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 && !in_pipe => last = i + 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    Some(last)
+}
+
+fn is_constant_handler(h: &str) -> bool {
+    if NAMED_HELPERS.contains(&h) {
+        return true;
+    }
+    // closure: strip the `|params|` prefix, then an optional `{ }` block
+    let Some(after_params) = strip_closure_params(h) else {
+        return false;
+    };
+    let mut body = after_params.trim();
+    if body.starts_with('{') && body.ends_with('}') {
+        body = body[1..body.len() - 1].trim();
+    }
+    is_constant_expr(body)
+}
+
+fn strip_closure_params(h: &str) -> Option<&str> {
+    let h = h.trim();
+    if let Some(rest) = h.strip_prefix("||") {
+        return Some(rest);
+    }
+    let rest = h.strip_prefix('|')?;
+    let end = rest.find('|')?;
+    Some(&rest[end + 1..])
+}
+
+/// `Ok(None)`, `Ok(Some(Value::Int(0)))`, `Ok(Some(Value::Object(None)))`,
+/// `Ok(Some(args[0].clone()))` — a body with no reads of VM or receiver state.
+fn is_constant_expr(body: &str) -> bool {
+    let c: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    if c == "Ok(None)" || c == "Ok(Some(args[0].clone()))" {
+        return true;
+    }
+    let Some(inner) = c
+        .strip_prefix("Ok(Some(")
+        .and_then(|s| s.strip_suffix("))"))
+    else {
+        return false;
+    };
+    if inner == "Value::Object(None)" {
+        return true;
+    }
+    for ty in ["Int", "Long", "Float", "Double", "Boolean", "Char", "Short", "Byte"] {
+        if let Some(lit) = inner
+            .strip_prefix(&format!("Value::{ty}("))
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            let lit = lit.strip_prefix('-').unwrap_or(lit);
+            if !lit.is_empty()
+                && lit
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == '_')
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// T9.1.10 — No `native_return_false` on `equals(Object)Z`.

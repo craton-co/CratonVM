@@ -1424,7 +1424,37 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // worker→daemon stream desync. (Disabled, not deleted; impl kept for
     // reference. native-builtins' copy is synthetic-jdk-gated, already inert.)
     let _ = register_concurrent_skip_list_map_natives;
-    register_stamped_lock_natives(registry);
+    // StampedLock: DISABLED 2026-07-28 — this crate's copy silently destroyed
+    // mutual exclusion, and it WON, because `register_collections_natives`
+    // runs after `register_builtins` (last-registration-wins) and so
+    // overwrote `native-builtins`' real `parking_lot`-backed implementation.
+    //
+    // Two independent defects, both measured against HotSpot 25:
+    //
+    //  1. `native_sl_write_lock` spins at most `SL_SPIN_LIMIT` (1000) yields
+    //     and then GIVES UP, returning stamp 0 — while the caller believes it
+    //     holds the lock. `writeLock()` must block until granted; returning 0
+    //     is `tryWriteLock`'s failure contract, not `writeLock`'s.
+    //  2. It keeps its state in `set_field(this, SL_FIELD_STATE, Value::Int)`
+    //     BY INDEX. In real-JDK mode index 0 of a real `StampedLock` is
+    //     `state`, a *long*, so the write is coerced and the read-back
+    //     `match { Value::Int(v) => v, _ => 0 }` always falls to 0 — the lock
+    //     reads as permanently unlocked, the spin loop never waits, and every
+    //     thread enters.
+    //
+    // Measured with 4 threads incrementing under `writeLock()` with a yield
+    // inside the critical section (max threads observed inside; HotSpot = 1):
+    //     default real-JDK mode : 335 threads inside, 345 lost updates
+    //     --synthetic-jdk       :   2 threads inside,   1 lost update
+    //
+    // `native-builtins`' implementation is layout-independent (state lives in
+    // a side table keyed by a GC-stable identity key, and it mirrors `state`
+    // BY NAME), genuinely parks on a `Condvar` instead of spinning, and
+    // provides a strictly larger surface (`tryUnlockRead`/`tryUnlockWrite`,
+    // `tryConvertTo*Lock`, `getReadLockCount`, plus `unlock(J)V` added
+    // alongside this change). Leaving the call site here, disabled, so the
+    // next reader sees why it must not be re-enabled.
+    let _ = register_stamped_lock_natives;
     // Phaser is overridden with a synthetic 3-int layout (parties=0, arrived=1,
     // phase=2) that conflicts with the real JDK field layout (state(0, J),
     // parent(1, L), root(2, L), evenQ(3, L), oddQ(4, L)). In real-JDK mode the
@@ -29698,10 +29728,17 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             if let Value::Object(Some(inner)) = ctx.get_field_by_name(coll, "c") {
                 return collect_collection_elements(ctx, inner);
             }
-            // SingletonList stores the element in field `element`.
-            if let Value::Object(Some(_)) = ctx.get_field_by_name(coll, "element") {
-                let v = ctx.get_field_by_name(coll, "element");
-                return vec![v];
+            // SingletonList and SingletonSet store their sole element in
+            // `element`.  That element is allowed to be null, so its presence
+            // must be determined by the receiver class, not by its Value
+            // representation.  Treating Object(None) as an absent backing
+            // collection turned `Collections.singletonList(null)` into an
+            // empty removal set, leaving null holes in ArrayList bulk
+            // operations and downstream protobuf repeated fields.
+            if cls_name == "java/util/Collections$SingletonList"
+                || cls_name == "java/util/Collections$SingletonSet"
+            {
+                return vec![ctx.get_field_by_name(coll, "element")];
             }
         }
         // RegularEnumSet — a real-JDK class CratonVM doesn't synthetically
@@ -42790,7 +42827,7 @@ fn register_iterator_protocol_natives(r: &mut NativeMethodRegistry) {
         spl,
         "trySplit",
         "()Ljava/util/Spliterator;",
-        native_return_null_obj,
+        native_spliterator_try_split,
     );
     r.register(
         spl,
@@ -43036,8 +43073,81 @@ fn native_spliterator_try_advance(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(Some(Value::Int(1)))
 }
 
-fn native_return_null_obj(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+/// `Spliterator.trySplit()` — hand the first half of the remaining elements to
+/// a new spliterator and keep the second half.
+///
+/// This used to be a flat `null` ("cannot split"), which is legal but disables
+/// parallel decomposition for EVERY synthetic spliterator in the VM. The real
+/// `ArraySpliterator.trySplit` is `int lo = index, mid = (lo + fence) >>> 1;`
+/// then `return (lo >= mid) ? null : new ArraySpliterator<>(array, lo, index =
+/// mid, chars);` — i.e. null only when fewer than two elements remain.
+///
+/// The JDK shares one array between both halves and relies on the per-instance
+/// `fence` (field 2). We deliberately do NOT do that: the sibling natives in
+/// this file (`estimateSize`, `tryAdvance`, `forEachRemaining`) all bound
+/// themselves by `array_length(field0)` and ignore field 2, so a shared array
+/// with a lowered fence would let the left half run straight on into the right
+/// half's elements and emit them twice. Copy the prefix into its own array
+/// instead — exact same element partition, no reader has to change, and field 2
+/// stays equal to the backing length as at every other construction site.
+fn native_spliterator_try_split(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Same guard as `tryAdvance`/`forEachRemaining`: dispatch can route a
+    // real-JDK Spliterator subclass in here, whose field 0 is not an array
+    // (e.g. an Iterator in `ServiceLoaderUtil$ServiceLoaderSpliterator`).
+    // "Cannot split" is the safe answer for those.
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if ctx.object_num_fields(this) < 2 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let lo = match ctx.get_field(this, 1) {
+        Value::Int(v) if v > 0 => v as usize,
+        _ => 0,
+    };
+    let fence = ctx.array_length(arr);
+    if lo >= fence {
+        return Ok(Some(Value::Object(None)));
+    }
+    let mid = (lo + fence) / 2;
+    if lo >= mid {
+        // Fewer than two elements remain — the JDK returns null here.
+        return Ok(Some(Value::Object(None)));
+    }
+    let prefix_len = mid - lo;
+    // GC-SAFETY: both allocations below can move `this` and `arr`; pin and
+    // re-read rather than holding the bare refs across them.
+    let this_pin = ctx.pin_native_root(this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let prefix = alloc_ref_array(ctx, prefix_len);
+    let prefix_pin = ctx.pin_native_root(prefix);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let prefix = ctx.read_native_pin(prefix_pin, prefix);
+    for i in 0..prefix_len {
+        let elem = ctx.get_array_element(arr, lo + i);
+        ctx.set_array_element(prefix, i, elem);
+    }
+    let left = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+    let left_pin = ctx.pin_native_root(left);
+    let prefix = ctx.read_native_pin(prefix_pin, prefix);
+    let left = ctx.read_native_pin(left_pin, left);
+    ctx.set_field(left, 0, Value::Object(Some(prefix)));
+    ctx.set_field(left, 1, Value::Int(0));
+    ctx.set_field(left, 2, Value::Int(prefix_len as i32));
+    // This spliterator now covers [mid, fence).
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, 1, Value::Int(mid as i32));
+    if ctx.object_num_fields(this) > 2 {
+        ctx.set_field(this, 2, Value::Int(fence as i32));
+    }
+    let left = ctx.read_native_pin(left_pin, left);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(left))))
 }
 
 fn native_spliterator_for_each_remaining(
@@ -45153,15 +45263,28 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
 
     // --- ForkJoinPool.awaitQuiescence ---
     //
-    // KEEP (W2 stub sweep). `true` means "the pool became quiescent within the
-    // timeout", and that is unconditionally the truth for CratonVM's
-    // ForkJoinPool: `phases_early`'s `register_forkjoin_natives` AND its
-    // real-JDK twin `register_real_jdk_forkjoin_essentials` both override
-    // `fork`/`invoke`/`submit`/`join` to run `compute()` INLINE on the calling
-    // thread, so no task is ever outstanding in a worker by the time any thread
-    // can observe the pool. It is consistent with the `getActiveThreadCount()
-    // == 0` / `getQueuedTaskCount() == 0` pair in that same file. Waiting or
-    // returning false here would only ever be a wait for nothing.
+    // ESCALATED (W4) — this constant is NOT safe, and the W2 justification it
+    // replaces was factually wrong. That note claimed every ForkJoinPool entry
+    // point runs its task INLINE on the calling thread, so nothing can be
+    // outstanding. `fork`/`invoke`/`submit`/`join` do, but `execute` does not:
+    // in BOTH run modes it hands the Runnable to a real worker thread —
+    // native-builtins `lib.rs` (inside `register_essential_natives_with_shims`,
+    // i.e. the default real-JDK build) and `concurrent_extras.rs`
+    // (`--synthetic-jdk`) both route `ForkJoinPool.execute(Runnable)` through
+    // `spawn_runnable_on_real_thread`. So a task CAN still be running when
+    // `awaitQuiescence` is called, and `true` then lies about it.
+    //
+    // Left as `true` deliberately rather than flipped: `false` means "timed
+    // out", and callers loop on that, so guessing the other way turns a stale
+    // answer into a hang. The real fix needs the pending/active task count of
+    // native-builtins' async worker pool (`async_worker_pool` /
+    // `note_async_runnable_submitted` in `native-builtins/src/lib.rs`), which
+    // this crate cannot see — `cratonvm-native-builtins` depends on
+    // `cratonvm-native-collections`, not the other way round. Either expose
+    // that count on `NativeContext` (e.g. `fn pending_async_tasks(&self) ->
+    // usize`) so the poll can happen here, or move this registration into
+    // native-builtins next to the pool it must observe. This registration is
+    // the LAST one for the triple tree-wide, so it is what runs.
     let pool = "java/util/concurrent/ForkJoinPool";
     r.register(
         pool,

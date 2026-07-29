@@ -10,6 +10,55 @@
 
 use super::*;
 
+/// Canonical charset name of a synthetic `java/nio/charset/Charset` receiver.
+/// Slot 0 holds the name string (see the `name()` / `displayName()` natives in
+/// `register_p61_charset`); it is run through `canonical_charset_name` so
+/// aliases (`UTF8`, `latin1`, `ASCII`, …) compare equal to their canonical
+/// spelling. Unknown names are returned verbatim.
+fn charset_name_field(ctx: &dyn NativeContext, cs: ObjectRef) -> String {
+    let raw = match ctx.get_field(cs, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    cratonvm_native_api::charset::canonical_charset_name(&raw)
+        .map(str::to_string)
+        .unwrap_or(raw)
+}
+
+/// `Charset.contains(Charset)` — "can `this` represent every character
+/// `other` can?". Abstract in the real JDK; these are the per-family answers
+/// the concrete `sun.nio.cs` classes give.
+///
+/// The default arm is deliberately `false` rather than "assume ASCII
+/// superset": CratonVM's charset table includes the EBCDIC code pages
+/// (`IBM500`, `IBM1047`), which are NOT ASCII supersets, so a blanket
+/// assumption would be wrong for them. A false negative only makes a caller
+/// transcode when it could have aliased; a false positive corrupts data.
+fn charset_contains(this: &str, other: &str) -> bool {
+    if this.eq_ignore_ascii_case(other) {
+        return true;
+    }
+    match this {
+        // sun.nio.cs.UTF_8 / UTF_16* / UTF_32* all `return true`: the Unicode
+        // charsets can encode every character of any other charset.
+        "UTF-8" | "UTF-16" | "UTF-16BE" | "UTF-16LE" | "UTF-32" | "UTF-32BE" | "UTF-32LE" => true,
+        // sun.nio.cs.ISO_8859_1.contains: US-ASCII and itself.
+        "ISO-8859-1" => matches!(other, "US-ASCII" | "ISO-8859-1"),
+        // sun.nio.cs.US_ASCII.contains: itself only.
+        "US-ASCII" => other == "US-ASCII",
+        // The remaining single-byte and CJK charsets in our table are ASCII
+        // supersets (ISO-8859-x, windows-125x, KOI8-*, Shift_JIS, EUC-*,
+        // Big5, GB*, IBM850) — but NOT the EBCDIC pages, which are listed
+        // explicitly below so they fall through to `false`.
+        "IBM500" | "IBM1047" => false,
+        "ISO-8859-2" | "ISO-8859-3" | "ISO-8859-4" | "ISO-8859-5" | "ISO-8859-15"
+        | "windows-1250" | "windows-1251" | "windows-1252" | "KOI8-R" | "KOI8-U" | "Shift_JIS"
+        | "EUC-JP" | "ISO-2022-JP" | "Big5" | "EUC-KR" | "GB2312" | "GBK" | "GB18030"
+        | "IBM850" => other == "US-ASCII",
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // java.nio.charset — Charset, StandardCharsets
 // ---------------------------------------------------------------------------
@@ -488,17 +537,54 @@ pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    r.register(cs, "isRegistered", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    // isRegistered() — STUB-REMOVAL (wave 3): was a flat `true`. The real body
+    // is one line, and it is decidable from the name we already store in slot
+    // 0: `return !name.startsWith("X-") && !name.startsWith("x-")` — an
+    // experimental/private charset is by definition NOT in the IANA registry.
+    r.register(cs, "isRegistered", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name = charset_name_field(ctx, this);
+        let experimental = name.starts_with("X-") || name.starts_with("x-");
+        Ok(Some(Value::Int(i32::from(!experimental))))
     });
+    // KEEP: spec-correct, not a stub. `java.nio.charset.Charset.canEncode()`
+    // IS `return true` in the real JDK; only decode-only charsets (e.g.
+    // JIS_AUTODETECT) override it to false, and CratonVM's charset table
+    // (`cratonvm_native_api::charset::canonical_charset_name`) contains none —
+    // every entry has a working `encode_chars` path.
+    // REACHABILITY: `register_p61_charset` is reached only via
+    // `register_phase61_natives` -> `register_synthetic_overrides`, which is
+    // `#[cfg(feature = "synthetic-jdk")]` — so in the default real-JDK build
+    // this registration does not exist and `Charset.canEncode()` runs its own
+    // (identical) bytecode.
     r.register(cs, "canEncode", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+    // contains(Charset) — STUB-REMOVAL (wave 3): was a flat `false`, which said
+    // "UTF-8 cannot represent US-ASCII". The method is ABSTRACT in the real JDK
+    // (each concrete charset answers for itself); decide it from the two
+    // canonical names. See `charset_contains` for the per-family rules and for
+    // why the default arm is deliberately conservative.
     r.register(
         cs,
         "contains",
         "(Ljava/nio/charset/Charset;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                // Real `contains(null)` NPEs on the instanceof-free impls.
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Charset.contains: null charset".to_string()),
+                    }
+                    .into())
+                }
+            };
+            let a = charset_name_field(ctx, this);
+            let b = charset_name_field(ctx, other);
+            Ok(Some(Value::Int(i32::from(charset_contains(&a, &b)))))
+        },
     );
     r.register(
         cs,
@@ -761,7 +847,28 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             },
         )))
     });
-    r.register(cb, "isDirect", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    // isDirect()Z — STUB-REMOVAL (wave 3): was a flat `false`. Derive it, the
+    // same way `hasArray` above derives from the backing array, so a genuinely
+    // direct buffer is never mis-reported: a CharBuffer with an `hb` char[] is
+    // heap-backed by definition. Everything this VM produces today lands in
+    // that branch — `allocate`/`wrap` above build an `hb`, and
+    // `ByteBuffer.asCharBuffer()` (`servlet.rs::s2_bb_as_char_buffer`)
+    // TRANSCODES into a fresh char[] instead of aliasing direct memory even
+    // when its source ByteBuffer is direct — so `false` stays the answer; only
+    // a future `Direct*`-classed CharBuffer flips it.
+    r.register(cb, "isDirect", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if cb_read_hb(ctx, this).is_some() {
+            return Ok(Some(Value::Int(0)));
+        }
+        let cid = ctx.class_id_of_object(this);
+        let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+        let direct = cname
+            .rsplit('/')
+            .next()
+            .is_some_and(|leaf| leaf.starts_with("Direct"));
+        Ok(Some(Value::Int(i32::from(direct))))
+    });
     // order()Ljava/nio/ByteOrder; — abstract on CharBuffer, like isReadOnly/
     // isDirect above; every concrete leaf subclass overrides it in real
     // OpenJDK. CratonVM never registered a native anywhere in the CharBuffer

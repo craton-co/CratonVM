@@ -95,6 +95,87 @@ pub(crate) fn native_unsafe_ensure_class_initialized(
     Ok(None)
 }
 
+/// `Unsafe.shouldBeInitialized(Class)` / `shouldBeInitialized0(Class)` —
+/// "does this class still need its `<clinit>` run?".
+///
+/// HotSpot answers `!k->is_initialized()`, so this reads the VM's own per-class
+/// init state through [`NativeContext::is_class_initialized`] rather than
+/// asserting a constant. Both natives are instance methods on `Unsafe`, so the
+/// mirror is not at a fixed argument index on every call path; scan for it the
+/// same way [`native_unsafe_ensure_class_initialized`] does.
+///
+/// Non-mirror arguments, primitive mirrors and array mirrors all answer
+/// `false`: none of them has a `<clinit>` that could still be pending.
+pub(crate) fn native_unsafe_should_be_initialized(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let class_id = args.iter().find_map(|v| match v {
+        Value::Object(Some(obj)) => {
+            let obj_cid = ctx.class_id_of_object(*obj);
+            let is_class_mirror = ctx
+                .class_name_of_id(obj_cid)
+                .map(|n| n == "java/lang/Class")
+                .unwrap_or(false);
+            if is_class_mirror {
+                crate::lang_class::mirror_class_id(ctx, *obj)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    });
+    let Some(class_id) = class_id else {
+        return Ok(Some(Value::Int(0)));
+    };
+    if let Some(name) = ctx.class_name_of_id(class_id) {
+        if name.starts_with('[')
+            || matches!(
+                name.as_str(),
+                "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
+                    | "void"
+            )
+        {
+            return Ok(Some(Value::Int(0)));
+        }
+    }
+    let initialized = ctx.is_class_initialized(class_id);
+    Ok(Some(Value::Int(if initialized { 0 } else { 1 })))
+}
+
+/// `jdk.internal.misc.CDS.isSharingEnabled0()` — is a class-data-sharing
+/// archive actually mapped into this run?
+///
+/// `vm/src/vm/vm_init.rs` sets `jdk.internal.vm.cds.enabled` when
+/// `-Xshare:on|auto` successfully loads the archive named by
+/// `-XX:SharedArchiveFile`. Same source as
+/// `cds.rs::native_cds_is_sharing_enabled`, so the `0`-suffixed native (the
+/// one the real JDK's `CDS.<clinit>` calls) and the synthetic-mode
+/// `isSharingEnabled` now agree.
+fn native_cds_is_sharing_enabled0(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let enabled = ctx
+        .get_system_property("jdk.internal.vm.cds.enabled")
+        .is_some_and(|v| v == "true");
+    Ok(Some(Value::Int(i32::from(enabled))))
+}
+
+/// `jdk.internal.misc.CDS.isDumpingArchive0()` — will this run produce an
+/// archive? True under `-Xshare:dump`, which makes `SharedVm` write the
+/// archive at shutdown; `vm_init.rs` publishes that as
+/// `jdk.internal.vm.cds.dumping`.
+fn native_cds_is_dumping_archive0(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let dumping = ctx
+        .get_system_property("jdk.internal.vm.cds.dumping")
+        .is_some_and(|v| v == "true");
+    Ok(Some(Value::Int(i32::from(dumping))))
+}
+
 // ---------------------------------------------------------------------------
 // Phase 14 Step 3: String extras
 // ---------------------------------------------------------------------------
@@ -1183,28 +1264,25 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
 
     // shouldBeInitialized(Class) — "is this class still uninitialized?".
     //
-    // KEPT as a constant `false`, deliberately: `NativeContext` exposes no
-    // initialization-state query (only `ensure_class_initialized`, which acts
-    // rather than reports), so there is nothing truthful to read. `false` is
-    // the correct answer on the dominant JDK call path —
-    // `DirectMethodHandle$EnsureInitialized.computeValue` calls
-    // `ensureClassInitialized(type)` (our real implementation) and only THEN
-    // asks `shouldBeInitialized(type)`; by that point the class genuinely is
-    // initialized. Answering `true` there would make the JDK conclude it is
-    // executing inside `<clinit>` and pin the `<clinit>` barrier on the method
-    // handle for the process lifetime. Revisit if a real
-    // `is_class_initialized` query is ever added to the native API.
+    // Now reads the VM's real per-class init state (see
+    // `native_unsafe_should_be_initialized`). The previous constant `false`
+    // was only accidentally right: it happened to match the dominant caller
+    // (`DirectMethodHandle$EnsureInitialized.computeValue` asks only AFTER
+    // calling `ensureClassInitialized`), but every other caller —
+    // `InvokerBytecodeGenerator`/`MethodHandles` deciding whether a `<clinit>`
+    // barrier is still needed — was told "already initialized" about classes
+    // whose `<clinit>` had not run.
     r.register(
         u,
         "shouldBeInitialized",
         "(Ljava/lang/Class;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_unsafe_should_be_initialized,
     );
     r.register(
         u2,
         "shouldBeInitialized0",
         "(Ljava/lang/Class;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_unsafe_should_be_initialized,
     );
 
     // staticFieldBase — returns the declaring class's mirror, which is what the
@@ -1244,24 +1322,47 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     );
 
     // defineClass — define a class from byte array (delegate to ClassLoader)
-    // jdk.internal.misc.CDS: CratonVM does not support HotSpot CDS archives.
-    // Class Data Sharing is an OPTIONAL HotSpot feature, and every native
-    // below is spec-correct for a VM that does not offer it — a stock HotSpot
-    // run with `-Xshare:off` answers exactly the same way. The three
-    // `is*0()Z` queries report "not dumping / not sharing"; the archive hooks
-    // (`logLambdaFormInvoker`, `initializeFromArchive`, `defineArchivedModules`,
-    // `dumpClassList`, `dumpDynamicArchive`) have nothing to record or write
-    // because no archive exists, and every caller in `java.base` is written to
-    // tolerate that. These are therefore permanent KEEPs, not unimplemented
-    // stubs. NOTE: identical registration sets also exist in `lib.rs`
-    // (register_essential_natives_with_shims) and
-    // `phases_early.rs::register_core_stdlib_extras`, both of which run AFTER
-    // this one in their respective registration worlds — see the duplication
-    // note in the stub-removal report.
+    // jdk.internal.misc.CDS. CratonVM has its own archive format (see
+    // `native-builtins/src/cds.rs` + `SharedVm::dump_cds_archive`), so two of
+    // these three predicates are NOT constants: `-Xshare:on/auto` with a
+    // loadable archive sets `jdk.internal.vm.cds.enabled`, and `-Xshare:dump`
+    // sets `jdk.internal.vm.cds.dumping` (both in `vm/src/vm/vm_init.rs`).
+    // They are read here, matching `cds.rs::native_cds_is_sharing_enabled`.
+    //
+    // `isDumpingClassList0` stays `false`: it reflects HotSpot's
+    // `-XX:DumpLoadedClassList=<file>`, which CratonVM's CLI does not accept
+    // at all, so there is no state to read.
+    //
+    // The archive HOOKS (`logLambdaFormInvoker`, `initializeFromArchive`,
+    // `defineArchivedModules`, `dumpClassList`, `dumpDynamicArchive`) stay
+    // no-ops even when an archive IS mapped: CratonVM's archive stores class
+    // BYTES only — no archived heap objects, no archived module graph, no
+    // lambda-form invoker list — and every `java.base` caller is written for
+    // exactly that ("restore returned nothing, build it normally").
+    //
+    // NOTE: overlapping registration sets also exist in `lib.rs`
+    // (register_essential_natives_with_shims), `phases_early.rs::
+    // register_core_stdlib_extras` and `cds.rs::register_cds_natives`, all of
+    // which run AFTER this one. DO NOT delete this block as a pure duplicate:
+    // `isSharingEnabled0` and `defineArchivedModules` are registered here and
+    // NOWHERE ELSE on the real-JDK path (the `lib.rs` block registers
+    // `isSharingEnabled`, without the `0`, and no `defineArchivedModules`;
+    // `phases_early`/`cds.rs` only run under the `synthetic-jdk` feature), so
+    // those two are live. The other seven are shadowed in both modes.
     let cds_cls = "jdk/internal/misc/CDS";
     r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
-    r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
-    r.register(cds_cls, "isSharingEnabled0", "()Z", native_return_false);
+    r.register(
+        cds_cls,
+        "isDumpingArchive0",
+        "()Z",
+        native_cds_is_dumping_archive0,
+    );
+    r.register(
+        cds_cls,
+        "isSharingEnabled0",
+        "()Z",
+        native_cds_is_sharing_enabled0,
+    );
     r.register(
         cds_cls,
         "logLambdaFormInvoker",
@@ -1280,10 +1381,14 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V",
         native_noop,
     );
-    // `getRandomSeedForDumping()` feeds the CDS archive's identity-hash
-    // randomisation. With no archive ever produced there is nothing to seed;
-    // HotSpot itself returns 0 here unless `-Xshare:dump` is active. Part of
-    // the permanent-KEEP CDS set documented above.
+    // `getRandomSeedForDumping()` — 0 means "not dumping", and 0 is the right
+    // answer here even under `-Xshare:dump`. Its one consumer is
+    // `java.util.ImmutableCollections`, which uses a NON-zero seed to pin
+    // `SALT32L` (Set/Map iteration order) so an archived heap is bit-identical
+    // across dump and use, and falls back to `System.nanoTime()` on 0.
+    // CratonVM's archive holds class bytes only — no archived
+    // `ImmutableCollections` state — so pinning the salt would remove
+    // iteration-order randomisation from an ordinary run and buy nothing.
     r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
     });

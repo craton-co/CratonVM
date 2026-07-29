@@ -2104,6 +2104,311 @@ fn net_is_exclusive_bind_available(
     Ok(Some(Value::Int(0)))
 }
 
+/// The exception `SocketOption`/`setOption` specify for an option the platform
+/// does not support. A fabricated "0" or a silently-swallowed tuning request is
+/// strictly worse than an honest error.
+fn ext_opt_unsupported(option: &str) -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: format!("{option}: extended socket option not supported by CratonVM"),
+    }
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// jdk.net.ExtendedSocketOptions — real per-socket options on Linux
+//
+// Wave 3 justified the whole `jdk/net/LinuxSocketOptions` family as
+// "unsupported" on the grounds that "none of them can reach the real OS socket
+// (the `int fd` the JDK hands them is CratonVM's synthetic handle id from
+// `register_handle`, not an OS descriptor)". The premise was wrong: the handle
+// id is the KEY into a registry that holds the live `TcpStream`, so the OS
+// descriptor is one lookup away (`ext_opt_raw_fd`). These options all exist on
+// Linux, so the honest answer is to implement them and let the `*Supported0`
+// probes report what the running kernel actually accepts.
+// ---------------------------------------------------------------------------
+
+/// Which extended option a native is asking about. Kept abstract so the
+/// registrations below are platform-independent; the mapping to
+/// `(level, optname)` lives in the Linux-only code.
+#[derive(Clone, Copy)]
+enum ExtOpt {
+    /// `TCP_KEEPIDLE` — seconds of idle before the first keepalive probe.
+    KeepAliveTime,
+    /// `TCP_KEEPINTVL` — seconds between keepalive probes.
+    KeepAliveIntvl,
+    /// `TCP_KEEPCNT` — probes before the connection is declared dead.
+    KeepAliveProbes,
+    /// `TCP_QUICKACK`.
+    QuickAck,
+    /// `SO_INCOMING_NAPI_ID` (read-only).
+    IncomingNapiId,
+}
+
+impl ExtOpt {
+    /// The name to put in an `UnsupportedOperationException` message.
+    fn label(self) -> &'static str {
+        match self {
+            ExtOpt::KeepAliveTime => "TCP_KEEPIDLE",
+            ExtOpt::KeepAliveIntvl => "TCP_KEEPINTERVAL",
+            ExtOpt::KeepAliveProbes => "TCP_KEEPCOUNT",
+            ExtOpt::QuickAck => "TCP_QUICKACK",
+            ExtOpt::IncomingNapiId => "SO_INCOMING_NAPI_ID",
+        }
+    }
+}
+
+/// The `int` arguments of an extended-option native, in order.
+///
+/// OpenJDK declares the `*0` methods `private static native`, so argument 0 is
+/// the fd; filtering for ints rather than indexing also tolerates the
+/// instance-method shape (argument 0 = receiver) at no cost. Booleans arrive as
+/// `Value::Int`, so `(IZ)V` reads the same way as `(II)V`.
+fn ext_opt_int_args(args: &[Value]) -> (Option<i32>, Option<i32>) {
+    let mut ints = args.iter().filter_map(|v| match v {
+        Value::Int(i) => Some(*i),
+        _ => None,
+    });
+    (ints.next(), ints.next())
+}
+
+#[cfg(target_os = "linux")]
+mod ext_opt_sys {
+    use super::{ExtOpt, NetSocketHandle};
+    use std::os::unix::io::{AsRawFd, RawFd};
+
+    // linux/tcp.h. These four are architecture-independent.
+    const TCP_KEEPIDLE: libc::c_int = 4;
+    const TCP_KEEPINTVL: libc::c_int = 5;
+    const TCP_KEEPCNT: libc::c_int = 6;
+    const TCP_QUICKACK: libc::c_int = 12;
+
+    /// `SO_INCOMING_NAPI_ID` from asm-generic/socket.h. `SO_*` numbering is
+    /// generic on every architecture the JDK ships for except a few legacy ones
+    /// (mips, sparc, …), which number them differently — probing 56 there would
+    /// name a DIFFERENT option, so report "unsupported" instead.
+    #[cfg(not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    )))]
+    const SO_INCOMING_NAPI_ID: Option<libc::c_int> = Some(56);
+    #[cfg(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    ))]
+    const SO_INCOMING_NAPI_ID: Option<libc::c_int> = None;
+
+    /// `(level, optname)` for an option, or `None` when this architecture has
+    /// no stable number for it.
+    pub(super) fn level_and_name(opt: ExtOpt) -> Option<(libc::c_int, libc::c_int)> {
+        Some(match opt {
+            ExtOpt::KeepAliveTime => (libc::IPPROTO_TCP, TCP_KEEPIDLE),
+            ExtOpt::KeepAliveIntvl => (libc::IPPROTO_TCP, TCP_KEEPINTVL),
+            ExtOpt::KeepAliveProbes => (libc::IPPROTO_TCP, TCP_KEEPCNT),
+            ExtOpt::QuickAck => (libc::IPPROTO_TCP, TCP_QUICKACK),
+            ExtOpt::IncomingNapiId => (libc::SOL_SOCKET, SO_INCOMING_NAPI_ID?),
+        })
+    }
+
+    /// The raw OS descriptor behind one of CratonVM's socket handle ids.
+    ///
+    /// `sun/nio/ch/Net` sockets live in `net_sockets`; a `SocketChannel` —
+    /// including an AF_UNIX one, which is what `SO_PEERCRED` is for — lives in
+    /// `socket_channel::tcp_registry`. Check both.
+    pub(super) fn raw_fd(id: i32) -> Option<RawFd> {
+        if let Some(NetSocketHandle::Stream(stream)) = super::net_sockets().read().get(&id) {
+            return Some(stream.as_raw_fd());
+        }
+        use crate::socket_channel::TcpHandle;
+        match crate::socket_channel::tcp_registry().read().get(&id) {
+            Some(TcpHandle::Stream(stream)) => Some(stream.as_raw_fd()),
+            Some(TcpHandle::Bound(stream)) | Some(TcpHandle::Connecting(stream)) => {
+                Some(stream.as_raw_fd())
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn get_int(
+        fd: RawFd,
+        level: libc::c_int,
+        name: libc::c_int,
+    ) -> std::io::Result<i32> {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `value` and `len` are valid out-pointers for an int-sized
+        // option, and `fd` is a live descriptor owned by a handle held by the
+        // registry for the duration of this call.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                (&mut value as *mut libc::c_int).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        if rc == 0 {
+            Ok(value)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    pub(super) fn set_int(
+        fd: RawFd,
+        level: libc::c_int,
+        name: libc::c_int,
+        value: i32,
+    ) -> std::io::Result<()> {
+        let value: libc::c_int = value;
+        // SAFETY: `value` is a live int-sized option value and `fd` is a live
+        // descriptor owned by a registry handle for the duration of the call.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                (&value as *const libc::c_int).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Ask the running kernel whether it accepts an option, exactly as the real
+    /// JNI `*Supported0` bodies do: open a throwaway TCP socket and try it.
+    pub(super) fn probe(opt: ExtOpt, writable: bool) -> bool {
+        let Some((level, name)) = level_and_name(opt) else {
+            return false;
+        };
+        // SAFETY: socket(2) with constant arguments; the descriptor is closed
+        // below on every path.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return false;
+        }
+        let supported = if writable {
+            set_int(fd, level, name, 1).is_ok()
+        } else {
+            get_int(fd, level, name).is_ok()
+        };
+        // SAFETY: `fd` came from the `socket(2)` above and is closed once.
+        unsafe { libc::close(fd) };
+        supported
+    }
+
+    /// `SO_PEERCRED`, encoded the way `LinuxSocketOptions.getSoPeerCred0`
+    /// returns it: `(uid << 32) | gid`. `None` when the socket is not an
+    /// AF_UNIX socket (the usual case) or the credentials are unavailable.
+    pub(super) fn so_peer_cred(id: i32) -> Option<i64> {
+        let fd = raw_fd(id)?;
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `cred`/`len` are a valid out-pointer pair sized for the
+        // `struct ucred` the kernel writes for SO_PEERCRED.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        if rc != 0 || cred.uid == u32::MAX || cred.gid == u32::MAX {
+            return None;
+        }
+        Some((i64::from(cred.uid) << 32) | i64::from(cred.gid))
+    }
+}
+
+/// Does this platform support the TCP keepalive tuning options?
+#[cfg(target_os = "linux")]
+fn ext_opt_keepalive_supported() -> bool {
+    static PROBE: OnceLock<bool> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        ext_opt_sys::probe(ExtOpt::KeepAliveTime, true)
+            && ext_opt_sys::probe(ExtOpt::KeepAliveIntvl, true)
+            && ext_opt_sys::probe(ExtOpt::KeepAliveProbes, true)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ext_opt_keepalive_supported() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn ext_opt_supported(opt: ExtOpt, writable: bool) -> bool {
+    ext_opt_sys::probe(opt, writable)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ext_opt_supported(_opt: ExtOpt, _writable: bool) -> bool {
+    false
+}
+
+/// `getXxx0(int fd)` — read an extended option off the real socket.
+#[cfg(target_os = "linux")]
+fn ext_opt_get(args: &[Value], opt: ExtOpt) -> Result<i32, MethodCallFailed> {
+    let (Some(id), _) = ext_opt_int_args(args) else {
+        return Err(ext_opt_unsupported(opt.label()));
+    };
+    let (Some((level, name)), Some(fd)) =
+        (ext_opt_sys::level_and_name(opt), ext_opt_sys::raw_fd(id))
+    else {
+        return Err(ext_opt_unsupported(opt.label()));
+    };
+    ext_opt_sys::get_int(fd, level, name).map_err(|e| net_err(opt.label(), e))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ext_opt_get(_args: &[Value], opt: ExtOpt) -> Result<i32, MethodCallFailed> {
+    Err(ext_opt_unsupported(opt.label()))
+}
+
+/// `setXxx0(int fd, int|boolean value)` — write an extended option through to
+/// the real socket.
+#[cfg(target_os = "linux")]
+fn ext_opt_set(args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
+    let (Some(id), Some(value)) = ext_opt_int_args(args) else {
+        return Err(ext_opt_unsupported(opt.label()));
+    };
+    let (Some((level, name)), Some(fd)) =
+        (ext_opt_sys::level_and_name(opt), ext_opt_sys::raw_fd(id))
+    else {
+        return Err(ext_opt_unsupported(opt.label()));
+    };
+    ext_opt_sys::set_int(fd, level, name, value).map_err(|e| net_err(opt.label(), e))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ext_opt_set(_args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
+    Err(ext_opt_unsupported(opt.label()))
+}
+
+/// `getSoPeerCred0(int fd)`.
+#[cfg(target_os = "linux")]
+fn ext_opt_peer_cred(args: &[Value]) -> i64 {
+    match ext_opt_int_args(args).0.and_then(ext_opt_sys::so_peer_cred) {
+        Some(encoded) => encoded,
+        None => -1,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ext_opt_peer_cred(_args: &[Value]) -> i64 {
+    -1
+}
+
 // ---------------------------------------------------------------------------
 // T19.5 registration
 // ---------------------------------------------------------------------------
@@ -2368,30 +2673,57 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // `Net.getSocketOption(fd, SO_LINGER)` → `EXTENDED_OPTIONS.isOptionSupported(..)`
     // → NPE, so a real java.net.Socket cannot be closed cleanly. Report "no
     // extended keepalive options" (false) so the clinit succeeds and the
-    // keepalive getters/setters below are never exercised; the IP_DONTFRAGMENT
-    // pair returns safe defaults.
+    // keepalive getters/setters below are never exercised.
     {
         let wso = "jdk/net/WindowsSocketOptions";
+        // PLATFORM GAP, not a placeholder: Windows 10 1703+ does expose
+        // TCP_KEEPIDLE/TCP_KEEPCNT/TCP_KEEPINTVL, but reaching them needs
+        // Ws2_32 `setsockopt`/`getsockopt` FFI that this crate does not carry
+        // (`libc` here is `cfg(unix)`-only, and `socket2` is not a dependency of
+        // native-io). Reporting "unsupported" keeps the probe and the
+        // getters/setters below consistent — flipping this to `true` without
+        // implementing the family would turn a clean
+        // UnsupportedOperationException at the caller into a lie followed by a
+        // failure further away. The Linux twin below IS implemented, and Linux
+        // is where the suites run. Resolution path: add `socket2` to
+        // native-io/Cargo.toml (it is already a native-builtins dependency) and
+        // drive all of this through `socket2::SockRef::set_tcp_keepalive`, which
+        // is portable and would also fix the documented SO_KEEPALIVE
+        // CONTRACT-DRIFT no-op in `net_set_int_option0`.
         r.register(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
             Ok(Some(Value::Int(0)))
         });
+        // IP_DONTFRAGMENT is NOT gated by a native probe — `ipDontFragmentSupported()`
+        // is plain Java returning true — so unlike the keepalive family below these
+        // two really are reachable from `DatagramSocket.setOption(IP_DONTFRAGMENT, ..)`.
+        // They used to accept the request and drop it on the floor.
         r.register(wso, "getIpDontFragment0", "(IZ)Z", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+            Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
         });
-        r.register(wso, "setIpDontFragment0", "(IZZ)V", |_c, _a| Ok(None));
+        r.register(wso, "setIpDontFragment0", "(IZZ)V", |_c, _a| {
+            Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
+        });
         for (name, desc) in [
             ("getTcpKeepAliveProbes0", "(I)I"),
             ("getTcpKeepAliveTime0", "(I)I"),
             ("getTcpKeepAliveIntvl0", "(I)I"),
         ] {
-            r.register(wso, name, desc, |_c, _a| Ok(Some(Value::Int(0))));
+            r.register(wso, name, desc, |_c, _a| {
+                Err(ext_opt_unsupported(
+                    "TCP_KEEPCOUNT/TCP_KEEPIDLE/TCP_KEEPINTERVAL",
+                ))
+            });
         }
         for (name, desc) in [
             ("setTcpKeepAliveProbes0", "(II)V"),
             ("setTcpKeepAliveTime0", "(II)V"),
             ("setTcpKeepAliveIntvl0", "(II)V"),
         ] {
-            r.register(wso, name, desc, |_c, _a| Ok(None));
+            r.register(wso, name, desc, |_c, _a| {
+                Err(ext_opt_unsupported(
+                    "TCP_KEEPCOUNT/TCP_KEEPIDLE/TCP_KEEPINTERVAL",
+                ))
+            });
         }
     }
 
@@ -2406,48 +2738,90 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // (Linux-specific TCP_QUICKACK tuning), so this surfaced as
     // `NoClassDefFoundError: SQLServerDriver` on every later reference,
     // silently masking the original `UnsatisfiedLinkError` per JVMS 5.5.
-    // Same "no extended options supported" policy as the Windows block:
-    // report unsupported everywhere so `<clinit>` succeeds and the
-    // getters/setters below are never exercised for real.
+    // IMPLEMENTED (wave 4), not stubbed: every option in this block exists on
+    // Linux, and the handle id the JDK passes is the key into the registry that
+    // holds the live socket — see the `ExtendedSocketOptions` note above
+    // `ext_opt_sys`. The `*Supported0` probes now ask the running kernel the
+    // same way the real JNI bodies do (throwaway socket + setsockopt/getsockopt),
+    // so `<clinit>` still succeeds on a kernel that lacks an option, and the
+    // getters/setters below are only reachable when the probe said yes.
+    //
+    // SHADOWING NOTE: `native-builtins/src/lib.rs` used to register a
+    // byte-for-byte twin of this block from
+    // `register_essential_natives_with_shims`; that copy was deleted in wave 3,
+    // so this is the only registration of the family.
     {
         let lso = "jdk/net/LinuxSocketOptions";
         r.register(lso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+            Ok(Some(Value::Int(i32::from(ext_opt_keepalive_supported()))))
         });
         r.register(lso, "quickAckSupported0", "()Z", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+            Ok(Some(Value::Int(i32::from(ext_opt_supported(
+                ExtOpt::QuickAck,
+                true,
+            )))))
         });
         r.register(lso, "incomingNapiIdSupported0", "()Z", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+            Ok(Some(Value::Int(i32::from(ext_opt_supported(
+                ExtOpt::IncomingNapiId,
+                false,
+            )))))
         });
+        // IP_DONTFRAGMENT is NOT gated by a native probe (`ipDontFragmentSupported()`
+        // is plain Java returning true), so these two are genuinely reachable and
+        // used to swallow the request silently. It is also the one option in this
+        // family with no single Linux socket option behind it — it is
+        // IP_MTU_DISCOVER on v4 and IPV6_MTU_DISCOVER on v6, and the native is
+        // handed no address family — so say "unsupported" out loud.
         r.register(lso, "getIpDontFragment0", "(IZ)Z", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+            Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
         });
-        r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, _a| Ok(None));
-        r.register(lso, "getQuickAck0", "(I)Z", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+        r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, _a| {
+            Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
         });
-        r.register(lso, "setQuickAck0", "(IZ)V", |_c, _a| Ok(None));
-        r.register(lso, "getSoPeerCred0", "(I)J", |_c, _a| {
-            Ok(Some(Value::Long(-1)))
+        r.register(lso, "getQuickAck0", "(I)Z", |_c, a| {
+            Ok(Some(Value::Int(i32::from(
+                ext_opt_get(a, ExtOpt::QuickAck)? != 0,
+            ))))
         });
-        r.register(lso, "getIncomingNapiId0", "(I)I", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+        r.register(lso, "setQuickAck0", "(IZ)V", |_c, a| {
+            ext_opt_set(a, ExtOpt::QuickAck)?;
+            Ok(None)
         });
-        for (name, desc) in [
-            ("getTcpKeepAliveProbes0", "(I)I"),
-            ("getTcpKeepAliveTime0", "(I)I"),
-            ("getTcpKeepAliveIntvl0", "(I)I"),
-        ] {
-            r.register(lso, name, desc, |_c, _a| Ok(Some(Value::Int(0))));
-        }
-        for (name, desc) in [
-            ("setTcpKeepAliveProbes0", "(II)V"),
-            ("setTcpKeepAliveTime0", "(II)V"),
-            ("setTcpKeepAliveIntvl0", "(II)V"),
-        ] {
-            r.register(lso, name, desc, |_c, _a| Ok(None));
-        }
+        // `-1` stays the answer for a socket with no peer credentials, because
+        // it is this native's OWN documented failure sentinel, not a
+        // placeholder: `ExtendedSocketOptions.getSoPeerCred` decodes the long as
+        // (uid<<32)|gid and turns a -1 uid/gid into `SocketException("Not a unix
+        // domain socket")` — which is exactly right for the TCP sockets that
+        // make up almost every caller. What changed is that a real AF_UNIX
+        // socket now gets its real SO_PEERCRED instead of the sentinel.
+        r.register(lso, "getSoPeerCred0", "(I)J", |_c, a| {
+            Ok(Some(Value::Long(ext_opt_peer_cred(a))))
+        });
+        r.register(lso, "getIncomingNapiId0", "(I)I", |_c, a| {
+            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::IncomingNapiId)?)))
+        });
+        r.register(lso, "getTcpKeepAliveProbes0", "(I)I", |_c, a| {
+            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveProbes)?)))
+        });
+        r.register(lso, "getTcpKeepAliveTime0", "(I)I", |_c, a| {
+            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveTime)?)))
+        });
+        r.register(lso, "getTcpKeepAliveIntvl0", "(I)I", |_c, a| {
+            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveIntvl)?)))
+        });
+        r.register(lso, "setTcpKeepAliveProbes0", "(II)V", |_c, a| {
+            ext_opt_set(a, ExtOpt::KeepAliveProbes)?;
+            Ok(None)
+        });
+        r.register(lso, "setTcpKeepAliveTime0", "(II)V", |_c, a| {
+            ext_opt_set(a, ExtOpt::KeepAliveTime)?;
+            Ok(None)
+        });
+        r.register(lso, "setTcpKeepAliveIntvl0", "(II)V", |_c, a| {
+            ext_opt_set(a, ExtOpt::KeepAliveIntvl)?;
+            Ok(None)
+        });
     }
 
     // NIO-SERVER-SOCKET: `IOUtil.newFD(int)` calls `setfdVal(fd, value)` to

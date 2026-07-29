@@ -2087,10 +2087,7 @@ fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
 /// `matchesKey()`, hanging Spring Boot's Thymeleaf layout-dialect
 /// `createLayoutFromConfigClass` test). See
 /// docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md.
-fn gc_reference_next_slot(shared: &SharedVm, ref_obj: ObjectRef) -> usize {
-    if shared.mem.heap.num_fields(ref_obj) <= 2 {
-        return 0; // legacy synthetic 2-field shape: referent, queue only
-    }
+fn gc_reference_next_slot(shared: &SharedVm) -> usize {
     let cm = shared.classes.class_manager.read();
     cm.find_bootstrap_class_by_name("java/lang/ref/Reference")
         .and_then(|reference_cid| {
@@ -2219,6 +2216,9 @@ fn process_references_after_gc(
     // there is no reason to nest those acquisitions.
     // See `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md` §2/§R1.
     let free_mb = shared.mem.heap.soft_ref_policy_free_mb();
+    // ClassManager is rank L10 and the reference processor is L7, so resolve
+    // the JDK field before acquiring the lower-ranked processor lock.
+    let reference_next_slot = gc_reference_next_slot(shared);
     let mut ref_proc = shared.mem.ref_processor.lock();
 
     // An object is "marked" (survived GC) if:
@@ -2372,7 +2372,11 @@ fn process_references_after_gc(
             .mem
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
-        let next_slot = gc_reference_next_slot(shared, ref_obj);
+        let next_slot = if shared.mem.heap.num_fields(ref_obj) <= 2 {
+            0 // legacy synthetic 2-field shape: referent, queue only
+        } else {
+            reference_next_slot
+        };
         shared.mem.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
                                                                  // RQ_FIELD_SIZE. Slot 1 is `size` in the synthetic two-slot shape but
                                                                  // `queueLength` — a `long` — on a real JDK ReferenceQueue, whose own
@@ -4888,6 +4892,9 @@ fn g1_remark_process_references(
     // why this is allocatable headroom rather than the former hardcoded `64`,
     // and why the `0` clock argument is correct rather than a second hardcode.
     let free_mb = shared.mem.heap.soft_ref_policy_free_mb();
+    // See `process_references_after_gc`: ClassManager must be consulted
+    // before taking the lower-ranked reference-processor lock.
+    let reference_next_slot = gc_reference_next_slot(shared);
     let mut ref_proc = shared.mem.ref_processor.lock();
     let result = ref_proc.process_references(is_marked, free_mb, 0);
 
@@ -4938,7 +4945,11 @@ fn g1_remark_process_references(
             .mem
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj)));
-        let next_slot = gc_reference_next_slot(shared, ref_obj);
+        let next_slot = if shared.mem.heap.num_fields(ref_obj) <= 2 {
+            0 // legacy synthetic 2-field shape: referent, queue only
+        } else {
+            reference_next_slot
+        };
         shared.mem.heap.set_field(ref_obj, next_slot, old_head);
         let size = match shared.mem.heap.get_field(q_obj, 1) {
             Value::Int(v) => v,
@@ -8086,6 +8097,20 @@ pub(crate) enum OsrBackoffOutcome {
     /// The new current frame index is communicated back via the
     /// `frame_idx` out-parameter (which the helper mutates).
     ContinueDispatch,
+    /// The OSR'd code exited with a Java exception in flight that this frame
+    /// cannot catch (an OSR'd method provably declares no exception table —
+    /// see RBC.6b in `compile_osr_artifact`). The caller must hand the
+    /// throwable to the dispatch loop's `pending_java_exception` channel so it
+    /// unwinds from THIS frame, instead of resuming the loop.
+    ///
+    /// The old behaviour here was `Skip` + a re-stashed exception, i.e.
+    /// "keep interpreting this frame from where it was". That is correct only
+    /// when the bail precedes any committed loop iteration; the exception can
+    /// surface at any invoke, arbitrarily far into the loop, and every
+    /// iteration the OSR'd body had already committed was then executed a
+    /// second time by the interpreter. See the retired
+    /// `jit-osr-bail-on-callee-exception-reruns-loop-iterations` write-up.
+    ThrowJava(ObjectRef),
 }
 
 /// Run the standard back-edge OSR orchestration: backoff check → try_osr →
@@ -8105,6 +8130,10 @@ pub(crate) enum OsrBackoffOutcome {
 ///                             initial_frame_idx, entry_pc) {
 ///     OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
 ///     OsrBackoffOutcome::ContinueDispatch => continue,
+///     OsrBackoffOutcome::ThrowJava(exc) => {
+///         pending_java_exception = Some((exc, entry_pc));
+///         continue;
+///     }
 ///     OsrBackoffOutcome::Skip => {}
 /// }
 /// safepoint_check(shared, thread);
@@ -8218,7 +8247,27 @@ pub(crate) fn try_osr_with_backoff(
         // artifact via its `osr_reused` fast path (no inline compile).
     }
     let osr_class_id = thread.frames[*frame_idx].class_id;
-    match try_osr(shared, thread, *frame_idx, osr_class_id, entry_pc) {
+    // Out-channel for an exception the OSR'd body exited with (see
+    // `OsrBackoffOutcome::ThrowJava`). `try_osr`'s return type has no error
+    // arm, and widening it would touch every `return None` in a ~500-line
+    // function; a single out-parameter written on exactly one path is the
+    // minimal honest channel.
+    let mut osr_throw: Option<ObjectRef> = None;
+    let osr_result = try_osr(
+        shared,
+        thread,
+        *frame_idx,
+        osr_class_id,
+        entry_pc,
+        &mut osr_throw,
+    );
+    // Checked BEFORE the rejection bookkeeping below: the OSR'd body RAN (and
+    // committed loop iterations), so this is not a rejected attempt and must
+    // not consume the per-pc rejection budget.
+    if let Some(exc) = osr_throw {
+        return OsrBackoffOutcome::ThrowJava(exc);
+    }
+    match osr_result {
         Some(osr_val) => {
             if *frame_idx > initial_frame_idx {
                 pop_and_recycle_frame(shared, thread);
@@ -8645,6 +8694,10 @@ fn execute_frame_from_index(
                                         ) {
                                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                             OsrBackoffOutcome::ContinueDispatch => continue,
+                                            OsrBackoffOutcome::ThrowJava(exc) => {
+                                                pending_java_exception = Some((exc, entry_pc));
+                                                continue;
+                                            }
                                             OsrBackoffOutcome::Skip => {}
                                         }
                                         safepoint_check(shared, thread);
@@ -8969,6 +9022,10 @@ fn execute_frame_from_index(
                         ) {
                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                             OsrBackoffOutcome::ContinueDispatch => continue,
+                            OsrBackoffOutcome::ThrowJava(exc) => {
+                                pending_java_exception = Some((exc, entry_pc));
+                                continue;
+                            }
                             OsrBackoffOutcome::Skip => {}
                         }
                         safepoint_check(shared, thread);
@@ -9011,6 +9068,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9056,6 +9117,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9100,6 +9165,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9144,6 +9213,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9188,6 +9261,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9232,6 +9309,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9463,6 +9544,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9506,6 +9591,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9549,6 +9638,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9592,6 +9685,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9635,6 +9732,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9678,6 +9779,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -10527,7 +10632,7 @@ fn execute_frame_from_index(
                     // 3 RwLocks + 2 hierarchy walks ran on EVERY virtual call and
                     // the inline cache was never consulted.)
                     let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, false,
+                        shared, thread, frame_idx, cp_index, saved_pc, false, false,
                     );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
@@ -10551,7 +10656,7 @@ fn execute_frame_from_index(
                     // Miss path — VtableManager lock-free dispatch; a hit here
                     // populates invoke_cache for the next call.
                     match execute_invokevirtual_vtable_fast(
-                        shared, thread, frame_idx, cp_index, saved_pc,
+                        shared, thread, frame_idx, cp_index, saved_pc, false,
                     ) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -10596,7 +10701,7 @@ fn execute_frame_from_index(
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
                     let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, true,
+                        shared, thread, frame_idx, cp_index, saved_pc, true, false,
                     );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
@@ -10716,7 +10821,7 @@ fn execute_frame_from_index(
                     // invokeinterface is 5 bytes: opcode(1) + index(2) + count(1) + 0(1)
                     thread.frames[frame_idx].pc = saved_pc + 5;
                     let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, false,
+                        shared, thread, frame_idx, cp_index, saved_pc, false, true,
                     );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
@@ -10743,7 +10848,7 @@ fn execute_frame_from_index(
                     // whether the call-site is invokevirtual or
                     // invokeinterface.
                     match execute_invokevirtual_vtable_fast(
-                        shared, thread, frame_idx, cp_index, saved_pc,
+                        shared, thread, frame_idx, cp_index, saved_pc, true,
                     ) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -11975,10 +12080,41 @@ fn route_jit_signal_exception(
 /// receiving `maybeThrow`'s athrow at bci 13 — `handler_pc=None`, and its own
 /// `catch (Boom)` never ran (5,619 of 20,000 iterations).
 ///
-/// Accept the bci only when it indexes an `athrow` (0xbf) in THIS method's
+/// Accept the bci when it indexes an instruction boundary in THIS method's
 /// code. Anything else falls back to the "throw pc unknown" sentinel, which is
 /// the pre-RBC.6 behaviour: typed handlers still match by exception class, and
 /// only a narrow catch-all is skipped.
+///
+/// **The boundary test replaced a `code[pc] == 0xbf` (athrow) test.** That
+/// opcode test dated from when a local `athrow` was the ONLY site that stamped
+/// a bci. `66548471f` then widened the PRODUCER — `emit_exception_check_stub`
+/// now emits one pad per distinct throw-site bci, each calling
+/// `JitRuntimeHelpers::set_throw_bci`, across all 19
+/// `emit_post_invoke_exception_check` sites plus `emit_post_alloc_oom_check` —
+/// but left this consumer still asserting "must be a literal athrow". The two
+/// halves then disagreed about what `athrow_bci` means, and every stamped
+/// INVOKE bci was thrown away here.
+///
+/// The observable cost was the whole `finally` family coming back:
+/// `FinallyBalanceProbe`'s `guarded` stamps bci 9 (its `invokestatic work`),
+/// this function rejected it because `code[9] != 0xbf`,
+/// `find_jit_exception_handler` took its `pc_unknown` path, and that path
+/// deliberately skips a catch-all whose region does not span the whole method —
+/// which is exactly a javac `finally`. Result: `handler_pc=None`, the `finally`
+/// never ran, and `CallPathProbe` leaked on every dispatch route.
+///
+/// The foreign-bci filter that the opcode test used to provide is replaced by a
+/// STRICTLY BETTER one: the pc must fall inside one of this method's own
+/// protected ranges (plus be a real instruction boundary). `athrow_bci` carries
+/// no method identity, so a callee's stamp can still be standing here — see the
+/// range check below and `test_compiled_callee_catches_its_own_athrow`, which
+/// pins exactly that case. Do not weaken it to a boundary test alone: a foreign
+/// bci is usually a valid boundary in this method too.
+///
+/// (A compiled method that exits through a precise-frame deopt stub instead
+/// publishes an exceptional frame, and `route_jit_signal_exception` prefers
+/// that — it is method-checked by `deopt_frame_matches_method` — over this
+/// fallback entirely.)
 fn jit_local_athrow_pc(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize {
     if athrow_bci < 0 {
         return usize::MAX;
@@ -11986,10 +12122,39 @@ fn jit_local_athrow_pc(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize 
     let pc = athrow_bci as usize;
     // `cached.code` carries 2 bytes of speculative-read padding.
     let code_len = cached.code.len().saturating_sub(2);
-    if pc < code_len && cached.code[pc] == 0xbf {
-        pc
-    } else {
-        usize::MAX
+    if pc >= code_len {
+        return usize::MAX;
+    }
+    // The bci must land inside one of THIS method's protected ranges.
+    //
+    // This is what replaces the old opcode test as the foreign-bci filter, and
+    // it is a far better one. `JitSignals::athrow_bci` carries no method
+    // identity, so a callee's stamp can still be standing when this method's
+    // drain runs — `JitPreciseHandlerFrame.plainStep` (protected range [0,4))
+    // receives its callee `maybeThrow`'s athrow bci 13, and
+    // `test_compiled_callee_catches_its_own_athrow` exists for exactly that.
+    // 13 is a perfectly valid instruction boundary in `plainStep` too, so a
+    // boundary test alone accepts it; the range test rejects it and falls back
+    // to the pc-unknown sentinel, where a TYPED handler still matches by
+    // exception class and the `catch (Boom)` runs.
+    //
+    // Rejecting an out-of-range pc costs nothing even when the pc is genuine:
+    // `find_jit_exception_handler` would find no covering entry for it anyway,
+    // and the one case the pc-unknown path still honours — a catch-all spanning
+    // the whole method — covers every pc by definition, so honouring it there
+    // is correct.
+    let in_a_protected_range = cached.exception_table.iter().any(|e| {
+        // Widening: u16 -> usize (non-negative, fits)
+        pc >= e.start_pc as usize && pc < e.end_pc as usize
+    });
+    if !in_a_protected_range {
+        return usize::MAX;
+    }
+    // `verified_code` is the process-shared, cached decode already used by the
+    // compiler frontends, so this is a hash lookup rather than a re-decode.
+    match cratonvm_reader::verified_code(&cached.code[..code_len]) {
+        Ok(verified) if verified.is_instruction_start(pc) => pc,
+        _ => usize::MAX,
     }
 }
 
@@ -16754,6 +16919,7 @@ fn execute_instruction(
                 *index,
                 saved_pc,
                 is_special_invoke,
+                false,
             )? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
@@ -16860,7 +17026,7 @@ fn execute_instruction(
             // once a receiver's concrete class is known (see the
             // `execute_invokevirtual_vtable_fast` "miss path" comment in the
             // raw fast-dispatch loop, which already relies on this fact).
-            match execute_invokevirtual_cached(shared, thread, frame_idx, *index, saved_pc, false)?
+            match execute_invokevirtual_cached(shared, thread, frame_idx, *index, saved_pc, false, true)?
             {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
@@ -18917,6 +19083,26 @@ fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, target_class_n
         return true;
     }
 
+    // `System.getLogger()` returns a `cratonvm/internal/SystemLogger`, a
+    // CONCRETE synthetic class. Concrete is the whole point: the receiver used
+    // to be allocated with the `java/lang/System$Logger` INTERFACE as its
+    // class, which left it inert from both directions at once — native lookup
+    // drops interface-declared instance natives, and the interface's own
+    // methods are abstract, so neither a native nor bytecode served it.
+    //
+    // The cost of that fix is that the receiver no longer carries the
+    // interface in its type hierarchy, so `instanceof System.Logger` and
+    // `checkcast` would fail. Nothing hits that today (javac emits no
+    // checkcast for `System.getLogger(..)`, whose declared return type is
+    // already `System.Logger`), but a caller that stashes one in an `Object`
+    // and casts it back would — and that failure would be baffling. Declare
+    // the relationship, which is in fact true.
+    if obj_name == "cratonvm/internal/SystemLogger"
+        && target_class_name == "java/lang/System$Logger"
+    {
+        return true;
+    }
+
     // Map.Entry implementations
     if target_class_name == "java/util/Map$Entry" {
         return matches!(
@@ -19528,6 +19714,17 @@ fn execute_ldc2w(shared: &SharedVm, frame: &mut Frame, index: u16) -> Result<(),
 /// namespaces below are delegated to the parent by ~every real custom loader, so
 /// global resolution already yields the loader-correct answer. Short-circuiting
 /// them keeps the re-entrant `loadClass` invocation off the common hot path.
+/// The object component type of an array descriptor, or `None` when `name`
+/// is not an array or its element type is primitive. `[[Lcom/x/Y;` yields
+/// `com/x/Y` -- the nesting depth is irrelevant, only the element class needs
+/// loader-faithful resolution.
+#[inline]
+fn array_component_class_name(name: &str) -> Option<&str> {
+    let element = name.strip_prefix('[')?.trim_start_matches('[');
+    let inner = element.strip_prefix('L')?.strip_suffix(';')?;
+    if inner.is_empty() { None } else { Some(inner) }
+}
+
 #[inline]
 fn is_global_resolution_namespace(name: &str) -> bool {
     name.starts_with("java/")
@@ -19837,6 +20034,35 @@ pub(crate) fn resolve_class_loader_aware(
     referencing_class_id: ClassId,
     name: &str,
 ) -> Result<ClassId, MethodCallFailed> {
+    // (0) An array reference resolves its COMPONENT type with the same
+    //     initiating loader as the array reference itself (JVMS 5.3.3: the
+    //     array class is synthesised from the resolved component; no class
+    //     file is consulted). Every loader-faithful branch below keys on
+    //     `name` itself, and `drive_defining_loader_load` declines `[` names
+    //     outright -- so an array name fell straight through to the flat
+    //     global `load_class_concurrent`, which fabricated a synthetic stub
+    //     for a component that exists only behind a custom loader AND
+    //     registered that stub globally under `Application`, permanently
+    //     poisoning the component for the real loader (a stub has no `Code`,
+    //     so the first real `new` of it fails with
+    //     "<init> ... has no Code attribute").
+    //     Found on the Keycloak 26.6.1 / Quarkus fast-jar boot: an
+    //     `ldc` of `[Lorg/jboss/threads/EnhancedQueueExecutor$TaskNode;`
+    //     from `EnhancedQueueExecutor.<clinit>`, whose jar is reachable only
+    //     through Quarkus's `RunnerClassLoader`.
+    //     Strictly additive: it only pre-resolves a component whose global
+    //     answer was going to be fabricated anyway.
+    if let Some(component) = array_component_class_name(name) {
+        if cratonvm_native_builtins::classloader::any_defining_loader_registered()
+            && shared
+                .classes
+                .class_manager
+                .read()
+                .would_fabricate_synthetic_stub(component)
+        {
+            let _ = drive_defining_loader_load(shared, thread, referencing_class_id, component);
+        }
+    }
     // (1) Gate / built-in / JDK-name fast paths + already-known loader-local
     //     answer — none of which need a re-entrant call.
     let direct_loader = shared
@@ -20098,6 +20324,25 @@ pub(crate) fn resolve_class_loader_aware(
             if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name)
             {
                 return Ok(id);
+            }
+            // An array resolution fails when its COMPONENT cannot be resolved
+            // globally, and `drive_defining_loader_load` declines `[` names --
+            // so offer the component to the referencing class's own loader and
+            // re-synthesise. The (0) pre-pass above only covers a component the
+            // global path would answer with a fabricated STUB; a component that
+            // is simply absent from the process class path lands here instead.
+            // Keycloak 26.6.1 / Quarkus fast-jar:
+            // `[Lorg/antlr/v4/runtime/atn/ATNConfig;` from
+            // `ATNConfigSet$AbstractConfigHashSet.createBuckets`, whose jar is
+            // reachable only through the `RunnerClassLoader`.
+            if let Some(component) = array_component_class_name(name) {
+                if drive_defining_loader_load(shared, thread, referencing_class_id, component)
+                    .is_some()
+                {
+                    if let Ok(id) = shared.load_class_concurrent(name) {
+                        return Ok(id);
+                    }
+                }
             }
             Err(MethodCallFailed::from(e))
         }
@@ -21338,6 +21583,12 @@ fn helpful_npe_invoke_message(
     num_params: usize,
 ) -> String {
     use crate::runtime::exceptions::helpful_npe;
+    // `-XX:-ShowCodeDetailsInExceptionMessages`: HotSpot's `getMessage()` is
+    // null. The throw site needs a `String`, so hand back the empty marker that
+    // `throw_runtime_error` maps to `None` (see its NPE arm).
+    if crate::runtime::env_cache::helpful_npe_suppressed() {
+        return String::new();
+    }
     let action = helpful_npe::action_invoke(owner_internal, method_name, method_descriptor);
     let frame = &thread.frames[frame_idx];
     // `last_instr_pc` is set by the dispatch loop to the bci of the opcode
@@ -21408,6 +21659,11 @@ fn helpful_npe_opcode_message_parts(
     depth_below_top: usize,
 ) -> String {
     use crate::runtime::exceptions::helpful_npe;
+    // See `helpful_npe_invoke_message`: an explicit opt-out yields the empty
+    // marker, which `throw_runtime_error` turns into a null `getMessage()`.
+    if crate::runtime::env_cache::helpful_npe_suppressed() {
+        return String::new();
+    }
     let resolver = CpPoolResolver {
         shared,
         class_id,
@@ -23075,10 +23331,22 @@ fn execute_invoke_kind(
         } else {
             None
         };
+    let receiver_interface_dispatch = (is_interface && !is_special)
+        .then_some(receiver_class_id)
+        .flatten()
+        .filter(|class_id| *class_id != ClassId::new(0))
+        .filter(|class_id| !shared.classes.lambda_proxies.read().contains_key(class_id));
     let dispatch_override: Option<ClassId> = if let Some((declaring_id, _)) =
         &private_virtual_target
     {
         Some(*declaring_id)
+    } else if let Some(receiver_id) = receiver_interface_dispatch {
+        // find_method_recursive performs the JVMS maximally-specific
+        // default-method selection only when it starts at the runtime
+        // receiver. Starting at the CP owner returns that interface's own
+        // default immediately and bypasses a covariant bridge declared by a
+        // subinterface implemented by the receiver.
+        Some(receiver_id)
     } else if let Some(interface_id) = loader_interface_override {
         Some(interface_id)
     } else if !is_special && crate::runtime::env_cache::loader_aware_resolution() {
@@ -28279,7 +28547,6 @@ fn force_native_over_real_jdk_bytecode(
             class_name,
             "org/apache/maven/surefire/booter/ForkedBooter"
                 | "org/apache/tomcat/util/buf/CharChunk"
-                | "org/apache/tomcat/util/buf/AbstractChunk"
                 | "org/apache/catalina/connector/Response"
                 | "org/apache/tomcat/util/bcel/classfile/Constant"
         ))
@@ -28293,19 +28560,19 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Only `toString` is listed here, and only because it has a matching
+    // registration (`native_char_chunk_to_string`). This gate used to also
+    // claim `endsWith(String)`, `indexOf(char)` and
+    // `AbstractChunk.indexOf(String,III)`, none of which were ever
+    // registered — every consumer resolves the callback through
+    // `NativeMethodRegistry::find` and silently falls back to bytecode when
+    // it misses, so those three were pure dead config that read as "served
+    // by a native" to anyone auditing this list. If natives are added for
+    // them later, BOTH this gate and the `CharChunk` registrations in
+    // `native-builtins`' `register_essential_natives_with_shims` must be
+    // updated together.
     if class_name == "org/apache/tomcat/util/buf/CharChunk"
-        && matches!(
-            (method_name, method_descriptor),
-            ("toString", "()Ljava/lang/String;")
-                | ("endsWith", "(Ljava/lang/String;)Z")
-                | ("indexOf", "(C)I")
-        )
-    {
-        return true;
-    }
-    if class_name == "org/apache/tomcat/util/buf/AbstractChunk"
-        && method_name == "indexOf"
-        && method_descriptor == "(Ljava/lang/String;III)I"
+        && (method_name, method_descriptor) == ("toString", "()Ljava/lang/String;")
     {
         return true;
     }
@@ -34346,6 +34613,37 @@ fn dbg_osr_recompile_reason(
     );
 }
 
+/// BUG-H parity for the OSR tier — does `callee` declare a non-empty exception
+/// table? A direct machine-code `CALL` into such a callee bypasses the
+/// interpreter↔JIT boundary, so an exception the callee should catch locally
+/// never reaches its own handler. Mirrors the gate inside `execute`'s
+/// `callee_compiler` closure; resolution is loader-aware via `caller_class_id`,
+/// exactly like the invoke-site resolution that produced the name.
+///
+/// Unresolvable metadata reports `true` (keep the dispatch helper) — the
+/// conservative direction, since the helper path is always correct.
+fn osr_callee_declares_handlers(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    callee_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+) -> bool {
+    let cm = shared.classes.class_manager.read();
+    let Some(callee_cid) = cm.find_class_by_name_for_class(callee_class, caller_class_id) else {
+        return true;
+    };
+    let store = cm.class_store();
+    let Some((method, _decl)) =
+        crate::classloading::find_method_recursive(callee_cid, callee_method, callee_desc, store)
+    else {
+        return true;
+    };
+    method
+        .code()
+        .map_or(true, |c| !c.exception_table.is_empty())
+}
+
 fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -34765,6 +35063,28 @@ fn compile_osr_artifact(
             let mut invoke_info: Vec<(usize, *const crate::jit::JitInvokeInfo)> = Vec::new();
             let mut owned_jit_invoke_infos2: Vec<Box<crate::jit::JitInvokeInfo>> = Vec::new();
             let mut direct_calls2: Vec<(usize, crate::jit::JitDirectCall)> = Vec::new();
+            // FIX (jit-osr-loop-direct-call-retired-code-segv): the entry
+            // addresses of COMPILED callees baked into this body as raw
+            // machine-code CALLs. `JitCache::prepare_for_publication` turns
+            // these into `_direct_callee_roots` — strong `Arc`s that keep each
+            // callee's `ExecutableBuffer` mapped for as long as this artifact
+            // can run. The method-entry tier has always populated
+            // `_direct_callee_entries` (jit/src/lib.rs); this OSR tier never
+            // did, so its baked CALLs were rooted by NOTHING: the first
+            // background tier-up `put` for such a callee dropped the artifact
+            // this body calls, `ExecutableBuffer::drop` unmapped it, and the
+            // next OSR entry jumped into freed memory (SIGSEGV with
+            // `pc == addr` at the callee's page-aligned entry — ~1-2 % of runs
+            // idle, ~20 % under load, on the `JitOsrLoopProgress` fixture).
+            //
+            // Only real compiled-artifact entries belong here: the intrinsic /
+            // helper direct calls emitted above (`Math.sqrt`,
+            // `Integer.valueOf`, `Integer.intValue`, the `HashMap` fast paths)
+            // are Rust function addresses with no owning artifact, and
+            // `resolve_jit_entry_owner` would fail on them — inflating the
+            // unrooted-callee counter and, under
+            // `CRATONVM_JIT_STRICT_CALLEE_ROOTS`, refusing publication.
+            let mut osr_direct_callee_entries: Vec<usize> = Vec::new();
             let mut mic_slots2: Vec<(usize, *const crate::jit::JitMICSlot)> = Vec::new();
             let mut owned_mic_slots2: Vec<Box<crate::jit::JitMICSlot>> = Vec::new();
             let mut pic_slots2: Vec<(usize, *const crate::jit::JitPICSlot)> = Vec::new();
@@ -35056,6 +35376,26 @@ fn compile_osr_artifact(
                         &callee_method,
                         &callee_desc,
                     )
+                    // BUG-H (jit-osr-bail-on-callee-exception): the OSR tier
+                    // was missing the gate the method-entry `callee_compiler`
+                    // has — never bake a direct machine-code CALL into a
+                    // callee that declares a non-empty exception table. The
+                    // direct CALL bypasses `jit_invoke_dispatch`, so
+                    // `route_implicit_exc_through_callee` never runs and the
+                    // callee's OWN `catch` is skipped: the exception escapes
+                    // into the OSR'd caller, where it hits the OSR bail path.
+                    // Measured on `JitOsrLoopProgress`: a callee whose handler
+                    // catches its own `Boom` had that Boom surface at the OSR
+                    // return five times per 20 000-iteration run. Dropping the
+                    // site to the dispatch helper restores the callee's
+                    // exception table exactly as the method-entry tier does.
+                    && !osr_callee_declares_handlers(
+                        shared,
+                        class_id,
+                        &callee_class,
+                        &callee_method,
+                        &callee_desc,
+                    )
                     // jit-invokedynamic-groovy-regression fix: never bake a
                     // direct machine-code CALL to an indy-trap-bearing
                     // artifact — see the matching gate in `callee_compiler`.
@@ -35075,6 +35415,11 @@ fn compile_osr_artifact(
                                 guard_class_id: 0,
                             },
                         ));
+                        // Keep this callee's body mapped for the lifetime of
+                        // the artifact we are about to emit — see the
+                        // declaration of `osr_direct_callee_entries`.
+                        // `baked_callee_pins` only covers the emit window.
+                        osr_direct_callee_entries.push(entry);
                         continue;
                     }
                 }
@@ -35423,6 +35768,13 @@ fn compile_osr_artifact(
                 return None;
             };
             cm.compiled_via_osr = true;
+            // Hand the baked callee entries to `put_osr` ->
+            // `prepare_for_publication`, which upgrades each to a strong `Arc`
+            // in `_direct_callee_roots`. Without this the OSR body's direct
+            // CALLs are unrooted; see the declaration above.
+            osr_direct_callee_entries.sort_unstable();
+            osr_direct_callee_entries.dedup();
+            cm._direct_callee_entries = osr_direct_callee_entries;
             cm._jit_strings = owned_jit_strings2;
             cm._jit_invoke_infos = owned_jit_invoke_infos2;
             cm._jit_mic_slots.extend(owned_mic_slots2);
@@ -35496,12 +35848,43 @@ fn compile_osr_artifact(
     Some(compiled)
 }
 
+/// jit-osr-bail-on-callee-exception fix — hand an exception the OSR'd body
+/// exited with to the dispatch loop's unwinder instead of resuming the loop.
+///
+/// Returns `true` when the caller must `return None` immediately (the
+/// throwable is now owned by `throw_out` and `OsrBackoffOutcome::ThrowJava`
+/// will deliver it to `pending_java_exception`, which searches this frame's
+/// handlers and then unwinds).
+///
+/// Returns `false` — leaving `throw_out` untouched — only when the OSR'd frame
+/// DOES declare an exception table, in which case the caller keeps its
+/// historical re-stash behaviour. `compile_osr_artifact` refuses to OSR such a
+/// method (RBC.6b), so this is a guard against a future gate relaxation
+/// silently changing exception routing, not a live path.
+fn propagate_osr_exception(
+    thread: &JvmThread,
+    frame_idx: usize,
+    exc: ObjectRef,
+    throw_out: &mut Option<ObjectRef>,
+) -> bool {
+    if !thread.frames[frame_idx].exception_table().is_empty() {
+        return false;
+    }
+    *throw_out = Some(exc);
+    true
+}
+
 fn try_osr(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
     class_id: ClassId,
     entry_pc: usize,
+    // Out-channel: set to the in-flight throwable when the OSR'd body exited
+    // exceptionally and this frame cannot catch it. Written on exactly the
+    // paths that used to re-stash + safe-reject; see `OsrBackoffOutcome::
+    // ThrowJava` for why the safe reject was wrong there.
+    throw_out: &mut Option<ObjectRef>,
 ) -> Option<Option<Value>> {
     if crate::classloading::any_class_redefined() {
         return None;
@@ -35636,13 +36019,36 @@ fn try_osr(
                 &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, cname
             );
         }
-        crate::jit::helpers::stash_jit_pending_exception(exc);
         // OSR is same-frame replacement: the interpreter keeps executing THIS
         // frame, so a frame naming the OSR'd method itself can never be used and
         // is dropped. A frame naming a CALLEE the OSR'd code invoked is a
-        // different matter — the exception is only re-stashed here and the
-        // callee's own drain routes it later, so that frame must survive.
+        // different matter — the callee's own drain routes it later, so that
+        // frame must survive.
         drop_own_exceptional_frame(&class_name_arc, &method_name_arc, &descriptor_arc);
+        // FIX (jit-osr-bail-on-callee-exception-reruns-loop-iterations,
+        // silent wrong answers on default settings): the re-stash + `return
+        // None` below is "OSR rejected, keep interpreting THIS frame from
+        // where it was". That is correct only when the bail precedes any
+        // committed loop iteration — true for the unconditional-at-header
+        // OSR-exit trigger it was written for, false here: the exception
+        // surfaces at an arbitrary invoke, possibly thousands of iterations
+        // into the loop, and the interpreter frame's induction variable and
+        // accumulators were never advanced by the OSR'd code. Every iteration
+        // between OSR entry and the throw was therefore executed a SECOND
+        // time (measured: 20 000 requested, 20 008 executed on the doc's
+        // repro; 12 346 requested, 42 730 executed when the exception escapes
+        // the OSR'd method entirely).
+        //
+        // Propagate instead. This frame cannot catch: `compile_osr_artifact`
+        // refuses to OSR a method with a non-empty exception table (RBC.6b)
+        // and refuses one that `athrow`s (RBC.6), so an exception reaching
+        // here always escapes the OSR'd method. `propagate_osr_exception`
+        // re-checks that rather than assuming it, and falls back to the
+        // historical re-stash if a future gate relaxation makes it false.
+        if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
+            return None;
+        }
+        crate::jit::helpers::stash_jit_pending_exception(exc);
         return None;
     }
     if crate::jit::helpers::take_jit_pending_npe() {
@@ -35678,8 +36084,15 @@ fn try_osr(
                     fire_jvmti_exception_catch(frame, handler_pc);
                     return None;
                 }
-                // No in-frame handler — fall back to re-stash so the
-                // NPE is not lost across the OSR→interpreter handoff.
+                // No in-frame handler. Propagate out of the OSR'd frame
+                // rather than re-stashing and resuming the loop — see the
+                // pending-exception drain above for why resuming re-runs
+                // already-committed iterations.
+                if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
+                    return None;
+                }
+                // Historical fallback (unreachable while RBC.6b holds): keep
+                // the NPE alive across the OSR→interpreter handoff.
                 crate::jit::helpers::stash_jit_pending_exception(exc);
             }
             _ => {
@@ -35707,10 +36120,13 @@ fn try_osr(
             "java/lang/ArrayIndexOutOfBoundsException",
             Some(&msg),
         ) {
-            Ok(exc) => {
-                if let Some((handler_pc, exc_ref)) =
-                    find_exception_handler_any_pc(shared, &thread.frames[frame_idx], entry_pc, exc)
-                {
+            Ok(exc_obj) => {
+                if let Some((handler_pc, exc_ref)) = find_exception_handler_any_pc(
+                    shared,
+                    &thread.frames[frame_idx],
+                    entry_pc,
+                    exc_obj,
+                ) {
                     let frame = &mut thread.frames[frame_idx];
                     frame.stack.clear();
                     let _ = frame.stack.push(Value::Object(Some(exc_ref)));
@@ -35718,7 +36134,13 @@ fn try_osr(
                     fire_jvmti_exception_catch(frame, handler_pc);
                     return None;
                 }
-                // No in-frame handler — re-stash so the AIOOBE is not lost.
+                // No in-frame handler. Propagate out of the OSR'd frame
+                // rather than re-stashing and resuming the loop (see the
+                // pending-exception drain above).
+                if propagate_osr_exception(thread, frame_idx, exc_obj, throw_out) {
+                    return None;
+                }
+                // Historical fallback (unreachable while RBC.6b holds).
                 crate::jit::helpers::stash_jit_pending_aioobe(index, length);
             }
             Err(_) => {
@@ -35755,7 +36177,13 @@ fn try_osr(
                     fire_jvmti_exception_catch(frame, handler_pc);
                     return None;
                 }
-                // No in-frame handler — re-stash so it is not lost.
+                // No in-frame handler. Propagate out of the OSR'd frame
+                // rather than re-stashing and resuming the loop (see the
+                // pending-exception drain above).
+                if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
+                    return None;
+                }
+                // Historical fallback (unreachable while RBC.6b holds).
                 crate::jit::helpers::stash_jit_pending_arithmetic();
             }
             _ => {
@@ -40538,6 +40966,7 @@ fn execute_invokevirtual_vtable_fast(
     frame_idx: usize,
     cp_index: u16,
     site_pc: usize,
+    is_interface: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     dbg_invoke_stats_record(2);
     let caller_class_id = thread.frames[frame_idx].class_id;
@@ -41128,6 +41557,28 @@ fn execute_invokevirtual_vtable_fast(
         // dispatch would otherwise form an AB-BA deadlock.
         drop(guard);
 
+        // A vtable slot stores one erased (name, descriptor) target, but an
+        // invokeinterface call can require a more-specific interface default
+        // than the slot inherited from its CP owner. Validate that the slot
+        // agrees with receiver-rooted JVMS selection before dispatching it.
+        // In particular, a covariant bridge has the parent return descriptor,
+        // so starting resolution at the CP interface picks its own default and
+        // skips the subinterface bridge.
+        if is_interface {
+            let cm = shared.classes.class_manager.read();
+            let receiver_selected = crate::classloading::find_method_recursive(
+                receiver_class_id,
+                &method_name,
+                &method_descriptor,
+                &cm.class_store,
+            )
+            .map(|(_, declaring_id)| declaring_id);
+            drop(cm);
+            if receiver_selected != Some(cached.declaring_class_id) {
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
+
         // JVMTI redefine guard — the VtableManager entry's `resolved_method`
         // is an immutable `Arc<CachedBytecodeMethod>` snapshot with NO
         // staleness tracking of its own (unlike `CachedInvokeTarget`, which
@@ -41479,6 +41930,7 @@ fn execute_invokevirtual_cached(
     cp_index: u16,
     site_pc: usize,
     is_special: bool,
+    is_interface: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
 
@@ -41877,6 +42329,30 @@ fn execute_invokevirtual_cached(
                             .unwrap_or(false);
                         drop(cm);
                         if is_ann_proxy {
+                            return Ok(CachedCallResult::CacheMiss);
+                        }
+                    }
+
+                    // A cache entry created through a vtable slot is valid for
+                    // an interface site only when it is the same target that
+                    // receiver-rooted maximally-specific default resolution
+                    // selects. This prevents a parent-interface default from
+                    // remaining cached after it masked a covariant bridge on a
+                    // receiver subinterface.
+                    if is_interface {
+                        let cm = shared.classes.class_manager.read();
+                        let receiver_selected = crate::classloading::find_method_recursive(
+                            actual_class_id,
+                            &cached.method_name,
+                            &cached.method_descriptor,
+                            &cm.class_store,
+                        )
+                        .map(|(_, declaring_id)| declaring_id);
+                        drop(cm);
+                        if receiver_selected != Some(cached.declaring_class_id) {
+                            thread
+                                .invoke_cache
+                                .evict(caller_class_id, cp_index, is_special);
                             return Ok(CachedCallResult::CacheMiss);
                         }
                     }
