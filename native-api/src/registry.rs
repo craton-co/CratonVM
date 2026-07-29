@@ -2899,6 +2899,41 @@ pub trait NativeThreadAccess: NativeHeapAccess {
     /// Get the number of alive threads in the VM.
     fn active_thread_count(&self) -> i32;
 
+    /// The OS thread id backing a Java `Thread` mirror, or `None` if unknown.
+    ///
+    /// Enables ARBITRARY-thread CPU time (`ThreadMXBean.getThreadCpuTime(long)`
+    /// and therefore `isThreadCpuTimeSupported()`), which reported `-1`/false
+    /// only because `ThreadRegistry`'s per-thread `os_tid` — published since
+    /// forever by `set_os_tid_current` — was not reachable from a native.
+    /// Current-thread CPU time never needed this and was already real.
+    fn thread_os_tid(&self, _thread_obj: ObjectRef) -> Option<u32> {
+        None
+    }
+
+    /// Total JIT compilation time in milliseconds, or `None` when the VM keeps
+    /// no such accounting.
+    ///
+    /// Backs BOTH `CompilationMXBean.getTotalCompilationTime()` and
+    /// `isCompilationTimeMonitoringSupported()` — returning one value for both
+    /// is deliberate, so they cannot drift into claiming support for a number
+    /// that is not kept. The unit is already milliseconds in
+    /// `jit::tiered::CompilationStats::total_compile_time_ms`, which is also
+    /// the unit the JMM specifies.
+    fn jit_total_compile_time_ms(&self) -> Option<u64> {
+        None
+    }
+
+    /// Virtual-thread scheduler counters as `(pool_size, mounted, queued)`,
+    /// or `None` when no scheduler is running.
+    ///
+    /// Returned as ONE triple rather than three accessors so
+    /// `VirtualThreadSchedulerMXBean`'s three getters cannot sample the
+    /// scheduler at three different instants and report a mutually
+    /// inconsistent snapshot.
+    fn vt_scheduler_stats(&self) -> Option<(i32, i32, i64)> {
+        None
+    }
+
     /// Number of objects queued for finalization but not yet finalized —
     /// `MemoryMXBean.getObjectPendingFinalizationCount()`.
     ///

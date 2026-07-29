@@ -19083,6 +19083,26 @@ fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, target_class_n
         return true;
     }
 
+    // `System.getLogger()` returns a `cratonvm/internal/SystemLogger`, a
+    // CONCRETE synthetic class. Concrete is the whole point: the receiver used
+    // to be allocated with the `java/lang/System$Logger` INTERFACE as its
+    // class, which left it inert from both directions at once — native lookup
+    // drops interface-declared instance natives, and the interface's own
+    // methods are abstract, so neither a native nor bytecode served it.
+    //
+    // The cost of that fix is that the receiver no longer carries the
+    // interface in its type hierarchy, so `instanceof System.Logger` and
+    // `checkcast` would fail. Nothing hits that today (javac emits no
+    // checkcast for `System.getLogger(..)`, whose declared return type is
+    // already `System.Logger`), but a caller that stashes one in an `Object`
+    // and casts it back would — and that failure would be baffling. Declare
+    // the relationship, which is in fact true.
+    if obj_name == "cratonvm/internal/SystemLogger"
+        && target_class_name == "java/lang/System$Logger"
+    {
+        return true;
+    }
+
     // Map.Entry implementations
     if target_class_name == "java/util/Map$Entry" {
         return matches!(

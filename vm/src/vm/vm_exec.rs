@@ -10308,6 +10308,40 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             .set_jmx_owned_synchronizer(owner_tid, synchronizer);
     }
 
+    /// OS thread id behind a Java `Thread` mirror, for arbitrary-thread CPU
+    /// time. Same two-step resolve `thread_jmx_snapshot` performs.
+    fn thread_os_tid(&self, thread_obj: ObjectRef) -> Option<u32> {
+        let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj)?;
+        self.shared.threads.thread_registry.os_tid_of(tid)
+    }
+
+    /// Total JIT compile time, already in the JMM's own unit (milliseconds).
+    fn jit_total_compile_time_ms(&self) -> Option<u64> {
+        Some(
+            self.shared
+                .jit
+                .tiered_manager
+                .stats()
+                .total_compile_time_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// `(pool_size, mounted, queued)` sampled in ONE call — see the trait doc
+    /// for why the three are not separate accessors.
+    fn vt_scheduler_stats(&self) -> Option<(i32, i32, i64)> {
+        let (pool, mounted, queued) = self
+            .shared
+            .threads
+            .virtual_thread_manager
+            .scheduler_counters();
+        Some((
+            i32::try_from(pool).unwrap_or(i32::MAX),
+            i32::try_from(mounted).unwrap_or(i32::MAX),
+            i64::try_from(queued).unwrap_or(i64::MAX),
+        ))
+    }
+
     /// Real finalization backlog, for `getObjectPendingFinalizationCount()`.
     /// `try_lock` rather than `lock`: this is a monitoring read, and blocking a
     /// JMX query behind an in-progress GC reference pass would be a worse
