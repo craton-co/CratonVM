@@ -9961,6 +9961,10 @@ impl Compiler {
                         FrameValue::StackSlotRef(-*off)
                     } else if indy_tag == Some(b'J') {
                         FrameValue::StackSlotLong(-*off)
+                    } else if indy_tag == Some(b'D') {
+                        FrameValue::StackSlotDouble(-*off)
+                    } else if indy_tag == Some(b'F') {
+                        FrameValue::StackSlotFloat(-*off)
                     } else if indy_tag == Some(b'I') || !wide_fp {
                         FrameValue::StackSlot(-*off)
                     } else {
@@ -9971,6 +9975,11 @@ impl Compiler {
                 // Object on resume); a non-oop slot is a cat-1 `Register` (Int)
                 // only when the method has no wide/FP value that could occupy it
                 // (or an indy-arg tag proves it's actually int/long).
+                //
+                // An FP indy arg in a GPR is a contradiction (the FP tier keeps
+                // `float`/`double` in XMM or a spill slot), so it stays
+                // `Unsupported` — exactly what `typed_local_frame_value` does
+                // for a `LocalKind::Float`/`Double` that claims a GPR home.
                 StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => {
                     if is_oop {
                         FrameValue::RegisterRef(*r)
@@ -9982,7 +9991,15 @@ impl Compiler {
                         FrameValue::Unsupported
                     }
                 }
-                StackSlot::Xmm(_) => FrameValue::Unsupported,
+                // An XMM-resident operand is FP, but float-vs-double is not
+                // recoverable from the abstract stack alone — EXCEPT at an
+                // invokedynamic trap bci, where the call site's own descriptor
+                // types each of its arguments exactly.
+                StackSlot::Xmm(n) => match indy_tag {
+                    Some(b'D') => FrameValue::XmmDouble(*n),
+                    Some(b'F') => FrameValue::XmmFloat(*n),
+                    _ => FrameValue::Unsupported,
+                },
             });
         }
 
