@@ -1137,6 +1137,14 @@ impl ThreadRegistry {
         if let Some(entry) = self.threads.read().get(&thread_id) {
             *entry.jmx_contended_monitor.lock() = Some(monitor);
             *entry.jmx_contended_started.lock() = Some(Instant::now());
+            // Count the block HERE, not on release. The JMM counts a thread as
+            // having blocked the moment it starts waiting, and a JMX consumer
+            // diagnosing a hang reads `getBlockedCount()` while the thread is
+            // STILL blocked — counting on the way out leaves exactly that case
+            // reporting zero, which is the case that matters. Measured: a
+            // thread parked on a held monitor reported `blockedCount == 0` on
+            // every thread in the VM until this moved.
+            entry.jmx_blocked_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1145,8 +1153,11 @@ impl ThreadRegistry {
     pub fn complete_jmx_monitor_enter(&self, thread_id: ThreadId, monitor: ObjectRef) {
         if let Some(entry) = self.threads.read().get(&thread_id) {
             *entry.jmx_contended_monitor.lock() = None;
+            // Only the DURATION is added here — the count was taken when the
+            // block began. `jmx_contended_started` is `None` on the uncontended
+            // arm (which calls this to publish ownership), so nothing accrues
+            // for an acquisition that never waited.
             if let Some(start) = entry.jmx_contended_started.lock().take() {
-                entry.jmx_blocked_count.fetch_add(1, Ordering::Relaxed);
                 entry.jmx_blocked_nanos.fetch_add(
                     start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                     Ordering::Relaxed,

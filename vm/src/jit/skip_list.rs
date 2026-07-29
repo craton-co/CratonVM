@@ -237,6 +237,22 @@ pub enum SkipReason {
     /// test-support loader method interpreted until its JIT lowering is
     /// understood.
     SpringBootModifiedClassPathLoader,
+    /// Spring Boot's zero-capture `ConditionEvaluationReport` mapping lambda
+    /// can return a raw `Object` after tiered compilation, corrupting the
+    /// report's `SortedMap<String, ConditionAndOutcomes>`. Keep the lambda
+    /// body interpreted until the JIT value-production defect is understood.
+    SpringBootConditionReportMapping,
+    /// Spring's JDK HTTP-client request builder lambda can resolve the
+    /// `String.CASE_INSENSITIVE_ORDER` comparator as a `Function` after
+    /// tiered compilation, attempting its nonexistent `apply(Object)` method.
+    /// Keep that exact request-building lambda interpreted until invokedynamic
+    /// interface-target lowering preserves the comparator's `compare` shape.
+    SpringBootJdkHttpRequestHeaderComparator,
+    /// Spring's annotation-attribute collector can dispatch its accumulator as
+    /// `Object.accept(Object, Object)` after tiered compilation. Keep the
+    /// one method that assembles the `MultiValueMap` interpreted until the
+    /// collector's functional-interface receiver is preserved by the JIT.
+    SpringAnnotatedMetadataAttributeCollector,
     /// `java/util/stream/MatchOps.makeInt/makeRef/makeLong/makeDouble`
     /// unconditionally reach an internal `invokedynamic` (lambda) call site
     /// that `jit_scan` lowers to an always-deopt uncommon trap
@@ -804,6 +820,49 @@ fn should_skip_jit_internal(
     // package name below differs from the upstream library's own source.
     if class_name == "org/springframework/javapoet/CodeBlock$Builder" && method_name == "add" {
         return Some(SkipReason::JavaPoetCodeBlockBuilderAdd);
+    }
+
+    // SPRINGBOOT-CONDITION-REPORT.1 (2026-07-29): repeatedly booting the
+    // real `BasicErrorControllerIntegrationTests` application passes 26/26
+    // under `--nojit`, but with the JIT enabled the tenth application context
+    // can fail in `ConditionEvaluationReport.getConditionAndOutcomesBySource`
+    // with `Object cannot be cast to ConditionAndOutcomes`. The only writer
+    // of that typed map is `recordConditionEvaluation`'s zero-capture
+    // `computeIfAbsent` lambda. Bisection with
+    // `CRATONVM_JIT_BISECT_SKIP=...ConditionEvaluationReport.lambda$recordConditionEvaluation$0`
+    // removes the failure while retaining JIT coverage for the surrounding
+    // Spring Boot workload. Keep exactly that value-producing lambda
+    // interpreted; do not weaken the entire autoconfigure package.
+    if class_name == "org/springframework/boot/autoconfigure/condition/ConditionEvaluationReport"
+        && method_name == "lambda$recordConditionEvaluation$0"
+    {
+        return Some(SkipReason::SpringBootConditionReportMapping);
+    }
+
+    // SPRINGBOOT-HTTP-HEADER-COMPARATOR.1 (2026-07-29): the real
+    // BasicErrorControllerIntegrationTests class passes 26/26 under --nojit,
+    // but its JIT run can terminate in JdkClientHttpRequest's header-building
+    // lambda with a call to CaseInsensitiveComparator.apply(Object), followed
+    // by a fatal invalid-reference checkcast. The comparator is not a
+    // Function; this is a tiered invokedynamic interface-target mismatch.
+    // Keep only the exact lambda interpreted, retaining JIT coverage for the
+    // HTTP client and the rest of the Spring Boot class.
+    if class_name == "org/springframework/http/client/JdkClientHttpRequest"
+        && method_name == "lambda$buildRequest$0"
+    {
+        return Some(SkipReason::SpringBootJdkHttpRequestHeaderComparator);
+    }
+
+    // SPRINGBOOT-ANNOTATED-METADATA-COLLECTOR.1 (2026-07-29):
+    // AnnotatedTypeMetadata.getAllAnnotationAttributes passes under --nojit,
+    // but after tiered compilation it can invoke the stream collector
+    // accumulator as Object.accept(Object, Object). The result then corrupts
+    // ConditionEvaluationReport's typed map. Keep this exact collector setup
+    // method interpreted; it is cold bootstrap code, not application traffic.
+    if class_name == "org/springframework/core/type/AnnotatedTypeMetadata"
+        && method_name == "getAllAnnotationAttributes"
+    {
+        return Some(SkipReason::SpringAnnotatedMetadataAttributeCollector);
     }
 
     // SPRINGBOOT-WITHOUT-JACKSON.2 -- REMOVED 2026-07-26. Re-verified with a
@@ -4666,6 +4725,57 @@ mod tests {
                 ),
                 Some(SkipReason::TypesErasure),
                 "Types.erasure must remain excluded under every policy",
+            );
+        }
+    }
+
+    #[test]
+    fn spring_boot_condition_report_mapping_lambda_is_unconditionally_interpreted() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/springframework/boot/autoconfigure/condition/ConditionEvaluationReport",
+                    "lambda$recordConditionEvaluation$0",
+                    false,
+                    true,
+                    policy,
+                ),
+                Some(SkipReason::SpringBootConditionReportMapping),
+                "the ConditionEvaluationReport mapping lambda must remain excluded under every policy",
+            );
+        }
+    }
+
+    #[test]
+    fn spring_boot_jdk_http_header_comparator_lambda_is_unconditionally_interpreted() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/springframework/http/client/JdkClientHttpRequest",
+                    "lambda$buildRequest$0",
+                    false,
+                    true,
+                    policy,
+                ),
+                Some(SkipReason::SpringBootJdkHttpRequestHeaderComparator),
+                "the JDK HTTP request header comparator lambda must remain excluded under every policy",
+            );
+        }
+    }
+
+    #[test]
+    fn spring_annotated_metadata_attribute_collector_is_unconditionally_interpreted() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/springframework/core/type/AnnotatedTypeMetadata",
+                    "getAllAnnotationAttributes",
+                    false,
+                    true,
+                    policy,
+                ),
+                Some(SkipReason::SpringAnnotatedMetadataAttributeCollector),
+                "the annotation metadata collector must remain excluded under every policy",
             );
         }
     }

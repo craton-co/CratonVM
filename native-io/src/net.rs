@@ -2344,7 +2344,10 @@ mod ext_opt_sys {
     const IP_DONTFRAGMENT: i32 = 14;
     const TCP_KEEPCNT: i32 = 16;
     const TCP_KEEPINTVL: i32 = 17;
-    const TCP_KEEPIDLE: i32 = 18;
+    /// mstcpip.h — `TCP_KEEPIDLE` is 3 on Windows (an alias of the older
+    /// `TCP_KEEPALIVE`), NOT 18. 18 is a different option entirely, so the
+    /// keepalive-idle getter/setter were addressing the wrong one.
+    const TCP_KEEPIDLE: i32 = 3;
 
     #[link(name = "ws2_32")]
     unsafe extern "system" {
@@ -2476,18 +2479,40 @@ fn ext_opt_set(_args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
 fn win_ext_opt_get(ctx: &dyn NativeContext, args: &[Value], opt: ExtOpt) -> Result<i32, MethodCallFailed> {
     let (Some(id), _) = ext_opt_int_args(args) else { return Err(ext_opt_unsupported(opt.label())); };
     let Some((level, name)) = ext_opt_sys::level_and_name(opt) else { return Err(ext_opt_unsupported(opt.label())); };
-    if let Some(raw) = ext_opt_sys::raw_fd(id) {
+    if let Some(raw) = win_ext_opt_any_socket(ctx, id) {
         return ext_opt_sys::get_int(raw, level, name).map_err(|e| net_err(opt.label(), e));
     }
     let fd = u32::try_from(id).map_err(|_| ext_opt_unsupported(opt.label()))?;
     ctx.fd_table().udp_get_socket_option_i32(fd, level, name).map_err(|e| net_err(opt.label(), e))
 }
 
+/// The raw `SOCKET` behind ANY extended-option handle id.
+///
+/// A CratonVM socket handle can live in four places: this crate's `net_sockets`
+/// and `socket_channel::tcp_registry` (both of which `ext_opt_sys::raw_fd`
+/// knows), or `native-api`'s fd table as a TCP or a UDP entry (which it cannot
+/// see — it has no `NativeContext`). Without the last two, a plain
+/// `java.net.Socket` fell through to the fd table's UDP-ONLY accessor and
+/// `Socket.setOption(TCP_KEEPIDLE, ..)` failed with `bad fd for udp` — a TCP
+/// socket reported as a bad datagram socket. Resolving to a raw `SOCKET` here
+/// means the real `setsockopt` runs for every handle shape.
+#[cfg(target_os = "windows")]
+fn win_ext_opt_any_socket(ctx: &dyn NativeContext, id: i32) -> Option<usize> {
+    if let Some(raw) = ext_opt_sys::raw_fd(id) {
+        return Some(raw);
+    }
+    let fd = u32::try_from(id).ok()?;
+    ctx.fd_table()
+        .tcp_raw_socket(fd)
+        .or_else(|| ctx.fd_table().udp_raw_socket(fd))
+        .map(|s| s as usize)
+}
+
 #[cfg(target_os = "windows")]
 fn win_ext_opt_set(ctx: &dyn NativeContext, args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
     let (Some(id), Some(value)) = ext_opt_int_args(args) else { return Err(ext_opt_unsupported(opt.label())); };
     let Some((level, name)) = ext_opt_sys::level_and_name(opt) else { return Err(ext_opt_unsupported(opt.label())); };
-    if let Some(raw) = ext_opt_sys::raw_fd(id) {
+    if let Some(raw) = win_ext_opt_any_socket(ctx, id) {
         return ext_opt_sys::set_int(raw, level, name, value).map_err(|e| net_err(opt.label(), e));
     }
     let fd = u32::try_from(id).map_err(|_| ext_opt_unsupported(opt.label()))?;
@@ -2529,6 +2554,80 @@ fn windows_keepalive_set_intvl(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     { win_ext_opt_set(ctx, args, ExtOpt::KeepAliveIntvl)?; return Ok(None); }
     #[cfg(not(target_os = "windows"))]
     { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+}
+
+/// The `int` arguments of an extended-option native, in order.
+///
+/// `setIpDontFragment0(fd, optval, isIPv6)` needs three, not the two
+/// [`ext_opt_int_args`] returns. Booleans arrive as `Value::Int`, so `(IZZ)V`
+/// reads the same way as `(III)V`.
+fn ext_opt_int_arg_list(args: &[Value]) -> Vec<i32> {
+    args.iter()
+        .filter_map(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `(level, optname)` for `IP_DONTFRAGMENT` on Linux, where it is expressed as
+/// the tri-state `IP_MTU_DISCOVER` rather than a boolean.
+#[cfg(target_os = "linux")]
+fn linux_dont_fragment_opt(is_ipv6: bool) -> (libc::c_int, libc::c_int) {
+    // linux/in.h / linux/in6.h.
+    const IP_MTU_DISCOVER: libc::c_int = 10;
+    const IPV6_MTU_DISCOVER: libc::c_int = 23;
+    if is_ipv6 {
+        (libc::IPPROTO_IPV6, IPV6_MTU_DISCOVER)
+    } else {
+        (libc::IPPROTO_IP, IP_MTU_DISCOVER)
+    }
+}
+
+/// `IP_PMTUDISC_DO` — "never fragment, probe the path MTU". `IP_PMTUDISC_DONT`
+/// is 0.
+#[cfg(target_os = "linux")]
+const LINUX_PMTUDISC_DO: i32 = 2;
+
+#[cfg(target_os = "linux")]
+fn linux_dont_fragment_get(args: &[Value]) -> Result<bool, MethodCallFailed> {
+    let ints = ext_opt_int_arg_list(args);
+    let Some(id) = ints.first().copied() else {
+        return Err(ext_opt_unsupported("IP_DONTFRAGMENT"));
+    };
+    let is_ipv6 = ints.get(1).copied().unwrap_or(0) != 0;
+    let Some(fd) = ext_opt_sys::raw_fd(id) else {
+        return Err(ext_opt_unsupported("IP_DONTFRAGMENT"));
+    };
+    let (level, name) = linux_dont_fragment_opt(is_ipv6);
+    let raw = ext_opt_sys::get_int(fd, level, name).map_err(|e| net_err("IP_DONTFRAGMENT", e))?;
+    Ok(raw == LINUX_PMTUDISC_DO)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_dont_fragment_set(args: &[Value]) -> Result<(), MethodCallFailed> {
+    let ints = ext_opt_int_arg_list(args);
+    let Some(id) = ints.first().copied() else {
+        return Err(ext_opt_unsupported("IP_DONTFRAGMENT"));
+    };
+    let on = ints.get(1).copied().unwrap_or(0) != 0;
+    let is_ipv6 = ints.get(2).copied().unwrap_or(0) != 0;
+    let Some(fd) = ext_opt_sys::raw_fd(id) else {
+        return Err(ext_opt_unsupported("IP_DONTFRAGMENT"));
+    };
+    let (level, name) = linux_dont_fragment_opt(is_ipv6);
+    let value = if on { LINUX_PMTUDISC_DO } else { 0 };
+    ext_opt_sys::set_int(fd, level, name, value).map_err(|e| net_err("IP_DONTFRAGMENT", e))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_dont_fragment_get(_args: &[Value]) -> Result<bool, MethodCallFailed> {
+    Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_dont_fragment_set(_args: &[Value]) -> Result<(), MethodCallFailed> {
+    Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
 }
 
 /// `getSoPeerCred0(int fd)`.
@@ -2884,17 +2983,22 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
                 false,
             )))))
         });
-        // IP_DONTFRAGMENT is NOT gated by a native probe (`ipDontFragmentSupported()`
-        // is plain Java returning true), so these two are genuinely reachable and
-        // used to swallow the request silently. It is also the one option in this
-        // family with no single Linux socket option behind it — it is
-        // IP_MTU_DISCOVER on v4 and IPV6_MTU_DISCOVER on v6, and the native is
-        // handed no address family — so say "unsupported" out loud.
-        r.register(lso, "getIpDontFragment0", "(IZ)Z", |_c, _a| {
-            Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
+        // IP_DONTFRAGMENT is NOT gated by a native probe
+        // (`ipDontFragmentSupported()` is plain Java returning true), so these
+        // two are genuinely reachable — and they are now IMPLEMENTED rather than
+        // refused. The earlier "the native is handed no address family"
+        // justification was factually wrong: the JDK signatures are
+        // `getIpDontFragment0(int fd, boolean isIPv6)` and
+        // `setIpDontFragment0(int fd, boolean optval, boolean isIPv6)`, so
+        // `IP_MTU_DISCOVER` (v4) / `IPV6_MTU_DISCOVER` (v6) is selectable —
+        // which is exactly what `LinuxSocketOptions.c` does. The Windows twin
+        // above has had a real implementation since the same round.
+        r.register(lso, "getIpDontFragment0", "(IZ)Z", |_c, a| {
+            Ok(Some(Value::Int(i32::from(linux_dont_fragment_get(a)?))))
         });
-        r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, _a| {
-            Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
+        r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, a| {
+            linux_dont_fragment_set(a)?;
+            Ok(None)
         });
         r.register(lso, "getQuickAck0", "(I)Z", |_c, a| {
             Ok(Some(Value::Int(i32::from(

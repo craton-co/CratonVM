@@ -178,6 +178,12 @@ impl ApplicationClassFinder {
     pub fn add_path(&mut self, path: &str) {
         self.class_path.add_path(path);
     }
+    /// Retract a runtime path added by [`Self::add_path`] — `URLClassLoader
+    /// .close()`. See [`ClassPath::remove_path`] for the use-count rule that
+    /// keeps one loader's close from breaking another's still-open loader.
+    pub fn remove_path(&mut self, path: &str) -> usize {
+        self.class_path.remove_path(path)
+    }
 }
 
 impl ClassFinder for ApplicationClassFinder {

@@ -1892,6 +1892,54 @@ impl FileDescriptorTable {
         }
     }
 
+    /// The raw OS descriptor of a UDP socket, for the options no portable
+    /// wrapper exposes.
+    ///
+    /// `jdk.net.ExtendedSocketOptions`' `IP_DONTFRAGMENT` is a datagram option,
+    /// so `native-io`'s extended-option bridge has to reach a socket that lives
+    /// in THIS table rather than in either TCP registry. `None` for a handle
+    /// that is not a UDP socket.
+    #[cfg(unix)]
+    pub fn udp_raw_fd(&self, fd: FdId) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        match &*self.get_entry(fd)? {
+            FileEntry::UdpSocket(s) => Some(s.as_raw_fd()),
+            _ => None,
+        }
+    }
+
+    /// Windows twin of [`Self::udp_raw_fd`], returning the raw `SOCKET`.
+    #[cfg(windows)]
+    pub fn udp_raw_socket(&self, fd: FdId) -> Option<u64> {
+        use std::os::windows::io::AsRawSocket;
+        match &*self.get_entry(fd)? {
+            FileEntry::UdpSocket(s) => Some(s.as_raw_socket()),
+            _ => None,
+        }
+    }
+
+    /// The raw OS descriptor of a TCP stream, for the same reason as
+    /// [`Self::udp_raw_fd`]: `jdk.net.ExtendedSocketOptions`' keepalive knobs
+    /// have no portable wrapper and must reach `setsockopt` directly.
+    #[cfg(unix)]
+    pub fn tcp_raw_fd(&self, fd: FdId) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        match &*self.get_entry(fd)? {
+            FileEntry::TcpStream(s) => Some(s.lock().as_raw_fd()),
+            _ => None,
+        }
+    }
+
+    /// Windows twin of [`Self::tcp_raw_fd`], returning the raw `SOCKET`.
+    #[cfg(windows)]
+    pub fn tcp_raw_socket(&self, fd: FdId) -> Option<u64> {
+        use std::os::windows::io::AsRawSocket;
+        match &*self.get_entry(fd)? {
+            FileEntry::TcpStream(s) => Some(s.lock().as_raw_socket()),
+            _ => None,
+        }
+    }
+
     /// Set the IP type-of-service / DSCP byte on a UDP socket (IP_TOS).
     ///
     /// Added so `DatagramChannel.setTrafficClass` could stop being a silent

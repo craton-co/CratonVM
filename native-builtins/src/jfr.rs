@@ -494,12 +494,36 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         ))))
     });
 
+    // `emitEvent(long eventTypeId, long timestamp, long when)` — IMPLEMENTED
+    // (was a flat `false`, i.e. "nothing was emitted"). It goes through the SAME
+    // `NativeContext` JFR route `beginRecording`/`isRecording` use, so there is
+    // one door into the recorder rather than two: the answer is now "yes"
+    // exactly when a recording is running.
+    //
+    // The three longs the JDK passes ARE this entry point's whole payload — it
+    // is the periodic-event door, not the EventWriter one, which still has no
+    // chunk writer behind it (see `newEventWriter`).
+    registry.register(JVM, "emitEvent", "(JJJ)Z", |ctx, args| {
+        let longs: Vec<i64> = args
+            .iter()
+            .filter_map(|v| match v {
+                Value::Long(l) => Some(*l),
+                _ => None,
+            })
+            .collect();
+        if !ctx.jfr_java_recording_active() {
+            return Ok(Some(Value::Int(0)));
+        }
+        let timestamp = longs.get(1).copied().unwrap_or(0).max(0) as u64;
+        ctx.jfr_emit_java_event("jdk.PeriodicEvent", timestamp, 0);
+        Ok(Some(Value::Int(1)))
+    });
+
     // Constant `false` answers that are STATEMENTS OF FACT about this VM, not
     // placeholders — each names the CratonVM property that makes it true:
     //   * `emitEvent`/`setThreshold`  — the Java-side per-event recorder is not
-    //     wired to a chunk writer here (payload collection is owned by the Rust
-    //     `jfr` crate), so no event is emitted through this boundary and the
-    //     honest answer to "did you emit it?" is no;
+    //   * `setThreshold` — tunes a per-event threshold this bridge does not
+    //     consume, and there is no getter that could disagree;
     //   * `getAllowedToDoEventRetransforms`/`isInstrumented` — `retransform
     //     Classes` above is a no-op, so no event class is ever instrumented;
     //     answering `true` to either would contradict that no-op;
@@ -508,7 +532,6 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // `isExcluded(Thread)` is deliberately NOT in this list: it is a guard whose
     // answer must follow `exclude`/`include` (see below).
     for (name, descriptor) in [
-        ("emitEvent", "(JJJ)Z"),
         ("setThreshold", "(JJ)Z"),
         ("getAllowedToDoEventRetransforms", "()Z"),
         ("isExcluded", "(Ljava/lang/Class;)Z"),
@@ -539,9 +562,47 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // committed (`commit`), no event class has been unloaded
     // (`getUnloadedEventClassCount`). `getThreadId` and the two `hostTotal*`
     // probes are deliberately NOT in this list — see below.
+    // `getStackTraceId(int skipFrames[, long hash])` — IMPLEMENTED (was a flat
+    // `0`, "no trace interned"). The id has to be STABLE: events reference
+    // traces by id and a chunk carries each trace once, so the same call site
+    // asked twice must get the same number back. Interning by the rendered
+    // frame list gives that without a VM-side table — `capture_stack_trace` is
+    // already on the native ABI.
+    //
+    // `0` remains the answer when there is no walkable stack, which is the
+    // JDK's own "no such trace".
+    fn jfr_stack_trace_id(ctx: &mut dyn NativeContext, skip: i32) -> i64 {
+        static IDS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, i64>>,
+        > = std::sync::OnceLock::new();
+        let frames = ctx.capture_stack_trace(0);
+        let skip = skip.max(0) as usize;
+        if frames.len() <= skip {
+            return 0;
+        }
+        let mut key = String::new();
+        for frame in frames.iter().skip(skip) {
+            key.push_str(&frame.class_name);
+            key.push('.');
+            key.push_str(&frame.method_name);
+            key.push(':');
+            key.push_str(&frame.line_number.to_string());
+            key.push('\n');
+        }
+        let table = IDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut table = table.lock().unwrap_or_else(|e| e.into_inner());
+        let next = table.len() as i64 + 1;
+        *table.entry(key).or_insert(next)
+    }
+    for descriptor in ["(IJ)J", "(I)J"] {
+        registry.register(JVM, "getStackTraceId", descriptor, |ctx, args| {
+            let skip = args.iter().find_map(|v| v.as_int()).unwrap_or(0);
+            Ok(Some(Value::Long(jfr_stack_trace_id(ctx, skip))))
+        });
+    }
+
     for (name, descriptor) in [
         ("getUnloadedEventClassCount", "()J"),
-        ("getStackTraceId", "(IJ)J"),
         ("commit", "(J)J"),
         (
             "registerStackFilter",

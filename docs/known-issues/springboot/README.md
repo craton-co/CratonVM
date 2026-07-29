@@ -124,6 +124,10 @@ allocation size). Full before/after table and reproduce instructions in
 `apps/spring-boot-suite-runner/RESULTS-20260728.md`.
 
 **Follow-up triage (same round):** investigated all 20 residual FAIL
+
+Update: the `BasicErrorControllerIntegrationTests` comparator crash was fixed
+and retired on 2026-07-29. Its 26/26 JIT and `--nojit` validation record is
+under `docs/internal/fixed-suite-bugs/springboot/`.
 classes plus the 2 CRASHes. 9 of the 20 FAIL classes matched existing
 docs (several already marked FIXED/RESOLVED by concurrent sessions —
 confirmation/regression notes added rather than re-filing); the remaining
@@ -133,7 +137,6 @@ grounded in `javap` disassembly and direct CratonVM source reading:
 - [`basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md) — `String$CaseInsensitiveComparator.apply()` NoSuchMethodError → fatal `checkcast` internal error (CRASH)
 - **Retired 2026-07-29:** [`OriginTrackedYamlLoaderTests` OOM fix](../../internal/fixed-suite-bugs/springboot/origintrackedyamlloadertests-oom-3mb-parse-crash-20260728-FIXED.md) — interpreter array allocation now uses the established young-to-old spill path after a JIT-safe non-moving young sweep.
 - [`ipv6-getbyaddress-dual-registration-jetty-cluster-20260728.md`](ipv6-getbyaddress-dual-registration-jetty-cluster-20260728.md) — two competing `InetAddress.getByAddress(byte[])` native registrations, the wrong one wins and emits RFC-5952-compressed IPv6 strings
-- [`instanttodateconverter-generic-interface-resolution-cluster-20260728.md`](instanttodateconverter-generic-interface-resolution-cluster-20260728.md) — `Class.getGenericInterfaces()` loses generic type args for a class implementing one non-generic + one generic interface
 - [`reflective-aliasfor-mirror-mismatch-20260728.md`](reflective-aliasfor-mirror-mismatch-20260728.md) — `@Reflective`'s `value`/`processors` `@AliasFor` mirror pair disagree for the same annotation instance
 - [`log4j2-custom-pattern-properties-not-applied-20260728.md`](log4j2-custom-pattern-properties-not-applied-20260728.md) — custom `logging.pattern.*` properties never reach actual Log4j2 output
 - [`healthendpointgroup-methodref-dispatch-nosuchmethod-20260728.md`](healthendpointgroup-methodref-dispatch-nosuchmethod-20260728.md) — a method-reference lambda dispatches against erased `Object` instead of the real receiver type

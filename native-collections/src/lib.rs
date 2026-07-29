@@ -18513,6 +18513,69 @@ fn collect_via_collector_protocol(
         == Some("java/lang/Object")
         && collector_tag_of(ctx, Value::Object(Some(collector))).is_none()
     {
+        // A real JDK `Collectors$CollectorImpl` can survive a loader/GC
+        // boundary with its object header collapsed to Object while retaining
+        // its five instance fields. The old list fallback avoided a
+        // NoSuchMethodError, but changed the result type: Spring's
+        // `MergedAnnotationCollectors.toMultiValueMap` then reached
+        // `AnnotatedTypeMetadata.getAllAnnotationAttributes` as ArrayList and
+        // failed its required MultiValueMap checkcast. CollectorImpl's stable
+        // JDK layout is supplier, accumulator, combiner, finisher,
+        // characteristics. Drive those preserved function objects directly.
+        if ctx.object_num_fields(collector) >= 5 {
+            let supplier = ctx.get_field(collector, 0);
+            let accumulator = ctx.get_field(collector, 1);
+            let finisher = ctx.get_field(collector, 3);
+            if let (
+                Value::Object(Some(supplier)),
+                Value::Object(Some(accumulator)),
+                Value::Object(Some(finisher)),
+            ) = (supplier, accumulator, finisher)
+            {
+                let supplier_pin = ctx.pin_native_root(supplier);
+                let accumulator_pin = ctx.pin_native_root(accumulator);
+                let finisher_pin = ctx.pin_native_root(finisher);
+                let container = match ctx.invoke_virtual(
+                    ctx.read_native_pin(supplier_pin, supplier),
+                    "get",
+                    "()Ljava/lang/Object;",
+                    &[],
+                ) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => Value::Object(None),
+                    Err(error) => {
+                        ctx.unpin_native_roots(supplier_pin);
+                        return Err(error);
+                    }
+                };
+                let container_pin = pin_value(ctx, container);
+                for element in elements {
+                    let container = read_pinned_elem(ctx, container_pin, container);
+                    let element_pin = pin_value(ctx, *element);
+                    let element = read_pinned_elem(ctx, element_pin, *element);
+                    let result = ctx.invoke_virtual(
+                        ctx.read_native_pin(accumulator_pin, accumulator),
+                        "accept",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                        &[container, element],
+                    );
+                    ctx.unpin_native_roots(element_pin);
+                    if let Err(error) = result {
+                        ctx.unpin_native_roots(supplier_pin);
+                        return Err(error);
+                    }
+                }
+                let container = read_pinned_elem(ctx, container_pin, container);
+                let result = ctx.invoke_virtual(
+                    ctx.read_native_pin(finisher_pin, finisher),
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[container],
+                );
+                ctx.unpin_native_roots(supplier_pin);
+                return result;
+            }
+        }
         return make_list_of(ctx, elements);
     }
     let supplier = match ctx.invoke_virtual_declared(
