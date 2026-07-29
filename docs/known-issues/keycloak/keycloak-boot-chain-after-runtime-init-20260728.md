@@ -81,6 +81,45 @@ contains only the banner ("truncated: full report requires allocator, unsafe in
 signal handler"). Whatever named the failing JIT method on other crashes did not
 fire here.
 
+## Blocker 0 (NEW, and it now masks the two below) — `StackOverflowError` on `dev`
+
+`origin/dev` at `1af2f0674` regressed this boot: it now dies right after
+`ISPN000974: Virtual threads support: enabled` — earlier than the Liquibase
+migration it used to complete — with
+
+```
+ATHROW class=java/lang/StackOverflowError msg="<no msg>"
+  ATHROW-STK[22] io/quarkus/runtime/Application.start pc=202
+  ...
+ERROR: Failed to start server in (development) mode      <- no cause printed, even with --verbose
+```
+
+**This is not caused by the RUNTIME_INIT work.** Verified by reverting
+`53168f3e7` in the merged tree and rebuilding: pure `origin/dev` (plus the
+then-opt-in `CRATONVM_REAL_QUARKUS_START=1`) reproduces the identical
+`StackOverflowError` at the identical point. The RUNTIME_INIT branch reached
+Keycloak's master-realm bootstrap immediately before merging `origin/dev`.
+
+The Java stack is only **22 frames deep** at the throw, so this is not a
+genuine Java stack overflow: it is the Rust-side re-entrancy ceiling
+(`EXEC_DEPTH_CEILING`, `vm/src/runtime/interpreter.rs`) tripping, which means
+something on `dev` added deep native<->Java ping-pong (or shrank the ceiling)
+on the path that enters the generated `ApplicationImpl.doStart`. Note that
+that ceiling's throw site does NOT call `dump_stack_on_soe`, which is why the
+failure arrives with no diagnostic at all.
+
+Candidate window: the `dev` commits merged on 2026-07-28, notably the
+`fix/stub-removal-w4-20260728` wave and `native-builtins/src/case_map.rs`.
+Bisect that range with
+
+```bash
+JAVA_OPTS_KC_HEAP='-Xms512m -Xmx4g' CRATONVM_DISABLE_JIT=1 CRATONVM_DBG_ATHROW=1 \
+  bash bin/kc.sh start-dev --http-enabled=true --hostname-strict=false
+```
+
+and grep for `ATHROW class=java/lang/StackOverflowError`. Until it is fixed the
+two blockers below are unreachable.
+
 ## Smaller residuals seen on the way
 
 * `NoSuchMethodError: java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.<init>`
