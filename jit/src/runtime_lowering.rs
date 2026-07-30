@@ -237,6 +237,15 @@ pub(crate) fn emit_hashed_vtable_stub(
     service_helper: usize,
     info_ptr: usize,
 ) -> Vec<usize> {
+    // This is a raw JIT-to-JIT call, exactly like the inline MIC/PIC hits.
+    // It must obey the same master gate: the resolving helper enters the
+    // callee through JitEntryGuard, whereas this stub deliberately bypasses
+    // it. Previously CRATONVM_JIT_DIRECT_CALLEE_CALLS=0 disabled only the
+    // MIC/PIC cascades and silently left this megamorphic raw edge live, so
+    // the moving collector still found an unguarded callee frame.
+    if !crate::direct_jit_callee_calls_enabled() {
+        return Vec::new();
+    }
     if arg_offsets.is_empty()
         || arg_offsets.len() + 1 > ENTRY_ABI_REGS.len()
         || JitPICSlot::MEGA_SET_SHIFT >= 32

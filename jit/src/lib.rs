@@ -7193,6 +7193,14 @@ pub fn ir_direct_calls_enabled() -> bool {
 }
 
 pub fn direct_jit_callee_calls_enabled() -> bool {
+    // A raw JIT-to-JIT call has no callee JitEntryGuard. Moving-young must be
+    // able to rewrite every live frame, so it cannot use that edge until the
+    // direct-call stub publishes the callee metadata atomically. The dispatch
+    // bridge installs the guard and is therefore the safe route in this mode.
+    if x64::moving_young_enabled() {
+        return false;
+    }
+
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
@@ -8263,6 +8271,12 @@ fn try_compile_inner(
     // correctness risk. C2 (`optimize == true`, every non-tiered caller)
     // keeps the historical IR-first behaviour.
     if optimize
+        // IR lowering has no exact-RBP or safepoint-map publication. A
+        // mapless IR frame can be live when the moving young collector runs,
+        // but cannot prove or rewrite its roots. The x64 backend enables its
+        // complete frame-metadata protocol whenever moving-young is active.
+        // Keep IR off until it supplies the same relocation contract.
+        && !x64::moving_young_enabled()
         && ir::ir_compatible(&scan)
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
         // tier used to refuse EVERY method with a `try`/`catch`, which is an
