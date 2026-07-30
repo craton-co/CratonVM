@@ -412,6 +412,150 @@ struct SimdIntArraySum {
     acc_is_long: bool,
 }
 
+/// A side-effect-free integer matrix dot-product loop.
+///
+/// `javac` emits this shape for the inner loop of the conventional
+/// `int[][]` matrix multiply:
+///
+/// ```text
+/// for (k = ...; k < bound; k++)
+///     sum += a[row][k] * b[k][column];
+/// ```
+///
+/// The generic bytecode emitter necessarily materializes the operand stack and
+/// repeats array checks around every load.  The pre-header fast path keeps the
+/// loop state in registers instead.  Every speculative shape check branches
+/// back to the untouched scalar bytecode with the original `k`/`sum` frame
+/// state, so null, jagged, short, negative-index, and zero-trip cases retain
+/// exact Java behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatrixDotLoop {
+    header_pc: usize,
+    back_edge_pc: usize,
+    iv_local: usize,
+    bound_local: usize,
+    acc_local: usize,
+    a_outer_local: usize,
+    a_row_local: usize,
+    b_outer_local: usize,
+    b_column_local: usize,
+}
+
+/// Detect the exact read-only matrix dot-product body documented on
+/// [`MatrixDotLoop`].  Requiring the whole body (rather than recognizing a
+/// subsequence) is what makes fallback restart safe: the skipped bytecodes have
+/// no externally visible effects and write only `iv_local`/`acc_local`.
+fn detect_matrix_dot_loop(
+    code: &[u8],
+    header: usize,
+    back_edge: usize,
+    iv_local: usize,
+) -> Option<MatrixDotLoop> {
+    if code.get(back_edge).copied() != Some(0xa7) || back_edge + 2 >= code.len() {
+        return None;
+    }
+
+    let take_iload = |pc: &mut usize| -> Option<usize> {
+        let local = extract_iload_local(code, *pc)?;
+        *pc += if code[*pc] == 0x15 { 2 } else { 1 };
+        Some(local)
+    };
+    let take_aload = |pc: &mut usize| -> Option<usize> {
+        let local = extract_aload_local(code, *pc)?;
+        *pc += if code[*pc] == 0x19 { 2 } else { 1 };
+        Some(local)
+    };
+    let take_istore = |pc: &mut usize| -> Option<usize> {
+        let local = extract_istore_local(code, *pc)?;
+        *pc += if code[*pc] == 0x36 { 2 } else { 1 };
+        Some(local)
+    };
+    let take = |pc: &mut usize, opcode: u8| -> Option<()> {
+        if code.get(*pc).copied()? != opcode {
+            return None;
+        }
+        *pc += 1;
+        Some(())
+    };
+
+    let mut pc = header;
+    if take_iload(&mut pc)? != iv_local {
+        return None;
+    }
+    let bound_local = take_iload(&mut pc)?;
+    if code.get(pc).copied()? != 0xa2 {
+        return None;
+    }
+    let exit_delta = i16::from_be_bytes([*code.get(pc + 1)?, *code.get(pc + 2)?]) as isize;
+    let exit_pc = (pc as isize).checked_add(exit_delta)?;
+    if exit_pc <= back_edge as isize {
+        return None;
+    }
+    pc += 3;
+
+    let acc_local = take_iload(&mut pc)?;
+    let a_outer_local = take_aload(&mut pc)?;
+    let a_row_local = take_iload(&mut pc)?;
+    take(&mut pc, 0x32)?; // aaload: a[row]
+    if take_iload(&mut pc)? != iv_local {
+        return None;
+    }
+    take(&mut pc, 0x2e)?; // iaload: a[row][k]
+
+    let b_outer_local = take_aload(&mut pc)?;
+    if take_iload(&mut pc)? != iv_local {
+        return None;
+    }
+    take(&mut pc, 0x32)?; // aaload: b[k]
+    let b_column_local = take_iload(&mut pc)?;
+    take(&mut pc, 0x2e)?; // iaload: b[k][column]
+    take(&mut pc, 0x68)?; // imul
+    take(&mut pc, 0x60)?; // iadd
+    if take_istore(&mut pc)? != acc_local {
+        return None;
+    }
+
+    if pc + 2 >= back_edge
+        || code.get(pc).copied()? != 0x84
+        || *code.get(pc + 1)? as usize != iv_local
+        || *code.get(pc + 2)? != 1
+    {
+        return None;
+    }
+    pc += 3;
+    if pc != back_edge {
+        return None;
+    }
+
+    let back_delta =
+        i16::from_be_bytes([*code.get(back_edge + 1)?, *code.get(back_edge + 2)?]) as isize;
+    if (back_edge as isize).checked_add(back_delta)? != header as isize {
+        return None;
+    }
+    if acc_local == iv_local
+        || bound_local == iv_local
+        || bound_local == acc_local
+        || a_row_local == iv_local
+        || a_row_local == acc_local
+        || b_column_local == iv_local
+        || b_column_local == acc_local
+    {
+        return None;
+    }
+
+    Some(MatrixDotLoop {
+        header_pc: header,
+        back_edge_pc: back_edge,
+        iv_local,
+        bound_local,
+        acc_local,
+        a_outer_local,
+        a_row_local,
+        b_outer_local,
+        b_column_local,
+    })
+}
+
 /// Detect a vectorizable int-array-sum pattern in a loop body.
 /// Matches: iload_sum, aload_arr, iload_iv, iaload, iadd, istore_sum, iinc iv 1, goto
 /// Or with long accumulator: aload_arr, iload_iv, iaload, i2l, lload_sum, ladd, lstore_sum
@@ -552,6 +696,18 @@ fn extract_lstore_local(code: &[u8], pc: usize) -> Option<usize> {
         0x42 => Some(3), // lstore_3
         // Cast: non-negative index/count to usize
         0x37 => code.get(pc + 1).map(|&b| b as usize), // lstore
+        _ => None,
+    }
+}
+
+/// Extract local index from an istore instruction at pc.
+fn extract_istore_local(code: &[u8], pc: usize) -> Option<usize> {
+    match *code.get(pc)? {
+        0x3b => Some(0), // istore_0
+        0x3c => Some(1), // istore_1
+        0x3d => Some(2), // istore_2
+        0x3e => Some(3), // istore_3
+        0x36 => code.get(pc + 1).map(|&b| b as usize), // istore
         _ => None,
     }
 }
@@ -8190,6 +8346,8 @@ struct Compiler {
     callee_saved_base: i32,
     /// SIMD: vectorizable loops detected during analysis.
     simd_loops: Vec<SimdIntArraySum>,
+    /// Guarded tight-loop lowering for read-only `int[][]` dot products.
+    matrix_dot_loops: Vec<MatrixDotLoop>,
     /// Bounds check elimination: bytecode PCs where bounds checks can be skipped
     /// because loop analysis proved the access is always in-bounds.
     bounds_safe_pcs: FxHashSet<usize>,
@@ -9296,6 +9454,7 @@ impl Compiler {
         hoist_info: Vec<LoopHoist>,
         arith_hoist_info: Vec<ArithLoopHoist>,
         alloc_result: super::regalloc::RegAllocResult,
+        reserve_matrix_dot_scratch: bool,
         helpers: JitRuntimeHelpers,
         num_scalar_slots: usize,
         cache_jit_thread_for_inline_new: bool,
@@ -9468,11 +9627,21 @@ impl Compiler {
             vec![None; raw_local_assignments_len]
         };
         let osr_block_live_in = alloc_result.block_live_in;
-        let alloc_used_regs = if gpr_local_homes_enabled {
+        let mut alloc_used_regs = if gpr_local_homes_enabled {
             raw_used_callee_saved
         } else {
             Vec::new()
         };
+        // The matrix-dot preheader owns R12..R15 for the duration of its tight
+        // loop.  Save them in the normal prologue/epilogue even when diagnostic
+        // flags disable register-homed Java locals; unlike PUSH/POP around the
+        // loop, frame saves also remain correct if a future cold path exits
+        // exceptionally.
+        if reserve_matrix_dot_scratch {
+            alloc_used_regs.extend([R12, R13, R14, R15]);
+            alloc_used_regs.sort_unstable();
+            alloc_used_regs.dedup();
+        }
         // The x86-64 System V ABI (Linux/macOS) makes every XMM register
         // caller-saved.  Keeping a Java float/double local in XMM8..15 across
         // an invoke therefore loses it when the callee/helper uses SIMD
@@ -9633,6 +9802,7 @@ impl Compiler {
             arith_scratch_base,
             callee_saved_base,
             simd_loops: Vec::new(),
+            matrix_dot_loops: Vec::new(),
             bounds_safe_pcs: FxHashSet::default(),
             bounds_check_stubs: Vec::new(),
             null_check_store_stubs: Vec::new(),
@@ -14047,6 +14217,244 @@ impl Compiler {
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+    }
+
+    /// Emit one checked matrix-dot element and advance R10D.
+    ///
+    /// The preheader keeps all Java-visible state in its original homes until
+    /// the complete dot product succeeds, so a guard can safely restart the
+    /// scalar bytecodes even when this element belongs to an unrolled batch.
+    fn emit_matrix_dot_element(
+        &mut self,
+        scalar_fallbacks: &mut Vec<usize>,
+        index_delta: i32,
+        advance_iv: bool,
+    ) {
+        let b_disp = HEADER_SIZE as i32
+            + index_delta * if narrow_oops_enabled() { 4 } else { 8 };
+        let a_disp = HEADER_SIZE as i32 + index_delta * 4;
+        if narrow_oops_enabled() {
+            // EAX = narrow b[k], then decode it with the loop-invariant heap
+            // base already in R11. A zero encoding is null -> scalar fallback.
+            self.buf.emit(&[
+                0x43,
+                0x8B,
+                0x44,
+                0x95,
+                b_disp as u8,
+            ]); // MOV EAX,[R13+R10*4+H]
+            self.buf.emit(&[0x48, 0xC1, 0xE0, 0x03]); // SHL RAX,3
+            scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+            self.buf.emit(&[0x4C, 0x01, 0xD8]); // ADD RAX,R11
+        } else {
+            self.buf.emit(&[
+                0x4B,
+                0x8B,
+                0x44,
+                0xD5,
+                b_disp as u8,
+            ]); // MOV RAX,[R13+R10*8+H]
+            self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+            scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+        }
+
+        // Each B row is independently mutable in Java, so its column check
+        // remains per element. A failure restarts the exact scalar body, which
+        // raises NPE/AIOOBE at the original bytecode.
+        self.buf
+            .emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+        self.buf.emit(&[0x41, 0x39, 0xD6]); // CMP R14D, EDX
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x83)); // JAE
+
+        self.buf.emit(&[
+            0x43,
+            0x8B,
+            0x54,
+            0x94,
+            a_disp as u8,
+        ]); // MOV EDX,[R12+R10*4+H]
+        self.buf.emit(&[
+            0x42,
+            0x0F,
+            0xAF,
+            0x54,
+            0xB0,
+            HEADER_SIZE as u8,
+        ]); // IMUL EDX,[RAX+R14*4+H]
+        self.buf.emit(&[0x41, 0x01, 0xD1]); // ADD R9D, EDX (Java int wrap)
+        if advance_iv {
+            self.buf.emit(&[0x41, 0xFF, 0xC2]); // INC R10D
+        }
+    }
+
+    /// Emit the guarded tight loop for a [`MatrixDotLoop`].
+    ///
+    /// Register contract:
+    /// - R12 = `a[row]`
+    /// - R13 = outer `b`
+    /// - R14D = column
+    /// - R15D = exclusive bound
+    /// - R10D = induction variable
+    /// - R9D = wrapping int accumulator
+    ///
+    /// R12..R15 are reserved from Java-local allocation and saved by the
+    /// method prologue.  RAX/RCX/RDX/R11 are ordinary emitter scratch.
+    fn emit_matrix_dot_preheader(&mut self, dot: &MatrixDotLoop) {
+        let mut scalar_fallbacks = Vec::new();
+
+        // Load the carried integer state.  Frame/register homes are left
+        // untouched until successful completion, so every failing guard can
+        // restart the original scalar loop without reconstructing state.
+        if let Some(reg) = self.reg_for_local(dot.iv_local) {
+            self.emit_mov_reg_reg(R10, reg);
+        } else {
+            self.emit_load_local(R10, self.local_offset(dot.iv_local));
+        }
+        if let Some(reg) = self.reg_for_local(dot.bound_local) {
+            self.emit_mov_reg_reg(R15, reg);
+        } else {
+            self.emit_load_local(R15, self.local_offset(dot.bound_local));
+        }
+        if let Some(reg) = self.reg_for_local(dot.acc_local) {
+            self.emit_mov_reg_reg(R9, reg);
+        } else {
+            self.emit_load_local(R9, self.local_offset(dot.acc_local));
+        }
+
+        // Zero trip: do not even inspect the arrays.
+        self.buf.emit(&[0x45, 0x39, 0xFA]); // CMP R10D, R15D
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x8D)); // JGE scalar header
+        self.buf.emit(&[0x45, 0x85, 0xD2]); // TEST R10D, R10D
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x88)); // JS scalar header
+
+        // Resolve a[row]. Prefer the LICM result that was emitted immediately
+        // before this preheader; fall back to a guarded direct load when LICM
+        // is disabled or this header was de-specialized.
+        let hoisted_a = self
+            .hoist_info
+            .iter()
+            .enumerate()
+            .find(|(_, h)| {
+                h.loop_header == dot.header_pc
+                    && h.array_local == dot.a_outer_local
+                    && h.index_local == dot.a_row_local
+            })
+            .map(|(idx, _)| self.hoist_offsets[idx]);
+        if let Some(off) = hoisted_a {
+            self.emit_load_local(RAX, off);
+        } else {
+            if let Some(reg) = self.reg_for_local(dot.a_outer_local) {
+                self.emit_mov_reg_reg(RAX, reg);
+            } else {
+                self.emit_load_local(RAX, self.local_offset(dot.a_outer_local));
+            }
+            if let Some(reg) = self.reg_for_local(dot.a_row_local) {
+                self.emit_mov_reg_reg(RCX, reg);
+            } else {
+                self.emit_load_local(RCX, self.local_offset(dot.a_row_local));
+            }
+            self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+            scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+            self.buf
+                .emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+            self.buf.emit(&[0x39, 0xD1]); // CMP ECX, EDX
+            scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x83)); // JAE
+            self.emit_ref_aload_regs();
+        }
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX (a[row])
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+        self.emit_mov_reg_reg(R12, RAX);
+
+        // Resolve the outer B array and the invariant column.
+        if let Some(reg) = self.reg_for_local(dot.b_outer_local) {
+            self.emit_mov_reg_reg(R13, reg);
+        } else {
+            self.emit_load_local(R13, self.local_offset(dot.b_outer_local));
+        }
+        self.buf.emit(&[0x4D, 0x85, 0xED]); // TEST R13, R13
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+        if let Some(reg) = self.reg_for_local(dot.b_column_local) {
+            self.emit_mov_reg_reg(R14, reg);
+        } else {
+            self.emit_load_local(R14, self.local_offset(dot.b_column_local));
+        }
+
+        // A's selected row and the outer B array must both cover the complete
+        // counted range.  JA (not JAE): length == bound is valid.
+        self.buf.emit(&[
+            0x41,
+            0x8B,
+            0x54,
+            0x24,
+            ARRAY_LENGTH_OFFSET as u8,
+        ]); // MOV EDX,[R12+len]
+        self.buf.emit(&[0x41, 0x39, 0xD7]); // CMP R15D, EDX
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x87)); // JA
+        self.buf
+            .emit(&[0x41, 0x8B, 0x55, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[R13+len]
+        self.buf.emit(&[0x41, 0x39, 0xD7]); // CMP R15D, EDX
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x87)); // JA
+
+        if narrow_oops_enabled() {
+            self.emit_mov_imm64(R11, narrow_base() as i64);
+        }
+
+        // Eight-way unrolling amortizes the induction compare/branch while
+        // retaining the original k-order for every multiply-add. Fixed
+        // displacements let the CPU overlap independent row-pointer loads
+        // without an INC dependency between elements. R8D is the
+        // first k that cannot start a full batch (`bound - 7`).
+        self.emit_mov_reg_reg(R8, R15);
+        self.buf.emit(&[0x41, 0x83, 0xE8, 0x07]); // SUB R8D,7
+        self.buf.emit(&[0x45, 0x39, 0xC2]); // CMP R10D,R8D
+        let scalar_tail_patch = self.emit_jcc_rel32_patch(0x8D); // JGE scalar tail
+
+        let batch_start = self.buf.pos();
+        for index_delta in 0..8 {
+            self.emit_matrix_dot_element(&mut scalar_fallbacks, index_delta, false);
+        }
+        self.buf.emit(&[0x41, 0x83, 0xC2, 0x08]); // ADD R10D,8
+        self.buf.emit(&[0x45, 0x39, 0xC2]); // CMP R10D,R8D
+        self.buf.emit(&[0x0F, 0x8C]); // JL batch_start
+        let batch_patch = self.buf.pos();
+        self.buf.emit(&[0u8; 4]);
+        let batch_rel = (batch_start as i32) - (batch_patch as i32 + 4);
+        self.buf.try_patch_i32(batch_patch, batch_rel).ok();
+
+        self.patch_rel32_to_here(scalar_tail_patch);
+        self.buf.emit(&[0x45, 0x39, 0xFA]); // CMP R10D,R15D
+        let publish_patch = self.emit_jcc_rel32_patch(0x8D); // JGE publish
+
+        let scalar_start = self.buf.pos();
+        self.emit_matrix_dot_element(&mut scalar_fallbacks, 0, true);
+        self.buf.emit(&[0x45, 0x39, 0xFA]); // CMP R10D, R15D
+        self.buf.emit(&[0x0F, 0x8C]); // JL scalar_start
+        let loop_patch = self.buf.pos();
+        self.buf.emit(&[0u8; 4]);
+        let loop_rel = (scalar_start as i32) - (loop_patch as i32 + 4);
+        self.buf.try_patch_i32(loop_patch, loop_rel).ok();
+
+        // Publish successful final state to whichever homes the scalar
+        // continuation expects. MOVSXD restores the backend's signed-i32 local
+        // representation after the wrapping 32-bit accumulator arithmetic.
+        self.patch_rel32_to_here(publish_patch);
+        self.buf.emit(&[0x4D, 0x63, 0xC9]); // MOVSXD R9,R9D
+        if let Some(reg) = self.reg_for_local(dot.acc_local) {
+            self.emit_mov_reg_reg(reg, R9);
+        } else {
+            self.emit_store_local(self.local_offset(dot.acc_local), R9);
+        }
+        if let Some(reg) = self.reg_for_local(dot.iv_local) {
+            self.emit_mov_reg_reg(reg, R10);
+        } else {
+            self.emit_store_local(self.local_offset(dot.iv_local), R10);
+        }
+
+        // All failed guards land after the success stores, leaving their
+        // original frame/register state untouched for the scalar bytecode.
+        for patch in scalar_fallbacks {
+            self.patch_rel32_to_here(patch);
+        }
     }
 
     /// Emit a vectorized double-array sum loop using AVX2 VADDPD.
@@ -20258,6 +20666,18 @@ impl Compiler {
                         self.emit_store_local(self.local_offset(iv_local), R10);
                     }
                 }
+            }
+
+            // Guarded `int[][]` dot-product replacement.  Like the SIMD
+            // preheaders above, normal back-edges target `pc_to_native[pc]`
+            // below and therefore skip this fall-through-only fast path.
+            if let Some(dot) = self
+                .matrix_dot_loops
+                .iter()
+                .find(|dot| dot.header_pc == pc)
+                .cloned()
+            {
+                self.emit_matrix_dot_preheader(&dot);
             }
 
             // (The speculative-BCE range guards are emitted at the TOP of this
@@ -29687,6 +30107,43 @@ pub fn compile_with_param_slots(
         analyze_bounds_elimination(code, code_len, &loops)
     };
 
+    // Guarded matrix dot-product lowering.  This is a pre-header replacement
+    // like the SIMD reductions below, but it remains useful for Java's
+    // array-of-row `int[][]` layout where the right-hand column is not
+    // contiguous and therefore cannot use ordinary packed loads.  The kill
+    // switch restores the generic scalar emitter for diagnostics.
+    let matrix_dot_enabled =
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_MATRIX_DOT").map_or(true, |v| {
+            let value = v.trim();
+            value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("off")
+        });
+    let matrix_dot_loops: Vec<MatrixDotLoop> = if matrix_dot_enabled && !no_bce {
+        loops
+            .iter()
+            .filter(|(header, _)| !bypassable_headers.contains(header))
+            .filter_map(|&(header, back_edge)| {
+                let loop_end = back_edge + bytecode_len_at(code, back_edge);
+                let iv = find_induction_variable(code, header, loop_end)?;
+                detect_matrix_dot_loop(code, header, back_edge, iv)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !matrix_dot_loops.is_empty()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    {
+        eprintln!(
+            "[JIT_GEN] matrix-dot headers={:?}",
+            matrix_dot_loops
+                .iter()
+                .map(|dot| dot.header_pc)
+                .collect::<Vec<_>>()
+        );
+    }
+
     // SIMD: detect vectorizable int-array-sum loops (requires AVX2)
     let simd_loops = if has_avx2() && !no_bce {
         let mut simd = Vec::new();
@@ -29842,7 +30299,7 @@ pub fn compile_with_param_slots(
         && compact_field_info.is_empty()
         && inline_sites.is_empty()
         && speculative_bce_guards.is_empty();
-    let alloc_result = if kernel_reg_homes {
+    let mut alloc_result = if kernel_reg_homes {
         let mut ar = alloc_result;
         let ref_mask =
             super::regalloc::find_reference_locals(code, code_len, max_locals) | param_oop_mask;
@@ -29861,6 +30318,18 @@ pub fn compile_with_param_slots(
     } else {
         alloc_result
     };
+    if !matrix_dot_loops.is_empty() {
+        // R12..R15 are private scratch homes for the tight pre-header.  Do not
+        // let graph coloring simultaneously assign a Java local to one of
+        // them; locals displaced here simply retain their canonical frame
+        // homes.  Compiler::new still saves all four registers for ABI
+        // correctness, independently of the local-home diagnostic gates.
+        for assignment in &mut alloc_result.assignments {
+            if matches!(*assignment, Some(R12 | R13 | R14 | R15)) {
+                *assignment = None;
+            }
+        }
+    }
 
     // Precise escape re-analysis. `jit_scan` produced `non_escaping_new`
     // with a conservative empty shape map (it has no CP resolver). Now
@@ -29998,6 +30467,7 @@ pub fn compile_with_param_slots(
         hoist_info,
         arith_hoist_info,
         alloc_result,
+        !matrix_dot_loops.is_empty(),
         *helpers,
         num_scalar_slots,
         cache_jit_thread_for_inline_new,
@@ -30265,6 +30735,7 @@ pub fn compile_with_param_slots(
     compiler.pic_slots = pic_slots;
     compiler.unroll_loops = unroll_loops;
     compiler.simd_loops = simd_loops;
+    compiler.matrix_dot_loops = matrix_dot_loops;
     compiler.branch_hints = branch_hints.into_iter().collect();
     compiler.loop_unroll_hints = loop_unroll_hints.into_iter().collect();
     compiler.ldc_info = ldc_info;
@@ -31096,6 +31567,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             alloc_result,
+            false,
             test_helpers(),
             0,
             false,
@@ -35930,6 +36402,54 @@ mod tests {
         assert_eq!(hoists[0].seq_end, 13);
         assert_eq!(hoists[0].array_local, 0);
         assert_eq!(hoists[0].index_local, 4);
+    }
+
+    #[test]
+    fn detects_exact_guarded_matrix_dot_product_loop() {
+        // CratonBench.matmul's javac bytecode at bci 31..62.
+        let mut code = vec![0u8; 31];
+        code.extend_from_slice(&[
+            0x15, 0x07, // 31: iload 7 (k)
+            0x1c, // 33: iload_2 (n)
+            0xa2, 0x00, 0x1d, // 34: if_icmpge 63
+            0x15, 0x06, // 37: iload 6 (sum)
+            0x2a, // 39: aload_0 (a)
+            0x15, 0x04, // 40: iload 4 (row)
+            0x32, // 42: aaload
+            0x15, 0x07, // 43: iload 7 (k)
+            0x2e, // 45: iaload
+            0x2b, // 46: aload_1 (b)
+            0x15, 0x07, // 47: iload 7 (k)
+            0x32, // 49: aaload
+            0x15, 0x05, // 50: iload 5 (column)
+            0x2e, // 52: iaload
+            0x68, // 53: imul
+            0x60, // 54: iadd
+            0x36, 0x06, // 55: istore 6
+            0x84, 0x07, 0x01, // 57: iinc 7,1
+            0xa7, 0xff, 0xe3, // 60: goto 31
+        ]);
+
+        let dot = detect_matrix_dot_loop(&code, 31, 60, 7).expect("matrix dot loop");
+        assert_eq!(
+            dot,
+            MatrixDotLoop {
+                header_pc: 31,
+                back_edge_pc: 60,
+                iv_local: 7,
+                bound_local: 2,
+                acc_local: 6,
+                a_outer_local: 0,
+                a_row_local: 4,
+                b_outer_local: 1,
+                b_column_local: 5,
+            }
+        );
+
+        // Any side effect or different arithmetic body must stay on the exact
+        // scalar emitter; fallback restart would not be valid for it.
+        code[53] = 0x4f; // iastore instead of imul
+        assert!(detect_matrix_dot_loop(&code, 31, 60, 7).is_none());
     }
 
     #[cfg(feature = "vm-tests")]
@@ -43375,9 +43895,9 @@ mod flag_and_header_contracts {
         let src = include_str!("x64.rs");
         // Needles assembled at runtime so this test's own text is not counted.
         let cases: [(&str, &str, usize); 4] = [
-            ("HEADER_SIZE", " as u8", 31),
-            ("HEADER_SIZE", " as i32", 11),
-            ("ARRAY_LENGTH_OFFSET", " as u8", 16),
+            ("HEADER_SIZE", " as u8", 32),
+            ("HEADER_SIZE", " as i32", 13),
+            ("ARRAY_LENGTH_OFFSET", " as u8", 20),
             ("ARRAY_LENGTH_OFFSET", " as i32", 5),
         ];
         for (base, suffix, expected) in cases {
