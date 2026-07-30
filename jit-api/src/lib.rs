@@ -1412,6 +1412,7 @@ mod tests {
             jit_card_old_base: 0x1178,
             jit_card_old_end: 0x1180,
             set_throw_bci: 0x1188,
+            service_callee_deopt: 0x1190,
         }
     }
 
@@ -1641,6 +1642,7 @@ mod tests {
             jit_card_old_base: 0,
             jit_card_old_end: 0,
             set_throw_bci: 0,
+            service_callee_deopt: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -1816,8 +1818,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 56.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 56);
+        // And the macro-driven count is the canonical 58.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 58);
     }
 
     #[test]
@@ -2100,6 +2102,11 @@ mod tests {
                 "set_throw_bci",
                 std::mem::offset_of!(JitRuntimeHelpers, set_throw_bci),
             ),
+            (
+                57,
+                "service_callee_deopt",
+                std::mem::offset_of!(JitRuntimeHelpers, service_callee_deopt),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2136,8 +2143,8 @@ mod tests {
 
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
-        // The macro must classify every field. 41 RequiredPtr + 6
-        // 41 RequiredPtr + 6 OptionalPtr + 9 Offset = 56. A new
+        // The macro must classify every field.
+        // 42 RequiredPtr + 7 OptionalPtr + 9 Offset = 58. A new
         // field whose classification is omitted will fail to compile (the
         // macro requires both arms); this test pins the *counts* so a
         // reclassification (e.g. demoting a RequiredPtr to OptionalPtr) is
@@ -2153,8 +2160,8 @@ mod tests {
             .filter(|e| e.kind == FieldKind::OptionalPtr)
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
-        assert_eq!(req, 41, "required-pointer count drifted");
-        assert_eq!(opt, 6, "optional-pointer count drifted");
+        assert_eq!(req, 42, "required-pointer count drifted");
+        assert_eq!(opt, 7, "optional-pointer count drifted");
         assert_eq!(off, 9, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
@@ -2197,7 +2204,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(names.len(), 41);
+        assert_eq!(names.len(), 42);
         for name in names {
             let mut h = make_helpers();
             // Zero the field by name via a match — the macro doesn't
@@ -2243,7 +2250,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(required.len(), 41, "expected 41 required pointers");
+        assert_eq!(required.len(), 42, "expected 42 required pointers");
         // throw_exception is the round-10 addition — pin it explicitly so
         // a regression that drops it from the required set is caught here
         // and not just by the count.
@@ -2357,6 +2364,7 @@ mod tests {
             "jit_frem" => h.jit_frem = 0,
             "jit_drem" => h.jit_drem = 0,
             "ldc_string" => h.ldc_string = 0,
+            "set_throw_bci" => h.set_throw_bci = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }
