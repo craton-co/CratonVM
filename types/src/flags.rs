@@ -50,7 +50,7 @@
 //!
 //! There is no single answer in this tree to "what does `CRATONVM_FOO=false`
 //! mean": the [`parse`] module carries five *different* boolean parsers because
-//! five different ones are in use today. `docs/internal/flag-census.md` §10 has
+//! five different ones are in use today. `docs/flag-census.md` §10 has
 //! the full matrix. Unifying them is a behaviour change and is deliberately not
 //! part of this refactor; naming each parser at each field is what makes the
 //! divergence visible enough to retire later, flag by flag, with benchmarks.
@@ -221,8 +221,8 @@ pub mod parse {
 
     /// `!(empty | "0" | "false" | "off" | "no")`, case-insensitive, trimmed.
     ///
-    /// Used by `native_io::env_flag_enabled` for the certified/untrusted
-    /// deployment profile.
+    /// Used by `native_io::env_flag_enabled` for the confinement and strict
+    /// defence-in-depth deployment profiles.
     #[inline]
     pub fn truthy_word(src: &dyn FlagSource, name: &str) -> bool {
         match utf8(src, name) {
@@ -362,7 +362,7 @@ pub mod parse {
     /// `matches!(var(NAME).as_deref(), Ok("1") | Ok("true") | Ok("yes"))` —
     /// exact, lowercase-only, untrimmed; `"on"` is **false** here, unlike
     /// [`affirmative_word`]. Truth table 8 (see the module docs and
-    /// `docs/internal/flag-census.md` §10). Lifted from
+    /// `docs/flag-census.md` §10). Lifted from
     /// `native_builtins::service_loader`'s `CRATONVM_DIAG_SERVICELOADER`.
     #[inline]
     pub fn one_true_yes_exact(src: &dyn FlagSource, name: &str) -> bool {
@@ -461,12 +461,13 @@ pub enum BlockedAccessMode {
 
 /// Compiled-in default for the moving (compacting) young generation.
 ///
-/// # This is the flip
+/// # Default-on contract
 ///
 /// `ARCHITECTURE.md` advertises a "generational semi-space collector (Cheney
 /// moving young gen)". The JIT, root gathering, and collector all now read
 /// [`GcFlags::moving_young`], so this single default switches them together.
-/// `CRATONVM_NO_MOVING_YOUNG` remains a compatibility opt-out.
+/// Keep this `true`: `CRATONVM_NO_MOVING_YOUNG` is the supported compatibility
+/// opt-out and the regression tests below pin both sides of that contract.
 ///
 /// See `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
 pub const DEFAULT_MOVING_YOUNG: bool = true;
@@ -882,11 +883,14 @@ impl LoaderFlags {
 /// Flags read by `cratonvm-native-io`.
 #[derive(Debug, Clone, Default)]
 pub struct IoFlags {
-    /// `CRATONVM_CONFINE_IO` — certified deployment profile: enable CWD
+    /// `CRATONVM_CONFINE_IO` — the confinement profile: enable CWD
     /// confinement, fail closed. [`parse::truthy_word`].
     pub confine_io: bool,
-    /// `CRATONVM_UNTRUSTED_CODE` — untrusted-bytecode profile: enable CWD
-    /// confinement, warn loudly. [`parse::truthy_word`].
+    /// `CRATONVM_UNTRUSTED_CODE` — the strict defence-in-depth profile: the
+    /// same fail-closed CWD confinement as `confine_io` (it aborts too, it does
+    /// not warn and continue), plus it implies `CRATONVM_REQUIRE_POLICY` and
+    /// unconditionally denies host-native access (JNI library loads,
+    /// `SymbolLookup`, FFM downcalls). [`parse::truthy_word`].
     pub untrusted_code: bool,
     /// `CRATONVM_BLOCK_PRIVATE_NETS` — deny outbound to loopback and RFC1918.
     /// [`parse::truthy_word`].
@@ -897,6 +901,8 @@ pub struct IoFlags {
     /// `CRATONVM_REAL_NET_SOCKETS` — use real OS sockets instead of the
     /// synthetic implementations.
     pub real_net_sockets: bool,
+    /// `CRATONVM_SYNTHETIC_NET_SOCKETS` explicitly selects the legacy surface.
+    pub synthetic_net_sockets_forced: bool,
     /// `CRATONVM_SYNTHETIC_FILEWRITER=1` — opt back into the synthetic (known
     /// lossy) `FileWriter`. Consumers want `!synthetic_filewriter_forced`.
     /// [`parse::exactly_one`].
@@ -951,7 +957,9 @@ impl IoFlags {
             untrusted_code: truthy_word(src, "CRATONVM_UNTRUSTED_CODE"),
             block_private_nets: truthy_word(src, "CRATONVM_BLOCK_PRIVATE_NETS"),
             resolve_outbound_host: truthy_word(src, "CRATONVM_RESOLVE_OUTBOUND_HOST"),
-            real_net_sockets: present(src, "CRATONVM_REAL_NET_SOCKETS"),
+            real_net_sockets: !present(src, "CRATONVM_SYNTHETIC_NET_SOCKETS")
+                || present(src, "CRATONVM_REAL_NET_SOCKETS"),
+            synthetic_net_sockets_forced: present(src, "CRATONVM_SYNTHETIC_NET_SOCKETS"),
             synthetic_filewriter_forced: exactly_one(src, "CRATONVM_SYNTHETIC_FILEWRITER"),
             synthetic_raf_forced: exactly_one(src, "CRATONVM_SYNTHETIC_RAF"),
             socket_capture_prefix: non_empty_string(src, "CRATONVM_SOCKET_CAPTURE"),
@@ -1382,6 +1390,8 @@ pub struct NativeFlags {
 
     /// `CRATONVM_REAL_AQS`
     pub real_aqs: bool,
+    /// Real JDK ForkJoinPool is default; the synthetic implementation is opt-in.
+    pub real_forkjoinpool: bool,
 
     /// `CRATONVM_REAL_JCA`
     pub real_jca: bool,
@@ -1445,6 +1455,8 @@ pub struct NativeFlags {
 
     /// `CRATONVM_SYNTHETIC_EQE` — [`parse::present_utf8`].
     pub synthetic_eqe: bool,
+    /// `CRATONVM_SYNTHETIC_FORKJOINPOOL`
+    pub synthetic_forkjoinpool: bool,
 
     /// `CRATONVM_SYNTHETIC_PQC`
     pub synthetic_pqc: bool,
@@ -1614,6 +1626,8 @@ impl NativeFlags {
             real_agroal: present(src, "CRATONVM_REAL_AGROAL"),
             real_annotations: on_unless_off_word_cased(src, "CRATONVM_REAL_ANNOTATIONS"),
             real_aqs: present(src, "CRATONVM_REAL_AQS"),
+            real_forkjoinpool: !present(src, "CRATONVM_SYNTHETIC_FORKJOINPOOL")
+                || present(src, "CRATONVM_REAL_FORKJOINPOOL"),
             real_jca: present(src, "CRATONVM_REAL_JCA"),
             real_proxy: truthy_word_default_true(src, "CRATONVM_REAL_PROXY"),
             real_proxy_strict: affirmative_word(src, "CRATONVM_REAL_PROXY_STRICT"),
@@ -1634,6 +1648,7 @@ impl NativeFlags {
             synthetic_dsa: present(src, "CRATONVM_SYNTHETIC_DSA"),
             synthetic_ec: present(src, "CRATONVM_SYNTHETIC_EC"),
             synthetic_eqe: present_utf8(src, "CRATONVM_SYNTHETIC_EQE"),
+            synthetic_forkjoinpool: present(src, "CRATONVM_SYNTHETIC_FORKJOINPOOL"),
             synthetic_pqc: present(src, "CRATONVM_SYNTHETIC_PQC"),
             synthetic_quarkus_start: present(src, "CRATONVM_SYNTHETIC_QUARKUS_START"),
             synthetic_rsa: present(src, "CRATONVM_SYNTHETIC_RSA"),
@@ -1850,18 +1865,18 @@ mod tests {
     fn empty_source_matches_all_documented_defaults() {
         let f = VmFlags::from_source(&MapSource::empty());
         // Every opt-in flag is off…
-        // `moving_young` is no longer an opt-in — it tracks
-        // `DEFAULT_MOVING_YOUNG`, which is the single constant that flips the
-        // young generation to a copying collector. Assert against the constant,
-        // not against `false`, so the flip does not have to edit this test (and
-        // so this test cannot silently become the thing that blocks it).
-        assert_eq!(f.gc.moving_young, DEFAULT_MOVING_YOUNG);
+        // `moving_young` is no longer an opt-in. Pin the shipped default
+        // directly so an accidental reversion cannot hide behind the constant.
+        assert!(DEFAULT_MOVING_YOUNG);
+        assert!(f.gc.moving_young);
         assert!(!f.gc.card_table_only);
         assert!(!f.gc.dbg_a2);
         assert!(!f.jit.shadow_stack);
         assert!(!f.jit.method_stats);
         // …and every default-ON flag is on.
         assert!(f.gc.old_sweep_jit);
+        assert!(f.io.real_net_sockets);
+        assert!(f.natives.real_forkjoinpool);
         // Value flags fall back.
         assert_eq!(f.gc.g1_workers, None);
         assert_eq!(f.gc.gc_stress_bytes, None);
@@ -1869,6 +1884,25 @@ mod tests {
         assert_eq!(f.gc.dbg_watch_cell, 0);
         assert_eq!(f.gc.dbg_blocked_access, BlockedAccessMode::Off);
         assert!(!f.jit.disable_jit);
+    }
+
+    #[test]
+    fn concurrency_and_socket_legacy_surfaces_require_explicit_opt_out() {
+        let f = VmFlags::from_source(&src(&[
+            ("CRATONVM_SYNTHETIC_FORKJOINPOOL", "1"),
+            ("CRATONVM_SYNTHETIC_NET_SOCKETS", "1"),
+        ]));
+        assert!(!f.natives.real_forkjoinpool);
+        assert!(!f.io.real_net_sockets);
+
+        let f = VmFlags::from_source(&src(&[
+            ("CRATONVM_SYNTHETIC_FORKJOINPOOL", "1"),
+            ("CRATONVM_REAL_FORKJOINPOOL", "1"),
+            ("CRATONVM_SYNTHETIC_NET_SOCKETS", "1"),
+            ("CRATONVM_REAL_NET_SOCKETS", "1"),
+        ]));
+        assert!(f.natives.real_forkjoinpool);
+        assert!(f.io.real_net_sockets);
     }
 
     #[test]
@@ -1956,7 +1990,15 @@ mod tests {
     /// never actually enable it in the case it exists for.
     #[test]
     fn moving_young_is_an_opt_out_with_a_compatibility_opt_in() {
-        assert!(!VmFlags::from_source(&src(&[("CRATONVM_NO_MOVING_YOUNG", "1")])).gc.moving_young);
+        assert!(
+            VmFlags::from_source(&MapSource::empty()).gc.moving_young,
+            "the shipped generational collector must compact young by default"
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_NO_MOVING_YOUNG", "1")]))
+                .gc
+                .moving_young
+        );
         // Opt-out beats opt-in — "turn it off" must always be honoured.
         let both = VmFlags::from_source(&src(&[
             ("CRATONVM_MOVING_YOUNG", "1"),
@@ -1964,7 +2006,11 @@ mod tests {
         ]));
         assert!(!both.gc.moving_young);
         // And the opt-in alone is sufficient: nothing else has to be set.
-        assert!(VmFlags::from_source(&src(&[("CRATONVM_MOVING_YOUNG", "1")])).gc.moving_young);
+        assert!(
+            VmFlags::from_source(&src(&[("CRATONVM_MOVING_YOUNG", "1")]))
+                .gc
+                .moving_young
+        );
     }
 
     #[test]

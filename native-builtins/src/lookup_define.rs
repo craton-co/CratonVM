@@ -223,6 +223,48 @@ fn inherit_lookup_loader(ctx: &mut dyn NativeContext, this_lookup: ObjectRef) ->
     }
 }
 
+/// Resolve the generated class's direct supertypes through the lookup class's
+/// initiating loader before definition. A lookup loader may legitimately
+/// delegate a superclass to its parent, so the superclass ClassId need not be
+/// defined under the generated class's own namespace. Passing the resolved
+/// identities through `DefineClassFull` prevents the class manager's
+/// name-only fallback from selecting an unrelated same-named copy.
+fn resolve_lookup_supertypes(
+    ctx: &mut dyn NativeContext,
+    this_lookup: ObjectRef,
+    class_bytes: &[u8],
+) -> (
+    Option<cratonvm_types::ClassId>,
+    Option<Vec<cratonvm_types::ClassId>>,
+) {
+    let lookup_mirror = match ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF) {
+        Value::Object(Some(mirror)) => mirror,
+        _ => return (None, None),
+    };
+    let Some(lookup_class_id) = crate::lang_class::mirror_class_id(ctx, lookup_mirror) else {
+        return (None, None);
+    };
+    let Ok(class_file) = cratonvm_reader::read_class(class_bytes) else {
+        return (None, None);
+    };
+
+    let superclass_id = match class_file.super_class.as_deref() {
+        Some(name) => match ctx.class_id_by_name_via_referencing_class(lookup_class_id, name) {
+            Ok(id) => Some(id),
+            Err(_) => return (None, None),
+        },
+        None => None,
+    };
+    let mut interface_ids = Vec::with_capacity(class_file.interfaces.len());
+    for name in &class_file.interfaces {
+        match ctx.class_id_by_name_via_referencing_class(lookup_class_id, name) {
+            Ok(id) => interface_ids.push(id),
+            Err(_) => return (None, None),
+        }
+    }
+    (superclass_id, Some(interface_ids))
+}
+
 /// Allocate a fresh Lookup synthetic with full-power modes pointing at
 /// the given mirror. Mirrors `classloader.rs::alloc_lookup` but uses
 /// only the public `NativeContext` surface so this module stays
@@ -269,10 +311,15 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // hostLoader)`. Without this, the proxy would always land in the
     // Application namespace and CGLIB's WeakCacheKey lookup misses.
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
+    let (superclass_id_override, interface_id_overrides) =
+        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
 
     let opts = cratonvm_native_api::DefineClassFull {
         skip_verification: true,
         code_source_url,
+        force_loader_faithful_linking: true,
+        superclass_id_override,
+        interface_id_overrides,
         ..Default::default()
     };
 
@@ -362,6 +409,8 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // requires the hidden class to "share the run-time package" of the
     // lookup class, which it cannot if the loaders differ.
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
+    let (superclass_id_override, interface_id_overrides) =
+        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
     // Keep the original name for the mangled hidden-class label.
     let nest_host_class_name_for_label = lookup_name;
 
@@ -381,6 +430,9 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         code_source_url,
         nest_host_class_name,
         initialize,
+        force_loader_faithful_linking: true,
+        superclass_id_override,
+        interface_id_overrides,
         ..Default::default()
     };
 
@@ -520,6 +572,8 @@ fn lk_define_hidden_class_with_class_data(
     // Same loader-inheritance fix as the plain variant — LambdaMetafactory
     // and CGLIB classData-bound proxies both rely on it.
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
+    let (superclass_id_override, interface_id_overrides) =
+        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
     let nest_host_class_name_for_label = lookup_name;
 
     let original = nest_host_class_name_for_label
@@ -535,6 +589,9 @@ fn lk_define_hidden_class_with_class_data(
         code_source_url,
         nest_host_class_name,
         initialize,
+        force_loader_faithful_linking: true,
+        superclass_id_override,
+        interface_id_overrides,
         ..Default::default()
     };
 
@@ -659,10 +716,13 @@ pub fn register_lookup_define_class(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ClassId;
 
     fn dummy_this() -> Value {
@@ -676,10 +736,20 @@ mod tests {
         let mut b = vec![0xCA, 0xFE, 0xBA, 0xBE]; // magic
         b.extend_from_slice(&[0x00, 0x00]); // minor 0
         b.extend_from_slice(&[0x00, 0x41]); // major 65 (JDK 21)
-        b.extend_from_slice(&[0x00, 0x01]); // cp_count = 1 (no entries)
+        b.extend_from_slice(&[0x00, 0x05]); // cp_count = 5
+        b.push(1); // #1 Utf8 Generated
+        b.extend_from_slice(&[0x00, 0x09]);
+        b.extend_from_slice(b"Generated");
+        b.push(7); // #2 Class #1
+        b.extend_from_slice(&[0x00, 0x01]);
+        b.push(1); // #3 Utf8 java/lang/Object
+        b.extend_from_slice(&[0x00, 0x10]);
+        b.extend_from_slice(b"java/lang/Object");
+        b.push(7); // #4 Class #3
+        b.extend_from_slice(&[0x00, 0x03]);
         b.extend_from_slice(&[0x00, 0x21]); // access_flags = ACC_PUBLIC|ACC_SUPER
-        b.extend_from_slice(&[0x00, 0x00]); // this_class
-        b.extend_from_slice(&[0x00, 0x00]); // super_class
+        b.extend_from_slice(&[0x00, 0x02]); // this_class
+        b.extend_from_slice(&[0x00, 0x04]); // super_class
         b.extend_from_slice(&[0x00, 0x00]); // interfaces_count
         b.extend_from_slice(&[0x00, 0x00]); // fields_count
         b.extend_from_slice(&[0x00, 0x00]); // methods_count
@@ -1077,6 +1147,21 @@ mod tests {
             Some(7),
             "Lookup.defineClass must inherit the lookup class's user-defined loader"
         );
+        let opts = ctx
+            .last_define_full_opts()
+            .expect("Lookup.defineClass must pass full definition options");
+        assert!(
+            opts.force_loader_faithful_linking,
+            "generated classes must request loader-faithful linking"
+        );
+        assert!(
+            opts.superclass_id_override.is_some(),
+            "the superclass resolved through the lookup class must be preserved by identity"
+        );
+        assert!(
+            opts.interface_id_overrides.is_some(),
+            "the complete interface identity list must be preserved, including an empty list"
+        );
     }
 
     /// Acceptance #2: Application loader (raw id 2) collapses to backend
@@ -1139,6 +1224,12 @@ mod tests {
             Some(11),
             "Lookup.defineHiddenClass must inherit the lookup class's user-defined loader"
         );
+        let opts = ctx
+            .last_define_full_opts()
+            .expect("defineHiddenClass must pass full definition options");
+        assert!(opts.force_loader_faithful_linking);
+        assert!(opts.superclass_id_override.is_some());
+        assert!(opts.interface_id_overrides.is_some());
     }
 
     /// Acceptance #4: `Lookup.defineHiddenClassWithClassData(...)` also
@@ -1172,5 +1263,11 @@ mod tests {
             Some(42),
             "Lookup.defineHiddenClassWithClassData must inherit the user-defined loader"
         );
+        let opts = ctx
+            .last_define_full_opts()
+            .expect("defineHiddenClassWithClassData must pass full definition options");
+        assert!(opts.force_loader_faithful_linking);
+        assert!(opts.superclass_id_override.is_some());
+        assert!(opts.interface_id_overrides.is_some());
     }
 }

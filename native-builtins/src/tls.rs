@@ -7,7 +7,7 @@
 //! for TLS/SSL support in the CratonVM native layer.
 
 // The `tls_impl` submodule contains a TLS 1.3 handshake emulator that depends
-// on the crypto primitives in `crate::crypto::crypto_impl`. It is therefore
+// on the crypto primitives in `crate::crypto_impl`. It is therefore
 // gated behind `legacy-synthetic-crypto`; the rest of the javax.net.ssl surface in
 // this module is unconditional (NEW-13).
 #[cfg(feature = "legacy-synthetic-crypto")]
@@ -3330,34 +3330,30 @@ mod tls_tests {
     }
 
     #[test]
-    fn test_ssl_socket_factory_registration() {
+    fn test_ssl_socket_factory_synthetic_surface_is_dropped_with_real_sockets() {
         let mut r = NativeMethodRegistry::new();
         register_tls_natives(&mut r);
         let cls = "javax/net/ssl/SSLSocketFactory";
-        assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r
-            .find(cls, "getDefault", "()Ljavax/net/ssl/SSLSocketFactory;")
-            .is_some());
-        assert!(r
-            .find(
-                cls,
+        for (name, descriptor) in [
+            ("<init>", "()V"),
+            ("getDefault", "()Ljavax/net/ssl/SSLSocketFactory;"),
+            (
                 "createSocket",
-                "(Ljava/lang/String;I)Ljava/net/Socket;"
-            )
-            .is_some());
-        assert!(r
-            .find(
-                cls,
+                "(Ljava/lang/String;I)Ljava/net/Socket;",
+            ),
+            (
                 "createSocket",
-                "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
-            )
-            .is_some());
-        assert!(r
-            .find(cls, "getDefaultCipherSuites", "()[Ljava/lang/String;")
-            .is_some());
-        assert!(r
-            .find(cls, "getSupportedCipherSuites", "()[Ljava/lang/String;")
-            .is_some());
+                "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;",
+            ),
+            ("getDefaultCipherSuites", "()[Ljava/lang/String;"),
+            ("getSupportedCipherSuites", "()[Ljava/lang/String;"),
+        ] {
+            assert!(
+                r.find(cls, name, descriptor).is_none(),
+                "{cls}.{name}{descriptor} is a SyntheticStub and must not shadow \
+                 the real socket/TLS path when real sockets are the default"
+            );
+        }
     }
 
     #[test]

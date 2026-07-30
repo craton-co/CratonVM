@@ -292,6 +292,10 @@ fn run_class_env(class_simple_name: &str, env_vars: &[(&str, &str)]) -> Option<R
         "CRATONVM_REAL_RAF",
         "CRATONVM_REAL_NET_SOCKETS",
         "CRATONVM_REAL_FORKJOINPOOL",
+        "CRATONVM_SYNTHETIC_AQS",
+        "CRATONVM_SYNTHETIC_RAF",
+        "CRATONVM_SYNTHETIC_NET_SOCKETS",
+        "CRATONVM_SYNTHETIC_FORKJOINPOOL",
     ] {
         cmd.env_remove(var);
     }
@@ -451,7 +455,7 @@ fn synthetic_vs_real() {
 /// attribute reads on a @Retention(RUNTIME) annotation.
 #[test]
 fn real_annotations_path() {
-    let run = match run_class_env("RealAnnotations", &[("CRATONVM_REAL_ANNOTATIONS", "1")]) {
+    let run = match run_class_env("RealAnnotations", &[]) {
         Some(r) => r,
         None => return,
     };
@@ -489,7 +493,7 @@ fn real_annotations_path() {
 /// condition through the real lock view.
 #[test]
 fn real_aqs_path() {
-    let run = match run_class_env("RealAqs", &[("CRATONVM_REAL_AQS", "1")]) {
+    let run = match run_class_env("RealAqs", &[]) {
         Some(r) => r,
         None => return,
     };
@@ -526,7 +530,7 @@ fn real_aqs_path() {
 /// verifies the values.
 #[test]
 fn real_raf_path() {
-    let run = match run_class_env("RealRaf", &[("CRATONVM_REAL_RAF", "1")]) {
+    let run = match run_class_env("RealRaf", &[]) {
         Some(r) => r,
         None => return,
     };
@@ -559,7 +563,7 @@ fn real_raf_path() {
 /// common pool and verifies the results.
 #[test]
 fn real_fjp_path() {
-    let run = match run_class_env("RealFjp", &[("CRATONVM_REAL_FORKJOINPOOL", "1")]) {
+    let run = match run_class_env("RealFjp", &[]) {
         Some(r) => r,
         None => return,
     };
@@ -592,7 +596,7 @@ fn real_fjp_path() {
 /// client from the same JVM, sends a byte, and verifies the exchange.
 #[test]
 fn real_net_sockets_path() {
-    let run = match run_class_env("RealNetSockets", &[("CRATONVM_REAL_NET_SOCKETS", "1")]) {
+    let run = match run_class_env("RealNetSockets", &[]) {
         Some(r) => r,
         None => return,
     };

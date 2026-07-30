@@ -47,15 +47,13 @@ production-ready as of the 0.3.0 release. Specific limitations:
   implemented. RSA-PSS, `NONEwithRSA`, and DSA are NOT backed —
   unrecognised algorithms fail closed (`sign()` yields an empty array,
   `verify()` returns `false`).
-- **Signed-JAR verification**: handled by a *separate* implementation
-  (`classloading/src/jar_signer.rs`) that verifies the PKCS#7 signer
-  block, the `.SF` digest binding, the SignerInfo signature, and the
-  X.509 chain to a trust anchor. It implements **RSA PKCS#1 v1.5
-  (SHA-1/256/384/512) only**; ECDSA and DSA signer blocks are
-  *recognised but fail closed* (`SigVerify::Unsupported` /
-  `TrustError::NotImplemented`), so ECDSA/DSA-signed JARs are rejected.
-  RSA-PSS is not handled. This differs from the JCA `Signature` API
-  above, which the JAR signer does not share code with.
+- **Signed-JAR verification**: `classloading/src/jar_signer.rs` verifies the
+  PKCS#7 signer block, `.SF` digest binding, SignerInfo signature, and an RFC
+  5280 path to a configured trust anchor. RSA PKCS#1 v1.5
+  (SHA-1/256/384/512), ECDSA P-256/P-384, and DSA signer blocks are supported;
+  RSA-PSS remains unsupported and fails closed. RSA verification is shared
+  with the JCA implementation through `native-builtins-crypto`, so the two
+  trust paths cannot silently drift in padding or digest handling.
 - **TLS (SunJSSE / SunJSSL)**: TLS endpoints are NOT supported. Use the
   process's external TLS terminator (nginx, Envoy) instead.
 
@@ -97,25 +95,19 @@ adversarial input.
   denies once a policy is parsed via `load_policy_file` / `set_active_policy`. Several
   `checkAccess` variants are unconditional allow. `ProcessBuilder.start` / `Runtime.exec*`
   consult the installed SecurityManager via `checkExec(command[0])` before any spawn
-  syscall. The Panama / FFI downcall path is **not** gated by the SecurityManager (a
-  documented follow-up), so native access bypasses these checks. This is **not** a
-  sandbox for untrusted code — stack-based access control is not enforced, no
-  `java.policy` is loaded by default, and the SecurityManager surface is deprecated for
+  syscall. Host-library loading and Panama/FFM downcalls consult the same
+  SecurityManager gate. `CRATONVM_UNTRUSTED_CODE` implies fail-closed policy
+  handling and rejects those host-native paths unconditionally. This is still
+  **not** an in-process sandbox: enforcement is incomplete, no policy is loaded
+  by default outside the strict profile, and SecurityManager is deprecated for
   removal (JEP 411).
 - No sandboxing of loaded Java classes
-- **Incomplete signed-JAR trust.** The signed-JAR verifier
-  (`classloading/src/jar_signer.rs`) implements RSA PKCS#1 v1.5 only. ECDSA and
-  DSA signer blocks, RSA-PSS, and full RFC 5280 certification-path validation are
-  **NOT** implemented. Signed-jar trust currently **fails closed**: a signed jar
-  whose signature cannot be verified by the supported path is rejected, but the
-  VM cannot cryptographically *establish trust* in the general case. Do not rely
-  on jar signatures as a trust boundary.
-- **Known JIT crash (under investigation).** A JIT-related native crash is
-  tracked in [`docs/real-raf-segv-root-cause.md`](docs/real-raf-segv-root-cause.md).
-  Two distinct root causes documented there have been fixed; the area remains
-  under active investigation and is disclosed here as a known issue rather than
-  hidden. Use `--nojit` to run the interpreter only if you need to avoid the JIT
-  entirely.
+- **Signed-JAR scope.** RSA-PSS and revocation checking remain unsupported.
+  Unsupported algorithms and untrusted paths fail closed. Do not treat signed
+  JARs as a substitute for controlling the classpath or an OS trust boundary.
+- **Resolved RAF/JIT crash history.** The two native-crash root causes and their
+  regression coverage are recorded in
+  [`docs/real-raf-segv-root-cause.md`](docs/real-raf-segv-root-cause.md).
 
 ## Hardening Measures
 
@@ -159,10 +151,13 @@ CratonVM uses `unsafe` Rust in the following subsystems:
 | jfr | Java Flight Recorder buffer encoding | Bounded ring buffers, length-checked writes |
 
 `unsafe` blocks in the core subsystems (GC, JIT, and `ObjectRef`) are documented
-with `// SAFETY:` comments describing the relied-upon invariant. Full
-`// SAFETY:` coverage across all subsystems above is still in progress — the
-peripheral subsystems (native-io, native-awt, cuda-bridge, jfr) are not yet
-fully annotated.
+with `// SAFETY:` comments describing the relied-upon invariant. The
+`native-io`, `native-awt`, `cuda-bridge`, and `jfr` crates now enforce
+`clippy::undocumented_unsafe_blocks` and `clippy::missing_safety_doc` as hard
+errors at their crate roots, including test targets and the optional real-CUDA
+feature. CI also runs Miri against the core `types` representation crate; this
+is a focused UB gate, not a claim that Miri can execute the OS/JIT/driver FFI
+surfaces.
 
 ## Reporting a Vulnerability
 

@@ -25,7 +25,7 @@
 //! will silently see "no candidates / not hot / not monomorphic" for every
 //! call site in the VM, and its effect will be indistinguishable from being
 //! turned off. That failure mode — a capability that reads as landed but never
-//! runs — is exactly what `docs/internal/flag-census.md` tracks.
+//! runs — is exactly what `docs/flag-census.md` tracks.
 //!
 //! **The live profile is [`crate::profile`]**, which the interpreter really
 //! does feed (`ProfileStore::record_branch_borrowed` / `record_backedge_borrowed`

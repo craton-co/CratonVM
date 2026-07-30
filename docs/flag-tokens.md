@@ -56,7 +56,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-342 tokens.
+349 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -135,6 +135,7 @@ export inherited from a parent shell.
 | `dupcall-filter` | `CRATONVM_DBG_DUPCALL_FILTER` |
 | `dupclass` | `CRATONVM_DBG_DUPCLASS` |
 | `dupclass-bt` | `CRATONVM_DBG_DUPCLASS_BT` |
+| `dupclass-filter` | `CRATONVM_DBG_DUPCLASS_FILTER` |
 | `dupx-methods` | `CRATONVM_DBG_DUPX_METHODS` |
 | `ecwatch` | `CRATONVM_DBG_ECWATCH` |
 | `ecwatch-native` | `CRATONVM_DBG_ECWATCH_NATIVE` |
@@ -194,6 +195,7 @@ export inherited from a parent shell.
 | `inline-fr` | `CRATONVM_DBG_INLINE_FR` |
 | `interrupt` | `CRATONVM_DBG_INTERRUPT` |
 | `intrinsic-stats` | `CRATONVM_INTRINSIC_STATS` |
+| `isolated-cnf` | `CRATONVM_DBG_ISOLATED_CNF` |
 | `invoke-coerce` | `CRATONVM_DBG_INVOKE_COERCE` |
 | `invoke-virtual-entry-trace` | `CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE` |
 | `invokestatic-loader-trace` | `CRATONVM_INVOKESTATIC_LOADER_TRACE` |
@@ -251,8 +253,10 @@ export inherited from a parent shell.
 | `modstatic` | `CRATONVM_DBG_MODSTATIC` |
 | `monenter` | `CRATONVM_DBG_MONENTER` |
 | `monexit` | `CRATONVM_DBG_MONEXIT` |
+| `moving-young-band-dbg` | `CRATONVM_MOVING_YOUNG_BAND_DBG` |
 | `moving-young-coverage-dbg` | `CRATONVM_MOVING_YOUNG_COVERAGE_DBG` |
 | `moving-young-fallbacks` | `CRATONVM_MOVING_YOUNG_FALLBACKS` |
+| `moving-young-no-band-verify` | `CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY` |
 | `moving-young-verify` | `CRATONVM_MOVING_YOUNG_VERIFY` |
 | `msc` | `CRATONVM_DBG_MSC` |
 | `mtroots` | `CRATONVM_DBG_MTROOTS` |
@@ -377,6 +381,7 @@ export inherited from a parent shell.
 | `track-native` | `CRATONVM_TRACK_NATIVE` |
 | `uclreg` | `CRATONVM_DBG_UCLREG` |
 | `uclres` | `CRATONVM_DBG_UCLRES` |
+| `ucltrace` | `CRATONVM_DBG_UCLTRACE` |
 | `ueh-debug` | `CRATONVM_UEH_DEBUG` |
 | `uncaught` | `CRATONVM_DBG_UNCAUGHT` |
 | `underflow` | `CRATONVM_DBG_UNDERFLOW` |
@@ -525,6 +530,7 @@ export inherited from a parent shell.
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
 | `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
+| `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
 | `overhead-limit` | `CRATONVM_GC_OVERHEAD_LIMIT` |
 | `par-min-bytes` | `CRATONVM_GC_PAR_MIN_BYTES` |
 | `par-threads` | `CRATONVM_GC_PAR_THREADS` |
@@ -551,10 +557,10 @@ export inherited from a parent shell.
 | `ec` | `CRATONVM_SYNTHETIC_EC` |
 | `eqe` | `CRATONVM_SYNTHETIC_EQE` |
 | `filewriter` | `CRATONVM_SYNTHETIC_FILEWRITER` |
-| `forkjoinpool` | `CRATONVM_REAL_FORKJOINPOOL` |
+| `forkjoinpool` | `CRATONVM_REAL_FORKJOINPOOL / CRATONVM_SYNTHETIC_FORKJOINPOOL` |
 | `jca` | `CRATONVM_REAL_JCA` |
 | `msc-real-start` | `CRATONVM_MSC_REAL_START` |
-| `net-sockets` | `CRATONVM_REAL_NET_SOCKETS` |
+| `net-sockets` | `CRATONVM_REAL_NET_SOCKETS / CRATONVM_SYNTHETIC_NET_SOCKETS` |
 | `pqc` | `CRATONVM_SYNTHETIC_PQC` |
 | `proxy` | `CRATONVM_REAL_PROXY` |
 | `proxy-strict` | `CRATONVM_REAL_PROXY_STRICT` |
@@ -638,7 +644,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-8 tokens.
+10 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -649,7 +655,9 @@ export inherited from a parent shell.
 | `jboss-logger-base-emit` | `CRATONVM_JBOSS_LOGGER_BASE_EMIT` |
 | `jboss-mp-root` | `CRATONVM_JBOSS_MP_ROOT` |
 | `lazy-streams` | `CRATONVM_LAZY_STREAMS` |
+| `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
+| `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 
 ## `CRATONVM_TEST`
 

@@ -355,6 +355,8 @@ fn dbb_allocate(size: i64) -> Result<u64, MethodCallFailed> {
     // zero, but `DirectByteBuffer`'s `<init>(int)` calls
     // `Unsafe.setMemory(addr, n, 0)`.  Doing it here at the source
     // means callers don't have to issue a separate native.
+    // SAFETY: `addr` is a fresh allocation of exactly `usize_size` bytes (or
+    // the zero-size sentinel) and is writable for that entire range.
     unsafe { std::ptr::write_bytes(addr, 0, usize_size) };
     // ABA fix: bump this address's live generation. Each free path then
     // recovers the generation captured in its size-record at allocation

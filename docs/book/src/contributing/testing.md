@@ -18,8 +18,9 @@ Tests that require `javac` skip gracefully when no JDK is on the `PATH`.
 
 The CI pipeline is configured to run `cargo fmt --check`, `cargo build`,
 `cargo clippy -D warnings`, and `cargo test` across the workspace on Linux and
-Windows. Coverage, semantic difftest, real-path smoke, and fuzz-smoke jobs are
-advisory today; check the current Actions run before treating a branch as
+Windows. The coverage job is blocking on the report being generated, but
+enforces no percentage; semantic difftest, real-path smoke, and fuzz-smoke jobs
+are advisory today. Check the current Actions run before treating a branch as
 release-ready.
 
 ## Local CI Checklist
@@ -34,16 +35,19 @@ cargo test --workspace --all-targets --no-fail-fast
 cargo llvm-cov --workspace --lcov --output-path lcov.info
 ```
 
-Then check the coverage target:
+If you want to measure against a threshold you have chosen locally, the
+repository retains:
 
 ```powershell
 pwsh scripts/check-lcov-threshold.ps1 -Path lcov.info -LineThreshold 85
 ```
 
-The repository currently treats **85% line coverage** as an advisory
-release-readiness target. CI does not enforce a coverage threshold today. If a
-branch cannot produce a whole-workspace LCOV report, or reports below 85%, call
-that out explicitly instead of treating the coverage job as green.
+That is a measurement aid only. The repository does **not** claim 85% line
+coverage — or any other minimum — because no complete, reproducible baseline
+has been measured on the release CI image. What CI enforces is that the report
+is *generated*: the coverage job fails if the whole-workspace LCOV report is
+missing. If a branch cannot produce one, call that out explicitly instead of
+treating the coverage job as green. See `docs/COVERAGE.md`.
 
 ## Test layers
 
@@ -118,8 +122,9 @@ when prerequisites such as `java` or the corpus are missing.
 
 ## Code coverage
 
-Coverage is generated with `cargo-llvm-cov` locally and in an advisory CI job.
-Release-ready branches should meet the 85% line coverage target, but the target
-is not an enforced CI threshold today. See the repository's coverage
-documentation for invocation details and the current advisory-to-blocking
-promotion checklist.
+Coverage is generated with `cargo-llvm-cov` locally and in CI. The CI job is
+blocking on the report being produced — it runs without soft-fail behaviour and
+uploads `lcov.info` with `if-no-files-found: error` — but no line-coverage
+percentage is enforced, and none is claimed: the project does not assert a
+coverage figure until a complete, reproducible baseline has been measured on the
+release CI image. See `docs/COVERAGE.md` for invocation details.

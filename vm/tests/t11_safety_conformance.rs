@@ -104,10 +104,36 @@ fn t11_1_gen_heap_safety_comments() {
     );
 }
 
+/// Sum `check_safety_comments` over a file and every `.rs` in a sibling
+/// directory of the same name.
+///
+/// `interpreter.rs` and `x64.rs` were split into `interpreter/` and `x64/`
+/// submodules in 2026-07. A gate that keeps measuring only the parent stops
+/// seeing the moved `unsafe` blocks entirely — for `interpreter.rs` that was 27
+/// of 105 — so the percentage it reports becomes an artefact of where the code
+/// happens to live rather than a statement about the code.
+fn check_safety_comments_tree(file: &str, dir: &str) -> (usize, usize) {
+    let (mut total, mut documented) = check_safety_comments(file);
+    let dir_path = ws(dir);
+    let entries = match std::fs::read_dir(&dir_path) {
+        Ok(e) => e,
+        Err(_) => return (total, documented),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let (t, d) = check_safety_comments(&path.to_string_lossy());
+        total += t;
+        documented += d;
+    }
+    (total, documented)
+}
+
 #[test]
 fn t11_1_x64_safety_comments() {
-    let p = ws("jit/src/x64.rs");
-    let (total, documented) = check_safety_comments(&p);
+    let (total, documented) = check_safety_comments_tree(&ws("jit/src/x64.rs"), "jit/src/x64");
     let coverage = if total > 0 {
         documented * 100 / total
     } else {
@@ -140,8 +166,8 @@ fn t11_1_helpers_safety_comments() {
 
 #[test]
 fn t11_1_interpreter_safety_comments() {
-    let p = ws("vm/src/runtime/interpreter.rs");
-    let (total, documented) = check_safety_comments(&p);
+    let (total, documented) =
+        check_safety_comments_tree(&ws("vm/src/runtime/interpreter.rs"), "vm/src/runtime/interpreter");
     let coverage = if total > 0 {
         documented * 100 / total
     } else {

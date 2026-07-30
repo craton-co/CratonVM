@@ -927,6 +927,12 @@ fn jla_find_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
+    // -1 searches every loaded library, so this is the same arbitrary-symbol
+    // address oracle as `SymbolLookup.find` and `NativeLibrary.findEntry0`,
+    // reached through `SharedSecrets`. Gate it identically: default-permissive,
+    // denying only under CRATONVM_UNTRUSTED_CODE or a SecurityManager policy
+    // that withholds `loadLibrary.*`.
+    crate::security_manager::check_host_native_access_or_throw(ctx, "findNative")?;
     let addr = ctx.find_native_symbol(-1, &name).unwrap_or(0);
     Ok(Some(Value::Long(addr as i64)))
 }

@@ -711,9 +711,45 @@ mod tests {
         assert_eq!(REF_ELEMENT_SIZE, 8);
     }
 
+    /// Reinterpret a `Value` as its raw cell bytes, keeping the padding
+    /// `MaybeUninit`.
+    ///
+    /// `Value` is an enum with padding, so `transmute::<Value, [u8; 16]>` is
+    /// Undefined Behaviour — it claims every byte is an initialised integer
+    /// when the padding is not. That is not pedantry: Miri rejects it, and it
+    /// is what this test used to do. Transmuting to `[MaybeUninit<u8>; 16]` is
+    /// always sound, and the readers below only ever `assume_init` the ranges
+    /// the layout defines as real data.
+    #[cfg(test)]
+    fn value_cell_bytes(value: crate::Value) -> [std::mem::MaybeUninit<u8>; SLOT_SIZE] {
+        const _: () = assert!(std::mem::size_of::<crate::Value>() == SLOT_SIZE);
+        // SAFETY: sizes are equal (checked above) and `MaybeUninit<u8>` imposes
+        // no validity requirement on any byte, padding included.
+        unsafe { std::mem::transmute(value) }
+    }
+
+    /// Read `N` initialised bytes at `offset` out of a cell.
+    ///
+    /// # Panics (as a test failure)
+    /// Reading a padding byte here would be UB; the caller is responsible for
+    /// only naming offsets the layout assertions establish as initialised.
+    #[cfg(test)]
+    fn cell_bytes_at<const N: usize>(
+        cell: &[std::mem::MaybeUninit<u8>; SLOT_SIZE],
+        offset: usize,
+    ) -> [u8; N] {
+        let mut out = [0u8; N];
+        for (i, slot) in out.iter_mut().enumerate() {
+            // SAFETY: `offset .. offset + N` is a discriminant or payload
+            // range, never padding — that is exactly what this test pins.
+            *slot = unsafe { cell[offset + i].assume_init() };
+        }
+        out
+    }
+
     /// Pin the in-memory layout of a `Value` field cell so the JIT's inline
     /// `getfield` codegen (which emits a raw `MOV [recv + FIELD_CELL_*]`)
-    /// stays correct. `Value` has no `#[repr]`; this test transmutes real
+    /// stays correct. `Value` has no `#[repr]`; this test reinterprets real
     /// values and asserts the discriminant / payload land at the documented
     /// offsets. If rustc ever changes `Value`'s layout this fails loudly.
     #[test]
@@ -721,60 +757,36 @@ mod tests {
         use crate::Value;
 
         // A 4-byte (`Int`) payload lives at FIELD_CELL_PAYLOAD32_OFFSET.
-        let cell: [u8; 16] = unsafe { std::mem::transmute(Value::Int(0x1234_5678)) };
-        let tag = u32::from_le_bytes(
-            cell[FIELD_CELL_TAG_OFFSET..FIELD_CELL_TAG_OFFSET + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let cell = value_cell_bytes(Value::Int(0x1234_5678));
+        let tag = u32::from_le_bytes(cell_bytes_at::<4>(&cell, FIELD_CELL_TAG_OFFSET));
         assert_eq!(
             tag, 0,
             "Int discriminant must be 0 at FIELD_CELL_TAG_OFFSET"
         );
-        let p32 = i32::from_le_bytes(
-            cell[FIELD_CELL_PAYLOAD32_OFFSET..FIELD_CELL_PAYLOAD32_OFFSET + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let p32 = i32::from_le_bytes(cell_bytes_at::<4>(&cell, FIELD_CELL_PAYLOAD32_OFFSET));
         assert_eq!(
             p32, 0x1234_5678,
             "Int payload at FIELD_CELL_PAYLOAD32_OFFSET"
         );
 
         // An 8-byte (`Long`) payload lives at FIELD_CELL_PAYLOAD64_OFFSET.
-        let cell: [u8; 16] = unsafe { std::mem::transmute(Value::Long(0x0102_0304_0506_0708_i64)) };
-        let tag = u32::from_le_bytes(
-            cell[FIELD_CELL_TAG_OFFSET..FIELD_CELL_TAG_OFFSET + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let cell = value_cell_bytes(Value::Long(0x0102_0304_0506_0708_i64));
+        let tag = u32::from_le_bytes(cell_bytes_at::<4>(&cell, FIELD_CELL_TAG_OFFSET));
         assert_eq!(tag, 1, "Long discriminant must be 1");
-        let p64 = i64::from_le_bytes(
-            cell[FIELD_CELL_PAYLOAD64_OFFSET..FIELD_CELL_PAYLOAD64_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let p64 = i64::from_le_bytes(cell_bytes_at::<8>(&cell, FIELD_CELL_PAYLOAD64_OFFSET));
         assert_eq!(p64, 0x0102_0304_0506_0708_i64, "Long payload at +8");
 
         // `Object(None)` (JVM null) must leave the 8-byte payload word zero.
-        let cell: [u8; 16] = unsafe { std::mem::transmute(Value::Object(None)) };
-        let p64 = u64::from_le_bytes(
-            cell[FIELD_CELL_PAYLOAD64_OFFSET..FIELD_CELL_PAYLOAD64_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let cell = value_cell_bytes(Value::Object(None));
+        let p64 = u64::from_le_bytes(cell_bytes_at::<8>(&cell, FIELD_CELL_PAYLOAD64_OFFSET));
         assert_eq!(p64, 0, "Object(None) payload word must be zero");
 
         // A non-null `Object` stores its raw pointer at FIELD_CELL_PAYLOAD64_OFFSET.
         let backing = Box::leak(Box::new(0u64));
         let raw = backing as *mut u64 as usize as u64;
         let oref = unsafe { crate::ObjectRef::from_raw(backing as *mut u64 as *mut u8) };
-        let cell: [u8; 16] = unsafe { std::mem::transmute(Value::Object(Some(oref))) };
-        let p64 = u64::from_le_bytes(
-            cell[FIELD_CELL_PAYLOAD64_OFFSET..FIELD_CELL_PAYLOAD64_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let cell = value_cell_bytes(Value::Object(Some(oref)));
+        let p64 = u64::from_le_bytes(cell_bytes_at::<8>(&cell, FIELD_CELL_PAYLOAD64_OFFSET));
         assert_eq!(
             p64, raw,
             "Object(Some) payload word must be the raw pointer"

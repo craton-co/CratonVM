@@ -16,9 +16,9 @@ build and in what order*, including the cross-feature dependencies below.
 | [`default-moving-young-gen.md`](default-moving-young-gen.md) | Make a moving/compacting young gen the default to close the bt18 ~23x gap (invariant: checksum = 68332206). | XL | precise JIT roots / deopt maps |
 | [`wire-tiered-manager.md`](wire-tiered-manager.md) | Turn the dormant tiered policy + queue into a real C1+C2 pipeline with a background compile thread and OSR. | L | OSR precision ← deopt |
 | [`activate-ir-optimizer.md`](activate-ir-optimizer.md) | **Largely landed (inc 1–29).** GVN/fold/DSE/LICM + escape→scalar-replacement broad; φ/branch dam fixed; `Op::Load`/`Store`/`New`/`Call` + a full **long (64-bit) value tier** built & **default-ON** (`IR_CALL`/`SCALAR_NEW`/`IR_LONG`/`IR_CALL_SPECIAL`). **Remaining:** long/double call *returns* (`i64::MIN`-sentinel), `ldiv`/`lrem` (long deopt-resume), `double`/`float` XMM tier — see the doc's "Remaining roadmap (post-inc-29)". | L | guard-surviving SR ← deopt |
-| [`real-cdi-bean-container.md`](../internal/real-cdi-bean-container.md) | Retire the per-framework shim cluster (ArC/Spring/WildFly/MSC/Infinispan/Agroal) with real bytecode. | XL | general `<clinit>`/classloading fixes |
+| [`real-cdi-bean-container.md`](../internal/fixed-suite-bugs/real-cdi-bean-container.md) | Retire the per-framework shim cluster (ArC/Spring/WildFly/MSC/Infinispan/Agroal) with real bytecode. | XL | general `<clinit>`/classloading fixes |
 | [`jep358-helpful-npe.md`](jep358-helpful-npe.md) | Helpful NPE messages via bci-context analysis + `getExtendedNPEMessage`. | M | JIT-NPE parity ← deopt |
-| [`proxy-real-classfile.md`](../internal/proxy-real-classfile.md) | Generate a real `$ProxyN` class file (vs. name-lookup synthetic shim). | M | runtime defineClass (WP2.3) |
+| [`proxy-real-classfile.md`](../internal/fixed-suite-bugs/proxy-real-classfile.md) | Generate a real `$ProxyN` class file (vs. name-lookup synthetic shim). | M | runtime defineClass (WP2.3) |
 | [`embedding-api.md`](embedding-api.md) | `libcratonvm` C-ABI + JNI Invocation-API parity (`JNI_CreateJavaVM`). | L | — |
 | [`keystore-mldsa-mlkem.md`](keystore-mldsa-mlkem.md) | `KeyStore.getInstance` PKCS12/JKS + route ML-DSA/ML-KEM to a real provider. | M | — |
 

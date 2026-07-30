@@ -53,7 +53,7 @@ Builder-style setters return `Self`, so chains compose cleanly.
 | `gc_algorithm = GcAlgorithm::G1` | Switch from the default generational collector to G1. See [`docs/gc-tuning.md`](gc-tuning.md) for the trade-offs. |
 | `use_compressed_oops`, `use_compact_headers` | Memory-footprint knobs; off by default. |
 | `with_xverify_mode(XverifyMode::All)` | Force verification of boot classes too (compliance testing). |
-| `with_aot_mode(AotMode::Training)` + `with_aot_cache_output(path)` | Project Leyden AOT cache writer. |
+| `with_aot_mode(AotMode::Training)` + `with_aot_cache_output(path)` | Project Leyden AOT cache writer (requires the `experimental-aot` feature; a build without it logs a warning and ignores the request). |
 | `with_jdwp(port, suspend)` | Spawn a JDWP server thread at startup (requires the `experimental-debug` feature). |
 | `with_container_support(false)` | Disable cgroup auto-sizing (`-XX:-UseContainerSupport`). |
 
