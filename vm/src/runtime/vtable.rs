@@ -616,6 +616,62 @@ impl VtableManager {
     /// intentionally empty (e.g. reserved for an abstract method that
     /// hasn't been overridden yet). The vec is moved — no clone.
     pub fn install_vtable(&mut self, class_id: u64, entries: Vec<Option<VtableEntry>>) {
+        // Redefinition keeps a ClassId stable and calls this installer again
+        // with fresh bytecode snapshots. Subclass vtables copy inherited
+        // entries when the subclass is linked, so merely replacing the
+        // redefined class's own table leaves every already-linked subclass
+        // pointing at the old Arc<CachedBytecodeMethod>. Refresh precisely
+        // those inherited entries before replacing the owner's table.
+        //
+        // This is intentionally O(total vtable slots) on the cold JVMTI
+        // redefine path. Dispatch remains O(1), and an unrelated override is
+        // protected by the declaring_class_id check. Prior code avoided this
+        // cold scan by permanently rejecting every inherited vtable hit after
+        // redefine, which forced method resolution and bytecode quickening
+        // back onto the per-call path.
+        if self.tables.contains_key(&class_id) {
+            let mut replacements: FxHashMap<u64, Vec<VtableEntry>> =
+                FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+            for entry in entries.iter().flatten() {
+                if entry.declaring_class_id == class_id {
+                    replacements
+                        .entry(fast_lookup_key(&entry.method_name, &entry.descriptor))
+                        .or_default()
+                        .push(entry.clone());
+                }
+            }
+            if !replacements.is_empty() {
+                for table in self.tables.values_mut() {
+                    if table.class_id == class_id {
+                        continue;
+                    }
+                    for slot in &mut table.entries {
+                        let Some(inherited) = slot.as_ref() else {
+                            continue;
+                        };
+                        if inherited.declaring_class_id != class_id {
+                            continue;
+                        }
+                        let key = fast_lookup_key(&inherited.method_name, &inherited.descriptor);
+                        let replacement = replacements.get(&key).and_then(|candidates| {
+                            candidates.iter().find(|candidate| {
+                                candidate.method_name == inherited.method_name
+                                    && candidate.descriptor == inherited.descriptor
+                            })
+                        });
+                        if let Some(replacement) = replacement {
+                            *slot = Some(replacement.clone());
+                        } else {
+                            // The JVM structural-redefinition checks normally
+                            // make this impossible. Fail closed if a malformed
+                            // internal caller violates that invariant.
+                            *slot = None;
+                        }
+                    }
+                }
+            }
+        }
+
         // Rebuild the signature index from the entries so `lookup_slot`
         // works. One map, one bucket per signature, no allocation per bucket
         // in the (overwhelmingly common) collision-free case — see the
@@ -1163,6 +1219,44 @@ mod tests {
         assert_eq!(vt.lookup_slot("stop", "()V"), Some(3));
         assert_eq!(vt.lookup_slot("stop", "(I)V"), None);
         assert_eq!(vt.lookup_slot("nope", "()V"), None);
+    }
+
+    #[test]
+    fn reinstall_refreshes_inherited_entries_without_touching_overrides() {
+        let mut mgr = VtableManager::new();
+        mgr.install_vtable(
+            1,
+            vec![
+                Some(probe_entry("inherited", "()I", 1, 0)),
+                Some(probe_entry("overridden", "()I", 1, 1)),
+            ],
+        );
+        mgr.install_vtable(
+            2,
+            vec![
+                Some(probe_entry("inherited", "()I", 1, 0)),
+                Some(probe_entry("overridden", "()I", 2, 9)),
+            ],
+        );
+
+        // Reinstalling an existing class id is the vtable side of JVMTI
+        // redefine. The child's inherited snapshot must move to the new
+        // method metadata while its own override remains untouched.
+        mgr.install_vtable(
+            1,
+            vec![
+                Some(probe_entry("inherited", "()I", 1, 7)),
+                Some(probe_entry("overridden", "()I", 1, 8)),
+            ],
+        );
+
+        let inherited = mgr.resolve_virtual(2, "inherited", "()I").unwrap();
+        assert_eq!(inherited.declaring_class_id, 1);
+        assert_eq!(inherited.method_index, 7);
+
+        let overridden = mgr.resolve_virtual(2, "overridden", "()I").unwrap();
+        assert_eq!(overridden.declaring_class_id, 2);
+        assert_eq!(overridden.method_index, 9);
     }
 
     #[test]

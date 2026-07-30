@@ -1692,12 +1692,35 @@ impl GenerationalHeap {
     // ----- Header access -----------------------------------------------------
 
     /// Read the object header from a heap reference.
+    ///
+    /// PERF: this is *the* accessor for `get_field`/`set_field`/`class_id_of`/
+    /// `kind_of`/`identity_hash_code`, so a single native collection call
+    /// reaches it several times. Both diagnostics it hosts are default-inert
+    /// and gated on a cached bool, but with the whole body out of line every
+    /// header read still cost a call/return pair — 7.0% of the `CratonBench
+    /// hashmap` phase, as its own profile symbol. The pointer read is now
+    /// inline and both gated bodies live in the `#[cold]`
+    /// [`Self::get_header_diagnostics`].
+    #[inline]
     pub fn get_header(&self, obj_ref: ObjectRef) -> &ObjectHeader {
         // SAFETY: `obj_ref` was created by one of this heap's `alloc_*` methods (or
         // forwarded during GC), so its pointer targets a valid, fully initialized
         // `ObjectHeader` within a heap-owned arena. The reference lifetime is bounded
         // by `&self`, ensuring the arena stays alive.
         let header = unsafe { &*(obj_ref.as_ptr() as *const ObjectHeader) };
+        if crate::stale_objref_debug::enabled() || crate::blocked_access_debug::enabled() {
+            self.get_header_diagnostics(obj_ref, header);
+        }
+        header
+    }
+
+    /// The two default-inert diagnostics [`Self::get_header`] hosts. Reached
+    /// only when `CRATONVM_DBG_STALE_OBJREF` or the blocked-access gate is
+    /// armed; both re-test their own gate, so behaviour is unchanged when
+    /// exactly one of them is on.
+    #[cold]
+    #[inline(never)]
+    fn get_header_diagnostics(&self, obj_ref: ObjectRef, header: &ObjectHeader) {
         // CRATONVM_DBG_STALE_OBJREF: `get_header` is the accessor native code
         // and interpreter bytecode dispatch use to inspect a supposedly-live
         // object (`get_field`/`set_field`/`class_id_of`/`array_length`/
@@ -1835,7 +1858,6 @@ impl GenerationalHeap {
             "heap header access",
             obj_ref.as_ptr() as usize,
         );
-        header
     }
 
     /// Get the class id of a heap object.

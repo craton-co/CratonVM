@@ -82,27 +82,60 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~1,348,000 Rust LoC across the 22 workspace
-member crates as of 2026-07-27, plus the separate `fuzz` harness workspace).
+The VM is the core of the project (~1,350,000 Rust LoC across the 22 workspace
+member crates as of 2026-07-30, plus the separate `fuzz` harness workspace).
 It contains six major subsystems (several now extracted into their own
 crates).
+
+That figure is the raw line count of every `.rs` file under the 22 directories
+named in the root `Cargo.toml` `[workspace] members` list, excluding `target/`,
+excluding the non-member `fuzz/` workspace, and excluding vendored third-party
+sources under any `vendor/` directory (e.g.
+`native-builtins/vendor/rustls-cbc`). Reproduce it with:
+
+```sh
+find <the 22 member dirs> -name '*.rs' -type f \
+  -not -path '*/target/*' -not -path '*/vendor/*' -print0 \
+  | xargs -0 cat | wc -l
+```
+
+which reported 1,349,978 lines across 702 files on 2026-07-30.
 
 Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
-| `native-builtins` | 571,000 | `native-awt` | 17,000 |
-| `vm` | 334,000 | `types` | 17,000 |
-| `jit` | 105,000 | `native-api` | 17,000 |
+| `native-builtins` | 552,000 | `native-awt` | 18,000 |
+| `vm` | 343,000 | `types` | 17,000 |
+| `jit` | 110,000 | `native-api` | 17,000 |
 | `gc` | 64,000 | `reader` | 14,000 |
-| `classloading` | 56,000 | `jfr` | 14,000 |
-| `native-collections` | 54,000 | `jit-cuda` | 10,000 |
-| `native-io` | 52,000 | remaining 10 | < 7,000 each |
+| `classloading` | 57,000 | `jfr` | 14,000 |
+| `native-collections` | 55,000 | `jit-cuda` | 10,000 |
+| `native-io` | 55,000 | remaining 9 | < 7,000 each |
 
-Several individual files are far larger than is comfortable. The two largest
-*production* files are `vm/src/runtime/interpreter.rs` (~47,900 lines) and
-`jit/src/x64.rs` (~42,600).
+Several individual files are far larger than is comfortable. The two worst were
+split on 2026-07-30, at the section banners the files already carried:
+
+- `vm/src/runtime/interpreter.rs` went ~50,500 → ~24,100 lines, with
+  `interpreter/typecheck.rs` (`checkcast`/`instanceof`/`aastore` compatibility),
+  `interpreter/constants.rs` (`ldc` and loader-faithful `CONSTANT_Class`
+  resolution), `interpreter/field_access.rs` (field resolution and invoke
+  argument plumbing), and `interpreter/invoke.rs` (method resolution, dispatch,
+  and the native bridge — ~23,200 lines, still the single largest thing here
+  because method invocation genuinely is one subsystem).
+- `jit/src/x64.rs` went ~44,200 → ~36,200 lines, with each optimization pass in
+  its own module: `x64/licm.rs`, `x64/licm_int.rs`, `x64/bce.rs`,
+  `x64/escape_analysis.rs`, `x64/null_check_elim.rs`, `x64/simd_analysis.rs`,
+  `x64/bytecode_compat.rs`, `x64/reg_encoding.rs`, `x64/switch_validation.rs`,
+  and `x64/cpu_features.rs`. What remains is the emitter and the compilation
+  entry point, which are not a clean seam.
+
+Nothing moved between modules and nothing became more public than it was: each
+child is `mod x; pub use x::*;`, and a glob re-export caps every item at its own
+declared visibility. Note that `hot_files_have_no_production_panics` enumerates
+both directories from disk — a gate that kept scanning only the parent would
+have turned this split into "silently stopped checking most of it".
 
 `vm/src/vm.rs` appears to dwarf both at ~74,200 lines, but that number is
 misleading and this is **not** the file to start reading. Everything from
@@ -143,9 +176,10 @@ measured rebuild or ownership benefit justifies another crate boundary.
 
 The bytecode execution engine.
 
-- **`interpreter.rs`** — Main dispatch loop (~45,000 lines). Each opcode reads
-  operands, manipulates the operand stack and local variables, and advances the
-  program counter.
+- **`interpreter.rs`** — Main dispatch loop (~24,100 lines, plus the
+  `interpreter/` submodules listed above). Each opcode reads operands,
+  manipulates the operand stack and local variables, and advances the program
+  counter.
 
   There are two cooperating dispatch paths:
 
@@ -208,15 +242,7 @@ Implements JVMS Ch. 5: loading, linking, and initialization. Extracted into the
 
 ### Memory (`gc/` crate)
 
-Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the
-generational collector with a moving (Cheney) young generation. A region-based
-G1 collector is also present and opt-in selectable via `-XX:+UseG1GC`
-(experimental; Generational remains the default safety net during G1
-maturation — see `docs/feature-designs/concurrent-gc-maturation.md`). ZGC is
-experimental and feature-gated (`--features zgc`, off by default): a
-metadata-only simulation plus a real STW mark-sweep heap (`ZgcRealHeap`) that
-is built but not yet wired into the backend dispatch (`GcBackend`), so neither
-is a selectable production collector.
+Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational collector with the Cheney moving young gen **enabled** — but see **"When the default does not compact"** below: requesting a moving cycle is not the same as running one, because each cycle must still carry a per-cycle root-coverage proof. A region-based G1 collector is also present and opt-in selectable via `-XX:+UseG1GC` (experimental; Generational remains the default safety net during G1 maturation — see `docs/feature-designs/concurrent-gc-maturation.md`). ZGC is experimental and feature-gated (`--features zgc`, not part of the default feature set): a metadata-only simulation plus a real STW mark-sweep heap (`ZgcRealHeap`) that is built but not yet wired into the backend dispatch (`GcBackend`), so neither is a selectable production collector.
 
 - **`heap.rs`** — Object/array layout and allocation (semi-space).
 - **`gen_heap.rs`** — Generational heap: young gen (copying) + old gen.
@@ -227,37 +253,53 @@ is a selectable production collector.
 - **`roots.rs`** — Root scanning and pointer remapping.
 - **`old_gen.rs`** — Old generation management.
 
-**The default compacts, fail-closed.** `types/src/flags.rs` defines
-`DEFAULT_MOVING_YOUNG = true`. `CRATONVM_MOVING_YOUNG` remains a compatibility
-opt-in, while `CRATONVM_NO_MOVING_YOUNG=1` is the authoritative opt-out. JIT
-code generation, root gathering, and the collector all consume the same typed
-flag, so the codegen cannot omit rewritable roots while the collector relocates.
+**When the default does not compact.** The flag gate is gone; the per-cycle
+proof is not. Read both before reasoning about allocation-path or GC-pause code.
 
-Default-on does not mean "move without proof." Every cycle must carry a
-**per-cycle coverage proof** before it may relocate:
-`collect_garbage_inner` diverts to the non-moving sweep on
-`divert_for_incomplete_moving_coverage`, which `vm/src/memory/roots.rs`
-computes from
-`conservative_roots::refresh_moving_young_coverage_for_collection()`. Every
-live compiled frame's active safepoint must certify
-`moving_young_coverage_complete`; unregistered JIT frames, unpublished young
-oops, and other incomplete coverage force the non-moving cycle. Each diversion
-is counted and logged with the specific unproven obligation
-(`gc_quiescence::incomplete_reason`), and `--verbose:gc` /
-`CRATONVM_GC_STATS` print `moving_young: cycles=N coverage_fallbacks=M` plus a
-per-reason histogram.
+1. `moving_young` is an **opt-out** flag that defaults to **true** —
+   `types/src/flags.rs::DEFAULT_MOVING_YOUNG`, shaped as
+   "`CRATONVM_NO_MOVING_YOUNG` turns it off, `CRATONVM_MOVING_YOUNG` is a
+   retained no-op opt-in", and pinned by
+   `empty_source_matches_all_documented_defaults` and
+   `moving_young_is_an_opt_out_with_a_compatibility_opt_in`. A default
+   `cargo build` therefore *requests* a moving young cycle.
+2. Requesting one is not running one: every cycle must carry a **per-cycle
+   coverage proof** before it may relocate. `collect_garbage_inner` diverts to
+   the non-moving sweep on `divert_for_incomplete_moving_coverage`, which
+   `vm/src/memory/roots.rs` computes from
+   `conservative_roots::refresh_moving_young_coverage_for_collection()` — every
+   live compiled frame's active safepoint must certify
+   `moving_young_coverage_complete`, no unregistered JIT frame may be on the
+   native stack, no peer thread may be in JIT, and a frame-band verifier must
+   find no young-resident word the shadow stack did not publish. Each diversion
+   is counted and logged at `warn` with the specific unproven obligation
+   (`gc_quiescence::incomplete_reason`), and `--verbose:gc` / `CRATONVM_GC_STATS`
+   print `moving_young: cycles=N coverage_fallbacks=M` plus a per-reason
+   histogram.
 
-An earlier `fail_closed_non_moving = is_active() && !allow_moving_young` term
-made compaction effectively unreachable once JIT code became live. That term
-and the independent `CRATONVM_ALLOW_MOVING_YOUNG` flag are gone. The remaining
-fallback is a coverage decision, not a second policy gate.
+   (An earlier `fail_closed_non_moving = is_active() && !allow_moving_young`
+   term made this unconditional — it meant `CRATONVM_MOVING_YOUNG=1` alone could
+   never run a moving cycle under a live JIT frame, the only case the feature
+   exists for. That term and the `CRATONVM_ALLOW_MOVING_YOUNG` flag are gone.)
 
-The corruption that originally blocked the default was five x64 codegen sites
-that pushed references without oop tags. Those sites now publish complete,
-rewritable homes, while coverage gaps such as oversized local maps or
-unregistered frames fail closed for that cycle. The historical gated work and
-the default-on validation are recorded in
-`docs/feature-designs/default-moving-young-gen.md`.
+So on a JIT-warm workload a default build can still spend cycles in the
+**generational non-moving mark-sweep with selective promotion** path — that is
+what a nonzero `coverage_fallbacks` count means, and it is the number to read
+before attributing a pause profile to compaction.
+
+Correctness stopped being the blocker on 2026-07-26: the heap corruption was
+five codegen sites pushing an untagged object reference onto the JIT's
+simulated operand stack. Throughput is the **remaining** work, now tracked as
+an optimization program rather than as a precondition, because the memory-
+footprint win decided the flip: on Binary-Trees-18 the moving path measures
+**2.1×** the sweep (six interleaved rounds, min 2905 ms vs 1363 ms), down from
+5.0× before the pre-cycle object-start walk stopped building a hash set of
+every object in from-space — but bt18 at `-Xmx512m` does not complete at all
+without compaction. bt18 is simultaneously the worst case for a copying
+collector and the workload that justifies it. The open items (the `pointer_map`
+`FxHashMap`, the disabled self-call spill elision, and the unpriced
+`jit_frame_record` helper) are itemised in
+[`docs/moving-young-throughput.md`](docs/moving-young-throughput.md).
 
 **Object layout:**
 ```
@@ -535,7 +577,7 @@ instances of this.
 
 | Capability | Where the default lives | Status |
 |------------|-------------------------|--------|
-| `moving_young` | `types/src/flags.rs::DEFAULT_MOVING_YOUNG` | Default-on and pinned by tests. `CRATONVM_NO_MOVING_YOUNG=1` is the authoritative opt-out; the former independent `allow_moving_young` gate has been deleted. |
+| `moving_young` | `types/src/flags.rs::DEFAULT_MOVING_YOUNG` | **Resolved.** Restructured as opt-out with a compatibility opt-in, and the compiled default is now `true`. The former independent `allow_moving_young` gate has been deleted. Retained here as the worked example of the fix shape, not as an open instance — but note the second gate: a moving cycle still needs its per-cycle coverage proof, so "flag on" and "compaction ran" remain distinct claims. |
 | `use_compressed_oops` | `vm/src/config.rs` | Opt-in, defaults false. Fully wired but never enabled on the default path — and the doc claimed for a while that it was *not* wired, which is the same failure mode in the opposite direction. |
 | `safepoint_reg_spill` | `jit/src/x64.rs:2650` | **Was** the canonical case: several call sites' own comments claimed a register spill as their protection, but that spill "only ran when the SEPARATE `CRATONVM_JIT_SAFEPOINT_REG_SPILL` env var was ALSO set — off by default, so the documented protection never actually happened." Now folded into default-on `precise_maps` and inverted to opt-**out** (`CRATONVM_NO_PRECISE_REG_SPILL`). This is the shape the fix should take. |
 | `precise_maps` register-spill half | `jit/src/x64.rs:2646-2662` | Same item; `precise_maps` was default-on since 2026-07-07 while its register-spill branch was not. A flag being on does not mean all of its branches are. |

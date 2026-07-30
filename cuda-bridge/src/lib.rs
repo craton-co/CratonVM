@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
+#![deny(
+    clippy::missing_safety_doc,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::undocumented_unsafe_blocks
+)]
+
 //! Thin CUDA Driver API bridge.
 //!
 //! See the crate-level [`README.md`](../../README.md) for the build-mode
@@ -118,7 +124,11 @@ pub struct DeviceContext(backend::DeviceContextInner);
 //
 // In stub mode `DeviceContextInner` is a unit struct and is trivially
 // `Send + Sync`; these impls are harmless there.
+// SAFETY: every driver-backed operation binds the retained owning context on
+// the current thread, and stub mode contains no raw handle.
 unsafe impl Send for DeviceContext {}
+// SAFETY: the identical driver/context-binding argument above also permits
+// shared references to be used from bound threads.
 unsafe impl Sync for DeviceContext {}
 
 impl DeviceContext {
@@ -623,7 +633,11 @@ impl<T> DeviceElem for T where T: bytemuck::Pod + Send + Sync + 'static {}
 //
 // In stub mode `DeviceBufferInner<T>` is just a `PhantomData<T>`, so the
 // conditional impls reduce to the auto-trait behaviour anyway.
+// SAFETY: CudaSlice already permits transfer when T: Send; retained streams
+// stay live and are driven only after binding their context.
 unsafe impl<T: Send> Send for DeviceBuffer<T> {}
+// SAFETY: shared access never mutates host `T`; CUDA ordering is mediated by
+// driver streams/events, so Sync follows exactly when `T: Sync`.
 unsafe impl<T: Sync> Sync for DeviceBuffer<T> {}
 
 #[cfg(feature = "cuda")]
@@ -745,6 +759,8 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         let event = std::sync::Arc::new(Event::new(ctx)?);
         // Submit the H→D copy AND record `last_write` on the USER
         // stream (see `from_host_async_unchecked` / `upload_on_stream`).
+        // SAFETY: this function's caller upholds the documented host lifetime;
+        // the event and stream handles are owned by live wrappers above.
         let inner = unsafe {
             backend::DeviceBufferInner::from_host_async_unchecked(
                 &ctx.0,

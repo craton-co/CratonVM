@@ -1,9 +1,9 @@
 # CratonVM — Security Hardening & Sandboxing
 
-This document describes the **opt-in hardening surface** CratonVM exposes for
-running untrusted or multi-tenant workloads: egress / SSRF policy, filesystem
-confinement, decompression-bomb and request-body caps, the cryptographic
-posture, and what is *not* covered.
+This document describes CratonVM's **opt-in defence-in-depth surface**:
+egress/SSRF policy, filesystem confinement, decompression-bomb and request-body
+caps, the cryptographic posture, and what is *not* covered. These controls are
+useful inside an OS sandbox; they do not make an in-process trust boundary.
 
 See also: [`SECURITY.md`](../SECURITY.md) (overall security policy and
 disclosure process), [`CONFIG.md`](CONFIG.md) (full flag/env reference), and
@@ -45,8 +45,8 @@ JDK-faithful) except where a numeric default is listed.
 
 | Env var | Effect | Default |
 |---------|--------|---------|
-| `CRATONVM_CONFINE_IO` | **Certified profile.** Turns on CWD path confinement and registers the process CWD as a sandbox root. **Fails closed**: if confinement cannot actually be enabled at startup, the VM `panic!`s rather than running unconfined. (`apply_certified_deployment_profile` in `native-io/src/lib.rs`.) | off |
-| `CRATONVM_UNTRUSTED_CODE` | **Untrusted-code profile.** Same confinement as above, but if it cannot be enabled it emits a **loud warning** instead of failing closed. | off |
+| `CRATONVM_CONFINE_IO` | **Confinement profile.** Turns on CWD path confinement and registers the process CWD as a sandbox root. **Fails closed**: if confinement cannot actually be enabled at startup, the VM aborts rather than running unconfined. (`apply_certified_deployment_profile` in `native-io/src/lib.rs`.) | off |
+| `CRATONVM_UNTRUSTED_CODE` | **Strict defence-in-depth profile.** Enables the same fail-closed filesystem confinement, implies `CRATONVM_REQUIRE_POLICY`, and rejects JNI/Panama downcalls and host-library loading even if a Java policy would otherwise grant them. It still requires an OS/container boundary. | off |
 | `CRATONVM_REQUIRE_POLICY` | When set, a **missing** `java.policy` **denies** (fail-closed) instead of the JDK-default allow-all. The absence of an explicitly-loaded policy can then never be mistaken for a grant. Must be set before the first permission check. (`security_manager.rs`.) | off (allow-all on no policy, JDK-parity) |
 | `CRATONVM_BLOCK_PRIVATE_NETS` | Extends the default egress policy to also deny loopback (`127.0.0.0/8`, `::1`) and the RFC1918 private ranges (`10/8`, `172.16/12`, `192.168/16`) plus their IPv6 equivalents (`fc00::/7` ULA and IPv4-mapped private v6), so a confined workload can't reach internal services by SSRF. The link-local metadata block is **always on** regardless. (`outbound_policy.rs`.) | off |
 | `CRATONVM_RESOLVE_OUTBOUND_HOST` | Resolve outbound **hostnames** and apply the per-IP egress policy to every resolved address (deny if any is blocked) — closes the DNS-alias/rebind bypass for direct `check_outbound`/`default_policy` callers. (`outbound_policy.rs`.) | off (no DNS in policy) |
@@ -55,7 +55,7 @@ JDK-faithful) except where a numeric default is listed.
 | `CRATONVM_ZIP_MAX_ENTRY_BYTES` | Max *declared* uncompressed size (bytes) of a single zip/JAR entry that will be inflated into memory — a decompression-bomb guard. Paired with an always-on `1000:1` compression-ratio cap. `0` / unparseable → default. (`native-io/src/zip_real_jar.rs`.) | `536870912` (512 MiB) |
 | `CRATONVM_TRUST_PEM` | Path to a PEM bundle of additional trust anchors for JAR-signature verification, consulted alongside the system trust store. (`classloading/src/jar_signer.rs`.) | unset |
 
-> Note: the certified/untrusted profiles only *add* restrictions; they never
+> Note: the confinement/untrusted profiles only *add* restrictions; they never
 > relax the env-less default. The CWD-confinement machinery is the same opt-in
 > code path you can also drive programmatically via `set_path_confine_to_cwd` /
 > `add_sandbox_root`.
@@ -201,11 +201,11 @@ checking remains gated off by default.
 - **No formal audit.** Nothing here has been independently security-reviewed.
   Treat the hardening profiles as defence-in-depth, not as a trust boundary.
 - **SecurityManager is partial.** The default (no policy ⇒ allow-all) is
-  JDK-faithful; `CRATONVM_REQUIRE_POLICY` flips it to fail-closed, but the
-  permission-enforcement surface is not a complete `java.security.Policy`
-  implementation. Sensitive native gates (`ProcessBuilder.start` / `Runtime.exec`,
-  the Panama host-call gate) consult the same singleton, but coverage is not
-  exhaustive.
+  JDK-faithful; `CRATONVM_REQUIRE_POLICY` flips it to fail-closed and
+  `CRATONVM_UNTRUSTED_CODE` implies that setting. Sensitive native gates
+  (`ProcessBuilder.start` / `Runtime.exec`, host-library loading, JNI, and
+  Panama/FFM downcalls) fail closed in the strict profile. The permission
+  surface is still not a complete `java.security.Policy` implementation.
 - **Egress policy guards the native connect paths**, not arbitrary
   user-supplied socket code that bypasses them; the literal-string default does
   no DNS itself (the per-resolved-IP re-check in `policy_connect` is what closes

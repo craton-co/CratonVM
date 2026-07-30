@@ -1972,15 +1972,22 @@ mod cds_tests {
     }
 
     #[test]
-    fn test_initialize_from_archive_returns_zero() {
+    fn test_initialize_from_archive_returns_void() {
+        // The descriptor is `(Ljava/lang/Class;)V`. Handing back an operand for
+        // a void method leaves it on the stack — the caller emits no pop.
         let result = native_cds_initialize_from_archive(&mut PanicContext, &[]);
-        assert_eq!(result.unwrap(), Some(Value::Int(0)));
+        assert_eq!(result.unwrap(), None);
     }
 
     #[test]
-    fn test_random_seed_for_dumping_value() {
+    fn test_random_seed_for_dumping_is_zero_outside_dump() {
+        // Must be 0 when not dumping a static archive, which CratonVM never
+        // does. `ImmutableCollections` seeds SALT from this value and falls
+        // back to `System.nanoTime()` only on 0; a fixed non-zero seed made
+        // `Set.of` / `Map.of` iteration order identical on every run, hiding
+        // exactly the order-dependence bugs the randomisation exists to expose.
         let result = native_cds_get_random_seed_for_dumping(&mut PanicContext, &[]);
-        assert_eq!(result.unwrap(), Some(Value::Long(12_345_678)));
+        assert_eq!(result.unwrap(), Some(Value::Long(0)));
     }
 
     #[test]

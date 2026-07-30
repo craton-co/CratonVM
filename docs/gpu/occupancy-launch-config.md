@@ -8,4 +8,4 @@ This replaces the former fixed 256-thread `LaunchConfig::elementwise` launch
 shape. The runtime still owns work sizing; occupancy tuning selects the block
 configuration used to cover that work efficiently on the active device.
 
-See also [the historical validation record](../internal/gpu-offload-followups-20260711.md#5-occupancy-tuned-block-size-is-dead-code--done).
+See also [the historical validation record](../internal/fixed-suite-bugs/gpu-offload-followups-20260711.md#5-occupancy-tuned-block-size-is-dead-code--done).

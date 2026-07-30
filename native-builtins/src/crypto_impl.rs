@@ -2222,24 +2222,18 @@ impl Rsa {
 
     /// PKCS#1 v1.5 SHA-256 verification.
     pub fn verify_sha256(key: &RsaPublicKey, message: &[u8], signature: &[u8]) -> bool {
-        let k = (key.n.bit_length() + 7) / 8;
-        if signature.len() != k {
-            return false;
-        }
-        let s = BigUint::from_bytes_be(signature);
-        let m = s.modpow(&key.e, &key.n);
-        let em = m.to_bytes_be_padded(k);
-
-        let hash = Sha256::digest(message);
+        cratonvm_native_builtins_crypto::signature::verify_rsa_pkcs1_v15(
+            &key.n.to_bytes_be(),
+            &key.e.to_bytes_be(),
+            cratonvm_native_builtins_crypto::signature::DigestAlgorithm::Sha256,
+            message,
+            signature,
+        )
         // A modulus too small to hold the DigestInfo + padding can never carry
         // a valid PKCS#1 v1.5 signature. Reject it as a verification failure
         // (fail-closed) rather than underflowing the padding-length math — this
         // is reachable from `verify_signature`/`checkServerTrusted` with an
         // attacker-supplied issuer key carrying a tiny RSA modulus.
-        let Some(expected) = Self::pkcs1v15_encode(&hash, k) else {
-            return false;
-        };
-        em == expected
     }
 
     /// Build the PKCS#1 v1.5 EMSA encoding (DigestInfo for SHA-256 wrapped in
@@ -4910,9 +4904,12 @@ fn extract_certs_from_der(data: &[u8], entries: &mut HashMap<String, KeyStoreEnt
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{:02x}", b)).collect()

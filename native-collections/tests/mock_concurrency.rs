@@ -16,7 +16,6 @@ use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 const CF: &str = "java/util/concurrent/CompletableFuture";
 const COWAL: &str = "java/util/concurrent/CopyOnWriteArrayList";
 const PBQ: &str = "java/util/concurrent/PriorityBlockingQueue";
-const SL: &str = "java/util/concurrent/locks/StampedLock";
 
 fn alloc_obj(ctx: &mut MockCtx, class_name: &str, fields: usize) -> ObjectRef {
     let cid = ctx.ensure_class_initialized(class_name).unwrap();
@@ -36,12 +35,6 @@ fn cf_array(ctx: &mut MockCtx, cfs: &[ObjectRef]) -> ObjectRef {
         ctx.set_array_element(arr, i, Value::Object(Some(*cf)));
     }
     arr
-}
-
-fn new_stamped_lock(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
-    let lock = alloc_obj(ctx, SL, 2);
-    call(reg, ctx, SL, "<init>", "()V", &[Value::Object(Some(lock))]).unwrap();
-    lock
 }
 
 fn new_priority_blocking_queue(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
@@ -396,64 +389,16 @@ fn priority_blocking_queue_take_removes_available_head() {
     assert_eq!(ctx.get_field(queue, 1), Value::Int(2));
 }
 
-#[test]
-fn stamped_lock_read_lock_does_not_grant_while_writer_remains_held() {
-    let reg = build_registry();
-    let mut ctx = MockCtx::new();
-    let lock = new_stamped_lock(&reg, &mut ctx);
-
-    let write_stamp = call(
-        &reg,
-        &mut ctx,
-        SL,
-        "writeLock",
-        "()J",
-        &[Value::Object(Some(lock))],
-    )
-    .unwrap();
-    assert!(matches!(write_stamp, Some(Value::Long(stamp)) if stamp != 0));
-    assert_eq!(ctx.get_field(lock, 0), Value::Int(1));
-
-    let read_stamp = call(
-        &reg,
-        &mut ctx,
-        SL,
-        "readLock",
-        "()J",
-        &[Value::Object(Some(lock))],
-    )
-    .unwrap();
-    assert_eq!(read_stamp, Some(Value::Long(0)));
-    assert_eq!(ctx.get_field(lock, 0), Value::Int(1));
-}
-
-#[test]
-fn stamped_lock_write_lock_does_not_grant_while_reader_remains_held() {
-    let reg = build_registry();
-    let mut ctx = MockCtx::new();
-    let lock = new_stamped_lock(&reg, &mut ctx);
-
-    let read_stamp = call(
-        &reg,
-        &mut ctx,
-        SL,
-        "readLock",
-        "()J",
-        &[Value::Object(Some(lock))],
-    )
-    .unwrap();
-    assert!(matches!(read_stamp, Some(Value::Long(stamp)) if stamp != 0));
-    assert_eq!(ctx.get_field(lock, 0), Value::Int(2));
-
-    let write_stamp = call(
-        &reg,
-        &mut ctx,
-        SL,
-        "writeLock",
-        "()J",
-        &[Value::Object(Some(lock))],
-    )
-    .unwrap();
-    assert_eq!(write_stamp, Some(Value::Long(0)));
-    assert_eq!(ctx.get_field(lock, 0), Value::Int(2));
-}
+// The two `stamped_lock_*` tests that lived here were deleted on 2026-07-30.
+//
+// They exercised this crate's `StampedLock` natives, which were DISABLED on
+// 2026-07-28 because they silently destroyed mutual exclusion, and they
+// asserted precisely the two defects that fix removed: `writeLock()` returning
+// stamp 0 after giving up (that is `tryWriteLock`'s failure contract, not
+// `writeLock`'s), and the lock word living in field 0 as a `Value::Int` (in
+// real-JDK mode field 0 of a real `StampedLock` is `state`, a `long`).
+//
+// Reinstating them would mean reinstating the bug. The surviving
+// implementation is `native-builtins`' `parking_lot`-backed one, and its
+// registration surface is gated by
+// `native-builtins/tests/registry_contracts.rs`.

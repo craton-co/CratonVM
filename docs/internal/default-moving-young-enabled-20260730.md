@@ -68,13 +68,34 @@ that field, so it still holds the `0` from `enter_with_compiled`.
 mirror second. A prune that removed nothing therefore overwrote the live RBP
 with that `0` on the way in, and the proof then failed itself.
 
-The reload now runs only when pruning actually changed the top. It was
-introduced by `c9b56f7d6` (2026-06-17), a throughput change that moved the hot
-per-invocation RBP write into a TLS mirror; the cold reload was left reading the
-field as if it were still authoritative. **Moving-young has therefore been
-unable to engage under JIT since mid-June** — before the 2026-07-01 "FINISHED"
-validation and before the 07-26 and 07-29 corruption work, which is worth
-keeping in mind when reading any moving-young claim dated between those points.
+The reload now runs only when pruning actually changed the top.
+
+### Its history is worth reading, because the symptom changed shape
+
+- **2026-06-17, `c9b56f7d6`** moved the hot per-invocation RBP write into a TLS
+  mirror for throughput and left the cold reload reading `exact_rbp` as if that
+  field were still authoritative.
+- **2026-07-01, `a5623891c`** made the moving-young coverage refresh call
+  `prune_returned_jit_entries`, which put the clobber directly on the GC path.
+- **2026-07-01 → 07-26** there was no `MISSING_EXACT_RBP` obligation yet, so a
+  zero `exact_rbp` was not detected. Moving cycles *ran*, and
+  `remap_active_jit_frames` — which requires `info.exact_rbp != 0` — silently
+  **skipped the innermost compiled frame**. A copying collection that does not
+  rewrite the innermost frame's oops is precisely the "moving young gen drops
+  JIT-held oops" failure class, and this is consistent with the corruption
+  reports that drove the 07-26 and 07-29 work, though it is not proof that it
+  was their only cause.
+- **2026-07-26, `9494c0680`** introduced `MISSING_EXACT_RBP`. From that point the
+  proof correctly refused to relocate — so the defect stopped corrupting and
+  started merely disabling, which is how it survived a "DEFAULT-ON" status line.
+- **2026-07-29, `86e69e848`** added defect 1's blanket on top, hiding the reason
+  behind `jit-relocation-contract-unproven`.
+
+The lesson worth keeping: a *detection* added for a corruption can turn an
+unsound feature into an inert one without anyone noticing the difference,
+because both states pass every correctness test. Only the cycle counter tells
+them apart, which is why `moving_young: cycles=N` is now printed next to the
+fallback count rather than derived on request.
 
 Regression test: `a_no_op_prune_does_not_clobber_the_live_rbp_mirror`.
 

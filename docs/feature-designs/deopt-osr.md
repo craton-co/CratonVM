@@ -61,7 +61,7 @@ These are inverses of the same regalloc state at a PC:
 To keep both consistent, the *exit map* emission reuses the same canonical-boundary PCs that OSR-entry already trusts (loop headers / block boundaries outside hoisted loops).
 
 ### B. Virtual-object (scalar-replaced) re-materialization
-Implemented in [deopt_materialize.rs](file:///C:/craton/CratonVM/vm/src/runtime/deopt_materialize.rs) via `materialize_virtual_objects`. It mutates `ReconstructedFrame` in-place, rewriting every `VirtualObject`/`VirtualObjectRef` slot to a real `FrameValue::Object(addr)`.
+Implemented in [deopt_materialize.rs](../../vm/src/runtime/deopt_materialize.rs) via `materialize_virtual_objects`. It mutates `ReconstructedFrame` in-place, rewriting every `VirtualObject`/`VirtualObjectRef` slot to a real `FrameValue::Object(addr)`.
 
 1. **Two-phase, cycle-safe materialization**:
    - **Phase 1 — shell allocation**: Collects all distinct `VirtualObjectState::id`s reachable from the frame. Allocates a pinned shell per id via `TempRootScope::alloc_shell` (TLAB allocation + class/mark header initialization).

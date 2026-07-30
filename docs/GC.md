@@ -189,10 +189,14 @@ next one, and the parallel walker writes nothing — on any grid anomaly
 it is abandoned wholesale and the untouched sequential walk (which owns
 every diagnostic and the unwind/re-anchor recovery) runs from scratch.
 Parallel EVACUATION does not exist here. The moving young gen's
-JIT-held-oop corruption is fixed and the moving path is now the default.
-`CRATONVM_NO_MOVING_YOUNG=1` selects the compatibility non-moving sweep;
-individual default-on cycles still fail closed to that sweep when complete
-rewritable JIT-root coverage cannot be proven.
+JIT-held-oop corruption is fixed, and it is now the **default**
+(`types/src/flags.rs::DEFAULT_MOVING_YOUNG`), with
+`CRATONVM_NO_MOVING_YOUNG` as the compatibility opt-out. The flag being
+on is not the same as a cycle having compacted: every cycle must carry
+its own root-coverage proof, and one that cannot prove complete coverage
+diverts to the non-moving sweep rather than relocating — so read
+`moving_young: cycles=N coverage_fallbacks=M` before attributing any
+cost or behaviour to compaction.
 Old gen is a free-list
 allocator collected by a VM-driven concurrent cycle (initial mark STW →
 concurrent trace → remark STW → concurrent sweep, with a remark-time

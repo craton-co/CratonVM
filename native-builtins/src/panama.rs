@@ -120,11 +120,13 @@ fn store_policy(policy: NativeAccessPolicy) {
 /// the scoped `--enable-native-access=<module-list>` form use
 /// [`set_native_access_modules`].
 pub fn set_native_access_enabled(enabled: bool) {
-    store_policy(if enabled {
-        NativeAccessPolicy::All
-    } else {
-        NativeAccessPolicy::None
-    });
+    store_policy(
+        if enabled && !cratonvm_types::flags::flags().io.untrusted_code {
+            NativeAccessPolicy::All
+        } else {
+            NativeAccessPolicy::None
+        },
+    );
 }
 
 /// Record the exact set of modules granted native access, parsed from the
@@ -142,6 +144,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    if cratonvm_types::flags::flags().io.untrusted_code {
+        store_policy(NativeAccessPolicy::None);
+        return;
+    }
     let mut set = std::collections::BTreeSet::new();
     let mut grant_all = false;
     for m in modules {
@@ -172,6 +178,9 @@ where
 /// [`NativeAccessPolicy`]). It fails closed: it returns `false` whenever no
 /// module has been granted access.
 pub fn native_access_enabled() -> bool {
+    if cratonvm_types::flags::flags().io.untrusted_code {
+        return false;
+    }
     NATIVE_ACCESS_POLICY
         .read()
         .map(|p| p.any_granted())
@@ -209,7 +218,7 @@ pub fn module_native_access_enabled(module: Option<&str>) -> bool {
 /// point. The grant is tracked per module by [`NativeAccessPolicy`]; see its
 /// docs for why the gate cannot yet consult it per caller. The behavior fails
 /// closed (denies unless *some* module is granted).
-fn require_native_access(op: &str) -> Result<(), MethodCallFailed> {
+fn require_native_access(ctx: &mut dyn NativeContext, op: &str) -> Result<(), MethodCallFailed> {
     if !native_access_enabled() {
         return Err(RuntimeError::IllegalCallerException {
             message: format!(
@@ -219,6 +228,7 @@ fn require_native_access(op: &str) -> Result<(), MethodCallFailed> {
         }
         .into());
     }
+    crate::security_manager::check_host_native_access_or_throw(ctx, "foreign")?;
     Ok(())
 }
 
@@ -763,7 +773,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/foreign/ValueLayout;J)Ljava/lang/Object;",
         |ctx, args| {
             // Defense-in-depth: dereferences the segment's raw `ptr` field.
-            require_native_access("getAtIndex")?;
+            require_native_access(ctx, "getAtIndex")?;
             let this = obj_arg(args, 0)?;
             let layout = obj_arg(args, 1)?;
             let index = match args.get(2) {
@@ -786,7 +796,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/foreign/ValueLayout;JLjava/lang/Object;)V",
         |ctx, args| {
             // Defense-in-depth: dereferences the segment's raw `ptr` field.
-            require_native_access("setAtIndex")?;
+            require_native_access(ctx, "setAtIndex")?;
             let this = obj_arg(args, 0)?;
             let layout = obj_arg(args, 1)?;
             let index = match args.get(2) {
@@ -1162,7 +1172,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "copy",
         "(Ljava/lang/Object;ILjava/lang/foreign/MemorySegment;Ljava/lang/foreign/ValueLayout;JI)V",
         |ctx, args| {
-            require_native_access("copy")?;
+            require_native_access(ctx, "copy")?;
             let src = obj_arg(args, 0)?;
             let src_index = match args.get(1) {
                 Some(Value::Int(v)) if *v >= 0 => *v as usize,
@@ -1213,7 +1223,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/foreign/MemorySegment;JLjava/lang/foreign/MemorySegment;JJ)V",
         |ctx, args| {
             // Defense-in-depth: copy dereferences both segments' raw `ptr` fields.
-            require_native_access("copy")?;
+            require_native_access(ctx, "copy")?;
             let src = obj_arg(args, 0)?;
             let src_offset = match args.get(1) {
                 Some(Value::Long(n)) => *n,
@@ -1327,7 +1337,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "(B)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
             // Defense-in-depth: fill writes to the segment's raw `ptr` field.
-            require_native_access("fill")?;
+            require_native_access(ctx, "fill")?;
             let this = obj_arg(args, 0)?;
             let byte_val = match args.get(1) {
                 Some(Value::Int(n)) => *n as u8,
@@ -1447,7 +1457,10 @@ static PE_SESSION_CLASS_MEMO: PeClassMemo = PeClassMemo::new();
 fn pe_session_modelled(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
     ctx.object_num_fields(session) >= PE_SESSION_SLOTS
         && PE_SESSION_CLASS_MEMO.matches(ctx, session, PE_SESSION_CLASS)
-        && matches!(ctx.get_field(session, PE_SESSION_STATE_FIELD), Value::Int(_))
+        && matches!(
+            ctx.get_field(session, PE_SESSION_STATE_FIELD),
+            Value::Int(_)
+        )
 }
 
 /// The session stored on a synthetic `Arena`, if `arena` is one.
@@ -1518,10 +1531,7 @@ fn pe_segment_session(ctx: &dyn NativeContext, seg: ObjectRef) -> Option<ObjectR
 /// This is the single choke point for `get`/`set`/`getAtIndex`/`setAtIndex`:
 /// all four reach [`pe_segment_access_addr`], which calls this before it
 /// computes an address.
-fn pe_segment_check_scope(
-    ctx: &dyn NativeContext,
-    seg: ObjectRef,
-) -> Result<(), MethodCallFailed> {
+fn pe_segment_check_scope(ctx: &dyn NativeContext, seg: ObjectRef) -> Result<(), MethodCallFailed> {
     let Some(session) = pe_segment_session(ctx, seg) else {
         return Ok(());
     };
@@ -1609,7 +1619,7 @@ fn pe_segment_access_addr(
 // Exact primitive/covariant descriptors used by real-JDK MemorySegment
 // default methods. They share the checked erased implementation above.
 fn pe_segment_get_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    require_native_access("getAtIndex")?;
+    require_native_access(ctx, "getAtIndex")?;
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
     let index = match args.get(2) {
@@ -1622,7 +1632,7 @@ fn pe_segment_get_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn pe_segment_set_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    require_native_access("setAtIndex")?;
+    require_native_access(ctx, "setAtIndex")?;
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
     let index = match args.get(2) {
@@ -1637,7 +1647,7 @@ fn pe_segment_set_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 fn pe_segment_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Defense-in-depth: get() dereferences the segment's raw `ptr` field.
-    require_native_access("get")?;
+    require_native_access(ctx, "get")?;
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
     let offset = match args.get(2) {
@@ -1689,7 +1699,7 @@ fn pe_segment_get_impl(
 
 fn pe_segment_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Defense-in-depth: set() dereferences the segment's raw `ptr` field.
-    require_native_access("set")?;
+    require_native_access(ctx, "set")?;
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
     let offset = match args.get(2) {
@@ -1828,6 +1838,7 @@ pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
             let path_obj = obj_arg(args, 0)?;
             let path = ctx.read_string(path_obj).unwrap_or_default();
 
+            require_native_access(ctx, "libraryLookup")?;
             let lib_index = ctx.load_native_library(&path)?;
 
             let lookup = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2);
@@ -1844,6 +1855,11 @@ pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
         "loaderLookup",
         "()Ljava/lang/foreign/SymbolLookup;",
         |ctx, _| {
+            // The returned lookup searches every loaded library (index -1),
+            // so obtaining one is itself a capability. Gated identically to
+            // `libraryLookup` minus the `--enable-native-access` requirement,
+            // which the JDK does not impose on `loaderLookup`.
+            crate::security_manager::check_host_native_access_or_throw(ctx, "symbolLookup")?;
             let lookup = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2);
             ctx.set_field(lookup, 0, Value::Long(-1)); // -1 = default/system lookup
             Ok(Some(Value::Object(Some(lookup))))
@@ -1863,6 +1879,14 @@ pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
                 Value::Long(n) => n,
                 _ => -1,
             };
+
+            // A `loaderLookup()` receiver carries `lib_index == -1`, and
+            // `find_native_symbol` treats that as "search every loaded
+            // library", so `loaderLookup().find(x)` is an arbitrary-symbol
+            // address oracle over libraries loaded by trusted code. Gate it
+            // the same way as the load paths rather than leaving the read
+            // side open when the load side is closed.
+            crate::security_manager::check_host_native_access_or_throw(ctx, "symbolLookup")?;
 
             match ctx.find_native_symbol(lib_index, &sym_name) {
                 Some(addr) => {
@@ -1930,6 +1954,7 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
             let impl_obj = obj_arg(args, 0)?;
             let name_obj = obj_arg(args, 1)?;
             let name = ctx.read_string(name_obj).unwrap_or_default();
+            require_native_access(ctx, "libraryLookup")?;
             match ctx.load_native_library(&name) {
                 Ok(lib_index) => {
                     // Stash the library index as the opaque `handle` long.
@@ -1992,6 +2017,14 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
             };
             let name_obj = obj_arg(args, 1)?;
             let name = ctx.read_string(name_obj).unwrap_or_default();
+            // `handle` is caller-supplied and is only `lib_index + 1`, a small
+            // dense integer, so without this gate a guest can walk 1, 2, 3, …
+            // and `dlsym` any library loaded by anyone in the process — a
+            // symbol-address oracle that never passes the load-time check.
+            // Same gate as the load paths, so trusted callers are unaffected:
+            // it denies only under CRATONVM_UNTRUSTED_CODE or a SecurityManager
+            // policy that withholds `loadLibrary.*`.
+            crate::security_manager::check_host_native_access_or_throw(ctx, "findEntry")?;
             // Undo the +1 offset applied by load0 to recover the library index.
             let lib_index = handle - 1;
             let addr = ctx.find_native_symbol(lib_index, &name).unwrap_or(0);
@@ -2291,6 +2324,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
     use crate::panama_libffi as plf;
     use libffi::middle::{arg as ffi_arg, CodePtr};
 
+    require_native_access(ctx, "downcall")?;
     let handle = obj_arg(args, 0)?;
     let fn_addr = match ctx.get_field(handle, 0) {
         Value::Long(n) => n,
@@ -4049,9 +4083,12 @@ fn r3_get_input_stream(ctx: &dyn NativeContext, buffered_reader: ObjectRef) -> O
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // FIX(test): RAII guard that enables the process-wide native-access gate
     // for the duration of a downcall test and restores the previous value on

@@ -229,12 +229,7 @@ mod loader_lookup_tests {
                 if let Some(old) = self.map.insert((loader, Arc::clone(&name)), id) {
                     release_name_definition(&mut self.index, &name, old);
                 }
-                *self
-                    .index
-                    .entry(name)
-                    .or_default()
-                    .entry(id)
-                    .or_insert(0) += 1;
+                *self.index.entry(name).or_default().entry(id).or_insert(0) += 1;
             }
             fn remove(&mut self, loader: ClassLoaderId, name: &str) {
                 let name: Arc<str> = Arc::from(name);
@@ -326,41 +321,21 @@ mod loader_lookup_tests {
             (ClassLoaderId::Application, "p/X", 3),
         ]);
         assert_eq!(
-            loaded_class_for_requesting_loader(
-                &all,
-                ClassLoaderId::Application,
-                "p/X",
-                true
-            ),
+            loaded_class_for_requesting_loader(&all, ClassLoaderId::Application, "p/X", true),
             Some(ClassId::new(1))
         );
         assert_eq!(
-            loaded_class_for_requesting_loader(
-                &all,
-                ClassLoaderId::Extension,
-                "p/X",
-                true
-            ),
+            loaded_class_for_requesting_loader(&all, ClassLoaderId::Extension, "p/X", true),
             Some(ClassId::new(1))
         );
 
         let app_only = definitions(&[(ClassLoaderId::Application, "p/Y", 4)]);
         assert_eq!(
-            loaded_class_for_requesting_loader(
-                &app_only,
-                ClassLoaderId::Bootstrap,
-                "p/Y",
-                true
-            ),
+            loaded_class_for_requesting_loader(&app_only, ClassLoaderId::Bootstrap, "p/Y", true),
             None
         );
         assert_eq!(
-            loaded_class_for_requesting_loader(
-                &app_only,
-                ClassLoaderId::Extension,
-                "p/Y",
-                true
-            ),
+            loaded_class_for_requesting_loader(&app_only, ClassLoaderId::Extension, "p/Y", true),
             None
         );
     }
@@ -967,8 +942,11 @@ fn fire_class_load_hook(class_id: u32, class_name: &str, thread_id: u64) {
     }
     if CLASS_LOAD_HOOK.get().is_some() {
         PENDING_CLASS_HOOKS.with(|q| {
-            q.borrow_mut()
-                .push(PendingClassHook::Load(class_id, class_name.to_string(), thread_id))
+            q.borrow_mut().push(PendingClassHook::Load(
+                class_id,
+                class_name.to_string(),
+                thread_id,
+            ))
         });
     }
 }
@@ -982,8 +960,11 @@ fn fire_class_prepare_hook(class_id: u32, class_name: &str, thread_id: u64) {
     }
     if CLASS_PREPARE_HOOK.get().is_some() {
         PENDING_CLASS_HOOKS.with(|q| {
-            q.borrow_mut()
-                .push(PendingClassHook::Prepare(class_id, class_name.to_string(), thread_id))
+            q.borrow_mut().push(PendingClassHook::Prepare(
+                class_id,
+                class_name.to_string(),
+                thread_id,
+            ))
         });
     }
 }
@@ -1515,6 +1496,11 @@ pub struct DefineClassOptions {
     /// bug, reproducible with a plain `Proxy.newProxyInstance` + custom
     /// `ClassLoader`, independent of annotations).
     pub force_loader_faithful_linking: bool,
+    /// Exact superclass identity supplied by a runtime define path that has
+    /// already performed JVMS initiating-loader resolution.
+    pub superclass_id_override: Option<ClassId>,
+    /// Exact interface identities, in class-file declaration order.
+    pub interface_id_overrides: Option<Vec<ClassId>>,
 }
 
 /// Options for [`ClassManager::redefine_class`] (WP2.4-B).
@@ -3940,8 +3926,30 @@ impl ClassManager {
                 other => other,
             }
         };
+        let validate_explicit_supertype =
+            |this: &Self, id: ClassId, expected_name: &str| -> Result<ClassId, VmError> {
+                match this.get_class(id) {
+                    Some(class) if class.name.as_ref() == expected_name => Ok(id),
+                    Some(class) => Err(VmError::Linkage(
+                        LinkageError::IncompatibleClassChangeError {
+                            message: format!(
+                                "explicit supertype identity mismatch: class file names \
+                                 {expected_name}, supplied ClassId {id:?} names {}",
+                                class.name
+                            ),
+                        },
+                    )),
+                    None => Err(VmError::Linkage(LinkageError::NoClassDefFoundError {
+                        class_name: expected_name.to_string(),
+                    })),
+                }
+            };
         let superclass_id = match class_file.super_class {
-            Some(ref super_name) => match resolve_supertype(self, &**super_name) {
+            Some(ref super_name) => match options
+                .superclass_id_override
+                .map(|id| validate_explicit_supertype(self, id, super_name))
+                .unwrap_or_else(|| resolve_supertype(self, super_name))
+            {
                 Ok(id) => Some(id),
                 Err(e) => {
                     self.loading_guard.remove(name);
@@ -3955,12 +3963,33 @@ impl ClassManager {
         // deref to `&str` for `load_class`. Same loader-faithful preference as
         // the superclass above (an enhanced subclass must link the loader's own
         // copy of an enhanced super-interface).
-        let interface_ids: Vec<ClassId> = match class_file
-            .interfaces
-            .iter()
-            .map(|iface_name| resolve_supertype(self, iface_name))
-            .collect::<Result<Vec<_>, _>>()
-        {
+        let resolved_interfaces = if let Some(explicit) = options.interface_id_overrides.as_ref() {
+            if explicit.len() != class_file.interfaces.len() {
+                Err(VmError::Linkage(
+                    LinkageError::IncompatibleClassChangeError {
+                        message: format!(
+                            "explicit interface identity count mismatch: class file has {}, \
+                             caller supplied {}",
+                            class_file.interfaces.len(),
+                            explicit.len()
+                        ),
+                    },
+                ))
+            } else {
+                explicit
+                    .iter()
+                    .zip(class_file.interfaces.iter())
+                    .map(|(&id, name)| validate_explicit_supertype(self, id, name))
+                    .collect::<Result<Vec<_>, _>>()
+            }
+        } else {
+            class_file
+                .interfaces
+                .iter()
+                .map(|iface_name| resolve_supertype(self, iface_name))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let interface_ids: Vec<ClassId> = match resolved_interfaces {
             Ok(ids) => ids,
             Err(e) => {
                 self.loading_guard.remove(name);
@@ -7992,7 +8021,6 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // `implements RandomAccess`.
         "cratonvm/internal/ArrayListSubList" => &["java/util/List", "java/util/RandomAccess"],
         "java/util/Dictionary" => &[],
-        "java/util/Dictionary" => &[],
         "java/util/ArrayDeque" => &[
             "java/util/Deque",
             "java/util/Queue",
@@ -8600,9 +8628,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/io/OutputStreamWriter" => {
             vec![named_field("out", "Ljava/io/OutputStream;")]
         }
-        "java/io/BufferedWriter" => {
-            pad_to(vec![named_field("out", "Ljava/io/Writer;")], 3)
-        }
+        "java/io/BufferedWriter" => pad_to(vec![named_field("out", "Ljava/io/Writer;")], 3),
         "java/io/DataInputStream" | "java/io/DataOutputStream" => instance_fields(1),
         "java/io/FileDescriptor" => instance_fields(4),
         // PrintStream/PrintWriter = 1 field (fd)
@@ -8970,71 +8996,72 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             }]
         }
-        "java/lang/Thread$State" => pad_to(vec![
-            ClassFileField {
-                access_flags: FieldAccessFlags::PUBLIC
-                    | FieldAccessFlags::STATIC
-                    | FieldAccessFlags::FINAL,
-                name: cratonvm_types::intern_arc("NEW"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::PUBLIC
-                    | FieldAccessFlags::STATIC
-                    | FieldAccessFlags::FINAL,
-                name: cratonvm_types::intern_arc("RUNNABLE"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::PUBLIC
-                    | FieldAccessFlags::STATIC
-                    | FieldAccessFlags::FINAL,
-                name: cratonvm_types::intern_arc("BLOCKED"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::PUBLIC
-                    | FieldAccessFlags::STATIC
-                    | FieldAccessFlags::FINAL,
-                name: cratonvm_types::intern_arc("WAITING"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::PUBLIC
-                    | FieldAccessFlags::STATIC
-                    | FieldAccessFlags::FINAL,
-                name: cratonvm_types::intern_arc("TIMED_WAITING"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::PUBLIC
-                    | FieldAccessFlags::STATIC
-                    | FieldAccessFlags::FINAL,
-                name: cratonvm_types::intern_arc("TERMINATED"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
-                attributes: vec![],
-            },
-        ], 2),
+        "java/lang/Thread$State" => pad_to(
+            vec![
+                ClassFileField {
+                    access_flags: FieldAccessFlags::PUBLIC
+                        | FieldAccessFlags::STATIC
+                        | FieldAccessFlags::FINAL,
+                    name: cratonvm_types::intern_arc("NEW"),
+                    descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::PUBLIC
+                        | FieldAccessFlags::STATIC
+                        | FieldAccessFlags::FINAL,
+                    name: cratonvm_types::intern_arc("RUNNABLE"),
+                    descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::PUBLIC
+                        | FieldAccessFlags::STATIC
+                        | FieldAccessFlags::FINAL,
+                    name: cratonvm_types::intern_arc("BLOCKED"),
+                    descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::PUBLIC
+                        | FieldAccessFlags::STATIC
+                        | FieldAccessFlags::FINAL,
+                    name: cratonvm_types::intern_arc("WAITING"),
+                    descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::PUBLIC
+                        | FieldAccessFlags::STATIC
+                        | FieldAccessFlags::FINAL,
+                    name: cratonvm_types::intern_arc("TIMED_WAITING"),
+                    descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::PUBLIC
+                        | FieldAccessFlags::STATIC
+                        | FieldAccessFlags::FINAL,
+                    name: cratonvm_types::intern_arc("TERMINATED"),
+                    descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                    attributes: vec![],
+                },
+            ],
+            2,
+        ),
         "java/security/Permission"
         | "java/security/BasicPermission"
         | "java/lang/RuntimePermission"
         | "java/util/PropertyPermission"
-        | "java/util/logging/LoggingPermission" => {
-            pad_to(
-                vec![ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("name"),
-                    descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
-                    attributes: vec![],
-                }],
-                2,
-            )
-        }
+        | "java/util/logging/LoggingPermission" => pad_to(
+            vec![ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("name"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
+                attributes: vec![],
+            }],
+            2,
+        ),
 
         // Atomic types: 1 field (value=0)
         "java/util/concurrent/atomic/AtomicInteger"
@@ -9217,56 +9244,59 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
-        "java/lang/reflect/Method" => pad_to(vec![
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("override"),
-                descriptor: cratonvm_types::intern_arc("Z"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("clazz"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("slot"),
-                descriptor: cratonvm_types::intern_arc("I"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("name"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("returnType"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("parameterTypes"),
-                descriptor: cratonvm_types::intern_arc("[Ljava/lang/Class;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("modifiers"),
-                descriptor: cratonvm_types::intern_arc("I"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("callerSensitive"),
-                descriptor: cratonvm_types::intern_arc("B"),
-                attributes: vec![],
-            },
-        ], 12),
+        "java/lang/reflect/Method" => pad_to(
+            vec![
+                ClassFileField {
+                    access_flags: FieldAccessFlags::empty(),
+                    name: cratonvm_types::intern_arc("override"),
+                    descriptor: cratonvm_types::intern_arc("Z"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::empty(),
+                    name: cratonvm_types::intern_arc("clazz"),
+                    descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::empty(),
+                    name: cratonvm_types::intern_arc("slot"),
+                    descriptor: cratonvm_types::intern_arc("I"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::empty(),
+                    name: cratonvm_types::intern_arc("name"),
+                    descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::empty(),
+                    name: cratonvm_types::intern_arc("returnType"),
+                    descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::empty(),
+                    name: cratonvm_types::intern_arc("parameterTypes"),
+                    descriptor: cratonvm_types::intern_arc("[Ljava/lang/Class;"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::empty(),
+                    name: cratonvm_types::intern_arc("modifiers"),
+                    descriptor: cratonvm_types::intern_arc("I"),
+                    attributes: vec![],
+                },
+                ClassFileField {
+                    access_flags: FieldAccessFlags::empty(),
+                    name: cratonvm_types::intern_arc("callerSensitive"),
+                    descriptor: cratonvm_types::intern_arc("B"),
+                    attributes: vec![],
+                },
+            ],
+            12,
+        ),
         "java/lang/reflect/Constructor" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
@@ -11110,21 +11140,27 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         ],
         // OptionMap = 1 (entries_arc_handle).  Immutable-after-build; the
         // Long round-trips to `lookup_map(handle)` for every read.
-        "org/xnio/OptionMap" => pad_to(vec![ClassFileField {
-            access_flags: FieldAccessFlags::empty(),
-            name: cratonvm_types::intern_arc("entriesHandle"),
-            descriptor: cratonvm_types::intern_arc("J"),
-            attributes: vec![],
-        }], 2),
+        "org/xnio/OptionMap" => pad_to(
+            vec![ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("entriesHandle"),
+                descriptor: cratonvm_types::intern_arc("J"),
+                attributes: vec![],
+            }],
+            2,
+        ),
         // OptionMap$Builder = 1 (pending_entries handle).  Mutable until
         // `getMap()` flips `consumed` atomically; subsequent `set()` raises
         // IllegalStateException.
-        "org/xnio/OptionMap$Builder" => pad_to(vec![ClassFileField {
-            access_flags: FieldAccessFlags::empty(),
-            name: cratonvm_types::intern_arc("pendingHandle"),
-            descriptor: cratonvm_types::intern_arc("J"),
-            attributes: vec![],
-        }], 2),
+        "org/xnio/OptionMap$Builder" => pad_to(
+            vec![ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("pendingHandle"),
+                descriptor: cratonvm_types::intern_arc("J"),
+                attributes: vec![],
+            }],
+            2,
+        ),
         // IoFuture = 3 (status int snapshot, result_slot handle, notifier_list
         // mirror handle).  Real state (AtomicU8, Mutex<FutureState>, Condvar)
         // lives in the process-wide `futures` registry.  Transitions are
@@ -11476,7 +11512,6 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         _ => vec![],
     }
 }
-
 
 #[cfg(test)]
 #[test]
@@ -13519,7 +13554,10 @@ mod tests {
 
         assert_eq!(unloaded.len(), 1);
         assert_eq!(unloaded[0].id, dead);
-        assert!(cm.get_class(dead).is_none(), "the proven-dead class is tombstoned");
+        assert!(
+            cm.get_class(dead).is_none(),
+            "the proven-dead class is tombstoned"
+        );
         assert!(
             cm.get_class(live).is_some(),
             "a live sibling in the same synthetic namespace must remain loaded"

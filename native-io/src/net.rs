@@ -2383,20 +2383,38 @@ mod ext_opt_sys {
     pub(super) fn get_int(fd: usize, level: i32, name: i32) -> std::io::Result<i32> {
         let mut value = 0i32;
         let mut len = std::mem::size_of::<i32>() as i32;
+        // SAFETY: `fd` is a live socket borrowed from a registry, and the
+        // value/length pointers name writable `i32` storage for this call.
         let rc = unsafe { getsockopt(fd, level, name, (&mut value as *mut i32).cast(), &mut len) };
-        if rc == 0 { Ok(value) } else { Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() })) }
+        if rc == 0 {
+            Ok(value)
+        } else {
+            // SAFETY: WSAGetLastError has no pointer arguments or preconditions.
+            Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        }
     }
 
     pub(super) fn set_int(fd: usize, level: i32, name: i32, value: i32) -> std::io::Result<()> {
+        // SAFETY: `fd` is a live socket borrowed from a registry, and `value`
+        // is readable for the exact byte count supplied to Winsock.
         let rc = unsafe { setsockopt(fd, level, name, (&value as *const i32).cast(), std::mem::size_of::<i32>() as i32) };
-        if rc == 0 { Ok(()) } else { Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() })) }
+        if rc == 0 {
+            Ok(())
+        } else {
+            // SAFETY: WSAGetLastError has no pointer arguments or preconditions.
+            Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        }
     }
 
     pub(super) fn probe(opt: ExtOpt, writable: bool) -> bool {
         let Some((level, name)) = level_and_name(opt) else { return false; };
+        // SAFETY: constants request an ordinary IPv4 TCP socket and no raw
+        // pointers cross the FFI boundary.
         let fd = unsafe { socket(2, 1, IPPROTO_TCP) };
         if fd == usize::MAX { return false; }
         let supported = if writable { set_int(fd, level, name, 1).is_ok() } else { get_int(fd, level, name).is_ok() };
+        // SAFETY: `fd` was returned successfully by `socket` above and is
+        // closed exactly once before leaving this probe.
         unsafe { closesocket(fd) };
         supported
     }

@@ -42,7 +42,7 @@ fn dbg_dopriv_enabled() -> bool {
     *DBG_DOPRIV.get_or_init(|| crate::nbflags().dbg_dopriv)
 }
 
-// SECURITY FIX (V10): strict opt-in for the certification profile.
+// SECURITY FIX (V10): strict opt-in for the defence-in-depth profile.
 //
 // Default runtime behavior: "no policy loaded = no enforcement" — when no
 // java.policy is installed the VM allows everything, matching JDK semantics
@@ -51,14 +51,54 @@ fn dbg_dopriv_enabled() -> bool {
 // JDK-compat case.
 //
 // When `CRATONVM_REQUIRE_POLICY` is set, a missing policy instead DENIES
-// (fail-closed). The certification profile sets this flag so that the
+// (fail-closed). `CRATONVM_UNTRUSTED_CODE` implies this flag so that the
 // absence of an explicitly-loaded policy can never be mistaken for an
 // allow-all grant. The flag must be set before the first permission check.
 static REQUIRE_POLICY: OnceLock<bool> = OnceLock::new();
 
 #[inline]
 fn require_policy_enabled() -> bool {
-    *REQUIRE_POLICY.get_or_init(|| crate::nbflags().require_policy)
+    *REQUIRE_POLICY.get_or_init(|| {
+        crate::nbflags().require_policy || cratonvm_types::flags::flags().io.untrusted_code
+    })
+}
+
+/// Enforce the common boundary for JNI library loads, symbol lookup, and FFM
+/// host calls. The untrusted-code profile always denies native execution.
+/// Otherwise an installed SecurityManager must grant the corresponding
+/// `RuntimePermission("loadLibrary.<target>")`.
+pub(crate) fn check_host_native_access_or_throw(
+    ctx: &mut dyn NativeContext,
+    target: &str,
+) -> Result<(), MethodCallFailed> {
+    let permission_target = format!("loadLibrary.{target}");
+    if cratonvm_types::flags::flags().io.untrusted_code {
+        return Err(RuntimeError::SecurityException {
+            message: format!(
+                "host native access denied by CRATONVM_UNTRUSTED_CODE ({permission_target})"
+            ),
+        }
+        .into());
+    }
+    if get_security_manager(&*ctx).is_none() {
+        return Ok(());
+    }
+    let code_base = current_privileged_code_base_arc();
+    let cert_digests = current_privileged_cert_digests_arc();
+    if policy_allows_full_generic(
+        "java/lang/RuntimePermission",
+        &permission_target,
+        "",
+        code_base.as_deref(),
+        &cert_digests,
+    ) {
+        Ok(())
+    } else {
+        Err(throw_access_control_exception(
+            ctx,
+            format!("access denied (\"java/lang/RuntimePermission\" \"{permission_target}\")"),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +115,20 @@ fn require_policy_enabled() -> bool {
 /// remapped, so the installed SM was ALSO collectable. Same pattern as
 /// `ASYNC_POOL` in lib.rs.
 static SECURITY_MANAGER: Mutex<Option<(i32, ObjectRef)>> = Mutex::new(None);
+
+#[cfg(test)]
+static SECURITY_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialize tests that mutate process-wide SecurityManager or policy state.
+///
+/// Holding the singleton's own mutex across a test would deadlock when the
+/// code under test reads it, so the harness uses this independent lock.
+#[cfg(test)]
+pub(crate) fn security_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    SECURITY_STATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 /// Return the currently-installed `java.lang.SecurityManager` reference,
 /// or `None` if `System.setSecurityManager(null)` is in effect (the default).
@@ -1472,10 +1526,13 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Helper: look up a native and call it through the registry.
     fn call_native(
@@ -1494,6 +1551,7 @@ mod tests {
 
     #[test]
     fn test_set_and_get_security_manager() {
+        let _guard = security_state_test_lock();
         let mut ctx = MockNativeContext::new();
         // Reset global state
         set_security_manager(&mut ctx, None);
@@ -1655,6 +1713,7 @@ mod tests {
 
     #[test]
     fn test_system_get_set_security_manager() {
+        let _guard = security_state_test_lock();
         // Reset global state
         let _ = set_security_manager_for_test(None);
 
@@ -2003,11 +2062,7 @@ mod tests {
     /// execution doesn't cause one test's `clear_policy_and_stack()` to
     /// race another's `set_active_policy(Some(...))`.
     fn policy_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        security_state_test_lock()
     }
 
     /// Reset global state between policy-sensitive tests.
@@ -2779,6 +2834,7 @@ mod tests {
 
     #[test]
     fn t19_n3_ac_get_stack_context_returns_null_when_no_security_manager() {
+        let _guard = security_state_test_lock();
         // No SecurityManager is installed; the spec-matching answer is null.
         let _ = set_security_manager_for_test(None);
 
