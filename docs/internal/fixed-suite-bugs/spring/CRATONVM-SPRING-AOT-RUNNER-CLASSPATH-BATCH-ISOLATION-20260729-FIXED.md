@@ -4,7 +4,8 @@
 > remaining VM semantic failures. One was a Linux fixture-classpath mismatch;
 > the other three were cascading discovery OOMs from sharing one CratonVM heap
 > across multiple heavy test classes. The runner now matches Gradle's owning-
-> module classpath and uses one VM per class by default.
+> module classpath and uses one VM per class by default. Final reconciliation
+> also exposed and fixed a newly merged StackWalker retain-access regression.
 
 ## Reported result
 
@@ -57,15 +58,36 @@ Validation also found that `--start N --count C` incremented `C` on rows before
 only after a row is selected. The focused runner regression changed from
 `0 classes` to exactly one class and produced the expected 7/7 result.
 
+### StackWalker retain access was scoped to the callback, not the frame
+
+During final reconciliation, an incoming StackWalker contract change made all
+34 `BeanDefinitionMethodGeneratorTests` fail in both modes while initializing
+Log4j. Log4j legally returns an `Optional<StackFrame>` from `StackWalker.walk()`
+and calls `getDeclaringClass()` after the walk callback returns. CratonVM stored
+the `RETAIN_CLASS_REFERENCE` authorization in a thread-local flag and cleared
+it when the callback returned, so the retained frame then threw
+`UnsupportedOperationException: No access to RETAIN_CLASS_REFERENCE`.
+
+The synthetic frame now carries a persistent retain bit in slot 7. Both
+`getDeclaringClass()` and `getMethodType()` read that per-frame bit, so frames
+remain valid after `walk()` returns while frames from a default walker still
+throw as required. The real JDK 25 `ClassFrameInfo` carrier also uses the
+correct `RETAIN_CLASS_REF_BIT` mask, `0x08000000`; the prior `0x01` mask did not
+match JDK 25's constructor or `retainClassRef()` bytecode.
+
+A focused HotSpot/CratonVM probe verified retained one-option and set-option
+walkers, a rejected default walker, and successful Log4j `LogManager`
+initialization in JIT and `--nojit` modes.
+
 ## Validation
 
 Remote host: `victor@20.83.144.174`, real JDK 25, isolated worktree
 `/data/data/wt-spring-aot-writer-beans-20260729-019fae8e`.
 
 Validated binary:
-`localbin/cratonvm-spring-aot-writer-beans-final-019fae8e`, built from
-`240fb6b3880f9339addc618927ee35cc6122faa2`, SHA-256
-`90a78ca7d8dcb7707bcf6d013469163cb16f5aed1f36557f8acb08d55d69e387`.
+`localbin/cratonvm-spring-aot-writer-beans-final-48cdde50-019fae8e`, built from
+`48cdde50b876bbcfd5c9179cf547af3bd8569e05`, SHA-256
+`809022a46fa9f6123395609615c031b7cb8411265b8eafd0baefed67def2572a`.
 
 | class | JIT | `--nojit` |
 |---|---:|---:|
@@ -79,5 +101,5 @@ Each mode totals 4 classes, 81 tests found, 79 passed, 0 failed, 2 skipped,
 `FAILCAUSE`, `LOADERR`, abort, panic, or segmentation-fault markers.
 
 The long `BeanRegistrationsAotContributionTests` full-class runs completed in
-6,873,024 ms with JIT and 6,741,712 ms with `--nojit`; they were not replaced by
+7,159,294 ms with JIT and 7,767,466 ms with `--nojit`; they were not replaced by
 method probes or inferred from process liveness.
