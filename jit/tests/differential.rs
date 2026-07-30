@@ -27,6 +27,21 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         panic!("JIT differential test invoked an unwired runtime helper");
     }
     let s = stub as *const () as usize;
+    // `set_throw_bci` only records the throwing bci in a thread-local; the
+    // backend calls it on the throw path of EVERY method that has an exception
+    // check, so reaching it is normal rather than a sign of missing wiring.
+    // Give it a real no-op instead of the panicking stub.
+    unsafe extern "C" fn record_throw_bci(_bci: i64) {}
+    let throw_bci = record_throw_bci as *const () as usize;
+    unsafe extern "C" fn deopt_unserviceable_stub(
+        _vm: i64,
+        _info: i64,
+        _args: i64,
+        _n: i64,
+    ) -> i64 {
+        i64::MIN
+    }
+    let deopt_unserviceable = deopt_unserviceable_stub as *const () as usize;
     JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
@@ -85,6 +100,16 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         region_bounds_addr: 0,
         native_stack_floor_fn: 0,
         ldc_string: s,
+        // Reached through emit_call_absolute, so a 0 here is a null CALL
+        // (SIGSEGV), not an inert "unwired" sentinel. Neither is a sign of
+        // missing wiring: `set_throw_bci` just records the throwing bci, and
+        // `service_callee_deopt` is the normal IR direct-call path when a
+        // callee returns the i64::MIN "threw" sentinel. The deopt stub returns
+        // that sentinel unchanged -- exactly what the real helper does for a
+        // vm/info it cannot service -- so the caller propagates the throw.
+        set_throw_bci: throw_bci,
+        service_callee_deopt: deopt_unserviceable,
+        ..Default::default()
     }
 }
 

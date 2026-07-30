@@ -13,6 +13,9 @@
 //! registered native over bytecode, and `java/util/HashMap.<init>()V` is
 //! exactly the dangerous shape — an empty bytecode constructor plus
 //! `native_map_init`, which allocates the 16-bucket table.
+//! `java/util/concurrent/ConcurrentHashMap.<init>()V` is similarly tiny, while
+//! its native installs the segmented backing store. The inline resolver must
+//! reject both native-shadowed classfile bodies, not only constructor elision.
 //!
 //! With the call elided, a JIT-compiled `new HashMap<>()` produced a map with
 //! no table; the first `put` then materialised one through `map_resize`, which
@@ -31,7 +34,9 @@
 //! (the oracle) and once with the JIT forced on for the fixture's package —
 //! and require byte-identical `r:` observation lines. The fixture prints
 //! iteration orders, which are a direct readout of each collection's table
-//! capacity.
+//! capacity, and exercises `ArrayList.equals` with allocating element
+//! comparisons so native collection loops cannot retain stale backing-array
+//! references across a moving GC.
 //!
 //! Prerequisites are gated exactly like the other subprocess tests: a missing
 //! `cratonvm` binary or uncompiled fixture prints a skip notice instead of
@@ -167,7 +172,9 @@ fn run_fixture(mode: Mode) -> Option<Run> {
     };
 
     let mut cmd = Command::new(&bin);
-    cmd.arg("-c")
+    cmd.arg("--Xmx")
+        .arg("64m")
+        .arg("-c")
         .arg(classpath_dir())
         .arg(format!("cratonvm.{FIXTURE}"))
         .stdin(Stdio::null())
@@ -253,8 +260,8 @@ fn jit_allocated_collections_iterate_like_interpreted_ones() {
     let jit_obs = observation_lines(&jit.stdout);
     assert_eq!(
         interp_obs.len(),
-        6,
-        "fixture should emit 6 'r:' observations; got {}.\nstdout:\n{}",
+        8,
+        "fixture should emit 8 'r:' observations; got {}.\nstdout:\n{}",
         interp_obs.len(),
         interp.stdout,
     );
@@ -268,7 +275,9 @@ fn jit_allocated_collections_iterate_like_interpreted_ones() {
         "JIT MISCOMPILE: a collection allocated in JIT-compiled code does not \
          match the interpreter's. A differing `hashMapNoArg=` line means the \
          table capacity differs — the trivial-constructor elision skipped a \
-         native-shadowed `<init>` (see this test's module docs).\n\
+         native-shadowed `<init>`; a missing `concurrentHashMap=` line means \
+         the inline resolver bypassed that constructor (see this test's module \
+         docs).\n\
          --- INTERP ---\n{}\n--- JIT ---\n{}\n--- JIT stderr ---\n{}",
         interp.stdout, jit.stdout, jit.stderr,
     );

@@ -6879,6 +6879,35 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
 ///    the dispatch helper, so the returned sentinel carries properly
 ///    stashed exception state for the caller's post-invoke check.
 ///
+/// Compiled `StringConcatFactory` bridge. Arguments reside in a JIT-owned raw
+/// spill buffer and are decoded by the call site's descriptor before Java code
+/// can run or move the heap.
+///
+/// SAFETY: all pointers are supplied by the generated call sequence for the
+/// current live VM and the site allocation is process-lived.
+pub unsafe extern "C" fn jit_indy_string_concat(
+    vm_ptr: i64,
+    site_ptr: i64,
+    args_ptr: *const i64,
+    arg_count: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        return 0;
+    };
+    let vm = &*(vm_ptr as *const SharedVm);
+    crate::runtime::invokedynamic::execute_jit_string_concat_raw(
+        vm,
+        thread,
+        site_ptr as usize,
+        args_ptr,
+        arg_count.max(0) as usize,
+    )
+    .map(|obj| obj.as_ptr() as i64)
+    .unwrap_or(0)
+}
+
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) -> i64 {
     // Same Rust<->JIT boundary bookkeeping as `jit_invoke_dispatch`: the
@@ -10677,6 +10706,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     // above. See `jit_integer_value_of_direct` / `jit_integer_int_value_direct`
     // and the recognition in `jit::try_compile`.
     cratonvm_jit::set_integer_value_of_direct_fn(jit_integer_value_of_direct as *const () as usize);
+    cratonvm_jit::set_indy_string_concat_fn(jit_indy_string_concat as *const () as usize);
     cratonvm_jit::set_integer_int_value_direct_fn(
         jit_integer_int_value_direct as *const () as usize,
     );

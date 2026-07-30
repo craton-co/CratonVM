@@ -350,33 +350,8 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     // Inflater natives.  Synthetic-layout replacements here corrupt real JDK
     // resource streams, so only the GZIPOutputStream bridge remains below.
 
-    // GZIPOutputStream — accumulates data in field 0/1, compresses on finish
-    let go = "java/util/zip/GZIPOutputStream";
-    r.register(go, "<init>", "(Ljava/io/OutputStream;)V", p58_gzip_out_init);
-    r.register(go, "write", "(I)V", p58_gzip_out_write);
-    r.register(go, "write", "([BII)V", p58_gzip_out_write_bytes);
-    r.register(go, "finish", "()V", p58_gzip_out_finish);
-    r.register(go, "flush", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Flush underlying stream
-        if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
-            let _ = ctx.invoke_virtual(underlying, "flush", "()V", &[]);
-        }
-        Ok(None)
-    });
-    r.register(go, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Finish compression if not already done (count >= 0 means not finished)
-        let count = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        if count >= 0 {
-            p58_gzip_out_finish(ctx, args)?;
-        }
-        // Close underlying stream
-        if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
-            let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
-        }
-        Ok(None)
-    });
+    // GZIPOutputStream follows the same real-JDK path, including its private
+    // Deflater natives and deterministic compressed-byte behavior.
 
     // ZipInputStream = 5-field (underlying=0, entry_names=1, entry_data=2, current_index=3, read_pos=4)
     let zi = "java/util/zip/ZipInputStream";
@@ -2614,57 +2589,28 @@ pub(crate) fn p58_crc32(data: &[u8]) -> u32 {
     !c
 }
 
-#[cfg(unix)]
 pub(crate) fn p58_zlib_deflate(data: &[u8]) -> Option<Vec<u8>> {
-    use std::ffi::c_void;
-    use std::os::raw::{c_char, c_int, c_ulong};
-
-    type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
-    type Compress2 =
-        unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
-
-    unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
-        let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
-        if ptr.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute_copy(&ptr))
-        }
-    }
-
-    let mut handle = std::ptr::null_mut();
-    for name in [b"libz.so.1\0".as_slice(), b"libz.so\0".as_slice()] {
-        handle = unsafe { libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_LAZY) };
-        if !handle.is_null() {
-            break;
-        }
-    }
-    if handle.is_null() {
-        return None;
-    }
-
-    let compress_bound: CompressBound = unsafe { sym(handle, b"compressBound\0")? };
-    let compress2: Compress2 = unsafe { sym(handle, b"compress2\0")? };
-
-    let source_len = data.len() as c_ulong;
-    let mut bound = unsafe { compress_bound(source_len) } as usize;
+    // `libz-sys` is statically linked for every supported host.  Calling it
+    // directly matters on Windows: the former Unix-only dlopen path fell back
+    // to flate2's alternate backend there, which yields a valid but different
+    // DEFLATE bitstream from `java.util.zip.GZIPOutputStream`.  Zipkin asserts
+    // HotSpot's exact gzip bytes, not merely that they inflate to the same data.
+    let source_len = data.len() as libz_sys::uLong;
+    let mut bound = unsafe { libz_sys::compressBound(source_len) } as usize;
     if bound == 0 {
         bound = data.len().saturating_add(64);
     }
     let mut z = vec![0u8; bound];
-    let mut z_len = bound as c_ulong;
-    let rc = unsafe { compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
+    let mut z_len = bound as libz_sys::uLong;
+    let rc = unsafe {
+        libz_sys::compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6)
+    };
     if rc != 0 || z_len < 6 {
         return None;
     }
     z.truncate(z_len as usize);
     // zlib wrapper = 2-byte header + raw deflate + 4-byte Adler-32 trailer.
     Some(z[2..z.len() - 4].to_vec())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn p58_zlib_deflate(_data: &[u8]) -> Option<Vec<u8>> {
-    None
 }
 
 pub(crate) fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
