@@ -135,6 +135,17 @@ Row notes:
   by forcing ~6x more young collections) and was reverted. Full measurement
   history, isolation methodology, and the root-cause writeup are in
   [`binarytrees-bt18-half-gap-20260730.md`](docs/internal/performance/binarytrees-bt18-half-gap-20260730.md).
+- **Sieve** is three counted `boolean[]` loops, and single-pass BCE refuses
+  inclusive (`<=`) loops and non-`arr.length` bounds, so every element kept a
+  null and bounds check. A 2026-07-30 change added three fall-through-only
+  guarded preheaders — a block clear, a strided store, and the whole sieve
+  nest, the last of which scans eight bytes at a time for the next unmarked
+  index. Two independent 9-round interleaved same-binary A/B measurements
+  (`CRATONVM_JIT_BULK_BYTE_LOOPS=0` as the dev-equivalent control, all 54
+  runs checksum `9592`) cut the HotSpot gap by **94.35%** and **95.30%**,
+  moving the ratio from 1.85x to **1.05x**. Full measurements, the guard
+  contract, and the differential probe are in
+  [`cratonbench-sieve-half-gap-20260730.md`](docs/internal/performance/cratonbench-sieve-half-gap-20260730.md).
 
 ### The performance gate
 
