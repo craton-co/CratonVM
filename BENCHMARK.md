@@ -65,7 +65,7 @@ on this shared box it is often the only trustworthy one.
 | Fibonacci(44)                     | 1,719 ms  | 4,790 ms  | 2.79x |
 | Sieve (100K × 20,000)             | 2,851 ms  | 6,508 ms  | 2.28x |
 | Matrix 1280×1280                  | 2,349 ms  | 6,875 ms  | 2.93x |
-| HashMap (10M put/get, isolated)   | 1,062 ms  | 1,870 ms  | **1.76x** |
+| HashMap (10M put/get, isolated)   | 1,017 ms  | 1,780 ms  | **1.75x** |
 | String/Regex (100K, isolated)     | 55 ms     | 423 ms    | **7.7x** |
 | Binary Trees (depth 18, isolated) | 176 ms    | 1,468 ms  | 8.34x |
 
@@ -96,9 +96,12 @@ Row notes:
   String/Regex's 07-25 row is left as recorded — it has not been re-measured
   and it was the *smaller* of the two claims (3.57x → 7.7x), but it came out of
   the same session, so it deserves the same scepticism.
-- **HashMap's 1.76x is that corrected baseline plus a real 73.1% gap
-  reduction.** From 4,065 ms to 1,870 ms against HotSpot's 1,062 ms, medians of
-  five interleaved fresh-process runs, every checksum `1549999915000000`. Two
+- **HashMap's 1.75x is that corrected baseline plus a real 72.3% gap
+  reduction.** From 3,776 ms to 1,780 ms against HotSpot's 1,017 ms, medians of
+  five interleaved fresh-process runs at load 3.4-3.8, every checksum
+  `1549999915000000`; the repository's own gate independently reports `PASS
+  median 1767ms`. A second series at load 10-12 reads 4,065 / 1,870 / 1,062,
+  i.e. 73.1% — the reduction is stable across load levels. Two
   causes: the Integer-keyed dense overlay was maintaining a second full
   `FxHashMap` purely to remember insertion order it could derive from the key
   (19.7% of the phase in `note_fresh_insert` alone), and a set of per-object
@@ -319,7 +322,7 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > (`bt18-inline-tlab-regression-20260724.md`, 1527–1533 ms); at 2023 ms quiet it
 > is 1.24x off its own doc and is the most tractable thread to pull.
 >
-> *(End of the 2026-07-25 text. The hashmap row was re-anchored to 1,870 ms on
+> *(End of the 2026-07-25 text. The hashmap row was re-anchored to 1,800 ms on
 > 2026-07-30 with the evidence doc the policy above asks for — see the banner at
 > the top of this block for why the "nothing reproduces 4237 ms" premise no
 > longer holds. The other three rows are untouched.)*

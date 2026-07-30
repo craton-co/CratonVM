@@ -209,31 +209,44 @@ same 4 KiB word being answered from the memo and never reaching the bitmap.
 ## Performance evidence
 
 The shared 16-vCPU host never reached the perf gate's required load below 2
-during this session (other sessions' work kept the 1-minute average between 5
-and 19). Acceptance therefore used balanced interleaved cycles pinned to cpu
-15, fresh processes, `-Xmx8g`, no discarded samples, with `mpstat -P ALL`
+during this session (other sessions' work kept the 1-minute average between 3.4
+and 19). Acceptance therefore used balanced interleaved runs pinned to cpu 15,
+fresh processes, `-Xmx8g`, no discarded samples, with `mpstat -P ALL`
 confirming cpu 15 at 90-100% for the measuring process. Load is recorded at
-each process start.
+every process start.
 
 ### Acceptance — `CratonBench hashmap`, the gate's own harness
 
-Five reps, arm order rotated each rep, cpu 15. All 15 checksums
-`1549999915000000`.
+Five reps, all three arms in each rep, cpu 15, taken in the session's quietest
+window (load 3.38-3.80). All 15 checksums `1549999915000000`.
 
 | Arm | Five samples (ms) | Median |
 |---|---|---:|
-| HotSpot JDK 25 | 1,052 / 1,058 / 1,062 / 1,129 / 1,155 | **1,062** |
-| Baseline `dev` @ `9ac1feffe` | 4,037 / 4,064 / 4,065 / 4,094 / 4,748 | **4,065** |
-| Final | 1,853 / 1,866 / 1,870 / 1,887 / 1,932 | **1,870** |
+| HotSpot JDK 25 | 975 / 997 / 1,017 / 1,019 / 1,032 | **1,017** |
+| Baseline `dev` @ `9ac1feffe` | 3,671 / 3,694 / 3,776 / 3,821 / 3,846 | **3,776** |
+| Final | 1,768 / 1,777 / 1,780 / 1,853 / 1,859 | **1,780** |
 
 ```text
-old_gap = 4065 - 1062 = 3003 ms
-new_gap = 1870 - 1062 =  808 ms
-gap_reduction = 1 - 808 / 3003 = 73.1%
+old_gap = 3776 - 1017 = 2759 ms
+new_gap = 1780 - 1017 =  763 ms
+gap_reduction = 1 - 763 / 2759 = 72.3%
 ```
 
-The ratio to HotSpot goes from **3.83x to 1.76x**. The requested reduction was
-50%; this exceeds it by 23.1 percentage points.
+The ratio to HotSpot goes from **3.71x to 1.75x**. The requested reduction was
+50%; this exceeds it by 22.3 percentage points.
+
+### Corroboration — same harness at load 10-12
+
+The identical series run earlier, while the host sat at load 10-12. Every
+absolute is inflated; the gap reduction is not.
+
+| Arm | Five samples (ms) | Median |
+|---|---|---:|
+| HotSpot JDK 25 | 1,052 / 1,058 / 1,062 / 1,129 / 1,155 | 1,062 |
+| Baseline | 4,037 / 4,064 / 4,065 / 4,094 / 4,748 | 4,065 |
+| Final | 1,853 / 1,866 / 1,870 / 1,887 / 1,932 | 1,870 |
+
+`gap_reduction = 1 - (1870 - 1062) / (4065 - 1062) = 73.1%`.
 
 ### Corroboration — `bench/HashMapOnly` 10M
 
@@ -252,6 +265,10 @@ what keeps this comparable). All 15 checksums exact.
 An earlier five-cycle pass at load 2.5, before the arena probes were restored,
 read HotSpot 997 / baseline 3,523 / candidate 1,799 — 68.1%. Every methodology
 tried lands between 68% and 73%.
+
+The repository's own gate agrees: `run-cratonbench-gate.sh --cpu 15 --reps 5
+--phases hashmap` against the final binary reports `PASS median 1767ms <=
+1963ms` at load 3.05, enforcing the exact checksum on all five runs.
 
 ### No regression elsewhere
 
@@ -292,11 +309,13 @@ is corrected to say exactly that.
 
 ### Perf-gate baseline
 
-The `hashmap` row is re-anchored from 4,300 ms to **1,870 ms**, still
-`provisional`. Caveat stated in the TSV and repeated here: that number was
-measured at load 10-12, so it is *inflated* and therefore a conservative
-ceiling. It should be tightened on a genuinely quiet host. Leaving it at 4,300
-was the worse option — the gate would no longer notice a 2x regression.
+The `hashmap` row is re-anchored from 4,300 ms to **1,800 ms**, still
+`provisional`. It is the acceptance median (1,780) rounded up, and the gate's
+own run reproduces it (1,767 at load 3.05, budget 1,890 at the default 5%
+tolerance). Caveat stated in the TSV and repeated here: load 3.4-3.8 is above
+the gate's own `--max-load 2`, so this is a slightly loose ceiling and should
+be tightened on a genuinely quiet host. Leaving it at 4,300 was the worse
+option — the gate would no longer notice a 2.4x regression.
 
 ## What is left
 
