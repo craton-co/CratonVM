@@ -3203,17 +3203,17 @@ pub fn set_kernel_reg_homes_osr_request(on: bool) {
     KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.set(on));
 }
 
-/// `CRATONVM_JIT_KERNEL_REG_OSR` gate (default **OFF**, opt in with `=1`) —
+/// `CRATONVM_JIT_KERNEL_REG_OSR` gate (default **ON**, opt out with `=0`) —
 /// see [`set_kernel_reg_homes_osr_request`].
 ///
-/// Measured 2026-07-18 on the QuickBench kernels this was built for:
-/// Arithmetic showed no wall-clock change (the kernel is long-division
-/// bound — `i/2` + `i%7` chains dwarf the local load/store traffic register
-/// homes remove), and no other kernel demonstrated a win before the round
-/// closed. Given the callee-saved-GPR family's miscompile history, an
-/// unproven-benefit default stays opt-in; bt18/QuickBench checksums were
-/// correct under it in the runs taken (68332206 et al.), so the lever is
-/// safe to experiment with.
+/// The original 2026-07-18 experiment predated constant long-division
+/// lowering, so Arithmetic was division-bound and register homes had no
+/// measurable effect. Once constant `ldiv`/`lrem` stopped dominating, the
+/// same pure-kernel gate became useful: loop-carried primitive locals and the
+/// deferred operand cache can remain in registers. The admission predicate
+/// below still excludes calls, fields, allocation, typechecks, speculative
+/// BCE, and reference locals, and the OSR trampoline seeds the exact assigned
+/// registers before entering the artifact.
 fn kernel_reg_osr_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -3221,9 +3221,9 @@ fn kernel_reg_osr_enabled() -> bool {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_KERNEL_REG_OSR")
             .map(|v| {
                 let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -8846,6 +8846,14 @@ struct Compiler {
     /// pure-int array kernels (QuickBench sieve). Opt out with
     /// `CRATONVM_JIT_NO_SLOT_MIRROR=1`.
     slot_mirror: Option<(i32, u8, usize)>,
+    /// Pure-kernel deferred operand cache. The general-purpose R8/R9 cache was
+    /// previously disabled because call-heavy methods repeatedly paid to flush
+    /// it. Pure kernels have no calls or GC-capable operations, so their only
+    /// flush is at a branch/return; at a counted-loop back edge the operand
+    /// stack is already empty. Keeping arithmetic intermediates in R8/R9
+    /// removes the template backend's remaining frame store/load pairs without
+    /// broadening the pure-kernel admission surface.
+    kernel_operand_cache: bool,
     /// `true` while `try_emit_inline` replays callee bytecode (see
     /// `slot_mirror`): suppresses both recording and consumption.
     slot_mirror_suppressed: bool,
@@ -9745,8 +9753,9 @@ impl Compiler {
         let raw_local_assignments = alloc_result.assignments;
         let raw_used_callee_saved = alloc_result.used_callee_saved;
         let raw_local_assignments_len = raw_local_assignments.len();
+        let kernel_reg_homes_active = KERNEL_REG_HOMES_ACTIVE.with(|c| c.get());
         let gpr_local_homes_enabled =
-            callee_saved_gpr_local_homes_enabled() || KERNEL_REG_HOMES_ACTIVE.with(|c| c.get());
+            callee_saved_gpr_local_homes_enabled() || kernel_reg_homes_active;
         let local_assignments = if gpr_local_homes_enabled {
             raw_local_assignments
         } else {
@@ -9986,6 +9995,7 @@ impl Compiler {
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
             slot_mirror: None,
+            kernel_operand_cache: kernel_reg_homes_active,
             slot_mirror_suppressed: false,
             precise_maps,
             inline_rbp_tls_disp,
@@ -16855,10 +16865,23 @@ impl Compiler {
     /// instead of being stored to the frame, avoiding the memory round-trip when
     /// the next bytecode immediately consumes the value.
     fn push_from_rax(&mut self) {
-        // Spill to frame slot. Scratch register caching (R8/R9) was tested but
-        // showed regressions: the frequent flush_scratch_registers calls before
-        // backward branches, calls, and other operations negate the benefit by
-        // adding an extra MOV per flush.
+        // The broad R8/R9 experiment regressed call-heavy methods because each
+        // call flushed live scratch values. Pure kernels contain no calls,
+        // allocation, fields, or other GC-capable operations; their counted
+        // loop back edges arrive with an empty operand stack. Restrict the
+        // deferred cache to that proven shape.
+        if self.kernel_operand_cache {
+            if let Some(reg) = SCRATCH_REGS.iter().copied().find(|&candidate| {
+                !self
+                    .stack
+                    .iter()
+                    .any(|slot| matches!(slot, StackSlot::Scratch(r) if *r == candidate))
+            }) {
+                self.emit_mov_reg_reg(reg, RAX);
+                self.stack_push(StackSlot::Scratch(reg), false);
+                return;
+            }
+        }
         match self.push_stack() {
             Some(StackSlot::Frame(off)) => self.emit_store_local(off, RAX),
             Some(_) => unreachable!("push_stack always returns Frame"),
@@ -30460,9 +30483,8 @@ pub fn compile_with_param_slots(
     // field/static ops, no allocation, no typechecks, no inline sites, and no
     // speculative BCE guards (those deopt with frame-stashed state). Reference
     // locals are masked back to frame homes, so GC visibility is unchanged.
-    let kernel_reg_homes = (kernel_reg_homes_requested || kernel_reg_homes_osr_requested)
+    let pure_kernel = (kernel_reg_homes_requested || kernel_reg_homes_osr_requested)
         && kernel_reg_locals_enabled()
-        && !callee_saved_gpr_local_homes_enabled()
         && invoke_info.is_empty()
         && direct_calls.is_empty()
         && mic_slots.is_empty()
@@ -30477,6 +30499,11 @@ pub fn compile_with_param_slots(
         && compact_field_info.is_empty()
         && inline_sites.is_empty()
         && speculative_bce_guards.is_empty();
+    // When precise-map general register homes are already enabled, this pure
+    // kernel does not need the narrow allocator to turn homes on again. It is
+    // still a pure kernel, however, and therefore remains eligible for the
+    // call-free deferred operand cache captured by `Compiler::new`.
+    let kernel_reg_homes = pure_kernel && !callee_saved_gpr_local_homes_enabled();
     let mut alloc_result = if kernel_reg_homes {
         let mut ar = alloc_result;
         let ref_mask =
@@ -30630,7 +30657,7 @@ pub fn compile_with_param_slots(
             found
         };
 
-    KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(kernel_reg_homes));
+    KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(pure_kernel));
     let mut compiler = Compiler::new(
         method_key.to_string(),
         buf,
