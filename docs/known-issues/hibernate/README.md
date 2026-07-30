@@ -13,6 +13,17 @@
 
 ## Open
 
+- [Native ANTLR intrinsics lose object roots under the moving young collector](antlr-native-roots-moving-young-hql-misparse-20260730.md)
+  (OPEN; root cause identified, 7 instances fixed) — `ASTParserLoadingTest` under `--nojit` rejects
+  valid HQL nondeterministically. `antlr_intrinsics.rs` holds raw `ObjectRef` locals and whole
+  `Vec<ObjectRef>` config snapshots across allocating calls, so a moving young collection links dead
+  addresses into the parser graph; the poisoned config is then memoized as a DFA edge, which is why
+  one mis-timed collection breaks a whole grammar path for the rest of the process. **Not** the
+  trivial-accessor fast path that was blamed and deleted on 2026-07-29: the verifier reports zero
+  field-resolution divergences, and `CRATONVM_NO_MOVING_YOUNG=1` passes 106/106. Fixes so far take
+  the witness from 1-15 failures per run to 0-2; the tail wants a scoped handle type, not more
+  per-site edits.
+
 - [`action.queue` GRAPH-default tests — blocked by flush-planner throughput](actionqueue-graph-default-tests-legacy-tradeoff-20260727.md)
   (OPEN; one of two root causes fixed) — real-JDK CratonVM defaults
   `hibernate.flush.queue.type` to `legacy`, which gates **19 of the 25

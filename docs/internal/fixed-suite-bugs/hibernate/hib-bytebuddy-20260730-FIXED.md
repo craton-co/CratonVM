@@ -131,10 +131,67 @@ A future blanket `net/bytebuddy/` guard fails the unit suite.
 
 ## 5. Validation
 
-See `RESULTS` section below — filled in from the final binary.
+Worktree `C:\craton\CratonVM-bytebuddy-retire-20260730`, branch
+`codex/fix-bytebuddy-retire-20260730`, binary
+`C:\craton\bb-retire-20260730\cratonvm-bbretire-r7.exe`
+(SHA-256 `8C030FAE1C94CD693F101A2BFD3D60711C0E45E609748CF8DF1512490D3A0947`),
+JDK 25.0.3, manifest `crash302.txt` (the exact 302 classes from the 2026-07-28
+no-ban crash run), 6 shards, 900 s per-class cap, no
+`CRATONVM_JIT_ALLOW_PACKAGES` override.
 
-## 6. Related
+### The 302-class ByteBuddy corpus
 
-- `actionqueue-graph-default-tests-legacy-tradeoff-20260727.md` — the three
+| Mode | PASS | FAIL | CRASH | HANG | ABORTED |
+|---|---:|---:|---:|---:|---:|
+| JIT | 301 | 0 | 0 | 0 | 1 |
+| `--nojit` | 300 | 1 | 0 | 0 | 1 |
+
+**Zero crashes and zero hangs in either mode** — the entire reason the ban
+existed. Both non-PASS rows are known, named, and neither is
+ByteBuddy-attributable:
+
+- `ManyToManyAssociationClassGeneratedIdTest` (ABORTED, both modes) is the
+  documented flush-queue assumption abort. It is **not** waived: re-run with an
+  explicit `-Dhibernate.flush.queue.type=legacy` it passes 1/1 in both modes,
+  and the three `action.queue` classes run with
+  `-Dhibernate.flush.queue.type=graph` pass 3/3 in both modes. No
+  assumption-only row is counted as green.
+- `ASTParserLoadingTest` (FAIL, `--nojit` only) is the moving-young native-root
+  defect in the ANTLR intrinsics — see section 6. Under JIT it is 106/106.
+
+### `ASTParserLoadingTest` specifically
+
+| Binary | JIT | `--nojit` |
+|---|---|---|
+| r3 (before the ANTLR fixes) | 106/106 | 91–105 / 106 |
+| r7 (after) | 106/106 | 104–106 / 106 |
+
+### Unit tests
+
+`cargo test --release -p cratonvm-native-collections -p cratonvm-native-builtins`
+— `gc_native_pins` **12/12**, including the five new alloc-time relocation tests
+that cover the collections rooting work. Six pre-existing environment/timing
+failures remain untouched by this branch (`tzdb` ×2, `proxy_selector` env vars,
+`StampedLock` ×2, `ForkJoinPool` quiescence).
+
+`vm/src/jit/skip_list.rs` carries the permanent gate test described in section 4.
+
+## 6. Known residual (separate issue, not ByteBuddy)
+
+`docs/known-issues/hibernate/antlr-native-roots-moving-young-hql-misparse-20260730.md`
+— the native ANTLR intrinsics hold raw `ObjectRef` locals (and whole
+`Vec<ObjectRef>` config snapshots) across allocating calls, so a moving young
+collection can link dead addresses into the parser graph; a poisoned config is
+then memoized as a DFA edge. Seven instances are fixed here, which took the
+witness from 1–15 failures per run to 0–2. The tail is the same defect class at
+un-converted sites; that doc explains why finishing it wants a scoped handle
+type rather than more per-site edits, and records
+`CRATONVM_NO_MOVING_YOUNG=1` as the interim mitigation.
+
+## 7. Related
+
+- `actionqueue-graph-default-tests-legacy-tradeoff-20260727.md` — the
   `org.hibernate.orm.test.action.queue.*` classes that self-abort under the
   non-GRAPH default; run with an explicit queue type here, not waived.
+- `hibernate-atnstate-transitions-npe-intermittent-hql-parse-20260721-FIXED.md`
+  — the 2026-07-22 pass over the same ANTLR file for the same defect class.
