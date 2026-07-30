@@ -34961,6 +34961,31 @@ fn dbg_osr_recompile_reason(
     );
 }
 
+/// A direct compiled call has no interpreter boundary to route an implicit
+/// exception through the callee's own handler. Keep those callees on checked
+/// dispatch for every entry tier, including OSR.
+fn osr_callee_declares_handlers(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    callee_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+) -> bool {
+    let cm = shared.classes.class_manager.read();
+    let Some(callee_cid) = cm.find_class_by_name_for_class(callee_class, caller_class_id) else {
+        return true;
+    };
+    let store = cm.class_store();
+    let Some((method, _decl)) =
+        crate::classloading::find_method_recursive(callee_cid, callee_method, callee_desc, store)
+    else {
+        return true;
+    };
+    method
+        .code()
+        .map_or(true, |code| !code.exception_table.is_empty())
+}
+
 fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -35689,6 +35714,13 @@ fn compile_osr_artifact(
                 if let Some((callee_pin, entry, needs_ctx)) = compiled_callee {
                     baked_callee_pins.push(callee_pin);
                     if !crate::jit::jit_direct_call_requires_dispatch(
+                        &callee_class,
+                        &callee_method,
+                        &callee_desc,
+                    )
+                    && !osr_callee_declares_handlers(
+                        shared,
+                        class_id,
                         &callee_class,
                         &callee_method,
                         &callee_desc,
@@ -37580,11 +37612,30 @@ fn try_jit_upgrade_with_gate(
             {
                 return None;
             }
-            // Exception-table callees may be baked as direct calls. The x64
-            // lowering snapshots their Java arguments and services an
-            // i64::MIN return through `jit_service_callee_deopt`, which resumes
-            // the callee at its own matching handler instead of attributing the
-            // exception to this caller.
+            // A direct compiled entry has no interpreter boundary to route an
+            // implicit exception through the callee's own handler. Keep only
+            // those methods on the checked dispatch path.
+            {
+                let cm = shared.classes.class_manager.read();
+                if let Some(callee_cid) =
+                    cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
+                {
+                    let store = cm.class_store();
+                    if let Some((method, _decl)) = crate::classloading::find_method_recursive(
+                        callee_cid,
+                        callee_method,
+                        callee_desc,
+                        store,
+                    ) {
+                        if method
+                            .code()
+                            .map_or(false, |code| !code.exception_table.is_empty())
+                        {
+                            return None;
+                        }
+                    }
+                }
+            }
             // Check JIT cache first
             let callee_class_arc: Arc<str> = Arc::from(callee_class);
             let callee_method_arc: Arc<str> = Arc::from(callee_method);
