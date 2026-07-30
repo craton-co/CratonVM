@@ -79,6 +79,17 @@ A focused HotSpot/CratonVM probe verified retained one-option and set-option
 walkers, a rejected default walker, and successful Log4j `LogManager`
 initialization in JIT and `--nojit` modes.
 
+### Cached virtual tier-up took a reentrant class-manager read lock
+
+A later `dev` reconciliation added a Java-util receiver check to
+`execute_invokevirtual_cached()` using a blocking `class_manager.read()`.
+During bootstrap the same VM thread can already own the class-manager write
+lock, so the JIT `BeanDefinitionMethodGeneratorTests` process self-deadlocked
+on a futex before test execution while `--nojit` remained green. The optional
+tier-up check now uses `try_read()` and conservatively suppresses tier-up while
+the class table is busy. The formerly hung JIT class then completed 34/34 in
+242,328 ms.
+
 ## Validation
 
 Remote host: `victor@20.83.144.174`, real JDK 25, isolated worktree
@@ -103,3 +114,12 @@ Each mode totals 4 classes, 81 tests found, 79 passed, 0 failed, 2 skipped,
 The long `BeanRegistrationsAotContributionTests` full-class runs completed in
 7,159,294 ms with JIT and 7,767,466 ms with `--nojit`; they were not replaced by
 method probes or inferred from process liveness.
+
+After that full matrix, moving `dev` was reconciled through merge
+`a800440c95398afc5208400daf3813b6bdb0885d`; the deadlock correction is commit
+`d664e336935d5c2348062ba4b1b16d1633b2f774`. The post-merge binary
+`cratonvm-spring-aot-writer-beans-deadlockfix-a800440c-019fae8e` has SHA-256
+`e5238dc02a4eb29f8dee3e2ec3a529ed2eaafdb3f4a07dc20d888b466b0686bc`.
+Integrated smokes retained the HotSpot-matched StackWalker/Log4j contract,
+FileNative 7/7 in both modes, BeanDefinition 34/34 in `--nojit`, and the
+corrected BeanDefinition 34/34 JIT completion.
