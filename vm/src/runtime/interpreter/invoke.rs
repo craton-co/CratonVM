@@ -12702,9 +12702,46 @@ pub(super) fn execute_invokestatic_cached(
     match target {
         CachedInvokeTarget::Native {
             callback,
-            num_params: _,
+            num_params,
             gate: _,
         } => {
+            // Real-JDK `String.toLowerCase(Locale)` delegates to this static
+            // `StringLatin1` helper. The cached target already proves the
+            // callback and the three-reference signature, while the generic
+            // path below would still resolve and parse that descriptor on
+            // every cache hit. Retain the ordinary prevalidated native
+            // machinery for pinning, forwarding, exceptions and return
+            // coercion.
+            if num_params == 3
+                && cratonvm_native_builtins::lang_string::is_lower_case_native_callback(callback)
+            {
+                let locale = thread.frames[frame_idx]
+                    .stack
+                    .pop_compact_with_long_mark()?
+                    .0
+                    .decode_by_descriptor(b'L');
+                let value = thread.frames[frame_idx]
+                    .stack
+                    .pop_compact_with_long_mark()?
+                    .0
+                    .decode_by_descriptor(b'L');
+                let source = thread.frames[frame_idx]
+                    .stack
+                    .pop_compact_with_long_mark()?
+                    .0
+                    .decode_by_descriptor(b'L');
+                let mut args = [source, value, locale];
+                refresh_stale_object_args(shared, &mut args);
+                invoke_cached_native_callback_prevalidated(
+                    shared,
+                    thread,
+                    frame_idx,
+                    callback,
+                    &args,
+                    "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+                )?;
+                return Ok(CachedCallResult::Handled);
+            }
             let (args, method_descriptor) = pop_coerced_invoke_args_static(
                 shared,
                 caller_class_id,
@@ -21887,6 +21924,46 @@ pub(super) fn execute_invokevirtual_cached(
                             callback,
                             &args,
                             &method_descriptor,
+                        )?;
+                        return Ok(CachedCallResult::Handled);
+                    }
+                    // The two hottest cache lookups in Tomcat are
+                    // `String.toLowerCase(Locale)` and `Map.get(Object)`.
+                    // Their virtual-native cache entries already prove both
+                    // receiver class and callback identity, but the generic
+                    // arm below still re-resolved the CP descriptor and
+                    // allocated a `Vec` for their two reference arguments on
+                    // every iteration. Pop the verifier-known reference pair
+                    // directly and retain the ordinary prevalidated native
+                    // call for pinning, GC remapping, exceptions and return
+                    // coercion.
+                    let cached_string_lower = num_params_usize == 1
+                        && cratonvm_native_builtins::lang_string::is_lower_case_native_callback(
+                            callback,
+                        );
+                    let cached_map_get = num_params_usize == 1
+                        && !cached_string_lower
+                        && cratonvm_native_collections::is_hot_map_get_native_callback(callback);
+                    if cached_string_lower || cached_map_get {
+                        let argument = thread.frames[frame_idx]
+                            .stack
+                            .pop_compact_with_long_mark()?
+                            .0
+                            .decode_by_descriptor(b'L');
+                        let receiver = thread.frames[frame_idx]
+                            .stack
+                            .pop_compact_with_long_mark()?
+                            .0
+                            .decode_by_descriptor(b'L');
+                        let mut args = [receiver, argument];
+                        refresh_stale_object_args(shared, &mut args);
+                        let descriptor = if cached_string_lower {
+                            "(Ljava/util/Locale;)Ljava/lang/String;"
+                        } else {
+                            "(Ljava/lang/Object;)Ljava/lang/Object;"
+                        };
+                        invoke_cached_native_callback_prevalidated(
+                            shared, thread, frame_idx, callback, &args, descriptor,
                         )?;
                         return Ok(CachedCallResult::Handled);
                     }

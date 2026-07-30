@@ -442,7 +442,7 @@ pub fn rootsnap_cache() -> bool {
 // remapping its cached roots through the collection's `pointer_map`, instead of
 // discarding the whole cache on every `collection_count` bump. The cache holds
 // object ADDRESSES; a collection only invalidates them if it RELOCATED the
-// object — and even the default non-moving young sweep relocates via selective
+// object — and even the non-moving young sweep relocates via selective
 // promotion (young→old), so the plain gen gate rebuilds the cache on nearly
 // every collection during an allocation-heavy deploy. Remapping (the same proven
 // operation that relocates frame locals) lets the cache survive. Fail-safe:

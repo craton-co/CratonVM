@@ -805,7 +805,7 @@ struct Compiler {
     /// that survive the call un-spilled, PLUS any oop the JIT's per-slot oop
     /// tracking fails to classify. Fully conservative — the scanner re-validates
     /// each qword via `heap.is_object_address`, so non-oop register values are
-    /// ignored. No post-call reload is needed under the default non-moving young
+    /// ignored. No post-call reload is needed under the opt-out non-moving young
     /// sweep (the object is never relocated, so the register stays valid).
     /// Gated `CRATONVM_JIT_SAFEPOINT_REG_SPILL`; off → byte-identical default
     /// path (no slots reserved, no stores).

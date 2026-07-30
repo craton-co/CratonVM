@@ -628,6 +628,13 @@ pub fn update_all_roots(
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
+        if let Some(key_object) = entry.key_object.as_mut() {
+            let old_addr = key_object.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *key_object = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
     }
     for entry in &mut thread.string_case_cache {
         for obj_ref in [&mut entry.source, &mut entry.first, &mut entry.second] {
@@ -635,6 +642,13 @@ pub fn update_all_roots(
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 debug_assert!(new_addr != 0, "GC pointer map contains null address");
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        if let Some(locale) = entry.locale.as_mut() {
+            let old_addr = locale.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *locale = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
     }

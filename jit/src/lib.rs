@@ -7194,6 +7194,39 @@ pub fn ir_direct_calls_enabled() -> bool {
     }
 }
 
+/// Whether the moving young generation is currently vetoing the optimizing
+/// (C2 / IR) tier — and, the first time it does, say so.
+///
+/// The veto itself is correct: IR lowering publishes no exact-RBP and no
+/// per-safepoint oop map, so a live IR frame cannot prove or rewrite its roots
+/// for a relocating young collection. What was not correct is that the two
+/// defaults were set independently and nothing reported the interaction, so
+/// "the optimizing tier never runs" had to be rediscovered from a cluster of
+/// unexplained `left: 0, right: 1` test failures and three separate open
+/// throughput documents.
+///
+/// One line, once per process, at `warn`. It costs nothing on the compile path
+/// (a relaxed atomic after the first call) and turns a cross-suite archaeology
+/// exercise into an observation.
+pub fn moving_young_disables_optimizing_tier() -> bool {
+    if !x64::moving_young_enabled() {
+        return false;
+    }
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "[jit] optimizing (C2/IR) tier DISABLED: the moving young generation is active \
+             and IR lowering publishes no exact-RBP or per-safepoint oop map, so an IR frame \
+             cannot prove or rewrite its roots for a relocating collection. Every method still \
+             compiles, but through the single-pass C1 backend only — the IR optimizer, its \
+             inline caches and its direct-call lowering contribute nothing. \
+             `CRATONVM_NO_MOVING_YOUNG=1` restores the optimizing tier and gives up compaction. \
+             See docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md",
+        );
+    }
+    true
+}
+
 pub fn direct_jit_callee_calls_enabled() -> bool {
     // A raw JIT-to-JIT call has no callee JitEntryGuard. Moving-young must be
     // able to rewrite every live frame, so it cannot use that edge until the
@@ -8279,7 +8312,15 @@ fn try_compile_inner(
         // but cannot prove or rewrite its roots. The x64 backend enables its
         // complete frame-metadata protocol whenever moving-young is active.
         // Keep IR off until it supplies the same relocation contract.
-        && !x64::moving_young_enabled()
+        //
+        // Because `DEFAULT_MOVING_YOUNG` is `true`, this term is FALSE on every
+        // default build: the optimizing tier never runs and every compile falls
+        // through to single-pass C1. That is a deliberate, documented trade —
+        // `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+        // — but it landed silently, and reconstructing it cost a cross-suite
+        // archaeology exercise. `report_optimizing_tier_disabled` makes the
+        // interaction announce itself once per process instead.
+        && !moving_young_disables_optimizing_tier()
         && ir::ir_compatible(&scan)
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
         // tier used to refuse EVERY method with a `try`/`catch`, which is an
@@ -15499,6 +15540,50 @@ mod tests {
             true,
         ));
         assert!(precise_exception_frame_sites_supported(
+            &code,
+            code.len(),
+            &table,
+        ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn protected_virtual_and_interface_calls_stay_out_of_precise_exception_coverage() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        // 0xb6/0xb9 are deliberately NOT admitted. They were admitted once
+        // (2026-07-27) and removed again by a523715a84 together with the
+        // `protected_precise_handler_call` suppression in `x64.rs`, because
+        // admitting them let Spring's
+        // `SimpleApplicationEventMulticaster.invokeListener` compile and then
+        // read its own pre-`try` `errorHandler` local back as null inside the
+        // handler (springboot-rerun-20260728-small-residuals-cluster, Case 3).
+        //
+        // Re-widening is not free-standing work: it needs that Spring class
+        // (or an equivalent that actually compiles) re-verified first. Doc 23
+        // measured re-widening as worth NOTHING to
+        // `TestCharsetCachePerformance` now that `try`/`catch` methods reach
+        // the optimizing tier by other means, so there is no throughput
+        // argument for carrying the risk.
+        let code = vec![
+            0x2a, // 0: aload_0
+            0xb6, 0x00, 0x01, // 1: invokevirtual #1
+            0x57, // 4: pop
+            0x2a, // 5: aload_0
+            0xb9, 0x00, 0x02, 0x01, 0x00, // 6: invokeinterface #2, count=1
+            0x57, // 11: pop
+            0xb1, // 12: return
+            0x4c, // 13: astore_1
+            0x2b, // 14: aload_1
+            0xbf, // 15: athrow
+        ];
+        let table = vec![ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 13,
+            handler_pc: 13,
+            catch_type: 0,
+        }];
+        assert!(!precise_exception_frame_sites_supported(
             &code,
             code.len(),
             &table,
