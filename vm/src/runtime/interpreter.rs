@@ -6751,7 +6751,7 @@ pub fn execute(
                     // pool) is simply omitted; the x64 codegen's 0xba arm then
                     // bails the whole compile (`return false`) rather than
                     // guessing, exactly like the OSR/hot-path resolvers.
-                    let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
+                    let mut indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)> = Vec::new();
                     if !scan.indy_ops.is_empty() {
                         let cm_lock = shared.classes.class_manager.read();
                         if let Some(class) = cm_lock.get_class(class_id) {
@@ -6768,7 +6768,19 @@ pub fn execute(
                                         let ret_type = crate::jit::return_type(descriptor);
                                         let arg_type_tags =
                                             crate::jit::indy_arg_type_tags(descriptor);
-                                        indy_info.push((pc_indy, arg_slots, ret_type, arg_type_tags));
+                                        let concat_site = crate::runtime::invokedynamic::make_jit_string_concat_site_from_parts(
+                                            &class.constant_pool,
+                                            &class.bootstrap_methods,
+                                            cp_idx,
+                                        )
+                                        .unwrap_or(0);
+                                        indy_info.push((
+                                            pc_indy,
+                                            arg_slots,
+                                            ret_type,
+                                            arg_type_tags,
+                                            concat_site,
+                                        ));
                                     }
                                 }
                             }
@@ -31378,7 +31390,14 @@ fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool
         return false;
     };
     let class_id = shared.mem.heap.class_id_of(*recv);
-    let cm = shared.classes.class_manager.read();
+    // read_recursive() instead of read() -- populate_virtual_invoke_cache
+    // already holds class_manager.read() across its own native-shadow
+    // exemption check (the is_real_tpe_execute call site) when it calls into
+    // this helper. A plain nested read() panics the lock-order tracker
+    // (debug builds) or can deadlock under parking_lot once a writer is
+    // queued (release builds) -- same fix as resolve_method_ref /
+    // surefire_lazy_launcher_discover_native.
+    let cm = shared.classes.class_manager.read_recursive();
     let Some(index) =
         crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, "workers", &cm.class_store)
     else {
@@ -32149,7 +32168,14 @@ fn surefire_lazy_launcher_discover_native(
         DESC_DISCOVER,
     )?;
     let cid = shared.mem.heap.class_id_of(recv_obj);
-    let cm = shared.classes.class_manager.read();
+    // read_recursive() instead of read() -- this native-override probe is
+    // reached from execute_invokevirtual_vtable_fast while it already holds
+    // class_manager.read() across the WP0.1 native-override check (see the
+    // "ALREADY-HELD cm guard" note above that call site). A plain nested
+    // read() panics the lock-order tracker (debug builds) or can deadlock
+    // under parking_lot once a writer is queued (release builds) -- same
+    // fix as resolve_method_ref.
+    let cm = shared.classes.class_manager.read_recursive();
     let ok = cm
         .get_class(cid)
         .map(|c| c.name.as_ref() == LAZY)
@@ -35223,9 +35249,12 @@ fn compile_osr_artifact(
             // for the full repro and trace. Like `has_athrow` above,
             // method-entry compilation (unaffected by this OSR-only bail path)
             // remains available, so do NOT bail-list here.
-            if !scan.indy_ops.is_empty() {
-                return None;
-            }
+            //
+            // RELAXED 2026-07-30 (tomcat known-issue 30): the blanket refusal
+            // moved below, to after `indy_info` is resolved. A site that lowers
+            // to the StringConcatFactory bridge emits a real call, not a trap,
+            // so there is no imprecise resume for an OSR frame to take. Only
+            // methods with an UNBRIDGED indy are still refused.
             // RBC.6b (dohead-residuals, 2026-07-18) — never OSR a method with
             // its own local exception handlers, even when it never directly
             // `athrow`s. `compile_with_param_slots` below has no
@@ -35666,7 +35695,7 @@ fn compile_osr_artifact(
             // field doc on the x64 `Compiler` struct. A site that cannot be
             // resolved is simply omitted; the x64 codegen's 0xba arm then
             // bails the whole compile (`return false`) rather than guessing.
-            let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
+            let mut indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)> = Vec::new();
             if !scan.indy_ops.is_empty() {
                 let cm_lock = shared.classes.class_manager.read();
                 if let Some(class) = cm_lock.get_class(class_id) {
@@ -35682,11 +35711,46 @@ fn compile_osr_artifact(
                                 let arg_slots = crate::jit::count_param_slots(descriptor);
                                 let ret_type = crate::jit::return_type(descriptor);
                                 let arg_type_tags = crate::jit::indy_arg_type_tags(descriptor);
-                                indy_info.push((pc_indy, arg_slots, ret_type, arg_type_tags));
+                                let concat_site = crate::runtime::invokedynamic::make_jit_string_concat_site_from_parts(
+                                    &class.constant_pool,
+                                    &class.bootstrap_methods,
+                                    cp_idx,
+                                )
+                                .unwrap_or(0);
+                                indy_info.push((
+                                    pc_indy,
+                                    arg_slots,
+                                    ret_type,
+                                    arg_type_tags,
+                                    concat_site,
+                                ));
                             }
                         }
                     }
                 }
+            }
+
+            // RBC.7 (relaxed) — an OSR frame cannot safely take the generic
+            // indy uncommon trap: the bail resumes the pre-OSR interpreter
+            // frame at the stale back-edge, silently re-running a loop whose
+            // side effects already committed (see
+            // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
+            // Admit only sites lowered by the StringConcatFactory bridge, which
+            // emits a direct call and never deopts at the indy bci. `indy_info`
+            // drops sites it cannot resolve, so a length mismatch also means
+            // "not fully bridged" and is refused here.
+            if indy_info.len() != scan.indy_ops.len()
+                || indy_info.iter().any(|(_, _, ret_type, _, concat_site)| {
+                    *concat_site == 0 || !matches!(*ret_type, b'L' | b'[')
+                })
+            {
+                if crate::runtime::env_cache::dbg_jitc() && !scan.indy_ops.is_empty() {
+                    eprintln!(
+                        "[cratonvm-jitc] osr-DENY (unbridged invokedynamic) {}.{}{}",
+                        class_name, method_name, method_descriptor
+                    );
+                }
+                return None;
             }
 
             // Eagerly compile invokestatic callees (class_manager lock released)
@@ -36985,11 +37049,13 @@ fn jit_method_calls_native_shadowed(
 /// caller. They must continue through interpreter dispatch, which chooses the
 /// Signature-attribute native implementation over the real-JDK bytecode.
 ///
-/// The caller already owns the class-manager read guard while borrowing the
-/// method bytecode. Reuse that guard rather than acquiring a recursive read:
-/// `parking_lot::RwLock` blocks new readers behind a queued writer, so an
-/// outer read + queued class-definition writer + nested read forms a permanent
-/// cycle. WildFly parallel extension boot reliably exercises that ordering.
+/// The caller must pass its existing class-manager guard. Do not make this
+/// helper acquire the lock itself: `try_jit_compile_callee_slow` already holds
+/// a read guard while extracting the method body. If a class-loading writer
+/// queues between that guard and a nested `read()`, parking_lot's task-fair
+/// `RwLock` parks the nested read behind the writer while the outer read keeps
+/// the writer parked forever. Hibernate model/ByteBuddy generation and
+/// WildFly parallel extension boot both exercise that ordering.
 fn jit_method_calls_forced_class_generic_metadata(
     cm: &crate::classloading::ClassManager,
     caller_class_id: ClassId,
@@ -39804,6 +39870,23 @@ fn resolve_inline_site(
 ) -> Option<cratonvm_jit::InlineSite> {
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
+    // A registered native shadows the classfile body. Inlining that bytecode
+    // would bypass the native completely, just as compiling the method itself
+    // would. This must precede even the "tiny constructor" path below:
+    // ConcurrentHashMap.<init>()V is only five bytes, but CratonVM's native
+    // constructor installs the segmented backing store. Background C1 used to
+    // inline the empty-looking JDK body, so a JIT-created map silently dropped
+    // every put after tier-up. The callee compiler already has this own-class
+    // guard; keep the inline resolver aligned with it.
+    if shared
+        .natives
+        .native_methods
+        .find(callee_class, callee_method, callee_desc)
+        .is_some()
+    {
+        return None;
+    }
+
     let cm = shared.classes.class_manager.read();
     let callee_class_id = cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
     let store = cm.class_store();
@@ -39813,6 +39896,21 @@ fn resolve_inline_site(
         callee_desc,
         store,
     )?;
+    // Same rule for an inherited native: resolution may start at a subclass
+    // while the executable override is registered on the declaring class.
+    // Checking exactly the declaring class still permits a real bytecode
+    // override on an intermediate subclass, matching
+    // `try_jit_compile_callee_slow`.
+    let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
+    if declaring_class_name != callee_class
+        && shared
+            .natives
+            .native_methods
+            .find(declaring_class_name, callee_method, callee_desc)
+            .is_some()
+    {
+        return None;
+    }
 
     if method.is_synchronized() {
         return None;
@@ -46026,6 +46124,16 @@ mod wave1_adoption_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_generic_metadata_scan_reuses_the_callers_class_manager_guard() {
+        let _guard_reusing_signature: fn(
+            &crate::classloading::ClassManager,
+            ClassId,
+            &[u8],
+            usize,
+        ) -> bool = jit_method_calls_forced_class_generic_metadata;
+    }
 
     #[test]
     fn invoke_args_root_guard_refreshes_forwarded_pins_and_restores_watermark() {

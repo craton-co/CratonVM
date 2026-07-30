@@ -57,6 +57,12 @@ merged-binary closeout reduced the measured CratonVM-versus-HotSpot gap by
 for re-anchoring absolute table values. See
 [`fibonacci-half-gap-20260730.md`](docs/internal/performance/fibonacci-half-gap-20260730.md).
 
+The Binary Trees row also retains its last quiet-host absolute values. A
+2026-07-30 follow-up (TLAB zero-elision + a GC-inert self-recursion proof for
+`itemCheck`) reduced the measured CratonVM-versus-HotSpot gap by a further
+**16.1%** in a clean 10-round interleaved Azure measurement. See
+[`binarytrees-bt18-half-gap-20260730.md`](docs/internal/performance/binarytrees-bt18-half-gap-20260730.md).
+
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums
