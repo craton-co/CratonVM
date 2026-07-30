@@ -85,12 +85,13 @@ reasons independent of the deleted gate:
   `HashMap$HashIterator`, `WeakHashMap$Entry`,
   `SpringIterableConfigurationPropertySource$CacheKey`) are already caught by
   the generic non-trivial-constructor gate in `should_skip_jit_with_init`.
-- **Shadowed by separate, still-active blanket bans**: all 16
+- **Shadowed at the time by separate blanket bans**: all 16
   `org/springframework/boot/context/properties/source/…` entries (SPB.2/SPB.3,
   covered by the live `org/springframework/boot/context/` and
   `org/springframework/boot/` bans), `ByteBuddyState.make` (HIB-PROXY, covered
-  by the live `org/hibernate/` ban — HIB-TEMPORAL.1, re-confirmed needed
-  2026-07-26), `junit/textui/TestRunner.main` (live `junit/` ban).
+  by the then-live `org/hibernate/` ban — HIB-TEMPORAL.1, re-confirmed needed
+  2026-07-26 and subsequently fixed and removed 2026-07-29),
+  `junit/textui/TestRunner.main` (live `junit/` ban).
 - **No fixture on this host**: `org/apache/felix/framework/util/SecureAction.
   lambda$getAccessor$0` (FELIX.1) — no Felix jar anywhere on the build host.
   Its sibling entry `AccessibleObject.setAccessible` was exercised

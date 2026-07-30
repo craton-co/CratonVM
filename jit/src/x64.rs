@@ -2320,6 +2320,27 @@ pub fn inline_tlab_new_enabled() -> bool {
     })
 }
 
+/// Default-on removal of redundant per-object zero stores from inline TLAB
+/// allocation.
+///
+/// Every production `VmHeap::refill_tlab` backend returns a fully zeroed
+/// chunk. Reclaimed generational spans are cleared before reuse, and G1
+/// applies the same contract when carving Eden. The inline allocator can
+/// therefore stamp only the non-zero / shape-defining header words before
+/// publishing the cursor instead of clearing every body/header word again.
+/// This is especially material for allocation storms: a compact two-reference
+/// node drops seven zero stores while preserving JVM default initialization.
+///
+/// Opt out with `CRATONVM_NO_JIT_TLAB_ZERO_ELISION=1` to restore the defensive
+/// per-object clears for bisection.
+pub fn inline_tlab_zero_elision_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_TLAB_ZERO_ELISION").is_none()
+    })
+}
+
 fn inline_site_is_fresh_ctor_first_store(
     site: &crate::InlineSite,
     cpc: usize,
@@ -2730,6 +2751,14 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // or the collector walks a shadow stack the codegen never pushed to.
     // `parse::present` == the former `var_os(..).is_some()`, so this is
     // behaviour-preserving.
+    // A thread pinning the moving-young policy (see `set_moving_young_override`)
+    // must not read -- or, worse, POPULATE -- this process-wide cache: whichever
+    // test touched it first would otherwise freeze the shadow-stack decision for
+    // every other test in the binary. Recompute instead; the override is never
+    // set in production, so the cached fast path is unchanged there.
+    if MOVING_YOUNG_OVERRIDE.with(|c| c.get()).is_some() {
+        return cratonvm_types::flags().jit.shadow_stack || moving_young_enabled();
+    }
     *G.get_or_init(|| cratonvm_types::flags().jit.shadow_stack || moving_young_enabled())
 }
 
@@ -2761,7 +2790,33 @@ pub fn shadow_stack_maps_enabled() -> bool {
 /// behaviour-preserving today and lets the default be flipped in one place
 /// later. Do NOT re-introduce a local `getenv` here.
 #[inline]
+thread_local! {
+    /// Per-thread override for [`moving_young_enabled`]; `None` = use the
+    /// process flag. Thread-local so parallel tests cannot race each other.
+    static MOVING_YOUNG_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`moving_young_enabled`] for the CURRENT THREAD only.
+///
+/// The optimizing IR tier is gated on `!moving_young_enabled()` (IR publishes
+/// no exact-RBP/safepoint map, so it must stay off while the young generation
+/// can relocate). That makes every IR-routing test depend on a *deployment*
+/// flag rather than on what it actually exercises — and when
+/// `DEFAULT_MOVING_YOUNG` flipped to `true` those tests began asserting against
+/// a pipeline that can no longer run, failing with a bare `left: 0, right: 1`.
+/// Tests that mean "exercise the IR pipeline" call this to say so explicitly.
+///
+/// This does NOT change what production does: nothing calls it outside tests,
+/// and the process flag remains the default on every thread.
+pub fn set_moving_young_override(value: Option<bool>) {
+    MOVING_YOUNG_OVERRIDE.with(|c| c.set(value));
+}
+
 pub fn moving_young_enabled() -> bool {
+    if let Some(forced) = MOVING_YOUNG_OVERRIDE.with(|c| c.get()) {
+        return forced;
+    }
     cratonvm_types::flags().gc.moving_young
 }
 
@@ -2904,6 +2959,23 @@ fn jit_safepoint_polls_enabled() -> bool {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
             .and_then(|v| v.into_string().ok())
             .is_none_or(|v| v != "0")
+    })
+}
+
+/// Default-on fast path for structurally GC-inert direct self recursion.
+///
+/// Such a method contains no allocation, no backward edge, and no call except
+/// the raw self-call that `try_compile` already proved resolves to this exact
+/// method. Its common recursive edge therefore cannot reach a safepoint. The
+/// cold native-stack-overflow guard remains a normal safepoint and deliberately
+/// publishes an incomplete moving-young map, forcing that exceptional cycle to
+/// the safe non-moving fallback.
+fn gc_inert_selfrec_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_GC_INERT_SELFREC")
+            .map_or(true, |v| !matches!(v.as_str(), "0" | "false" | "off"))
     })
 }
 
@@ -9083,6 +9155,9 @@ struct Compiler {
     /// recompile. Empty (`""`) on the legacy/test `compile()` wrapper and in
     /// production (the registry is empty), so the consult is a no-op there.
     method_key: String,
+    /// The common direct-recursive edge cannot allocate, call another method,
+    /// or poll. See [`gc_inert_selfrec_candidate`].
+    gc_inert_selfrec: bool,
     /// deopt-osr Step 2 / P2: frame offset (positive depth-from-RBP) of the
     /// DEEPEST qword of the always-reserved 256-byte
     /// `SavedRegisters{gpr:[u64;16],xmm:[u64;16]}` region the frame-deopt stub
@@ -9593,6 +9668,7 @@ impl Compiler {
         num_scalar_slots: usize,
         cache_jit_thread_for_inline_new: bool,
         reserve_stack_floor: bool,
+        gc_inert_selfrec: bool,
         precise_exception_frames: bool,
         protected_ranges: Vec<(u32, u32)>,
     ) -> Self {
@@ -10046,6 +10122,7 @@ impl Compiler {
             deopt_boxes: Vec::new(),
             deopt_epoch_guard: std::ptr::null(),
             method_key: String::new(),
+            gc_inert_selfrec,
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),
             exc_frame_box_ptr_by_bci: FxHashMap::default(),
@@ -11032,6 +11109,17 @@ impl Compiler {
     }
 
     fn emit_pre_safepoint_spill(&mut self) {
+        self.emit_pre_safepoint_spill_impl(true);
+    }
+
+    /// Publish a cold safepoint without claiming moving-young shadow coverage.
+    /// This is used only by the overflow guard of a GC-inert recursive method;
+    /// an exceptional collection safely falls back to the non-moving sweep.
+    fn emit_pre_safepoint_spill_without_shadow(&mut self) {
+        self.emit_pre_safepoint_spill_impl(false);
+    }
+
+    fn emit_pre_safepoint_spill_impl(&mut self, publish_shadow: bool) {
         if self.failed {
             return;
         }
@@ -11109,7 +11197,12 @@ impl Compiler {
         // Shadow-stack precise roots — push every live oop onto the thread's
         // shadow stack so a moving collector can rewrite it precisely. Paired
         // with `emit_shadow_reload` in `emit_oop_map_for_safepoint`. Gated.
-        self.emit_shadow_push();
+        if publish_shadow {
+            self.emit_shadow_push();
+        } else {
+            self.pending_shadow.clear();
+            self.pending_shadow_coverage_complete = false;
+        }
     }
 
     /// Publish the precise-map safepoint id without conservatively copying the
@@ -11475,7 +11568,19 @@ impl Compiler {
     /// matching reload. `pending_shadow` is cleared first so an unbalanced
     /// (no-reload) safepoint cannot hand stale homes to a later reload.
     fn emit_shadow_push(&mut self) {
-        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+        // The `helpers.get_current_thread != 0` check MUST mirror the
+        // prologue's gate (`emit_prologue`'s shadow-stack block): the
+        // prologue only zero-initializes `shadow_thread_slot_off` when that
+        // helper is wired. Without this matching guard here, a context
+        // where the helper isn't wired (e.g. the JIT unit tests' stub
+        // `test_helpers()`) would load uninitialized stack garbage as if it
+        // were a live `*mut JvmThread` and dereference it — see the epilogue
+        // fix in `emit_epilogue` for the full incident writeup.
+        if self.failed
+            || !self.shadow_enabled
+            || self.helpers.get_current_thread == 0
+            || self.shadow_thread_slot_off == 0
+        {
             self.pending_shadow_coverage_complete = false;
             return;
         }
@@ -11569,7 +11674,12 @@ impl Compiler {
     /// scratch used is R10 (thread), R11 (top), R8 (frame-slot value temp).
     /// No-op when `pending_shadow` is empty (unmatched safepoint).
     fn emit_shadow_reload(&mut self) {
-        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+        // Mirror `emit_shadow_push`'s gate — see its comment for why.
+        if self.failed
+            || !self.shadow_enabled
+            || self.helpers.get_current_thread == 0
+            || self.shadow_thread_slot_off == 0
+        {
             return;
         }
         if shadow_nopush() || shadow_noreload() {
@@ -15502,7 +15612,9 @@ impl Compiler {
         // thread could possibly park at the barrier. No-op unless the env
         // flag is set AND the helper table wired the flag address (see
         // `emit_safepoint_poll_prologue` / `emit_safepoint_poll`).
-        self.emit_safepoint_poll_prologue();
+        if !self.gc_inert_selfrec {
+            self.emit_safepoint_poll_prologue();
+        }
     }
 
     /// Lazy-prologue perf lever — call AFTER the whole body is compiled. If the
@@ -15558,7 +15670,26 @@ impl Compiler {
         // restores top to its own entry value on return. Null-guarded so an OSR
         // entry (which zero-inits the thread slot) skips this safely. R10/R11
         // are caller-saved scratch (free at return); RAX (return value) untouched.
-        if self.shadow_enabled && self.shadow_thread_slot_off != 0 {
+        //
+        // The `helpers.get_current_thread != 0` check MUST mirror the
+        // prologue's gate (see `emit_prologue`'s shadow-stack block). The
+        // prologue only zero-initializes `shadow_thread_slot_off` when that
+        // helper is wired; when it isn't (e.g. the JIT unit tests' stub
+        // `test_helpers()`, which leaves `get_current_thread` null), the
+        // prologue skips its block ENTIRELY and the slot is never written.
+        // Without this matching guard, the epilogue still ran, loaded
+        // whatever uninitialized stack garbage happened to occupy that
+        // frame slot, treated it as a live `*mut JvmThread` when nonzero,
+        // and wrote through it — a wild pointer store that crashed
+        // deterministically-but-content-dependently (STATUS_ACCESS_VIOLATION
+        // on Windows), reproducing only when prior stack usage happened to
+        // leave a nonzero value there. The real VM never hit this because
+        // `build_helpers()` always wires `get_current_thread` when precise
+        // maps are on.
+        if self.shadow_enabled
+            && self.helpers.get_current_thread != 0
+            && self.shadow_thread_slot_off != 0
+        {
             self.emit_load_local(R10, self.shadow_thread_slot_off);
             self.emit_test_r64_r64(R10);
             let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
@@ -16666,21 +16797,25 @@ impl Compiler {
         self.emit_cmp_r64_mem_disp32(RAX, R10, end_off);
         let tlab_full_patch = self.emit_jcc_rel32_patch(0x87); // JA slow_path
 
-        // JVM default initialization and TLAB-reuse safety: clear the complete
-        // object body before publishing the bump. Young-space sweep can reuse
-        // cells whose old field bytes are non-zero, so relying on refill-time
-        // zeroing is not sufficient. Both layouts are qword-sized here
-        // (legacy fields are 16 bytes; compact fields are 8 or 16 bytes).
+        // JVM default initialization and TLAB-reuse safety. All refill
+        // backends return zeroed TLAB ranges, including cells reused by a
+        // non-moving sweep, so the default path does not repeat those stores
+        // per object. The opt-out retains the older defensive clear. Both
+        // layouts are qword-sized here (legacy fields are 16 bytes; compact
+        // fields are 8 or 16 bytes).
         //
         // This also makes the all-zero-tag primitive family (int, boolean,
         // byte, char, short) fully initialized inline as `Value::Int(0)`.
         // Only long/float/double need the post-init helper to install a non-zero
         // Value discriminant; reference fields in the compact layout are null
         // bare pointers after this clear.
-        debug_assert_eq!((total_size - HEADER_SIZE) % 8, 0);
-        self.emit_mov_imm32_sx(RDX, 0);
-        for body_off in (HEADER_SIZE..total_size).step_by(8) {
-            self.emit_mov_mem_disp32_r64(R11, RDX, body_off as i32);
+        let zero_elision = inline_tlab_zero_elision_enabled();
+        if !zero_elision {
+            debug_assert_eq!((total_size - HEADER_SIZE) % 8, 0);
+            self.emit_mov_imm32_sx(RDX, 0);
+            for body_off in (HEADER_SIZE..total_size).step_by(8) {
+                self.emit_mov_mem_disp32_r64(R11, RDX, body_off as i32);
+            }
         }
 
         // BinTrees-18 heap-corruption fix (jit/gc audit, 2026-06):
@@ -16745,9 +16880,10 @@ impl Compiler {
         // 2026-07-26 header-offset audit — see
         // `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
         self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::OBJECT_KIND_OFFSET as i32, 0);
-        // identity_hash_code = 0 (lazy-mint contract). Written explicitly, not
-        // left to refill zeroing — see the default-on note below.
-        self.emit_mov_dword_mem_disp32_imm32(R11, IDENTITY_HASH_CODE_OFFSET as i32, 0);
+        if !zero_elision {
+            // identity_hash_code = 0 (lazy-mint contract).
+            self.emit_mov_dword_mem_disp32_imm32(R11, IDENTITY_HASH_CODE_OFFSET as i32, 0);
+        }
         // offset 12: the full 32-bit field count for Object kind.
         let shape = num_fields as u32;
         self.emit_mov_dword_mem_disp32_imm32(
@@ -16773,21 +16909,28 @@ impl Compiler {
                     << (8 * (cratonvm_types::GC_FLAGS_OFFSET - cratonvm_types::OBJECT_KIND_OFFSET)),
             );
         }
-        // default-on hardening (bt18-inline-tlab-regression-20260724): the
-        // "TLAB refill zeroes the region" assumption was empirically violated
-        // once already (the offset-4/12 incident above), so with this path
-        // default-on NO header field may depend on it. forwarding_ptr
-        // (16..24) and mark_word (24..32, MARK_NEUTRAL == 0) are written
-        // explicitly as dword pairs (no qword-imm store emitter; four dwords
-        // per `new` is negligible vs. a helper call).
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::FORWARDING_PTR_OFFSET as i32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(
-            R11,
-            cratonvm_types::FORWARDING_PTR_OFFSET as i32 + 4,
-            0,
-        );
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32 + 4, 0);
+        // The opt-out also retains the older defensive forwarding_ptr and
+        // mark_word stores. The default path gets their required zero values
+        // from the refill invariant; neither field is subsequently published
+        // with a non-zero initialization value.
+        if !zero_elision {
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::FORWARDING_PTR_OFFSET as i32,
+                0,
+            );
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::FORWARDING_PTR_OFFSET as i32 + 4,
+                0,
+            );
+            self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+                0,
+            );
+        }
 
         // Commit the bump LAST: [R10 + cursor_off] = RAX. This publishes the
         // object's end as the new cursor (and, transitively, the object's
@@ -16803,11 +16946,10 @@ impl Compiler {
             // written inline above, the header is complete enough for
             // both the GC walker and the runtime; no helper call needed.
             //
-            // All other header fields (kind=0/Object,
-            // element_type=0/Reference, padding, array_length, gc_age,
-            // gc_flags, forwarding_ptr=null, mark_word=MARK_NEUTRAL) are
-            // written explicitly by the inline stores above — nothing
-            // depends on refill zeroing anymore.
+            // Class, kind/flags, and shape are explicitly published above.
+            // Body defaults, forwarding_ptr=null, and
+            // mark_word=MARK_NEUTRAL come from the refill zeroing invariant
+            // unless the conservative opt-out repeats those stores inline.
             //
             // RAX = obj_ptr — both arms converge with RAX holding the
             // freshly-allocated object pointer.
@@ -24224,6 +24366,24 @@ impl Compiler {
                                 .unwrap_or(false);
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
+                        // A null receiver must become a real Java NPE here, before
+                        // either the inline store or the `jit_putfield_*` helper can
+                        // turn it into a silent no-op. The helper's guard
+                        // (`!plausible_heap_pointer(obj_ptr) { return; }`) exists to
+                        // avoid dereferencing garbage, but it returns WITHOUT raising,
+                        // so a `putfield` on null silently dropped the store and
+                        // execution continued -- see probes/NullPutfieldProbe.java.
+                        //
+                        // This is the same call the inlined-callee `0xb5` arm already
+                        // makes; only the top-level arm was missed when
+                        // `emit_precise_null_check_field_store` landed. Inside a
+                        // protected range under `precise_exception_frames` it records a
+                        // reason-10 precise NPE frame; otherwise it falls back to the
+                        // ordinary null-check stub. NOT emitted on the
+                        // scalar-replaced branch above, whose "objectref" is a dummy
+                        // with no real receiver behind it.
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        self.emit_precise_null_check_field_store();
                         if type_tag == b'L' || type_tag == b'[' {
                             // HIGH-5 / R20: inline the reference-field store on the
                             // barrier-free fast path (CRATONVM_JIT_INLINE_PUTFIELD).
@@ -26524,7 +26684,11 @@ impl Compiler {
                                 } else {
                                     None
                                 };
-                                self.emit_pre_safepoint_spill();
+                                if self.gc_inert_selfrec {
+                                    self.emit_pre_safepoint_spill_without_shadow();
+                                } else {
+                                    self.emit_pre_safepoint_spill();
+                                }
                                 self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                                 self.emit_call_absolute(self.helpers.self_call_stack_guard);
                                 if self.precise_maps || self.shadow_enabled {
@@ -26545,7 +26709,13 @@ impl Compiler {
                         // Round-8 wave-3: defensive callee-saved spill
                         // before the recursive CALL (which transitively
                         // can allocate and reach a GC safepoint).
-                        if self.can_elide_self_call_register_spill() {
+                        if self.gc_inert_selfrec {
+                            // The callee is this same poll-free,
+                            // allocation-free method. The direct edge is not a
+                            // safepoint, so publishing roots here would be pure
+                            // overhead. The overflow helper above retains its
+                            // cold safepoint protocol.
+                        } else if self.can_elide_self_call_register_spill() {
                             self.emit_safepoint_metadata_only();
                         } else {
                             self.emit_pre_safepoint_spill();
@@ -26575,7 +26745,7 @@ impl Compiler {
                         // paired RELOAD (inside `emit_oop_map_for_safepoint`) must
                         // run here too, else the shadow stack grows unbalanced
                         // through this recursive call → unbounded pinning → OOM.
-                        if self.precise_maps || self.shadow_enabled {
+                        if !self.gc_inert_selfrec && (self.precise_maps || self.shadow_enabled) {
                             self.emit_oop_map_for_safepoint();
                         }
                         self.emit_stack_arg_cleanup(total_sub);
@@ -30110,6 +30280,81 @@ pub fn compile(
 /// slots the body actually reads. Pass `&[]` / `0` for the legacy
 /// "arg index == slot" behavior (see the [`compile`] wrapper).
 #[allow(clippy::too_many_arguments)]
+/// Prove that every hot recursive edge in this body is GC-inert.
+///
+/// A raw `invokestatic` (no invoke/direct-call metadata) is the x64 backend's
+/// representation of a self call; `try_compile` only leaves a site raw after
+/// resolving it to the current method. The strict opcode whitelist excludes
+/// allocation, arbitrary helpers, monitors, exception creation, arrays, and
+/// loops. Forward branches and resolved inline `getfield` are harmless.
+fn gc_inert_selfrec_candidate(
+    code: &[u8],
+    code_len: usize,
+    field_info: &[(usize, usize, u8)],
+    new_info: &[(usize, u32, usize, bool, bool)],
+    anewarray_info: &[(usize, u32)],
+    invoke_info: &[(usize, *const JitInvokeInfo)],
+    direct_calls: &[(usize, super::JitDirectCall)],
+    mic_slots: &[(usize, *const super::JitMICSlot)],
+    pic_slots: &[(usize, *const super::JitPICSlot)],
+    indy_info: &[(usize, usize, u8, Vec<u8>, usize)],
+) -> bool {
+    if !gc_inert_selfrec_enabled()
+        || !new_info.is_empty()
+        || !anewarray_info.is_empty()
+        || !invoke_info.is_empty()
+        || !direct_calls.is_empty()
+        || !mic_slots.is_empty()
+        || !pic_slots.is_empty()
+        || !indy_info.is_empty()
+    {
+        return false;
+    }
+
+    let mut pc = 0usize;
+    let mut self_calls = 0usize;
+    let mut saw_return = false;
+    while pc < code_len {
+        let op = code[pc];
+        let allowed = match op {
+            0x00..=0x11
+            | 0x15..=0x2d
+            | 0x36..=0x4e
+            | 0x57..=0x6b
+            | 0x74..=0x98 => true,
+            // Conditional branches and forward goto only. A backward edge
+            // would need cooperative polling and is therefore not GC-inert.
+            0x99..=0xa7 | 0xc6 | 0xc7 => {
+                if pc + 2 >= code_len {
+                    return false;
+                }
+                let rel = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+                rel > 0 && pc.checked_add_signed(rel).is_some_and(|t| t < code_len)
+            }
+            0xac..=0xb1 => {
+                saw_return = true;
+                true
+            }
+            0xb4 => field_info.iter().any(|(field_pc, _, _)| *field_pc == pc),
+            0xb8 => {
+                self_calls += 1;
+                true
+            }
+            _ => false,
+        };
+        if !allowed {
+            return false;
+        }
+        let len = bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return false;
+        }
+        pc += len;
+    }
+    pc == code_len && self_calls != 0 && saw_return
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
     code: &[u8],
     code_len: usize,
@@ -30180,6 +30425,18 @@ pub fn compile_with_param_slots(
     indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
 ) -> Option<CompiledMethod> {
     let needs_heap = needs_heap || !ldc_string_info.is_empty();
+    let gc_inert_selfrec = gc_inert_selfrec_candidate(
+        code,
+        code_len,
+        &field_info,
+        &new_info,
+        &anewarray_info,
+        &invoke_info,
+        &direct_calls,
+        &mic_slots,
+        &pic_slots,
+        &indy_info,
+    );
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
     // One-shot like every other staged request below: take it here so an early
     // bail cannot leak this method's handler ranges into an unrelated later
@@ -30756,6 +31013,7 @@ pub fn compile_with_param_slots(
         num_scalar_slots,
         cache_jit_thread_for_inline_new,
         reserve_stack_floor,
+        gc_inert_selfrec && reserve_stack_floor,
         precise_exception_frames,
         protected_ranges,
     );
@@ -31801,6 +32059,59 @@ mod tests {
     use cratonvm_types::{ObjectRef, Value};
 
     #[test]
+    fn gc_inert_selfrec_accepts_forward_field_walk_and_rejects_gc_edges() {
+        // aload_0; getfield; ifnonnull L; iconst_1; ireturn;
+        // L: iconst_1; aload_0; getfield; invokestatic self; iadd; ireturn
+        let pure = [
+            0x2a, 0xb4, 0x00, 0x01, 0xc7, 0x00, 0x05, 0x04, 0xac, 0x04, 0x2a, 0xb4, 0x00,
+            0x01, 0xb8, 0x00, 0x02, 0x60, 0xac,
+        ];
+        let fields = [(1usize, 0usize, b'L'), (11, 0, b'L')];
+        assert!(gc_inert_selfrec_candidate(
+            &pure,
+            pure.len(),
+            &fields,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
+
+        let mut allocates = pure.to_vec();
+        allocates[9] = 0xbb; // new
+        assert!(!gc_inert_selfrec_candidate(
+            &allocates,
+            allocates.len(),
+            &fields,
+            &[(9, 1, 0, false, false)],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
+
+        let mut loops = pure;
+        loops[4..7].copy_from_slice(&[0xa7, 0xff, 0xfc]); // goto pc 0
+        assert!(!gc_inert_selfrec_candidate(
+            &loops,
+            loops.len(),
+            &fields,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
     fn stack_bang_frame_probes_cover_crossed_pages() {
         assert_eq!(stack_bang_frame_probe_disps(0), Some(Vec::new()));
         assert_eq!(stack_bang_frame_probe_disps(128), Some(vec![-128]));
@@ -31872,6 +32183,7 @@ mod tests {
             false,
             test_helpers(),
             0,
+            false,
             false,
             false,
             false,
@@ -43456,6 +43768,10 @@ mod tests {
     /// is sufficient to prove the per-clone path runs.
     #[test]
     fn test_unroll_mints_per_clone_pic_slots() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        super::set_moving_young_override(Some(false));
         // Not OnceLock-cached (see `direct_jit_callee_calls_enabled`), so
         // setting it here is observed immediately; no other jit test asserts
         // on invoke-info/PIC/MIC-slot counts, so this is safe under parallel

@@ -147,8 +147,10 @@ failure modes. Neither mode is specific to a configuration:
   shaded and unshaded runtimes, and is still not liftable by
   `CRATONVM_JIT_ALLOW_PACKAGES`.
 * `org/h2/` is unaffected; HIB-LONGTAIL.1 remains open on its three H2 classes.
-* HIB-TEMPORAL.1 (`org/hibernate/`) is unaffected and still confirmed needed —
-  see [`hib-temporal-1-still-needed-20260726.md`](../../known-issues/jit-bans/hib-temporal-1-still-needed-20260726.md).
+* HIB-TEMPORAL.1 (`org/hibernate/`) was separate from this package-ban
+  finding and remained active at the time. It was fixed and retired on
+  2026-07-29; see
+  [`hib-temporal-1-retired-20260729.md`](hib-temporal-1-retired-20260729.md).
 
 ## Reproduction
 
