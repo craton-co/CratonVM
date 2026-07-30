@@ -1,8 +1,8 @@
 # `TestCharsetCachePerformance` — the cached paths lose to the uncached one
 
 **Status:** OPEN, **half fixed** (last measured 2026-07-30). The
-`timeFull < timeNone` assertion now passes; `timeLazy < timeNone` still fails,
-by 4.0x. Read the final section first — it supersedes the running diagnosis
+`timeFull < timeNone` assertion now passes in most runs but is flaky (5 of 7);
+`timeLazy < timeNone` still fails, by 4.0x. Read the final section first — it supersedes the running diagnosis
 below, and it reframes the residual as a *thread-scaling* wall in the dispatch
 helper rather than anything specific to charset caching.
 
@@ -467,24 +467,32 @@ run to run. Medians of the real class:
 | `FullCsCache` | 49.4s | 37.1s | **-25%** |
 | `LazyCsCache` | 243.3s | 157.8s | **-35%** |
 
-`assertTrue(timeFull < timeNone)` passes on this branch (37.1s < 39.3s, ratio
-0.94; it was 1.38 on dev). `assertTrue(timeLazy < timeNone)` still fails, by
-4.0x rather than 6.8x. **Doc 23 stays OPEN on the second assertion.**
+`assertTrue(timeLazy < timeNone)` still fails, by 4.0x rather than 6.8x.
+**Doc 23 stays OPEN on it.**
 
-**Caveat on the control arm — the `timeFull` margin is thinner than it looks.**
-Within the full class, `NoCsCache` reads 35.6-36.0s on dev and 39.0-39.4s on
-this branch: tight on both sides, three rounds, and it reproduces. Measured
-*alone*, it does not: `NoArmOnly` (the arm's code copied verbatim, four runs per
-binary) gives 31.9s vs 31.7s with individual runs spanning **27s-37s on both**,
-and `ForNameProbe2` shows `Charset.forName` itself unchanged (2641 -> 2635 ns/op
-at one thread, 9281 -> 9232 at ten). `Charset.forName` is a native here
-(`native_charset_for_name`) whose profile is ~14% `RawMutex::lock_slow` on both
-binaries, and the two profiles are otherwise indistinguishable. So the in-class
-shift is real and repeatable but has no located cause, and it inflates
-`timeNone`, which is the value the passing assertion is compared against. Judge
-the fix on the cached arms: measured against **dev's own** control (35.8s), the
-branch's `FullCsCache` at 37.1s would still be marginally over. What is not in
-doubt is 49.4s -> 37.1s and 243.3s -> 157.8s on the arms the fix targets.
+`assertTrue(timeFull < timeNone)` is now **flaky rather than fixed**, and that
+distinction matters. Its ratio moved from 1.36-1.43 on dev (fails every time) to
+a median 0.95 here — but across seven runs of this branch it came out
+0.89 / 0.94 / 0.95 / 0.95 / 0.98 / 1.09 / 1.14, i.e. **5 pass, 2 fail**. The
+`FullCsCache` arm itself is steady (34.5-37.2s across those seven). All the
+movement is in the control: `NoCsCache` alone spans **31.2s-39.8s**. Anyone
+re-running this class should expect the first assertion to flip.
+
+**Where the control arm's spread comes from — and a warning.** Within any one
+sweep the control looks tight and *systematic*: three interleaved rounds gave
+35.6-36.0s on dev and 39.0-39.4s here, which reads as a clean 10% regression.
+Over more runs it is not: the arm measured alone (`NoArmOnly`, the arm's code
+copied verbatim, four runs per binary) gives 31.9s vs 31.7s with runs spanning
+27s-37s on both, and `ForNameProbe2` shows `Charset.forName` itself unchanged
+(2641 -> 2635 ns/op at one thread, 9281 -> 9232 at ten). `Charset.forName` is a
+native here (`native_charset_for_name`) whose profile is ~14%
+`RawMutex::lock_slow` on both binaries, and the two profiles are otherwise
+indistinguishable. Consecutive runs on this host correlate strongly, so a tight
+triple is not evidence — this arm needs 8+ runs before any claim about it, in
+either direction.
+
+Judge the fix on the two arms it targets, where the effect is far outside that
+noise: 49.4s -> 37.1s and 243.3s -> 157.8s.
 
 ### What landed
 
