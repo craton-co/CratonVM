@@ -14022,6 +14022,10 @@ fn stream_inherit_close_handlers(ctx: &mut dyn NativeContext, src: ObjectRef, ds
     if src == dst {
         return;
     }
+    let pin_base = ctx.pin_native_root(src);
+    let dst_pin = ctx.pin_native_root(dst);
+    let src = ctx.read_native_pin(pin_base, src);
+    let dst = ctx.read_native_pin(dst_pin, dst);
     // W1 fix: several ad-hoc synthetic-stream allocations use a 1-field
     // (elements-only) layout with no close-handler slot. Guard slot-1 access the
     // same way the LAZY_SPLITERATOR (slot 2) / OP_CHAIN (slot 3) readers already
@@ -14031,11 +14035,16 @@ fn stream_inherit_close_handlers(ctx: &mut dyn NativeContext, src: ObjectRef, ds
     if ctx.object_num_fields(src) <= STREAM_FIELD_CLOSE_HANDLERS
         || ctx.object_num_fields(dst) <= STREAM_FIELD_CLOSE_HANDLERS
     {
+        ctx.unpin_native_roots(pin_base);
         return;
     }
     if let Value::Object(Some(arr)) = ctx.get_field(src, STREAM_FIELD_CLOSE_HANDLERS) {
+        let arr_pin = ctx.pin_native_root(arr);
+        let dst = ctx.read_native_pin(dst_pin, dst);
+        let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_field(dst, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(Some(arr)));
     }
+    ctx.unpin_native_roots(pin_base);
 }
 
 /// `make_stream` for an intermediate op: build the result, then inherit `src`'s
@@ -14046,7 +14055,7 @@ fn make_derived_stream(
     elements: &[Value],
 ) -> MethodCallResult {
     let src_pin = ctx.pin_native_root(src);
-    let r = match make_stream(ctx, elements) {
+    let mut r = match make_stream(ctx, elements) {
         Ok(r) => r,
         Err(e) => {
             ctx.unpin_native_roots(src_pin);
@@ -14054,8 +14063,13 @@ fn make_derived_stream(
         }
     };
     if let Some(Value::Object(Some(dst))) = &r {
+        let dst = *dst;
+        let dst_pin = ctx.pin_native_root(dst);
         let src = ctx.read_native_pin(src_pin, src);
-        stream_inherit_close_handlers(ctx, src, *dst);
+        let dst = ctx.read_native_pin(dst_pin, dst);
+        stream_inherit_close_handlers(ctx, src, dst);
+        let dst = ctx.read_native_pin(dst_pin, dst);
+        r = Some(Value::Object(Some(dst)));
     }
     ctx.unpin_native_roots(src_pin);
     Ok(r)
@@ -14226,21 +14240,30 @@ fn stream_make_lazy_derived(
     let new_chain = alloc_ref_array(ctx, src_len + 1);
     let new_chain_pin = ctx.pin_native_root(new_chain);
     if let Some(a) = src_chain {
-        let a = ctx.read_native_pin(src_chain_pin, a);
-        let new_chain = ctx.read_native_pin(new_chain_pin, new_chain);
         for i in 0..src_len {
+            let a = ctx.read_native_pin(src_chain_pin, a);
             let v = ctx.get_array_element(a, i);
+            let value_pin = pin_value(ctx, v);
+            let new_chain = ctx.read_native_pin(new_chain_pin, new_chain);
+            let v = read_pinned_elem(ctx, value_pin, v);
             ctx.set_array_element(new_chain, i, v);
+            if value_pin != usize::MAX {
+                ctx.unpin_native_roots(value_pin);
+            }
         }
     }
     let rec = alloc_synthetic(ctx, "cratonvm/stream/LazyOp", 3);
     let rec_pin = ctx.pin_native_root(rec);
     let lambda_cur = lambda.map(|l| ctx.read_native_pin(lambda_pin, l));
-    let rec = ctx.read_native_pin(rec_pin, rec);
+    let mut rec = ctx.read_native_pin(rec_pin, rec);
     ctx.set_field(rec, 0, Value::Int(kind));
+    rec = ctx.read_native_pin(rec_pin, rec);
+    let lambda_cur = lambda_cur.map(|l| ctx.read_native_pin(lambda_pin, l));
     ctx.set_field(rec, 1, Value::Object(lambda_cur));
+    rec = ctx.read_native_pin(rec_pin, rec);
     ctx.set_field(rec, 2, Value::Long(aux));
     let new_chain = ctx.read_native_pin(new_chain_pin, new_chain);
+    let rec = ctx.read_native_pin(rec_pin, rec);
     ctx.set_array_element(new_chain, src_len, Value::Object(Some(rec)));
     let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS_LAZY);
     // `stream_inherit_close_handlers` can allocate while it reads/copies the
@@ -14249,11 +14272,13 @@ fn stream_make_lazy_derived(
     // return its current address after that call. A raw local here let a
     // moving young GC strand the just-built Stream and its LazyOp chain.
     let stream_pin = ctx.pin_native_root(stream);
-    let stream_cur = ctx.read_native_pin(stream_pin, stream);
+    let mut stream_cur = ctx.read_native_pin(stream_pin, stream);
     let source_cur = read_pinned_elem(ctx, source_pin, source);
-    let new_chain = ctx.read_native_pin(new_chain_pin, new_chain);
     ctx.set_field(stream_cur, STREAM_FIELD_ELEMENTS, source_cur);
+    stream_cur = ctx.read_native_pin(stream_pin, stream);
     ctx.set_field(stream_cur, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    stream_cur = ctx.read_native_pin(stream_pin, stream);
+    let new_chain = ctx.read_native_pin(new_chain_pin, new_chain);
     ctx.set_field(
         stream_cur,
         STREAM_FIELD_OP_CHAIN,
@@ -14263,6 +14288,7 @@ fn stream_make_lazy_derived(
     // eventual terminal drives it inline through the now-extended chain.
     if let Some(spl) = src_lazy_spl {
         let spl_cur = ctx.read_native_pin(spl_pin, spl);
+        let stream_cur = ctx.read_native_pin(stream_pin, stream);
         ctx.set_field(
             stream_cur,
             STREAM_FIELD_LAZY_SPLITERATOR,
@@ -14273,10 +14299,9 @@ fn stream_make_lazy_derived(
     let stream_cur = ctx.read_native_pin(stream_pin, stream);
     stream_inherit_close_handlers(ctx, src_cur, stream_cur);
     let stream_cur = ctx.read_native_pin(stream_pin, stream);
-    if spl_pin != usize::MAX {
-        ctx.unpin_native_roots(spl_pin);
-    }
-    ctx.unpin_native_roots(stream_pin);
+    // `src_pin` is the first pin owned by this scope, so this single truncate
+    // releases every optional/source/chain/record/derived-stream pin above in
+    // the correct order.
     ctx.unpin_native_roots(src_pin);
     Ok(Some(Value::Object(Some(stream_cur))))
 }
@@ -17311,6 +17336,7 @@ fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             _ => None,
         };
         let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+        let opt_pin = ctx.pin_native_root(opt);
         if let Some(fv) = found {
             let fv = match (fv, found_pin) {
                 (Value::Object(Some(o)), Some(pin)) => {
@@ -17318,11 +17344,11 @@ fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
                 }
                 _ => fv,
             };
+            let opt = ctx.read_native_pin(opt_pin, opt);
             ctx.set_field(opt, OPT_FIELD_VALUE, fv);
         }
-        if let Some(pin) = found_pin {
-            ctx.unpin_native_roots(pin);
-        }
+        let opt = ctx.read_native_pin(opt_pin, opt);
+        ctx.unpin_native_roots(found_pin.unwrap_or(opt_pin));
         return Ok(Some(Value::Object(Some(opt))));
     }
     let elements = stream_elements(ctx, this)?;
@@ -17331,16 +17357,17 @@ fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => None,
     });
     let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+    let opt_pin = ctx.pin_native_root(opt);
     if let Some(first) = elements.first() {
         let first = match (*first, first_pin) {
             (Value::Object(Some(o)), Some(pin)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
             _ => *first,
         };
+        let opt = ctx.read_native_pin(opt_pin, opt);
         ctx.set_field(opt, OPT_FIELD_VALUE, first);
     }
-    if let Some(pin) = first_pin {
-        ctx.unpin_native_roots(pin);
-    }
+    let opt = ctx.read_native_pin(opt_pin, opt);
+    ctx.unpin_native_roots(first_pin.unwrap_or(opt_pin));
     Ok(Some(Value::Object(Some(opt))))
 }
 
