@@ -31378,7 +31378,14 @@ fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool
         return false;
     };
     let class_id = shared.mem.heap.class_id_of(*recv);
-    let cm = shared.classes.class_manager.read();
+    // read_recursive() instead of read() -- populate_virtual_invoke_cache
+    // already holds class_manager.read() across its own native-shadow
+    // exemption check (the is_real_tpe_execute call site) when it calls into
+    // this helper. A plain nested read() panics the lock-order tracker
+    // (debug builds) or can deadlock under parking_lot once a writer is
+    // queued (release builds) -- same fix as resolve_method_ref /
+    // surefire_lazy_launcher_discover_native.
+    let cm = shared.classes.class_manager.read_recursive();
     let Some(index) =
         crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, "workers", &cm.class_store)
     else {
@@ -32149,7 +32156,14 @@ fn surefire_lazy_launcher_discover_native(
         DESC_DISCOVER,
     )?;
     let cid = shared.mem.heap.class_id_of(recv_obj);
-    let cm = shared.classes.class_manager.read();
+    // read_recursive() instead of read() -- this native-override probe is
+    // reached from execute_invokevirtual_vtable_fast while it already holds
+    // class_manager.read() across the WP0.1 native-override check (see the
+    // "ALREADY-HELD cm guard" note above that call site). A plain nested
+    // read() panics the lock-order tracker (debug builds) or can deadlock
+    // under parking_lot once a writer is queued (release builds) -- same
+    // fix as resolve_method_ref.
+    let cm = shared.classes.class_manager.read_recursive();
     let ok = cm
         .get_class(cid)
         .map(|c| c.name.as_ref() == LAZY)
