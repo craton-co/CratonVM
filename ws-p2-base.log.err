@@ -1,0 +1,74 @@
+﻿cratonvm-doc32r4-base.exe : [cratonvm] 4 per-flag variable(s) set directly; the supported spelling is now: CRATONVM_THR
+EADS=-default-watchdog CRATONVM_REAL=aqs CRATONVM_REAL=net-sockets CRATONVM_JIT=rootsnap-cache
+At line:1 char:995
++ ... estAsyncMessagesPerformance'); & $b[1] $a 1>$log 2>"$log.err"; $s0=(S ...
++                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([cratonvm] 4 pe...=rootsnap-cache:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-07-30T17:45:46.723012Z  WARN cratonvm_vm::vm::vm_util: Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE p
+opulated (18/18)
+2026-07-30T17:45:46.800805Z  WARN cratonvm_vm::vm::vm_util: Post-clinit fixup: File fs/separator/pathSeparator populate
+d (5/5)
+30-Jul-2026 17:45:46.908 INFO [main] org.apache.catalina.startup.LoggingBaseTest.setUp Starting test case [testAsyncTim
+ing]
+30-Jul-2026 17:45:47.093 WARNING [main] org.apache.catalina.util.SessionIdGeneratorBase.<clinit> The default SHA1PRNG a
+lgorithm for SecureRandom is not supported by this JVM. Using the platform default.
+30-Jul-2026 17:45:51.134 INFO [main] org.apache.coyote.AbstractProtocol.init Initializing ProtocolHandler ["http-nio-12
+7.0.0.1-auto-1"]
+30-Jul-2026 17:45:51.428 INFO [main] org.apache.catalina.core.StandardService.startInternal Starting service [Tomcat]
+30-Jul-2026 17:45:51.429 INFO [main] org.apache.catalina.core.StandardEngine.startInternal Starting Servlet engine: [Ap
+ache Tomcat/12.0.0-M1-dev]
+30-Jul-2026 17:45:51.701 INFO [main] org.apache.coyote.AbstractProtocol.start Starting ProtocolHandler ["http-nio-127.0
+.0.1-auto-1-51562"]
+2026-07-30T17:46:10.296668Z  WARN cratonvm_gc::gc_quiescence: [moving-young] fallback #1: reason=xt-helper-window-conse
+rvative-scan — a live JIT frame could not prove a complete rewritable root map, so this young collection runs the NON-M
+OVING sweep (no compaction, free-list allocation). Persistent fallbacks mean the young generation is not actually a cop
+ying collector.
+2026-07-30T17:46:16.730836Z  WARN cratonvm_gc::gc_quiescence: [moving-young] fallback #2: reason=compiled-frame-oop-not
+-published — a live JIT frame could not prove a complete rewritable root map, so this young collection runs the NON-MOV
+ING sweep (no compaction, free-list allocation). Persistent fallbacks mean the young generation is not actually a copyi
+ng collector.
+30-Jul-2026 17:46:18.781 INFO [main] org.apache.coyote.AbstractProtocol.pause Pausing ProtocolHandler ["http-nio-127.0.
+0.1-auto-1-51562"]
+30-Jul-2026 17:46:18.800 INFO [main] org.apache.catalina.core.StandardService.stopInternal Stopping service [Tomcat]
+2026-07-30T17:46:18.838980Z  WARN cratonvm_vm::vm::vm_util: Post-clinit fixup: UnsafeConstants populated (5/5)
+30-Jul-2026 17:46:18.828 WARNING [main] org.apache.catalina.loader.WebappClassLoaderBase.clearReferencesThreads The web
+ application [ROOT] appears to have started a thread named [http-nio-127.0.0.1-auto-1-exec-2] but has failed to stop it
+. This is very likely to create a memory leak. Stack trace of thread:
+ org.apache.tomcat.websocket.TesterAsyncTiming$Endpoint.onMessage(TesterAsyncTiming.java:64)
+ org.apache.tomcat.websocket.pojo.PojoMessageHandlerWholeBase.onMessage(PojoMessageHandlerWholeBase.java:127)
+ org.apache.tomcat.websocket.WsFrameBase.sendMessageText(WsFrameBase.java:426)
+ org.apache.tomcat.websocket.server.WsFrameServer.sendMessageText(WsFrameServer.java:142)
+ org.apache.tomcat.websocket.WsFrameBase.processDataText(WsFrameBase.java:520)
+ org.apache.tomcat.websocket.WsFrameBase.processData(WsFrameBase.java:313)
+ org.apache.tomcat.websocket.WsFrameBase.processInputBuffer(WsFrameBase.java:146)
+ org.apache.tomcat.websocket.server.WsFrameServer.onDataAvailable(WsFrameServer.java:97)
+ org.apache.tomcat.websocket.server.WsFrameServer.doOnDataAvailable(WsFrameServer.java:196)
+ org.apache.tomcat.websocket.server.WsFrameServer.notifyDataAvailable(WsFrameServer.java:176)
+ org.apache.tomcat.websocket.server.WsHttpUpgradeHandler.upgradeDispatch(WsHttpUpgradeHandler.java:167)
+ org.apache.coyote.http11.upgrade.UpgradeProcessorInternal.dispatch(UpgradeProcessorInternal.java:73)
+ org.apache.coyote.AbstractProcessorLight.process(AbstractProcessorLight.java:65)
+ org.apache.coyote.AbstractProtocol$ConnectionHandler.process(AbstractProtocol.java:1307)
+ org.apache.tomcat.util.net.NioEndpoint$SocketProcessor.doRun(NioEndpoint.java:2035)
+ org.apache.tomcat.util.net.SocketProcessorBase.run(SocketProcessorBase.java:74)
+ org.apache.tomcat.util.threads.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:949)
+ org.apache.tomcat.util.threads.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:483)
+ org.apache.tomcat.util.threads.TaskThread$WrappingRunnable.run(TaskThread.java:74)
+30-Jul-2026 17:46:18.856 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [StandardWrapperValve[Container is null]] after stop() had already been called. The second call will be ignored.
+30-Jul-2026 17:46:18.859 INFO [main] org.apache.coyote.AbstractProtocol.stop Stopping ProtocolHandler ["http-nio-127.0.
+0.1-auto-1-51562"]
+30-Jul-2026 17:46:18.877 INFO [main] org.apache.coyote.AbstractProtocol.destroy Destroying ProtocolHandler ["http-nio-1
+27.0.0.1-auto-1-51562"]
+30-Jul-2026 17:46:18.881 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [StandardEngineValve[Container is null]] after stop() had already been called. The second call will be ignored.
+30-Jul-2026 17:46:18.884 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [ErrorReportValve[Container is null]] after stop() had already been called. The second call will be ignored.
+30-Jul-2026 17:46:18.886 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [StandardHostValve[Container is null]] after stop() had already been called. The second call will be ignored.
+30-Jul-2026 17:46:18.889 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [NonLoginAuthenticator[Container is null]] after stop() had already been called. The second call will be ignored.
+30-Jul-2026 17:46:18.891 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [StandardContextValve[Container is null]] after stop() had already been called. The second call will be ignored.
+[cratonvm] System.exit(1) called вЂ” process terminating

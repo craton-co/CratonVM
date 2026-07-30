@@ -2069,15 +2069,6 @@ fn try_deliver_ready_read(
     attachment: Option<ObjectRef>,
     buffer: ObjectRef,
 ) -> bool {
-    if length == 0 {
-        return false;
-    }
-    let available = crate::net::socket_available_stream(stream)
-        .unwrap_or(0)
-        .max(0) as usize;
-    if available == 0 {
-        return false;
-    }
     let entered = INLINE_READY_READ_DEPTH.with(|depth| {
         if depth.get() >= INLINE_READY_READ_MAX_DEPTH {
             false
@@ -2087,22 +2078,21 @@ fn try_deliver_ready_read(
         }
     });
     if !entered {
+        if aio_inline_dbg_enabled() {
+            aio_inline_record(&AIO_INLINE_DEPTH_CAPPED);
+        }
         return false;
     }
 
-    // FIONREAD reported at least one byte immediately above, and an
-    // `AsynchronousSocketChannel` permits only one outstanding read at a time,
-    // so no other consumer can drain the socket between the two calls.
-    let mut bytes = vec![0u8; available.min(length)];
-    let outcome = match stream.read(&mut bytes) {
-        Ok(n) if n > 0 => {
-            bytes.truncate(n);
-            Some(ReadOutcome::Bytes(bytes))
-        }
-        Ok(_) => Some(ReadOutcome::Eof),
-        Err(e) if e.kind() == ErrorKind::WouldBlock => None,
-        Err(e) => Some(ReadOutcome::Error(format!("read failed: {e}"))),
-    };
+    // Shared with the Future form. An `AsynchronousSocketChannel` permits only
+    // one outstanding read at a time, so no other consumer can drain the socket
+    // between the `FIONREAD` probe and the read.
+    let outcome = try_read_ready_bytes(stream, length).map(|o| match o {
+        FutureOutcome::Bytes(bytes) => ReadOutcome::Bytes(bytes),
+        FutureOutcome::Eof => ReadOutcome::Eof,
+        FutureOutcome::Count(n) => ReadOutcome::Count(n),
+        FutureOutcome::Error(m) => ReadOutcome::Error(m),
+    });
     let delivered = outcome.is_some();
     if let Some(outcome) = outcome {
         // `deliver_read_completion` releases these roots itself.
@@ -2148,10 +2138,34 @@ fn aio_asc_read_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if length <= 0 {
         return post(FutureOutcome::Count(0));
     }
-    let stream = match aio_clone_backing_stream(ctx, fd) {
+    let mut stream = match aio_clone_backing_stream(ctx, fd) {
         Ok(stream) => stream,
         Err(error) => return post(FutureOutcome::Error(format!("read: {error}"))),
     };
+
+    // Already-buffered bytes complete the Future on this thread, so
+    // `Future.get()` returns without a worker wake OR a dispatcher wake. This
+    // is the path Tomcat's WebSocket CLIENT takes: `AsyncChannelWrapperNonSecure`
+    // reads through the Future form, not the handler form, which is why the
+    // handler-form fast path alone left known-issue tomcat/32.3's SEQ1
+    // assertion (the gap between the two 8k chunks of one 16k message)
+    // essentially unchanged at 494 failures out of 500.
+    //
+    // Unlike the handler form there is no re-entrancy to bound: completing the
+    // Future cannot run application code here, because the Future has not been
+    // returned to Java yet and so carries no dependent stages.
+    if let Some(outcome) = try_read_ready_bytes(&mut stream, length as usize) {
+        deliver_future_completion(
+            ctx,
+            FutureCompletion {
+                future_gref,
+                buffer_gref,
+                outcome,
+            },
+        );
+        return Ok(Some(Value::Object(Some(future))));
+    }
+
     if job_sender()
         .send(Job::ReadFutureFd {
             stream: Arc::new(Mutex::new(stream)),
@@ -2166,6 +2180,78 @@ fn aio_asc_read_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         ));
     }
     Ok(Some(Value::Object(Some(future))))
+}
+
+/// `CRATONVM_DBG_AIO_INLINE=1` reports how often the ready-read fast path is
+/// actually taken, split by why it declined. Without this it is impossible to
+/// tell "the fast path did not help" from "the fast path never ran" — the two
+/// call for opposite next steps.
+fn aio_inline_dbg_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_DBG_AIO_INLINE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => false,
+        },
+    )
+}
+
+static AIO_INLINE_TAKEN: AtomicUsize = AtomicUsize::new(0);
+static AIO_INLINE_NOT_READY: AtomicUsize = AtomicUsize::new(0);
+static AIO_INLINE_DEPTH_CAPPED: AtomicUsize = AtomicUsize::new(0);
+
+fn aio_inline_record(counter: &AtomicUsize) {
+    counter.fetch_add(1, Ordering::Relaxed);
+    let taken = AIO_INLINE_TAKEN.load(Ordering::Relaxed);
+    let not_ready = AIO_INLINE_NOT_READY.load(Ordering::Relaxed);
+    let capped = AIO_INLINE_DEPTH_CAPPED.load(Ordering::Relaxed);
+    let total = taken + not_ready + capped;
+    if total % 500 == 0 {
+        eprintln!(
+            "[DBG_AIO_INLINE] reads={total} inline={taken} not_ready={not_ready} \
+             depth_capped={capped} inline_rate={:.3}",
+            taken as f64 / total as f64
+        );
+    }
+}
+
+/// Read without blocking when `FIONREAD` proves bytes are already queued.
+///
+/// Shared by the handler and Future read fast paths. `None` means "not ready,
+/// use the worker pool" — including the `WouldBlock` that a racing consumer
+/// could still produce — so every caller keeps its existing asynchronous
+/// behaviour whenever this declines.
+fn try_read_ready_bytes(stream: &mut TcpStream, length: usize) -> Option<FutureOutcome> {
+    if length == 0 {
+        return None;
+    }
+    let available = crate::net::socket_available_stream(stream)
+        .unwrap_or(0)
+        .max(0) as usize;
+    if available == 0 {
+        if aio_inline_dbg_enabled() {
+            aio_inline_record(&AIO_INLINE_NOT_READY);
+        }
+        return None;
+    }
+    let mut bytes = vec![0u8; available.min(length)];
+    let outcome = match stream.read(&mut bytes) {
+        Ok(n) if n > 0 => {
+            bytes.truncate(n);
+            Some(FutureOutcome::Bytes(bytes))
+        }
+        Ok(_) => Some(FutureOutcome::Eof),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => None,
+        Err(e) => Some(FutureOutcome::Error(format!("read failed: {e}"))),
+    };
+    if aio_inline_dbg_enabled() {
+        aio_inline_record(if outcome.is_some() {
+            &AIO_INLINE_TAKEN
+        } else {
+            &AIO_INLINE_NOT_READY
+        });
+    }
+    outcome
 }
 
 /// Future-form `AsynchronousSocketChannel.write(ByteBuffer)`. The previous
