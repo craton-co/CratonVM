@@ -6751,7 +6751,7 @@ pub fn execute(
                     // pool) is simply omitted; the x64 codegen's 0xba arm then
                     // bails the whole compile (`return false`) rather than
                     // guessing, exactly like the OSR/hot-path resolvers.
-                    let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
+                    let mut indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)> = Vec::new();
                     if !scan.indy_ops.is_empty() {
                         let cm_lock = shared.classes.class_manager.read();
                         if let Some(class) = cm_lock.get_class(class_id) {
@@ -6768,7 +6768,19 @@ pub fn execute(
                                         let ret_type = crate::jit::return_type(descriptor);
                                         let arg_type_tags =
                                             crate::jit::indy_arg_type_tags(descriptor);
-                                        indy_info.push((pc_indy, arg_slots, ret_type, arg_type_tags));
+                                        let concat_site = crate::runtime::invokedynamic::make_jit_string_concat_site_from_parts(
+                                            &class.constant_pool,
+                                            &class.bootstrap_methods,
+                                            cp_idx,
+                                        )
+                                        .unwrap_or(0);
+                                        indy_info.push((
+                                            pc_indy,
+                                            arg_slots,
+                                            ret_type,
+                                            arg_type_tags,
+                                            concat_site,
+                                        ));
                                     }
                                 }
                             }
@@ -35223,9 +35235,12 @@ fn compile_osr_artifact(
             // for the full repro and trace. Like `has_athrow` above,
             // method-entry compilation (unaffected by this OSR-only bail path)
             // remains available, so do NOT bail-list here.
-            if !scan.indy_ops.is_empty() {
-                return None;
-            }
+            //
+            // RELAXED 2026-07-30 (tomcat known-issue 30): the blanket refusal
+            // moved below, to after `indy_info` is resolved. A site that lowers
+            // to the StringConcatFactory bridge emits a real call, not a trap,
+            // so there is no imprecise resume for an OSR frame to take. Only
+            // methods with an UNBRIDGED indy are still refused.
             // RBC.6b (dohead-residuals, 2026-07-18) — never OSR a method with
             // its own local exception handlers, even when it never directly
             // `athrow`s. `compile_with_param_slots` below has no
@@ -35666,7 +35681,7 @@ fn compile_osr_artifact(
             // field doc on the x64 `Compiler` struct. A site that cannot be
             // resolved is simply omitted; the x64 codegen's 0xba arm then
             // bails the whole compile (`return false`) rather than guessing.
-            let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
+            let mut indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)> = Vec::new();
             if !scan.indy_ops.is_empty() {
                 let cm_lock = shared.classes.class_manager.read();
                 if let Some(class) = cm_lock.get_class(class_id) {
@@ -35682,11 +35697,46 @@ fn compile_osr_artifact(
                                 let arg_slots = crate::jit::count_param_slots(descriptor);
                                 let ret_type = crate::jit::return_type(descriptor);
                                 let arg_type_tags = crate::jit::indy_arg_type_tags(descriptor);
-                                indy_info.push((pc_indy, arg_slots, ret_type, arg_type_tags));
+                                let concat_site = crate::runtime::invokedynamic::make_jit_string_concat_site_from_parts(
+                                    &class.constant_pool,
+                                    &class.bootstrap_methods,
+                                    cp_idx,
+                                )
+                                .unwrap_or(0);
+                                indy_info.push((
+                                    pc_indy,
+                                    arg_slots,
+                                    ret_type,
+                                    arg_type_tags,
+                                    concat_site,
+                                ));
                             }
                         }
                     }
                 }
+            }
+
+            // RBC.7 (relaxed) — an OSR frame cannot safely take the generic
+            // indy uncommon trap: the bail resumes the pre-OSR interpreter
+            // frame at the stale back-edge, silently re-running a loop whose
+            // side effects already committed (see
+            // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
+            // Admit only sites lowered by the StringConcatFactory bridge, which
+            // emits a direct call and never deopts at the indy bci. `indy_info`
+            // drops sites it cannot resolve, so a length mismatch also means
+            // "not fully bridged" and is refused here.
+            if indy_info.len() != scan.indy_ops.len()
+                || indy_info.iter().any(|(_, _, ret_type, _, concat_site)| {
+                    *concat_site == 0 || !matches!(*ret_type, b'L' | b'[')
+                })
+            {
+                if crate::runtime::env_cache::dbg_jitc() && !scan.indy_ops.is_empty() {
+                    eprintln!(
+                        "[cratonvm-jitc] osr-DENY (unbridged invokedynamic) {}.{}{}",
+                        class_name, method_name, method_descriptor
+                    );
+                }
+                return None;
             }
 
             // Eagerly compile invokestatic callees (class_manager lock released)

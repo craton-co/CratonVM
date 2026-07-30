@@ -8565,7 +8565,7 @@ struct Compiler {
     /// to precisely type this call's own arguments on the operand stack
     /// instead of falling back to the coarse per-method `wide_fp` gate. See
     /// `indy_arg_type_tags`'s doc comment.
-    indy_info: Vec<(usize, usize, u8, Vec<u8>)>,
+    indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
     /// Direct call targets: (bytecode_pc, direct call info).
     /// For invokestatic/invokespecial where the callee is already JIT-compiled.
     direct_calls: Vec<(usize, super::JitDirectCall)>,
@@ -29128,7 +29128,8 @@ impl Compiler {
                         .indy_info_idx
                         .get(&pc)
                         .map(|&i| self.indy_info[i].clone());
-                    let Some((_pc, arg_slots, ret_type, arg_type_tags)) = info else {
+                    let Some((_pc, arg_slots, ret_type, arg_type_tags, concat_site)) = info
+                    else {
                         // No resolver, or this site couldn't be resolved at
                         // compile time: fail safe and bail the whole method,
                         // exactly like every other CP-resolved metadata miss
@@ -29138,6 +29139,72 @@ impl Compiler {
                     };
 
                     self.flush_scratch_registers();
+
+                    // A `StringConcatFactory` site has a resolved,
+                    // process-lifetime bridge, so call it directly instead of
+                    // taking the uncommon trap below. This is what removes
+                    // RBC.7's premise for the common
+                    // `println("..." + x)`-after-a-loop shape: with no trap at
+                    // the indy bci there is nothing for an OSR frame to resume
+                    // imprecisely, so the OSR artifact keeps running. Every
+                    // other bootstrap kind still falls through to the trap.
+                    let concat_entry =
+                        crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    if concat_site != 0 && concat_entry != 0 && matches!(ret_type, b'L' | b'[') {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                            eprintln!(
+                                "[cratonvm-jitc] indy-concat bridge pc={} args={}",
+                                pc, arg_slots
+                            );
+                        }
+                        let pre_pop_spill = self.next_spill_offset;
+                        let mut arg_slots_vec = Vec::with_capacity(arg_slots);
+                        for _ in 0..arg_slots {
+                            arg_slots_vec.push(self.pop_stack());
+                        }
+                        arg_slots_vec.reverse();
+                        let post_pop_spill = self.next_spill_offset;
+                        if arg_slots > 0 {
+                            let Some(args_end) =
+                                self.checked_spill_range_end(pre_pop_spill, arg_slots)
+                            else {
+                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                                    .is_some()
+                                {
+                                    eprintln!(
+                                        "[cratonvm-jitc] indy-concat bridge spill overflow pc={} base={} args={}",
+                                        pc, pre_pop_spill, arg_slots
+                                    );
+                                }
+                                return false;
+                            };
+                            self.next_spill_offset = args_end;
+                            for (i, slot) in arg_slots_vec.iter().enumerate() {
+                                let offset = pre_pop_spill + ((arg_slots - 1 - i) as i32) * 8;
+                                self.load_slot_to_reg(RAX, *slot);
+                                self.emit_store_local(offset, RAX);
+                            }
+                        }
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.emit_mov_imm64(ARG_REGS[1], concat_site as i64);
+                        if arg_slots > 0 {
+                            self.emit_lea_frame_slot(
+                                ARG_REGS[2],
+                                pre_pop_spill + ((arg_slots as i32) - 1) * 8,
+                            );
+                        } else {
+                            self.emit_xor_reg_self(ARG_REGS[2]);
+                        }
+                        self.emit_mov_imm32_sx(ARG_REGS[3], arg_slots as i32);
+                        self.emit_pre_safepoint_spill();
+                        self.emit_call_absolute(concat_entry);
+                        self.emit_oop_map_for_safepoint();
+                        self.next_spill_offset = post_pop_spill;
+                        self.push_from_rax();
+                        self.mark_top_as_oop();
+                        pc += 5;
+                        continue;
+                    }
 
                     // Unconditional JMP to the shared deopt stub. Mirrors the
                     // conditional String-intrinsic bail edges elsewhere in
@@ -30098,7 +30165,7 @@ pub fn compile_with_param_slots(
     // field doc on the `Compiler` struct. Empty from the legacy `compile()`
     // test wrapper (which also passes no `indy_ops` to `jit_scan` callers, so
     // this is always consistent with an invokedynamic-free method there).
-    indy_info: Vec<(usize, usize, u8, Vec<u8>)>,
+    indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
 ) -> Option<CompiledMethod> {
     let needs_heap = needs_heap || !ldc_string_info.is_empty();
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
@@ -31488,7 +31555,18 @@ pub fn compile_with_param_slots(
     // install sites in vm/src/jit/helpers.rs) consult this flag so every
     // call to such a method stays on a dispatch helper, whose
     // `try_resume_trapped_callee` resolves the trap precisely in place.
-    cm.has_indy_trap = !compiler.indy_info.is_empty();
+    // Only sites that actually lower to a trap count. A fully bridged
+    // method (every indy is a StringConcatFactory call) carries no trap, so it
+    // must not be forced onto the dispatch-helper path for its callers.
+    cm.has_indy_trap = {
+        let concat_entry = crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        compiler
+            .indy_info
+            .iter()
+            .any(|(_pc, _arg_slots, ret_type, _tags, concat_site)| {
+                !(*concat_site != 0 && concat_entry != 0 && matches!(*ret_type, b'L' | b'['))
+            })
+    };
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;
