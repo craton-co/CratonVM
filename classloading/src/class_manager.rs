@@ -116,6 +116,41 @@ fn loaded_classes_probe(
         .map(|(_, &id)| id)
 }
 
+/// Probe `name` against the delegation ANCESTORS of a user-defined loader
+/// (nearest parent first), skipping the loader's own namespace and the
+/// built-in chain — both of which every caller probes separately.
+///
+/// This is the Rust-side half of parent delegation for *resolution*, as opposed
+/// to *finding bytes*: see `loaders::USER_LOADER_PARENTS` for why it did not
+/// exist before 2026-07-30 and what its absence caused.
+fn loaded_class_via_parent_chain(
+    map: &LoadedClassesMap,
+    requesting_loader: ClassLoaderId,
+    name: &str,
+) -> Option<ClassId> {
+    if !crate::loaders::loader_parent_chain_enabled() || !crate::loaders::has_user_loader_parents()
+    {
+        return None;
+    }
+    let ClassLoaderId::UserDefined(ns) = requesting_loader else {
+        return None;
+    };
+    let mut ancestors = [0u32; crate::loaders::MAX_USER_LOADER_DEPTH];
+    let n = crate::loaders::user_loader_ancestors(ns, &mut ancestors);
+    for &parent in &ancestors[..n] {
+        if let Some(id) = loaded_classes_probe(map, ClassLoaderId::UserDefined(parent), name) {
+            if crate::loaders::dbg_loader_chain() {
+                eprintln!(
+                    "[loader-chain] {name}: ns {ns} resolved through parent ns {parent} -> cid {}",
+                    id.as_u32()
+                );
+            }
+            return Some(id);
+        }
+    }
+    None
+}
+
 /// Resolve an already-defined class through one requesting loader's reachable
 /// namespaces. Built-in loaders are strictly parent-first and never delegate
 /// down to a child. A user loader may prefer its own definition when its Java
@@ -145,6 +180,14 @@ fn loaded_class_for_requesting_loader(
                 if let Some(id) = loaded_classes_probe(map, requesting_loader, name) {
                     return Some(id);
                 }
+            }
+            // A registered user-loader ANCESTOR outranks the built-in chain:
+            // the built-in chain is this loader's parent only when nothing
+            // closer was recorded. Probing it first is what let a fork
+            // loader's child resolve the application copy of a name its own
+            // parent had already defined.
+            if let Some(id) = loaded_class_via_parent_chain(map, requesting_loader, name) {
+                return Some(id);
             }
             for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
                 if let Some(id) = loaded_classes_probe(map, *loader_id, name) {
@@ -2287,6 +2330,14 @@ impl ClassManager {
                         return Some(id);
                     }
                 }
+                // Same ordering as `loaded_class_for_requesting_loader`: a
+                // registered delegation ancestor is closer than the built-in
+                // chain and must be consulted before it.
+                if let Some(id) =
+                    loaded_class_via_parent_chain(&self.loaded_classes, requesting_loader, name)
+                {
+                    return Some(id);
+                }
                 for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
                     if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name) {
                         return Some(id);
@@ -3904,6 +3955,29 @@ impl ClassManager {
             if loader_faithful {
                 if let Some(id) = loaded_classes_probe(&this.loaded_classes, loader_id, internal) {
                     return Ok(id);
+                }
+                // JVMS 5.3.5: the defining loader is the INITIATING loader for
+                // every supertype, so delegation applies. Without this the only
+                // remaining option is `load_class`, which is loader-blind: for a
+                // name that is also on the application classpath it happily
+                // DEFINES A SECOND COPY in the application namespace and links
+                // the subclass to that, which is how a Spring CGLIB proxy came
+                // to extend a different copy of its own superclass than the
+                // fork-loaded test class held.
+                if let Some(id) =
+                    loaded_class_via_parent_chain(&this.loaded_classes, loader_id, internal)
+                {
+                    return Ok(id);
+                }
+                if crate::loaders::dbg_loader_chain() {
+                    if let ClassLoaderId::UserDefined(ns) = loader_id {
+                        let mut ancestors = [0u32; crate::loaders::MAX_USER_LOADER_DEPTH];
+                        let n = crate::loaders::user_loader_ancestors(ns, &mut ancestors);
+                        eprintln!(
+                            "[loader-chain] supertype {internal} for ns {ns}: not in own ns, ancestors {:?} all missed -> global load",
+                            &ancestors[..n]
+                        );
+                    }
                 }
             }
             match this.load_class(internal) {
