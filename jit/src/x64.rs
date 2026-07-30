@@ -2285,11 +2285,12 @@ fn self_cache_inherit_enabled() -> bool {
 
 /// Step 1 of `docs/feature-designs/precise-jit-maps-default.md` — opt-IN
 /// **inline** frame-record. When on (and precise maps are on, and the OS TLS
-/// probe in [`inline_rbp_tls_disp`] succeeds), the JIT prologue stores RBP
-/// straight into the precise-maps innermost-RBP mirror with a single
-/// `mov gs:[disp], rbp` instead of `call jit_frame_record`. This removes the
-/// per-invocation CALL that is the residual ~1.68× call-heavy regression after
-/// the thread-local cache (`82cf85e9`) already cut the helper body cost.
+/// probe in [`inline_rbp_tls_disp`] succeeds), the JIT stores RBP straight into
+/// the precise-maps innermost-RBP mirror with one segment-relative `mov`
+/// (`gs:` on Windows, `fs:` on Linux) instead of `call jit_frame_record`.
+/// This removes the per-invocation CALL that is the residual ~1.68× call-heavy
+/// regression after the thread-local cache (`82cf85e9`) already cut the helper
+/// body cost.
 ///
 /// **DEFAULT ON** (Step 2 flip, 2026-06-21; opt out with
 /// `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`). Validated on the inlined path:
@@ -2298,9 +2299,9 @@ fn self_cache_inherit_enabled() -> bool {
 /// mismatches over billions of fib44 invocations). Off → the existing
 /// `call jit_frame_record` is emitted (the pre-Step-1 default). Only meaningful
 /// with precise maps on (otherwise there is no frame-record at all), so it is
-/// anded with [`precise_jit_maps_enabled`]. On non-Windows / on a failed TLS
-/// probe, [`inline_rbp_tls_disp`] returns 0 and the CALL path is used even when
-/// this is on, so the flip is a safe no-op there.
+/// anded with [`precise_jit_maps_enabled`]. On an unsupported target or a failed
+/// TLS probe, [`inline_rbp_tls_disp`] returns 0 and the CALL path is used even
+/// when this is on.
 pub fn precise_inline_frame_record_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -2325,12 +2326,11 @@ pub fn verify_inline_frame_record_enabled() -> bool {
     })
 }
 
-/// Step 1 — the GS-relative byte displacement of the Windows TLS slot that
-/// backs the precise-maps innermost-RBP mirror, or `0` when inline
-/// frame-record is disabled or unavailable. This is the **single source of
-/// truth** shared by the JIT codegen (which bakes `mov gs:[disp], rbp`) and the
-/// VM-side mirror accessor in `vm/src/jit/conservative_roots.rs` (which
-/// reads/writes the same slot). Computed once, cached for the process.
+/// Step 1 — the segment-relative byte displacement of the OS TLS slot that
+/// backs the precise-maps innermost-RBP mirror, or `0` when inline frame-record
+/// is disabled or unavailable. This is the **single source of truth** shared by
+/// JIT codegen and the VM-side mirror accessor in
+/// `vm/src/jit/conservative_roots.rs`. Computed once, cached for the process.
 ///
 /// Windows x86-64 stores the 64 static TLS slots in the TEB at offset `0x1480`
 /// (`TlsSlots`), reachable as `gs:[0x1480 + slot*8]`. We `TlsAlloc` a slot,
@@ -2412,11 +2412,106 @@ pub fn inline_rbp_tls_disp() -> usize {
     })
 }
 
-/// Non-Windows: inline frame-record is unsupported (the single-instruction
-/// store relies on the Windows TEB TLS layout); always return 0 → CALL path.
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+thread_local! {
+    /// Linux counterpart of the Windows OS-TLS slot. Generated code reaches
+    /// this exact Rust TLS cell as `fs:[disp32]`; the startup probe below writes
+    /// a sentinel through `Cell` and reads it back through `fs:` before the
+    /// displacement is accepted.
+    static LINUX_INLINE_RBP_MIRROR: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Linux x86-64 inline frame-record. ELF TLS lives at a stable signed offset
+/// from the thread's FS base. Recover that offset once, encode it as the raw
+/// disp32 bits expected by the x86 instruction, and sentinel-probe the exact
+/// `fs:[offset]` address before enabling generated stores. Any layout or range
+/// surprise returns 0 and retains the existing helper-call path.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_rbp_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if !precise_inline_frame_record_enabled() {
+            return 0;
+        }
+        let disp = LINUX_INLINE_RBP_MIRROR.with(|cell| {
+            // On the System V x86-64 ABI, fs:[0] is the thread-control-block
+            // self pointer. Do not trust that convention blindly: the raw
+            // sentinel read below proves the derived address before use.
+            let fs_base = unsafe { read_fs_qword(0) };
+            let cell_addr = cell as *const std::cell::Cell<usize> as usize;
+            let delta = (cell_addr as i128) - (fs_base as i128);
+            let Ok(delta32) = i32::try_from(delta) else {
+                return 0;
+            };
+            if delta32 == 0 {
+                return 0;
+            }
+            let old = cell.replace(0x5242_504C_494E_5558);
+            let probed = unsafe { read_fs_qword(delta32 as isize) };
+            cell.set(old);
+            if probed == 0x5242_504C_494E_5558 {
+                (delta32 as u32) as usize
+            } else {
+                0
+            }
+        });
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+            if disp != 0 {
+                eprintln!(
+                    "[INLINE-FR] inline frame-record ENABLED: storing RBP via mov fs:[{:#x}]",
+                    disp as u32
+                );
+            } else {
+                eprintln!("[INLINE-FR] Linux TLS probe FAILED — using CALL path");
+            }
+        }
+        disp
+    })
+}
+
+/// Unsupported targets retain the helper-call path.
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
 pub fn inline_rbp_tls_disp() -> usize {
     0
+}
+
+/// Segment override used by generated inline frame-record stores.
+///
+/// This is shared with the OSR trampoline emitter in `lib.rs`; keeping the
+/// platform byte in one place prevents that independently emitted prologue
+/// from silently retaining the Windows `gs:` prefix on Linux.
+pub(crate) const fn inline_rbp_tls_segment_prefix() -> u8 {
+    #[cfg(windows)]
+    {
+        0x65
+    }
+    #[cfg(not(windows))]
+    {
+        0x64
+    }
+}
+
+/// VM-side access to the Linux TLS cell used by generated `fs:` stores.
+/// `None` means the startup probe did not enable the inline path.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_rbp_tls_mirror_read() -> Option<usize> {
+    if inline_rbp_tls_disp() == 0 {
+        None
+    } else {
+        Some(LINUX_INLINE_RBP_MIRROR.with(std::cell::Cell::get))
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_rbp_tls_mirror_write(value: usize) -> bool {
+    if inline_rbp_tls_disp() == 0 {
+        false
+    } else {
+        LINUX_INLINE_RBP_MIRROR.with(|cell| cell.set(value));
+        true
+    }
 }
 
 /// Read the 8-byte value at `gs:[disp]` (Windows TEB-relative). Used only by
@@ -2429,6 +2524,21 @@ unsafe fn read_gs_qword(disp: usize) -> usize {
         "mov {out}, qword ptr gs:[{addr}]",
         out = out(reg) val,
         addr = in(reg) disp,
+        options(nostack, preserves_flags, readonly),
+    );
+    val
+}
+
+/// Read the 8-byte value at `fs:[offset]` on Linux x86-64. Used only by the
+/// sentinel probe for [`inline_rbp_tls_disp`].
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[inline]
+unsafe fn read_fs_qword(offset: isize) -> usize {
+    let val: usize;
+    core::arch::asm!(
+        "mov {out}, qword ptr fs:[{addr}]",
+        out = out(reg) val,
+        addr = in(reg) offset,
         options(nostack, preserves_flags, readonly),
     );
     val
@@ -2748,6 +2858,21 @@ fn reference_local_in_register(
     }
 }
 
+/// Whether a direct self-call under moving-young may publish an empty precise
+/// root map without emitting the normal local/full-GPR spill and shadow push.
+///
+/// Moving collection suppresses the conservative JIT-frame scan, so this is
+/// sound only when the dataflow coverage proof is complete and the exact set
+/// of live, rewritable oop homes is empty. Keeping this as a small predicate
+/// makes both fail-closed conditions independently testable.
+fn moving_oop_free_self_call_is_publishable(
+    moving_young: bool,
+    coverage_complete: bool,
+    live_oop_home_count: usize,
+) -> bool {
+    moving_young && coverage_complete && live_oop_home_count == 0
+}
+
 /// Register-only operand-stack-oop soundness — whether `flush_scratch_registers`
 /// (the standard pre-call / pre-backward-branch / pre-return flush) ALSO spills
 /// `StackSlot::CalleeSaved` operand-stack entries that hold an object reference
@@ -2922,17 +3047,17 @@ pub fn set_kernel_reg_homes_osr_request(on: bool) {
     KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.set(on));
 }
 
-/// `CRATONVM_JIT_KERNEL_REG_OSR` gate (default **OFF**, opt in with `=1`) —
+/// `CRATONVM_JIT_KERNEL_REG_OSR` gate (default **ON**, opt out with `=0`) —
 /// see [`set_kernel_reg_homes_osr_request`].
 ///
-/// Measured 2026-07-18 on the QuickBench kernels this was built for:
-/// Arithmetic showed no wall-clock change (the kernel is long-division
-/// bound — `i/2` + `i%7` chains dwarf the local load/store traffic register
-/// homes remove), and no other kernel demonstrated a win before the round
-/// closed. Given the callee-saved-GPR family's miscompile history, an
-/// unproven-benefit default stays opt-in; bt18/QuickBench checksums were
-/// correct under it in the runs taken (68332206 et al.), so the lever is
-/// safe to experiment with.
+/// The original 2026-07-18 experiment predated constant long-division
+/// lowering, so Arithmetic was division-bound and register homes had no
+/// measurable effect. Once constant `ldiv`/`lrem` stopped dominating, the
+/// same pure-kernel gate became useful: loop-carried primitive locals and the
+/// deferred operand cache can remain in registers. The admission predicate
+/// below still excludes calls, fields, allocation, typechecks, speculative
+/// BCE, and reference locals, and the OSR trampoline seeds the exact assigned
+/// registers before entering the artifact.
 fn kernel_reg_osr_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -2940,9 +3065,9 @@ fn kernel_reg_osr_enabled() -> bool {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_KERNEL_REG_OSR")
             .map(|v| {
                 let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -8563,6 +8688,14 @@ struct Compiler {
     /// pure-int array kernels (QuickBench sieve). Opt out with
     /// `CRATONVM_JIT_NO_SLOT_MIRROR=1`.
     slot_mirror: Option<(i32, u8, usize)>,
+    /// Pure-kernel deferred operand cache. The general-purpose R8/R9 cache was
+    /// previously disabled because call-heavy methods repeatedly paid to flush
+    /// it. Pure kernels have no calls or GC-capable operations, so their only
+    /// flush is at a branch/return; at a counted-loop back edge the operand
+    /// stack is already empty. Keeping arithmetic intermediates in R8/R9
+    /// removes the template backend's remaining frame store/load pairs without
+    /// broadening the pure-kernel admission surface.
+    kernel_operand_cache: bool,
     /// `true` while `try_emit_inline` replays callee bytecode (see
     /// `slot_mirror`): suppresses both recording and consumption.
     slot_mirror_suppressed: bool,
@@ -8570,10 +8703,11 @@ struct Compiler {
     /// (gate `CRATONVM_PRECISE_JIT_MAPS`). Gates the prologue frame-record
     /// call and the per-safepoint id store. Off → byte-identical default path.
     precise_maps: bool,
-    /// Step 1 (`precise-jit-maps-default.md`) — GS-relative TLS displacement of
-    /// the innermost-RBP mirror slot, or 0 when inline frame-record is off /
-    /// unavailable. Non-zero → the prologue emits `mov gs:[disp], rbp` instead
-    /// of `call jit_frame_record`. Cached from `inline_rbp_tls_disp()` at
+    /// Step 1 (`precise-jit-maps-default.md`) — segment-relative TLS
+    /// displacement of the innermost-RBP mirror slot, or 0 when inline
+    /// frame-record is off / unavailable. Non-zero → the prologue emits one
+    /// `mov` (`gs:` on Windows, `fs:` on Linux) instead of
+    /// `call jit_frame_record`. Cached from `inline_rbp_tls_disp()` at
     /// construction so codegen reads it once.
     inline_rbp_tls_disp: usize,
     /// Step 1 debug self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`) —
@@ -9460,8 +9594,9 @@ impl Compiler {
         let raw_local_assignments = alloc_result.assignments;
         let raw_used_callee_saved = alloc_result.used_callee_saved;
         let raw_local_assignments_len = raw_local_assignments.len();
+        let kernel_reg_homes_active = KERNEL_REG_HOMES_ACTIVE.with(|c| c.get());
         let gpr_local_homes_enabled =
-            callee_saved_gpr_local_homes_enabled() || KERNEL_REG_HOMES_ACTIVE.with(|c| c.get());
+            callee_saved_gpr_local_homes_enabled() || kernel_reg_homes_active;
         let local_assignments = if gpr_local_homes_enabled {
             raw_local_assignments
         } else {
@@ -9690,6 +9825,7 @@ impl Compiler {
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
             slot_mirror: None,
+            kernel_operand_cache: kernel_reg_homes_active,
             slot_mirror_suppressed: false,
             precise_maps,
             inline_rbp_tls_disp,
@@ -10809,12 +10945,34 @@ impl Compiler {
     /// Publish the precise-map safepoint id without conservatively copying the
     /// whole GPR file into the frame. This is used only when
     /// [`Self::can_elide_self_call_register_spill`] proves that no live oop at
-    /// the direct recursive call resides exclusively in a register.
+    /// the direct recursive call resides exclusively in a register. Under
+    /// moving-young the proof is stronger: coverage must be complete and the
+    /// exact live-oop home set must be empty, so the empty precise map itself is
+    /// the complete root publication and no shadow slots need push/reload.
     fn emit_safepoint_metadata_only(&mut self) {
         if self.failed {
             return;
         }
-        debug_assert!(!self.shadow_enabled && !moving_young_enabled());
+        if self.shadow_enabled || moving_young_enabled() {
+            let coverage_complete = self.moving_young_safepoint_coverage_complete();
+            let live_oop_home_count = self.collect_live_oop_homes().len();
+            if !moving_oop_free_self_call_is_publishable(
+                moving_young_enabled(),
+                coverage_complete,
+                live_oop_home_count,
+            ) {
+                // This should be unreachable because the caller uses the same
+                // predicate. Fail compilation closed if future call-site
+                // refactoring breaks that pairing.
+                self.failed = true;
+                return;
+            }
+            // Match the metadata state normally established by
+            // `emit_pre_safepoint_spill` + an empty `emit_shadow_push`.
+            self.pending_live_frame_hi = self.next_spill_offset;
+            self.pending_shadow.clear();
+            self.pending_shadow_coverage_complete = true;
+        }
         if self.precise_maps && self.sp_id_slot_off != 0 {
             if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SPID").is_some() {
                 eprintln!(
@@ -10904,9 +11062,9 @@ impl Compiler {
         self.cur_bc_pc = saved_pc;
     }
 
-    /// A direct self-call may omit the blind all-GPR spill when this method is
-    /// at the exact call-site state proves every surviving operand is already
-    /// visible in a canonical frame slot.
+    /// A direct self-call may omit the blind all-GPR spill when this method's
+    /// exact call-site state proves every surviving operand is already visible
+    /// in a canonical frame slot.
     /// The callee prologue canonicalizes its arguments before it can reach a GC
     /// safepoint; the caller still publishes its precise oop-map id.
     ///
@@ -10962,13 +11120,20 @@ impl Compiler {
     /// When `safepoint_publish` is `None` (the legacy `compile` test wrapper and
     /// the OSR artifact path, which do not build a plan) this falls back to the
     /// old all-or-nothing test, so those paths are byte-identical.
+    ///
+    /// Moving-young formerly disabled this optimization unconditionally. That
+    /// was necessary for frames containing references because the collector
+    /// suppresses its conservative JIT-frame scan and must be able to rewrite
+    /// every root. It is unnecessary for an exactly proven oop-free frame:
+    /// `moving_young_safepoint_coverage_complete` certifies the analysis, and an
+    /// empty `collect_live_oop_homes` proves the empty precise map is complete.
+    /// Any reference home or incomplete analysis still fails closed to the full
+    /// spill + shadow publication.
     fn can_elide_self_call_register_spill(&self) -> bool {
         let any_reference_local_in_a_register =
             reference_local_in_register(self.safepoint_publish.as_ref(), &self.local_assignments);
         if full_self_call_spill_requested()
             || !self.precise_maps
-            || self.shadow_enabled
-            || moving_young_enabled()
             || any_reference_local_in_a_register
             || self.stack.len() != self.stack_oop_marks.len()
             || !self.stack_oop_marks_exact
@@ -10982,9 +11147,22 @@ impl Compiler {
         // values that survive in the caller to be frame-resident means the
         // conservative frame walk sees them regardless of their oop tags; any
         // register/XMM home fails closed to the SB-CRASH-04 full spill.
-        self.stack
+        let all_survivors_frame_resident = self
+            .stack
             .iter()
-            .all(|slot| matches!(slot, StackSlot::Frame(_)))
+            .all(|slot| matches!(slot, StackSlot::Frame(_)));
+        if !all_survivors_frame_resident {
+            return false;
+        }
+
+        if self.shadow_enabled || moving_young_enabled() {
+            return moving_oop_free_self_call_is_publishable(
+                moving_young_enabled(),
+                self.moving_young_safepoint_coverage_complete(),
+                self.collect_live_oop_homes().len(),
+            );
+        }
+        true
     }
 
     /// Return whether the shadow-stack push can prove it will publish every
@@ -12678,6 +12856,14 @@ impl Compiler {
 
     fn emit_post_call_rbp_republish(&mut self) {
         if !self.precise_maps || self.helpers.frame_record == 0 {
+            return;
+        }
+        if self.inline_rbp_tls_disp != 0 {
+            // A compiled callee publishes its own RBP on entry. Restore this
+            // caller's RBP into the same mirror after return, using the exact
+            // inline mechanism as the prologue. This is value-equivalent to
+            // `jit_frame_record(rbp)` and preserves RAX without a save/restore.
+            self.emit_mov_tls_disp32_rbp(self.inline_rbp_tls_disp as u32);
             return;
         }
         self.buf.emit_byte(0x50); // PUSH RAX (callee return value)
@@ -14756,7 +14942,8 @@ impl Compiler {
         // frame pointers so the real RBP can't be recovered by walking). Done
         // once per invocation, after params are saved so the call doesn't lose
         // them. RBP → ABI arg0; the helper records it into the top JIT chain
-        // entry. Gated off by default (zero default-path cost), and skipped if
+        // entry. The default inline path stores RBP into the mirror TLS cell;
+        // unsupported targets or a failed TLS probe use the helper. Skipped if
         // the helper pointer isn't wired.
         // Frame-record recording is "configured" iff the helper pointer is
         // wired (`build_helpers` sets it whenever precise maps are on). Gate
@@ -14766,11 +14953,11 @@ impl Compiler {
         if self.precise_maps && self.helpers.frame_record != 0 {
             if self.inline_rbp_tls_disp != 0 {
                 // Step 1 (inline frame-record) — store RBP straight into the
-                // mirror TLS slot with one `mov gs:[disp], rbp`, no CALL. The
+                // mirror TLS slot with one segment-relative `mov`, no CALL. The
                 // VM-side mirror accessor reads the SAME slot (single source of
                 // truth via `inline_rbp_tls_disp()`), so the GC root walk sees
                 // the innermost RBP exactly as with the helper path.
-                self.emit_mov_gs_disp32_rbp(self.inline_rbp_tls_disp as u32);
+                self.emit_mov_tls_disp32_rbp(self.inline_rbp_tls_disp as u32);
                 // Debug self-check: also call the verify helper (wired into
                 // `frame_record` by `build_helpers` when the knob is on), which
                 // reads the slot back and asserts it equals RBP.
@@ -15073,20 +15260,21 @@ impl Compiler {
         }
     }
 
-    /// Step 1 (inline frame-record) — emit `MOV gs:[disp32], RBP`, the single
-    /// instruction that stores RBP straight into the precise-maps innermost-RBP
-    /// mirror TLS slot, replacing `call jit_frame_record`. `disp32` is the
-    /// GS-relative byte displacement from [`inline_rbp_tls_disp`].
+    /// Step 1 (inline frame-record) — emit the single segment-relative `MOV`
+    /// that stores RBP straight into the precise-maps innermost-RBP mirror TLS
+    /// slot, replacing `call jit_frame_record`. Windows uses `gs:` (`0x65`);
+    /// Linux uses `fs:` (`0x64`). `disp32` comes from the sentinel-probed
+    /// [`inline_rbp_tls_disp`].
     ///
-    /// Encoding (9 bytes): `65 48 89 2C 25 <disp32-le>`
-    ///   * `65`       — GS segment override prefix.
+    /// Encoding (9 bytes): `<seg> 48 89 2C 25 <disp32-le>`
+    ///   * `<seg>`    — GS (`65`) or FS (`64`) segment override prefix.
     ///   * `48`       — REX.W (64-bit operand).
     ///   * `89`       — MOV r/m64, r64.
     ///   * `2C`       — ModRM mod=00 reg=RBP(5) r/m=100(SIB).
     ///   * `25`       — SIB scale=0 index=none(4) base=none(5) → [disp32].
-    ///   * `disp32`   — absolute displacement; effective address = GS_base+disp.
-    fn emit_mov_gs_disp32_rbp(&mut self, disp32: u32) {
-        self.buf.emit_byte(0x65); // GS prefix
+    ///   * `disp32`   — displacement; effective address = segment base + disp.
+    fn emit_mov_tls_disp32_rbp(&mut self, disp32: u32) {
+        self.buf.emit_byte(inline_rbp_tls_segment_prefix());
         self.buf.emit_byte(0x48); // REX.W
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.buf.emit_byte(0x2C); // ModRM: reg=RBP, r/m=SIB
@@ -16269,10 +16457,23 @@ impl Compiler {
     /// instead of being stored to the frame, avoiding the memory round-trip when
     /// the next bytecode immediately consumes the value.
     fn push_from_rax(&mut self) {
-        // Spill to frame slot. Scratch register caching (R8/R9) was tested but
-        // showed regressions: the frequent flush_scratch_registers calls before
-        // backward branches, calls, and other operations negate the benefit by
-        // adding an extra MOV per flush.
+        // The broad R8/R9 experiment regressed call-heavy methods because each
+        // call flushed live scratch values. Pure kernels contain no calls,
+        // allocation, fields, or other GC-capable operations; their counted
+        // loop back edges arrive with an empty operand stack. Restrict the
+        // deferred cache to that proven shape.
+        if self.kernel_operand_cache {
+            if let Some(reg) = SCRATCH_REGS.iter().copied().find(|&candidate| {
+                !self
+                    .stack
+                    .iter()
+                    .any(|slot| matches!(slot, StackSlot::Scratch(r) if *r == candidate))
+            }) {
+                self.emit_mov_reg_reg(reg, RAX);
+                self.stack_push(StackSlot::Scratch(reg), false);
+                return;
+            }
+        }
         match self.push_stack() {
             Some(StackSlot::Frame(off)) => self.emit_store_local(off, RAX),
             Some(_) => unreachable!("push_stack always returns Frame"),
@@ -29825,9 +30026,8 @@ pub fn compile_with_param_slots(
     // field/static ops, no allocation, no typechecks, no inline sites, and no
     // speculative BCE guards (those deopt with frame-stashed state). Reference
     // locals are masked back to frame homes, so GC visibility is unchanged.
-    let kernel_reg_homes = (kernel_reg_homes_requested || kernel_reg_homes_osr_requested)
+    let pure_kernel = (kernel_reg_homes_requested || kernel_reg_homes_osr_requested)
         && kernel_reg_locals_enabled()
-        && !callee_saved_gpr_local_homes_enabled()
         && invoke_info.is_empty()
         && direct_calls.is_empty()
         && mic_slots.is_empty()
@@ -29842,6 +30042,11 @@ pub fn compile_with_param_slots(
         && compact_field_info.is_empty()
         && inline_sites.is_empty()
         && speculative_bce_guards.is_empty();
+    // When precise-map general register homes are already enabled, this pure
+    // kernel does not need the narrow allocator to turn homes on again. It is
+    // still a pure kernel, however, and therefore remains eligible for the
+    // call-free deferred operand cache captured by `Compiler::new`.
+    let kernel_reg_homes = pure_kernel && !callee_saved_gpr_local_homes_enabled();
     let alloc_result = if kernel_reg_homes {
         let mut ar = alloc_result;
         let ref_mask =
@@ -29983,7 +30188,7 @@ pub fn compile_with_param_slots(
             found
         };
 
-    KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(kernel_reg_homes));
+    KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(pure_kernel));
     let mut compiler = Compiler::new(
         method_key.to_string(),
         buf,
@@ -43219,6 +43424,76 @@ mod flag_and_header_contracts {
     }
 
     // -- arch-2026-07-26 R1: reference-only self-call spill elision ---------
+
+    #[test]
+    fn moving_oop_free_self_call_requires_complete_empty_root_proof() {
+        assert!(
+            moving_oop_free_self_call_is_publishable(true, true, 0),
+            "moving-young may publish a metadata-only empty map when exact coverage proves no roots"
+        );
+        assert!(
+            !moving_oop_free_self_call_is_publishable(true, false, 0),
+            "incomplete moving-young coverage must retain the full spill"
+        );
+        assert!(
+            !moving_oop_free_self_call_is_publishable(true, true, 1),
+            "one live oop home must retain spill plus shadow publication"
+        );
+        assert!(
+            !moving_oop_free_self_call_is_publishable(false, true, 0),
+            "shadow-only mode keeps its established conservative path"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_inline_rbp_tls_slot_is_live_and_round_trips() {
+        assert_eq!(inline_rbp_tls_segment_prefix(), 0x64);
+        let disp = inline_rbp_tls_disp();
+        assert_ne!(
+            disp, 0,
+            "the sentinel-probed Linux fs-relative TLS slot should be available"
+        );
+        let old = inline_rbp_tls_mirror_read().expect("probe enabled the mirror");
+        let marker = 0x5242_5054_4553_5401usize;
+        assert!(inline_rbp_tls_mirror_write(marker));
+        assert_eq!(inline_rbp_tls_mirror_read(), Some(marker));
+        assert!(inline_rbp_tls_mirror_write(old));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_inline_rbp_tls_slot_is_thread_local() {
+        let disp = inline_rbp_tls_disp();
+        assert_ne!(disp, 0);
+        let old = inline_rbp_tls_mirror_read().expect("probe enabled the mirror");
+        let main_marker = 0x5242_5054_4852_4401usize;
+        let child_marker = 0x5242_5054_4852_4402usize;
+        assert!(inline_rbp_tls_mirror_write(main_marker));
+
+        let child = std::thread::spawn(move || {
+            assert_eq!(
+                inline_rbp_tls_disp(),
+                disp,
+                "the static ELF TLS offset must be identical in every thread"
+            );
+            assert_eq!(
+                inline_rbp_tls_mirror_read(),
+                Some(0),
+                "a new thread must not inherit the caller's frame mirror"
+            );
+            assert!(inline_rbp_tls_mirror_write(child_marker));
+            assert_eq!(inline_rbp_tls_mirror_read(), Some(child_marker));
+        });
+        child.join().expect("TLS isolation probe thread panicked");
+
+        assert_eq!(
+            inline_rbp_tls_mirror_read(),
+            Some(main_marker),
+            "the child thread must not overwrite the caller's frame mirror"
+        );
+        assert!(inline_rbp_tls_mirror_write(old));
+    }
 
     /// `int fib(int)` — the workload the elision exists for. No `aload`/`astore`
     /// anywhere, so no local can hold a reference and the elision must fire

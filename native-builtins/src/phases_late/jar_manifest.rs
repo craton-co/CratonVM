@@ -259,7 +259,15 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = match ctx.get_field(this, 0) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Object(None))),
+            // `close()` clears the path slot for the synthetic JarFile. The
+            // inherited ZipFile contract is to reject every accessor after
+            // close, rather than silently treating the archive as commentless.
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "zip file closed".into(),
+                }
+                .into())
+            }
         };
         let comment = std::fs::File::open(path)
             .ok()

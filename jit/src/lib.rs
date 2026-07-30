@@ -2494,17 +2494,17 @@ unsafe fn emit_osr_trampoline(
     // RBP publication used by precise JIT maps. Mirror the prologue here after
     // live ABI arguments have been saved to their frame homes: prefer the
     // default inline TLS store when available; fall back to the helper-table
-    // callback on non-Windows / inline opt-out. The helper call can clobber
-    // caller-saved registers, so preserve the incoming locals/thread pointers
-    // in the frame's reserved helper-call stack-arg area.
+    // callback on an unsupported target / inline opt-out. The helper call can
+    // clobber caller-saved registers, so preserve the incoming locals/thread
+    // pointers in the frame's reserved helper-call stack-arg area.
     let inline_rbp_disp = if frame_record != 0 {
         crate::x64::inline_rbp_tls_disp()
     } else {
         0
     };
     if inline_rbp_disp != 0 {
-        // MOV qword ptr gs:[disp32], RBP
-        tramp.emit_byte(0x65);
+        // MOV qword ptr <gs|fs>:[disp32], RBP
+        tramp.emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
         tramp.emit_byte(0x48);
         tramp.emit_byte(0x89);
         tramp.emit_byte(0x2C);

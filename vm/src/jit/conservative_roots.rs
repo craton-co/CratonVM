@@ -233,13 +233,13 @@ thread_local! {
 /// frame-record) — read/write the innermost-RBP mirror.
 ///
 /// When inline frame-record is active (`cratonvm_jit::x64::inline_rbp_tls_disp()
-/// != 0`), the JIT prologue stores RBP directly into a Windows TLS slot with a
-/// single `mov gs:[disp], rbp`; these accessors read/write the SAME slot via
-/// `gs:[disp]` so the cold push/pop/prune/remap paths observe the inlined
-/// writes. When inactive (the default), they fall back to the Rust
-/// `thread_local! TOP_RBP` exactly as before, so the default path is
-/// byte-identical. The displacement is the single source of truth shared with
-/// the JIT codegen, so the two can never disagree on slot vs thread-local.
+/// != 0`), generated code stores RBP directly into an OS TLS slot with one
+/// segment-relative instruction (`gs:` on Windows, `fs:` on Linux); these
+/// accessors read/write that SAME slot so cold push/pop/prune/remap paths
+/// observe the inlined writes. When unavailable, they fall back to the Rust
+/// `thread_local! TOP_RBP` exactly as before. The displacement and mirror
+/// accessors are shared with JIT codegen, so the two cannot disagree on the
+/// slot.
 #[inline]
 fn top_rbp_get() -> usize {
     #[cfg(windows)]
@@ -251,6 +251,10 @@ fn top_rbp_get() -> usize {
             // present on every thread.
             return unsafe { read_gs_qword(disp) };
         }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(value) = cratonvm_jit::x64::inline_rbp_tls_mirror_read() {
+        return value;
     }
     TOP_RBP.with(|c| c.get())
 }
@@ -289,6 +293,10 @@ fn top_rbp_set(v: usize) {
             unsafe { write_gs_qword(disp, v) };
             return;
         }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if cratonvm_jit::x64::inline_rbp_tls_mirror_write(v) {
+        return;
     }
     TOP_RBP.with(|c| c.set(v));
 }
