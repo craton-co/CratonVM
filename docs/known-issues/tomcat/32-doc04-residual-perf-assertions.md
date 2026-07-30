@@ -10,7 +10,7 @@ assertion is about speed, with its own separate reason.
 | item | disposition after the 2026-07-30 re-derivation |
 |---|---|
 | 32.1 | OPEN, **fully root-caused** — a dev regression, not a mapper problem. Closes when that is fixed; no Tomcat work left. |
-| 32.2 | ✅ **CLOSED** — passes; a property of the test's shape, not a defect. |
+| 32.2 | ✅ **Not a defect** — passes on a quiet host. Genuinely load-sensitive; expect intermittency on a busy one. |
 | 32.3 | OPEN, improved ~12–16 %. Root cause identified as per-completion processing, not I/O; no further AIO work will close it. |
 | 32.4 | OPEN, and **harder than recorded** — belongs to doc [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md)'s family, not here. |
 
@@ -165,16 +165,26 @@ benign-by-default since 07-28), and the mapper shadow itself.
 
 ---
 
-## 32.2 `el.parser.TestELParserPerformance.testParserInstanceReuse` — CLOSED, not a defect
+## 32.2 `el.parser.TestELParserPerformance.testParserInstanceReuse` — not a defect, but genuinely load-sensitive
 
 Asserts `ReInit` is faster than `new ELParser()`. The test runs its `ReInit`
 loop **first**, so that loop absorbs JIT warm-up and the second loop measures
 warmed code.
 
-**Re-measured 2026-07-30: PASS in 320.9 s.** Across 12 rounds each, `ReInit`
-averaged 3.87 s against `new ELParser()`'s 3.99 s — consistently the right way
-round. This is a property of the test's shape on any VM with a warm-up curve,
-not a defect. Kept here only so it is not re-triaged as one.
+Measured both ways on 2026-07-30, and the difference between them is the whole
+story — it is a **margin** problem, not a direction problem:
+
+| host | result | `ReInit` | `new ELParser()` | margin |
+|---|---|---|---|---|
+| quiet | **PASS**, 320.9 s | 3.87 s | 3.99 s | 3.0 % |
+| loaded (concurrent builds) | **FAIL**, 1022.9 s | 12.72 s | 12.83 s | 0.9 % |
+
+`ReInit` is faster *on average in both runs*; what changes is that the margin
+collapses to under 1 %, so individual round comparisons flip on scheduling
+noise. That is a property of the test's shape on any VM with a warm-up curve,
+not a CratonVM defect — but it does mean **this test is expected to be
+intermittent on a busy host**, and a lone failure is not evidence of a
+regression. Re-run it quiet before believing it.
 
 ---
 
