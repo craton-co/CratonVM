@@ -76,3 +76,79 @@ fn registry_rows_have_nonempty_method_identity() {
         }
     }
 }
+
+/// A class whose state the VM owns must be intercepted *completely*.
+///
+/// `StampedLock` is the worked example. Its native backend keeps the lock word
+/// in a Rust-side table rather than the real `state` field, so any method left
+/// to real JDK bytecode reads and spins on a word nothing maintains. A partial
+/// interception is worse than none: with no registration at all the real
+/// bytecode is at least self-consistent with itself.
+///
+/// This is not hypothetical. `tryConvertToOptimisticRead` was the single
+/// missing entry, and because Agroal's `StampedCopyOnWriteArrayList` uses it as
+/// its release path instead of `unlockWrite`, the call released nothing and
+/// deadlocked the Keycloak boot. Nothing in the registry's shape made that one
+/// gap visible, which is what this gate is for.
+#[test]
+fn stamped_lock_surface_is_intercepted_completely() {
+    let registry = production_registry();
+
+    const SL: &str = "java/util/concurrent/locks/StampedLock";
+    const WRITE_VIEW: &str = "java/util/concurrent/locks/StampedLock$WriteLockView";
+    const READ_VIEW: &str = "java/util/concurrent/locks/StampedLock$ReadLockView";
+
+    let required = [
+        // Acquire.
+        (SL, "<init>", "()V"),
+        (SL, "readLock", "()J"),
+        (SL, "writeLock", "()J"),
+        (SL, "readLockInterruptibly", "()J"),
+        (SL, "writeLockInterruptibly", "()J"),
+        (SL, "tryReadLock", "()J"),
+        (SL, "tryWriteLock", "()J"),
+        (SL, "tryReadLock", "(JLjava/util/concurrent/TimeUnit;)J"),
+        (SL, "tryWriteLock", "(JLjava/util/concurrent/TimeUnit;)J"),
+        (SL, "tryOptimisticRead", "()J"),
+        // Release. Each of these is the path some library takes instead of the
+        // obvious one.
+        (SL, "unlock", "(J)V"),
+        (SL, "unlockRead", "(J)V"),
+        (SL, "unlockWrite", "(J)V"),
+        (SL, "unstampedUnlockRead", "()V"),
+        (SL, "unstampedUnlockWrite", "()V"),
+        (SL, "tryUnlockRead", "()Z"),
+        (SL, "tryUnlockWrite", "()Z"),
+        // Conversion — where the Agroal deadlock came from.
+        (SL, "tryConvertToReadLock", "(J)J"),
+        (SL, "tryConvertToWriteLock", "(J)J"),
+        (SL, "tryConvertToOptimisticRead", "(J)J"),
+        // Observation. A stale answer here is a silent wrong result rather
+        // than a hang, which makes it harder to find, not easier.
+        (SL, "validate", "(J)Z"),
+        (SL, "isLocked", "()Z"),
+        (SL, "isReadLocked", "()Z"),
+        (SL, "isWriteLocked", "()Z"),
+        (SL, "getReadLockCount", "()I"),
+        // The Lock views delegate to the same backend and carry the same
+        // all-or-nothing requirement.
+        (WRITE_VIEW, "lock", "()V"),
+        (WRITE_VIEW, "tryLock", "()Z"),
+        (WRITE_VIEW, "unlock", "()V"),
+        (READ_VIEW, "lock", "()V"),
+        (READ_VIEW, "tryLock", "()Z"),
+        (READ_VIEW, "unlock", "()V"),
+    ];
+
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|(class, method, descriptor)| registry.find(class, method, descriptor).is_none())
+        .map(|(class, method, descriptor)| format!("{class}.{method}{descriptor}"))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these StampedLock methods would run real JDK bytecode against a lock \
+         word the native backend does not maintain, and hang: {missing:?}"
+    );
+}

@@ -139,6 +139,45 @@ jobs:
         timeout-minutes: 20
         run: cargo test -p cratonvm-vm --lib --features synthetic-jdk
 
+  # The `experimental-*` features and `zgc` left the default set, so an ordinary
+  # build no longer carries them. That trade is only safe because of this job.
+  # The `synthetic-jdk` module already proved what happens otherwise: a
+  # configuration nothing compiles rots silently, and 1,522 tests had stopped
+  # building before anyone noticed. Code outside the default build must still be
+  # inside SOME build.
+  experimental-features:
+    name: Feature gate (experimental-* and zgc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Check every optional feature compiles, test targets included
+        run: >
+          cargo check --all-targets
+          -p cratonvm-vm -p cratonvm-native-builtins
+          --features experimental-tls,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug,zgc
+
+      # Some test targets are gated in their entirety —
+      # `vm/tests/t4_8_jdwp_conformance.rs` is `#![cfg(feature =
+      # "experimental-debug")]` — and so execute nowhere else.
+      - name: Test the feature-gated surface
+        timeout-minutes: 30
+        run: >
+          cargo test
+          -p cratonvm-vm -p cratonvm-native-builtins
+          --features experimental-tls,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug,zgc
+
   # Build + publish the libcratonvm C-ABI embedding library (cdylib + staticlib)
   # and its public C headers as downloadable CI artifacts, per
   # docs/feature-designs/embedding-api.md ("CI publication of the .so/.dll/.a +
