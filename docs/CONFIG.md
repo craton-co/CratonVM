@@ -219,10 +219,10 @@ is where the grouped-variable syntax came from.
 | Token | Description | Default |
 |-------|-------------|---------|
 | `-stubs` | Drop **every** `SyntheticStub` native at registration so calls fall through to real JDK bytecode (or a clear `NoSuchMethodError`) instead of a fake. Surfaces real gaps as errors. `Intrinsic`/`Bridge` natives are unaffected. | stubs present |
-| `net-sockets` | Use the real `java.net` socket bytecode (the central registry drops the synthetic `java/net/Socket`/`ServerSocket` natives) instead of the synthetic socket layer. | synthetic |
-| `aqs` / `-aqs` | Route `AbstractQueuedSynchronizer` / `ReentrantLock` etc. through real `java.util.concurrent` bytecode instead of the synthetic lock natives. | synthetic |
+| `net-sockets` / `-net-sockets` | Use the real `java.net` socket bytecode (the central registry drops the synthetic `java/net/Socket`/`ServerSocket` natives) instead of the synthetic socket layer. | real |
+| `aqs` / `-aqs` | Route `AbstractQueuedSynchronizer` / `ReentrantLock` etc. through real `java.util.concurrent` bytecode instead of the synthetic lock natives. | real |
 | `annotations` / `-annotations` | Annotation reflection uses real proxy-backed annotation objects. | real |
-| `forkjoinpool` | Drop the synthetic `ForkJoinPool` natives and run the real `java.util.concurrent` pool. **Experimental** (see Family A4 in known-issues). | synthetic |
+| `forkjoinpool` / `-forkjoinpool` | Drop the synthetic `ForkJoinPool` natives and run the real `java.util.concurrent` pool. The `-` form also seeds Weld's `threadPoolType=NONE`, because the synthetic pool cannot service `commonPool().invokeAll`. | real |
 | `raf` / `-raf` | Force real / synthetic `RandomAccessFile`. | real |
 | `proxy-super` / `-proxy-super` | Use the real `java.lang.reflect.Proxy` super-class path. | real |
 | `agroal`, `vertx`, `ec`, `rsa`, `dsa`, `pqc`, `filewriter`, `buffered-writer`, `quarkus-arc`, … | Per-subsystem selection; the `-` form picks the experimental Rust implementation for that one subsystem. | see `docs/flag-tokens.md` |
