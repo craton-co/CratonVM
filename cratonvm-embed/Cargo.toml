@@ -22,16 +22,22 @@ readme = "README.md"
 default = []
 vm-defaults = [
     "awt",
-    "experimental-tls",
-    "experimental-jmx",
+    "management",
     "experimental-serialization",
     "experimental-aot",
     "experimental-debug",
 ]
 awt = ["cratonvm-vm/awt"]
 synthetic-jdk = ["cratonvm-vm/synthetic-jdk"]
-experimental-tls = ["cratonvm-vm/experimental-tls"]
-experimental-jmx = ["cratonvm-vm/experimental-jmx"]
+# `sun.management` + `javax.management` natives. Called `experimental-jmx`
+# until 2026-07-30; the old name is retained below as a back-compat alias.
+management = ["cratonvm-vm/management"]
+experimental-jmx = ["management"]
+# DEPRECATED no-op (NEW-13) — `javax.net.ssl` is always compiled and
+# registered. Retained only so existing `--features` invocations keep
+# resolving; removal slated for 0.4.
+deprecated-noop-tls = ["cratonvm-vm/deprecated-noop-tls"]
+experimental-tls = ["deprecated-noop-tls"]
 experimental-serialization = ["cratonvm-vm/experimental-serialization"]
 experimental-aot = ["cratonvm-vm/experimental-aot"]
 experimental-debug = ["cratonvm-vm/experimental-debug"]

@@ -35,7 +35,7 @@ cratonvm-embed = { version = "0.3", features = ["vm-defaults"] }
 ```
 
 You can also enable individual forwarded features such as `awt`,
-`synthetic-jdk`, `experimental-tls`, or `gpu-offload`.
+`synthetic-jdk`, `management`, or `gpu-offload`.
 
 ## What it exposes
 

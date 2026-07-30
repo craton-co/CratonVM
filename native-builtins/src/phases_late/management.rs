@@ -23,7 +23,7 @@ use super::*;
 // so the `jmx.rs` version is the one that dispatches. In real-JDK mode this
 // module is not registered at all (`register_synthetic_overrides` is skipped),
 // while `register_jmx_natives` IS called from `vm/src/vm/vm_init.rs`.
-// `experimental-jmx` is a DEFAULT feature, so both paths are the normal build.
+// `management` is a DEFAULT feature, so both paths are the normal build.
 //
 // Consequence: fixing a value here alone changes nothing. The `jmx.rs`
 // counterpart has to be fixed too — that is why `MEMORY_MX_VERBOSE` below is
@@ -139,7 +139,7 @@ pub(crate) fn live_thread_ids(ctx: &mut dyn NativeContext) -> Vec<i64> {
 //
 // These live here rather than in `crate::jmx` for the same reason
 // `daemon_thread_count` / `live_thread_ids` do: `jmx.rs` is gated on the
-// `experimental-jmx` feature and this module is not, yet both register the same
+// `management` feature and this module is not, yet both register the same
 // `ThreadMXBean` triples. One copy of the platform code is what stops the two
 // registrations from drifting apart.
 

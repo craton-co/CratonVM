@@ -26,9 +26,13 @@
 //!
 //! `cratonvm-embed` disables `cratonvm-vm` default features by default so the
 //! facade dependency graph stays headless and avoids optional desktop or
-//! experimental crates. Enable `vm-defaults` to mirror the VM crate's default
-//! feature set, or enable individual forwarded features such as `awt` or
-//! `experimental-tls`.
+//! experimental crates. Enable `vm-defaults` for the VM crate's default
+//! feature set plus the optional experiments, or enable individual forwarded
+//! features such as `awt` or `management`.
+//!
+//! Note that disabling default features also drops `management`, which backs
+//! `java.lang.management.ManagementFactory` — a host that calls it needs
+//! `management` (or `vm-defaults`) turned on explicitly.
 //!
 //! ## Lifecycle (API contract)
 //!

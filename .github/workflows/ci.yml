@@ -190,11 +190,25 @@ jobs:
       # `experimental-t19-diag`, `app-stubs` and `synthetic-quarkus-arc` were
       # missing here and were compiled by nothing at all — which is how this
       # repository lost 1,522 tests once already.
+      #
+      # `management` and `deprecated-noop-tls` are the post-2026-07-30 names for
+      # `experimental-jmx` / `experimental-tls`. The deprecated aliases get their
+      # own resolve check below, so a broken alias fails CI rather than silently
+      # breaking a downstream build.
       - name: Check every optional feature compiles, test targets included
         run: >
           cargo check --all-targets
           -p cratonvm-vm -p cratonvm-native-builtins
-          --features experimental-tls,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug,experimental-t19-diag,zgc
+          --features deprecated-noop-tls,management,experimental-serialization,experimental-aot,experimental-debug,experimental-t19-diag,zgc
+
+      # The whole point of keeping the old names is that existing invocations
+      # keep working. Resolve them explicitly — a feature that vanishes breaks
+      # downstream builds silently, and nothing else in CI spells them out.
+      - name: Check the deprecated feature aliases still resolve
+        run: >
+          cargo check
+          -p cratonvm-vm -p cratonvm-native-builtins
+          --features experimental-tls,experimental-jmx
       - name: Check the native-builtins-only optional features compile
         run: >
           cargo check --all-targets
@@ -209,7 +223,7 @@ jobs:
         run: >
           cargo test
           -p cratonvm-vm -p cratonvm-native-builtins
-          --features experimental-tls,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug,zgc
+          --features deprecated-noop-tls,management,experimental-serialization,experimental-aot,experimental-debug,zgc
 
   # Build + publish the libcratonvm C-ABI embedding library (cdylib + staticlib)
   # and its public C headers as downloadable CI artifacts, per

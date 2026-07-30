@@ -35,8 +35,9 @@ path = "../vm"
 version = "0.3.0"
 default-features = false
 features = [
-    "experimental-tls",
-    "experimental-jmx",
+    # Default-on in cratonvm-vm and required by `ManagementFactory`; it must be
+    # listed explicitly because `default-features = false` drops it.
+    "management",
     "experimental-serialization",
     "experimental-aot",
     "experimental-debug",
