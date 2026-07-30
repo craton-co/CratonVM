@@ -1,7 +1,6 @@
 # A callee that declares an exception table is barred from the inline-cache fast path
 
-**Status:** OPEN. Found 2026-07-28 while measuring the (separate, now-fixed) C2
-exclusion of exception-table methods.
+**Status:** FIXED 2026-07-30. The direct-entry MIC, PIC and static paths now service the callee sentinel and resume its own handler without replaying side effects.
 
 ## The measurement
 

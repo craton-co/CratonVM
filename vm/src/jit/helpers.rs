@@ -1498,12 +1498,13 @@ unsafe fn virtual_dispatch_class(
 unsafe fn resolve_callee_cached(
     vm: &SharedVm,
     info: &JitInvokeInfo,
+    receiver_class_id: ClassId,
 ) -> Option<std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>> {
     let cm = vm.classes.class_manager.read();
-    let class_id = if info.declaring_class_id == 0 {
-        cm.find_bootstrap_class_by_name(info.class_name)
-    } else {
-        cm.find_class_by_name_for_class(info.class_name, ClassId::new(info.declaring_class_id))
+    let class_id = match info.invoke_kind {
+        0 | 2 if receiver_class_id.as_u32() != 0 => Some(receiver_class_id),
+        _ if info.declaring_class_id == 0 => cm.find_bootstrap_class_by_name(info.class_name),
+        _ => cm.find_class_by_name_for_class(info.class_name, ClassId::new(info.declaring_class_id)),
     }?;
     let store = cm.class_store();
     let (method, declaring_id) =
@@ -1553,11 +1554,12 @@ unsafe fn try_run_callee_handler(
     vm: &SharedVm,
     thread: &mut JvmThread,
     info: &JitInvokeInfo,
+    receiver_class_id: ClassId,
     args_slice: &[i64],
     exc: cratonvm_types::ObjectRef,
     throw_pc: usize,
 ) -> Option<i64> {
-    let cached = resolve_callee_cached(vm, info)?;
+    let cached = resolve_callee_cached(vm, info, receiver_class_id)?;
     let args = decode_dispatch_values(vm, info, args_slice);
     let res = crate::runtime::interpreter::run_jit_callee_handler(
         vm, thread, &cached, throw_pc, exc, &args,
@@ -1688,6 +1690,20 @@ unsafe fn route_implicit_exc_through_callee(
     // bci for the callee's OWN table sees it.
     let callee_throw_bci = peek_jit_athrow_bci();
     clear_jit_athrow_bci();
+    let receiver_class_id = if matches!(info.invoke_kind, 0 | 2) {
+        args_slice
+            .first()
+            .and_then(|raw| vm.mem.heap.is_object_address(*raw as usize))
+            .map(|obj| vm.mem.heap.class_id_of(obj))
+            .unwrap_or_else(|| ClassId::new(0))
+    } else {
+        ClassId::new(0)
+    };
+    let callee_has_handler = if matches!(info.invoke_kind, 0 | 2) {
+        mic_callee_has_exception_table(vm, receiver_class_id, info)
+    } else {
+        callee_has_exception_table(vm, info)
+    };
     if rbc6_dbg() {
         eprintln!(
             "[rbc6-dbg] route_implicit_exc_through_callee ENTER {}.{}{} has_last_deopt={} pending_exc={} pending_npe_or_aioobe_unread=?",
@@ -1752,7 +1768,7 @@ unsafe fn route_implicit_exc_through_callee(
         // re-execute it in the interpreter so its exception table runs. The
         // interpreter re-run regenerates and routes the exception, so the
         // stale stashed copy is dropped first to avoid a double-drain.
-        if jit_pending_exception_is_set() && callee_has_exception_table(vm, info) {
+        if jit_pending_exception_is_set() && callee_has_handler {
             if let Some((thread, _guard)) = jit_thread_mut() {
                 // FIRST: resume the callee AT its own handler. The re-run below
                 // double-executes everything the compiled attempt already did
@@ -1779,7 +1795,7 @@ unsafe fn route_implicit_exc_through_callee(
                         usize::MAX
                     };
                     if let Some(v) =
-                        try_run_callee_handler(vm, thread, info, args_slice, exc, throw_pc)
+                        try_run_callee_handler(vm, thread, info, receiver_class_id, args_slice, exc, throw_pc)
                     {
                         return v;
                     }
@@ -1810,17 +1826,46 @@ unsafe fn route_implicit_exc_through_callee(
         }
         return rc;
     }
-    if !callee_has_exception_table(vm, info) {
+    if !callee_has_handler {
         return restash_and_return();
     }
-    // Re-execute the callee in the interpreter so the implicit exception routes
-    // through the callee's own exception table.
+    // Materialize the implicit signal and resume the callee at its handler.
+    // Re-entering at bytecode 0 replays every prefix side effect (and was the
+    // source of the old finally/counter leak).
     if let Some((thread, _guard)) = jit_thread_mut() {
-        // Same reasoning as the general-exception arm above: the re-run replaces
-        // the abandoned compiled attempt, so its exceptional frame is stale.
-        cratonvm_jit::deopt::clear_exceptional_frame();
-        let bail_args = decode_dispatch_values(vm, info, args_slice);
-        return bail_to_interpreter(vm, thread, info, &bail_args);
+        let exc = match (aioobe, npe) {
+            (Some((index, length)), _) => {
+                let msg = format!("Index {index} out of bounds for length {length}");
+                crate::runtime::exceptions::create_exception_object(
+                    vm,
+                    thread,
+                    "java/lang/ArrayIndexOutOfBoundsException",
+                    Some(&msg),
+                )
+                .ok()
+            }
+            (None, true) => crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/NullPointerException",
+                None,
+            )
+            .ok(),
+            (None, false) => None,
+        };
+        if let Some(exc) = exc {
+            if let Some(v) = try_run_callee_handler(
+                vm,
+                thread,
+                info,
+                receiver_class_id,
+                args_slice,
+                exc,
+                usize::MAX,
+            ) {
+                return v;
+            }
+        }
     }
     restash_and_return()
 }
@@ -1977,9 +2022,7 @@ pub unsafe extern "C" fn jit_service_callee_deopt(
         .and_then(|raw| vm.mem.heap.is_object_address(*raw as usize))
         .map(|obj| vm.mem.heap.class_id_of(obj))
         .unwrap_or_else(|| ClassId::new(0));
-    match handle_compiled_callee_deopt_sentinel(vm, thread, info, receiver_class_id, || {
-        decode_dispatch_values(vm, info, args_slice)
-    }) {
+    match handle_compiled_callee_deopt_sentinel(vm, thread, info, receiver_class_id, args_slice) {
         Some(v) => v,
         None => i64::MIN,
     }
@@ -2004,38 +2047,101 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     thread: &mut JvmThread,
     info: &JitInvokeInfo,
     receiver_class_id: ClassId,
-    decode_values: impl FnOnce() -> JitDecodedArgs,
+    args_slice: &[i64],
 ) -> Option<i64> {
     // Precise resume of a frame-stashing deopt in the dispatched callee (see
-    // `try_resume_trapped_callee`). Must run BEFORE the implicit-exception
-    // drains below — a pure deopt sets no exception flags.
+    // `try_resume_trapped_callee`). Must run before consuming the exception
+    // signals below: a pure deopt sets no exception flags.
     if let Some(v) = try_resume_trapped_callee(vm, thread, info) {
         return Some(v);
     }
-    // BUG-H: if the receiver-resolved callee threw an implicit exception
-    // (AIOOBE/NPE) its own `catch` should handle, the direct compiled call
-    // bypassed its exception table. Re-execute it in the interpreter so the
-    // exception routes through the callee's table (e.g. Tomcat
-    // `HttpParser.isNotRequestTargetRelaxed`: `IS_NOT_REQUEST_TARGET[c]`
-    // inside `catch (AIOOBE)`).
-    let aioobe = take_jit_pending_aioobe();
-    let npe = if aioobe.is_none() {
-        take_jit_pending_npe()
+
+    // A machine-call cache hit returns the callee's sentinel in the caller's
+    // ABI.  Drain the *whole* signal record here, while the receiver class and
+    // outgoing arguments still identify that callee, and run its handler at
+    // the recorded throw bci.  Re-entering the callee from bytecode 0 used to
+    // duplicate all side effects before a caught bounds/null/divide exception.
+    let signals = take_all_jit_signals();
+    let throw_pc = if signals.athrow_bci >= 0 {
+        signals.athrow_bci as usize
     } else {
-        false
+        usize::MAX
     };
-    if aioobe.is_some() || npe {
-        if mic_callee_has_exception_table(vm, receiver_class_id, info) {
-            let values = decode_values();
-            return Some(bail_to_interpreter(vm, thread, info, &values));
+    let has_handler = mic_callee_has_exception_table(vm, receiver_class_id, info);
+    if has_handler {
+        if let Some(exc) = signals.exception {
+            if let Some(v) = try_run_callee_handler(
+                vm,
+                thread,
+                info,
+                receiver_class_id,
+                args_slice,
+                exc,
+                throw_pc,
+            ) {
+                return Some(v);
+            }
+        } else {
+            let implicit = match signals.aioobe {
+                Some((index, length)) => {
+                    let msg = format!("Index {index} out of bounds for length {length}");
+                    crate::runtime::exceptions::create_exception_object(
+                        vm,
+                        thread,
+                        "java/lang/ArrayIndexOutOfBoundsException",
+                        Some(&msg),
+                    )
+                    .ok()
+                }
+                None if signals.npe => crate::runtime::exceptions::create_exception_object(
+                    vm,
+                    thread,
+                    "java/lang/NullPointerException",
+                    None,
+                )
+                .ok(),
+                None if signals.arithmetic => crate::runtime::exceptions::create_exception_object(
+                    vm,
+                    thread,
+                    "java/lang/ArithmeticException",
+                    Some("/ by zero"),
+                )
+                .ok(),
+                None => None,
+            };
+            if let Some(exc) = implicit {
+                if let Some(v) = try_run_callee_handler(
+                    vm,
+                    thread,
+                    info,
+                    receiver_class_id,
+                    args_slice,
+                    exc,
+                    throw_pc,
+                ) {
+                    return Some(v);
+                }
+            }
         }
-        // No local handler — re-stash the consumed flag and propagate the
-        // sentinel unchanged.
-        if let Some((idx, len)) = aioobe {
-            stash_jit_pending_aioobe(idx, len);
-        } else if npe {
-            stash_jit_pending_npe();
-        }
+    }
+
+    // Nothing in the callee consumed the exception. Restore precisely the
+    // original signal shape so the existing caller-side drain remains the
+    // fallback; this preserves behaviour for a miss or a non-covering catch.
+    if let Some(exc) = signals.exception {
+        set_jit_pending_exception(exc);
+    }
+    if let Some((index, length)) = signals.aioobe {
+        stash_jit_pending_aioobe(index, length);
+    }
+    if signals.npe {
+        stash_jit_pending_npe();
+    }
+    if signals.arithmetic {
+        stash_jit_pending_arithmetic();
+    }
+    if signals.deopt {
+        set_jit_deopt_pending();
     }
     None
 }
@@ -8418,7 +8524,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                             thread,
                             info,
                             ClassId::new(receiver_cid),
-                            decode_values,
+                            args_slice,
                         ) {
                             return v;
                         }
@@ -8467,7 +8573,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                         thread,
                         info,
                         receiver_class_id,
-                        decode_values,
+                        args_slice,
                     ) {
                         return v;
                     }
@@ -8538,11 +8644,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 true,
             )
         };
-        // BUG-H: as in the cache-miss branch below, do not publish a direct
-        // compiled entry for a callee with a local exception table — the inline
-        // machine-code cascade would bypass it. Keep dispatch on the
-        // `invoke_or_native` path so the exception routes through the callee's
-        // own table.
+        // A direct inline-cache hit is safe for a callee with a local exception
+        // table: the generated call site checks the i64::MIN sentinel and
+        // invokes `jit_service_callee_deopt`, which re-enters this dispatch
+        // boundary to route an implicit exception through the resolved callee's
+        // own table. Do not keep such entries cold merely because they declare
+        // a handler.
         if let Some((_callee_pin, entry_ptr, needs_ctx)) = compile_res {
             // `_callee_pin` holds the callee artifact across the publications
             // below: `update`/`install` take their own keep-alive by resolving
@@ -8553,8 +8660,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             // inline MIC/PIC cascade would machine-CALL it, letting the trap's
             // sentinel + stashed frame bail through the compiled caller's
             // epilogue past the only point able to resume it precisely.
-            if !mic_callee_has_exception_table(vm, receiver_class_id, info)
-                && !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
+            if !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
             {
                 // Publish through `update`, never with a raw store: `update` is
                 // the only writer that also resolves and RETAINS the callee's
@@ -8699,18 +8805,14 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         None => (None, 0, false),
     };
 
-    // BUG-H: never publish a direct compiled entry for a callee that declares a
-    // local exception table. The inline machine-code MIC/PIC cascade emitted in
-    // `jit/src/x64.rs` would `CALL` it directly, bypassing the callee's own
-    // exception table — so an implicit AIOOBE/NPE the callee should catch
-    // locally escapes its `catch` (Tomcat `HttpParser.isNotRequestTarget
-    // Relaxed`, an *instance* method: `IS_NOT_REQUEST_TARGET[c]` inside
-    // `catch (AIOOBE)`). Leaving the cache empty keeps every dispatch on the
-    // helper's `invoke_or_native` path below, which routes the exception
-    // through the callee's table correctly. (The statically-bound sibling is
-    // gated in the `callee_compiler` closure in `interpreter.rs`.)
+    // Publish exception-table callees too. The inline MIC/PIC machine-code
+    // cascade in `jit/src/x64.rs` calls the entry directly, then detects its
+    // i64::MIN exceptional return and calls `jit_service_callee_deopt`. That
+    // service consumes the implicit NPE/AIOOBE signal and re-enters the
+    // resolved callee in the interpreter, so its own `catch` still runs (the
+    // Tomcat `HttpParser.isNotRequestTargetRelaxed` shape). The normal hit
+    // path pays only the already-emitted not-taken sentinel branch.
     if cacheable_receiver
-        && !mic_callee_has_exception_table(vm, receiver_class_id, info)
         // jit-invokedynamic-groovy-regression fix — see the matching gate in
         // the cache-hit branch above: an indy-trap-bearing artifact must stay
         // on the dispatch helper, never in a machine-called MIC/PIC entry.
