@@ -34937,37 +34937,6 @@ fn dbg_osr_recompile_reason(
     );
 }
 
-/// BUG-H parity for the OSR tier — does `callee` declare a non-empty exception
-/// table? A direct machine-code `CALL` into such a callee bypasses the
-/// interpreter↔JIT boundary, so an exception the callee should catch locally
-/// never reaches its own handler. Mirrors the gate inside `execute`'s
-/// `callee_compiler` closure; resolution is loader-aware via `caller_class_id`,
-/// exactly like the invoke-site resolution that produced the name.
-///
-/// Unresolvable metadata reports `true` (keep the dispatch helper) — the
-/// conservative direction, since the helper path is always correct.
-fn osr_callee_declares_handlers(
-    shared: &SharedVm,
-    caller_class_id: ClassId,
-    callee_class: &str,
-    callee_method: &str,
-    callee_desc: &str,
-) -> bool {
-    let cm = shared.classes.class_manager.read();
-    let Some(callee_cid) = cm.find_class_by_name_for_class(callee_class, caller_class_id) else {
-        return true;
-    };
-    let store = cm.class_store();
-    let Some((method, _decl)) =
-        crate::classloading::find_method_recursive(callee_cid, callee_method, callee_desc, store)
-    else {
-        return true;
-    };
-    method
-        .code()
-        .map_or(true, |c| !c.exception_table.is_empty())
-}
-
 fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -35696,26 +35665,6 @@ fn compile_osr_artifact(
                 if let Some((callee_pin, entry, needs_ctx)) = compiled_callee {
                     baked_callee_pins.push(callee_pin);
                     if !crate::jit::jit_direct_call_requires_dispatch(
-                        &callee_class,
-                        &callee_method,
-                        &callee_desc,
-                    )
-                    // BUG-H (jit-osr-bail-on-callee-exception): the OSR tier
-                    // was missing the gate the method-entry `callee_compiler`
-                    // has — never bake a direct machine-code CALL into a
-                    // callee that declares a non-empty exception table. The
-                    // direct CALL bypasses `jit_invoke_dispatch`, so
-                    // `route_implicit_exc_through_callee` never runs and the
-                    // callee's OWN `catch` is skipped: the exception escapes
-                    // into the OSR'd caller, where it hits the OSR bail path.
-                    // Measured on `JitOsrLoopProgress`: a callee whose handler
-                    // catches its own `Boom` had that Boom surface at the OSR
-                    // return five times per 20 000-iteration run. Dropping the
-                    // site to the dispatch helper restores the callee's
-                    // exception table exactly as the method-entry tier does.
-                    && !osr_callee_declares_handlers(
-                        shared,
-                        class_id,
                         &callee_class,
                         &callee_method,
                         &callee_desc,
@@ -37602,38 +37551,11 @@ fn try_jit_upgrade_with_gate(
             {
                 return None;
             }
-            // BUG-H: refuse a *direct* JIT→JIT call into a callee that declares
-            // a non-empty exception table. The direct machine-code `CALL`
-            // bypasses the interpreter↔JIT boundary, so an implicit runtime
-            // exception (AIOOBE/NPE) the callee should catch locally escapes its
-            // own `catch` and is mis-routed through the caller's table
-            // (`TestHexUtils`/`HexUtils.getDec`: `T[i-'0']` in `catch (AIOOBE)`).
-            // Returning None here drops the site to the dispatch helper
-            // (`jit_invoke_dispatch`), which re-executes such a throwing callee
-            // in the interpreter so the exception routes through the callee's
-            // own exception table. Callees without a table keep the fast direct
-            // call (no perf change on the bench/gauntlet hot paths).
-            {
-                let cm = shared.classes.class_manager.read();
-                if let Some(callee_cid) =
-                    cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
-                {
-                    let store = cm.class_store();
-                    if let Some((method, _decl)) = crate::classloading::find_method_recursive(
-                        callee_cid,
-                        callee_method,
-                        callee_desc,
-                        store,
-                    ) {
-                        if method
-                            .code()
-                            .map_or(false, |c| !c.exception_table.is_empty())
-                        {
-                            return None;
-                        }
-                    }
-                }
-            }
+            // Exception-table callees may be baked as direct calls. The x64
+            // lowering snapshots their Java arguments and services an
+            // i64::MIN return through `jit_service_callee_deopt`, which resumes
+            // the callee at its own matching handler instead of attributing the
+            // exception to this caller.
             // Check JIT cache first
             let callee_class_arc: Arc<str> = Arc::from(callee_class);
             let callee_method_arc: Arc<str> = Arc::from(callee_method);
@@ -43185,9 +43107,19 @@ fn execute_invokevirtual_cached(
                     // tier-up exclusion so subtypes reached through List/Map
                     // or Iterator are covered as well.
                     let receiver_is_java_util = {
-                        let cm = shared.classes.class_manager.read();
-                        cm.get_class(receiver_class_id)
-                            .is_some_and(|class| class.name.starts_with("java/util/"))
+                        // This dispatch can run while the current thread still
+                        // owns the class-manager write lock during bootstrap.
+                        // A blocking read here self-deadlocks. If the table is
+                        // busy, conservatively suppress this optional tier-up.
+                        shared
+                            .classes
+                            .class_manager
+                            .try_read()
+                            .map(|cm| {
+                                cm.get_class(receiver_class_id)
+                                    .is_some_and(|class| class.name.starts_with("java/util/"))
+                            })
+                            .unwrap_or(true)
                     };
                     if !is_special
                         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
