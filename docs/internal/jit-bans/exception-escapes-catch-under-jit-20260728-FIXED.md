@@ -1,6 +1,23 @@
 # An exception escapes its own `catch` under JIT (two ordinary shapes)
 
-**Status:** OPEN. Found 2026-07-28 by the `C2Handlers` differential probe.
+**Status:** FIXED and retired 2026-07-29. Found 2026-07-28 by the `C2Handlers` differential probe.
+
+## Closure validation (2026-07-29)
+
+The escape repair (`66548471f`), the protected-range local-liveness repair
+(`c40fb6161`), and the independently fixed lambda-entry/finally routing
+follow-up are all present in `origin/dev`.
+
+On Azure, a fresh `origin/dev` worktree was built as
+`cratonvm-exception-catch-019fb03f`
+(SHA-256 `085a11c4cb48b8f9d6a1fc1bc8aaa0c8ffd29ba6f2b20b8f48bc1e105a473333`).
+`C2Handlers` (all 12 shapes), `CallPathProbe` (all five routes),
+`FinallyBalanceProbe`, `FinallyShapeProbe`, and `FinallyThrowSiteProbe`
+all passed 200,000 iterations in both JIT and `--nojit` modes. The committed
+`JitPreciseHandlerFrame` regression methods also passed in both modes:
+its own-catch, end-of-try, and handler-only-local checks were all zero-mismatch
+(the repository JIT release test harness was 15/15).
+
 Pre-existing — reproduces with the 2026-07-28 exception-table/C2 fix both
 enabled and disabled on the same binary, so it is independent of that change.
 
@@ -155,11 +172,11 @@ Verified, same worktree and commit, `git stash`-ed A/B:
 Also clean: 600k iterations, `--nojit` control, and `HandlerLocals` (the RBC.6
 conformance probe, 200k).
 
-### Still open, found on the way
+### Related follow-up (resolved independently on 2026-07-29)
 
 `CallPathProbe` leaks on all five dispatch routes on clean dev, including the
 three `66548471f` fixed — see
-[finally-skipped-again-callpathprobe-all-five-routes-20260728.md](finally-skipped-again-callpathprobe-all-five-routes-20260728.md).
+[the retained resolution](finally-skipped-again-callpathprobe-all-five-routes-20260728-FIXED.md).
 Independent of everything above (reproduced with this fix stashed).
 
 **Diagnostic added:** `CRATONVM_DBG_EXCFRAME=1` prints every local DROPPED from
