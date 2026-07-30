@@ -2164,6 +2164,27 @@ pub fn inline_tlab_new_enabled() -> bool {
     })
 }
 
+/// Default-on removal of redundant per-object zero stores from inline TLAB
+/// allocation.
+///
+/// Every production `VmHeap::refill_tlab` backend returns a fully zeroed
+/// chunk. Reclaimed generational spans are cleared before reuse, and G1
+/// applies the same contract when carving Eden. The inline allocator can
+/// therefore stamp only the non-zero / shape-defining header words before
+/// publishing the cursor instead of clearing every body/header word again.
+/// This is especially material for allocation storms: a compact two-reference
+/// node drops seven zero stores while preserving JVM default initialization.
+///
+/// Opt out with `CRATONVM_NO_JIT_TLAB_ZERO_ELISION=1` to restore the defensive
+/// per-object clears for bisection.
+pub fn inline_tlab_zero_elision_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_TLAB_ZERO_ELISION").is_none()
+    })
+}
+
 fn inline_site_is_fresh_ctor_first_store(
     site: &crate::InlineSite,
     cpc: usize,
@@ -2638,6 +2659,23 @@ fn jit_safepoint_polls_enabled() -> bool {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
             .and_then(|v| v.into_string().ok())
             .is_none_or(|v| v != "0")
+    })
+}
+
+/// Default-on fast path for structurally GC-inert direct self recursion.
+///
+/// Such a method contains no allocation, no backward edge, and no call except
+/// the raw self-call that `try_compile` already proved resolves to this exact
+/// method. Its common recursive edge therefore cannot reach a safepoint. The
+/// cold native-stack-overflow guard remains a normal safepoint and deliberately
+/// publishes an incomplete moving-young map, forcing that exceptional cycle to
+/// the safe non-moving fallback.
+fn gc_inert_selfrec_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_GC_INERT_SELFREC")
+            .map_or(true, |v| !matches!(v.as_str(), "0" | "false" | "off"))
     })
 }
 
@@ -8791,6 +8829,9 @@ struct Compiler {
     /// recompile. Empty (`""`) on the legacy/test `compile()` wrapper and in
     /// production (the registry is empty), so the consult is a no-op there.
     method_key: String,
+    /// The common direct-recursive edge cannot allocate, call another method,
+    /// or poll. See [`gc_inert_selfrec_candidate`].
+    gc_inert_selfrec: bool,
     /// deopt-osr Step 2 / P2: frame offset (positive depth-from-RBP) of the
     /// DEEPEST qword of the always-reserved 256-byte
     /// `SavedRegisters{gpr:[u64;16],xmm:[u64;16]}` region the frame-deopt stub
@@ -9300,6 +9341,7 @@ impl Compiler {
         num_scalar_slots: usize,
         cache_jit_thread_for_inline_new: bool,
         reserve_stack_floor: bool,
+        gc_inert_selfrec: bool,
         precise_exception_frames: bool,
         protected_ranges: Vec<(u32, u32)>,
     ) -> Self {
@@ -9740,6 +9782,7 @@ impl Compiler {
             deopt_boxes: Vec::new(),
             deopt_epoch_guard: std::ptr::null(),
             method_key: String::new(),
+            gc_inert_selfrec,
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),
             exc_frame_box_ptr_by_bci: FxHashMap::default(),
@@ -10726,6 +10769,17 @@ impl Compiler {
     }
 
     fn emit_pre_safepoint_spill(&mut self) {
+        self.emit_pre_safepoint_spill_impl(true);
+    }
+
+    /// Publish a cold safepoint without claiming moving-young shadow coverage.
+    /// This is used only by the overflow guard of a GC-inert recursive method;
+    /// an exceptional collection safely falls back to the non-moving sweep.
+    fn emit_pre_safepoint_spill_without_shadow(&mut self) {
+        self.emit_pre_safepoint_spill_impl(false);
+    }
+
+    fn emit_pre_safepoint_spill_impl(&mut self, publish_shadow: bool) {
         if self.failed {
             return;
         }
@@ -10803,7 +10857,12 @@ impl Compiler {
         // Shadow-stack precise roots — push every live oop onto the thread's
         // shadow stack so a moving collector can rewrite it precisely. Paired
         // with `emit_shadow_reload` in `emit_oop_map_for_safepoint`. Gated.
-        self.emit_shadow_push();
+        if publish_shadow {
+            self.emit_shadow_push();
+        } else {
+            self.pending_shadow.clear();
+            self.pending_shadow_coverage_complete = false;
+        }
     }
 
     /// Publish the precise-map safepoint id without conservatively copying the
@@ -14895,7 +14954,9 @@ impl Compiler {
         // thread could possibly park at the barrier. No-op unless the env
         // flag is set AND the helper table wired the flag address (see
         // `emit_safepoint_poll_prologue` / `emit_safepoint_poll`).
-        self.emit_safepoint_poll_prologue();
+        if !self.gc_inert_selfrec {
+            self.emit_safepoint_poll_prologue();
+        }
     }
 
     /// Lazy-prologue perf lever — call AFTER the whole body is compiled. If the
@@ -16069,10 +16130,13 @@ impl Compiler {
         // Only long/float/double need the post-init helper to install a non-zero
         // Value discriminant; reference fields in the compact layout are null
         // bare pointers after this clear.
-        debug_assert_eq!((total_size - HEADER_SIZE) % 8, 0);
-        self.emit_mov_imm32_sx(RDX, 0);
-        for body_off in (HEADER_SIZE..total_size).step_by(8) {
-            self.emit_mov_mem_disp32_r64(R11, RDX, body_off as i32);
+        let zero_elision = inline_tlab_zero_elision_enabled();
+        if !zero_elision {
+            debug_assert_eq!((total_size - HEADER_SIZE) % 8, 0);
+            self.emit_mov_imm32_sx(RDX, 0);
+            for body_off in (HEADER_SIZE..total_size).step_by(8) {
+                self.emit_mov_mem_disp32_r64(R11, RDX, body_off as i32);
+            }
         }
 
         // BinTrees-18 heap-corruption fix (jit/gc audit, 2026-06):
@@ -16137,9 +16201,10 @@ impl Compiler {
         // 2026-07-26 header-offset audit — see
         // `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
         self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::OBJECT_KIND_OFFSET as i32, 0);
-        // identity_hash_code = 0 (lazy-mint contract). Written explicitly, not
-        // left to refill zeroing — see the default-on note below.
-        self.emit_mov_dword_mem_disp32_imm32(R11, IDENTITY_HASH_CODE_OFFSET as i32, 0);
+        if !zero_elision {
+            // identity_hash_code = 0 (lazy-mint contract).
+            self.emit_mov_dword_mem_disp32_imm32(R11, IDENTITY_HASH_CODE_OFFSET as i32, 0);
+        }
         // offset 12: the full 32-bit field count for Object kind.
         let shape = num_fields as u32;
         self.emit_mov_dword_mem_disp32_imm32(
@@ -16172,14 +16237,24 @@ impl Compiler {
         // (16..24) and mark_word (24..32, MARK_NEUTRAL == 0) are written
         // explicitly as dword pairs (no qword-imm store emitter; four dwords
         // per `new` is negligible vs. a helper call).
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::FORWARDING_PTR_OFFSET as i32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(
-            R11,
-            cratonvm_types::FORWARDING_PTR_OFFSET as i32 + 4,
-            0,
-        );
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32 + 4, 0);
+        if !zero_elision {
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::FORWARDING_PTR_OFFSET as i32,
+                0,
+            );
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::FORWARDING_PTR_OFFSET as i32 + 4,
+                0,
+            );
+            self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+                0,
+            );
+        }
 
         // Commit the bump LAST: [R10 + cursor_off] = RAX. This publishes the
         // object's end as the new cursor (and, transitively, the object's
@@ -25891,7 +25966,11 @@ impl Compiler {
                                 } else {
                                     None
                                 };
-                                self.emit_pre_safepoint_spill();
+                                if self.gc_inert_selfrec {
+                                    self.emit_pre_safepoint_spill_without_shadow();
+                                } else {
+                                    self.emit_pre_safepoint_spill();
+                                }
                                 self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                                 self.emit_call_absolute(self.helpers.self_call_stack_guard);
                                 if self.precise_maps || self.shadow_enabled {
@@ -25912,7 +25991,13 @@ impl Compiler {
                         // Round-8 wave-3: defensive callee-saved spill
                         // before the recursive CALL (which transitively
                         // can allocate and reach a GC safepoint).
-                        if self.can_elide_self_call_register_spill() {
+                        if self.gc_inert_selfrec {
+                            // The callee is this same poll-free,
+                            // allocation-free method. The direct edge is not a
+                            // safepoint, so publishing roots here would be pure
+                            // overhead. The overflow helper above retains its
+                            // cold safepoint protocol.
+                        } else if self.can_elide_self_call_register_spill() {
                             self.emit_safepoint_metadata_only();
                         } else {
                             self.emit_pre_safepoint_spill();
@@ -25942,7 +26027,7 @@ impl Compiler {
                         // paired RELOAD (inside `emit_oop_map_for_safepoint`) must
                         // run here too, else the shadow stack grows unbalanced
                         // through this recursive call → unbounded pinning → OOM.
-                        if self.precise_maps || self.shadow_enabled {
+                        if !self.gc_inert_selfrec && (self.precise_maps || self.shadow_enabled) {
                             self.emit_oop_map_for_safepoint();
                         }
                         self.emit_stack_arg_cleanup(total_sub);
@@ -29410,6 +29495,81 @@ pub fn compile(
 /// slots the body actually reads. Pass `&[]` / `0` for the legacy
 /// "arg index == slot" behavior (see the [`compile`] wrapper).
 #[allow(clippy::too_many_arguments)]
+/// Prove that every hot recursive edge in this body is GC-inert.
+///
+/// A raw `invokestatic` (no invoke/direct-call metadata) is the x64 backend's
+/// representation of a self call; `try_compile` only leaves a site raw after
+/// resolving it to the current method. The strict opcode whitelist excludes
+/// allocation, arbitrary helpers, monitors, exception creation, arrays, and
+/// loops. Forward branches and resolved inline `getfield` are harmless.
+fn gc_inert_selfrec_candidate(
+    code: &[u8],
+    code_len: usize,
+    field_info: &[(usize, usize, u8)],
+    new_info: &[(usize, u32, usize, bool, bool)],
+    anewarray_info: &[(usize, u32)],
+    invoke_info: &[(usize, *const JitInvokeInfo)],
+    direct_calls: &[(usize, super::JitDirectCall)],
+    mic_slots: &[(usize, *const super::JitMICSlot)],
+    pic_slots: &[(usize, *const super::JitPICSlot)],
+    indy_info: &[(usize, usize, u8, Vec<u8>)],
+) -> bool {
+    if !gc_inert_selfrec_enabled()
+        || !new_info.is_empty()
+        || !anewarray_info.is_empty()
+        || !invoke_info.is_empty()
+        || !direct_calls.is_empty()
+        || !mic_slots.is_empty()
+        || !pic_slots.is_empty()
+        || !indy_info.is_empty()
+    {
+        return false;
+    }
+
+    let mut pc = 0usize;
+    let mut self_calls = 0usize;
+    let mut saw_return = false;
+    while pc < code_len {
+        let op = code[pc];
+        let allowed = match op {
+            0x00..=0x11
+            | 0x15..=0x2d
+            | 0x36..=0x4e
+            | 0x57..=0x6b
+            | 0x74..=0x98 => true,
+            // Conditional branches and forward goto only. A backward edge
+            // would need cooperative polling and is therefore not GC-inert.
+            0x99..=0xa7 | 0xc6 | 0xc7 => {
+                if pc + 2 >= code_len {
+                    return false;
+                }
+                let rel = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+                rel > 0 && pc.checked_add_signed(rel).is_some_and(|t| t < code_len)
+            }
+            0xac..=0xb1 => {
+                saw_return = true;
+                true
+            }
+            0xb4 => field_info.iter().any(|(field_pc, _, _)| *field_pc == pc),
+            0xb8 => {
+                self_calls += 1;
+                true
+            }
+            _ => false,
+        };
+        if !allowed {
+            return false;
+        }
+        let len = bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return false;
+        }
+        pc += len;
+    }
+    pc == code_len && self_calls != 0 && saw_return
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
     code: &[u8],
     code_len: usize,
@@ -29480,6 +29640,18 @@ pub fn compile_with_param_slots(
     indy_info: Vec<(usize, usize, u8, Vec<u8>)>,
 ) -> Option<CompiledMethod> {
     let needs_heap = needs_heap || !ldc_string_info.is_empty();
+    let gc_inert_selfrec = gc_inert_selfrec_candidate(
+        code,
+        code_len,
+        &field_info,
+        &new_info,
+        &anewarray_info,
+        &invoke_info,
+        &direct_calls,
+        &mic_slots,
+        &pic_slots,
+        &indy_info,
+    );
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
     // One-shot like every other staged request below: take it here so an early
     // bail cannot leak this method's handler ranges into an unrelated later
@@ -30002,6 +30174,7 @@ pub fn compile_with_param_slots(
         num_scalar_slots,
         cache_jit_thread_for_inline_new,
         reserve_stack_floor,
+        gc_inert_selfrec,
         precise_exception_frames,
         protected_ranges,
     );
@@ -31098,6 +31271,7 @@ mod tests {
             alloc_result,
             test_helpers(),
             0,
+            false,
             false,
             false,
             false,
