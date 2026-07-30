@@ -94,6 +94,12 @@ fn stub_helpers() -> JitRuntimeHelpers {
         region_bounds_addr: 0,
         native_stack_floor_fn: 0,
         ldc_string: s,
+        // Wired to the same trap stub as every other call target in this
+        // table: both are reached through emit_call_absolute, so a 0 here
+        // is a null CALL (SIGSEGV), not an inert "unwired" sentinel.
+        set_throw_bci: s,
+        service_callee_deopt: s,
+        ..Default::default()
     }
 }
 
