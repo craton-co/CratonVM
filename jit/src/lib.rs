@@ -6938,16 +6938,6 @@ fn jit_allow_package(prefix: &str) -> bool {
         .any(|entry| jit_allow_entry_allows_prefix(entry, prefix))
 }
 
-fn hibernate_temporal_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
-    const SLASH_PREFIX: &str = "org/hibernate/";
-    const DOT_PREFIX: &str = "org.hibernate.";
-    if class_name.starts_with(SLASH_PREFIX) {
-        Some(SLASH_PREFIX)
-    } else {
-        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
-    }
-}
-
 fn hsqldb_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
     const SLASH_PREFIX: &str = "org/hsqldb/";
     const DOT_PREFIX: &str = "org.hsqldb.";
@@ -7509,9 +7499,6 @@ pub fn try_compile_with_invokespecial_resolver(
         return None;
     }
 
-    // HIB-TEMPORAL.1 (2026-07-08): final fail-closed Hibernate guard. The VM
-    // skip-list catches most eligibility paths, but tiered/background compile
-    // can still reach this crate's final `try_compile` gate. The proven stable
     // SPB-FLYWAY-HSQLDB.1: Keep the final admission gate aligned with the VM
     // skip-list. The Flyway HSQLDB integration SIGSEGVs under JIT, while the
     // package-level interpreted control completes the entire class. Background
@@ -7521,15 +7508,6 @@ pub fn try_compile_with_invokespecial_resolver(
             return None;
         }
     }
-    // control for the temporal residuals is exactly the same shape as
-    // `CRATONVM_JIT_DENY=org/hibernate/`, so keep Hibernate bytecode interpreted
-    // here too unless the package is explicitly allowed for bisection.
-    if let Some(prefix) = hibernate_temporal_jit_deny_prefix(&cached.class_name) {
-        if !jit_allow_package(prefix) {
-            return None;
-        }
-    }
-
     // The `org/glassfish/jaxb/` final-admission mirror of the VM skip-list
     // guard was removed 2026-07-27. It is the SECOND of the two gates that
     // enforced that ban, and deleting `jaxb_mapping_residual_skip_prefix` from
@@ -11061,19 +11039,6 @@ mod tests {
     }
 
     #[test]
-    fn hibernate_temporal_jit_deny_matches_slash_and_dot_names() {
-        assert_eq!(
-            hibernate_temporal_jit_deny_prefix("org/hibernate/dialect/H2Dialect"),
-            Some("org/hibernate/")
-        );
-        assert_eq!(
-            hibernate_temporal_jit_deny_prefix("org.hibernate.dialect.H2Dialect"),
-            Some("org.hibernate.")
-        );
-        assert_eq!(hibernate_temporal_jit_deny_prefix("org/example/Foo"), None);
-    }
-
-    #[test]
     fn xerces_schema_jit_deny_matches_slash_and_dot_names() {
         assert_eq!(
             xerces_schema_jit_deny_prefix("com/sun/org/apache/xerces/internal/util/SymbolHash"),
@@ -11102,22 +11067,6 @@ mod tests {
             Some("org.hsqldb.")
         );
         assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
-    }
-
-    #[test]
-    fn hibernate_temporal_jit_allow_entries_are_prefix_based() {
-        assert!(jit_allow_entry_allows_prefix(
-            "org/hibernate/",
-            "org/hibernate/"
-        ));
-        assert!(jit_allow_entry_allows_prefix(
-            "org.hibernate.",
-            "org.hibernate."
-        ));
-        assert!(!jit_allow_entry_allows_prefix(
-            "org/hibernate/",
-            "org.hibernate."
-        ));
     }
 
     #[test]
