@@ -12,6 +12,9 @@
   `JarFile.getComment()` now rejects access after that instance is closed.
 - SSL context supported-parameter reporting preserves an explicitly configured
   TLSv1.1 connector policy through Tomcat's JSSE validation path.
+- Instance-method invocation tier-up now defaults off. Its pre-decoded virtual
+  promotion could strand an embedded-server request; static JIT tier-up and
+  the normal checked dispatcher remain enabled.
 
 ## Verification
 

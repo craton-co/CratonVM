@@ -8644,12 +8644,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 true,
             )
         };
-        // A direct inline-cache hit is safe for a callee with a local exception
-        // table: the generated call site checks the i64::MIN sentinel and
-        // invokes `jit_service_callee_deopt`, which re-enters this dispatch
-        // boundary to route an implicit exception through the resolved callee's
-        // own table. Do not keep such entries cold merely because they declare
-        // a handler.
+        // Keep handler-bearing methods on the helper path. A raw compiled
+        // entry can leave a pending exceptional frame that the caller cannot
+        // safely resume while the HTTP request is still active.
         if let Some((_callee_pin, entry_ptr, needs_ctx)) = compile_res {
             // `_callee_pin` holds the callee artifact across the publications
             // below: `update`/`install` take their own keep-alive by resolving
@@ -8660,7 +8657,8 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             // inline MIC/PIC cascade would machine-CALL it, letting the trap's
             // sentinel + stashed frame bail through the compiled caller's
             // epilogue past the only point able to resume it precisely.
-            if !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
+            if !mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info)
+                && !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
             {
                 // Publish through `update`, never with a raw store: `update` is
                 // the only writer that also resolves and RETAINS the callee's
@@ -8805,14 +8803,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         None => (None, 0, false),
     };
 
-    // Publish exception-table callees too. The inline MIC/PIC machine-code
-    // cascade in `jit/src/x64.rs` calls the entry directly, then detects its
-    // i64::MIN exceptional return and calls `jit_service_callee_deopt`. That
-    // service consumes the implicit NPE/AIOOBE signal and re-enters the
-    // resolved callee in the interpreter, so its own `catch` still runs (the
-    // Tomcat `HttpParser.isNotRequestTargetRelaxed` shape). The normal hit
-    // path pays only the already-emitted not-taken sentinel branch.
+    // A machine-code MIC/PIC call has no interpreter boundary at which the
+    // callee's local handler can be resumed. Leave such callees on the checked
+    // helper path; ordinary handler-free callees retain the raw-entry fast path.
     if cacheable_receiver
+        && !mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info)
         // jit-invokedynamic-groovy-regression fix — see the matching gate in
         // the cache-hit branch above: an indy-trap-bearing artifact must stay
         // on the dispatch helper, never in a machine-called MIC/PIC entry.
