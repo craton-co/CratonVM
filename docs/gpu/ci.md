@@ -7,7 +7,7 @@ CLI flags, architecture), see [`README.md`](README.md).
 ## Why this exists
 
 Every real-GPU test in this tree is `#[ignore]`d or `gpu-it`-gated (see the
-[completed follow-ups record](../internal/gpu-offload-followups-20260711.md),
+[completed follow-ups record](../internal/fixed-suite-bugs/gpu-offload-followups-20260711.md),
 item 7), and [`cuda-bridge.yml`](../../.github/workflows/cuda-bridge.yml)
 only compiles the `cuda` Cargo feature on a public `ubuntu-latest` runner —
 it links against `cudarc` but never opens a device or launches a kernel. So

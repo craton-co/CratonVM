@@ -82,23 +82,37 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~1,348,000 Rust LoC across the 22 workspace
-member crates as of 2026-07-27, plus the separate `fuzz` harness workspace).
+The VM is the core of the project (~1,350,000 Rust LoC across the 22 workspace
+member crates as of 2026-07-30, plus the separate `fuzz` harness workspace).
 It contains six major subsystems (several now extracted into their own
 crates).
+
+That figure is the raw line count of every `.rs` file under the 22 directories
+named in the root `Cargo.toml` `[workspace] members` list, excluding `target/`,
+excluding the non-member `fuzz/` workspace, and excluding vendored third-party
+sources under any `vendor/` directory (e.g.
+`native-builtins/vendor/rustls-cbc`). Reproduce it with:
+
+```sh
+find <the 22 member dirs> -name '*.rs' -type f \
+  -not -path '*/target/*' -not -path '*/vendor/*' -print0 \
+  | xargs -0 cat | wc -l
+```
+
+which reported 1,349,978 lines across 702 files on 2026-07-30.
 
 Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
-| `native-builtins` | 571,000 | `native-awt` | 17,000 |
-| `vm` | 334,000 | `types` | 17,000 |
-| `jit` | 105,000 | `native-api` | 17,000 |
+| `native-builtins` | 552,000 | `native-awt` | 18,000 |
+| `vm` | 343,000 | `types` | 17,000 |
+| `jit` | 110,000 | `native-api` | 17,000 |
 | `gc` | 64,000 | `reader` | 14,000 |
-| `classloading` | 56,000 | `jfr` | 14,000 |
-| `native-collections` | 54,000 | `jit-cuda` | 10,000 |
-| `native-io` | 52,000 | remaining 10 | < 7,000 each |
+| `classloading` | 57,000 | `jfr` | 14,000 |
+| `native-collections` | 55,000 | `jit-cuda` | 10,000 |
+| `native-io` | 55,000 | remaining 9 | < 7,000 each |
 
 Several individual files are far larger than is comfortable. The two worst were
 split on 2026-07-30, at the section banners the files already carried:

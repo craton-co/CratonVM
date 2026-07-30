@@ -1855,6 +1855,11 @@ pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
         "loaderLookup",
         "()Ljava/lang/foreign/SymbolLookup;",
         |ctx, _| {
+            // The returned lookup searches every loaded library (index -1),
+            // so obtaining one is itself a capability. Gated identically to
+            // `libraryLookup` minus the `--enable-native-access` requirement,
+            // which the JDK does not impose on `loaderLookup`.
+            crate::security_manager::check_host_native_access_or_throw(ctx, "symbolLookup")?;
             let lookup = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2);
             ctx.set_field(lookup, 0, Value::Long(-1)); // -1 = default/system lookup
             Ok(Some(Value::Object(Some(lookup))))
@@ -1874,6 +1879,14 @@ pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
                 Value::Long(n) => n,
                 _ => -1,
             };
+
+            // A `loaderLookup()` receiver carries `lib_index == -1`, and
+            // `find_native_symbol` treats that as "search every loaded
+            // library", so `loaderLookup().find(x)` is an arbitrary-symbol
+            // address oracle over libraries loaded by trusted code. Gate it
+            // the same way as the load paths rather than leaving the read
+            // side open when the load side is closed.
+            crate::security_manager::check_host_native_access_or_throw(ctx, "symbolLookup")?;
 
             match ctx.find_native_symbol(lib_index, &sym_name) {
                 Some(addr) => {
@@ -2004,6 +2017,14 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
             };
             let name_obj = obj_arg(args, 1)?;
             let name = ctx.read_string(name_obj).unwrap_or_default();
+            // `handle` is caller-supplied and is only `lib_index + 1`, a small
+            // dense integer, so without this gate a guest can walk 1, 2, 3, …
+            // and `dlsym` any library loaded by anyone in the process — a
+            // symbol-address oracle that never passes the load-time check.
+            // Same gate as the load paths, so trusted callers are unaffected:
+            // it denies only under CRATONVM_UNTRUSTED_CODE or a SecurityManager
+            // policy that withholds `loadLibrary.*`.
+            crate::security_manager::check_host_native_access_or_throw(ctx, "findEntry")?;
             // Undo the +1 offset applied by load0 to recover the library index.
             let lib_index = handle - 1;
             let addr = ctx.find_native_symbol(lib_index, &name).unwrap_or(0);

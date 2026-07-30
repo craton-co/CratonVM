@@ -1,6 +1,7 @@
-# JIT caller gate for transparent GPU offload
+# JIT caller gate for automatic GPU offload
 
-Transparent offload is initiated from the interpreter's `invokestatic` path.
+Automatic (`--gpu`) offload is initiated from the interpreter's `invokestatic`
+path.
 If a caller were JIT-compiled or OSR-compiled, it could bypass that hook and
 silently execute the callee on CPU instead.
 

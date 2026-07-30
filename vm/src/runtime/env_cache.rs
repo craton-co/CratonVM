@@ -394,7 +394,18 @@ pub fn real_proxy_super() -> bool {
 // cache entry is reused only while that frame's root shape is unchanged. The
 // real ForkJoinPool lane bypasses both cache reuse and survive-GC remapping.
 //
-cached_is_set!(real_forkjoinpool, "CRATONVM_REAL_FORKJOINPOOL");
+// This MUST read the resolved flag, not the presence of
+// `CRATONVM_REAL_FORKJOINPOOL`. Real ForkJoinPool is the default now, so the
+// env var is normally unset — a presence check reported "not the real lane"
+// on exactly the configuration that is the real lane, and silently withdrew
+// the bypass from every default run. `flags().natives.real_forkjoinpool` is
+// the authoritative answer (default true, `CRATONVM_SYNTHETIC_FORKJOINPOOL`
+// opts out, `CRATONVM_REAL_FORKJOINPOOL` opts back in).
+#[inline]
+pub fn real_forkjoinpool() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| cratonvm_types::flags::flags().natives.real_forkjoinpool)
+}
 
 // DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang). Previously
 // default-OFF: `update_root_snapshot` rescans EVERY interpreter frame on every

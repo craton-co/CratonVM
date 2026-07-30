@@ -3620,8 +3620,9 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     let mut snapshot = snap_arc.lock();
     snapshot.clear();
 
-    // The frozen-frame cache yields to the default path in the opt-in real
-    // ForkJoinPool lane. Those native overrides recursively re-enter Java from
+    // The frozen-frame cache yields to the default path in the real
+    // ForkJoinPool lane, which is now the default rather than opt-in.
+    // Those native overrides recursively re-enter Java from
     // `fork`/`join`/`submit`; frames that look prefix-stable to the cache can
     // still expose changing local/operand roots around those native returns.
     // The default full-frame scan keeps that GC-stress path exact while the

@@ -183,11 +183,23 @@ jobs:
           distribution: temurin
           java-version: '25'
 
+      # This list must stay a superset of every optional feature declared in
+      # `vm/Cargo.toml` and `native-builtins/Cargo.toml` except the two that
+      # have their own jobs (`synthetic-jdk`) or need hardware (`gpu-offload`,
+      # covered by `cuda-bridge.yml` and the self-hosted `gpu-selfhosted.yml`).
+      # `experimental-t19-diag`, `app-stubs` and `synthetic-quarkus-arc` were
+      # missing here and were compiled by nothing at all — which is how this
+      # repository lost 1,522 tests once already.
       - name: Check every optional feature compiles, test targets included
         run: >
           cargo check --all-targets
           -p cratonvm-vm -p cratonvm-native-builtins
-          --features experimental-tls,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug,zgc
+          --features experimental-tls,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug,experimental-t19-diag,zgc
+      - name: Check the native-builtins-only optional features compile
+        run: >
+          cargo check --all-targets
+          -p cratonvm-native-builtins
+          --features app-stubs,synthetic-quarkus-arc,legacy-synthetic-crypto
 
       # Some test targets are gated in their entirety —
       # `vm/tests/t4_8_jdwp_conformance.rs` is `#![cfg(feature =

@@ -267,7 +267,7 @@ reasonably believe they work, and at least two of them make a *measurement* wron
 | `CRATONVM_PRECISE_INLINE_FRAME_RECORD` | 2 | **No-op.** Real gate is `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD` (`x64.rs:2288`), opt-out. |
 | `CRATONVM_SHADOW_OSR_TRACK` | 14 | **No-op.** No read site; the surviving shadow-stack knobs are `CRATONVM_SHADOW_STACK` / `_PIN` / `_NOPUSH` / `_NORELOAD`. |
 | `CRATONVM_JIT_SCAN_CACHE` | 1 | **No-op.** Real gate is `CRATONVM_NO_JIT_SCAN_CACHE` (`vm/src/jit/conservative_roots.rs:899`). |
-| `CRATONVM_NONMOVING_YOUNG` / `CRATONVM_FORCE_MOVING` | 1 each | **No-op.** Real gates are `CRATONVM_MOVING_YOUNG` and `CRATONVM_ALLOW_MOVING_YOUNG`. |
+| `CRATONVM_NONMOVING_YOUNG` / `CRATONVM_FORCE_MOVING` | 1 each | **No-op.** The real gate is the opt-out `CRATONVM_NO_MOVING_YOUNG` — the moving young gen is now the default (`DEFAULT_MOVING_YOUNG = true`), so `CRATONVM_MOVING_YOUNG` survives only as a no-op compatibility opt-in. (`CRATONVM_ALLOW_MOVING_YOUNG`, named here when this census was generated, has since been removed outright.) |
 | `CRATONVM_BUGS` / `CRATONVM_CRASHES` | 29 / 12 | Not flags at all — doc-internal shorthand that the scanner picks up. Harmless, listed for completeness. |
 
 The recurring pattern is a default flip: a flag `X` is introduced opt-in, later
@@ -288,7 +288,7 @@ read would silently turn the feature off*).
 | Flag | Reads | Cached | Polarity | Crates | First site |
 | --- | ---: | :---: | --- | --- | --- |
 | `CRATONVM_ALLOW_JSR_RET` | 2 | **no** | value/other | classloading,types | `classloading/src/verifier.rs:2842` |
-| `CRATONVM_ALLOW_MOVING_YOUNG` | 1 | **no** | value/other | types | `types/src/flags.rs:614` |
+| `CRATONVM_ALLOW_MOVING_YOUNG` | 0 (**removed**) | — | — | — | gone; was `types/src/flags.rs:614` at generation time |
 | `CRATONVM_AOT_HMAC_KEY` | 1 | **no** | value/other | native-builtins | `native-builtins/src/aot.rs:265` |
 | `CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS` | 1 | **no** | value/other | types | `types/src/flags.rs:1413` |
 | `CRATONVM_ASYNC_SUBMIT_GRACE_MS` | 1 | **no** | value/other | types | `types/src/flags.rs:1415` |
@@ -398,7 +398,8 @@ read would silently turn the feature off*).
 | `CRATONVM_LONGREWRITE_LOOSE` | 1 | yes | opt-in (default OFF) | vm | `vm/src/runtime/value_stack.rs:198` |
 | `CRATONVM_MAVEN_REPO_LOCAL` | 2 | **no** | value/other | native-builtins | `native-builtins/src/jboss_module_loader.rs:301` |
 | `CRATONVM_MAX_INFLATED_BYTES` | 1 | **no** | value/other | types | `types/src/flags.rs:1526` |
-| `CRATONVM_MOVING_YOUNG` | 5 | partial | opt-in (default OFF) | jit,types,vm | `jit/src/x64.rs:2458` |
+| `CRATONVM_MOVING_YOUNG` | 5 | partial | **compatibility opt-in over a default-ON feature** — the read expression is `is_some()`, but `DEFAULT_MOVING_YOUNG` is `true`, so setting this changes nothing; the live gate is the opt-out `CRATONVM_NO_MOVING_YOUNG` (`types/src/flags.rs:665`) | jit,types,vm | `jit/src/x64.rs:2458` |
+| `CRATONVM_NO_MOVING_YOUNG` | 1 | **no** | opt-out (default ON) — the real gate for the moving young gen | types | `types/src/flags.rs:665` |
 | `CRATONVM_MOVING_YOUNG_FALLBACKS` | 1 | **no** | value/other | types | `types/src/flags.rs:615` |
 | `CRATONVM_MSC_REAL_START` | 1 | **no** | value/other | types | `types/src/flags.rs:1527` |
 | `CRATONVM_NATIVE_EC_MULTIPLY` | 1 | **no** | value/other | types | `types/src/flags.rs:1528` |

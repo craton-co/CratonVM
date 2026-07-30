@@ -14,7 +14,7 @@ Brief description of what this PR does.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` run
 - [ ] `cargo fmt --all --check` run
 - [ ] `cargo test --workspace` run
-- [ ] Coverage checked or intentionally deferred; release-ready branches should meet the 85% line coverage target
+- [ ] Coverage checked or intentionally deferred; the CI job is blocking on the report being *generated* — no percentage bar is claimed or expected (see `docs/COVERAGE.md`)
 - [ ] Semantic difftest smoke checked or intentionally deferred
 - [ ] Fuzz build smoke checked or intentionally deferred
 - [ ] Known failures or skipped checks explained

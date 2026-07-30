@@ -170,24 +170,26 @@ pub fn add_sandbox_root<P: AsRef<Path>>(path: P) {
 // `validate_path` is permissive by default (JDK-faithful: absolute paths and
 // symlink escapes are accepted) and confinement is opt-in via
 // `set_path_confine_to_cwd` + `add_sandbox_root`. That is correct for a
-// single-tenant `java -jar app.jar` launch, but a certified or multi-tenant
+// single-tenant `java -jar app.jar` launch, but a hardened or multi-tenant
 // deployment that runs untrusted bytecode must *fail closed* without relying
 // on the embedder to remember to call the opt-in APIs.
 //
-// This startup hook reads the deployment-profile environment and, when a
-// certified/untrusted profile is requested, automatically enables CWD
-// confinement and registers the process CWD as a sandbox root. It also emits
-// a loud, fail-closed warning (hard error under the certified flag) if an
-// "untrusted code" mode was requested but confinement did not actually get
-// turned on. Called once from `register_io_natives` at startup.
+// This startup hook reads the deployment-profile environment and, when either
+// hardening profile is requested, automatically enables CWD confinement and
+// registers the process CWD as a sandbox root. If confinement did not actually
+// get turned on, it panics — under *both* flags, never a warn-and-continue.
+// Called once from `register_io_natives` at startup.
 //
 // Recognised env vars (presence = enabled; value `0`/`false`/`off`/`no`
 // disables, case-insensitive):
-//   * `CRATONVM_CONFINE_IO`      — certified profile: enable confinement,
+//   * `CRATONVM_CONFINE_IO`      — confinement profile: enable confinement,
 //                                  fail closed (hard error) if it can't.
-//   * `CRATONVM_UNTRUSTED_CODE`  — untrusted-code mode: enable confinement,
-//                                  loud warning if it isn't actually on.
-/// SECURITY FIX (V12): apply the certified/untrusted deployment profile at
+//   * `CRATONVM_UNTRUSTED_CODE`  — strict defence-in-depth profile: the same
+//                                  fail-closed confinement, and additionally
+//                                  implies `CRATONVM_REQUIRE_POLICY` and denies
+//                                  host-native access (see
+//                                  `native-builtins/src/security_manager.rs`).
+/// SECURITY FIX (V12): apply the requested hardening deployment profile at
 /// startup. Idempotent; safe to call more than once.
 fn apply_certified_deployment_profile() {
     let certified = io_flags().confine_io;
@@ -200,18 +202,18 @@ fn apply_certified_deployment_profile() {
     // Fail closed: turn on CWD confinement and register the CWD as a sandbox
     // root, reusing the already-sound opt-in machinery. We do NOT change the
     // *default* (env-less) behaviour — this only fires when an operator
-    // explicitly requests the certified/untrusted profile.
+    // explicitly requests one of the two hardening profiles.
     set_path_confine_to_cwd(true);
     if let Ok(cwd) = std::env::current_dir() {
         add_sandbox_root(&cwd);
     }
 
     // Startup assertion: confinement must actually be on now. If it somehow
-    // is not (e.g. a later caller raced and disabled it), this is a
-    // hard-fail under the certified flag and a loud warning under the
-    // untrusted-code flag — never a silent permissive fallthrough.
+    // is not (e.g. a later caller raced and disabled it), this is a hard-fail
+    // under *either* flag — never a warning-and-continue, and never a silent
+    // permissive fallthrough.
     if !is_path_confine_to_cwd() {
-        let msg = "CRATONVM SECURITY (V12): untrusted/certified I/O profile requested \
+        let msg = "CRATONVM SECURITY (V12): I/O hardening profile requested \
                    (CRATONVM_CONFINE_IO / CRATONVM_UNTRUSTED_CODE) but path confinement \
                    is NOT enabled — file I/O is NOT sandboxed.";
         // Both explicit hardening profiles fail closed. Warning-and-continue
@@ -219,7 +221,7 @@ fn apply_certified_deployment_profile() {
         panic!("{msg}");
     } else {
         eprintln!(
-            "CRATONVM SECURITY (V12): certified/untrusted I/O profile active — \
+            "CRATONVM SECURITY (V12): I/O hardening profile active — \
              file paths confined to CWD sandbox + registered roots."
         );
     }
@@ -359,19 +361,21 @@ pub fn is_path_confine_to_cwd() -> bool {
 /// symlink escape. Do not assume `validate_path` sandboxes you — it does not
 /// unless you turn confinement on.
 ///
-/// # SECURITY FIX (V12) — certified-deployment env switch
+/// # SECURITY FIX (V12) — hardening-profile env switch
 ///
 /// **Default = unconfined (matches the JDK):** an absolute path or a symlink
 /// targeting outside the launch directory is accepted, because a legitimate
 /// `java -jar app.jar` launch must read/write wherever the host process can.
 ///
-/// **For untrusted / multi-tenant deployments, set `CRATONVM_CONFINE_IO`
-/// (certified, fail-closed) or `CRATONVM_UNTRUSTED_CODE` (loud warning) in the
-/// environment at startup.** Either flag makes the runtime auto-enable CWD
-/// confinement and register the process CWD as a sandbox root
-/// (see [`apply_certified_deployment_profile`]), so the deployment fails
-/// closed without the embedder having to call [`set_path_confine_to_cwd`] /
-/// [`add_sandbox_root`] by hand. The env-less default behaviour is unchanged.
+/// **For untrusted / multi-tenant deployments, set `CRATONVM_CONFINE_IO` (the
+/// confinement profile) or `CRATONVM_UNTRUSTED_CODE` (the strict
+/// defence-in-depth profile) in the environment at startup.** Both fail closed
+/// identically: either flag makes the runtime auto-enable CWD confinement and
+/// register the process CWD as a sandbox root, and aborts if that does not
+/// take effect (see [`apply_certified_deployment_profile`]). The deployment
+/// therefore fails closed without the embedder having to call
+/// [`set_path_confine_to_cwd`] / [`add_sandbox_root`] by hand. The env-less
+/// default behaviour is unchanged.
 pub(crate) fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
     // Reject null bytes (security check — runs even when validation
     // is otherwise disabled, since a NUL truncates the path at the
@@ -4653,7 +4657,7 @@ fn real_filewriter_enabled() -> bool {
 pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // SECURITY FIX (V12): apply the certified/untrusted deployment profile
+    // SECURITY FIX (V12): apply the requested hardening deployment profile
     // before any I/O natives are registered, so a deployment that requests it
     // (CRATONVM_CONFINE_IO / CRATONVM_UNTRUSTED_CODE) fails closed — CWD
     // confinement on + CWD registered as a sandbox root — without the embedder

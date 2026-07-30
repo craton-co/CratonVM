@@ -169,10 +169,14 @@ documented round by round:
 
 Measured 2026-07-11 on a GeForce RTX 2060 (sm_75) against HotSpot JDK 25
 (C2) and TornadoVM 4.0.1 (PTX backend, `@Parallel`/`@Reduce` + TaskGraph
-API). CratonVM offload is **transparent**: plain static methods over
-primitive arrays, no annotations, no API
-(`cargo build --features gpu-driver`, run with `--gpu`). All timings are
-warm and include the full per-call H2D + kernel + D2H round-trip.
+API). CratonVM offload is **opt-in and automatic within a narrow envelope**:
+the kernels below are plain static methods over primitive arrays with no
+annotations and no API at the call site, but they require a GPU build and an
+explicit flag (`cargo build --features gpu-driver`, run with `--gpu`), and
+anything the analyzer doesn't accept stays on the CPU. All timings are warm
+and include the full per-call H2D + kernel + D2H round-trip. There is no
+self-hosted GPU hardware CI, so these are point-in-time measurements rather
+than a continuously enforced budget.
 
 | Kernel (N = 2²⁴)                         | HotSpot C2 | TornadoVM GPU | CratonVM GPU | vs HotSpot | vs TornadoVM |
 |------------------------------------------|------------|---------------|--------------|------------|--------------|
@@ -191,8 +195,8 @@ Notes:
   `vdivpd`); TornadoVM's diverges slightly — its PTX backend doesn't
   guarantee bit-exact division.
 - TornadoVM 4.0.1 throws `TornadoInternalError: unimplemented` on the
-  equivalent `@Reduce`-over-`LongArray` kernel; CratonVM's transparent
-  reduction handles it (slowly — a proper tree/shared-memory reduction is
+  equivalent `@Reduce`-over-`LongArray` kernel; CratonVM's automatic
+  `--gpu` path handles it (slowly — a proper tree/shared-memory reduction is
   an open item).
 - The multiply-add and dot-product rows are kept as honest counter-cases:
   CPU AVX2 stays competitive on MAD-dominated kernels at every size, and a

@@ -42,7 +42,7 @@ fn dbg_dopriv_enabled() -> bool {
     *DBG_DOPRIV.get_or_init(|| crate::nbflags().dbg_dopriv)
 }
 
-// SECURITY FIX (V10): strict opt-in for the certification profile.
+// SECURITY FIX (V10): strict opt-in for the defence-in-depth profile.
 //
 // Default runtime behavior: "no policy loaded = no enforcement" — when no
 // java.policy is installed the VM allows everything, matching JDK semantics
@@ -51,7 +51,7 @@ fn dbg_dopriv_enabled() -> bool {
 // JDK-compat case.
 //
 // When `CRATONVM_REQUIRE_POLICY` is set, a missing policy instead DENIES
-// (fail-closed). The certification profile sets this flag so that the
+// (fail-closed). `CRATONVM_UNTRUSTED_CODE` implies this flag so that the
 // absence of an explicitly-loaded policy can never be mistaken for an
 // allow-all grant. The flag must be set before the first permission check.
 static REQUIRE_POLICY: OnceLock<bool> = OnceLock::new();

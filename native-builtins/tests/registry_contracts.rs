@@ -152,3 +152,113 @@ fn stamped_lock_surface_is_intercepted_completely() {
          word the native backend does not maintain, and hang: {missing:?}"
     );
 }
+
+/// Every path that can resolve a native symbol or load a native library must
+/// pass the host-native-access gate.
+///
+/// This is a source-level scan rather than a behavioural test because the hole
+/// it exists to catch is an *omission*: four separate natives
+/// (`NativeLibrary.findEntry0`, `SymbolLookup.loaderLookup`, `SymbolLookup.find`
+/// and `JavaLangAccess.findNative`) reached `find_native_symbol` without ever
+/// calling a gate, so the load side was closed while the read side stayed open.
+/// A guest could hand `findEntry0` a small integer handle — it is just
+/// `lib_index + 1` — and walk it to `dlsym` any library loaded by trusted code.
+/// Nothing failed, because there was no test that could fail: each native was
+/// individually plausible, and only the *set* was wrong.
+///
+/// So the gate is all-or-nothing over the set, the same shape as
+/// `stamped_lock_surface_is_intercepted_completely` above. A new native that
+/// reaches either capability fails this test until it is gated or explicitly
+/// listed as exempt.
+#[test]
+fn native_symbol_lookups_all_pass_the_host_access_gate() {
+    const GATES: [&str; 2] = ["check_host_native_access_or_throw", "require_native_access"];
+    const CAPABILITIES: [&str; 2] = ["find_native_symbol", "load_native_library"];
+
+    // Exempt: reached only from VM-internal bootstrap, never from a Java
+    // caller's control. Keep this list short and justified.
+    const EXEMPT_FNS: [&str; 0] = [];
+
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut ungated: Vec<String> = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut call_sites = 0usize;
+
+    let mut stack = vec![src_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).expect("native-builtins/src must be readable");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            scanned_files += 1;
+
+            // Everything from the first `#[cfg(test)]` module onward is test
+            // scaffolding, which legitimately calls these directly.
+            let body = match text.find("#[cfg(test)]") {
+                Some(cut) => &text[..cut],
+                None => &text[..],
+            };
+
+            for cap in CAPABILITIES {
+                let needle = format!("ctx.{cap}(");
+                let mut from = 0usize;
+                while let Some(rel) = body[from..].find(&needle) {
+                    let at = from + rel;
+                    from = at + needle.len();
+
+                    // Skip commented-out mentions.
+                    let line_start = body[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    let prefix = body[line_start..at].trim_start();
+                    if prefix.starts_with("//") || prefix.starts_with("///") {
+                        continue;
+                    }
+                    call_sites += 1;
+
+                    // Scope: the enclosing registered closure, or failing that
+                    // the enclosing free function.
+                    let scope_start = body[..at]
+                        .rfind("r.register(")
+                        .or_else(|| body[..at].rfind("\nfn "))
+                        .unwrap_or(0);
+                    let scope = &body[scope_start..at];
+                    if EXEMPT_FNS.iter().any(|f| scope.contains(f)) {
+                        continue;
+                    }
+                    if GATES.iter().any(|g| scope.contains(g)) {
+                        continue;
+                    }
+                    let line = body[..at].matches('\n').count() + 1;
+                    let file = path.strip_prefix(&src_dir).unwrap_or(&path).display();
+                    ungated.push(format!("{file}:{line} ({cap})"));
+                }
+            }
+        }
+    }
+
+    // Vacuity guard: a scan that silently stops finding call sites would
+    // "pass" forever. This is the failure mode the audit that produced this
+    // test was written about.
+    assert!(
+        scanned_files > 10,
+        "source scan found only {scanned_files} files — the scan itself is broken"
+    );
+    assert!(
+        call_sites >= 8,
+        "source scan found only {call_sites} native-symbol call sites; expected \
+         at least 8. Either the capability was renamed or the scan is broken."
+    );
+
+    assert!(
+        ungated.is_empty(),
+        "these natives resolve a native symbol or load a native library without \
+         passing the host-native-access gate, so a caller denied `loadLibrary.*` \
+         (or running under CRATONVM_UNTRUSTED_CODE) can still reach them: {ungated:?}"
+    );
+}

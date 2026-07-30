@@ -221,8 +221,8 @@ pub mod parse {
 
     /// `!(empty | "0" | "false" | "off" | "no")`, case-insensitive, trimmed.
     ///
-    /// Used by `native_io::env_flag_enabled` for the certified/untrusted
-    /// deployment profile.
+    /// Used by `native_io::env_flag_enabled` for the confinement and strict
+    /// defence-in-depth deployment profiles.
     #[inline]
     pub fn truthy_word(src: &dyn FlagSource, name: &str) -> bool {
         match utf8(src, name) {
@@ -882,11 +882,14 @@ impl LoaderFlags {
 /// Flags read by `cratonvm-native-io`.
 #[derive(Debug, Clone, Default)]
 pub struct IoFlags {
-    /// `CRATONVM_CONFINE_IO` — certified deployment profile: enable CWD
+    /// `CRATONVM_CONFINE_IO` — the confinement profile: enable CWD
     /// confinement, fail closed. [`parse::truthy_word`].
     pub confine_io: bool,
-    /// `CRATONVM_UNTRUSTED_CODE` — untrusted-bytecode profile: enable CWD
-    /// confinement, warn loudly. [`parse::truthy_word`].
+    /// `CRATONVM_UNTRUSTED_CODE` — the strict defence-in-depth profile: the
+    /// same fail-closed CWD confinement as `confine_io` (it aborts too, it does
+    /// not warn and continue), plus it implies `CRATONVM_REQUIRE_POLICY` and
+    /// unconditionally denies host-native access (JNI library loads,
+    /// `SymbolLookup`, FFM downcalls). [`parse::truthy_word`].
     pub untrusted_code: bool,
     /// `CRATONVM_BLOCK_PRIVATE_NETS` — deny outbound to loopback and RFC1918.
     /// [`parse::truthy_word`].

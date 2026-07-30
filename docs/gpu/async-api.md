@@ -1,14 +1,16 @@
 # Phase 3 Java async API — `GpuExecutor`, `GpuFuture`, `GpuArray`, `GpuStream`
 
 Reference for the **explicit, async** Java surface introduced in Phase 3.
-Companion to the transparent `invokestatic` offload path already documented
+Companion to the automatic `invokestatic` offload path already documented
 in [`README.md`](README.md).
 
 The two paths coexist:
 
-- **Transparent offload** (Phase 1/2) — `--gpu` on the command line; any
-  `@GpuKernel`-eligible static method called via `invokestatic` is silently
-  routed to the GPU. The user writes no async code.
+- **Automatic offload** (Phase 1/2, the "transparent" path elsewhere in
+  these docs) — a `gpu`/`gpu-driver` build plus `--gpu` on the command line;
+  a static method the analyzer accepts, called via `invokestatic`, is routed
+  to the GPU without any call-site change. The user writes no async code.
+  Methods outside the accepted shape run on the CPU as usual.
 - **Explicit async API** (Phase 3, this document) — `GpuExecutor` lets the
   application *schedule* offloaded work, chain kernels on the same device
   stream, and read results back as `GpuFuture<T>`. No `--gpu` flag is
@@ -19,7 +21,7 @@ point.
 
 ## Quick start
 
-Before — transparent offload of a single kernel via `invokestatic`:
+Before — automatic offload of a single eligible kernel via `invokestatic`:
 
 ```java
 // Run on a JVM started with --gpu. The call below is dispatched to the
@@ -482,7 +484,7 @@ from the by-design [Limitations](#limitations) below.
 - **Not a Java CUDA wrapper.** You cannot `cuMemAlloc` from Java. The
   device-side surface is intentionally narrow — wrap an array, launch a
   kernel, read it back. Anything more is the Rust side's concern.
-- **Not a replacement for the transparent `invokestatic` offload.**
+- **Not a replacement for the automatic `invokestatic` offload.**
   Code that has been running fine under `--gpu` should keep running
   fine; the explicit API is for *new* code that wants async semantics.
 - **Not a Project Babylon stand-in.** Babylon's Code Reflection is a
