@@ -49,15 +49,40 @@ fresh-process runs — full methodology in [BENCHMARK.md](BENCHMARK.md)):
 | Fibonacci(44)                     | 1,719 ms  | 4,790 ms  | 2.79x | 07-18 |
 | Sieve (100K × 20,000)             | 2,851 ms  | 6,508 ms  | 2.28x | 07-18 |
 | Matrix 1280×1280                  | 2,349 ms  | 6,875 ms  | 2.93x | 07-18 |
-| HashMap (10M put/get)             | 1,039 ms  | 22,077 ms | 21.2x | 07-25 |
+| HashMap (10M put/get)             | 1,017 ms  | 1,780 ms  | 1.75x | 07-30 |
 | String/Regex (100K)               | 55 ms     | 423 ms    | 7.7x  | 07-25 |
 | Binary Trees (depth 18)           | 176 ms    | 1,468 ms  | 8.34x | 07-18 |
+
+The HashMap row is a **correction plus an improvement**, and the two are
+separate. The 07-25 entry (`22,077 ms`, `21.2x`) does not reproduce: measured
+before any change here, `dev` runs this kernel in **3,776 ms** — 3.71x, not
+21.2x. Why the old reading was ~5x too slow is not established; the obvious
+candidate was tested and refuted. On top of that corrected baseline, the
+2026-07-30 closeout cut the HotSpot gap by **72.3%** (3,776 → 1,780 ms against
+1,017 ms). Both columns are medians of five interleaved fresh-process runs on
+one pinned core at load 3.4-3.8 — above the gate's own quiet-host threshold, so
+the absolutes are mildly inflated while the ratio holds. See
+[`hashmap-half-gap-20260730.md`](docs/internal/performance/hashmap-half-gap-20260730.md).
 
 The Fibonacci row retains its last quiet-host absolute values. The 2026-07-30
 merged-binary closeout reduced the measured CratonVM-versus-HotSpot gap by
 **71.90%** in balanced alternating runs; the loaded shared host was unsuitable
 for re-anchoring absolute table values. See
 [`fibonacci-half-gap-20260730.md`](docs/internal/performance/fibonacci-half-gap-20260730.md).
+
+The Binary Trees row also retains its last quiet-host absolute values. A
+2026-07-30 follow-up (TLAB zero-elision + a GC-inert self-recursion proof for
+`itemCheck`) reduced the measured CratonVM-versus-HotSpot gap by a further
+**16.1%** in a clean 10-round interleaved Azure measurement. See
+[`binarytrees-bt18-half-gap-20260730.md`](docs/internal/performance/binarytrees-bt18-half-gap-20260730.md).
+
+The Sieve row likewise retains its last quiet-host absolute values. Guarded
+byte-array loop lowerings landed 2026-07-30 cut the measured
+CratonVM-versus-HotSpot gap by **94.35%**, taking the ratio from 1.85x to
+**1.05x** across two independent 9-round interleaved same-binary A/B
+measurements; the loaded shared host was unsuitable for re-anchoring absolute
+table values. See
+[`cratonbench-sieve-half-gap-20260730.md`](docs/internal/performance/cratonbench-sieve-half-gap-20260730.md).
 
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)

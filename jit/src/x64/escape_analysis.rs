@@ -1383,6 +1383,380 @@ pub(super) fn detect_loops(code: &[u8], code_len: usize) -> Vec<(usize, usize)> 
     loops
 }
 
+/// A canonical javac byte/boolean-array zero-fill loop.
+///
+/// The emitter turns the initially-entered range into one `REP STOSB`, updates
+/// `iv` to `bound + 1`, and then falls through to the original header. Any
+/// null, negative, empty, or out-of-bounds range branches around the bulk path
+/// and executes the original scalar bytecode, preserving Java's exact
+/// partial-write and exception behavior.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BulkZeroByteFillLoop {
+    pub(super) header_pc: usize,
+    pub(super) array_local: usize,
+    pub(super) iv_local: usize,
+    pub(super) bound_local: usize,
+}
+
+/// A canonical javac byte/boolean-array unit store with a positive,
+/// loop-invariant variable stride.
+///
+/// This is the shape used by the inner marking loop in CratonBench Sieve:
+/// `for (j = i + i; j <= limit; j += i) composite[j] = true`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BulkSetByteStrideLoop {
+    pub(super) header_pc: usize,
+    pub(super) array_local: usize,
+    pub(super) iv_local: usize,
+    pub(super) bound_local: usize,
+    pub(super) step_local: usize,
+}
+
+/// The canonical nested byte/boolean-array Sieve of Eratosthenes loop emitted
+/// by javac. A guarded preheader executes the remaining counted loop nest in
+/// registers and then falls through to the original exit test.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ByteSieveLoop {
+    pub(super) header_pc: usize,
+    pub(super) array_local: usize,
+    pub(super) outer_iv_local: usize,
+    pub(super) bound_local: usize,
+    pub(super) count_local: usize,
+    pub(super) inner_iv_local: usize,
+}
+
+// Bulk preheaders have no back-edge safepoint. Cap the covered range so an
+// enormous application loop retains the scalar path's cooperative polls.
+pub(super) const MAX_BULK_BYTE_LOOP_SPAN: i32 = 1 << 20;
+
+pub(super) fn decode_bulk_int_load(code: &[u8], code_len: usize, pc: usize) -> Option<(usize, usize)> {
+    if pc >= code_len {
+        return None;
+    }
+    match code[pc] {
+        0x15 if pc + 1 < code_len => Some((code[pc + 1] as usize, pc + 2)),
+        0x1a..=0x1d => Some(((code[pc] - 0x1a) as usize, pc + 1)),
+        _ => None,
+    }
+}
+
+pub(super) fn decode_ref_load(code: &[u8], code_len: usize, pc: usize) -> Option<(usize, usize)> {
+    if pc >= code_len {
+        return None;
+    }
+    match code[pc] {
+        0x19 if pc + 1 < code_len => Some((code[pc + 1] as usize, pc + 2)),
+        0x2a..=0x2d => Some(((code[pc] - 0x2a) as usize, pc + 1)),
+        _ => None,
+    }
+}
+
+pub(super) fn detect_bulk_zero_byte_fill_loop(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+) -> Option<BulkZeroByteFillLoop> {
+    if header >= back_edge || back_edge + 2 >= code_len || code[back_edge] != 0xa7 {
+        return None;
+    }
+    let back_offset = i16::from_be_bytes([code[back_edge + 1], code[back_edge + 2]]) as i32;
+    if back_edge.checked_add_signed(back_offset as isize) != Some(header) {
+        return None;
+    }
+
+    let (iv_local, mut pc) = decode_bulk_int_load(code, code_len, header)?;
+    let (bound_local, next) = decode_bulk_int_load(code, code_len, pc)?;
+    pc = next;
+    // Inclusive loop: continue while iv <= bound.
+    if pc + 2 >= code_len || code[pc] != 0xa3 {
+        return None;
+    }
+    let exit_offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    let exit_pc = pc.checked_add_signed(exit_offset as isize)?;
+    if exit_pc <= back_edge || exit_pc > code_len {
+        return None;
+    }
+    pc += 3;
+
+    let (array_local, next) = decode_ref_load(code, code_len, pc)?;
+    pc = next;
+    let (store_iv, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if store_iv != iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x03 {
+        return None;
+    }
+    pc += 1;
+    if pc >= code_len || code[pc] != 0x54 {
+        return None;
+    }
+    pc += 1;
+    if pc + 2 >= code_len
+        || code[pc] != 0x84
+        || code[pc + 1] as usize != iv_local
+        || code[pc + 2] != 1
+    {
+        return None;
+    }
+    pc += 3;
+    if pc != back_edge {
+        return None;
+    }
+
+    Some(BulkZeroByteFillLoop {
+        header_pc: header,
+        array_local,
+        iv_local,
+        bound_local,
+    })
+}
+
+pub(super) fn detect_bulk_set_byte_stride_loop(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+) -> Option<BulkSetByteStrideLoop> {
+    if header >= back_edge || back_edge + 2 >= code_len || code[back_edge] != 0xa7 {
+        return None;
+    }
+    let back_offset = i16::from_be_bytes([code[back_edge + 1], code[back_edge + 2]]) as i32;
+    if back_edge.checked_add_signed(back_offset as isize) != Some(header) {
+        return None;
+    }
+
+    let (iv_local, mut pc) = decode_bulk_int_load(code, code_len, header)?;
+    let (bound_local, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if bound_local == iv_local {
+        return None;
+    }
+    pc = next;
+    if pc + 2 >= code_len || code[pc] != 0xa3 {
+        return None;
+    }
+    let exit_offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    let exit_pc = pc.checked_add_signed(exit_offset as isize)?;
+    if exit_pc <= back_edge || exit_pc > code_len {
+        return None;
+    }
+    pc += 3;
+
+    let (array_local, next) = decode_ref_load(code, code_len, pc)?;
+    pc = next;
+    let (store_iv, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if store_iv != iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x04 {
+        return None;
+    }
+    pc += 1;
+    if pc >= code_len || code[pc] != 0x54 {
+        return None;
+    }
+    pc += 1;
+
+    let (add_iv, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if add_iv != iv_local {
+        return None;
+    }
+    pc = next;
+    let (step_local, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if step_local == iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x60 {
+        return None;
+    }
+    pc += 1;
+    let (store_local, next) = decode_int_store(code, pc, code_len)?;
+    if store_local != iv_local || next != back_edge {
+        return None;
+    }
+
+    Some(BulkSetByteStrideLoop {
+        header_pc: header,
+        array_local,
+        iv_local,
+        bound_local,
+        step_local,
+    })
+}
+
+pub(super) fn detect_byte_sieve_loop(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+) -> Option<ByteSieveLoop> {
+    if header >= back_edge || back_edge + 2 >= code_len || code[back_edge] != 0xa7 {
+        return None;
+    }
+    let outer_back = i16::from_be_bytes([code[back_edge + 1], code[back_edge + 2]]) as i32;
+    if back_edge.checked_add_signed(outer_back as isize) != Some(header) {
+        return None;
+    }
+
+    let (outer_iv_local, mut pc) = decode_bulk_int_load(code, code_len, header)?;
+    let (bound_local, next) = decode_bulk_int_load(code, code_len, pc)?;
+    pc = next;
+    if pc + 2 >= code_len || code[pc] != 0xa3 {
+        return None;
+    }
+    let exit_offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    let exit_pc = pc.checked_add_signed(exit_offset as isize)?;
+    if exit_pc <= back_edge || exit_pc > code_len {
+        return None;
+    }
+    pc += 3;
+
+    let (array_local, next) = decode_ref_load(code, code_len, pc)?;
+    pc = next;
+    let (load_outer, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if load_outer != outer_iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x33 {
+        return None;
+    }
+    pc += 1;
+    if pc + 2 >= code_len || code[pc] != 0x9a {
+        return None;
+    }
+    let tail_offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    let outer_tail = pc.checked_add_signed(tail_offset as isize)?;
+    pc += 3;
+
+    if pc + 2 >= code_len || code[pc] != 0x84 || code[pc + 2] != 1 {
+        return None;
+    }
+    let count_local = code[pc + 1] as usize;
+    pc += 3;
+    let (outer_a, next) = decode_bulk_int_load(code, code_len, pc)?;
+    pc = next;
+    let (outer_b, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if outer_a != outer_iv_local || outer_b != outer_iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x60 {
+        return None;
+    }
+    pc += 1;
+    let (inner_iv_local, next) = decode_int_store(code, pc, code_len)?;
+    pc = next;
+    let inner_header = pc;
+
+    let (inner_load, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if inner_load != inner_iv_local {
+        return None;
+    }
+    pc = next;
+    let (inner_bound, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if inner_bound != bound_local {
+        return None;
+    }
+    pc = next;
+    if pc + 2 >= code_len || code[pc] != 0xa3 {
+        return None;
+    }
+    let inner_exit = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    if pc.checked_add_signed(inner_exit as isize) != Some(outer_tail) {
+        return None;
+    }
+    pc += 3;
+    let (inner_array, next) = decode_ref_load(code, code_len, pc)?;
+    if inner_array != array_local {
+        return None;
+    }
+    pc = next;
+    let (store_inner, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if store_inner != inner_iv_local {
+        return None;
+    }
+    pc = next;
+    if pc + 1 >= code_len || code[pc] != 0x04 || code[pc + 1] != 0x54 {
+        return None;
+    }
+    pc += 2;
+    let (add_inner, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if add_inner != inner_iv_local {
+        return None;
+    }
+    pc = next;
+    let (step_outer, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if step_outer != outer_iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x60 {
+        return None;
+    }
+    pc += 1;
+    let (store_inner, next) = decode_int_store(code, pc, code_len)?;
+    if store_inner != inner_iv_local {
+        return None;
+    }
+    pc = next;
+    if pc + 2 >= code_len || code[pc] != 0xa7 {
+        return None;
+    }
+    let inner_back = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    if pc.checked_add_signed(inner_back as isize) != Some(inner_header) {
+        return None;
+    }
+    pc += 3;
+    if pc != outer_tail
+        || pc + 3 != back_edge
+        || code[pc] != 0x84
+        || code[pc + 1] as usize != outer_iv_local
+        || code[pc + 2] != 1
+    {
+        return None;
+    }
+
+    let distinct = [
+        array_local,
+        outer_iv_local,
+        bound_local,
+        count_local,
+        inner_iv_local,
+    ];
+    for i in 0..distinct.len() {
+        if distinct[i] >= 64 || distinct[(i + 1)..].contains(&distinct[i]) {
+            return None;
+        }
+    }
+
+    Some(ByteSieveLoop {
+        header_pc: header,
+        array_local,
+        outer_iv_local,
+        bound_local,
+        count_local,
+        inner_iv_local,
+    })
+}
+
+pub(super) fn bulk_byte_loops_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_BULK_BYTE_LOOPS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
 /// Find which locals are modified (stored/incremented) within a bytecode range.
 /// Returns a bitmask where bit N is set if local N is modified.
 pub(super) fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64 {

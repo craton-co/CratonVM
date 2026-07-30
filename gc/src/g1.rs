@@ -6531,6 +6531,12 @@ impl G1Collector {
             if remaining >= 256 {
                 let actual = requested_size.min(remaining);
                 if let Some((ptr, _off)) = regions[cur].bump_alloc(actual, 8) {
+                    // TLAB contract: every backend returns a fully zeroed
+                    // chunk. Inline compiled allocation relies on this for
+                    // JVM default field values and zero-valued header words.
+                    // Eden regions are recycled without clearing their bytes,
+                    // so G1 must establish the contract here.
+                    unsafe { std::ptr::write_bytes(ptr, 0, actual) };
                     return Some((ptr, actual));
                 }
             }
@@ -6562,6 +6568,9 @@ impl G1Collector {
             if remaining >= 256 {
                 let actual = requested_size.min(remaining);
                 if let Some((ptr, _off)) = regions[idx].bump_alloc(actual, 8) {
+                    // SAFETY: bump_alloc reserved `actual` writable bytes
+                    // exclusively from this Eden region.
+                    unsafe { std::ptr::write_bytes(ptr, 0, actual) };
                     self.note_region_consumed_locked(&regions);
                     return Some((ptr, actual));
                 }
@@ -8255,6 +8264,30 @@ mod tests {
 
     fn make_collector() -> G1Collector {
         G1Collector::new(small_config())
+    }
+
+    #[test]
+    fn refill_tlab_zeroes_dirty_eden_bytes() {
+        let gc = make_collector();
+        let _seed = gc.alloc_object(ClassId::new(1), 0);
+
+        let expected_ptr = {
+            let mut regions = gc.regions.lock();
+            let idx = gc.current_eden.load(Ordering::Relaxed);
+            let region = &mut regions[idx];
+            let ptr = unsafe { region.data.as_mut_ptr().add(region.cursor) };
+            unsafe { std::ptr::write_bytes(ptr, 0xa5, 4096) };
+            ptr
+        };
+
+        let (ptr, len) = gc.refill_tlab(4096).expect("TLAB refill");
+        assert_eq!(ptr, expected_ptr);
+        assert_eq!(len, 4096);
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert!(
+            bytes.iter().all(|&byte| byte == 0),
+            "G1 must return a fully zeroed TLAB even from dirty recycled Eden"
+        );
     }
 
     fn unaligned_ptr(buf: &mut [u8], align: usize) -> *mut u8 {

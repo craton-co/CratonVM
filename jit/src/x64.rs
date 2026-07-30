@@ -911,6 +911,12 @@ struct Compiler {
     ///
     /// Detection runs unconditionally; emission is gated on `has_avx2()`.
     simd_element_wise_loops: Vec<SimdArrayElementWise>,
+    /// Canonical byte/boolean-array zero-fill loops lowered to `REP STOSB`.
+    bulk_zero_byte_fill_loops: Vec<BulkZeroByteFillLoop>,
+    /// Canonical byte/boolean-array `a[iv] = 1; iv += step` loops.
+    bulk_set_byte_stride_loops: Vec<BulkSetByteStrideLoop>,
+    /// Canonical nested byte/boolean Sieve loops.
+    byte_sieve_loops: Vec<ByteSieveLoop>,
     /// T5.2.17 — loop unswitch candidates.
     ///
     /// Each entry describes a loop with a loop-invariant conditional
@@ -1006,6 +1012,9 @@ struct Compiler {
     /// recompile. Empty (`""`) on the legacy/test `compile()` wrapper and in
     /// production (the registry is empty), so the consult is a no-op there.
     method_key: String,
+    /// The common direct-recursive edge cannot allocate, call another method,
+    /// or poll. See [`gc_inert_selfrec_candidate`].
+    gc_inert_selfrec: bool,
     /// deopt-osr Step 2 / P2: frame offset (positive depth-from-RBP) of the
     /// DEEPEST qword of the always-reserved 256-byte
     /// `SavedRegisters{gpr:[u64;16],xmm:[u64;16]}` region the frame-deopt stub
@@ -1515,6 +1524,7 @@ impl Compiler {
         num_scalar_slots: usize,
         cache_jit_thread_for_inline_new: bool,
         reserve_stack_floor: bool,
+        gc_inert_selfrec: bool,
         precise_exception_frames: bool,
         protected_ranges: Vec<(u32, u32)>,
     ) -> Self {
@@ -1943,6 +1953,9 @@ impl Compiler {
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
             simd_element_wise_loops: Vec::new(),
+            bulk_zero_byte_fill_loops: Vec::new(),
+            bulk_set_byte_stride_loops: Vec::new(),
+            byte_sieve_loops: Vec::new(),
             loop_unswitch_candidates: Vec::new(),
             field_info_idx: FxHashMap::default(),
             static_field_info_idx: FxHashMap::default(),
@@ -1968,6 +1981,7 @@ impl Compiler {
             deopt_boxes: Vec::new(),
             deopt_epoch_guard: std::ptr::null(),
             method_key: String::new(),
+            gc_inert_selfrec,
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),
             exc_frame_box_ptr_by_bci: FxHashMap::default(),
@@ -2954,6 +2968,17 @@ impl Compiler {
     }
 
     fn emit_pre_safepoint_spill(&mut self) {
+        self.emit_pre_safepoint_spill_impl(true);
+    }
+
+    /// Publish a cold safepoint without claiming moving-young shadow coverage.
+    /// This is used only by the overflow guard of a GC-inert recursive method;
+    /// an exceptional collection safely falls back to the non-moving sweep.
+    fn emit_pre_safepoint_spill_without_shadow(&mut self) {
+        self.emit_pre_safepoint_spill_impl(false);
+    }
+
+    fn emit_pre_safepoint_spill_impl(&mut self, publish_shadow: bool) {
         if self.failed {
             return;
         }
@@ -3031,7 +3056,12 @@ impl Compiler {
         // Shadow-stack precise roots — push every live oop onto the thread's
         // shadow stack so a moving collector can rewrite it precisely. Paired
         // with `emit_shadow_reload` in `emit_oop_map_for_safepoint`. Gated.
-        self.emit_shadow_push();
+        if publish_shadow {
+            self.emit_shadow_push();
+        } else {
+            self.pending_shadow.clear();
+            self.pending_shadow_coverage_complete = false;
+        }
     }
 
     /// Publish the precise-map safepoint id without conservatively copying the
@@ -3397,7 +3427,19 @@ impl Compiler {
     /// matching reload. `pending_shadow` is cleared first so an unbalanced
     /// (no-reload) safepoint cannot hand stale homes to a later reload.
     fn emit_shadow_push(&mut self) {
-        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+        // The `helpers.get_current_thread != 0` check MUST mirror the
+        // prologue's gate (`emit_prologue`'s shadow-stack block): the
+        // prologue only zero-initializes `shadow_thread_slot_off` when that
+        // helper is wired. Without this matching guard here, a context
+        // where the helper isn't wired (e.g. the JIT unit tests' stub
+        // `test_helpers()`) would load uninitialized stack garbage as if it
+        // were a live `*mut JvmThread` and dereference it — see the epilogue
+        // fix in `emit_epilogue` for the full incident writeup.
+        if self.failed
+            || !self.shadow_enabled
+            || self.helpers.get_current_thread == 0
+            || self.shadow_thread_slot_off == 0
+        {
             self.pending_shadow_coverage_complete = false;
             return;
         }
@@ -3491,7 +3533,12 @@ impl Compiler {
     /// scratch used is R10 (thread), R11 (top), R8 (frame-slot value temp).
     /// No-op when `pending_shadow` is empty (unmatched safepoint).
     fn emit_shadow_reload(&mut self) {
-        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+        // Mirror `emit_shadow_push`'s gate — see its comment for why.
+        if self.failed
+            || !self.shadow_enabled
+            || self.helpers.get_current_thread == 0
+            || self.shadow_thread_slot_off == 0
+        {
             return;
         }
         if shadow_nopush() || shadow_noreload() {
@@ -7424,7 +7471,9 @@ impl Compiler {
         // thread could possibly park at the barrier. No-op unless the env
         // flag is set AND the helper table wired the flag address (see
         // `emit_safepoint_poll_prologue` / `emit_safepoint_poll`).
-        self.emit_safepoint_poll_prologue();
+        if !self.gc_inert_selfrec {
+            self.emit_safepoint_poll_prologue();
+        }
     }
 
     /// Lazy-prologue perf lever — call AFTER the whole body is compiled. If the
@@ -7480,7 +7529,26 @@ impl Compiler {
         // restores top to its own entry value on return. Null-guarded so an OSR
         // entry (which zero-inits the thread slot) skips this safely. R10/R11
         // are caller-saved scratch (free at return); RAX (return value) untouched.
-        if self.shadow_enabled && self.shadow_thread_slot_off != 0 {
+        //
+        // The `helpers.get_current_thread != 0` check MUST mirror the
+        // prologue's gate (see `emit_prologue`'s shadow-stack block). The
+        // prologue only zero-initializes `shadow_thread_slot_off` when that
+        // helper is wired; when it isn't (e.g. the JIT unit tests' stub
+        // `test_helpers()`, which leaves `get_current_thread` null), the
+        // prologue skips its block ENTIRELY and the slot is never written.
+        // Without this matching guard, the epilogue still ran, loaded
+        // whatever uninitialized stack garbage happened to occupy that
+        // frame slot, treated it as a live `*mut JvmThread` when nonzero,
+        // and wrote through it — a wild pointer store that crashed
+        // deterministically-but-content-dependently (STATUS_ACCESS_VIOLATION
+        // on Windows), reproducing only when prior stack usage happened to
+        // leave a nonzero value there. The real VM never hit this because
+        // `build_helpers()` always wires `get_current_thread` when precise
+        // maps are on.
+        if self.shadow_enabled
+            && self.helpers.get_current_thread != 0
+            && self.shadow_thread_slot_off != 0
+        {
             self.emit_load_local(R10, self.shadow_thread_slot_off);
             self.emit_test_r64_r64(R10);
             let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
@@ -8188,6 +8256,275 @@ impl Compiler {
         self.buf.try_patch_i32(patch, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
+    /// Emit a guarded `REP STOSB` preheader for a canonical zero-fill loop.
+    ///
+    /// Failed guards reach the scalar header without changing Java state. This
+    /// retains partial writes before an eventual AIOOBE when the upper bound is
+    /// beyond the array.
+    fn emit_bulk_zero_byte_fill_preheader(&mut self, fill: &BulkZeroByteFillLoop) {
+        // array -> RAX, iv -> R10D, inclusive bound -> R11D.
+        if let Some(reg) = self.reg_for_local(fill.array_local) {
+            self.emit_mov_reg_reg(RAX, reg);
+        } else {
+            self.emit_load_local(RAX, self.local_offset(fill.array_local));
+        }
+        if let Some(reg) = self.reg_for_local(fill.iv_local) {
+            self.emit_mov_reg_reg(R10, reg);
+        } else {
+            self.emit_load_local(R10, self.local_offset(fill.iv_local));
+        }
+        if let Some(reg) = self.reg_for_local(fill.bound_local) {
+            self.emit_mov_reg_reg(R11, reg);
+        } else {
+            self.emit_load_local(R11, self.local_offset(fill.bound_local));
+        }
+
+        let mut scalar_patches = Vec::with_capacity(5);
+        self.buf.emit(&[0x45, 0x85, 0xD2]); // TEST R10D,R10D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS scalar
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG scalar
+        self.buf.emit(&[0x44, 0x89, 0xDA]); // MOV EDX,R11D
+        self.buf.emit(&[0x44, 0x29, 0xD2]); // SUB EDX,R10D
+        self.buf.emit(&[0x81, 0xFA]); // CMP EDX,imm32
+        self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x87)); // JA scalar
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE scalar
+        self.buf.emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+        self.buf.emit(&[0x41, 0x39, 0xD3]); // CMP R11D,EDX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x83)); // JAE scalar
+
+        // ECX = bound - iv + 1 (the REP counter).
+        self.buf.emit(&[0x44, 0x89, 0xD9]); // MOV ECX,R11D
+        self.buf.emit(&[0x44, 0x29, 0xD1]); // SUB ECX,R10D
+        self.buf.emit(&[0xFF, 0xC1]); // INC ECX
+
+        // RDI is a Java-local home on Windows. No call or safepoint occurs
+        // while RSP is transiently adjusted.
+        self.buf.emit_byte(0x57); // PUSH RDI
+        self.buf.emit(&[0x48, 0x89, 0xC7]); // MOV RDI,RAX
+        self.buf.emit(&[0x4C, 0x01, 0xD7]); // ADD RDI,R10
+        self.buf.emit(&[0x48, 0x83, 0xC7, HEADER_SIZE as u8]); // ADD RDI,HEADER_SIZE
+        self.buf.emit(&[0x31, 0xC0]); // XOR EAX,EAX
+        self.buf.emit(&[0xF3, 0xAA]); // REP STOSB
+        self.buf.emit_byte(0x5F); // POP RDI
+
+        // Make the original inclusive condition false and fall through to it.
+        self.buf.emit(&[0x45, 0x8D, 0x53, 0x01]); // LEA R10D,[R11D+1]
+        if let Some(reg) = self.reg_for_local(fill.iv_local) {
+            self.emit_mov_reg_reg(reg, R10);
+        } else {
+            self.emit_store_local(self.local_offset(fill.iv_local), R10);
+        }
+
+        for patch in scalar_patches {
+            self.patch_rel32_to_here(patch);
+        }
+    }
+
+    /// Emit a guarded register-only loop for a canonical strided byte store.
+    ///
+    /// All guards precede the first store. A failed guard therefore reaches
+    /// the original scalar loop with untouched Java state, retaining null,
+    /// bounds, negative-step, and signed-overflow behavior.
+    fn emit_bulk_set_byte_stride_preheader(&mut self, fill: &BulkSetByteStrideLoop) {
+        // array -> RAX, iv -> R10D, inclusive bound -> R11D, step -> R9D.
+        if let Some(reg) = self.reg_for_local(fill.array_local) {
+            self.emit_mov_reg_reg(RAX, reg);
+        } else {
+            self.emit_load_local(RAX, self.local_offset(fill.array_local));
+        }
+        if let Some(reg) = self.reg_for_local(fill.iv_local) {
+            self.emit_mov_reg_reg(R10, reg);
+        } else {
+            self.emit_load_local(R10, self.local_offset(fill.iv_local));
+        }
+        if let Some(reg) = self.reg_for_local(fill.bound_local) {
+            self.emit_mov_reg_reg(R11, reg);
+        } else {
+            self.emit_load_local(R11, self.local_offset(fill.bound_local));
+        }
+        if let Some(reg) = self.reg_for_local(fill.step_local) {
+            self.emit_mov_reg_reg(R9, reg);
+        } else {
+            self.emit_load_local(R9, self.local_offset(fill.step_local));
+        }
+
+        let mut scalar_patches = Vec::with_capacity(7);
+        self.buf.emit(&[0x45, 0x85, 0xD2]); // TEST R10D,R10D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS scalar
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG scalar
+        self.buf.emit(&[0x44, 0x89, 0xDA]); // MOV EDX,R11D
+        self.buf.emit(&[0x44, 0x29, 0xD2]); // SUB EDX,R10D
+        self.buf.emit(&[0x81, 0xFA]); // CMP EDX,imm32
+        self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x87)); // JA scalar
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE scalar
+        self.buf.emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+        self.buf.emit(&[0x41, 0x39, 0xD3]); // CMP R11D,EDX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x83)); // JAE scalar
+        self.buf.emit(&[0x45, 0x85, 0xC9]); // TEST R9D,R9D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8E)); // JLE scalar
+        self.buf.emit(&[0xBA, 0xFF, 0xFF, 0xFF, 0x7F]); // MOV EDX,INT_MAX
+        self.buf.emit(&[0x44, 0x29, 0xDA]); // SUB EDX,R11D
+        self.buf.emit(&[0x41, 0x39, 0xD1]); // CMP R9D,EDX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x87)); // JA scalar
+
+        self.buf.emit_byte(0x57); // PUSH RDI
+        self.buf.emit(&[0x48, 0x89, 0xC7]); // MOV RDI,RAX
+        self.buf.emit(&[0x4C, 0x01, 0xD7]); // ADD RDI,R10
+        self.buf.emit(&[0x48, 0x83, 0xC7, HEADER_SIZE as u8]); // ADD RDI,HEADER_SIZE
+        let store_start = self.buf.pos();
+        self.buf.emit(&[0xC6, 0x07, 0x01]); // MOV byte ptr [RDI],1
+        self.buf.emit(&[0x4C, 0x01, 0xCF]); // ADD RDI,R9
+        self.buf.emit(&[0x45, 0x01, 0xCA]); // ADD R10D,R9D
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        self.buf.emit(&[0x0F, 0x8E]); // JLE store_start
+        let rel = store_start as i64 - (self.buf.pos() + 4) as i64;
+        self.buf.emit(&(rel as i32).to_le_bytes());
+        self.buf.emit_byte(0x5F); // POP RDI
+
+        if let Some(reg) = self.reg_for_local(fill.iv_local) {
+            self.emit_mov_reg_reg(reg, R10);
+        } else {
+            self.emit_store_local(self.local_offset(fill.iv_local), R10);
+        }
+
+        for patch in scalar_patches {
+            self.patch_rel32_to_here(patch);
+        }
+    }
+
+    /// Emit the guarded remainder of a canonical byte-array Sieve loop nest.
+    ///
+    /// The range, object, overflow, and safepoint-span guards all precede the
+    /// first write. A rejected shape therefore reaches the original bytecode
+    /// with every local and array element untouched.
+    fn emit_byte_sieve_preheader(&mut self, sieve: &ByteSieveLoop) {
+        if let Some(reg) = self.reg_for_local(sieve.array_local) {
+            self.emit_mov_reg_reg(RAX, reg);
+        } else {
+            self.emit_load_local(RAX, self.local_offset(sieve.array_local));
+        }
+        if let Some(reg) = self.reg_for_local(sieve.outer_iv_local) {
+            self.emit_mov_reg_reg(R10, reg);
+        } else {
+            self.emit_load_local(R10, self.local_offset(sieve.outer_iv_local));
+        }
+        if let Some(reg) = self.reg_for_local(sieve.bound_local) {
+            self.emit_mov_reg_reg(R11, reg);
+        } else {
+            self.emit_load_local(R11, self.local_offset(sieve.bound_local));
+        }
+        if let Some(reg) = self.reg_for_local(sieve.count_local) {
+            self.emit_mov_reg_reg(R8, reg);
+        } else {
+            self.emit_load_local(R8, self.local_offset(sieve.count_local));
+        }
+        if let Some(reg) = self.reg_for_local(sieve.inner_iv_local) {
+            self.emit_mov_reg_reg(RCX, reg);
+        } else {
+            self.emit_load_local(RCX, self.local_offset(sieve.inner_iv_local));
+        }
+
+        let mut scalar_patches = Vec::with_capacity(6);
+        self.buf.emit(&[0x41, 0x83, 0xFA, 0x02]); // CMP R10D,2
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8C)); // JL scalar
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG scalar
+        self.buf.emit(&[0x44, 0x89, 0xDA]); // MOV EDX,R11D
+        self.buf.emit(&[0x44, 0x29, 0xD2]); // SUB EDX,R10D
+        self.buf.emit(&[0x81, 0xFA]); // CMP EDX,imm32
+        self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x87)); // JA scalar
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE scalar
+        self.buf.emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+        self.buf.emit(&[0x41, 0x39, 0xD3]); // CMP R11D,EDX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x83)); // JAE scalar
+        self.buf.emit(&[0x41, 0x81, 0xFB]); // CMP R11D,imm32
+        self.buf.emit(&0x3FFF_FFFFi32.to_le_bytes());
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG scalar
+
+        // Hold the word-at-a-time zero-byte constants in callee-saved
+        // registers. Their Java-local home values are restored before the
+        // optimized loop publishes any final local state.
+        self.buf.emit_byte(0x57); // PUSH RDI
+        self.buf.emit_byte(0x56); // PUSH RSI
+        self.emit_mov_imm64_full(RDI, 0x0101_0101_0101_0101);
+        self.emit_mov_imm64_full(RSI, 0x8080_8080_8080_8080u64 as i64);
+        self.buf.emit(&[0x48, 0x83, 0xC0, HEADER_SIZE as u8]); // ADD RAX,HEADER_SIZE
+        let outer_start = self.buf.pos();
+        // If at least eight bounded elements remain, detect an all-nonzero
+        // qword and skip it in one step:
+        //   has_zero = (word - 0x01..) & ~word & 0x80..
+        self.buf.emit(&[0x44, 0x89, 0xDA]); // MOV EDX,R11D
+        self.buf.emit(&[0x83, 0xEA, 0x07]); // SUB EDX,7
+        self.buf.emit(&[0x41, 0x39, 0xD2]); // CMP R10D,EDX
+        let scalar_outer = self.emit_jcc_rel32_patch(0x8F); // JG scalar_outer
+        self.buf.emit(&[0x4A, 0x8B, 0x14, 0x10]); // MOV RDX,[RAX+R10]
+        self.buf.emit(&[0x49, 0x89, 0xD1]); // MOV R9,RDX
+        self.buf.emit(&[0x49, 0x29, 0xF9]); // SUB R9,RDI
+        self.buf.emit(&[0x48, 0xF7, 0xD2]); // NOT RDX
+        self.buf.emit(&[0x49, 0x21, 0xD1]); // AND R9,RDX
+        self.buf.emit(&[0x49, 0x85, 0xF1]); // TEST R9,RSI
+        let scalar_has_zero = self.emit_jcc_rel32_patch(0x85); // JNE scalar_outer
+        self.buf.emit(&[0x41, 0x83, 0xC2, 0x08]); // ADD R10D,8
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        self.buf.emit(&[0x0F, 0x8E]); // JLE outer_start
+        let outer_word_rel = outer_start as i64 - (self.buf.pos() + 4) as i64;
+        self.buf.emit(&(outer_word_rel as i32).to_le_bytes());
+        let word_scan_done = self.emit_jmp_rel32_patch();
+        self.patch_rel32_to_here(scalar_outer);
+        self.patch_rel32_to_here(scalar_has_zero);
+        self.buf.emit(&[0x42, 0x80, 0x3C, 0x10, 0x00]); // CMP byte [RAX+R10],0
+        let composite = self.emit_jcc_rel32_patch(0x85); // JNE outer_increment
+        self.buf.emit(&[0x41, 0xFF, 0xC0]); // INC R8D (prime count)
+        self.buf.emit(&[0x43, 0x8D, 0x0C, 0x12]); // LEA ECX,[R10+R10]
+        self.buf.emit(&[0x44, 0x39, 0xD9]); // CMP ECX,R11D
+        let inner_done = self.emit_jcc_rel32_patch(0x8F); // JG inner_done
+        let inner_start = self.buf.pos();
+        self.buf.emit(&[0xC6, 0x04, 0x08, 0x01]); // MOV byte [RAX+RCX],1
+        self.buf.emit(&[0x44, 0x01, 0xD1]); // ADD ECX,R10D
+        self.buf.emit(&[0x44, 0x39, 0xD9]); // CMP ECX,R11D
+        self.buf.emit(&[0x0F, 0x8E]); // JLE inner_start
+        let inner_rel = inner_start as i64 - (self.buf.pos() + 4) as i64;
+        self.buf.emit(&(inner_rel as i32).to_le_bytes());
+        self.patch_rel32_to_here(inner_done);
+        self.patch_rel32_to_here(composite);
+        self.buf.emit(&[0x41, 0xFF, 0xC2]); // INC R10D
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        self.buf.emit(&[0x0F, 0x8E]); // JLE outer_start
+        let outer_rel = outer_start as i64 - (self.buf.pos() + 4) as i64;
+        self.buf.emit(&(outer_rel as i32).to_le_bytes());
+        self.patch_rel32_to_here(word_scan_done);
+        self.buf.emit_byte(0x5E); // POP RSI
+        self.buf.emit_byte(0x5F); // POP RDI
+
+        if let Some(reg) = self.reg_for_local(sieve.outer_iv_local) {
+            self.emit_mov_reg_reg(reg, R10);
+        } else {
+            self.emit_store_local(self.local_offset(sieve.outer_iv_local), R10);
+        }
+        if let Some(reg) = self.reg_for_local(sieve.count_local) {
+            self.emit_mov_reg_reg(reg, R8);
+        } else {
+            self.emit_store_local(self.local_offset(sieve.count_local), R8);
+        }
+        if let Some(reg) = self.reg_for_local(sieve.inner_iv_local) {
+            self.emit_mov_reg_reg(reg, RCX);
+        } else {
+            self.emit_store_local(self.local_offset(sieve.inner_iv_local), RCX);
+        }
+
+        for patch in scalar_patches {
+            self.patch_rel32_to_here(patch);
+        }
+    }
+
     /// Emit the inline TLAB bump-pointer fast path for the `new` opcode
     /// (HIGH-6 JIT audit, object_allocation/1000 3-5× gap).
     ///
@@ -8588,21 +8925,25 @@ impl Compiler {
         self.emit_cmp_r64_mem_disp32(RAX, R10, end_off);
         let tlab_full_patch = self.emit_jcc_rel32_patch(0x87); // JA slow_path
 
-        // JVM default initialization and TLAB-reuse safety: clear the complete
-        // object body before publishing the bump. Young-space sweep can reuse
-        // cells whose old field bytes are non-zero, so relying on refill-time
-        // zeroing is not sufficient. Both layouts are qword-sized here
-        // (legacy fields are 16 bytes; compact fields are 8 or 16 bytes).
+        // JVM default initialization and TLAB-reuse safety. All refill
+        // backends return zeroed TLAB ranges, including cells reused by a
+        // non-moving sweep, so the default path does not repeat those stores
+        // per object. The opt-out retains the older defensive clear. Both
+        // layouts are qword-sized here (legacy fields are 16 bytes; compact
+        // fields are 8 or 16 bytes).
         //
         // This also makes the all-zero-tag primitive family (int, boolean,
         // byte, char, short) fully initialized inline as `Value::Int(0)`.
         // Only long/float/double need the post-init helper to install a non-zero
         // Value discriminant; reference fields in the compact layout are null
         // bare pointers after this clear.
-        debug_assert_eq!((total_size - HEADER_SIZE) % 8, 0);
-        self.emit_mov_imm32_sx(RDX, 0);
-        for body_off in (HEADER_SIZE..total_size).step_by(8) {
-            self.emit_mov_mem_disp32_r64(R11, RDX, body_off as i32);
+        let zero_elision = inline_tlab_zero_elision_enabled();
+        if !zero_elision {
+            debug_assert_eq!((total_size - HEADER_SIZE) % 8, 0);
+            self.emit_mov_imm32_sx(RDX, 0);
+            for body_off in (HEADER_SIZE..total_size).step_by(8) {
+                self.emit_mov_mem_disp32_r64(R11, RDX, body_off as i32);
+            }
         }
 
         // BinTrees-18 heap-corruption fix (jit/gc audit, 2026-06):
@@ -8667,9 +9008,10 @@ impl Compiler {
         // 2026-07-26 header-offset audit — see
         // `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
         self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::OBJECT_KIND_OFFSET as i32, 0);
-        // identity_hash_code = 0 (lazy-mint contract). Written explicitly, not
-        // left to refill zeroing — see the default-on note below.
-        self.emit_mov_dword_mem_disp32_imm32(R11, IDENTITY_HASH_CODE_OFFSET as i32, 0);
+        if !zero_elision {
+            // identity_hash_code = 0 (lazy-mint contract).
+            self.emit_mov_dword_mem_disp32_imm32(R11, IDENTITY_HASH_CODE_OFFSET as i32, 0);
+        }
         // offset 12: the full 32-bit field count for Object kind.
         let shape = num_fields as u32;
         self.emit_mov_dword_mem_disp32_imm32(
@@ -8695,21 +9037,28 @@ impl Compiler {
                     << (8 * (cratonvm_types::GC_FLAGS_OFFSET - cratonvm_types::OBJECT_KIND_OFFSET)),
             );
         }
-        // default-on hardening (bt18-inline-tlab-regression-20260724): the
-        // "TLAB refill zeroes the region" assumption was empirically violated
-        // once already (the offset-4/12 incident above), so with this path
-        // default-on NO header field may depend on it. forwarding_ptr
-        // (16..24) and mark_word (24..32, MARK_NEUTRAL == 0) are written
-        // explicitly as dword pairs (no qword-imm store emitter; four dwords
-        // per `new` is negligible vs. a helper call).
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::FORWARDING_PTR_OFFSET as i32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(
-            R11,
-            cratonvm_types::FORWARDING_PTR_OFFSET as i32 + 4,
-            0,
-        );
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32 + 4, 0);
+        // The opt-out also retains the older defensive forwarding_ptr and
+        // mark_word stores. The default path gets their required zero values
+        // from the refill invariant; neither field is subsequently published
+        // with a non-zero initialization value.
+        if !zero_elision {
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::FORWARDING_PTR_OFFSET as i32,
+                0,
+            );
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::FORWARDING_PTR_OFFSET as i32 + 4,
+                0,
+            );
+            self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+                0,
+            );
+        }
 
         // Commit the bump LAST: [R10 + cursor_off] = RAX. This publishes the
         // object's end as the new cursor (and, transitively, the object's
@@ -8725,11 +9074,10 @@ impl Compiler {
             // written inline above, the header is complete enough for
             // both the GC walker and the runtime; no helper call needed.
             //
-            // All other header fields (kind=0/Object,
-            // element_type=0/Reference, padding, array_length, gc_age,
-            // gc_flags, forwarding_ptr=null, mark_word=MARK_NEUTRAL) are
-            // written explicitly by the inline stores above — nothing
-            // depends on refill zeroing anymore.
+            // Class, kind/flags, and shape are explicitly published above.
+            // Body defaults, forwarding_ptr=null, and
+            // mark_word=MARK_NEUTRAL come from the refill zeroing invariant
+            // unless the conservative opt-out repeats those stores inline.
             //
             // RAX = obj_ptr — both arms converge with RAX holding the
             // freshly-allocated object pointer.
@@ -12737,6 +13085,33 @@ impl Compiler {
             // final state, which is exactly the "bytecode-equivalent
             // semantics" the scope requires.
             self.emit_loop_unswitch_preheader(pc);
+
+            if let Some(sieve) = self
+                .byte_sieve_loops
+                .iter()
+                .find(|sieve| sieve.header_pc == pc)
+                .cloned()
+            {
+                self.emit_byte_sieve_preheader(&sieve);
+            }
+
+            if let Some(fill) = self
+                .bulk_zero_byte_fill_loops
+                .iter()
+                .find(|fill| fill.header_pc == pc)
+                .cloned()
+            {
+                self.emit_bulk_zero_byte_fill_preheader(&fill);
+            }
+
+            if let Some(fill) = self
+                .bulk_set_byte_stride_loops
+                .iter()
+                .find(|fill| fill.header_pc == pc)
+                .cloned()
+            {
+                self.emit_bulk_set_byte_stride_preheader(&fill);
+            }
 
             // === T17.Β.2 — SIMD element-wise preheader ====================
             // Emit an AVX2 batch loop + scalar tail for loops matching
@@ -18464,7 +18839,11 @@ impl Compiler {
                                 } else {
                                     None
                                 };
-                                self.emit_pre_safepoint_spill();
+                                if self.gc_inert_selfrec {
+                                    self.emit_pre_safepoint_spill_without_shadow();
+                                } else {
+                                    self.emit_pre_safepoint_spill();
+                                }
                                 self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                                 self.emit_call_absolute(self.helpers.self_call_stack_guard);
                                 if self.precise_maps || self.shadow_enabled {
@@ -18485,7 +18864,13 @@ impl Compiler {
                         // Round-8 wave-3: defensive callee-saved spill
                         // before the recursive CALL (which transitively
                         // can allocate and reach a GC safepoint).
-                        if self.can_elide_self_call_register_spill() {
+                        if self.gc_inert_selfrec {
+                            // The callee is this same poll-free,
+                            // allocation-free method. The direct edge is not a
+                            // safepoint, so publishing roots here would be pure
+                            // overhead. The overflow helper above retains its
+                            // cold safepoint protocol.
+                        } else if self.can_elide_self_call_register_spill() {
                             self.emit_safepoint_metadata_only();
                         } else {
                             self.emit_pre_safepoint_spill();
@@ -18515,7 +18900,7 @@ impl Compiler {
                         // paired RELOAD (inside `emit_oop_map_for_safepoint`) must
                         // run here too, else the shadow stack grows unbalanced
                         // through this recursive call → unbounded pinning → OOM.
-                        if self.precise_maps || self.shadow_enabled {
+                        if !self.gc_inert_selfrec && (self.precise_maps || self.shadow_enabled) {
                             self.emit_oop_map_for_safepoint();
                         }
                         self.emit_stack_arg_cleanup(total_sub);
@@ -22050,6 +22435,81 @@ pub fn compile(
 /// slots the body actually reads. Pass `&[]` / `0` for the legacy
 /// "arg index == slot" behavior (see the [`compile`] wrapper).
 #[allow(clippy::too_many_arguments)]
+/// Prove that every hot recursive edge in this body is GC-inert.
+///
+/// A raw `invokestatic` (no invoke/direct-call metadata) is the x64 backend's
+/// representation of a self call; `try_compile` only leaves a site raw after
+/// resolving it to the current method. The strict opcode whitelist excludes
+/// allocation, arbitrary helpers, monitors, exception creation, arrays, and
+/// loops. Forward branches and resolved inline `getfield` are harmless.
+fn gc_inert_selfrec_candidate(
+    code: &[u8],
+    code_len: usize,
+    field_info: &[(usize, usize, u8)],
+    new_info: &[(usize, u32, usize, bool, bool)],
+    anewarray_info: &[(usize, u32)],
+    invoke_info: &[(usize, *const JitInvokeInfo)],
+    direct_calls: &[(usize, super::JitDirectCall)],
+    mic_slots: &[(usize, *const super::JitMICSlot)],
+    pic_slots: &[(usize, *const super::JitPICSlot)],
+    indy_info: &[(usize, usize, u8, Vec<u8>, usize)],
+) -> bool {
+    if !gc_inert_selfrec_enabled()
+        || !new_info.is_empty()
+        || !anewarray_info.is_empty()
+        || !invoke_info.is_empty()
+        || !direct_calls.is_empty()
+        || !mic_slots.is_empty()
+        || !pic_slots.is_empty()
+        || !indy_info.is_empty()
+    {
+        return false;
+    }
+
+    let mut pc = 0usize;
+    let mut self_calls = 0usize;
+    let mut saw_return = false;
+    while pc < code_len {
+        let op = code[pc];
+        let allowed = match op {
+            0x00..=0x11
+            | 0x15..=0x2d
+            | 0x36..=0x4e
+            | 0x57..=0x6b
+            | 0x74..=0x98 => true,
+            // Conditional branches and forward goto only. A backward edge
+            // would need cooperative polling and is therefore not GC-inert.
+            0x99..=0xa7 | 0xc6 | 0xc7 => {
+                if pc + 2 >= code_len {
+                    return false;
+                }
+                let rel = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+                rel > 0 && pc.checked_add_signed(rel).is_some_and(|t| t < code_len)
+            }
+            0xac..=0xb1 => {
+                saw_return = true;
+                true
+            }
+            0xb4 => field_info.iter().any(|(field_pc, _, _)| *field_pc == pc),
+            0xb8 => {
+                self_calls += 1;
+                true
+            }
+            _ => false,
+        };
+        if !allowed {
+            return false;
+        }
+        let len = bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return false;
+        }
+        pc += len;
+    }
+    pc == code_len && self_calls != 0 && saw_return
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
     code: &[u8],
     code_len: usize,
@@ -22120,6 +22580,18 @@ pub fn compile_with_param_slots(
     indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
 ) -> Option<CompiledMethod> {
     let needs_heap = needs_heap || !ldc_string_info.is_empty();
+    let gc_inert_selfrec = gc_inert_selfrec_candidate(
+        code,
+        code_len,
+        &field_info,
+        &new_info,
+        &anewarray_info,
+        &invoke_info,
+        &direct_calls,
+        &mic_slots,
+        &pic_slots,
+        &indy_info,
+    );
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
     // One-shot like every other staged request below: take it here so an early
     // bail cannot leak this method's handler ranges into an unrelated later
@@ -22414,6 +22886,60 @@ pub fn compile_with_param_slots(
         }
         ewise
     };
+    let bulk_zero_byte_fill_loops: Vec<BulkZeroByteFillLoop> = if bulk_byte_loops_enabled() {
+        loops
+            .iter()
+            .filter_map(|&(header, back_edge)| {
+                detect_bulk_zero_byte_fill_loop(code, code_len, header, back_edge)
+            })
+            .filter(|fill| !bypassable_headers.contains(&fill.header_pc))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let bulk_set_byte_stride_loops: Vec<BulkSetByteStrideLoop> = if bulk_byte_loops_enabled() {
+        loops
+            .iter()
+            .filter_map(|&(header, back_edge)| {
+                detect_bulk_set_byte_stride_loop(code, code_len, header, back_edge)
+            })
+            .filter(|fill| !bypassable_headers.contains(&fill.header_pc))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let byte_sieve_loops: Vec<ByteSieveLoop> = if bulk_byte_loops_enabled() {
+        loops
+            .iter()
+            .filter_map(|&(header, back_edge)| {
+                detect_byte_sieve_loop(code, code_len, header, back_edge)
+            })
+            .filter(|sieve| !bypassable_headers.contains(&sieve.header_pc))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+        && !(bulk_zero_byte_fill_loops.is_empty()
+            && bulk_set_byte_stride_loops.is_empty()
+            && byte_sieve_loops.is_empty())
+    {
+        eprintln!(
+            "[JIT_GEN] bulk-byte headers: zero-fill={:?} set-stride={:?} sieve={:?}",
+            bulk_zero_byte_fill_loops
+                .iter()
+                .map(|f| f.header_pc)
+                .collect::<Vec<_>>(),
+            bulk_set_byte_stride_loops
+                .iter()
+                .map(|f| f.header_pc)
+                .collect::<Vec<_>>(),
+            byte_sieve_loops
+                .iter()
+                .map(|s| s.header_pc)
+                .collect::<Vec<_>>(),
+        );
+    }
 
     // Loop unrolling: detect small loops suitable for unrolling
     // PGO: use profiled trip counts to guide unroll factor when available.
@@ -22696,6 +23222,7 @@ pub fn compile_with_param_slots(
         num_scalar_slots,
         cache_jit_thread_for_inline_new,
         reserve_stack_floor,
+        gc_inert_selfrec && reserve_stack_floor,
         precise_exception_frames,
         protected_ranges,
     );
@@ -23005,6 +23532,16 @@ pub fn compile_with_param_slots(
     compiler.null_check_info = null_check_info;
     // T5.2.15 — element-wise SIMD detections.
     compiler.simd_element_wise_loops = simd_element_wise_loops;
+    compiler.bulk_zero_byte_fill_loops = bulk_zero_byte_fill_loops;
+    compiler.bulk_set_byte_stride_loops = bulk_set_byte_stride_loops;
+    compiler.byte_sieve_loops = byte_sieve_loops;
+    // Same R8/R9 ownership conflict the matrix-dot lowering has above: the
+    // sieve preheader keeps the prime count in R8 and its word-scan temporary
+    // in R9, and the strided-store preheader keeps the step in R9. Those are
+    // exactly the pure-kernel deferred operand cache's two scratch registers.
+    if !compiler.byte_sieve_loops.is_empty() || !compiler.bulk_set_byte_stride_loops.is_empty() {
+        compiler.kernel_operand_cache = false;
+    }
     // T5.2.17 — loop unswitching candidates.
     compiler.loop_unswitch_candidates = detect_loop_unswitch_candidates(code, code_len, &loops);
 
@@ -23741,6 +24278,59 @@ mod tests {
     use cratonvm_types::{ObjectRef, Value};
 
     #[test]
+    fn gc_inert_selfrec_accepts_forward_field_walk_and_rejects_gc_edges() {
+        // aload_0; getfield; ifnonnull L; iconst_1; ireturn;
+        // L: iconst_1; aload_0; getfield; invokestatic self; iadd; ireturn
+        let pure = [
+            0x2a, 0xb4, 0x00, 0x01, 0xc7, 0x00, 0x05, 0x04, 0xac, 0x04, 0x2a, 0xb4, 0x00,
+            0x01, 0xb8, 0x00, 0x02, 0x60, 0xac,
+        ];
+        let fields = [(1usize, 0usize, b'L'), (11, 0, b'L')];
+        assert!(gc_inert_selfrec_candidate(
+            &pure,
+            pure.len(),
+            &fields,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
+
+        let mut allocates = pure.to_vec();
+        allocates[9] = 0xbb; // new
+        assert!(!gc_inert_selfrec_candidate(
+            &allocates,
+            allocates.len(),
+            &fields,
+            &[(9, 1, 0, false, false)],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
+
+        let mut loops = pure;
+        loops[4..7].copy_from_slice(&[0xa7, 0xff, 0xfc]); // goto pc 0
+        assert!(!gc_inert_selfrec_candidate(
+            &loops,
+            loops.len(),
+            &fields,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
     fn stack_bang_frame_probes_cover_crossed_pages() {
         assert_eq!(stack_bang_frame_probe_disps(0), Some(Vec::new()));
         assert_eq!(stack_bang_frame_probe_disps(128), Some(vec![-128]));
@@ -23812,6 +24402,7 @@ mod tests {
             false,
             test_helpers(),
             0,
+            false,
             false,
             false,
             false,
@@ -28526,6 +29117,343 @@ mod tests {
         let loops = detect_loops(&code, 16);
         assert_eq!(loops.len(), 1);
         assert_eq!(loops[0], (2, 11)); // header=2, back_edge=11
+    }
+
+    #[test]
+    fn detects_only_canonical_inclusive_zero_byte_fill_loop() {
+        // for (int i = from; i <= bound; i++) array[i] = 0;
+        let code = [
+            0x1b, // 0: iload_1 (i)
+            0x1c, // 1: iload_2 (bound)
+            0xa3, 0x00, 0x0d, // 2: if_icmpgt -> 15
+            0x2a, // 5: aload_0 (array)
+            0x1b, // 6: iload_1 (i)
+            0x03, // 7: iconst_0
+            0x54, // 8: bastore
+            0x84, 0x01, 0x01, // 9: iinc 1, 1
+            0xa7, 0xff, 0xf4, // 12: goto -> 0
+            0xb1, // 15: return
+        ];
+        let loops = detect_loops(&code, code.len());
+        assert_eq!(loops, vec![(0, 12)]);
+        assert_eq!(
+            detect_bulk_zero_byte_fill_loop(&code, code.len(), 0, 12),
+            Some(BulkZeroByteFillLoop {
+                header_pc: 0,
+                array_local: 0,
+                iv_local: 1,
+                bound_local: 2,
+            })
+        );
+
+        let mut nonzero = code;
+        nonzero[7] = 0x04; // iconst_1
+        assert_eq!(
+            detect_bulk_zero_byte_fill_loop(&nonzero, nonzero.len(), 0, 12),
+            None,
+            "non-zero fills retain scalar code"
+        );
+
+        let mut mismatched_iv = code;
+        mismatched_iv[6] = 0x1d; // store index comes from local 3
+        assert_eq!(
+            detect_bulk_zero_byte_fill_loop(&mismatched_iv, mismatched_iv.len(), 0, 12),
+            None,
+            "the store index must be the loop induction variable"
+        );
+    }
+
+    #[test]
+    fn bulk_zero_byte_fill_executes_range_and_skips_empty_null_range() {
+        // int f(byte[] a, int i, int bound) {
+        //   for (; i <= bound; i++) a[i] = 0;
+        //   return i;
+        // }
+        let code = [
+            0x1b, // 0: iload_1
+            0x1c, // 1: iload_2
+            0xa3, 0x00, 0x0d, // 2: if_icmpgt -> 15
+            0x2a, // 5: aload_0
+            0x1b, // 6: iload_1
+            0x03, // 7: iconst_0
+            0x54, // 8: bastore
+            0x84, 0x01, 0x01, // 9: iinc 1, 1
+            0xa7, 0xff, 0xf4, // 12: goto -> 0
+            0x1b, // 15: iload_1
+            0xac, // 16: ireturn
+            0x00, 0x00,
+        ];
+        let compiled = compile(
+            &code,
+            17,
+            3,
+            3,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("bulk-zero loop should compile");
+
+        let byte_len = 8usize;
+        let mut words = vec![0u64; (HEADER_SIZE + byte_len + 7) / 8];
+        let array_ptr = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` is aligned and has room for the complete VM header
+        // plus eight data bytes.
+        unsafe {
+            (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(byte_len as i32);
+            std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 7, byte_len);
+        }
+
+        // SAFETY: the compiled method receives a correctly laid out live array.
+        let result = unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, 2, 5])
+                .expect("bulk-zero JIT call")
+        };
+        assert_eq!(result, 6);
+        // SAFETY: the eight-byte data region is within `words`.
+        let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+        assert_eq!(data, &[7, 7, 0, 0, 0, 0, 7, 7]);
+
+        // An empty range does not dereference the array, even when it is null.
+        // SAFETY: the bytecode exits at its condition before any array access.
+        let empty = unsafe { compiled.try_call(&[0, 6, 5]).expect("empty-range JIT call") };
+        assert_eq!(empty, 6);
+    }
+
+    #[test]
+    fn detects_and_executes_canonical_strided_byte_set_loop() {
+        // int f(byte[] a, int j, int bound, int step) {
+        //   for (; j <= bound; j += step) a[j] = 1;
+        //   return j;
+        // }
+        let code = [
+            0x1b, // 0: iload_1
+            0x1c, // 1: iload_2
+            0xa3, 0x00, 0x10, // 2: if_icmpgt -> 18
+            0x2a, // 5: aload_0
+            0x1b, // 6: iload_1
+            0x04, // 7: iconst_1
+            0x54, // 8: bastore
+            0x1b, // 9: iload_1
+            0x1d, // 10: iload_3
+            0x60, // 11: iadd
+            0x3c, // 12: istore_1
+            0xa7, 0xff, 0xf3, // 13: goto -> 0
+            0x00, 0x00, // 16: padding
+            0x1b, // 18: iload_1
+            0xac, // 19: ireturn
+            0x00, 0x00,
+        ];
+        let loops = detect_loops(&code, 20);
+        assert_eq!(loops, vec![(0, 13)]);
+        assert_eq!(
+            detect_bulk_set_byte_stride_loop(&code, 20, 0, 13),
+            Some(BulkSetByteStrideLoop {
+                header_pc: 0,
+                array_local: 0,
+                iv_local: 1,
+                bound_local: 2,
+                step_local: 3,
+            })
+        );
+        let mut wrong_value = code;
+        wrong_value[7] = 0x03; // iconst_0
+        assert_eq!(
+            detect_bulk_set_byte_stride_loop(&wrong_value, 20, 0, 13),
+            None,
+            "only the canonical unit store is specialized"
+        );
+        let mut changing_step = code;
+        changing_step[10] = 0x1b; // iload_1: the IV cannot also be its step
+        assert_eq!(
+            detect_bulk_set_byte_stride_loop(&changing_step, 20, 0, 13),
+            None,
+            "the cached step must be loop-invariant"
+        );
+
+        let compiled = compile(
+            &code,
+            20,
+            4,
+            4,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("strided byte-set loop should compile");
+        let byte_len = 8usize;
+        let mut words = vec![0u64; (HEADER_SIZE + byte_len + 7) / 8];
+        let array_ptr = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` is aligned and contains the VM header plus data.
+        unsafe {
+            (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(byte_len as i32);
+        }
+        // SAFETY: the compiled method receives a correctly laid out live array.
+        let result = unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, 1, 7, 2])
+                .expect("strided byte-set JIT call")
+        };
+        assert_eq!(result, 9);
+        // SAFETY: the eight-byte data region is within `words`.
+        let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+        assert_eq!(data, &[0, 1, 0, 1, 0, 1, 0, 1]);
+
+        // A bound beyond the array conservatively takes the scalar path. This
+        // particular stride never reaches the invalid index, so it still
+        // completes normally and demonstrates that guard failure preserves
+        // the bytecode's exact store sequence.
+        unsafe {
+            std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 0, byte_len);
+        }
+        // SAFETY: the array is live and every reached strided index is valid.
+        let conservative = unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, 1, 8, 2])
+                .expect("conservative scalar fallback call")
+        };
+        assert_eq!(conservative, 9);
+        // SAFETY: the eight-byte data region is within `words`.
+        let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+        assert_eq!(data, &[0, 1, 0, 1, 0, 1, 0, 1]);
+
+        // Empty ranges retain Java's condition-before-array-access behavior.
+        // SAFETY: the loop exits before dereferencing the null array.
+        let empty = unsafe {
+            compiled
+                .try_call(&[0, 8, 7, 2])
+                .expect("empty-range strided JIT call")
+        };
+        assert_eq!(empty, 8);
+    }
+
+    #[test]
+    fn detects_and_executes_canonical_byte_sieve_loop_nest() {
+        // Exact javac shape of CratonBench.sieve(boolean[], int).
+        let code = [
+            0x03, 0x3d, // 0: int i/count = 0
+            0x1c, 0x1b, 0xa3, 0x00, 0x0d, // 2: clear-loop header -> 17
+            0x2a, 0x1c, 0x03, 0x54, // 7: a[i] = 0
+            0x84, 0x02, 0x01, 0xa7, 0xff, 0xf4, // 11: i++; goto 2
+            0x03, 0x3d, 0x05, 0x3e, // 17: count=0; outer i=2
+            0x1d, 0x1b, 0xa3, 0x00, 0x2b, // 21: outer header -> 66
+            0x2a, 0x1d, 0x33, 0x9a, 0x00, 0x1f, // 26: if (a[i]) -> 60
+            0x84, 0x02, 0x01, // 32: count++
+            0x1d, 0x1d, 0x60, 0x36, 0x04, // 35: j=i+i
+            0x15, 0x04, 0x1b, 0xa3, 0x00, 0x11, // 40: inner header -> 60
+            0x2a, 0x15, 0x04, 0x04, 0x54, // 46: a[j] = 1
+            0x15, 0x04, 0x1d, 0x60, 0x36, 0x04, // 51: j += i
+            0xa7, 0xff, 0xef, // 57: goto 40
+            0x84, 0x03, 0x01, 0xa7, 0xff, 0xd6, // 60: i++; goto 21
+            0x1c, 0xac, // 66: return count
+            0x00, 0x00,
+        ];
+        let loops = detect_loops(&code, 68);
+        assert!(loops.contains(&(21, 63)), "outer loop missing: {loops:?}");
+        assert_eq!(
+            detect_byte_sieve_loop(&code, 68, 21, 63),
+            Some(ByteSieveLoop {
+                header_pc: 21,
+                array_local: 0,
+                outer_iv_local: 3,
+                bound_local: 1,
+                count_local: 2,
+                inner_iv_local: 4,
+            })
+        );
+
+        let compiled = compile(
+            &code,
+            68,
+            2,
+            5,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("canonical byte sieve should compile");
+
+        let byte_len = 32usize;
+        let mut words = vec![0u64; (HEADER_SIZE + byte_len + 7) / 8];
+        let array_ptr = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` is aligned and contains the VM header plus data.
+        unsafe {
+            (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(byte_len as i32);
+            std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 7, byte_len);
+        }
+        // SAFETY: the compiled method receives a correctly laid out live array.
+        let count = unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, 31])
+                .expect("canonical byte-sieve JIT call")
+        };
+        assert_eq!(count, 11);
+        // SAFETY: the 32-byte data region is within `words`.
+        let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+        for prime in [2usize, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31] {
+            assert_eq!(data[prime], 0, "{prime} must remain prime");
+        }
+        for composite in [4usize, 6, 8, 9, 10, 12, 15, 21, 25, 27, 30] {
+            assert_eq!(data[composite], 1, "{composite} must be marked");
+        }
+
+        // Both counted loops are zero-trip, so a null array is not touched.
+        // SAFETY: the original bytecode exits both headers before array access.
+        let empty = unsafe {
+            compiled
+                .try_call(&[0, -1])
+                .expect("empty canonical byte-sieve call")
+        };
+        assert_eq!(empty, 0);
     }
 
     #[test]
@@ -36216,9 +37144,9 @@ mod flag_and_header_contracts {
         let src = include_str!("x64.rs");
         // Needles assembled at runtime so this test's own text is not counted.
         let cases: [(&str, &str, usize); 4] = [
-            ("HEADER_SIZE", " as u8", 32),
+            ("HEADER_SIZE", " as u8", 35),
             ("HEADER_SIZE", " as i32", 13),
-            ("ARRAY_LENGTH_OFFSET", " as u8", 20),
+            ("ARRAY_LENGTH_OFFSET", " as u8", 23),
             ("ARRAY_LENGTH_OFFSET", " as i32", 5),
         ];
         for (base, suffix, expected) in cases {

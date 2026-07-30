@@ -711,6 +711,46 @@ fn mapper_natives_enabled() -> bool {
     )
 }
 
+/// `CRATONVM_DBG_MAPPER=1` reports `native_mapper_internal_map`'s memo hit rate.
+///
+/// Known-issue tomcat/32 recorded the memo's effectiveness as unmeasured and
+/// guessed it was permanently unusable for a host that selects a context but no
+/// version. The counters below exist so that question is answered by a number
+/// rather than by reading the validity condition.
+fn mapper_dbg_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_DBG_MAPPER") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => false,
+        },
+    )
+}
+
+static MAPPER_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAPPER_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one `internalMap` outcome and print a running tally every 250k calls.
+fn mapper_memo_record(hit: bool) {
+    use std::sync::atomic::Ordering;
+    let counter = if hit {
+        &MAPPER_MEMO_HITS
+    } else {
+        &MAPPER_MEMO_MISSES
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    let hits = MAPPER_MEMO_HITS.load(Ordering::Relaxed);
+    let misses = MAPPER_MEMO_MISSES.load(Ordering::Relaxed);
+    let total = hits + misses;
+    if total % 250_000 == 0 {
+        eprintln!(
+            "[DBG_MAPPER] internalMap calls={total} memo_hits={hits} memo_misses={misses} \
+             hit_rate={:.4}",
+            hits as f64 / total as f64
+        );
+    }
+}
+
 /// Copy a `CharChunk`'s `[start, end)` characters out of the heap ONCE, using
 /// the bulk reader, so a caller that scans the same range repeatedly does not
 /// pay a `get_array_element` VM round trip per character per comparison.
@@ -1929,10 +1969,16 @@ fn native_mapper_internal_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 && contexts_key_now == entry.contexts_key
                 && !paused_now
             {
+                if mapper_dbg_enabled() {
+                    mapper_memo_record(true);
+                }
                 mapper_apply_fast_entry(ctx, &entry, mapping_data, uri_chunk);
                 return Ok(None);
             }
         }
+    }
+    if mapper_dbg_enabled() {
+        mapper_memo_record(false);
     }
     let mut mapped_host =
         mapper_exact_find_chunk_range(ctx, hosts, host_chunk, host_start, host_end, true);

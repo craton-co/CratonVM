@@ -337,6 +337,27 @@ pub fn inline_tlab_new_enabled() -> bool {
     })
 }
 
+/// Default-on removal of redundant per-object zero stores from inline TLAB
+/// allocation.
+///
+/// Every production `VmHeap::refill_tlab` backend returns a fully zeroed
+/// chunk. Reclaimed generational spans are cleared before reuse, and G1
+/// applies the same contract when carving Eden. The inline allocator can
+/// therefore stamp only the non-zero / shape-defining header words before
+/// publishing the cursor instead of clearing every body/header word again.
+/// This is especially material for allocation storms: a compact two-reference
+/// node drops seven zero stores while preserving JVM default initialization.
+///
+/// Opt out with `CRATONVM_NO_JIT_TLAB_ZERO_ELISION=1` to restore the defensive
+/// per-object clears for bisection.
+pub fn inline_tlab_zero_elision_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_TLAB_ZERO_ELISION").is_none()
+    })
+}
+
 pub(super) fn inline_site_is_fresh_ctor_first_store(
     site: &crate::InlineSite,
     cpc: usize,
@@ -955,6 +976,23 @@ pub(super) fn jit_safepoint_polls_enabled() -> bool {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
             .and_then(|v| v.into_string().ok())
             .is_none_or(|v| v != "0")
+    })
+}
+
+/// Default-on fast path for structurally GC-inert direct self recursion.
+///
+/// Such a method contains no allocation, no backward edge, and no call except
+/// the raw self-call that `try_compile` already proved resolves to this exact
+/// method. Its common recursive edge therefore cannot reach a safepoint. The
+/// cold native-stack-overflow guard remains a normal safepoint and deliberately
+/// publishes an incomplete moving-young map, forcing that exceptional cycle to
+/// the safe non-moving fallback.
+pub(super) fn gc_inert_selfrec_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_GC_INERT_SELFREC")
+            .map_or(true, |v| !matches!(v.as_str(), "0" | "false" | "off"))
     })
 }
 
