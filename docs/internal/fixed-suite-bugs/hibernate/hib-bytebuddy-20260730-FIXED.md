@@ -133,8 +133,8 @@ A future blanket `net/bytebuddy/` guard fails the unit suite.
 
 Worktree `C:\craton\CratonVM-bytebuddy-retire-20260730`, branch
 `codex/fix-bytebuddy-retire-20260730` merged up to `origin/dev`, binary
-`C:\craton\bb-retire-20260730\cratonvm-bbretire-r10.exe`
-(SHA-256 `FEAAAB0A26D8C17A97952AA9EB9339ACFF1421134DC04F7433D168A6F204B379`),
+`C:\craton\bb-retire-20260730\cratonvm-bbretire-r11.exe`
+(SHA-256 `69D2E62D530992D374AC2CE3AA87D832731128194E1680506182C69E3ABF5CDA`),
 JDK 25.0.3, manifest `crash302.txt` (the exact 302 classes from the 2026-07-28
 no-ban crash run), 6 shards, 900 s per-class cap, no
 `CRATONVM_JIT_ALLOW_PACKAGES` override.
@@ -168,7 +168,7 @@ No assumption-only row is counted as green anywhere in this table.
 | r3 (before any ANTLR rooting fixes) | 106/106 | 1, 15 |
 | r7 (parent/merge fixes) | 106/106, then 1 FAIL under 6-shard load | 2 |
 | r8 (index-based config iteration) | 106/106 | 0, 0, 0, 0, 1, 0 |
-| r10 (final, merged with dev's own rooting pass) | 106/106 | 0 in both corpus arms |
+| r10 / r11 (final, merged with dev's own rooting pass) | 106/106 | 0 in both corpus arms, twice |
 
 ### Unit tests
 
@@ -180,9 +180,11 @@ against dev's independently-written collections rooting pass they dropped to
 (`make_iterator_from_array`, `native_ad_iterator`, `alloc_unmod_list_itr`) were
 found and fixed.
 
-Six pre-existing environment/timing failures remain, all in files this branch
-does not touch (`tzdb` ×2, `proxy_selector` env vars, `StampedLock` ×2,
-`ForkJoinPool` quiescence).
+**Zero failures overall.** Six environment/timing tests (`tzdb` ×2,
+`proxy_selector` env vars, `StampedLock` ×2, `ForkJoinPool` quiescence) were
+failing on the intermediate trees; they are all in files this branch does not
+touch, and they went green when the final `dev` merge brought in that team's own
+test-triage work — confirming they were never this branch's.
 
 `vm/src/jit/skip_list.rs` carries the permanent gate test described in section 4.
 
