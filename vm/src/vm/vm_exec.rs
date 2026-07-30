@@ -9998,6 +9998,21 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // A thread blocks on the monitor it is contending for, or waits on the
         // one it called `wait()` on — never both, so prefer the contended one.
         let lock = contended.or(waiting);
+        // The native CountDownLatch compatibility implementation waits on the
+        // public latch monitor instead of materialising the JDK-private AQS
+        // synchronizer. Preserve that monitor's identity hash, but report the
+        // logical synchronizer class required by the JMM/ThreadInfo contract.
+        // A contended monitor always wins over a wait snapshot and must retain
+        // its physical class name.
+        let lock_class_name = if contended.is_none() {
+            waiting.and_then(|object| {
+                (self.class_name_of_id(self.class_id_of_object(object)).as_deref()
+                    == Some("java/util/concurrent/CountDownLatch"))
+                    .then(|| "java/util/concurrent/CountDownLatch$Sync".to_string())
+            })
+        } else {
+            None
+        };
         let (lock_owner_id, lock_owner_name) = match lock {
             Some(obj) => match self.shared.threads.monitors.current_owner(obj) {
                 // A thread never reports itself as the owner it is waiting on:
@@ -10021,6 +10036,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             thread_status,
             stack_trace: self.thread_stack_trace(thread_obj),
             lock,
+            lock_class_name,
             lock_owner_id,
             lock_owner_name,
             locked_monitors,

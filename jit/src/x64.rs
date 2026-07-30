@@ -25579,6 +25579,19 @@ impl Compiler {
                                 continue;
                             }
 
+                            // Preserve Java arguments in a contiguous frame range for
+                            // the cold callee-sentinel service. A baked direct call has no
+                            // dispatch helper frame to recover them from when its own
+                            // exception table must run.
+                            let service_args_base = info_ptr.and_then(|_| {
+                                let base = self.reserve_spill_slots(arg_slots.len())?;
+                                for (i, slot) in arg_slots.iter().enumerate() {
+                                    self.load_slot_to_reg(R11, *slot);
+                                    let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
+                                    self.emit_store_local(off, R11);
+                                }
+                                Some(base)
+                            });
                             // Round-8 wave-3 HIGH fix: stack-arg setup
                             // for direct calls whose total arg count
                             // exceeds ARG_REGS. Uses platform ABI
@@ -25596,6 +25609,9 @@ impl Compiler {
                             // may allocate and trigger GC transitively.
                             self.emit_oop_map_for_safepoint();
                             self.emit_stack_arg_cleanup(total_sub);
+                            if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
+                                self.emit_inline_callee_deopt_check(info as *const crate::JitInvokeInfo, arg_slots.len(), args_base);
+                            }
 
                             // A directly-called compiled callee that throws
                             // (or deopts) returns the `i64::MIN` sentinel.
@@ -26056,6 +26072,12 @@ impl Compiler {
                         }
                     }
 
+                    // The direct exceptional-return service needs the same
+                    // invoke metadata as the normal dispatch fallback.
+                    let info_ptr = self
+                        .invoke_info_idx
+                        .get(&pc)
+                        .map(|&i| self.invoke_info[i].1);
                     // Check for direct call target (invokespecial with compiled callee)
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let direct = self.direct_calls_idx.get(&pc).map(|&i| {
@@ -27320,6 +27342,17 @@ impl Compiler {
                             }
                             arg_slots.reverse();
 
+                            // Preserve Java arguments for the cold direct-callee
+                            // exception-table service before call marshalling.
+                            let service_args_base = info_ptr.and_then(|_| {
+                                let base = self.reserve_spill_slots(arg_slots.len())?;
+                                for (i, slot) in arg_slots.iter().enumerate() {
+                                    self.load_slot_to_reg(R11, *slot);
+                                    let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
+                                    self.emit_store_local(off, R11);
+                                }
+                                Some(base)
+                            });
                             // Round-8 wave-3 HIGH fix: stack-arg setup for
                             // invokespecial/virtual direct calls whose
                             // receiver+params exceed ARG_REGS.
@@ -27344,6 +27377,9 @@ impl Compiler {
                                 self.emit_oop_map_for_safepoint();
                             }
                             self.emit_stack_arg_cleanup(total_sub);
+                            if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
+                                self.emit_inline_callee_deopt_check(info as *const crate::JitInvokeInfo, arg_slots.len(), args_base);
+                            }
 
                             // A directly-called compiled callee that throws (or
                             // deopts) returns the `i64::MIN` sentinel. Propagate
@@ -27992,6 +28028,11 @@ impl Compiler {
                                     }
                                     // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
                                     self.buf.emit(&[0x41, 0xFF, 0xD3]);
+                                    self.emit_inline_callee_deopt_check(
+                                        info,
+                                        n,
+                                        args_base_offset,
+                                    );
 
                                     // JMP rel32 → .done. Use rel32 because
                                     // for slots 0 and 1 the skip distance
