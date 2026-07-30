@@ -436,10 +436,11 @@ platform's ceiling rather than a wish list.
 
 A green checklist here is not a green build.
 
-`cargo test --workspace --no-fail-fast` on this branch, after merging `dev` at
-`cd451facc` and rebuilding: **13 failing tests across 6 targets**, out of a suite
-whose `cratonvm-vm --lib` leg alone runs 2,454. For scale, `dev` plus only the
-four compile fixes measured 48 at the start of this work.
+`cargo test --workspace --no-fail-fast` on this branch, after merging `origin/dev`
+at `0477c8851` and rebuilding from a tree with no stale release binary:
+**11 failing tests**, out of a suite whose `cratonvm-vm --lib` leg alone runs
+about 2,450. For scale, `dev` plus only the four compile fixes measured 48 at the
+start of this work.
 
 Treat that 48 as an order-of-magnitude comparison, not a subtraction. It was
 measured before `dev` moved and before the merge, and the earlier "39" quoted
@@ -448,21 +449,23 @@ merge** — the test helper prefers a release binary over a debug one, so every
 subprocess test in that run was validating pre-merge code. The number was wrong
 and is withdrawn rather than adjusted.
 
-Of the 13, two are worth naming because they are not what they look like:
+One of the 11 is worth naming because it is not what it looks like:
+`config_from_args_fails_loudly_when_no_jdk_is_available` passes alone and fails
+in-binary. It asserts real behaviour only when it wins the race to initialise
+the process-wide flag snapshot, so its harness's environment override is a
+no-op the rest of the time. Pre-existing, order-dependent, and filed at
+[`../../known-issues/libcratonvm-no-jdk-test-passes-only-when-it-runs-first-20260730.md`](../../known-issues/libcratonvm-no-jdk-test-passes-only-when-it-runs-first-20260730.md).
 
-- `root_snapshot_cache_tests::local_write_invalidates_cached_deep_frame_roots`
-  was broken *by a fix made on this branch* and is green again after reverting
-  it. See the ForkJoinPool item above — the suite caught it, which is the system
-  working.
-- `config_from_args_fails_loudly_when_no_jdk_is_available` passes alone and
-  fails in-binary: it asserts real behaviour only when it wins the race to
-  initialise the process-wide flag snapshot. Pre-existing, order-dependent, and
-  filed at
-  [`../../known-issues/libcratonvm-no-jdk-test-passes-only-when-it-runs-first-20260730.md`](../../known-issues/libcratonvm-no-jdk-test-passes-only-when-it-runs-first-20260730.md).
+The other 10 are the JIT `skip_list` / `conservative_roots` cluster, two
+class-loader-unload cases, two ConcurrentHashMap cases and the attach-listener
+socket — none of them touched by this work.
 
-The rest are the JIT `skip_list` / `conservative_roots` cluster, two
-class-loader-unload cases, two ConcurrentHashMap cases and a socket timeout —
-none of them touched by this work.
+A twelfth failure existed and is gone:
+`root_snapshot_cache_tests::local_write_invalidates_cached_deep_frame_roots` was
+broken *by a fix made on this branch*, and is green again after reverting it.
+See the ForkJoinPool item above. The suite catching a change that reasoned
+correctly and acted wrongly is the system working, and it is the reason that
+change is filed instead of shipped.
 
 `cargo fmt --all --check` is still red, deliberately, and it is still step 1 of
 CI. **Nothing in this file has ever run in CI**, because the job has not reached

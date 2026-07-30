@@ -70,7 +70,7 @@ the gate works is not.
 | | failing tests |
 |---|--:|
 | `origin/dev` + compile fixes only, before `dev` moved | 48 |
-| `fix/deep-audit-retire-20260730`, after merging `dev` at `cd451facc` | 13 |
+| `fix/deep-audit-retire-20260730`, after merging `origin/dev` at `0477c8851` | 11 |
 
 **A "39" previously stood in that second row and was wrong.** It was measured
 against a stale `target/release/cratonvm.exe` built before the merge:
