@@ -4076,8 +4076,10 @@ pub(crate) mod bigint;
 // Real crypto primitives (RustCrypto SHA/AES/RSA/ECDSA/X509/keystore). Always
 // compiled — the always-on JCA/TLS/x509 paths depend on it. Previously this was
 // a submodule of the feature-gated `crypto` module, which broke the
-// `--no-default-features` build; it now lives at the top level. `crypto.rs`
-// re-exports it as `crate::crypto::crypto_impl` for feature-on back-compat.
+// `--no-default-features` build; it now lives at the top level. There is no
+// `crypto.rs` re-export shim: the comment used to promise one, and the
+// `legacy-synthetic-crypto` call sites that still said `crate::crypto::`
+// were simply unbuildable under that feature until 2026-07-30.
 pub mod classfile_api;
 #[allow(dead_code)]
 pub mod classloader;

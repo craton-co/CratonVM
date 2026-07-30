@@ -136,9 +136,29 @@ figure is not demonstrated.
 census became the exact ratchet; the `synthetic-jdk` compile checks stayed
 blocking and an `experimental-features` job was added.
 
-One promotion was reverted after measuring it. `Test vm (synthetic-jdk)` was
-made blocking on the assumption that the module's old failure set had been
-worked through. It has not:
+Each promotion was then actually run. Results:
+
+| gate | promoted to blocking | verified |
+|---|---|---|
+| `Test native-builtins (synthetic-jdk)` | yes | **3,313 pass, 0 fail** — backed |
+| Semantic differential gate | yes | failed on a stale ledger; ledger refreshed, now **exit 0** — backed |
+| Exact stub ratchet | yes | **157 of 9,320, zero slack** — backed |
+| Markdown link check | added | **98 files** — backed |
+| Miri (`cratonvm-types --lib`) | added | run from this host; see the run log |
+| Fuzz build smoke | yes | **not verified** — needs `cargo-fuzz` + libFuzzer, which is a Linux/macOS toolchain; CI runs it on `ubuntu-latest` |
+| `Test vm (synthetic-jdk)` | yes | **not backed — reverted**, see below |
+
+The difftest one is worth its own note. It failed identically on `origin/dev`,
+and the stated reason for it having been advisory was wrong: the comment said
+the ledger might not reproduce off the Windows host that captured it, and it
+fails *on* Windows. The real cause was staleness — CratonVM's
+`ClassCastException` message was fixed from internal to source form
+(`java/lang/String` → `java.lang.String`) after the 2026-06-21 capture, so the
+recorded divergence had narrowed and the gate correctly flagged the change.
+Regenerating with the documented procedure makes it clean.
+
+`Test vm (synthetic-jdk)` was made blocking on the assumption that the module's
+old failure set had been worked through. It has not:
 
 ```
 declared   3927 tests

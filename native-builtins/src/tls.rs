@@ -7,7 +7,7 @@
 //! for TLS/SSL support in the CratonVM native layer.
 
 // The `tls_impl` submodule contains a TLS 1.3 handshake emulator that depends
-// on the crypto primitives in `crate::crypto::crypto_impl`. It is therefore
+// on the crypto primitives in `crate::crypto_impl`. It is therefore
 // gated behind `legacy-synthetic-crypto`; the rest of the javax.net.ssl surface in
 // this module is unconditional (NEW-13).
 #[cfg(feature = "legacy-synthetic-crypto")]

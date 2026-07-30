@@ -26,7 +26,7 @@ fn read_retry_eintr<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> std::io
 }
 
 #[cfg(feature = "legacy-synthetic-crypto")]
-use crate::crypto::crypto_impl;
+use crate::crypto_impl;
 use crate::lang_class::{mirror_class_id, native_class_is_record, native_class_is_sealed};
 use crate::lang_invoke::register_phase54_method_handle;
 use crate::lang_misc::register_phase53_record;

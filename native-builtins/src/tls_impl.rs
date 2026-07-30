@@ -639,7 +639,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 /// SHA-256 hash — delegates to the real implementation in crypto_impl.
 fn sha256(data: &[u8]) -> [u8; 32] {
-    use crate::crypto::crypto_impl::Sha256;
+    use crate::crypto_impl::Sha256;
     let mut h = Sha256::new();
     h.update(data);
     h.finalize()
@@ -1100,7 +1100,7 @@ impl Tls13StateMachine {
                 self.update_transcript(HT_CLIENT_HELLO);
                 // Generate cryptographically secure server random
                 {
-                    use crate::crypto::crypto_impl::SecureRandom;
+                    use crate::crypto_impl::SecureRandom;
                     let mut rng = SecureRandom::new();
                     rng.next_bytes(&mut self.server_random);
                 }
@@ -1180,7 +1180,7 @@ fn native_ssl_engine_do_handshake(
     match &engine.state {
         TlsState::Connected => Ok(Some(Value::Int(0))),
         TlsState::Start => {
-            let mut rng = crate::crypto::crypto_impl::SecureRandom::new();
+            let mut rng = crate::crypto_impl::SecureRandom::new();
             let mut client_random = [0u8; 32];
             rng.next_bytes(&mut client_random);
             let mut session_id = [0u8; 32];
