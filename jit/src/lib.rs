@@ -7932,7 +7932,7 @@ fn precise_exception_frame_sites_supported(
         // unconditional deopt trap, not to a call site that publishes a frame.
         if covered(pc)
             && may_throw_without_precise_frame(op)
-            && !matches!(op, 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xc2 | 0xc3)
+            && !matches!(op, 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xc2 | 0xc3)
         {
             return false;
         }
@@ -15454,12 +15454,23 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn protected_virtual_and_interface_calls_have_precise_exception_coverage() {
+    fn protected_virtual_and_interface_calls_stay_out_of_precise_exception_coverage() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
 
-        // The two variable-width invoke forms must stay admitted together.
-        // Both lower through emit_post_invoke_exception_check, which records
-        // the reason-9 frame before a local handler can observe its locals.
+        // 0xb6/0xb9 are deliberately NOT admitted. They were admitted once
+        // (2026-07-27) and removed again by a523715a84 together with the
+        // `protected_precise_handler_call` suppression in `x64.rs`, because
+        // admitting them let Spring's
+        // `SimpleApplicationEventMulticaster.invokeListener` compile and then
+        // read its own pre-`try` `errorHandler` local back as null inside the
+        // handler (springboot-rerun-20260728-small-residuals-cluster, Case 3).
+        //
+        // Re-widening is not free-standing work: it needs that Spring class
+        // (or an equivalent that actually compiles) re-verified first. Doc 23
+        // measured re-widening as worth NOTHING to
+        // `TestCharsetCachePerformance` now that `try`/`catch` methods reach
+        // the optimizing tier by other means, so there is no throughput
+        // argument for carrying the risk.
         let code = vec![
             0x2a, // 0: aload_0
             0xb6, 0x00, 0x01, // 1: invokevirtual #1
@@ -15478,7 +15489,7 @@ mod tests {
             handler_pc: 13,
             catch_type: 0,
         }];
-        assert!(precise_exception_frame_sites_supported(
+        assert!(!precise_exception_frame_sites_supported(
             &code,
             code.len(),
             &table,

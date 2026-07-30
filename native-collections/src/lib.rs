@@ -1745,15 +1745,30 @@ fn chm_seg_resize_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
     })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
-// Every CHM mutator holds a `ChmMonitorGuard`. This companion seqlock is the
-// cache-invalidating generation for a segment: odd while a writer may alter
-// nodes, even after publication. It is deliberately separate from the resize
-// epoch because resize nests inside a mutator.
+// Validity generation for the per-thread CHM String-node memo. Every CHM
+// mutator holds a `ChmMonitorGuard`, which bumps both striped counters below:
+// `SEG_MUTATION_ACTIVE` for as long as it may be altering nodes, and
+// `SEG_MUTATION_EPOCHS` once as it leaves. Deliberately separate from the
+// resize epoch, because a resize nests inside a mutator.
+//
+// A reader may memoize a node only if it saw `active == 0` both before and
+// after its chain walk AND the epoch did not move across it; validating a memo
+// hit later re-checks the same pair against the recorded epoch. Any mutator
+// whose window overlaps the walk is caught by one of those three observations,
+// because the epoch is bumped after the last node write and the in-flight
+// count is dropped after that.
+//
+// This is a counter plus an in-flight count rather than the usual single
+// odd/even parity word because a parity word needs the writers sharing one
+// stripe serialized against each other, and the only place to serialize them
+// is around `monitor_enter` — i.e. a host mutex held across a GC-safepoint
+// park. A thread blocked on such a mutex is not at a safepoint, so it would
+// stall every collection queued behind it.
 static SEG_MUTATION_EPOCHS: std::sync::OnceLock<
     [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
 > = std::sync::OnceLock::new();
-static SEG_MUTATION_LOCKS: std::sync::OnceLock<
-    [parking_lot::Mutex<()>; NUM_SEG_LOCKS],
+static SEG_MUTATION_ACTIVE: std::sync::OnceLock<
+    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
 > = std::sync::OnceLock::new();
 
 fn chm_seg_mutation_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
@@ -1763,10 +1778,20 @@ fn chm_seg_mutation_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 
     })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
-fn chm_seg_mutation_lock_for(seg_id: i32) -> &'static parking_lot::Mutex<()> {
+fn chm_seg_mutation_active(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
     let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    &SEG_MUTATION_LOCKS.get_or_init(|| std::array::from_fn(|_| parking_lot::Mutex::new(())))
-        [((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+    &SEG_MUTATION_ACTIVE.get_or_init(|| {
+        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+}
+
+/// `(epoch, in-flight mutators)` for the stripe owning `seg_id`. The in-flight
+/// count is read first so a snapshot can never pair an already-advanced epoch
+/// with a stale-low count.
+fn chm_seg_mutation_snapshot(seg_id: i32) -> (u64, u64) {
+    let active = chm_seg_mutation_active(seg_id).load(std::sync::atomic::Ordering::Acquire);
+    let epoch = chm_seg_mutation_epoch(seg_id).load(std::sync::atomic::Ordering::Acquire);
+    (epoch, active)
 }
 
 struct ChmSegmentResizeGuard {
@@ -1776,16 +1801,22 @@ struct ChmSegmentResizeGuard {
 
 impl ChmSegmentResizeGuard {
     fn acquire(seg_id: i32) -> Self {
+        // Take the stripe's write lock BEFORE marking the epoch odd, and
+        // release it after marking it even again. Bumping first would let two
+        // resizers sharing a stripe interleave their increments and leave the
+        // epoch EVEN while one of them is still relinking — which is exactly
+        // what an optimistic reader reads as "no resize in progress".
+        let lock = chm_seg_lock_for(seg_id).write();
         let epoch = chm_seg_resize_epoch(seg_id);
         epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Self { epoch, lock: Some(chm_seg_lock_for(seg_id).write()) }
+        Self { epoch, lock: Some(lock) }
     }
 }
 
 impl Drop for ChmSegmentResizeGuard {
     fn drop(&mut self) {
-        self.lock.take();
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.lock.take();
     }
 }
 
@@ -1832,11 +1863,12 @@ struct ChmMonitorGuard<'a> {
     /// write lock; every later toucher of that segment deadlocked). Drop
     /// re-reads the pin and exits the CURRENT address.
     pin: usize,
+    /// Bumped once on the way out, after the last node write. See
+    /// [`chm_seg_mutation_snapshot`].
     mutation_epoch: &'static std::sync::atomic::AtomicU64,
-    // Serializes writers sharing an epoch stripe. Without this, two distinct
-    // segments on one stripe could each increment the seqlock and make it
-    // appear even while one writer was still changing a node.
-    mutation_lock: Option<parking_lot::MutexGuard<'static, ()>>,
+    /// Held up (`+1`) for the whole guarded section, so a reader can tell
+    /// "a mutator is in flight on this stripe" from "a mutator has finished".
+    mutation_active: &'static std::sync::atomic::AtomicU64,
     /// Phantom borrow tying the guard's lifetime parameter `'a` to a
     /// surrounding scope at the type level. Using
     /// `fn() -> &'a mut dyn NativeContext` rather than `&'a mut …` directly
@@ -1851,9 +1883,9 @@ impl<'a> ChmMonitorGuard<'a> {
     fn acquire(ctx: &mut dyn NativeContext, seg: ObjectRef) -> Self {
         let pin = ctx.pin_native_root(seg);
         let seg_id = ctx.identity_hash_code(seg);
-        let mutation_lock = chm_seg_mutation_lock_for(seg_id).lock();
         let mutation_epoch = chm_seg_mutation_epoch(seg_id);
-        mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mutation_active = chm_seg_mutation_active(seg_id);
+        mutation_active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         ctx.monitor_enter(seg);
         // SAFETY: the guard MUST be dropped before the `&mut dyn NativeContext`
         // borrow ends. We transmute away the lifetime so the guard doesn't
@@ -1871,7 +1903,7 @@ impl<'a> ChmMonitorGuard<'a> {
             seg,
             pin,
             mutation_epoch,
-            mutation_lock: Some(mutation_lock),
+            mutation_active,
             _borrow: std::marker::PhantomData,
         }
     }
@@ -1897,9 +1929,9 @@ impl<'a> ChmMonitorGuard<'a> {
     fn acquire_gc_safe(ctx: &mut dyn NativeContext, seg: ObjectRef) -> (Self, ObjectRef) {
         let pin = ctx.pin_native_root(seg);
         let seg_id = ctx.identity_hash_code(seg);
-        let mutation_lock = chm_seg_mutation_lock_for(seg_id).lock();
         let mutation_epoch = chm_seg_mutation_epoch(seg_id);
-        mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mutation_active = chm_seg_mutation_active(seg_id);
+        mutation_active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let fixed = ctx.monitor_enter_gc_safe(seg);
         let fixed = ctx.read_native_pin(pin, fixed);
         // SAFETY: identical lifetime-erasure contract to `acquire` above.
@@ -1912,7 +1944,7 @@ impl<'a> ChmMonitorGuard<'a> {
                 seg: fixed,
                 pin,
                 mutation_epoch,
-                mutation_lock: Some(mutation_lock),
+                mutation_active,
                 _borrow: std::marker::PhantomData,
             },
             fixed,
@@ -1946,9 +1978,15 @@ impl<'a> Drop for ChmMonitorGuard<'a> {
             (*ctx_ptr).monitor_exit(seg);
             (*ctx_ptr).unpin_native_roots(pin);
         }));
+        // Order matters: the epoch must advance after the last node write
+        // (and after `monitor_exit` publishes it), and the in-flight count
+        // must drop only after that. A reader that sees `active == 0` on both
+        // sides of its walk with an unchanged epoch has therefore observed no
+        // mutation of this stripe across the walk.
         self.mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        self.mutation_lock.take();
+        self.mutation_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
         if result.is_err() {
             eprintln!(
                 "[CHM] monitor_exit panicked during ChmMonitorGuard::drop — ignoring to avoid double-panic abort"
@@ -7035,6 +7073,17 @@ fn native_hashmap_get_string_fast(
         }
         .into(),
     ))
+}
+
+/// Whether a cached virtual-native call is a two-object map lookup.
+///
+/// Both callbacks accept exactly `(receiver, key)` and preserve their own
+/// collision, equality, mutation and exception behavior. The interpreter uses
+/// this identity check only to reuse its prevalidated cached-native plumbing
+/// without re-resolving the already-known descriptor on every lookup.
+pub fn is_hot_map_get_native_callback(callback: cratonvm_native_api::NativeCallback) -> bool {
+    let callback = callback as usize;
+    callback == native_map_get as usize || callback == native_chm_get as usize
 }
 
 /// Exact-class HashMap get entry used after a receiver-ClassId guard.
@@ -37373,27 +37422,23 @@ fn chm_seg_get(
 /// exactly the code they ran before.
 fn native_chm_get_string_chain(
     ctx: &mut dyn NativeContext,
-    map: ObjectRef,
     seg: ObjectRef,
-    seg_id: i32,
     key: ObjectRef,
-    key_text: &str,
     hash: i32,
-    cache_generation: Option<u64>,
-) -> Option<Value> {
+) -> Option<(Value, Option<ObjectRef>)> {
     let buckets = match ctx.get_field_volatile(seg, MAP_FIELD_BUCKETS) {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => arr,
-        _ => return Some(Value::Object(None)),
+        _ => return Some((Value::Object(None), None)),
     };
     let cap = ctx.array_length(buckets) as i32;
     if cap <= 0 {
-        return Some(Value::Object(None));
+        return Some((Value::Object(None), None));
     }
     let mut node_value = ctx.get_array_element(buckets, map_bucket_index(hash, cap));
     const CHAIN_WALK_LIMIT: usize = 4096;
     for _ in 0..CHAIN_WALK_LIMIT {
         let Value::Object(Some(node)) = node_value else {
-            return Some(Value::Object(None));
+            return Some((Value::Object(None), None));
         };
         let Value::Object(Some(node_key)) = get_node_key(ctx, node) else {
             // CHM rejects null keys, so this is an unexpected node shape —
@@ -37403,19 +37448,23 @@ fn native_chm_get_string_chain(
         match ctx.java_strings_equal(node_key, key) {
             Some(true) => {
                 let value = get_node_value(ctx, node);
-                if let Some(generation) = cache_generation {
-                    ctx.chm_string_node_cache_put(map, seg_id, key, key_text, node, generation);
-                }
                 // An in-flight `computeIfAbsent` parks the segment object
                 // itself in the value slot as a reservation marker; lock-free
                 // readers must read that as absent, exactly as `chm_seg_get`
                 // does (CHM-mapper-deadlock fix, 2026-07-21).
+                //
+                // Handing back no memoizable node with it is what keeps that
+                // marker out of the per-thread node memo — a memo hit answers
+                // later lookups WITHOUT re-running this filter, and the
+                // `computeIfAbsent` phases that install and then replace the
+                // marker deliberately run outside `ChmMonitorGuard`, so they
+                // never bump the mutation epoch that would evict the entry.
                 if let Value::Object(Some(v)) = value {
                     if std::ptr::eq(v.as_ptr(), seg.as_ptr()) {
-                        return Some(Value::Object(None));
+                        return Some((Value::Object(None), None));
                     }
                 }
-                return Some(value);
+                return Some((value, Some(node)));
             }
             Some(false) => {}
             // A non-String key on the chain — hand the whole lookup back so
@@ -37432,47 +37481,61 @@ fn native_chm_get_string_fast(
     this: ObjectRef,
     key: ObjectRef,
 ) -> Option<Value> {
-    // The memo is keyed by the CHM receiver, not its segment. A validated hit
-    // therefore skips the String hash, segment-array access, and segment
-    // identity-hash minting that a regular CHM get requires.
+    // The memo is keyed by the CHM receiver and the exact key String object,
+    // not by its segment. A validated hit therefore skips the String hash, the
+    // segment-array access, and the segment identity-hash minting that a
+    // regular CHM get requires.
     if let Some((cached_seg_id, cached_generation, value)) =
         ctx.chm_string_node_cache_get_object(this, key)
     {
-        let cached_epoch = chm_seg_mutation_epoch(cached_seg_id);
-        if cached_generation & 1 == 0
-            && cached_epoch.load(std::sync::atomic::Ordering::Acquire) == cached_generation
-        {
+        let (epoch, active) = chm_seg_mutation_snapshot(cached_seg_id);
+        if active == 0 && epoch == cached_generation {
             return Some(value);
         }
     }
     let raw_hash = ctx.java_string_hash_code(key)?;
     let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
     let seg = chm_segment_for(ctx, this, hash)?;
-    let mutation_epoch = chm_seg_mutation_epoch(ctx.identity_hash_code(seg));
-    let generation = mutation_epoch.load(std::sync::atomic::Ordering::Acquire);
-    let cache_generation = if generation & 1 == 0 { Some(generation) } else { None };
-    /*
-     * A writer could have started after `generation` was sampled. Publishing
-     * under that older generation remains safe: its next lookup rechecks the
-     * seqlock and therefore cannot use the entry after the writer changes it.
-     */
-    let key_text = ctx.read_string(key)?;
     let seg_id = ctx.identity_hash_code(seg);
-    let epoch = chm_seg_resize_epoch(seg_id);
-    let before = epoch.load(std::sync::atomic::Ordering::Acquire);
-    if before & 1 == 0 {
-        let result = native_chm_get_string_chain(
-            ctx, this, seg, seg_id, key, &key_text, hash, cache_generation,
-        );
-        if epoch.load(std::sync::atomic::Ordering::Acquire) == before {
-            return result;
+    let before_mutation = chm_seg_mutation_snapshot(seg_id);
+
+    // Optimistic walk. The resize epoch is odd for exactly as long as a
+    // resizer holds this stripe's write lock, so an unchanged even epoch
+    // across the walk means no relinking overlapped it.
+    let resize_epoch = chm_seg_resize_epoch(seg_id);
+    let resize_before = resize_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let walked = if resize_before & 1 == 0 {
+        let result = native_chm_get_string_chain(ctx, seg, key, hash);
+        if resize_epoch.load(std::sync::atomic::Ordering::Acquire) == resize_before {
+            Some(result)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // The resize writer relinks existing node chains in place. If it overlapped
+    // the optimistic walk, redo the walk under the established stripe lock.
+    let (result, node) = match walked {
+        Some(result) => result?,
+        None => {
+            let _read_guard = chm_seg_lock_for(seg_id).read();
+            native_chm_get_string_chain(ctx, seg, key, hash)?
+        }
+    };
+
+    // Memoize only a node that no mutator touched across the walk. Re-sampling
+    // the stripe here, rather than trusting the pre-walk read, is what makes
+    // the recorded generation a promise about the walk itself.
+    if let Some(node) = node {
+        let after_mutation = chm_seg_mutation_snapshot(seg_id);
+        if before_mutation == after_mutation && before_mutation.1 == 0 {
+            if let Some(key_text) = ctx.read_string(key) {
+                ctx.chm_string_node_cache_put(this, seg_id, key, &key_text, node, before_mutation.0);
+            }
         }
     }
-
-    // The resize writer relinks existing node chains in place. If it overlaps
-    // the optimistic walk, retry under the established stripe lock.
-    let _read_guard = chm_seg_lock_for(seg_id).read();
-    native_chm_get_string_chain(ctx, this, seg, seg_id, key, &key_text, hash, cache_generation)
+    Some(result)
 }
 
 pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

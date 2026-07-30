@@ -1,7 +1,10 @@
 # `TestCharsetCachePerformance` — the cached paths lose to the uncached one
 
-**Status:** OPEN, **half fixed** (2026-07-27). The `timeFull < timeNone`
-assertion now PASSES; `timeLazy < timeNone` still fails.
+**Status:** OPEN, **half fixed** (last measured 2026-07-30). The
+`timeFull < timeNone` assertion now passes; `timeLazy < timeNone` still fails,
+by 4.0x. Read the final section first — it supersedes the running diagnosis
+below, and it reframes the residual as a *thread-scaling* wall in the dispatch
+helper rather than anything specific to charset caching.
 
 The RBC.6 admission gate described below as "why this was not fixed here" WAS
 subsequently fixed — see *Update* at the end — which is what flipped the first
@@ -305,7 +308,8 @@ cause on its own.
 
 The actual cause of the 7x is caller-side and is written up separately:
 [a callee that declares an exception table is barred from the inline-cache fast
-path](../jit-bans/exception-table-callee-barred-from-inline-cache-20260728.md).
+path](../../internal/jit-bans/exception-table-callee-barred-from-inline-cache-20260728.md)
+(itself FIXED 2026-07-30).
 Every call to such a method pays the full dispatch helper instead of the inline
 cascade, because the helper is the only place that can route a pending exception
 through the callee's own table.
@@ -321,3 +325,216 @@ flag; if a control that *cannot* move does move, the comparison is invalid.
 
 **Consequence for this document:** `timeLazy` is still expected to fail, and the
 reason is now the inline-cache ban, not the tier. Doc 23 stays OPEN.
+
+*(Superseded 2026-07-30: that inline-cache ban has since been fixed, and
+`timeLazy` still fails. See the final section.)*
+
+## Update 2026-07-30 — `timeFull` passes on merit; the residual is a thread-scaling wall
+
+Measured on the Azure Linux build host (16 cores, Temurin 25.0.3, load < 2),
+`origin/dev` @ `fcc723007` versus this branch, **interleaved on one host, three
+rounds each**, because the arms drift seconds run to run. Medians of the real
+class:
+
+| arm | dev | this branch | change |
+|---|---|---|---|
+| `NoCsCache` (control) | 35.2s | 35.7s | — (see the caveat) |
+| `FullCsCache` | 54.5s | 37.5s | **-31%** |
+| `LazyCsCache` | 237.8s | 158.5s | **-33%** |
+
+`assertTrue(timeFull < timeNone)` passes in 5 of 6 observed runs (ratio
+1.55 -> 0.96). `assertTrue(timeLazy < timeNone)` still fails, by 4.0x rather
+than 6.8x. **Doc 23 stays OPEN on the second assertion.**
+
+**Caveat on the control arm.** A first 3-run sample put `NoCsCache` at 35.1s on
+dev and 40.0s on this branch and looked like a systematic 13% regression. It is
+not. The arm was then measured alone (`NoArmOnly` — the arm's code copied
+verbatim) four times per binary: 31.9s vs 31.7s, with individual runs spanning
+**27s-37s on both**. `Charset.forName` is a native here
+(`native_charset_for_name`) whose profile is ~14% `RawMutex::lock_slow` on both
+binaries; at that contention three runs cannot resolve 13%. Do not read a single
+triple of this class as a regression signal.
+
+### What landed
+
+1. `native_chm_get` grew a per-thread String-node memo keyed by `(map, exact key
+   String object)` and validated against a striped generation counter that every
+   `ChmMonitorGuard` advances. A validated hit skips the String hash, the
+   segment-array walk and the segment identity-hash mint.
+2. That fast path's chain walk became optimistic: it reads the stripe's resize
+   seqlock instead of taking the stripe read lock, and redoes the walk under the
+   lock only when a resize overlapped it.
+3. The `String.to{Lower,Upper}Case` per-receiver memo became Locale-aware
+   (`(source, locale, upper)` rather than `(source, upper)`) and is checked
+   *before* the synthetic-Locale language lookup, so a repeated ASCII fold no
+   longer takes that contended path. With the key fixed, the four real-JDK
+   registrations that had been deliberately left uncached could adopt it.
+4. `StringLatin1.toLowerCase(String,byte[],Locale)` became a named callback, and
+   the interpreter's cached-invoke paths grew fast arms for it, for
+   `String.toLowerCase(Locale)` and for `Map.get(Object)`. Those cache entries
+   already prove receiver class and callback identity, yet the generic arm still
+   re-resolved the CP descriptor and allocated an argument `Vec` per call.
+5. The `HashMap` node memo is keyed on the key object instead of re-comparing
+   String contents on every probe.
+
+Isolated (`ForNameProbe2`): `toLowerCase(Locale.ENGLISH)` on a repeated receiver
+goes 2347 -> 1977 ns/op at one thread and 12536 -> 9819 ns/op at ten. A
+never-repeating receiver, where the memo cannot hit and can only cost, is
+unchanged at one thread and 8% faster at ten. `Charset.forName` itself is
+unchanged (2641 -> 2635 ns/op at one thread, 9281 -> 9232 at ten).
+
+### Three correctness defects in that memo, and how they were caught
+
+The memo as first written returned **the segment object itself** from
+`ConcurrentHashMap.get`. `native_chm_get_string_chain` published the node to the
+memo *before* the `computeIfAbsent` reservation-marker filter, and a memo hit
+answers later lookups without ever re-running that filter — so once a reader
+observed a key mid-`computeIfAbsent`, every later lookup of that key on that
+thread returned the internal marker. `ChmMemoStressProbe` (readers pinned to one
+key object, writers replacing and removing it, a grower forcing segment
+relinking, and a slow `computeIfAbsent` holding a marker) prints
+`FAIL reservation marker leaked: class cratonvm.synthetic.AnonymousObject$3`
+within seconds on that build, and passes on dev and on the fixed branch. The fix
+is structural: the chain walk hands back a memoizable node *only* for a value
+that survived the marker filter.
+
+Two more, from reviewing the same code:
+
+* `ChmSegmentResizeGuard` incremented the resize epoch **before** taking the
+  stripe write lock, so two resizers sharing a stripe could interleave their
+  increments and leave the epoch EVEN while one was still relinking — exactly
+  what an optimistic reader reads as "no resize in progress". Lock first, then
+  mark.
+* The generation counter was a parity word protected by a striped
+  `parking_lot::Mutex` held across `ChmMonitorGuard`'s `monitor_enter`, i.e.
+  across a GC-safepoint park. A thread blocked on that mutex is not at a
+  safepoint, so it stalls every collection queued behind it, and a nested guard
+  on a same-stripe segment closes an AB-BA cycle outright. Replaced with a
+  lock-free epoch plus an in-flight-mutator count: a reader may memoize only if
+  it saw zero in-flight mutators on both sides of its walk with an unchanged
+  epoch, which catches every overlapping mutator without serializing writers at
+  all.
+
+**Do not "harden" a memo hit with a `node.key == key` identity test.** The entry
+is published after a *content* comparison, and a CHM's stored key is almost never
+the same object as the lookup key — `CharsetCache` stores the name it built at
+construction and looks up a freshly lower-cased one. That test misses on every
+hit and silently disables the memo: it cost the `LazyCsCache` arm 156s -> 201s
+before the A/B above caught it.
+
+### The re-widened RBC.6 whitelist was reverted — it now buys nothing
+
+A first draft of this work re-added `0xb6`/`0xb9` to
+`precise_exception_frame_sites_supported`, restoring the 2026-07-27 widening
+described earlier in this document. That widening had been **removed again on
+dev the day before**, by `a523715a84`, together with the
+`protected_precise_handler_call` suppression in `x64.rs` — because it let
+Spring's `SimpleApplicationEventMulticaster.invokeListener` compile and then
+read its own pre-`try` `errorHandler` local back as null inside the handler
+(`springboot-rerun-20260728-small-residuals-cluster`, Case 3).
+
+Re-widening was A/B'd on this branch against itself, one line apart, two rounds:
+
+| arm | whitelist widened | whitelist as dev has it |
+|---|---|---|
+| `FullCsCache` | 36.3s / 38.7s | 36.0s / 37.5s |
+| `LazyCsCache` | 154.5s / 159.5s | 159.0s / 157.3s |
+
+**Indistinguishable.** The 2026-07-27 reasoning — that this whitelist is what
+lets `CharsetCache.getCharset` compile at all — no longer holds: `try`/`catch`
+methods now reach the optimizing tier by skipping handler bodies (`c05f85967a`),
+and the inline-cache ban on exception-table callees is itself fixed
+(`675799f47a`). So the widening would carry a known Spring correctness risk for
+zero measured throughput, and this branch keeps dev's narrower list. The unit
+test now pins the narrow contract and records what a future re-widening would
+have to re-verify first.
+
+### The real residual: CratonVM does not scale on this shape at all
+
+This is a **ten-thread** benchmark, which every earlier analysis in this document
+treated as incidental. `ScaleProbe` runs the same arm shapes at 1, 2, 4 and 10
+threads and reports ns/op *per thread*:
+
+| probe | dev 1t | dev 10t | branch 1t | branch 10t | HotSpot 1t | HotSpot 10t |
+|---|---|---|---|---|---|---|
+| `HashMap.get(name.toLowerCase(L))` | 1070 | 5231 | 675 | 3654 | 20.2 | 33.1 |
+| `toLowerCase(Locale)` alone | 797 | 4517 | 479 | 3502 | 11.3 | 18.8 |
+| `HashMap.get` alone | 369 | 3679 | 187 | 3837 | 6.6 | 12.7 |
+| `ConcurrentHashMap.get` alone | 1104 | 11888 | 494 | 3675 | 6.8 | 13.1 |
+
+At ten threads all four converge on ~3500-3800 ns/op **regardless of how much
+work the arm does** — a 3.6x spread at one thread collapses to nothing, and
+aggregate throughput is nearly flat from 1 to 10 threads. HotSpot's spread
+survives. The workload is serialized on something shared, and it is not the map
+and not the case conversion.
+
+`perf record -F 499` on that ten-thread run, flat:
+
+```
+13.45%  parking_lot::raw_rwlock::RawRwLock::lock_shared_slow
+ 8.97%  parking_lot::raw_mutex::RawMutex::lock_slow
+ 7.20%  [kernel]                                            (futex)
+ 6.75%  cratonvm_vm::jit::helpers::virtual_dispatch_target_for_receiver
+ 5.73%  cratonvm_vm::runtime::interpreter::try_jit_compile_callee
+ 4.68%  cratonvm_vm::jit::helpers::jit_getstatic
+ 4.46%  cratonvm_vm::jit::helpers::jit_invoke_virtual_mic
+ 2.98%  cratonvm_native_api::registry::NativeMethodRegistry::slot_for_exact
+```
+
+About a third of all CPU is lock acquisition, and the *parking* variants at
+that. `CRATONVM_DBG_MIC_PROF=1` names the path: **`hit_noentry` is 33% of all
+MIC calls** (3,762,994 of 11,461,404). That is the arm where the monomorphic
+inline cache matches the receiver class but holds no compiled entry, so the call
+
+1. calls `virtual_dispatch_target_for_receiver`, which takes
+   `vm.classes.class_manager.read()` just to turn the receiver's ClassId into a
+   name;
+2. then, in `jit_invoke_dispatch`, takes a **second** `class_manager.read()` for
+   `get_loaded_class_id(&target.class_name) == receiver_cid`; and
+3. re-runs `try_jit_compile_callee` for a callee that will never yield an entry.
+
+A **native** callee can never have a compiled entry, and both hot operations here
+— `String.toLowerCase(Locale)` and `Map.get` — are natives in CratonVM. So every
+one of the 100,000,000 lookups takes two acquisitions of one process-wide
+`RwLock` plus a failed compile probe. Reader-reader `parking_lot` contention on a
+single cache line at ten threads is exactly the flat ~3700 ns/op ceiling above.
+
+**Why it is not fixed here.** The obvious repair is a thread-local memo of
+`(call site, receiver ClassId) -> (dispatch class name, cacheable, globally
+named)`, flushed on the same three signals that already flush
+`VIRTUAL_DISPATCH_CACHE` (`any_class_redefined`, `jit_cache_generation`,
+`jit_supersede_epoch`). Two of the three components are safe to cache that way.
+`globally_named` is not: it is `get_loaded_class_id(name) == receiver_cid`, and
+that answer flips the moment a second loader defines the same name — a plain
+class *definition*, which none of those three signals covers. Caching a stale
+`true` would let a compiled entry be reused for a receiver whose name is no
+longer unique, i.e. dispatch into the wrong class's method: a silent-wrong-answer
+bug on the hottest path in the VM. The prerequisite is a class-definition/unload
+epoch counter on `ClassManager`, and there is none today (checked). With one,
+this is a small change, and it lifts a ceiling that applies to **every**
+multi-threaded workload whose inner loop crosses a native or an uncompilable
+callee — not just this test.
+
+The single-thread gap that remains (675 vs 20.2 ns/op on the full-cache arm) is
+the separate, already-known native-call dispatch overhead, and is not addressed
+here either.
+
+### Reproduction
+
+```bash
+# the arms, isolated, with a thread-count sweep — this is the useful one
+<cratonvm> --java-home <jdk25> -cp <probes> ScaleProbe 300000
+# the control arm alone; it is noisy, expect 27-40s, run it 4+ times per binary
+<cratonvm> --java-home <jdk25> -cp <probes> NoArmOnly
+# the memo's correctness net (fails in seconds on a memo that caches markers)
+<cratonvm> --java-home <jdk25> -cp <probes> ChmMemoStressProbe 20
+# where the ten-thread time goes
+perf record -F 499 -- <cratonvm> ... ScaleProbe 300000
+perf report --stdio --sort symbol
+CRATONVM_DBG_MIC_PROF=1 <cratonvm> ... ScaleProbe 100000    # hit_noentry share
+```
+
+Regression check for the change set: the 62 `org.apache.tomcat.util.{buf,
+collections,http}` / `org.apache.catalina.util` classes run identically on dev
+and on this branch — 59 PASS, the same two `*LargeHeap` failures (they want more
+than the 2g used here) and the same `TestMethodPerformance` timeout on both.

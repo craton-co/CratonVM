@@ -7493,6 +7493,20 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 index += 1;
                 continue;
             }
+            // NOTE: do NOT "harden" this with a `node.key == key` identity
+            // test. The entry was published after a CONTENT comparison
+            // (`java_strings_equal`), and a CHM's stored key is almost never
+            // the same object as the caller's lookup key — Tomcat's
+            // `CharsetCache` puts the name it built at construction and looks
+            // up a freshly lower-cased one. An identity test therefore misses
+            // on every hit and silently disables the memo (measured: the
+            // `LazyCsCache` arm goes 156s -> 201s). What makes the entry safe
+            // is the segment generation checked by the caller, plus the fact
+            // that no memoized node ever holds a `computeIfAbsent` reservation
+            // marker — the only CHM writes that skip `ChmMonitorGuard`, and so
+            // the only ones that do not advance that generation, are the
+            // marker install/replace phases, and `native_chm_get_string_chain`
+            // refuses to memoize a marker node.
             return Some((segment_id, generation, self.shared.mem.heap.get_field(entry_node, 2)));
         }
         None
