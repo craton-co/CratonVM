@@ -114,6 +114,12 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         region_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
         native_stack_floor_fn: native_stack_floor as *const () as usize,
         ldc_string: s,
+        // Wired to the same trap stub as every other call target in this
+        // table: both are reached through emit_call_absolute, so a 0 here
+        // is a null CALL (SIGSEGV), not an inert "unwired" sentinel.
+        set_throw_bci: s,
+        service_callee_deopt: s,
+        ..Default::default()
     }
 }
 

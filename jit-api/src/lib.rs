@@ -505,7 +505,23 @@ pub mod npe_action {
 /// JIT may read a field either by name or by computed byte offset; the
 /// default `repr(Rust)` layout is unspecified and the compiler is free to
 /// reorder fields, so a stable C layout is the only sound contract here.
-#[derive(Clone, Copy, Debug)]
+///
+/// `Default` (every field zero) exists for the integration tests in
+/// `jit/tests`, which build this table literally and wire up only the helpers
+/// they exercise. They spread `..Default::default()` so that adding a field
+/// here cannot break all of them at once — it did, for `service_callee_deopt`
+/// and `set_throw_bci`.
+///
+/// Zero is the right default only for the fields whose contract already reads
+/// 0 as unwired (`get_current_thread`, `safepoint_flag_addr`, the TLAB and
+/// card-table offsets, …), where the backend checks for it and falls back.
+/// It is NOT inert for a field the backend reaches via `emit_call_absolute`:
+/// there a 0 is a CALL to a null pointer. If you add a call-target helper,
+/// expect the `jit/tests` tables to need it wired explicitly to their local
+/// trap stub, exactly as `set_throw_bci` / `service_callee_deopt` are.
+/// Production builds always go through `build_helpers`, which populates every
+/// field explicitly.
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct JitRuntimeHelpers {
     pub newarray: usize,

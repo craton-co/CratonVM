@@ -304,3 +304,161 @@ interprets until RBC.7's premise is removed (direction 2: link
 
 Sibling doc `23-charsetcache-pathological-slowdown.md` shares this gate and was
 half-closed by the same change (its `timeFull < timeNone` assertion now passes).
+
+## Update 2026-07-30 — ban 1's premise is removed, and a SECOND gate is found behind it
+
+Direction 2 ("link `invokedynamic` in compiled code instead of lowering it to a
+trap") is now implemented, narrowly, for `StringConcatFactory` sites. **RBC.7 no
+longer refuses `testGetMethodPerformance`.** It still does not OSR — because a
+second, completely independent gate refuses the same entry, and that gate was
+invisible for as long as RBC.7 bailed first.
+
+### What was built
+
+A resolved concat call site is lowered to a direct call instead of an uncommon
+trap:
+
+* `vm/src/runtime/invokedynamic.rs` — `make_jit_string_concat_site_from_parts`
+  resolves a bootstrap to a process-lived `JitStringConcatSite` (recipe +
+  constants + target descriptor), or `None` for every other bootstrap kind.
+  `execute_jit_string_concat_raw` decodes the JIT's raw i64 arg buffer **through
+  the call site's descriptor** before any Java code runs, so a category-2 value
+  is never reclassified from its bit pattern.
+* `jit/src/x64.rs` — the `0xba` arm calls that bridge when a site resolved;
+  every other bootstrap still falls through to the existing trap.
+* `vm/src/runtime/interpreter.rs` — RBC.7's blanket
+  `if !scan.indy_ops.is_empty() { return None; }` becomes a *bridged-only*
+  admission, evaluated after `indy_info` resolves. A method with any unbridged
+  indy is still refused, and logs
+  `[cratonvm-jitc] osr-DENY (unbridged invokedynamic)`.
+
+`has_indy_trap` is now computed from *unbridged* sites only, so a fully bridged
+method no longer forces its callers onto the dispatch helper.
+
+### The result — ban 1 is cleared, and it was not the only blocker
+
+```
+[cratonvm-jitc] bg-compile OsrConcatProbe.main([Ljava/lang/String;)V tier=C2 optimized=true osr_bci=4
+[cratonvm-jitc] indy-concat bridge pc=25 args=1
+[cratonvm-jitc] indy-concat bridge pc=56 args=1
+[cratonvm-jitc] OSR-reject OsrConcatProbe.main([Ljava/lang/String;)V entry_pc=4 (dead_mask non-zero; memoed)
+```
+
+The bridge fires, no `osr-DENY` is logged — RBC.7 passed. The OSR body then
+*compiles successfully* and is refused at the door by
+`CompiledMethod::can_osr_enter`, which rejects any entry pc whose
+`osr_dead_mask` is non-zero. Identical on the real shape
+(`OsrMessageBytesProbe`, `entry_pc=24`, bridge at `pc=62`).
+
+**So the doc's original root-cause list was incomplete.** Removing RBC.7 does
+not make `testGetMethodPerformance` OSR; it only moves the refusal one gate
+later. Anyone measuring direction 2 in isolation and seeing no speedup should
+look here before concluding the bridge is broken.
+
+### The second gate, precisely
+
+`CRATONVM_DBG_OSR_META=1` prints the published mask:
+
+```
+[osr-meta] gpr_resident=0xb xmm_resident=0x0
+           blanket_entries=[(0,a),(4,1),(a,1),(15,9),(23,1),(29,1),(34,9)]
+           published_entries=[(0,8),(4,1),(a,1),(23,1),(29,1)] unblocked=2
+```
+
+At `entry_pc=4` the mask is `0x1` — local 0 (`args`). It is **dead** at the loop
+head but register-resident, and it shares a home GPR with a live local
+(graph-colouring coalescing reused the register once `args`'s range ended).
+Entering there would load the interpreter's stale `args` over the live local's
+register.
+
+The obvious fix — *don't load dead locals at entry* — *is already implemented*
+in the OSR trampoline (`jit/src/lib.rs`, the `dead_mask >> i & 1` `continue`,
+added 2026-06-03 in `62e65640f`), and it is **not sufficient**. The guard that
+currently short-circuits it was added **after**, on 2026-07-03 in `3415d052b`
+("fix(jit): reject unsafe OSR dead-local entries"), whose own write-up says
+skipping the load "still left the OSR-entered compiled frame relying on a
+coalesced state transition that was not proven safe". The root problem is that
+`osr_local_assignments` is a **whole-method** table: it cannot express "at this
+pc this register belongs to local *j*, not local *i*". Two tests pin the
+refusal (`test_can_osr_enter_rejects_dead_masked_entry`,
+`test_osr_enter_rejects_dead_mask_before_trampoline`).
+
+**Do not simply delete that guard.** Making this entry safe means giving OSR a
+per-pc local→location map, not relaxing the check.
+
+### Correctness evidence for the bridge
+
+`ConcatBridgeProbe` drives 14 distinct `makeConcatWithConstants` shapes from a
+hot loop — `int`, `long` (full 64-bit, `(i<<33)^i`), `double`, `float`, `char`,
+`boolean`, `byte`, `short`, a null `String`, a null `Object`, mixed arity with
+interleaved category-2 values, and the no-constant / bracketed forms — and FNV
+checksums every string produced:
+
+| | acc | sample |
+|---|---|---|
+| HotSpot JDK 25 | 510489415044571348 | `m=199999:1717978328665407:99999.5:s7` |
+| CratonVM, JIT | 510489415044571348 | identical |
+| CratonVM, `--nojit` | 510489415044571348 | identical |
+
+19 `indy-concat bridge` lowerings were logged in the JIT run, so the bridge is
+genuinely on the measured path rather than being bypassed.
+
+`OsrConcatProbe` (the exact loop-then-`println("..."+total)` shape RBC.7 was
+written to protect) returns `first=12499997500000 second=24999995000000`,
+matching HotSpot — no duplicate loop execution.
+
+Five Tomcat classes A/B against a pure-`origin/dev` binary built on the same
+host: `TestMessageBytes` (8), `TestByteChunk` (8), `TestCharChunk` (3),
+`TestStringCache` (1), `TestCookieParsing` (8) — all `OK`, identical both sides.
+
+Throughput is neutral, as expected while the second gate still blocks OSR —
+interleaved A/B, `OsrMessageBytesProbe` 500k, quiet host (load 0.8):
+
+| round | base (ns) | new (ns) |
+|---|---|---|
+| 1 | 8 697 986 374 | 8 530 225 215 |
+| 2 | 8 474 439 293 | 8 748 237 515 |
+| 3 | 8 573 803 178 | 8 585 377 862 |
+
+~0.5% apart on the means, inside the baseline's own 2.6% run-to-run spread.
+
+### Deliberately NOT ported from the handover branch
+
+The originating worktree (`codex/fix-tomcat-hotloop-jit-admission-20260728`,
+based 187 commits behind) also carried three changes that were **dropped** here:
+
+1. **The RBC.6 admission-gate rewrite.** It deleted the `return false` in
+   `precise_exception_frame_sites_supported`, leaving an empty `if` whose
+   comment still claims it checks something — i.e. the gate admits everything.
+   That is a much larger safety change than this doc needs, it re-opens what
+   `a523715a8` ("Fix Spring Boot residual exception-handler cluster") closed on
+   2026-07-29 by re-admitting `0xb6`/`0xb9`, and it collides head-on with the
+   still-unmerged `codex/fix-tomcat-charsetcache-complete-20260729-019fb049`,
+   which re-widens the same line *with* a regression test. RBC.7 is a separate
+   gate; none of this was required.
+2. **The generic protected-range exact-resume trap** in `x64.rs`, which existed
+   only to justify (1).
+3. **`RETIRED_COMPILED_METHODS`** — process-lifetime retention of every
+   superseded compiled body. `dev` already solves that problem properly with
+   `defer_jit_owner` (drop immediately when no JIT execution is in flight,
+   otherwise hold until `ACTIVE_JIT_EXECUTIONS` hits zero).
+
+`DIRECT_CALLEE_EXCEPTION_ROUTE_TAG` (admitting exception-table callees as
+tagged direct calls instead of refusing them) was also left out — it is an
+independent optimisation, not part of ban 1.
+
+### Unrelated breakage found on `dev`
+
+`cargo test -p cratonvm-jit` **does not compile on `origin/dev`**: 11 integration
+tests fail with `E0063: missing fields service_callee_deopt and set_throw_bci in
+initializer of JitRuntimeHelpers`. Identical count on a pure-`origin/dev`
+checkout and on this branch, so it predates this work — but it means that suite
+is currently unavailable as a regression gate for anyone touching the JIT.
+
+### Status
+
+Ban 1 (RBC.7) — **premise removed** for string-concat sites; the ban now only
+covers unbridged bootstraps. Ban 2 (RBC.6) — see doc 23, unchanged here. Ban 3
+(constructor) — unchanged. **This document stays OPEN**: the 730x class-level
+gap is untouched, and the next lever is no longer an admission ban at all but
+the per-pc local→location map that `can_osr_enter` needs.

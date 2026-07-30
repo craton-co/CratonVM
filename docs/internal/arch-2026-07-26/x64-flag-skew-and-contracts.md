@@ -418,11 +418,12 @@ fails, this table is stale.
 | Pattern | Count | Encoding | Line numbers |
 | --- | ---: | --- | --- |
 | `HEADER_SIZE as u8` via `buf.emit_byte(..)` | 17 | ModRM **disp8** | 14608, 14632, 17106, 17117, 17129, 17138, 17156, 17175, 17201, 17223, 17234, 17248, 17260, 17272, 17283, 20078, 20112 |
-| `HEADER_SIZE as u8` inside a literal instruction byte array | 14 | **disp8** / imm8 | 23746, 23755, 23981, 24104, 24107, 24232, 25130, 25142, 25199, 25211, 25366, 25369, 26068, 26086 |
+| `HEADER_SIZE as u8` inside a literal instruction byte array | 15 | **disp8** / imm8 | 14282 (matrix-dot B value), 23746, 23755, 23981, 24104, 24107, 24232, 25130, 25142, 25199, 25211, 25366, 25369, 26068, 26086 |
 | `(HEADER_SIZE as i32).to_le_bytes()` | 10 | **disp32** / imm32 | 13063, 13144, 13199, 13285, 13580, 13588, 13596, 13674, 13680, 13689 |
 | `HEADER_SIZE as i32` (bare) | 1 | disp32 | 25881 |
+| `HEADER_SIZE as i32` in a computed matrix-dot displacement | 2 | **disp8** after range-bounded arithmetic | 14233 (B row), 14235 (A element) |
 | `HEADER_SIZE` in compile-time arithmetic | 18 | not emitted directly | 64 (import), 14880, 14959, 15070, 15164, 15166, 22109, 22110, 22313, 22552, 22641, 27247, 28426, 29437, 29461, 29476, 29491, 29507, 29529 |
-| `ARRAY_LENGTH_OFFSET as u8` | 16 | **disp8** | 17289, 17452, 18886, 18976, 23706, 23716, 23968, 24064, 24068, 24234, 25094, 25175, 25220, 25351, 25354, 26042 |
+| `ARRAY_LENGTH_OFFSET as u8` | 20 | **disp8** | 14265, 14359, 14389, 14394 (matrix-dot guards), 17289, 17452, 18886, 18976, 23706, 23716, 23968, 24064, 24068, 24234, 25094, 25175, 25220, 25351, 25354, 26042 |
 | `ARRAY_LENGTH_OFFSET as i32` | 5 | disp32 | 25497, 25503, 25607, 25723, 25728 |
 | `NUM_SLOTS_OFFSET as i32` | 4 | disp32 | 14915, 15239 (inline TLAB `shape`), 22614, 22689 |
 | `GC_FLAGS_OFFSET as i32` | 11 | disp32 | 14671, 14690, 14890, 14900, 14965, 14972, 22144, 22351, 22591, 22600, 22669 |
@@ -432,9 +433,9 @@ fails, this table is stale.
 | `IDENTITY_HASH_CODE_OFFSET as i32` | 1 | disp32 | 15234 (was bare `8`) |
 | `NUM_SLOTS_OFFSET` in Rust pointer arithmetic | 1 | n/a | 29422 |
 
-Totals: **31** `HEADER_SIZE` disp8 sites, **11** `HEADER_SIZE` disp32 sites, **18**
-compile-time-arithmetic uses, **21** `ARRAY_LENGTH_OFFSET` sites, **23** other named
-header-offset sites. **104 sites** in this file.
+Totals: **34** `HEADER_SIZE` disp8 sites, **11** `HEADER_SIZE` disp32 sites, **18**
+compile-time-arithmetic uses, **25** `ARRAY_LENGTH_OFFSET` sites, **23** other named
+header-offset sites. **111 sites** in this file.
 
 The four rows marked "was bare" are the whole of this session's mechanical change to §6:
 three bare integer literals (`4`, `8`, `4`) inside `emit_inline_tlab_new` became named
@@ -444,11 +445,11 @@ constants, and the `<< 24` compact-flag shift became
 ### 6.3 What the shrink actually has to deal with
 
 1. **`HEADER_SIZE` shrinking 32 → 16 is value-safe for every disp8 site.** 16 still fits a
-   signed byte. Those 31 sites need no encoding change; they recompile correctly.
+   signed byte. Those 34 sites need no encoding change; they recompile correctly.
 2. **`ARRAY_LENGTH_OFFSET` / `NUM_SLOTS_OFFSET` is the harder surface.** It is `12` today
    and *will* move in a 16-byte header (`class_id`(4) + kind-word(4) + `shape`(4) = 12
-   leaves only 4 bytes, so the mark word cannot fit at 16 unless `shape` moves). 21 sites
-   bake it, 16 of them as disp8. All are mechanical **provided** the new offset still fits
+   leaves only 4 bytes, so the mark word cannot fit at 16 unless `shape` moves). 25 sites
+   bake it, 20 of them as disp8. All are mechanical **provided** the new offset still fits
    disp8 — it will, but nothing asserts it. The `#[cfg(test)]`
    `header_size_fits_signed_disp8_and_is_qword_aligned` added this session now asserts
    `i8::try_from(ARRAY_LENGTH_OFFSET).is_ok()` so the shrink trips a test rather than
