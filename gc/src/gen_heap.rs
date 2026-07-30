@@ -973,18 +973,17 @@ impl GenerationalHeap {
     ///   - 4 GiB heap (-Xmx4g):  young_semi = 512 MiB (ceiling 1 GiB)
     ///   - 16 GiB heap:          young_semi = 512 MiB (ceiling 4 GiB)
     ///
-    /// The young semi-space can still *grow* up to
-    /// `young_semi * MAX_HEAP_EXPANSION_FACTOR` after a low-reclamation
-    /// minor GC (see the expansion logic in `collect_garbage_inner`).
+    /// The young semi-space can still grow after a low-reclamation minor GC
+    /// (see `collect_garbage_inner`). Its stable upper bound remains the
+    /// uncapped `total / 4` value.
     pub fn with_capacity(total_bytes: usize) -> Self {
         let total = total_bytes.max(4096);
         // Young takes 1/2 of total, split across from+to semi-spaces (so
         // each semi gets 1/4 of total). The other half goes to old gen.
         let young_semi_raw = total / 4;
-        // Clamp: floor at 512 bytes (the smallest test heap) so very
-        // tiny test heaps still produce a non-trivial arena. No ceiling —
-        // the user passed -Xmx N to get N bytes of heap, not "N capped
-        // at some arbitrary internal constant".
+        // Floor the growth ceiling at 512 bytes so tiny test heaps still
+        // produce a non-trivial arena. Cap only the initial semi-space;
+        // `max_young_semi` retains the user's proportional `-Xmx` capacity.
         const YOUNG_SEMI_MIN: usize = 512;
         let max_young_semi = young_semi_raw.max(YOUNG_SEMI_MIN);
         let young_semi = max_young_semi.min(MAX_INITIAL_YOUNG_SEMI_SIZE);
@@ -11763,15 +11762,14 @@ mod tests {
     }
 
     /// Regression: `with_capacity` starts with a compact young semi-space
-    /// with the total heap requested — no hidden internal cap.
+    /// while preserving the proportional capacity requested by `-Xmx`.
     ///
     /// Commit a98a375 moved the split from 25/75 (young_semi = 12.5% of
     /// total) to 50/50 (young_semi = 25% of total). This test pins the
-    /// post-commit ratios so a future edit cannot silently regress to an
-    /// arbitrary internal ceiling (the original bug had a 32 MiB cap
-    /// regardless of -Xmx; the fix has *no* ceiling other than the user-
-    /// supplied total). Large heaps now retain that proportional value as the
-    /// growth ceiling rather than faulting it eagerly.
+    /// post-commit ratios so a future edit cannot silently regress to the
+    /// original fixed 32 MiB growth ceiling regardless of `-Xmx`. Large heaps
+    /// now retain their proportional value as the growth ceiling without
+    /// faulting all of it eagerly.
     ///
     /// We test the same -Xmx values the orchestrator uses to validate
     /// QuickBenchLong's binary-trees-d18 kernel:

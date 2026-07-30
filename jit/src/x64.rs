@@ -16307,11 +16307,12 @@ impl Compiler {
         self.emit_cmp_r64_mem_disp32(RAX, R10, end_off);
         let tlab_full_patch = self.emit_jcc_rel32_patch(0x87); // JA slow_path
 
-        // JVM default initialization and TLAB-reuse safety: clear the complete
-        // object body before publishing the bump. Young-space sweep can reuse
-        // cells whose old field bytes are non-zero, so relying on refill-time
-        // zeroing is not sufficient. Both layouts are qword-sized here
-        // (legacy fields are 16 bytes; compact fields are 8 or 16 bytes).
+        // JVM default initialization and TLAB-reuse safety. All refill
+        // backends return zeroed TLAB ranges, including cells reused by a
+        // non-moving sweep, so the default path does not repeat those stores
+        // per object. The opt-out retains the older defensive clear. Both
+        // layouts are qword-sized here (legacy fields are 16 bytes; compact
+        // fields are 8 or 16 bytes).
         //
         // This also makes the all-zero-tag primitive family (int, boolean,
         // byte, char, short) fully initialized inline as `Value::Int(0)`.
@@ -16418,13 +16419,10 @@ impl Compiler {
                     << (8 * (cratonvm_types::GC_FLAGS_OFFSET - cratonvm_types::OBJECT_KIND_OFFSET)),
             );
         }
-        // default-on hardening (bt18-inline-tlab-regression-20260724): the
-        // "TLAB refill zeroes the region" assumption was empirically violated
-        // once already (the offset-4/12 incident above), so with this path
-        // default-on NO header field may depend on it. forwarding_ptr
-        // (16..24) and mark_word (24..32, MARK_NEUTRAL == 0) are written
-        // explicitly as dword pairs (no qword-imm store emitter; four dwords
-        // per `new` is negligible vs. a helper call).
+        // The opt-out also retains the older defensive forwarding_ptr and
+        // mark_word stores. The default path gets their required zero values
+        // from the refill invariant; neither field is subsequently published
+        // with a non-zero initialization value.
         if !zero_elision {
             self.emit_mov_dword_mem_disp32_imm32(
                 R11,
@@ -16458,11 +16456,10 @@ impl Compiler {
             // written inline above, the header is complete enough for
             // both the GC walker and the runtime; no helper call needed.
             //
-            // All other header fields (kind=0/Object,
-            // element_type=0/Reference, padding, array_length, gc_age,
-            // gc_flags, forwarding_ptr=null, mark_word=MARK_NEUTRAL) are
-            // written explicitly by the inline stores above — nothing
-            // depends on refill zeroing anymore.
+            // Class, kind/flags, and shape are explicitly published above.
+            // Body defaults, forwarding_ptr=null, and
+            // mark_word=MARK_NEUTRAL come from the refill zeroing invariant
+            // unless the conservative opt-out repeats those stores inline.
             //
             // RAX = obj_ptr — both arms converge with RAX holding the
             // freshly-allocated object pointer.
