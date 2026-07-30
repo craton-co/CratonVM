@@ -732,21 +732,36 @@ fn pack_obj_key(hash: u32, generation: u32) -> usize {
 /// Authoritative lazy store for fresh, exact-class HashMaps with primitive
 /// Integer keys. Heap HashMap$Node objects are materialized on demand when an
 /// operation outside the fast put/get/size surface needs the ordinary table.
+#[derive(Clone, Copy)]
+struct SparseIntEntry {
+    key: ObjectRef,
+    value: Value,
+    seq: u64,
+}
+
 #[derive(Default)]
 struct DenseIntEntries {
+    // The common dense lookup array stays key/value-only. For monotonically
+    // inserted non-negative keys, insertion sequence equals the key itself,
+    // so storing an extra u64 in every entry only widens the 10M-key hot set.
     dense: Vec<Option<(ObjectRef, Value)>>,
-    sparse: FxHashMap<i32, (ObjectRef, Value)>,
+    sparse: FxHashMap<i32, SparseIntEntry>,
+    // Only out-of-order, migrated, or reinserted dense keys need metadata.
+    // Sequential generated-ID maps leave this empty.
+    dense_seq_overrides: FxHashMap<i32, u64>,
     len: usize,
     // Real JDK `HashMap` never shrinks its table on `remove`, and a node's
     // position within its bucket chain is fixed at first-insertion time
     // (a value-only update via a later `put` of the same key does not move
-    // it). `peak_len` mirrors the never-shrinks capacity rule and `seq`/
-    // `next_seq` mirror per-key insertion order, so `keys_in_java_hashmap_order`
-    // below can reproduce real bucket-iteration order instead of this dense
-    // store's raw ascending-key layout. See that method's doc comment.
+    // it). `peak_len` mirrors the never-shrinks capacity rule and the sparse
+    // entry/exception sequences plus `next_seq` mirror per-key insertion order,
+    // so
+    // `keys_in_java_hashmap_order` below can reproduce real bucket-iteration
+    // order instead of this dense store's raw ascending-key layout. Deriving
+    // the common dense sequence from the key avoids both a widened 10M-entry
+    // array and a second full hash-table insertion.
     peak_len: usize,
     next_seq: u64,
-    seq: FxHashMap<i32, u64>,
 }
 
 impl DenseIntEntries {
@@ -756,12 +771,12 @@ impl DenseIntEntries {
         self.len
     }
 
-    fn note_fresh_insert(&mut self, key: i32) {
+    fn note_fresh_insert(&mut self) -> u64 {
         self.len += 1;
         self.peak_len = self.peak_len.max(self.len);
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.seq.insert(key, seq);
+        seq
     }
 
     fn insert(&mut self, key: i32, value: (ObjectRef, Value)) -> Option<(ObjectRef, Value)> {
@@ -771,28 +786,79 @@ impl DenseIntEntries {
                 if index >= self.dense.len() {
                     self.dense.resize(index + 1, None);
                 }
-                let sparse_old = self.sparse.remove(&key);
-                let old = self.dense[index].replace(value).or(sparse_old);
-                if old.is_none() {
-                    self.note_fresh_insert(key);
+                if let Some(entry) = self.dense[index].as_mut() {
+                    let old = *entry;
+                    *entry = value;
+                    return Some(old);
                 }
-                return old;
+                // A key can begin sparse when it is far ahead of the dense
+                // frontier, then migrate here after intervening inserts grow
+                // the vector. Preserve its first-insertion sequence.
+                if !self.sparse.is_empty() {
+                    if let Some(entry) = self.sparse.remove(&key) {
+                        let old = (entry.key, entry.value);
+                        self.dense[index] = Some(value);
+                        self.record_dense_seq(key, entry.seq);
+                        return Some(old);
+                    }
+                }
+                let seq = self.note_fresh_insert();
+                self.dense[index] = Some(value);
+                self.record_dense_seq(key, seq);
+                return None;
             }
         }
-        let old = self.sparse.insert(key, value);
-        if old.is_none() {
-            self.note_fresh_insert(key);
+        if let Some(entry) = self.sparse.get_mut(&key) {
+            let old = (entry.key, entry.value);
+            entry.key = value.0;
+            entry.value = value.1;
+            return Some(old);
         }
-        old
+        let seq = self.note_fresh_insert();
+        self.sparse.insert(
+            key,
+            SparseIntEntry {
+                key: value.0,
+                value: value.1,
+                seq,
+            },
+        );
+        None
     }
 
-    fn get(&self, key: &i32) -> Option<&(ObjectRef, Value)> {
+    fn record_dense_seq(&mut self, key: i32, seq: u64) {
+        debug_assert!(key >= 0);
+        if seq == key as u64 {
+            if !self.dense_seq_overrides.is_empty() {
+                self.dense_seq_overrides.remove(&key);
+            }
+        } else {
+            self.dense_seq_overrides.insert(key, seq);
+        }
+    }
+
+    fn get(&self, key: &i32) -> Option<(ObjectRef, Value)> {
         if *key >= 0 {
             if let Some(value) = self.dense.get(*key as usize).and_then(Option::as_ref) {
-                return Some(value);
+                return Some(*value);
             }
         }
-        self.sparse.get(key)
+        self.sparse.get(key).map(|entry| (entry.key, entry.value))
+    }
+
+    fn insertion_seq(&self, key: &i32) -> Option<u64> {
+        if *key >= 0 {
+            let index = *key as usize;
+            if self.dense.get(index).is_some_and(Option::is_some) {
+                return Some(
+                    self.dense_seq_overrides
+                        .get(key)
+                        .copied()
+                        .unwrap_or(*key as u64),
+                );
+            }
+        }
+        self.sparse.get(key).map(|entry| entry.seq)
     }
 
     fn remove(&mut self, key: &i32) -> Option<(ObjectRef, Value)> {
@@ -800,12 +866,19 @@ impl DenseIntEntries {
             self.dense
                 .get_mut(*key as usize)
                 .and_then(Option::take)
-                .or_else(|| self.sparse.remove(key))
+                .or_else(|| {
+                    self.sparse
+                        .remove(key)
+                        .map(|entry| (entry.key, entry.value))
+                })
         } else {
-            self.sparse.remove(key)
+            self.sparse
+                .remove(key)
+                .map(|entry| (entry.key, entry.value))
         };
         if old.is_some() {
             self.len -= 1;
+            self.dense_seq_overrides.remove(key);
         }
         old
     }
@@ -822,18 +895,23 @@ impl DenseIntEntries {
             .chain(self.sparse.keys().copied())
     }
 
-    fn values(&self) -> impl Iterator<Item = &(ObjectRef, Value)> {
+    fn values(&self) -> impl Iterator<Item = (ObjectRef, Value)> + '_ {
         self.dense
             .iter()
-            .filter_map(Option::as_ref)
-            .chain(self.sparse.values())
+            .filter_map(|entry| *entry)
+            .chain(self.sparse.values().map(|entry| (entry.key, entry.value)))
     }
 
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut (ObjectRef, Value)> {
+    fn values_mut(&mut self) -> impl Iterator<Item = (&mut ObjectRef, &mut Value)> {
         self.dense
             .iter_mut()
             .filter_map(Option::as_mut)
-            .chain(self.sparse.values_mut())
+            .map(|entry| (&mut entry.0, &mut entry.1))
+            .chain(
+                self.sparse
+                    .values_mut()
+                    .map(|entry| (&mut entry.key, &mut entry.value)),
+            )
     }
 
     /// Real-JDK `HashMap` bucket-iteration order for the entries currently
@@ -860,7 +938,7 @@ impl DenseIntEntries {
             // for `Integer`, `hashCode()` is the int value itself.
             let h = k ^ (((k as u32) >> 16) as i32);
             let bucket = mask & h;
-            (bucket, self.seq.get(&k).copied().unwrap_or(0))
+            (bucket, self.insertion_seq(&k).unwrap_or(0))
         });
         ordered
     }
@@ -889,7 +967,7 @@ mod dense_int_entries_tests {
         assert_eq!(entries.insert(-7, (object(0x3000), Value::Int(30))), None);
         assert_eq!(entries.len(), 3);
         assert_eq!(
-            entries.get(&1024).map(|(_, value)| *value),
+            entries.get(&1024).map(|(_, value)| value),
             Some(Value::Int(20))
         );
         assert_eq!(
@@ -903,6 +981,46 @@ mod dense_int_entries_tests {
         let mut keys: Vec<_> = entries.keys().collect();
         keys.sort_unstable();
         assert_eq!(keys, vec![0, 1024]);
+    }
+
+    #[test]
+    fn insertion_sequence_survives_updates_migration_and_reinsert() {
+        let mut entries = DenseIntEntries::default();
+        // 2048 starts sparse because it is beyond the initial dense frontier.
+        assert_eq!(entries.insert(2048, (object(0x1000), Value::Int(1))), None);
+        assert_eq!(entries.insert(0, (object(0x2000), Value::Int(2))), None);
+        for key in 1..=1024 {
+            assert_eq!(
+                entries.insert(key, (object(0x3000 + key as usize * 8), Value::Int(key))),
+                None
+            );
+        }
+        let original_seq = entries.insertion_seq(&2048).expect("sparse entry");
+        // The now-nearby key migrates into the dense vector and a value update
+        // must retain its original position within a bucket.
+        assert_eq!(
+            entries.insert(2048, (object(0x9000), Value::Int(3))),
+            Some((object(0x1000), Value::Int(1)))
+        );
+        assert_eq!(
+            entries.insertion_seq(&2048).expect("migrated entry"),
+            original_seq
+        );
+        assert_eq!(
+            entries.insert(2048, (object(0xA000), Value::Int(4))),
+            Some((object(0x9000), Value::Int(3)))
+        );
+        assert_eq!(
+            entries.insertion_seq(&2048).expect("updated entry"),
+            original_seq
+        );
+
+        assert_eq!(entries.remove(&2048), Some((object(0xA000), Value::Int(4))));
+        assert_eq!(entries.insert(2048, (object(0xB000), Value::Int(5))), None);
+        assert!(
+            entries.insertion_seq(&2048).expect("reinserted entry") > original_seq,
+            "remove followed by reinsert must create a new bucket-chain position"
+        );
     }
 }
 
@@ -1142,7 +1260,7 @@ fn try_hm_int_fast_get(
         state
             .entries
             .get(&int_key)
-            .map(|(_, value)| *value)
+            .map(|(_, value)| value)
             .unwrap_or(Value::Object(None)),
     )))
 }
@@ -1173,7 +1291,6 @@ fn materialize_hm_int_fast(
             table
                 .get(&object_key)
                 .and_then(|state| state.entries.get(&int_key))
-                .copied()
                 .expect("fast HashMap entry disappeared during materialization")
         };
         let iter_pin_base = ctx.pin_native_root(key_ref);
@@ -5646,7 +5763,7 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
                     state
                         .entries
                         .get(&k)
-                        .map(|(key, _)| Value::Object(Some(*key)))
+                        .map(|(key, _)| Value::Object(Some(key)))
                 })
                 .collect()
         })
@@ -5696,7 +5813,7 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
                 .entries
                 .keys_in_java_hashmap_order()
                 .into_iter()
-                .filter_map(|k| state.entries.get(&k).map(|(_, value)| *value))
+                .filter_map(|k| state.entries.get(&k).map(|(_, value)| value))
                 .collect()
         })
     {
@@ -5744,7 +5861,7 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
                     state
                         .entries
                         .get(&k)
-                        .map(|(key, value)| (Value::Object(Some(*key)), *value))
+                        .map(|(key, value)| (Value::Object(Some(key)), value))
                 })
                 .collect()
         })
@@ -31924,9 +32041,9 @@ pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
             .get(&key)
         {
             for (entry_key, value) in state.entries.values() {
-                roots.push(*entry_key);
+                roots.push(entry_key);
                 if let Value::Object(Some(object)) = value {
-                    roots.push(*object);
+                    roots.push(object);
                 }
             }
         }

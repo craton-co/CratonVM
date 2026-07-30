@@ -7056,12 +7056,15 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
     if (raw & 0x7) == 0 && raw < (1u64 << 48) {
-        if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
-            return match vm.mem.heap.get_field(object, 0) {
-                Value::Int(value) => value as i64,
-                _ => 0,
-            };
-        }
+        // The verifier types this receiver as the final `Integer` class, and
+        // the JIT oop map keeps the argument current across every safepoint.
+        // Re-probing all heap arenas here was therefore redundant after the
+        // null/alignment/canonical-address checks above.
+        let object = ObjectRef::from_raw(raw as usize as *mut u8);
+        return match vm.mem.heap.get_field(object, 0) {
+            Value::Int(value) => value as i64,
+            _ => 0,
+        };
     }
     // Defensive fallback: hand the call to the generic dispatcher (same
     // machinery the non-direct site would have used).
@@ -7274,14 +7277,15 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
             if (kraw & 0x7) != 0 || kraw >= (1u64 << 48) {
                 break 'fast;
             }
-            match vm.mem.heap.is_object_address(key as usize) {
-                Some(object) => Value::Object(Some(object)),
-                None => break 'fast,
-            }
+            // `HashMap.get`'s descriptor and the bytecode verifier guarantee
+            // an oop here. The call-site oop map owns its relocation across
+            // safepoints; this helper has not entered one since receiving it.
+            Value::Object(Some(ObjectRef::from_raw(key as usize as *mut u8)))
         };
-        let Some(recv_obj) = vm.mem.heap.is_object_address(receiver as usize) else {
-            break 'fast;
-        };
+        // `jit_hashmap_receiver_is_exact` just read this live receiver's class
+        // header and matched exact `HashMap`, so a second arena membership
+        // probe cannot add safety on this path.
+        let recv_obj = ObjectRef::from_raw(receiver as usize as *mut u8);
         let Some((thread, _guard)) = jit_thread_mut() else {
             break 'fast;
         };
@@ -7460,14 +7464,14 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
             if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
                 break 'fast;
             }
-            match vm.mem.heap.is_object_address(raw as usize) {
-                Some(object) => vals[slot] = Value::Object(Some(object)),
-                None => break 'fast,
-            }
+            // Descriptor-typed JIT arguments are verifier-proven oops and are
+            // published in the call site's oop map. No safepoint occurs
+            // between entry and this conversion.
+            vals[slot] = Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)));
         }
-        let Some(recv_obj) = vm.mem.heap.is_object_address(receiver as usize) else {
-            break 'fast;
-        };
+        // Exact-class screening above already dereferenced and validated this
+        // live HashMap receiver.
+        let recv_obj = ObjectRef::from_raw(receiver as usize as *mut u8);
         let Some((thread, _guard)) = jit_thread_mut() else {
             break 'fast;
         };
