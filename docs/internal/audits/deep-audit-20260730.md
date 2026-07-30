@@ -123,6 +123,21 @@ implemented; `SECURITY.md` now matches the code.
 and pointer representation, not a claim that Miri can execute the JIT or driver
 FFI.
 
+The gate earned its place immediately. Run for the first time, it rejected
+`heap_types::tests::field_cell_layout_matches_value_enum`:
+
+```
+constructing invalid value of type [u8; 16]: at [8],
+encountered uninitialized memory, but expected an integer
+```
+
+The test did `transmute::<Value, [u8; 16]>`, and `Value` is an enum with
+padding — claiming every byte is an initialised integer when the padding is
+not. Fixed by transmuting to `[MaybeUninit<u8>; 16]`, which is always sound,
+and only `assume_init`-ing the discriminant and payload ranges the test exists
+to pin. That is a live example of the audit's point: a gate added but never run
+is not a gate, and this one found something on the first attempt.
+
 **P1 — README claim.** "Memory-safe by construction" is gone.
 
 ## Tests and coverage
@@ -144,7 +159,7 @@ Each promotion was then actually run. Results:
 | Semantic differential gate | yes | failed on a stale ledger; ledger refreshed, now **exit 0** — backed |
 | Exact stub ratchet | yes | **157 of 9,320, zero slack** — backed |
 | Markdown link check | added | **98 files** — backed |
-| Miri (`cratonvm-types --lib`) | added | run from this host; see the run log |
+| Miri (`cratonvm-types --lib`) | added | **found real UB on its first run**, fixed — see below |
 | Fuzz build smoke | yes | failed; two real misalignments fixed, `cargo check --all-targets` in `fuzz/` now clean — backed as far as a non-Linux host can show |
 | `Test vm (synthetic-jdk)` | yes | **not backed — reverted**, see below |
 
