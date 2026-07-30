@@ -9,17 +9,17 @@ row by at least 50%, while retaining its exact checksum `173943680`.
 
 Final acceptance used `bench/CratonBench.java`, Temurin 25.0.3, `-Xmx8g`, and
 fresh CratonVM processes on Windows 11. The control and candidate were the
-same release binary built from merge commit `d959bbde1`, which contains current
-`origin/dev` `e88f14830`; the control set only
+same release binary built from reconciliation commit `62f289e71`, which
+contains current `origin/dev` `3c97d2be6`; the control set only
 `CRATONVM_JIT_MATRIX_DOT=0`. Runs alternated control/candidate order, and no
 sample was discarded:
 
 | Variant | Five reported times (ms) | Median |
 |---|---|---:|
-| Matrix-dot lowering disabled | 9,407, 11,182, 12,291, 9,844, 9,800 | 9,844 |
-| Matrix-dot lowering enabled | 3,541, 3,545, 4,137, 3,307, 4,836 | 3,545 |
+| Matrix-dot lowering disabled | 9,336, 9,993, 11,533, 9,409, 9,303 | 9,409 |
+| Matrix-dot lowering enabled | 3,751, 4,587, 4,205, 4,560, 4,199 | 4,205 |
 
-The enabled median is **2.78x faster** and **63.99% lower** than the disabled
+The enabled median is **2.24x faster** and **55.31% lower** than the disabled
 median, clearing the required 50% reduction. All ten executions produced the
 exact checksum.
 
@@ -59,6 +59,9 @@ dependencies dominated Matrix.
 - Process eight elements per batch with fixed `k+0` through `k+7`
   displacements, one induction update, and one batch branch. Integer
   multiply-add order and Java two's-complement wrapping are unchanged.
+- Retain upstream's default-on pure-kernel/OSR local homes, but disable its
+  deferred R8/R9 operand cache only when matrix-dot lowering is present,
+  because the specialized batch limit and accumulator own those registers.
 - Support both wide references and the opt-in compressed-oop array layout.
 - Provide `CRATONVM_JIT_MATRIX_DOT=0` as a diagnostic kill switch and report
   recognized headers under `CRATONVM_DBG_JIT_GEN`.
@@ -72,9 +75,9 @@ closed the residual gap.
 ## Validation
 
 - Final release binary:
-  `cratonvm-matrix-candidate-merged-e88-019fb302.exe`,
+  `cratonvm-matrix-candidate-62f-019fb302.exe`,
   SHA-256
-  `235e511a37e5dcc9639cebdf4bfc42e17b05a2e81c04d524671562e6fb1f973c`.
+  `33ff70f4049abcdccad6d58dbd378a710fdb0049e0048057660f340f06d8a514`.
 - The recognition trace reported
   `[JIT_GEN] matrix-dot headers=[31]` for the real
   `CratonBench.matmul` bytecode, with no code-buffer bailout.
