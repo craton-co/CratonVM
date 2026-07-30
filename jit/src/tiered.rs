@@ -1701,6 +1701,17 @@ mod tests {
         MethodKey::new("java/lang/String", "hashCode", "()I")
     }
 
+    /// A key used ONLY by the deny-list test.
+    ///
+    /// `mark_osr_denied` writes to a PROCESS-GLOBAL set. Marking the shared
+    /// `test_key()` therefore denies OSR for every other test in the binary
+    /// that uses it, for as long as the mark stands — which is exactly how
+    /// `stats_osr_compilations` intermittently observed 0 OSR compilations
+    /// instead of 1. Keep the poison on a key nobody else touches.
+    fn osr_deny_only_key() -> MethodKey {
+        MethodKey::new("craton/test/OsrDenyOnly", "denied", "()V")
+    }
+
     fn test_key2() -> MethodKey {
         MethodKey::new(
             "java/util/HashMap",
@@ -1813,8 +1824,22 @@ mod tests {
 
     // ── wire-tiered-manager Step 5: request_osr ──────────────────────────
 
+    /// Serialises the tests that mutate the process-global OSR deny list.
+    ///
+    /// `osr_deny_list()` is one `RwLock<HashSet<MethodKey>>` for the whole
+    /// process, and `clear_osr_deny_list_for_test` wipes it outright. Run in
+    /// parallel, one test's clear lands between another's `mark_osr_denied`
+    /// and its assertion. There is no per-test identity to key off here -- the
+    /// deny list IS the shared state under test -- so unlike the code-cache
+    /// tests these serialise rather than retry.
+    fn osr_deny_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn step5_request_osr_enqueues_osr_task_immediately() {
+        let _osr_deny_guard = osr_deny_test_guard();
         clear_osr_deny_list_for_test();
         let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
@@ -1843,9 +1868,10 @@ mod tests {
 
     #[test]
     fn step5_request_osr_honors_osr_deny_list() {
+        let _osr_deny_guard = osr_deny_test_guard();
         clear_osr_deny_list_for_test();
         let mgr = TieredCompilationManager::with_default_policy();
-        let key = test_key();
+        let key = osr_deny_only_key();
         mark_osr_denied(key.clone());
         assert!(
             mgr.request_osr(&key, 42).is_none(),
@@ -1861,6 +1887,7 @@ mod tests {
 
     #[test]
     fn step5_request_osr_is_independent_of_method_entry_c2_but_honors_bailout() {
+        let _osr_deny_guard = osr_deny_test_guard();
         clear_osr_deny_list_for_test();
         // A method-entry C2 body does not provide an OSR entry and therefore
         // must not suppress the separately cached OSR artifact.

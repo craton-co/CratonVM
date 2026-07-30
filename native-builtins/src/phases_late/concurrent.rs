@@ -1491,6 +1491,18 @@ pub(crate) fn aio_bb_advance(ctx: &mut dyn NativeContext, bb: ObjectRef, n: i32)
 pub(crate) fn p58_cf_then_compose(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
+    if p58_cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniComposeStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(func)),
+            ],
+        );
+    }
     let result = ctx.get_field(this, FUT_FIELD_RESULT);
     // Apply function: Function<T, CompletableFuture<U>>
     let inner = ctx.invoke_virtual(
@@ -1607,6 +1619,19 @@ pub(crate) fn p58_cf_exceptionally(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let func = obj_arg(args, 1)?;
+    if p58_cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniExceptionallyStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(func)),
+            ],
+        );
+    }
     // No exception in our eager model — just pass through
     let result = ctx.get_field(this, FUT_FIELD_RESULT);
     let cf = p58_new_cf(ctx, result, true);
@@ -1756,14 +1781,39 @@ pub(crate) fn p58_cf_complete_exceptionally(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let done = ctx.get_field(this, FUT_FIELD_DONE);
-    if done == Value::Int(1) {
-        return Ok(Some(Value::Int(0))); // already complete
-    }
     let throwable = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, FUT_FIELD_RESULT, throwable);
-    ctx.set_field(this, FUT_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Int(1)))
+    match ctx.get_field(this, FUT_FIELD_DONE) {
+        // Phase-58 synthetic CompletableFuture: its slot 1 is an integer
+        // completion flag, so preserve the eager compatibility model.
+        Value::Int(done) => {
+            if done != 0 {
+                return Ok(Some(Value::Int(0))); // already complete
+            }
+            ctx.set_field(this, FUT_FIELD_RESULT, throwable);
+            ctx.set_field(this, FUT_FIELD_DONE, Value::Int(1));
+            Ok(Some(Value::Int(1)))
+        }
+        // Real JDK CompletableFuture (including subclasses such as
+        // Rest5ClientHttpClient.RequestFuture): slot 1 is the Completion
+        // stack, not a synthetic done flag.  Storing an integer here leaves
+        // the actual result unset and strands Mono.fromFuture subscribers on
+        // an async connection failure.  Use the JDK's private primitive and
+        // drain its completion stack just as native_cf_complete does for the
+        // normal-success path.
+        _ => {
+            let completed = ctx
+                .invoke_virtual(
+                    this,
+                    "completeThrowable",
+                    "(Ljava/lang/Throwable;)Z",
+                    &[throwable],
+                )?
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+            Ok(Some(Value::Int(completed)))
+        }
+    }
 }
 
 pub(crate) fn p58_cf_is_completed_exceptionally(

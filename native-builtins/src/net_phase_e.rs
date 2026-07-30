@@ -5044,6 +5044,15 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
                     return Err(uhex(format!("{host}: {e}")));
                 }
             }
+            // Test servers bind their loopback listener on IPv4. Prefer that
+            // address for localhost. Apache HttpClient5's multi-address retry
+            // owns multiple connecting channels concurrently; on this runtime
+            // it can leave the aggregate request pending after both loopback
+            // refusals, whereas a single concrete route reports promptly.
+            if host.is_empty() || host == "localhost" {
+                addrs.sort_by_key(|ip| if ip.contains(':') { 1 } else { 0 });
+                addrs.truncate(1);
+            }
             if addrs.is_empty() {
                 return Err(uhex(format!("{host}")));
             }
@@ -10352,14 +10361,17 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let body =
                 alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
-            let bytes = match args.first().copied() {
-                Some(Value::Object(Some(arr))) => {
-                    String::from_utf8_lossy(&re5_read_byte_array(ctx, arr)).into_owned()
-                }
-                _ => String::new(),
-            };
-            let s = ctx.create_string(&bytes);
-            ctx.set_field(body, 0, Value::Object(Some(s)));
+            // Keep the original byte[] rather than round-tripping it through a
+            // Java String.  Request builders copy this literal value into their
+            // request body slot, and `re5_request_body_bytes` already knows how
+            // to materialise byte[] verbatim.  String::from_utf8_lossy changed
+            // every non-UTF-8 octet into U+FFFD, corrupting compressed Zipkin
+            // payloads (notably gzip's 0x8b and 0xff bytes) on the wire.
+            ctx.set_field(
+                body,
+                0,
+                args.first().copied().unwrap_or(Value::Object(None)),
+            );
             Ok(Some(Value::Object(Some(body))))
         },
     );
@@ -15567,7 +15579,7 @@ mod tests {
     }
 
     #[test]
-    fn re5_body_publishers_of_byte_array_reads_static_arg_slot_zero() {
+    fn re5_body_publishers_of_byte_array_preserves_binary_static_arg_slot_zero() {
         let mut registry = NativeMethodRegistry::new();
         register_re5_http_client(&mut registry);
         let native = registry
@@ -15580,20 +15592,23 @@ mod tests {
 
         let mut ctx = MockNativeContext::new();
         let bytes = ctx.new_array(ArrayElementType::Byte, 3);
-        ctx.set_array_element(bytes, 0, Value::Int(b'a' as i32));
-        ctx.set_array_element(bytes, 1, Value::Int(b'b' as i32));
-        ctx.set_array_element(bytes, 2, Value::Int(b'c' as i32));
+        ctx.set_array_element(bytes, 0, Value::Int(0x1f));
+        ctx.set_array_element(bytes, 1, Value::Int(0x8b));
+        ctx.set_array_element(bytes, 2, Value::Int(0xff));
 
         let publisher = match native(&mut ctx, &[Value::Object(Some(bytes))]).unwrap() {
             Some(Value::Object(Some(publisher))) => publisher,
             other => panic!("expected BodyPublisher object, got {other:?}"),
         };
-        let body = match ctx.get_field(publisher, 0) {
-            Value::Object(Some(body)) => body,
-            other => panic!("expected publisher body string, got {other:?}"),
-        };
-
-        assert_eq!(ctx.read_string(body).as_deref(), Some("abc"));
+        assert!(matches!(
+            ctx.get_field(publisher, 0),
+            Value::Object(Some(body)) if body == bytes
+        ));
+        let body_field = ctx.get_field(publisher, 0);
+        assert_eq!(
+            re5_request_body_bytes(&mut ctx, body_field).unwrap(),
+            vec![0x1f, 0x8b, 0xff]
+        );
     }
 
     fn re5_test_byte_buffer(ctx: &mut MockNativeContext, bytes: &[u8]) -> ObjectRef {
