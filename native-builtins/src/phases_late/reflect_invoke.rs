@@ -9,6 +9,7 @@
 //! is byte-identical to before the split.
 
 use super::*;
+
 // ---------------------------------------------------------------------------
 // java.lang.reflect extras: Parameter, Executable
 // ---------------------------------------------------------------------------
@@ -1630,7 +1631,7 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         p59_sw_get_caller_class,
     );
 
-    // StackFrame = 7-field synthetic — WP1.9 (+ WP1.10 slot 6):
+    // StackFrame = 8-field synthetic — WP1.9 (+ WP1.10 slots 6-7):
     //   slot 0: className (String, with '/' → '.')
     //   slot 1: methodName (String)
     //   slot 2: fileName (String or null)
@@ -1643,9 +1644,9 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
     //           (see that function's doc comment for why: a fresh by-name
     //           lookup performed later, from `getDeclaringClass()`, can fail
     //           for a frame whose class is still running its own `<clinit>`)
-    //   slot 7: retainClassRef (Int boolean), copied from the owning walker.
-    //           It must persist on the frame because callers may access a
-    //           frame after walk() has returned.
+    //   slot 7: retainClassRef (Int boolean) — copied from the owning walker so
+    //           a StackFrame returned from walk() keeps its access contract
+    //           after the user Function has returned.
     let sf = "java/lang/StackWalker$StackFrame";
     r.register(sf, "getClassName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1667,10 +1668,11 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 4)))
     });
-    // StackFrame.getDeclaringClass() — resolve the Class mirror via the
-    // StackFrame.getDeclaringClass() returns its eagerly resolved mirror (slot 6).
-    // RETAIN_CLASS_REFERENCE is scoped around walk/forEach consumer execution
-    // and is honored below; the JDK otherwise throws UnsupportedOperationException.
+    // StackFrame.getDeclaringClass() returns its eagerly resolved mirror (slot
+    // 6). RETAIN_CLASS_REFERENCE belongs to the frame, not the dynamic extent
+    // of walk(): callers may legally return a StackFrame (or Optional holding
+    // one) and inspect it after the Function has returned, so the permission is
+    // read from the frame's own slot 7 (or the real carrier's flags bit).
     r.register(
         sf,
         "getDeclaringClass",
@@ -1698,7 +1700,7 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         sf,
         "getMethodType",
         "()Ljava/lang/invoke/MethodType;",
-        p59_sf_get_method_type,
+        p59_sf_get_method_type_retain_checked,
     );
     r.register(sf, "isNativeMethod", "()Z", |ctx, args| {
         // Native iff lineNumber == -2 (per StackTraceElement convention).
@@ -1822,12 +1824,13 @@ pub(crate) fn p59_sf_get_method_type(
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
-    // Descriptor metadata is receiver-local and remains available after the
-    // walk callback returns.  Do not consult transient thread-local walk
-    // state here: `getDescriptor()` delegates through this helper, and Log4j
-    // deliberately retains a StackFrame for lazy inspection.  Operations
-    // that genuinely require `RETAIN_CLASS_REFERENCE` enforce the permission
-    // persisted in this carrier's slot 7.
+    // NOTE: this helper is deliberately unguarded. `getDescriptor()` is
+    // specified to work WITHOUT `RETAIN_CLASS_REFERENCE` and delegates through
+    // here (see `register_real_jdk_stackwalker_frame_method_type`), so putting
+    // the permission check in the shared helper made every `getDescriptor()`
+    // call throw on a default walker. The check that the JDK does mandate for
+    // `getMethodType()` lives in `p59_sf_get_method_type_retain_checked`, which
+    // is what the `getMethodType` registrations bind.
     let internal = match ctx.get_field(this, 5) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
@@ -1876,8 +1879,32 @@ pub(crate) fn p59_sf_get_method_type(
     )))
 }
 
-/// Populate the 6-slot StackFrame synthetic from a `StackTraceEntry`.
-/// WP1.9: writes bci + declaringClassInternalName in addition to the
+/// `StackFrame.getMethodType()` — the RETAIN_CLASS_REFERENCE-gated entry point.
+///
+/// Unlike `getDescriptor()`, `getMethodType()` is specified to throw
+/// `UnsupportedOperationException` when the owning walker was not configured
+/// with `Option.RETAIN_CLASS_REFERENCE`. The permission is read from the frame
+/// itself (the real carrier's `flags` bit when the receiver is a real-JDK
+/// `ClassFrameInfo`, otherwise the persistent copy in the synthetic carrier's
+/// slot 7) rather than from transient walk state, because a frame may legally
+/// outlive the `walk()` callback.
+pub(crate) fn p59_sf_get_method_type_retain_checked(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let retains_class_ref = crate::lang_stackwalker::class_frame_retains_class_ref(ctx, this)
+            .unwrap_or_else(|| matches!(ctx.get_field(this, 7), Value::Int(value) if value != 0));
+        if !retains_class_ref {
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+            }
+            .into());
+        }
+    }
+    p59_sf_get_method_type(ctx, args)
+}
+
 /// Promote only the real-JDK-safe StackWalker carrier accessors without
 /// enabling synthetic reflection layouts in the default registry.
 pub fn register_real_jdk_stackwalker_frame_method_type(r: &mut NativeMethodRegistry) {
@@ -1886,7 +1913,7 @@ pub fn register_real_jdk_stackwalker_frame_method_type(r: &mut NativeMethodRegis
         SF,
         "getMethodType",
         "()Ljava/lang/invoke/MethodType;",
-        p59_sf_get_method_type,
+        p59_sf_get_method_type_retain_checked,
     );
     r.register(SF, "getDescriptor", "()Ljava/lang/String;", |ctx, args| {
         match p59_sf_get_method_type(ctx, args)? {
@@ -1901,7 +1928,8 @@ pub fn register_real_jdk_stackwalker_frame_method_type(r: &mut NativeMethodRegis
     });
 }
 
-/// pre-existing 4 slots.
+/// Populate the 8-slot StackFrame synthetic from a `StackTraceEntry`, including
+/// the eagerly resolved declaring-class mirror and persistent retain-class bit.
 pub(crate) fn populate_stack_frame(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,

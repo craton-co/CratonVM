@@ -3403,16 +3403,12 @@ fn tlab_alloc_array(
 
 /// Try to allocate an array, running GC and retrying on failure.
 ///
-/// The pre-GC probe is deliberately young-only.  Spilling into old space before
-/// the boundary collection defers reclamation and can make the no-JIT native
-/// allocation-pressure path collect later while a native still owns transient
-/// array state.  That corrupted live parser buffers under sustained Hibernate
-/// allocation.  After the boundary collection, JIT mode uses
-/// `try_alloc_array_full` because a non-moving JIT-safe sweep can leave young
-/// space fragmented despite ample old-generation headroom.  Interpreter-only
-/// mode keeps arrays in the moving young generation; diverting those arrays
-/// into old space violated its boundary-pressure ordering and mutated shared
-/// Hibernate query buffers.
+/// `try_alloc_array_full` is deliberately used rather than the young-only
+/// `try_alloc_array`: it has the same young-first policy, but once a
+/// non-moving JIT-safe sweep has left the young generation fragmented it can
+/// spill the request into old space.  This matches `alloc_object_shared`'s
+/// object path.  Retrying young-only here used to report OOM for a tiny array
+/// while most of the heap was available as old-generation headroom.
 fn gc_alloc_array(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -3426,7 +3422,7 @@ fn gc_alloc_array(
     if let Some(arr) = shared
         .mem
         .heap
-        .try_alloc_array(class_id, element_type, length)
+        .try_alloc_array_full(class_id, element_type, length)
     {
         return Ok(arr);
     }
@@ -3443,41 +3439,27 @@ fn gc_alloc_array(
             },
         )));
     }
-    let post_gc = if crate::runtime::env_cache::disable_jit() {
-        shared
-            .mem
-            .heap
-            .try_alloc_array(class_id, element_type, length)
-    } else {
-        shared
-            .mem
-            .heap
-            .try_alloc_array_full(class_id, element_type, length)
-    };
-    if let Some(arr) = post_gc {
+    if let Some(arr) = shared
+        .mem
+        .heap
+        .try_alloc_array_full(class_id, element_type, length)
+    {
         return Ok(arr);
     }
     // G1 last-ditch: the young pause above cannot reclaim dead Old/humongous
     // spans — only a completed mark cycle's cleanup can. Run one
     // synchronously and retry once before surfacing OOM.
     g1_force_full_cycle(shared, thread);
-    let last_attempt = if crate::runtime::env_cache::disable_jit() {
-        shared
-            .mem
-            .heap
-            .try_alloc_array(class_id, element_type, length)
-    } else {
-        shared
-            .mem
-            .heap
-            .try_alloc_array_full(class_id, element_type, length)
-    };
-    last_attempt.ok_or_else(|| {
-        maybe_dump_heap_on_oom(shared, thread);
-        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
-            message: format!("Java heap space (alloc_array length {})", length),
-        }))
-    })
+    shared
+        .mem
+        .heap
+        .try_alloc_array_full(class_id, element_type, length)
+        .ok_or_else(|| {
+            maybe_dump_heap_on_oom(shared, thread);
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
+                message: format!("Java heap space (alloc_array length {})", length),
+            }))
+        })
 }
 
 /// Update the thread's root snapshot with current frame ObjectRefs.
@@ -42366,6 +42348,213 @@ fn native_override_for_cached_reflect_invoke(
 /// Fast invokevirtual/invokeinterface/invokespecial using monomorphic inline cache
 /// (stackless dispatch). Returns FramePushed for bytecode cache hits,
 /// Handled for native, CacheMiss for fall-through.
+/// Execute the canonical instance-field accessor body without allocating an
+/// interpreter frame.
+///
+/// A substantial fraction of real workloads are made of generated getters
+/// (`aload_0; getfield; <x>return`).  They are semantically simple, but even
+/// with an already-warm virtual-call cache the normal interpreter path still
+/// builds a frame, executes three bytecodes, and tears the frame down.  That
+/// dominates `--nojit` graph-planning workloads, where the accessors are hot
+/// enough that compiling them would normally hide the cost.
+///
+/// This deliberately accepts only the exact five-byte verifier-safe shape,
+/// uses an *already resolved* field entry (a cold symbolic reference falls
+/// through to ordinary bytecode), and stays out of every JVMTI/redefinition
+/// mode that needs to observe the callee frame or field access.  It therefore
+/// has the same field value and exception behaviour as the bytecode body while
+/// retaining the normal path for all observable instrumentation cases.
+fn try_execute_cached_trivial_instance_getter(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cached: &CachedBytecodeMethod,
+    args: &[Value],
+) -> Result<Option<CachedCallResult>, MethodCallFailed> {
+    if !crate::runtime::env_cache::trivial_getter_fast_path()
+        || cached.is_static
+        || cached.is_synchronized
+        || cached.num_params != 0
+        || args.len() != 1
+        || crate::classloading::any_class_redefined()
+        || crate::runtime::jvmti::any_method_entry_listener_active()
+        || crate::runtime::jvmti::any_method_exit_listener_active()
+        || crate::runtime::jvmti::any_field_watchpoint_active()
+    {
+        return Ok(None);
+    }
+
+    // Cached bytecode carries two speculative-read padding bytes.
+    let code_len = cached.code.len().saturating_sub(2);
+    let code = &cached.code[..code_len];
+    if code.len() != 5 || code[0] != 0x2a || code[1] != 0xb4 {
+        return Ok(None);
+    }
+    let return_opcode = code[4];
+    if !matches!(return_opcode, 0xac | 0xad | 0xae | 0xaf | 0xb0) {
+        return Ok(None);
+    }
+    let field_cp_index = u16::from_be_bytes([code[2], code[3]]);
+
+    // Do not resolve here: resolving a first-use symbolic reference may load
+    // classes and collect, while the decoded argument is intentionally a
+    // short-lived Rust local.  The ordinary first invocation resolves it and
+    // all later invocations can use this pure cache hit.
+    let field = match shared
+        .classes
+        .resolution_cache
+        .read()
+        .get_field(cached.declaring_class_id, field_cp_index)
+    {
+        Some(field) if !field.is_static && !field.is_volatile => field.clone(),
+        _ => return Ok(None),
+    };
+
+    // Validate that the field descriptor is precisely this method's return
+    // descriptor, not just the broad return opcode category.
+    let descriptor_matches = {
+        let cm = shared.classes.class_manager.read();
+        let Some(class) = cm.get_class(cached.declaring_class_id) else {
+            return Ok(None);
+        };
+        let Some(ConstantPoolEntry::FieldReference {
+            name_and_type_index,
+            ..
+        }) = class.constant_pool.get(field_cp_index)
+        else {
+            return Ok(None);
+        };
+        let Some((_, field_descriptor)) =
+            class.constant_pool.get_name_and_type(*name_and_type_index)
+        else {
+            return Ok(None);
+        };
+        cached
+            .method_descriptor
+            .strip_prefix("()")
+            .is_some_and(|return_descriptor| return_descriptor == field_descriptor)
+    };
+    if !descriptor_matches {
+        return Ok(None);
+    }
+
+    let return_matches_field = matches!(
+        (field.desc_byte, return_opcode),
+        (b'J', 0xad)
+            | (b'F', 0xae)
+            | (b'D', 0xaf)
+            | (b'L' | b'[', 0xb0)
+            | (b'Z' | b'B' | b'C' | b'S' | b'I', 0xac)
+    );
+    if !return_matches_field {
+        return Ok(None);
+    }
+
+    // CRATONVM_TRIVIAL_GETTER_VERIFY — resolve the same field reference the way
+    // the `getfield` opcode would and report any divergence.
+    //
+    // This exists because the fast path reads the `resolution_cache` raw, while
+    // the opcode goes through `resolve_field_ref_loader_aware`, which documents
+    // that a cache entry "may have been populated by a loader-blind helper" and
+    // refuses to trust one for a user-defined-loader caller. That made the fast
+    // path the prime suspect for the 2026-07-30 Hibernate HQL mis-parse. It was
+    // not: a full `ASTParserLoadingTest` run under this verifier reported ZERO
+    // divergences while still mis-parsing, and the same run passed 106/106 with
+    // `CRATONVM_NO_MOVING_YOUNG=1`. Keep the verifier so that conclusion stays
+    // one env var away from being re-checked instead of re-argued.
+    if crate::runtime::env_cache::trivial_getter_verify() {
+        if let Ok(authoritative) = resolve_field_ref_loader_aware(
+            shared,
+            thread,
+            cached.declaring_class_id,
+            field_cp_index,
+        ) {
+            if authoritative.field_index != field.field_index
+                || authoritative.desc_byte != field.desc_byte
+                || authoritative.is_reference != field.is_reference
+                || authoritative.is_volatile != field.is_volatile
+                || authoritative.declaring_class_id != field.declaring_class_id
+            {
+                eprintln!(
+                    "[TRIVIAL-GETTER-DIVERGENCE] {}.{}{} cp#{field_cp_index}: \
+                     cached(idx={} desc={} ref={} vol={} owner={:?}) != \
+                     loader_aware(idx={} desc={} ref={} vol={} owner={:?})",
+                    cached.class_name,
+                    cached.method_name,
+                    cached.method_descriptor,
+                    field.field_index,
+                    field.desc_byte as char,
+                    field.is_reference,
+                    field.is_volatile,
+                    field.declaring_class_id,
+                    authoritative.field_index,
+                    authoritative.desc_byte as char,
+                    authoritative.is_reference,
+                    authoritative.is_volatile,
+                    authoritative.declaring_class_id,
+                );
+            }
+        }
+    }
+
+    let Value::Object(Some(receiver)) = args[0] else {
+        // The normal invokevirtual null check remains responsible for the
+        // precisely constructed NPE and its stack trace.
+        return Ok(None);
+    };
+    let receiver = shared.mem.heap.load_and_forward(receiver);
+    let mut value = shared.mem.heap.get_field(receiver, field.field_index);
+    match field.desc_byte {
+        b'J' => {
+            let bits = match value {
+                Value::Long(x) => x,
+                Value::Double(x) => x.to_bits() as i64,
+                Value::Int(x) => x as i64,
+                Value::Object(None) | Value::Uninitialized => 0,
+                Value::Object(Some(raw)) => raw.as_ptr() as usize as i64,
+                Value::Float(x) => x.to_bits() as i64,
+                Value::ReturnAddress(pc) => pc as i64,
+            };
+            thread.frames[frame_idx]
+                .stack
+                .push_compact_long_checked(CompactValue::long(bits))?;
+        }
+        b'D' => {
+            let number = match value {
+                Value::Double(x) => x,
+                Value::Long(x) => f64::from_bits(x as u64),
+                Value::Int(x) => x as f64,
+                Value::Object(None) | Value::Uninitialized => 0.0,
+                Value::Object(Some(raw)) => f64::from_bits(raw.as_ptr() as usize as u64),
+                Value::Float(x) => x as f64,
+                Value::ReturnAddress(pc) => pc as f64,
+            };
+            thread.frames[frame_idx]
+                .stack
+                .push_compact_double_checked(CompactValue::double(number))?;
+        }
+        _ => {
+            if field.is_reference {
+                if matches!(value, Value::Int(0) | Value::Long(0)) {
+                    value = Value::Object(None);
+                }
+            } else {
+                value = match value {
+                    Value::Object(None) => Value::Int(0),
+                    Value::Object(Some(raw)) => Value::Int(raw.as_ptr() as usize as i32),
+                    other => other,
+                };
+                value = narrow_int_to_field_type(value, field.desc_byte);
+            }
+            if let Value::Object(Some(object)) = value {
+                value = Value::Object(Some(shared.mem.heap.load_and_forward(object)));
+            }
+            push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+        }
+    }
+    Ok(Some(CachedCallResult::Handled))
+}
+
 fn execute_invokevirtual_cached(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -42978,6 +43167,12 @@ fn execute_invokevirtual_cached(
                         shared, thread, frame_idx, &cached, args_slice,
                     ) {
                         return res;
+                    }
+
+                    if let Some(result) = try_execute_cached_trivial_instance_getter(
+                        shared, thread, frame_idx, &cached, args_slice,
+                    )? {
+                        return Ok(result);
                     }
 
                     // (bug-03 layer B, default-ON; off-switch CRATONVM_JIT_VIRTUAL_TIERUP=0)

@@ -1320,10 +1320,16 @@ pub fn make_iterator_from_array(
     snapshot_array: ObjectRef,
     size: usize,
 ) -> MethodCallResult {
-    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3);
-    ctx.set_field(itr, 0, Value::Object(Some(snapshot_array)));
-    ctx.set_field(itr, 1, Value::Int(0));
-    ctx.set_field(itr, 2, Value::Int(size as i32));
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/HashMap$KeyItr",
+        3,
+        &[
+            (0, Value::Object(Some(snapshot_array))),
+            (1, Value::Int(0)),
+            (2, Value::Int(size as i32)),
+        ],
+    );
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -1623,6 +1629,58 @@ fn read_pinned_elem(ctx: &dyn NativeContext, handle: usize, orig: Value) -> Valu
         }
         _ => orig,
     }
+}
+
+/// Allocate a synthetic object and install an arbitrary field set while every
+/// referenced value and the new object remain rooted. This is the common safe
+/// constructor for snapshot iterators/spliterators: class initialization and
+/// allocation can relocate their backing arrays, and any field store can
+/// relocate the newly allocated shell.
+fn alloc_synthetic_with_fields(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    num_fields: usize,
+    fields: &[(usize, Value)],
+) -> ObjectRef {
+    let values: Vec<Value> = fields.iter().map(|(_, value)| *value).collect();
+    let (value_base, handles) = pin_value_slice(ctx, &values);
+    let object = alloc_synthetic(ctx, class_name, num_fields);
+    let object_pin = ctx.pin_native_root(object);
+    for ((slot, original), handle) in fields.iter().zip(handles.iter()) {
+        let object_cur = ctx.read_native_pin(object_pin, object);
+        let value_cur = read_pinned_elem(ctx, *handle, *original);
+        ctx.set_field(object_cur, *slot, value_cur);
+    }
+    let object_cur = ctx.read_native_pin(object_pin, object);
+    ctx.unpin_native_roots(if value_base == usize::MAX {
+        object_pin
+    } else {
+        value_base
+    });
+    object_cur
+}
+
+/// Read one element from a snapshot and advance its iterator cursor while the
+/// snapshot, iterator shell, and returned element remain rooted across the
+/// cursor store.
+fn snapshot_cursor_store_and_read(
+    ctx: &mut dyn NativeContext,
+    iterator: ObjectRef,
+    snapshot: ObjectRef,
+    cursor_slot: usize,
+    element_index: usize,
+    new_cursor: i32,
+) -> Value {
+    let iterator_pin = ctx.pin_native_root(iterator);
+    let snapshot_pin = ctx.pin_native_root(snapshot);
+    let snapshot_cur = ctx.read_native_pin(snapshot_pin, snapshot);
+    let value = ctx.get_array_element(snapshot_cur, element_index);
+    let value_pin = pin_value(ctx, value);
+    let iterator_cur = ctx.read_native_pin(iterator_pin, iterator);
+    ctx.set_field(iterator_cur, cursor_slot, Value::Int(new_cursor));
+    let value_cur = read_pinned_elem(ctx, value_pin, value);
+    ctx.unpin_native_roots(iterator_pin);
+    value_cur
 }
 
 /// Allocate a hash-map bucket table of `cap` entries, **capping the eager
@@ -2353,11 +2411,20 @@ fn al_is_list_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 /// Allocate an ArrayList instance, sized to fit whichever field layout the
 /// runtime is using. Initializes elementData and size to (buf, init_size).
 fn alloc_arraylist_with(ctx: &mut dyn NativeContext, buf: ObjectRef, init_size: i32) -> ObjectRef {
+    // The list allocation can move its backing array. Keep both halves of the
+    // new graph rooted and refresh the list before every field store.
+    let buf_pin = ctx.pin_native_root(buf);
     let (data_slot, size_slot, n_fields) = al_slots(ctx);
     let list = alloc_synthetic(ctx, "java/util/ArrayList", n_fields);
-    ctx.set_field(list, data_slot, Value::Object(Some(buf)));
-    ctx.set_field(list, size_slot, Value::Int(init_size));
-    list
+    let list_pin = ctx.pin_native_root(list);
+    let list_cur = ctx.read_native_pin(list_pin, list);
+    let buf_cur = ctx.read_native_pin(buf_pin, buf);
+    ctx.set_field(list_cur, data_slot, Value::Object(Some(buf_cur)));
+    let list_cur = ctx.read_native_pin(list_pin, list);
+    ctx.set_field(list_cur, size_slot, Value::Int(init_size));
+    let list_cur = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(buf_pin);
+    list_cur
 }
 
 #[inline]
@@ -3603,6 +3670,27 @@ fn native_collection_to_array_generator(
     Ok(Some(Value::Object(Some(target))))
 }
 
+fn make_arraylist_iterator(ctx: &mut dyn NativeContext, list: ObjectRef) -> MethodCallResult {
+    // `alloc_synthetic` initializes/allocates the iterator class and can run a
+    // moving collection. Root both the list and the new iterator until the
+    // backing link and cursor state are installed.
+    let list_pin = ctx.pin_native_root(list);
+    let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
+    let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr_cur = ctx.read_native_pin(itr_pin, itr);
+    let list_cur = ctx.read_native_pin(list_pin, list);
+    ctx.set_field(itr_cur, list_slot, Value::Object(Some(list_cur)));
+    let itr_cur = ctx.read_native_pin(itr_pin, itr);
+    ctx.set_field(itr_cur, cursor_slot, Value::Int(0));
+    let itr_cur = ctx.read_native_pin(itr_pin, itr);
+    let last_ret_slot = al_itr_last_ret_slot(ctx);
+    ctx.set_field(itr_cur, last_ret_slot, Value::Int(-1));
+    let itr_cur = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(list_pin);
+    Ok(Some(Value::Object(Some(itr_cur))))
+}
+
 pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -3656,11 +3744,7 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             let snap_len = snapshot.map(|a| ctx.array_length(a) as i32).unwrap_or(0);
             let backing = snapshot.unwrap_or_else(|| alloc_ref_array(ctx, 0));
             let wrapper = alloc_arraylist_with(ctx, backing, snap_len);
-            let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
-            let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
-            ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
-            ctx.set_field(itr, cursor_slot, Value::Int(0));
-            return Ok(Some(Value::Object(Some(itr))));
+            return make_arraylist_iterator(ctx, wrapper);
         }
     }
     // EnumSet reached via the `Iterable.iterator()` interface native: the
@@ -3695,21 +3779,13 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 ctx.set_array_element(backing, i, *v);
             }
             let wrapper = alloc_arraylist_with(ctx, backing, elems.len() as i32);
-            let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
-            let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
-            ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
-            ctx.set_field(itr, cursor_slot, Value::Int(0));
-            return Ok(Some(Value::Object(Some(itr))));
+            return make_arraylist_iterator(ctx, wrapper);
         }
     }
     // Create ArrayList$Itr. Real-JDK has fields: cursor, lastRet,
     // expectedModCount, this$0. Use field-name resolution so we write to
     // the right slots regardless of layout.
-    let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
-    let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
-    ctx.set_field(itr, list_slot, Value::Object(Some(this)));
-    ctx.set_field(itr, cursor_slot, Value::Int(0));
-    Ok(Some(Value::Object(Some(itr))))
+    make_arraylist_iterator(ctx, this)
 }
 
 fn native_al_ensure_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5674,16 +5750,15 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     if is_lhm_receiver(ctx, this) {
         return lhm_collect_keys(ctx, this);
     }
-    let (buckets, _size, cap) = map_state(ctx, this);
+    let (buckets, size, cap) = map_state(ctx, this);
     let mut keys = Vec::new();
     if let Some(b) = buckets {
+        let mut budget = bucket_walk_budget(size, cap);
         for i in 0..(cap as usize) {
-            let mut visited = std::collections::HashSet::new();
             let mut node_val = ctx.get_array_element(b, i);
             while let Value::Object(Some(node)) = node_val {
-                if !visited.insert(node.as_ptr() as usize) {
-                    eprintln!("[HM-COLLECT-GUARD] bucket cycle detected while collecting keys");
-                    break;
+                if !spend_bucket_walk_budget(&mut budget, "keys") {
+                    return keys;
                 }
                 let key = get_node_key(ctx, node);
                 keys.push(key);
@@ -5692,6 +5767,37 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
         }
     }
     keys
+}
+
+/// Total number of node hops a native chain walker may make before declaring
+/// the table corrupt.
+///
+/// Every node lives in exactly one chain, so a well-formed table with `size`
+/// entries costs exactly `size` hops for a full scan; `extra` (the bucket count
+/// for HashMap, `0` for the LinkedHashMap insertion-order list) and the constant
+/// floor cover tables whose cached `size` field is stale or unset. A `next`
+/// cycle — which a torn link write under a moving collector can create — would
+/// otherwise spin forever inside a native, presenting as a VM hang with no Java
+/// stack, which is strictly harder to diagnose than a truncated view.
+fn bucket_walk_budget(size: i32, extra: i32) -> usize {
+    let size = size.max(0) as usize;
+    let extra = extra.max(0) as usize;
+    size.saturating_add(extra).saturating_add(1024)
+}
+
+/// Charge one node hop against `budget`; returns `false` once it is exhausted,
+/// after reporting the corruption.
+#[inline]
+fn spend_bucket_walk_budget(budget: &mut usize, what: &str) -> bool {
+    if *budget == 0 {
+        eprintln!(
+            "[HM-COLLECT-GUARD] chain exceeded its node budget while collecting {what} \
+             — treating the table as corrupt and truncating the view"
+        );
+        return false;
+    }
+    *budget -= 1;
+    true
 }
 
 /// Collect all values from a HashMap into a Vec.
@@ -5723,16 +5829,15 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     if is_lhm_receiver(ctx, this) {
         return lhm_collect_values(ctx, this);
     }
-    let (buckets, _size, cap) = map_state(ctx, this);
+    let (buckets, size, cap) = map_state(ctx, this);
     let mut values = Vec::new();
     if let Some(b) = buckets {
+        let mut budget = bucket_walk_budget(size, cap);
         for i in 0..(cap as usize) {
-            let mut visited = std::collections::HashSet::new();
             let mut node_val = ctx.get_array_element(b, i);
             while let Value::Object(Some(node)) = node_val {
-                if !visited.insert(node.as_ptr() as usize) {
-                    eprintln!("[HM-COLLECT-GUARD] bucket cycle detected while collecting values");
-                    break;
+                if !spend_bucket_walk_budget(&mut budget, "values") {
+                    return values;
                 }
                 let value = get_node_value(ctx, node);
                 values.push(value);
@@ -5779,16 +5884,15 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
         let vs = lhm_collect_values(ctx, this);
         return ks.into_iter().zip(vs).collect();
     }
-    let (buckets, _size, cap) = map_state(ctx, this);
+    let (buckets, size, cap) = map_state(ctx, this);
     let mut entries = Vec::new();
     if let Some(b) = buckets {
+        let mut budget = bucket_walk_budget(size, cap);
         for i in 0..(cap as usize) {
-            let mut visited = std::collections::HashSet::new();
             let mut node_val = ctx.get_array_element(b, i);
             while let Value::Object(Some(node)) = node_val {
-                if !visited.insert(node.as_ptr() as usize) {
-                    eprintln!("[HM-COLLECT-GUARD] bucket cycle detected while collecting entries");
-                    break;
+                if !spend_bucket_walk_budget(&mut budget, "entries") {
+                    return entries;
                 }
                 let key = get_node_key(ctx, node);
                 let value = get_node_value(ctx, node);
@@ -10165,18 +10269,24 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         let k = read_pinned_elem(ctx, key_handles[i], *k);
         ctx.set_array_element(keys_arr, i, k);
     }
-    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS);
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(total as i32));
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/HashMap$KeyItr",
+        MAP_KEY_ITR_NUM_FIELDS,
+        &[
+            (MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr))),
+            (MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0)),
+            (MAP_KEY_ITR_FIELD_TOTAL, Value::Int(total as i32)),
+            (MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this))),
+            (MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1)),
+        ],
+    );
     // Wire backing HashSet for Iterator.remove() — without this, JDK code
     // like MXBeanSupport.findMXBeanInterface (which iterates a HashSet and
     // calls it.remove() inside the loop) throws UnsupportedOperationException
     // because dispatch falls through to the default Iterator.remove().
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
@@ -10186,10 +10296,16 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             let arr = alloc_ref_array(ctx, 0);
-            let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
-            ctx.set_field(spl, 0, Value::Object(Some(arr)));
-            ctx.set_field(spl, 1, Value::Int(0));
-            ctx.set_field(spl, 2, Value::Int(0));
+            let spl = alloc_synthetic_with_fields(
+                ctx,
+                "java/util/Spliterator",
+                3,
+                &[
+                    (0, Value::Object(Some(arr))),
+                    (1, Value::Int(0)),
+                    (2, Value::Int(0)),
+                ],
+            );
             return Ok(Some(Value::Object(Some(spl))));
         }
     };
@@ -10216,11 +10332,17 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     for (i, v) in elems.iter().enumerate().take(len) {
         ctx.set_array_element(arr, i, *v);
     }
-    let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
     let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.set_field(spl, 0, Value::Object(Some(arr)));
-    ctx.set_field(spl, 1, Value::Int(0));
-    ctx.set_field(spl, 2, Value::Int(len as i32));
+    let spl = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/Spliterator",
+        3,
+        &[
+            (0, Value::Object(Some(arr))),
+            (1, Value::Int(0)),
+            (2, Value::Int(len as i32)),
+        ],
+    );
     ctx.unpin_native_roots(backing_pin);
     ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(spl))))
@@ -10410,14 +10532,22 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this_pin = ctx.pin_native_root(this);
+    let this_cur = ctx.read_native_pin(this_pin, this);
     let (cursor_slot, list_slot, _) = al_itr_slots(ctx);
-    let cursor = match ctx.get_field(this, cursor_slot) {
+    let cursor = match ctx.get_field(this_cur, cursor_slot) {
         Value::Int(c) => c,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
-    let list = match ctx.get_field(this, list_slot) {
+    let list = match ctx.get_field(this_cur, list_slot) {
         Value::Object(Some(l)) => l,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let (data, size) = al_state(ctx, list);
     if cursor >= size {
@@ -10425,6 +10555,7 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // `NoSuchElementException` per the JDK contract — returning `null`
         // silently masks the over-read and lets callers treat exhausted
         // iterators as holding a trailing `null` element.
+        ctx.unpin_native_roots(this_pin);
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "no more elements".to_string(),
@@ -10434,17 +10565,25 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     }
     let data = match data {
         Some(d) => d,
-        None => return Ok(Some(Value::Object(None))),
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let val = ctx.get_array_element(data, cursor as usize);
-    ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
+    let val_pin = pin_value(ctx, val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_cur, cursor_slot, Value::Int(cursor + 1));
     // Record the index just consumed in `lastRet` so a subsequent
     // `Iterator.remove()` is legal. Real-JDK `next()` does `lastRet = i`
     // via `dup_x1; putfield`; because this native shadows the bytecode that
     // write must be reproduced here, otherwise `remove()` sees the
     // constructor's `lastRet == -1` and throws `IllegalStateException`.
     let last_ret_slot = al_itr_last_ret_slot(ctx);
-    ctx.set_field(this, last_ret_slot, Value::Int(cursor));
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_cur, last_ret_slot, Value::Int(cursor));
+    let val = read_pinned_elem(ctx, val_pin, val);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(val))
 }
 
@@ -10536,16 +10675,33 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Value::Object(Some(arr)) => arr,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let val = ctx.get_array_element(keys, cursor as usize);
-    ctx.set_field(this, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
+    let this_pin = ctx.pin_native_root(this);
+    let keys_pin = ctx.pin_native_root(keys);
+    let keys_cur = ctx.read_native_pin(keys_pin, keys);
+    let val = ctx.get_array_element(keys_cur, cursor as usize);
+    let val_pin = pin_value(ctx, val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(
+        this_cur,
+        MAP_KEY_ITR_FIELD_CURSOR,
+        Value::Int(cursor + 1),
+    );
     // Record index just returned for a subsequent Iterator.remove().
     // Iterator allocated with <5 fields (older snapshot iterators) silently
     // ignores the write because alloc_object pre-sized the field block.
-    let n_fields = ctx.object_num_fields(this);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let n_fields = ctx.object_num_fields(this_cur);
     if n_fields > MAP_KEY_ITR_FIELD_LAST_RET {
-        ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(cursor));
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        ctx.set_field(
+            this_cur,
+            MAP_KEY_ITR_FIELD_LAST_RET,
+            Value::Int(cursor),
+        );
     }
-    Ok(Some(val))
+    let val_cur = read_pinned_elem(ctx, val_pin, val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(val_cur))
 }
 
 /// Native `HashMap$KeyItr.remove()` — pairs with `native_hs_iterator` so
@@ -16023,10 +16179,16 @@ fn native_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => {
             // Null receiver — return an empty spliterator.
             let arr = alloc_ref_array(ctx, 0);
-            let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
-            ctx.set_field(spl, 0, Value::Object(Some(arr)));
-            ctx.set_field(spl, 1, Value::Int(0));
-            ctx.set_field(spl, 2, Value::Int(0));
+            let spl = alloc_synthetic_with_fields(
+                ctx,
+                "java/util/Spliterator",
+                3,
+                &[
+                    (0, Value::Object(Some(arr))),
+                    (1, Value::Int(0)),
+                    (2, Value::Int(0)),
+                ],
+            );
             return Ok(Some(Value::Object(Some(spl))));
         }
     };
@@ -16044,11 +16206,17 @@ fn native_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     for (i, v) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
-    let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
     let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.set_field(spl, 0, Value::Object(Some(arr)));
-    ctx.set_field(spl, 1, Value::Int(0));
-    ctx.set_field(spl, 2, Value::Int(n as i32));
+    let spl = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/Spliterator",
+        3,
+        &[
+            (0, Value::Object(Some(arr))),
+            (1, Value::Int(0)),
+            (2, Value::Int(n as i32)),
+        ],
+    );
     // Element pins (if any) precede `arr_pin`; release the whole batch from the
     // earliest handle.
     let unpin_from = if base != usize::MAX { base } else { arr_pin };
@@ -19878,14 +20046,19 @@ fn make_primitive_iterator(
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
         ctx.set_array_element(arr, i, val);
     }
-    let itr = alloc_synthetic(ctx, iterator_class, 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.set_field(
-        itr,
-        PRIMITIVE_ITERATOR_FIELD_ELEMENTS,
-        Value::Object(Some(arr)),
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        iterator_class,
+        2,
+        &[
+            (
+                PRIMITIVE_ITERATOR_FIELD_ELEMENTS,
+                Value::Object(Some(arr)),
+            ),
+            (PRIMITIVE_ITERATOR_FIELD_CURSOR, Value::Int(0)),
+        ],
     );
-    ctx.set_field(itr, PRIMITIVE_ITERATOR_FIELD_CURSOR, Value::Int(0));
     ctx.unpin_native_roots(if elem_base == usize::MAX {
         arr_pin
     } else {
@@ -19930,13 +20103,14 @@ fn primitive_iterator_next_value(
             .into(),
         );
     }
-    let val = ctx.get_array_element(arr, cursor);
-    ctx.set_field(
+    Ok(snapshot_cursor_store_and_read(
+        ctx,
         this,
+        arr,
         PRIMITIVE_ITERATOR_FIELD_CURSOR,
-        Value::Int((cursor + 1) as i32),
-    );
-    Ok(val)
+        cursor,
+        (cursor + 1) as i32,
+    ))
 }
 
 fn native_primitive_iterator_has_next(
@@ -25650,11 +25824,20 @@ fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this_pin = ctx.pin_native_root(this);
     let arr = ll_snapshot_array(ctx, this);
-    let it = alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3);
-    ctx.set_field(it, 0, Value::Object(Some(arr)));
-    ctx.set_field(it, 1, Value::Int(0));
-    ctx.set_field(it, 2, Value::Object(Some(this)));
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let it = alloc_synthetic_with_fields(
+        ctx,
+        "cratonvm/internal/LinkedListSnapshotListItr",
+        3,
+        &[
+            (0, Value::Object(Some(arr))),
+            (1, Value::Int(0)),
+            (2, Value::Object(Some(this_cur))),
+        ],
+    );
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(it))))
 }
 
@@ -25667,11 +25850,20 @@ fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
+    let this_pin = ctx.pin_native_root(this);
     let arr = ll_snapshot_array(ctx, this);
-    let it = alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3);
-    ctx.set_field(it, 0, Value::Object(Some(arr)));
-    ctx.set_field(it, 1, Value::Int(idx.max(0)));
-    ctx.set_field(it, 2, Value::Object(Some(this)));
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let it = alloc_synthetic_with_fields(
+        ctx,
+        "cratonvm/internal/LinkedListSnapshotListItr",
+        3,
+        &[
+            (0, Value::Object(Some(arr))),
+            (1, Value::Int(idx.max(0))),
+            (2, Value::Object(Some(this_cur))),
+        ],
+    );
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(it))))
 }
 
@@ -25728,8 +25920,14 @@ fn native_ll_listitr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             .into(),
         );
     }
-    let elem = ctx.get_array_element(arr, cursor as usize);
-    ctx.set_field(this, 1, Value::Int(cursor + 1));
+    let elem = snapshot_cursor_store_and_read(
+        ctx,
+        this,
+        arr,
+        1,
+        cursor as usize,
+        cursor + 1,
+    );
     Ok(Some(elem))
 }
 
@@ -25780,8 +25978,14 @@ fn native_ll_listitr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             .into(),
         );
     }
-    let elem = ctx.get_array_element(arr, (cursor - 1) as usize);
-    ctx.set_field(this, 1, Value::Int(cursor - 1));
+    let elem = snapshot_cursor_store_and_read(
+        ctx,
+        this,
+        arr,
+        1,
+        (cursor - 1) as usize,
+        cursor - 1,
+    );
     Ok(Some(elem))
 }
 
@@ -25937,22 +26141,44 @@ fn native_ll_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let arr = alloc_ref_array(ctx, 0);
-            let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
-            ctx.set_field(spl, 0, Value::Object(Some(arr)));
-            ctx.set_field(spl, 1, Value::Int(0));
-            ctx.set_field(spl, 2, Value::Int(0));
+            let spl = alloc_synthetic_with_fields(
+                ctx,
+                "java/util/Spliterator",
+                3,
+                &[
+                    (0, Value::Object(Some(arr))),
+                    (1, Value::Int(0)),
+                    (2, Value::Int(0)),
+                ],
+            );
             return Ok(Some(Value::Object(Some(spl))));
         }
     };
     let elements = ll_overlay_elements(ctx, this);
+    let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let arr = alloc_ref_array(ctx, elements.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, v) in elements.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
+        let arr_cur = ctx.read_native_pin(arr_pin, arr);
+        let value_cur = read_pinned_elem(ctx, elem_handles[i], *v);
+        ctx.set_array_element(arr_cur, i, value_cur);
     }
-    let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
-    ctx.set_field(spl, 0, Value::Object(Some(arr)));
-    ctx.set_field(spl, 1, Value::Int(0));
-    ctx.set_field(spl, 2, Value::Int(elements.len() as i32));
+    let arr_cur = ctx.read_native_pin(arr_pin, arr);
+    let spl = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/Spliterator",
+        3,
+        &[
+            (0, Value::Object(Some(arr_cur))),
+            (1, Value::Int(0)),
+            (2, Value::Int(elements.len() as i32)),
+        ],
+    );
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        arr_pin
+    } else {
+        elem_base
+    });
     Ok(Some(Value::Object(Some(spl))))
 }
 
@@ -26684,10 +26910,16 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let head = ll_get(ctx, this, "head");
-    let itr = alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3);
-    ctx.set_field(itr, 0, head); // current node
-    ctx.set_field(itr, 1, Value::Object(Some(this))); // list ref
-    ctx.set_field(itr, 2, Value::Object(None)); // last returned node
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/LinkedList$Itr",
+        3,
+        &[
+            (0, head),                             // current node
+            (1, Value::Object(Some(this))),        // list ref
+            (2, Value::Object(None)),              // last returned node
+        ],
+    );
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -26723,12 +26955,23 @@ fn native_ll_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             )
         }
     };
-    let element = ctx.get_field(cur, LL_NODE_ELEM);
-    let next = ctx.get_field(cur, LL_NODE_NEXT);
-    ctx.set_field(this, 0, next);
+    let this_pin = ctx.pin_native_root(this);
+    let cur_pin = ctx.pin_native_root(cur);
+    let cur_cur = ctx.read_native_pin(cur_pin, cur);
+    let element = ctx.get_field(cur_cur, LL_NODE_ELEM);
+    let element_pin = pin_value(ctx, element);
+    let next = ctx.get_field(cur_cur, LL_NODE_NEXT);
+    let next_pin = pin_value(ctx, next);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let next_cur = read_pinned_elem(ctx, next_pin, next);
+    ctx.set_field(this_cur, 0, next_cur);
     // Record the node just returned so `remove()` can unlink it.
-    ctx.set_field(this, 2, Value::Object(Some(cur)));
-    Ok(Some(element))
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let cur_cur = ctx.read_native_pin(cur_pin, cur);
+    ctx.set_field(this_cur, 2, Value::Object(Some(cur_cur)));
+    let element_cur = read_pinned_elem(ctx, element_pin, element);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(element_cur))
 }
 
 /// Native `LinkedList$Itr.remove()` — removes the element returned by the most
@@ -28107,13 +28350,22 @@ fn native_lhm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(None)
 }
 
+/// Hop budget for a walk of the LinkedHashMap insertion-order (`after`) list.
+/// The list holds exactly `size` nodes; see [`bucket_walk_budget`].
+fn lhm_walk_budget(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    let size = match lhm_get(ctx, this, "size", LHM_FIELD_SIZE) {
+        Value::Int(n) => n,
+        _ => 0,
+    };
+    bucket_walk_budget(size, 0)
+}
+
 fn lhm_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let mut keys = Vec::new();
-    let mut visited = std::collections::HashSet::new();
+    let mut budget = lhm_walk_budget(ctx, this);
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
-        if !visited.insert(node.as_ptr() as usize) {
-            eprintln!("[LHM-COLLECT-GUARD] insertion-order cycle detected while collecting keys");
+        if !spend_bucket_walk_budget(&mut budget, "insertion-order keys") {
             break;
         }
         keys.push(ctx.get_field(node, LHM_NODE_KEY));
@@ -28124,11 +28376,10 @@ fn lhm_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 
 fn lhm_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let mut vals = Vec::new();
-    let mut visited = std::collections::HashSet::new();
+    let mut budget = lhm_walk_budget(ctx, this);
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
-        if !visited.insert(node.as_ptr() as usize) {
-            eprintln!("[LHM-COLLECT-GUARD] insertion-order cycle detected while collecting values");
+        if !spend_bucket_walk_budget(&mut budget, "insertion-order values") {
             break;
         }
         vals.push(ctx.get_field(node, LHM_NODE_VALUE));
@@ -28169,13 +28420,10 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let this = ctx.read_native_pin(pin_base, this);
     // Collect (key, value) pairs in insertion order.
     let mut pairs = Vec::new();
-    let mut visited = std::collections::HashSet::new();
+    let mut budget = lhm_walk_budget(ctx, this);
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
-        if !visited.insert(node.as_ptr() as usize) {
-            eprintln!(
-                "[LHM-COLLECT-GUARD] insertion-order cycle detected while collecting entries"
-            );
+        if !spend_bucket_walk_budget(&mut budget, "insertion-order entries") {
             break;
         }
         let key = ctx.get_field(node, LHM_NODE_KEY);
@@ -29012,16 +29260,26 @@ fn native_ad_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data, head, _, size) = ad_state(ctx, this);
-    let arr = alloc_ref_array(ctx, size as usize);
-    if let Some(buf) = data {
-        let cap = ctx.array_length(buf);
-        for i in 0..(size as usize) {
-            let idx = (head as usize + i) % cap;
-            let elem = ctx.get_array_element(buf, idx);
-            ctx.set_array_element(arr, i, elem);
-        }
+    // `alloc_ref_array` and every reference-array store may trigger the moving
+    // collector.  Snapshot the deque first, pin every element, and keep the
+    // destination array rooted throughout the copy.  Carrying `data`, `arr`,
+    // or element refs raw here can turn a finite deque into a recycled-object
+    // graph that later iterates forever.
+    let elems = ad_collect_elements(ctx, this);
+    let (elem_base, elem_handles) = pin_value_slice(ctx, &elems);
+    let arr = alloc_ref_array(ctx, elems.len());
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, elem) in elems.iter().enumerate() {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let elem = read_pinned_elem(ctx, elem_handles[i], *elem);
+        ctx.set_array_element(arr, i, elem);
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        arr_pin
+    } else {
+        elem_base
+    });
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -29045,16 +29303,38 @@ fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     // ArrayDeque$Itr: field 0 = snapshot array, field 1 = cursor,
     // field 2 = backing ArrayDeque (so Iterator.remove() can mutate it).
-    let elems = ad_collect_elements(ctx, this);
+    // GC-SAFETY: constructing the snapshot is an allocating object graph.
+    // Keep the deque receiver, every snapshot element, the backing array, and
+    // the iterator itself rooted until all links are installed.  JAXB creates
+    // and drains these iterators while reflection allocates aggressively; the
+    // old raw locals could be relocated between `alloc_ref_array`,
+    // `alloc_synthetic`, and the field stores.  The resulting recycled
+    // snapshot/cursor graph made `ArrayDeque$Itr` repeat indefinitely in JIT
+    // mode while the equivalent no-JIT class completed.
+    let this_pin = ctx.pin_native_root(this);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let elems = ad_collect_elements(ctx, this_cur);
+    let (_, elem_handles) = pin_value_slice(ctx, &elems);
     let arr = alloc_ref_array(ctx, elems.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, e) in elems.iter().enumerate() {
-        ctx.set_array_element(arr, i, *e);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let e = read_pinned_elem(ctx, elem_handles[i], *e);
+        ctx.set_array_element(arr, i, e);
     }
     let itr = alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
-    ctx.set_field(itr, 2, Value::Object(Some(this)));
-    Ok(Some(Value::Object(Some(itr))))
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr_cur = ctx.read_native_pin(itr_pin, itr);
+    let arr_cur = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(itr_cur, 0, Value::Object(Some(arr_cur)));
+    let itr_cur = ctx.read_native_pin(itr_pin, itr);
+    ctx.set_field(itr_cur, 1, Value::Int(0));
+    let itr_cur = ctx.read_native_pin(itr_pin, itr);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(itr_cur, 2, Value::Object(Some(this_cur)));
+    let itr_cur = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(itr_cur))))
 }
 
 /// `ArrayDeque$Itr.remove()` — remove the element returned by the last `next()`
@@ -29569,14 +29849,25 @@ fn native_pq_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, size) = pq_state(ctx, this);
+    let data_pin = data.map(|buf| ctx.pin_native_root(buf));
     let arr = alloc_ref_array(ctx, size as usize);
+    let arr_pin = ctx.pin_native_root(arr);
     if let Some(buf) = data {
         for i in 0..(size as usize) {
+            let buf = ctx.read_native_pin(data_pin.expect("data pin"), buf);
             let elem = ctx.get_array_element(buf, i);
-            ctx.set_array_element(arr, i, elem);
+            let elem_pin = pin_value(ctx, elem);
+            let arr_cur = ctx.read_native_pin(arr_pin, arr);
+            let elem_cur = read_pinned_elem(ctx, elem_pin, elem);
+            ctx.set_array_element(arr_cur, i, elem_cur);
+            if elem_pin != usize::MAX {
+                ctx.unpin_native_roots(elem_pin);
+            }
         }
     }
-    Ok(Some(Value::Object(Some(arr))))
+    let arr_cur = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(data_pin.unwrap_or(arr_pin));
+    Ok(Some(Value::Object(Some(arr_cur))))
 }
 
 fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29585,11 +29876,20 @@ fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, size) = pq_state(ctx, this);
+    let data_pin = data.map(|buf| ctx.pin_native_root(buf));
     let arr = alloc_ref_array(ctx, size as usize);
+    let arr_pin = ctx.pin_native_root(arr);
     if let Some(buf) = data {
         for i in 0..(size as usize) {
+            let buf = ctx.read_native_pin(data_pin.expect("data pin"), buf);
             let elem = ctx.get_array_element(buf, i);
-            ctx.set_array_element(arr, i, elem);
+            let elem_pin = pin_value(ctx, elem);
+            let arr_cur = ctx.read_native_pin(arr_pin, arr);
+            let elem_cur = read_pinned_elem(ctx, elem_pin, elem);
+            ctx.set_array_element(arr_cur, i, elem_cur);
+            if elem_pin != usize::MAX {
+                ctx.unpin_native_roots(elem_pin);
+            }
         }
     }
     // Return an `ArrayList$Itr` over an ArrayList-shaped wrapper holding the
@@ -29601,12 +29901,11 @@ fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // wrapper + name-resolved `al_itr_slots` layout is exactly the EnumSet/COWAL
     // iteration path; `ArrayList$Itr.hasNext/next` read it correctly in both
     // real-JDK and synthetic-jdk modes.
-    let wrapper = alloc_arraylist_with(ctx, arr, size);
-    let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
-    let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
-    ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
-    ctx.set_field(itr, cursor_slot, Value::Int(0));
-    Ok(Some(Value::Object(Some(itr))))
+    let arr_cur = ctx.read_native_pin(arr_pin, arr);
+    let wrapper = alloc_arraylist_with(ctx, arr_cur, size);
+    let result = make_arraylist_iterator(ctx, wrapper);
+    ctx.unpin_native_roots(data_pin.unwrap_or(arr_pin));
+    result
 }
 
 fn native_pq_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -31248,9 +31547,16 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             // re-dispatch into `next` (which shadows the real bytecode → recurse).
             if let Some((queue, size, cursor)) = real_inner_itr_state(ctx, this, &cn) {
                 if cursor < size {
-                    let elem = ctx.get_array_element(queue, cursor as usize);
-                    ctx.set_field_by_name(this, "cursor", Value::Int(cursor + 1));
-                    return Ok(Some(elem));
+                    let this_pin = ctx.pin_native_root(this);
+                    let queue_pin = ctx.pin_native_root(queue);
+                    let queue_cur = ctx.read_native_pin(queue_pin, queue);
+                    let elem = ctx.get_array_element(queue_cur, cursor as usize);
+                    let elem_pin = pin_value(ctx, elem);
+                    let this_cur = ctx.read_native_pin(this_pin, this);
+                    ctx.set_field_by_name(this_cur, "cursor", Value::Int(cursor + 1));
+                    let elem_cur = read_pinned_elem(ctx, elem_pin, elem);
+                    ctx.unpin_native_roots(this_pin);
+                    return Ok(Some(elem_cur));
                 }
                 return Err(
                     cratonvm_types::error::RuntimeError::NoSuchElementException {
@@ -31297,8 +31603,14 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             .into(),
         );
     }
-    let elem = ctx.get_array_element(arr, cursor as usize);
-    ctx.set_field(this, 1, Value::Int(cursor + 1));
+    let elem = snapshot_cursor_store_and_read(
+        ctx,
+        this,
+        arr,
+        1,
+        cursor as usize,
+        cursor + 1,
+    );
     Ok(Some(elem))
 }
 
@@ -34708,13 +35020,30 @@ fn native_tm_key_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // Both fast and array modes go through the shared snapshot helper so
     // the iterator sees sorted-order keys regardless of backing store.
     let pairs = tm_collect_pairs(ctx, this);
+    let keys: Vec<Value> = pairs.iter().map(|(key, _)| *key).collect();
+    let (key_base, key_handles) = pin_value_slice(ctx, &keys);
     let snap = alloc_ref_array(ctx, pairs.len().max(1));
-    for (i, (k, _)) in pairs.iter().enumerate() {
-        ctx.set_array_element(snap, i, *k);
+    let snap_pin = ctx.pin_native_root(snap);
+    for (i, key) in keys.iter().enumerate() {
+        let snap_cur = ctx.read_native_pin(snap_pin, snap);
+        let key_cur = read_pinned_elem(ctx, key_handles[i], *key);
+        ctx.set_array_element(snap_cur, i, key_cur);
     }
-    let itr = alloc_synthetic(ctx, "java/util/TreeMap$KeyItr", 2);
-    ctx.set_field(itr, 0, Value::Object(Some(snap)));
-    ctx.set_field(itr, 1, Value::Int(0));
+    let snap_cur = ctx.read_native_pin(snap_pin, snap);
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/TreeMap$KeyItr",
+        2,
+        &[
+            (0, Value::Object(Some(snap_cur))),
+            (1, Value::Int(0)),
+        ],
+    );
+    ctx.unpin_native_roots(if key_base == usize::MAX {
+        snap_pin
+    } else {
+        key_base
+    });
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -35208,22 +35537,41 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this_pin = ctx.pin_native_root(this);
     let (data_opt, size, _) = ts_state(ctx, this);
+    let data_pin = data_opt.map(|data| ctx.pin_native_root(data));
     let snap = alloc_ref_array(ctx, size as usize);
+    let snap_pin = ctx.pin_native_root(snap);
     if let Some(data) = data_opt {
         for i in 0..(size as usize) {
-            let v = ctx.get_array_element(data, i);
-            ctx.set_array_element(snap, i, v);
+            let data_cur = ctx.read_native_pin(data_pin.expect("data pin"), data);
+            let value = ctx.get_array_element(data_cur, i);
+            let value_pin = pin_value(ctx, value);
+            let snap_cur = ctx.read_native_pin(snap_pin, snap);
+            let value_cur = read_pinned_elem(ctx, value_pin, value);
+            ctx.set_array_element(snap_cur, i, value_cur);
+            if value_pin != usize::MAX {
+                ctx.unpin_native_roots(value_pin);
+            }
         }
     }
     // Field 0 = snapshot array, field 1 = cursor, field 2 = owning TreeSet.
     // The back-reference to the owning set lets `TreeSet$Itr.remove()` delete
     // the last-returned element from the live set (real-JDK `Iterator.remove`
     // contract) rather than throwing UnsupportedOperationException.
-    let itr = alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3);
-    ctx.set_field(itr, 0, Value::Object(Some(snap)));
-    ctx.set_field(itr, 1, Value::Int(0));
-    ctx.set_field(itr, 2, Value::Object(Some(this)));
+    let snap_cur = ctx.read_native_pin(snap_pin, snap);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/TreeSet$Itr",
+        3,
+        &[
+            (0, Value::Object(Some(snap_cur))),
+            (1, Value::Int(0)),
+            (2, Value::Object(Some(this_cur))),
+        ],
+    );
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -35738,21 +36086,40 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this_pin = ctx.pin_native_root(this);
     let (data_opt, size, _) = ts_state(ctx, this);
+    let data_pin = data_opt.map(|data| ctx.pin_native_root(data));
     let n = size as usize;
     let snap = alloc_ref_array(ctx, n);
+    let snap_pin = ctx.pin_native_root(snap);
     if let Some(data) = data_opt {
         for i in 0..n {
             // Reverse: snap[i] = data[size-1-i] (the data array is kept sorted
             // ascending by native_ts_add).
-            let v = ctx.get_array_element(data, n - 1 - i);
-            ctx.set_array_element(snap, i, v);
+            let data_cur = ctx.read_native_pin(data_pin.expect("data pin"), data);
+            let value = ctx.get_array_element(data_cur, n - 1 - i);
+            let value_pin = pin_value(ctx, value);
+            let snap_cur = ctx.read_native_pin(snap_pin, snap);
+            let value_cur = read_pinned_elem(ctx, value_pin, value);
+            ctx.set_array_element(snap_cur, i, value_cur);
+            if value_pin != usize::MAX {
+                ctx.unpin_native_roots(value_pin);
+            }
         }
     }
-    let itr = alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3);
-    ctx.set_field(itr, 0, Value::Object(Some(snap)));
-    ctx.set_field(itr, 1, Value::Int(0));
-    ctx.set_field(itr, 2, Value::Object(Some(this)));
+    let snap_cur = ctx.read_native_pin(snap_pin, snap);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/TreeSet$Itr",
+        3,
+        &[
+            (0, Value::Object(Some(snap_cur))),
+            (1, Value::Int(0)),
+            (2, Value::Object(Some(this_cur))),
+        ],
+    );
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -39990,12 +40357,24 @@ fn alloc_unmod_wrapper(
     class_name: &str,
     backing: ObjectRef,
 ) -> ObjectRef {
+    // Both class initialization/allocation and the backing-field store can run
+    // the moving collector. Keep the two halves of the new wrapper graph
+    // rooted until the link is installed, then return the wrapper's forwarded
+    // address. A stale wrapper here surfaced as an endlessly recycled JAXB
+    // UnmodifiableCollection iterator while Hibernate bootstrapped H2.
     let backing_pin = ctx.pin_native_root(backing);
     let wrapper = alloc_synthetic(ctx, class_name, 2);
-    let backing = ctx.read_native_pin(backing_pin, backing);
-    ctx.set_field(wrapper, UNMOD_FIELD_BACKING, Value::Object(Some(backing)));
+    let wrapper_pin = ctx.pin_native_root(wrapper);
+    let wrapper_cur = ctx.read_native_pin(wrapper_pin, wrapper);
+    let backing_cur = ctx.read_native_pin(backing_pin, backing);
+    ctx.set_field(
+        wrapper_cur,
+        UNMOD_FIELD_BACKING,
+        Value::Object(Some(backing_cur)),
+    );
+    let wrapper_cur = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(backing_pin);
-    wrapper
+    wrapper_cur
 }
 
 /// Allocate an *immutable*-collection wrapper (the `List.of`/`Set.of`/`Map.of`/
@@ -40008,8 +40387,12 @@ fn alloc_immutable_wrapper(
     backing: ObjectRef,
 ) -> ObjectRef {
     let wrapper = alloc_unmod_wrapper(ctx, class_name, backing);
-    ctx.set_field(wrapper, UNMOD_FIELD_IMMUTABLE, Value::Int(1));
-    wrapper
+    let wrapper_pin = ctx.pin_native_root(wrapper);
+    let wrapper_cur = ctx.read_native_pin(wrapper_pin, wrapper);
+    ctx.set_field(wrapper_cur, UNMOD_FIELD_IMMUTABLE, Value::Int(1));
+    let wrapper_cur = ctx.read_native_pin(wrapper_pin, wrapper);
+    ctx.unpin_native_roots(wrapper_pin);
+    wrapper_cur
 }
 
 /// Read the backing collection out of a wrapper. Recurses if the backing is
@@ -41249,10 +41632,24 @@ fn alloc_unmod_list_itr(
     snapshot: ObjectRef,
     cursor: i32,
 ) -> ObjectRef {
+    // The iterator allocation can relocate the snapshot and each field store
+    // can relocate the iterator. Root both objects and refresh them before
+    // every store so a finite snapshot cannot turn into a recycled graph.
+    let snapshot_pin = ctx.pin_native_root(snapshot);
     let it = alloc_synthetic(ctx, UNMOD_LIST_ITR_CLASS, 2);
-    ctx.set_field(it, UNMOD_LIST_ITR_SNAPSHOT, Value::Object(Some(snapshot)));
-    ctx.set_field(it, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor));
-    it
+    let it_pin = ctx.pin_native_root(it);
+    let it_cur = ctx.read_native_pin(it_pin, it);
+    let snapshot_cur = ctx.read_native_pin(snapshot_pin, snapshot);
+    ctx.set_field(
+        it_cur,
+        UNMOD_LIST_ITR_SNAPSHOT,
+        Value::Object(Some(snapshot_cur)),
+    );
+    let it_cur = ctx.read_native_pin(it_pin, it);
+    ctx.set_field(it_cur, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor));
+    let it_cur = ctx.read_native_pin(it_pin, it);
+    ctx.unpin_native_roots(snapshot_pin);
+    it_cur
 }
 
 /// `listIterator()` returns a read-only `ListIterator` over the backing list.
@@ -41331,9 +41728,20 @@ fn native_unmod_listitr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
         .into());
     }
-    let elem = ctx.get_array_element(snapshot, cursor as usize);
-    ctx.set_field(this, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor + 1));
-    Ok(Some(elem))
+    let this_pin = ctx.pin_native_root(this);
+    let snapshot_pin = ctx.pin_native_root(snapshot);
+    let snapshot_cur = ctx.read_native_pin(snapshot_pin, snapshot);
+    let elem = ctx.get_array_element(snapshot_cur, cursor as usize);
+    let elem_pin = pin_value(ctx, elem);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(
+        this_cur,
+        UNMOD_LIST_ITR_CURSOR,
+        Value::Int(cursor + 1),
+    );
+    let elem_cur = read_pinned_elem(ctx, elem_pin, elem);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(elem_cur))
 }
 
 fn native_unmod_listitr_has_previous(
@@ -41363,9 +41771,16 @@ fn native_unmod_listitr_previous(ctx: &mut dyn NativeContext, args: &[Value]) ->
         .into());
     }
     let idx = cursor - 1;
-    let elem = ctx.get_array_element(snapshot, idx as usize);
-    ctx.set_field(this, UNMOD_LIST_ITR_CURSOR, Value::Int(idx));
-    Ok(Some(elem))
+    let this_pin = ctx.pin_native_root(this);
+    let snapshot_pin = ctx.pin_native_root(snapshot);
+    let snapshot_cur = ctx.read_native_pin(snapshot_pin, snapshot);
+    let elem = ctx.get_array_element(snapshot_cur, idx as usize);
+    let elem_pin = pin_value(ctx, elem);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_cur, UNMOD_LIST_ITR_CURSOR, Value::Int(idx));
+    let elem_cur = read_pinned_elem(ctx, elem_pin, elem);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(elem_cur))
 }
 
 fn native_unmod_listitr_next_index(
@@ -41924,9 +42339,12 @@ fn native_collections_empty_iterator(
     _args: &[Value],
 ) -> MethodCallResult {
     let arr = alloc_ref_array(ctx, 0);
-    let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyItr", 2);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/Collections$EmptyItr",
+        2,
+        &[(0, Value::Object(Some(arr))), (1, Value::Int(0))],
+    );
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -43156,27 +43574,50 @@ fn native_lbq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.monitor_enter(this);
-    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+    let this_pin = ctx.pin_native_root(this);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.monitor_enter(this_cur);
+    let size = match ctx.get_field(this_cur, LBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
-    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+    let arr = match ctx.get_field(this_cur, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
         _ => {
-            ctx.monitor_exit(this);
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            ctx.monitor_exit(this_cur);
+            ctx.unpin_native_roots(this_pin);
             return Ok(Some(Value::Object(None)));
         }
     };
-    let head = lbq_head(ctx, this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let head = lbq_head(ctx, this_cur);
     let snap = alloc_ref_array(ctx, size as usize);
+    let snap_pin = ctx.pin_native_root(snap);
     for i in 0..size as usize {
-        ctx.set_array_element(snap, i, ctx.get_array_element(arr, head + i));
+        let arr_cur = ctx.read_native_pin(arr_pin, arr);
+        let value = ctx.get_array_element(arr_cur, head + i);
+        let value_pin = pin_value(ctx, value);
+        let snap_cur = ctx.read_native_pin(snap_pin, snap);
+        let value_cur = read_pinned_elem(ctx, value_pin, value);
+        ctx.set_array_element(snap_cur, i, value_cur);
+        if value_pin != usize::MAX {
+            ctx.unpin_native_roots(value_pin);
+        }
     }
-    ctx.monitor_exit(this);
-    let itr = alloc_synthetic(ctx, "java/util/concurrent/LinkedBlockingQueue$Itr", 2);
-    ctx.set_field(itr, 0, Value::Object(Some(snap)));
-    ctx.set_field(itr, 1, Value::Int(0));
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.monitor_exit(this_cur);
+    let snap_cur = ctx.read_native_pin(snap_pin, snap);
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/concurrent/LinkedBlockingQueue$Itr",
+        2,
+        &[
+            (0, Value::Object(Some(snap_cur))),
+            (1, Value::Int(0)),
+        ],
+    );
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -43394,8 +43835,9 @@ fn native_list_itr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         return Ok(Some(Value::Object(None)));
     }
     let new_cursor = cursor - 1;
-    ctx.set_field(this, 1, Value::Int(new_cursor));
-    Ok(Some(ctx.get_array_element(arr, new_cursor as usize)))
+    let value =
+        snapshot_cursor_store_and_read(ctx, this, arr, 1, new_cursor as usize, new_cursor);
+    Ok(Some(value))
 }
 
 fn native_list_itr_next_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -43483,9 +43925,20 @@ fn native_spliterator_try_advance(ctx: &mut dyn NativeContext, args: &[Value]) -
     if cursor >= len {
         return Ok(Some(Value::Int(0)));
     }
-    let elem = ctx.get_array_element(arr, cursor);
-    ctx.set_field(this, 1, Value::Int((cursor + 1) as i32));
-    ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem])?;
+    let this_pin = ctx.pin_native_root(this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let consumer_pin = ctx.pin_native_root(consumer);
+    let arr_cur = ctx.read_native_pin(arr_pin, arr);
+    let elem = ctx.get_array_element(arr_cur, cursor);
+    let elem_pin = pin_value(ctx, elem);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_cur, 1, Value::Int((cursor + 1) as i32));
+    let consumer_cur = ctx.read_native_pin(consumer_pin, consumer);
+    let elem_cur = read_pinned_elem(ctx, elem_pin, elem);
+    let result =
+        ctx.invoke_virtual(consumer_cur, "accept", "(Ljava/lang/Object;)V", &[elem_cur]);
+    ctx.unpin_native_roots(this_pin);
+    result?;
     Ok(Some(Value::Int(1)))
 }
 
@@ -43651,9 +44104,12 @@ fn native_spliterator_for_each_remaining(
 
 fn native_spliterators_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let arr = alloc_ref_array(ctx, 0);
-    let itr = alloc_synthetic(ctx, "java/util/Spliterators$EmptySpliterator", 2);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/Spliterators$EmptySpliterator",
+        2,
+        &[(0, Value::Object(Some(arr))), (1, Value::Int(0))],
+    );
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -43676,18 +44132,28 @@ fn native_empty_iterator(ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
             // store it in the static field (GC-rooted, so it survives
             // relocation), and return it so all callers share one instance.
             let arr = alloc_ref_array(ctx, 0);
-            let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyIterator", 2);
-            ctx.set_field(itr, 0, Value::Object(Some(arr)));
-            ctx.set_field(itr, 1, Value::Int(0));
-            ctx.set_static_field(cid, idx, Value::Object(Some(itr)));
-            return Ok(Some(Value::Object(Some(itr))));
+            let itr = alloc_synthetic_with_fields(
+                ctx,
+                "java/util/Collections$EmptyIterator",
+                2,
+                &[(0, Value::Object(Some(arr))), (1, Value::Int(0))],
+            );
+            let itr_pin = ctx.pin_native_root(itr);
+            let itr_cur = ctx.read_native_pin(itr_pin, itr);
+            ctx.set_static_field(cid, idx, Value::Object(Some(itr_cur)));
+            let itr_cur = ctx.read_native_pin(itr_pin, itr);
+            ctx.unpin_native_roots(itr_pin);
+            return Ok(Some(Value::Object(Some(itr_cur))));
         }
     }
     // Fallback (class/field unavailable): fresh synthetic empty iterator.
     let arr = alloc_ref_array(ctx, 0);
-    let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyIterator", 2);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/Collections$EmptyIterator",
+        2,
+        &[(0, Value::Object(Some(arr))), (1, Value::Int(0))],
+    );
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -43711,18 +44177,28 @@ fn native_empty_list_iterator(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
                 return Ok(Some(v));
             }
             let arr = alloc_ref_array(ctx, 0);
-            let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyListIterator", 2);
-            ctx.set_field(itr, 0, Value::Object(Some(arr)));
-            ctx.set_field(itr, 1, Value::Int(0));
-            ctx.set_static_field(cid, idx, Value::Object(Some(itr)));
-            return Ok(Some(Value::Object(Some(itr))));
+            let itr = alloc_synthetic_with_fields(
+                ctx,
+                "java/util/Collections$EmptyListIterator",
+                2,
+                &[(0, Value::Object(Some(arr))), (1, Value::Int(0))],
+            );
+            let itr_pin = ctx.pin_native_root(itr);
+            let itr_cur = ctx.read_native_pin(itr_pin, itr);
+            ctx.set_static_field(cid, idx, Value::Object(Some(itr_cur)));
+            let itr_cur = ctx.read_native_pin(itr_pin, itr);
+            ctx.unpin_native_roots(itr_pin);
+            return Ok(Some(Value::Object(Some(itr_cur))));
         }
     }
     // Fallback (class/field unavailable): fresh synthetic empty list iterator.
     let arr = alloc_ref_array(ctx, 0);
-    let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyListIterator", 2);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
+    let itr = alloc_synthetic_with_fields(
+        ctx,
+        "java/util/Collections$EmptyListIterator",
+        2,
+        &[(0, Value::Object(Some(arr))), (1, Value::Int(0))],
+    );
     Ok(Some(Value::Object(Some(itr))))
 }
 
