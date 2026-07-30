@@ -9,7 +9,7 @@
 #                       re-anchored with a normal PR justification.
 #
 # phase	baseline_ms	checksum	status	evidence
-arithmetic	4700	5000000003999999995	provisional	pair-1 best 4635, 2026-07-24
+arithmetic	3976	5000000003999999995	provisional	pure-kernel OSR reg-homes default-on + R8/R9 operand cache, median-of-7 3976ms (checksum-verified), 2026-07-30
 fib	4450	701408733	provisional	pair-1 best 4417, 2026-07-24
 sieve	5800	9592	provisional	pair-1 best 5759, 2026-07-24
 matrix	5700	173943680	provisional	pair-1 best 5630, 2026-07-24

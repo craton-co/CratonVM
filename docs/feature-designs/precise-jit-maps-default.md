@@ -268,12 +268,16 @@ not behaviour flips.
 (`x64.rs`) is replaced, when enabled, by a single instruction:
 
 ```text
-mov gs:[disp], rbp      ; 65 48 89 2C 25 <disp32>  (9 bytes, no CALL)
+mov <gs|fs>:[disp], rbp ; <65|64> 48 89 2C 25 <disp32> (9 bytes, no CALL)
 ```
 
 storing RBP straight into the precise-maps innermost-RBP mirror. Gate:
 `precise_inline_frame_record_enabled()` (`x64.rs`), **default-on**, opt out with
 `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`.
+
+The 2026-07-30 Linux completion also applies this store after each direct
+JIT-to-JIT return to restore the caller's RBP. Previously those return sites
+still called `jit_frame_record`, including on Windows.
 
 **Design note — supersedes the "chain-top cache slot" sketch.** The scaffolding
 section below proposed caching the chain-top *address* in a frame slot (by
@@ -281,20 +285,20 @@ analogy with the shadow path's thread-pointer cache). That only helps if
 obtaining the address is cheap, but the frame-record runs **once per
 invocation**, so "fetch address (CALL) + store" is no cheaper than the original
 CALL. The shipped design instead bakes the address as an immediate: the mirror
-lives in a **Windows OS TLS slot** (`TlsAlloc`), whose `gs:[0x1480 + slot*8]`
-displacement is recovered and **sentinel-probed at startup**
-(`inline_rbp_tls_disp()`). No frame slot, no per-call address fetch — just one
-`mov`. The probe is the safety net the Risks section demands: a unique 64-bit
-sentinel is written via the documented `TlsSetValue` and read back through the
-candidate `gs:[disp]` (with a fallback scan of the 64-slot static band); on any
-mismatch (slot ≥ 64, unexpected TEB layout) **or** non-Windows, it returns 0 and
-the CALL path is used. A wrong layout assumption therefore degrades to the
-existing safe behaviour, never to a silently mis-tracked mirror.
+lives in an **OS TLS slot**: `TlsAlloc`/`gs:` on Windows and a Rust TLS
+`Cell`/`fs:` on Linux x86-64. Its displacement is recovered and
+**sentinel-probed at startup** (`inline_rbp_tls_disp()`). No frame slot, no
+per-call address fetch — just one `mov`. The probe is the safety net the Risks
+section demands: a unique 64-bit sentinel is written through the supported TLS
+accessor and read back through the candidate segment-relative address. Any
+range or layout mismatch returns 0 and keeps the CALL path. A wrong layout
+assumption therefore degrades to the existing safe behaviour, never to a
+silently mis-tracked mirror.
 
 **Single source of truth.** `inline_rbp_tls_disp()` (jit crate) is consulted by
-both the codegen (which bakes `gs:[disp]`) and the VM-side mirror accessor
-`top_rbp_get/set` (`conservative_roots.rs`, which reads/writes the same slot when
-active, else the legacy `thread_local! TOP_RBP`). Codegen and GC can never
+both the codegen (which bakes `gs:[disp]` or `fs:[disp]`) and the VM-side mirror
+accessor `top_rbp_get/set` (`conservative_roots.rs`, which reads/writes the same
+slot when active, else the legacy `thread_local! TOP_RBP`). Codegen and GC can never
 disagree on slot-vs-thread-local. The change is **behaviour-equivalent to the
 CALL path for the mirror value** — same RBP, same program point, same per-thread
 mirror, consumed identically; only the mechanism and cost differ. (On the
@@ -305,7 +309,7 @@ load-bearing only for the moving/relocation path.)
 **Self-check.** `CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD` (default-off) wires a
 verify helper into the `frame_record` slot; the prologue emits the inline store
 *and* calls it to assert the mirror reads back the RBP just stored — proving the
-hand-rolled `gs:[disp]` encoding lands exactly where the GC reads.
+hand-rolled segment-relative encoding lands exactly where the GC reads.
 
 **Validation (this build, quiet host, JDK-25 HotSpot oracle):**
 
@@ -326,9 +330,12 @@ inline cuts ~74 % of the frame-record overhead (CALL added ~10.8 s; inline adds
 
 **Scope / residuals (not regressions of this work):**
 
-- **Windows-only.** The single-instruction store relies on the Windows TEB TLS
-  layout. On non-Windows `inline_rbp_tls_disp()` returns 0 → CALL path, so the
-  default flip is a safe no-op there. A Linux `fs:`-based path is future work.
+- **Linux x86-64 landed 2026-07-30.** Linux uses a sentinel-probed Rust TLS
+  `Cell` at a signed `fs:[disp32]` offset. The prologue and every post-direct-
+  call restoration store into that cell, and the VM reads/writes the same
+  mirror. The separate OSR trampoline shares the same centralized GS/FS prefix
+  selector. Unsupported targets or a failed probe retain the helper path. See
+  `docs/internal/performance/fibonacci-half-gap-20260730.md`.
 - **Multi-thread.** The mirror is per-thread (TLS), identical to the CALL path's
   per-thread `TOP_RBP`. The `MTRegex` GC-root stress repro is **flaky on both
   inline-on and inline-off** — it exercises the *documented, pre-existing*
