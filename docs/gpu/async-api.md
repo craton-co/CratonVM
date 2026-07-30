@@ -444,16 +444,11 @@ from the by-design [Limitations](#limitations) below.
   registered `Native.*` entry point lets a dispatch be routed onto that
   explicit handle instead of the executor's default — see the note under
   [`GpuStream`](#gpustream).
-- **JIT-compiled callers bypass transparent offload.** Not specific to
-  the explicit API in this document (which always calls through a
-  native method, never a JIT-visible `invokestatic`), but relevant if
-  application code mixes both paths: the offload hook lives in
-  `execute_invokestatic`'s interpreter slow path. If the *caller
-  method* containing an offload-eligible call gets JIT-compiled (OSR
-  of a hot loop), dispatch moves into JIT-emitted code and the hook is
-  never consulted again — offload silently stops, structurally, even
-  though the 2026-07-11 fix keeps eligible interpreted call sites
-  re-entering the hook correctly. See [`jit-caller-gate.md`](jit-caller-gate.md).
+- **JIT-caller bypass closed.** The automatic path still enters through the
+  interpreter's `invokestatic` hook, so `offload_jit_gate` keeps a caller with
+  an eligible offload site out of JIT and OSR compilation while `--gpu` is
+  active. Callers without eligible sites remain compilable. See
+  [`jit-caller-gate.md`](jit-caller-gate.md).
 
 ## Limitations
 
@@ -508,5 +503,4 @@ from the by-design [Limitations](#limitations) below.
 - [`README.md`](README.md) — top-level reference: build matrix
   (`gpu` vs `gpu-driver`), CLI surface, file index.
 - [`reductions.md`](reductions.md) and [`jit-caller-gate.md`](jit-caller-gate.md)
-  — the reduction void-return gate and the JIT-caller bypass referenced in
-  [Current limitations](#current-limitations).
+  — scalar-reduction support and the closed JIT-caller bypass.

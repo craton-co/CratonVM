@@ -219,10 +219,12 @@ fn remap_collection_overlays(_: &crate::vm::SharedVm, map: &HashMap<usize, usize
 }
 fn scan_loaders_and_jmx(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::classloader::gc_scan_loader_singleton_roots(roots);
+    #[cfg(feature = "experimental-jmx")]
     cratonvm_native_builtins::jmx::gc_scan_platform_mbean_server_root(roots);
 }
 fn remap_loaders_and_jmx(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
     cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(map);
+    #[cfg(feature = "experimental-jmx")]
     cratonvm_native_builtins::jmx::gc_update_platform_mbean_server_ref(map);
 }
 fn scan_system(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {

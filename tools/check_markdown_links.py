@@ -125,9 +125,7 @@ def main() -> int:
     else:
         paths = sorted(
             {
-                root / "README.md",
-                root / "ARCHITECTURE.md",
-                root / "BENCHMARK.md",
+                *[p for p in root.glob("*.md")],
                 *markdown_files(root / "docs" / "book" / "src"),
                 *[p for p in (root / "docs").glob("*.md")],
             }

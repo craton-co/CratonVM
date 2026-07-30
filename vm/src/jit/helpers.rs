@@ -18,6 +18,10 @@ use cratonvm_types::{
 };
 
 use crate::memory::vm_heap::VmHeap;
+use crate::runtime::redefine_state::{
+    class_id_or_name_was_redefined, class_was_redefined, hierarchy_was_redefined,
+    named_class_was_redefined,
+};
 use crate::threading::jvm_thread::JvmThread;
 use crate::vm::SharedVm;
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
@@ -70,12 +74,12 @@ use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot
 #[inline]
 fn direct_static_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(
-        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY") {
+    *CACHE.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
-        },
-    )
+        }
+    })
 }
 
 // The virtual-call counterpart of the flag above. Default-ON now that every
@@ -109,14 +113,13 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
 #[inline]
 fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(
-        || match cratonvm_types::flags::runtime_var(
-            "CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY",
-        ) {
+    *CACHE.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY")
+        {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
-        },
-    )
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,8 +1510,12 @@ unsafe fn resolve_callee_cached(
         _ => cm.find_class_by_name_for_class(info.class_name, ClassId::new(info.declaring_class_id)),
     }?;
     let store = cm.class_store();
-    let (method, declaring_id) =
-        crate::classloading::find_method_recursive(class_id, info.method_name, info.descriptor, store)?;
+    let (method, declaring_id) = crate::classloading::find_method_recursive(
+        class_id,
+        info.method_name,
+        info.descriptor,
+        store,
+    )?;
     let code_attr = method.code()?;
     if code_attr.exception_table.is_empty() || method.is_synchronized() {
         return None;
@@ -1581,10 +1588,7 @@ unsafe fn callee_has_exception_table(vm: &SharedVm, info: &JitInvokeInfo) -> boo
     let class_id = if info.declaring_class_id == 0 {
         cm.find_bootstrap_class_by_name(info.class_name)
     } else {
-        cm.find_class_by_name_for_class(
-            info.class_name,
-            ClassId::new(info.declaring_class_id),
-        )
+        cm.find_class_by_name_for_class(info.class_name, ClassId::new(info.declaring_class_id))
     };
     let Some(class_id) = class_id else {
         return false;
@@ -1967,7 +1971,6 @@ fn descriptors_match_modulo_return(a: &str, b: &str) -> bool {
     }
 }
 
-
 /// Service a compiled callee's `i64::MIN` sentinel returned by a GENERATED
 /// inline call (the MIC/PIC cascade in `jit/src/x64.rs`).
 ///
@@ -2165,14 +2168,10 @@ unsafe fn try_resume_trapped_callee(
         return None;
     };
     if key.is_empty() || bci == u32::MAX {
-        trc("no usable stash identity", &format_args!("key={key:?} bci={bci}"));
-        return None;
-    }
-    // After a class redefinition the stash (from a pre-redefine artifact) may
-    // describe bytecode that no longer matches the class store — refuse and
-    // let the conservative re-run handle it (mirrors `try_osr`'s guard).
-    if crate::classloading::any_class_redefined() {
-        trc("a class was redefined", &key);
+        trc(
+            "no usable stash identity",
+            &format_args!("key={key:?} bci={bci}"),
+        );
         return None;
     }
     let Some((rest, key_desc)) = key.rsplit_once(':') else {
@@ -2183,14 +2182,17 @@ unsafe fn try_resume_trapped_callee(
         trc("unparseable stash key", &key);
         return None;
     };
+    // A redefine of this exact callee invalidates the stashed frame. An
+    // unrelated agent transformation must not disable deopt resume globally.
+    if named_class_was_redefined(vm, key_class) {
+        trc("the stashed callee was redefined", &key);
+        return None;
+    }
     if key_method != info.method_name || !descriptors_match_modulo_return(key_desc, info.descriptor)
     {
         trc(
             "stash is not this call site's callee",
-            &format_args!(
-                "stash={key} site={}{}",
-                info.method_name, info.descriptor
-            ),
+            &format_args!("stash={key} site={}{}", info.method_name, info.descriptor),
         );
         return None;
     }
@@ -2203,10 +2205,7 @@ unsafe fn try_resume_trapped_callee(
         let class_id = if info.declaring_class_id == 0 {
             cm.find_bootstrap_class_by_name(key_class)?
         } else {
-            cm.find_class_by_name_for_class(
-                key_class,
-                ClassId::new(info.declaring_class_id),
-            )?
+            cm.find_class_by_name_for_class(key_class, ClassId::new(info.declaring_class_id))?
         };
         let store = cm.class_store();
         let (method, declaring_id) =
@@ -2878,7 +2877,8 @@ fn dbg_tlabmiss(reason: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some())
+    {
         return;
     }
     static COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -4818,13 +4818,11 @@ fn jit_typecheck_target_cache_put(cache_key: (usize, usize, usize), target: Clas
 fn jit_is_subclass_of_cached(vm: &SharedVm, child: ClassId, parent: ClassId) -> bool {
     let vm_key = vm as *const SharedVm as usize;
     let key = (vm_key, child.as_u32(), parent.as_u32());
-    let redefined = crate::classloading::any_class_redefined();
-    if !redefined {
-        let hit =
-            JIT_SUBTYPE_POSITIVE_CACHE.with(|cache| cache.borrow().iter().any(|e| *e == key));
-        if hit {
-            return true;
-        }
+    // JVMTI class redefinition cannot change superclass or interface identity,
+    // so a positive subtype result remains valid across method-body changes.
+    let hit = JIT_SUBTYPE_POSITIVE_CACHE.with(|cache| cache.borrow().iter().any(|e| *e == key));
+    if hit {
+        return true;
     }
     let is_subclass = {
         vm.classes
@@ -4832,7 +4830,7 @@ fn jit_is_subclass_of_cached(vm: &SharedVm, child: ClassId, parent: ClassId) -> 
             .read()
             .is_subclass_of(child, parent)
     };
-    if is_subclass && !redefined {
+    if is_subclass {
         JIT_SUBTYPE_POSITIVE_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             if cache.len() >= JIT_SUBTYPE_CACHE_CAP {
@@ -4959,7 +4957,9 @@ unsafe fn jit_typecheck_resolve(
             .borrow()
             .iter()
             .find(|(cached_vm, cached_ptr, cached_len, _)| {
-                *cached_vm == cache_key.0 && *cached_ptr == cache_key.1 && *cached_len == cache_key.2
+                *cached_vm == cache_key.0
+                    && *cached_ptr == cache_key.1
+                    && *cached_len == cache_key.2
             })
             .map(|(_, _, _, raw)| ClassId::new(*raw))
     });
@@ -5253,8 +5253,7 @@ pub unsafe extern "C" fn jit_checkcast(
             // `java.lang.String cannot be cast to java.lang.String` that cost
             // a session of misdiagnosis on TestObjectDataType. HotSpot prints
             // `[Ljava.lang.String;`.
-            let obj_cls_name = match crate::runtime::interpreter::array_descriptor_of(vm, obj_ref)
-            {
+            let obj_cls_name = match crate::runtime::interpreter::array_descriptor_of(vm, obj_ref) {
                 Some(desc) => desc.replace('/', "."),
                 None => vm
                     .classes
@@ -6114,13 +6113,12 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // gate matches the resolution site below. Runs ahead of the recursion
     // depth guard like the Integer block: the cached callbacks are native
     // leaves that never re-enter JIT code.
-    if matches!(info.invoke_kind, 0 | 2)
-        && !args_slice.is_empty()
-        && !crate::classloading::any_class_redefined()
-    {
+    if matches!(info.invoke_kind, 0 | 2) && !args_slice.is_empty() {
         let cached =
             OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
-        if let Some(entry) = cached {
+        if let Some(entry) =
+            cached.filter(|entry| !class_was_redefined(vm, ClassId::new(entry.receiver_class_id)))
+        {
             let receiver_raw = args_slice[0] as u64;
             if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
                 if let Some(receiver) = vm.mem.heap.is_object_address(receiver_raw as usize) {
@@ -6137,7 +6135,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             }
         }
     }
-    if !crate::classloading::any_class_redefined() {
+    if !class_id_or_name_was_redefined(vm, info.declaring_class_id, info.class_name) {
         let cached =
             INTEGER_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
         let integer_native = match cached {
@@ -6197,7 +6195,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // (`ctx.invoke_virtual`). Hot monomorphic virtual sites are already served
     // by the receiver-guarded MIC helper (`jit_invoke_virtual_mic`).
     let statically_bound = matches!(info.invoke_kind, 1 | 3);
-    let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+    let redefine_jit_quiesced =
+        class_id_or_name_was_redefined(vm, info.declaring_class_id, info.class_name);
     if redefine_jit_quiesced {
         DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
         VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
@@ -6523,63 +6522,61 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         .map(|_| ObjectNativeKind::HashMap)
         .or_else(|| matcher_native_arg_count(info).map(|_| ObjectNativeKind::Matcher))
         .or_else(|| stringbuilder_native_arg_count(info).map(|_| ObjectNativeKind::StringBuilder));
-    if matches!(info.invoke_kind, 0 | 2)
-        && !crate::classloading::any_class_redefined()
-        && object_native_kind.is_some()
-        && !args_slice.is_empty()
-    {
+    if matches!(info.invoke_kind, 0 | 2) && object_native_kind.is_some() && !args_slice.is_empty() {
         let kind = object_native_kind.expect("checked above");
         let receiver_raw = args_slice[0] as u64;
         if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
             if let Some(receiver) = vm.mem.heap.is_object_address(receiver_raw as usize) {
                 let receiver_class_id = vm.mem.heap.class_id_of(receiver).as_u32();
-                let cached = OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| {
-                    cache
-                        .borrow()
-                        .get(&info_key)
-                        .copied()
-                        .filter(|entry| entry.receiver_class_id == receiver_class_id)
-                });
-                if let Some(entry) = cached {
-                    if let Some(result) =
-                        call_object_native_raw(vm, thread, info, receiver, args_slice, entry)
-                    {
-                        return result;
-                    }
-                } else {
-                    let expected_class = match kind {
-                        ObjectNativeKind::HashMap => "java/util/HashMap",
-                        ObjectNativeKind::Matcher => "java/util/regex/Matcher",
-                        ObjectNativeKind::StringBuilder => "java/lang/StringBuilder",
-                    };
-                    let is_exact_receiver = {
-                        let classes = vm.classes.class_manager.read();
-                        classes
-                            .get_class(ClassId::new(receiver_class_id))
-                            .map(|class| class.name.as_ref() == expected_class)
-                            .unwrap_or(false)
-                    };
-                    if is_exact_receiver {
-                        let callback = match kind {
-                            ObjectNativeKind::HashMap => hashmap_native_callback(info),
-                            ObjectNativeKind::Matcher => matcher_native_callback(info),
-                            ObjectNativeKind::StringBuilder => {
-                                stringbuilder_native_callback(vm, info)
-                            }
+                if !class_was_redefined(vm, ClassId::new(receiver_class_id)) {
+                    let cached = OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| {
+                        cache
+                            .borrow()
+                            .get(&info_key)
+                            .copied()
+                            .filter(|entry| entry.receiver_class_id == receiver_class_id)
+                    });
+                    if let Some(entry) = cached {
+                        if let Some(result) =
+                            call_object_native_raw(vm, thread, info, receiver, args_slice, entry)
+                        {
+                            return result;
+                        }
+                    } else {
+                        let expected_class = match kind {
+                            ObjectNativeKind::HashMap => "java/util/HashMap",
+                            ObjectNativeKind::Matcher => "java/util/regex/Matcher",
+                            ObjectNativeKind::StringBuilder => "java/lang/StringBuilder",
                         };
-                        if let Some(callback) = callback {
-                            let entry = NativeDispatchCache {
-                                receiver_class_id,
-                                callback,
-                                kind,
+                        let is_exact_receiver = {
+                            let classes = vm.classes.class_manager.read();
+                            classes
+                                .get_class(ClassId::new(receiver_class_id))
+                                .map(|class| class.name.as_ref() == expected_class)
+                                .unwrap_or(false)
+                        };
+                        if is_exact_receiver {
+                            let callback = match kind {
+                                ObjectNativeKind::HashMap => hashmap_native_callback(info),
+                                ObjectNativeKind::Matcher => matcher_native_callback(info),
+                                ObjectNativeKind::StringBuilder => {
+                                    stringbuilder_native_callback(vm, info)
+                                }
                             };
-                            OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| {
-                                cache.borrow_mut().insert(info_key, entry);
-                            });
-                            if let Some(result) = call_object_native_raw(
-                                vm, thread, info, receiver, args_slice, entry,
-                            ) {
-                                return result;
+                            if let Some(callback) = callback {
+                                let entry = NativeDispatchCache {
+                                    receiver_class_id,
+                                    callback,
+                                    kind,
+                                };
+                                OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| {
+                                    cache.borrow_mut().insert(info_key, entry);
+                                });
+                                if let Some(result) = call_object_native_raw(
+                                    vm, thread, info, receiver, args_slice, entry,
+                                ) {
+                                    return result;
+                                }
                             }
                         }
                     }
@@ -6889,13 +6886,14 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
     let value = value as i32;
-    if !(-128..=127).contains(&value) && !crate::classloading::any_class_redefined() {
+    if !(-128..=127).contains(&value) {
         let vm_key = vm as *const SharedVm as usize;
         let cached_class = INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
             cache
                 .get()
                 .filter(|(cached_vm, _)| *cached_vm == vm_key)
                 .map(|(_, raw)| ClassId::new(raw))
+                .filter(|class_id| !class_was_redefined(vm, *class_id))
         });
         if let Some(class_id) = cached_class {
             if let Some((thread, _guard)) = jit_thread_mut() {
@@ -6909,9 +6907,8 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                 // exhaustion (or an oversized layout) falls back to the full
                 // allocator with its old-gen spill/batch behavior.
                 thread_local! {
-                    // (vm_key, class_id, slots) — invalidated implicitly by
-                    // the enclosing `any_class_redefined` gate (field counts
-                    // only change through redefinition).
+                    // (vm_key, class_id, slots). The exact-class redefine gate
+                    // above prevents use after that class's layout changes.
                     static INTEGER_ALLOC_SLOTS: std::cell::Cell<Option<(usize, u32, u32)>> =
                         const { std::cell::Cell::new(None) };
                 }
@@ -7137,7 +7134,7 @@ unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
     let cid = std::ptr::read(receiver as usize as *const u32);
     let vm_key = vm as *const SharedVm as usize;
     if HASHMAP_CLASS_CACHE.with(|c| c.get() == Some((vm_key, cid))) {
-        return !crate::classloading::any_class_redefined();
+        return !class_was_redefined(vm, ClassId::new(cid));
     }
     let is_exact = vm
         .classes
@@ -7148,7 +7145,7 @@ unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
         .unwrap_or(false);
     if is_exact {
         HASHMAP_CLASS_CACHE.with(|c| c.set(Some((vm_key, cid))));
-        return !crate::classloading::any_class_redefined();
+        return !class_was_redefined(vm, ClassId::new(cid));
     }
     false
 }
@@ -7157,7 +7154,7 @@ unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64)
     let cid = std::ptr::read(receiver as usize as *const u32);
     let vm_key = vm as *const SharedVm as usize;
     if CONCURRENT_HASHMAP_CLASS_CACHE.with(|c| c.get() == Some((vm_key, cid))) {
-        return !crate::classloading::any_class_redefined();
+        return !class_was_redefined(vm, ClassId::new(cid));
     }
     let exact = vm
         .classes
@@ -7169,7 +7166,7 @@ unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64)
     if exact {
         CONCURRENT_HASHMAP_CLASS_CACHE.with(|c| c.set(Some((vm_key, cid))));
     }
-    exact && !crate::classloading::any_class_redefined()
+    exact && !class_was_redefined(vm, ClassId::new(cid))
 }
 
 /// Guarded direct path for `ConcurrentMap.get(Object)` when the runtime
@@ -8343,7 +8340,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // resolution. Guarding the exact receiver class preserves subclass
     // overrides; the feature gate in `matcher_native_callback` preserves the
     // native opt-out, and class redefinition keeps using the generic resolver.
-    if !crate::classloading::any_class_redefined() {
+    if !class_was_redefined(vm, receiver_class_id) {
         if let Some(callback) = matcher_native_callback(info) {
             if is_exact_matcher_class(vm, receiver_class_id) {
                 if let Some(result) =
@@ -8442,7 +8439,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     }
 
     let mic = &*(mic_ptr as *const JitMICSlot);
-    let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+    let redefine_jit_quiesced = hierarchy_was_redefined(vm, receiver_class_id);
     if redefine_jit_quiesced {
         mic.clear_compiled_entry();
         if pic_ptr != 0 {
@@ -10887,7 +10884,9 @@ pub unsafe extern "C" fn jit_safepoint_slow_path() {
     };
     if let Some((thread, _guard)) = jit_thread_mut() {
         let hit = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if hit <= 16 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_SAFEPOINTS").is_some() {
+        if hit <= 16
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_SAFEPOINTS").is_some()
+        {
             eprintln!(
                 "[jit-safepoint] cooperative slow-path hit={} thread_id={}",
                 hit, thread.thread_id.0

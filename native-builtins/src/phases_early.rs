@@ -9020,8 +9020,8 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     // public real-JDK submit path on the same side-table-backed semantics as
     // invoke(). Letting the concrete JDK submit bytecode enqueue into the real
     // pool exposes WorkQueue/status machinery that CratonVM only partially
-    // models under CRATONVM_REAL_FORKJOINPOOL, and Fork6Hard observes stale
-    // task/result objects there under GC stress.
+    // models on the default real-ForkJoinPool path, and Fork6Hard observes
+    // stale task/result objects there under GC stress.
     for submit_name in ["submit", "externalSubmit"] {
         r.register(
             "java/util/concurrent/ForkJoinPool",

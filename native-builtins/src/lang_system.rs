@@ -1320,6 +1320,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let name = ctx.read_string(name_obj).unwrap_or_default();
+            crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
             // Map bare library name to platform-specific filename.
             // resolve_library_path() in NativeContextImpl will search java.library.path.
             let lib_name = platform_lib_name(&name);
@@ -1337,6 +1338,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let path = ctx.read_string(path_obj).unwrap_or_default();
+            crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
             let _ = ctx.load_native_library(&path);
             Ok(None)
         },
@@ -1350,6 +1352,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             let name_obj = obj_arg(args, 0)?;
             let name = ctx.read_string(name_obj).unwrap_or_default();
+            crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
             let lib_name = platform_lib_name(&name);
             let _ = ctx.load_native_library(&lib_name);
             Ok(None)
@@ -1362,6 +1365,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let path = ctx.read_string(path_obj).unwrap_or_default();
+            crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
             let _ = ctx.load_native_library(&path);
             Ok(None)
         },
@@ -2166,7 +2170,6 @@ pub(crate) fn native_pb_command(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    eprintln!("[PB-START-OLD] called! args.len={}", args.len());
     // SECURITY: this is the "simplified" ProcessBuilder.start stub that
     // never actually spawns вЂ” it returns a dummy Process with exit_code=0.
     // The real spawning path is `phases_late::register_phase57_process`,
@@ -4259,7 +4262,7 @@ mod t15_tests {
 #[cfg(test)]
 mod checkexec_security_tests {
     use super::*;
-    use crate::security_manager::set_security_manager_for_test;
+    use crate::security_manager::{security_state_test_lock, set_security_manager_for_test};
     use crate::test_utils::mock_ctx;
     #[allow(unused_imports)]
     use cratonvm_native_api::{
@@ -4286,6 +4289,7 @@ mod checkexec_security_tests {
 
     #[test]
     fn no_security_manager_allows_check_exec() {
+        let _guard = security_state_test_lock();
         // Ensure no SM is installed (defensive вЂ” other tests may have set one).
         let prev = set_security_manager_for_test(None);
 
@@ -4306,6 +4310,7 @@ mod checkexec_security_tests {
 
     #[test]
     fn denying_security_manager_blocks_check_exec() {
+        let _guard = security_state_test_lock();
         let mut ctx = mock_ctx();
         let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
         let prev = set_security_manager_for_test(Some(sm));
@@ -4329,6 +4334,7 @@ mod checkexec_security_tests {
 
     #[test]
     fn denying_sm_blocks_runtime_exec_before_spawn() {
+        let _guard = security_state_test_lock();
         // End-to-end check: a deny-all SM must short-circuit
         // native_runtime_exec_string with SecurityException вЂ” std::process::Command
         // is never invoked. Using a bogus program path proves no fallback
@@ -4365,6 +4371,7 @@ mod checkexec_security_tests {
 
     #[test]
     fn denying_sm_blocks_processbuilder_start_stub() {
+        let _guard = security_state_test_lock();
         // Same coverage for the simplified `native_pb_start` stub. Even
         // though this stub doesn't actually spawn, the SM gate runs first
         // so a future refactor that wires it to std::process::Command can
@@ -4409,6 +4416,7 @@ mod checkexec_security_tests {
 
     #[test]
     fn allow_listed_sm_lets_specific_paths_through() {
+        let _guard = security_state_test_lock();
         let mut ctx = mock_ctx();
         let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
         let prev = set_security_manager_for_test(Some(sm));

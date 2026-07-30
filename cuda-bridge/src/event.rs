@@ -81,8 +81,12 @@ struct EventCuda {
 // per the CUDA driver model. See `DeviceContext`'s `# Safety`
 // paragraph in `lib.rs` for the bridge-wide caller contract.
 #[cfg(feature = "cuda")]
+// SAFETY: every public operation binds the retained owning device on the
+// current thread before using the raw event handle.
 unsafe impl Send for EventCuda {}
 #[cfg(feature = "cuda")]
+// SAFETY: CUDA serializes event operations and the retained device keeps the
+// handle's context alive; each driving thread binds that context first.
 unsafe impl Sync for EventCuda {}
 
 #[cfg(feature = "cuda")]
@@ -92,6 +96,8 @@ impl Drop for EventCuda {
         // cudarc uses in `CudaDevice::drop` (which destroys the
         // per-device sync event).
         let _ = self.device.bind_to_thread();
+        // SAFETY: the event remains uniquely owned and live, and its owning
+        // device context was bound immediately above.
         unsafe {
             let _ = cudarc::driver::result::event::destroy(self.cu_event);
         }
@@ -190,6 +196,7 @@ impl Event {
         // event has completed on whatever stream recorded it. If the
         // event was never recorded the call returns immediately (the
         // CUDA driver treats an unrecorded event as already-complete).
+        // SAFETY: the owning device was bound above and keeps this event live.
         unsafe { cudarc::driver::result::event::synchronize(self.inner.cu_event) }
             .map_err(|e| DeviceError::Driver(format!("cuEventSynchronize: {e:?}")))
     }
@@ -226,6 +233,7 @@ impl Event {
         // is still in flight. We map the not-ready code to
         // `Ok(false)` so callers don't have to grep for the specific
         // driver error variant; anything else is a genuine failure.
+        // SAFETY: the owning device was bound above and keeps this event live.
         match unsafe { cudarc::driver::result::event::query(self.inner.cu_event) } {
             Ok(()) => Ok(true),
             Err(e) => {
@@ -285,6 +293,8 @@ impl Stream {
         // stream's command queue. Subsequent `cuEventQuery` /
         // `cuEventSynchronize` calls observe completion of any work
         // ahead of this point on the stream.
+        // SAFETY: event and stream share the bound owning context and remain
+        // live for this synchronous enqueue.
         unsafe { cudarc::driver::result::event::record(event.inner.cu_event, self.raw()) }
             .map_err(|e| DeviceError::Driver(format!("cuEventRecord: {e:?}")))
     }
@@ -319,6 +329,8 @@ impl Stream {
         // inserts a barrier on this stream that blocks all subsequent
         // submissions until `event` fires on whichever stream
         // recorded it. The wait itself does not block the host.
+        // SAFETY: event and stream share the bound owning context and remain
+        // live for this synchronous enqueue.
         unsafe {
             cudarc::driver::result::stream::wait_event(
                 self.raw(),

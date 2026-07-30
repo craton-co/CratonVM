@@ -1,4 +1,4 @@
-# Where the moving young generation's throughput went
+# Moving-young collector throughput
 
 Slug: `moving-young-throughput` · 2026-07-26
 Follows `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`,

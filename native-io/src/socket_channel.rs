@@ -700,6 +700,8 @@ pub fn channel_fields_update_after_gc<S: std::hash::BuildHasher>(
             let old = state.object.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old) {
                 debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                // SAFETY: the stop-the-world GC supplies a non-null forwarding
+                // address for this live ObjectRef before mutators resume.
                 state.object = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
@@ -3902,6 +3904,8 @@ pub fn ss_back_ref_update_after_gc<S: std::hash::BuildHasher>(
         let old = obj.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old) {
             debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            // SAFETY: this runs during stop-the-world root remapping and the
+            // map entry is the non-null forwarding address for `obj`.
             unsafe { ObjectRef::from_raw(new_addr as *mut u8) }
         } else {
             obj

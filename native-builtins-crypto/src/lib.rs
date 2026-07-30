@@ -11,3 +11,4 @@ pub mod bc_aes;
 pub mod bc_chacha;
 pub mod bc_newhope;
 mod bc_newhope_tables;
+pub mod signature;

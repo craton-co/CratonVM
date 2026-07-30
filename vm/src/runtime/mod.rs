@@ -53,6 +53,7 @@ pub mod agent_loader;
 pub mod instrument;
 pub mod lang_reflect_constructor;
 pub mod proxy;
+pub(crate) mod redefine_state;
 pub mod stackwalker;
 
 // Part C of the GPU offload plan — primitive-array marshalling between the

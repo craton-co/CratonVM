@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
+#![deny(
+    clippy::missing_safety_doc,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::undocumented_unsafe_blocks
+)]
+
 //! Java I/O native methods for CratonVM.
 //!
 //! Contains native method implementations for java.io and java.nio I/O classes.
@@ -39,7 +45,7 @@
 /// Every `CRATONVM_*` flag this crate reads is a field on
 /// [`cratonvm_types::IoFlags`], parsed once at first use. This crate used to
 /// carry its own `env_flag_enabled` boolean parser, one of the five
-/// inconsistent truth tables catalogued in `docs/internal/flag-census.md`; the
+/// inconsistent truth tables catalogued in `docs/flag-census.md`; the
 /// parser now lives in `cratonvm_types::flags::parse::truthy_word` with its
 /// semantics unchanged.
 #[inline]
@@ -208,12 +214,9 @@ fn apply_certified_deployment_profile() {
         let msg = "CRATONVM SECURITY (V12): untrusted/certified I/O profile requested \
                    (CRATONVM_CONFINE_IO / CRATONVM_UNTRUSTED_CODE) but path confinement \
                    is NOT enabled — file I/O is NOT sandboxed.";
-        if certified {
-            // Certified profile must fail closed rather than run unconfined.
-            panic!("{msg}");
-        } else {
-            eprintln!("WARNING: {msg}");
-        }
+        // Both explicit hardening profiles fail closed. Warning-and-continue
+        // under a flag named UNTRUSTED_CODE would create a silent sandbox gap.
+        panic!("{msg}");
     } else {
         eprintln!(
             "CRATONVM SECURITY (V12): certified/untrusted I/O profile active — \
@@ -14136,6 +14139,8 @@ fn os_release_lock(file: &std::fs::File, pos: i64, size: i64) -> io::Result<()> 
     };
     let n_low = (len as u64 & 0xFFFF_FFFF) as Dword;
     let n_high = ((len as u64 >> 32) & 0xFFFF_FFFF) as Dword;
+    // SAFETY: `file` keeps `handle` live, `overlapped` is fully initialized
+    // for a byte-range unlock, and the call borrows it synchronously.
     let ok = unsafe { UnlockFileEx(handle, 0, n_low, n_high, &mut overlapped) };
     if ok == 0 {
         Err(io::Error::last_os_error())

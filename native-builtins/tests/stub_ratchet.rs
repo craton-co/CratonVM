@@ -38,11 +38,9 @@ use cratonvm_native_builtins::register_essential_natives;
 /// Frozen upper bound on the number of `SyntheticStub`-tagged registrations in
 /// the default (real-JDK / `register_essential_natives`) registry.
 ///
-/// This is the **current observed count plus a small slack**. The ratchet only
-/// fails when the count RISES above this number — i.e. when a change introduces
-/// a NEW synthetic stub. Removing stubs is encouraged; when you do, LOWER this
-/// constant to lock in the win (the ratchet never demands that, but keeping the
-/// baseline tight is what makes it bite).
+/// This is the exact current observed count. The ratchet has zero slack: adding
+/// one synthetic stub fails, while removing one requires lowering the baseline
+/// in the same change to lock in the improvement.
 ///
 /// ## How to (re)compute the baseline
 ///
@@ -59,22 +57,13 @@ use cratonvm_native_builtins::register_essential_natives;
 /// stub-ratchet: <N> SyntheticStub registrations (baseline <BASELINE>)
 /// ```
 ///
-/// Set this constant to `<N> + SLACK`. The slack absorbs a couple of
-/// legitimately-needed stubs landing alongside an unrelated change without
-/// forcing a baseline bump in the same PR; keep it small so the gate stays
-/// meaningful.
-///
-/// NOTE ON THE INITIAL VALUE: this baseline was seeded GENEROUSLY (the registry
-/// is populated at runtime and could not be executed when the gate was first
-/// authored). The intended workflow is: on the first CI run, read the printed
-/// `<N>` and TIGHTEN this constant to `<N> + SLACK`. A loose baseline still
-/// catches a large regression; a tight one catches a single new stub. Tighten
-/// it. See `docs/internal/stub-ratchet.md`.
-const BASELINE_SYNTHETIC_STUBS: usize = 2000;
+/// Set this constant to `<N>` and keep [`SLACK`] at zero. See
+/// `docs/contributing/stub-ratchet.md`.
+const BASELINE_SYNTHETIC_STUBS: usize = 157;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
-const SLACK: usize = 16;
+const SLACK: usize = 0;
 
 /// Build the default native registry exactly as the VM's real-JDK boot path
 /// does, and return `(synthetic_stub_count, total_registrations)`.

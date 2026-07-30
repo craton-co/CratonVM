@@ -34,13 +34,24 @@ exclude = [
 # synthetic test suite or to debug against Rust-side stubs, pass
 # `--features synthetic-jdk` explicitly. See `docs/roadmap.md` NEW-11
 # for the rationale and the census-driven migration plan.
-default = ["awt", "experimental-tls", "experimental-jmx", "experimental-serialization", "experimental-aot", "experimental-debug", "zgc"]
+# Keep the shipping build surface to production-intended subsystems. Optional
+# experiments remain available explicitly (`--features experimental-*`), and
+# ZGC remains selectable with `--features zgc`; compiling them is no longer
+# part of an ordinary build.
+default = ["awt"]
 # AWT/Swing/Java2D desktop natives. On by default so the standard build
 # registers them exactly as before. `cratonvm-native-awt` sets
 # `publish = false`, so this feature is what makes the dependency optional:
 # `cargo publish -p cratonvm-vm --no-default-features` can drop it.
 awt = ["dep:cratonvm-native-awt"]
-synthetic-jdk = ["cratonvm-native-builtins/synthetic-jdk", "cratonvm-native-collections/synthetic-jdk", "cratonvm-native-io/synthetic-jdk"]
+synthetic-jdk = [
+    "cratonvm-native-builtins/synthetic-jdk",
+    "cratonvm-native-collections/synthetic-jdk",
+    "cratonvm-native-io/synthetic-jdk",
+    # The legacy synthetic surface includes JMX bootstrap classes and therefore
+    # intentionally opts into that experimental native module.
+    "experimental-jmx",
+]
 experimental-tls = ["cratonvm-native-builtins/experimental-tls"]
 experimental-jmx = ["cratonvm-native-builtins/experimental-jmx"]
 experimental-serialization = ["cratonvm-native-builtins/experimental-serialization"]

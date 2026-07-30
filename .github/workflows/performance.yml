@@ -1,0 +1,33 @@
+name: Performance gate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 2,5'
+
+jobs:
+  cratonbench-priority:
+    name: HashMap, Regex, and Binary Trees budgets
+    runs-on: [self-hosted, linux, cratonvm-perf]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build release VM
+        run: cargo build --release -p cratonvm-cli
+
+      - name: Run priority performance budgets
+        run: >
+          bash regression-suite/perf/run-cratonbench-gate.sh
+          -Exe "$PWD/target/release/cratonvm"
+          --phases hashmap,stringregex,bintrees
+          --reps 5
+          --tolerance 5
