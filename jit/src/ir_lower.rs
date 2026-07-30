@@ -1125,8 +1125,14 @@ impl<'a> Lowerer<'a> {
         num_args: usize,
         entry: usize,
         callee_needs_ctx: bool,
+        info_ptr: usize,
         ty: IrType,
     ) {
+        for i in 0..num_args {
+            let arg = inputs[2 + i];
+            self.load_to_rax(self.slot_of(arg));
+            self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+        }
         let base = if callee_needs_ctx {
             self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
             1
@@ -1140,7 +1146,30 @@ impl<'a> Lowerer<'a> {
         // MOV RAX, entry ; CALL RAX.
         self.emit_mov_reg_imm64(RAX, entry as u64);
         self.buf.emit(&[0xFF, 0xD0]);
+        self.emit_inline_callee_deopt_service(info_ptr, num_args);
         self.emit_call_return_check(slot, ty);
+    }
+
+    /// Service an exceptional return from an inline cached compiled callee.
+    /// The arguments already live in the fixed staging area, so this preserves
+    /// the callee identity and incoming locals until its own handler can run.
+    fn emit_inline_callee_deopt_service(&mut self, info_ptr: usize, num_args: usize) {
+        if self.service_callee_deopt == 0 {
+            return;
+        }
+        self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        self.buf.emit(&[0x0F, 0x85]); // JNE .done
+        let skip = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[1], info_ptr as u64);
+        self.lea_reg_from_frame(CALL_ARG_REGS[2], self.args_stage_top_off);
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[3], num_args as u64);
+        self.emit_mov_reg_imm64(RAX, self.service_callee_deopt as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        let rel = self.buf.pos() as i32 - (skip as i32 + 4);
+        Self::patch_or_bail(&mut self.buf, skip, rel);
     }
 
     // ── Inline caches (jit-inlining-and-ir-calls) ────────────────────
@@ -1342,6 +1371,12 @@ impl<'a> Lowerer<'a> {
         );
         let mut done_patches: Vec<usize> = Vec::new();
         let mut slow_patches: Vec<usize> = Vec::new();
+        // The MIC/PIC hit service needs the exact outgoing Java arguments too.
+        for i in 0..num_args {
+            let arg = inputs[2 + i];
+            self.load_to_rax(self.slot_of(arg));
+            self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+        }
 
         // Receiver = arg0. Load it and its class id ONCE for the whole cascade.
         self.load_to_rax(self.slot_of(inputs[2]));
@@ -1376,6 +1411,7 @@ impl<'a> Lowerer<'a> {
         self.emit_ic_abi_marshal(inputs, num_args, false);
         self.patch_rel32_to_here(mic_call);
         self.emit_call_cached_entry(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
+        self.emit_inline_callee_deopt_service(info_ptr, num_args);
         done_patches.push(self.emit_jmp_rel32());
 
         // ── Polymorphic 4-way cascade ───────────────────────────────
@@ -1404,6 +1440,7 @@ impl<'a> Lowerer<'a> {
             self.emit_ic_abi_marshal(inputs, num_args, false);
             self.patch_rel32_to_here(call);
             self.emit_call_cached_entry(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
+            self.emit_inline_callee_deopt_service(info_ptr, num_args);
             done_patches.push(self.emit_jmp_rel32());
         }
         debug_assert!(next_entry.is_none());
@@ -2189,6 +2226,7 @@ impl<'a> Lowerer<'a> {
                             num_args,
                             entry,
                             callee_needs_ctx,
+                            *info_ptr,
                             node.ty,
                         );
                         return;
