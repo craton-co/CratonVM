@@ -3961,6 +3961,18 @@ pub fn set_integer_value_of_direct_fn(addr: usize) {
     INTEGER_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-lifetime bridge for `StringConcatFactory` sites lowered by the
+/// single-pass backend. It stays outside the stable helper-table ABI because
+/// the address is installed once at VM start, not per compiled artifact.
+pub static INDY_STRING_CONCAT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `StringConcatFactory` bridge (called once from the VM's
+/// `build_helpers`).
+pub fn set_indy_string_concat_fn(addr: usize) {
+    INDY_STRING_CONCAT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `Integer.intValue()` sibling of [`INTEGER_VALUE_OF_DIRECT_FN`].
 /// `java/lang/Integer` is `final`, so an `invokevirtual` site whose
 /// constant-pool class is exactly `Integer` is statically monomorphic and
@@ -9935,7 +9947,7 @@ fn try_compile_inner(
     // resolved) bails the WHOLE compile via `?`, exactly like every other
     // CP-resolved metadata table here — the codegen must never guess an
     // invokedynamic's stack effect.
-    let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
+    let mut indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)> = Vec::new();
     if !scan.indy_ops.is_empty() {
         let Some(resolver) = cp_invokedynamic_descriptor_resolver else {
             jitc_bail!("cp_invokedynamic_descriptor_resolver")
@@ -9947,7 +9959,7 @@ fn try_compile_inner(
             let arg_slots = count_param_slots(&descriptor);
             let ret_type = return_type(&descriptor);
             let arg_type_tags = indy_arg_type_tags(&descriptor);
-            indy_info.push((pc, arg_slots, ret_type, arg_type_tags));
+            indy_info.push((pc, arg_slots, ret_type, arg_type_tags, 0));
         }
     }
 
