@@ -30941,6 +30941,13 @@ pub fn compile_with_param_slots(
     compiler.unroll_loops = unroll_loops;
     compiler.simd_loops = simd_loops;
     compiler.matrix_dot_loops = matrix_dot_loops;
+    // The pure-kernel deferred cache owns R8/R9 across bytecodes, while the
+    // matrix-dot preheader uses those registers for its batch limit and
+    // wrapping accumulator. Keep upstream's pure-kernel local homes, but
+    // disable only the conflicting operand cache for this exact lowering.
+    if !compiler.matrix_dot_loops.is_empty() {
+        compiler.kernel_operand_cache = false;
+    }
     compiler.branch_hints = branch_hints.into_iter().collect();
     compiler.loop_unroll_hints = loop_unroll_hints.into_iter().collect();
     compiler.ldc_info = ldc_info;
