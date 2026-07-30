@@ -13826,15 +13826,19 @@ fn drain_spliterator_to_array_capped(
     spl: ObjectRef,
     safety_cap: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    let pin_base = ctx.pin_native_root(spl);
     let collector = alloc_synthetic(ctx, "cratonvm/internal/StreamCollector", 2);
-    let storage = alloc_ref_array(ctx, 16);
-    ctx.set_field(collector, 0, Value::Object(Some(storage)));
-    ctx.set_field(collector, 1, Value::Int(0));
-    let spl_pin = ctx.pin_native_root(spl);
     let col_pin = ctx.pin_native_root(collector);
+    let storage = alloc_ref_array(ctx, 16);
+    let storage_pin = ctx.pin_native_root(storage);
+    let mut collector = ctx.read_native_pin(col_pin, collector);
+    let storage = ctx.read_native_pin(storage_pin, storage);
+    ctx.set_field(collector, 0, Value::Object(Some(storage)));
+    collector = ctx.read_native_pin(col_pin, collector);
+    ctx.set_field(collector, 1, Value::Int(0));
     let mut n = 0usize;
     loop {
-        let s = ctx.read_native_pin(spl_pin, spl);
+        let s = ctx.read_native_pin(pin_base, spl);
         let c = ctx.read_native_pin(col_pin, collector);
         match ctx.invoke_virtual(
             s,
@@ -13850,8 +13854,7 @@ fn drain_spliterator_to_array_capped(
             }
             Ok(_) => break,
             Err(e) => {
-                ctx.unpin_native_roots(spl_pin);
-                ctx.unpin_native_roots(col_pin);
+                ctx.unpin_native_roots(pin_base);
                 return Err(e);
             }
         }
@@ -13864,8 +13867,9 @@ fn drain_spliterator_to_array_capped(
     let storage = match ctx.get_field(col, 0) {
         Value::Object(Some(a)) => a,
         _ => {
-            ctx.unpin_native_roots(spl_pin);
-            return Ok(alloc_ref_array(ctx, 0));
+            let out = alloc_ref_array(ctx, 0);
+            ctx.unpin_native_roots(pin_base);
+            return Ok(out);
         }
     };
     // Family-1 fix (cce0079): the `out` alloc below can trigger a moving GC.
@@ -13878,12 +13882,20 @@ fn drain_spliterator_to_array_capped(
     // across the alloc and copy from the refreshed address.
     let storage_pin = ctx.pin_native_root(storage);
     let out = alloc_ref_array(ctx, len);
-    let storage = ctx.read_native_pin(storage_pin, storage);
+    let out_pin = ctx.pin_native_root(out);
     for i in 0..len {
+        let storage = ctx.read_native_pin(storage_pin, storage);
+        let out = ctx.read_native_pin(out_pin, out);
         let v = ctx.get_array_element(storage, i);
+        let value_pin = pin_value(ctx, v);
+        let v = read_pinned_elem(ctx, value_pin, v);
         ctx.set_array_element(out, i, v);
+        if value_pin != usize::MAX {
+            ctx.unpin_native_roots(value_pin);
+        }
     }
-    ctx.unpin_native_roots(spl_pin);
+    let out = ctx.read_native_pin(out_pin, out);
+    ctx.unpin_native_roots(pin_base);
     Ok(out)
 }
 
@@ -13914,8 +13926,11 @@ fn materialize_lazy_stream(
             return Err(e);
         }
     };
+    let arr_pin = ctx.pin_native_root(arr);
     let stream = ctx.read_native_pin(stream_pin, stream);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    let stream = ctx.read_native_pin(stream_pin, stream);
     ctx.set_field(stream, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
     ctx.unpin_native_roots(stream_pin);
     Ok(())
@@ -13948,6 +13963,7 @@ fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallRes
     let stream = ctx.read_native_pin(stream_pin, stream);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    let stream = ctx.read_native_pin(stream_pin, stream);
     ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
     ctx.unpin_native_roots(if elem_base == usize::MAX {
         stream_pin
@@ -14483,10 +14499,12 @@ fn stream_pull_internal(
             // element array so a stray second terminal call on the same
             // stream object behaves like an already-drained ordinary stream
             // (mirrors `materialize_lazy_stream`'s post-drain bookkeeping).
-            let stream = ctx.read_native_pin(stream_pin, this);
             let empty = alloc_ref_array(ctx, 0);
+            let empty_pin = ctx.pin_native_root(empty);
             let stream = ctx.read_native_pin(stream_pin, this);
+            let empty = ctx.read_native_pin(empty_pin, empty);
             ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(empty)));
+            let stream = ctx.read_native_pin(stream_pin, this);
             ctx.set_field(stream, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
             return Ok(if emit_stopped {
                 PullStep::Stop
@@ -14633,14 +14651,16 @@ fn stream_pull_synthetic_downstream(
                     };
                 drain_spliterator_inline(ctx, spl, &chain, &chain_pins, &mut downstream_emit)?;
             }
-            let stream_cur = ctx.read_native_pin(stream_pin, stream);
             let empty = alloc_ref_array(ctx, 0);
+            let empty_pin = ctx.pin_native_root(empty);
             let stream_cur = ctx.read_native_pin(stream_pin, stream);
+            let empty = ctx.read_native_pin(empty_pin, empty);
             ctx.set_field(
                 stream_cur,
                 STREAM_FIELD_ELEMENTS,
                 Value::Object(Some(empty)),
             );
+            let stream_cur = ctx.read_native_pin(stream_pin, stream);
             ctx.set_field(
                 stream_cur,
                 STREAM_FIELD_LAZY_SPLITERATOR,
@@ -17076,9 +17096,16 @@ fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let arr = alloc_ref_array(ctx, 0);
+            let arr_pin = ctx.pin_native_root(arr);
             let itr = alloc_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+            let itr_pin = ctx.pin_native_root(itr);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let itr = ctx.read_native_pin(itr_pin, itr);
             ctx.set_field(itr, 0, Value::Object(Some(arr)));
+            let itr = ctx.read_native_pin(itr_pin, itr);
             ctx.set_field(itr, 1, Value::Int(0));
+            let itr = ctx.read_native_pin(itr_pin, itr);
+            ctx.unpin_native_roots(arr_pin);
             return Ok(Some(Value::Object(Some(itr))));
         }
     };
@@ -17097,7 +17124,9 @@ fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let arr = ctx.read_native_pin(arr_pin, arr);
     let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.set_field(itr, 1, Value::Int(0));
+    let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.unpin_native_roots(if elem_base == usize::MAX {
         arr_pin
     } else {
