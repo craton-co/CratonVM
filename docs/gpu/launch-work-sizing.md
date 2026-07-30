@@ -9,4 +9,4 @@ and falls back to the signature estimate only for scalar-only cases with no
 runtime array length. A kernel over `N` elements therefore launches `N` work
 items rather than an arbitrary estimate-sized grid.
 
-See also [the historical validation record](../internal/gpu-offload-followups-20260711.md#4-small-array-thread-over-launch-min-2⁰-threads-per-launch--done).
+See also [the historical validation record](../internal/fixed-suite-bugs/gpu-offload-followups-20260711.md#4-small-array-thread-over-launch-min-2⁰-threads-per-launch--done).

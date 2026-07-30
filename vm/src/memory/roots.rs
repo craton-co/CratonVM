@@ -32,7 +32,7 @@ pub(crate) fn conservative_locals_enabled() -> bool {
     // risk). Opt out even under the gate with `CRATONVM_NO_CONSERVATIVE_LOCALS`.
     static ENABLED: OnceLock<bool> = OnceLock::new();
     let base = *ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_FORKJOINPOOL").is_some()
+        cratonvm_types::flags::flags().natives.real_forkjoinpool
             && cratonvm_types::flags::runtime_var_os("CRATONVM_NO_CONSERVATIVE_LOCALS").is_none()
     });
     base && cratonvm_gc::gc_quiescence::is_active()
@@ -50,6 +50,7 @@ fn conditional_loader_metadata(shared: &SharedVm) -> bool {
                 || cratonvm_gc::gc_quiescence::major_gc_requested()
         }
         crate::config::GcAlgorithm::G1 => cratonvm_gc::gc_quiescence::class_unload_marking(),
+        #[cfg(feature = "zgc")]
         crate::config::GcAlgorithm::Zgc => true,
     }
 }
@@ -578,7 +579,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         let cache = shared.classes.resolution_cache.read();
         cache.for_each_condy_root(|class_id, object| {
             if conditional_metadata
-                && shared.mem.heap.metadata_pin_deferrable(object.as_ptr() as usize)
+                && shared
+                    .mem
+                    .heap
+                    .metadata_pin_deferrable(object.as_ptr() as usize)
             {
                 if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {

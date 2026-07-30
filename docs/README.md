@@ -48,6 +48,8 @@ and large reference tables without duplicating the manual.
 - [How the JIT Got Fast](book/src/performance/jit-internals.md)
 - [JIT Optimization History](JIT_OPTIMIZATION.md)
 - [GC Tuning](gc-tuning.md)
+- [Moving-young throughput status](moving-young-throughput.md)
+- [Framework throughput program](framework-throughput.md)
 
 ## Architecture and internals
 
@@ -84,6 +86,9 @@ Current deep dives include:
 - [Shared verified-code IR](architecture/shared-verified-code-ir.md)
 - [Native target-method metadata](architecture/native-target-method-metadata.md)
 - [Mapped JAR and shared class bytes](architecture/mapped-jar-shared-class-bytes.md)
+- [Runtime flag census](flag-census.md)
+- [Differential testing and divergence log](differential-testing.md)
+- [Synthetic versus real JDK paths](synthetic-vs-real-explained.md)
 
 The canonical in-source lock hierarchy is
 [`../vm/src/runtime/lock_order.rs`](../vm/src/runtime/lock_order.rs). The
@@ -140,6 +145,7 @@ status.
 - [Testing](book/src/contributing/testing.md)
 - [Documentation Guide](book/src/contributing/documentation.md)
 - [`../RELEASING.md`](../RELEASING.md)
+- [Release Readiness](RELEASE_READINESS.md)
 - [`../ROADMAP.md`](../ROADMAP.md)
 - [Code Coverage](COVERAGE.md)
 

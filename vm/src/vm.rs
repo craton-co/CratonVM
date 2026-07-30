@@ -49,7 +49,10 @@ use crate::threading::jvm_thread::{JvmThread, ThreadId};
 #[cfg(all(test, feature = "synthetic-jdk"))]
 use crate::types::{ObjectRef, Value};
 #[cfg(all(test, feature = "synthetic-jdk"))]
-use cratonvm_native_api::NativeContext;
+use cratonvm_native_api::{
+    NativeClassAccess, NativeContext, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+    NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+};
 #[cfg(all(test, feature = "synthetic-jdk"))]
 use cratonvm_reader::attribute::LazyAttribute;
 #[cfg(all(test, feature = "synthetic-jdk"))]
@@ -2836,6 +2839,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         id
@@ -2889,6 +2893,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         // Also register in the loaded_classes map so find_class_by_name works
@@ -5992,7 +5997,7 @@ mod tests {
         thread.frames.push(frame);
 
         // Deposit snapshot
-        let ctx = NativeContextImpl {
+        let mut ctx = NativeContextImpl {
             shared: &shared,
             thread: &mut thread,
         };
@@ -53414,6 +53419,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
             cm.register_class_name(ClassLoaderId::Application, "com/example/Point", id);
@@ -53496,6 +53502,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
             let id2 = cm.class_store.next_id();
@@ -53541,6 +53548,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
             (id1, id2)
@@ -53641,6 +53649,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
 
@@ -53678,6 +53687,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
 
@@ -53715,6 +53725,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
 
@@ -56379,6 +56390,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
 
@@ -61787,6 +61799,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             };
 
@@ -62760,6 +62773,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
         }
@@ -62843,6 +62857,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
         }
@@ -62978,6 +62993,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
         }
@@ -69618,6 +69634,7 @@ mod tests {
     // 90.1: JDWP Breakpoint Support
     // ---------------------------------------------------------------
 
+    #[cfg(feature = "experimental-debug")]
     #[test]
     fn p90_jdwp_set_breakpoint_and_check() {
         // Set a breakpoint in the JDWP EventManager and verify it matches.
@@ -69642,6 +69659,7 @@ mod tests {
         assert!(ds.events.check_breakpoint(42, 100, 5).is_none());
     }
 
+    #[cfg(feature = "experimental-debug")]
     #[test]
     fn p90_jdwp_breakpoints_active_flag() {
         // The breakpoints_active AtomicBool gates the fast-path check in the interpreter.
@@ -69671,6 +69689,7 @@ mod tests {
         assert!(ds.events.check_breakpoint(1, 2, 0).is_some());
     }
 
+    #[cfg(feature = "experimental-debug")]
     #[test]
     fn p90_jdwp_suspend_thread_on_breakpoint() {
         // Verify that hitting a breakpoint with SuspendPolicy::EventThread marks thread suspended.
@@ -71525,6 +71544,7 @@ public class SkippedTest {
     // -----------------------------------------------------------------------
 
     /// 94.1 Test 1: Dump classes to a CDS archive file using CdsArchiveGenerator directly.
+    #[cfg(feature = "experimental-aot")]
     #[test]
     fn cds_dump_archive_to_file() {
         use std::io::Read;
@@ -71571,6 +71591,7 @@ public class SkippedTest {
     }
 
     /// 94.1 Test 2: Load a dumped archive and verify entries.
+    #[cfg(feature = "experimental-aot")]
     #[test]
     fn cds_load_archive_entries() {
         let tmp = std::env::temp_dir().join("cratonvm_cds_test_load.jsa");
@@ -71619,6 +71640,7 @@ public class SkippedTest {
     }
 
     /// 94.1 Test 3: Checksum verification — corrupted archive is rejected.
+    #[cfg(feature = "experimental-aot")]
     #[test]
     fn cds_checksum_verification() {
         use std::io::Write;
@@ -71656,6 +71678,7 @@ public class SkippedTest {
     }
 
     /// 94.2 Test 1: Classes load from CDS archive on startup.
+    #[cfg(feature = "experimental-aot")]
     #[test]
     fn cds_classes_load_from_archive() {
         let tmp = std::env::temp_dir().join("cratonvm_cds_test_startup.jsa");
@@ -71696,6 +71719,7 @@ public class SkippedTest {
     }
 
     /// 94.2 Test 2: Class identity is preserved through dump-and-load cycle.
+    #[cfg(feature = "experimental-aot")]
     #[test]
     fn cds_class_identity_preserved() {
         let tmp = std::env::temp_dir().join("cratonvm_cds_test_identity.jsa");
@@ -71745,6 +71769,7 @@ public class SkippedTest {
     }
 
     /// 94.2 Test 3: Startup time delta — CDS loading is faster than cold loading.
+    #[cfg(feature = "experimental-aot")]
     #[test]
     fn cds_startup_time_improvement() {
         let tmp = std::env::temp_dir().join("cratonvm_cds_test_timing.jsa");

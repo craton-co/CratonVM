@@ -219,10 +219,10 @@ is where the grouped-variable syntax came from.
 | Token | Description | Default |
 |-------|-------------|---------|
 | `-stubs` | Drop **every** `SyntheticStub` native at registration so calls fall through to real JDK bytecode (or a clear `NoSuchMethodError`) instead of a fake. Surfaces real gaps as errors. `Intrinsic`/`Bridge` natives are unaffected. | stubs present |
-| `net-sockets` | Use the real `java.net` socket bytecode (the central registry drops the synthetic `java/net/Socket`/`ServerSocket` natives) instead of the synthetic socket layer. | synthetic |
-| `aqs` / `-aqs` | Route `AbstractQueuedSynchronizer` / `ReentrantLock` etc. through real `java.util.concurrent` bytecode instead of the synthetic lock natives. | synthetic |
+| `net-sockets` / `-net-sockets` | Use the real `java.net` socket bytecode (the central registry drops the synthetic `java/net/Socket`/`ServerSocket` natives) instead of the synthetic socket layer. | real |
+| `aqs` / `-aqs` | Route `AbstractQueuedSynchronizer` / `ReentrantLock` etc. through real `java.util.concurrent` bytecode instead of the synthetic lock natives. | real |
 | `annotations` / `-annotations` | Annotation reflection uses real proxy-backed annotation objects. | real |
-| `forkjoinpool` | Drop the synthetic `ForkJoinPool` natives and run the real `java.util.concurrent` pool. **Experimental** (see Family A4 in known-issues). | synthetic |
+| `forkjoinpool` / `-forkjoinpool` | Drop the synthetic `ForkJoinPool` natives and run the real `java.util.concurrent` pool. The `-` form also seeds Weld's `threadPoolType=NONE`, because the synthetic pool cannot service `commonPool().invokeAll`. | real |
 | `raf` / `-raf` | Force real / synthetic `RandomAccessFile`. | real |
 | `proxy-super` / `-proxy-super` | Use the real `java.lang.reflect.Proxy` super-class path. | real |
 | `agroal`, `vertx`, `ec`, `rsa`, `dsa`, `pqc`, `filewriter`, `buffered-writer`, `quarkus-arc`, … | Per-subsystem selection; the `-` form picks the experimental Rust implementation for that one subsystem. | see `docs/flag-tokens.md` |
@@ -252,10 +252,10 @@ are **off by default** (the default posture is JDK-faithful single-tenant).
 
 | Token | Description | Default |
 |-------|-------------|---------|
-| `confine-io` | Enable CWD file-I/O confinement (fail-closed): filesystem access is restricted to the working directory and explicitly registered sandbox roots. The certified hardening switch. | Off |
-| `untrusted-code` | Like `confine-io` but warning-mode — auto-enables CWD confinement for untrusted-bytecode hosting. | Off |
+| `confine-io` | Enable CWD file-I/O confinement (fail-closed): filesystem access is restricted to the working directory and explicitly registered sandbox roots. The confinement profile. | Off |
+| `untrusted-code` | The strict defence-in-depth profile. Same fail-closed CWD confinement as `confine-io` — it aborts if confinement cannot be established, it does **not** warn and continue — and additionally implies `require-policy` and unconditionally denies host-native access (JNI library loads, `SymbolLookup`, FFM downcalls). Neither profile is an in-process sandbox; both still need an OS or container boundary. | Off |
 | `block-private-nets` | Additionally deny outbound connections to loopback and RFC1918 private ranges (the link-local cloud-metadata block always runs). | Off |
-| `require-policy` | With a `SecurityManager` installed but no policy loaded, **deny** (fail-closed) instead of allow-all. Used by the certification profile. | Off |
+| `require-policy` | With a `SecurityManager` installed but no policy loaded, **deny** (fail-closed) instead of allow-all. Implied by `untrusted-code`. | Off |
 | `harden-manifest-classpath` | Drop JAR-manifest `Class-Path` entries that resolve outside the JAR's own directory (absolute roots, `file:/…`, `..` escapes). | Off |
 | `trust-pem=PATH` | PEM trust bundle, consulted after the `javax.net.ssl.trustStore` sys-prop and before the JDK `cacerts`. | — |
 

@@ -449,6 +449,9 @@ impl PlatformBackend for X11Backend {
 
         // X11 put_image expects the data as bytes. For 32-bit depth
         // we pass the pixel data directly.
+        // SAFETY: `u32` has no invalid bit patterns, byte length is exactly
+        // four times the checked pixel count, and the slice cannot outlive
+        // the borrowed `pixels` storage.
         let data: &[u8] =
             unsafe { std::slice::from_raw_parts(pixels.as_ptr() as *const u8, pixels.len() * 4) };
 

@@ -11,7 +11,7 @@
 
 ## Open
 
-- [`action.queue` GRAPH-default tests — blocked by flush-planner throughput](actionqueue-graph-default-tests-legacy-tradeoff-20260727.md)
+- [`action.queue` GRAPH-default tests — blocked by flush-planner throughput](../../internal/fixed-suite-bugs/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md)
   (OPEN; one of two root causes fixed) — real-JDK CratonVM defaults
   `hibernate.flush.queue.type` to `legacy`, which gates **19 of the 25
   `action.queue` classes**: 2 fail outright and 17 self-abort via

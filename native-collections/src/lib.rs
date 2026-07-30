@@ -47827,17 +47827,22 @@ mod tests {
     }
 
     #[test]
-    fn fork_join_pool_await_quiescence_registered() {
+    fn fork_join_pool_invoke_registered_and_quiescence_left_to_native_builtins() {
         let r = build_registry();
         let pool = "java/util/concurrent/ForkJoinPool";
+        // `awaitQuiescence` deliberately does NOT live here: `native-builtins`
+        // registers it after establishing the real async-worker completion
+        // tracker, and `register_collections_natives` runs later, so a local
+        // constant would win and overwrite that stateful implementation. This
+        // test used to assert the opposite and had gone red unnoticed.
         assert!(
             r.find(
                 pool,
                 "awaitQuiescence",
                 "(JLjava/util/concurrent/TimeUnit;)Z"
             )
-            .is_some(),
-            "FJP awaitQuiescence"
+            .is_none(),
+            "FJP awaitQuiescence must stay owned by native-builtins"
         );
         assert!(
             r.find(

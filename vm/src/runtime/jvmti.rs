@@ -1215,6 +1215,7 @@ impl JvmtiEventManager {
     // --- Event firing methods ---
 
     pub fn fire_vm_init(&self) {
+        #[cfg(feature = "experimental-debug")]
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
         if let Some(shared) = real_agent_shared() {
             crate::jvmti::notify_vm_init(&shared.debug.jvmti_env.lock(), 0);
@@ -1231,6 +1232,7 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_vm_death(&self) {
+        #[cfg(feature = "experimental-debug")]
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
         if let Some(shared) = real_agent_shared() {
             crate::jvmti::notify_vm_death(&shared.debug.jvmti_env.lock());
@@ -1247,6 +1249,7 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_thread_start(&self, thread: ThreadId) {
+        #[cfg(feature = "experimental-debug")]
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
         if let Some(shared) = real_agent_shared() {
             let name = resolve_thread_name_for_bridge(&shared, thread);
@@ -1264,6 +1267,7 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_thread_end(&self, thread: ThreadId) {
+        #[cfg(feature = "experimental-debug")]
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
         // Note: `vm/src/vm/vm_exec.rs` already has its own hand-written
         // `notify_thread_end` call site for the real env; this bridge makes
@@ -1324,6 +1328,7 @@ impl JvmtiEventManager {
         // (a narrower helper that only covered one dynamic-load path), which
         // was removed so ClassLoad reaches the real env exactly once, from
         // every class-definition path, not just that one.
+        #[cfg(feature = "experimental-debug")]
         if let Some(shared) = real_agent_shared() {
             if let Some(name) = resolve_class_name_for_bridge(&shared, class_id) {
                 crate::jvmti::notify_class_load(&shared.debug.jvmti_env.lock(), class_id, &name);
@@ -1354,6 +1359,7 @@ impl JvmtiEventManager {
     /// [`Self::fire_class_load`] — see its doc comment.
     pub fn fire_class_prepare(&self, thread: ThreadId, class_id: ClassId) {
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        #[cfg(feature = "experimental-debug")]
         if let Some(shared) = real_agent_shared() {
             if let Some(name) = resolve_class_name_for_bridge(&shared, class_id) {
                 crate::jvmti::notify_class_prepare(&shared.debug.jvmti_env.lock(), class_id, &name);
@@ -1569,6 +1575,7 @@ impl JvmtiEventManager {
 
     pub fn fire_gc_start(&self) {
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        #[cfg(feature = "experimental-debug")]
         if let Some(shared) = real_agent_shared() {
             crate::jvmti::notify_gc_start(&shared.debug.jvmti_env.lock());
         }
@@ -1585,6 +1592,7 @@ impl JvmtiEventManager {
 
     pub fn fire_gc_finish(&self) {
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        #[cfg(feature = "experimental-debug")]
         if let Some(shared) = real_agent_shared() {
             crate::jvmti::notify_gc_finish(&shared.debug.jvmti_env.lock());
         }
@@ -1747,6 +1755,7 @@ impl JvmtiEventManager {
         // flag tracks only this (synthetic) manager's own listeners, so a
         // real native agent with `can_tag_objects` and nothing registered
         // here would otherwise never see its own ObjectFree events.
+        #[cfg(feature = "experimental-debug")]
         if let Some(shared) = real_agent_shared() {
             crate::jvmti::notify_object_free(&shared.debug.jvmti_env.lock(), tag);
         }

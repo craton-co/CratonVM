@@ -254,6 +254,8 @@ mod platform {
 
     pub(super) fn write_pipe(raw: u64, buf: &[u8]) -> std::io::Result<isize> {
         let mut written: u32 = 0;
+        // SAFETY: `raw` is a live pipe handle owned by the registry; `buf`
+        // remains readable and `written` writable for the synchronous call.
         let ok = unsafe {
             WriteFile(
                 raw as Handle,
