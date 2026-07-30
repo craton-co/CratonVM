@@ -7195,11 +7195,14 @@ pub fn ir_direct_calls_enabled() -> bool {
 }
 
 pub fn direct_jit_callee_calls_enabled() -> bool {
-    // A raw JIT-to-JIT call has no callee JitEntryGuard. Moving-young must be
-    // able to rewrite every live frame, so it cannot use that edge until the
-    // direct-call stub publishes the callee metadata atomically. The dispatch
-    // bridge installs the guard and is therefore the safe route in this mode.
-    if x64::moving_young_enabled() {
+    // A raw JIT-to-JIT call has no callee JitEntryGuard, so the callee frame is
+    // not reachable from the entry chain and cannot be rewritten. That matters
+    // only if a collection can RELOCATE while such a frame is live; the runtime
+    // veto means it cannot (see `moving_young_relocates_compiled_frames`), so
+    // this gate is scoped to the same constant as the optimizing-tier gate
+    // rather than to the moving-young flag. The dispatch bridge, which installs
+    // the guard, remains the route the moment that contract is real.
+    if x64::moving_young_relocates_compiled_frames() {
         return false;
     }
 
@@ -8274,12 +8277,25 @@ fn try_compile_inner(
     // correctness risk. C2 (`optimize == true`, every non-tiered caller)
     // keeps the historical IR-first behaviour.
     if optimize
-        // IR lowering has no exact-RBP or safepoint-map publication. A
-        // mapless IR frame can be live when the moving young collector runs,
-        // but cannot prove or rewrite its roots. The x64 backend enables its
-        // complete frame-metadata protocol whenever moving-young is active.
-        // Keep IR off until it supplies the same relocation contract.
-        && !x64::moving_young_enabled()
+        // IR lowering has no exact-RBP or safepoint-map publication, so a
+        // mapless IR frame must never be live while the young collector
+        // RELOCATES. That is what this gate protects — and the question it has
+        // to ask is whether relocation can actually observe a compiled frame,
+        // not whether the moving-young flag happens to be set.
+        //
+        // Keyed on the flag alone, it fired on every default run
+        // (`DEFAULT_MOVING_YOUNG` is `true`) even though the runtime vetoes
+        // moving-young process-wide as soon as any compiled code exists — so
+        // the frame it guards against cannot occur. The optimizing tier was
+        // switched off in exchange for nothing: every compile fell through to
+        // the single-pass backend. See
+        // `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+        // and `moving_young_relocates_compiled_frames` for the invariant.
+        //
+        // This scopes the gate; it does not remove it. When the JIT publishes a
+        // real relocation contract, `JIT_PUBLISHES_RELOCATION_CONTRACT` flips,
+        // the runtime veto lifts and this gate re-arms together with it.
+        && !x64::moving_young_relocates_compiled_frames()
         && ir::ir_compatible(&scan)
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
         // tier used to refuse EVERY method with a `try`/`catch`, which is an

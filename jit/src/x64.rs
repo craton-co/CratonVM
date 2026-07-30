@@ -36818,6 +36818,44 @@ mod flag_and_header_contracts {
         );
     }
 
+    /// The relocation-safety gates must ask "can a relocating collection see a
+    /// compiled frame?", which is strictly narrower than "is moving-young on?".
+    /// Equating the two is what switched the optimizing tier off by default.
+    #[test]
+    fn relocates_compiled_frames_implies_moving_young_but_not_conversely() {
+        assert!(
+            !moving_young_relocates_compiled_frames() || moving_young_enabled(),
+            "relocation of compiled frames must imply the moving young gen is on"
+        );
+        assert_eq!(
+            moving_young_relocates_compiled_frames(),
+            moving_young_enabled() && cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT,
+            "the predicate must be exactly `moving_young && JIT_PUBLISHES_RELOCATION_CONTRACT` — \
+             the same constant the runtime veto in conservative_roots reads, or the veto and \
+             these gates can drift apart"
+        );
+    }
+
+    /// While the JIT publishes no relocation contract, the runtime vetoes
+    /// moving-young for the whole process as soon as any compiled code exists.
+    /// The optimizing tier must therefore NOT be disabled by the moving-young
+    /// default — that trade bought nothing. Pins the regression that
+    /// `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+    /// describes.
+    #[test]
+    fn optimizing_tier_is_not_disabled_while_relocation_is_vetoed() {
+        if cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT {
+            // Contract landed: the gates are supposed to be armed again.
+            return;
+        }
+        assert!(
+            !moving_young_relocates_compiled_frames(),
+            "with no published relocation contract, no compiled frame can be live during a \
+             relocating young collection, so the IR/direct-call gates must be open regardless \
+             of the moving-young default"
+        );
+    }
+
     /// `CRATONVM_SHADOW_STACK` is likewise read by `jit`, `gc` and `vm`; the
     /// emission side and the root-scan side must agree or the collector walks
     /// a shadow stack the codegen never pushed to. Moving-young implies it.

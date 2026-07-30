@@ -1646,7 +1646,15 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
     // Interpreter-only executions retain copying young collections.  This is a
     // VM-wide GC/JIT safety boundary, deliberately not an ANTLR/Hibernate
     // exception or a JIT eligibility ban.
-    if cratonvm_jit::jit_code_range_count() != 0 {
+    // The same constant the JIT's relocation-safety admission gates read, so the
+    // veto and those gates cannot drift apart: while it is `false` this veto is
+    // in force and `x64::moving_young_relocates_compiled_frames()` is `false`,
+    // which is exactly what makes those gates safe to scope. Flipping it lifts
+    // the veto and re-arms them in the same change. See
+    // `cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT`.
+    if !cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT
+        && cratonvm_jit::jit_code_range_count() != 0
+    {
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
             cratonvm_gc::gc_quiescence::incomplete_reason::JIT_RELOCATION_UNSUPPORTED,
         );

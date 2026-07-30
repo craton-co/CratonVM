@@ -837,6 +837,34 @@ pub fn moving_young_enabled() -> bool {
     cratonvm_types::flags().gc.moving_young
 }
 
+/// Can a **relocating** young collection ever observe a live *compiled* frame?
+///
+/// This is the question the JIT's relocation-safety admission gates actually
+/// need — not "is the moving young flag on?". The two differ today, and the
+/// difference is expensive.
+///
+/// `moving_young_enabled()` is on by default, but
+/// `conservative_roots::refresh_moving_young_coverage_for_current_thread`
+/// vetoes moving-young process-wide the moment `jit_code_range_count() != 0`,
+/// and `memory::roots::collect_roots` runs that refresh on the path of every
+/// collection. So a relocating cycle happens only while the process holds no
+/// compiled code at all, and no compiled frame can be live during one.
+///
+/// A gate that exists solely to keep an un-rewritable compiled frame away from
+/// a relocating collector is therefore guarding an unreachable state whenever
+/// this returns `false`. Gates that protect something else — the *emission* of
+/// precise maps, which must stay in lockstep with the collector's expectations
+/// — keep reading [`moving_young_enabled`] directly and are unaffected.
+///
+/// Both halves read the same
+/// [`cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT`], so the veto and
+/// these gates cannot drift apart: see that constant for what flipping it
+/// requires.
+#[inline]
+pub fn moving_young_relocates_compiled_frames() -> bool {
+    moving_young_enabled() && cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT
+}
+
 pub(super) fn shadow2_diag_enabled(method_label: &str) -> bool {
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW2").is_none() {
         return false;

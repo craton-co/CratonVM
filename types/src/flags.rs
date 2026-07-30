@@ -471,6 +471,55 @@ pub enum BlockedAccessMode {
 /// See `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
 pub const DEFAULT_MOVING_YOUNG: bool = true;
 
+/// Whether the JIT publishes a complete, mechanically-enumerable **relocation
+/// contract** for its compiled frames — exact frame base, bounded spill band,
+/// and every live oop published as a rewritable root at every GC-capable
+/// safepoint, for *every* compiled entry kind (single-pass, optimizing IR, OSR,
+/// and frames entered by a direct JIT→JIT call, which push no entry guard).
+///
+/// # Why this exists, and why it is `false`
+///
+/// It is `false` because that contract does not hold today, and the VM already
+/// says so at runtime:
+/// `conservative_roots::refresh_moving_young_coverage_for_current_thread`
+/// vetoes moving-young for the whole process as soon as
+/// `jit_code_range_count() != 0`. Since `memory::roots::collect_roots` runs that
+/// refresh on the path of *every* collection, the resulting invariant is:
+///
+/// > A relocating young collection can only occur while the process holds **no
+/// > compiled code at all**. Therefore **no compiled frame can ever be live
+/// > during relocation.**
+///
+/// That single fact is what this constant names. Several JIT admission gates
+/// were written to protect the moving collector from frames it cannot rewrite —
+/// the optimizing IR tier, and direct JIT→JIT calls. Keyed on
+/// `moving_young` alone they fire whenever the *flag* is on, which under
+/// [`DEFAULT_MOVING_YOUNG`] is always — even though the state they guard against
+/// is unreachable. The cost is not theoretical: with the IR gate closed, every
+/// compile falls through to the single-pass backend and the optimizing tier
+/// contributes nothing (see
+/// `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`).
+///
+/// So the gates read this constant *in addition to* `moving_young`, and the
+/// runtime veto reads it too. One flip re-arms all of them together, which is
+/// the point: a future change that gives the JIT the real contract must not be
+/// able to lift the veto while leaving a gate disarmed, or vice versa.
+///
+/// # What flipping this to `true` requires
+///
+/// Not just IR safepoint maps. Every obligation the verifier in
+/// `conservative_roots` can report must hold in production traffic:
+/// unregistered JIT frames on the stack, unavailable exact frame bases,
+/// unbounded spill bands, live oops outside the published map, and the
+/// cross-thread handshake (`CROSS_THREAD_JIT_PEER`). The blanket veto was
+/// introduced precisely because all of those were observed failing.
+///
+/// This constant does **not** gate the map-publication machinery itself.
+/// `x64::shadow_stack_maps_enabled` and `collect_live_oop_homes` stay keyed on
+/// `moving_young`, so the single-pass backend keeps emitting and testing the
+/// protocol that a future flip depends on.
+pub const JIT_PUBLISHES_RELOCATION_CONTRACT: bool = false;
+
 /// Flags read by `cratonvm-gc` (and, for the shared ones, by `jit` and `vm`).
 ///
 /// Unless a field says otherwise it was built with [`parse::present`], i.e. it
