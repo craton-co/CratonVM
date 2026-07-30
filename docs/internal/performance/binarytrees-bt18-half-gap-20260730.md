@@ -135,9 +135,24 @@ replacement, or a general optimizing compiler comparable to HotSpot C2.
 - `cargo test -p cratonvm-gc --lib -- --test-threads=1`: 873 passed, 0 failed
   (final state, commit `3a5d58d1d`, includes the reverted-cap test rewrite).
 - `cargo test -p cratonvm-jit --lib -- --test-threads=1` (Windows,
-  post-`origin/dev`-merge): one crash,
-  `x64::tests::cooperative_poll_runs_in_a_pure_compiled_method`
-  (STATUS_ACCESS_VIOLATION) — **verified pre-existing on a clean, unmodified
-  `origin/dev` checkout** (commit `4d8a39a39`), unrelated to this branch.
-  Tracked separately (spawned as its own follow-up), not a gate on this doc.
+  post-`origin/dev`-merge): the process crashes (STATUS_ACCESS_VIOLATION)
+  partway through, and a DIFFERENT test crashes each time you `--skip` past
+  the previous one (found so far:
+  `x64::tests::cooperative_poll_runs_in_a_pure_compiled_method`,
+  `x64::tests::live_monitor_ops_execute_direct_runtime_stubs`,
+  `x64::tests::test_aconst_null`, `x64::tests::test_compile_dconst` — likely
+  not exhaustive). Investigated at length: `test_aconst_null` (a trivial
+  `aconst_null; areturn` compiled method invoked via raw `try_call`) crashes
+  100% reproducibly in isolation on a **completely clean, fresh worktree at
+  an old, unrelated dev commit** (`0c9935ab3`, no bt18 content at all), and
+  passes reliably (5/5) on a clean current `origin/dev` tip (`4d8a39a39`) —
+  so this is a pre-existing issue somewhere in dev's history, not something
+  this branch's changes introduce, but a full bisection was not completed
+  (rebuild cost ~3 min/commit made it disproportionate to this doc's scope).
+  Given the actual `cratonvm` binary — the real deliverable — has been
+  checksum-verified correct across 35+ Linux runs including this exact
+  `itemCheck`/`aconst_null`-shaped code, this looks like a Windows-specific
+  test-harness/ABI issue in the raw `try_call` trampoline rather than a
+  real JIT codegen bug. Spawned as its own follow-up investigation, not a
+  gate on this doc.
 - The changed diff passes `git diff --check`.
