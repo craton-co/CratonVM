@@ -33,7 +33,7 @@ use crate::{
 use crate::bi_alloc;
 use crate::bi_read;
 #[cfg(feature = "legacy-synthetic-crypto")]
-use crate::crypto::crypto_impl;
+use crate::crypto_impl;
 use crate::normalize_charset_name;
 use crate::{
     bi_add_str, bi_bit_count_str, bi_bit_length_str, bi_bitwise_and, bi_bitwise_or, bi_bitwise_xor,

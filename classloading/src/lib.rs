@@ -20,7 +20,7 @@
 ///
 /// Every `CRATONVM_*` flag this crate reads is a field on
 /// [`cratonvm_types::LoaderFlags`], parsed once at first use. See
-/// `docs/internal/flag-census.md` for the inventory and
+/// `docs/flag-census.md` for the inventory and
 /// `cratonvm_types::flags` for the latching rules.
 #[inline]
 pub(crate) fn loader_flags() -> &'static cratonvm_types::LoaderFlags {

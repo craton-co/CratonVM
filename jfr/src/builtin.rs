@@ -2875,6 +2875,9 @@ fn host_physical_memory() -> Option<(i64, i64)> {
             ull_avail_virtual: 0,
             ull_avail_extended_virtual: 0,
         };
+        // SAFETY: `status` is initialized with the required `dw_length`,
+        // points to writable storage for the exact C layout declared above,
+        // and remains alive for the duration of the synchronous Win32 call.
         let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
         if ok != 0 {
             let total = status.ull_total_phys.min(i64::MAX as u64) as i64;

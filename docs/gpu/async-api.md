@@ -1,14 +1,16 @@
 # Phase 3 Java async API — `GpuExecutor`, `GpuFuture`, `GpuArray`, `GpuStream`
 
 Reference for the **explicit, async** Java surface introduced in Phase 3.
-Companion to the transparent `invokestatic` offload path already documented
+Companion to the automatic `invokestatic` offload path already documented
 in [`README.md`](README.md).
 
 The two paths coexist:
 
-- **Transparent offload** (Phase 1/2) — `--gpu` on the command line; any
-  `@GpuKernel`-eligible static method called via `invokestatic` is silently
-  routed to the GPU. The user writes no async code.
+- **Automatic offload** (Phase 1/2, the "transparent" path elsewhere in
+  these docs) — a `gpu`/`gpu-driver` build plus `--gpu` on the command line;
+  a static method the analyzer accepts, called via `invokestatic`, is routed
+  to the GPU without any call-site change. The user writes no async code.
+  Methods outside the accepted shape run on the CPU as usual.
 - **Explicit async API** (Phase 3, this document) — `GpuExecutor` lets the
   application *schedule* offloaded work, chain kernels on the same device
   stream, and read results back as `GpuFuture<T>`. No `--gpu` flag is
@@ -19,7 +21,7 @@ point.
 
 ## Quick start
 
-Before — transparent offload of a single kernel via `invokestatic`:
+Before — automatic offload of a single eligible kernel via `invokestatic`:
 
 ```java
 // Run on a JVM started with --gpu. The call below is dispatched to the
@@ -444,16 +446,11 @@ from the by-design [Limitations](#limitations) below.
   registered `Native.*` entry point lets a dispatch be routed onto that
   explicit handle instead of the executor's default — see the note under
   [`GpuStream`](#gpustream).
-- **JIT-compiled callers bypass transparent offload.** Not specific to
-  the explicit API in this document (which always calls through a
-  native method, never a JIT-visible `invokestatic`), but relevant if
-  application code mixes both paths: the offload hook lives in
-  `execute_invokestatic`'s interpreter slow path. If the *caller
-  method* containing an offload-eligible call gets JIT-compiled (OSR
-  of a hot loop), dispatch moves into JIT-emitted code and the hook is
-  never consulted again — offload silently stops, structurally, even
-  though the 2026-07-11 fix keeps eligible interpreted call sites
-  re-entering the hook correctly. See [`jit-caller-gate.md`](jit-caller-gate.md).
+- **JIT-caller bypass closed.** The automatic path still enters through the
+  interpreter's `invokestatic` hook, so `offload_jit_gate` keeps a caller with
+  an eligible offload site out of JIT and OSR compilation while `--gpu` is
+  active. Callers without eligible sites remain compilable. See
+  [`jit-caller-gate.md`](jit-caller-gate.md).
 
 ## Limitations
 
@@ -487,7 +484,7 @@ from the by-design [Limitations](#limitations) below.
 - **Not a Java CUDA wrapper.** You cannot `cuMemAlloc` from Java. The
   device-side surface is intentionally narrow — wrap an array, launch a
   kernel, read it back. Anything more is the Rust side's concern.
-- **Not a replacement for the transparent `invokestatic` offload.**
+- **Not a replacement for the automatic `invokestatic` offload.**
   Code that has been running fine under `--gpu` should keep running
   fine; the explicit API is for *new* code that wants async semantics.
 - **Not a Project Babylon stand-in.** Babylon's Code Reflection is a
@@ -508,5 +505,4 @@ from the by-design [Limitations](#limitations) below.
 - [`README.md`](README.md) — top-level reference: build matrix
   (`gpu` vs `gpu-driver`), CLI surface, file index.
 - [`reductions.md`](reductions.md) and [`jit-caller-gate.md`](jit-caller-gate.md)
-  — the reduction void-return gate and the JIT-caller bypass referenced in
-  [Current limitations](#current-limitations).
+  — scalar-reduction support and the closed JIT-caller bypass.

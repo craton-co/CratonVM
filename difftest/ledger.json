@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "host": "multi",
-  "captured_at": "2026-06-21",
-  "jdk": "java version \"25.0.1\" 2025-10-21 LTS",
+  "host": "windows-x86_64",
+  "captured_at": "epoch:1785436557",
+  "jdk": "openjdk version \"25.0.3\" 2026-04-21 LTS",
   "entries": [
     {
       "id": "div-0001",
@@ -10,8 +10,8 @@
       "repro_path": "difftest/seeds\\ExceptionId.java",
       "classification": "universal",
       "cratonvm": {
-        "stdout": "AE: / by zero\nCCE: java/lang/String cannot be cast to java/lang/Integer\nNPE: Cannot load from int array because \"ExceptionId.arr\" is null\nSIOOBE: null\ndone",
-        "stderr": "[cratonvm] stack-dump watchdog armed: will dump + abort after 120s\n[cratonvm] main-vm run() returned Ok \u2014 VM main exiting normally",
+        "stdout": "AE: / by zero\nCCE: java.lang.String cannot be cast to java.lang.Integer\nNPE: Cannot load from int array because \"ExceptionId.arr\" is null\nSIOOBE: null\ndone",
+        "stderr": "\u001b[2m2026-07-30T18:35:56.284528Z\u001b[0m \u001b[33m WARN\u001b[0m \u001b[2mcratonvm_vm::vm::vm_object\u001b[0m\u001b[2m:\u001b[0m [NativeBridge] 1 unregistered native methods:\n\u001b[2m2026-07-30T18:35:56.284603Z\u001b[0m \u001b[33m WARN\u001b[0m \u001b[2mcratonvm_vm::vm::vm_object\u001b[0m\u001b[2m:\u001b[0m   MISSING: jdk/internal/misc/VM.latestUserDefinedLoader0()Ljava/lang/ClassLoader;\n\u001b[2m2026-07-30T18:35:56.284628Z\u001b[0m \u001b[33m WARN\u001b[0m \u001b[2mcratonvm_vm::vm::vm_init\u001b[0m\u001b[2m:\u001b[0m [NativeBridge] 1 ACC_NATIVE methods have no Rust implementation; they will throw UnsatisfiedLinkError if called\n[cratonvm] main-vm run() returned Ok — VM main exiting normally",
         "exit_code": 0,
         "exception": null,
         "timed_out": false,

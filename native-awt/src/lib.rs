@@ -65,6 +65,11 @@
 //! Cross-thread access is mediated through `EventQueue.invokeLater`.
 
 #![allow(clippy::collapsible_if)]
+#![deny(
+    clippy::missing_safety_doc,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::undocumented_unsafe_blocks
+)]
 
 pub mod clipboard;
 pub mod color;

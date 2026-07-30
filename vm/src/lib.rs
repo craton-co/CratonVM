@@ -28,7 +28,7 @@
 //! # Embedding
 //!
 //! For a worked example of embedding CratonVM as a library in a Rust
-//! application, see [`docs/embedding.md`](https://github.com/craton-co/cratonvm/blob/main/docs/embedding.md)
+//! application, see [`docs/EMBEDDING.md`](https://github.com/craton-co/cratonvm/blob/main/docs/EMBEDDING.md)
 //! in the workspace root. The first-party `vm-cli` binary is the
 //! reference embedder.
 

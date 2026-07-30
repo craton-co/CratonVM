@@ -1,22 +1,26 @@
 # CratonVM
 
-### Java on the GPU. No annotations. No rewrites. Just faster.
+### Java on the GPU. Plain static kernels, one `--gpu` flag, measurably faster.
 
-**CratonVM is the Java Virtual Machine that runs your existing Java code on
-the GPU — and beats the fastest Java GPU framework doing it. Built entirely
-in Rust: one self-contained binary, memory-safe from the first line.**
+**CratonVM is a Java Virtual Machine that moves eligible Java compute kernels
+onto the GPU — and beats the fastest Java GPU framework on the kernels both
+can run. Built entirely in Rust: one self-contained binary.**
 
 *Version 0.3.0 · Java SE 8–25 · by Craton Software Company*
 
 ---
 
-## Your Java. On the GPU. Automatically.
+## Your Java. On the GPU. Automatically — inside a documented envelope.
 
-Every other path to GPU acceleration in Java asks you to rewrite your code:
-special annotations, task graphs, new APIs, new build steps. CratonVM asks
-for nothing. Point it at your compiled classes and eligible computations move
-to the GPU transparently — the same `.class` files, the same `main()`, the
-same results, bit for bit.
+Every other path to GPU acceleration in Java asks you to rewrite your kernels:
+special annotations, task graphs, new APIs, off-heap array types, new build
+steps. CratonVM asks for a build flag and a run flag. Build with
+`--features gpu-driver`, run with `--gpu`, and the methods that match a
+deliberately narrow, documented shape — pure static methods over primitive
+arrays in counted loops — move to the GPU automatically: the same `.class`
+files, the same `main()`, the same results, bit for bit. Everything outside
+that subset keeps running on the CPU, unchanged. The envelope is written
+down, not guessed at ([`docs/gpu/README.md`](gpu/README.md)).
 
 And it isn't just easier. **It's faster.** On division-dominated compute —
 the workloads where CPUs have no vectorized answer — CratonVM's GPU
@@ -30,16 +34,23 @@ leading Java GPU framework:
 
 Three things make that second row special:
 
-1. **No code changes.** TornadoVM needed `@Parallel` annotations and its
-   TaskGraph API to get its number. CratonVM ran plain Java.
+1. **No kernel rewrite.** TornadoVM needed `@Parallel` annotations, its
+   TaskGraph API, and off-heap array types to get its number. CratonVM ran
+   plain Java `int[]`/`double[]` static methods, unmodified, behind `--gpu`.
 2. **Bit-exact results.** CratonVM's GPU division matches HotSpot's answer
    to the last bit, IEEE-754 exact. TornadoVM's doesn't.
 3. **It handles what others can't.** On a reduction kernel TornadoVM's own
    backend throws `unimplemented`, CratonVM just runs it.
 
 Where the CPU is genuinely better — multiply-heavy kernels that AVX2
-vectorizes beautifully — CratonVM leaves the work on the CPU. Transparent
-means honest: the right processor for each job.
+vectorizes beautifully — CratonVM leaves the work on the CPU. Automatic
+means honest: the right processor for each job, and no offload at all for
+shapes the analyzer doesn't accept.
+
+These are point-in-time measurements on one RTX 2060, checksum-verified
+against HotSpot. There is no self-hosted GPU hardware CI re-running them on
+every change, so treat them as a published result rather than an enforced
+budget.
 
 ---
 
@@ -48,10 +59,12 @@ means honest: the right processor for each job.
 For twenty-five years the Java runtime has rested on millions of lines of
 C and C++. CratonVM starts over in **Rust**:
 
-- **Memory-safe by construction.** The interpreter, the JIT compiler, and
-  the garbage collector inherit Rust's ownership and bounds guarantees.
-  Whole categories of classic VM vulnerabilities are designed out before
-  the first line of your code runs.
+- **Rust all the way down.** The interpreter, the JIT compiler, and the
+  garbage collector are written in safe Rust wherever they can be, which
+  removes many of the ambient memory hazards a C++ runtime lives with. The
+  VM, JIT, GC, FFI, I/O, AWT, CUDA, and JFR still contain reviewed and
+  still-being-audited `unsafe` regions — see
+  [SECURITY.md](../SECURITY.md).
 - **One self-contained binary.** No JDK install, no `JAVA_HOME`, no
   `rt.jar`. Download, run. When a JDK *is* present, CratonVM can boot from
   its real class library for maximum fidelity.
@@ -83,13 +96,15 @@ cloud-native, event-driven Java to CratonVM.
 ## Who it's for
 
 - **Teams with GPU-hungry Java compute** — simulation, pricing, scoring,
-  signal processing — who want acceleration without a rewrite.
+  signal processing — whose hot kernels fit the supported shape and who want
+  acceleration without rewriting them.
 - **Performance engineers** who want a transparent, hackable runtime
   instead of an opaque black box.
-- **Security-conscious organizations** evaluating a runtime that eliminates
-  native-memory vulnerability classes by construction.
+- **Security-conscious organizations** evaluating a runtime whose memory
+  handling is Rust-first, with its remaining `unsafe` surface documented
+  rather than assumed away.
 - **Researchers and enthusiasts** who want to see what a from-scratch,
-  memory-safe JVM can do.
+  Rust-native JVM can do.
 
 CratonVM is fast-moving, research-grade software — early, ambitious, and
 improving measurably every week. Every published benchmark ships with

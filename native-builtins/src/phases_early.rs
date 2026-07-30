@@ -26,12 +26,13 @@ fn read_retry_eintr<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> std::io
 }
 
 #[cfg(feature = "legacy-synthetic-crypto")]
-use crate::crypto::crypto_impl;
+use crate::crypto_impl;
 use crate::lang_class::{mirror_class_id, native_class_is_record, native_class_is_sealed};
 use crate::lang_invoke::register_phase54_method_handle;
 use crate::lang_misc::register_phase53_record;
 use crate::lang_string::{
-    native_string_hash_code, native_string_to_lower_case, register_phase52_string_buffer,
+    native_string_hash_code, native_string_latin1_to_lower_case, native_string_to_lower_case,
+    register_phase52_string_buffer,
 };
 use crate::{
     alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop, native_return_false,
@@ -2008,7 +2009,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         s,
         "toLowerCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        crate::lang_string::native_string_to_lower_case_uncached,
+        crate::lang_string::native_string_to_lower_case,
     );
 
     // --- String.getBytes(String charsetName) ---
@@ -9020,8 +9021,8 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     // public real-JDK submit path on the same side-table-backed semantics as
     // invoke(). Letting the concrete JDK submit bytecode enqueue into the real
     // pool exposes WorkQueue/status machinery that CratonVM only partially
-    // models under CRATONVM_REAL_FORKJOINPOOL, and Fork6Hard observes stale
-    // task/result objects there under GC stress.
+    // models on the default real-ForkJoinPool path, and Fork6Hard observes
+    // stale task/result objects there under GC stress.
     for submit_name in ["submit", "externalSubmit"] {
         r.register(
             "java/util/concurrent/ForkJoinPool",
@@ -20515,14 +20516,7 @@ pub fn register_string_latin1_natives(r: &mut NativeMethodRegistry) {
         c,
         "toLowerCase",
         "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let locale = args.get(2).cloned().unwrap_or(Value::Object(None));
-            native_string_to_lower_case(ctx, &[this, locale])
-        },
+        native_string_latin1_to_lower_case,
     );
 
     // static char getChar(byte[] val, int index)

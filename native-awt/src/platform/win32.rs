@@ -50,6 +50,8 @@ impl PaintGuard {
     /// that case, per the Win32 contract).
     unsafe fn begin(hwnd: HWND) -> Option<Self> {
         let mut ps = PAINTSTRUCT::default();
+        // SAFETY: caller guarantees `hwnd` is a live window; `ps` is writable
+        // for the synchronous BeginPaint call and is retained for EndPaint.
         let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
         if hdc.is_invalid() {
             return None;
@@ -82,6 +84,8 @@ struct GlobalAllocGuard {
 
 impl GlobalAllocGuard {
     unsafe fn new(flags: GLOBAL_ALLOC_FLAGS, size: usize) -> WinResult<Self> {
+        // SAFETY: caller chooses valid GlobalAlloc flags; the API accepts any
+        // byte size and returns an owned handle or an error.
         let handle = unsafe { GlobalAlloc(flags, size) }?;
         Ok(Self {
             handle,
@@ -118,6 +122,8 @@ struct ClipboardGuard;
 
 impl ClipboardGuard {
     unsafe fn open(hwnd: HWND) -> WinResult<Self> {
+        // SAFETY: caller supplies either a live owner HWND or the documented
+        // null/default handle; the guard balances success with CloseClipboard.
         unsafe { OpenClipboard(hwnd) }?;
         Ok(Self)
     }
@@ -154,6 +160,8 @@ impl DcGuard {
 
 impl Drop for DcGuard {
     fn drop(&mut self) {
+        // SAFETY: this guard is constructed only for a valid owned HDC and
+        // Drop runs once after selected objects have been restored.
         unsafe {
             let _ = DeleteDC(self.0);
         }
@@ -185,6 +193,8 @@ impl GdiObjectGuard {
 impl Drop for GdiObjectGuard {
     fn drop(&mut self) {
         if !self.released {
+            // SAFETY: the guard owns this valid GDI handle and selection guards
+            // have restored it out of every DC before Drop.
             unsafe {
                 let _ = DeleteObject(self.handle);
             }
@@ -204,6 +214,8 @@ impl SelectObjectGuard {
     /// Selects `obj` into `hdc` and remembers the previously selected object
     /// so it can be restored on drop.
     unsafe fn select<T: Into<HGDIOBJ>>(hdc: HDC, obj: T) -> Self {
+        // SAFETY: caller guarantees the HDC and object are live and compatible;
+        // this guard records the returned prior object for exact restoration.
         let prev = unsafe { SelectObject(hdc, obj.into()) };
         Self { hdc, prev }
     }
@@ -211,6 +223,8 @@ impl SelectObjectGuard {
 
 impl Drop for SelectObjectGuard {
     fn drop(&mut self) {
+        // SAFETY: `hdc` remains live longer than this guard and `prev` is the
+        // exact object returned by the paired SelectObject call.
         unsafe {
             SelectObject(self.hdc, self.prev);
         }
@@ -247,6 +261,8 @@ struct DirectWriteRenderer {
 
 impl DirectWriteRenderer {
     fn new() -> WinResult<Self> {
+        // SAFETY: the COM-producing API has no raw pointer inputs; the typed
+        // result owns the returned shared DirectWrite factory.
         let factory: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         Ok(Self {
             factory,
@@ -281,6 +297,8 @@ impl DirectWriteRenderer {
         } else {
             DWRITE_FONT_STYLE_NORMAL
         };
+        // SAFETY: family_wide is NUL-terminated and alive during the call;
+        // all remaining parameters are valid DirectWrite enums/scalars.
         let format = unsafe {
             self.factory.CreateTextFormat(
                 PCWSTR(family_wide.as_ptr()),
@@ -308,6 +326,8 @@ impl DirectWriteRenderer {
     ) -> WinResult<IDWriteTextLayout> {
         let format = self.get_or_create_format(font_family, font_size, bold, italic)?;
         let text_wide: Vec<u16> = text.encode_utf16().collect();
+        // SAFETY: the UTF-16 slice and format remain alive during the
+        // synchronous COM call and the returned layout owns its resources.
         unsafe {
             self.factory
                 .CreateTextLayout(&text_wide, &format, 10000.0, 10000.0)
@@ -332,6 +352,8 @@ unsafe impl Send for Win32Backend {}
 
 impl Win32Backend {
     pub fn new() -> Result<Self, PlatformError> {
+        // SAFETY: null requests the module handle for the current process and
+        // requires no caller-owned pointer.
         let hmodule = unsafe { GetModuleHandleW(PCWSTR::null()) }
             .map_err(|e| PlatformError::EventLoopError(format!("GetModuleHandleW: {e}")))?;
         let hinstance = HINSTANCE(hmodule.0);
@@ -374,6 +396,8 @@ impl Win32Backend {
             cbWndExtra: 0,
             hInstance: self.hinstance(),
             hIcon: HICON::default(),
+            // SAFETY: the predefined IDC_ARROW resource belongs to the system
+            // module and the returned typed cursor is borrowed process-wide.
             hCursor: unsafe { LoadCursorW(HINSTANCE::default(), IDC_ARROW) }
                 .unwrap_or(HCURSOR::default()),
             hbrBackground: HBRUSH::default(),
@@ -381,6 +405,8 @@ impl Win32Backend {
             lpszClassName: class_name,
             hIconSm: HICON::default(),
         };
+        // SAFETY: `wc` is fully initialized and all pointer members reference
+        // static wide strings for the synchronous registration.
         let atom = unsafe { RegisterClassExW(&wc) };
         if atom == 0 {
             return Err(PlatformError::CreationFailed(
@@ -406,6 +432,8 @@ impl Win32Backend {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        // SAFETY: Windows invokes this callback with a valid message tuple;
+        // forwarding untouched to DefWindowProcW is the documented fallback.
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
@@ -427,6 +455,8 @@ impl Win32Backend {
 
     fn current_modifiers() -> KeyModifiers {
         let mut m = KeyModifiers::empty();
+        // SAFETY: GetKeyState accepts these predefined virtual-key values and
+        // has no pointer or lifetime requirements.
         unsafe {
             if GetKeyState(VK_SHIFT.0 as i32) < 0 {
                 m |= KeyModifiers::SHIFT;
@@ -536,6 +566,8 @@ impl PlatformBackend for Win32Backend {
     ) -> Result<WindowId, PlatformError> {
         self.ensure_class_registered()?;
         let tw: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: the registered class and instance handles are live, `tw` is
+        // NUL-terminated for the call, and no creation parameter is borrowed.
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -574,12 +606,15 @@ impl PlatformBackend for Win32Backend {
             .remove(&id)
             .ok_or(PlatformError::WindowNotFound)?;
         self.hwnd_to_wid.remove(&info.hwnd_raw);
+        // SAFETY: WindowInfo is removed exactly once and contains the live HWND
+        // created by this backend.
         let _ = unsafe { DestroyWindow(info.hwnd()) };
         Ok(())
     }
 
     fn show_window(&mut self, id: WindowId, visible: bool) -> Result<(), PlatformError> {
         let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
+        // SAFETY: the registry lookup proves the HWND is owned and live.
         unsafe {
             let _ = ShowWindow(info.hwnd(), if visible { SW_SHOW } else { SW_HIDE });
         }
@@ -589,6 +624,8 @@ impl PlatformBackend for Win32Backend {
     fn set_window_title(&mut self, id: WindowId, title: &str) -> Result<(), PlatformError> {
         let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
         let w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: the HWND is live and `w` is a NUL-terminated buffer retained
+        // for the duration of the synchronous call.
         let _ = unsafe { SetWindowTextW(info.hwnd(), PCWSTR(w.as_ptr())) };
         Ok(())
     }
@@ -605,6 +642,8 @@ impl PlatformBackend for Win32Backend {
             .windows
             .get_mut(&id)
             .ok_or(PlatformError::WindowNotFound)?;
+        // SAFETY: the HWND is live; scalar bounds are copied synchronously and
+        // TRUE requests the documented repaint behavior.
         let _ = unsafe { MoveWindow(info.hwnd(), x, y, w as i32, h as i32, TRUE) };
         info.width = w;
         info.height = h;
@@ -614,6 +653,8 @@ impl PlatformBackend for Win32Backend {
     fn get_window_bounds(&self, id: WindowId) -> Result<(i32, i32, u32, u32), PlatformError> {
         let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
         let mut rect = RECT::default();
+        // SAFETY: the HWND is live and `rect` is writable for the exact
+        // Win32 structure during this synchronous call.
         let _ = unsafe { GetWindowRect(info.hwnd(), &mut rect) };
         Ok((
             rect.left,
@@ -625,6 +666,8 @@ impl PlatformBackend for Win32Backend {
 
     fn request_repaint(&mut self, id: WindowId) -> Result<(), PlatformError> {
         let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
+        // SAFETY: the HWND is live; None invalidates the whole client area and
+        // no raw pointer is retained.
         let _ = unsafe { InvalidateRect(info.hwnd(), None, FALSE) };
         Ok(())
     }
@@ -654,6 +697,9 @@ impl PlatformBackend for Win32Backend {
                 ))
             }
         };
+        // SAFETY: every Win32/GDI handle is checked or wrapped in an owning
+        // guard; `pixel_count` was checked against both the DIB dimensions and
+        // source slice, and raw DIB slices stay within that allocation.
         unsafe {
             // BeginPaint -> EndPaint pair. If we bail with `?` below the
             // guard's Drop closes the paint session.
@@ -735,6 +781,8 @@ impl PlatformBackend for Win32Backend {
 
     fn poll_events(&mut self) -> Vec<PlatformEvent> {
         let mut events = std::mem::take(&mut self.pending_events);
+        // SAFETY: `msg` is writable Win32 message storage; returned messages
+        // are dispatched before the local goes out of scope.
         unsafe {
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() {
@@ -753,6 +801,8 @@ impl PlatformBackend for Win32Backend {
 
     fn run_event_loop(&mut self) {
         loop {
+            // SAFETY: `msg` is writable Win32 message storage and the API owns
+            // the event queue; handles in delivered messages are OS-provided.
             unsafe {
                 let mut msg = MSG::default();
                 let ret = GetMessageW(&mut msg, HWND::default(), 0, 0);
@@ -770,12 +820,14 @@ impl PlatformBackend for Win32Backend {
 
     fn post_quit(&mut self) {
         self.quit = true;
+        // SAFETY: posts to the current GUI thread queue and takes no pointers.
         unsafe {
             PostQuitMessage(0);
         }
     }
 
     fn screen_size(&self) -> (u32, u32) {
+        // SAFETY: GetSystemMetrics takes only predefined metric identifiers.
         unsafe {
             (
                 GetSystemMetrics(SM_CXSCREEN) as u32,
@@ -785,6 +837,8 @@ impl PlatformBackend for Win32Backend {
     }
 
     fn screen_dpi(&self) -> f64 {
+        // SAFETY: GetDC(NULL) returns a screen DC which is kept live through
+        // GetDeviceCaps and released exactly once before leaving the block.
         unsafe {
             let hdc = GetDC(HWND::default());
             let dpi = GetDeviceCaps(hdc, LOGPIXELSX) as f64;
@@ -841,6 +895,8 @@ impl PlatformBackend for Win32Backend {
                 Err(_) => return empty,
             }
         } else {
+            // SAFETY: the factory API has no caller-owned pointer inputs and
+            // returns a typed COM owner on success.
             let factory: IDWriteFactory =
                 match unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) } {
                     Ok(f) => f,
@@ -862,6 +918,8 @@ impl PlatformBackend for Win32Backend {
                 DWRITE_FONT_STYLE_NORMAL
             };
 
+            // SAFETY: family_wide is NUL-terminated and alive for the call;
+            // the remaining inputs are valid DirectWrite values.
             let format = match unsafe {
                 factory.CreateTextFormat(
                     PCWSTR(family_wide.as_ptr()),
@@ -878,12 +936,16 @@ impl PlatformBackend for Win32Backend {
             };
 
             let text_wide: Vec<u16> = text.encode_utf16().collect();
+            // SAFETY: the UTF-16 slice and format remain alive during the
+            // synchronous call; the layout owns returned COM state.
             match unsafe { factory.CreateTextLayout(&text_wide, &format, 10000.0, 10000.0) } {
                 Ok(l) => l,
                 Err(_) => return empty,
             }
         };
 
+        // SAFETY: `layout` is a live typed COM object and `m` is writable
+        // storage for the exact metrics structure.
         let (tw, th) = unsafe {
             let mut m = DWRITE_TEXT_METRICS::default();
             if layout.GetMetrics(&mut m).is_err() {
@@ -917,6 +979,9 @@ impl PlatformBackend for Win32Backend {
         let cg = (color >> 8) & 0xFF;
         let cb = color & 0xFF;
 
+        // SAFETY: all GDI handles are checked and paired with RAII guards;
+        // `raster_px` bounds the 32-bpp DIB exactly, and every temporary UTF-16
+        // buffer remains alive through its synchronous Win32 call.
         unsafe {
             let hdc_screen = GetDC(HWND::default());
             let mem_dc = match DcGuard::new(CreateCompatibleDC(hdc_screen)) {
@@ -1027,6 +1092,8 @@ impl PlatformBackend for Win32Backend {
         use windows::Win32::System::DataExchange::*;
         use windows::Win32::System::Ole::CF_UNICODETEXT;
 
+        // SAFETY: clipboard/global-memory handles are checked, locked only
+        // while read, bounded by GlobalSize, then unlocked and closed by RAII.
         unsafe {
             // ClipboardGuard ensures CloseClipboard runs on every exit path
             // (including the early `return None` inside the closure below).
@@ -1063,6 +1130,8 @@ impl PlatformBackend for Win32Backend {
 
         let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
 
+        // SAFETY: allocated global memory is sized to `wide`, locked before
+        // copying, and either transferred to the clipboard or freed by RAII.
         unsafe {
             // GlobalAlloc -> GlobalFree pair. If `OpenClipboard` below fails
             // (the previous code's leak site), the guard's Drop frees the
@@ -1116,6 +1185,8 @@ impl PlatformBackend for Win32Backend {
             MessageDialogType::Error => MB_OK | MB_ICONERROR,
             MessageDialogType::Question => MB_YESNO | MB_ICONQUESTION,
         };
+        // SAFETY: both UTF-16 buffers are NUL-terminated and alive for the
+        // synchronous MessageBoxW call; the default owner is permitted.
         unsafe {
             let _ = MessageBoxW(
                 HWND::default(),
@@ -1144,6 +1215,8 @@ impl Drop for Win32Backend {
             // the class has been destroyed. We ignore the return value:
             // failure here is non-fatal (e.g. the class was already torn
             // down by another instance) and we are already in `drop`.
+            // SAFETY: all windows owned by this instance were destroyed above;
+            // the class name is static and hinstance matches registration.
             unsafe {
                 let _ = UnregisterClassW(class_name, self.hinstance());
             }

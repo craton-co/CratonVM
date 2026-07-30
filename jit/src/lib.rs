@@ -15507,6 +15507,50 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn protected_virtual_and_interface_calls_stay_out_of_precise_exception_coverage() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        // 0xb6/0xb9 are deliberately NOT admitted. They were admitted once
+        // (2026-07-27) and removed again by a523715a84 together with the
+        // `protected_precise_handler_call` suppression in `x64.rs`, because
+        // admitting them let Spring's
+        // `SimpleApplicationEventMulticaster.invokeListener` compile and then
+        // read its own pre-`try` `errorHandler` local back as null inside the
+        // handler (springboot-rerun-20260728-small-residuals-cluster, Case 3).
+        //
+        // Re-widening is not free-standing work: it needs that Spring class
+        // (or an equivalent that actually compiles) re-verified first. Doc 23
+        // measured re-widening as worth NOTHING to
+        // `TestCharsetCachePerformance` now that `try`/`catch` methods reach
+        // the optimizing tier by other means, so there is no throughput
+        // argument for carrying the risk.
+        let code = vec![
+            0x2a, // 0: aload_0
+            0xb6, 0x00, 0x01, // 1: invokevirtual #1
+            0x57, // 4: pop
+            0x2a, // 5: aload_0
+            0xb9, 0x00, 0x02, 0x01, 0x00, // 6: invokeinterface #2, count=1
+            0x57, // 11: pop
+            0xb1, // 12: return
+            0x4c, // 13: astore_1
+            0x2b, // 14: aload_1
+            0xbf, // 15: athrow
+        ];
+        let table = vec![ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 13,
+            handler_pc: 13,
+            catch_type: 0,
+        }];
+        assert!(!precise_exception_frame_sites_supported(
+            &code,
+            code.len(),
+            &table,
+        ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn protected_field_access_keeps_unsafe_handler_interpreted() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
 

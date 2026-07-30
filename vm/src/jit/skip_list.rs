@@ -378,8 +378,19 @@ fn allow_putfield_init() -> bool {
 }
 
 pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
+    classify_init_complexity_with(bytecode, allow_putfield_init())
+}
+
+/// [`classify_init_complexity`] with the `putfield` gate supplied explicitly.
+///
+/// [`allow_putfield_init`] latches its answer in a `OnceLock`, so a test in
+/// this process cannot exercise both sides of the `CRATONVM_JIT_PUTFIELD_INIT`
+/// kill switch through the public entry point — and that switch is the
+/// documented escape hatch for a structural ban lifted on measurement rather
+/// than on an incident write-up, so it is precisely the path that wants
+/// coverage. Splitting the pure classifier out lets the tests pin both sides.
+fn classify_init_complexity_with(bytecode: &[u8], allow_putfield: bool) -> InitComplexity {
     use std::cmp::min;
-    let allow_putfield = allow_putfield_init();
     let mut pc = 0usize;
     while pc < bytecode.len() {
         let op = bytecode[pc];
@@ -4149,11 +4160,57 @@ mod tests {
         assert_eq!(classify_init_complexity(&bc), InitComplexity::Trivial);
     }
 
+    /// A `putfield`-only constructor is **Trivial by default** since
+    /// 2026-07-28 — see `allow_putfield_init`, which lifted that structural
+    /// ban on measurement (1846 ns/alloc banned vs 226 allowed) and kept
+    /// `CRATONVM_JIT_PUTFIELD_INIT=0` as the kill switch.
+    ///
+    /// This test used to assert `Complex`, i.e. the pre-flip behaviour, and
+    /// was left behind when the default changed. It now pins BOTH sides of the
+    /// gate, which is what the kill switch actually needs: flipping the
+    /// default back must not require rediscovering that `putfield` is the one
+    /// disqualifier the flag governs.
     #[test]
-    fn classify_complex_ctor_with_putfield() {
+    fn putfield_only_ctor_follows_the_putfield_gate() {
         // aload_0; aload_0; iconst_1; putfield #2; return
         let bc = vec![0x2a, 0x2a, 0x04, 0xb5, 0x00, 0x02, 0xb1];
-        assert_eq!(classify_init_complexity(&bc), InitComplexity::Complex);
+        assert_eq!(
+            classify_init_complexity_with(&bc, true),
+            InitComplexity::Trivial,
+            "default (CRATONVM_JIT_PUTFIELD_INIT unset): a field-storing ctor is compilable",
+        );
+        assert_eq!(
+            classify_init_complexity_with(&bc, false),
+            InitComplexity::Complex,
+            "kill switch (CRATONVM_JIT_PUTFIELD_INIT=0): the historical ban returns",
+        );
+        // The public entry point agrees with whichever side the process latched.
+        let expected = if super::allow_putfield_init() {
+            InitComplexity::Trivial
+        } else {
+            InitComplexity::Complex
+        };
+        assert_eq!(classify_init_complexity(&bc), expected);
+    }
+
+    /// The other four disqualifiers are NOT governed by the `putfield` gate:
+    /// `putstatic`, `monitorenter`, `monitorexit` and `invokedynamic` stay
+    /// `Complex` on both sides of it.
+    #[test]
+    fn the_other_disqualifiers_ignore_the_putfield_gate() {
+        for bc in [
+            vec![0x05, 0xb3, 0x00, 0x03, 0xb1], // iconst_2; putstatic #3; return
+            vec![0x2a, 0xc2, 0x2a, 0xc3, 0xb1], // aload_0; monitorenter; aload_0; monitorexit; return
+            vec![0xba, 0x00, 0x04, 0x00, 0x00, 0xb1], // invokedynamic #4 0 0; return
+        ] {
+            for allow_putfield in [true, false] {
+                assert_eq!(
+                    classify_init_complexity_with(&bc, allow_putfield),
+                    InitComplexity::Complex,
+                    "bytecode {bc:02x?} must stay Complex with allow_putfield={allow_putfield}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -4211,9 +4268,19 @@ mod tests {
         );
     }
 
+    /// A genuinely complex constructor still keeps the historical ban.
+    ///
+    /// The bytecode here used to be `putfield`-only, which stopped being
+    /// Complex when `allow_putfield_init` flipped on 2026-07-28 — so the test
+    /// was asserting the ban against a constructor the VM had deliberately
+    /// made eligible. It now uses `monitorenter`/`monitorexit`, a disqualifier
+    /// the flag does not govern, so it tests the ban rather than the flag.
+    /// The `putfield` side is covered by
+    /// [`putfield_only_ctor_is_jit_eligible_by_default`].
     #[test]
     fn complex_ctor_keeps_constructor_ban() {
-        let complex_bc = vec![0x2a, 0x2a, 0x04, 0xb5, 0x00, 0x02, 0xb1];
+        // aload_0; monitorenter; aload_0; monitorexit; return
+        let complex_bc = vec![0x2a, 0xc2, 0x2a, 0xc3, 0xb1];
         let comp = classify_init_complexity(&complex_bc);
         assert_eq!(comp, InitComplexity::Complex);
         assert_eq!(
@@ -4228,6 +4295,35 @@ mod tests {
             ),
             Some(SkipReason::Constructor),
             "complex constructors keep the historical ban"
+        );
+    }
+
+    /// The point of lifting `allow_putfield_init`: a constructor whose whole
+    /// body is field stores must reach the JIT. `classify_init_complexity`
+    /// answering `Trivial` is only half of it — this pins the end-to-end
+    /// result through `should_skip_jit_with_init`, which is what the compiler
+    /// actually consults.
+    #[test]
+    fn putfield_only_ctor_is_jit_eligible_by_default() {
+        if !super::allow_putfield_init() {
+            return; // CRATONVM_JIT_PUTFIELD_INIT=0 in this environment
+        }
+        // aload_0; aload_0; iconst_1; putfield #2; return
+        let bc = vec![0x2a, 0x2a, 0x04, 0xb5, 0x00, 0x02, 0xb1];
+        let comp = classify_init_complexity(&bc);
+        assert_eq!(comp, InitComplexity::Trivial);
+        assert_eq!(
+            should_skip_jit_with_init(
+                "Foo",
+                "<init>",
+                false,
+                true,
+                SkipPolicy::Aggressive,
+                &[],
+                comp,
+            ),
+            None,
+            "a field-storing constructor must be JIT-eligible (allow_putfield_init, 2026-07-28)"
         );
     }
 
@@ -4637,18 +4733,53 @@ mod tests {
         }
     }
 
+    /// SPR-PROXY.1 (2026-07-28) re-banned `java.lang.reflect.Proxy`-generated
+    /// classes after PROXY-JITCALL.1 had removed the older ban, and this test
+    /// — which asserted the gap between the two — was left behind.
+    ///
+    /// The newer ban is the one that stands, and it is not a tuning choice:
+    /// CratonVM implements proxy semantics at DISPATCH (`vm_exec.rs`'s
+    /// `proxy_invoke_handler_shared` / `proxy_annotation_handler_invoke` /
+    /// `annotation_proxy_dispatch_impl`), so a compiled proxy body is a third
+    /// dispatch path that bypasses annotation-member coercion and the
+    /// foreign-proxy `equals` delegation. See `is_jdk_dynamic_proxy_class` for
+    /// the OOM that pinned it. Deliberately not liftable by
+    /// `CRATONVM_JIT_ALLOW_PACKAGES`, hence "under every policy".
     #[test]
-    fn generated_proxy_class_is_jit_eligible_after_proxy_jitcall_1_removal() {
+    fn generated_proxy_class_is_never_jit_eligible_spr_proxy_1() {
         for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            for (class, method) in [
+                // JDK 9+ names: one package per defining loader...
+                ("jdk/proxy1/$Proxy0", "invoke"),
+                ("jdk/proxy3/$Proxy17", "equals"),
+                // ...and unnamed-module proxies for non-public interfaces sit
+                // in the interface's own package.
+                ("com/example/$Proxy0", "invoke"),
+                ("com/example/$Proxy42", "hashCode"),
+            ] {
+                assert_eq!(
+                    check(class, method, false, true, policy),
+                    Some(SkipReason::JdkDynamicProxyTrampoline),
+                    "{class}.{method} must stay interpreted under {policy:?} (SPR-PROXY.1)",
+                );
+            }
+        }
+    }
+
+    /// The guard is on the `$ProxyN` naming rule, not on "contains Proxy":
+    /// an application class that merely has `Proxy` in its name is ordinary
+    /// code and must not be swept up by SPR-PROXY.1.
+    #[test]
+    fn ordinary_classes_named_proxy_are_not_caught_by_spr_proxy_1() {
+        for class in [
+            "com/example/ProxyFactory",
+            "org/springframework/aop/framework/JdkDynamicAopProxy",
+            "com/example/Proxy0",
+        ] {
             assert_eq!(
-                check("com/example/$Proxy0", "invoke", false, true, policy),
+                check(class, "invoke", false, true, SkipPolicy::Aggressive),
                 None,
-                "$ProxyN classes must be JIT-eligible now that PROXY-JITCALL.1 is removed",
-            );
-            assert_eq!(
-                check("com/example/$Proxy42", "hashCode", false, true, policy),
-                None,
-                "$ProxyN classes must be JIT-eligible now that PROXY-JITCALL.1 is removed",
+                "{class} is not a generated proxy class",
             );
         }
     }

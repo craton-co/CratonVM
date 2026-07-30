@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 env:
@@ -25,6 +25,12 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -53,6 +59,10 @@ jobs:
         shell: bash
         run: bash tools/flag-census/check-surface.sh
 
+      - name: Check maintained Markdown links
+        if: matrix.os == 'ubuntu-latest'
+        run: python tools/check_markdown_links.py
+
       - name: Clippy
         # `[workspace.lints]` in Cargo.toml already silences the noise lints
         # (dead_code, unused_*, rustdoc broken_intra_doc_links, clippy
@@ -63,34 +73,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      # Synthetic-stub census guard: the `synthetic-stub` native bucket should
-      # only ever SHRINK as the audit sweep classifies/deletes stubs. The VM's
-      # `--dump-native-registry` flag emits a JSON census whose `counts` block
-      # carries a `"synthetic-stub": N` total; this step boots the VM, dumps the
-      # census, and reports that count.
-      #
-      # `cargo build --workspace` above already produced the cratonvm binary, so
-      # this step reuses it (no rebuild). Generating a fresh census needs a JDK
-      # runtime image (the command boots the VM and runs HelloWorld), which the
-      # existing CI does NOT provision. Until a JDK is wired into CI this step is
-      # ADVISORY: it is gated to Linux (one matrix leg, no duplication) and
-      # marked `continue-on-error` so a missing JDK / boot failure does not
-      # red-flag the build. Once a JDK is added here the gate becomes blocking
-      # by dropping `continue-on-error`. See docs/synthetic-vs-real-explained.md.
-      - name: synthetic-stub census guard
+      # Exact synthetic-stub ratchet. The committed baseline is intentionally
+      # slack-free, so newly introduced application-visible stubs fail CI.
+      - name: Synthetic-stub ratchet
         if: matrix.os == 'ubuntu-latest'
-        continue-on-error: true
-        shell: bash
-        run: |
-          CENSUS="$(mktemp)"
-          cargo run --quiet -p cratonvm-cli --bin cratonvm -- \
-            --dump-native-registry "$CENSUS" \
-            -cp vm-cli/tests/resources HelloWorld
-          STUBS="$(grep -oE '"synthetic-stub": *[0-9]+' "$CENSUS" | grep -oE '[0-9]+')"
-          echo "synthetic-stub natives in the default build: ${STUBS:-unknown}"
-          if [ "${STUBS:-0}" -ne 0 ]; then
-            echo "::warning::default build registered ${STUBS} synthetic-stub native(s)"
-          fi
+        run: cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
 
   # `synthetic-jdk` feature gate. This feature is documented and supported (see
   # the `[features]` table in vm/Cargo.toml and NEW-11 in docs/roadmap.md), but
@@ -122,6 +109,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
       # Lib + bin scope across the whole workspace: proves the feature-gated
       # production code (native-builtins' synthetic overrides, and every crate
       # that forwards the feature) still compiles.
@@ -134,33 +127,89 @@ jobs:
           cargo check --all-targets --features synthetic-jdk
           -p cratonvm-vm -p cratonvm-native-builtins
 
-      # `cratonvm-native-builtins` is the crate whose synthetic overrides the
-      # feature actually switches on: 3251 lib tests pass under the flag versus
-      # 3075 without it, so this step is where the 176 feature-only tests get
-      # exercised — and its failure set under the flag is exactly the same five
-      # pre-existing failures as the default build. Blocking, same as the
-      # default `cargo test --workspace`.
+      # `cratonvm-native-builtins` owns most synthetic overrides, so its
+      # feature-only unit tests must execute, not merely compile. This is a
+      # blocking signal with no accepted failure set.
       - name: Test native-builtins (synthetic-jdk)
         run: cargo test -p cratonvm-native-builtins --lib --features synthetic-jdk
 
-      # ADVISORY for now, and it needs a timeout. `cratonvm-vm`'s inline test
-      # module is entirely synthetic-jdk-gated, and its 1,522 tests spent the
-      # whole unbuildable period drifting away from VM semantics as well as from
-      # the API. Once made to compile again (2026-07-25): 186 of them fail, and
-      # the harness does not exit after the last result — a lingering non-daemon
-      # VM thread keeps the process alive, which surfaces either as a hang or as
-      # a SIGSEGV on the shutdown path. Those are pre-existing defects that were
-      # merely invisible while the module was unbuildable, not a regression from
-      # fixing the build — but they must not red-flag every PR until triaged.
+      # ADVISORY, with a measurement rather than a guess.
       #
-      # The `cargo check --all-targets` step above is what is blocking today: it
-      # is what stops the module silently rotting out of compilability again.
-      # Drop `continue-on-error` and the timeout once the runtime failures and
-      # the non-exiting harness are worked through.
-      - name: Test vm (synthetic-jdk, advisory)
+      # This step was promoted to blocking during the 2026-07-30 audit sweep on
+      # the assumption that the module's old failure set had been worked
+      # through. It has not. Measured on this branch, Windows, JDK 25:
+      #
+      #   declared   3927 tests
+      #   reported   2584 (2523 pass, 61 fail)
+      #   then       exit code 1 with NO `test result` line
+      #
+      # The harness aborts mid-run, so 1,343 tests never execute and the 61 is a
+      # floor, not a total. That is the same non-exiting-harness defect this
+      # step has carried since the module was made to compile again, and a step
+      # that cannot report a result cannot be a gate.
+      #
+      # The `cargo check --all-targets` step above is what is blocking, and it
+      # is what stops the module silently rotting out of compilability again —
+      # the failure mode that cost this repository 1,522 tests once already.
+      #
+      # To promote this: fix the abort first (the process must reach a `test
+      # result` line), then drive the failures to zero, then drop
+      # `continue-on-error`. Do not drop it while either is outstanding.
+      - name: Test vm (synthetic-jdk, advisory — see comment)
         continue-on-error: true
         timeout-minutes: 20
         run: cargo test -p cratonvm-vm --lib --features synthetic-jdk
+
+  # The `experimental-*` features and `zgc` left the default set, so an ordinary
+  # build no longer carries them. That trade is only safe because of this job.
+  # The `synthetic-jdk` module already proved what happens otherwise: a
+  # configuration nothing compiles rots silently, and 1,522 tests had stopped
+  # building before anyone noticed. Code outside the default build must still be
+  # inside SOME build.
+  experimental-features:
+    name: Feature gate (experimental-* and zgc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # This list must stay a superset of every optional feature declared in
+      # `vm/Cargo.toml` and `native-builtins/Cargo.toml` except the two that
+      # have their own jobs (`synthetic-jdk`) or need hardware (`gpu-offload`,
+      # covered by `cuda-bridge.yml` and the self-hosted `gpu-selfhosted.yml`).
+      # `experimental-t19-diag`, `app-stubs` and `synthetic-quarkus-arc` were
+      # missing here and were compiled by nothing at all — which is how this
+      # repository lost 1,522 tests once already.
+      - name: Check every optional feature compiles, test targets included
+        run: >
+          cargo check --all-targets
+          -p cratonvm-vm -p cratonvm-native-builtins
+          --features experimental-tls,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug,experimental-t19-diag,zgc
+      - name: Check the native-builtins-only optional features compile
+        run: >
+          cargo check --all-targets
+          -p cratonvm-native-builtins
+          --features app-stubs,synthetic-quarkus-arc,legacy-synthetic-crypto
+
+      # Some test targets are gated in their entirety —
+      # `vm/tests/t4_8_jdwp_conformance.rs` is `#![cfg(feature =
+      # "experimental-debug")]` — and so execute nowhere else.
+      - name: Test the feature-gated surface
+        timeout-minutes: 30
+        run: >
+          cargo test
+          -p cratonvm-vm -p cratonvm-native-builtins
+          --features experimental-tls,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug,zgc
 
   # Build + publish the libcratonvm C-ABI embedding library (cdylib + staticlib)
   # and its public C headers as downloadable CI artifacts, per
@@ -224,7 +273,7 @@ jobs:
   # Smoke-test every per-subsystem CRATONVM_REAL_* real-path gate.
   # Requires a JDK (for javac to compile the Java test classes in build.rs)
   # and the cratonvm binary. The tests skip gracefully when prerequisites are
-  # absent, so this job is non-blocking if the JDK setup fails.
+  # absent during local development; CI provisions both prerequisites.
   real-path-coverage:
     name: Real-path smoke tests (per-subsystem REAL_* gates)
     runs-on: ubuntu-latest
@@ -236,24 +285,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Set up JDK 21 (needed for build.rs javac and as cratonvm boot JDK)
+      - name: Set up JDK 25 (needed for build.rs javac and as cratonvm boot JDK)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '25'
 
       - name: Build (debug — produces cratonvm binary for subprocess tests)
         run: cargo build --workspace
 
       - name: Run real-path smoke tests
-        run: >
-          cargo test -p cratonvm-vm --test synthetic_diff
-          real_annotations_path
-          real_aqs_path
-          real_raf_path
-          real_fjp_path
-          real_net_sockets_path
-          -- --nocapture
+        run: cargo test -p cratonvm-vm --test synthetic_diff -- --nocapture
 
   # Semantic differential gate (difftest, design
   # docs/feature-designs/differential-fuzzer.md §3.5). `cratonvm-difftest gate` diffs a
@@ -263,18 +305,9 @@ jobs:
   # forced on. It exits 3 (non-fatal) if `java` or the cratonvm binary is
   # absent. A *new* CratonVM/HotSpot divergence on a seed fails this job;
   # tracked `known` divergences (e.g. ExceptionId's message-parity gaps) pass.
-  #
-  # ADVISORY for now (`continue-on-error`): the committed difftest/ledger.json
-  # baseline was captured on a Windows dev host. The recorded divergence text is
-  # Java-semantic (exception messages, no paths), so it *should* reproduce
-  # byte-identically on this Linux runner — but until that's confirmed by a
-  # green CI run, a platform-drift must not red-flag dev. Regenerate the ledger
-  # here (`cratonvm-difftest run --update-ledger`, mark entries `known`) and DROP
-  # `continue-on-error` to make the gate blocking.
   difftest-gate:
-    name: Semantic differential gate (advisory)
+    name: Semantic differential gate
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -292,16 +325,14 @@ jobs:
       - name: Build difftest + cratonvm
         run: cargo build -p cratonvm-difftest -p cratonvm-cli
 
-      - name: Run the semantic differential gate (advisory)
+      - name: Run the semantic differential gate
         run: cargo run -p cratonvm-difftest --bin cratonvm-difftest -- gate --corpus difftest/seeds
 
-  # Fuzz build smoke. This is intentionally advisory until the standalone fuzz
-  # workspace and native-builtins feature set are aligned; keeping it visible in
-  # CI prevents the fuzz harness from drifting silently.
+  # Fuzz build smoke. Keeping this blocking prevents the standalone harness and
+  # the native-builtins feature set from drifting.
   fuzz-smoke:
-    name: Fuzz build smoke (advisory)
+    name: Fuzz build smoke
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -313,32 +344,33 @@ jobs:
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@cargo-fuzz
 
-      - name: Build fuzz targets (advisory)
+      - name: Build fuzz targets
         run: cargo +nightly fuzz build
 
-  # Future CI hardening — not yet enabled. Uncomment once the
-  # corresponding gates are ready to be enforced.
-  #
-  # coverage:
-  #   name: Coverage
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@stable
-  #     - uses: Swatinem/rust-cache@v2
-  #     - name: Install cargo-llvm-cov
-  #       uses: taiki-e/install-action@cargo-llvm-cov
-  #     - name: Generate coverage
-  #       run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-  #
-  # miri:
-  #   name: Miri
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@nightly
-  #       with:
-  #         components: miri
-  #     - uses: Swatinem/rust-cache@v2
-  #     - name: Run Miri
-  #       run: cargo miri test --workspace
+  miri:
+    name: Miri (core value and pointer invariants)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # Scoped to `heap_types` on purpose. The whole-crate run aborts partway
+      # through on Windows: `intern::tests::concurrent_intern_*` spawns threads
+      # and Miri stops with "can't call foreign function `GetModuleHandleA`",
+      # an unsupported-operation error, not UB. That leaves the crate-wide
+      # invocation unverifiable from a Windows host, and a gate nobody can run
+      # locally before pushing is the failure mode this whole audit is about.
+      #
+      # `heap_types` is the object header, `Value` cell layout and slot
+      # arithmetic — the "core value and pointer representation" this job is
+      # named for, and where the UB actually was: the first run of this gate
+      # rejected `field_cell_layout_matches_value_enum` for transmuting a
+      # padded enum to `[u8; 16]` and claiming every byte was an initialised
+      # integer. 63 tests, verified green under Miri on 2026-07-30.
+      #
+      # To widen it: run the crate-wide command on Linux, and if it is clean
+      # there, drop the filter and say in this comment that it is Linux-only.
+      - name: Run Miri on the core representation module
+        run: cargo +nightly miri test -p cratonvm-types --lib heap_types

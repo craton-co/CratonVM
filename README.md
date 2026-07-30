@@ -4,8 +4,8 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 
-A Java Virtual Machine written entirely in Rust, with a custom x86-64 JIT
-compiler and transparent GPU offload.
+A Java Virtual Machine written in Rust, with a custom x86-64 JIT and an
+opt-in automatic GPU fast path for a documented subset of Java kernels.
 
 CratonVM boots against a real JDK when one is present (`JAVA_HOME`,
 `CRATONVM_JAVA_HOME`, or `java` on `PATH`) and runs fully standalone when it
@@ -17,18 +17,21 @@ install, no `rt.jar`, one self-contained binary.
 - **Custom x86-64 JIT** — tiered compilation (interpreter → C1 → C2), OSR,
   LICM, bounds-check elimination, AVX2 SIMD, precise stack maps. Experimental
   AArch64 backend.
-- **Transparent GPU offload** — eligible Java methods run on NVIDIA GPUs with
-  **no annotations and no API changes**, and beat TornadoVM on
-  division-dominated kernels (see below).
+- **Automatic GPU fast path** — supported pure static array kernels can run on
+  NVIDIA GPUs without API changes. Eligibility is intentionally narrow and
+  unsupported shapes fall back to CPU (see below).
 - **Generational GC** — young/old generations, card table, selective
-  promotion. The default young collection is a **non-moving sweep**; the
-  moving/compacting young gen is opt-in (`CRATONVM_MOVING_YOUNG`, off by
-  default — see [ARCHITECTURE.md](ARCHITECTURE.md#memory-gc-crate)). Opt-in
+  promotion. The moving/compacting (Cheney) young gen is the **default**, with
+  `CRATONVM_NO_MOVING_YOUNG` as the compatibility opt-out; a cycle that cannot
+  prove complete root coverage diverts to the non-moving sweep rather than
+  relocating (see [ARCHITECTURE.md](ARCHITECTURE.md#memory-gc-crate) and
+  [moving-young throughput](docs/moving-young-throughput.md)). Opt-in
   region-based G1 (`-XX:+UseG1GC`).
 - **Real frameworks run** — Spring, Spring Boot, Tomcat, Hibernate, and H2
   boot and pass large test suites.
-- **Memory-safe by construction** — the interpreter, GC, and JIT are Rust;
-  classic VM vulnerability classes are designed out at the language level.
+- **Rust implementation** — Rust removes many ambient memory hazards, but the
+  VM, JIT, GC, FFI, I/O, AWT, CUDA, and JFR contain reviewed and still-being-
+  audited `unsafe` regions. See [SECURITY.md](SECURITY.md).
 - **JNI & embedding** — JNI Invocation API, a stable C-ABI library
   (`libcratonvm`), and a Rust facade (`cratonvm-embed`).
 - **Observability & hardening** — Java Flight Recorder, bytecode
@@ -46,9 +49,20 @@ fresh-process runs — full methodology in [BENCHMARK.md](BENCHMARK.md)):
 | Fibonacci(44)                     | 1,719 ms  | 4,790 ms  | 2.79x | 07-18 |
 | Sieve (100K × 20,000)             | 2,851 ms  | 6,508 ms  | 2.28x | 07-18 |
 | Matrix 1280×1280                  | 2,349 ms  | 6,875 ms  | 2.93x | 07-18 |
-| HashMap (10M put/get)             | 1,039 ms  | 22,077 ms | 21.2x | 07-25 |
+| HashMap (10M put/get)             | 1,017 ms  | 1,780 ms  | 1.75x | 07-30 |
 | String/Regex (100K)               | 55 ms     | 423 ms    | 7.7x  | 07-25 |
 | Binary Trees (depth 18)           | 176 ms    | 1,468 ms  | 8.34x | 07-18 |
+
+The HashMap row is a **correction plus an improvement**, and the two are
+separate. The 07-25 entry (`22,077 ms`, `21.2x`) does not reproduce: measured
+before any change here, `dev` runs this kernel in **3,776 ms** — 3.71x, not
+21.2x. Why the old reading was ~5x too slow is not established; the obvious
+candidate was tested and refuted. On top of that corrected baseline, the
+2026-07-30 closeout cut the HotSpot gap by **72.3%** (3,776 → 1,780 ms against
+1,017 ms). Both columns are medians of five interleaved fresh-process runs on
+one pinned core at load 3.4-3.8 — above the gate's own quiet-host threshold, so
+the absolutes are mildly inflated while the ratio holds. See
+[`hashmap-half-gap-20260730.md`](docs/internal/performance/hashmap-half-gap-20260730.md).
 
 The Fibonacci row retains its last quiet-host absolute values. The 2026-07-30
 merged-binary closeout reduced the measured CratonVM-versus-HotSpot gap by
@@ -62,6 +76,14 @@ The Binary Trees row also retains its last quiet-host absolute values. A
 **16.1%** in a clean 10-round interleaved Azure measurement. See
 [`binarytrees-bt18-half-gap-20260730.md`](docs/internal/performance/binarytrees-bt18-half-gap-20260730.md).
 
+The Sieve row likewise retains its last quiet-host absolute values. Guarded
+byte-array loop lowerings landed 2026-07-30 cut the measured
+CratonVM-versus-HotSpot gap by **94.35%**, taking the ratio from 1.85x to
+**1.05x** across two independent 9-round interleaved same-binary A/B
+measurements; the loaded shared host was unsuitable for re-anchoring absolute
+table values. See
+[`cratonbench-sieve-half-gap-20260730.md`](docs/internal/performance/cratonbench-sieve-half-gap-20260730.md).
+
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums
@@ -74,10 +96,10 @@ bit-identical to HotSpot):
 | 96 multiply-adds/elem (AVX2 on CPU)      | 8 ms       | 17 ms         | 11 ms        | 0.7x       | 1.5x         |
 | Dot-product reduction (int·int → long)   | 7 ms       | unimplemented | 18 ms        | 0.4x       | n/a          |
 
-Unlike TornadoVM, CratonVM needs no `@Parallel` annotations or TaskGraph
-API — plain Java methods offload transparently — and its GPU division is
-IEEE-754 bit-exact with HotSpot. Full results, extra sizes, and the honest
-counter-cases: [BENCHMARK.md](BENCHMARK.md) and
+Unlike TornadoVM, the supported automatic path needs no `@Parallel`
+annotations or TaskGraph API. This applies only to the eligibility subset in
+the GPU reference; it is not a general promise that arbitrary Java runs on the
+GPU. Full results, extra sizes, and counter-cases: [BENCHMARK.md](BENCHMARK.md) and
 [docs/gpu/README.md](docs/gpu/README.md).
 
 ## What Runs Today
@@ -201,8 +223,8 @@ bash regression-suite/run.sh   # fast HotSpot-differential regression suite
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Architectural orientation lives in
-[ARCHITECTURE.md](ARCHITECTURE.md); the fast regression suite and the
-performance gate (`regression-suite/`) are the merge gates.
+[ARCHITECTURE.md](ARCHITECTURE.md); required merge signals are defined by
+[release readiness](docs/RELEASE_READINESS.md) and the CI workflows.
 
 ## License
 

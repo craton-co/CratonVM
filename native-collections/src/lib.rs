@@ -732,21 +732,36 @@ fn pack_obj_key(hash: u32, generation: u32) -> usize {
 /// Authoritative lazy store for fresh, exact-class HashMaps with primitive
 /// Integer keys. Heap HashMap$Node objects are materialized on demand when an
 /// operation outside the fast put/get/size surface needs the ordinary table.
+#[derive(Clone, Copy)]
+struct SparseIntEntry {
+    key: ObjectRef,
+    value: Value,
+    seq: u64,
+}
+
 #[derive(Default)]
 struct DenseIntEntries {
+    // The common dense lookup array stays key/value-only. For monotonically
+    // inserted non-negative keys, insertion sequence equals the key itself,
+    // so storing an extra u64 in every entry only widens the 10M-key hot set.
     dense: Vec<Option<(ObjectRef, Value)>>,
-    sparse: FxHashMap<i32, (ObjectRef, Value)>,
+    sparse: FxHashMap<i32, SparseIntEntry>,
+    // Only out-of-order, migrated, or reinserted dense keys need metadata.
+    // Sequential generated-ID maps leave this empty.
+    dense_seq_overrides: FxHashMap<i32, u64>,
     len: usize,
     // Real JDK `HashMap` never shrinks its table on `remove`, and a node's
     // position within its bucket chain is fixed at first-insertion time
     // (a value-only update via a later `put` of the same key does not move
-    // it). `peak_len` mirrors the never-shrinks capacity rule and `seq`/
-    // `next_seq` mirror per-key insertion order, so `keys_in_java_hashmap_order`
-    // below can reproduce real bucket-iteration order instead of this dense
-    // store's raw ascending-key layout. See that method's doc comment.
+    // it). `peak_len` mirrors the never-shrinks capacity rule and the sparse
+    // entry/exception sequences plus `next_seq` mirror per-key insertion order,
+    // so
+    // `keys_in_java_hashmap_order` below can reproduce real bucket-iteration
+    // order instead of this dense store's raw ascending-key layout. Deriving
+    // the common dense sequence from the key avoids both a widened 10M-entry
+    // array and a second full hash-table insertion.
     peak_len: usize,
     next_seq: u64,
-    seq: FxHashMap<i32, u64>,
 }
 
 impl DenseIntEntries {
@@ -756,43 +771,110 @@ impl DenseIntEntries {
         self.len
     }
 
-    fn note_fresh_insert(&mut self, key: i32) {
+    fn note_fresh_insert(&mut self) -> u64 {
         self.len += 1;
         self.peak_len = self.peak_len.max(self.len);
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.seq.insert(key, seq);
+        seq
     }
 
     fn insert(&mut self, key: i32, value: (ObjectRef, Value)) -> Option<(ObjectRef, Value)> {
         if key >= 0 {
             let index = key as usize;
+            // Generated-ID maps append 0, 1, 2, ... . Handle that dominant
+            // case before the general dense/sparse migration machinery:
+            // `resize`, an occupied-slot probe, and sparse lookup are all
+            // redundant when this is exactly the next dense slot and no
+            // sparse entry can already own it.
+            if index <= Self::MAX_DENSE_KEY
+                && index == self.dense.len()
+                && self.sparse.is_empty()
+            {
+                let seq = self.note_fresh_insert();
+                self.dense.push(Some(value));
+                if seq != key as u64 {
+                    self.dense_seq_overrides.insert(key, seq);
+                }
+                return None;
+            }
             if index <= Self::MAX_DENSE_KEY && index <= self.dense.len().saturating_add(1024) {
                 if index >= self.dense.len() {
                     self.dense.resize(index + 1, None);
                 }
-                let sparse_old = self.sparse.remove(&key);
-                let old = self.dense[index].replace(value).or(sparse_old);
-                if old.is_none() {
-                    self.note_fresh_insert(key);
+                if let Some(entry) = self.dense[index].as_mut() {
+                    let old = *entry;
+                    *entry = value;
+                    return Some(old);
                 }
-                return old;
+                // A key can begin sparse when it is far ahead of the dense
+                // frontier, then migrate here after intervening inserts grow
+                // the vector. Preserve its first-insertion sequence.
+                if !self.sparse.is_empty() {
+                    if let Some(entry) = self.sparse.remove(&key) {
+                        let old = (entry.key, entry.value);
+                        self.dense[index] = Some(value);
+                        self.record_dense_seq(key, entry.seq);
+                        return Some(old);
+                    }
+                }
+                let seq = self.note_fresh_insert();
+                self.dense[index] = Some(value);
+                self.record_dense_seq(key, seq);
+                return None;
             }
         }
-        let old = self.sparse.insert(key, value);
-        if old.is_none() {
-            self.note_fresh_insert(key);
+        if let Some(entry) = self.sparse.get_mut(&key) {
+            let old = (entry.key, entry.value);
+            entry.key = value.0;
+            entry.value = value.1;
+            return Some(old);
         }
-        old
+        let seq = self.note_fresh_insert();
+        self.sparse.insert(
+            key,
+            SparseIntEntry {
+                key: value.0,
+                value: value.1,
+                seq,
+            },
+        );
+        None
     }
 
-    fn get(&self, key: &i32) -> Option<&(ObjectRef, Value)> {
+    fn record_dense_seq(&mut self, key: i32, seq: u64) {
+        debug_assert!(key >= 0);
+        if seq == key as u64 {
+            if !self.dense_seq_overrides.is_empty() {
+                self.dense_seq_overrides.remove(&key);
+            }
+        } else {
+            self.dense_seq_overrides.insert(key, seq);
+        }
+    }
+
+    fn get(&self, key: &i32) -> Option<(ObjectRef, Value)> {
         if *key >= 0 {
             if let Some(value) = self.dense.get(*key as usize).and_then(Option::as_ref) {
-                return Some(value);
+                return Some(*value);
             }
         }
-        self.sparse.get(key)
+        self.sparse.get(key).map(|entry| (entry.key, entry.value))
+    }
+
+    fn insertion_seq(&self, key: &i32) -> Option<u64> {
+        if *key >= 0 {
+            let index = *key as usize;
+            if self.dense.get(index).is_some_and(Option::is_some) {
+                return Some(
+                    self.dense_seq_overrides
+                        .get(key)
+                        .copied()
+                        .unwrap_or(*key as u64),
+                );
+            }
+        }
+        self.sparse.get(key).map(|entry| entry.seq)
     }
 
     fn remove(&mut self, key: &i32) -> Option<(ObjectRef, Value)> {
@@ -800,12 +882,19 @@ impl DenseIntEntries {
             self.dense
                 .get_mut(*key as usize)
                 .and_then(Option::take)
-                .or_else(|| self.sparse.remove(key))
+                .or_else(|| {
+                    self.sparse
+                        .remove(key)
+                        .map(|entry| (entry.key, entry.value))
+                })
         } else {
-            self.sparse.remove(key)
+            self.sparse
+                .remove(key)
+                .map(|entry| (entry.key, entry.value))
         };
         if old.is_some() {
             self.len -= 1;
+            self.dense_seq_overrides.remove(key);
         }
         old
     }
@@ -822,18 +911,23 @@ impl DenseIntEntries {
             .chain(self.sparse.keys().copied())
     }
 
-    fn values(&self) -> impl Iterator<Item = &(ObjectRef, Value)> {
+    fn values(&self) -> impl Iterator<Item = (ObjectRef, Value)> + '_ {
         self.dense
             .iter()
-            .filter_map(Option::as_ref)
-            .chain(self.sparse.values())
+            .filter_map(|entry| *entry)
+            .chain(self.sparse.values().map(|entry| (entry.key, entry.value)))
     }
 
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut (ObjectRef, Value)> {
+    fn values_mut(&mut self) -> impl Iterator<Item = (&mut ObjectRef, &mut Value)> {
         self.dense
             .iter_mut()
             .filter_map(Option::as_mut)
-            .chain(self.sparse.values_mut())
+            .map(|entry| (&mut entry.0, &mut entry.1))
+            .chain(
+                self.sparse
+                    .values_mut()
+                    .map(|entry| (&mut entry.key, &mut entry.value)),
+            )
     }
 
     /// Real-JDK `HashMap` bucket-iteration order for the entries currently
@@ -860,7 +954,7 @@ impl DenseIntEntries {
             // for `Integer`, `hashCode()` is the int value itself.
             let h = k ^ (((k as u32) >> 16) as i32);
             let bucket = mask & h;
-            (bucket, self.seq.get(&k).copied().unwrap_or(0))
+            (bucket, self.insertion_seq(&k).unwrap_or(0))
         });
         ordered
     }
@@ -889,7 +983,7 @@ mod dense_int_entries_tests {
         assert_eq!(entries.insert(-7, (object(0x3000), Value::Int(30))), None);
         assert_eq!(entries.len(), 3);
         assert_eq!(
-            entries.get(&1024).map(|(_, value)| *value),
+            entries.get(&1024).map(|(_, value)| value),
             Some(Value::Int(20))
         );
         assert_eq!(
@@ -903,6 +997,46 @@ mod dense_int_entries_tests {
         let mut keys: Vec<_> = entries.keys().collect();
         keys.sort_unstable();
         assert_eq!(keys, vec![0, 1024]);
+    }
+
+    #[test]
+    fn insertion_sequence_survives_updates_migration_and_reinsert() {
+        let mut entries = DenseIntEntries::default();
+        // 2048 starts sparse because it is beyond the initial dense frontier.
+        assert_eq!(entries.insert(2048, (object(0x1000), Value::Int(1))), None);
+        assert_eq!(entries.insert(0, (object(0x2000), Value::Int(2))), None);
+        for key in 1..=1024 {
+            assert_eq!(
+                entries.insert(key, (object(0x3000 + key as usize * 8), Value::Int(key))),
+                None
+            );
+        }
+        let original_seq = entries.insertion_seq(&2048).expect("sparse entry");
+        // The now-nearby key migrates into the dense vector and a value update
+        // must retain its original position within a bucket.
+        assert_eq!(
+            entries.insert(2048, (object(0x9000), Value::Int(3))),
+            Some((object(0x1000), Value::Int(1)))
+        );
+        assert_eq!(
+            entries.insertion_seq(&2048).expect("migrated entry"),
+            original_seq
+        );
+        assert_eq!(
+            entries.insert(2048, (object(0xA000), Value::Int(4))),
+            Some((object(0x9000), Value::Int(3)))
+        );
+        assert_eq!(
+            entries.insertion_seq(&2048).expect("updated entry"),
+            original_seq
+        );
+
+        assert_eq!(entries.remove(&2048), Some((object(0xA000), Value::Int(4))));
+        assert_eq!(entries.insert(2048, (object(0xB000), Value::Int(5))), None);
+        assert!(
+            entries.insertion_seq(&2048).expect("reinserted entry") > original_seq,
+            "remove followed by reinsert must create a new bucket-chain position"
+        );
     }
 }
 
@@ -1142,7 +1276,7 @@ fn try_hm_int_fast_get(
         state
             .entries
             .get(&int_key)
-            .map(|(_, value)| *value)
+            .map(|(_, value)| value)
             .unwrap_or(Value::Object(None)),
     )))
 }
@@ -1173,7 +1307,6 @@ fn materialize_hm_int_fast(
             table
                 .get(&object_key)
                 .and_then(|state| state.entries.get(&int_key))
-                .copied()
                 .expect("fast HashMap entry disappeared during materialization")
         };
         let iter_pin_base = ctx.pin_native_root(key_ref);
@@ -1734,6 +1867,92 @@ fn chm_seg_lock_for(seg_id: i32) -> &'static parking_lot::RwLock<()> {
     &seg_locks()[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
+static SEG_RESIZE_EPOCHS: std::sync::OnceLock<
+    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
+> = std::sync::OnceLock::new();
+
+fn chm_seg_resize_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
+    let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &SEG_RESIZE_EPOCHS.get_or_init(|| {
+        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+}
+
+// Validity generation for the per-thread CHM String-node memo. Every CHM
+// mutator holds a `ChmMonitorGuard`, which bumps both striped counters below:
+// `SEG_MUTATION_ACTIVE` for as long as it may be altering nodes, and
+// `SEG_MUTATION_EPOCHS` once as it leaves. Deliberately separate from the
+// resize epoch, because a resize nests inside a mutator.
+//
+// A reader may memoize a node only if it saw `active == 0` both before and
+// after its chain walk AND the epoch did not move across it; validating a memo
+// hit later re-checks the same pair against the recorded epoch. Any mutator
+// whose window overlaps the walk is caught by one of those three observations,
+// because the epoch is bumped after the last node write and the in-flight
+// count is dropped after that.
+//
+// This is a counter plus an in-flight count rather than the usual single
+// odd/even parity word because a parity word needs the writers sharing one
+// stripe serialized against each other, and the only place to serialize them
+// is around `monitor_enter` — i.e. a host mutex held across a GC-safepoint
+// park. A thread blocked on such a mutex is not at a safepoint, so it would
+// stall every collection queued behind it.
+static SEG_MUTATION_EPOCHS: std::sync::OnceLock<
+    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
+> = std::sync::OnceLock::new();
+static SEG_MUTATION_ACTIVE: std::sync::OnceLock<
+    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
+> = std::sync::OnceLock::new();
+
+fn chm_seg_mutation_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
+    let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &SEG_MUTATION_EPOCHS.get_or_init(|| {
+        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+}
+
+fn chm_seg_mutation_active(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
+    let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &SEG_MUTATION_ACTIVE.get_or_init(|| {
+        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+}
+
+/// `(epoch, in-flight mutators)` for the stripe owning `seg_id`. The in-flight
+/// count is read first so a snapshot can never pair an already-advanced epoch
+/// with a stale-low count.
+fn chm_seg_mutation_snapshot(seg_id: i32) -> (u64, u64) {
+    let active = chm_seg_mutation_active(seg_id).load(std::sync::atomic::Ordering::Acquire);
+    let epoch = chm_seg_mutation_epoch(seg_id).load(std::sync::atomic::Ordering::Acquire);
+    (epoch, active)
+}
+
+struct ChmSegmentResizeGuard {
+    epoch: &'static std::sync::atomic::AtomicU64,
+    lock: Option<parking_lot::RwLockWriteGuard<'static, ()>>,
+}
+
+impl ChmSegmentResizeGuard {
+    fn acquire(seg_id: i32) -> Self {
+        // Take the stripe's write lock BEFORE marking the epoch odd, and
+        // release it after marking it even again. Bumping first would let two
+        // resizers sharing a stripe interleave their increments and leave the
+        // epoch EVEN while one of them is still relinking — which is exactly
+        // what an optimistic reader reads as "no resize in progress".
+        let lock = chm_seg_lock_for(seg_id).write();
+        let epoch = chm_seg_resize_epoch(seg_id);
+        epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self { epoch, lock: Some(lock) }
+    }
+}
+
+impl Drop for ChmSegmentResizeGuard {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.lock.take();
+    }
+}
+
 /// RAII guard for a native monitor (`ctx.monitor_enter` / `monitor_exit`).
 ///
 /// CRIT fix (round-5): the previous CHM write path performed
@@ -1777,6 +1996,12 @@ struct ChmMonitorGuard<'a> {
     /// write lock; every later toucher of that segment deadlocked). Drop
     /// re-reads the pin and exits the CURRENT address.
     pin: usize,
+    /// Bumped once on the way out, after the last node write. See
+    /// [`chm_seg_mutation_snapshot`].
+    mutation_epoch: &'static std::sync::atomic::AtomicU64,
+    /// Held up (`+1`) for the whole guarded section, so a reader can tell
+    /// "a mutator is in flight on this stripe" from "a mutator has finished".
+    mutation_active: &'static std::sync::atomic::AtomicU64,
     /// Phantom borrow tying the guard's lifetime parameter `'a` to a
     /// surrounding scope at the type level. Using
     /// `fn() -> &'a mut dyn NativeContext` rather than `&'a mut …` directly
@@ -1790,6 +2015,10 @@ struct ChmMonitorGuard<'a> {
 impl<'a> ChmMonitorGuard<'a> {
     fn acquire(ctx: &mut dyn NativeContext, seg: ObjectRef) -> Self {
         let pin = ctx.pin_native_root(seg);
+        let seg_id = ctx.identity_hash_code(seg);
+        let mutation_epoch = chm_seg_mutation_epoch(seg_id);
+        let mutation_active = chm_seg_mutation_active(seg_id);
+        mutation_active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         ctx.monitor_enter(seg);
         // SAFETY: the guard MUST be dropped before the `&mut dyn NativeContext`
         // borrow ends. We transmute away the lifetime so the guard doesn't
@@ -1806,6 +2035,8 @@ impl<'a> ChmMonitorGuard<'a> {
             ctx: ctx_ptr_static,
             seg,
             pin,
+            mutation_epoch,
+            mutation_active,
             _borrow: std::marker::PhantomData,
         }
     }
@@ -1830,6 +2061,10 @@ impl<'a> ChmMonitorGuard<'a> {
     /// (`pin_value`/`read_pinned_elem`) — for everything after this call.
     fn acquire_gc_safe(ctx: &mut dyn NativeContext, seg: ObjectRef) -> (Self, ObjectRef) {
         let pin = ctx.pin_native_root(seg);
+        let seg_id = ctx.identity_hash_code(seg);
+        let mutation_epoch = chm_seg_mutation_epoch(seg_id);
+        let mutation_active = chm_seg_mutation_active(seg_id);
+        mutation_active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let fixed = ctx.monitor_enter_gc_safe(seg);
         let fixed = ctx.read_native_pin(pin, fixed);
         // SAFETY: identical lifetime-erasure contract to `acquire` above.
@@ -1841,6 +2076,8 @@ impl<'a> ChmMonitorGuard<'a> {
                 ctx: ctx_ptr_static,
                 seg: fixed,
                 pin,
+                mutation_epoch,
+                mutation_active,
                 _borrow: std::marker::PhantomData,
             },
             fixed,
@@ -1874,6 +2111,15 @@ impl<'a> Drop for ChmMonitorGuard<'a> {
             (*ctx_ptr).monitor_exit(seg);
             (*ctx_ptr).unpin_native_roots(pin);
         }));
+        // Order matters: the epoch must advance after the last node write
+        // (and after `monitor_exit` publishes it), and the in-flight count
+        // must drop only after that. A reader that sees `active == 0` on both
+        // sides of its walk with an unchanged epoch has therefore observed no
+        // mutation of this stripe across the walk.
+        self.mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.mutation_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
         if result.is_err() {
             eprintln!(
                 "[CHM] monitor_exit panicked during ChmMonitorGuard::drop — ignoring to avoid double-panic abort"
@@ -5393,7 +5639,7 @@ fn map_resize_inner(
         // `parking_lot::RwLock::write` is infallible (no PoisonError),
         // so no `unwrap_or_else` wrapper is needed.
         let seg_id = ctx.identity_hash_code(this);
-        Some(chm_seg_lock_for(seg_id).write())
+        Some(ChmSegmentResizeGuard::acquire(seg_id))
     } else {
         None
     };
@@ -5706,7 +5952,7 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
                     state
                         .entries
                         .get(&k)
-                        .map(|(key, _)| Value::Object(Some(*key)))
+                        .map(|(key, _)| Value::Object(Some(key)))
                 })
                 .collect()
         })
@@ -5756,7 +6002,7 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
                 .entries
                 .keys_in_java_hashmap_order()
                 .into_iter()
-                .filter_map(|k| state.entries.get(&k).map(|(_, value)| *value))
+                .filter_map(|k| state.entries.get(&k).map(|(_, value)| value))
                 .collect()
         })
     {
@@ -5804,7 +6050,7 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
                     state
                         .entries
                         .get(&k)
-                        .map(|(key, value)| (Value::Object(Some(*key)), *value))
+                        .map(|(key, value)| (Value::Object(Some(key)), value))
                 })
                 .collect()
         })
@@ -7017,7 +7263,7 @@ fn native_hashmap_get_string_fast(
         };
         if let Value::Object(Some(node_key)) = get_node_key(ctx, node) {
             if ctx.read_string(node_key).as_deref() == Some(key_text.as_str()) {
-                ctx.hashmap_string_node_cache_put(this, &key_text, node);
+                ctx.hashmap_string_node_cache_put(this, key, &key_text, node);
                 return Some(Ok(Some(get_node_value(ctx, node))));
             }
         }
@@ -7029,6 +7275,17 @@ fn native_hashmap_get_string_fast(
         }
         .into(),
     ))
+}
+
+/// Whether a cached virtual-native call is a two-object map lookup.
+///
+/// Both callbacks accept exactly `(receiver, key)` and preserve their own
+/// collision, equality, mutation and exception behavior. The interpreter uses
+/// this identity check only to reuse its prevalidated cached-native plumbing
+/// without re-resolving the already-known descriptor on every lookup.
+pub fn is_hot_map_get_native_callback(callback: cratonvm_native_api::NativeCallback) -> bool {
+    let callback = callback as usize;
+    callback == native_map_get as usize || callback == native_chm_get as usize
 }
 
 /// Exact-class HashMap get entry used after a receiver-ClassId guard.
@@ -32032,9 +32289,9 @@ pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
             .get(&key)
         {
             for (entry_key, value) in state.entries.values() {
-                roots.push(*entry_key);
+                roots.push(entry_key);
                 if let Value::Object(Some(object)) = value {
-                    roots.push(*object);
+                    roots.push(object);
                 }
             }
         }
@@ -37411,33 +37668,25 @@ fn chm_seg_get(
 /// key, or a chain containing any non-String key. Mixed-key maps and every
 /// exotic key type (enums, Thread mirrors, user-defined `equals`) therefore run
 /// exactly the code they ran before.
-fn native_chm_get_string_fast(
+fn native_chm_get_string_chain(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    seg: ObjectRef,
     key: ObjectRef,
-) -> Option<Value> {
-    let raw_hash = ctx.java_string_hash_code(key)?;
-    // Same spreading `map_hash_key` applies — this must agree with whatever
-    // bucket `put` chose.
-    let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
-    let seg = chm_segment_for(ctx, this, hash)?;
-    // The same stripe read lock the general path takes, for the same reason:
-    // serialize against `map_resize_concurrent`'s in-place NEXT relinking.
-    let seg_id = ctx.identity_hash_code(seg);
-    let _read_guard = chm_seg_lock_for(seg_id).read();
+    hash: i32,
+) -> Option<(Value, Option<ObjectRef>)> {
     let buckets = match ctx.get_field_volatile(seg, MAP_FIELD_BUCKETS) {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => arr,
-        _ => return Some(Value::Object(None)),
+        _ => return Some((Value::Object(None), None)),
     };
     let cap = ctx.array_length(buckets) as i32;
     if cap <= 0 {
-        return Some(Value::Object(None));
+        return Some((Value::Object(None), None));
     }
     let mut node_value = ctx.get_array_element(buckets, map_bucket_index(hash, cap));
     const CHAIN_WALK_LIMIT: usize = 4096;
     for _ in 0..CHAIN_WALK_LIMIT {
         let Value::Object(Some(node)) = node_value else {
-            return Some(Value::Object(None));
+            return Some((Value::Object(None), None));
         };
         let Value::Object(Some(node_key)) = get_node_key(ctx, node) else {
             // CHM rejects null keys, so this is an unexpected node shape —
@@ -37451,12 +37700,19 @@ fn native_chm_get_string_fast(
                 // itself in the value slot as a reservation marker; lock-free
                 // readers must read that as absent, exactly as `chm_seg_get`
                 // does (CHM-mapper-deadlock fix, 2026-07-21).
+                //
+                // Handing back no memoizable node with it is what keeps that
+                // marker out of the per-thread node memo — a memo hit answers
+                // later lookups WITHOUT re-running this filter, and the
+                // `computeIfAbsent` phases that install and then replace the
+                // marker deliberately run outside `ChmMonitorGuard`, so they
+                // never bump the mutation epoch that would evict the entry.
                 if let Value::Object(Some(v)) = value {
                     if std::ptr::eq(v.as_ptr(), seg.as_ptr()) {
-                        return Some(Value::Object(None));
+                        return Some((Value::Object(None), None));
                     }
                 }
-                return Some(value);
+                return Some((value, Some(node)));
             }
             Some(false) => {}
             // A non-String key on the chain — hand the whole lookup back so
@@ -37466,6 +37722,68 @@ fn native_chm_get_string_fast(
         node_value = ctx.get_field_volatile(node, NODE_FIELD_NEXT);
     }
     None
+}
+
+fn native_chm_get_string_fast(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: ObjectRef,
+) -> Option<Value> {
+    // The memo is keyed by the CHM receiver and the exact key String object,
+    // not by its segment. A validated hit therefore skips the String hash, the
+    // segment-array access, and the segment identity-hash minting that a
+    // regular CHM get requires.
+    if let Some((cached_seg_id, cached_generation, value)) =
+        ctx.chm_string_node_cache_get_object(this, key)
+    {
+        let (epoch, active) = chm_seg_mutation_snapshot(cached_seg_id);
+        if active == 0 && epoch == cached_generation {
+            return Some(value);
+        }
+    }
+    let raw_hash = ctx.java_string_hash_code(key)?;
+    let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
+    let seg = chm_segment_for(ctx, this, hash)?;
+    let seg_id = ctx.identity_hash_code(seg);
+    let before_mutation = chm_seg_mutation_snapshot(seg_id);
+
+    // Optimistic walk. The resize epoch is odd for exactly as long as a
+    // resizer holds this stripe's write lock, so an unchanged even epoch
+    // across the walk means no relinking overlapped it.
+    let resize_epoch = chm_seg_resize_epoch(seg_id);
+    let resize_before = resize_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let walked = if resize_before & 1 == 0 {
+        let result = native_chm_get_string_chain(ctx, seg, key, hash);
+        if resize_epoch.load(std::sync::atomic::Ordering::Acquire) == resize_before {
+            Some(result)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // The resize writer relinks existing node chains in place. If it overlapped
+    // the optimistic walk, redo the walk under the established stripe lock.
+    let (result, node) = match walked {
+        Some(result) => result?,
+        None => {
+            let _read_guard = chm_seg_lock_for(seg_id).read();
+            native_chm_get_string_chain(ctx, seg, key, hash)?
+        }
+    };
+
+    // Memoize only a node that no mutator touched across the walk. Re-sampling
+    // the stripe here, rather than trusting the pre-walk read, is what makes
+    // the recorded generation a promise about the walk itself.
+    if let Some(node) = node {
+        let after_mutation = chm_seg_mutation_snapshot(seg_id);
+        if before_mutation == after_mutation && before_mutation.1 == 0 {
+            if let Some(key_text) = ctx.read_string(key) {
+                ctx.chm_string_node_cache_put(this, seg_id, key, &key_text, node, before_mutation.0);
+            }
+        }
+    }
+    Some(result)
 }
 
 pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -47694,17 +48012,22 @@ mod tests {
     }
 
     #[test]
-    fn fork_join_pool_await_quiescence_registered() {
+    fn fork_join_pool_invoke_registered_and_quiescence_left_to_native_builtins() {
         let r = build_registry();
         let pool = "java/util/concurrent/ForkJoinPool";
+        // `awaitQuiescence` deliberately does NOT live here: `native-builtins`
+        // registers it after establishing the real async-worker completion
+        // tracker, and `register_collections_natives` runs later, so a local
+        // constant would win and overwrite that stateful implementation. This
+        // test used to assert the opposite and had gone red unnoticed.
         assert!(
             r.find(
                 pool,
                 "awaitQuiescence",
                 "(JLjava/util/concurrent/TimeUnit;)Z"
             )
-            .is_some(),
-            "FJP awaitQuiescence"
+            .is_none(),
+            "FJP awaitQuiescence must stay owned by native-builtins"
         );
         assert!(
             r.find(
