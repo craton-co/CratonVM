@@ -132,60 +132,81 @@ A future blanket `net/bytebuddy/` guard fails the unit suite.
 ## 5. Validation
 
 Worktree `C:\craton\CratonVM-bytebuddy-retire-20260730`, branch
-`codex/fix-bytebuddy-retire-20260730`, binary
-`C:\craton\bb-retire-20260730\cratonvm-bbretire-r7.exe`
-(SHA-256 `8C030FAE1C94CD693F101A2BFD3D60711C0E45E609748CF8DF1512490D3A0947`),
+`codex/fix-bytebuddy-retire-20260730` merged up to `origin/dev`, binary
+`C:\craton\bb-retire-20260730\cratonvm-bbretire-r10.exe`
+(SHA-256 `FEAAAB0A26D8C17A97952AA9EB9339ACFF1421134DC04F7433D168A6F204B379`),
 JDK 25.0.3, manifest `crash302.txt` (the exact 302 classes from the 2026-07-28
 no-ban crash run), 6 shards, 900 s per-class cap, no
 `CRATONVM_JIT_ALLOW_PACKAGES` override.
 
 ### The 302-class ByteBuddy corpus
 
-| Mode | PASS | FAIL | CRASH | HANG | ABORTED |
-|---|---:|---:|---:|---:|---:|
-| JIT | 301 | 0 | 0 | 0 | 1 |
-| `--nojit` | 300 | 1 | 0 | 0 | 1 |
+| Mode | Classes | PASS | FAIL | CRASH | HANG | ABORTED | found | started | ok | skipped |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| JIT | 302 | 301 | 0 | 0 | 0 | 1 | 1281 | 1275 | 1272 | 6 |
+| `--nojit` | 302 | 301 | 0 | 0 | 0 | 1 | 1281 | 1275 | 1272 | 6 |
 
 **Zero crashes and zero hangs in either mode** — the entire reason the ban
-existed. Both non-PASS rows are known, named, and neither is
-ByteBuddy-attributable:
+existed — and zero failures. The counts are identical between the two modes.
 
-- `ManyToManyAssociationClassGeneratedIdTest` (ABORTED, both modes) is the
-  documented flush-queue assumption abort. It is **not** waived: re-run with an
-  explicit `-Dhibernate.flush.queue.type=legacy` it passes 1/1 in both modes,
-  and the three `action.queue` classes run with
-  `-Dhibernate.flush.queue.type=graph` pass 3/3 in both modes. No
-  assumption-only row is counted as green.
-- `ASTParserLoadingTest` (FAIL, `--nojit` only) is the moving-young native-root
-  defect in the ANTLR intrinsics — see section 6. Under JIT it is 106/106.
+The single ABORTED row in each mode is
+`ManyToManyAssociationClassGeneratedIdTest`, the documented flush-queue
+assumption abort. It is **not** waived: re-run with an explicit queue type it
+passes outright, in both modes:
 
-### `ASTParserLoadingTest` specifically
-
-| Binary | JIT | `--nojit` |
+| Run | JIT | `--nojit` |
 |---|---|---|
-| r3 (before the ANTLR fixes) | 106/106 | 91–105 / 106 |
-| r7 (after) | 106/106 | 104–106 / 106 |
+| 3 `action.queue` classes, `-Dhibernate.flush.queue.type=graph` | 3/3 PASS | 3/3 PASS |
+| `ManyToManyAssociationClassGeneratedIdTest`, `-Dhibernate.flush.queue.type=legacy` | 1/1 PASS | 1/1 PASS |
+
+No assumption-only row is counted as green anywhere in this table.
+
+### `ASTParserLoadingTest` — the class that drove the ANTLR work
+
+| Binary | JIT | `--nojit` failures per run |
+|---|---|---|
+| r3 (before any ANTLR rooting fixes) | 106/106 | 1, 15 |
+| r7 (parent/merge fixes) | 106/106, then 1 FAIL under 6-shard load | 2 |
+| r8 (index-based config iteration) | 106/106 | 0, 0, 0, 0, 1, 0 |
+| r10 (final, merged with dev's own rooting pass) | 106/106 | 0 in both corpus arms |
 
 ### Unit tests
 
-`cargo test --release -p cratonvm-native-collections -p cratonvm-native-builtins`
-— `gc_native_pins` **12/12**, including the five new alloc-time relocation tests
-that cover the collections rooting work. Six pre-existing environment/timing
-failures remain untouched by this branch (`tzdb` ×2, `proxy_selector` env vars,
-`StampedLock` ×2, `ForkJoinPool` quiescence).
+`cargo test --release --no-fail-fast -p cratonvm-native-collections
+-p cratonvm-native-builtins` — `gc_native_pins` **12/12**, including the five new
+alloc-time relocation tests. Those tests earned their keep during the dev merge:
+against dev's independently-written collections rooting pass they dropped to
+9/12, which is how the three remaining unrooted iterator constructors
+(`make_iterator_from_array`, `native_ad_iterator`, `alloc_unmod_list_itr`) were
+found and fixed.
+
+Six pre-existing environment/timing failures remain, all in files this branch
+does not touch (`tzdb` ×2, `proxy_selector` env vars, `StampedLock` ×2,
+`ForkJoinPool` quiescence).
 
 `vm/src/jit/skip_list.rs` carries the permanent gate test described in section 4.
 
-## 6. Known residual (separate issue, not ByteBuddy)
+## 6. The `--nojit` HQL mis-parse, and where it ended up
 
 `docs/known-issues/hibernate/antlr-native-roots-moving-young-hql-misparse-20260730.md`
-— the native ANTLR intrinsics hold raw `ObjectRef` locals (and whole
-`Vec<ObjectRef>` config snapshots) across allocating calls, so a moving young
-collection can link dead addresses into the parser graph; a poisoned config is
-then memoized as a DFA edge. Seven instances are fixed here, which took the
-witness from 1–15 failures per run to 0–2. The tail is the same defect class at
-un-converted sites; that doc explains why finishing it wants a scoped handle
-type rather than more per-site edits, and records
+carries the full account. In short: the native ANTLR intrinsics held raw
+`ObjectRef` locals — and whole `Vec<ObjectRef>` config snapshots — across
+allocating calls, so a moving young collection linked dead addresses into the
+parser's own graph, and the poisoned config was then memoized as a DFA edge.
+That is why one mis-timed collection broke a whole grammar path
+(`<expression> <comparison-op>`) for the rest of the process.
+
+It is **not** the trivial-accessor fast path that the 2026-07-29 investigation
+blamed and deleted; that deletion is reverted here, with the measurements that
+refute it recorded in section 3.
+
+Two independent efforts converged on this: the fixes on this branch, and a
+broader rooting pass another session landed on `dev` while this work was in
+flight. The merge takes dev's version of `antlr_intrinsics.rs` wholesale rather
+than re-landing a competing rework. The corpus is clean in both modes on the
+merged result, but the underlying idiom — a bare `ObjectRef` living across an
+allocating call — is still the file's default style, so the known-issue doc
+stays OPEN with a recommended scoped-handle approach and
 `CRATONVM_NO_MOVING_YOUNG=1` as the interim mitigation.
 
 ## 7. Related
