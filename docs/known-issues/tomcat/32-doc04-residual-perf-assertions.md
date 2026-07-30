@@ -150,6 +150,13 @@ baseline. The cost is accumulated across several of the 07-29/07-30 JIT changes
 (the CratonBench Matrix/Fibonacci work and the dispatch fixes all land here)
 rather than concentrated in one.
 
+It is **not** the `moving_young` default flip described in
+[jit-optimizing-tier-disabled-by-moving-young-default](../jit-optimizing-tier-disabled-by-moving-young-default.md),
+even though that lands in the same window and has exactly the same shape ("a
+default flip silently disabled a JIT tier"). Tested directly: with the tier-up
+gate pinned on, `CRATONVM_MOVING_YOUNG=0` gives 2 415 ns against the default's
+2 377 ns — no change — where dev `b695d468f` reaches 628 ns.
+
 Eliminated along the way, so nobody re-tests them: the ctor putfield-init ban
 (`CRATONVM_JIT_PUTFIELD_INIT=0` changes nothing — 24.2 vs 24.6 µs — and it is
 benign-by-default since 07-28), and the mapper shadow itself.
