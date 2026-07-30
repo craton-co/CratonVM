@@ -50,6 +50,12 @@ fresh-process runs — full methodology in [BENCHMARK.md](BENCHMARK.md)):
 | String/Regex (100K)               | 55 ms     | 423 ms    | 7.7x  | 07-25 |
 | Binary Trees (depth 18)           | 176 ms    | 1,468 ms  | 8.34x | 07-18 |
 
+The Fibonacci row retains its last quiet-host absolute values. The 2026-07-30
+merged-binary closeout reduced the measured CratonVM-versus-HotSpot gap by
+**71.90%** in balanced alternating runs; the loaded shared host was unsuitable
+for re-anchoring absolute table values. See
+[`fibonacci-half-gap-20260730.md`](docs/internal/performance/fibonacci-half-gap-20260730.md).
+
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums
