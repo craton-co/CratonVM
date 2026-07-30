@@ -5735,6 +5735,380 @@ fn detect_loops(code: &[u8], code_len: usize) -> Vec<(usize, usize)> {
     loops
 }
 
+/// A canonical javac byte/boolean-array zero-fill loop.
+///
+/// The emitter turns the initially-entered range into one `REP STOSB`, updates
+/// `iv` to `bound + 1`, and then falls through to the original header. Any
+/// null, negative, empty, or out-of-bounds range branches around the bulk path
+/// and executes the original scalar bytecode, preserving Java's exact
+/// partial-write and exception behavior.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BulkZeroByteFillLoop {
+    header_pc: usize,
+    array_local: usize,
+    iv_local: usize,
+    bound_local: usize,
+}
+
+/// A canonical javac byte/boolean-array unit store with a positive,
+/// loop-invariant variable stride.
+///
+/// This is the shape used by the inner marking loop in CratonBench Sieve:
+/// `for (j = i + i; j <= limit; j += i) composite[j] = true`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BulkSetByteStrideLoop {
+    header_pc: usize,
+    array_local: usize,
+    iv_local: usize,
+    bound_local: usize,
+    step_local: usize,
+}
+
+/// The canonical nested byte/boolean-array Sieve of Eratosthenes loop emitted
+/// by javac. A guarded preheader executes the remaining counted loop nest in
+/// registers and then falls through to the original exit test.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ByteSieveLoop {
+    header_pc: usize,
+    array_local: usize,
+    outer_iv_local: usize,
+    bound_local: usize,
+    count_local: usize,
+    inner_iv_local: usize,
+}
+
+// Bulk preheaders have no back-edge safepoint. Cap the covered range so an
+// enormous application loop retains the scalar path's cooperative polls.
+const MAX_BULK_BYTE_LOOP_SPAN: i32 = 1 << 20;
+
+fn decode_bulk_int_load(code: &[u8], code_len: usize, pc: usize) -> Option<(usize, usize)> {
+    if pc >= code_len {
+        return None;
+    }
+    match code[pc] {
+        0x15 if pc + 1 < code_len => Some((code[pc + 1] as usize, pc + 2)),
+        0x1a..=0x1d => Some(((code[pc] - 0x1a) as usize, pc + 1)),
+        _ => None,
+    }
+}
+
+fn decode_ref_load(code: &[u8], code_len: usize, pc: usize) -> Option<(usize, usize)> {
+    if pc >= code_len {
+        return None;
+    }
+    match code[pc] {
+        0x19 if pc + 1 < code_len => Some((code[pc + 1] as usize, pc + 2)),
+        0x2a..=0x2d => Some(((code[pc] - 0x2a) as usize, pc + 1)),
+        _ => None,
+    }
+}
+
+fn detect_bulk_zero_byte_fill_loop(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+) -> Option<BulkZeroByteFillLoop> {
+    if header >= back_edge || back_edge + 2 >= code_len || code[back_edge] != 0xa7 {
+        return None;
+    }
+    let back_offset = i16::from_be_bytes([code[back_edge + 1], code[back_edge + 2]]) as i32;
+    if back_edge.checked_add_signed(back_offset as isize) != Some(header) {
+        return None;
+    }
+
+    let (iv_local, mut pc) = decode_bulk_int_load(code, code_len, header)?;
+    let (bound_local, next) = decode_bulk_int_load(code, code_len, pc)?;
+    pc = next;
+    // Inclusive loop: continue while iv <= bound.
+    if pc + 2 >= code_len || code[pc] != 0xa3 {
+        return None;
+    }
+    let exit_offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    let exit_pc = pc.checked_add_signed(exit_offset as isize)?;
+    if exit_pc <= back_edge || exit_pc > code_len {
+        return None;
+    }
+    pc += 3;
+
+    let (array_local, next) = decode_ref_load(code, code_len, pc)?;
+    pc = next;
+    let (store_iv, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if store_iv != iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x03 {
+        return None;
+    }
+    pc += 1;
+    if pc >= code_len || code[pc] != 0x54 {
+        return None;
+    }
+    pc += 1;
+    if pc + 2 >= code_len
+        || code[pc] != 0x84
+        || code[pc + 1] as usize != iv_local
+        || code[pc + 2] != 1
+    {
+        return None;
+    }
+    pc += 3;
+    if pc != back_edge {
+        return None;
+    }
+
+    Some(BulkZeroByteFillLoop {
+        header_pc: header,
+        array_local,
+        iv_local,
+        bound_local,
+    })
+}
+
+fn detect_bulk_set_byte_stride_loop(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+) -> Option<BulkSetByteStrideLoop> {
+    if header >= back_edge || back_edge + 2 >= code_len || code[back_edge] != 0xa7 {
+        return None;
+    }
+    let back_offset = i16::from_be_bytes([code[back_edge + 1], code[back_edge + 2]]) as i32;
+    if back_edge.checked_add_signed(back_offset as isize) != Some(header) {
+        return None;
+    }
+
+    let (iv_local, mut pc) = decode_bulk_int_load(code, code_len, header)?;
+    let (bound_local, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if bound_local == iv_local {
+        return None;
+    }
+    pc = next;
+    if pc + 2 >= code_len || code[pc] != 0xa3 {
+        return None;
+    }
+    let exit_offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    let exit_pc = pc.checked_add_signed(exit_offset as isize)?;
+    if exit_pc <= back_edge || exit_pc > code_len {
+        return None;
+    }
+    pc += 3;
+
+    let (array_local, next) = decode_ref_load(code, code_len, pc)?;
+    pc = next;
+    let (store_iv, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if store_iv != iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x04 {
+        return None;
+    }
+    pc += 1;
+    if pc >= code_len || code[pc] != 0x54 {
+        return None;
+    }
+    pc += 1;
+
+    let (add_iv, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if add_iv != iv_local {
+        return None;
+    }
+    pc = next;
+    let (step_local, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if step_local == iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x60 {
+        return None;
+    }
+    pc += 1;
+    let (store_local, next) = decode_int_store(code, pc, code_len)?;
+    if store_local != iv_local || next != back_edge {
+        return None;
+    }
+
+    Some(BulkSetByteStrideLoop {
+        header_pc: header,
+        array_local,
+        iv_local,
+        bound_local,
+        step_local,
+    })
+}
+
+fn detect_byte_sieve_loop(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+) -> Option<ByteSieveLoop> {
+    if header >= back_edge || back_edge + 2 >= code_len || code[back_edge] != 0xa7 {
+        return None;
+    }
+    let outer_back = i16::from_be_bytes([code[back_edge + 1], code[back_edge + 2]]) as i32;
+    if back_edge.checked_add_signed(outer_back as isize) != Some(header) {
+        return None;
+    }
+
+    let (outer_iv_local, mut pc) = decode_bulk_int_load(code, code_len, header)?;
+    let (bound_local, next) = decode_bulk_int_load(code, code_len, pc)?;
+    pc = next;
+    if pc + 2 >= code_len || code[pc] != 0xa3 {
+        return None;
+    }
+    let exit_offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    let exit_pc = pc.checked_add_signed(exit_offset as isize)?;
+    if exit_pc <= back_edge || exit_pc > code_len {
+        return None;
+    }
+    pc += 3;
+
+    let (array_local, next) = decode_ref_load(code, code_len, pc)?;
+    pc = next;
+    let (load_outer, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if load_outer != outer_iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x33 {
+        return None;
+    }
+    pc += 1;
+    if pc + 2 >= code_len || code[pc] != 0x9a {
+        return None;
+    }
+    let tail_offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    let outer_tail = pc.checked_add_signed(tail_offset as isize)?;
+    pc += 3;
+
+    if pc + 2 >= code_len || code[pc] != 0x84 || code[pc + 2] != 1 {
+        return None;
+    }
+    let count_local = code[pc + 1] as usize;
+    pc += 3;
+    let (outer_a, next) = decode_bulk_int_load(code, code_len, pc)?;
+    pc = next;
+    let (outer_b, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if outer_a != outer_iv_local || outer_b != outer_iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x60 {
+        return None;
+    }
+    pc += 1;
+    let (inner_iv_local, next) = decode_int_store(code, pc, code_len)?;
+    pc = next;
+    let inner_header = pc;
+
+    let (inner_load, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if inner_load != inner_iv_local {
+        return None;
+    }
+    pc = next;
+    let (inner_bound, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if inner_bound != bound_local {
+        return None;
+    }
+    pc = next;
+    if pc + 2 >= code_len || code[pc] != 0xa3 {
+        return None;
+    }
+    let inner_exit = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    if pc.checked_add_signed(inner_exit as isize) != Some(outer_tail) {
+        return None;
+    }
+    pc += 3;
+    let (inner_array, next) = decode_ref_load(code, code_len, pc)?;
+    if inner_array != array_local {
+        return None;
+    }
+    pc = next;
+    let (store_inner, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if store_inner != inner_iv_local {
+        return None;
+    }
+    pc = next;
+    if pc + 1 >= code_len || code[pc] != 0x04 || code[pc + 1] != 0x54 {
+        return None;
+    }
+    pc += 2;
+    let (add_inner, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if add_inner != inner_iv_local {
+        return None;
+    }
+    pc = next;
+    let (step_outer, next) = decode_bulk_int_load(code, code_len, pc)?;
+    if step_outer != outer_iv_local {
+        return None;
+    }
+    pc = next;
+    if pc >= code_len || code[pc] != 0x60 {
+        return None;
+    }
+    pc += 1;
+    let (store_inner, next) = decode_int_store(code, pc, code_len)?;
+    if store_inner != inner_iv_local {
+        return None;
+    }
+    pc = next;
+    if pc + 2 >= code_len || code[pc] != 0xa7 {
+        return None;
+    }
+    let inner_back = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+    if pc.checked_add_signed(inner_back as isize) != Some(inner_header) {
+        return None;
+    }
+    pc += 3;
+    if pc != outer_tail
+        || pc + 3 != back_edge
+        || code[pc] != 0x84
+        || code[pc + 1] as usize != outer_iv_local
+        || code[pc + 2] != 1
+    {
+        return None;
+    }
+
+    let distinct = [
+        array_local,
+        outer_iv_local,
+        bound_local,
+        count_local,
+        inner_iv_local,
+    ];
+    for i in 0..distinct.len() {
+        if distinct[i] >= 64 || distinct[(i + 1)..].contains(&distinct[i]) {
+            return None;
+        }
+    }
+
+    Some(ByteSieveLoop {
+        header_pc: header,
+        array_local,
+        outer_iv_local,
+        bound_local,
+        count_local,
+        inner_iv_local,
+    })
+}
+
+fn bulk_byte_loops_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_BULK_BYTE_LOOPS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
 /// Find which locals are modified (stored/incremented) within a bytecode range.
 /// Returns a bitmask where bit N is set if local N is modified.
 fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64 {
@@ -8696,6 +9070,12 @@ struct Compiler {
     ///
     /// Detection runs unconditionally; emission is gated on `has_avx2()`.
     simd_element_wise_loops: Vec<SimdArrayElementWise>,
+    /// Canonical byte/boolean-array zero-fill loops lowered to `REP STOSB`.
+    bulk_zero_byte_fill_loops: Vec<BulkZeroByteFillLoop>,
+    /// Canonical byte/boolean-array `a[iv] = 1; iv += step` loops.
+    bulk_set_byte_stride_loops: Vec<BulkSetByteStrideLoop>,
+    /// Canonical nested byte/boolean Sieve loops.
+    byte_sieve_loops: Vec<ByteSieveLoop>,
     /// T5.2.17 — loop unswitch candidates.
     ///
     /// Each entry describes a loop with a loop-invariant conditional
@@ -9715,6 +10095,9 @@ impl Compiler {
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
             simd_element_wise_loops: Vec::new(),
+            bulk_zero_byte_fill_loops: Vec::new(),
+            bulk_set_byte_stride_loops: Vec::new(),
+            byte_sieve_loops: Vec::new(),
             loop_unswitch_candidates: Vec::new(),
             field_info_idx: FxHashMap::default(),
             static_field_info_idx: FxHashMap::default(),
@@ -15658,6 +16041,275 @@ impl Compiler {
         self.buf.try_patch_i32(patch, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
+    /// Emit a guarded `REP STOSB` preheader for a canonical zero-fill loop.
+    ///
+    /// Failed guards reach the scalar header without changing Java state. This
+    /// retains partial writes before an eventual AIOOBE when the upper bound is
+    /// beyond the array.
+    fn emit_bulk_zero_byte_fill_preheader(&mut self, fill: &BulkZeroByteFillLoop) {
+        // array -> RAX, iv -> R10D, inclusive bound -> R11D.
+        if let Some(reg) = self.reg_for_local(fill.array_local) {
+            self.emit_mov_reg_reg(RAX, reg);
+        } else {
+            self.emit_load_local(RAX, self.local_offset(fill.array_local));
+        }
+        if let Some(reg) = self.reg_for_local(fill.iv_local) {
+            self.emit_mov_reg_reg(R10, reg);
+        } else {
+            self.emit_load_local(R10, self.local_offset(fill.iv_local));
+        }
+        if let Some(reg) = self.reg_for_local(fill.bound_local) {
+            self.emit_mov_reg_reg(R11, reg);
+        } else {
+            self.emit_load_local(R11, self.local_offset(fill.bound_local));
+        }
+
+        let mut scalar_patches = Vec::with_capacity(5);
+        self.buf.emit(&[0x45, 0x85, 0xD2]); // TEST R10D,R10D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS scalar
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG scalar
+        self.buf.emit(&[0x44, 0x89, 0xDA]); // MOV EDX,R11D
+        self.buf.emit(&[0x44, 0x29, 0xD2]); // SUB EDX,R10D
+        self.buf.emit(&[0x81, 0xFA]); // CMP EDX,imm32
+        self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x87)); // JA scalar
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE scalar
+        self.buf.emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+        self.buf.emit(&[0x41, 0x39, 0xD3]); // CMP R11D,EDX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x83)); // JAE scalar
+
+        // ECX = bound - iv + 1 (the REP counter).
+        self.buf.emit(&[0x44, 0x89, 0xD9]); // MOV ECX,R11D
+        self.buf.emit(&[0x44, 0x29, 0xD1]); // SUB ECX,R10D
+        self.buf.emit(&[0xFF, 0xC1]); // INC ECX
+
+        // RDI is a Java-local home on Windows. No call or safepoint occurs
+        // while RSP is transiently adjusted.
+        self.buf.emit_byte(0x57); // PUSH RDI
+        self.buf.emit(&[0x48, 0x89, 0xC7]); // MOV RDI,RAX
+        self.buf.emit(&[0x4C, 0x01, 0xD7]); // ADD RDI,R10
+        self.buf.emit(&[0x48, 0x83, 0xC7, HEADER_SIZE as u8]); // ADD RDI,HEADER_SIZE
+        self.buf.emit(&[0x31, 0xC0]); // XOR EAX,EAX
+        self.buf.emit(&[0xF3, 0xAA]); // REP STOSB
+        self.buf.emit_byte(0x5F); // POP RDI
+
+        // Make the original inclusive condition false and fall through to it.
+        self.buf.emit(&[0x45, 0x8D, 0x53, 0x01]); // LEA R10D,[R11D+1]
+        if let Some(reg) = self.reg_for_local(fill.iv_local) {
+            self.emit_mov_reg_reg(reg, R10);
+        } else {
+            self.emit_store_local(self.local_offset(fill.iv_local), R10);
+        }
+
+        for patch in scalar_patches {
+            self.patch_rel32_to_here(patch);
+        }
+    }
+
+    /// Emit a guarded register-only loop for a canonical strided byte store.
+    ///
+    /// All guards precede the first store. A failed guard therefore reaches
+    /// the original scalar loop with untouched Java state, retaining null,
+    /// bounds, negative-step, and signed-overflow behavior.
+    fn emit_bulk_set_byte_stride_preheader(&mut self, fill: &BulkSetByteStrideLoop) {
+        // array -> RAX, iv -> R10D, inclusive bound -> R11D, step -> R9D.
+        if let Some(reg) = self.reg_for_local(fill.array_local) {
+            self.emit_mov_reg_reg(RAX, reg);
+        } else {
+            self.emit_load_local(RAX, self.local_offset(fill.array_local));
+        }
+        if let Some(reg) = self.reg_for_local(fill.iv_local) {
+            self.emit_mov_reg_reg(R10, reg);
+        } else {
+            self.emit_load_local(R10, self.local_offset(fill.iv_local));
+        }
+        if let Some(reg) = self.reg_for_local(fill.bound_local) {
+            self.emit_mov_reg_reg(R11, reg);
+        } else {
+            self.emit_load_local(R11, self.local_offset(fill.bound_local));
+        }
+        if let Some(reg) = self.reg_for_local(fill.step_local) {
+            self.emit_mov_reg_reg(R9, reg);
+        } else {
+            self.emit_load_local(R9, self.local_offset(fill.step_local));
+        }
+
+        let mut scalar_patches = Vec::with_capacity(7);
+        self.buf.emit(&[0x45, 0x85, 0xD2]); // TEST R10D,R10D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS scalar
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG scalar
+        self.buf.emit(&[0x44, 0x89, 0xDA]); // MOV EDX,R11D
+        self.buf.emit(&[0x44, 0x29, 0xD2]); // SUB EDX,R10D
+        self.buf.emit(&[0x81, 0xFA]); // CMP EDX,imm32
+        self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x87)); // JA scalar
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE scalar
+        self.buf.emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+        self.buf.emit(&[0x41, 0x39, 0xD3]); // CMP R11D,EDX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x83)); // JAE scalar
+        self.buf.emit(&[0x45, 0x85, 0xC9]); // TEST R9D,R9D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8E)); // JLE scalar
+        self.buf.emit(&[0xBA, 0xFF, 0xFF, 0xFF, 0x7F]); // MOV EDX,INT_MAX
+        self.buf.emit(&[0x44, 0x29, 0xDA]); // SUB EDX,R11D
+        self.buf.emit(&[0x41, 0x39, 0xD1]); // CMP R9D,EDX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x87)); // JA scalar
+
+        self.buf.emit_byte(0x57); // PUSH RDI
+        self.buf.emit(&[0x48, 0x89, 0xC7]); // MOV RDI,RAX
+        self.buf.emit(&[0x4C, 0x01, 0xD7]); // ADD RDI,R10
+        self.buf.emit(&[0x48, 0x83, 0xC7, HEADER_SIZE as u8]); // ADD RDI,HEADER_SIZE
+        let store_start = self.buf.pos();
+        self.buf.emit(&[0xC6, 0x07, 0x01]); // MOV byte ptr [RDI],1
+        self.buf.emit(&[0x4C, 0x01, 0xCF]); // ADD RDI,R9
+        self.buf.emit(&[0x45, 0x01, 0xCA]); // ADD R10D,R9D
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        self.buf.emit(&[0x0F, 0x8E]); // JLE store_start
+        let rel = store_start as i64 - (self.buf.pos() + 4) as i64;
+        self.buf.emit(&(rel as i32).to_le_bytes());
+        self.buf.emit_byte(0x5F); // POP RDI
+
+        if let Some(reg) = self.reg_for_local(fill.iv_local) {
+            self.emit_mov_reg_reg(reg, R10);
+        } else {
+            self.emit_store_local(self.local_offset(fill.iv_local), R10);
+        }
+
+        for patch in scalar_patches {
+            self.patch_rel32_to_here(patch);
+        }
+    }
+
+    /// Emit the guarded remainder of a canonical byte-array Sieve loop nest.
+    ///
+    /// The range, object, overflow, and safepoint-span guards all precede the
+    /// first write. A rejected shape therefore reaches the original bytecode
+    /// with every local and array element untouched.
+    fn emit_byte_sieve_preheader(&mut self, sieve: &ByteSieveLoop) {
+        if let Some(reg) = self.reg_for_local(sieve.array_local) {
+            self.emit_mov_reg_reg(RAX, reg);
+        } else {
+            self.emit_load_local(RAX, self.local_offset(sieve.array_local));
+        }
+        if let Some(reg) = self.reg_for_local(sieve.outer_iv_local) {
+            self.emit_mov_reg_reg(R10, reg);
+        } else {
+            self.emit_load_local(R10, self.local_offset(sieve.outer_iv_local));
+        }
+        if let Some(reg) = self.reg_for_local(sieve.bound_local) {
+            self.emit_mov_reg_reg(R11, reg);
+        } else {
+            self.emit_load_local(R11, self.local_offset(sieve.bound_local));
+        }
+        if let Some(reg) = self.reg_for_local(sieve.count_local) {
+            self.emit_mov_reg_reg(R8, reg);
+        } else {
+            self.emit_load_local(R8, self.local_offset(sieve.count_local));
+        }
+        if let Some(reg) = self.reg_for_local(sieve.inner_iv_local) {
+            self.emit_mov_reg_reg(RCX, reg);
+        } else {
+            self.emit_load_local(RCX, self.local_offset(sieve.inner_iv_local));
+        }
+
+        let mut scalar_patches = Vec::with_capacity(6);
+        self.buf.emit(&[0x41, 0x83, 0xFA, 0x02]); // CMP R10D,2
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8C)); // JL scalar
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG scalar
+        self.buf.emit(&[0x44, 0x89, 0xDA]); // MOV EDX,R11D
+        self.buf.emit(&[0x44, 0x29, 0xD2]); // SUB EDX,R10D
+        self.buf.emit(&[0x81, 0xFA]); // CMP EDX,imm32
+        self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x87)); // JA scalar
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE scalar
+        self.buf.emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+        self.buf.emit(&[0x41, 0x39, 0xD3]); // CMP R11D,EDX
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x83)); // JAE scalar
+        self.buf.emit(&[0x41, 0x81, 0xFB]); // CMP R11D,imm32
+        self.buf.emit(&0x3FFF_FFFFi32.to_le_bytes());
+        scalar_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG scalar
+
+        // Hold the word-at-a-time zero-byte constants in callee-saved
+        // registers. Their Java-local home values are restored before the
+        // optimized loop publishes any final local state.
+        self.buf.emit_byte(0x57); // PUSH RDI
+        self.buf.emit_byte(0x56); // PUSH RSI
+        self.emit_mov_imm64_full(RDI, 0x0101_0101_0101_0101);
+        self.emit_mov_imm64_full(RSI, 0x8080_8080_8080_8080u64 as i64);
+        self.buf.emit(&[0x48, 0x83, 0xC0, HEADER_SIZE as u8]); // ADD RAX,HEADER_SIZE
+        let outer_start = self.buf.pos();
+        // If at least eight bounded elements remain, detect an all-nonzero
+        // qword and skip it in one step:
+        //   has_zero = (word - 0x01..) & ~word & 0x80..
+        self.buf.emit(&[0x44, 0x89, 0xDA]); // MOV EDX,R11D
+        self.buf.emit(&[0x83, 0xEA, 0x07]); // SUB EDX,7
+        self.buf.emit(&[0x41, 0x39, 0xD2]); // CMP R10D,EDX
+        let scalar_outer = self.emit_jcc_rel32_patch(0x8F); // JG scalar_outer
+        self.buf.emit(&[0x4A, 0x8B, 0x14, 0x10]); // MOV RDX,[RAX+R10]
+        self.buf.emit(&[0x49, 0x89, 0xD1]); // MOV R9,RDX
+        self.buf.emit(&[0x49, 0x29, 0xF9]); // SUB R9,RDI
+        self.buf.emit(&[0x48, 0xF7, 0xD2]); // NOT RDX
+        self.buf.emit(&[0x49, 0x21, 0xD1]); // AND R9,RDX
+        self.buf.emit(&[0x49, 0x85, 0xF1]); // TEST R9,RSI
+        let scalar_has_zero = self.emit_jcc_rel32_patch(0x85); // JNE scalar_outer
+        self.buf.emit(&[0x41, 0x83, 0xC2, 0x08]); // ADD R10D,8
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        self.buf.emit(&[0x0F, 0x8E]); // JLE outer_start
+        let outer_word_rel = outer_start as i64 - (self.buf.pos() + 4) as i64;
+        self.buf.emit(&(outer_word_rel as i32).to_le_bytes());
+        let word_scan_done = self.emit_jmp_rel32_patch();
+        self.patch_rel32_to_here(scalar_outer);
+        self.patch_rel32_to_here(scalar_has_zero);
+        self.buf.emit(&[0x42, 0x80, 0x3C, 0x10, 0x00]); // CMP byte [RAX+R10],0
+        let composite = self.emit_jcc_rel32_patch(0x85); // JNE outer_increment
+        self.buf.emit(&[0x41, 0xFF, 0xC0]); // INC R8D (prime count)
+        self.buf.emit(&[0x43, 0x8D, 0x0C, 0x12]); // LEA ECX,[R10+R10]
+        self.buf.emit(&[0x44, 0x39, 0xD9]); // CMP ECX,R11D
+        let inner_done = self.emit_jcc_rel32_patch(0x8F); // JG inner_done
+        let inner_start = self.buf.pos();
+        self.buf.emit(&[0xC6, 0x04, 0x08, 0x01]); // MOV byte [RAX+RCX],1
+        self.buf.emit(&[0x44, 0x01, 0xD1]); // ADD ECX,R10D
+        self.buf.emit(&[0x44, 0x39, 0xD9]); // CMP ECX,R11D
+        self.buf.emit(&[0x0F, 0x8E]); // JLE inner_start
+        let inner_rel = inner_start as i64 - (self.buf.pos() + 4) as i64;
+        self.buf.emit(&(inner_rel as i32).to_le_bytes());
+        self.patch_rel32_to_here(inner_done);
+        self.patch_rel32_to_here(composite);
+        self.buf.emit(&[0x41, 0xFF, 0xC2]); // INC R10D
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D,R11D
+        self.buf.emit(&[0x0F, 0x8E]); // JLE outer_start
+        let outer_rel = outer_start as i64 - (self.buf.pos() + 4) as i64;
+        self.buf.emit(&(outer_rel as i32).to_le_bytes());
+        self.patch_rel32_to_here(word_scan_done);
+        self.buf.emit_byte(0x5E); // POP RSI
+        self.buf.emit_byte(0x5F); // POP RDI
+
+        if let Some(reg) = self.reg_for_local(sieve.outer_iv_local) {
+            self.emit_mov_reg_reg(reg, R10);
+        } else {
+            self.emit_store_local(self.local_offset(sieve.outer_iv_local), R10);
+        }
+        if let Some(reg) = self.reg_for_local(sieve.count_local) {
+            self.emit_mov_reg_reg(reg, R8);
+        } else {
+            self.emit_store_local(self.local_offset(sieve.count_local), R8);
+        }
+        if let Some(reg) = self.reg_for_local(sieve.inner_iv_local) {
+            self.emit_mov_reg_reg(reg, RCX);
+        } else {
+            self.emit_store_local(self.local_offset(sieve.inner_iv_local), RCX);
+        }
+
+        for patch in scalar_patches {
+            self.patch_rel32_to_here(patch);
+        }
+    }
+
     /// Emit the inline TLAB bump-pointer fast path for the `new` opcode
     /// (HIGH-6 JIT audit, object_allocation/1000 3-5× gap).
     ///
@@ -20194,6 +20846,33 @@ impl Compiler {
             // final state, which is exactly the "bytecode-equivalent
             // semantics" the scope requires.
             self.emit_loop_unswitch_preheader(pc);
+
+            if let Some(sieve) = self
+                .byte_sieve_loops
+                .iter()
+                .find(|sieve| sieve.header_pc == pc)
+                .cloned()
+            {
+                self.emit_byte_sieve_preheader(&sieve);
+            }
+
+            if let Some(fill) = self
+                .bulk_zero_byte_fill_loops
+                .iter()
+                .find(|fill| fill.header_pc == pc)
+                .cloned()
+            {
+                self.emit_bulk_zero_byte_fill_preheader(&fill);
+            }
+
+            if let Some(fill) = self
+                .bulk_set_byte_stride_loops
+                .iter()
+                .find(|fill| fill.header_pc == pc)
+                .cloned()
+            {
+                self.emit_bulk_set_byte_stride_preheader(&fill);
+            }
 
             // === T17.Β.2 — SIMD element-wise preheader ====================
             // Emit an AVX2 batch loop + scalar tail for loops matching
@@ -29737,6 +30416,39 @@ pub fn compile_with_param_slots(
         }
         ewise
     };
+    let bulk_zero_byte_fill_loops: Vec<BulkZeroByteFillLoop> = if bulk_byte_loops_enabled() {
+        loops
+            .iter()
+            .filter_map(|&(header, back_edge)| {
+                detect_bulk_zero_byte_fill_loop(code, code_len, header, back_edge)
+            })
+            .filter(|fill| !bypassable_headers.contains(&fill.header_pc))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let bulk_set_byte_stride_loops: Vec<BulkSetByteStrideLoop> = if bulk_byte_loops_enabled() {
+        loops
+            .iter()
+            .filter_map(|&(header, back_edge)| {
+                detect_bulk_set_byte_stride_loop(code, code_len, header, back_edge)
+            })
+            .filter(|fill| !bypassable_headers.contains(&fill.header_pc))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let byte_sieve_loops: Vec<ByteSieveLoop> = if bulk_byte_loops_enabled() {
+        loops
+            .iter()
+            .filter_map(|&(header, back_edge)| {
+                detect_byte_sieve_loop(code, code_len, header, back_edge)
+            })
+            .filter(|sieve| !bypassable_headers.contains(&sieve.header_pc))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Loop unrolling: detect small loops suitable for unrolling
     // PGO: use profiled trip counts to guide unroll factor when available.
@@ -30303,6 +31015,9 @@ pub fn compile_with_param_slots(
     compiler.null_check_info = null_check_info;
     // T5.2.15 — element-wise SIMD detections.
     compiler.simd_element_wise_loops = simd_element_wise_loops;
+    compiler.bulk_zero_byte_fill_loops = bulk_zero_byte_fill_loops;
+    compiler.bulk_set_byte_stride_loops = bulk_set_byte_stride_loops;
+    compiler.byte_sieve_loops = byte_sieve_loops;
     // T5.2.17 — loop unswitching candidates.
     compiler.loop_unswitch_candidates = detect_loop_unswitch_candidates(code, code_len, &loops);
 
@@ -35807,6 +36522,343 @@ mod tests {
         let loops = detect_loops(&code, 16);
         assert_eq!(loops.len(), 1);
         assert_eq!(loops[0], (2, 11)); // header=2, back_edge=11
+    }
+
+    #[test]
+    fn detects_only_canonical_inclusive_zero_byte_fill_loop() {
+        // for (int i = from; i <= bound; i++) array[i] = 0;
+        let code = [
+            0x1b, // 0: iload_1 (i)
+            0x1c, // 1: iload_2 (bound)
+            0xa3, 0x00, 0x0d, // 2: if_icmpgt -> 15
+            0x2a, // 5: aload_0 (array)
+            0x1b, // 6: iload_1 (i)
+            0x03, // 7: iconst_0
+            0x54, // 8: bastore
+            0x84, 0x01, 0x01, // 9: iinc 1, 1
+            0xa7, 0xff, 0xf4, // 12: goto -> 0
+            0xb1, // 15: return
+        ];
+        let loops = detect_loops(&code, code.len());
+        assert_eq!(loops, vec![(0, 12)]);
+        assert_eq!(
+            detect_bulk_zero_byte_fill_loop(&code, code.len(), 0, 12),
+            Some(BulkZeroByteFillLoop {
+                header_pc: 0,
+                array_local: 0,
+                iv_local: 1,
+                bound_local: 2,
+            })
+        );
+
+        let mut nonzero = code;
+        nonzero[7] = 0x04; // iconst_1
+        assert_eq!(
+            detect_bulk_zero_byte_fill_loop(&nonzero, nonzero.len(), 0, 12),
+            None,
+            "non-zero fills retain scalar code"
+        );
+
+        let mut mismatched_iv = code;
+        mismatched_iv[6] = 0x1d; // store index comes from local 3
+        assert_eq!(
+            detect_bulk_zero_byte_fill_loop(&mismatched_iv, mismatched_iv.len(), 0, 12),
+            None,
+            "the store index must be the loop induction variable"
+        );
+    }
+
+    #[test]
+    fn bulk_zero_byte_fill_executes_range_and_skips_empty_null_range() {
+        // int f(byte[] a, int i, int bound) {
+        //   for (; i <= bound; i++) a[i] = 0;
+        //   return i;
+        // }
+        let code = [
+            0x1b, // 0: iload_1
+            0x1c, // 1: iload_2
+            0xa3, 0x00, 0x0d, // 2: if_icmpgt -> 15
+            0x2a, // 5: aload_0
+            0x1b, // 6: iload_1
+            0x03, // 7: iconst_0
+            0x54, // 8: bastore
+            0x84, 0x01, 0x01, // 9: iinc 1, 1
+            0xa7, 0xff, 0xf4, // 12: goto -> 0
+            0x1b, // 15: iload_1
+            0xac, // 16: ireturn
+            0x00, 0x00,
+        ];
+        let compiled = compile(
+            &code,
+            17,
+            3,
+            3,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("bulk-zero loop should compile");
+
+        let byte_len = 8usize;
+        let mut words = vec![0u64; (HEADER_SIZE + byte_len + 7) / 8];
+        let array_ptr = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` is aligned and has room for the complete VM header
+        // plus eight data bytes.
+        unsafe {
+            (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(byte_len as i32);
+            std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 7, byte_len);
+        }
+
+        // SAFETY: the compiled method receives a correctly laid out live array.
+        let result = unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, 2, 5])
+                .expect("bulk-zero JIT call")
+        };
+        assert_eq!(result, 6);
+        // SAFETY: the eight-byte data region is within `words`.
+        let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+        assert_eq!(data, &[7, 7, 0, 0, 0, 0, 7, 7]);
+
+        // An empty range does not dereference the array, even when it is null.
+        // SAFETY: the bytecode exits at its condition before any array access.
+        let empty = unsafe { compiled.try_call(&[0, 6, 5]).expect("empty-range JIT call") };
+        assert_eq!(empty, 6);
+    }
+
+    #[test]
+    fn detects_and_executes_canonical_strided_byte_set_loop() {
+        // int f(byte[] a, int j, int bound, int step) {
+        //   for (; j <= bound; j += step) a[j] = 1;
+        //   return j;
+        // }
+        let code = [
+            0x1b, // 0: iload_1
+            0x1c, // 1: iload_2
+            0xa3, 0x00, 0x10, // 2: if_icmpgt -> 18
+            0x2a, // 5: aload_0
+            0x1b, // 6: iload_1
+            0x04, // 7: iconst_1
+            0x54, // 8: bastore
+            0x1b, // 9: iload_1
+            0x1d, // 10: iload_3
+            0x60, // 11: iadd
+            0x3c, // 12: istore_1
+            0xa7, 0xff, 0xf3, // 13: goto -> 0
+            0x00, 0x00, // 16: padding
+            0x1b, // 18: iload_1
+            0xac, // 19: ireturn
+            0x00, 0x00,
+        ];
+        let loops = detect_loops(&code, 20);
+        assert_eq!(loops, vec![(0, 13)]);
+        assert_eq!(
+            detect_bulk_set_byte_stride_loop(&code, 20, 0, 13),
+            Some(BulkSetByteStrideLoop {
+                header_pc: 0,
+                array_local: 0,
+                iv_local: 1,
+                bound_local: 2,
+                step_local: 3,
+            })
+        );
+        let mut wrong_value = code;
+        wrong_value[7] = 0x03; // iconst_0
+        assert_eq!(
+            detect_bulk_set_byte_stride_loop(&wrong_value, 20, 0, 13),
+            None,
+            "only the canonical unit store is specialized"
+        );
+        let mut changing_step = code;
+        changing_step[10] = 0x1b; // iload_1: the IV cannot also be its step
+        assert_eq!(
+            detect_bulk_set_byte_stride_loop(&changing_step, 20, 0, 13),
+            None,
+            "the cached step must be loop-invariant"
+        );
+
+        let compiled = compile(
+            &code,
+            20,
+            4,
+            4,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("strided byte-set loop should compile");
+        let byte_len = 8usize;
+        let mut words = vec![0u64; (HEADER_SIZE + byte_len + 7) / 8];
+        let array_ptr = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` is aligned and contains the VM header plus data.
+        unsafe {
+            (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(byte_len as i32);
+        }
+        // SAFETY: the compiled method receives a correctly laid out live array.
+        let result = unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, 1, 7, 2])
+                .expect("strided byte-set JIT call")
+        };
+        assert_eq!(result, 9);
+        // SAFETY: the eight-byte data region is within `words`.
+        let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+        assert_eq!(data, &[0, 1, 0, 1, 0, 1, 0, 1]);
+
+        // A bound beyond the array conservatively takes the scalar path. This
+        // particular stride never reaches the invalid index, so it still
+        // completes normally and demonstrates that guard failure preserves
+        // the bytecode's exact store sequence.
+        unsafe {
+            std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 0, byte_len);
+        }
+        // SAFETY: the array is live and every reached strided index is valid.
+        let conservative = unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, 1, 8, 2])
+                .expect("conservative scalar fallback call")
+        };
+        assert_eq!(conservative, 9);
+        // SAFETY: the eight-byte data region is within `words`.
+        let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+        assert_eq!(data, &[0, 1, 0, 1, 0, 1, 0, 1]);
+
+        // Empty ranges retain Java's condition-before-array-access behavior.
+        // SAFETY: the loop exits before dereferencing the null array.
+        let empty = unsafe {
+            compiled
+                .try_call(&[0, 8, 7, 2])
+                .expect("empty-range strided JIT call")
+        };
+        assert_eq!(empty, 8);
+    }
+
+    #[test]
+    fn detects_and_executes_canonical_byte_sieve_loop_nest() {
+        // Exact javac shape of CratonBench.sieve(boolean[], int).
+        let code = [
+            0x03, 0x3d, // 0: int i/count = 0
+            0x1c, 0x1b, 0xa3, 0x00, 0x0d, // 2: clear-loop header -> 17
+            0x2a, 0x1c, 0x03, 0x54, // 7: a[i] = 0
+            0x84, 0x02, 0x01, 0xa7, 0xff, 0xf4, // 11: i++; goto 2
+            0x03, 0x3d, 0x05, 0x3e, // 17: count=0; outer i=2
+            0x1d, 0x1b, 0xa3, 0x00, 0x2b, // 21: outer header -> 66
+            0x2a, 0x1d, 0x33, 0x9a, 0x00, 0x1f, // 26: if (a[i]) -> 60
+            0x84, 0x02, 0x01, // 32: count++
+            0x1d, 0x1d, 0x60, 0x36, 0x04, // 35: j=i+i
+            0x15, 0x04, 0x1b, 0xa3, 0x00, 0x11, // 40: inner header -> 60
+            0x2a, 0x15, 0x04, 0x04, 0x54, // 46: a[j] = 1
+            0x15, 0x04, 0x1d, 0x60, 0x36, 0x04, // 51: j += i
+            0xa7, 0xff, 0xef, // 57: goto 40
+            0x84, 0x03, 0x01, 0xa7, 0xff, 0xd6, // 60: i++; goto 21
+            0x1c, 0xac, // 66: return count
+            0x00, 0x00,
+        ];
+        let loops = detect_loops(&code, 68);
+        assert!(loops.contains(&(21, 63)), "outer loop missing: {loops:?}");
+        assert_eq!(
+            detect_byte_sieve_loop(&code, 68, 21, 63),
+            Some(ByteSieveLoop {
+                header_pc: 21,
+                array_local: 0,
+                outer_iv_local: 3,
+                bound_local: 1,
+                count_local: 2,
+                inner_iv_local: 4,
+            })
+        );
+
+        let compiled = compile(
+            &code,
+            68,
+            2,
+            5,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("canonical byte sieve should compile");
+
+        let byte_len = 32usize;
+        let mut words = vec![0u64; (HEADER_SIZE + byte_len + 7) / 8];
+        let array_ptr = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` is aligned and contains the VM header plus data.
+        unsafe {
+            (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(byte_len as i32);
+            std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 7, byte_len);
+        }
+        // SAFETY: the compiled method receives a correctly laid out live array.
+        let count = unsafe {
+            compiled
+                .try_call(&[array_ptr as i64, 31])
+                .expect("canonical byte-sieve JIT call")
+        };
+        assert_eq!(count, 11);
+        // SAFETY: the 32-byte data region is within `words`.
+        let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+        for prime in [2usize, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31] {
+            assert_eq!(data[prime], 0, "{prime} must remain prime");
+        }
+        for composite in [4usize, 6, 8, 9, 10, 12, 15, 21, 25, 27, 30] {
+            assert_eq!(data[composite], 1, "{composite} must be marked");
+        }
+
+        // Both counted loops are zero-trip, so a null array is not touched.
+        // SAFETY: the original bytecode exits both headers before array access.
+        let empty = unsafe {
+            compiled
+                .try_call(&[0, -1])
+                .expect("empty canonical byte-sieve call")
+        };
+        assert_eq!(empty, 0);
     }
 
     #[test]
@@ -43375,9 +44427,9 @@ mod flag_and_header_contracts {
         let src = include_str!("x64.rs");
         // Needles assembled at runtime so this test's own text is not counted.
         let cases: [(&str, &str, usize); 4] = [
-            ("HEADER_SIZE", " as u8", 31),
+            ("HEADER_SIZE", " as u8", 34),
             ("HEADER_SIZE", " as i32", 11),
-            ("ARRAY_LENGTH_OFFSET", " as u8", 16),
+            ("ARRAY_LENGTH_OFFSET", " as u8", 19),
             ("ARRAY_LENGTH_OFFSET", " as i32", 5),
         ];
         for (base, suffix, expected) in cases {
