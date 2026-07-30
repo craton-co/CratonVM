@@ -17,6 +17,14 @@ use cratonvm_jit::{JitDirectCall, JitIntrinsic};
 use cratonvm_jit_api::JitRuntimeHelpers;
 use std::collections::{HashMap, HashSet};
 
+/// `set_throw_bci` is a `RequiredPtr`, so it cannot be left null, but these
+/// harnesses have no signal state for it to write. The real helper stashes the
+/// bci of a throwing `athrow` for the caller's handler search; discarding it is
+/// the correct no-op here. It must have the real ABI — a zero-argument
+/// `panic!` stub unwinds out of JIT-generated code and faults the process.
+unsafe extern "C" fn test_noop_set_throw_bci(_bci: i64) {}
+
+
 /// Dummy runtime helpers — bit-op intrinsics never touch the heap, fields,
 /// type checks, or dispatch, so a panicking stub pointer is never reached.
 fn dummy_helpers() -> JitRuntimeHelpers {
@@ -79,8 +87,10 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         region_bounds_addr: 0,
         native_stack_floor_fn: 0,
         ldc_string: s,
-        set_throw_bci: s,
-        service_callee_deopt: s,
+        set_throw_bci: test_noop_set_throw_bci as *const () as usize,
+        // `service_callee_deopt` is an `OptionalPtr`: leaving it unwired is a
+        // supported configuration and exercises the JIT's no-helper path.
+        service_callee_deopt: 0,
     }
 }
 

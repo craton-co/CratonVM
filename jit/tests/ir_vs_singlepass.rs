@@ -24,6 +24,27 @@ use cratonvm_types::{
 };
 use std::sync::Arc;
 
+/// `set_throw_bci` is a `RequiredPtr`, so it cannot be left null, but these
+/// harnesses have no signal state for it to write. The real helper stashes the
+/// bci of a throwing `athrow` for the caller's handler search; discarding it is
+/// the correct no-op here. It must have the real ABI — a zero-argument
+/// `panic!` stub unwinds out of JIT-generated code and faults the process.
+unsafe extern "C" fn test_noop_set_throw_bci(_bci: i64) {}
+
+/// `service_callee_deopt` is consulted only on the rare `RAX == i64::MIN`
+/// branch after an inline call. Returning the sentinel unchanged is the
+/// documented "keep propagating" answer, which is what a harness with no
+/// interpreter behind it must say.
+unsafe extern "C" fn test_service_callee_deopt(
+    _vm: i64,
+    _info: i64,
+    _args: i64,
+    _num_args: i64,
+) -> i64 {
+    i64::MIN
+}
+
+
 /// Dummy runtime helpers — the corpus is pure arithmetic / branches / counted
 /// loops, so no helper (alloc, field, dispatch) is ever invoked; the stub
 /// pointer is baked but never called.
@@ -114,8 +135,8 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         region_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
         native_stack_floor_fn: native_stack_floor as *const () as usize,
         ldc_string: s,
-        set_throw_bci: s,
-        service_callee_deopt: s,
+        set_throw_bci: test_noop_set_throw_bci as *const () as usize,
+        service_callee_deopt: test_service_callee_deopt as *const () as usize,
     }
 }
 

@@ -21578,12 +21578,25 @@ impl InvokeArgsRootGuard {
     }
 
     fn replace_object_arg(&self, args: &[Value], index: usize, obj: ObjectRef) {
-        let ordinal = args[..=index]
+        // Both callers replace a receiver they have just proven live, so the
+        // ordinal is always present. Return rather than `.expect()` on the
+        // counterfactual: this file's `#![cfg_attr(not(test), deny(...))]`
+        // header forbids a production panic on the invoke path, and skipping
+        // the pin refresh degrades to the argument's existing root instead of
+        // tearing the VM down. `debug_assert!` keeps the invariant enforced
+        // under test.
+        let Some(ordinal) = args[..=index]
             .iter()
             .filter(|value| matches!(value, Value::Object(Some(_))))
             .count()
             .checked_sub(1)
-            .expect("replacement invoke argument must already be a non-null object");
+        else {
+            debug_assert!(
+                false,
+                "replacement invoke argument must already be a non-null object"
+            );
+            return;
+        };
         // SAFETY: same lexical-lifetime argument as `refresh`; the computed
         // slot belongs to this guard's contiguous pin range.
         unsafe {
