@@ -1494,19 +1494,6 @@ fn should_skip_jit_internal(
         // write-up).
         // `HamcrestProbe.java` is the regression witness for this entry only.
 
-        // WILDFLY-CONTROLLER-JIT.1 (2026-07-13): the optimized
-        // invokespecial path skipped AbstractOperationContext.<init> while
-        // constructing OperationContextImpl. Its controllerOperations list
-        // remained null and parallel EJB boot failed; the same standalone boot
-        // reaches past that point with CRATONVM_DISABLE_JIT=1. Keep controller
-        // bytecode interpreted until the special-call backend is corrected.
-        // Liftable with CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/as/controller/.
-        // WILDFLY-CONTROLLER-JIT.1's org/jboss/as/controller/ guard is active.
-        if class_name.starts_with("org/jboss/as/controller/")
-            && !package_allowed("org/jboss/as/controller/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
 
         // JSONSMART-PARSER.1 -- REMOVED 2026-07-26. Originally (2026-07-09)
         // the default JIT crashed inside emitted code after compiling parser
@@ -3845,6 +3832,26 @@ mod tests {
                     check(class_name, method, false, true, policy),
                     None,
                     "{class_name}.{method} must be JIT-eligible now that JSONSMART-PARSER.1 is removed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wildfly_controller_is_jit_eligible_after_wildfly_controller_jit_1_removal() {
+        // The former blanket org/jboss/as/controller/ guard masked an
+        // invokespecial constructor defect. Keep both concrete boot paths
+        // eligible under both policies; the real WildFly matrix is the
+        // behavioural witness for construction and parallel execution.
+        for (class_name, method_name) in [
+            ("org/jboss/as/controller/OperationContextImpl", "executeOperation"),
+            ("org/jboss/as/controller/AbstractOperationContext", "executeOperation"),
+        ] {
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, method_name, false, true, policy),
+                    None,
+                    "{class_name}.{method_name} must stay JIT-eligible after WILDFLY-CONTROLLER-JIT.1 removal",
                 );
             }
         }
