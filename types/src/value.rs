@@ -222,13 +222,55 @@ fn provenance_leaf_alloc(slot: &AtomicPtr<AtomicU64>) -> *mut AtomicU64 {
     }
 }
 
-#[inline]
+thread_local! {
+    /// Per-thread memo for [`record_object_ref_payload`]: `(block, bits)`,
+    /// where `block` is `raw >> 12` — the 4 KiB span one leaf `u64` covers
+    /// (64 granules x 64 bytes) — and `bits` is a subset of that word's
+    /// granule bits this thread has already observed *set* in the global
+    /// bitmap.
+    ///
+    /// PERF: recording is idempotent and the bitmap never clears, so a
+    /// remembered set bit means the global store is already done. That turns
+    /// the steady-state hot path — object references handed back out of a
+    /// TLAB, where consecutive allocations share a 4 KiB block for ~100
+    /// objects — into two shifts, a compare and a bit test, replacing an
+    /// indexed load out of the 1 MiB L1 table plus a relaxed atomic load out
+    /// of a 2 MiB leaf. Measured at 6.1% of the `CratonBench hashmap` phase
+    /// before this memo (`record_object_ref_payload` was the fourth-hottest
+    /// symbol in the profile).
+    ///
+    /// SOUNDNESS: the memo can only skip work that would have been a no-op.
+    /// Bits are recorded here only after the global bit is known set, and
+    /// `PROVENANCE_L1` leaves are never freed and bits never cleared, so a
+    /// hit cannot be stale. It is thread-local, so it adds no cross-thread
+    /// obligations to the ordering argument below.
+    static PROVENANCE_MEMO: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) };
+}
+
+/// log2 of the address span one leaf `u64` word covers (64 granules x 64 B).
+const PROVENANCE_WORD_COVER_SHIFT: u32 = PROVENANCE_GRANULE_SHIFT + 6;
+
+#[inline(always)]
 fn record_object_ref_payload(ptr: *mut u8) {
     let raw = ptr as u64;
     if !plausible_heap_pointer(raw) {
         return;
     }
-    let (l1, word, bit) = provenance_indices(raw);
+    let block = raw >> PROVENANCE_WORD_COVER_SHIFT;
+    let bit = 1u64 << ((raw >> PROVENANCE_GRANULE_SHIFT) & 63);
+    let memo = PROVENANCE_MEMO.with(|memo| memo.get());
+    if memo.0 == block && memo.1 & bit != 0 {
+        return;
+    }
+    record_object_ref_payload_slow(raw, block, bit, memo);
+}
+
+/// Out-of-line remainder of [`record_object_ref_payload`]: consult (and, if
+/// needed, allocate) the real bitmap leaf, then refresh the per-thread memo
+/// with every granule bit that word already has set.
+#[inline(never)]
+fn record_object_ref_payload_slow(raw: u64, block: u64, bit: u64, memo: (u64, u64)) {
+    let (l1, word, _) = provenance_indices(raw);
     let slot = &PROVENANCE_L1[l1];
     let mut leaf = slot.load(Ordering::Acquire);
     if leaf.is_null() {
@@ -257,9 +299,15 @@ fn record_object_ref_payload(ptr: *mut u8) {
     // bit and rejects a genuine reference, which degrades to the typed decode
     // paths (`decode_value_checked` and friends) — those are the load-bearing
     // defence, so a miss here is conservative, not memory-unsafe.
-    if w.load(Ordering::Relaxed) & bit == 0 {
+    let mut observed = w.load(Ordering::Relaxed);
+    if observed & bit == 0 {
         w.fetch_or(bit, Ordering::Relaxed);
+        observed |= bit;
     }
+    // Remember every bit this word already carries, not just ours: within a
+    // TLAB the next ~100 object references land in this same word.
+    let carried = if memo.0 == block { memo.1 } else { 0 };
+    PROVENANCE_MEMO.with(|m| m.set((block, carried | observed)));
 }
 
 #[inline]
@@ -352,13 +400,23 @@ fn single_thread_guard_violation(recorded: u64, token: u64) -> ! {
 
 /// Hot-path entry: enforce the single-OS-thread invariant when the tripwire is
 /// armed. A no-op (single relaxed load) otherwise.
-#[inline]
+///
+/// `inline(always)` with the armed branch outlined: the intent has always been
+/// that a disabled tripwire costs one predictable relaxed load, but the
+/// compiler was emitting a real call per `ObjectRef` construction instead
+/// (1.4% of the `CratonBench hashmap` phase, as its own profile symbol).
+#[inline(always)]
 fn enforce_single_os_thread() {
     if single_thread_guard_enabled() {
-        let token = current_thread_token();
-        if let Err(recorded) = check_single_thread_against(&SINGLE_THREAD_GUARD, token) {
-            single_thread_guard_violation(recorded, token);
-        }
+        enforce_single_os_thread_armed();
+    }
+}
+
+#[inline(never)]
+fn enforce_single_os_thread_armed() {
+    let token = current_thread_token();
+    if let Err(recorded) = check_single_thread_against(&SINGLE_THREAD_GUARD, token) {
+        single_thread_guard_violation(recorded, token);
     }
 }
 
