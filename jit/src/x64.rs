@@ -11568,7 +11568,19 @@ impl Compiler {
     /// matching reload. `pending_shadow` is cleared first so an unbalanced
     /// (no-reload) safepoint cannot hand stale homes to a later reload.
     fn emit_shadow_push(&mut self) {
-        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+        // The `helpers.get_current_thread != 0` check MUST mirror the
+        // prologue's gate (`emit_prologue`'s shadow-stack block): the
+        // prologue only zero-initializes `shadow_thread_slot_off` when that
+        // helper is wired. Without this matching guard here, a context
+        // where the helper isn't wired (e.g. the JIT unit tests' stub
+        // `test_helpers()`) would load uninitialized stack garbage as if it
+        // were a live `*mut JvmThread` and dereference it — see the epilogue
+        // fix in `emit_epilogue` for the full incident writeup.
+        if self.failed
+            || !self.shadow_enabled
+            || self.helpers.get_current_thread == 0
+            || self.shadow_thread_slot_off == 0
+        {
             self.pending_shadow_coverage_complete = false;
             return;
         }
@@ -11662,7 +11674,12 @@ impl Compiler {
     /// scratch used is R10 (thread), R11 (top), R8 (frame-slot value temp).
     /// No-op when `pending_shadow` is empty (unmatched safepoint).
     fn emit_shadow_reload(&mut self) {
-        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+        // Mirror `emit_shadow_push`'s gate — see its comment for why.
+        if self.failed
+            || !self.shadow_enabled
+            || self.helpers.get_current_thread == 0
+            || self.shadow_thread_slot_off == 0
+        {
             return;
         }
         if shadow_nopush() || shadow_noreload() {
@@ -15653,7 +15670,26 @@ impl Compiler {
         // restores top to its own entry value on return. Null-guarded so an OSR
         // entry (which zero-inits the thread slot) skips this safely. R10/R11
         // are caller-saved scratch (free at return); RAX (return value) untouched.
-        if self.shadow_enabled && self.shadow_thread_slot_off != 0 {
+        //
+        // The `helpers.get_current_thread != 0` check MUST mirror the
+        // prologue's gate (see `emit_prologue`'s shadow-stack block). The
+        // prologue only zero-initializes `shadow_thread_slot_off` when that
+        // helper is wired; when it isn't (e.g. the JIT unit tests' stub
+        // `test_helpers()`, which leaves `get_current_thread` null), the
+        // prologue skips its block ENTIRELY and the slot is never written.
+        // Without this matching guard, the epilogue still ran, loaded
+        // whatever uninitialized stack garbage happened to occupy that
+        // frame slot, treated it as a live `*mut JvmThread` when nonzero,
+        // and wrote through it — a wild pointer store that crashed
+        // deterministically-but-content-dependently (STATUS_ACCESS_VIOLATION
+        // on Windows), reproducing only when prior stack usage happened to
+        // leave a nonzero value there. The real VM never hit this because
+        // `build_helpers()` always wires `get_current_thread` when precise
+        // maps are on.
+        if self.shadow_enabled
+            && self.helpers.get_current_thread != 0
+            && self.shadow_thread_slot_off != 0
+        {
             self.emit_load_local(R10, self.shadow_thread_slot_off);
             self.emit_test_r64_r64(R10);
             let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
