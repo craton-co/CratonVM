@@ -8357,11 +8357,22 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "getSupportedProtocols",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
+            // JSSE exposes TLSv1.1 as a configurable legacy protocol even
+            // though the rustls transport below cannot negotiate it. Tomcat
+            // intersects SSLHostConfig.protocols with this advertised set
+            // before it stores the connector configuration; omitting it here
+            // therefore destroys an explicit `TLSv1.1+TLSv1.2` configuration
+            // instead of preserving its requested policy. The handshake
+            // mapper remains intentionally limited to rustls's TLS 1.2/1.3
+            // implementation, so this only restores the configuration API's
+            // round-trip contract.
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 3);
             let s1 = ctx.create_string("TLSv1.3");
             let s2 = ctx.create_string("TLSv1.2");
+            let s3 = ctx.create_string("TLSv1.1");
             ctx.set_array_element(arr, 0, Value::Object(Some(s1)));
             ctx.set_array_element(arr, 1, Value::Object(Some(s2)));
+            ctx.set_array_element(arr, 2, Value::Object(Some(s3)));
             Ok(Some(Value::Object(Some(arr))))
         },
     );

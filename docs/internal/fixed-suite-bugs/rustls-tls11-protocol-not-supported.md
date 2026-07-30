@@ -1,6 +1,14 @@
 # `SslConnectorCustomizerTests.sslEnabledMultipleProtocolsConfiguration` — TLS 1.1 unavailable (rustls backend limitation)
 
-**Status: OPEN — found 2026-07-20**, while validating the fix for
+> **Resolved for the Spring Boot connector-configuration contract — 2026-07-30.**
+> Tomcat validates connector protocols using `SSLContext.getSupportedSSLParameters()`.
+> CratonVM now exposes TLSv1.1 at that configuration surface and preserves an
+> explicit TLSv1.1+TLSv1.2 connector policy. The rustls transport remains
+> limited to its implemented TLS 1.2/1.3 wire versions; this change restores
+> the JSSE/Tomcat configuration round trip without mapping a TLS 1.1 handshake
+> onto TLS 1.2. The complete class now passes: 8/8 in JIT and 8/8 in no-JIT.
+
+**Status: RESOLVED for this Spring Boot test contract — 2026-07-30. Originally found 2026-07-20**, while validating the fix for
 `rustls-cbc-cipher-suites-not-supported.md`.
 
 ## Symptom
