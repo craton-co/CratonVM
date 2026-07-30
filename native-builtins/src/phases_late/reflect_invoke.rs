@@ -9,7 +9,6 @@
 //! is byte-identical to before the split.
 
 use super::*;
-
 // ---------------------------------------------------------------------------
 // java.lang.reflect extras: Parameter, Executable
 // ---------------------------------------------------------------------------
@@ -1631,7 +1630,7 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         p59_sw_get_caller_class,
     );
 
-    // StackFrame = 8-field synthetic — WP1.9 (+ WP1.10 slots 6-7):
+    // StackFrame = 7-field synthetic — WP1.9 (+ WP1.10 slot 6):
     //   slot 0: className (String, with '/' → '.')
     //   slot 1: methodName (String)
     //   slot 2: fileName (String or null)
@@ -1644,9 +1643,9 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
     //           (see that function's doc comment for why: a fresh by-name
     //           lookup performed later, from `getDeclaringClass()`, can fail
     //           for a frame whose class is still running its own `<clinit>`)
-    //   slot 7: retainClassRef (Int boolean) — copied from the owning walker so
-    //           a StackFrame returned from walk() keeps its access contract
-    //           after the user Function has returned.
+    //   slot 7: retainClassRef (Int boolean), copied from the owning walker.
+    //           It must persist on the frame because callers may access a
+    //           frame after walk() has returned.
     let sf = "java/lang/StackWalker$StackFrame";
     r.register(sf, "getClassName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1668,17 +1667,25 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 4)))
     });
-    // StackFrame.getDeclaringClass() returns its eagerly resolved mirror (slot
-    // 6). RETAIN_CLASS_REFERENCE belongs to the frame, not the dynamic extent
-    // of walk(): callers may legally return a StackFrame (or Optional holding
-    // one) and inspect it after the Function has returned.
+    // StackFrame.getDeclaringClass() — resolve the Class mirror via the
+    // StackFrame.getDeclaringClass() returns its eagerly resolved mirror (slot 6).
+    // RETAIN_CLASS_REFERENCE is scoped around walk/forEach consumer execution
+    // and is honored below; the JDK otherwise throws UnsupportedOperationException.
     r.register(
         sf,
         "getDeclaringClass",
         "()Ljava/lang/Class;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if ctx.get_field(this, 7).as_int().unwrap_or(0) == 0 {
+            // Interface dispatch can route a real-JDK StackFrameInfo receiver
+            // through this synthetic-carrier registration. Prefer the real
+            // ClassFrameInfo.flags bit when present; otherwise use the
+            // persistent permission copied onto our synthetic carrier.
+            let retains_class_ref =
+                crate::lang_stackwalker::class_frame_retains_class_ref(ctx, this).unwrap_or_else(
+                    || matches!(ctx.get_field(this, 7), Value::Int(value) if value != 0),
+                );
+            if !retains_class_ref {
                 return Err(RuntimeError::UnsupportedOperationException {
                     message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
                 }
@@ -1815,12 +1822,12 @@ pub(crate) fn p59_sf_get_method_type(
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
-    if ctx.get_field(this, 7).as_int().unwrap_or(0) == 0 {
-        return Err(RuntimeError::UnsupportedOperationException {
-            message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-        }
-        .into());
-    }
+    // Descriptor metadata is receiver-local and remains available after the
+    // walk callback returns.  Do not consult transient thread-local walk
+    // state here: `getDescriptor()` delegates through this helper, and Log4j
+    // deliberately retains a StackFrame for lazy inspection.  Operations
+    // that genuinely require `RETAIN_CLASS_REFERENCE` enforce the permission
+    // persisted in this carrier's slot 7.
     let internal = match ctx.get_field(this, 5) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
@@ -1869,6 +1876,8 @@ pub(crate) fn p59_sf_get_method_type(
     )))
 }
 
+/// Populate the 6-slot StackFrame synthetic from a `StackTraceEntry`.
+/// WP1.9: writes bci + declaringClassInternalName in addition to the
 /// Promote only the real-JDK-safe StackWalker carrier accessors without
 /// enabling synthetic reflection layouts in the default registry.
 pub fn register_real_jdk_stackwalker_frame_method_type(r: &mut NativeMethodRegistry) {
@@ -1892,8 +1901,7 @@ pub fn register_real_jdk_stackwalker_frame_method_type(r: &mut NativeMethodRegis
     });
 }
 
-/// Populate the 8-slot StackFrame synthetic from a `StackTraceEntry`, including
-/// the eagerly resolved declaring-class mirror and persistent retain-class bit.
+/// pre-existing 4 slots.
 pub(crate) fn populate_stack_frame(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,
@@ -1949,40 +1957,56 @@ pub(crate) fn populate_stack_frame(
 
     sf = ctx.read_native_pin(base, sf);
     cls_str = ctx.read_native_pin(h_cls, cls_str);
+    ctx.set_field(sf, 0, Value::Object(Some(cls_str)));
+    sf = ctx.read_native_pin(base, sf);
     meth_str = ctx.read_native_pin(h_meth, meth_str);
+    ctx.set_field(sf, 1, Value::Object(Some(meth_str)));
+    sf = ctx.read_native_pin(base, sf);
     if let (Some(s), Some(h)) = (file_str, h_file) {
         file_str = Some(ctx.read_native_pin(h, s));
     }
-    decl_internal = ctx.read_native_pin(h_decl, decl_internal);
-    if let (Some(m), Some(h)) = (decl_mirror, h_mirror) {
-        decl_mirror = Some(ctx.read_native_pin(h, m));
-    }
-
-    ctx.set_field(sf, 0, Value::Object(Some(cls_str)));
-    ctx.set_field(sf, 1, Value::Object(Some(meth_str)));
     ctx.set_field(
         sf,
         2,
         file_str.map_or(Value::Object(None), |s| Value::Object(Some(s))),
     );
+    sf = ctx.read_native_pin(base, sf);
     ctx.set_field(sf, 3, Value::Int(entry.line_number));
+    sf = ctx.read_native_pin(base, sf);
     ctx.set_field(sf, 4, Value::Int(entry.byte_code_index));
+    sf = ctx.read_native_pin(base, sf);
+    decl_internal = ctx.read_native_pin(h_decl, decl_internal);
     ctx.set_field(sf, 5, Value::Object(Some(decl_internal)));
+    sf = ctx.read_native_pin(base, sf);
+    if let (Some(m), Some(h)) = (decl_mirror, h_mirror) {
+        decl_mirror = Some(ctx.read_native_pin(h, m));
+    }
     ctx.set_field(
         sf,
         6,
         decl_mirror.map_or(Value::Object(None), |m| Value::Object(Some(m))),
     );
-    ctx.set_field(
-        sf,
-        7,
-        Value::Int(if retain_class_ref { 1 } else { 0 }),
-    );
+    sf = ctx.read_native_pin(base, sf);
+    ctx.set_field(sf, 7, Value::Int(i32::from(retain_class_ref)));
+    sf = ctx.read_native_pin(base, sf);
     ctx.unpin_native_roots(base);
     sf
 }
 
 pub(crate) fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let function = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Frame construction allocates heavily before the callback is invoked.
+    // Keep both native arguments rooted and use the callback as the base pin
+    // for the complete frame-array-stream graph.
+    let pin_base = ctx.pin_native_root(function);
+    let walker = args.first().and_then(|value| match value {
+        Value::Object(Some(walker)) => Some(*walker),
+        _ => None,
+    });
+    let walker_pin = walker.map(|walker| ctx.pin_native_root(walker));
     // Capture the current call stack and build a Stream<StackFrame>.
     // `capture_stack_trace` returns outer→inner (oldest frame first); a
     // `StackWalker` stream must be inner→outer (the walk()-caller first),
@@ -1992,13 +2016,11 @@ pub(crate) fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // the caller the raw outer→inner order. Without this, `skip`/`limit`
     // chains over the stream (e.g. Lucene's `TestSecrets.ensureCaller`)
     // land on the wrong frame and misidentify the caller.
-    let retain_class_ref = args
-        .first()
-        .and_then(|value| match value {
-            Value::Object(Some(walker)) => Some(*walker),
-            _ => None,
-        })
+    let retain_class_ref = walker
         .map(|walker| {
+            let walker = walker_pin
+                .map(|pin| ctx.read_native_pin(pin, walker))
+                .unwrap_or(walker);
             ctx.get_field_by_name(walker, "retainClassRef")
                 .as_int()
                 .unwrap_or(0)
@@ -2016,25 +2038,29 @@ pub(crate) fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let mut arr = arr;
     for (i, entry) in frames.iter().enumerate() {
         let sf = populate_stack_frame(ctx, entry, retain_class_ref);
+        let sf_pin = ctx.pin_native_root(sf);
         arr = ctx.read_native_pin(arr_pin, arr);
+        let sf = ctx.read_native_pin(sf_pin, sf);
         ctx.set_array_element(arr, i, Value::Object(Some(sf)));
+        ctx.unpin_native_roots(sf_pin);
     }
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+    let stream_pin = ctx.pin_native_root(stream);
     arr = ctx.read_native_pin(arr_pin, arr);
+    let stream = ctx.read_native_pin(stream_pin, stream);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
-    ctx.unpin_native_roots(arr_pin);
+    let stream = ctx.read_native_pin(stream_pin, stream);
 
     // Apply the Function argument to the stream: function.apply(stream)
-    let function = match args.get(1) {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    ctx.invoke_virtual(
+    let function = ctx.read_native_pin(pin_base, function);
+    let result = ctx.invoke_virtual(
         function,
         "apply",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         &[Value::Object(Some(stream))],
-    )
+    );
+    ctx.unpin_native_roots(pin_base);
+    result
 }
 
 pub(crate) fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2042,15 +2068,19 @@ pub(crate) fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    // Same inner→outer ordering as `p59_sw_walk`; copy the retain option into
-    // every frame so consumers can preserve and inspect frames later.
-    let retain_class_ref = args
-        .first()
-        .and_then(|value| match value {
-            Value::Object(Some(walker)) => Some(*walker),
-            _ => None,
-        })
+    let pin_base = ctx.pin_native_root(consumer);
+    let walker = args.first().and_then(|value| match value {
+        Value::Object(Some(walker)) => Some(*walker),
+        _ => None,
+    });
+    let walker_pin = walker.map(|walker| ctx.pin_native_root(walker));
+    // Same inner→outer ordering as `p59_sw_walk`; copy the retain option onto
+    // every frame so a consumer may safely retain it after this method returns.
+    let retain_class_ref = walker
         .map(|walker| {
+            let walker = walker_pin
+                .map(|pin| ctx.read_native_pin(pin, walker))
+                .unwrap_or(walker);
             ctx.get_field_by_name(walker, "retainClassRef")
                 .as_int()
                 .unwrap_or(0)
@@ -2059,16 +2089,30 @@ pub(crate) fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         .unwrap_or(false);
     let raw_trace = ctx.capture_stack_trace(0);
     let frames = crate::lang_stackwalker::ordered_stack_walk_frames(&raw_trace);
+    let mut failure = None;
     for entry in &frames {
         let sf = populate_stack_frame(ctx, entry, retain_class_ref);
-        ctx.invoke_virtual(
+        let sf_pin = ctx.pin_native_root(sf);
+        let consumer = ctx.read_native_pin(pin_base, consumer);
+        let sf = ctx.read_native_pin(sf_pin, sf);
+        let call = ctx.invoke_virtual(
             consumer,
             "accept",
             "(Ljava/lang/Object;)V",
             &[Value::Object(Some(sf))],
-        )?;
+        );
+        ctx.unpin_native_roots(sf_pin);
+        if let Err(error) = call {
+            failure = Some(error);
+            break;
+        }
     }
-    Ok(None)
+    let result = match failure {
+        Some(error) => Err(error),
+        None => Ok(None),
+    };
+    ctx.unpin_native_roots(pin_base);
+    result
 }
 
 pub(crate) fn p59_sw_get_caller_class(

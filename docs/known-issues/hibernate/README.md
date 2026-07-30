@@ -2,12 +2,11 @@
 
 ## Resolved (2026-07-29)
 
-- **HIB-BYTEBUDDY ban re-instated** — the 2026-07-28 removal of the `net/bytebuddy/` blanket JIT
-  ban was premature (15-class sample too narrow); a full 4548-class run surfaced 302 CRASH-status
-  classes as a result. Re-instated the ban, reran all 302: 298/302 (98.7%) now PASS, zero crashes.
-  See `hib-bytebuddy-reinstated-20260729-FIXED.md`. The
-  stale removal doc (`hib-bytebuddy-removed-20260728.md`, still in this directory) is marked
-  SUPERSEDED — do not act on its original claim.
+- **HIB-BYTEBUDDY ban fully lifted** — the 302-class crash spike was captured on an older
+  runtime that predated the JIT code-lifetime fixes; reinstating `net/bytebuddy/` only hid that
+  stale-code fault. Current `dev`, with no blanket guard, passes the exact 302-class manifest in
+  both JIT and `--nojit`: 1,275/1,275 started tests pass per mode, with zero failures or aborts.
+  See `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-reinstated-20260729-FIXED.md`.
 
 ## Open
 
