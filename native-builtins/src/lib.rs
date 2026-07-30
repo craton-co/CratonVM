@@ -8,7 +8,9 @@
 
 #![allow(clippy::collapsible_if, clippy::needless_range_loop, dead_code)]
 
-use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{
+    NativeCallback, NativeContext, NativeHandleScope, NativeMethodRegistry,
+};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
@@ -3655,11 +3657,15 @@ fn native_spring_extension_resolve_parameter(
         Some(Value::Object(Some(parameter))) => parameter,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let index = ctx
+    // This native makes many re-entrant calls after acquiring the reflective
+    // Parameter. Keep it in a GC-updated handle, not a raw ObjectRef.
+    let mut scope = NativeHandleScope::new(ctx);
+    let parameter_handle = scope.root(parameter);
+    let index = scope
         .invoke_virtual(parameter_context, "getIndex", "()I", &[])?
         .and_then(|v| v.as_int())
         .unwrap_or(0);
-    let executable = match ctx.invoke_virtual(
+    let executable = match scope.invoke_virtual(
         parameter_context,
         "getDeclaringExecutable",
         "()Ljava/lang/reflect/Executable;",
@@ -3668,7 +3674,7 @@ fn native_spring_extension_resolve_parameter(
         Some(Value::Object(Some(executable))) => executable,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let mut test_class = match ctx.invoke_virtual(
+    let mut test_class = match scope.invoke_virtual(
         extension_context,
         "getRequiredTestClass",
         "()Ljava/lang/Class;",
@@ -3678,17 +3684,17 @@ fn native_spring_extension_resolve_parameter(
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    if ctx
-        .class_name_of_id(ctx.class_id_of_object(executable))
+    if scope
+        .class_name_of_id(scope.class_id_of_object(executable))
         .as_deref()
         == Some("java/lang/reflect/Constructor")
     {
         if let Ok(Some(Value::Object(Some(declaring)))) =
-            ctx.invoke_virtual(executable, "getDeclaringClass", "()Ljava/lang/Class;", &[])
+            scope.invoke_virtual(executable, "getDeclaringClass", "()Ljava/lang/Class;", &[])
         {
             test_class = declaring;
             if let Ok(Some(Value::Object(Some(scoped)))) = spring_extension_invoke_special_anchored_on_test_class(
-                ctx,
+                &mut *scope,
                 "org/springframework/test/context/junit/jupiter/SpringExtension",
                 "findProperlyScopedExtensionContext",
                 "(Ljava/lang/Class;Lorg/junit/jupiter/api/extension/ExtensionContext;)Lorg/junit/jupiter/api/extension/ExtensionContext;",
@@ -3720,7 +3726,7 @@ fn native_spring_extension_resolve_parameter(
     // real (unmodified) BeanOverrideUtils.resolveHandlerForParameter, which
     // itself performs the isBeanOverride check internally (returns null for
     // non-override parameters), so this is purely additive.
-    let application_context = spring_extension_get_application_context(ctx, extension_context)?;
+    let application_context = spring_extension_get_application_context(&mut *scope, extension_context)?;
     let application_context_obj = match application_context {
         Some(Value::Object(Some(application_context))) => application_context,
         other => return Ok(other),
@@ -3759,8 +3765,9 @@ fn native_spring_extension_resolve_parameter(
     // Application-loader copy of `resolveHandlerForParameter` on a
     // fork-loaded parameter returns null for EVERY parameter, while the fork's
     // own copy returns the handlers (`service0B` -> beanName `s0B`).
+    let parameter = scope.get(&parameter_handle);
     if let Ok(Some(Value::Object(Some(handler)))) = spring_extension_invoke_special_anchored_on_test_class(
-        ctx,
+        &mut *scope,
         "org/springframework/test/context/bean/override/BeanOverrideUtils",
         "resolveHandlerForParameter",
         "(Ljava/lang/reflect/Parameter;Ljava/lang/Class;)Lorg/springframework/test/context/bean/override/BeanOverrideHandler;",
@@ -3771,9 +3778,9 @@ fn native_spring_extension_resolve_parameter(
         ],
     ) {
         if let Ok(Some(Value::Object(Some(bean_name)))) =
-            ctx.invoke_virtual(handler, "getBeanName", "()Ljava/lang/String;", &[])
+            scope.invoke_virtual(handler, "getBeanName", "()Ljava/lang/String;", &[])
         {
-            return ctx.invoke_virtual(
+            return scope.invoke_virtual(
                 application_context_obj,
                 "getBean",
                 "(Ljava/lang/String;)Ljava/lang/Object;",
@@ -3782,7 +3789,7 @@ fn native_spring_extension_resolve_parameter(
         }
     }
 
-    let bean_factory_result = ctx.invoke_virtual(
+    let bean_factory_result = scope.invoke_virtual(
         application_context_obj,
         "getAutowireCapableBeanFactory",
         "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
@@ -3792,7 +3799,8 @@ fn native_spring_extension_resolve_parameter(
         Some(Value::Object(Some(bean_factory))) => bean_factory,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.invoke_special(
+    let parameter = scope.get(&parameter_handle);
+    scope.invoke_special(
         "org/springframework/beans/factory/annotation/ParameterResolutionDelegate",
         "resolveDependency",
         "(Ljava/lang/reflect/Parameter;ILjava/lang/Class;Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;)Ljava/lang/Object;",
