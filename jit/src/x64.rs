@@ -30197,7 +30197,7 @@ fn gc_inert_selfrec_candidate(
     direct_calls: &[(usize, super::JitDirectCall)],
     mic_slots: &[(usize, *const super::JitMICSlot)],
     pic_slots: &[(usize, *const super::JitPICSlot)],
-    indy_info: &[(usize, usize, u8, Vec<u8>)],
+    indy_info: &[(usize, usize, u8, Vec<u8>, usize)],
 ) -> bool {
     if !gc_inert_selfrec_enabled()
         || !new_info.is_empty()
