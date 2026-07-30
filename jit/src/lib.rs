@@ -7932,7 +7932,20 @@ fn precise_exception_frame_sites_supported(
         // unconditional deopt trap, not to a call site that publishes a frame.
         if covered(pc)
             && may_throw_without_precise_frame(op)
-            && !matches!(op, 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xc2 | 0xc3)
+            // 0xb4/0xb5 (getfield/putfield) are NOT here. They were added
+            // 2026-07-28 in 5bf306bb0 alongside a precise null check, but that
+            // check has a single call site on the INLINED-CALLEE putfield path;
+            // the top-level arms keep an inline fast path that neither
+            // null-checks nor publishes a frame. Measured on this tree with
+            // probes/Rbc6FieldProbe.java: a `getfield` NPE inside a protected
+            // range let the handler read a non-parameter local as 0 instead of
+            // 38, and a `putfield` on a null receiver did not throw at all
+            // (returned the normal-path -1 instead of the handler's 66). Both
+            // are silent wrong answers, which is exactly what RBC.6 exists to
+            // prevent. Re-admit them only together with a precise frame at the
+            // top-level field arms -- see
+            // docs/known-issues/tomcat/23-charsetcache-pathological-slowdown.md.
+            && !matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
         {
             return false;
         }

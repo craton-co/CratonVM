@@ -321,3 +321,80 @@ flag; if a control that *cannot* move does move, the comparison is invalid.
 
 **Consequence for this document:** `timeLazy` is still expected to fail, and the
 reason is now the inline-cache ban, not the tier. Doc 23 stays OPEN.
+
+## Update 2026-07-30 — the `getfield`/`putfield` widening was UNSOUND and is reverted
+
+`0xb4`/`0xb5` were added to `precise_exception_frame_sites_supported`'s exempt
+list on 2026-07-28 in `5bf306bb0` ("jit: compile synchronized Tomcat paths
+safely"). **That widening produced silent wrong values and has been removed.**
+
+This is the case this document warned about: the whitelist was widened without
+auditing that *every* lowering the opcode can select publishes a reason-9 frame.
+`5bf306bb0` did add one — `emit_precise_null_check_field_store` — but it has a
+single call site, on the **inlined-callee** `putfield` path. The top-level field
+arms never got it.
+
+### Measured, both directions
+
+`probes/Rbc6FieldProbe.java` builds the exact shape RBC.6 protects: a protected
+range containing a field access on a null receiver, a non-parameter local
+written inside the `try`, and a handler that reads it.
+
+| probe | HotSpot 25 | CratonVM `--nojit` | CratonVM JIT, `0xb4/0xb5` exempt |
+|---|---|---|---|
+| `getfieldInt(null,5)` | 38 | 38 | **0** |
+| `putfield(null,5)` | 66 | 66 | **-1** |
+| `twoLocals(null,5)` | 105205 | 105205 | **0** |
+| `getfieldRef(null,5)` | 60 | 60 | 60 |
+| `getfieldLong(null,5)` | 5000015 | 5000015 | 5000015 |
+| whole-run `acc` | 3505302427599075008 | same | **3505299872972359454** |
+
+`0` is the handler reading a zeroed non-parameter local — params-only
+reconstruction, exactly the silent-wrong-locals hazard. With `0xb4`/`0xb5`
+removed from the list, every figure matches HotSpot and `--nojit` including the
+checksum, and `cargo test -p cratonvm-jit` is fully green (1056 lib tests, all
+integration binaries).
+
+Note the reference-typed and category-2 loads were *already* correct — they take
+the helper exit, which does publish. Only the inline fast path was wrong, which
+is why reading the arm for "does it publish?" is not enough: **the question is
+which lowering each opcode can select, not whether some lowering is safe.**
+
+### The regression test that already said so
+
+`tests::protected_field_access_keeps_unsafe_handler_interpreted` (added
+2026-07-27, `83e078aa5`) asserts exactly this refusal. `5bf306bb0` landed one day
+later and broke it, without mentioning it. It then went unseen for two days
+because `cargo test -p cratonvm-jit` could not compile (fixed `4d8a39a39`) and
+then SIGSEGV'd before reaching it (fixed `fcc723007`). The test was right the
+whole time; it is now passing again, unmodified.
+
+### What this costs
+
+Methods with a field access inside a `try` whose handler reads a non-parameter
+local go back to being interpreted. That is a real throughput loss and it takes
+back part of what `5bf306bb0` was reaching for. It is not negotiable against
+silently wrong results, and the note in the exempt list now records the
+measurement so the next person does not re-widen it by inspection.
+
+The way to earn the widening back is the one this document has always specified:
+publish a precise reason-9 frame at the **top-level** `getfield`/`putfield`
+arms — including the inline fast path — and only then re-admit the opcodes,
+with `Rbc6FieldProbe` as the acceptance test.
+
+### Separate defect found by the same probe — `putfield` on null does not throw
+
+`probes/NullPutfieldProbe.java` puts the store in a method with **no exception
+table at all**, so RBC.6 never applies:
+
+| | HotSpot | CratonVM JIT |
+|---|---|---|
+| `putfield` int / ref / long on a null receiver | NPE | **NO-THROW** |
+| `getfield` int on a null receiver | NPE | NPE |
+
+A compiled `putfield` to a null receiver silently drops the store and continues.
+This is independent of the gate above and is **not** fixed by this change — the
+gate revert only stops it being reachable through the protected-range path.
+Tracked separately; the likely fix is to give the top-level `0xb5` arm the same
+`emit_precise_null_check_field_store` its inlined-callee sibling already has,
+taking care not to null-check a scalar-replaced receiver.
