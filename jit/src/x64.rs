@@ -30174,7 +30174,7 @@ pub fn compile_with_param_slots(
         num_scalar_slots,
         cache_jit_thread_for_inline_new,
         reserve_stack_floor,
-        gc_inert_selfrec,
+        gc_inert_selfrec && reserve_stack_floor,
         precise_exception_frames,
         protected_ranges,
     );
@@ -31199,6 +31199,59 @@ mod tests {
     use super::*;
     use crate::JitInvokeInfo;
     use cratonvm_types::{ObjectRef, Value};
+
+    #[test]
+    fn gc_inert_selfrec_accepts_forward_field_walk_and_rejects_gc_edges() {
+        // aload_0; getfield; ifnonnull L; iconst_1; ireturn;
+        // L: iconst_1; aload_0; getfield; invokestatic self; iadd; ireturn
+        let pure = [
+            0x2a, 0xb4, 0x00, 0x01, 0xc7, 0x00, 0x05, 0x04, 0xac, 0x04, 0x2a, 0xb4, 0x00,
+            0x01, 0xb8, 0x00, 0x02, 0x60, 0xac,
+        ];
+        let fields = [(1usize, 0usize, b'L'), (11, 0, b'L')];
+        assert!(gc_inert_selfrec_candidate(
+            &pure,
+            pure.len(),
+            &fields,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
+
+        let mut allocates = pure.to_vec();
+        allocates[9] = 0xbb; // new
+        assert!(!gc_inert_selfrec_candidate(
+            &allocates,
+            allocates.len(),
+            &fields,
+            &[(9, 1, 0, false, false)],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
+
+        let mut loops = pure;
+        loops[4..7].copy_from_slice(&[0xa7, 0xff, 0xfc]); // goto pc 0
+        assert!(!gc_inert_selfrec_candidate(
+            &loops,
+            loops.len(),
+            &fields,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
+    }
 
     #[test]
     fn stack_bang_frame_probes_cover_crossed_pages() {

@@ -67,6 +67,16 @@ use cratonvm_types::{ClassId, CompactLayout, FieldStorageKind, ObjectRef, Value}
 /// for the young gen; 64 MB for a 256 MB max heap is the same ratio.
 const DEFAULT_YOUNG_SEMI_SIZE: usize = 64 * 1024 * 1024;
 
+/// Do not eagerly size one young semi-space beyond 512 MiB.
+///
+/// `-Xmx8g` previously created a 2 GiB from-space. Allocation storms that die
+/// young then faulted and zeroed roughly half a million pages before the first
+/// useful sweep (bt18: ~2.3 GiB RSS and ~5 s of kernel CPU), even though their
+/// live set fits in a few hundred MiB. Start compact and retain the
+/// `Xmx / 4` value as the growth ceiling; high-survival workloads can still
+/// expand, while high-reclamation workloads reuse a resident arena.
+const MAX_INITIAL_YOUNG_SEMI_SIZE: usize = 512 * 1024 * 1024;
+
 /// Size of the old generation (128 MB).
 const DEFAULT_OLD_GEN_SIZE: usize = 128 * 1024 * 1024;
 
@@ -787,10 +797,21 @@ impl GenerationalHeap {
 
     /// Create a generational heap with custom young semi-space and old gen sizes.
     pub fn with_sizes(young_semi_size: usize, old_gen_size: usize) -> Self {
+        let max_young = young_semi_size
+            .max(1024)
+            .saturating_mul(MAX_HEAP_EXPANSION_FACTOR);
+        Self::with_sizes_and_max_young(young_semi_size, old_gen_size, max_young)
+    }
+
+    fn with_sizes_and_max_young(
+        young_semi_size: usize,
+        old_gen_size: usize,
+        max_young_semi_size: usize,
+    ) -> Self {
         let young_semi_size = young_semi_size.max(1024);
         let old_gen_size = old_gen_size.max(1024);
         let threshold = young_semi_size * YOUNG_GC_THRESHOLD_PERCENT / 100;
-        let max_young = young_semi_size * MAX_HEAP_EXPANSION_FACTOR;
+        let max_young = max_young_semi_size.max(young_semi_size);
 
         let old_gen = OldGen::new(old_gen_size);
         let card_table = CardTable::new(old_gen.base_ptr() as usize, old_gen_size);
@@ -930,9 +951,12 @@ impl GenerationalHeap {
 
     /// Create a generational heap with a total capacity split proportionally.
     ///
-    /// HotSpot-equivalent sizing: young gen takes ~50% of the total heap
-    /// (the from+to semi-space pair together), split across two
-    /// semi-spaces. So each semi-space is ~25% of -Xmx. HotSpot's default
+    /// HotSpot-equivalent ceiling: young gen may grow to ~50% of the total
+    /// heap (the from+to semi-space pair together), split across two
+    /// semi-spaces. Each semi-space can therefore reach ~25% of -Xmx. The
+    /// initial semi-space is capped at [`MAX_INITIAL_YOUNG_SEMI_SIZE`] so a
+    /// large `-Xmx` does not commit a multi-GiB transient working set before
+    /// the collector has any survival evidence. HotSpot's default
     /// is closer to NewRatio=2 (young = 1/3 of heap) but our copying
     /// collector trades old-gen room for young-gen room more aggressively
     /// because (a) the non-moving sweep that runs while JIT frames are
@@ -942,12 +966,12 @@ impl GenerationalHeap {
     /// young semi is essentially free unless the working set actually
     /// grows to fill it.
     ///
-    /// For the common ranges:
+    /// Initial sizes for the common ranges:
     ///   - 64 KiB heap (test):   young_semi = 16 KiB
     ///   - 256 MiB heap (def.):  young_semi = 64 MiB
     ///   - 1 GiB heap:           young_semi = 256 MiB
-    ///   - 4 GiB heap (-Xmx4g):  young_semi = 1 GiB
-    ///   - 16 GiB heap:          young_semi = 4 GiB
+    ///   - 4 GiB heap (-Xmx4g):  young_semi = 512 MiB (ceiling 1 GiB)
+    ///   - 16 GiB heap:          young_semi = 512 MiB (ceiling 4 GiB)
     ///
     /// The young semi-space can still *grow* up to
     /// `young_semi * MAX_HEAP_EXPANSION_FACTOR` after a low-reclamation
@@ -962,13 +986,15 @@ impl GenerationalHeap {
         // the user passed -Xmx N to get N bytes of heap, not "N capped
         // at some arbitrary internal constant".
         const YOUNG_SEMI_MIN: usize = 512;
-        let young_semi = young_semi_raw.max(YOUNG_SEMI_MIN);
-        // Old gen gets whatever's left after the young (from+to). Use
+        let max_young_semi = young_semi_raw.max(YOUNG_SEMI_MIN);
+        let young_semi = max_young_semi.min(MAX_INITIAL_YOUNG_SEMI_SIZE);
+        // Old gen gets whatever is left after reserving the young pair's
+        // GROWTH CEILING, not merely its compact initial size. Use
         // `saturating_sub` so a tiny `total` (`max(4096)`) doesn't
         // underflow when the clamped young is larger than half of it.
-        let young_pair = young_semi.saturating_mul(2);
+        let young_pair = max_young_semi.saturating_mul(2);
         let old_size = total.saturating_sub(young_pair).max(512);
-        Self::with_sizes(young_semi, old_size)
+        Self::with_sizes_and_max_young(young_semi, old_size, max_young_semi)
     }
 
     // ----- Allocation --------------------------------------------------------
@@ -11736,7 +11762,7 @@ mod tests {
         );
     }
 
-    /// Regression: `with_capacity` MUST scale the young semi-space linearly
+    /// Regression: `with_capacity` starts with a compact young semi-space
     /// with the total heap requested — no hidden internal cap.
     ///
     /// Commit a98a375 moved the split from 25/75 (young_semi = 12.5% of
@@ -11744,7 +11770,8 @@ mod tests {
     /// post-commit ratios so a future edit cannot silently regress to an
     /// arbitrary internal ceiling (the original bug had a 32 MiB cap
     /// regardless of -Xmx; the fix has *no* ceiling other than the user-
-    /// supplied total).
+    /// supplied total). Large heaps now retain that proportional value as the
+    /// growth ceiling rather than faulting it eagerly.
     ///
     /// We test the same -Xmx values the orchestrator uses to validate
     /// QuickBenchLong's binary-trees-d18 kernel:
@@ -11752,11 +11779,14 @@ mod tests {
     ///   - 1 GiB heap   → young_semi = 256 MiB
     ///   - 4 GiB heap   → young_semi = 1 GiB
     ///
-    /// Each semi must be exactly `total / 4`; the lower bound (>= the
+    /// The 4 GiB entry above names the growth ceiling; its initial semi is
+    /// capped at 512 MiB.
+    ///
+    /// Through 1 GiB each semi is exactly `total / 4`; the lower bound (>= the
     /// orchestrator's "≥256 MiB at -Xmx 1g" criterion) is also asserted
     /// explicitly so the test fails loudly if someone reinstates a clamp.
     #[test]
-    fn with_capacity_scales_young_semi_with_xmx() {
+    fn with_capacity_caps_initial_young_but_preserves_xmx_growth_ceiling() {
         // -Xmx 256m → 64 MiB young semi (4× larger than the buggy 32 MiB cap)
         let h_256m = GenerationalHeap::with_capacity(256 * 1024 * 1024);
         assert_eq!(
@@ -11785,10 +11815,16 @@ mod tests {
 
         // -Xmx 4g → 1 GiB young semi.
         let h_4g = GenerationalHeap::with_capacity(4_usize * 1024 * 1024 * 1024);
+        // Initial 512 MiB; proportional growth ceiling 1 GiB.
         assert_eq!(
             h_4g.young_semi_capacity(),
+            512 * 1024 * 1024,
+            "with_capacity(4g) must not eagerly fault a 1 GiB young semi",
+        );
+        assert_eq!(
+            h_4g.max_young_semi_size,
             1024 * 1024 * 1024,
-            "with_capacity(4g) must give a 1 GiB young semi",
+            "with_capacity(4g) must retain the 1 GiB proportional growth ceiling",
         );
 
         // Tiny test heap (64 KiB): the floor (512 B) does not engage
