@@ -1796,121 +1796,6 @@ fn field_descriptor_remember(vm_key: usize, class_id: u32, slot_index: usize, by
 /// a miss simply re-walks immutable class metadata and repopulates the entry.
 const FIELD_DESCRIPTOR_CACHE_CAP: usize = 1 << 16;
 
-// ---------------------------------------------------------------------------
-// Field NAME -> slot memoization for the by-name native field accessors
-// ---------------------------------------------------------------------------
-
-/// Process-global epoch for instance-field **layout**.
-///
-/// Bumped whenever a class's field layout could have changed underneath a
-/// `ClassId` that a memo may already hold. This is a conservative guard, the
-/// same one `redefine_class_with` already applies to `field_descriptor_cache`,
-/// rather than a known-live invalidation:
-///
-/// * `ClassId`s are never recycled — `ClassStore::remove` leaves a `None` hole
-///   and `next_id()` is `classes.len()`, so an unloaded class's id is never
-///   handed to a different class.
-/// * `class_manager::redefine_class` debug-asserts that `Class::fields`'
-///   shape, `first_field_index` and `num_total_fields` all survive a
-///   redefinition (JEP 109 requires layout preservation).
-///
-/// The memo is thread-local, so an epoch is the only way to invalidate copies
-/// held by threads other than the one performing the redefinition.
-static FIELD_LAYOUT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Invalidate every thread's `(ClassId, field name) -> slot` memo.
-pub(crate) fn bump_field_layout_epoch() {
-    FIELD_LAYOUT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Hard bound for name memoization, in cached `(class, name)` pairs. Eviction
-/// is correctness-neutral for the same reason as the descriptor cap.
-const FIELD_SLOT_BY_NAME_CAP: usize = 1 << 16;
-
-thread_local! {
-    /// Memoised `(vm, ClassId, field name) -> slot` for
-    /// [`NativeContextImpl::get_field_by_name`] / `set_field_by_name`.
-    ///
-    /// Both of those take the global class-manager READ LOCK and then walk the
-    /// receiver's class hierarchy comparing every non-static field's name, on
-    /// EVERY access. Native shadows address fields by name almost exclusively,
-    /// so that resolution dominates them rather than the heap access it guards:
-    /// Tomcat's `Mapper` shadow performs dozens of by-name accesses per
-    /// `Mapper.map()` call, and `TestMapperPerformance` makes 10^6 such calls
-    /// against an ABSOLUTE 5 s budget (known-issue tomcat/32.1).
-    ///
-    /// Only POSITIVE results are memoised. A miss can be transient — an
-    /// ancestor that is not loaded yet, or a synthetic stub later promoted to a
-    /// real class carrying real fields — and caching it would make the
-    /// promotion invisible. This mirrors `resolve_field_descriptor_byte_cached`,
-    /// which likewise refuses to cache transient misses.
-    ///
-    /// Nested so the inner probe borrows the caller's `&str` through
-    /// `Box<str>: Borrow<str>` and allocates nothing on the hit path. The tuple
-    /// head is the layout epoch the entries were resolved under.
-    static FIELD_SLOT_BY_NAME: std::cell::RefCell<(
-        u64,
-        std::collections::HashMap<(usize, u32), std::collections::HashMap<Box<str>, usize>>,
-        usize,
-    )> = std::cell::RefCell::new((0, std::collections::HashMap::new(), 0));
-}
-
-/// Resolve an instance field's slot by name, memoising positive results per
-/// thread. See [`FIELD_SLOT_BY_NAME`] for why this exists and what it may cache.
-fn resolve_field_index_by_name_cached(
-    shared: &SharedVm,
-    class_id: ClassId,
-    field_name: &str,
-) -> Option<usize> {
-    // A SharedVm address can be recycled after a short-lived VM is dropped,
-    // so key on the process-unique lifetime identity, as the descriptor cache
-    // does — otherwise a later VM could inherit a stale slot for the same id.
-    let vm_key = shared.vm_identity;
-    let epoch = FIELD_LAYOUT_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
-    let cached = FIELD_SLOT_BY_NAME.with(|cell| {
-        let cache = cell.borrow();
-        if cache.0 != epoch {
-            return None;
-        }
-        cache
-            .1
-            .get(&(vm_key, class_id.as_u32()))
-            .and_then(|by_name| by_name.get(field_name))
-            .copied()
-    });
-    if let Some(slot) = cached {
-        return Some(slot);
-    }
-
-    let slot = {
-        let cm = shared.classes.class_manager.read();
-        resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
-    }?;
-
-    FIELD_SLOT_BY_NAME.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        if cache.0 != epoch {
-            cache.1.clear();
-            cache.2 = 0;
-            cache.0 = epoch;
-        }
-        if cache.2 >= FIELD_SLOT_BY_NAME_CAP {
-            cache.1.clear();
-            cache.2 = 0;
-        }
-        if cache
-            .1
-            .entry((vm_key, class_id.as_u32()))
-            .or_default()
-            .insert(field_name.into(), slot)
-            .is_none()
-        {
-            cache.2 += 1;
-        }
-    });
-    Some(slot)
-}
-
 fn cache_field_descriptor(shared: &SharedVm, key: (ClassId, usize), byte: u8) {
     let mut cache = shared.classes.field_descriptor_cache.write();
     if !cache.contains_key(&key) && cache.len() >= FIELD_DESCRIPTOR_CACHE_CAP {
@@ -3917,10 +3802,6 @@ impl<'a> NativeContextImpl<'a> {
         // conservative guard against any future relaxation of that invariant.
         // Redefinition is rare, so the rebuild cost is negligible.
         self.shared.classes.field_descriptor_cache.write().clear();
-        // Same guard for the per-thread `(ClassId, field name) -> slot` memo.
-        // That one is thread-local, so bumping the shared epoch is the only way
-        // to reach copies held by threads other than this one.
-        bump_field_layout_epoch();
         // JVMTI redefinition can stale caller-side direct calls and inline
         // dispatch caches, not just compiled bodies declared by `name`. Full
         // eviction is rare and keeps agent-woven bytecode authoritative.
@@ -7737,7 +7618,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
         let obj = self.shared.mem.heap.load_and_forward(obj);
         let class_id = self.shared.mem.heap.class_id_of(obj);
-        if let Some(index) = resolve_field_index_by_name_cached(self.shared, class_id, field_name) {
+        let cm = self.shared.classes.class_manager.read();
+        if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
+        {
             self.shared.mem.heap.get_field(obj, index)
         } else {
             Value::Object(None)
@@ -7747,7 +7630,10 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
         let class_id = self.shared.mem.heap.class_id_of(obj);
-        if let Some(index) = resolve_field_index_by_name_cached(self.shared, class_id, field_name) {
+        let cm = self.shared.classes.class_manager.read();
+        if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
+        {
+            drop(cm);
             self.shared.mem.heap.set_field(obj, index, value);
             // write_barrier fires automatically inside set_field
         }
@@ -7764,7 +7650,8 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         class_id: ClassId,
         field_name: &str,
     ) -> Option<usize> {
-        resolve_field_index_by_name_cached(self.shared, class_id, field_name)
+        let cm = self.shared.classes.class_manager.read();
+        resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
