@@ -62,6 +62,15 @@ fn dummy_helpers() -> JitRuntimeHelpers {
     // Give it a real no-op instead of the panicking stub.
     unsafe extern "C" fn record_throw_bci(_bci: i64) {}
     let throw_bci = record_throw_bci as *const () as usize;
+    unsafe extern "C" fn deopt_unserviceable_stub(
+        _vm: i64,
+        _info: i64,
+        _args: i64,
+        _n: i64,
+    ) -> i64 {
+        i64::MIN
+    }
+    let deopt_unserviceable = deopt_unserviceable_stub as *const () as usize;
     JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
@@ -121,11 +130,14 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         native_stack_floor_fn: native_stack_floor as *const () as usize,
         ldc_string: s,
         // Reached through emit_call_absolute, so a 0 here is a null CALL
-        // (SIGSEGV), not an inert "unwired" sentinel. `service_callee_deopt`
-        // keeps the trap stub -- reaching it means a deopt these tests do not
-        // model -- while `set_throw_bci` gets a real no-op recorder.
+        // (SIGSEGV), not an inert "unwired" sentinel. Neither is a sign of
+        // missing wiring: `set_throw_bci` just records the throwing bci, and
+        // `service_callee_deopt` is the normal IR direct-call path when a
+        // callee returns the i64::MIN "threw" sentinel. The deopt stub returns
+        // that sentinel unchanged -- exactly what the real helper does for a
+        // vm/info it cannot service -- so the caller propagates the throw.
         set_throw_bci: throw_bci,
-        service_callee_deopt: s,
+        service_callee_deopt: deopt_unserviceable,
         ..Default::default()
     }
 }
@@ -2448,6 +2460,10 @@ fn check_frem(
 
 #[test]
 fn ir_fp_frem_integer_operands() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // int f(int a, int b) { return (int)((float)a % (float)b); }
     //   iload_0; i2f; iload_1; i2f; frem; f2i; ireturn
     check_frem(
@@ -2470,6 +2486,10 @@ fn ir_fp_frem_integer_operands() {
 
 #[test]
 fn ir_fp_drem_integer_operands() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // int f(int a, int b) { return (int)((double)a % (double)b); }
     //   iload_0; i2d; iload_1; i2d; drem; d2i; ireturn
     check_frem(
@@ -2492,6 +2512,10 @@ fn ir_fp_drem_integer_operands() {
 
 #[test]
 fn ir_fp_frem_fractional() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // int f(int a, int b) { return (int)(((a/4f) % (b/4f)) * 4f); } — genuinely
     // fractional intermediate remainders (0.25, …) prove the helper computes a
     // real fmod, not just integer-operand agreement. The *4 rescale lands on an
@@ -2521,6 +2545,10 @@ fn ir_fp_frem_fractional() {
 
 #[test]
 fn ir_fp_drem_fractional() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // Double analogue of `ir_fp_frem_fractional`.
     //   iload_0;i2d; iconst_4;i2d;ddiv; iload_1;i2d; iconst_4;i2d;ddiv; drem;
     //   iconst_4;i2d;dmul; d2i; ireturn
@@ -3383,6 +3411,10 @@ fn selfrec_long_return_bails_to_singlepass() {
 
 #[test]
 fn selfrec_int_return_uses_ir() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // static int f(int n) { return n < 2 ? n : f(n-1) + f(n-2); }  // (I)I
     // The gate is wide-return-specific: an INT self-recursive call is unaffected
     // and still lowers to the IR Op::Call path (pre-existing behaviour).
@@ -3411,6 +3443,10 @@ fn selfrec_int_return_uses_ir() {
 
 #[test]
 fn crossmethod_long_return_uses_ir() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // static long f(int n) { return g(n); }   // g:(I)J, NOT self-recursive
     // Confirms the gate is SELF-recursion specific: a cross-method long-returning
     // call is the intended inc-29 unblock and still lowers to IR Op::Call.
@@ -3434,6 +3470,10 @@ fn crossmethod_long_return_uses_ir() {
 
 #[test]
 fn selfrec_int_direct_call_executes_correctly() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // Integer-returning self-recursion is the common QuickBench fib shape.
     // With the direct-call gate on it must stay on IR without routing every
     // recursive edge through jit_invoke_dispatch.
@@ -3488,6 +3528,10 @@ fn selfrec_int_direct_call_executes_correctly() {
 
 #[test]
 fn selfrec_long_direct_call_executes_correctly() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // fib44-fix follow-up: with CRATONVM_JIT_IR_SELFREC_DIRECT on, a self-recursive
     // long method stays on the IR pipeline but its recursive call is a DIRECT call
     // to its own entry (not jit_invoke_dispatch). Verify it (a) takes the IR
@@ -3620,6 +3664,10 @@ fn compile_with_direct_callee(
 
 #[test]
 fn ir_direct_call_static_with_context_executes_correctly() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // static int f(int a, int b) { return g(a, b) * 2; }
     //   iload_0; iload_1; invokestatic #2; iconst_2; imul; ireturn
     let mut helpers = dummy_helpers();
@@ -3666,6 +3714,10 @@ fn ir_direct_call_static_with_context_executes_correctly() {
 
 #[test]
 fn ir_direct_call_static_without_context_executes_correctly() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // Same shape, but the callee reports `needs_context == false`, so the first
     // Java argument occupies abi[0] rather than abi[1]. A mis-shifted marshalling
     // would pass the VM pointer as `a`.
@@ -3707,6 +3759,10 @@ fn ir_direct_call_static_without_context_executes_correctly() {
 
 #[test]
 fn ir_direct_call_exception_sentinel_bails() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     // A directly-called callee that threw returns `i64::MIN`. The caller must
     // detect the sentinel and bail (returning it unchanged so the VM takes the
     // pending exception) instead of using it as the call's result — exactly the
@@ -3860,6 +3916,10 @@ fn try_catch_code(handler_reads: u8) -> Vec<u8> {
 
 #[test]
 fn try_catch_param_only_handler_uses_ir() {
+    // This test exercises the optimizing IR pipeline, which is gated off
+    // whenever the young generation can relocate. Pin the policy so the
+    // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
     let helpers = dummy_helpers();
     // 0x1a = iload_0: the handler reads only the incoming parameter.
     let cm = cached_with_handler("f", "(I)I", try_catch_code(0x1a), 3, 1, 4, 8, 11);

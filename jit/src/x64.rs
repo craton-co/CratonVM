@@ -2730,6 +2730,14 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // or the collector walks a shadow stack the codegen never pushed to.
     // `parse::present` == the former `var_os(..).is_some()`, so this is
     // behaviour-preserving.
+    // A thread pinning the moving-young policy (see `set_moving_young_override`)
+    // must not read -- or, worse, POPULATE -- this process-wide cache: whichever
+    // test touched it first would otherwise freeze the shadow-stack decision for
+    // every other test in the binary. Recompute instead; the override is never
+    // set in production, so the cached fast path is unchanged there.
+    if MOVING_YOUNG_OVERRIDE.with(|c| c.get()).is_some() {
+        return cratonvm_types::flags().jit.shadow_stack || moving_young_enabled();
+    }
     *G.get_or_init(|| cratonvm_types::flags().jit.shadow_stack || moving_young_enabled())
 }
 
@@ -2761,7 +2769,33 @@ pub fn shadow_stack_maps_enabled() -> bool {
 /// behaviour-preserving today and lets the default be flipped in one place
 /// later. Do NOT re-introduce a local `getenv` here.
 #[inline]
+thread_local! {
+    /// Per-thread override for [`moving_young_enabled`]; `None` = use the
+    /// process flag. Thread-local so parallel tests cannot race each other.
+    static MOVING_YOUNG_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`moving_young_enabled`] for the CURRENT THREAD only.
+///
+/// The optimizing IR tier is gated on `!moving_young_enabled()` (IR publishes
+/// no exact-RBP/safepoint map, so it must stay off while the young generation
+/// can relocate). That makes every IR-routing test depend on a *deployment*
+/// flag rather than on what it actually exercises — and when
+/// `DEFAULT_MOVING_YOUNG` flipped to `true` those tests began asserting against
+/// a pipeline that can no longer run, failing with a bare `left: 0, right: 1`.
+/// Tests that mean "exercise the IR pipeline" call this to say so explicitly.
+///
+/// This does NOT change what production does: nothing calls it outside tests,
+/// and the process flag remains the default on every thread.
+pub fn set_moving_young_override(value: Option<bool>) {
+    MOVING_YOUNG_OVERRIDE.with(|c| c.set(value));
+}
+
 pub fn moving_young_enabled() -> bool {
+    if let Some(forced) = MOVING_YOUNG_OVERRIDE.with(|c| c.get()) {
+        return forced;
+    }
     cratonvm_types::flags().gc.moving_young
 }
 
@@ -43456,6 +43490,10 @@ mod tests {
     /// is sufficient to prove the per-clone path runs.
     #[test]
     fn test_unroll_mints_per_clone_pic_slots() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        super::set_moving_young_override(Some(false));
         // Not OnceLock-cached (see `direct_jit_callee_calls_enabled`), so
         // setting it here is observed immediately; no other jit test asserts
         // on invoke-info/PIC/MIC-slot counts, so this is safe under parallel
