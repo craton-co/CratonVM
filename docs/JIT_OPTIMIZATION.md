@@ -318,9 +318,12 @@ today.*
 
 A Java Virtual Machine written entirely in Rust:
 
-- **~1,290,000 lines** of Rust code (project-wide, across the 20 workspace
-  member crates, measured 2026-07-25; the JIT alone is now ~116,600 lines
-  across `jit/src`, `jit/tests`, and `vm/src/jit` — see above)
+- **~1,350,000 lines** of Rust code (project-wide, across the 22 workspace
+  member crates, measured 2026-07-30 — every `.rs` file under the members
+  listed in the root `Cargo.toml`, excluding `target/`, excluding the
+  non-member `fuzz/` workspace, and excluding vendored code under any
+  `vendor/` directory; the JIT alone is now ~131,600 lines across `jit/src`,
+  `jit/tests`, and `vm/src/jit` — see above)
 - Large Rust/Java test corpus with clippy and formatting tracked as release gates
 - **~3,100+ native method** registrations (java.lang, java.util, java.io, java.time, ...)
 - Full interpreter with 140+ fast-path bytecodes
@@ -832,8 +835,8 @@ String access/search, Arrays, CRC32).
 
 | Metric | Value |
 |--------|-------|
-| Total Rust LoC | **~1,290,000** (20 workspace members, measured 2026-07-25) |
-| JIT LoC (jit crate + vm/src/jit) | **~116,600** (`jit/src` 88,720 + `jit/tests` 8,447 + `vm/src/jit` 19,448) |
+| Total Rust LoC | **~1,350,000** (22 workspace members, measured 2026-07-30; `.rs` files under the root `Cargo.toml` members, excluding `target/`, the non-member `fuzz/` workspace, and any `vendor/` directory — 1,349,978 lines across 702 files) |
+| JIT LoC (jit crate + vm/src/jit) | **~131,600** (`jit/src` 100,391 + `jit/tests` 9,674 + `vm/src/jit` 21,549, measured 2026-07-30) |
 | JIT backends | x86-64 (single-pass + IR-optimizing), AArch64 |
 | JIT bytecodes | ~130 core opcodes + ~40 call-site intrinsics |
 | JIT unit/integration tests | ~hundreds in `x64.rs` + differential/IR-vs-singlepass/intrinsic suites in `jit/tests/` |

@@ -474,10 +474,11 @@ pub struct JvmThread {
     /// the invoke cache repeatedly, and the old guard paid a native-registry hash
     /// lookup for every ancestor on every miss.
     ///
-    /// Keyed by `(receiver_class_id, method_name_hash, descriptor_hash)` and
-    /// bypassed whenever class redefinition is active, because redefine can
-    /// suppress native shadows for woven bytecode.
-    pub native_shadow_cache: FxHashMap<(u32, u64, u64), bool>,
+    /// Keyed by `(receiver_class_id, hierarchy_redefine_fingerprint,
+    /// method_name_hash, descriptor_hash)`. A redefine changes the
+    /// fingerprint of the affected class hierarchy, so those entries
+    /// self-invalidate without disabling this cache process-wide.
+    pub native_shadow_cache: FxHashMap<(u32, u64, u64, u64), bool>,
 
     /// Whether this is a platform or virtual thread (JEP 444, Java 21).
     pub kind: ThreadKind,
@@ -615,7 +616,9 @@ impl JvmThread {
     #[inline]
     pub fn vm_state_diagnostics_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VM_STATE").is_some())
+        *ENABLED.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VM_STATE").is_some()
+        })
     }
 
     /// Publish a short diagnostic state for STW census. No-op unless enabled.
@@ -687,10 +690,7 @@ impl JvmThread {
         }
         let (local_vals, local_tags, stack_vals, stack_tags) = frame.take_pool_parts();
         crate::runtime::frame::offer_frame_parts_to_tls_pool(
-            local_vals,
-            local_tags,
-            stack_vals,
-            stack_tags,
+            local_vals, local_tags, stack_vals, stack_tags,
         );
     }
 

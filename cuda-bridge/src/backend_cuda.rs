@@ -66,6 +66,8 @@ pub(crate) fn probe() -> Result<DeviceCaps> {
     // global memory is queried with `cuDeviceTotalMem` instead. The
     // safe wrapper is `result::device::total_mem`, which takes the raw
     // `CUdevice` handle exposed by `CudaDevice::cu_device()`.
+    // SAFETY: `dev` owns a live device handle for the duration of this
+    // synchronous query.
     let total_mem = unsafe {
         cudarc::driver::result::device::total_mem(*dev.cu_device())
             .map_err(map_err("total memory"))?
@@ -110,11 +112,15 @@ struct StreamBarriers {
 // contract documented on `DeviceContext` (see SOUND-1 in the C32
 // review).
 unsafe impl Send for StreamBarriers {}
+// SAFETY: the same context-binding and Arc lifetime invariant above permits
+// concurrent references; CUDA serializes event operations.
 unsafe impl Sync for StreamBarriers {}
 
 impl Drop for StreamBarriers {
     fn drop(&mut self) {
         let _ = self.dev.bind_to_thread();
+        // SAFETY: both events were created by this context, remain live and
+        // uniquely owned by the dropping barrier after binding the context.
         unsafe {
             let _ = cudarc::driver::result::event::destroy(self.e_h2d);
             let _ = cudarc::driver::result::event::destroy(self.e_k);
@@ -488,6 +494,8 @@ impl DeviceModuleInner {
                     *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(kernel_done.clone());
                 }
             }
+            // SAFETY: the context is bound and owns both the live barrier event
+            // and compute stream for this synchronous submission.
             unsafe {
                 cudarc::driver::result::event::record(ctx.barriers.e_k, ctx.compute.stream)
                     .map_err(map_err("cuEventRecord e_k"))?;
@@ -542,9 +550,11 @@ impl DeviceModuleInner {
         if let Err(bind_err) = ctx.bind_to_thread() {
             return Err(DeviceError::Launch(format!(
                 "kernel completion event recording failed ({err}); bind_to_thread cleanup failed \
-                 ({bind_err})"
+                ({bind_err})"
             )));
         }
+        // SAFETY: `ctx` is now bound on this thread and owns the live compute
+        // stream until this wait returns.
         match unsafe { cudarc::driver::result::stream::synchronize(ctx.compute.stream) } {
             Ok(()) => {
                 for slot in last_write_slots {
@@ -768,6 +778,8 @@ unsafe fn upload_via_copy_h2d_stream<T: bytemuck::Pod + DeviceRepr + Send + Sync
 ) -> Result<CudaSlice<T>> {
     // Allocate uninitialised device storage. cudarc's `alloc` takes
     // `&Arc<CudaDevice>`; it `bind_to_thread`s internally.
+    // SAFETY: T is a valid device representation and the returned slice owns
+    // exactly `host.len()` uninitialized device elements.
     let slice: CudaSlice<T> = unsafe {
         ctx.dev
             .alloc::<T>(host.len())
@@ -776,6 +788,8 @@ unsafe fn upload_via_copy_h2d_stream<T: bytemuck::Pod + DeviceRepr + Send + Sync
     // Submit the H→D copy onto the dedicated upload stream. `device_ptr`
     // on a `&CudaSlice<T>` returns `&CUdeviceptr`; we deref-copy it.
     let dst = *DevicePtr::device_ptr(&slice);
+    // SAFETY: allocation and handles share `ctx`; the caller keeps `host`
+    // alive until the upload stream completes.
     unsafe {
         cudarc::driver::result::memcpy_htod_async(dst, host, ctx.copy_h2d.stream)
             .map_err(map_err("cuMemcpyHtoDAsync copy_h2d"))?;
@@ -818,12 +832,16 @@ unsafe fn upload_on_stream<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static
     upload_stream: cudarc::driver::sys::CUstream,
     last_write_event: cudarc::driver::sys::CUevent,
 ) -> Result<CudaSlice<T>> {
+    // SAFETY: T is a valid device representation and the returned slice owns
+    // exactly `host.len()` uninitialized device elements.
     let slice: CudaSlice<T> = unsafe {
         ctx.dev
             .alloc::<T>(host.len())
             .map_err(map_err("alloc for from_host_async"))?
     };
     let dst = *DevicePtr::device_ptr(&slice);
+    // SAFETY: allocation and handles share a live context; the caller upholds
+    // `host` lifetime through completion of `upload_stream`.
     unsafe {
         cudarc::driver::result::memcpy_htod_async(dst, host, upload_stream)
             .map_err(map_err("cuMemcpyHtoDAsync user_stream"))?;
@@ -914,6 +932,8 @@ impl<
         check_alloc_size::<T>("alloc uninit", len)?;
         // Output buffers are bound to the compute stream — the kernel
         // launch that fills them already runs there.
+        // SAFETY: overflow was rejected and T is a valid device
+        // representation; CudaSlice owns the allocation.
         let slice = unsafe { ctx.dev.alloc::<T>(len).map_err(map_err("alloc uninit"))? };
         Ok(Self {
             slice: Arc::new(slice),
@@ -982,6 +1002,8 @@ impl<
         // contract. Uses `cuStreamSynchronize` rather than
         // `cuCtxSynchronize` so the compute and copy_d2h streams keep
         // running concurrently with whatever the caller does next.
+        // SAFETY: the context is bound and owns the live upload stream; this
+        // wait discharges the borrowed-host lifetime obligation.
         unsafe {
             cudarc::driver::result::stream::synchronize(ctx.copy_h2d.stream)
                 .map_err(map_err("cuStreamSynchronize copy_h2d"))?;
@@ -1083,6 +1105,8 @@ impl<
         // pushes the responsibility onto the caller's stream
         // synchronisation point.
         let src = *DevicePtr::device_ptr(&*self.slice);
+        // SAFETY: dst length matches the device slice; all handles remain live
+        // and the final stream sync completes writes before dst is reused.
         unsafe {
             if let Some(ev) = wait_event {
                 cudarc::driver::result::stream::wait_event(

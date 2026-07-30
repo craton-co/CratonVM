@@ -104,6 +104,8 @@ impl MockNativeContext {
     /// `InputStream` over `bytes`: it fills the caller's array with up to the
     /// requested length and returns the count, then `-1` at exhaustion.
     pub(crate) fn script_input_stream(&mut self, bytes: &[u8]) {
+        // SAFETY: the mock is single-threaded and `&mut self` excludes every
+        // other access to this UnsafeCell for the duration of the borrow.
         let q = unsafe { &mut *self.stream_bytes.get() };
         q.clear();
         q.extend(bytes.iter().copied());
@@ -125,6 +127,8 @@ impl MockNativeContext {
             _ => 0,
         };
         let chunk: Vec<u8> = {
+            // SAFETY: the mock is single-threaded and `&mut self` excludes
+            // concurrent or aliased access to the scripted queue.
             let q = unsafe { &mut *self.stream_bytes.get() };
             let n = want.min(q.len());
             q.drain(..n).collect()
@@ -170,9 +174,13 @@ impl MockNativeContext {
     }
 
     fn strings_mut(&self) -> &mut HashMap<usize, String> {
+        // SAFETY: this test-only context is never shared between threads and
+        // callers do not retain a second reference across another mock call.
         unsafe { &mut *self.strings.get() }
     }
     fn strings_ref(&self) -> &HashMap<usize, String> {
+        // SAFETY: same single-threaded mock invariant as `strings_mut`; no
+        // mutable borrow is live while this shared reference is used.
         unsafe { &*self.strings.get() }
     }
 
@@ -187,21 +195,28 @@ impl MockNativeContext {
     }
 
     fn heap_mut(&self) -> &mut Vec<HeapEntry> {
+        // SAFETY: test-only single-threaded mock; helper borrows are scoped to
+        // one call and never overlap.
         unsafe { &mut *self.heap.get() }
     }
     fn heap_ref(&self) -> &Vec<HeapEntry> {
+        // SAFETY: no mutable heap helper borrow is live at this call site.
         unsafe { &*self.heap.get() }
     }
     fn ptr_map_mut(&self) -> &mut HashMap<usize, usize> {
+        // SAFETY: test-only single-threaded mock; helper borrows never overlap.
         unsafe { &mut *self.ptr_to_index.get() }
     }
     fn ptr_map_ref(&self) -> &HashMap<usize, usize> {
+        // SAFETY: no mutable pointer-map helper borrow is live here.
         unsafe { &*self.ptr_to_index.get() }
     }
     fn named_fields_mut(&self) -> &mut HashMap<(usize, String), Value> {
+        // SAFETY: test-only single-threaded mock; helper borrows never overlap.
         unsafe { &mut *self.named_fields.get() }
     }
     fn named_fields_ref(&self) -> &HashMap<(usize, String), Value> {
+        // SAFETY: no mutable named-field helper borrow is live here.
         unsafe { &*self.named_fields.get() }
     }
 
@@ -211,6 +226,8 @@ impl MockNativeContext {
         let ptr = self.next_ptr;
         self.next_ptr += 8;
         self.ptr_map_mut().insert(ptr, idx);
+        // SAFETY: the mock assigns unique, non-null, aligned sentinel
+        // addresses and records each one in ptr_to_index before exposure.
         unsafe { ObjectRef::from_raw(ptr as *mut u8) }
     }
 
@@ -244,11 +261,15 @@ impl MockNativeContext {
     }
 
     pub(crate) fn recorded_calls(&self) -> &[InvokeCall] {
+        // SAFETY: the test-only mock is single-threaded and no writer borrow is
+        // alive while a test observes this returned slice.
         unsafe { &*self.calls.get() }
     }
 
     pub(crate) fn field_read_count(&self, obj: ObjectRef, index: usize) -> usize {
         let ptr = obj.as_ptr() as usize;
+        // SAFETY: the mock is single-threaded and no mutable field-read borrow
+        // overlaps this read-only inspection.
         unsafe { &*self.field_reads.get() }
             .iter()
             .filter(|(read_obj, read_index)| *read_obj == ptr && *read_index == index)
@@ -417,6 +438,8 @@ impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
         args: &[Value],
     ) -> MethodCallResult {
         // Record the call so tests can assert on it.
+        // SAFETY: NativeContext invocation takes `&mut self`; no other call can
+        // access the test-only call log concurrently or retain its borrow.
         let calls = unsafe { &mut *self.calls.get() };
         calls.push(InvokeCall {
             declared_class: None,
@@ -447,6 +470,8 @@ impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+        // SAFETY: as in `invoke_virtual`, `&mut self` provides exclusive
+        // access to the test-only call log.
         let calls = unsafe { &mut *self.calls.get() };
         calls.push(InvokeCall {
             declared_class: Some(declared_class.to_string()),
@@ -497,6 +522,8 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         }
     }
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+        // SAFETY: the test context is single-threaded; this short mutation of
+        // the instrumentation log cannot overlap another borrow.
         unsafe { &mut *self.field_reads.get() }.push((obj.as_ptr() as usize, index));
         match &self.heap_ref()[self.entry_index(obj)] {
             HeapEntry::Object { fields } => fields.get(index).copied().unwrap_or(Value::Int(0)),
@@ -721,6 +748,8 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
         if addr <= 0 {
             return false;
         }
+        // SAFETY: this test helper is called only with a live native allocation
+        // spanning `out.len()` bytes; slices guarantee a valid destination.
         unsafe {
             std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
         }
@@ -733,6 +762,8 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
         if addr <= 0 {
             return false;
         }
+        // SAFETY: this test helper is called only with a live writable native
+        // allocation spanning `data.len()` bytes; the source slice is valid.
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
         }

@@ -261,6 +261,8 @@ mod imp_windows {
         // failure to its asynchronous caller.
         let mut err: i32 = 0;
         let mut len: i32 = std::mem::size_of::<i32>() as i32;
+        // SAFETY: `s` is borrowed from the live TcpStream and the output
+        // pointers name writable i32 storage of the advertised length.
         let rc = unsafe {
             getsockopt(
                 s,
@@ -271,6 +273,7 @@ mod imp_windows {
             )
         };
         if rc != 0 {
+            // SAFETY: WSAGetLastError has no pointer arguments or preconditions.
             return ConnectPoll::Failed(std::io::Error::from_raw_os_error(unsafe {
                 WSAGetLastError()
             }));
