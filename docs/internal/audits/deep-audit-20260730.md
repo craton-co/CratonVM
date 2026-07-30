@@ -37,14 +37,27 @@ an `IncompatibleClassChangeError`, never a silent substitution). All three
 that needs the Azure host, and the Spring bug list records the outstanding
 evidence rather than claiming closure.
 
-**P0 — Redefinition caching.** The process-wide `any_class_redefined()` flag is
-now only a cheap negative fast path; positive decisions are scoped to an exact
-class or receiver hierarchy (`vm/src/runtime/redefine_state.rs`). The JIT
-dispatch caches, the Integer/Object/HashMap native caches, the subtype cache,
-the lambda caches and the deopt-resume stash all key off the exact class instead
-of quiescing globally. `VtableManager::install_vtable` now refreshes inherited
-entries in already-linked subclasses on reinstall, which is what previously
-forced method resolution and quickening back onto the per-call path.
+**P0 — Redefinition caching. Landed, and measured as insufficient.** The
+process-wide `any_class_redefined()` flag is now only a cheap negative fast
+path; positive decisions are scoped to an exact class or receiver hierarchy
+(`vm/src/runtime/redefine_state.rs`). The JIT dispatch caches, the
+Integer/Object/HashMap native caches, the subtype cache, the lambda caches and
+the deopt-resume stash all key off the exact class instead of quiescing
+globally. `VtableManager::install_vtable` refreshes inherited entries in
+already-linked subclasses on reinstall.
+
+Then the audit's own acceptance criterion was run — `SbCostProbe`, the 90-second
+reproducer from the known-issue doc, on Mockito 5.21 and JDK 25:
+
+| | before mock | after mock | multiplier |
+|---|--:|--:|--:|
+| HotSpot 25 | 2 ns/call | 50 ns/call | 25× |
+| CratonVM | 1,822 ns/call | 245,653 ns/call | 134× |
+
+The multiplier improved from the original 451×, so the gate narrowing does
+something real. The bug is not closed: 245 µs against HotSpot's 50 ns is ~4,900×.
+The known-issue doc stays OPEN and now records that "the caches were keyed too
+coarsely" is not the whole story.
 
 **P0 — Default synthetic runtime surface.** Real ForkJoinPool and real
 `java.net` sockets are now the default, with `CRATONVM_SYNTHETIC_FORKJOINPOOL` /
