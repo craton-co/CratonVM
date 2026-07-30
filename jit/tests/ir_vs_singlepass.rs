@@ -56,6 +56,12 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         0
     }
     let s = stub as *const () as usize;
+    // `set_throw_bci` only records the throwing bci in a thread-local; the
+    // backend calls it on the throw path of EVERY method that has an exception
+    // check, so reaching it is normal rather than a sign of missing wiring.
+    // Give it a real no-op instead of the panicking stub.
+    unsafe extern "C" fn record_throw_bci(_bci: i64) {}
+    let throw_bci = record_throw_bci as *const () as usize;
     JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
@@ -114,10 +120,11 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         region_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
         native_stack_floor_fn: native_stack_floor as *const () as usize,
         ldc_string: s,
-        // Wired to the same trap stub as every other call target in this
-        // table: both are reached through emit_call_absolute, so a 0 here
-        // is a null CALL (SIGSEGV), not an inert "unwired" sentinel.
-        set_throw_bci: s,
+        // Reached through emit_call_absolute, so a 0 here is a null CALL
+        // (SIGSEGV), not an inert "unwired" sentinel. `service_callee_deopt`
+        // keeps the trap stub -- reaching it means a deopt these tests do not
+        // model -- while `set_throw_bci` gets a real no-op recorder.
+        set_throw_bci: throw_bci,
         service_callee_deopt: s,
         ..Default::default()
     }

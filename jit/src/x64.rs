@@ -15385,6 +15385,20 @@ impl Compiler {
         // staged ABI arg registers). Done last in the prologue, after params are
         // saved to their homes, so `get_current_thread` (caller-saved clobbers)
         // can't lose an argument. RAX holds the returned thread pointer.
+        // Initialise the cached-thread slot whenever it EXISTS, independently of
+        // whether `get_current_thread` is wired. Both consumers -- the safepoint
+        // push in `emit_shadow_push_for_safepoint` and the epilogue savetop
+        // restore -- gate only on `shadow_enabled && shadow_thread_slot_off != 0`
+        // and rely on the slot READING NULL to skip themselves. Folding this
+        // zeroing into the `get_current_thread != 0` arm broke that invariant:
+        // with the helper unwired the slot kept whatever stack garbage occupied
+        // the frame, the push's null test passed, and it stored a live oop
+        // through a wild pointer (SIGSEGV at `mov %rax,0(%r11)`). Production
+        // always wires the helper, so this was latent there.
+        if self.shadow_enabled && self.shadow_thread_slot_off != 0 {
+            self.emit_xor_reg_self(RAX); // RAX = 0
+            self.emit_store_local(self.shadow_thread_slot_off, RAX);
+        }
         if self.shadow_enabled
             && self.helpers.get_current_thread != 0
             && self.shadow_thread_slot_off != 0
@@ -15402,8 +15416,6 @@ impl Compiler {
             // skip safely. `get_current_thread` is a caller-saved clobber but
             // we are still in the prologue (params already homed), so this is a
             // register-safe place to keep the actual fetch.
-            self.emit_xor_reg_self(RAX); // RAX = 0
-            self.emit_store_local(self.shadow_thread_slot_off, RAX);
             self.shadow_fetch_start = self.buf.pos();
             self.emit_call_absolute(self.helpers.get_current_thread);
             self.emit_store_local(self.shadow_thread_slot_off, RAX);
@@ -32014,6 +32026,11 @@ mod tests {
             panic!("JIT test helper called an unimplemented runtime stub");
         }
         let sentinel = unimplemented_stub as *const () as usize; // Cast: address arithmetic
+        // `set_throw_bci` only records the throwing bci in a thread-local and is
+        // called on the throw path of every method carrying an exception check,
+        // so it needs a real no-op rather than the panicking stub.
+        unsafe extern "C" fn record_throw_bci(_bci: i64) {}
+        let throw_bci = record_throw_bci as *const () as usize; // Cast: address arithmetic
         JitRuntimeHelpers {
             newarray: sentinel,
             new_object: sentinel,
@@ -32064,7 +32081,7 @@ mod tests {
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
             throw_exception: sentinel,
-            set_throw_bci: sentinel,
+            set_throw_bci: throw_bci,
             service_callee_deopt: sentinel,
             jit_npe_with_action: sentinel,
             dispatch_threw: sentinel,
