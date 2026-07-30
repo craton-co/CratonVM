@@ -11012,6 +11012,33 @@ fn hsqldb_jit_deny_matches_slash_and_dot_names() {
 }
 #[cfg(test)]
 mod tests {
+    /// Poll `cond` until it holds, for up to ~1s.
+    ///
+    /// Several globals these tests observe are *eventually* consistent, not
+    /// immediately so, and cargo runs this binary's tests on a thread pool, so
+    /// a single sample races every other test in the process:
+    ///
+    ///  * `jit_code_region_covering` is a `try_lock` and returns
+    ///    `JitRegionLookup::Locked` — a documented, legitimate answer — while
+    ///    any other thread is registering or unregistering a buffer.
+    ///  * `defer_jit_owner` does NOT drop a superseded artifact while
+    ///    `ACTIVE_JIT_EXECUTIONS != 0`; it queues it. So a body whose last
+    ///    owner this test released stays alive until whichever unrelated test
+    ///    is currently executing JIT code returns.
+    ///
+    /// Both resolve on their own, so retry rather than serialising the suite.
+    /// This does NOT paper over a wrong answer: a condition that is genuinely
+    /// false stays false for the whole window and still fails the assertion.
+    fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cond()
+    }
+
     use super::*;
 
     #[test]
@@ -12995,14 +13022,23 @@ mod tests {
     fn live_code_region_covers_a_buffer_the_name_registry_never_saw() {
         let buf = ExecutableBuffer::new(4096).expect("alloc failed");
         let base = buf.as_ptr() as usize;
-        assert!(matches!(
-            jit_code_region_covering(base),
-            JitRegionLookup::Found(b, cap) if b == base && cap == 4096
-        ));
-        assert!(matches!(
-            jit_code_region_covering(base + 4095),
-            JitRegionLookup::Found(..)
-        ));
+        // `Locked` is a legitimate answer from this `try_lock` accessor, not a
+        // miss — retry past any concurrent registration rather than reading it
+        // as "the region is absent".
+        assert!(
+            eventually(|| matches!(
+                jit_code_region_covering(base),
+                JitRegionLookup::Found(b, cap) if b == base && cap == 4096
+            )),
+            "the live buffer must be covered at its base"
+        );
+        assert!(
+            eventually(|| matches!(
+                jit_code_region_covering(base + 4095),
+                JitRegionLookup::Found(..)
+            )),
+            "the live buffer must be covered at its last byte"
+        );
         // One past the end is outside THIS buffer. Phrased as "not this base"
         // rather than "NotFound" because a concurrently-created buffer may
         // legitimately be mapped immediately after it.
@@ -13011,10 +13047,13 @@ mod tests {
             JitRegionLookup::Found(b, _) if b == base
         ));
         drop(buf);
-        assert!(!matches!(
-            jit_code_region_covering(base),
-            JitRegionLookup::Found(b, _) if b == base
-        ));
+        assert!(
+            eventually(|| !matches!(
+                jit_code_region_covering(base),
+                JitRegionLookup::Found(b, _) if b == base
+            )),
+            "dropping the buffer must unregister its region"
+        );
     }
 
     #[test]
@@ -13580,7 +13619,7 @@ mod tests {
         );
         drop(old);
         assert!(
-            lookup_jit_code_range(old_entry).is_none(),
+            eventually(|| lookup_jit_code_range(old_entry).is_none()),
             "the replaced artifact must unregister after its last Arc is released"
         );
         if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
@@ -13689,7 +13728,7 @@ mod tests {
 
         assert!(cache.get(&class, &method, &desc, cid).is_none());
         assert!(
-            lookup_jit_code_range(entry).is_none(),
+            eventually(|| lookup_jit_code_range(entry).is_none()),
             "removed code must unregister when no caller or reader owns it"
         );
     }
@@ -13746,7 +13785,7 @@ mod tests {
 
         cache.remove(&caller_class, &caller_method, &desc, cid);
         assert!(
-            lookup_jit_code_range(old_entry).is_none(),
+            eventually(|| lookup_jit_code_range(old_entry).is_none()),
             "dropping the final direct caller must reclaim the old body"
         );
     }
@@ -13768,38 +13807,59 @@ mod tests {
     /// callee's page-aligned entry).
     #[test]
     fn a_body_with_an_unpinnable_baked_callee_is_not_published() {
-        let cache = JitCache::new();
-        // An entry no `put` ever registered an owner for, whose buffer is
-        // already gone: exactly what `resolve_jit_entry_owner` cannot pin.
-        let orphan_entry = {
-            let mut buf = ExecutableBuffer::new(64).expect("alloc orphan callee");
-            buf.emit(&[0xC3]);
-            let cm = CompiledMethod::new(buf);
-            let entry = cm.entry_ptr() as usize;
-            drop(cm);
-            entry
-        };
-        assert!(
-            resolve_jit_entry_owner(orphan_entry).is_none(),
-            "test setup: the orphan entry must not resolve to a live owner"
-        );
-
-        let mut caller_buf = ExecutableBuffer::new(64).expect("alloc caller");
-        caller_buf.emit(&[0xC3]);
-        let mut caller = CompiledMethod::new(caller_buf);
-        caller._direct_callee_entries.push(orphan_entry);
-
+        // The scenario needs an entry no `put` ever registered an owner for,
+        // whose buffer is already gone: exactly what `resolve_jit_entry_owner`
+        // cannot pin. That address is recyclable, so a concurrently allocating
+        // test can adopt it at any point -- including between establishing it
+        // and publishing the caller. Retry the whole scenario when that
+        // happens, and tell the two outcomes apart by re-reading ownership at
+        // the assertion: a publish while the orphan is STILL unowned is the
+        // real defect and fails, exactly as it always did.
         let class: Arc<str> = Arc::from("DanglingCaller");
         let method: Arc<str> = Arc::from("call");
         let desc: Arc<str> = Arc::from("()V");
         let cid = cratonvm_types::ClassId::new(4713);
-        cache.put(class.clone(), method.clone(), desc.clone(), cid, caller);
 
-        assert!(
-            cache.get(&class, &method, &desc, cid).is_none(),
-            "a body whose baked `call` target is unowned must not be published; \
-             it stays interpreted and recompiles once the callee is live again"
-        );
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            assert!(
+                attempts < 100,
+                "a concurrently allocating test kept adopting the orphan address"
+            );
+
+            let cache = JitCache::new();
+            let orphan_entry = {
+                let mut buf = ExecutableBuffer::new(64).expect("alloc orphan callee");
+                buf.emit(&[0xC3]);
+                let cm = CompiledMethod::new(buf);
+                let entry = cm.entry_ptr() as usize;
+                drop(cm);
+                entry
+            };
+            if resolve_jit_entry_owner(orphan_entry).is_some() {
+                continue; // adopted before we could use it
+            }
+
+            let mut caller_buf = ExecutableBuffer::new(64).expect("alloc caller");
+            caller_buf.emit(&[0xC3]);
+            let mut caller = CompiledMethod::new(caller_buf);
+            caller._direct_callee_entries.push(orphan_entry);
+            cache.put(class.clone(), method.clone(), desc.clone(), cid, caller);
+
+            if cache.get(&class, &method, &desc, cid).is_none() {
+                break; // the body was refused, which is the invariant
+            }
+
+            // It WAS published. Legitimate only if someone adopted the orphan
+            // between the check above and the `put`, making the callee
+            // genuinely pinnable; otherwise this is the defect.
+            assert!(
+                resolve_jit_entry_owner(orphan_entry).is_some(),
+                "a body whose baked `call` target is unowned must not be published; \
+                 it stays interpreted and recompiles once the callee is live again"
+            );
+        }
     }
 
     /// An inline cache that publishes a compiled entry MUST retain the
@@ -13826,10 +13886,16 @@ mod tests {
             cid,
             CompiledMethod::new(buf),
         );
-        let entry = cache
+        let published = cache
             .get(&class, &method, &desc, cid)
-            .expect("target published")
-            .entry_ptr() as usize;
+            .expect("target published");
+        let entry = published.entry_ptr() as usize;
+        // Identity, not address: once this artifact is unmapped its address can
+        // be handed straight back to a concurrently-allocating test, and
+        // `resolve_jit_entry_owner` would then correctly report SOMEONE at
+        // `entry`. A `Weak` to our own body cannot be confused that way.
+        let artifact = Arc::downgrade(&published);
+        drop(published);
 
         let slot = JitMICSlot::new();
         slot.update(cid.as_u32(), &class, entry as u64, false);
@@ -13854,7 +13920,7 @@ mod tests {
 
         slot.clear_compiled_entry();
         assert!(
-            resolve_jit_entry_owner(entry).is_none(),
+            eventually(|| artifact.strong_count() == 0),
             "clearing the last holder must release the artifact"
         );
     }
@@ -14319,14 +14385,12 @@ mod tests {
         // The cache held the last strong reference, so eviction must have run
         // `CompiledMethod::drop` — which unmaps the code and unregisters the
         // range — for both bodies.
-        assert_eq!(
-            weak_a.strong_count(),
-            0,
+        assert!(
+            eventually(|| weak_a.strong_count() == 0),
             "clear_all must release the last owner of body A"
         );
-        assert_eq!(
-            weak_b.strong_count(),
-            0,
+        assert!(
+            eventually(|| weak_b.strong_count() == 0),
             "clear_all must release the last owner of body B"
         );
         // And no code range still binds our entry addresses to OUR bodies. A
@@ -14404,9 +14468,8 @@ mod tests {
         // Every body lost its last owner, so `CompiledMethod::drop` ran for all
         // eight — unmapping the code and returning `committed_by_test` bytes.
         for (i, weak) in bodies.iter().enumerate() {
-            assert_eq!(
-                weak.strong_count(),
-                0,
+            assert!(
+                eventually(|| weak.strong_count() == 0),
                 "clear_all must return body m{i}'s executable mapping"
             );
         }
@@ -15633,12 +15696,18 @@ mod tests {
 
     #[test]
     fn code_cache_committed_counter_tracks_buffer_allocation() {
-        let before = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        // A before/after DELTA is not a sound observable here: the counter is
+        // process-global and every other test that drops an `ExecutableBuffer`
+        // decrements it, so `after` can legitimately sit below `before + 4096`.
+        // What does hold at every instant is that the ledger is exact — `new`
+        // adds `capacity`, `Drop` subtracts it — so while our buffer is live
+        // the total cannot be below our own contribution. Same reasoning as
+        // `test_clear_all_releases_committed_executable_bytes`.
         let buf = ExecutableBuffer::new(4096).expect("alloc failed");
         let after = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
-            after >= before + 4096,
-            "committed counter must rise by at least the requested capacity"
+            after >= 4096,
+            "committed ledger {after} is below this test's own live mapping (4096 bytes)"
         );
         // Drop now returns the executable mapping. Exact post-drop accounting
         // is covered by the reclamation tests because this suite runs other
