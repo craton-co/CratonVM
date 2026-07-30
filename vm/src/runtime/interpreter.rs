@@ -21509,6 +21509,83 @@ fn refresh_stale_object_args(shared: &SharedVm, args: &mut [Value]) {
     }
 }
 
+/// Keeps interpreter invoke arguments live while the slow dispatcher resolves
+/// classes, checks bridges, and may re-enter Java before it builds the callee
+/// frame.
+///
+/// `execute_invoke_kind` pops its arguments into a Rust `Vec<Value>`. That Vec
+/// is not part of the Java root set. A moving collection during the relatively
+/// long slow-dispatch path therefore updates the object everywhere except in
+/// `args`; the later method lookup sees the zeroed from-space header and can
+/// mis-dispatch `Map.get` as `Object.get`. Pin each non-null object in the
+/// thread's collector-scanned native roots and copy the forwarded values back
+/// at every boundary where the dispatcher consumes the Vec again.
+///
+/// The guard uses a raw thread pointer solely so it does not hold a Rust borrow
+/// across the dispatcher. Its lifetime is lexical inside `execute_invoke_kind`,
+/// and Drop restores the exact pin watermark on every return/error path.
+struct InvokeArgsRootGuard {
+    thread: *mut JvmThread,
+    pin_base: usize,
+    object_count: usize,
+}
+
+impl InvokeArgsRootGuard {
+    fn new(thread: &mut JvmThread, args: &[Value]) -> Self {
+        let pin_base = thread.native_pin_roots.len();
+        for value in args {
+            if let Value::Object(Some(obj)) = value {
+                thread.native_pin_roots.push(*obj);
+            }
+        }
+        Self {
+            thread: thread as *mut JvmThread,
+            pin_base,
+            object_count: thread.native_pin_roots.len() - pin_base,
+        }
+    }
+
+    fn refresh(&self, args: &mut [Value]) {
+        // SAFETY: the guard is scoped to the active interpreter invocation;
+        // `thread` remains alive and exclusively owned by that invocation.
+        let thread = unsafe { &*self.thread };
+        let mut pin = self.pin_base;
+        for value in args {
+            if matches!(value, Value::Object(Some(_))) {
+                *value = Value::Object(Some(thread.native_pin_roots[pin]));
+                pin += 1;
+            }
+        }
+        debug_assert_eq!(pin, self.pin_base + self.object_count);
+    }
+
+    fn replace_object_arg(&self, args: &[Value], index: usize, obj: ObjectRef) {
+        let ordinal = args[..=index]
+            .iter()
+            .filter(|value| matches!(value, Value::Object(Some(_))))
+            .count()
+            .checked_sub(1)
+            .expect("replacement invoke argument must already be a non-null object");
+        // SAFETY: same lexical-lifetime argument as `refresh`; the computed
+        // slot belongs to this guard's contiguous pin range.
+        unsafe {
+            let thread = &mut *self.thread;
+            thread.native_pin_roots[self.pin_base + ordinal] = obj;
+        }
+    }
+}
+
+impl Drop for InvokeArgsRootGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `refresh`; nested native calls restore their own later
+        // watermarks before control returns here.
+        unsafe {
+            let thread = &mut *self.thread;
+            thread.native_pin_roots.truncate(self.pin_base);
+        }
+    }
+}
+
 /// Pop `invokevirtual` / `invokespecial` / `invokeinterface` arguments from
 /// the operand stack (slow-path order) and apply `coerce_invoke_arg_for_descriptor`
 /// so cached fast paths match `execute_invoke`.
@@ -22026,6 +22103,7 @@ fn execute_invoke_kind(
             *obj = shared.mem.heap.load_and_forward(*obj);
         }
     }
+    let args_root_guard = InvokeArgsRootGuard::new(thread, &args);
     if crate::runtime::env_cache::dbg_loader_trace()
         && method_class_name.contains("RootReference")
         && method_name.as_ref() == "tryUpdate"
@@ -22276,6 +22354,7 @@ fn execute_invoke_kind(
             None
         };
         if let Some(live) = recovered {
+            args_root_guard.replace_object_arg(&args, 0, live);
             args[0] = Value::Object(Some(live));
         }
     }
@@ -23629,6 +23708,9 @@ fn execute_invoke_kind(
             method_owner_name, method_name, method_descriptor, is_special, invoke_class, invoke_class_resolved, receiver_class_id, recv_loader, current_class_id, cur_loader, dispatch_override
         );
     }
+    // Class/interface resolution above may have triggered a moving collection
+    // while `args` lived only in its Rust Vec. Re-read the remapped pin slots.
+    args_root_guard.refresh(&mut args);
     // Try stackless frame push for bytecode methods (avoids Rust stack recursion)
     // For virtual/special calls, do NOT walk the native hierarchy — subclass
     // bytecode overrides must take priority over parent native overrides.
@@ -23645,6 +23727,7 @@ fn execute_invoke_kind(
         dispatch_override,
     )? {
         CachedCallResult::FramePushed => {
+            args_root_guard.refresh(&mut args);
             if is_special || private_virtual_target.is_some() {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
             } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
@@ -23662,6 +23745,7 @@ fn execute_invoke_kind(
             return Ok(CachedCallResult::FramePushed);
         }
         CachedCallResult::Handled => {
+            args_root_guard.refresh(&mut args);
             if is_special || private_virtual_target.is_some() {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
             } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
@@ -23679,6 +23763,7 @@ fn execute_invoke_kind(
             return Ok(CachedCallResult::Handled);
         }
         CachedCallResult::CacheMiss => {
+            args_root_guard.refresh(&mut args);
             // Exotic case — fall through to recursive dispatch
         }
     }
@@ -45780,6 +45865,49 @@ mod wave1_adoption_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invoke_args_root_guard_refreshes_forwarded_pins_and_restores_watermark() {
+        // The guard never dereferences these values; aligned sentinel addresses
+        // are sufficient to model a collector rewriting native pin slots.
+        let obj = |addr: usize| unsafe { ObjectRef::from_raw(addr as *mut u8) };
+        let existing = obj(0x1000);
+        let old_a = obj(0x2000);
+        let old_b = obj(0x3000);
+        let new_a = obj(0x4000);
+        let new_b = obj(0x5000);
+
+        let mut thread = JvmThread::default();
+        thread.native_pin_roots.push(existing);
+        let mut args = [
+            Value::Object(Some(old_a)),
+            Value::Int(7),
+            Value::Object(None),
+            Value::Object(Some(old_b)),
+        ];
+
+        {
+            let guard = InvokeArgsRootGuard::new(&mut thread, &args);
+            assert_eq!(thread.native_pin_roots, vec![existing, old_a, old_b]);
+
+            // Model a moving collector's in-place root rewrite.
+            thread.native_pin_roots[1] = new_a;
+            thread.native_pin_roots[2] = new_b;
+            guard.refresh(&mut args);
+
+            assert!(matches!(args[0], Value::Object(Some(o)) if o == new_a));
+            assert!(matches!(args[1], Value::Int(7)));
+            assert!(matches!(args[2], Value::Object(None)));
+            assert!(matches!(args[3], Value::Object(Some(o)) if o == new_b));
+
+            let replacement = obj(0x6000);
+            guard.replace_object_arg(&args, 0, replacement);
+            guard.refresh(&mut args);
+            assert!(matches!(args[0], Value::Object(Some(o)) if o == replacement));
+        }
+
+        assert_eq!(thread.native_pin_roots, vec![existing]);
+    }
 
     #[test]
     fn class_array_reflection_uses_class_id_backed_natives() {

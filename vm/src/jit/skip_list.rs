@@ -2227,47 +2227,6 @@ fn should_skip_jit_internal(
         // docs/internal. The residual it hands off to is
         // `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
 
-        // SPB.8c (Session 113 r2) — companion blanket ban for the WildFly
-        // security-manager package (`org/wildfly/`). The
-        // `CRATONVM_DBG_JIT_DISPATCH=1` capture shows the very last JIT
-        // dispatches before the SIGSEGV are
-        // `org/wildfly/security/manager/WildFlySecurityManager.<init>` and
-        // `WildFlySecurityManager$2.run`, plus
-        // `GetAccessibleDeclaredFieldAction.run` and
-        // `ReadPropertyAction.run`, immediately followed by a
-        // `java/lang/reflect/AccessibleObject.setAccessible0(Z)Z` chain
-        // that culminates in `java/lang/Long.parseLong(String,int)` being
-        // dispatched with a corrupted reference arg0
-        // (`0xfffd_<heap-ptr>`). The 16-bit-tag corruption at offset 48
-        // is the same JIT codegen archetype that bites
-        // `Integer.valueOf` / `String.toLowerCase` — the JIT promotes
-        // `ReadPropertyAction.run` and miscompiles the field load that
-        // returns the property value, OR-ing the high tag bits into the
-        // String reference before it is forwarded to `Long.parseLong`.
-        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/wildfly/`.
-        // WildFly 39 / session-15 progression: boot now advances past the
-        // `org/wildfly/` ban and the same rc=139 SIGSEGV surfaces in the
-        // JBoss MSC service container (`ServiceName.equals`) plus the
-        // JBoss Logging facade (`JDKLogger.<init>` / `LoggerProvider.getLogger`
-        // were dispatched ~200x in the trace immediately before the crash).
-        // Both `org/jboss/msc/` and `org/jboss/logging/` are extended below
-        // with the same SPB.8 archetype reasoning.
-        // SPB.8c's org/wildfly/, org/jboss/msc/, org/jboss/logging/ guards are active.
-        if class_name.starts_with("org/wildfly/")
-            && !package_allowed("org/wildfly/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("org/jboss/msc/")
-            && !package_allowed("org/jboss/msc/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("org/jboss/logging/")
-            && !package_allowed("org/jboss/logging/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
 
         // SPB.9 -- `org/slf4j/` and `ch/qos/logback/` REMOVED 2026-07-26.
         // Originally (Session 114) banned as a blanket trio (with

@@ -3833,6 +3833,59 @@ fn pin_native_object_values(thread: &mut JvmThread, values: &[Value]) -> Vec<Opt
     handles
 }
 
+/// Keeps the argument vector of a recursive VM dispatch rooted until the
+/// dispatch either reaches a scanned Java frame or returns to its caller.
+///
+/// Unlike `safe_native_call`, class/method resolution happens before a native
+/// or bytecode target is known. It can re-enter Java and collect while its
+/// `Vec<Value>` argument copy is otherwise invisible to the collector. The
+/// guard pins every object entry and can restore the collector-forwarded value
+/// before the terminal receiver-based retry.
+struct PinnedDispatchArgs {
+    thread: *mut JvmThread,
+    pin_base: usize,
+    handles: Vec<Option<usize>>,
+}
+
+impl PinnedDispatchArgs {
+    fn new(thread: &mut JvmThread, values: &[Value]) -> Self {
+        let pin_base = thread.native_pin_roots.len();
+        let handles = pin_native_object_values(thread, values);
+        Self {
+            thread: thread as *mut JvmThread,
+            pin_base,
+            handles,
+        }
+    }
+
+    fn refresh(&self, values: &mut [Value]) {
+        // SAFETY: the guard is lexically scoped to its dispatch invocation;
+        // the owning JvmThread outlives it and remains exclusively driven by
+        // that invocation between stop-the-world collections.
+        let thread = unsafe { &*self.thread };
+        for (value, handle) in values.iter_mut().zip(&self.handles) {
+            if matches!(&*value, Value::Object(Some(_))) {
+                if let Some(handle) = handle {
+                    if let Some(forwarded) = thread.native_pin_roots.get(*handle).copied() {
+                        *value = Value::Object(Some(forwarded));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PinnedDispatchArgs {
+    fn drop(&mut self) {
+        // SAFETY: see `refresh`; all nested pin scopes have returned before
+        // this lexical owner is dropped.
+        unsafe {
+            let thread = &mut *self.thread;
+            thread.native_pin_roots.truncate(self.pin_base);
+        }
+    }
+}
+
 fn reread_native_object_values(
     thread: &JvmThread,
     values: &[Value],
@@ -7421,6 +7474,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     // -- Heap access methods --
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
         // T10.9.E вЂ” descriptor-aware read path. Resolve (and cache) the
         // declared field descriptor for the receiver's class and route
         // the slot decode through `get_field_as`, so a long-typed field
@@ -7436,6 +7490,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
         // DIAGNOSTIC-ONLY (cce0079 tree-key tail): decisive probe - capture
         // the minor-GC epoch at entry and compare at exit. A delta proves a
         // GC completed INSIDE a plain ref store (and names the stack);
@@ -7549,6 +7604,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
         let class_id = self.shared.mem.heap.class_id_of(obj);
         let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
@@ -7560,6 +7616,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
         let class_id = self.shared.mem.heap.class_id_of(obj);
         let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
@@ -7664,6 +7721,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     #[track_caller]
     fn array_length(&self, obj: ObjectRef) -> usize {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
         let kind = self.shared.mem.heap.kind_of(obj);
         if kind != ObjectKind::Array {
             // Only emit the (noisy) diagnostic when explicitly requested — the
@@ -7705,6 +7763,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
         self.shared
             .mem
             .heap
@@ -7713,10 +7772,12 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn object_is_array(&self, obj: ObjectRef) -> bool {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
         self.shared.mem.heap.kind_of(obj) == ObjectKind::Array
     }
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
         let _ = self.shared.mem.heap.set_array_element(obj, index, value);
         // write_barrier fires automatically inside set_array_element for ref arrays
     }
@@ -8460,6 +8521,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
         // T10.9.E вЂ” descriptor-aware volatile read.
         let class_id = self.shared.mem.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
@@ -8469,6 +8531,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
         if crate::runtime::env_cache::dbg_loader_trace() {
             if let Value::Object(Some(o)) = value {
                 let new_cid = self.shared.mem.heap.class_id_of(o);
@@ -16517,6 +16580,9 @@ fn invoke_on_class_shared_inner(
     args: &[Value],
     no_retarget: bool,
 ) -> MethodCallResult {
+    let mut rooted_args = args.to_vec();
+    let args_roots = PinnedDispatchArgs::new(thread, &rooted_args);
+    let args = &mut rooted_args;
     dbg_dispatch_tally("invoke_on_class_shared_inner", "", method_name, descriptor);
     if method_name != "<init>" && method_name != "<clinit>" {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
@@ -20470,6 +20536,26 @@ fn invoke_on_class_shared_inner(
                 } else {
                     ""
                 };
+                // A VM-dispatch lookup can allocate/re-enter before it proves
+                // its target. If that moved the receiver, retry against the
+                // collector-forwarded runtime class rather than turning a
+                // stale `Map` into `Object.get` at this terminal miss.
+                args_roots.refresh(args);
+                if !no_retarget && method_name != "<init>" && method_name != "<clinit>" {
+                    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                        let refreshed_cid = shared.mem.heap.class_id_of(recv);
+                        if refreshed_cid != class_id && refreshed_cid != ClassId::new(0) {
+                            return invoke_on_class_shared_no_retarget(
+                                shared,
+                                thread,
+                                refreshed_cid,
+                                method_name,
+                                descriptor,
+                                args,
+                            );
+                        }
+                    }
+                }
                 tracing::warn!(
                     method = format!("{class_name}.{method_name}{descriptor}{stub_hint}"),
                     caller = thread

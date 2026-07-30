@@ -4486,16 +4486,25 @@ fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             return Ok(Some(Value::Int(0)));
         }
         let ea = collection_elements_generic(ctx, this);
+        let (ea_pin, ea_handles) = pin_value_slice(ctx, &ea);
         let eb = collection_elements_generic(ctx, other);
-        if ea.len() != eb.len() {
-            return Ok(Some(Value::Int(0)));
-        }
-        for (va, vb) in ea.iter().zip(eb.iter()) {
-            if !values_equal_deep(ctx, va, vb)? {
-                return Ok(Some(Value::Int(0)));
+        let (eb_pin, eb_handles) = pin_value_slice(ctx, &eb);
+        let pin_base = if ea_pin == usize::MAX { eb_pin } else { ea_pin };
+        let equal: Result<bool, MethodCallFailed> = (|| {
+            if ea.len() != eb.len() {
+                return Ok(false);
             }
-        }
-        return Ok(Some(Value::Int(1)));
+            for i in 0..ea.len() {
+                let va = read_pinned_elem(ctx, ea_handles[i], ea[i]);
+                let vb = read_pinned_elem(ctx, eb_handles[i], eb[i]);
+                if !values_equal_deep(ctx, &va, &vb)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        ctx.unpin_native_roots(pin_base);
+        return Ok(Some(Value::Int(if equal? { 1 } else { 0 })));
     }
     if size_a != size_b {
         return Ok(Some(Value::Int(0)));
@@ -4503,14 +4512,22 @@ fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let size = size_a as usize;
     match (data_a, data_b) {
         (Some(da), Some(db)) => {
-            for i in 0..size {
-                let va = ctx.get_array_element(da, i);
-                let vb = ctx.get_array_element(db, i);
-                if !values_equal_deep(ctx, &va, &vb)? {
-                    return Ok(Some(Value::Int(0)));
+            let da_pin = ctx.pin_native_root(da);
+            let db_pin = ctx.pin_native_root(db);
+            let equal: Result<bool, MethodCallFailed> = (|| {
+                for i in 0..size {
+                    let da = ctx.read_native_pin(da_pin, da);
+                    let va = ctx.get_array_element(da, i);
+                    let db = ctx.read_native_pin(db_pin, db);
+                    let vb = ctx.get_array_element(db, i);
+                    if !values_equal_deep(ctx, &va, &vb)? {
+                        return Ok(false);
+                    }
                 }
-            }
-            Ok(Some(Value::Int(1)))
+                Ok(true)
+            })();
+            ctx.unpin_native_roots(da_pin);
+            Ok(Some(Value::Int(if equal? { 1 } else { 0 })))
         }
         (None, None) => Ok(Some(Value::Int(1))),
         _ => Ok(Some(Value::Int(0))),
@@ -7979,14 +7996,19 @@ fn native_map_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Int(0))),
     };
     let entries = map_collect_entries(ctx, this);
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (pin_base, handles) = pin_value_slice(ctx, &flat);
     let mut hash: i32 = 0;
-    for (key, value) in &entries {
+    for i in 0..entries.len() {
+        let key = read_pinned_elem(ctx, handles[2 * i], flat[2 * i]);
         // Map.hashCode contract: sum of Map.Entry hashes,
         // where Entry hash = keyHash ^ valueHash.
-        let kh = element_hash_code(ctx, key);
-        let vh = element_hash_code(ctx, value);
+        let kh = element_hash_code(ctx, &key);
+        let value = read_pinned_elem(ctx, handles[2 * i + 1], flat[2 * i + 1]);
+        let vh = element_hash_code(ctx, &value);
         hash = hash.wrapping_add(kh ^ vh);
     }
+    ctx.unpin_native_roots(pin_base);
     Ok(Some(Value::Int(hash)))
 }
 
@@ -8035,42 +8057,39 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // resolve to whatever natives or bytecode `other`'s real class provides,
     // restoring `AbstractMap.equals` semantics for cross-implementation
     // comparisons.
-    let size_a = hm_int_fast_len(ctx, this)
-        .map(|size| size as i32)
-        .unwrap_or_else(|| map_state(ctx, this).1);
-    let size_b = match ctx.invoke_virtual(other, "size", "()I", &[])? {
-        Some(Value::Int(s)) => s,
-        // Defensive: a Map whose `size()` did not yield an int — fall back to
-        // the native-layout read rather than mis-comparing.
-        _ => {
-            let (_, s, _) = map_state(ctx, other);
-            s
+    let this_pin = ctx.pin_native_root(this);
+    let other_pin = ctx.pin_native_root(other);
+    let result = (|| {
+        let this = ctx.read_native_pin(this_pin, this);
+        let other = ctx.read_native_pin(other_pin, other);
+        let size_a = hm_int_fast_len(ctx, this)
+            .map(|size| size as i32)
+            .unwrap_or_else(|| map_state(ctx, this).1);
+        let size_b = match ctx.invoke_virtual(other, "size", "()I", &[])? {
+            Some(Value::Int(s)) => s,
+            _ => {
+                let other = ctx.read_native_pin(other_pin, other);
+                let (_, s, _) = map_state(ctx, other);
+                s
+            }
+        };
+        if size_a != size_b {
+            return Ok(Some(Value::Int(0)));
         }
-    };
-    if size_a != size_b {
-        return Ok(Some(Value::Int(0)));
-    }
-    // Check that every entry in `this` is present-and-equal in `other`.
-    //
-    // `AbstractMap.equals` wraps the per-entry comparison loop in
-    // `try { ... } catch (ClassCastException | NullPointerException) { return
-    // false; }`: if a key/value lookup or a value's own `equals` throws one of
-    // those (e.g. a value whose `equals` dereferences a null field — Hibernate's
-    // `DynamicFetchBuilderLegacy.equals` does exactly this for cache-key copies
-    // with a null `lockMode`), the JDK treats the maps as unequal rather than
-    // letting the exception escape. CratonVM's native `Map.equals` previously
-    // let the `?` propagate that exception, so e.g. the query-plan cache GET
-    // aborted with an NPE instead of recording a clean miss (SQLTest 3/38). Run
-    // the loop in a helper and restore the catch-and-return-false semantics.
-    match map_equals_entries(ctx, this, other) {
-        Ok(equal) => Ok(Some(Value::Int(if equal { 1 } else { 0 }))),
-        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
-            if exc_is_cce_or_npe(ctx, exc) =>
-        {
-            Ok(Some(Value::Int(0)))
+        let this = ctx.read_native_pin(this_pin, this);
+        let other = ctx.read_native_pin(other_pin, other);
+        match map_equals_entries(ctx, this, other) {
+            Ok(equal) => Ok(Some(Value::Int(if equal { 1 } else { 0 }))),
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+                if exc_is_cce_or_npe(ctx, exc) =>
+            {
+                Ok(Some(Value::Int(0)))
+            }
+            Err(e) => Err(e),
         }
-        Err(e) => Err(e),
-    }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 /// Returns `true` iff `exc` is a `ClassCastException` or `NullPointerException`
@@ -8099,49 +8118,52 @@ fn map_equals_entries(
     other: ObjectRef,
 ) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
     let entries = map_collect_entries(ctx, this);
-    for (key, value) in &entries {
-        let other_val = ctx
-            .invoke_virtual(
-                other,
-                "get",
-                "(Ljava/lang/Object;)Ljava/lang/Object;",
-                &[*key],
-            )?
-            .unwrap_or(Value::Object(None));
-        match value {
-            Value::Object(None) => {
-                if !matches!(other_val, Value::Object(None)) {
-                    return Ok(false);
-                }
-                let has =
-                    ctx.invoke_virtual(other, "containsKey", "(Ljava/lang/Object;)Z", &[*key])?;
-                if !matches!(has, Some(Value::Int(1))) {
-                    return Ok(false);
-                }
-            }
-            _ => {
-                // Compare values per the `Map.equals` contract: `v.equals(ov)`.
-                // For two object values this must dispatch the value's Java
-                // `equals(Object)` — `values_equal` only knows identity, String
-                // contents and enum identity, so it wrongly reported unequal for
-                // List/bean/etc. values (e.g. two maps whose values are equal
-                // `List`s compared `false`). `map_keys_equal` already honours
-                // the contract (it falls back to the Java `equals`), so reuse it
-                // for object/object pairs and keep `values_equal` for the
-                // primitive / null / mixed cases.
-                let eq = match (value, &other_val) {
-                    (Value::Object(Some(va)), Value::Object(Some(vb))) => {
-                        map_keys_equal(ctx, *va, *vb)?
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (entries_pin, handles) = pin_value_slice(ctx, &flat);
+    let other_pin = ctx.pin_native_root(other);
+    let result = (|| {
+        for i in 0..entries.len() {
+            let key = read_pinned_elem(ctx, handles[2 * i], flat[2 * i]);
+            let other = ctx.read_native_pin(other_pin, other);
+            let other_val = ctx
+                .invoke_virtual(
+                    other,
+                    "get",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[key],
+                )?
+                .unwrap_or(Value::Object(None));
+            let value = read_pinned_elem(ctx, handles[2 * i + 1], flat[2 * i + 1]);
+            match &value {
+                Value::Object(None) => {
+                    if !matches!(other_val, Value::Object(None)) {
+                        return Ok(false);
                     }
-                    _ => values_equal(ctx, value, &other_val),
-                };
-                if !eq {
-                    return Ok(false);
+                    let other = ctx.read_native_pin(other_pin, other);
+                    let key = read_pinned_elem(ctx, handles[2 * i], flat[2 * i]);
+                    let has =
+                        ctx.invoke_virtual(other, "containsKey", "(Ljava/lang/Object;)Z", &[key])?;
+                    if !matches!(has, Some(Value::Int(1))) {
+                        return Ok(false);
+                    }
+                }
+                _ => {
+                    let eq = match (&value, &other_val) {
+                        (Value::Object(Some(va)), Value::Object(Some(vb))) => {
+                            map_keys_equal(ctx, *va, *vb)?
+                        }
+                        _ => values_equal(ctx, &value, &other_val),
+                    };
+                    if !eq {
+                        return Ok(false);
+                    }
                 }
             }
         }
-    }
-    Ok(true)
+        Ok(true)
+    })();
+    ctx.unpin_native_roots(entries_pin);
+    result
 }
 
 // ===========================================================================
@@ -9545,11 +9567,14 @@ fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(m) => map_collect_keys(ctx, m),
         None => collect_collection_elements_or_real(ctx, this),
     };
+    let (pin_base, handles) = pin_value_slice(ctx, &keys);
     let mut h: i32 = 0;
-    for k in &keys {
+    for i in 0..keys.len() {
+        let k = read_pinned_elem(ctx, handles[i], keys[i]);
         // Set.hashCode contract: sum of element hashCode()s (0 for null).
-        h = h.wrapping_add(element_hash_code(ctx, k));
+        h = h.wrapping_add(element_hash_code(ctx, &k));
     }
+    ctx.unpin_native_roots(pin_base);
     Ok(Some(Value::Int(h)))
 }
 
@@ -9578,25 +9603,40 @@ fn native_hs_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     if !obj_is_instance_of(ctx, other, "java/util/Set") {
         return Ok(Some(Value::Int(0)));
     }
-    let backing = match hs_backing_map(ctx, this) {
-        Some(m) => m,
-        None => return Ok(Some(Value::Int(0))),
-    };
-    let other_size = match ctx.invoke_virtual(other, "size", "()I", &[])? {
-        Some(Value::Int(n)) => n,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let keys = map_collect_keys(ctx, backing);
-    if keys.len() as i32 != other_size {
-        return Ok(Some(Value::Int(0)));
-    }
-    for k in &keys {
-        let contains = ctx.invoke_virtual(other, "contains", "(Ljava/lang/Object;)Z", &[*k])?;
-        if !matches!(contains, Some(Value::Int(1))) {
-            return Ok(Some(Value::Int(0)));
-        }
-    }
-    Ok(Some(Value::Int(1)))
+    let this_pin = ctx.pin_native_root(this);
+    let other_pin = ctx.pin_native_root(other);
+    let result = (|| {
+        let other = ctx.read_native_pin(other_pin, other);
+        let other_size = match ctx.invoke_virtual(other, "size", "()I", &[])? {
+            Some(Value::Int(n)) => n,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let this = ctx.read_native_pin(this_pin, this);
+        let backing = match hs_backing_map(ctx, this) {
+            Some(m) => m,
+            None => return Ok(Some(Value::Int(0))),
+        };
+        let keys = map_collect_keys(ctx, backing);
+        let (keys_pin, handles) = pin_value_slice(ctx, &keys);
+        let contains_result: Result<bool, MethodCallFailed> = (|| {
+            if keys.len() as i32 != other_size {
+                return Ok(false);
+            }
+            for i in 0..keys.len() {
+                let other = ctx.read_native_pin(other_pin, other);
+                let key = read_pinned_elem(ctx, handles[i], keys[i]);
+                let contains = ctx.invoke_virtual(other, "contains", "(Ljava/lang/Object;)Z", &[key])?;
+                if !matches!(contains, Some(Value::Int(1))) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        ctx.unpin_native_roots(keys_pin);
+        Ok(Some(Value::Int(if contains_result? { 1 } else { 0 })))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 /// LETSGO_S1: HashSet.containsAll(Collection<?>) — true iff every element
@@ -10112,6 +10152,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let keys_arr_pin = ctx.pin_native_root(keys_arr);
     let backing = ctx.read_native_pin(backing_pin, backing);
     let keys = collect_view_snapshot_ordered(ctx, backing);
+    let (_, key_handles) = pin_value_slice(ctx, &keys);
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
     let total = std::cmp::min(len, keys.len());
     if dbg_hs_itr() {
@@ -10121,7 +10162,8 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         );
     }
     for (i, k) in keys.iter().enumerate().take(total) {
-        ctx.set_array_element(keys_arr, i, *k);
+        let k = read_pinned_elem(ctx, key_handles[i], *k);
+        ctx.set_array_element(keys_arr, i, k);
     }
     let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS);
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
@@ -39921,8 +39963,11 @@ fn alloc_unmod_wrapper(
     class_name: &str,
     backing: ObjectRef,
 ) -> ObjectRef {
+    let backing_pin = ctx.pin_native_root(backing);
     let wrapper = alloc_synthetic(ctx, class_name, 2);
+    let backing = ctx.read_native_pin(backing_pin, backing);
     ctx.set_field(wrapper, UNMOD_FIELD_BACKING, Value::Object(Some(backing)));
+    ctx.unpin_native_roots(backing_pin);
     wrapper
 }
 
