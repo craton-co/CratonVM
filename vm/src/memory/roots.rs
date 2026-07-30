@@ -236,17 +236,13 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      a live (`Some`) slot is a GC root exactly like a pin. A `None`
     //      hole is an already-released slot and contributes nothing.
     //
-    //      NOTE (integration gap, out of scope for this change): a moving
-    //      collection must ALSO rewrite these slots in place after
-    //      relocating an object, mirroring the `native_pin_roots` remap
-    //      loop in `vm::memory::gc::update_all_roots`
-    //      (vm/src/memory/gc.rs, right after that function's own
-    //      `native_pin_roots` block) — that companion remap has NOT been
-    //      added yet. Until it lands, a handle survives a NON-moving
-    //      collection correctly (this scan keeps the slot's object alive)
-    //      but is NOT yet immune to going stale across a MOVING collection,
-    //      same residual risk `native_pin_roots` would have without its own
-    //      remap loop. See docs/feature-designs/native-handle-discipline.md.
+    //      Moving-GC remap is paired across all ownership paths: the current
+    //      collector in `memory::gc::update_all_roots`, a safepoint peer in
+    //      `interpreter::apply_pointer_map_to_thread`, and a native-blocked
+    //      peer in `NativeContextImpl::check_post_block_gc_refs`. The leaked-
+    //      blocked-region fallback (`apply_pending_blocked_fixups`) consumes
+    //      the same fixup chain and remaps them too. Both snapshot-producing
+    //      peer paths publish these slots in their deposited root snapshots.
     for slot in &thread.handle_slots {
         if let Some(obj_ref) = slot {
             roots.push(*obj_ref);

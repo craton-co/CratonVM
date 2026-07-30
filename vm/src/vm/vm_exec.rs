@@ -1407,6 +1407,11 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
+        // The ordinary blocked-wake path remaps handle slots directly, but a
+        // leaked blocked region is repaired here from the same composed fixup
+        // chain. Keep the fallback complete as well: otherwise a handle-only
+        // owner can resume from its next safepoint with the pre-move address.
+        crate::memory::gc::remap_handle_slots(&mut thread.handle_slots, &fixup);
         for (_key_id, key_ref, val) in &mut thread.scoped_values {
             if let Some(obj_ref) = key_ref {
                 let old_addr = obj_ref.as_ptr() as usize;
@@ -2743,6 +2748,10 @@ impl<'a> NativeContextImpl<'a> {
             );
         }
         snapshot.extend(self.thread.native_pin_roots.iter().copied());
+        // Handle scopes are collector-visible per-thread roots too. A blocked
+        // native thread is represented only by this snapshot, so omitting them
+        // lets a peer collection reclaim or relocate the handled object.
+        snapshot.extend(self.thread.handle_slots.iter().flatten().copied());
         snapshot.extend(self.thread.native_alloc_pool.iter().copied());
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
@@ -3071,6 +3080,9 @@ impl<'a> NativeContextImpl<'a> {
                     *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                 }
             }
+            // The fixup advances the snapshot keys while this thread sleeps;
+            // write those forwarded addresses back into the owning handle table.
+            crate::memory::gc::remap_handle_slots(&mut self.thread.handle_slots, &fixup);
             for obj_ref in &mut self.thread.native_alloc_pool {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = fixup.get(&old_addr) {
@@ -21739,6 +21751,27 @@ mod tests {
                 .iter()
                 .any(|root| root.as_ptr() == returned.as_ptr()),
             "the next safepoint must publish the pending native return"
+        );
+    }
+
+    #[test]
+    fn leaked_blocked_fixup_remaps_live_native_handle_slots() {
+        let shared = test_shared();
+        let mut thread = JvmThread::new(ThreadId(0), "handle-fixup-test");
+        let before = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let after = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        thread.handle_slots.push(Some(before));
+        thread
+            .gc_block_state
+            .fixup
+            .lock()
+            .insert(before.as_ptr() as usize, after.as_ptr() as usize);
+
+        assert_eq!(apply_pending_blocked_fixups(&shared, &mut thread), 1);
+        assert_eq!(
+            thread.handle_slots,
+            vec![Some(after)],
+            "safepoint repair must rewrite handle slots when blocked wake was skipped"
         );
     }
 
