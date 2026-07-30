@@ -3243,14 +3243,24 @@ fn antlr_parser_remove_all_configs_not_in_rule_stop_state(
     }
     let names = antlr_names_for_object(ctx, configs);
     let full_ctx = antlr_atn_config_set_full_ctx(ctx, configs);
+    // GC-SAFETY: `configs` is a bare argument and everything below allocates —
+    // the result set, the per-config adds, the epsilon lookups. Root it, then
+    // read each config out of it by index on every pass (see `antlr_config_at`)
+    // rather than snapshotting the set into a Rust `Vec`.
+    let configs_pin = ctx.pin_native_root(configs);
     let result = antlr_new_atn_config_set(ctx, names, full_ctx)?;
     let result_pin = ctx.pin_native_root(result);
     let merge_cache = antlr_parser_merge_cache(ctx, simulator);
 
-    // Whole-vector rooting: the body allocates (config-set adds, epsilon
-    // lookups), so per-iteration pinning would capture already-moved configs.
-    for (config, config_pin) in antlr_pin_config_vec(ctx, configs) {
-        let config = ctx.read_native_pin(config_pin, config);
+    let configs_len = {
+        let configs = ctx.read_native_pin(configs_pin, configs);
+        antlr_atn_config_set_len(ctx, configs)
+    };
+    for config_index in 0..configs_len {
+        let configs = ctx.read_native_pin(configs_pin, configs);
+        let Some(config) = antlr_config_at(ctx, configs, config_index) else {
+            continue;
+        };
         let state = antlr_ref_field(ctx, config, "state", 0);
         if state
             .map(|state| antlr_state_is_rule_stop(ctx, state))
@@ -3271,6 +3281,11 @@ fn antlr_parser_remove_all_configs_not_in_rule_stop_state(
                     if let Some(stop_state) =
                         antlr_parser_rule_stop_state_for(ctx, simulator, state)
                     {
+                        // `config` predates the two calls above; re-read it.
+                        let configs = ctx.read_native_pin(configs_pin, configs);
+                        let Some(config) = antlr_config_at(ctx, configs, config_index) else {
+                            continue;
+                        };
                         let next_config = antlr_alloc_atn_config(
                             ctx,
                             names,
@@ -3282,13 +3297,10 @@ fn antlr_parser_remove_all_configs_not_in_rule_stop_state(
                 }
             }
         }
-        // NB: no per-iteration unpin — `unpin_native_roots` TRUNCATES, so
-        // releasing this config's handle would also drop every later config's.
-        // The batch is released by `result_pin` below, which sits underneath.
     }
 
     let result = ctx.read_native_pin(result_pin, result);
-    ctx.unpin_native_roots(result_pin);
+    ctx.unpin_native_roots(configs_pin);
     Ok(result)
 }
 
@@ -3313,22 +3325,27 @@ fn native_antlr_parser_compute_reach_set(
     let intermediate_pin = ctx.pin_native_root(intermediate);
     let mut skipped_stop_states: Vec<(ObjectRef, usize)> = Vec::new();
 
-    let closure_set = ctx.read_native_pin(closure_pin, closure_set);
-    // GC-SAFETY: `antlr_atn_config_set_config_vec` snapshots the ENTIRE set
-    // into a Rust `Vec` before the loop body runs, and the body allocates on
-    // every iteration. Pinning a config at the top of its own iteration is too
-    // late — by then earlier iterations have relocated it, so the pin captures
-    // a dead address. Root the whole vector up front and read each entry back
-    // through its own handle.
-    let pinned_configs = antlr_pin_config_vec(ctx, closure_set);
-    for (config, config_pin) in pinned_configs {
-        let config = ctx.read_native_pin(config_pin, config);
+    // GC-SAFETY: iterate by index out of the pinned set rather than out of a
+    // Rust snapshot — see `antlr_config_at`. The body allocates every
+    // iteration, so a snapshot's not-yet-visited entries would be dead by the
+    // time the loop reached them.
+    let closure_len = {
+        let closure_set = ctx.read_native_pin(closure_pin, closure_set);
+        antlr_atn_config_set_len(ctx, closure_set)
+    };
+    for config_index in 0..closure_len {
+        let closure_set = ctx.read_native_pin(closure_pin, closure_set);
+        let Some(config) = antlr_config_at(ctx, closure_set, config_index) else {
+            continue;
+        };
         let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
             continue;
         };
 
         if antlr_state_is_rule_stop(ctx, state) {
             if full_ctx || token == -1 {
+                // These outlive the loop, so they DO need a lasting root.
+                let config_pin = ctx.pin_native_root(config);
                 skipped_stop_states.push((config, config_pin));
             }
             continue;
@@ -3342,8 +3359,13 @@ fn native_antlr_parser_compute_reach_set(
             _ => 0,
         };
         for transition_index in 0..transition_count {
-            // Matching a previous edge can allocate.  Reacquire the state
-            // from the pinned config before indexing `transitions` again.
+            // Everything below allocates, so re-read the config from the
+            // (rooted) set and the state from the refreshed config on every
+            // pass instead of carrying either across the iteration.
+            let closure_set = ctx.read_native_pin(closure_pin, closure_set);
+            let Some(config) = antlr_config_at(ctx, closure_set, config_index) else {
+                continue;
+            };
             let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
                 continue;
             };
@@ -3383,11 +3405,14 @@ fn native_antlr_parser_compute_reach_set(
         let closure_busy_pin = ctx.pin_native_root(closure_busy);
         let treat_eof_as_epsilon = token == -1;
         let intermediate = ctx.read_native_pin(intermediate_pin, intermediate);
-        // Same whole-vector rooting as the first loop: the closure call below
-        // allocates, so every not-yet-visited config must already be rooted.
-        let pinned_intermediate = antlr_pin_config_vec(ctx, intermediate);
-        for (config, config_pin) in pinned_intermediate {
-            let config = ctx.read_native_pin(config_pin, config);
+        // Index-based for the same reason as the first loop: the closure call
+        // below allocates, so a Rust snapshot's later entries would be dead.
+        let intermediate_len = antlr_atn_config_set_len(ctx, intermediate);
+        for config_index in 0..intermediate_len {
+            let intermediate = ctx.read_native_pin(intermediate_pin, intermediate);
+            let Some(config) = antlr_config_at(ctx, intermediate, config_index) else {
+                continue;
+            };
             let reach_set = ctx.read_native_pin(reach_pin, reach_set);
             let closure_busy = ctx.read_native_pin(closure_busy_pin, closure_busy);
             this = ctx.read_native_pin(base_pin, this);
@@ -4590,27 +4615,46 @@ fn antlr_atn_config_set_config_vec(ctx: &mut dyn NativeContext, set: ObjectRef) 
     result
 }
 
-/// Snapshot an `ATNConfigSet`'s configs AND root every one of them, returning
-/// `(config, pin_handle)` pairs.
+/// Number of configs currently in an `ATNConfigSet`. Pairs with
+/// [`antlr_config_at`] for GC-safe index-based iteration.
+fn antlr_atn_config_set_len(ctx: &mut dyn NativeContext, set: ObjectRef) -> usize {
+    let Some(configs) = antlr_ref_field(ctx, set, "configs", 2) else {
+        return 0;
+    };
+    let Some(data) = antlr_arraylist_data(ctx, configs) else {
+        return 0;
+    };
+    std::cmp::min(antlr_arraylist_size(ctx, configs), ctx.array_length(data))
+}
+
+/// Read config `index` straight out of a **currently rooted** `ATNConfigSet`.
 ///
-/// [`antlr_atn_config_set_config_vec`] alone is unsafe to iterate whenever the
-/// loop body allocates: the whole set is copied into a Rust `Vec` up front, so
-/// configs the loop has not reached yet are unrooted while earlier iterations
-/// run the collector. Pinning inside the loop body cannot fix that — by then
-/// the address is already dead. Callers must read each config back through its
-/// handle, and release the LOWEST handle once (the pin stack is truncating, so
-/// that drops the whole batch).
-fn antlr_pin_config_vec(
+/// This is the GC-safe way to iterate a config set whose loop body allocates.
+/// [`antlr_atn_config_set_config_vec`] copies the whole set into a Rust `Vec`
+/// first, so configs the loop has not reached yet are unrooted while earlier
+/// iterations run the collector — and pinning one inside its own iteration is
+/// too late, because the address is already dead by then. Rooting the entire
+/// batch up front fixes the staleness but makes every config of every set a GC
+/// root for the whole walk, which inflates the live set on exactly the
+/// allocation-heavy path that provoked the problem.
+///
+/// Re-reading from the (pinned) set each iteration is both correct and O(1) in
+/// roots: the caller keeps only the set rooted, and the element it is about to
+/// use. `set` MUST have been refreshed through its own pin by the caller first.
+fn antlr_config_at(
     ctx: &mut dyn NativeContext,
     set: ObjectRef,
-) -> Vec<(ObjectRef, usize)> {
-    antlr_atn_config_set_config_vec(ctx, set)
-        .into_iter()
-        .map(|config| {
-            let pin = ctx.pin_native_root(config);
-            (config, pin)
-        })
-        .collect()
+    index: usize,
+) -> Option<ObjectRef> {
+    let configs = antlr_ref_field(ctx, set, "configs", 2)?;
+    let data = antlr_arraylist_data(ctx, configs)?;
+    if index >= ctx.array_length(data) {
+        return None;
+    }
+    match ctx.get_array_element(data, index) {
+        Value::Object(Some(config)) => Some(config),
+        _ => None,
+    }
 }
 
 fn antlr_contexts_equal_opt(
