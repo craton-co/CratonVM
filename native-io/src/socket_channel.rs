@@ -174,20 +174,32 @@ pub enum SelectorConnectProbe {
 /// a `Stream` entry counts as `Ready` (an immediate/loopback connect already
 /// promoted it). Everything else is `NotConnecting`.
 pub fn probe_connect_status(net_fd: i32) -> SelectorConnectProbe {
-    let map = tcp_registry().read();
-    match map.get(&net_fd) {
-        Some(TcpHandle::Connecting(s)) => match crate::nb_connect::poll(s) {
-            crate::nb_connect::ConnectPoll::Pending => SelectorConnectProbe::Pending,
-            // Both success and failure must surface OP_CONNECT so the reactor
-            // calls finishConnect(), which reads SO_ERROR and reports the
-            // outcome (a ConnectException on failure) rather than hanging.
-            crate::nb_connect::ConnectPoll::Connected
-            | crate::nb_connect::ConnectPoll::Failed(_) => SelectorConnectProbe::Ready,
-        },
-        Some(TcpHandle::ConnectFailed(_, _)) => SelectorConnectProbe::Ready,
-        Some(TcpHandle::Stream(_)) => SelectorConnectProbe::Ready,
-        _ => SelectorConnectProbe::NotConnecting,
+    let failed = {
+        let map = tcp_registry().read();
+        match map.get(&net_fd) {
+            Some(TcpHandle::Connecting(s)) => match crate::nb_connect::poll(s) {
+                crate::nb_connect::ConnectPoll::Pending => return SelectorConnectProbe::Pending,
+                crate::nb_connect::ConnectPoll::Connected => return SelectorConnectProbe::Ready,
+                // `SO_ERROR` is consumptive on Windows. Preserve its first
+                // failure below so the reactor's subsequent finishConnect()
+                // sees the same ConnectException instead of a false success.
+                crate::nb_connect::ConnectPoll::Failed(e) => Some(e),
+            },
+            Some(TcpHandle::ConnectFailed(_, _)) | Some(TcpHandle::Stream(_)) => {
+                return SelectorConnectProbe::Ready;
+            }
+            _ => return SelectorConnectProbe::NotConnecting,
+        }
+    };
+
+    if let Some(error) = failed {
+        let saved = std::io::Error::new(error.kind(), error.to_string());
+        let mut map = tcp_registry().write();
+        if let Some(TcpHandle::Connecting(stream)) = map.remove(&net_fd) {
+            map.insert(net_fd, TcpHandle::ConnectFailed(stream, saved));
+        }
     }
+    SelectorConnectProbe::Ready
 }
 
 /// Per-fd non-blocking flag. The OS state on the real socket mirrors this.
@@ -516,6 +528,8 @@ fn seed_channel_interruptor(ctx: &mut dyn NativeContext, ch: ObjectRef) -> Objec
 ///   field 6 = remote port (i32, 0=unset)
 ///   field 7 = protocol family (0=INET/INET6, 1=UNIX)
 ///   field 8 = Unix-domain socket path (String or null; both ends' address)
+///   field 9 = input shutdown (1=shut down, 0=open)
+///   field 10 = output shutdown (1=shut down, 0=open)
 const F_OPEN: usize = 0;
 const F_BLOCKING: usize = 1;
 const F_REG_ID: usize = 2;
@@ -525,7 +539,9 @@ const F_REMOTE: usize = 5;
 const F_REMOTE_PORT: usize = 6;
 const F_FAMILY: usize = 7;
 const F_UDS_PATH: usize = 8;
-const N_FIELDS: usize = 9;
+const F_INPUT_SHUTDOWN: usize = 9;
+const F_OUTPUT_SHUTDOWN: usize = 10;
+const N_FIELDS: usize = 11;
 
 /// `F_FAMILY` value for a `StandardProtocolFamily.UNIX` channel.
 const FAMILY_UNIX: i32 = 1;
@@ -1182,17 +1198,43 @@ fn sc_is_connection_pending(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 /// `SocketChannelImpl.isInputOpen()` / `isOutputOpen()` (package-private) —
 /// consulted by sun.nio.ch.SocketAdaptor's input/output streams (the streams
-/// returned by socket().getInputStream()/getOutputStream()). CratonVM does not
-/// track half-close separately, so report open whenever the channel is open and
-/// connected. Without these, SocketAdaptor.getOutputStream NoSuchMethodErrors.
-fn sc_io_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// returned by socket().getInputStream()/getOutputStream()).
+fn sc_io_open(ctx: &mut dyn NativeContext, args: &[Value], shutdown_field: usize) -> MethodCallResult {
     match obj_or_none(args, 0) {
         Some(o) => {
             let open = matches!(cf_get(ctx, o, F_OPEN), Value::Int(1));
-            Ok(Some(Value::Int(if open { 1 } else { 0 })))
+            let shut_down = matches!(cf_get(ctx, o, shutdown_field), Value::Int(1));
+            Ok(Some(Value::Int(if open && !shut_down { 1 } else { 0 })))
         }
         _ => Ok(Some(Value::Int(0))),
     }
+}
+
+/// `SocketChannel.shutdownInput()` / `shutdownOutput()`.
+///
+/// Apache HttpComponents half-closes the request side after it has written an
+/// HTTP request.  The abstract declaration has no Code attribute, so leaving
+/// it unregistered terminates the reactor thread with AbstractMethodError and
+/// strands its CompletableFuture.  Apply the actual TCP half-close and retain
+/// the state for the package-private `is{Input,Output}Open` accessors.
+fn sc_shutdown(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    how: std::net::Shutdown,
+    shutdown_field: usize,
+    operation: &str,
+) -> MethodCallResult {
+    let this = obj_or_none(args, 0).ok_or_else(|| ioex(format!("{operation}: null channel")))?;
+    let id = read_reg_id(ctx, this)
+        .ok_or_else(|| ioex(format!("{operation}: channel not connected")))?;
+    match resolve_stream(id) {
+        StreamTarget::Ready(stream) => stream.shutdown(how).map_err(|e| map_err(operation, e))?,
+        StreamTarget::Connecting => return Err(ioex(format!("{operation}: channel not connected"))),
+        StreamTarget::Failed(error) => return Err(map_err(operation, error)),
+        StreamTarget::Unavailable => return Err(ioex(format!("{operation}: channel is closed"))),
+    }
+    cf_set(ctx, this, shutdown_field, Value::Int(1));
+    Ok(Some(Value::Object(Some(this))))
 }
 
 fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3559,8 +3601,18 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         );
         r.register(c, "finishConnect", "()Z", sc_finish_connect);
         r.register(c, "isConnectionPending", "()Z", sc_is_connection_pending);
-        r.register(c, "isInputOpen", "()Z", sc_io_open);
-        r.register(c, "isOutputOpen", "()Z", sc_io_open);
+        r.register(c, "isInputOpen", "()Z", |ctx, args| {
+            sc_io_open(ctx, args, F_INPUT_SHUTDOWN)
+        });
+        r.register(c, "isOutputOpen", "()Z", |ctx, args| {
+            sc_io_open(ctx, args, F_OUTPUT_SHUTDOWN)
+        });
+        r.register(c, "shutdownInput", "()Ljava/nio/channels/SocketChannel;", |ctx, args| {
+            sc_shutdown(ctx, args, std::net::Shutdown::Read, F_INPUT_SHUTDOWN, "shutdownInput")
+        });
+        r.register(c, "shutdownOutput", "()Ljava/nio/channels/SocketChannel;", |ctx, args| {
+            sc_shutdown(ctx, args, std::net::Shutdown::Write, F_OUTPUT_SHUTDOWN, "shutdownOutput")
+        });
         r.register(c, "read", "(Ljava/nio/ByteBuffer;)I", sc_read);
         r.register(c, "write", "(Ljava/nio/ByteBuffer;)I", sc_write);
         // Vectored (scattering read / gathering write). Abstract on

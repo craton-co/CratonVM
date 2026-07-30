@@ -124,6 +124,17 @@ Row notes:
   The perf gate's anchored baseline is 1,550 ms, reflecting a deliberate
   ~2% correctness hardening (explicit header initialization in the inline
   allocator) accepted after that fix.
+  A 2026-07-30 follow-up (TLAB zero-elision for the fields that don't need
+  it, plus a GC-inert proof for `itemCheck`'s allocation-free self-
+  recursion) cut a further **14.5%** off the wall-time in a clean 10-round
+  interleaved Azure measurement (1,529.5 ms candidate vs 1,789.5 ms
+  `origin/dev`, 177 ms HotSpot — 16.1% HotSpot-gap reduction). An
+  accompanying attempt to also cap the initial young semispace at 512 MiB
+  measured as a **12-13% regression** instead (it multiplied a pre-existing
+  "young GC always falls back to non-moving sweep for this workload" defect
+  by forcing ~6x more young collections) and was reverted. Full measurement
+  history, isolation methodology, and the root-cause writeup are in
+  [`binarytrees-bt18-half-gap-20260730.md`](docs/internal/performance/binarytrees-bt18-half-gap-20260730.md).
 
 ### The performance gate
 
