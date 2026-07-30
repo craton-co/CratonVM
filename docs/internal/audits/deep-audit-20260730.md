@@ -21,7 +21,7 @@ So the audit's recurring complaint — advisory gates, unenforced thresholds,
 claims outrunning evidence — understated the problem. The gates were not merely
 soft; the two hardest ones were already red, which is why everything else could
 drift. Details:
-[`../../known-issues/jit-regressions-hidden-by-unbuildable-test-targets-20260730.md`](../../known-issues/jit-regressions-hidden-by-unbuildable-test-targets-20260730.md).
+[`../jit-regressions-hidden-by-unbuildable-test-targets-20260730.md`](../jit-regressions-hidden-by-unbuildable-test-targets-20260730.md).
 
 ## Critical code and architecture
 
