@@ -34,8 +34,17 @@ run them on every push and pull request:
 3. **Build** — `cargo build --workspace`
 4. **Test** — `cargo test --workspace`
 
-CI runs these on `ubuntu-latest` and `windows-latest`. Coverage and semantic
-difftest jobs are advisory today; Miri is planned but not yet enabled.
+CI runs these on `ubuntu-latest` and `windows-latest`, together with the
+`synthetic-jdk` and `experimental-*` feature gates, the exact synthetic-stub
+ratchet, the Markdown link check, the semantic differential gate, the fuzz build
+smoke, coverage generation, and a Miri job over the core representation crate.
+None of them are `continue-on-error`.
+
+**Step 4 is not green today.** `cargo test --workspace` has a residual failure
+set that predates any given change, tracked in
+[`docs/known-issues/jit-regressions-hidden-by-unbuildable-test-targets-20260730.md`](docs/known-issues/jit-regressions-hidden-by-unbuildable-test-targets-20260730.md).
+Compare your run against that list rather than against zero, and note in the PR
+which entries you saw — a *new* name in the output is the signal.
 
 ### Code Style
 
