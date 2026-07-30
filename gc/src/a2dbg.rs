@@ -38,7 +38,13 @@ static LOG: Mutex<Vec<Rec>> = Mutex::new(Vec::new());
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Record a young allocation's header at write time. No-op unless gated on.
-#[inline]
+///
+/// PERF: the gate is a cached bool, but the seven-argument body kept the
+/// whole thing out of line, so every young allocation paid a call/return pair
+/// to reach a `return` (1.2% of the `CratonBench hashmap` phase as its own
+/// profile symbol). The gate test is now inlined at the call site and the
+/// recording body is `#[cold]`.
+#[inline(always)]
 pub fn record(
     addr: usize,
     class_id: u32,
@@ -51,6 +57,20 @@ pub fn record(
     if !enabled() {
         return;
     }
+    record_armed(addr, class_id, kind, element_type, array_length, num_slots, size);
+}
+
+#[cold]
+#[inline(never)]
+fn record_armed(
+    addr: usize,
+    class_id: u32,
+    kind: u8,
+    element_type: u8,
+    array_length: u32,
+    num_slots: u32,
+    size: usize,
+) {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut l) = LOG.lock() {
         // Bound memory on this contended host: the young gen is tiny, so the
