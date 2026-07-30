@@ -4792,6 +4792,128 @@ const JIT_SUBTYPE_CACHE_CAP: usize = 32;
 /// ladder plus the sites around it.
 const JIT_TYPECHECK_TARGET_CACHE_CAP: usize = 64;
 
+/// Entry cap for [`JIT_TYPECHECK_ANSWER_CACHE`].
+const JIT_TYPECHECK_ANSWER_CACHE_CAP: usize = 16;
+
+thread_local! {
+    /// Whole-answer memo for a *non-array* receiver at one type-check site:
+    /// `(vm, class_name_ptr, class_name_len, obj_class_id)` -> the check
+    /// passed. Move-to-front, so a monomorphic site — the overwhelmingly
+    /// common shape in a compiled loop — is found on the first compare.
+    ///
+    /// This sits in front of everything [`jit_typecheck_resolve`] does, and
+    /// in front of `str::from_utf8` in the callers. A `checkcast
+    /// java/lang/Integer` in a hot loop was paying, per iteration: a UTF-8
+    /// validation of the 17-byte class name, an `ObjectKind` header read, a
+    /// linear scan of the 64-entry [`JIT_TYPECHECK_TARGET_CACHE`], and then
+    /// the identity compare that actually answers it. Together with
+    /// `jit_typecheck_resolve` and `str::from_utf8` that was 4.5% of the
+    /// `CratonBench hashmap` phase.
+    ///
+    /// SOUNDNESS mirrors [`JIT_SUBTYPE_POSITIVE_CACHE`] exactly, and rests on
+    /// the same two facts:
+    ///
+    ///  * Only `true` is memoized. A class's superclass/interface lists are
+    ///    fixed at definition, so once assignability holds for a
+    ///    `(receiver class, target name)` pair it holds for the life of the
+    ///    `SharedVm`. A `false` can be observed while the hierarchy is still
+    ///    being populated — or before the target class is loaded at all — so
+    ///    negatives keep paying the full path.
+    ///  * The cache is bypassed and not written whenever
+    ///    `any_class_redefined()` is set.
+    ///
+    /// Two further conditions are checked by the callers before consulting it:
+    /// the receiver must not be an array (a reference array's header stores
+    /// its *component* class id, so `obj_class_id` does not identify the
+    /// receiver's type — see the array branch of `jit_typecheck_resolve`),
+    /// and `lenient` must match, which it does because only `checkcast`
+    /// (lenient) and `instanceof` (strict) use this and they key on distinct
+    /// call-site name pointers only by accident. To keep that from ever
+    /// mattering, `lenient` is part of the key.
+    static JIT_TYPECHECK_ANSWER_CACHE:
+        std::cell::RefCell<Vec<(usize, usize, usize, u32, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Memo probe for a proven-assignable, non-array receiver at one type-check
+/// site. Move-to-front on hit.
+fn jit_typecheck_answer_cached(key: (usize, usize, usize, u32, bool)) -> bool {
+    JIT_TYPECHECK_ANSWER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        match cache.iter().position(|entry| *entry == key) {
+            Some(0) => true,
+            Some(idx) => {
+                cache.swap(0, idx);
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// Record a proven-assignable answer, evicting the least recently used entry.
+fn jit_typecheck_answer_cache_put(key: (usize, usize, usize, u32, bool)) {
+    JIT_TYPECHECK_ANSWER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.iter().any(|entry| *entry == key) {
+            return;
+        }
+        if cache.len() >= JIT_TYPECHECK_ANSWER_CACHE_CAP {
+            cache.pop();
+        }
+        cache.insert(0, key);
+    });
+}
+
+/// Shared front end for `jit_checkcast` / `jit_instanceof`: answer from
+/// [`JIT_TYPECHECK_ANSWER_CACHE`] when possible, otherwise run the full
+/// [`jit_typecheck_resolve`] and memoize a positive, non-array answer.
+///
+/// # Safety
+/// Same contract as [`jit_typecheck_resolve`]: `obj_ref` must be non-null and
+/// live, and `vm_ptr` must come from JIT code compiled against this live VM.
+unsafe fn jit_typecheck_memoized(
+    vm: &SharedVm,
+    obj_class_id: ClassId,
+    obj_ref: &mut ObjectRef,
+    class_name_ptr: *const u8,
+    class_name_len: usize,
+    lenient: bool,
+) -> Option<bool> {
+    let vm_key = vm as *const SharedVm as usize;
+    let key = (
+        vm_key,
+        class_name_ptr as usize,
+        class_name_len,
+        obj_class_id.as_u32(),
+        lenient,
+    );
+    // An array receiver is excluded from the memo entirely: its header holds
+    // the component class id, which `jit_typecheck_resolve`'s array branch
+    // (the authority for that shape) never consults.
+    let memoizable = !crate::classloading::any_class_redefined()
+        && vm.mem.heap.kind_of(*obj_ref) != cratonvm_types::ObjectKind::Array;
+    if memoizable && jit_typecheck_answer_cached(key) {
+        return Some(true);
+    }
+    // SAFETY: `class_name_ptr` is non-null with `class_name_len > 0` (checked
+    // by both callers); it points into the JIT string table, which outlives
+    // this call.
+    let class_name =
+        std::str::from_utf8(std::slice::from_raw_parts(class_name_ptr, class_name_len)).ok()?;
+    let assignable = jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name, lenient);
+    // Re-test the gates: `jit_typecheck_resolve` can load classes (and so can
+    // flip `any_class_redefined`), and it can move `*obj_ref`.
+    if assignable
+        && memoizable
+        && !crate::classloading::any_class_redefined()
+        && vm.mem.heap.kind_of(*obj_ref) != cratonvm_types::ObjectKind::Array
+    {
+        jit_typecheck_answer_cache_put(key);
+    }
+    Some(assignable)
+}
+
 /// Record `(site key) -> resolved target class id`, evicting the oldest entry
 /// once the cache is full.
 fn jit_typecheck_target_cache_put(cache_key: (usize, usize, usize), target: ClassId) {
@@ -5181,15 +5303,6 @@ pub unsafe extern "C" fn jit_checkcast(
             return 0;
         }
     };
-    // SAFETY: class_name_ptr is non-null (checked above) and class_name_len > 0.
-    // The pointer comes from the JIT string table which outlives this call.
-    let class_name = match std::str::from_utf8(std::slice::from_raw_parts(
-        class_name_ptr,
-        class_name_len as usize,
-    )) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
     let obj_class_id = vm.mem.heap.class_id_of(obj_ref);
     // checkcast: lenient (SBR-03).
     //
@@ -5203,9 +5316,30 @@ pub unsafe extern "C" fn jit_checkcast(
     // exactly what surfaced as `ClassCastException: java.lang.Object cannot
     // be cast to org.jboss.as.controller.AttributeDefinition` (and other
     // targets) during WildFly's concurrent `parallel-extension-add` boot.
-    if jit_typecheck_resolve(vm, obj_class_id, &mut obj_ref, class_name, true) {
+    //
+    // `None` = the site's class name is not valid UTF-8: keep the old
+    // fail-soft `0` the `str::from_utf8` guard used to return here.
+    let Some(assignable) = jit_typecheck_memoized(
+        vm,
+        obj_class_id,
+        &mut obj_ref,
+        class_name_ptr,
+        class_name_len as usize,
+        true,
+    ) else {
+        return 0;
+    };
+    if assignable {
         obj_ref.as_ptr() as i64
     } else {
+        // SAFETY: `class_name_ptr` is non-null with `class_name_len > 0`
+        // (checked above) and points into the JIT string table; validity was
+        // already proven by `jit_typecheck_memoized` returning `Some`.
+        let class_name = std::str::from_utf8(std::slice::from_raw_parts(
+            class_name_ptr,
+            class_name_len as usize,
+        ))
+        .unwrap_or("<invalid-utf8>");
         if cv_trace_enabled() {
             // The receiver's OBJECT KIND disambiguates this failure: for a
             // reference array the header stores the *component* class id, and
@@ -5332,15 +5466,6 @@ pub unsafe extern "C" fn jit_instanceof(
         Some(r) => r,
         None => return 0,
     };
-    // SAFETY: class_name_ptr is non-null (checked above) and class_name_len > 0.
-    // The pointer comes from the JIT string table which outlives this call.
-    let class_name = match std::str::from_utf8(std::slice::from_raw_parts(
-        class_name_ptr,
-        class_name_len as usize,
-    )) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
     let obj_class_id = vm.mem.heap.class_id_of(obj_ref);
     // instanceof: strict (SBR-03). `obj_ref` is passed `&mut` — see the
     // GC-SAFETY comment in `jit_checkcast` — so any GC triggered by
@@ -5348,10 +5473,18 @@ pub unsafe extern "C" fn jit_instanceof(
     // doesn't leave the fallback checks in that function reading through a
     // stale pointer. `instanceof` returns a bool, not a pointer, so there is
     // no analogous stale-return-value fix needed here.
-    if jit_typecheck_resolve(vm, obj_class_id, &mut obj_ref, class_name, false) {
-        1
-    } else {
-        0
+    //
+    // `None` (class name not valid UTF-8) keeps the old fail-soft `0`.
+    match jit_typecheck_memoized(
+        vm,
+        obj_class_id,
+        &mut obj_ref,
+        class_name_ptr,
+        class_name_len as usize,
+        false,
+    ) {
+        Some(true) => 1,
+        _ => 0,
     }
 }
 
@@ -7085,6 +7218,13 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
     if (raw & 0x7) == 0 && raw < (1u64 << 48) {
+        // The arena-membership probe stays. Nothing on this path has read the
+        // receiver's header yet, so this probe is the ONLY thing standing
+        // between a stale/fabricated argument and the `get_field` dereference
+        // below; the alignment and canonical-address tests above reject wild
+        // bit patterns but not a plausible-looking non-object address. It also
+        // costs ~0 here (see the hashmap-half-gap closeout doc: restoring all
+        // three probes measured inside run-to-run noise).
         if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
             return match vm.mem.heap.get_field(object, 0) {
                 Value::Int(value) => value as i64,
@@ -7303,14 +7443,19 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
             if (kraw & 0x7) != 0 || kraw >= (1u64 << 48) {
                 break 'fast;
             }
+            // The key is dereferenced for the first time downstream, by
+            // `unbox_wrapper`'s `class_id_of`. Keep the arena-membership probe:
+            // it is the only check between a stale/fabricated key argument and
+            // that dereference.
             match vm.mem.heap.is_object_address(key as usize) {
                 Some(object) => Value::Object(Some(object)),
                 None => break 'fast,
             }
         };
-        let Some(recv_obj) = vm.mem.heap.is_object_address(receiver as usize) else {
-            break 'fast;
-        };
+        // `jit_hashmap_receiver_is_exact` just read this live receiver's class
+        // header and matched exact `HashMap`, so a second arena membership
+        // probe cannot add safety on this path.
+        let recv_obj = ObjectRef::from_raw(receiver as usize as *mut u8);
         let Some((thread, _guard)) = jit_thread_mut() else {
             break 'fast;
         };
@@ -7489,14 +7634,19 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
             if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
                 break 'fast;
             }
+            // Key and value are dereferenced downstream for the first time
+            // (`unbox_wrapper`'s `class_id_of` on the key, and the value once
+            // it is read back out). Keep the arena-membership probe: it is the
+            // only check between a stale/fabricated argument and that
+            // dereference.
             match vm.mem.heap.is_object_address(raw as usize) {
                 Some(object) => vals[slot] = Value::Object(Some(object)),
                 None => break 'fast,
             }
         }
-        let Some(recv_obj) = vm.mem.heap.is_object_address(receiver as usize) else {
-            break 'fast;
-        };
+        // Exact-class screening above already dereferenced and validated this
+        // live HashMap receiver.
+        let recv_obj = ObjectRef::from_raw(receiver as usize as *mut u8);
         let Some((thread, _guard)) = jit_thread_mut() else {
             break 'fast;
         };
