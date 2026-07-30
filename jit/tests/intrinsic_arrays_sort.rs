@@ -39,6 +39,12 @@ fn stub_helpers() -> JitRuntimeHelpers {
         panic!("ARRAYS_SORT intrinsic test invoked an unwired runtime helper");
     }
     let s = stub as *const () as usize;
+    // `set_throw_bci` only records the throwing bci in a thread-local; the
+    // backend calls it on the throw path of EVERY method that has an exception
+    // check, so reaching it is normal rather than a sign of missing wiring.
+    // Give it a real no-op instead of the panicking stub.
+    unsafe extern "C" fn record_throw_bci(_bci: i64) {}
+    let throw_bci = record_throw_bci as *const () as usize;
     JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
@@ -94,6 +100,13 @@ fn stub_helpers() -> JitRuntimeHelpers {
         region_bounds_addr: 0,
         native_stack_floor_fn: 0,
         ldc_string: s,
+        // Reached through emit_call_absolute, so a 0 here is a null CALL
+        // (SIGSEGV), not an inert "unwired" sentinel. `service_callee_deopt`
+        // keeps the trap stub -- reaching it means a deopt these tests do not
+        // model -- while `set_throw_bci` gets a real no-op recorder.
+        set_throw_bci: throw_bci,
+        service_callee_deopt: s,
+        ..Default::default()
     }
 }
 

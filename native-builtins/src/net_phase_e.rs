@@ -5309,6 +5309,10 @@ const HUC_BODY: usize = 6;
 const HUC_DO_INPUT: usize = 7;
 const HUC_DO_OUTPUT: usize = 8;
 const HUC_CONNECTED: usize = 9;
+// Synthetic JarURLConnection instances reserve the first ten carrier slots
+// for URLConnection state. Keep the connection-owned JarFile immediately
+// after them so repeated getJarFile() calls observe the same close state.
+const HUC_JAR_FILE: usize = 10;
 
 struct HttpResponse {
     status: i32,
@@ -7115,6 +7119,13 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/util/jar/JarFile;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // A JarURLConnection owns one JarFile for its lifetime. In
+            // particular, callers that disable caches close that instance;
+            // a later getJarFile() must return the closed object rather than
+            // silently allocating a fresh archive.
+            if let Value::Object(Some(jar_file)) = ctx.get_field(this, HUC_JAR_FILE) {
+                return Ok(Some(Value::Object(Some(jar_file))));
+            }
             let url_obj = match ctx.get_field(this, HUC_URL) {
                 Value::Object(Some(o)) => o,
                 _ => return Err(ioex("JarURLConnection.getJarFile: no URL")),
@@ -7185,6 +7196,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(jar_file)), Value::Object(Some(path_str))],
             )?;
+            ctx.set_field(this, HUC_JAR_FILE, Value::Object(Some(jar_file)));
             Ok(Some(Value::Object(Some(jar_file))))
         },
     );
@@ -10794,13 +10806,15 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     // supported protocols + cipher suites here. The synthetic SSLContext has no
     // contextSpi, so the inherited javax bytecode NPEs; return a REAL
     // javax.net.ssl.SSLParameters (plain data holder) with the protocol/cipher
-    // lists the rustls-backed engine negotiates.
+    // lists accepted by the JSSE configuration surface. TLSv1.1 remains
+    // disabled by default below, but must be present here so an explicitly
+    // requested legacy protocol survives Tomcat's configuration intersection.
     r.register(
         ctx_cls,
         "getSupportedSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
-            let protocols = ["TLSv1.3", "TLSv1.2"];
+            let protocols = ["TLSv1.3", "TLSv1.2", "TLSv1.1"];
             // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
             // Tomcat's `JSSEUtil.initialise()` reads this list and
             // `SSLUtilBase.getEnabled` silently DROPS any configured suite

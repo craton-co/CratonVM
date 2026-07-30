@@ -412,6 +412,150 @@ struct SimdIntArraySum {
     acc_is_long: bool,
 }
 
+/// A side-effect-free integer matrix dot-product loop.
+///
+/// `javac` emits this shape for the inner loop of the conventional
+/// `int[][]` matrix multiply:
+///
+/// ```text
+/// for (k = ...; k < bound; k++)
+///     sum += a[row][k] * b[k][column];
+/// ```
+///
+/// The generic bytecode emitter necessarily materializes the operand stack and
+/// repeats array checks around every load.  The pre-header fast path keeps the
+/// loop state in registers instead.  Every speculative shape check branches
+/// back to the untouched scalar bytecode with the original `k`/`sum` frame
+/// state, so null, jagged, short, negative-index, and zero-trip cases retain
+/// exact Java behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatrixDotLoop {
+    header_pc: usize,
+    back_edge_pc: usize,
+    iv_local: usize,
+    bound_local: usize,
+    acc_local: usize,
+    a_outer_local: usize,
+    a_row_local: usize,
+    b_outer_local: usize,
+    b_column_local: usize,
+}
+
+/// Detect the exact read-only matrix dot-product body documented on
+/// [`MatrixDotLoop`].  Requiring the whole body (rather than recognizing a
+/// subsequence) is what makes fallback restart safe: the skipped bytecodes have
+/// no externally visible effects and write only `iv_local`/`acc_local`.
+fn detect_matrix_dot_loop(
+    code: &[u8],
+    header: usize,
+    back_edge: usize,
+    iv_local: usize,
+) -> Option<MatrixDotLoop> {
+    if code.get(back_edge).copied() != Some(0xa7) || back_edge + 2 >= code.len() {
+        return None;
+    }
+
+    let take_iload = |pc: &mut usize| -> Option<usize> {
+        let local = extract_iload_local(code, *pc)?;
+        *pc += if code[*pc] == 0x15 { 2 } else { 1 };
+        Some(local)
+    };
+    let take_aload = |pc: &mut usize| -> Option<usize> {
+        let local = extract_aload_local(code, *pc)?;
+        *pc += if code[*pc] == 0x19 { 2 } else { 1 };
+        Some(local)
+    };
+    let take_istore = |pc: &mut usize| -> Option<usize> {
+        let local = extract_istore_local(code, *pc)?;
+        *pc += if code[*pc] == 0x36 { 2 } else { 1 };
+        Some(local)
+    };
+    let take = |pc: &mut usize, opcode: u8| -> Option<()> {
+        if code.get(*pc).copied()? != opcode {
+            return None;
+        }
+        *pc += 1;
+        Some(())
+    };
+
+    let mut pc = header;
+    if take_iload(&mut pc)? != iv_local {
+        return None;
+    }
+    let bound_local = take_iload(&mut pc)?;
+    if code.get(pc).copied()? != 0xa2 {
+        return None;
+    }
+    let exit_delta = i16::from_be_bytes([*code.get(pc + 1)?, *code.get(pc + 2)?]) as isize;
+    let exit_pc = (pc as isize).checked_add(exit_delta)?;
+    if exit_pc <= back_edge as isize {
+        return None;
+    }
+    pc += 3;
+
+    let acc_local = take_iload(&mut pc)?;
+    let a_outer_local = take_aload(&mut pc)?;
+    let a_row_local = take_iload(&mut pc)?;
+    take(&mut pc, 0x32)?; // aaload: a[row]
+    if take_iload(&mut pc)? != iv_local {
+        return None;
+    }
+    take(&mut pc, 0x2e)?; // iaload: a[row][k]
+
+    let b_outer_local = take_aload(&mut pc)?;
+    if take_iload(&mut pc)? != iv_local {
+        return None;
+    }
+    take(&mut pc, 0x32)?; // aaload: b[k]
+    let b_column_local = take_iload(&mut pc)?;
+    take(&mut pc, 0x2e)?; // iaload: b[k][column]
+    take(&mut pc, 0x68)?; // imul
+    take(&mut pc, 0x60)?; // iadd
+    if take_istore(&mut pc)? != acc_local {
+        return None;
+    }
+
+    if pc + 2 >= back_edge
+        || code.get(pc).copied()? != 0x84
+        || *code.get(pc + 1)? as usize != iv_local
+        || *code.get(pc + 2)? != 1
+    {
+        return None;
+    }
+    pc += 3;
+    if pc != back_edge {
+        return None;
+    }
+
+    let back_delta =
+        i16::from_be_bytes([*code.get(back_edge + 1)?, *code.get(back_edge + 2)?]) as isize;
+    if (back_edge as isize).checked_add(back_delta)? != header as isize {
+        return None;
+    }
+    if acc_local == iv_local
+        || bound_local == iv_local
+        || bound_local == acc_local
+        || a_row_local == iv_local
+        || a_row_local == acc_local
+        || b_column_local == iv_local
+        || b_column_local == acc_local
+    {
+        return None;
+    }
+
+    Some(MatrixDotLoop {
+        header_pc: header,
+        back_edge_pc: back_edge,
+        iv_local,
+        bound_local,
+        acc_local,
+        a_outer_local,
+        a_row_local,
+        b_outer_local,
+        b_column_local,
+    })
+}
+
 /// Detect a vectorizable int-array-sum pattern in a loop body.
 /// Matches: iload_sum, aload_arr, iload_iv, iaload, iadd, istore_sum, iinc iv 1, goto
 /// Or with long accumulator: aload_arr, iload_iv, iaload, i2l, lload_sum, ladd, lstore_sum
@@ -552,6 +696,18 @@ fn extract_lstore_local(code: &[u8], pc: usize) -> Option<usize> {
         0x42 => Some(3), // lstore_3
         // Cast: non-negative index/count to usize
         0x37 => code.get(pc + 1).map(|&b| b as usize), // lstore
+        _ => None,
+    }
+}
+
+/// Extract local index from an istore instruction at pc.
+fn extract_istore_local(code: &[u8], pc: usize) -> Option<usize> {
+    match *code.get(pc)? {
+        0x3b => Some(0), // istore_0
+        0x3c => Some(1), // istore_1
+        0x3d => Some(2), // istore_2
+        0x3e => Some(3), // istore_3
+        0x36 => code.get(pc + 1).map(|&b| b as usize), // istore
         _ => None,
     }
 }
@@ -2285,11 +2441,12 @@ fn self_cache_inherit_enabled() -> bool {
 
 /// Step 1 of `docs/feature-designs/precise-jit-maps-default.md` — opt-IN
 /// **inline** frame-record. When on (and precise maps are on, and the OS TLS
-/// probe in [`inline_rbp_tls_disp`] succeeds), the JIT prologue stores RBP
-/// straight into the precise-maps innermost-RBP mirror with a single
-/// `mov gs:[disp], rbp` instead of `call jit_frame_record`. This removes the
-/// per-invocation CALL that is the residual ~1.68× call-heavy regression after
-/// the thread-local cache (`82cf85e9`) already cut the helper body cost.
+/// probe in [`inline_rbp_tls_disp`] succeeds), the JIT stores RBP straight into
+/// the precise-maps innermost-RBP mirror with one segment-relative `mov`
+/// (`gs:` on Windows, `fs:` on Linux) instead of `call jit_frame_record`.
+/// This removes the per-invocation CALL that is the residual ~1.68× call-heavy
+/// regression after the thread-local cache (`82cf85e9`) already cut the helper
+/// body cost.
 ///
 /// **DEFAULT ON** (Step 2 flip, 2026-06-21; opt out with
 /// `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`). Validated on the inlined path:
@@ -2298,9 +2455,9 @@ fn self_cache_inherit_enabled() -> bool {
 /// mismatches over billions of fib44 invocations). Off → the existing
 /// `call jit_frame_record` is emitted (the pre-Step-1 default). Only meaningful
 /// with precise maps on (otherwise there is no frame-record at all), so it is
-/// anded with [`precise_jit_maps_enabled`]. On non-Windows / on a failed TLS
-/// probe, [`inline_rbp_tls_disp`] returns 0 and the CALL path is used even when
-/// this is on, so the flip is a safe no-op there.
+/// anded with [`precise_jit_maps_enabled`]. On an unsupported target or a failed
+/// TLS probe, [`inline_rbp_tls_disp`] returns 0 and the CALL path is used even
+/// when this is on.
 pub fn precise_inline_frame_record_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -2325,12 +2482,11 @@ pub fn verify_inline_frame_record_enabled() -> bool {
     })
 }
 
-/// Step 1 — the GS-relative byte displacement of the Windows TLS slot that
-/// backs the precise-maps innermost-RBP mirror, or `0` when inline
-/// frame-record is disabled or unavailable. This is the **single source of
-/// truth** shared by the JIT codegen (which bakes `mov gs:[disp], rbp`) and the
-/// VM-side mirror accessor in `vm/src/jit/conservative_roots.rs` (which
-/// reads/writes the same slot). Computed once, cached for the process.
+/// Step 1 — the segment-relative byte displacement of the OS TLS slot that
+/// backs the precise-maps innermost-RBP mirror, or `0` when inline frame-record
+/// is disabled or unavailable. This is the **single source of truth** shared by
+/// JIT codegen and the VM-side mirror accessor in
+/// `vm/src/jit/conservative_roots.rs`. Computed once, cached for the process.
 ///
 /// Windows x86-64 stores the 64 static TLS slots in the TEB at offset `0x1480`
 /// (`TlsSlots`), reachable as `gs:[0x1480 + slot*8]`. We `TlsAlloc` a slot,
@@ -2412,11 +2568,106 @@ pub fn inline_rbp_tls_disp() -> usize {
     })
 }
 
-/// Non-Windows: inline frame-record is unsupported (the single-instruction
-/// store relies on the Windows TEB TLS layout); always return 0 → CALL path.
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+thread_local! {
+    /// Linux counterpart of the Windows OS-TLS slot. Generated code reaches
+    /// this exact Rust TLS cell as `fs:[disp32]`; the startup probe below writes
+    /// a sentinel through `Cell` and reads it back through `fs:` before the
+    /// displacement is accepted.
+    static LINUX_INLINE_RBP_MIRROR: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Linux x86-64 inline frame-record. ELF TLS lives at a stable signed offset
+/// from the thread's FS base. Recover that offset once, encode it as the raw
+/// disp32 bits expected by the x86 instruction, and sentinel-probe the exact
+/// `fs:[offset]` address before enabling generated stores. Any layout or range
+/// surprise returns 0 and retains the existing helper-call path.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_rbp_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if !precise_inline_frame_record_enabled() {
+            return 0;
+        }
+        let disp = LINUX_INLINE_RBP_MIRROR.with(|cell| {
+            // On the System V x86-64 ABI, fs:[0] is the thread-control-block
+            // self pointer. Do not trust that convention blindly: the raw
+            // sentinel read below proves the derived address before use.
+            let fs_base = unsafe { read_fs_qword(0) };
+            let cell_addr = cell as *const std::cell::Cell<usize> as usize;
+            let delta = (cell_addr as i128) - (fs_base as i128);
+            let Ok(delta32) = i32::try_from(delta) else {
+                return 0;
+            };
+            if delta32 == 0 {
+                return 0;
+            }
+            let old = cell.replace(0x5242_504C_494E_5558);
+            let probed = unsafe { read_fs_qword(delta32 as isize) };
+            cell.set(old);
+            if probed == 0x5242_504C_494E_5558 {
+                (delta32 as u32) as usize
+            } else {
+                0
+            }
+        });
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+            if disp != 0 {
+                eprintln!(
+                    "[INLINE-FR] inline frame-record ENABLED: storing RBP via mov fs:[{:#x}]",
+                    disp as u32
+                );
+            } else {
+                eprintln!("[INLINE-FR] Linux TLS probe FAILED — using CALL path");
+            }
+        }
+        disp
+    })
+}
+
+/// Unsupported targets retain the helper-call path.
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
 pub fn inline_rbp_tls_disp() -> usize {
     0
+}
+
+/// Segment override used by generated inline frame-record stores.
+///
+/// This is shared with the OSR trampoline emitter in `lib.rs`; keeping the
+/// platform byte in one place prevents that independently emitted prologue
+/// from silently retaining the Windows `gs:` prefix on Linux.
+pub(crate) const fn inline_rbp_tls_segment_prefix() -> u8 {
+    #[cfg(windows)]
+    {
+        0x65
+    }
+    #[cfg(not(windows))]
+    {
+        0x64
+    }
+}
+
+/// VM-side access to the Linux TLS cell used by generated `fs:` stores.
+/// `None` means the startup probe did not enable the inline path.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_rbp_tls_mirror_read() -> Option<usize> {
+    if inline_rbp_tls_disp() == 0 {
+        None
+    } else {
+        Some(LINUX_INLINE_RBP_MIRROR.with(std::cell::Cell::get))
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_rbp_tls_mirror_write(value: usize) -> bool {
+    if inline_rbp_tls_disp() == 0 {
+        false
+    } else {
+        LINUX_INLINE_RBP_MIRROR.with(|cell| cell.set(value));
+        true
+    }
 }
 
 /// Read the 8-byte value at `gs:[disp]` (Windows TEB-relative). Used only by
@@ -2429,6 +2680,21 @@ unsafe fn read_gs_qword(disp: usize) -> usize {
         "mov {out}, qword ptr gs:[{addr}]",
         out = out(reg) val,
         addr = in(reg) disp,
+        options(nostack, preserves_flags, readonly),
+    );
+    val
+}
+
+/// Read the 8-byte value at `fs:[offset]` on Linux x86-64. Used only by the
+/// sentinel probe for [`inline_rbp_tls_disp`].
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[inline]
+unsafe fn read_fs_qword(offset: isize) -> usize {
+    let val: usize;
+    core::arch::asm!(
+        "mov {out}, qword ptr fs:[{addr}]",
+        out = out(reg) val,
+        addr = in(reg) offset,
         options(nostack, preserves_flags, readonly),
     );
     val
@@ -2748,6 +3014,21 @@ fn reference_local_in_register(
     }
 }
 
+/// Whether a direct self-call under moving-young may publish an empty precise
+/// root map without emitting the normal local/full-GPR spill and shadow push.
+///
+/// Moving collection suppresses the conservative JIT-frame scan, so this is
+/// sound only when the dataflow coverage proof is complete and the exact set
+/// of live, rewritable oop homes is empty. Keeping this as a small predicate
+/// makes both fail-closed conditions independently testable.
+fn moving_oop_free_self_call_is_publishable(
+    moving_young: bool,
+    coverage_complete: bool,
+    live_oop_home_count: usize,
+) -> bool {
+    moving_young && coverage_complete && live_oop_home_count == 0
+}
+
 /// Register-only operand-stack-oop soundness — whether `flush_scratch_registers`
 /// (the standard pre-call / pre-backward-branch / pre-return flush) ALSO spills
 /// `StackSlot::CalleeSaved` operand-stack entries that hold an object reference
@@ -2922,17 +3203,17 @@ pub fn set_kernel_reg_homes_osr_request(on: bool) {
     KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.set(on));
 }
 
-/// `CRATONVM_JIT_KERNEL_REG_OSR` gate (default **OFF**, opt in with `=1`) —
+/// `CRATONVM_JIT_KERNEL_REG_OSR` gate (default **ON**, opt out with `=0`) —
 /// see [`set_kernel_reg_homes_osr_request`].
 ///
-/// Measured 2026-07-18 on the QuickBench kernels this was built for:
-/// Arithmetic showed no wall-clock change (the kernel is long-division
-/// bound — `i/2` + `i%7` chains dwarf the local load/store traffic register
-/// homes remove), and no other kernel demonstrated a win before the round
-/// closed. Given the callee-saved-GPR family's miscompile history, an
-/// unproven-benefit default stays opt-in; bt18/QuickBench checksums were
-/// correct under it in the runs taken (68332206 et al.), so the lever is
-/// safe to experiment with.
+/// The original 2026-07-18 experiment predated constant long-division
+/// lowering, so Arithmetic was division-bound and register homes had no
+/// measurable effect. Once constant `ldiv`/`lrem` stopped dominating, the
+/// same pure-kernel gate became useful: loop-carried primitive locals and the
+/// deferred operand cache can remain in registers. The admission predicate
+/// below still excludes calls, fields, allocation, typechecks, speculative
+/// BCE, and reference locals, and the OSR trampoline seeds the exact assigned
+/// registers before entering the artifact.
 fn kernel_reg_osr_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -2940,9 +3221,9 @@ fn kernel_reg_osr_enabled() -> bool {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_KERNEL_REG_OSR")
             .map(|v| {
                 let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -8190,6 +8471,8 @@ struct Compiler {
     callee_saved_base: i32,
     /// SIMD: vectorizable loops detected during analysis.
     simd_loops: Vec<SimdIntArraySum>,
+    /// Guarded tight-loop lowering for read-only `int[][]` dot products.
+    matrix_dot_loops: Vec<MatrixDotLoop>,
     /// Bounds check elimination: bytecode PCs where bounds checks can be skipped
     /// because loop analysis proved the access is always in-bounds.
     bounds_safe_pcs: FxHashSet<usize>,
@@ -8282,7 +8565,7 @@ struct Compiler {
     /// to precisely type this call's own arguments on the operand stack
     /// instead of falling back to the coarse per-method `wide_fp` gate. See
     /// `indy_arg_type_tags`'s doc comment.
-    indy_info: Vec<(usize, usize, u8, Vec<u8>)>,
+    indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
     /// Direct call targets: (bytecode_pc, direct call info).
     /// For invokestatic/invokespecial where the callee is already JIT-compiled.
     direct_calls: Vec<(usize, super::JitDirectCall)>,
@@ -8563,6 +8846,14 @@ struct Compiler {
     /// pure-int array kernels (QuickBench sieve). Opt out with
     /// `CRATONVM_JIT_NO_SLOT_MIRROR=1`.
     slot_mirror: Option<(i32, u8, usize)>,
+    /// Pure-kernel deferred operand cache. The general-purpose R8/R9 cache was
+    /// previously disabled because call-heavy methods repeatedly paid to flush
+    /// it. Pure kernels have no calls or GC-capable operations, so their only
+    /// flush is at a branch/return; at a counted-loop back edge the operand
+    /// stack is already empty. Keeping arithmetic intermediates in R8/R9
+    /// removes the template backend's remaining frame store/load pairs without
+    /// broadening the pure-kernel admission surface.
+    kernel_operand_cache: bool,
     /// `true` while `try_emit_inline` replays callee bytecode (see
     /// `slot_mirror`): suppresses both recording and consumption.
     slot_mirror_suppressed: bool,
@@ -8570,10 +8861,11 @@ struct Compiler {
     /// (gate `CRATONVM_PRECISE_JIT_MAPS`). Gates the prologue frame-record
     /// call and the per-safepoint id store. Off → byte-identical default path.
     precise_maps: bool,
-    /// Step 1 (`precise-jit-maps-default.md`) — GS-relative TLS displacement of
-    /// the innermost-RBP mirror slot, or 0 when inline frame-record is off /
-    /// unavailable. Non-zero → the prologue emits `mov gs:[disp], rbp` instead
-    /// of `call jit_frame_record`. Cached from `inline_rbp_tls_disp()` at
+    /// Step 1 (`precise-jit-maps-default.md`) — segment-relative TLS
+    /// displacement of the innermost-RBP mirror slot, or 0 when inline
+    /// frame-record is off / unavailable. Non-zero → the prologue emits one
+    /// `mov` (`gs:` on Windows, `fs:` on Linux) instead of
+    /// `call jit_frame_record`. Cached from `inline_rbp_tls_disp()` at
     /// construction so codegen reads it once.
     inline_rbp_tls_disp: usize,
     /// Step 1 debug self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`) —
@@ -9296,6 +9588,7 @@ impl Compiler {
         hoist_info: Vec<LoopHoist>,
         arith_hoist_info: Vec<ArithLoopHoist>,
         alloc_result: super::regalloc::RegAllocResult,
+        reserve_matrix_dot_scratch: bool,
         helpers: JitRuntimeHelpers,
         num_scalar_slots: usize,
         cache_jit_thread_for_inline_new: bool,
@@ -9460,19 +9753,30 @@ impl Compiler {
         let raw_local_assignments = alloc_result.assignments;
         let raw_used_callee_saved = alloc_result.used_callee_saved;
         let raw_local_assignments_len = raw_local_assignments.len();
+        let kernel_reg_homes_active = KERNEL_REG_HOMES_ACTIVE.with(|c| c.get());
         let gpr_local_homes_enabled =
-            callee_saved_gpr_local_homes_enabled() || KERNEL_REG_HOMES_ACTIVE.with(|c| c.get());
+            callee_saved_gpr_local_homes_enabled() || kernel_reg_homes_active;
         let local_assignments = if gpr_local_homes_enabled {
             raw_local_assignments
         } else {
             vec![None; raw_local_assignments_len]
         };
         let osr_block_live_in = alloc_result.block_live_in;
-        let alloc_used_regs = if gpr_local_homes_enabled {
+        let mut alloc_used_regs = if gpr_local_homes_enabled {
             raw_used_callee_saved
         } else {
             Vec::new()
         };
+        // The matrix-dot preheader owns R12..R15 for the duration of its tight
+        // loop.  Save them in the normal prologue/epilogue even when diagnostic
+        // flags disable register-homed Java locals; unlike PUSH/POP around the
+        // loop, frame saves also remain correct if a future cold path exits
+        // exceptionally.
+        if reserve_matrix_dot_scratch {
+            alloc_used_regs.extend([R12, R13, R14, R15]);
+            alloc_used_regs.sort_unstable();
+            alloc_used_regs.dedup();
+        }
         // The x86-64 System V ABI (Linux/macOS) makes every XMM register
         // caller-saved.  Keeping a Java float/double local in XMM8..15 across
         // an invoke therefore loses it when the callee/helper uses SIMD
@@ -9633,6 +9937,7 @@ impl Compiler {
             arith_scratch_base,
             callee_saved_base,
             simd_loops: Vec::new(),
+            matrix_dot_loops: Vec::new(),
             bounds_safe_pcs: FxHashSet::default(),
             bounds_check_stubs: Vec::new(),
             null_check_store_stubs: Vec::new(),
@@ -9690,6 +9995,7 @@ impl Compiler {
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
             slot_mirror: None,
+            kernel_operand_cache: kernel_reg_homes_active,
             slot_mirror_suppressed: false,
             precise_maps,
             inline_rbp_tls_disp,
@@ -10809,12 +11115,34 @@ impl Compiler {
     /// Publish the precise-map safepoint id without conservatively copying the
     /// whole GPR file into the frame. This is used only when
     /// [`Self::can_elide_self_call_register_spill`] proves that no live oop at
-    /// the direct recursive call resides exclusively in a register.
+    /// the direct recursive call resides exclusively in a register. Under
+    /// moving-young the proof is stronger: coverage must be complete and the
+    /// exact live-oop home set must be empty, so the empty precise map itself is
+    /// the complete root publication and no shadow slots need push/reload.
     fn emit_safepoint_metadata_only(&mut self) {
         if self.failed {
             return;
         }
-        debug_assert!(!self.shadow_enabled && !moving_young_enabled());
+        if self.shadow_enabled || moving_young_enabled() {
+            let coverage_complete = self.moving_young_safepoint_coverage_complete();
+            let live_oop_home_count = self.collect_live_oop_homes().len();
+            if !moving_oop_free_self_call_is_publishable(
+                moving_young_enabled(),
+                coverage_complete,
+                live_oop_home_count,
+            ) {
+                // This should be unreachable because the caller uses the same
+                // predicate. Fail compilation closed if future call-site
+                // refactoring breaks that pairing.
+                self.failed = true;
+                return;
+            }
+            // Match the metadata state normally established by
+            // `emit_pre_safepoint_spill` + an empty `emit_shadow_push`.
+            self.pending_live_frame_hi = self.next_spill_offset;
+            self.pending_shadow.clear();
+            self.pending_shadow_coverage_complete = true;
+        }
         if self.precise_maps && self.sp_id_slot_off != 0 {
             if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SPID").is_some() {
                 eprintln!(
@@ -10904,9 +11232,9 @@ impl Compiler {
         self.cur_bc_pc = saved_pc;
     }
 
-    /// A direct self-call may omit the blind all-GPR spill when this method is
-    /// at the exact call-site state proves every surviving operand is already
-    /// visible in a canonical frame slot.
+    /// A direct self-call may omit the blind all-GPR spill when this method's
+    /// exact call-site state proves every surviving operand is already visible
+    /// in a canonical frame slot.
     /// The callee prologue canonicalizes its arguments before it can reach a GC
     /// safepoint; the caller still publishes its precise oop-map id.
     ///
@@ -10962,13 +11290,20 @@ impl Compiler {
     /// When `safepoint_publish` is `None` (the legacy `compile` test wrapper and
     /// the OSR artifact path, which do not build a plan) this falls back to the
     /// old all-or-nothing test, so those paths are byte-identical.
+    ///
+    /// Moving-young formerly disabled this optimization unconditionally. That
+    /// was necessary for frames containing references because the collector
+    /// suppresses its conservative JIT-frame scan and must be able to rewrite
+    /// every root. It is unnecessary for an exactly proven oop-free frame:
+    /// `moving_young_safepoint_coverage_complete` certifies the analysis, and an
+    /// empty `collect_live_oop_homes` proves the empty precise map is complete.
+    /// Any reference home or incomplete analysis still fails closed to the full
+    /// spill + shadow publication.
     fn can_elide_self_call_register_spill(&self) -> bool {
         let any_reference_local_in_a_register =
             reference_local_in_register(self.safepoint_publish.as_ref(), &self.local_assignments);
         if full_self_call_spill_requested()
             || !self.precise_maps
-            || self.shadow_enabled
-            || moving_young_enabled()
             || any_reference_local_in_a_register
             || self.stack.len() != self.stack_oop_marks.len()
             || !self.stack_oop_marks_exact
@@ -10982,9 +11317,22 @@ impl Compiler {
         // values that survive in the caller to be frame-resident means the
         // conservative frame walk sees them regardless of their oop tags; any
         // register/XMM home fails closed to the SB-CRASH-04 full spill.
-        self.stack
+        let all_survivors_frame_resident = self
+            .stack
             .iter()
-            .all(|slot| matches!(slot, StackSlot::Frame(_)))
+            .all(|slot| matches!(slot, StackSlot::Frame(_)));
+        if !all_survivors_frame_resident {
+            return false;
+        }
+
+        if self.shadow_enabled || moving_young_enabled() {
+            return moving_oop_free_self_call_is_publishable(
+                moving_young_enabled(),
+                self.moving_young_safepoint_coverage_complete(),
+                self.collect_live_oop_homes().len(),
+            );
+        }
+        true
     }
 
     /// Return whether the shadow-stack push can prove it will publish every
@@ -12680,6 +13028,14 @@ impl Compiler {
         if !self.precise_maps || self.helpers.frame_record == 0 {
             return;
         }
+        if self.inline_rbp_tls_disp != 0 {
+            // A compiled callee publishes its own RBP on entry. Restore this
+            // caller's RBP into the same mirror after return, using the exact
+            // inline mechanism as the prologue. This is value-equivalent to
+            // `jit_frame_record(rbp)` and preserves RAX without a save/restore.
+            self.emit_mov_tls_disp32_rbp(self.inline_rbp_tls_disp as u32);
+            return;
+        }
         self.buf.emit_byte(0x50); // PUSH RAX (callee return value)
         let (abi_reserve, _) = Self::stack_arg_block_size(0);
         let reserve = abi_reserve + 8; // restore 16-byte call-site alignment
@@ -14049,6 +14405,244 @@ impl Compiler {
         self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
+    /// Emit one checked matrix-dot element and advance R10D.
+    ///
+    /// The preheader keeps all Java-visible state in its original homes until
+    /// the complete dot product succeeds, so a guard can safely restart the
+    /// scalar bytecodes even when this element belongs to an unrolled batch.
+    fn emit_matrix_dot_element(
+        &mut self,
+        scalar_fallbacks: &mut Vec<usize>,
+        index_delta: i32,
+        advance_iv: bool,
+    ) {
+        let b_disp = HEADER_SIZE as i32
+            + index_delta * if narrow_oops_enabled() { 4 } else { 8 };
+        let a_disp = HEADER_SIZE as i32 + index_delta * 4;
+        if narrow_oops_enabled() {
+            // EAX = narrow b[k], then decode it with the loop-invariant heap
+            // base already in R11. A zero encoding is null -> scalar fallback.
+            self.buf.emit(&[
+                0x43,
+                0x8B,
+                0x44,
+                0x95,
+                b_disp as u8,
+            ]); // MOV EAX,[R13+R10*4+H]
+            self.buf.emit(&[0x48, 0xC1, 0xE0, 0x03]); // SHL RAX,3
+            scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+            self.buf.emit(&[0x4C, 0x01, 0xD8]); // ADD RAX,R11
+        } else {
+            self.buf.emit(&[
+                0x4B,
+                0x8B,
+                0x44,
+                0xD5,
+                b_disp as u8,
+            ]); // MOV RAX,[R13+R10*8+H]
+            self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+            scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+        }
+
+        // Each B row is independently mutable in Java, so its column check
+        // remains per element. A failure restarts the exact scalar body, which
+        // raises NPE/AIOOBE at the original bytecode.
+        self.buf
+            .emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+        self.buf.emit(&[0x41, 0x39, 0xD6]); // CMP R14D, EDX
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x83)); // JAE
+
+        self.buf.emit(&[
+            0x43,
+            0x8B,
+            0x54,
+            0x94,
+            a_disp as u8,
+        ]); // MOV EDX,[R12+R10*4+H]
+        self.buf.emit(&[
+            0x42,
+            0x0F,
+            0xAF,
+            0x54,
+            0xB0,
+            HEADER_SIZE as u8,
+        ]); // IMUL EDX,[RAX+R14*4+H]
+        self.buf.emit(&[0x41, 0x01, 0xD1]); // ADD R9D, EDX (Java int wrap)
+        if advance_iv {
+            self.buf.emit(&[0x41, 0xFF, 0xC2]); // INC R10D
+        }
+    }
+
+    /// Emit the guarded tight loop for a [`MatrixDotLoop`].
+    ///
+    /// Register contract:
+    /// - R12 = `a[row]`
+    /// - R13 = outer `b`
+    /// - R14D = column
+    /// - R15D = exclusive bound
+    /// - R10D = induction variable
+    /// - R9D = wrapping int accumulator
+    ///
+    /// R12..R15 are reserved from Java-local allocation and saved by the
+    /// method prologue.  RAX/RCX/RDX/R11 are ordinary emitter scratch.
+    fn emit_matrix_dot_preheader(&mut self, dot: &MatrixDotLoop) {
+        let mut scalar_fallbacks = Vec::new();
+
+        // Load the carried integer state.  Frame/register homes are left
+        // untouched until successful completion, so every failing guard can
+        // restart the original scalar loop without reconstructing state.
+        if let Some(reg) = self.reg_for_local(dot.iv_local) {
+            self.emit_mov_reg_reg(R10, reg);
+        } else {
+            self.emit_load_local(R10, self.local_offset(dot.iv_local));
+        }
+        if let Some(reg) = self.reg_for_local(dot.bound_local) {
+            self.emit_mov_reg_reg(R15, reg);
+        } else {
+            self.emit_load_local(R15, self.local_offset(dot.bound_local));
+        }
+        if let Some(reg) = self.reg_for_local(dot.acc_local) {
+            self.emit_mov_reg_reg(R9, reg);
+        } else {
+            self.emit_load_local(R9, self.local_offset(dot.acc_local));
+        }
+
+        // Zero trip: do not even inspect the arrays.
+        self.buf.emit(&[0x45, 0x39, 0xFA]); // CMP R10D, R15D
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x8D)); // JGE scalar header
+        self.buf.emit(&[0x45, 0x85, 0xD2]); // TEST R10D, R10D
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x88)); // JS scalar header
+
+        // Resolve a[row]. Prefer the LICM result that was emitted immediately
+        // before this preheader; fall back to a guarded direct load when LICM
+        // is disabled or this header was de-specialized.
+        let hoisted_a = self
+            .hoist_info
+            .iter()
+            .enumerate()
+            .find(|(_, h)| {
+                h.loop_header == dot.header_pc
+                    && h.array_local == dot.a_outer_local
+                    && h.index_local == dot.a_row_local
+            })
+            .map(|(idx, _)| self.hoist_offsets[idx]);
+        if let Some(off) = hoisted_a {
+            self.emit_load_local(RAX, off);
+        } else {
+            if let Some(reg) = self.reg_for_local(dot.a_outer_local) {
+                self.emit_mov_reg_reg(RAX, reg);
+            } else {
+                self.emit_load_local(RAX, self.local_offset(dot.a_outer_local));
+            }
+            if let Some(reg) = self.reg_for_local(dot.a_row_local) {
+                self.emit_mov_reg_reg(RCX, reg);
+            } else {
+                self.emit_load_local(RCX, self.local_offset(dot.a_row_local));
+            }
+            self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+            scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+            self.buf
+                .emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+            self.buf.emit(&[0x39, 0xD1]); // CMP ECX, EDX
+            scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x83)); // JAE
+            self.emit_ref_aload_regs();
+        }
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX (a[row])
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+        self.emit_mov_reg_reg(R12, RAX);
+
+        // Resolve the outer B array and the invariant column.
+        if let Some(reg) = self.reg_for_local(dot.b_outer_local) {
+            self.emit_mov_reg_reg(R13, reg);
+        } else {
+            self.emit_load_local(R13, self.local_offset(dot.b_outer_local));
+        }
+        self.buf.emit(&[0x4D, 0x85, 0xED]); // TEST R13, R13
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+        if let Some(reg) = self.reg_for_local(dot.b_column_local) {
+            self.emit_mov_reg_reg(R14, reg);
+        } else {
+            self.emit_load_local(R14, self.local_offset(dot.b_column_local));
+        }
+
+        // A's selected row and the outer B array must both cover the complete
+        // counted range.  JA (not JAE): length == bound is valid.
+        self.buf.emit(&[
+            0x41,
+            0x8B,
+            0x54,
+            0x24,
+            ARRAY_LENGTH_OFFSET as u8,
+        ]); // MOV EDX,[R12+len]
+        self.buf.emit(&[0x41, 0x39, 0xD7]); // CMP R15D, EDX
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x87)); // JA
+        self.buf
+            .emit(&[0x41, 0x8B, 0x55, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[R13+len]
+        self.buf.emit(&[0x41, 0x39, 0xD7]); // CMP R15D, EDX
+        scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x87)); // JA
+
+        if narrow_oops_enabled() {
+            self.emit_mov_imm64(R11, narrow_base() as i64);
+        }
+
+        // Eight-way unrolling amortizes the induction compare/branch while
+        // retaining the original k-order for every multiply-add. Fixed
+        // displacements let the CPU overlap independent row-pointer loads
+        // without an INC dependency between elements. R8D is the
+        // first k that cannot start a full batch (`bound - 7`).
+        self.emit_mov_reg_reg(R8, R15);
+        self.buf.emit(&[0x41, 0x83, 0xE8, 0x07]); // SUB R8D,7
+        self.buf.emit(&[0x45, 0x39, 0xC2]); // CMP R10D,R8D
+        let scalar_tail_patch = self.emit_jcc_rel32_patch(0x8D); // JGE scalar tail
+
+        let batch_start = self.buf.pos();
+        for index_delta in 0..8 {
+            self.emit_matrix_dot_element(&mut scalar_fallbacks, index_delta, false);
+        }
+        self.buf.emit(&[0x41, 0x83, 0xC2, 0x08]); // ADD R10D,8
+        self.buf.emit(&[0x45, 0x39, 0xC2]); // CMP R10D,R8D
+        self.buf.emit(&[0x0F, 0x8C]); // JL batch_start
+        let batch_patch = self.buf.pos();
+        self.buf.emit(&[0u8; 4]);
+        let batch_rel = (batch_start as i32) - (batch_patch as i32 + 4);
+        self.buf.try_patch_i32(batch_patch, batch_rel).ok();
+
+        self.patch_rel32_to_here(scalar_tail_patch);
+        self.buf.emit(&[0x45, 0x39, 0xFA]); // CMP R10D,R15D
+        let publish_patch = self.emit_jcc_rel32_patch(0x8D); // JGE publish
+
+        let scalar_start = self.buf.pos();
+        self.emit_matrix_dot_element(&mut scalar_fallbacks, 0, true);
+        self.buf.emit(&[0x45, 0x39, 0xFA]); // CMP R10D, R15D
+        self.buf.emit(&[0x0F, 0x8C]); // JL scalar_start
+        let loop_patch = self.buf.pos();
+        self.buf.emit(&[0u8; 4]);
+        let loop_rel = (scalar_start as i32) - (loop_patch as i32 + 4);
+        self.buf.try_patch_i32(loop_patch, loop_rel).ok();
+
+        // Publish successful final state to whichever homes the scalar
+        // continuation expects. MOVSXD restores the backend's signed-i32 local
+        // representation after the wrapping 32-bit accumulator arithmetic.
+        self.patch_rel32_to_here(publish_patch);
+        self.buf.emit(&[0x4D, 0x63, 0xC9]); // MOVSXD R9,R9D
+        if let Some(reg) = self.reg_for_local(dot.acc_local) {
+            self.emit_mov_reg_reg(reg, R9);
+        } else {
+            self.emit_store_local(self.local_offset(dot.acc_local), R9);
+        }
+        if let Some(reg) = self.reg_for_local(dot.iv_local) {
+            self.emit_mov_reg_reg(reg, R10);
+        } else {
+            self.emit_store_local(self.local_offset(dot.iv_local), R10);
+        }
+
+        // All failed guards land after the success stores, leaving their
+        // original frame/register state untouched for the scalar bytecode.
+        for patch in scalar_fallbacks {
+            self.patch_rel32_to_here(patch);
+        }
+    }
+
     /// Emit a vectorized double-array sum loop using AVX2 VADDPD.
     /// Processes 4 doubles per iteration (256-bit YMM registers).
     /// Assumes: RCX = array base ptr, R10D = start index, R11D = bound.
@@ -14756,7 +15350,8 @@ impl Compiler {
         // frame pointers so the real RBP can't be recovered by walking). Done
         // once per invocation, after params are saved so the call doesn't lose
         // them. RBP → ABI arg0; the helper records it into the top JIT chain
-        // entry. Gated off by default (zero default-path cost), and skipped if
+        // entry. The default inline path stores RBP into the mirror TLS cell;
+        // unsupported targets or a failed TLS probe use the helper. Skipped if
         // the helper pointer isn't wired.
         // Frame-record recording is "configured" iff the helper pointer is
         // wired (`build_helpers` sets it whenever precise maps are on). Gate
@@ -14766,11 +15361,11 @@ impl Compiler {
         if self.precise_maps && self.helpers.frame_record != 0 {
             if self.inline_rbp_tls_disp != 0 {
                 // Step 1 (inline frame-record) — store RBP straight into the
-                // mirror TLS slot with one `mov gs:[disp], rbp`, no CALL. The
+                // mirror TLS slot with one segment-relative `mov`, no CALL. The
                 // VM-side mirror accessor reads the SAME slot (single source of
                 // truth via `inline_rbp_tls_disp()`), so the GC root walk sees
                 // the innermost RBP exactly as with the helper path.
-                self.emit_mov_gs_disp32_rbp(self.inline_rbp_tls_disp as u32);
+                self.emit_mov_tls_disp32_rbp(self.inline_rbp_tls_disp as u32);
                 // Debug self-check: also call the verify helper (wired into
                 // `frame_record` by `build_helpers` when the knob is on), which
                 // reads the slot back and asserts it equals RBP.
@@ -14790,6 +15385,20 @@ impl Compiler {
         // staged ABI arg registers). Done last in the prologue, after params are
         // saved to their homes, so `get_current_thread` (caller-saved clobbers)
         // can't lose an argument. RAX holds the returned thread pointer.
+        // Initialise the cached-thread slot whenever it EXISTS, independently of
+        // whether `get_current_thread` is wired. Both consumers -- the safepoint
+        // push in `emit_shadow_push_for_safepoint` and the epilogue savetop
+        // restore -- gate only on `shadow_enabled && shadow_thread_slot_off != 0`
+        // and rely on the slot READING NULL to skip themselves. Folding this
+        // zeroing into the `get_current_thread != 0` arm broke that invariant:
+        // with the helper unwired the slot kept whatever stack garbage occupied
+        // the frame, the push's null test passed, and it stored a live oop
+        // through a wild pointer (SIGSEGV at `mov %rax,0(%r11)`). Production
+        // always wires the helper, so this was latent there.
+        if self.shadow_enabled && self.shadow_thread_slot_off != 0 {
+            self.emit_xor_reg_self(RAX); // RAX = 0
+            self.emit_store_local(self.shadow_thread_slot_off, RAX);
+        }
         if self.shadow_enabled
             && self.helpers.get_current_thread != 0
             && self.shadow_thread_slot_off != 0
@@ -14807,8 +15416,6 @@ impl Compiler {
             // skip safely. `get_current_thread` is a caller-saved clobber but
             // we are still in the prologue (params already homed), so this is a
             // register-safe place to keep the actual fetch.
-            self.emit_xor_reg_self(RAX); // RAX = 0
-            self.emit_store_local(self.shadow_thread_slot_off, RAX);
             self.shadow_fetch_start = self.buf.pos();
             self.emit_call_absolute(self.helpers.get_current_thread);
             self.emit_store_local(self.shadow_thread_slot_off, RAX);
@@ -15073,20 +15680,21 @@ impl Compiler {
         }
     }
 
-    /// Step 1 (inline frame-record) — emit `MOV gs:[disp32], RBP`, the single
-    /// instruction that stores RBP straight into the precise-maps innermost-RBP
-    /// mirror TLS slot, replacing `call jit_frame_record`. `disp32` is the
-    /// GS-relative byte displacement from [`inline_rbp_tls_disp`].
+    /// Step 1 (inline frame-record) — emit the single segment-relative `MOV`
+    /// that stores RBP straight into the precise-maps innermost-RBP mirror TLS
+    /// slot, replacing `call jit_frame_record`. Windows uses `gs:` (`0x65`);
+    /// Linux uses `fs:` (`0x64`). `disp32` comes from the sentinel-probed
+    /// [`inline_rbp_tls_disp`].
     ///
-    /// Encoding (9 bytes): `65 48 89 2C 25 <disp32-le>`
-    ///   * `65`       — GS segment override prefix.
+    /// Encoding (9 bytes): `<seg> 48 89 2C 25 <disp32-le>`
+    ///   * `<seg>`    — GS (`65`) or FS (`64`) segment override prefix.
     ///   * `48`       — REX.W (64-bit operand).
     ///   * `89`       — MOV r/m64, r64.
     ///   * `2C`       — ModRM mod=00 reg=RBP(5) r/m=100(SIB).
     ///   * `25`       — SIB scale=0 index=none(4) base=none(5) → [disp32].
-    ///   * `disp32`   — absolute displacement; effective address = GS_base+disp.
-    fn emit_mov_gs_disp32_rbp(&mut self, disp32: u32) {
-        self.buf.emit_byte(0x65); // GS prefix
+    ///   * `disp32`   — displacement; effective address = segment base + disp.
+    fn emit_mov_tls_disp32_rbp(&mut self, disp32: u32) {
+        self.buf.emit_byte(inline_rbp_tls_segment_prefix());
         self.buf.emit_byte(0x48); // REX.W
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.buf.emit_byte(0x2C); // ModRM: reg=RBP, r/m=SIB
@@ -16269,10 +16877,23 @@ impl Compiler {
     /// instead of being stored to the frame, avoiding the memory round-trip when
     /// the next bytecode immediately consumes the value.
     fn push_from_rax(&mut self) {
-        // Spill to frame slot. Scratch register caching (R8/R9) was tested but
-        // showed regressions: the frequent flush_scratch_registers calls before
-        // backward branches, calls, and other operations negate the benefit by
-        // adding an extra MOV per flush.
+        // The broad R8/R9 experiment regressed call-heavy methods because each
+        // call flushed live scratch values. Pure kernels contain no calls,
+        // allocation, fields, or other GC-capable operations; their counted
+        // loop back edges arrive with an empty operand stack. Restrict the
+        // deferred cache to that proven shape.
+        if self.kernel_operand_cache {
+            if let Some(reg) = SCRATCH_REGS.iter().copied().find(|&candidate| {
+                !self
+                    .stack
+                    .iter()
+                    .any(|slot| matches!(slot, StackSlot::Scratch(r) if *r == candidate))
+            }) {
+                self.emit_mov_reg_reg(reg, RAX);
+                self.stack_push(StackSlot::Scratch(reg), false);
+                return;
+            }
+        }
         match self.push_stack() {
             Some(StackSlot::Frame(off)) => self.emit_store_local(off, RAX),
             Some(_) => unreachable!("push_stack always returns Frame"),
@@ -20258,6 +20879,18 @@ impl Compiler {
                         self.emit_store_local(self.local_offset(iv_local), R10);
                     }
                 }
+            }
+
+            // Guarded `int[][]` dot-product replacement.  Like the SIMD
+            // preheaders above, normal back-edges target `pc_to_native[pc]`
+            // below and therefore skip this fall-through-only fast path.
+            if let Some(dot) = self
+                .matrix_dot_loops
+                .iter()
+                .find(|dot| dot.header_pc == pc)
+                .cloned()
+            {
+                self.emit_matrix_dot_preheader(&dot);
             }
 
             // (The speculative-BCE range guards are emitted at the TOP of this
@@ -28507,7 +29140,8 @@ impl Compiler {
                         .indy_info_idx
                         .get(&pc)
                         .map(|&i| self.indy_info[i].clone());
-                    let Some((_pc, arg_slots, ret_type, arg_type_tags)) = info else {
+                    let Some((_pc, arg_slots, ret_type, arg_type_tags, concat_site)) = info
+                    else {
                         // No resolver, or this site couldn't be resolved at
                         // compile time: fail safe and bail the whole method,
                         // exactly like every other CP-resolved metadata miss
@@ -28517,6 +29151,72 @@ impl Compiler {
                     };
 
                     self.flush_scratch_registers();
+
+                    // A `StringConcatFactory` site has a resolved,
+                    // process-lifetime bridge, so call it directly instead of
+                    // taking the uncommon trap below. This is what removes
+                    // RBC.7's premise for the common
+                    // `println("..." + x)`-after-a-loop shape: with no trap at
+                    // the indy bci there is nothing for an OSR frame to resume
+                    // imprecisely, so the OSR artifact keeps running. Every
+                    // other bootstrap kind still falls through to the trap.
+                    let concat_entry =
+                        crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    if concat_site != 0 && concat_entry != 0 && matches!(ret_type, b'L' | b'[') {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                            eprintln!(
+                                "[cratonvm-jitc] indy-concat bridge pc={} args={}",
+                                pc, arg_slots
+                            );
+                        }
+                        let pre_pop_spill = self.next_spill_offset;
+                        let mut arg_slots_vec = Vec::with_capacity(arg_slots);
+                        for _ in 0..arg_slots {
+                            arg_slots_vec.push(self.pop_stack());
+                        }
+                        arg_slots_vec.reverse();
+                        let post_pop_spill = self.next_spill_offset;
+                        if arg_slots > 0 {
+                            let Some(args_end) =
+                                self.checked_spill_range_end(pre_pop_spill, arg_slots)
+                            else {
+                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                                    .is_some()
+                                {
+                                    eprintln!(
+                                        "[cratonvm-jitc] indy-concat bridge spill overflow pc={} base={} args={}",
+                                        pc, pre_pop_spill, arg_slots
+                                    );
+                                }
+                                return false;
+                            };
+                            self.next_spill_offset = args_end;
+                            for (i, slot) in arg_slots_vec.iter().enumerate() {
+                                let offset = pre_pop_spill + ((arg_slots - 1 - i) as i32) * 8;
+                                self.load_slot_to_reg(RAX, *slot);
+                                self.emit_store_local(offset, RAX);
+                            }
+                        }
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.emit_mov_imm64(ARG_REGS[1], concat_site as i64);
+                        if arg_slots > 0 {
+                            self.emit_lea_frame_slot(
+                                ARG_REGS[2],
+                                pre_pop_spill + ((arg_slots as i32) - 1) * 8,
+                            );
+                        } else {
+                            self.emit_xor_reg_self(ARG_REGS[2]);
+                        }
+                        self.emit_mov_imm32_sx(ARG_REGS[3], arg_slots as i32);
+                        self.emit_pre_safepoint_spill();
+                        self.emit_call_absolute(concat_entry);
+                        self.emit_oop_map_for_safepoint();
+                        self.next_spill_offset = post_pop_spill;
+                        self.push_from_rax();
+                        self.mark_top_as_oop();
+                        pc += 5;
+                        continue;
+                    }
 
                     // Unconditional JMP to the shared deopt stub. Mirrors the
                     // conditional String-intrinsic bail edges elsewhere in
@@ -29477,7 +30177,7 @@ pub fn compile_with_param_slots(
     // field doc on the `Compiler` struct. Empty from the legacy `compile()`
     // test wrapper (which also passes no `indy_ops` to `jit_scan` callers, so
     // this is always consistent with an invokedynamic-free method there).
-    indy_info: Vec<(usize, usize, u8, Vec<u8>)>,
+    indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
 ) -> Option<CompiledMethod> {
     let needs_heap = needs_heap || !ldc_string_info.is_empty();
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
@@ -29687,6 +30387,43 @@ pub fn compile_with_param_slots(
         analyze_bounds_elimination(code, code_len, &loops)
     };
 
+    // Guarded matrix dot-product lowering.  This is a pre-header replacement
+    // like the SIMD reductions below, but it remains useful for Java's
+    // array-of-row `int[][]` layout where the right-hand column is not
+    // contiguous and therefore cannot use ordinary packed loads.  The kill
+    // switch restores the generic scalar emitter for diagnostics.
+    let matrix_dot_enabled =
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_MATRIX_DOT").map_or(true, |v| {
+            let value = v.trim();
+            value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("off")
+        });
+    let matrix_dot_loops: Vec<MatrixDotLoop> = if matrix_dot_enabled && !no_bce {
+        loops
+            .iter()
+            .filter(|(header, _)| !bypassable_headers.contains(header))
+            .filter_map(|&(header, back_edge)| {
+                let loop_end = back_edge + bytecode_len_at(code, back_edge);
+                let iv = find_induction_variable(code, header, loop_end)?;
+                detect_matrix_dot_loop(code, header, back_edge, iv)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !matrix_dot_loops.is_empty()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    {
+        eprintln!(
+            "[JIT_GEN] matrix-dot headers={:?}",
+            matrix_dot_loops
+                .iter()
+                .map(|dot| dot.header_pc)
+                .collect::<Vec<_>>()
+        );
+    }
+
     // SIMD: detect vectorizable int-array-sum loops (requires AVX2)
     let simd_loops = if has_avx2() && !no_bce {
         let mut simd = Vec::new();
@@ -29825,9 +30562,8 @@ pub fn compile_with_param_slots(
     // field/static ops, no allocation, no typechecks, no inline sites, and no
     // speculative BCE guards (those deopt with frame-stashed state). Reference
     // locals are masked back to frame homes, so GC visibility is unchanged.
-    let kernel_reg_homes = (kernel_reg_homes_requested || kernel_reg_homes_osr_requested)
+    let pure_kernel = (kernel_reg_homes_requested || kernel_reg_homes_osr_requested)
         && kernel_reg_locals_enabled()
-        && !callee_saved_gpr_local_homes_enabled()
         && invoke_info.is_empty()
         && direct_calls.is_empty()
         && mic_slots.is_empty()
@@ -29842,7 +30578,12 @@ pub fn compile_with_param_slots(
         && compact_field_info.is_empty()
         && inline_sites.is_empty()
         && speculative_bce_guards.is_empty();
-    let alloc_result = if kernel_reg_homes {
+    // When precise-map general register homes are already enabled, this pure
+    // kernel does not need the narrow allocator to turn homes on again. It is
+    // still a pure kernel, however, and therefore remains eligible for the
+    // call-free deferred operand cache captured by `Compiler::new`.
+    let kernel_reg_homes = pure_kernel && !callee_saved_gpr_local_homes_enabled();
+    let mut alloc_result = if kernel_reg_homes {
         let mut ar = alloc_result;
         let ref_mask =
             super::regalloc::find_reference_locals(code, code_len, max_locals) | param_oop_mask;
@@ -29861,6 +30602,18 @@ pub fn compile_with_param_slots(
     } else {
         alloc_result
     };
+    if !matrix_dot_loops.is_empty() {
+        // R12..R15 are private scratch homes for the tight pre-header.  Do not
+        // let graph coloring simultaneously assign a Java local to one of
+        // them; locals displaced here simply retain their canonical frame
+        // homes.  Compiler::new still saves all four registers for ABI
+        // correctness, independently of the local-home diagnostic gates.
+        for assignment in &mut alloc_result.assignments {
+            if matches!(*assignment, Some(R12 | R13 | R14 | R15)) {
+                *assignment = None;
+            }
+        }
+    }
 
     // Precise escape re-analysis. `jit_scan` produced `non_escaping_new`
     // with a conservative empty shape map (it has no CP resolver). Now
@@ -29983,7 +30736,7 @@ pub fn compile_with_param_slots(
             found
         };
 
-    KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(kernel_reg_homes));
+    KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(pure_kernel));
     let mut compiler = Compiler::new(
         method_key.to_string(),
         buf,
@@ -29998,6 +30751,7 @@ pub fn compile_with_param_slots(
         hoist_info,
         arith_hoist_info,
         alloc_result,
+        !matrix_dot_loops.is_empty(),
         *helpers,
         num_scalar_slots,
         cache_jit_thread_for_inline_new,
@@ -30265,6 +31019,14 @@ pub fn compile_with_param_slots(
     compiler.pic_slots = pic_slots;
     compiler.unroll_loops = unroll_loops;
     compiler.simd_loops = simd_loops;
+    compiler.matrix_dot_loops = matrix_dot_loops;
+    // The pure-kernel deferred cache owns R8/R9 across bytecodes, while the
+    // matrix-dot preheader uses those registers for its batch limit and
+    // wrapping accumulator. Keep upstream's pure-kernel local homes, but
+    // disable only the conflicting operand cache for this exact lowering.
+    if !compiler.matrix_dot_loops.is_empty() {
+        compiler.kernel_operand_cache = false;
+    }
     compiler.branch_hints = branch_hints.into_iter().collect();
     compiler.loop_unroll_hints = loop_unroll_hints.into_iter().collect();
     compiler.ldc_info = ldc_info;
@@ -30805,7 +31567,18 @@ pub fn compile_with_param_slots(
     // install sites in vm/src/jit/helpers.rs) consult this flag so every
     // call to such a method stays on a dispatch helper, whose
     // `try_resume_trapped_callee` resolves the trap precisely in place.
-    cm.has_indy_trap = !compiler.indy_info.is_empty();
+    // Only sites that actually lower to a trap count. A fully bridged
+    // method (every indy is a StringConcatFactory call) carries no trap, so it
+    // must not be forced onto the dispatch-helper path for its callers.
+    cm.has_indy_trap = {
+        let concat_entry = crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        compiler
+            .indy_info
+            .iter()
+            .any(|(_pc, _arg_slots, ret_type, _tags, concat_site)| {
+                !(*concat_site != 0 && concat_entry != 0 && matches!(*ret_type, b'L' | b'['))
+            })
+    };
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;
@@ -31096,6 +31869,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             alloc_result,
+            false,
             test_helpers(),
             0,
             false,
@@ -31252,6 +32026,11 @@ mod tests {
             panic!("JIT test helper called an unimplemented runtime stub");
         }
         let sentinel = unimplemented_stub as *const () as usize; // Cast: address arithmetic
+        // `set_throw_bci` only records the throwing bci in a thread-local and is
+        // called on the throw path of every method carrying an exception check,
+        // so it needs a real no-op rather than the panicking stub.
+        unsafe extern "C" fn record_throw_bci(_bci: i64) {}
+        let throw_bci = record_throw_bci as *const () as usize; // Cast: address arithmetic
         JitRuntimeHelpers {
             newarray: sentinel,
             new_object: sentinel,
@@ -31302,7 +32081,7 @@ mod tests {
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
             throw_exception: sentinel,
-            set_throw_bci: sentinel,
+            set_throw_bci: throw_bci,
             service_callee_deopt: sentinel,
             jit_npe_with_action: sentinel,
             dispatch_threw: sentinel,
@@ -35930,6 +36709,54 @@ mod tests {
         assert_eq!(hoists[0].seq_end, 13);
         assert_eq!(hoists[0].array_local, 0);
         assert_eq!(hoists[0].index_local, 4);
+    }
+
+    #[test]
+    fn detects_exact_guarded_matrix_dot_product_loop() {
+        // CratonBench.matmul's javac bytecode at bci 31..62.
+        let mut code = vec![0u8; 31];
+        code.extend_from_slice(&[
+            0x15, 0x07, // 31: iload 7 (k)
+            0x1c, // 33: iload_2 (n)
+            0xa2, 0x00, 0x1d, // 34: if_icmpge 63
+            0x15, 0x06, // 37: iload 6 (sum)
+            0x2a, // 39: aload_0 (a)
+            0x15, 0x04, // 40: iload 4 (row)
+            0x32, // 42: aaload
+            0x15, 0x07, // 43: iload 7 (k)
+            0x2e, // 45: iaload
+            0x2b, // 46: aload_1 (b)
+            0x15, 0x07, // 47: iload 7 (k)
+            0x32, // 49: aaload
+            0x15, 0x05, // 50: iload 5 (column)
+            0x2e, // 52: iaload
+            0x68, // 53: imul
+            0x60, // 54: iadd
+            0x36, 0x06, // 55: istore 6
+            0x84, 0x07, 0x01, // 57: iinc 7,1
+            0xa7, 0xff, 0xe3, // 60: goto 31
+        ]);
+
+        let dot = detect_matrix_dot_loop(&code, 31, 60, 7).expect("matrix dot loop");
+        assert_eq!(
+            dot,
+            MatrixDotLoop {
+                header_pc: 31,
+                back_edge_pc: 60,
+                iv_local: 7,
+                bound_local: 2,
+                acc_local: 6,
+                a_outer_local: 0,
+                a_row_local: 4,
+                b_outer_local: 1,
+                b_column_local: 5,
+            }
+        );
+
+        // Any side effect or different arithmetic body must stay on the exact
+        // scalar emitter; fallback restart would not be valid for it.
+        code[53] = 0x4f; // iastore instead of imul
+        assert!(detect_matrix_dot_loop(&code, 31, 60, 7).is_none());
     }
 
     #[cfg(feature = "vm-tests")]
@@ -43220,6 +44047,76 @@ mod flag_and_header_contracts {
 
     // -- arch-2026-07-26 R1: reference-only self-call spill elision ---------
 
+    #[test]
+    fn moving_oop_free_self_call_requires_complete_empty_root_proof() {
+        assert!(
+            moving_oop_free_self_call_is_publishable(true, true, 0),
+            "moving-young may publish a metadata-only empty map when exact coverage proves no roots"
+        );
+        assert!(
+            !moving_oop_free_self_call_is_publishable(true, false, 0),
+            "incomplete moving-young coverage must retain the full spill"
+        );
+        assert!(
+            !moving_oop_free_self_call_is_publishable(true, true, 1),
+            "one live oop home must retain spill plus shadow publication"
+        );
+        assert!(
+            !moving_oop_free_self_call_is_publishable(false, true, 0),
+            "shadow-only mode keeps its established conservative path"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_inline_rbp_tls_slot_is_live_and_round_trips() {
+        assert_eq!(inline_rbp_tls_segment_prefix(), 0x64);
+        let disp = inline_rbp_tls_disp();
+        assert_ne!(
+            disp, 0,
+            "the sentinel-probed Linux fs-relative TLS slot should be available"
+        );
+        let old = inline_rbp_tls_mirror_read().expect("probe enabled the mirror");
+        let marker = 0x5242_5054_4553_5401usize;
+        assert!(inline_rbp_tls_mirror_write(marker));
+        assert_eq!(inline_rbp_tls_mirror_read(), Some(marker));
+        assert!(inline_rbp_tls_mirror_write(old));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_inline_rbp_tls_slot_is_thread_local() {
+        let disp = inline_rbp_tls_disp();
+        assert_ne!(disp, 0);
+        let old = inline_rbp_tls_mirror_read().expect("probe enabled the mirror");
+        let main_marker = 0x5242_5054_4852_4401usize;
+        let child_marker = 0x5242_5054_4852_4402usize;
+        assert!(inline_rbp_tls_mirror_write(main_marker));
+
+        let child = std::thread::spawn(move || {
+            assert_eq!(
+                inline_rbp_tls_disp(),
+                disp,
+                "the static ELF TLS offset must be identical in every thread"
+            );
+            assert_eq!(
+                inline_rbp_tls_mirror_read(),
+                Some(0),
+                "a new thread must not inherit the caller's frame mirror"
+            );
+            assert!(inline_rbp_tls_mirror_write(child_marker));
+            assert_eq!(inline_rbp_tls_mirror_read(), Some(child_marker));
+        });
+        child.join().expect("TLS isolation probe thread panicked");
+
+        assert_eq!(
+            inline_rbp_tls_mirror_read(),
+            Some(main_marker),
+            "the child thread must not overwrite the caller's frame mirror"
+        );
+        assert!(inline_rbp_tls_mirror_write(old));
+    }
+
     /// `int fib(int)` — the workload the elision exists for. No `aload`/`astore`
     /// anywhere, so no local can hold a reference and the elision must fire
     /// **even though** the allocator gave locals register homes. Before R1 the
@@ -43375,9 +44272,9 @@ mod flag_and_header_contracts {
         let src = include_str!("x64.rs");
         // Needles assembled at runtime so this test's own text is not counted.
         let cases: [(&str, &str, usize); 4] = [
-            ("HEADER_SIZE", " as u8", 31),
-            ("HEADER_SIZE", " as i32", 11),
-            ("ARRAY_LENGTH_OFFSET", " as u8", 16),
+            ("HEADER_SIZE", " as u8", 32),
+            ("HEADER_SIZE", " as i32", 13),
+            ("ARRAY_LENGTH_OFFSET", " as u8", 20),
             ("ARRAY_LENGTH_OFFSET", " as i32", 5),
         ];
         for (base, suffix, expected) in cases {

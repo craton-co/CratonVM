@@ -2494,17 +2494,17 @@ unsafe fn emit_osr_trampoline(
     // RBP publication used by precise JIT maps. Mirror the prologue here after
     // live ABI arguments have been saved to their frame homes: prefer the
     // default inline TLS store when available; fall back to the helper-table
-    // callback on non-Windows / inline opt-out. The helper call can clobber
-    // caller-saved registers, so preserve the incoming locals/thread pointers
-    // in the frame's reserved helper-call stack-arg area.
+    // callback on an unsupported target / inline opt-out. The helper call can
+    // clobber caller-saved registers, so preserve the incoming locals/thread
+    // pointers in the frame's reserved helper-call stack-arg area.
     let inline_rbp_disp = if frame_record != 0 {
         crate::x64::inline_rbp_tls_disp()
     } else {
         0
     };
     if inline_rbp_disp != 0 {
-        // MOV qword ptr gs:[disp32], RBP
-        tramp.emit_byte(0x65);
+        // MOV qword ptr <gs|fs>:[disp32], RBP
+        tramp.emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
         tramp.emit_byte(0x48);
         tramp.emit_byte(0x89);
         tramp.emit_byte(0x2C);
@@ -3959,6 +3959,18 @@ pub static INTEGER_VALUE_OF_DIRECT_FN: std::sync::atomic::AtomicUsize =
 /// the VM's `build_helpers`).
 pub fn set_integer_value_of_direct_fn(addr: usize) {
     INTEGER_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Process-lifetime bridge for `StringConcatFactory` sites lowered by the
+/// single-pass backend. It stays outside the stable helper-table ABI because
+/// the address is installed once at VM start, not per compiled artifact.
+pub static INDY_STRING_CONCAT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `StringConcatFactory` bridge (called once from the VM's
+/// `build_helpers`).
+pub fn set_indy_string_concat_fn(addr: usize) {
+    INDY_STRING_CONCAT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `Integer.intValue()` sibling of [`INTEGER_VALUE_OF_DIRECT_FN`].
@@ -9957,7 +9969,7 @@ fn try_compile_inner(
     // resolved) bails the WHOLE compile via `?`, exactly like every other
     // CP-resolved metadata table here — the codegen must never guess an
     // invokedynamic's stack effect.
-    let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
+    let mut indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)> = Vec::new();
     if !scan.indy_ops.is_empty() {
         let Some(resolver) = cp_invokedynamic_descriptor_resolver else {
             jitc_bail!("cp_invokedynamic_descriptor_resolver")
@@ -9969,7 +9981,7 @@ fn try_compile_inner(
             let arg_slots = count_param_slots(&descriptor);
             let ret_type = return_type(&descriptor);
             let arg_type_tags = indy_arg_type_tags(&descriptor);
-            indy_info.push((pc, arg_slots, ret_type, arg_type_tags));
+            indy_info.push((pc, arg_slots, ret_type, arg_type_tags, 0));
         }
     }
 
