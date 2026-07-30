@@ -13,4 +13,4 @@ lifetime of the eligible call site.
 This is a correctness and observability guard, not a permanent general JIT
 restriction: callers without an eligible offload site are unaffected.
 
-See also [the historical validation record](../internal/gpu-offload-followups-20260711.md#2-jit-compiled-callers-bypass-the-offload-hook--done).
+See also [the historical validation record](../internal/fixed-suite-bugs/gpu-offload-followups-20260711.md#2-jit-compiled-callers-bypass-the-offload-hook--done).

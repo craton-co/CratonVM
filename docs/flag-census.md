@@ -8,8 +8,8 @@ repo root. Regenerate with the scripts recorded at the bottom of this file.*
 >
 > The user-facing surface is now **fifteen** environment variables: ten grouped
 > ones that take a comma-separated token list, plus five scalars. See
-> [`docs/CONFIG.md`](../CONFIG.md) for how to set them and
-> [`docs/flag-tokens.md`](../flag-tokens.md) for every token.
+> [`docs/CONFIG.md`](CONFIG.md) for how to set them and
+> [`docs/flag-tokens.md`](flag-tokens.md) for every token.
 >
 > | Then | Now |
 > | --- | ---: |
@@ -19,7 +19,7 @@ repo root. Regenerate with the scripts recorded at the bottom of this file.*
 > | Documented flags that were silent no-ops | 8 → **0** |
 > | `X` / `NO_X` and `REAL_X` / `SYNTHETIC_X` duplicate pairs | 7 → **0** |
 >
-> The definition lives in [`types/src/flag_groups.rs`](../../types/src/flag_groups.rs).
+> The definition lives in [`types/src/flag_groups.rs`](../types/src/flag_groups.rs).
 > `types/tests/flag_surface.rs` and `tools/flag-census/check-surface.sh` (CI) fail
 > the build if a read site appears without a token, or if the reference docs name
 > a token that does not exist.
@@ -432,7 +432,7 @@ read would silently turn the feature off*).
 | `CRATONVM_REAL_AQS` | 3 | **no** | value/other | types,vm | `vm/tests/synthetic_diff.rs:291` |
 | `CRATONVM_REAL_FORKJOINPOOL` | 6 | partial | opt-out (default ON) | native-api,vm | `vm/tests/synthetic_diff.rs:294` |
 | `CRATONVM_REAL_JCA` | 2 | partial | value/other | types,vm | `vm/src/runtime/env_cache.rs:966` |
-| `CRATONVM_REAL_NET_SOCKETS` | 4 | partial | opt-in (default OFF) | native-api,types,vm | `vm/tests/synthetic_diff.rs:293` |
+| `CRATONVM_REAL_NET_SOCKETS` | 4 | partial | opt-out (default ON) | native-api,types,vm | `vm/tests/synthetic_diff.rs:293` |
 | `CRATONVM_REAL_PROXY` | 1 | **no** | value/other | types | `types/src/flags.rs:1537` |
 | `CRATONVM_REAL_PROXY_STRICT` | 1 | **no** | value/other | types | `types/src/flags.rs:1538` |
 | `CRATONVM_REAL_PROXY_SUPER` | 3 | partial | value/other | types,vm | `vm/src/runtime/env_cache.rs:354` |

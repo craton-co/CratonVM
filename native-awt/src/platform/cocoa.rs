@@ -84,6 +84,8 @@ impl CocoaBackend {
     }
 
     fn translate_ns_event(&self, ns_event: &NSEvent) -> Option<PlatformEvent> {
+        // SAFETY: `ns_event` is a live AppKit-owned NSEvent received from the
+        // application queue; querying its immutable type is valid here.
         let event_type = unsafe { ns_event.r#type() };
         let ns_window = ns_event.window()?;
         let id = self.lookup_window_id(&ns_window)?;
@@ -153,6 +155,7 @@ impl CocoaBackend {
             }
             NSEventType::ScrollWheel => {
                 let loc = ns_event.locationInWindow();
+                // SAFETY: the matched event is a live ScrollWheel NSEvent.
                 let dy = unsafe { ns_event.deltaY() } as i32;
                 Some(PlatformEvent::MouseWheel {
                     id,
@@ -163,6 +166,8 @@ impl CocoaBackend {
             }
             NSEventType::KeyDown => {
                 let key_code = ns_event.keyCode() as u32;
+                // SAFETY: the matched event is a live KeyDown NSEvent and the
+                // returned NSString is retained by the event during this call.
                 let chars = unsafe { ns_event.characters() };
                 let char_val = chars.and_then(|s| s.to_string().chars().next());
                 let modifiers = cocoa_modifiers(ns_event);
@@ -175,6 +180,8 @@ impl CocoaBackend {
             }
             NSEventType::KeyUp => {
                 let key_code = ns_event.keyCode() as u32;
+                // SAFETY: the matched event is a live KeyUp NSEvent and the
+                // returned NSString is retained by the event during this call.
                 let chars = unsafe { ns_event.characters() };
                 let char_val = chars.and_then(|s| s.to_string().chars().next());
                 let modifiers = cocoa_modifiers(ns_event);
@@ -238,6 +245,8 @@ impl PlatformBackend for CocoaBackend {
             | NSWindowStyleMask::Miniaturizable
             | NSWindowStyleMask::Resizable;
 
+        // SAFETY: construction occurs on the main thread (proved by `mtm`);
+        // the rectangle/style/backing values satisfy AppKit's initializer.
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(),
@@ -251,6 +260,8 @@ impl PlatformBackend for CocoaBackend {
         let title_ns = NSString::from_str(title);
         window.setTitle(&title_ns);
 
+        // SAFETY: construction and attachment occur on the main thread; the
+        // retained view and window keep each other valid after this call.
         let view = unsafe {
             let view = NSView::initWithFrame(NSView::alloc(), content_rect);
             window.setContentView(Some(&view));
@@ -302,6 +313,8 @@ impl PlatformBackend for CocoaBackend {
             NSPoint::new(x as f64, y as f64),
             NSSize::new(w as f64, h as f64),
         );
+        // SAFETY: the retained window is live and all backend calls are
+        // confined to the AppKit main thread.
         unsafe {
             info.window.setFrame_display(frame, true);
         }
@@ -361,6 +374,9 @@ impl PlatformBackend for CocoaBackend {
         // pre-multiplied output. Memory ordering matches the existing
         // Win32 GDI path; see `core_graphics` extern block for the C API
         // contract.
+        // SAFETY: pixel length was checked above; every CoreFoundation handle
+        // is null-checked and released exactly once, and all Cocoa calls occur
+        // on the main thread while their retained objects are alive.
         unsafe {
             if !info.view.lockFocusIfCanDraw() {
                 return Ok(());
@@ -444,6 +460,8 @@ impl PlatformBackend for CocoaBackend {
         let mut events = std::mem::take(&mut self.pending_events);
 
         loop {
+            // SAFETY: `app` is the main-thread NSApplication and all selector
+            // arguments are framework-owned constants or copied scalars.
             let ns_event = unsafe {
                 app.nextEventMatchingMask_untilDate_inMode_dequeue(
                     objc2_app_kit::NSEventMask::Any,
@@ -457,6 +475,8 @@ impl PlatformBackend for CocoaBackend {
                     if let Some(pe) = self.translate_ns_event(&event) {
                         events.push(pe);
                     }
+                    // SAFETY: `event` came from this application's queue and
+                    // remains retained for the synchronous dispatch.
                     unsafe {
                         app.sendEvent(&event);
                     }
@@ -469,6 +489,7 @@ impl PlatformBackend for CocoaBackend {
 
     fn run_event_loop(&mut self) {
         let app = NSApplication::sharedApplication(self.mtm);
+        // SAFETY: `mtm` proves main-thread execution for AppKit's run loop.
         unsafe {
             app.run();
         }
@@ -477,12 +498,14 @@ impl PlatformBackend for CocoaBackend {
     fn post_quit(&mut self) {
         self.quit = true;
         let app = NSApplication::sharedApplication(self.mtm);
+        // SAFETY: `mtm` proves main-thread execution and nil sender is allowed.
         unsafe {
             app.stop(None);
         }
     }
 
     fn screen_size(&self) -> (u32, u32) {
+        // SAFETY: `mtm` proves this AppKit query runs on the main thread.
         let frame = unsafe { objc2_app_kit::NSScreen::mainScreen(self.mtm) };
         match frame {
             Some(screen) => {
@@ -497,6 +520,7 @@ impl PlatformBackend for CocoaBackend {
         // macOS reports backing scale factor rather than DPI.
         // A Retina display has factor 2.0, which means 144 DPI
         // (72 * 2). Non-retina is 72 DPI (1 point = 1 pixel).
+        // SAFETY: `mtm` proves this AppKit query runs on the main thread.
         let screen = unsafe { objc2_app_kit::NSScreen::mainScreen(self.mtm) };
         match screen {
             Some(s) => {
@@ -515,6 +539,9 @@ impl PlatformBackend for CocoaBackend {
         bold: bool,
         _italic: bool,
     ) -> (f32, f32) {
+        // SAFETY: all Objective-C objects are retained for the synchronous
+        // selectors; `NSFont` is an AnyObject subclass, making the reference
+        // cast layout-preserving, and execution is confined to the main thread.
         unsafe {
             let family_ns = NSString::from_str(font_family);
             let font = if bold {
@@ -690,6 +717,8 @@ impl PlatformBackend for CocoaBackend {
     }
 
     fn clipboard_get_text(&self) -> Option<String> {
+        // SAFETY: the backend is main-thread confined; pasteboard objects and
+        // returned strings remain retained for each synchronous selector.
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             let nsstring = pb.stringForType(NSPasteboardTypeString)?;
@@ -698,6 +727,8 @@ impl PlatformBackend for CocoaBackend {
     }
 
     fn clipboard_set_text(&mut self, text: &str) -> Result<(), PlatformError> {
+        // SAFETY: the backend is main-thread confined and every retained
+        // NSString/NSArray stays alive through its synchronous selector.
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
@@ -729,6 +760,8 @@ impl PlatformBackend for CocoaBackend {
     }
 
     fn show_message_dialog(&mut self, title: &str, message: &str, msg_type: MessageDialogType) {
+        // SAFETY: the backend is main-thread confined and all Objective-C
+        // objects are retained through the modal alert selectors.
         unsafe {
             let alert: Retained<AnyObject> = msg_send![objc2::class!(NSAlert), new];
             let title_ns = NSString::from_str(title);
@@ -756,7 +789,7 @@ impl Drop for CocoaBackend {
     }
 }
 
-// Safety: CocoaBackend must only be used from the main thread, but we
+// SAFETY: CocoaBackend must only be used from the main thread, but we
 // mark it Send so it satisfies the PlatformBackend bound. The
 // MainThreadMarker guarantees construction happens on the main thread,
 // and the EDT design ensures all subsequent calls are also on that thread.

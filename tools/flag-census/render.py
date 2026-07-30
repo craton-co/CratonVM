@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2024-2026 Craton Software Company
-"""Render `docs/internal/flag-census.md` from the scan in `census.py`.
+"""Render `docs/flag-census.md` from the scan in `census.py`.
 
 Usage:  python3 tools/flag-census/render.py [REPO_ROOT]
 
@@ -19,7 +19,7 @@ import census  # noqa: E402
 
 ROOT = sys.argv[1] if len(sys.argv) > 1 else \
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-OUT = os.path.join(ROOT, 'docs', 'internal', 'flag-census.md')
+OUT = os.path.join(ROOT, 'docs', 'flag-census.md')
 
 sites, nonrust = census.scan(ROOT)
 rows = census.aggregate(sites, nonrust)

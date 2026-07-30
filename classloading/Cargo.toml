@@ -21,6 +21,7 @@ cratonvm-types = { path = "../types", version = "0.3.0" }
 cratonvm-reader = { path = "../reader", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
 cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
+cratonvm-native-builtins-crypto = { path = "../native-builtins-crypto", version = "0.3.0" }
 tracing.workspace = true
 parking_lot.workspace = true
 zip.workspace = true

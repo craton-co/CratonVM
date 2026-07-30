@@ -118,7 +118,11 @@ fn parse_osr_backedge_enabled(raw: Option<&str>) -> bool {
 pub fn osr_backedge_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        parse_osr_backedge_enabled(cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR").ok().as_deref())
+        parse_osr_backedge_enabled(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -259,10 +263,12 @@ pub fn tier_osr_backedge() -> Option<u32> {
 #[inline]
 pub fn osr_newarray_allowed() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_OSR_NEWARRAY") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    })
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_OSR_NEWARRAY") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
 }
 
 /// `CRATONVM_DISABLE_INTRINSICS` — kill-switch that prevents the interpreter
@@ -277,10 +283,12 @@ pub fn osr_newarray_allowed() -> bool {
 #[inline]
 pub fn intrinsics_disabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_DISABLE_INTRINSICS") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
-    })
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_DISABLE_INTRINSICS") {
+            Ok(v) => !v.is_empty() && v != "0",
+            Err(_) => false,
+        },
+    )
 }
 
 /// `CRATONVM_HELPFUL_NPE_OPCODES` — JEP 358 increment 2 opt-in. When set,
@@ -321,9 +329,11 @@ pub fn set_show_code_details_in_exception_messages(on: bool) {
 fn show_code_details_explicit() -> Option<bool> {
     // Explicit env override wins (interim developer knob), parsed once.
     static ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env = *ENV.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_HELPFUL_NPE_OPCODES") {
-        Ok(v) => Some(!v.is_empty() && v != "0"),
-        Err(_) => None,
+    let env = *ENV.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_HELPFUL_NPE_OPCODES") {
+            Ok(v) => Some(!v.is_empty() && v != "0"),
+            Err(_) => None,
+        }
     });
     if env.is_some() {
         return env;
@@ -375,14 +385,16 @@ pub fn helpful_npe_opcodes() -> bool {
 #[inline]
 pub fn real_proxy_super() -> bool {
     static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_REAL_PROXY_SUPER") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        // Unset (the default): real `java.lang.reflect.Proxy` super.
-        Err(_) => true,
-    })
+    *GATE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_REAL_PROXY_SUPER") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            }
+            // Unset (the default): real `java.lang.reflect.Proxy` super.
+            Err(_) => true,
+        },
+    )
 }
 
 // Cache the per-native-call GC root snapshot's *frozen* lower frames and
@@ -394,7 +406,10 @@ pub fn real_proxy_super() -> bool {
 // cache entry is reused only while that frame's root shape is unchanged. The
 // real ForkJoinPool lane bypasses both cache reuse and survive-GC remapping.
 //
-cached_is_set!(real_forkjoinpool, "CRATONVM_REAL_FORKJOINPOOL");
+#[inline]
+pub fn real_forkjoinpool() -> bool {
+    cratonvm_types::flags::flags().natives.real_forkjoinpool
+}
 
 // DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang). Previously
 // default-OFF: `update_root_snapshot` rescans EVERY interpreter frame on every
@@ -410,12 +425,14 @@ cached_is_set!(real_forkjoinpool, "CRATONVM_REAL_FORKJOINPOOL");
 #[inline]
 pub fn rootsnap_cache() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_ROOTSNAP_CACHE") {
-        // Explicit opt-out only: `0` / `false` disable; unset or any other
-        // value (incl. `1`, empty) enables.
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    })
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_ROOTSNAP_CACHE") {
+            // Explicit opt-out only: `0` / `false` disable; unset or any other
+            // value (incl. `1`, empty) enables.
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
 }
 
 // Opt-in: keep the `rootsnap_cache` frozen-frame cache valid ACROSS a GC by
@@ -442,12 +459,12 @@ pub fn rootsnap_cache() -> bool {
 #[inline]
 pub fn rootsnap_cache_survive_gc() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(
-        || match cratonvm_types::flags::runtime_var("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC") {
+    *CACHE.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
-        },
-    )
+        }
+    })
 }
 
 cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
@@ -485,10 +502,12 @@ cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
 #[inline]
 pub fn bg_compile() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_BG_COMPILE") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    })
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_BG_COMPILE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
 }
 // wire-tiered-manager Step 4 (PGO handoff C1 → C2): opt-in profile collection.
 // When set, `SharedVm::new` calls `jit::profile::enable_profiling(true)` once at
@@ -515,12 +534,14 @@ cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
 #[inline]
 pub fn jit_virtual_tierup() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_TIERUP") {
-        // Explicit opt-out only: `0` / `false` disable; unset or any other
-        // value (incl. `1`, empty) enables.
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    })
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_TIERUP") {
+            // Explicit opt-out only: `0` / `false` disable; unset or any other
+            // value (incl. `1`, empty) enables.
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
 }
 /// `CRATONVM_NATIVE_STRING_REGEX` — route `String.replaceAll` / `replaceFirst`
 /// / `matches` and the literal `String.replace(CharSequence,CharSequence)` to
@@ -541,11 +562,13 @@ pub fn jit_virtual_tierup() -> bool {
 #[inline]
 pub fn native_string_regex() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_STRING_REGEX") {
-        // Explicit opt-out only: `0` / `false` disable; unset or any other
-        // value (incl. `1`, empty) enables.
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+    *CACHE.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_STRING_REGEX") {
+            // Explicit opt-out only: `0` / `false` disable; unset or any other
+            // value (incl. `1`, empty) enables.
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     })
 }
 
@@ -583,11 +606,13 @@ pub fn native_string_regex() -> bool {
 #[inline]
 pub fn native_matcher_find() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_MATCHER_FIND") {
-        // Explicit opt-out only: `0` / `false` disable; unset or any other
-        // value (incl. `1`, empty) enables.
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+    *CACHE.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_MATCHER_FIND") {
+            // Explicit opt-out only: `0` / `false` disable; unset or any other
+            // value (incl. `1`, empty) enables.
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     })
 }
 cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
@@ -708,7 +733,10 @@ cached_is_set!(dbg_dupcall_filter, "CRATONVM_DBG_DUPCALL_FILTER");
 /// `CRATONVM_DBG_BLOCKGC` note in `vm_exec.rs`. Keep this predicate as the
 /// left operand: a `OnceLock<bool>` read is cheaper than the string compare,
 /// so it short-circuits the common (unset) case in a single load.
-cached_is_set!(invoke_virtual_entry_trace, "CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE");
+cached_is_set!(
+    invoke_virtual_entry_trace,
+    "CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE"
+);
 
 // ── PERF 2026-07-25: the five `getenv` hogs found by an LD_PRELOAD tally ──
 //
@@ -842,16 +870,20 @@ cached_is_ok!(charset_dbg, "CRATONVM_DBG_CHARSET");
 #[inline]
 pub fn strict_swallows() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_STRICT_SWALLOWS") {
-        Ok(v) => v == "1",
-        Err(_) => false,
-    })
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_STRICT_SWALLOWS") {
+            Ok(v) => v == "1",
+            Err(_) => false,
+        },
+    )
 }
 
 #[inline]
 pub fn jit_scalar_new() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0"))
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0")
+    })
 }
 
 /// C1→C2 supersede (default-ON): after the background worker publishes a C1
@@ -864,26 +896,34 @@ pub fn jit_scalar_new() -> bool {
 pub fn c2_supersede() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var("CRATONVM_C2_SUPERSEDE").map_or(true, |v| v != "0" && v != "false")
+        cratonvm_types::flags::runtime_var("CRATONVM_C2_SUPERSEDE")
+            .map_or(true, |v| v != "0" && v != "false")
     })
 }
 
 #[inline]
 pub fn jit_ir_call() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"))
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0")
+    })
 }
 
 #[inline]
 pub fn jit_ir_call_special() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"))
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL_SPECIAL")
+            .map_or(true, |v| v != "0")
+    })
 }
 
 #[inline]
 pub fn jit_ir_long() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"))
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0")
+    })
 }
 
 #[inline]
@@ -898,13 +938,17 @@ pub fn jit_ir_call_virtual() -> bool {
 #[inline]
 pub fn jit_ir_fp() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"))
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0")
+    })
 }
 
 #[inline]
 pub fn inline_allow_static() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_INLINE_ALLOW_STATIC").is_some())
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_INLINE_ALLOW_STATIC").is_some()
+    })
 }
 
 // NOTE (real-cdi-bean-container Step 3): the former `real_spring_startup()` gate

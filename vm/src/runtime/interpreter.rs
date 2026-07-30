@@ -62,6 +62,10 @@ use crate::memory::heap::ArrayElementType;
 use crate::memory::roots::collect_roots;
 use crate::runtime::exceptions::convert_class_not_found;
 use crate::runtime::frame::Frame;
+use crate::runtime::redefine_state::{
+    class_was_redefined, hierarchy_fingerprint_in, named_class_was_redefined,
+    native_shadow_suppressed_in,
+};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{CompactTag, CompactValue, ObjectRef, Value};
 use crate::vm::{
@@ -6058,7 +6062,11 @@ pub fn execute(
         // and use the shared artifacts normally.
         let env_disable_jit = crate::runtime::env_cache::disable_jit()
             || matches!(thread.kind, crate::threading::ThreadKind::Virtual);
-        let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+        // Redefinition invalidates only the class whose bytecode changed.
+        // Invoke/JIT cache entries already carry that class's generation
+        // handle, so an unrelated Mockito mock must not disable compilation
+        // for the rest of the process.
+        let redefine_jit_quiesced = class_was_redefined(shared, class_id);
         // GPU-offload JIT admission gate (known-issues followups item 2):
         // while `--gpu` is active, a caller whose bytecode contains an
         // offload-eligible invokestatic must stay interpreted, or its
@@ -6101,7 +6109,7 @@ pub fn execute(
             // `mark_jit_bail_listed`/the `jit_skip_set.write().insert(...)`
             // calls in the compile-attempt branch below. Scoped to the
             // static per-method reasons only — `env_disable_jit` /
-            // `redefine_jit_quiesced` / `gpu_gate_skip` are process-global or
+            // `redefine_jit_quiesced` / `gpu_gate_skip` are runtime or
             // call-site-dependent, not per-method-permanent, so they must NOT
             // poison this method's entry for future calls where those flags
             // may differ.
@@ -7269,8 +7277,12 @@ pub fn execute(
                                         method_name: Arc::from(method_name),
                                         method_descriptor: Arc::from(method_descriptor),
                                         source_file: source_file.as_deref().map(Arc::from),
-                                        code: crate::runtime::frame::padded_bytecode(&code_attr.code),
-                                        exception_table: Arc::from(code_attr.exception_table.as_slice()),
+                                        code: crate::runtime::frame::padded_bytecode(
+                                            &code_attr.code,
+                                        ),
+                                        exception_table: Arc::from(
+                                            code_attr.exception_table.as_slice(),
+                                        ),
                                         max_stack: code_attr.max_stack,
                                         max_locals: code_attr.max_locals,
                                         num_params: count_method_params(method_descriptor) as u16,
@@ -13605,7 +13617,7 @@ fn real_frame_deopt_resume_and_despeculate(
     // side effects). Class redefinition invalidates the bytecode itself, so
     // it keeps the conservative skip in either mode.
     let fresh = compiled.compilation_epoch >= live
-        || (!vm_jit_free_code_enabled() && !crate::classloading::any_class_redefined());
+        || (!vm_jit_free_code_enabled() && !class_was_redefined(shared, cached.declaring_class_id));
     let resumed = if fresh {
         resume_real_ir_deopt(shared, thread, cached, rframe)
     } else {
@@ -24863,7 +24875,7 @@ fn try_lambda_default_method_dispatch(
 
 thread_local! {
     static LAMBDA_IMPL_BYTECODE_CACHE: std::cell::RefCell<
-        rustc_hash::FxHashMap<(u32, u32), Arc<CachedBytecodeMethod>>
+        rustc_hash::FxHashMap<(u32, u32), (Arc<CachedBytecodeMethod>, RedefineGate)>
     > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
@@ -24874,15 +24886,11 @@ thread_local! {
 // lambda/accessor continues through the normal dispatch path.
 thread_local! {
     static TDIGEST_DOUBLE_GET_FIELD_CACHE: std::cell::RefCell<
-        rustc_hash::FxHashMap<(u32, u32), usize>
+        rustc_hash::FxHashMap<(u32, u32), (usize, RedefineGate)>
     > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
 fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef, index: i32) -> Option<f64> {
-    if crate::classloading::any_class_redefined() {
-        TDIGEST_DOUBLE_GET_FIELD_CACHE.with(|cache| cache.borrow_mut().clear());
-        return None;
-    }
     let proxy_class_id = shared.mem.heap.class_id_of(proxy);
     let call_site = shared
         .classes
@@ -24910,9 +24918,19 @@ fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef, index: i32
     let receiver_class_id = shared.mem.heap.class_id_of(receiver);
     let key = (proxy_class_id.as_u32(), receiver_class_id.as_u32());
     let field_index = TDIGEST_DOUBLE_GET_FIELD_CACHE
-        .with(|cache| cache.borrow().get(&key).copied())
+        .with(|cache| {
+            let mut cache = cache.borrow_mut();
+            match cache.get(&key) {
+                Some((field_index, gate)) if !gate.is_stale() => Some(*field_index),
+                Some(_) => {
+                    cache.remove(&key);
+                    None
+                }
+                None => None,
+            }
+        })
         .or_else(|| {
-            let (declaring_id, field_cp_index) = {
+            let (declaring_id, field_cp_index, gate) = {
                 let cm = shared.classes.class_manager.read();
                 let (method, declaring_id) = crate::classloading::find_method_recursive(
                     receiver_class_id,
@@ -24933,14 +24951,16 @@ fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef, index: i32
                 (
                     declaring_id,
                     ((code.code[2] as u16) << 8) | code.code[3] as u16,
+                    RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id)),
                 )
             };
             let field = resolve_field_ref(shared, declaring_id, field_cp_index).ok()?;
             if field.is_static || field.desc_byte != b'[' {
                 return None;
             }
-            TDIGEST_DOUBLE_GET_FIELD_CACHE
-                .with(|cache| cache.borrow_mut().insert(key, field.field_index));
+            TDIGEST_DOUBLE_GET_FIELD_CACHE.with(|cache| {
+                cache.borrow_mut().insert(key, (field.field_index, gate));
+            });
             Some(field.field_index)
         })?;
     if index < 0 {
@@ -24970,12 +24990,18 @@ fn try_invoke_cached_lambda_impl(
     descriptor: &str,
     args: &[Value],
 ) -> Result<Option<Option<Value>>, MethodCallFailed> {
-    if crate::classloading::any_class_redefined() {
-        LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| cache.borrow_mut().clear());
-        return Ok(None);
-    }
     let key = (proxy_class_id.as_u32(), receiver_class_id.as_u32());
-    let cached = LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| cache.borrow().get(&key).cloned());
+    let cached = LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        match cache.get(&key) {
+            Some((cached, gate)) if !gate.is_stale() => Some(Arc::clone(cached)),
+            Some(_) => {
+                cache.remove(&key);
+                None
+            }
+            None => None,
+        }
+    });
     let cached = match cached {
         Some(c) if &*c.method_name == method_name && &*c.method_descriptor == descriptor => c,
         Some(_) => return Ok(None),
@@ -25027,8 +25053,11 @@ fn try_invoke_cached_lambda_impl(
                 jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
                 quickened: std::sync::OnceLock::new(),
             });
+            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
             drop(cm);
-            LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| cache.borrow_mut().insert(key, Arc::clone(&c)));
+            LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(key, (Arc::clone(&c), gate));
+            });
             c
         }
     };
@@ -27865,10 +27894,11 @@ pub(crate) fn is_forkjoin_native_override(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
-    // Under CRATONVM_REAL_FORKJOINPOOL, keep real pool initialization but force
-    // the VM Bridge methods that otherwise enqueue work into ForkJoinPool's
-    // queue/status machinery. The task-family methods share the side-table
-    // state scanned and remapped by GC.
+    // On the default real-ForkJoinPool path, keep real pool initialization but
+    // force the VM bridge methods that otherwise enqueue work into
+    // ForkJoinPool's queue/status machinery. The task-family methods share the
+    // side-table state scanned and remapped by GC. The legacy synthetic path is
+    // selected explicitly with CRATONVM_SYNTHETIC_FORKJOINPOOL.
     if class_name == "java/util/concurrent/ForkJoinPool"
         && matches!(
             (method_name, descriptor),
@@ -30907,32 +30937,7 @@ fn native_shadow_suppressed_by_redefine(shared: &SharedVm, class_name: &str) -> 
         return false;
     }
     let cm = shared.classes.class_manager.read();
-    native_shadow_suppressed_by_redefine_in(&cm, class_name)
-}
-
-/// Guard-reusing variant of [`native_shadow_suppressed_by_redefine`] for call
-/// sites that already hold a `class_manager` read guard. `parking_lot`
-/// `RwLock::read()` is task-fair and NOT reentrant: when a writer queues
-/// between a thread’s first and second read acquisition of the same lock,
-/// the second read parks behind the writer while the first guard blocks that
-/// writer forever — a same-thread self-deadlock. `try_stackless_invoke`’s
-/// native-override hierarchy walk hit exactly this once Mockito’s inline
-/// mock maker armed `any_class_redefined` (the nested acquisition is only
-/// reached after that flag is set), wedging ~25-50% of
-/// `HttpComponentsClientHttpRequestFactoryTests` runs in teardown while
-/// `load_class_concurrent`’s write was pending on another thread.
-#[inline]
-fn native_shadow_suppressed_by_redefine_in(
-    cm: &crate::classloading::ClassManager,
-    class_name: &str,
-) -> bool {
-    if !crate::classloading::any_class_redefined() {
-        return false;
-    }
-    match cm.get_loaded_class_id(class_name) {
-        Some(cid) => cm.class_redefine_generation(cid) > 0,
-        None => false,
-    }
+    native_shadow_suppressed_in(&cm, class_name)
 }
 
 /// Reflection-metadata natives on the `java.lang.reflect.*` member types that
@@ -32589,7 +32594,7 @@ fn try_stackless_invoke(
             // calls) silently bypassed the mock's advice and ran the real
             // native instead. Skip an ancestor's native the same way the
             // receiver-class check does.
-            let parent_redefined = native_shadow_suppressed_by_redefine_in(&cm, &parent.name)
+            let parent_redefined = native_shadow_suppressed_in(&cm, &parent.name)
                 && !redefine_immune_forced_native(&parent.name, method_name, descriptor);
             if !parent_redefined {
                 if let Some(cb) =
@@ -34301,8 +34306,8 @@ fn execute_invokestatic_cached(
     // (e.g. Mockito `mockStatic(X)` woves X's static methods) — evict and
     // re-resolve so the woven bytecode + advice run. Fast-pathed on
     // `any_class_redefined`.
-    let redefine_jit_quiesced = crate::classloading::any_class_redefined();
-    if redefine_jit_quiesced
+    let any_class_redefined = crate::classloading::any_class_redefined();
+    if any_class_redefined
         && matches!(
             &target,
             CachedInvokeTarget::Native { .. } | CachedInvokeTarget::Intrinsic { .. }
@@ -34315,9 +34320,7 @@ fn execute_invokestatic_cached(
             }
         }
     }
-    if (redefine_jit_quiesced || continuation_interpreted)
-        && matches!(&target, CachedInvokeTarget::Jit { .. })
-    {
+    if continuation_interpreted && matches!(&target, CachedInvokeTarget::Jit { .. }) {
         thread.invoke_cache.evict(caller_class_id, cp_index, false);
         return Ok(CachedCallResult::CacheMiss);
     }
@@ -34450,7 +34453,8 @@ fn execute_invokestatic_cached(
             // live generation the cache content is unchanged since we last looked
             // and missed, and looking again cannot find anything. Steady state is
             // two integer loads plus a compare: no hashing, no string compares.
-            if jit_enabled && !redefine_jit_quiesced && !continuation_interpreted {
+            let target_redefined = entry_gate.generation > 0;
+            if jit_enabled && !target_redefined && !continuation_interpreted {
                 // Read the generation BEFORE probing. A publication racing in
                 // after the probe leaves us memoizing an older generation, which
                 // compares unequal next time and re-probes -- safe. Memoizing a
@@ -34573,7 +34577,7 @@ fn execute_invokestatic_cached(
             let should_attempt = past_threshold
                 && (invoc_count == jit_invocation_threshold
                     || (invoc_count - jit_invocation_threshold) % JIT_RETRY_STRIDE == 0);
-            if should_attempt && !redefine_jit_quiesced && !continuation_interpreted {
+            if should_attempt && !target_redefined && !continuation_interpreted {
                 // Consult tiered compilation manager for recommended tier
                 let tiered_key = crate::jit::tiered::MethodKey::new(
                     cached.class_name.as_ref(),
@@ -36210,7 +36214,7 @@ fn try_osr(
     // ThrowJava` for why the safe reject was wrong there.
     throw_out: &mut Option<ObjectRef>,
 ) -> Option<Option<Value>> {
-    if crate::classloading::any_class_redefined() {
+    if class_was_redefined(shared, class_id) {
         return None;
     }
     let frame = &thread.frames[frame_idx];
@@ -37012,13 +37016,13 @@ fn jit_method_calls_forced_class_generic_metadata(
                     _ => return true,
                 };
                 matches!(
-                    (cp.get_class_name(class_index), cp.get_name_and_type(nat_index)),
+                    (
+                        cp.get_class_name(class_index),
+                        cp.get_name_and_type(nat_index)
+                    ),
                     (
                         Some("java/lang/Class"),
-                        Some((
-                            "getTypeParameters",
-                            "()[Ljava/lang/reflect/TypeVariable;"
-                        ))
+                        Some(("getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;"))
                             | Some(("getGenericInterfaces", "()[Ljava/lang/reflect/Type;"))
                             | Some(("getGenericSuperclass", "()Ljava/lang/reflect/Type;"))
                     )
@@ -37146,7 +37150,10 @@ fn try_jit_upgrade_with_gate(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
-    if crate::classloading::any_class_redefined() {
+    // The gate is bound to this exact declaring class. Keep the conservative
+    // no-JIT policy for a retransformed body, but do not punish every other
+    // class in the VM after an agent touches one class.
+    if gate.generation > 0 {
         return None;
     }
     // The compiled-call ABI has no ACC_SYNCHRONIZED monitor prologue/epilogue.
@@ -38432,9 +38439,6 @@ pub fn try_jit_compile_callee(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
-    if crate::classloading::any_class_redefined() {
-        return None;
-    }
     // RBC.4 — short-circuit permanently-uncompilable methods before the
     // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
     if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
@@ -38472,6 +38476,9 @@ pub fn try_jit_compile_callee(
             .read()
             .get_loaded_class_id(class_name)
             .unwrap_or(ClassId::new(0));
+        if class_was_redefined(shared, probe_class_id) {
+            return None;
+        }
         let jit_cache = shared.jit.jit_cache.read();
         if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id) {
             // Cast: object/code pointer to integer address
@@ -38534,7 +38541,7 @@ fn try_jit_compile_wrapped_entry(
     descriptor: &str,
     optimize: bool,
 ) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
-    if crate::runtime::env_cache::disable_jit() || crate::classloading::any_class_redefined() {
+    if crate::runtime::env_cache::disable_jit() || named_class_was_redefined(shared, class_name) {
         return None;
     }
     let mut cache_negative = false;
@@ -39527,12 +39534,9 @@ fn background_compile_task(
         // about this method. Charge it to neither counter.
         None => return fail(0),
     };
-    if crate::classloading::any_class_redefined() {
-        // Global latch, never reset: once any class is redefined this returns
-        // for EVERY subsequent task. Charging it to `tier_fail_count` would
-        // have banned every hot method in the process after three attempts
-        // apiece, regardless of whether the method itself was compilable.
-        // It is permanent, so record it as the permanent decline it is.
+    if named_class_was_redefined(&shared, &task.method_key.class_name) {
+        // A retransformed target remains interpreted for now. This is a
+        // per-class decline; unrelated background tasks continue compiling.
         return declined(0);
     }
     // Keep asynchronous tiering aligned with the foreground admission paths.
@@ -41356,11 +41360,13 @@ const NATIVE_SHADOW_CACHE_MAX_ENTRIES: usize = 8192;
 #[inline]
 fn vtable_native_shadow_cache_key(
     receiver_class_id: ClassId,
+    redefine_fingerprint: u64,
     method_name: &str,
     method_descriptor: &str,
-) -> (u32, u64, u64) {
+) -> (u32, u64, u64, u64) {
     (
         receiver_class_id.as_u32(),
+        redefine_fingerprint,
         crate::runtime::fx_collections::fx_hash_str(method_name),
         crate::runtime::fx_collections::fx_hash_str(method_descriptor),
     )
@@ -41369,7 +41375,7 @@ fn vtable_native_shadow_cache_key(
 #[inline]
 fn remember_vtable_native_shadow(
     thread: &mut JvmThread,
-    key: Option<(u32, u64, u64)>,
+    key: Option<(u32, u64, u64, u64)>,
     verdict: bool,
 ) {
     if let Some(key) = key {
@@ -41813,14 +41819,12 @@ fn execute_invokevirtual_vtable_fast(
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
             }
-            let native_shadow_cache_key =
-                (!crate::classloading::any_class_redefined()).then(|| {
-                    vtable_native_shadow_cache_key(
-                        receiver_class_id,
-                        &method_name,
-                        &method_descriptor,
-                    )
-                });
+            let native_shadow_cache_key = Some(vtable_native_shadow_cache_key(
+                receiver_class_id,
+                hierarchy_fingerprint_in(&cm, receiver_class_id),
+                &method_name,
+                &method_descriptor,
+            ));
             let cached_native_shadow = native_shadow_cache_key
                 .and_then(|key| thread.native_shadow_cache.get(&key).copied());
             if cached_native_shadow == Some(true) {
@@ -42000,47 +42004,11 @@ fn execute_invokevirtual_vtable_fast(
             }
         }
 
-        // JVMTI redefine guard — the VtableManager entry's `resolved_method`
-        // is an immutable `Arc<CachedBytecodeMethod>` snapshot with NO
-        // staleness tracking of its own (unlike `CachedInvokeTarget`, which
-        // carries a `RedefineGate` checked on every hit). A class's OWN
-        // vtable is refreshed when IT is redefined (`redefine_class` calls
-        // `vtable_install_adapter` for that class), but a SUBCLASS's vtable
-        // — which copies/inherits the slot from its declaring ancestor at
-        // the time the subclass's own vtable was built, typically at
-        // ordinary class-load time, long before any agent runs — is never
-        // transitively refreshed. So once a receiver's vtable has cached an
-        // inherited slot, a LATER redefinition of the DECLARING ancestor
-        // (e.g. Mockito's inline mock maker weaving advice into a spied
-        // class's whole hierarchy) leaves this entry pointing at the
-        // pre-redefinition bytecode forever — permanently and silently
-        // bypassing the woven advice for any call site that reaches this
-        // fast path before ever going through `execute_invokevirtual_cached`
-        // / `populate_virtual_invoke_cache` (whose `RedefineGate` entries
-        // stay sound). Observed as: `given(spy.get(k)).willReturn(...)`
-        // stubs are silently ignored — `MockMethodAdvice.handle()` is never
-        // even entered — for any call to `spy.get(k)` reached via a call
-        // site whose declared receiver type is an INTERFACE the concrete
-        // spied class doesn't directly implement (so its own invokevirtual
-        // call sites warm the sound tier-1 cache first, but an unrelated
-        // 3rd-party class's invokeinterface call site never does before
-        // hitting this stale entry). See
-        // docs/known-issues/springboot/mockito-inline-nested-selfcall-stub-bypass.md.
-        //
-        // Fix: same guard already used for the native-shadow decision a few
-        // lines above (`receiver_redefined`) — if the entry's OWN declaring
-        // class has ever been redefined, this snapshot cannot be trusted;
-        // cede to the slow, redefine-aware path instead of trusting it.
-        if crate::classloading::any_class_redefined()
-            && shared
-                .classes
-                .class_manager
-                .read()
-                .class_redefine_generation(cached.declaring_class_id)
-                > 0
-        {
-            return Ok(CachedCallResult::CacheMiss);
-        }
+        // `VtableManager::install_vtable` refreshes inherited entries when a
+        // declaring class is reinstalled by JVMTI redefine. The snapshot here
+        // is therefore generation-current even for an already-linked
+        // subclass; dispatch can stay on the cached path instead of
+        // permanently re-resolving every call after the first redefine.
         // `vtable_install_adapter` (called
         // from `ClassManager::define_class_with_options` while defining a
         // class) takes the locks in the OPPOSITE order - class_manager
@@ -42371,7 +42339,6 @@ fn try_execute_cached_trivial_instance_getter(
         || cached.is_synchronized
         || cached.num_params != 0
         || args.len() != 1
-        || crate::classloading::any_class_redefined()
         || crate::runtime::jvmti::any_method_entry_listener_active()
         || crate::runtime::jvmti::any_method_exit_listener_active()
         || crate::runtime::jvmti::any_field_watchpoint_active()
@@ -43193,7 +43160,7 @@ fn execute_invokevirtual_cached(
                         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
                         && !cached.is_synchronized
                         && !has_registered_native
-                        && !crate::classloading::any_class_redefined()
+                        && entry_gate.generation == 0
                         && !crate::runtime::env_cache::disable_jit()
                         // The generic-conversion regression reaches a hot
                         // java.util graph while Spring creates annotation and

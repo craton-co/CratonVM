@@ -22,7 +22,6 @@ fn dbg_toarray_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::nbflags().dbg_toarray)
 }
 
-
 /// Normalise property keys after `read_string` (trim stray control/NUL).
 #[inline]
 fn normalize_java_property_key(key: &str) -> String {
@@ -123,11 +122,6 @@ struct SpringXmlGrammarPoolEntry {
     fallback: ObjectRef,
 }
 
-
-
-
-
-
 fn native_spring_default_document_loader_create_document_builder_factory(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -184,10 +178,6 @@ fn native_spring_default_document_loader_create_document_builder_factory(
     ctx.unpin_native_roots(factory_pin);
     result
 }
-
-
-
-
 
 fn native_output_stream_writer_write_string(
     ctx: &mut dyn NativeContext,
@@ -647,8 +637,6 @@ fn message_bytes_set_string_object(
         .remove(&ctx.identity_hash_code(mb));
 }
 
-
-
 fn char_chunk_parts(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, usize, usize)> {
     let buff = match ctx.get_field_by_name(this, "buff") {
         Value::Object(Some(o)) => o,
@@ -1023,7 +1011,10 @@ fn native_response_request_string(
     request: ObjectRef,
     name: &str,
 ) -> Option<String> {
-    match ctx.invoke_virtual(request, name, "()Ljava/lang/String;", &[]).ok()? {
+    match ctx
+        .invoke_virtual(request, name, "()Ljava/lang/String;", &[])
+        .ok()?
+    {
         Some(Value::Object(Some(o))) => ctx.read_string(o),
         _ => None,
     }
@@ -1162,7 +1153,9 @@ fn native_char_chunk_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         units.push(ctx.get_array_element(buff, i).as_int().unwrap_or(0) as u16);
     }
     let text = String::from_utf16_lossy(&units);
-    Ok(Some(Value::Object(Some(ctx.create_string_uninterned_gc_safe(&text)))))
+    Ok(Some(Value::Object(Some(
+        ctx.create_string_uninterned_gc_safe(&text),
+    ))))
 }
 
 fn native_char_chunk_equals_string(
@@ -2556,9 +2549,12 @@ fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 #[cfg(test)]
 mod bootstrap_property_fallback_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -2717,17 +2713,12 @@ fn native_process_environment_environ(
     Ok(Some(Value::Object(Some(outer))))
 }
 
-
-
 #[derive(Clone, Copy)]
 struct RandomizedRootEntry {
     root: usize,
     fallback: ObjectRef,
     identity: i32,
 }
-
-
-
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct RandomizedContextCacheKey {
@@ -2736,9 +2727,6 @@ struct RandomizedContextCacheKey {
     group: i32,
 }
 
-
-
-
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct RandomizedRandomCacheKey {
     vm: usize,
@@ -2746,32 +2734,10 @@ struct RandomizedRandomCacheKey {
     thread: i32,
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn native_randomness_get_random(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     Ok(Some(ctx.get_field_by_name(this, "random")))
 }
-
-
-
 
 #[inline]
 fn xoroshiro_state(ctx: &dyn NativeContext, this: ObjectRef) -> (u64, u64) {
@@ -2928,10 +2894,6 @@ struct RandomizedPerThreadCacheEntry {
     resource_id: i32,
 }
 
-
-
-
-
 fn float_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> f32 {
     match ctx.get_array_element(arr, index) {
         Value::Float(v) => v,
@@ -2939,7 +2901,6 @@ fn float_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> f3
         _ => 0.0,
     }
 }
-
 
 /// The JVM's preferred SIMD lane count for `float`, mirroring
 /// `jdk.incubator.vector`'s `VectorSpecies.ofPreferred(float.class)`: 16
@@ -2965,10 +2926,6 @@ fn panama_preferred_lanes_f32() -> usize {
         4
     }
 }
-
-
-
-
 
 #[inline]
 fn float_arg(args: &[Value], index: usize) -> f32 {
@@ -3037,15 +2994,6 @@ fn byte_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> i32
     ctx.get_array_element(arr, index).as_int().unwrap_or(0) as i8 as i32
 }
 
-
-
-
-
-
-
-
-
-
 #[inline]
 fn int_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> i32 {
     match ctx.get_array_element(arr, index) {
@@ -3061,33 +3009,6 @@ fn bool_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> boo
         _ => false,
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn native_java_arrays_sort_long_range(
     ctx: &mut dyn NativeContext,
@@ -3130,29 +3051,10 @@ fn java_string_hash_code_ascii(s: &str) -> i32 {
     h
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const LUCENE_RAM_USAGE_FALLBACK_DOCUMENT_BYTES: i64 = 1024;
 const LUCENE_RAM_USAGE_MIN_DOCUMENT_BYTES: i64 = 1024;
 const LUCENE_RAM_USAGE_DOCUMENT_BASE_BYTES: i64 = 376;
 const LUCENE_RAM_USAGE_EXTRA_FIELD_BYTES: i64 = 256;
-
-
-
 
 fn invoke_list_size(ctx: &mut dyn NativeContext, list: ObjectRef) -> Option<i32> {
     let pin = ctx.pin_native_root(list);
@@ -3173,12 +3075,6 @@ fn invoke_list_get(ctx: &mut dyn NativeContext, list: ObjectRef, index: i32) -> 
         _ => None,
     }
 }
-
-
-
-
-
-
 
 fn heap_byte_buffer_remaining(ctx: &dyn NativeContext, block: ObjectRef) -> i32 {
     let position = ctx
@@ -3223,25 +3119,6 @@ fn heap_byte_buffer_write_slice(
     n
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn array_deque_size_direct(
     ctx: &dyn NativeContext,
     deque: ObjectRef,
@@ -3262,95 +3139,6 @@ fn array_deque_size_direct(
     }
     Ok(size)
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn native_jackson_stream_read_constraints_max_name_length(
     _ctx: &mut dyn NativeContext,
@@ -3498,7 +3286,6 @@ fn native_spring_annotation_filter_matches_class(
     )
 }
 
-
 fn spring_has_plain_java_annotations_only_name(name: &str) -> bool {
     name.starts_with("java.") || name == "org.springframework.core.Ordered"
 }
@@ -3589,8 +3376,7 @@ fn spring_extension_get_application_context(
     ctx: &mut dyn NativeContext,
     extension_context: ObjectRef,
 ) -> MethodCallResult {
-    const SPRING_EXTENSION: &str =
-        "org/springframework/test/context/junit/jupiter/SpringExtension";
+    const SPRING_EXTENSION: &str = "org/springframework/test/context/junit/jupiter/SpringExtension";
     const GET_APP_CTX_DESC: &str =
         "(Lorg/junit/jupiter/api/extension/ExtensionContext;)Lorg/springframework/context/ApplicationContext;";
 
@@ -4604,39 +4390,39 @@ pub mod proxy_selector;
 // by Maven, Spring, Hibernate, every build/runtime that consumes XML.
 pub mod xml_stax;
 
-/// Interpreter intrinsic table — fast-path dispatch for hot JDK methods.
-/// See `docs/feature_roadmap_interpreter_intrinsic_table.md`.
-pub mod intrinsics;
 pub mod antlr_intrinsics;
-pub mod lucene_es;
-pub mod unsafe_natives_ext;
-pub mod xml_xerces;
-pub mod regex_matcher;
-pub mod math_bignum;
-pub mod util_concurrent_ext;
-pub mod test_frameworks;
-pub mod logging_shims;
-pub mod messaging_shims;
-pub mod orm_hibernate;
 /// Third-party application-shim registration seams (BouncyCastle,
 /// JBoss/WildFly/XNIO, the JCA pools, ANTLR/ByteBuddy/Mockito/Hibernate).
 /// Grouping only — every family below is still registered unconditionally.
 pub mod app_shims;
+/// Interpreter intrinsic table — fast-path dispatch for hot JDK methods.
+/// See `docs/feature_roadmap_interpreter_intrinsic_table.md`.
+pub mod intrinsics;
+pub mod logging_shims;
+pub mod lucene_es;
+pub mod math_bignum;
+pub mod messaging_shims;
 pub mod net_uri_inet;
+pub mod orm_hibernate;
 pub mod reflect_annotations;
-pub use reflect_annotations::*;
+pub mod regex_matcher;
+pub mod test_frameworks;
+pub mod unsafe_natives_ext;
+pub mod util_concurrent_ext;
+pub mod xml_xerces;
+pub use antlr_intrinsics::*;
+pub use logging_shims::*;
+pub use lucene_es::*;
+pub use math_bignum::*;
+pub use messaging_shims::*;
 pub use net_uri_inet::*;
 pub use orm_hibernate::*;
-pub use messaging_shims::*;
-pub use logging_shims::*;
-pub use test_frameworks::*;
-pub use util_concurrent_ext::*;
-pub use math_bignum::*;
+pub use reflect_annotations::*;
 pub use regex_matcher::*;
-pub use xml_xerces::*;
+pub use test_frameworks::*;
 pub use unsafe_natives_ext::*;
-pub use lucene_es::*;
-pub use antlr_intrinsics::*;
+pub use util_concurrent_ext::*;
+pub use xml_xerces::*;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -4773,10 +4559,13 @@ fn native_thread_get_context_class_loader(
 
 #[cfg(test)]
 mod context_class_loader_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn explicit_null_context_class_loader_round_trips() {
@@ -4958,7 +4747,6 @@ pub(crate) const REF_FIELD_NEXT: usize = 2;
 pub(crate) const RQ_FIELD_HEAD: usize = 0;
 pub(crate) const RQ_FIELD_SIZE: usize = 1;
 
-
 std::thread_local! {
     /// Guards nested `URL.setURLStreamHandlerFactory` installs (Spring Boot 3.x
     /// / insurance) that recurse through class-init while the outer call is
@@ -4966,8 +4754,6 @@ std::thread_local! {
     /// letting JDK bytecode re-enter unbounded.
     static URL_SET_STREAM_HANDLER_FACTORY_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
 }
-
-
 
 fn native_permissions_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -5059,16 +4845,6 @@ fn essential_class_has_static_initializer(ctx: &mut dyn NativeContext, args: &[V
         None => false,
     }
 }
-
-
-
-
-
-
-
-
-
-
 
 const ANTLR_PC: &str = "org/antlr/v4/runtime/atn/PredictionContext";
 const ANTLR_SINGLETON_PC: &str = "org/antlr/v4/runtime/atn/SingletonPredictionContext";
@@ -5231,198 +5007,6 @@ enum AntlrPredictionContextKind {
     Other,
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[derive(Copy, Clone)]
 struct AntlrAtnConfigSnapshot {
     state: Option<ObjectRef>,
@@ -5432,200 +5016,11 @@ struct AntlrAtnConfigSnapshot {
     reaches: i32,
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 struct AntlrAltSubsetGroup {
     state_number: i32,
     context: Option<ObjectRef>,
     alts: Vec<i32>,
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[derive(Clone, Copy)]
 struct NettyQueueEntry {
@@ -5703,16 +5098,6 @@ fn netty_queue_drain_retired(ctx: &mut dyn NativeContext) {
         netty_queue_release(ctx, entry);
     }
 }
-
-
-
-
-
-
-
-
-
-
 
 fn set_declared_field(
     ctx: &mut dyn NativeContext,
@@ -5964,9 +5349,6 @@ fn native_spring_default_subscription_init(
     Ok(None)
 }
 
-
-
-
 fn native_byte_buffer_wrap_bytes_offset_len(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -6159,29 +5541,12 @@ fn spring_bytes_to_java_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Obje
     arr
 }
 
-
-
-
-
-
-
 fn native_return_first_object_arg(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
 }
-
-
-
-
-
-
-
-
-
-
-
 
 const XERCES_CMSTATESET: &str = "com/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet";
 const XERCES_XMLCHAR: &str = "com/sun/org/apache/xerces/internal/util/XMLChar";
@@ -6280,10 +5645,6 @@ fn cmstateset_same_set(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> b
     a_bytes == b_bytes
 }
 
-
-
-
-
 fn xmlchar_chars_array(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
     let class_id = ctx
         .class_id_by_name(XERCES_XMLCHAR)
@@ -6319,44 +5680,6 @@ fn xmlchar_has_mask_in_table(ctx: &dyn NativeContext, chars: ObjectRef, c: i32, 
     }
     (ctx.get_array_element(chars, index).as_int().unwrap_or(0) & mask) != 0
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn xsd_key_field_ref(
     ctx: &dyn NativeContext,
@@ -6441,42 +5764,6 @@ fn set_int_field_named(ctx: &dyn NativeContext, this: ObjectRef, field_name: &st
 fn bool_field_named(ctx: &dyn NativeContext, this: ObjectRef, field_name: &str) -> bool {
     int_field_named(ctx, this, field_name) != 0
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Register ONLY the truly native methods (`ACC_NATIVE` in real JDK class files).
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
@@ -6693,7 +5980,6 @@ fn register_liquibase_checksum_intrinsics(registry: &mut NativeMethodRegistry) {
     );
 }
 
-
 fn char_array_to_string(ctx: &dyn NativeContext, arr: ObjectRef) -> String {
     let len = ctx.array_length(arr);
     let mut units = Vec::with_capacity(len);
@@ -6702,9 +5988,6 @@ fn char_array_to_string(ctx: &dyn NativeContext, arr: ObjectRef) -> String {
     }
     String::from_utf16_lossy(&units)
 }
-
-
-
 
 fn native_jasper_jdtcompiler_accept_result(
     ctx: &mut dyn NativeContext,
@@ -6799,7 +6082,6 @@ fn native_jasper_jdtcompiler_accept_result(
     Ok(None)
 }
 
-
 fn native_jsp_servlet_handle_missing_resource(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -6882,7 +6164,6 @@ fn strip_zone_id(addr: &str) -> Option<&str> {
         Some(addr)
     }
 }
-
 
 // Thread-layout helpers shared by `register_essential_natives` and
 // `register_synthetic_overrides`.
@@ -9686,67 +8967,67 @@ pub fn register_essential_natives_with_shims(
     // gets attributed to the right side of the boundary. See known-issue
     // tomcat/04.
     if mapper_natives_enabled() {
-    registry.register(
+        registry.register(
         "org/apache/catalina/mapper/Mapper",
         "find",
         "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)I",
         native_mapper_find_chunk,
     );
-    registry.register(
+        registry.register(
         "org/apache/catalina/mapper/Mapper",
         "find",
         "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;II)I",
         native_mapper_find_chunk_range,
     );
-    registry.register(
+        registry.register(
         "org/apache/catalina/mapper/Mapper",
         "findIgnoreCase",
         "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)I",
         native_mapper_find_ignore_case,
     );
-    registry.register(
+        registry.register(
         "org/apache/catalina/mapper/Mapper",
         "findIgnoreCase",
         "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;II)I",
         native_mapper_find_ignore_case_range,
     );
-    registry.register(
-        "org/apache/catalina/mapper/Mapper",
-        "find",
-        "([Lorg/apache/catalina/mapper/Mapper$MapElement;Ljava/lang/String;)I",
-        native_mapper_find_string,
-    );
-    registry.register(
+        registry.register(
+            "org/apache/catalina/mapper/Mapper",
+            "find",
+            "([Lorg/apache/catalina/mapper/Mapper$MapElement;Ljava/lang/String;)I",
+            native_mapper_find_string,
+        );
+        registry.register(
         "org/apache/catalina/mapper/Mapper",
         "exactFind",
         "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)Lorg/apache/catalina/mapper/Mapper$MapElement;",
         native_mapper_exact_find_chunk,
     );
-    registry.register(
+        registry.register(
         "org/apache/catalina/mapper/Mapper",
         "exactFindIgnoreCase",
         "([Lorg/apache/catalina/mapper/Mapper$MapElement;Lorg/apache/tomcat/util/buf/CharChunk;)Lorg/apache/catalina/mapper/Mapper$MapElement;",
         native_mapper_exact_find_ignore_case,
     );
-    registry.register(
+        registry.register(
         "org/apache/catalina/mapper/Mapper",
         "exactFind",
         "([Lorg/apache/catalina/mapper/Mapper$MapElement;Ljava/lang/String;)Lorg/apache/catalina/mapper/Mapper$MapElement;",
         native_mapper_exact_find_string,
     );
-    registry.register(
+        registry.register(
         "org/apache/catalina/mapper/Mapper",
         "map",
         "(Lorg/apache/tomcat/util/buf/MessageBytes;Lorg/apache/tomcat/util/buf/MessageBytes;Ljava/lang/String;Lorg/apache/catalina/mapper/MappingData;)V",
         native_mapper_map,
     );
-    registry.register(
+        registry.register(
         "org/apache/catalina/mapper/Mapper",
         "internalMap",
         "(Lorg/apache/tomcat/util/buf/CharChunk;Lorg/apache/tomcat/util/buf/CharChunk;Ljava/lang/String;Lorg/apache/catalina/mapper/MappingData;)V",
         native_mapper_internal_map,
     );
-    registry.register(
+        registry.register(
         "org/apache/catalina/mapper/Mapper",
         "internalMapWildcardWrapper",
         "([Lorg/apache/catalina/mapper/Mapper$MappedWrapper;ILorg/apache/tomcat/util/buf/CharChunk;Lorg/apache/catalina/mapper/MappingData;)V",
@@ -14122,6 +13403,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
+            crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
             let handle = match ctx.load_native_library(&name) {
                 Ok(lib_index) => lib_index + 1,
                 Err(_) => 0,
@@ -15903,7 +15185,9 @@ pub fn register_essential_natives_with_shims(
             // back to declaration order for the synthetic-JDK shape, where no
             // field metadata exists to resolve against.
             let cid = ctx.class_id_of_object(d);
-            let i_classes = ctx.resolve_field_index_by_class_id(cid, "classes").unwrap_or(0);
+            let i_classes = ctx
+                .resolve_field_index_by_class_id(cid, "classes")
+                .unwrap_or(0);
             let i_class_enabled = ctx
                 .resolve_field_index_by_class_id(cid, "classEnabled")
                 .unwrap_or(1);
@@ -15913,7 +15197,9 @@ pub fn register_essential_natives_with_shims(
             let i_package_enabled = ctx
                 .resolve_field_index_by_class_id(cid, "packageEnabled")
                 .unwrap_or(3);
-            let i_deflt = ctx.resolve_field_index_by_class_id(cid, "deflt").unwrap_or(4);
+            let i_deflt = ctx
+                .resolve_field_index_by_class_id(cid, "deflt")
+                .unwrap_or(4);
             ctx.set_field(d, i_classes, Value::Object(Some(classes)));
             ctx.set_field(d, i_class_enabled, Value::Object(Some(class_enabled)));
             ctx.set_field(d, i_packages, Value::Object(Some(packages)));
@@ -16292,16 +15578,25 @@ pub fn register_essential_natives_with_shims(
             "next",
             "()Ljava/lang/Object;",
             |_ctx, _args| -> MethodCallResult {
-                Err(MethodCallFailed::from(RuntimeError::NoSuchElementException {
-                    message: "Collections.emptyIterator()".to_string(),
-                }))
+                Err(MethodCallFailed::from(
+                    RuntimeError::NoSuchElementException {
+                        message: "Collections.emptyIterator()".to_string(),
+                    },
+                ))
             },
         );
-        registry.register(empty_iterator, "remove", "()V", |_ctx, _args| -> MethodCallResult {
-            Err(MethodCallFailed::from(RuntimeError::IllegalStateException {
-                message: "Collections.emptyIterator(): remove() before next()".to_string(),
-            }))
-        });
+        registry.register(
+            empty_iterator,
+            "remove",
+            "()V",
+            |_ctx, _args| -> MethodCallResult {
+                Err(MethodCallFailed::from(
+                    RuntimeError::IllegalStateException {
+                        message: "Collections.emptyIterator(): remove() before next()".to_string(),
+                    },
+                ))
+            },
+        );
     }
     let empty_list_iterator = "java/util/Collections$EmptyListIterator";
     // Real body: `return false;`
@@ -16313,9 +15608,11 @@ pub fn register_essential_natives_with_shims(
         "previous",
         "()Ljava/lang/Object;",
         |_ctx, _args| -> MethodCallResult {
-            Err(MethodCallFailed::from(RuntimeError::NoSuchElementException {
-                message: "Collections.emptyListIterator()".to_string(),
-            }))
+            Err(MethodCallFailed::from(
+                RuntimeError::NoSuchElementException {
+                    message: "Collections.emptyListIterator()".to_string(),
+                },
+            ))
         },
     );
     // Real bodies: `return 0;` / `return -1;` — the cursor sits before
@@ -16337,9 +15634,11 @@ pub fn register_essential_natives_with_shims(
         "set",
         "(Ljava/lang/Object;)V",
         |_ctx, _args| -> MethodCallResult {
-            Err(MethodCallFailed::from(RuntimeError::IllegalStateException {
-                message: "Collections.emptyListIterator(): set() before next()".to_string(),
-            }))
+            Err(MethodCallFailed::from(
+                RuntimeError::IllegalStateException {
+                    message: "Collections.emptyListIterator(): set() before next()".to_string(),
+                },
+            ))
         },
     );
     registry.register(
@@ -16367,9 +15666,11 @@ pub fn register_essential_natives_with_shims(
         "nextElement",
         "()Ljava/lang/Object;",
         |_ctx, _args| -> MethodCallResult {
-            Err(MethodCallFailed::from(RuntimeError::NoSuchElementException {
-                message: "Collections.emptyEnumeration()".to_string(),
-            }))
+            Err(MethodCallFailed::from(
+                RuntimeError::NoSuchElementException {
+                    message: "Collections.emptyEnumeration()".to_string(),
+                },
+            ))
         },
     );
 
@@ -16621,16 +15922,24 @@ pub fn register_essential_natives_with_shims(
     // HotSpot does not define these natives on Windows at all, so the 0
     // fallback there is unreachable in practice.
     registry.register("jdk/internal/misc/VM", "getuid", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(process_credential(ProcessCredential::Uid))))
+        Ok(Some(Value::Long(process_credential(
+            ProcessCredential::Uid,
+        ))))
     });
     registry.register("jdk/internal/misc/VM", "geteuid", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(process_credential(ProcessCredential::Euid))))
+        Ok(Some(Value::Long(process_credential(
+            ProcessCredential::Euid,
+        ))))
     });
     registry.register("jdk/internal/misc/VM", "getgid", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(process_credential(ProcessCredential::Gid))))
+        Ok(Some(Value::Long(process_credential(
+            ProcessCredential::Gid,
+        ))))
     });
     registry.register("jdk/internal/misc/VM", "getegid", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(process_credential(ProcessCredential::Egid))))
+        Ok(Some(Value::Long(process_credential(
+            ProcessCredential::Egid,
+        ))))
     });
 
     // --- java/lang/NullPointerException ---
@@ -17057,7 +16366,9 @@ pub fn register_essential_natives_with_shims(
                         == Some("java/lang/String")
             );
             if is_synthetic {
-                return Ok(Some(ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL)));
+                return Ok(Some(
+                    ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL),
+                ));
             }
             Ok(Some(Value::Object(None)))
         },
@@ -17299,7 +16610,9 @@ pub fn register_essential_natives_with_shims(
                         == Some("java/lang/String")
             );
             if is_synthetic {
-                return Ok(Some(ctx.get_field(this, crate::logmanager::LOGGER_FIELD_PARENT)));
+                return Ok(Some(
+                    ctx.get_field(this, crate::logmanager::LOGGER_FIELD_PARENT),
+                ));
             }
             // Real-layout Logger: no reliable slot to read, but if anything
             // has called `setParent` on it we recorded the link in the
@@ -19817,18 +19130,25 @@ pub fn register_essential_natives_with_shims(
     // `docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md`.
     const ZONEINFO_LEGACY_FLOOR_EPOCH_SEC: i64 = -2_208_988_800; // 1900-01-01T00:00:00Z
 
-    fn legacy_offset_and_standard(ctx: &mut dyn NativeContext, id: &str, epoch_sec: i64) -> (i32, i32) {
+    fn legacy_offset_and_standard(
+        ctx: &mut dyn NativeContext,
+        id: &str,
+        epoch_sec: i64,
+    ) -> (i32, i32) {
         if epoch_sec < ZONEINFO_LEGACY_FLOOR_EPOCH_SEC {
             let raw = crate::tzdb::raw_offset_seconds(ctx, id).unwrap_or(0);
             return (raw, raw);
         }
         let total_sec = crate::tzdb::offset_seconds_at_instant(ctx, id, epoch_sec).unwrap_or(0);
-        let standard_sec =
-            crate::tzdb::standard_offset_seconds_at_instant(ctx, id, epoch_sec).unwrap_or(total_sec);
+        let standard_sec = crate::tzdb::standard_offset_seconds_at_instant(ctx, id, epoch_sec)
+            .unwrap_or(total_sec);
         (total_sec, standard_sec)
     }
 
-    fn register_tzdb_offset_natives_for(registry: &mut NativeMethodRegistry, class_name: &'static str) {
+    fn register_tzdb_offset_natives_for(
+        registry: &mut NativeMethodRegistry,
+        class_name: &'static str,
+    ) {
         registry.register(class_name, "getOffset", "(J)I", |ctx, args| {
             let this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
@@ -19874,9 +19194,13 @@ pub fn register_essential_natives_with_shims(
             };
             let local_epoch_sec = wall.div_euclid(1000);
             let (total, epoch_sec) = if local_epoch_sec < ZONEINFO_LEGACY_FLOOR_EPOCH_SEC {
-                (crate::tzdb::raw_offset_seconds(ctx, &id).unwrap_or(0), local_epoch_sec)
+                (
+                    crate::tzdb::raw_offset_seconds(ctx, &id).unwrap_or(0),
+                    local_epoch_sec,
+                )
             } else {
-                let t = crate::tzdb::offset_seconds_at_local(ctx, &id, local_epoch_sec).unwrap_or(0);
+                let t =
+                    crate::tzdb::offset_seconds_at_local(ctx, &id, local_epoch_sec).unwrap_or(0);
                 (t, local_epoch_sec - t as i64)
             };
             let (_, standard) = legacy_offset_and_standard(ctx, &id, epoch_sec);
@@ -20823,7 +20147,6 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
     registry.set_category(__prev_cat);
 }
 
-
 #[cfg(feature = "synthetic-jdk")]
 pub fn register_builtins(registry: &mut NativeMethodRegistry) {
     // Essential natives first (these are always needed)
@@ -21583,16 +20906,14 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // receiver. The executing VM context is not the receiver when one thread
     // inspects another, as JULI's ThreadMXBean lookup does below.
     registry.register("java/lang/Thread", "getId", "()J", |ctx, args| {
-        let receiver_tid = args
-            .first()
-            .and_then(|value| match value {
-                Value::Object(Some(thread)) => match ctx.get_field_by_name(*thread, "tid") {
-                    Value::Long(tid) if tid > 0 => Some(tid),
-                    Value::Int(tid) if tid > 0 => Some(tid as i64),
-                    _ => None,
-                },
+        let receiver_tid = args.first().and_then(|value| match value {
+            Value::Object(Some(thread)) => match ctx.get_field_by_name(*thread, "tid") {
+                Value::Long(tid) if tid > 0 => Some(tid),
+                Value::Int(tid) if tid > 0 => Some(tid as i64),
                 _ => None,
-            });
+            },
+            _ => None,
+        });
         Ok(Some(Value::Long(
             receiver_tid.unwrap_or_else(|| ctx.thread_id().max(1) as i64),
         )))
@@ -23707,18 +23028,6 @@ fn native_lazy_launcher_discover(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ctx.invoke_virtual(delegate, "discover", DESC_DISCOVER, &[req_cur])
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 fn eprint_java_throwable(ctx: &mut dyn NativeContext, label: &str, exc: ObjectRef) {
     match ctx.invoke_virtual(exc, "toString", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => {
@@ -23734,11 +23043,6 @@ fn eprint_java_throwable(ctx: &mut dyn NativeContext, label: &str, exc: ObjectRe
     }
     let _ = ctx.invoke_virtual(exc, "printStackTrace", "()V", &[]);
 }
-
-
-
-
-
 
 /// Exception <init>(Ljava/lang/String;)V — sets detailMessage (field 0)
 /// Exception <init>(Ljava/lang/String;Ljava/lang/Throwable;)V
@@ -24166,7 +23470,6 @@ pub(crate) fn platform_lib_name(name: &str) -> String {
         format!("lib{}.so", name)
     }
 }
-
 
 fn native_springboot_mongo_reactive_customizer_destroy(
     ctx: &mut dyn NativeContext,
@@ -25566,8 +24869,6 @@ fn with_stdio_print_lock<R>(f: impl FnOnce() -> R) -> R {
 const SUREFIRE_FORWARDING_PRINT_STREAM: &str =
     "org/apache/maven/surefire/api/report/ConsoleOutputCapture$ForwardingPrintStream";
 
-
-
 /// Detect if a PrintStream / PrintWriter is (or wraps) a system stream
 /// (stdout fd=1, stderr fd=2).  Returns the fd_id if so, None otherwise.
 ///
@@ -25777,7 +25078,11 @@ fn printwriter_autoflush_if_needed(ctx: &mut dyn NativeContext, args: &[Value]) 
     // bytecode (which already honours `autoFlush`), and the fd-backed
     // `PrintStream` path is unbuffered, so flushing it every line would be
     // pure overhead on a very hot path.
-    if ctx.class_name_of_id(ctx.class_id_of_object(this)).as_deref() != Some("java/io/PrintWriter") {
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+        != Some("java/io/PrintWriter")
+    {
         return;
     }
     if !matches!(ctx.get_field_by_name(this, "autoFlush"), Value::Int(v) if v != 0) {
@@ -25828,7 +25133,6 @@ thread_local! {
     /// falls back to the direct native writeln, which cannot recurse.
     static EMIT_FRAMEWORK_LOG_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
-
 
 /// Include the Throwable's Java representation for overloads whose contract
 /// carries an exception.  Calling `printStackTrace` here would bypass the
@@ -26085,9 +25389,11 @@ pub(crate) fn craton_alloc_system_logger(ctx: &mut dyn NativeContext, name: Valu
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
     };
-    let class_id = ctx.class_id_by_name(CRATON_SYSTEM_LOGGER_CLASS).unwrap_or_else(|| {
-        ctx.ensure_synthetic_class(CRATON_SYSTEM_LOGGER_CLASS, SYSTEM_LOGGER_SLOTS)
-    });
+    let class_id = ctx
+        .class_id_by_name(CRATON_SYSTEM_LOGGER_CLASS)
+        .unwrap_or_else(|| {
+            ctx.ensure_synthetic_class(CRATON_SYSTEM_LOGGER_CLASS, SYSTEM_LOGGER_SLOTS)
+        });
     let slots = SYSTEM_LOGGER_SLOTS.max(ctx.class_num_total_fields(class_id));
     let logger = ctx
         .try_alloc_object_gc_safe(class_id, slots)
@@ -26447,14 +25753,6 @@ fn native_println_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(None)
 }
 
-
-
-
-
-
-
-
-
 fn native_println_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let val = match args.get(1) {
         Some(Value::Float(v)) => *v,
@@ -26482,16 +25780,6 @@ fn native_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
     Ok(Some(Value::Object(this_opt)))
 }
-
-
-
-
-
-
-
-
-
-
 
 /// Return the underlying `Writer` from a `PrintWriter` object when it is a
 /// non-fd-backed Writer (e.g. `StringWriter` in `ModelNode.toString()`).
@@ -26631,9 +25919,6 @@ fn printwriter_get_backing_writer(
     }
     None
 }
-
-
-
 
 /// Format a double like Java does (no trailing zeros for integers, etc.)
 // ---------------------------------------------------------------------------
@@ -26904,11 +26189,6 @@ fn native_uuid_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Int(version)))
 }
 
-
-
-
-
-
 // =====================================================================
 // CRIT perf — sharded side-store globals for the Unsafe / Class$Atomic
 // hot path.
@@ -26941,9 +26221,7 @@ fn native_uuid_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 const UNSAFE_SHARDS: usize = 32;
 const UNSAFE_SHARD_MASK: usize = UNSAFE_SHARDS - 1;
 
-
 type UnsafeShardedMap<K, V> = [parking_lot::Mutex<rustc_hash::FxHashMap<K, V>>; UNSAFE_SHARDS];
-
 
 /// Fallback store for Unsafe.{getAndAdd,CAS,get,put}Long on a null object
 /// (static-field access via absolute offset). Used to service callers like
@@ -27036,7 +26314,6 @@ pub(crate) fn log_record_real_layout(
     matches!(ctx.get_field_by_name(rec, "longThreadID"), Value::Long(_))
 }
 
-
 // =====================================================================
 // CAS-livelock fix — synthetic-offset side store for Unsafe.{CAS,get,put}.
 //
@@ -27116,18 +26393,6 @@ struct UnsafeStaticFieldTarget {
     field_index: usize,
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 /// Per-object side store for fields stored at a synthetic offset.  Keyed
 /// by `(identity_hash, offset)` so each receiver has its own slot and
 /// CAS sees a consistent value across the load and the compare-and-store.
@@ -27181,7 +26446,6 @@ pub(crate) fn synthetic_put(
     let mut map = synthetic_field_store().lock();
     map.insert((id, offset), val);
 }
-
 
 /// CAS on the synthetic per-object slot.  Returns true on success.  The
 /// expected/new pair may be Object, Int or Long; the comparison is by the
@@ -27248,8 +26512,6 @@ fn class_atomic_side_store(
     > = std::sync::OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
-
-
 
 #[inline]
 fn class_atomic_cas_impl(
@@ -27478,14 +26740,10 @@ fn native_class_atomic_cas_annotation_data(
     Ok(result)
 }
 
-
-
 // Sentinel offset (chosen in the usize-sparse high range to not collide
 // with real slot indices) for Buffer.address probes; recognised by
 // native_unsafe_get_long which answers non-zero.
 pub(crate) const BUFFER_ADDRESS_SENTINEL: usize = 0x7fff_ffff_ffff_fffe;
-
-
 
 /// Derive the `Unsafe.arrayIndexScale` value from an array class's
 /// internal name (e.g. `[I`, `[Ljava/lang/Object;`). Returns 1 for
@@ -27504,23 +26762,6 @@ pub(crate) fn array_index_scale_for_name(name: &str) -> i32 {
         _ => 1,
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn native_scoped_memory_get_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let adapted = scoped_memory_access_unsafe_args(args);
@@ -27577,7 +26818,6 @@ fn native_scoped_memory_copy_memory(
     unsafe_natives::native_unsafe_copy_memory_consolidated(ctx, &adapted)
 }
 
-
 fn asm_u16(b: &[u8], big_endian: bool) -> i64 {
     let v = if big_endian {
         u16::from_be_bytes([b[0], b[1]])
@@ -27603,21 +26843,6 @@ fn asm_i32(b: &[u8], big_endian: bool) -> i64 {
     v as i64
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn try_yield_virtual_park(
     ctx: &mut dyn NativeContext,
     timeout: Option<std::time::Duration>,
@@ -27638,19 +26863,8 @@ fn try_yield_virtual_park(
     )))
 }
 
-
-
 /// Maximum CAS retry iterations before yielding to prevent livelock.
 const CAS_MAX_RETRIES: usize = 1024;
-
-
-
-
-
-
-
-
-
 
 /// Byte width of one element of a primitive array.
 fn array_elem_byte_width(t: cratonvm_types::ArrayElementType) -> usize {
@@ -27664,23 +26878,11 @@ fn array_elem_byte_width(t: cratonvm_types::ArrayElementType) -> usize {
     }
 }
 
-
-
 /// Upper bound on a single `Unsafe.copyMemory` / `Unsafe.setMemory` request.
 /// Attacker-controlled `bytes` would otherwise drive an unbounded per-slot
 /// loop (`ctx.set_field`) for non-byte-exact targets. Mirrors the 256 MiB cap
 /// that `panama.rs` applies to `MemorySegment` copy/fill (finding M3).
 const MAX_UNSAFE_COPY_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
-
-
-
-
-
-
-
-
-
-
 
 /// FIX(test-isolation): the `unsafe_arena` off-heap store is process-global and
 /// reuses freed addresses, so tests that allocate→free→assert-evicted race when
@@ -27693,30 +26895,6 @@ pub(crate) fn arena_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// ClassLoader.findBootstrapClass — find a class in the bootstrap class path.
 fn native_classloader_find_bootstrap_class(
@@ -27869,8 +27047,8 @@ fn native_init_stack_trace_element(
     let method = ste_field_string(&*ctx, source, "methodName")
         .or_else(|| ste_field_string(&*ctx, source, "name"))
         .or_else(|| ste_slot_string(&*ctx, source, 1));
-    let file = ste_field_string(&*ctx, source, "fileName")
-        .or_else(|| ste_slot_string(&*ctx, source, 2));
+    let file =
+        ste_field_string(&*ctx, source, "fileName").or_else(|| ste_slot_string(&*ctx, source, 2));
     let line = match ctx.get_field_by_name(source, "lineNumber") {
         Value::Int(l) => l,
         _ => match ctx.get_field(source, 3) {
@@ -28245,50 +27423,6 @@ fn native_timezone_get_gmt_offset_id(
     Ok(Some(Value::Object(None)))
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ===========================================================================
 // java.lang.Enum
 // ===========================================================================
@@ -28390,7 +27524,12 @@ fn objects_values_equal(
         // `return (this == obj || obj == null)` precisely so that
         // `getBean(name)` compares equal to null.
         (Value::Object(Some(ra)), Value::Object(None)) => {
-            let r = ctx.invoke_virtual(*ra, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(None)])?;
+            let r = ctx.invoke_virtual(
+                *ra,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(None)],
+            )?;
             Ok(matches!(r, Some(Value::Int(v)) if v != 0))
         }
         (_, Value::Object(None)) => Ok(false),
@@ -28762,7 +27901,6 @@ const JAVA_REGEX_DOTALL: i32 = 32;
 const JAVA_REGEX_UNICODE_CASE: i32 = 64;
 const JAVA_REGEX_UNICODE_CHARACTER_CLASS: i32 = 256;
 
-
 /// A successful match, with byte offsets into the haystack. We materialise the
 /// matched text as `String` so callers (which often need to bridge into the
 /// Java heap) don't have to keep the haystack borrow alive.
@@ -28791,16 +27929,12 @@ impl JavaCaptures {
     }
 }
 
-
 /// One unit of a parsed Java replacement string.
 enum JavaReplToken {
     Lit(String),
     Group(usize),
     Named(String),
 }
-
-
-
 
 /// Split a string on every match of a fancy-regex Regex. Mirrors the semantics
 /// of `regex::Regex::split`: yields the text between matches, possibly
@@ -28864,8 +27998,6 @@ fn fancy_splitn(r: &fancy_regex::Regex, text: &str, limit: usize) -> Vec<String>
     out
 }
 
-
-
 /// Compile an already-translated regex pattern string straight into a
 /// `JavaRegex`, trying the `regex` crate first and falling back to
 /// `fancy-regex`. Unlike `compile_java_regex` this does NOT run
@@ -28903,7 +28035,6 @@ pub(crate) fn compile_anchored_cached(full: &str) -> Option<JavaRegex> {
     }
     compiled
 }
-
 
 /// Rewrite the Perl character-class shorthands `\d \D \w \W \s \S` and the word
 /// boundaries `\b \B` from the `regex` crate's Unicode-by-default meaning to
@@ -29129,9 +28260,12 @@ fn map_java_predefined_class(name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod java_predefined_class_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::compile_java_regex;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn m(pat: &str, s: &str) -> bool {
         compile_java_regex(pat, 0)
@@ -29312,7 +28446,6 @@ fn utf8_char_len(b: u8) -> usize {
     }
 }
 
-
 fn native_standard_location_compute_is_module_oriented_location(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -29321,20 +28454,6 @@ fn native_standard_location_compute_is_module_oriented_location(
     let name = ctx.read_string(name_obj).unwrap_or_default();
     Ok(Some(Value::Int((name == "MODULE") as i32)))
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Spring's forked compiler-test launcher sets the thread context class loader
 /// immediately before rediscovering the test. CratonVM can otherwise reuse the
@@ -29389,33 +28508,17 @@ fn native_spring_is_using_forked_class_path_loader(
     )
 }
 
-
-
-
-
-
-
 fn r3_br_pending_chars() -> &'static parking_lot::Mutex<std::collections::HashMap<i32, i32>> {
     static T: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<i32, i32>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
-
-
 fn real_pattern_cache() -> &'static Mutex<std::collections::HashMap<(usize, String, i32), usize>> {
     static CACHE: OnceLock<Mutex<std::collections::HashMap<(usize, String, i32), usize>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
-
-
-
-
-
-
-
-
 
 // --- Matcher natives ---
 //
@@ -29481,12 +28584,6 @@ struct MatcherCaptures {
     named: std::collections::HashMap<String, usize>,
 }
 
-
-
-
-
-
-
 /// Advance a byte offset into `text` past exactly one UTF-8 scalar value.
 ///
 /// Used by `Matcher.find()` to step past a zero-width match. A bare
@@ -29512,32 +28609,6 @@ fn advance_one_char(text: &str, offset: usize) -> usize {
     }
     next
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Resolved slot indices for every `Matcher`/`Pattern` field this fast path
 /// touches, resolved BY NAME exactly once (via `resolve_field_index`, the
@@ -29576,16 +28647,12 @@ struct MatcherFieldIndices {
     mod_count: usize,
 }
 
-
 #[derive(Clone, Copy)]
 struct PatternFieldIndices {
     pattern: usize,
     flags: usize,
     capturing_group_count: usize,
 }
-
-
-
 
 /// One matcher's decoded input text plus the UTF-8-byte <-> UTF-16-code-unit
 /// offset tables needed to bridge Java's UTF-16 `Matcher` indices to the
@@ -29635,7 +28702,6 @@ struct MatcherRealCache {
     re: JavaRegex,
 }
 
-
 thread_local! {
     /// A Matcher is explicitly not thread-safe, so the most recent cache entry
     /// on this Java thread is the overwhelmingly common case. The global map
@@ -29662,25 +28728,6 @@ struct MatcherRealState {
     from: i32,
     to: i32,
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ===========================================================================
 // java.time — LocalDate, LocalTime, Instant, Duration (Phase 17)
@@ -30113,7 +29160,6 @@ fn convert_time_unit_to_millis(value: i64, ordinal: i32) -> i64 {
     }
 }
 
-
 /// Build a `java.util.HashSet` with a real-layout `java.util.HashMap` inside,
 /// populated with the supplied String keys (each mapped to the canonical
 /// `HashSet.PRESENT` singleton — represented here as the same `Boolean.TRUE`
@@ -30398,10 +29444,6 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-
-
-
-
 pub(crate) fn build_synthetic_module_descriptor(
     ctx: &mut dyn NativeContext,
     module_name: &str,
@@ -30441,34 +29483,6 @@ pub(crate) fn build_synthetic_module_descriptor(
     ctx.unpin_native_roots(pin);
     desc
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // T19.H2: MethodHandles.Lookup.<clinit> dependency natives
@@ -30741,8 +29755,6 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-
-
 // LinkedBlockingQueue: add element at tail, grow array if needed
 #[cfg(feature = "synthetic-jdk")]
 fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
@@ -30818,7 +29830,6 @@ fn m18_abq_remove_head(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     result
 }
 
-
 /// Helper: create a ConcurrentSkipListMap containing entries in [from, to) range
 fn cslm_subrange(
     ctx: &mut dyn NativeContext,
@@ -30880,18 +29891,6 @@ fn cslm_subrange(
     Ok(Some(Value::Object(Some(result))))
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 /// Release a `ReentrantLock` for a thread that is about to `await()` on one
 /// of its conditions. Returns the saved hold count to restore on re-acquire,
 /// or `None` if the caller does not own the lock.
@@ -30945,8 +29944,6 @@ fn bounded_monitor_wait_ms(remaining: std::time::Duration, cap_ms: u64) -> u64 {
     remaining.as_millis().clamp(1, cap_ms as u128) as u64
 }
 
-
-
 /// Shared core for timed `Condition` waits (`await(time,unit)` and
 /// `awaitUntil(Date)`): release the owning lock, monitor-wait up to
 /// `timeout_ms`, then re-acquire. Returns Z — 1 if signaled before the
@@ -30996,7 +29993,6 @@ fn cond_await_millis(
     Ok(Some(Value::Int(if timed_out { 0 } else { 1 })))
 }
 
-
 /// Re-acquire a `ReentrantLock` after a condition `await()` returns,
 /// restoring the saved reentrant hold count. Spins (with a short monitor
 /// wait) until the lock is free.
@@ -31041,9 +30037,6 @@ fn reacquire_lock_after_await(
     }
 }
 
-
-
-
 // --- CountDownLatch ---
 
 // The real `java.util.concurrent.CountDownLatch` has a single field,
@@ -31074,14 +30067,12 @@ fn cdl_count(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     }
 }
 
-static NEXT_CDL_WAIT_KEY: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static NEXT_CDL_WAIT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn next_cdl_wait_key() -> i32 {
     loop {
-        let candidate = NEXT_CDL_WAIT_KEY
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            & i32::MAX as u64;
+        let candidate =
+            NEXT_CDL_WAIT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & i32::MAX as u64;
         if candidate != 0 {
             return candidate as i32;
         }
@@ -31131,12 +30122,6 @@ fn cdl_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: i32) {
     ctx.set_field(this, CDL_FIELD_COUNT, Value::Object(Some(holder)));
 }
 
-
-
-
-
-
-
 // --- Semaphore ---
 
 // The real `java.util.concurrent.Semaphore` has a single field
@@ -31157,42 +30142,16 @@ struct SemObjKeyEntry {
     generation: u32,
 }
 
-
 #[inline]
 fn pack_sem_obj_key(hash: u32, generation: u32) -> usize {
     ((hash as usize) << 32) | generation as usize
 }
-
 
 #[derive(Clone, Copy)]
 struct SemState {
     permits: i32,
     fair: i32,
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // --- CyclicBarrier ---
 
@@ -31671,7 +30630,9 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
                 continue;
             }
         }
-        return Err(format!("Input byte array has incorrect ending byte at {sp}"));
+        return Err(format!(
+            "Input byte array has incorrect ending byte at {sp}"
+        ));
     }
     Ok(out)
 }
@@ -31940,10 +30901,11 @@ fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 #[cfg(test)]
 mod base64_tests {
+    use super::{b64_decode, b64_encode, B64_VARIANT_BASIC, B64_VARIANT_MIME, B64_VARIANT_URL};
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
-    use super::{
-        b64_decode, b64_encode, B64_VARIANT_BASIC, B64_VARIANT_MIME, B64_VARIANT_URL,
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
 
     /// Every expectation below is a literal line of `Base64Probe`'s output on
@@ -32030,7 +30992,10 @@ mod base64_tests {
             vec![0x00, 0x10, 0x83]
         );
         // `-` and `_` are not in the MIME alphabet, so both are dropped.
-        assert_eq!(b64_decode(b"-_", B64_VARIANT_MIME).expect("skipped"), Vec::<u8>::new());
+        assert_eq!(
+            b64_decode(b"-_", B64_VARIANT_MIME).expect("skipped"),
+            Vec::<u8>::new()
+        );
         // …but they ARE the URL alphabet's 62/63.
         assert_eq!(b64_decode(b"-_", B64_VARIANT_URL).expect("url"), vec![0xfb]);
         // A lone char is fatal for BASIC but reaches decode0 for MIME.
@@ -32038,16 +31003,34 @@ mod base64_tests {
             err("A", B64_VARIANT_MIME),
             "Last unit does not have enough valid bits"
         );
-        assert_eq!(b64_decode(b"", B64_VARIANT_MIME).expect("empty"), Vec::<u8>::new());
+        assert_eq!(
+            b64_decode(b"", B64_VARIANT_MIME).expect("empty"),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
     fn decode_accepts_the_well_formed_shapes() {
-        assert_eq!(b64_decode(b"", B64_VARIANT_BASIC).expect("ok"), Vec::<u8>::new());
-        assert_eq!(b64_decode(b"AB", B64_VARIANT_BASIC).expect("ok"), vec![0x00]);
-        assert_eq!(b64_decode(b"AB==", B64_VARIANT_BASIC).expect("ok"), vec![0x00]);
-        assert_eq!(b64_decode(b"ABC", B64_VARIANT_BASIC).expect("ok"), vec![0x00, 0x10]);
-        assert_eq!(b64_decode(b"ABC=", B64_VARIANT_BASIC).expect("ok"), vec![0x00, 0x10]);
+        assert_eq!(
+            b64_decode(b"", B64_VARIANT_BASIC).expect("ok"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            b64_decode(b"AB", B64_VARIANT_BASIC).expect("ok"),
+            vec![0x00]
+        );
+        assert_eq!(
+            b64_decode(b"AB==", B64_VARIANT_BASIC).expect("ok"),
+            vec![0x00]
+        );
+        assert_eq!(
+            b64_decode(b"ABC", B64_VARIANT_BASIC).expect("ok"),
+            vec![0x00, 0x10]
+        );
+        assert_eq!(
+            b64_decode(b"ABC=", B64_VARIANT_BASIC).expect("ok"),
+            vec![0x00, 0x10]
+        );
         assert_eq!(
             b64_decode(b"ABCD", B64_VARIANT_BASIC).expect("ok"),
             vec![0x00, 0x10, 0x83]
@@ -32082,9 +31065,15 @@ mod base64_tests {
     fn mime_round_trip_survives_the_line_separators() {
         let payload: Vec<u8> = (0..300u16).map(|i| (i * 7) as u8).collect();
         let encoded = b64_encode(&payload, B64_VARIANT_MIME, false);
-        assert_eq!(b64_decode(&encoded, B64_VARIANT_MIME).expect("round trip"), payload);
+        assert_eq!(
+            b64_decode(&encoded, B64_VARIANT_MIME).expect("round trip"),
+            payload
+        );
         let encoded = b64_encode(&payload, B64_VARIANT_BASIC, false);
-        assert_eq!(b64_decode(&encoded, B64_VARIANT_BASIC).expect("round trip"), payload);
+        assert_eq!(
+            b64_decode(&encoded, B64_VARIANT_BASIC).expect("round trip"),
+            payload
+        );
     }
 
     #[test]
@@ -33015,7 +32004,6 @@ fn register_tomcat_jni_natives(registry: &mut NativeMethodRegistry) {
     });
 }
 
-
 /// Public wrapper so vm_init.rs can register charset natives in real-JDK mode.
 pub fn register_charset_natives_pub(registry: &mut NativeMethodRegistry) {
     register_charset_natives(registry);
@@ -33182,7 +32170,7 @@ fn native_charset_available_charsets(
                 Value::Object(Some(key)),
                 Value::Object(Some(value)),
             ],
-    )?;
+        )?;
         ctx.unpin_native_roots(value_pin);
     }
     let map = ctx.read_native_pin(map_pin, map);
@@ -33314,9 +32302,6 @@ pub(crate) fn normalize_charset_name(name: &str) -> String {
 pub(crate) const BI_FIELD_VALUE: usize = 0; // Synthetic-mode: String decimal representation
 pub(crate) const BI_FIELD_SIGNUM: usize = 1; // Synthetic-mode: Int signum (-1, 0, or 1)
 
-
-
-
 /// Convert a big-endian base-2^32 magnitude array to a decimal string.
 /// Returns `"0"` for an empty array.  Used by `bi_read` (real-JDK layout).
 fn mag_words_to_decimal(mag: &[u32]) -> String {
@@ -33369,71 +32354,6 @@ fn decimal_to_mag_words(decimal: &str) -> Vec<u32> {
     words
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ===========================================================================
 // BigDecimal — 3-field synthetic (value String, scale Int, precision Int)
 // ===========================================================================
@@ -33446,15 +32366,6 @@ const BD_FIELD_PRECISION: usize = 2; // Synthetic-mode: Int precision
 /// `Long.MIN_VALUE`, the value lives in `intVal` (a `BigInteger`).  Otherwise
 /// the compact long is the unscaled value and `intVal` may be null.
 const BD_INFLATED: i64 = i64::MIN;
-
-
-
-
-
-
-
-
-
 
 /// Format an unscaled integer string + a scale into the canonical
 /// `BigDecimal.toString` decimal representation (no exponent — used for
@@ -33490,10 +32401,6 @@ fn apply_scale(unscaled: &str, scale: i32) -> String {
     }
 }
 
-
-
-
-
 /// `5^n` as a limb `BigInt` via square-and-multiply.
 fn bigint_pow5(n: u32) -> crate::bigint::BigInt {
     use crate::bigint::BigInt;
@@ -33512,12 +32419,6 @@ fn bigint_pow5(n: u32) -> crate::bigint::BigInt {
     result
 }
 
-
-
-
-
-
-
 /// Read a `BigDecimal` as `(unscaled BigInteger, scale)` for EXACT decimal
 /// arithmetic. Replaces the old `f64` round-trip that silently dropped both
 /// scale (Rust `{}`-formatting strips trailing zeros: `10.0` → "10") and
@@ -33528,7 +32429,6 @@ fn bigint_from_i64(v: i64) -> crate::bigint::BigInt {
     let mag = v.unsigned_abs();
     crate::bigint::BigInt::from_le_words(v < 0, vec![mag as u32, (mag >> 32) as u32])
 }
-
 
 /// Multiply an unscaled `BigInt` by `10^n` (n >= 0) — used to align scales for
 /// `add`/`subtract` (BigDecimal rescales the smaller-scale operand up to the
@@ -33545,17 +32445,6 @@ fn bigint_mul_pow10(bi: &crate::bigint::BigInt, n: i32) -> crate::bigint::BigInt
     bi.mul(&crate::bigint::BigInt::from_decimal(&p))
 }
 
-
-
-
-
-
-
-
-
-
-
-
 /// Low `bits` of a `BigInt`'s two's-complement representation — the
 /// narrowing `BigInteger.intValue()`/`longValue()` semantics.
 fn bigint_low_twos_complement(v: &crate::bigint::BigInt, bits: u32) -> u64 {
@@ -33570,16 +32459,6 @@ fn bigint_low_twos_complement(v: &crate::bigint::BigInt, bits: u32) -> u64 {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
 /// `BigDecimal.setScale` old-style rounding-mode constants (`RoundingMode`
 /// shares the same ordinals via its `oldMode` field — see
 /// `RoundingMode.setScale(int,RoundingMode)`'s bytecode, which reads
@@ -33593,37 +32472,12 @@ const BD_ROUND_HALF_DOWN: i32 = 5;
 const BD_ROUND_HALF_EVEN: i32 = 6;
 const BD_ROUND_UNNECESSARY: i32 = 7;
 
-
-
-
-
-
-
-
 // Executor = 2-field synthetic (field 0 = pool size, field 1 = shutdown flag)
 const EXEC_FIELD_SIZE: usize = 0;
 const EXEC_FIELD_SHUTDOWN: usize = 1;
 // Future = 2-field synthetic (field 0 = result value, field 1 = done flag)
 pub(crate) const FUT_FIELD_RESULT: usize = 0;
 pub(crate) const FUT_FIELD_DONE: usize = 1;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Executor compatibility paths run work inline. Return a real, completed
 /// `CompletableFuture` instead of a two-slot object carrying FutureTask's real
@@ -33644,16 +32498,19 @@ fn completed_executor_future(
     };
     let result_pin = result_obj.map(|result_obj| ctx.pin_native_root(result_obj));
     let outcome = (|| -> Result<ObjectRef, MethodCallFailed> {
-        let future =
-            match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
-                Some(Value::Object(Some(future))) => future,
-                _ => {
-                    return Err(RuntimeError::IllegalStateException {
-                        message: "could not allocate executor completion future".to_string(),
-                    }
-                    .into())
+        let future = match ctx.new_object_initialized(
+            "java/util/concurrent/CompletableFuture",
+            "()V",
+            &[],
+        )? {
+            Some(Value::Object(Some(future))) => future,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "could not allocate executor completion future".to_string(),
                 }
-            };
+                .into())
+            }
+        };
         let future_pin = ctx.pin_native_root(future);
         let result = match (result_pin, result_obj) {
             (Some(result_pin), Some(result_obj)) => {
@@ -33761,9 +32618,6 @@ fn native_new_cached_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     )
 }
 
-
-
-
 /// Process-wide singleton async worker pool (Bug D). Kept alive across calls +
 /// GC via `register_var_handle_root` (a `pin_native_root` handle is NOT usable
 /// here: that is a transient per-thread pin stack cleared after each native
@@ -33833,7 +32687,6 @@ pub(crate) fn async_handoff_sleep_millis(requested: i64) -> i64 {
         requested
     }
 }
-
 
 /// Get-or-create the singleton bounded async worker pool. Returns `None` if the
 /// pool could not be constructed (caller then falls back to inline execution).
@@ -34187,9 +33040,6 @@ pub(crate) fn interrupt_executor_workers_filtered(
     true
 }
 
-
-
-
 fn juli_utc_date_days_ago(days_ago: i64) -> String {
     let days = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -34210,16 +33060,6 @@ fn juli_utc_date_days_ago(days_ago: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-
-
-
-
-
-
-
-
-
-
 fn cf_capture_throwable(
     ctx: &mut dyn NativeContext,
     err: &cratonvm_types::error::MethodCallFailed,
@@ -34235,8 +33075,6 @@ fn cf_capture_throwable(
         _ => Value::Object(None),
     }
 }
-
-
 
 // ===========================================================================
 // Phase 29: java.text — DecimalFormat, NumberFormat
@@ -34456,15 +33294,12 @@ fn native_df_apply_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(None)
 }
 
-
 const URL_FIELD_PROTOCOL: usize = 0;
 const URL_FIELD_HOST: usize = 1;
 const URL_FIELD_PORT: usize = 2;
 const URL_FIELD_PATH: usize = 3;
 const URL_FIELD_QUERY: usize = 4;
 const URL_FIELD_FULL: usize = 5; // Original string for toString
-
-
 
 /// Extract the path portion from a URI string
 fn extract_path(uri: &str) -> &str {
@@ -34479,15 +33314,6 @@ fn extract_path(uri: &str) -> &str {
         uri
     }
 }
-
-
-
-
-
-
-
-
-
 
 fn is_ascii_hex_digit(b: u8) -> bool {
     b.is_ascii_hexdigit()
@@ -34546,13 +33372,6 @@ fn quote_uric(s: &str) -> String {
     }
     out
 }
-
-
-
-
-
-
-
 
 // InetAddress = 2-field synthetic (field 0 = hostname, field 1 = address)
 
@@ -34638,9 +33457,6 @@ pub(crate) fn resolve_primary_ipv4(hostname: &str) -> String {
     "127.0.0.1".to_string()
 }
 
-
-
-
 /// Read a Java `byte[]` of length `len` into a `Vec<u8>` (sign-extending each
 /// element back to its unsigned form). Used by [`native_inet_get_by_address`]
 /// and the byte-array helper in [`native_inet_get_address`].
@@ -34654,17 +33470,6 @@ fn read_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef, len: usize) -> V
         })
         .collect()
 }
-
-
-
-
-
-
-
-
-
-
-
 
 fn dmr_model_type_undefined(ctx: &mut dyn NativeContext) -> Value {
     let cid = match ctx.ensure_class_initialized("org/jboss/dmr/ModelType") {
@@ -34726,23 +33531,6 @@ fn native_dmr_model_node_is_defined(
         1
     })))
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn native_file_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     #[cfg(windows)]
@@ -34941,7 +33729,6 @@ fn native_level_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
     Ok(None)
 }
 
-
 const LOGGER_FIELD_NAME: usize = 0;
 const LOGGER_FIELD_LEVEL: usize = 1;
 const LEVEL_FIELD_NAME: usize = 0;
@@ -35012,7 +33799,6 @@ fn native_logger_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // Print the log message
     jul_log_msg(ctx, args)
 }
-
 
 /// Log a message only if the logger's current level allows `method_level`.
 /// Compares current level (read from LOGGER_FIELD_LEVEL field 1) against the
@@ -35102,12 +33888,6 @@ const SLF4J_LEVEL: usize = 1;
 std::thread_local! {
     static MDC_MAP: std::cell::RefCell<std::collections::HashMap<String, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
-
-
-
-
-
-
 
 fn register_locale_natives(_registry: &mut NativeMethodRegistry) {
     // synthetic-stub removed: java.util.Locale has real JDK bytecode.
@@ -36527,19 +35307,6 @@ fn sr_next_seed(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
     val as i64
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // StampedLock — real implementation backed by `stamped_lock` module.
 // ---------------------------------------------------------------------------
@@ -36626,9 +35393,6 @@ fn gc_stable_lock_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> usize {
     pack_lock_key(hash, generation)
 }
 
-
-
-
 fn mirror_stamped_state(ctx: &mut dyn NativeContext, obj: ObjectRef, addr: usize) {
     ctx.set_field_by_name(
         obj,
@@ -36636,32 +35400,6 @@ fn mirror_stamped_state(ctx: &mut dyn NativeContext, obj: ObjectRef, addr: usize
         Value::Long(crate::stamped_lock::stamped_visible_state(addr)),
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // --- LongAdder ---
 //
@@ -36784,9 +35522,12 @@ fn striped64_base_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize
 
 #[cfg(test)]
 mod striped64_base_slot_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::striped64_base_slot_from_layout;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn real_jdk_inherited_base_slot_wins_over_synthetic_fallback() {
@@ -37100,25 +35841,6 @@ fn native_double_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     }
     Ok(None)
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ===========================================================================
 // Phase 35: Missing functional interfaces
@@ -38498,10 +37220,6 @@ fn register_synthetic_instant_stub_natives(registry: &mut NativeMethodRegistry) 
     registry.set_category(__prev_cat);
 }
 
-
-
-
-
 fn sync_collection_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     match ctx.get_field_by_name(this, "c") {
         Value::Object(Some(c)) => Some(c),
@@ -38509,32 +37227,12 @@ fn sync_collection_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Opti
     }
 }
 
-
-
-
-
-
-
-
-
 fn sync_map_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     match ctx.get_field_by_name(this, "m") {
         Value::Object(Some(m)) => Some(m),
         _ => None,
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn register_synchronized_collection_wrapper_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
@@ -38657,18 +37355,9 @@ const ISS_FIELD_SUM: usize = 1;
 const ISS_FIELD_MIN: usize = 2;
 const ISS_FIELD_MAX: usize = 3;
 
-
-
-
-
-
-
-
-
 fn native_return_true(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(1)))
 }
-
 
 /// Validate the target accepted by `java.lang.reflect.Array` before using an
 /// array accessor.  A non-null ordinary object used to reach the generic
@@ -39094,18 +37783,6 @@ static PROXY_MODULE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::A
 static PROXY_LOADER_MODULES: parking_lot::RwLock<Option<rustc_hash::FxHashMap<u32, u32>>> =
     parking_lot::RwLock::new(None);
 
-
-
-
-
-
-
-
-
-
-
-
-
 /// WP2.5 v3 item 6 — classify a thrown exception from
 /// `InvocationHandler.invoke` against the proxied method's declared
 /// throws set; wrap in `java.lang.reflect.UndeclaredThrowableException`
@@ -39340,9 +38017,6 @@ fn native_invocation_handler_invoke_default(
     }
 }
 
-
-
-
 /// real-cdi-bean-container — Agroal datasource shim gate (Keycloak Gap 8).
 ///
 /// When ON, the `agroal_pool.rs` native shim is **not** registered, so
@@ -39378,7 +38052,6 @@ pub fn real_vertx() -> bool {
     crate::nbflags().real_vertx && !crate::nbflags().synthetic_vertx
 }
 
-
 /// Outcome of [`define_or_get_proxy_class`]. Distinguishes the *intended*
 /// gate-off degrade (use the synthetic shim) from a *genuine* generation
 /// failure, so STRICT mode ([`real_proxy_strict`]) can surface the latter as a
@@ -39392,13 +38065,6 @@ enum ProxyClassOutcome {
     /// the exception message + the `CRATONVM_DBG_PROXY` audit.
     Failed(&'static str),
 }
-
-
-
-
-
-
-
 
 /// WP2.5 v3 — parse a JVMS method descriptor's parameter list into
 /// internal class names. Primitives map to their wrapper internal
@@ -39721,14 +38387,6 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
 
 const AB_FIELD_VALUE: usize = 0;
 
-
-
-
-
-
-
-
-
 // ===========================================================================
 // AtomicStampedReference — JDK-faithful single `pair` field (slot 0) that
 // holds an `AtomicStampedReference$Pair { reference@0, stamp@1 }`.
@@ -39779,14 +38437,6 @@ fn asr_read_pair(ctx: &mut dyn NativeContext, this: ObjectRef) -> (Value, i32) {
         _ => (Value::Object(None), 0),
     }
 }
-
-
-
-
-
-
-
-
 
 // ===========================================================================
 // AtomicMarkableReference — JDK-faithful single `pair` field (slot 0) that
@@ -39845,7 +38495,6 @@ fn amr_read_pair(ctx: &mut dyn NativeContext, this: ObjectRef) -> (Value, bool) 
         _ => (Value::Object(None), false),
     }
 }
-
 
 fn native_amr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -40964,13 +39613,15 @@ fn pd_has_failure(ctx: &dyn NativeContext, scope: ObjectRef) -> bool {
     false
 }
 
-
 #[cfg(test)]
 mod vector_support_essential_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn register_essential_includes_jdk25_vector_support_natives() {
@@ -41047,10 +39698,13 @@ mod vector_support_essential_tests {
 
 #[cfg(test)]
 mod base64_encoder_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ArrayElementType;
 
     #[test]
@@ -41091,10 +39745,13 @@ mod base64_encoder_tests {
 
 #[cfg(test)]
 mod nio_heap_byte_buffer_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ArrayElementType;
 
     #[test]
@@ -41179,10 +39836,13 @@ mod nio_heap_byte_buffer_tests {
 
 #[cfg(test)]
 mod charset_alias_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn charset_for_name_initializes_alias_fields_and_aliases_native_caches_set() {
@@ -41235,9 +39895,12 @@ mod charset_alias_tests {
 
 #[cfg(test)]
 mod reflection_field_essential_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn register_essential_includes_reflective_field_accessors() {
@@ -41272,12 +39935,14 @@ mod reflection_field_essential_tests {
     }
 }
 
-
 #[cfg(test)]
 mod panama_essential_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn register_essential_includes_symbol_lookup_bridge() {
@@ -41317,14 +39982,15 @@ mod panama_essential_tests {
     }
 }
 
-
-
 #[cfg(test)]
 mod liquibase_checksum_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ArrayElementType;
 
     const ABSTRACT_CHANGE: &str = "liquibase/change/core/CreateTableChange";
@@ -41523,18 +40189,18 @@ mod liquibase_checksum_tests {
     }
 }
 
-
-
-
 // ===========================================================================
 // T2.3.5 — java.util.Random natives
 // ===========================================================================
 #[cfg(test)]
 mod t2_random_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn alloc_random(ctx: &mut dyn NativeContext) -> ObjectRef {
         // Random's synthetic layout: field 0 = seed (Long), field 1 =
@@ -41642,9 +40308,12 @@ mod t2_random_tests {
 // ===========================================================================
 #[cfg(test)]
 mod t2_6_crypto_acceptance_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// T2.6.19 — SHA-256("hello") matches RFC 6234 test vector
     /// `2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824`

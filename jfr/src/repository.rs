@@ -483,6 +483,8 @@ pub const DEFAULT_SPSC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 // `UnsafeCell<usize>` cached_tail is never touched by consumers.
 // `EventInstance` is `Send`.
 unsafe impl Sync for SpscEventRing {}
+// SAFETY: the same SPSC ownership and atomic-publication argument above means
+// ownership of the ring may move between threads without racing slot access.
 unsafe impl Send for SpscEventRing {}
 
 impl SpscEventRing {
@@ -2096,6 +2098,10 @@ mod tests {
         // the fix the backing is leaked (still mapped), so this is a valid read
         // of the producer-initialised `EventInstance`. We read it without moving
         // it out (so we don't double-drop the skipped slot's payload).
+        // SAFETY: this test deliberately models the consumer-resume half of
+        // the wedged-drop contract. The fixed drop path leaks the slot backing
+        // when the consumer gate is held, and `active_tail < head` proves this
+        // producer-published slot is initialized and still mapped.
         let ev_ref: &EventInstance = unsafe { (*(*slot_ptr).get()).assume_init_ref() };
         assert_eq!(ev_ref.start_time, active_tail as u64);
         match &ev_ref.fields[0] {
