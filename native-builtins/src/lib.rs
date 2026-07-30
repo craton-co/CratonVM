@@ -9188,7 +9188,8 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(a))) => *a,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let len = ctx.array_length(arr);
+            let arr_pin = ctx.pin_native_root(arr);
+            let len = ctx.array_length(ctx.read_native_pin(arr_pin, arr));
             let trace = crate::nbflags().trace_arrays_hashcode;
             if trace {
                 let mut desc = String::new();
@@ -9196,6 +9197,7 @@ pub fn register_essential_natives_with_shims(
                     if i > 0 {
                         desc.push_str(", ");
                     }
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     match ctx.get_array_element(arr, i) {
                         Value::Object(None) => desc.push_str("null"),
                         Value::Object(Some(o)) => {
@@ -9275,6 +9277,7 @@ pub fn register_essential_natives_with_shims(
             }
             let mut hash = 1i32;
             for i in 0..len {
+                let arr = ctx.read_native_pin(arr_pin, arr);
                 let elem_hash = match ctx.get_array_element(arr, i) {
                     Value::Object(None) => 0,
                     Value::Object(Some(o)) => match ctx.invoke_virtual(o, "hashCode", "()I", &[]) {
@@ -9285,6 +9288,7 @@ pub fn register_essential_natives_with_shims(
                 };
                 hash = hash.wrapping_mul(31).wrapping_add(elem_hash);
             }
+            ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Int(hash)))
         },
     );
