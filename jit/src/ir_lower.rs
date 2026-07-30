@@ -2088,7 +2088,8 @@ impl<'a> Lowerer<'a> {
             }
             // putfield write — `Op::Store`. The IR builder emits only
             // `Op::Store(MemKind::Int)` (int-category instance fields). Inline
-            // the `jit_putfield_int` heap write: null receiver → no-op, else
+            // the heap write: a null receiver DEOPTS (the interpreter then
+            // re-executes this putfield and throws NullPointerException), else
             // write a `Value::Int(value)` cell (discriminant 0 + the 32-bit
             // payload, high qword cleared so no stale ref/garbage survives —
             // mirroring the scalar-replace store and the real helper).
@@ -2105,15 +2106,21 @@ impl<'a> Lowerer<'a> {
                 let tag_off = HEADER_SIZE as i32 + (field_index as i32) * SLOT_SIZE as i32;
                 let pay_off = tag_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
                 let high_off = tag_off + 8; // the 8-byte payload region (Long/ref)
-                                            // Receiver → RAX, value → RCX. Both loaded BEFORE the null
-                                            // check so the guarded body is a fixed size (the value load is
-                                            // variable-width; doing it here keeps the JE displacement
-                                            // constant). The value load on the null path is harmless.
+                let bci = node.bytecode_pc.unwrap_or(0);
+                // Receiver → RAX, value → RCX.
                 self.load_to_rax(self.slot_of(base));
                 self.load_to_rcx(self.slot_of(value));
-                // TEST RAX,RAX ; JE +27 → skip (null receiver = no-op).
-                self.buf.emit(&[0x48, 0x85, 0xC0]);
-                self.buf.emit(&[0x74, 27]);
+                // A null receiver is a NullPointerException, not a no-op. This
+                // arm used to `JE` over the store, silently dropping it and
+                // continuing — the same silent-data-loss defect fixed in the
+                // single-pass backend in cd451faccc, which this tier still had.
+                // Deopt instead, exactly as the `ArrayLoad`/`ArrayStore` guards
+                // below already do for a null array: control leaves for the
+                // shared deopt stub, and the interpreter re-executes this
+                // putfield and throws. No new machinery, and the store body is
+                // no longer required to be a fixed 27 bytes.
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
                 // MOV dword [RAX + tag_off], 0   (Value::Int discriminant) — 10 bytes.
                 self.buf.emit(&[0xC7, 0x80]);
                 self.buf.emit(&tag_off.to_le_bytes());
@@ -2125,7 +2132,8 @@ impl<'a> Lowerer<'a> {
                 self.buf.emit(&[0x48, 0xC7, 0x80]);
                 self.buf.emit(&high_off.to_le_bytes());
                 self.buf.emit(&0u32.to_le_bytes());
-                // skip:  (10 + 6 + 11 = 27 bytes guarded — matches the JE rel8)
+                // (the store body no longer needs a fixed size: the null path
+                // exits to the deopt stub rather than jumping over these bytes)
             }
             // FP array element load (Slice B) — `faload`/`daload`. inputs =
             // [ctrl, mem, array, index]. Load the array pointer to RAX and the

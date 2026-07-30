@@ -413,9 +413,36 @@ nothing but field stores. An implicit null check (fault + signal translation,
 as HotSpot does) was therefore not pursued — there is no measured cost to
 recover.
 
-**Still open, same defect, different tier:** the IR/C2 lowering in
-`jit/src/ir_lower.rs` (`Op::Store`) documents its own behaviour as "null
-receiver → no-op" and has the identical silent drop. It is unreachable on a
-default build today because the optimizing tier is gated off entirely (see
-`docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`),
-so it must be fixed *before* that gate is lifted, not after.
+**The same defect in the other tier is now FIXED too** (2026-07-30). The IR/C2
+lowering in `jit/src/ir_lower.rs` (`Op::Store`) described its own behaviour as
+"null receiver → no-op" and jumped over the store with a `JE +27`. It now emits
+`emit_deopt_if_zero(bci, DeoptReason::NullCheck)` — the identical guard the
+neighbouring `ArrayLoad`/`ArrayStore` arms already used for a null array — so
+control leaves for the shared deopt stub and the interpreter re-executes the
+`putfield` and throws. No new machinery was needed: contrary to the worry that
+the IR lowerer cannot raise mid-graph, it has raised from array guards all
+along.
+
+**Reaching it takes TWO gates open, not one.** Besides the optimizing tier
+being off by default (see
+`jit-optimizing-tier-disabled-by-moving-young-default.md`), the IR *builder*
+bails out of `putfield` whenever `compact_ref_fields_enabled()` — which
+defaults to **true** (`Err(_) => true` in `types/src/field_layout.rs`). So the
+repro needs both:
+
+```bash
+CRATONVM_NO_MOVING_YOUNG=1 CRATONVM_COMPACT_REF_FIELDS=0 \
+  <cratonvm> --java-home <jdk25> -cp probeout NullPutfieldProbe 400000
+```
+
+Under that configuration the pre-fix binary reports `putfield-int =NO-THROW`
+and everything else `NPE` — exactly right, because the IR builder only lowers
+**int-category** fields (`I Z B C S`) to `Op::Store`; reference and long stores
+never reach this tier and took the single-pass path fixed in `cd451faccc`. A
+one-row failure is the signature of this bug, not a partial repro.
+
+Cost: none. The guard replaces `TEST+JE` with `TEST+Jcc`-to-stub, the same
+fast-path shape. Interleaved against a pre-fix binary in the IR-live
+configuration: `PutfieldPerfProbe` 20M is indistinguishable (ints 122.2 ms both,
+wide 126.7 ms both), and `BinTreesClassic` d=18 shows base median 2608 ms vs fix
+2524 ms with checksum 68332206 on every run.
