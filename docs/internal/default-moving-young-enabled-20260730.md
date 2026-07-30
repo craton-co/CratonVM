@@ -3,92 +3,207 @@
 ## Outcome
 
 The generational collector's moving/compacting young path is the supported
-default. `CRATONVM_NO_MOVING_YOUNG=1` is the compatibility opt-out, and an
-incomplete per-cycle JIT root-coverage proof still diverts that collection to
-the non-moving sweep.
+default **and it now runs**. `CRATONVM_NO_MOVING_YOUNG=1` is the compatibility
+opt-out, and an incomplete per-cycle JIT root-coverage proof still diverts that
+individual collection to the non-moving sweep.
 
-The compiled constant was already `true` on `origin/dev`: commit
-`67de5400ac60d7d4097b0657bbfac9965cbd744a` changed it while fixing Liquibase
-GC corruption. The rest of the repository had not completed that transition.
-This delivery pins the empty-environment result directly, keeps the opt-out
-contract covered, corrects the stale default-off documentation/comments, and
-repairs a synthetic shadow-stack test fixture that no longer represented the
-fixed-capacity production layout.
+`DEFAULT_MOVING_YOUNG` had been `true` on `origin/dev` since
+`67de5400ac60d7d4097b0657bbfac9965cbd744a` (it arrived while fixing Liquibase GC
+corruption). The first half of this delivery made the repository state
+deliberate — pinning the empty-environment result, covering the opt-out, and
+correcting the stale default-off documentation.
 
-## Build and unit evidence
+**The second half found that the flip was nominal.** With the constant `true`,
+every young collection in any process that had compiled a single method still
+ran the non-moving sweep. Measured on `BinTreesClassic 18` at `-Xmx512m`:
+`cycles=0 coverage_fallbacks=66`. Three independent defects produced that, and
+all three are fixed here. The same lane now reports `cycles=25
+coverage_fallbacks=0` with the HotSpot checksum, and completes in ~4.3 s instead
+of ~15.3 s.
 
-- `cargo check --workspace`: PASS.
-- `cratonvm-types` moving-young filter: 1 passed.
-- `cratonvm-types` library: 417 passed. Its separate `flag_surface` integration
-  fixture rejected a checked-in UTF-8 BOM before any moving-young assertion;
-  this is fixture invalidation, not VM evidence.
-- `cratonvm-gc --lib`: 872 passed, zero failed.
-- `cratonvm-jit --lib moving_young`: 2 passed, zero failed. The final complete
-  JIT library run reached 819 explicit passes and 12 unrelated failures before
-  the Windows test process hit `STATUS_ACCESS_VIOLATION` in
-  `cooperative_poll_runs_in_a_pure_compiled_method`; it produced no valid final
-  suite summary.
-- `cratonvm-vm --lib moving_young`: 9 passed, zero failed.
-- `shadow_window_is_recovered_from_a_live_compiled_frame`: 1 passed. The fixture
-  now allocates `DEFAULT_SHADOW_SLOTS` and publishes the real fixed-capacity
-  `end`, matching `ShadowStack::ensure_allocated`.
-- Complete `cratonvm-vm --lib`: 2,448 passed, six failed, 111 ignored. The six
-  failures are unrelated skip-list classification, panic-census, and
-  serviceability socket baselines; every moving-young and shadow-window test
-  passed.
+## Defect 1 — a process-wide blanket bypassed the per-cycle proof
 
-## Runtime contract and pressure evidence
+`refresh_moving_young_coverage_for_current_thread` opened with
 
-Release binary: `cratonvm-moving-young-default-019fb305.exe`, SHA-256
-`66D0368246687D5FE120AF3ACCF8C1A39644D44CB0DC9869ABA54EAFBFE3ACB4`.
+```rust
+if cratonvm_jit::jit_code_range_count() != 0 {
+    mark_moving_young_coverage_incomplete_because(JIT_RELOCATION_UNSUPPORTED);
+    return false;
+}
+```
 
-The pressure lanes returned their HotSpot checksums:
+added by `86e69e848` (2026-07-29) after a Hibernate corruption chase. The
+existence of *any* compiled code — not a specific unproven frame — refused every
+moving collection, so the entire per-frame verifier below it was unreachable in
+production.
 
-| Lane | Heap | Result | Moving diagnostic |
-|---|---:|---:|---|
-| default JIT | 512m | 68332206 | requested=true; cycles=0, coverage_fallbacks=64 |
-| default `--nojit` | 128m, depth 16 | 14985902 | 31 non-diverted moving collections |
-| `CRATONVM_NO_MOVING_YOUNG=1`, JIT | 8g | 68332206 | absent, as required |
+Its stated rationale was that "discovering a gap while scanning is too late to
+repair that collection". That does not describe the wiring: this function *is*
+the pre-cycle proof. `memory/roots.rs::collect_roots` calls it (through
+`refresh_moving_young_coverage_for_collection`) **before** the collector selects
+a young path, and `gen_heap::collect_garbage_inner` diverts on the published
+verdict. A gap found here has always been found in time.
 
-The `--nojit` lane logged
-`moving_young_requested=true divert_non_moving=false` 31 times and therefore
-exercised 31 real Cheney cycles. The counter printed at shutdown is deliberately
-limited to moves with live JIT roots, so it remains zero in that lane. The JIT
-pressure lane proves every unsafe cycle is visibly fail-closed when the merged
-JIT cannot recover an exact frame base; the correct checksum across both moving
-and diverted cycles proves the safety split.
+It is now the `CRATONVM_MOVING_YOUNG_NO_JIT=1` knob — the same fail-closed
+direction, no longer the only available setting. Keeping it is worthwhile: it
+makes "is this a moving-young defect?" a single-variable experiment, and it is
+the correct emergency lever if a workload exposes an obligation the verifier
+does not model.
 
-The HotSpot-differential regression suite passed all 18 classes in each of:
+## Defect 2 — the coverage proof erased its own input
 
-- default JIT;
-- default `--nojit`;
-- `CRATONVM_NO_MOVING_YOUNG=1`, JIT.
+With the blanket off, **100%** of fallbacks became `missing-exact-rbp`, and the
+diagnostic showed `top_rbp=0x0` for a frame that had 7 oop maps and a live
+sp-id slot. Nothing was wrong with the frame.
 
-That is 54/54 class runs with every deterministic output matching HotSpot.
+`prune_returned_jit_entries` ended with an unconditional
+`reload_top_rbp_cache(&v)`. The innermost-RBP mirror is the **live** value —
+each compiled prologue writes it with an inline `mov gs:[disp], rbp` (or through
+the `jit_frame_record` helper). `PreciseFrameInfo::exact_rbp` is only a
+*snapshot* of that mirror, taken in `push_entry_full` at the moment an entry
+stops being top. For the entry that is *currently* top, nothing has ever written
+that field, so it still holds the `0` from `enter_with_compiled`.
 
-## Real-JDK application gauntlet
+`refresh_moving_young_coverage_for_current_thread` prunes first and reads the
+mirror second. A prune that removed nothing therefore overwrote the live RBP
+with that `0` on the way in, and the proof then failed itself.
 
-Every valid fixture was run as a whole class in both JIT and `--nojit`:
+The reload now runs only when pruning actually changed the top. It was
+introduced by `c9b56f7d6` (2026-06-17), a throughput change that moved the hot
+per-invocation RBP write into a TLS mirror; the cold reload was left reading the
+field as if it were still authoritative. **Moving-young has therefore been
+unable to engage under JIT since mid-June** — before the 2026-07-01 "FINISHED"
+validation and before the 07-26 and 07-29 corruption work, which is worth
+keeping in mind when reading any moving-young claim dated between those points.
 
-- Spring Boot: four classes, 17 tests per mode, zero failed, aborted, skipped,
-  or failed containers. Classes covered security auto-configuration, Web MVC
-  management context configuration, embedded Tomcat lifecycle, and thread-dump
-  actuator behavior.
-- Hibernate ORM: ten classes, 41 found/started and 41 successful per mode, zero
-  failed/aborted/skipped, with all ten `@@RESULT` rows recorded.
-- Tomcat: `org.apache.catalina.startup.TestTomcat`, `OK (26 tests)` per mode.
+Regression test: `a_no_op_prune_does_not_clobber_the_live_rbp_mirror`.
 
-Two additional Spring Boot candidates were excluded after `SBRUNNER_LOAD_FAIL`
-showed their compiled test classes were absent from the available fixture.
-Likewise, no compiled standalone H2 suite fixture was present. Neither
-pre-launch condition was counted as VM evidence.
+## Defect 3 — recursion was misread as an unguarded foreign frame
+
+With defect 2 fixed, 100% of fallbacks moved to
+`innermost-rbp-belongs-to-unguarded-callee`. `chain_entry_rbp_is_foreign`
+rejected any frame whose return address pointed into registered JIT code, on the
+grounds that a chain entry names a boundary method and cannot describe a callee
+reached by a guardless JIT→JIT call.
+
+But a compiled method that **recurses** does so through a direct `E8 rel32` CALL
+back to its own entry (`x64.rs`, `self_call_patches`), pushing no guard — so any
+recursive Java workload leaves the mirror pointing at an inner activation of the
+very method the entry names, which `info.compiled_method` describes exactly.
+`BinTreesClassic`'s `itemCheck`/`bottomUpTree` recursion made this 82/82 of the
+fallbacks at depth 18.
+
+The check now recognises that case from the machine code rather than inferring
+it from which direct-call features happen to be gated off: the return address
+must lie in the entry's own body **and** the five bytes ending there must be
+`E8 rel32` resolving to that body's entry point. An indirect call, a call from a
+different method, or bytes that cannot be read all stay foreign. Regression
+test: `direct_self_call_return_is_recognised_only_for_a_real_e8_to_the_entry`.
+
+## Runtime evidence
+
+Release binary `cvm-myd-r4.exe`, built from this branch under a unique name so
+no measurement can borrow a stale image.
+
+| Lane | Heap / depth | moving cycles | fallbacks | checksum | time |
+|---|---|---:|---:|---|---:|
+| default | 512m, 18 | **25** | **0** | 68332206 ✓ | 4,260 ms |
+| `CRATONVM_MOVING_YOUNG_NO_JIT=1` | 512m, 18 | 0 | 64 | 68332206 ✓ | 15,789 ms |
+| `CRATONVM_NO_MOVING_YOUNG=1` | 512m, 18 | — | — | 68332206 ✓ | 4,986 ms |
+| default | 128m, 16 | **22** | **0** | 14985902 ✓ | 851 ms |
+| default | 256m, 14 | **2** | **0** | 3222190 ✓ | 176 ms |
+| default | 8g, 18 | **1** | **0** | 68332206 ✓ | 3,315 ms |
+
+Three consecutive repeats of the 512m lane returned `cycles=25
+coverage_fallbacks=0` and the HotSpot checksum every time — the engagement is
+deterministic, not a race that happened to land.
+
+Five interleaved rounds at 512m on a loaded host gave moving 4,430–6,420 ms and
+`NO_MOVING_YOUNG` 4,719–6,473 ms, while **every** `MOVING_YOUNG_NO_JIT` round
+died with `OutOfMemoryError: Java heap space`. That is the pre-fix default's real
+shape: it reserves the Cheney 50% young-GC headroom (the moving path's trigger)
+and then never compacts, so it collects about twice as often as the non-moving
+policy would and reclaims less each time. Before this delivery the moving-young
+default was *worse than either* of the two configurations it sits between.
+
+## Cross-thread coverage is still an open obligation (by design)
+
+`probes/MovingYoungConcurrentProbe.java` puts four threads in long-lived
+compiled frames, allocating hard enough to collect from each of them. Its
+checksum is order-independent, so HotSpot and CratonVM must agree exactly. Run
+as `MovingYoungConcurrentProbe 4 400 2000` at `-Xmx256m`.
+
+| Lane | checksum | moving cycles | fallbacks |
+|---|---|---:|---|
+| HotSpot JDK 25 | 3852744000 | — | — |
+| default | 3852744000 ✓ | 0 | `cross-thread-jit-peer` = 3 |
+| `CRATONVM_MOVING_YOUNG_NO_JIT=1` | 3852744000 ✓ | 0 | `jit-relocation-contract-unproven` = 3 |
+| `CRATONVM_NO_MOVING_YOUNG=1` | 3852744000 ✓ | — | — |
+
+`refresh_moving_young_coverage_for_collection` treats a cycle as unproven
+whenever a peer thread is in compiled code, because a peer's registers and frame
+slots are not rewritable by this collection. That is obligation #8 in
+`docs/internal/arch-2026-07-26/moving-young-precise-roots.md` ("cross-thread
+coverage handshake") and it is not implemented. So single-threaded phases now
+compact and multi-threaded phases still take the non-moving sweep — visibly
+accounted rather than silently. Closing it is the next item, and the largest
+remaining throughput lever for Tomcat/Spring-shaped workloads.
+
+## Test and suite evidence
+
+- `cargo test -p cratonvm-gc --lib` — 873 passed, 0 failed.
+- `cargo test -p cratonvm-types` — 422 passed, 0 failed across all targets. The
+  `flag_surface` fixture had been failing for two reasons unrelated to
+  moving-young, both fixed here: a checked-in UTF-8 BOM made the first variable
+  unreachable, and `CRATONVM_SYNTHETIC_QUARKUS_START` had been added to the
+  inventory without the fixture.
+- `cargo test -p cratonvm-jit --lib` — 1,053 passed, 0 failed.
+- `cargo test -p cratonvm-jit --test ir_vs_singlepass` — 89 passed, 0 failed.
+- `cargo test -p cratonvm-vm --lib` — 2,449 passed, 111 ignored, 6 failed. The
+  same 6 fail with these changes stashed (skip-list classification ×3, the
+  interpreter panic census, the interpreter B3 gate, and the attach-listener
+  socket baseline), so they are pre-existing and unrelated.
+- HotSpot-differential lane — **20/20 matched in each of three modes**: default,
+  `CRATONVM_NO_MOVING_YOUNG=1`, and `CRATONVM_MOVING_YOUNG_NO_JIT=1`. The same
+  lane on the pre-change binary also matched 20/20, so the baseline is a real
+  control and not an empty one. The lane runs each of
+  `cratonvm.{DiffArithmetic, DiffFloatFormat, DiffLocaleCase, DiffNpeMessage,
+  DiffString, IntrinsicDiff, IntrinsicMegamorphic, IntrinsicVirtualGuard,
+  JitCollectionCtorIdentity, JitDeepRecursionFaultRecovery, JitDifferential,
+  JitExceptionTableInlineCache, JitNull, JitOsrLoopProgress, NestedClinitStartup,
+  RealAnnotations, RealAqs, RealFjp, RealRaf, SyntheticDiff}` from
+  `vm/tests/resources` under both VMs and compares stdout byte-for-byte, after
+  dropping CratonVM-only diagnostics (`tracing` records and the launcher's
+  `[cratonvm]`/`[GC]` lines) and normalising CRLF — MSYS `grep`/`sed` strip CR
+  from one side of the pipeline but not the other, which otherwise reports every
+  line as divergent.
+- Tomcat `org.apache.catalina.startup.TestTomcat` — `OK (26 tests)`, matching
+  the recorded baseline.
+- Hibernate ORM, first 120 classes of `passed.txt`, 4 shards — **119 PASS, 1
+  FAIL**. The single failure,
+  `org.hibernate.orm.test.action.queue.integration.DeferredIdentityGenerationIntegrationTest`,
+  fails identically in the `CRATONVM_MOVING_YOUNG_NO_JIT=1` control lane, so it
+  is pre-existing (it belongs to the open `action.queue` tiering item). The
+  default lane finished in 346 s wall / 1,091,777 ms of class time against the
+  control's 526 s / 1,667,098 ms; the lanes ran back-to-back rather than
+  interleaved, so treat that as indicative of direction, not a calibrated figure.
+- Spring Boot was **not** run: the checkout on this box cannot configure
+  (`build-plugin/spring-boot-antlib` is missing, so `-RefreshClasspaths` fails
+  during Gradle configuration). That is a fixture gap, not VM evidence in either
+  direction.
 
 ## Safety contract
 
 Default-on does not authorize relocation by itself. A live compiled frame must
-still publish complete rewritable oop homes for the active safepoint. Missing
-exact frame identity, an unguarded callee, a wide-locals gap, or another
-incomplete proof records a reason and runs the non-moving sweep for that cycle.
-The explicit opt-out overrides the compatibility opt-in for the compiled-frame
-codegen/root/collector contract. Interpreter-only collections remain safely
-relocatable because all of their roots are rewritable.
+still publish complete rewritable oop homes for the active safepoint. A missing
+exact frame base, a genuinely foreign innermost frame, an unregistered entry, an
+unpublished band word, a wide-locals gap, or a peer thread in compiled code each
+record a reason and run the non-moving sweep for that cycle. The explicit
+opt-out overrides the compatibility opt-in across the whole
+codegen/root/collector contract. Interpreter-only collections remain relocatable
+because all of their roots are rewritable.
+
+The per-reason histogram (`[GC] moving_young_fallback_reason:` under
+`CRATONVM_DBG=gc-stats`) is what turned this delivery from archaeology into
+three successive one-line answers, and it is the first thing to read if
+moving-young ever appears to stop engaging again.

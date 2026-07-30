@@ -7194,6 +7194,39 @@ pub fn ir_direct_calls_enabled() -> bool {
     }
 }
 
+/// Whether the moving young generation is currently vetoing the optimizing
+/// (C2 / IR) tier — and, the first time it does, say so.
+///
+/// The veto itself is correct: IR lowering publishes no exact-RBP and no
+/// per-safepoint oop map, so a live IR frame cannot prove or rewrite its roots
+/// for a relocating young collection. What was not correct is that the two
+/// defaults were set independently and nothing reported the interaction, so
+/// "the optimizing tier never runs" had to be rediscovered from a cluster of
+/// unexplained `left: 0, right: 1` test failures and three separate open
+/// throughput documents.
+///
+/// One line, once per process, at `warn`. It costs nothing on the compile path
+/// (a relaxed atomic after the first call) and turns a cross-suite archaeology
+/// exercise into an observation.
+pub fn moving_young_disables_optimizing_tier() -> bool {
+    if !x64::moving_young_enabled() {
+        return false;
+    }
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "[jit] optimizing (C2/IR) tier DISABLED: the moving young generation is active \
+             and IR lowering publishes no exact-RBP or per-safepoint oop map, so an IR frame \
+             cannot prove or rewrite its roots for a relocating collection. Every method still \
+             compiles, but through the single-pass C1 backend only — the IR optimizer, its \
+             inline caches and its direct-call lowering contribute nothing. \
+             `CRATONVM_NO_MOVING_YOUNG=1` restores the optimizing tier and gives up compaction. \
+             See docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md",
+        );
+    }
+    true
+}
+
 pub fn direct_jit_callee_calls_enabled() -> bool {
     // A raw JIT-to-JIT call has no callee JitEntryGuard. Moving-young must be
     // able to rewrite every live frame, so it cannot use that edge until the
@@ -8279,7 +8312,15 @@ fn try_compile_inner(
         // but cannot prove or rewrite its roots. The x64 backend enables its
         // complete frame-metadata protocol whenever moving-young is active.
         // Keep IR off until it supplies the same relocation contract.
-        && !x64::moving_young_enabled()
+        //
+        // Because `DEFAULT_MOVING_YOUNG` is `true`, this term is FALSE on every
+        // default build: the optimizing tier never runs and every compile falls
+        // through to single-pass C1. That is a deliberate, documented trade —
+        // `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+        // — but it landed silently, and reconstructing it cost a cross-suite
+        // archaeology exercise. `report_optimizing_tier_disabled` makes the
+        // interaction announce itself once per process instead.
+        && !moving_young_disables_optimizing_tier()
         && ir::ir_compatible(&scan)
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
         // tier used to refuse EVERY method with a `try`/`catch`, which is an

@@ -109,6 +109,48 @@ throughput ceiling for a GC-correctness hazard, which is the wrong direction and
 reverses a deliberate architecture decision
 (`docs/internal/arch-2026-07-26/moving-young-precise-roots.md`).
 
+## Update 2026-07-30 — item 3 landed; the trade is now real, not theoretical
+
+`moving_young_disables_optimizing_tier()` (jit/src/lib.rs) replaces the bare
+`!x64::moving_young_enabled()` term at the admission site. It returns the same
+answer and, the first time it vetoes, emits one `warn` naming the cause, the
+consequence, and the opt-out. Observed on a Tomcat `TestTomcat` run:
+
+```
+WARN cratonvm_jit: [jit] optimizing (C2/IR) tier DISABLED: the moving young
+generation is active and IR lowering publishes no exact-RBP or per-safepoint
+oop map, ... `CRATONVM_NO_MOVING_YOUNG=1` restores the optimizing tier and
+gives up compaction.
+```
+
+**What changed underneath it.** Until 2026-07-30 this document described a trade
+that was not actually being made: the moving young generation was
+default-*requested* but could never *engage* under JIT, so a process paid the
+optimizing tier for compaction it never received. Two defects caused that (see
+`docs/internal/default-moving-young-enabled-20260730.md`) and both are fixed —
+`BinTreesClassic 18` at `-Xmx512m` now runs 25 real Cheney young cycles with
+zero coverage fallbacks. The cost recorded here is now buying something, so the
+comparison a reader should make is three-way, not two-way:
+
+| `-Xmx512m` bt18 | young collector | optimizing tier | result |
+|---|---|---|---|
+| default | moving, 25 cycles | off | ~4.3 s |
+| `CRATONVM_MOVING_YOUNG_NO_JIT=1` (the pre-fix behaviour) | non-moving, on the moving-young heap policy | off | ~15.3 s; OOM under load |
+| `CRATONVM_NO_MOVING_YOUNG=1` | non-moving | **on** | ~5.0 s |
+
+**Item 2 is more tractable than it looks, and for a specific reason — but it is
+still not the answer.** An IR-lowered `CompiledMethod` publishes no `oop_maps`
+and no `sp_id_slot_off`, so `conservative_roots::moving_young_frame_coverage_complete`
+returns `false` for any live IR frame *by construction*: the per-cycle proof
+already fails closed on exactly the condition the gate exists to prevent.
+Admitting IR would therefore not be unsound — it would mean every cycle with a
+live IR frame diverts to the non-moving sweep. Since IR compiles the hottest
+methods, that is close to "moving-young never engages again", which is why it
+is **not** done here. C2 and a relocating young generation are mutually
+exclusive in practice until IR supplies the map contract (item 1); choosing
+between them is a policy decision with measurable stakes on both sides, and the
+warning above now makes the choice visible instead of silent.
+
 ## Test-side follow-up already landed
 
 The 24 affected tests exercise IR *lowering*, not the deployment policy, so they

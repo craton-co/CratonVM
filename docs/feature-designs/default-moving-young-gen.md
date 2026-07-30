@@ -1,9 +1,31 @@
 # Default Moving / Compacting Young Generation
 
-Status (2026-07-30): **DEFAULT-ON.** `DEFAULT_MOVING_YOUNG = true` is the
-shipped contract; `CRATONVM_NO_MOVING_YOUNG=1` remains the compatibility
-opt-out. Every moving cycle still requires complete rewritable-root coverage
-and fails closed to the non-moving sweep when that proof is incomplete.
+Status (2026-07-30): **DEFAULT-ON AND ENGAGING.** `DEFAULT_MOVING_YOUNG = true`
+is the shipped contract; `CRATONVM_NO_MOVING_YOUNG=1` remains the compatibility
+opt-out. Every moving cycle still requires complete rewritable-root coverage and
+fails closed to the non-moving sweep when that proof is incomplete.
+
+"And engaging" is the part that had to be earned separately, and it is the
+single most important thing to check before believing any status line in this
+document. The constant was `true` from 2026-07-28 onward while the collector
+still ran the non-moving sweep on **every** cycle of **every** process that
+compiled a method — `cycles=0 coverage_fallbacks=66` on bt18 at `-Xmx512m`.
+Three defects did that (a process-wide blanket that bypassed the per-cycle
+proof; a stale mirror reload that erased the proof's own input; and recursion
+being misread as an unguarded foreign frame) and all three are fixed. The same
+lane now runs 25 real Cheney cycles with zero fallbacks and the HotSpot
+checksum, in ~4.3 s rather than ~15.3 s. Full account and evidence:
+`docs/internal/default-moving-young-enabled-20260730.md`.
+
+The one obligation still open by design is the **cross-thread coverage
+handshake**: a cycle is treated as unproven whenever a peer thread is in
+compiled code, so multi-threaded phases keep taking the non-moving sweep. It is
+counted as `cross-thread-jit-peer` in the fallback histogram.
+
+Ask `CRATONVM_DBG=gc-stats` for `[GC] moving_young: cycles=… coverage_fallbacks=…`
+plus the per-reason histogram before treating this feature as active. A correct
+checksum proves safety; only a non-zero cycle count proves the collector is
+actually copying.
 
 The heap corruption that blocked this feature is fixed. In the 2026-07-26
 validation, five `jit/src/x64.rs` sites pushed an object reference onto the operand stack
