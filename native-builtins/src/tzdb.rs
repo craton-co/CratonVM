@@ -719,10 +719,37 @@ mod tests {
     use super::*;
 
     fn test_catalog() -> Arc<TzdbCatalog> {
-        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME_FOR_TZDB_TEST")
-            .unwrap_or_else(|_| "/home/victor/jdk25".to_string());
-        let path = std::path::Path::new(&java_home).join("lib").join("tzdb.dat");
-        let data = std::fs::read(path).expect("tzdb.dat not found for test");
+        let mut candidates = [
+            cratonvm_types::flags::runtime_var("JAVA_HOME_FOR_TZDB_TEST").ok(),
+            cratonvm_types::flags::runtime_var("JAVA_HOME").ok(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+        if let Ok(output) = std::process::Command::new("java")
+            .args(["-XshowSettings:properties", "-version"])
+            .output()
+        {
+            let settings = String::from_utf8_lossy(&output.stderr);
+            if let Some(java_home) = settings.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("java.home = ")
+                    .map(str::to_owned)
+            }) {
+                candidates.push(java_home);
+            }
+        }
+
+        let path = candidates
+            .into_iter()
+            .map(|java_home| std::path::PathBuf::from(java_home).join("lib").join("tzdb.dat"))
+            .find(|path| path.is_file())
+            .expect(
+                "tzdb.dat not found: set JAVA_HOME_FOR_TZDB_TEST or JAVA_HOME to a complete JDK",
+            );
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         Arc::new(parse_catalog(&data).expect("failed to parse tzdb.dat"))
     }
 

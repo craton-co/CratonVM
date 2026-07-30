@@ -1147,6 +1147,8 @@ fn file_identity_triple(ctx: &mut dyn NativeContext, fd: FdId) -> (u32, u32, u32
             // only read it when the call returns non-zero. `as_raw_handle`
             // yields a live OS handle owned by `file` for the call's duration.
             let mut info: win_fileid::ByHandleFileInformation = unsafe { std::mem::zeroed() };
+            // SAFETY: `file` keeps the raw handle live and `info` is writable
+            // storage for the exact Win32 structure until the call returns.
             let ok = unsafe {
                 win_fileid::GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info)
             };
@@ -1281,14 +1283,20 @@ fn native_fc_map0_legacy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let mut opts = memmap2::MmapOptions::new();
     opts.offset(position as u64).len(length as usize);
     let holder = match prot {
+        // SAFETY: the cloned file remains alive in the returned mapping;
+        // position/length were validated above and memmap2 reports OS errors.
         MAP_RO => MmapHolder::Ro(unsafe {
             opts.map(&file)
                 .map_err(|e| io_error(format!("map0: mmap RO: {e}")))?
         }),
+        // SAFETY: as above; the fd-table grants a private cloned handle and
+        // mutable mapping ownership is retained exclusively by MmapHolder.
         MAP_RW => MmapHolder::Rw(unsafe {
             opts.map_mut(&file)
                 .map_err(|e| io_error(format!("map0: mmap RW: {e}")))?
         }),
+        // SAFETY: as above; copy-on-write prevents writes from aliasing the
+        // underlying file through this mapping.
         MAP_PV => MmapHolder::Cow(unsafe {
             opts.map_copy(&file)
                 .map_err(|e| io_error(format!("map0: mmap COW: {e}")))?
@@ -1331,6 +1339,8 @@ mod tests {
         let file = fdt.clone_file(fd).unwrap();
 
         let mut opts = memmap2::MmapOptions::new();
+        // SAFETY: the test-created file is 4096 bytes, remains open, and this
+        // mapping is the sole mutable view for its full length.
         let mut m = unsafe { opts.len(4096).map_mut(&file).unwrap() };
 
         // Mutate via the mapping.
@@ -1363,6 +1373,8 @@ mod tests {
         let file = fdt.clone_file(fd).unwrap();
 
         let mut opts = memmap2::MmapOptions::new();
+        // SAFETY: the test file is 8192 initialized bytes and remains open for
+        // the lifetime of this read-only mapping.
         let m = unsafe { opts.len(8192).map(&file).unwrap() };
         assert_eq!(&m[..], &payload[..]);
     }
@@ -1386,6 +1398,8 @@ mod tests {
         let file = fdt.clone_file(fd).unwrap();
 
         let mut opts = memmap2::MmapOptions::new();
+        // SAFETY: set_len established SIZE bytes, the handle remains open, and
+        // this is the sole mutable mapping.
         let mut m = unsafe { opts.len(SIZE).map_mut(&file).unwrap() };
 
         // Touch the four corners and the midpoint.
@@ -1398,6 +1412,8 @@ mod tests {
         let f2 = std::fs::File::open(&path).unwrap();
         let file2 = f2;
         let opts2 = memmap2::MmapOptions::new();
+        // SAFETY: the file still has SIZE bytes and remains open for the
+        // lifetime of the read-only mapping.
         let m2 = unsafe { opts2.map(&file2).unwrap() };
         assert_eq!(m2[0], 0xAA);
         assert_eq!(m2[SIZE - 1], 0x55);
@@ -1423,6 +1439,8 @@ mod tests {
         // Map starting at offset 0 first — verify the basic
         // mapping covers the entire 64 KiB.
         let mut opts = memmap2::MmapOptions::new();
+        // SAFETY: the test initialized all 64 KiB and holds the file open for
+        // the lifetime of this read-only mapping.
         let m = unsafe { opts.offset(0).len(64 * 1024).map(&file).unwrap() };
         assert_eq!(m[100], (100 & 0xff) as u8);
         assert_eq!(m[1024], (1024 & 0xff) as u8);
@@ -1432,6 +1450,8 @@ mod tests {
         // platform we target). Verify the first byte of the
         // new mapping equals byte 4096 of the file.
         let mut opts2 = memmap2::MmapOptions::new();
+        // SAFETY: offset and length are page-aligned and wholly inside the
+        // initialized 64 KiB test file, which remains open.
         let m2 = unsafe { opts2.offset(4096).len(4096).map(&file).unwrap() };
         // First byte of m2 should == byte 4096 of the file == 0
         // (because (4096 & 0xff) == 0).
@@ -1452,6 +1472,8 @@ mod tests {
         let file = fdt.clone_file(fd).unwrap();
 
         let mut opts = memmap2::MmapOptions::new();
+        // SAFETY: the initialized 4096-byte file remains open and map_copy
+        // creates a private copy-on-write view owned by this test.
         let mut m = unsafe { opts.len(4096).map_copy(&file).unwrap() };
 
         // Mutate the COW view.
@@ -1558,6 +1580,8 @@ mod tests {
         let fd = fdt.open_read(path.to_str().unwrap()).unwrap();
         let file = fdt.clone_file(fd).unwrap();
         let mut opts = memmap2::MmapOptions::new();
+        // SAFETY: the 4096-byte test file remains open for the lifetime of
+        // this read-only mapping.
         let m = unsafe { opts.len(4096).map(&file).unwrap() };
         let addr = m.as_ptr() as usize;
         let holder = MmapHolder::Ro(m);
@@ -1695,6 +1719,8 @@ mod tests {
         let file = fdt.clone_file(fd).unwrap();
 
         let mut opts = memmap2::MmapOptions::new();
+        // SAFETY: set_len established SIZE bytes, the handle remains open, and
+        // this is the sole mutable mapping.
         let mut m = unsafe { opts.len(SIZE).map_mut(&file).unwrap() };
         // Stride writes to force the kernel to fault each page.
         let stride = 4096;

@@ -20,8 +20,8 @@ the values `0` / `false` / `off` / `no` (case-insensitive) disable. Each is read
 
 | Variable | Effect | Default |
 |----------|--------|---------|
-| `CRATONVM_CONFINE_IO` | **Certified profile.** Turns on working-directory path confinement and registers the CWD as a sandbox root. **Fails closed:** if confinement can't be enabled at startup, the VM aborts rather than running unconfined. | off |
-| `CRATONVM_UNTRUSTED_CODE` | **Untrusted-code profile.** Same confinement, but if it can't be enabled it emits a loud warning instead of failing closed. | off |
+| `CRATONVM_CONFINE_IO` | **Confinement profile.** Turns on working-directory path confinement and registers the process CWD as a sandbox root. **Fails closed:** if confinement cannot actually be enabled at startup, the VM aborts rather than running unconfined. | off |
+| `CRATONVM_UNTRUSTED_CODE` | **Strict defence-in-depth profile.** Enables the same fail-closed filesystem confinement (it aborts identically — it does *not* warn and continue), implies `CRATONVM_REQUIRE_POLICY`, and rejects JNI/Panama downcalls and host-library loading even if a Java policy would otherwise grant them. It still requires an OS/container boundary. | off |
 | `CRATONVM_REQUIRE_POLICY` | With a `SecurityManager` installed but no policy loaded, **deny** (fail-closed) instead of the JDK-default allow-all. | off |
 | `CRATONVM_BLOCK_PRIVATE_NETS` | Extend the egress policy to also deny loopback (`127.0.0.0/8`, `::1`) and the RFC 1918 private ranges (and IPv6 equivalents), so a confined workload can't reach internal services by SSRF. | off |
 | `CRATONVM_RESOLVE_OUTBOUND_HOST` | Resolve outbound **hostnames** and apply the per-IP egress policy to every resolved address (closes the DNS-alias / DNS-rebind bypass). | off |
@@ -30,9 +30,10 @@ the values `0` / `false` / `off` / `no` (case-insensitive) disable. Each is read
 | `CRATONVM_ZIP_MAX_ENTRY_BYTES` | Max declared uncompressed size (bytes) of a single zip/JAR entry that will be inflated — a decompression-bomb guard, paired with an always-on 1000:1 ratio cap. | `536870912` (512 MiB) |
 | `CRATONVM_TRUST_PEM` | Path to a PEM bundle of additional trust anchors for JAR-signature verification. | unset |
 
-The certified/untrusted profiles only *add* restrictions; they never relax the
-default. The same confinement machinery is also drivable programmatically by an
-embedder (see [Embedding](../embedding/overview.md)).
+Both hardening profiles only *add* restrictions; they never relax the default,
+and both fail closed rather than continuing unconfined. The same confinement
+machinery is also drivable programmatically by an embedder (see
+[Embedding](../embedding/overview.md)).
 
 ## Filesystem confinement
 

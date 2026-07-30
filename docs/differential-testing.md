@@ -13,7 +13,7 @@
 > `assert_main_matches_hotspot("cratonvm/YourFixture")` test, or point the
 > `DIFFERENTIAL_CLASSES` env var at it for an ad-hoc sweep.
 
-This document tracked known behavioral divergences between CratonVM and HotSpot
+This document tracks the resolved behavioral divergences between CratonVM and HotSpot
 (OpenJDK 25) discovered through differential testing (`vm/tests/differential.rs`).
 
 Each entry records the class, method, expected (HotSpot) behavior, actual

@@ -39,7 +39,6 @@ pub(crate) fn encode_path_for_url(p: &str) -> String {
         .replace('?', "%3F")
 }
 
-
 /// Immutable backing for an archive. On-disk archives are mapped once and all
 /// `ZipArchive` cursors plus stored class entries share that mapping. Nested
 /// archives and test fixtures retain an owned reference-counted buffer.
@@ -2828,10 +2827,7 @@ impl ClassPath {
                         let certs =
                             Self::certs_for_signed_class(info, archive, &relative_path, None);
                         return Some((
-                            format!(
-                                "jar:file:/{}!/{nested_path}",
-                                encode_path_for_url(&outer)
-                            ),
+                            format!("jar:file:/{}!/{nested_path}", encode_path_for_url(&outer)),
                             certs,
                         ));
                     }
@@ -3989,7 +3985,10 @@ impl ClassPath {
                             let p = p.strip_prefix("//?/").unwrap_or(&p);
                             let p = p.trim_start_matches('/');
                             for candidate in candidates {
-                                urls.push(format!("jar:file:/{}!/{candidate}", encode_path_for_url(&p)));
+                                urls.push(format!(
+                                    "jar:file:/{}!/{candidate}",
+                                    encode_path_for_url(&p)
+                                ));
                             }
                         }
                         continue;
@@ -4103,7 +4102,10 @@ impl ClassPath {
                         for candidate in
                             Self::matching_resource_entry_names(class_entry_index.iter(), name)
                         {
-                            urls.push(format!("jar:file:/{}!/{candidate}", encode_path_for_url(&p)));
+                            urls.push(format!(
+                                "jar:file:/{}!/{candidate}",
+                                encode_path_for_url(&p)
+                            ));
                         }
                         continue;
                     }

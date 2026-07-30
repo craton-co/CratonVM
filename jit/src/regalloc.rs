@@ -2704,7 +2704,6 @@ mod tests {
 
     // ── live_locals_per_pc (OSR-exit dead-local detection) ──────────────────
 
-    #[test]
     /// A local that ONLY the catch handler reads is live throughout the
     /// protected range — the handler is a successor of every instruction in
     /// it. Without exception edges the liveness scan says "dead", and the

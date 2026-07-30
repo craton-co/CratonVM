@@ -14,4 +14,4 @@ CPU fallback. `ptxas_round_trip_dot_reduction` guards the emitted form.
 Float and double reductions intentionally remain on CPU. Their atomic-add
 order is not bit-identical to Java's sequential floating-point accumulation.
 
-See also [the historical validation record](../internal/gpu-offload-followups-20260711.md#1-reduction-kernels-never-dispatch-void-return-gate--done).
+See also [the historical validation record](../internal/fixed-suite-bugs/gpu-offload-followups-20260711.md#1-reduction-kernels-never-dispatch-void-return-gate--done).

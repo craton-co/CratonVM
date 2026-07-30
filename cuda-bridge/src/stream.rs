@@ -161,8 +161,12 @@ pub(crate) struct StreamCuda {
 // stream operation, or use the `bind_to_thread`-on-entry pattern
 // `EventCuda` already follows.
 #[cfg(feature = "cuda")]
+// SAFETY: every stream-driving public method binds the retained device on the
+// current thread before using the raw handle.
 unsafe impl Send for Stream {}
 #[cfg(feature = "cuda")]
+// SAFETY: CUDA serializes stream operations; the retained device keeps the
+// context alive and each driving thread binds it before access.
 unsafe impl Sync for Stream {}
 
 #[cfg(feature = "cuda")]
@@ -187,7 +191,7 @@ static CUDA_STREAM_ID_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic:
 // cudarc's own `result::event::query` does internally for `cuEventQuery`.
 #[cfg(feature = "cuda")]
 unsafe extern "C" fn host_callback_trampoline(user_data: *mut std::ffi::c_void) {
-    // # Safety: `user_data` was produced by `Stream::add_host_callback`
+    // SAFETY: `user_data` was produced by `Stream::add_host_callback`
     // via `Box::into_raw` on a `Box<Box<dyn FnOnce() + Send>>`. The CUDA
     // driver invokes a given `cuLaunchHostFunc` submission's trampoline
     // exactly once and never again afterwards (per the `cuLaunchHostFunc`
@@ -317,6 +321,8 @@ impl Stream {
         // `result::stream::synchronize` on the raw `sys::CUstream`,
         // mirroring what `CudaDevice::synchronize` does for the
         // default stream.
+        // SAFETY: the retained device was bound above and owns the live stream
+        // for the duration of this synchronous wait.
         unsafe { cudarc::driver::result::stream::synchronize(self.raw()) }
             .map_err(|e| crate::DeviceError::Driver(format!("cuStreamSynchronize: {e:?}")))
     }
@@ -459,6 +465,8 @@ impl Stream {
         // reclaimed right here on a synchronous submission failure.
         let boxed: Box<Box<dyn FnOnce() + Send>> = Box::new(f);
         let user_data = Box::into_raw(boxed) as *mut std::ffi::c_void;
+        // SAFETY: the stream is live in the bound context; `user_data` is a
+        // thin Box allocation transferred to the exactly-once trampoline.
         let result = unsafe {
             cudarc::driver::sys::lib().cuLaunchHostFunc(
                 self.raw(),
@@ -476,6 +484,8 @@ impl Stream {
                 // will never call the trampoline for this submission,
                 // so it will never reclaim `user_data`. Reclaim (and
                 // drop) it here or it leaks forever.
+                // SAFETY: submission failed synchronously, so ownership never
+                // transferred and this is the original Box::into_raw pointer.
                 unsafe {
                     drop(Box::from_raw(user_data as *mut Box<dyn FnOnce() + Send>));
                 }

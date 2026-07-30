@@ -2,11 +2,43 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — root mechanism identified and reduced to a 90-second reproducer; not fixed. |
+| **Status** | OPEN — the process-wide gates were narrowed to per-class on 2026-07-30 and the reproducer **still fails**. Re-measured, not fixed. |
 | **Category** | VM-PERFORMANCE (JVMTI redefine / interpreter caching) |
 | **Found** | 2026-07-26, Azure host `20.83.144.174`, dev `7cb040a97`, real JDK 25. |
 | **CratonVM** | ~40,950 ns per `StringBuilder.length()` call after `Mockito.mock(StringBuilder.class)` |
 | **HotSpot** | 17 ns per call in the same state |
+
+## Re-measured 2026-07-30, after the per-class gate work
+
+`fix/deep-audit-retire-20260730` replaced the process-wide
+`any_class_redefined()` quiesce with exact-class / exact-hierarchy checks
+(`vm/src/runtime/redefine_state.rs`), refreshed inherited vtable entries on
+reinstall, and stopped one `mock()` from disabling JIT compilation for the whole
+process. **That did not close this bug.**
+
+Windows 11, release build, JDK 25, Mockito 5.21, same `SbCostProbe`:
+
+| | before mock | after mock | multiplier |
+|---|--:|--:|--:|
+| HotSpot 25 | 2 ns/call | 50 ns/call | 25× |
+| CratonVM | 1,822 ns/call | **245,653 ns/call** | 134× |
+
+The post-mock multiplier improved (451× on the original Azure run → 134× here),
+which is consistent with the gate narrowing doing something real. The absolute
+number did not: 245 µs per call against HotSpot's 50 ns is **~4,900× slower**,
+and 2M calls take 8 minutes. Absolute figures are not comparable across the two
+hosts — this host's *pre*-mock cost is also 23× the Azure run's — so read the
+within-run multiplier, not the µs.
+
+Correctness is still fine: a real `StringBuilder` returns the right length after
+an unrelated mock.
+
+What this rules out: "the caches were keyed too coarsely" is not the whole
+story. The remaining cost is the per-call re-resolution and re-quickening
+signature in the profile below, which the generation-keyed caches were expected
+to fix and evidently do not. The next step is unchanged — find what produces a
+fresh `Arc<[u8]>` for a redefined method's code on every invocation — but it is
+now known that narrowing the redefine gates does not get there on its own.
 
 ## Reproducer (90 seconds, no Spring, no JUnit)
 
