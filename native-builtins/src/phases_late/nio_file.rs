@@ -7300,7 +7300,9 @@ pub(crate) mod p57_win_path_tests {
     //! `sun.nio.fs.WindowsPath` exactly (cross-checked against JDK 25 via the
     //! `PVerify` repro). The parser accepts both `\` and the `/`-canonical
     //! internal form, so both spellings are exercised.
-    use super::{p57_trim_path_trailing_separator, p57_win_is_absolute, p57_win_parent_of};
+    use super::{p57_win_is_absolute, p57_win_parent_of};
+    #[cfg(windows)]
+    use super::p57_trim_path_trailing_separator;
     #[allow(unused_imports)]
     use cratonvm_native_api::{
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
@@ -7351,6 +7353,7 @@ pub(crate) mod p57_win_path_tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn path_construction_trims_only_non_root_trailing_separators() {
         assert_eq!(p57_trim_path_trailing_separator("a\\"), "a");
         assert_eq!(p57_trim_path_trailing_separator("C:/a/"), "C:/a");

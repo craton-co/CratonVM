@@ -2730,6 +2730,14 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // or the collector walks a shadow stack the codegen never pushed to.
     // `parse::present` == the former `var_os(..).is_some()`, so this is
     // behaviour-preserving.
+    // A thread pinning the moving-young policy (see `set_moving_young_override`)
+    // must not read -- or, worse, POPULATE -- this process-wide cache: whichever
+    // test touched it first would otherwise freeze the shadow-stack decision for
+    // every other test in the binary. Recompute instead; the override is never
+    // set in production, so the cached fast path is unchanged there.
+    if MOVING_YOUNG_OVERRIDE.with(|c| c.get()).is_some() {
+        return cratonvm_types::flags().jit.shadow_stack || moving_young_enabled();
+    }
     *G.get_or_init(|| cratonvm_types::flags().jit.shadow_stack || moving_young_enabled())
 }
 
@@ -2761,7 +2769,33 @@ pub fn shadow_stack_maps_enabled() -> bool {
 /// behaviour-preserving today and lets the default be flipped in one place
 /// later. Do NOT re-introduce a local `getenv` here.
 #[inline]
+thread_local! {
+    /// Per-thread override for [`moving_young_enabled`]; `None` = use the
+    /// process flag. Thread-local so parallel tests cannot race each other.
+    static MOVING_YOUNG_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`moving_young_enabled`] for the CURRENT THREAD only.
+///
+/// The optimizing IR tier is gated on `!moving_young_enabled()` (IR publishes
+/// no exact-RBP/safepoint map, so it must stay off while the young generation
+/// can relocate). That makes every IR-routing test depend on a *deployment*
+/// flag rather than on what it actually exercises — and when
+/// `DEFAULT_MOVING_YOUNG` flipped to `true` those tests began asserting against
+/// a pipeline that can no longer run, failing with a bare `left: 0, right: 1`.
+/// Tests that mean "exercise the IR pipeline" call this to say so explicitly.
+///
+/// This does NOT change what production does: nothing calls it outside tests,
+/// and the process flag remains the default on every thread.
+pub fn set_moving_young_override(value: Option<bool>) {
+    MOVING_YOUNG_OVERRIDE.with(|c| c.set(value));
+}
+
 pub fn moving_young_enabled() -> bool {
+    if let Some(forced) = MOVING_YOUNG_OVERRIDE.with(|c| c.get()) {
+        return forced;
+    }
     cratonvm_types::flags().gc.moving_young
 }
 
@@ -15385,6 +15419,20 @@ impl Compiler {
         // staged ABI arg registers). Done last in the prologue, after params are
         // saved to their homes, so `get_current_thread` (caller-saved clobbers)
         // can't lose an argument. RAX holds the returned thread pointer.
+        // Initialise the cached-thread slot whenever it EXISTS, independently of
+        // whether `get_current_thread` is wired. Both consumers -- the safepoint
+        // push in `emit_shadow_push_for_safepoint` and the epilogue savetop
+        // restore -- gate only on `shadow_enabled && shadow_thread_slot_off != 0`
+        // and rely on the slot READING NULL to skip themselves. Folding this
+        // zeroing into the `get_current_thread != 0` arm broke that invariant:
+        // with the helper unwired the slot kept whatever stack garbage occupied
+        // the frame, the push's null test passed, and it stored a live oop
+        // through a wild pointer (SIGSEGV at `mov %rax,0(%r11)`). Production
+        // always wires the helper, so this was latent there.
+        if self.shadow_enabled && self.shadow_thread_slot_off != 0 {
+            self.emit_xor_reg_self(RAX); // RAX = 0
+            self.emit_store_local(self.shadow_thread_slot_off, RAX);
+        }
         if self.shadow_enabled
             && self.helpers.get_current_thread != 0
             && self.shadow_thread_slot_off != 0
@@ -15402,8 +15450,6 @@ impl Compiler {
             // skip safely. `get_current_thread` is a caller-saved clobber but
             // we are still in the prologue (params already homed), so this is a
             // register-safe place to keep the actual fetch.
-            self.emit_xor_reg_self(RAX); // RAX = 0
-            self.emit_store_local(self.shadow_thread_slot_off, RAX);
             self.shadow_fetch_start = self.buf.pos();
             self.emit_call_absolute(self.helpers.get_current_thread);
             self.emit_store_local(self.shadow_thread_slot_off, RAX);
@@ -32014,6 +32060,11 @@ mod tests {
             panic!("JIT test helper called an unimplemented runtime stub");
         }
         let sentinel = unimplemented_stub as *const () as usize; // Cast: address arithmetic
+        // `set_throw_bci` only records the throwing bci in a thread-local and is
+        // called on the throw path of every method carrying an exception check,
+        // so it needs a real no-op rather than the panicking stub.
+        unsafe extern "C" fn record_throw_bci(_bci: i64) {}
+        let throw_bci = record_throw_bci as *const () as usize; // Cast: address arithmetic
         JitRuntimeHelpers {
             newarray: sentinel,
             new_object: sentinel,
@@ -32064,7 +32115,7 @@ mod tests {
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
             throw_exception: sentinel,
-            set_throw_bci: sentinel,
+            set_throw_bci: throw_bci,
             service_callee_deopt: sentinel,
             jit_npe_with_action: sentinel,
             dispatch_threw: sentinel,
@@ -43439,6 +43490,10 @@ mod tests {
     /// is sufficient to prove the per-clone path runs.
     #[test]
     fn test_unroll_mints_per_clone_pic_slots() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        super::set_moving_young_override(Some(false));
         // Not OnceLock-cached (see `direct_jit_callee_calls_enabled`), so
         // setting it here is observed immediately; no other jit test asserts
         // on invoke-info/PIC/MIC-slot counts, so this is safe under parallel

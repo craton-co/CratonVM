@@ -11328,6 +11328,10 @@ mod tests {
     // `#[test]` runs on its own thread, so parallel compile tests can't perturb it.
     #[test]
     fn step3_optimize_toggle_routes_c1_singlepass_and_c2_ir() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         use std::sync::Arc;
 
         // `static int add(int a, int b) { return a + b; }`
@@ -12007,6 +12011,10 @@ mod tests {
     // the flag) and does not (==0 without — the builder bails on the invoke).
     #[test]
     fn ir_call_wiring_routes_through_ir_only_with_flag() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         use std::sync::Arc;
 
         // `static int f(int a, int b) { return g(a, b); }`
@@ -12123,6 +12131,10 @@ mod tests {
     /// path ran.
     #[test]
     fn ir_special_call_wiring_routes_through_ir_only_with_flag() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         use std::sync::Arc;
 
         // `static int f(Obj o, int n) { return o.g(n); }`  (g private → invokespecial)
@@ -12243,6 +12255,10 @@ mod tests {
     /// ran — `IR_LOWER_COMPILES` does.
     #[test]
     fn ir_long_wiring_routes_through_ir_only_with_flag() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         use std::sync::Arc;
 
         // `static long add(long a, long b) { return a + b; }`
@@ -12305,6 +12321,10 @@ mod tests {
     /// proves it (==1 with the flag, ==0 without → vacuous single-pass fallback).
     #[test]
     fn ir_fp_wiring_routes_through_ir_only_with_flag() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         use std::sync::Arc;
 
         // `static int f(int a) { return (int)((float)a + 2.0f); }`
@@ -12377,6 +12397,10 @@ mod tests {
     /// invokevirtual, so result-equality alone would not prove the IR path ran.
     #[test]
     fn ir_virtual_call_wiring_routes_through_ir_only_with_flag() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         use std::sync::Arc;
 
         // `static int f(Obj o, int n) { return o.g(n); }`  (g virtual → invokevirtual)
@@ -14532,6 +14556,10 @@ mod tests {
 
     #[test]
     fn recursive_compile_cycle_routes_parent_direct_call_through_dispatch() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         use std::sync::Arc;
 
         clear_jit_recursive_cycle_methods_for_test();
