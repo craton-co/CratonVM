@@ -10,12 +10,13 @@
 > Verified vs HotSpot (JDK 25) with `test_classes/DistinctEquals` (pre-fix dev over-counts:
 > record 4 vs 3, value-class 5 vs 3; post-fix 5/5, String/Integer dedup unchanged).
 >
-> **Residual (unconfirmed, see "More than one root cause?" / open question 1):** the 4
-> empty-message `FileNativeConfigurationWriterTests` cases (`reflectionConfig`, `jniConfig`,
-> `serializationConfig`, `proxyConfig`) do NOT flow through `distinct()` and were never confirmed
-> to fail on CratonVM (static-analysis-only at the time). If they do fail, the cause is separate
-> (case-insensitive field sort, or the `comment` field under `NON_EXTENSIBLE`) — re-triage as a
-> new item; it is NOT the distinct() bug fixed here.
+> **Residual answered 2026-07-29:** all 5 writer cases (`reflectionConfig`, `resourceConfig`,
+> `jniConfig`, `serializationConfig`, `proxyConfig`) failed identically on HotSpot and CratonVM
+> when the suite runner loaded Spring from its versioned snapshot JAR. The manifest made
+> `SpringVersion.getVersion()` non-null, so the writer emitted a top-level `comment` rejected by
+> the `NON_EXTENSIBLE` assertions. Prepending the owning module's main output, as Gradle does,
+> makes the class 7/7 on both VMs. This is a fixture-classpath issue, not a second VM bug; see
+> `spring/CRATONVM-SPRING-AOT-RUNNER-CLASSPATH-BATCH-ISOLATION-20260729-FIXED.md`.
 
 ## Symptom
 Three Spring AOT nativex tests fail with resource glob count mismatches:
@@ -94,11 +95,13 @@ let dup = unique.iter().any(|u| list_element_matches(ctx, u, elem)); // needs &m
 Note `list_element_matches`/`group_key_equal` take `&mut dyn NativeContext` (they call `invoke_virtual`); `native_stream_distinct` already has `&mut`. The existing O(n^2) loop stays semantically correct since Spring re-sorts after distinct, so output ordering is irrelevant вЂ” only the dedup count matters.
 
 ## More than one root cause?
-Likely **only one** root cause for the 3 count-mismatch failures (the distinct() bug above). The 4 empty-message `FileNativeConfigurationWriterTests` cases (`reflectionConfig`, `jniConfig`, `serializationConfig`, `proxyConfig`) do **not** flow through `distinct()` вЂ” `ReflectionHintsAttributes` (`.../aot/nativex/ReflectionHintsAttributes.java`) uses `sorted()`, `Collectors.toMap`, `Stream.concat`, and `merge` instead. If those four genuinely fail under CratonVM (could not be confirmed вЂ” static-analysis-only, no VM run permitted), the cause is separate and most plausibly one of:
-1. case-insensitive field ordering (`Comparator.comparing(FieldHint::getName, String::compareToIgnoreCase)` at `ReflectionHintsAttributes.java:152`) diverging in CratonVM's String comparison, or
-2. CratonVM emitting the top-level `"comment": "Spring Framework ..."` (RuntimeHintsWriter.java:39-42) when `SpringVersion.getVersion()` is non-null, which would break `JSONCompareMode.NON_EXTENSIBLE` (FileNativeConfigurationWriterTests.java:196).
-These should be triaged independently if they actually fail.
+There were two independent effects: the VM's `Stream.distinct()` equality bug
+caused the original three resource-count mismatches, while the later five
+`FileNativeConfigurationWriterTests` failures were the HotSpot-identical
+versioned-JAR `comment` fixture effect. The suspected case-insensitive field
+ordering divergence did not occur. The corrected owning-module classpath makes
+the entire writer class 7/7 in JIT and `--nojit`.
 
 ## Open questions
-- Do the 4 empty-message reflection/jni/serialization/proxy FileNativeConfigurationWriterTests actually fail on CratonVM, or were they bucketed by proximity? If they fail, is it the case-insensitive field sort or the `comment` field under NON_EXTENSIBLE? (Needs a VM run, which is currently prohibited.)
+- **Answered:** the failures were the versioned-JAR `comment` fixture effect and matched HotSpot exactly; the corrected runner is 7/7 on both VMs.
 - Are there other terminal/intermediate stream natives (`Collectors.toSet`, `Set`-collectors) that likewise dedup via `values_equal` and would mis-handle value classes? Worth a sweep when applying the fix.
