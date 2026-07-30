@@ -108,9 +108,15 @@ Row notes:
   merged branches), so ~8 bisect steps. **Bisect on HashMap 1M** — it shows the
   regression at 7.1x, runs in seconds rather than 25 s, and needs no quiet host
   at that effect size.
-- **Fibonacci** is recursion-bound; the recursive self-call already
-  compiles to a guarded direct call, and the remaining gap is register
-  allocation and recursion inlining, which the current backends do not do.
+- **Fibonacci** is recursion-bound and its recursive self-call compiles to a
+  guarded direct call. The 2026-07-30 closeout removed the Linux
+  `jit_frame_record` helper from the prologue and both post-recursive-call
+  restoration sites, replacing each with one sentinel-probed `fs:` TLS store.
+  It also permits a metadata-only empty root map when moving-young analysis
+  proves the recursive caller has no live oops. The merged-binary alternating
+  acceptance reduced the HotSpot gap by **71.90%**. Full measurements and
+  generated-code evidence are in
+  [`fibonacci-half-gap-20260730.md`](docs/internal/performance/fibonacci-half-gap-20260730.md).
 - **Binary Trees** was measured at `-Xmx8g` as seven alternating
   fresh-process pairs; all fourteen checksums were `68332206`.
   A July 2026 dev regression that temporarily quadrupled this row was

@@ -502,24 +502,18 @@ pub fn bg_compile() -> bool {
 // opted in. See `docs/feature-designs/wire-tiered-manager.md` (Step 4).
 cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
 // Invocation-count tier-up for INSTANCE methods (invokevirtual/invokeinterface).
-// DEFAULT-ON as of 2026-06-15 (bug-03 layer B). Previously default-OFF: only
-// static methods had an invocation counter (`execute_invokestatic_cached`), so
-// short-loop instance hot methods (e.g. java.util.regex `Pattern$*.match`) never
-// compiled and ran ~1000x slow. `execute_invokevirtual_cached` now compiles +
-// dispatches monomorphic instance call sites via the JIT. The two defects that
-// blocked default-on are fixed: (1) the virtual-dispatch BAIL resolved on the
-// static call-site class (regex zero-width corruption — `bail_to_interpreter`
-// receiver-class fix); (2) the codePointAt precise-ON inline-cascade spill crash.
-// Validated: bt16/bt18 golden + regex + WildFly smoke sample B-on == B-off.
-// Off-switch for diagnosis/bisection: `CRATONVM_JIT_VIRTUAL_TIERUP=0`.
+// Default-OFF: the pre-decoded instance-call route can strand a live embedded
+// server request (Spring Boot MultipartAutoConfigurationTests) after promotion.
+// Static-method tier-up and JIT compilation through the normal checked
+// dispatcher remain enabled. Opt in for targeted performance work with
+// `CRATONVM_JIT_VIRTUAL_TIERUP=1` only after validating the workload.
 #[inline]
 pub fn jit_virtual_tierup() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_TIERUP") {
-        // Explicit opt-out only: `0` / `false` disable; unset or any other
-        // value (incl. `1`, empty) enables.
+        // Explicit opt-in only: nonzero/non-false enables; unset is safe.
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+        Err(_) => false,
     })
 }
 /// `CRATONVM_NATIVE_STRING_REGEX` — route `String.replaceAll` / `replaceFirst`
