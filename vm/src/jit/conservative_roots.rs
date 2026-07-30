@@ -3531,20 +3531,51 @@ mod tests {
         cm: cratonvm_jit::CompiledMethod,
     }
 
+    /// Build a frame + `JvmThread` + `ShadowStack` triple satisfying the EXACT
+    /// invariant `shadow_window_from_frame` checks.
+    ///
+    /// That matters more than it looks. This fixture used to allocate a buffer
+    /// only `values.len()` slots wide and alias `end` to `top`, which was fine
+    /// while the resolver merely required non-null 8-aligned words. It is not
+    /// fine since the SIGSEGV hardening (a `base` of `0x5555_0000_0004` walked
+    /// as a shadow window): the resolver now demands the real
+    /// `ShadowStack::ensure_allocated` shape — `end - base` EXACTLY
+    /// `DEFAULT_SHADOW_SLOTS * 8`, `top` inside `[base, end]`. A three-slot
+    /// buffer fails that, so every test built on this fixture was resolving
+    /// `None`:
+    ///
+    ///   * `shadow_window_is_recovered_from_a_live_compiled_frame` failed
+    ///     outright (`window must resolve`) — that is how this was found;
+    ///   * `nulled_thread_slot_publishes_nothing_rather_than_proving_everything`,
+    ///     `shadow_window_is_unresolvable_without_the_layout_offsets`,
+    ///     `shadow_window_rejects_an_unaligned_base` and
+    ///     `shadow_window_rejects_a_window_wider_than_the_backing_buffer`
+    ///     all still PASSED — vacuously. Each asserts `is_none()`, and the
+    ///     fixture was already `None` before the mutation each one applies.
+    ///     Four tests were asserting nothing.
+    ///
+    /// The buffer is now full-size and `end` is derived rather than aliased;
+    /// `values` occupy the published prefix `[base, top)`.
     fn fake_shadow_thread(values: &[usize], thread_is_null: bool) -> FakeShadowThread {
         const SHADOW_OFF_IN_THREAD: usize = 24;
         const THREAD_SLOT_OFF: usize = 8;
+        use cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS;
 
-        let mut slots: Box<[usize]> = vec![0usize; values.len().max(1)].into_boxed_slice();
+        assert!(
+            values.len() <= DEFAULT_SHADOW_SLOTS,
+            "fixture cannot publish more slots than the real buffer holds"
+        );
+        let mut slots: Box<[usize]> = vec![0usize; DEFAULT_SHADOW_SLOTS].into_boxed_slice();
         slots[..values.len()].copy_from_slice(values);
         let base = slots.as_ptr() as usize;
         let top = base + values.len() * 8;
+        let end = base + DEFAULT_SHADOW_SLOTS * 8;
 
         // thread[0..] with a ShadowStack {top, end, base} at byte offset 24.
         let mut thread: Box<[usize]> = vec![0usize; 8].into_boxed_slice();
         let ss = SHADOW_OFF_IN_THREAD / 8;
         thread[ss] = top; // TOP_OFFSET  = 0
-        thread[ss + 1] = top; // END_OFFSET  = 8
+        thread[ss + 1] = end; // END_OFFSET  = 8
         thread[ss + 2] = base; // BASE_OFFSET = 16
 
         // frame[..] with the cached thread pointer at [rbp - 8].
@@ -3660,6 +3691,26 @@ mod tests {
         assert!(
             shadow_window_from_frame(f.rbp, &f.cm).is_none(),
             "a window wider than the buffer is not a shadow window",
+        );
+    }
+
+    /// The third arm of the same invariant, and the one that silently voided
+    /// this module's other shadow tests for a while: `end - base` must be
+    /// EXACTLY the fixed buffer size. A `[base, end)` pair that is merely
+    /// *plausible* — aligned, ordered, with `top` inside it — is still not a
+    /// `ShadowStack` if it is the wrong width, and reading three words out of
+    /// an arbitrary stack slot is exactly the SIGSEGV this check exists to
+    /// prevent.
+    #[test]
+    fn shadow_window_rejects_a_buffer_of_the_wrong_size() {
+        let mut f = fake_shadow_thread(&[0x1111, 0x2222], false);
+        let ss = 24 / 8; // SHADOW_OFF_IN_THREAD / 8, END_OFFSET = 8
+        // Shrink `end` to just past `top`: ordered, aligned, `top` in range —
+        // and the exact shape the old fixture built by accident.
+        f._thread[ss + 1] = f._thread[ss];
+        assert!(
+            shadow_window_from_frame(f.rbp, &f.cm).is_none(),
+            "end - base must be exactly DEFAULT_SHADOW_SLOTS * 8",
         );
     }
 
