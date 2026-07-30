@@ -7920,7 +7920,7 @@ fn precise_exception_frame_sites_supported(
         // unconditional deopt trap, not to a call site that publishes a frame.
         if covered(pc)
             && may_throw_without_precise_frame(op)
-            && !matches!(op, 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xc2 | 0xc3)
+            && !matches!(op, 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xc2 | 0xc3)
         {
             return false;
         }
@@ -15433,6 +15433,39 @@ mod tests {
             "(Ljava/lang/Object;)V",
             true,
         ));
+        assert!(precise_exception_frame_sites_supported(
+            &code,
+            code.len(),
+            &table,
+        ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn protected_virtual_and_interface_calls_have_precise_exception_coverage() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        // The two variable-width invoke forms must stay admitted together.
+        // Both lower through emit_post_invoke_exception_check, which records
+        // the reason-9 frame before a local handler can observe its locals.
+        let code = vec![
+            0x2a, // 0: aload_0
+            0xb6, 0x00, 0x01, // 1: invokevirtual #1
+            0x57, // 4: pop
+            0x2a, // 5: aload_0
+            0xb9, 0x00, 0x02, 0x01, 0x00, // 6: invokeinterface #2, count=1
+            0x57, // 11: pop
+            0xb1, // 12: return
+            0x4c, // 13: astore_1
+            0x2b, // 14: aload_1
+            0xbf, // 15: athrow
+        ];
+        let table = vec![ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 13,
+            handler_pc: 13,
+            catch_type: 0,
+        }];
         assert!(precise_exception_frame_sites_supported(
             &code,
             code.len(),

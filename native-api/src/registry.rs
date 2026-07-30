@@ -2035,7 +2035,38 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
 
     /// Publish an exact HashMap node for [`Self::hashmap_string_node_cache_get`].
     /// Implementations must preserve normal map mutation semantics.
-    fn hashmap_string_node_cache_put(&mut self, _map: ObjectRef, _key: &str, _node: ObjectRef) {}
+    fn hashmap_string_node_cache_put(
+        &mut self,
+        _map: ObjectRef,
+        _key_object: ObjectRef,
+        _key: &str,
+        _node: ObjectRef,
+    ) {
+    }
+
+    /// Look up a ConcurrentHashMap segment node whose mutation generation is
+    /// still current. The segment layout has no Java `modCount` field, so it
+    /// cannot share the exact-HashMap validity predicate above.
+    fn chm_string_node_cache_get_object(
+        &mut self,
+        _map: ObjectRef,
+        _key: ObjectRef,
+    ) -> Option<(i32, u64, Value)> {
+        None
+    }
+
+    /// Publish a ConcurrentHashMap segment node guarded by the caller's
+    /// seqlock-style mutation generation.
+    fn chm_string_node_cache_put(
+        &mut self,
+        _map: ObjectRef,
+        _segment_id: i32,
+        _key_object: ObjectRef,
+        _key: &str,
+        _node: ObjectRef,
+        _generation: u64,
+    ) {
+    }
 
     /// Get the identity hash code of an ObjectRef.
     fn identity_hash_code(&self, obj: ObjectRef) -> i32;
@@ -2422,6 +2453,7 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     fn get_ascii_case_string_cached(
         &mut self,
         _source: ObjectRef,
+        _locale: Option<ObjectRef>,
         _upper: bool,
     ) -> Option<ObjectRef> {
         None
@@ -2431,6 +2463,7 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     fn create_ascii_case_string_cached(
         &mut self,
         _source: ObjectRef,
+        _locale: Option<ObjectRef>,
         text: &str,
         _upper: bool,
     ) -> ObjectRef {

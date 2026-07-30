@@ -777,11 +777,17 @@ fn stw_take_over_and_wait(
             for entry in peer.jit_hashmap_string_node_cache.iter() {
                 xt_roots.push(entry.map);
                 xt_roots.push(entry.node);
+                if let Some(key_object) = entry.key_object {
+                    xt_roots.push(key_object);
+                }
             }
             for entry in peer.string_case_cache.iter() {
                 xt_roots.push(entry.source);
                 xt_roots.push(entry.first);
                 xt_roots.push(entry.second);
+                if let Some(locale) = entry.locale {
+                    xt_roots.push(locale);
+                }
             }
         }
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some() {
@@ -3764,6 +3770,9 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     for entry in &thread.jit_hashmap_string_node_cache {
         snapshot.push(entry.map);
         snapshot.push(entry.node);
+        if let Some(key_object) = entry.key_object {
+            snapshot.push(key_object);
+        }
     }
     // TOMCAT-JNDIREALM-JIT.3 (2026-07-26) — the ASCII case-conversion cache,
     // exactly the same contract as the HashMap node cache above. It was wired
@@ -3780,6 +3789,9 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         snapshot.push(entry.source);
         snapshot.push(entry.first);
         snapshot.push(entry.second);
+        if let Some(locale) = entry.locale {
+            snapshot.push(locale);
+        }
     }
     // JNI local references (INT-5, safepoint half): a JNI native that
     // obtained local refs and re-entered Java parks HERE — and a
@@ -4336,6 +4348,12 @@ pub(crate) fn apply_pointer_map_to_thread(
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
+        if let Some(key_object) = entry.key_object.as_mut() {
+            let old_addr = key_object.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *key_object = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
     }
     // TOMCAT-JNDIREALM-JIT.3 — remap companion to the publish added above.
     // Same reasoning as the HashMap node cache: the entries are raw
@@ -4346,6 +4364,12 @@ pub(crate) fn apply_pointer_map_to_thread(
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        if let Some(locale) = entry.locale.as_mut() {
+            let old_addr = locale.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *locale = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
     }

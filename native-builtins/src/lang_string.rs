@@ -3663,6 +3663,15 @@ fn string_case_impl(
     lowercase: bool,
     memoize: bool,
 ) -> MethodCallResult {
+    // A cached result is valid only for the same Locale object. Checking it
+    // before resolving the language avoids a contended synthetic-locale lookup
+    // for repeated ASCII case conversion, while preserving Turkish/Lithuanian
+    // and other locale-specific mappings.
+    if memoize {
+        if let Some(result) = ctx.get_ascii_case_string_cached(this, locale, !lowercase) {
+            return Ok(Some(Value::Object(Some(result))));
+        }
+    }
     let lang = crate::locale_language_for_case_mapping(ctx, locale);
     if crate::case_map::is_locale_dependent(&lang) {
         let src = ctx.read_string(this).unwrap_or_default();
@@ -3679,11 +3688,6 @@ fn string_case_impl(
         ))));
     }
 
-    if memoize {
-        if let Some(result) = ctx.get_ascii_case_string_cached(this, !lowercase) {
-            return Ok(Some(Value::Object(Some(result))));
-        }
-    }
     let mut folded = ctx.read_string(this).unwrap_or_default();
     let changed = if folded.is_ascii() {
         let changed = folded.bytes().any(|byte| {
@@ -3715,7 +3719,7 @@ fn string_case_impl(
     let result = if !changed {
         this
     } else if memoize {
-        ctx.create_ascii_case_string_cached(this, &folded, !lowercase)
+        ctx.create_ascii_case_string_cached(this, locale, &folded, !lowercase)
     } else {
         ctx.create_string_uninterned_gc_safe(&folded)
     };

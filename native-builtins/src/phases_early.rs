@@ -2008,7 +2008,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         s,
         "toLowerCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        crate::lang_string::native_string_to_lower_case_uncached,
+        crate::lang_string::native_string_to_lower_case,
     );
 
     // --- String.getBytes(String charsetName) ---
