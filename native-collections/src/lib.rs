@@ -782,6 +782,22 @@ impl DenseIntEntries {
     fn insert(&mut self, key: i32, value: (ObjectRef, Value)) -> Option<(ObjectRef, Value)> {
         if key >= 0 {
             let index = key as usize;
+            // Generated-ID maps append 0, 1, 2, ... . Handle that dominant
+            // case before the general dense/sparse migration machinery:
+            // `resize`, an occupied-slot probe, and sparse lookup are all
+            // redundant when this is exactly the next dense slot and no
+            // sparse entry can already own it.
+            if index <= Self::MAX_DENSE_KEY
+                && index == self.dense.len()
+                && self.sparse.is_empty()
+            {
+                let seq = self.note_fresh_insert();
+                self.dense.push(Some(value));
+                if seq != key as u64 {
+                    self.dense_seq_overrides.insert(key, seq);
+                }
+                return None;
+            }
             if index <= Self::MAX_DENSE_KEY && index <= self.dense.len().saturating_add(1024) {
                 if index >= self.dense.len() {
                     self.dense.resize(index + 1, None);
