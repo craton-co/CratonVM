@@ -66,13 +66,26 @@ already were; the audit's claim there was stale). The stub ratchet is now exact 
 157 of 9,320 registrations, zero slack — and CI runs the whole `synthetic_diff`
 suite rather than five named cases.
 
-**P1 — Experimental features out of the default build.** `vm`'s default set is
-`["awt"]`. `synthetic-jdk` still implies `experimental-jmx` because the legacy
-surface includes JMX bootstrap classes. A new `experimental-features` CI job
-compiles and runs the whole optional surface, because this repository has
-already lost 1,522 tests to a configuration nothing compiled. Requests the build
-cannot honour (`-XX:AOTMode`, `-XX:SharedArchiveFile`) now warn instead of
-silently no-opping.
+**P1 — Experimental features out of the default build. Partly rejected, with
+evidence.** `vm`'s default set is `["awt", "experimental-jmx"]`. A new
+`experimental-features` CI job compiles and runs the whole optional surface,
+because this repository has already lost 1,522 tests to a configuration nothing
+compiled, and requests the build cannot honour (`-XX:AOTMode`,
+`-XX:SharedArchiveFile`) now warn instead of silently no-opping.
+
+`experimental-jmx` had to go back. The audit item reasons from the feature's
+*name*; what it actually gates is the `sun.management` native surface, and
+`java.lang.management.ManagementFactory` is core JDK API that the JDK's own
+bootstrap reaches. Dropping it made `getMemoryPoolMXBeans()` fail with
+`UnsatisfiedLinkError: sun/management/VMManagementImpl.getVersion0()` —
+caught by `vm/tests/wave1_a_jmx_mxbeans.rs`, which is the only reason this was
+noticed rather than shipped. Renaming the feature is the honest fix; removing
+it from the default build is not. `experimental-tls` is similarly misnamed: it
+is a no-op alias and the TLS implementation is always compiled.
+
+Worth stating plainly, since it is the second time on this branch: an audit item
+that reasons from a name rather than from what the code does will produce a
+change that looks like cleanup and is a regression.
 
 **P1 — Giant files.** Split at the section banners the files already carried:
 

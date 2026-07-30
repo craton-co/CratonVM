@@ -34,18 +34,28 @@ exclude = [
 # synthetic test suite or to debug against Rust-side stubs, pass
 # `--features synthetic-jdk` explicitly. See `docs/roadmap.md` NEW-11
 # for the rationale and the census-driven migration plan.
-# Keep the shipping build surface to production-intended subsystems. Optional
-# experiments remain available explicitly (`--features experimental-*`), and
-# ZGC remains selectable with `--features zgc`; compiling them is no longer part
-# of an ordinary build. What that actually removes differs per feature:
-# `experimental-jmx` / `-aot` / `-serialization` gate module declarations in
-# `cratonvm-native-builtins`, so dropping them really stops compiling that code.
-# `experimental-tls` is a no-op alias (NEW-13) kept only so downstream feature
-# requests and `check-cfg` keep resolving — the `javax.net.ssl` implementation
-# is always compiled and registered. The `experimental-features` CI job builds
-# and runs the whole optional surface, because this repository has already lost
-# 1,522 tests to a configuration that nothing compiled.
-default = ["awt"]
+# Keep the shipping build surface to production-intended subsystems. What
+# dropping a feature actually removes differs per feature:
+#
+#  * `experimental-aot` / `-serialization` gate module declarations in
+#    `cratonvm-native-builtins`, so dropping them really stops compiling that
+#    code. `experimental-debug` gates the JDWP surface the same way.
+#  * `experimental-tls` is a no-op alias (NEW-13) kept only so downstream
+#    feature requests and `check-cfg` keep resolving — the `javax.net.ssl`
+#    implementation is always compiled and registered.
+#  * `experimental-jmx` is NOT optional in practice and stays in the default
+#    set. Its name says experiment; what it gates is the `sun.management`
+#    native surface, and `java.lang.management.ManagementFactory` is core JDK
+#    API that the JDK's own bootstrap reaches. Without it,
+#    `ManagementFactory.getMemoryPoolMXBeans()` dies with
+#    `UnsatisfiedLinkError: sun/management/VMManagementImpl.getVersion0()`
+#    (`vm/tests/wave1_a_jmx_mxbeans.rs` catches exactly this). Renaming the
+#    feature would be the honest fix; removing it from the default build is not.
+#
+# ZGC remains selectable with `--features zgc`. The `experimental-features` CI
+# job builds and runs the whole optional surface, because this repository has
+# already lost 1,522 tests to a configuration that nothing compiled.
+default = ["awt", "experimental-jmx"]
 # AWT/Swing/Java2D desktop natives. On by default so the standard build
 # registers them exactly as before. `cratonvm-native-awt` sets
 # `publish = false`, so this feature is what makes the dependency optional:

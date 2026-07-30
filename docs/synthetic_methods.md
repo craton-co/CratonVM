@@ -161,11 +161,18 @@ native-tls-backed `javax.net.ssl` implementation is always compiled and
 registered, and the feature is retained only so downstream requests and
 `check-cfg` keep resolving.
 
+`experimental-jmx` is the exception that proves the naming is wrong. It stays in
+the default set, because what it gates is the `sun.management` native surface
+and `java.lang.management.ManagementFactory` is core JDK API the JDK's own
+bootstrap reaches. Removing it makes `getMemoryPoolMXBeans()` die with
+`UnsatisfiedLinkError: sun/management/VMManagementImpl.getVersion0()`. It is an
+experiment in name only.
+
 | File(s) | Feature | In default build | Status |
 |---|---|---|---|
 | `serialization.rs` | `experimental-serialization` | **NO** | Partial — ObjectInputStream/ObjectOutputStream |
 | `aot.rs`, `aot_pipeline.rs` | `experimental-aot` | **NO** | GraalVM compat stubs |
-| `jmx.rs`, `jmx_openmbean.rs` | `experimental-jmx` | **NO** (implied by `synthetic-jdk`) | Partial JMX bean registration |
+| `jmx.rs`, `jmx_openmbean.rs` | `experimental-jmx` | **YES** — required by `ManagementFactory` | Partial JMX bean registration |
 | `tls.rs`, `tls_impl.rs`, `t27_tls.rs` | `experimental-tls` (no-op alias) | **YES — always compiled** | TLS/SSL |
 | `bc_aes.rs`, `bc_chacha.rs`, `bc_newhope.rs`, `bc_newhope_tables.rs` | `legacy-synthetic-crypto` | **NO** | Old Bouncy Castle replacements |
 | `craton_gpu.rs` | `gpu-offload` | **NO** | GPU marshalling |
