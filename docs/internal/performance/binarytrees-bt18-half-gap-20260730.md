@@ -156,3 +156,13 @@ replacement, or a general optimizing compiler comparable to HotSpot C2.
   real JIT codegen bug. Spawned as its own follow-up investigation, not a
   gate on this doc.
 - The changed diff passes `git diff --check`.
+- `regression-suite/perf/run-cratonbench-gate.sh` (all 7 phases, reps=5,
+  Azure host, load 5.73): **arithmetic, fib, sieve, matrix, hashmap,
+  bintrees all PASS** (several >10% better than their anchored baselines —
+  worth a future re-anchor, not done here). **stringregex FAILS** (candidate
+  209ms vs 173ms budget) — but this is **pre-existing on plain `origin/dev`
+  too** (baseline measured 212ms on the same gate, same host, same phase —
+  confirmed separately), so it is not caused by this branch. Left for
+  whichever session owns that regression (concurrent worktrees already exist
+  for it: `stringregex-halfgap-20260730-019fb303`,
+  `stringregex-bisect-019fb303`).
