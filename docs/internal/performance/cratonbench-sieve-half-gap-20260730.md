@@ -81,6 +81,30 @@ median against HotSpot's **fastest** sample — still gives
 `1 - (2567-2358)/(5794-2358)` = **93.9%** and 1.09x. The result does not
 depend on which end of HotSpot's spread is used.
 
+### Re-verified after merging current `origin/dev`
+
+`dev` moved during this work (the HashMap half-gap branch landed, touching
+`jit/src/x64.rs`, `vm/src/jit/helpers.rs`, and `types/src/value.rs`), so the
+whole acceptance was repeated against the post-merge tip `0ee5ca629`
+(Linux binary SHA-256
+`a9bf132b6fbdb0d93c77552f9cdd9f04b4f03dbf39de5463c55e3f0eaf53a2e5`):
+recognition still fires at `zero-fill=[2] set-stride=[40] sieve=[21]`, the
+probe is still line-identical to HotSpot under JIT / `--nojit` / the kill
+switch, `cargo test -p cratonvm-jit` is still 1,250 / 0 failed, and a fresh
+nine-round A/B reads baseline 9,719 / candidate 4,017 / HotSpot 3,764 ms —
+**95.75%**, 1.067x. That run straddled a load spike from ~5 to 14.5 (visible
+in the baseline arm's 5,565–10,164 spread), which is why its absolutes are not
+used as the headline; the ratio is unchanged.
+
+Four independent measurements, two operating systems, two hosts:
+
+| Measurement | gap reduction | candidate/HotSpot |
+|---|---:|---:|
+| Windows, round 1 | 94.35% | 1.048x |
+| Windows, round 2 | 95.30% | 1.052x |
+| Linux, pre-merge | 106.40% | 0.930x |
+| Linux, post-merge | 95.75% | 1.067x |
+
 ## Root cause
 
 `CratonBench.sieve(boolean[], int)` is three counted `boolean[]` loops:
