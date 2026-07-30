@@ -712,7 +712,7 @@ fn stw_take_over_and_wait(
     // the whole frozen window, and the non-moving sweep zeroed the still-live
     // object in place (WildFly parallel-extension-add: fresh
     // StringBuilder/Reader receivers reading back all-zero — see
-    // docs/known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md).
+    // docs/internal/fixed-suite-bugs/wildfly/wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md).
     // Walk each frozen peer's interpreter frames directly into `xt_roots`.
     //
     // SAFETY: each address was published by its owning thread with the

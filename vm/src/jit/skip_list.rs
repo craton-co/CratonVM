@@ -2221,12 +2221,12 @@ fn should_skip_jit_internal(
         // 4/6 vs 5/6 over a 6+6 A/B on the Azure host, and every failure in
         // BOTH arms is the same pre-existing flaky
         // `NoSuchMethodError: java/lang/Object.hasNext()Z` from
-        // `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
+        // `docs/internal/fixed-suite-bugs/wildfly/wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md`.
         // The full write-up (root causes, the A/B, and the per-package results
         // for the four sibling bans, which stay in place) is the retired
         // `modeltypevalidator-validtypes-npe` doc — archived with the rest of
         // docs/internal. The residual it hands off to is
-        // `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
+        // `docs/internal/fixed-suite-bugs/wildfly/wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md`.
 
 
         // SPB.9 -- `org/slf4j/` and `ch/qos/logback/` REMOVED 2026-07-26.

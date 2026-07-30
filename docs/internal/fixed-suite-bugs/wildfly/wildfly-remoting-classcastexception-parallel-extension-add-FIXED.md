@@ -4,7 +4,7 @@ Status: **CLOSED 2026-07-22 — all ten producers this doc ever tracked are FIXE
 campaign: 0 recurrences of any producer signature in 600 attempts). See "FINAL STATUS 2026-07-22"
 at the bottom.** The one remaining, precisely-characterized non-native mechanism (interpreter
 operand-stack slot staleness) is tracked in
-`../../../known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md` and its fatal
+`wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md` and its fatal
 manifestation in `docs/known-issues/wildfly-boot-stale-reader-nsme-mechanismdatabase.md`. The
 separately-tracked register-invisible-root family was closed earlier (young start-set truncation,
 `wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md`).
@@ -1132,7 +1132,7 @@ producers.
 
 What remains is a single, precisely-characterized non-native mechanism — an interpreter
 OPERAND-STACK slot reading stale after a nested allocating call — documented with discriminating
-slot-level captures in `../../../known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md`
+slot-level captures in `wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md`
 (its fatal manifestation:
 `docs/known-issues/wildfly-boot-stale-reader-nsme-mechanismdatabase.md`, ~2/1,500 attempts). That
 work belongs to the GC/frame-scan (precise-maps) roadmap; the native-side surface of this family is
