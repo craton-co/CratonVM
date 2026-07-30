@@ -18,8 +18,8 @@ LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)|!\[[^\]]*\]\(([^)]+)\)")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 
-def markdown_files(root: Path) -> list[Path]:
-    excluded = {".git", "target", "node_modules"}
+def markdown_files(root: Path, excluded: set[str] | None = None) -> list[Path]:
+    excluded = {".git", "target", "node_modules"} | (excluded or set())
     return sorted(
         path
         for path in root.rglob("*.md")
@@ -115,7 +115,11 @@ def main() -> int:
     parser.add_argument(
         "--all",
         action="store_true",
-        help="check every Markdown file; default checks maintained public docs",
+        help=(
+            "audit every Markdown file in the repo, including the dated "
+            "docs/internal/ archive and vendored trees; the default scope is "
+            "root *.md plus docs/** excluding docs/internal/"
+        ),
     )
     args = parser.parse_args()
 
@@ -123,13 +127,20 @@ def main() -> int:
     if args.all:
         paths = markdown_files(root)
     else:
+        # Default (CI) scope: root-level Markdown plus everything under docs/
+        # recursively, minus docs/internal/.
+        #
+        # docs/internal/ is dated archival material (~396 broken links), and
+        # most of those links point at documents that were intentionally
+        # deleted once the work they described landed. Gating CI on it would
+        # produce pure noise and would pressure people into resurrecting dead
+        # files just to make the check green. Every other subtree under docs/
+        # is maintained and is gated here. Use --all for the
+        # everything-including-internal audit mode.
         paths = sorted(
             {
-                root / "README.md",
-                root / "ARCHITECTURE.md",
-                root / "BENCHMARK.md",
-                *markdown_files(root / "docs" / "book" / "src"),
-                *[p for p in (root / "docs").glob("*.md")],
+                *[p for p in root.glob("*.md")],
+                *markdown_files(root / "docs", excluded={"internal"}),
             }
         )
 

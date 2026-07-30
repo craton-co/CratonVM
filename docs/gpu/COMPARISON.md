@@ -63,12 +63,14 @@ The practical consequence is that CratonVM's CPU-only build is
 *byte-identical* to its pre-GPU state — `--features gpu-driver` is a
 single Cargo flag with zero hot-path branches in the interpreter when off.
 That kind of cfg-discipline is hard to retrofit onto HotSpot. The
-transparent `--gpu` path also distinguishes CratonVM: the user writes
-ordinary `int[]` static methods, no annotations required, and the
-interpreter hook decides per-invocation. TornadoVM requires a
-`TaskGraph`; Babylon/HAT requires `@CodeReflection` + `NDRange`; Aparapi
-requires subclassing `Kernel`; IBM requires `Arrays.sort`. CratonVM
-requires nothing on the call site.
+automatic `--gpu` path also distinguishes CratonVM: within the analyzer's
+supported shape the user writes ordinary `int[]` static methods with no
+annotations, and the interpreter hook decides per-invocation. TornadoVM
+requires a `TaskGraph`; Babylon/HAT requires `@CodeReflection` + `NDRange`;
+Aparapi requires subclassing `Kernel`; IBM requires `Arrays.sort`. CratonVM
+requires a `gpu-driver` build and the `--gpu` flag, but nothing at the call
+site — and it pays for that with a far narrower eligible set than any of
+them (row 9), with everything else falling back to the CPU.
 
 **What others do that CratonVM doesn't.** Almost everything else, frankly.
 TornadoVM ships four GPU backends (OpenCL, PTX, SPIR-V, Metal) plus FPGA

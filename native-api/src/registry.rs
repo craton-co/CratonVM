@@ -22,11 +22,7 @@ use crate::native_id::{NativeMethodId, NativeMethodKey};
 /// bytecode drives the `sun/nio/ch/Net` path. Cached in a `OnceLock` because
 /// `register()` is called thousands of times at startup.
 fn real_net_sockets_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_NET_SOCKETS").is_some()
-    })
+    cratonvm_types::flags::flags().io.real_net_sockets
 }
 
 /// REAL-FORKJOINPOOL (opt-in `CRATONVM_REAL_FORKJOINPOOL`): when set, the
@@ -53,11 +49,7 @@ fn real_net_sockets_enabled() -> bool {
 /// concurrent-CDI workloads that don't lean on parallel-stream result passing.
 /// HIB-CV-20.
 fn real_forkjoinpool_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_FORKJOINPOOL").is_some()
-    })
+    cratonvm_types::flags::flags().natives.real_forkjoinpool
 }
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -189,6 +181,11 @@ pub struct DefineClassFull {
     /// than the loader-agnostic global `load_class(name)` fallback that
     /// `CRATONVM_LOADER_AWARE_RESOLUTION` (default off) otherwise gates.
     pub force_loader_faithful_linking: bool,
+    /// Exact superclass identity already resolved through the defining
+    /// lookup/loader.
+    pub superclass_id_override: Option<ClassId>,
+    /// Exact interface identities, in class-file declaration order.
+    pub interface_id_overrides: Option<Vec<ClassId>>,
 }
 
 /// The lambda-call-site metadata needed to round-trip a serializable lambda.

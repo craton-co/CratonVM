@@ -842,6 +842,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn env_proxy_lookup_prefers_lowercase_when_both_are_set() {
         let settings = with_proxy_env(
@@ -855,6 +856,24 @@ mod tests {
             settings.socks,
             Some(("lower.corp".to_string(), 1080)),
             "lowercase-wins precedence must survive the key-pair rewrite"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn env_proxy_lookup_respects_case_insensitive_windows_storage() {
+        let settings = with_proxy_env(
+            &[
+                ("all_proxy", "socks://lower.corp:1080"),
+                ("ALL_PROXY", "socks://upper.corp:1081"),
+            ],
+            || read_settings(&MockNativeContext::new()),
+        );
+        assert_eq!(
+            settings.socks,
+            Some(("upper.corp".to_string(), 1081)),
+            "Windows stores environment keys case-insensitively, so the final \
+             assignment is the single value visible through either spelling"
         );
     }
 

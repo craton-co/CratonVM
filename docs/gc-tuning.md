@@ -4,7 +4,8 @@ Audience: developers tuning CratonVM heap behaviour for a specific workload
 — Quarkus boot, JFR-recorded benchmarks, low-latency request handlers,
 long-running daemons, or test fixtures with tight budget envelopes.
 
-Source: [`gc/src/`](../gc/src/) (24 files, ~29 k LOC). The collector
+Source: [`gc/src/`](../gc/src/) (34 files, ~62 k LOC, measured 2026-07-30).
+The collector
 dispatches through the `VmHeap` enum
 ([`gc/src/vm_heap.rs`](../gc/src/vm_heap.rs)); each backend is a separate
 module.

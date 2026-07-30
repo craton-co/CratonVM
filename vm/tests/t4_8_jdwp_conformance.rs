@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
+#![cfg(feature = "experimental-debug")]
 
 //! T4.8 -- JDWP Conformance Tests
 //!

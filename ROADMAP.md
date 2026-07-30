@@ -12,12 +12,27 @@ production caveats.
 
 ## Near-term (next minor release)
 
-- Tighter HotSpot C2 performance parity on QuickBench, Fannkuch, and N-Body.
+- Tighter HotSpot C2 performance parity, with blocking regression budgets for
+  HashMap, Binary Trees, and Regex before optimizing broader benchmark totals.
 - GC throughput improvements on allocation-heavy workloads (Binary Trees).
+  Moving-young collection is now the default (`CRATONVM_NO_MOVING_YOUNG` opts
+  out), so its remaining optimizations — the `pointer_map` `FxHashMap`, the
+  disabled self-call spill elision, and the unpriced `jit_frame_record` helper —
+  are work on the default path, tracked in
+  [`docs/moving-young-throughput.md`](docs/moving-young-throughput.md).
+- Repeatable framework-throughput qualification for Spring Boot, Quarkus, and
+  Micronaut, following [`docs/framework-throughput.md`](docs/framework-throughput.md).
 - Complete `java.util.concurrent` parity (ForkJoin, ReentrantReadWriteLock,
   Phaser).
 - Bytecode verifier completeness for pre-Java-7 class files.
 - AArch64 JIT backend feature parity with x86-64.
+
+The near-term and medium-term lists below are not stretch goals. Pre-Java-7
+verifier coverage, `java.util.concurrent` parity, AArch64 parity, real-JDK boot
+from a stock `java.base`, JNI function-table and lifecycle coverage, JFR event
+coverage, and JEP 261 module semantics are the unresolved holes that currently
+define what CratonVM can be used for. Read them as the platform's ceiling, not
+as a wish list.
 
 ## Medium-term
 
@@ -36,23 +51,31 @@ production caveats.
 
 ## GPU offload
 
-**Validated on real hardware 2026-07-11** (RTX 2060, `--features gpu-driver`): transparent
-`--gpu` offload matches HotSpot checksums bit-for-bit and reaches ~210x over HotSpot C2 and
+**Validated on real hardware 2026-07-11** (RTX 2060, `--features gpu-driver`):
+automatic offload for the documented eligible kernel subset matches HotSpot
+checksums bit-for-bit and reaches ~210x over HotSpot C2 and
 ~3x over TornadoVM's PTX backend on a 48-division-per-element div-chain kernel at n = 2^24
 (see [`bench-gpu/results/divchain-comparison-20260711.md`](bench-gpu/results/divchain-comparison-20260711.md)
 and [docs/gpu/COMPARISON.md](docs/gpu/COMPARISON.md)). It remains opt-in
 (`--features gpu-offload`/`gpu-driver`, `--gpu` at runtime) and CUDA/NVIDIA-only; see
 [docs/gpu/README.md](docs/gpu/README.md).
 
-In progress (July 2026) — tracked in
-[docs/known-issues/gpu-offload-followups-20260711.md](docs/known-issues/gpu-offload-followups-20260711.md):
+Current product limits:
 
-- Reduction-kernel dispatch (non-void-return methods currently never launch on GPU).
-- Closing the JIT-caller bypass gap, where an offload-eligible call site inside a
-  JIT-compiled/OSR'd caller skips the interpreter offload hook.
-- True async kernel completion (`dispatch_async` is synchronous under the hood today).
-- Analyzer/lowering coverage: `ldc`/`ldc2_w` constants, `frem`/`drem`, non-canonical loop shapes.
-- Self-hosted hardware CI running the `bench-gpu/` suite on real CUDA hardware on every change.
+- Array-returning kernels and device-resident array chaining are not yet
+  implemented; scalar reductions and caller-supplied output arrays are.
+- Explicit non-default stream selection is only partially wired through the
+  Java API.
+- Analyzer/lowering coverage remains intentionally narrower than Java:
+  non-canonical and nested loop shapes are rejected rather than silently
+  offloaded.
+- There is no self-hosted hardware CI: the `bench-gpu/` suite is not run on real
+  CUDA hardware on every change, so the numbers above are point-in-time
+  measurements rather than a continuously enforced budget.
+
+Closed GPU follow-ups, including asynchronous completion and the JIT-caller
+admission gate, are retained as
+[historical evidence](docs/internal/fixed-suite-bugs/gpu-offload-followups-20260711.md).
 
 Longer-horizon:
 

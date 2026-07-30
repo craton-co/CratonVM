@@ -66,7 +66,7 @@ building it into the default `target/` directory would invalidate the
 incremental-build cache for `cratonvm-vm`, `cratonvm-gc`, and friends every
 time you switched between a CPU build and a GPU build. This repo avoids
 that by pointing the GPU build at its own target directory —
-[`build-gpu-driver.bat`](build-gpu-driver.bat) at the repo root:
+[`scripts/build-gpu.bat`](scripts/build-gpu.bat):
 
 ```bat
 set "CARGO_TARGET_DIR=C:\craton\CratonVM\target-gpu"
@@ -143,7 +143,7 @@ binary-trees workload) and `--nojit` to isolate interpreter-only timings.
 
 ## Workspace layout
 
-The workspace has 20 member crates (including `libcratonvm`, `cratonvm-embed`,
+The workspace has 22 member crates (including `libcratonvm`, `cratonvm-embed`,
 and `cratonvm-difftest`); the `fuzz` harness is a separate, standalone
 workspace, not a member. See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed structure and
 [CONTRIBUTING.md](CONTRIBUTING.md#project-structure) for the per-crate purpose

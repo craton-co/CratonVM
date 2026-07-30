@@ -24,6 +24,20 @@ documentation = "https://github.com/craton-co/cratonvm/tree/main/docs"
 # `--exclude cratonvm-fuzz`). Build targets via `cargo +nightly fuzz build`.
 [workspace]
 
+# The root workspace patches `rustls` to the vendored, minimally-patched
+# 0.23.38 at `native-builtins/vendor/rustls-cbc`, which adds the
+# `KeyBlockShape::mac_key_len` that classic CBC+HMAC cipher suites need
+# (`native-builtins/src/t27_tls_cbc.rs`). `[patch]` is not inherited by a
+# standalone workspace, so without this the fuzz build resolves stock rustls
+# from crates.io and `cratonvm-native-builtins` does not compile at all.
+#
+# That is the entire content of "the fuzz workspace and the native-builtins
+# feature set are not aligned", which kept `fuzz-smoke` advisory. It has to be
+# kept in step with the root `[patch.crates-io]` by hand; there is no
+# mechanism that does it for us.
+[patch.crates-io]
+rustls = { path = "../native-builtins/vendor/rustls-cbc" }
+
 [package.metadata]
 cargo-fuzz = true
 

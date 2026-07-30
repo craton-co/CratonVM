@@ -76,26 +76,30 @@ fn lookup_process_native_symbol(name: &str) -> Option<usize> {
     #[cfg(target_os = "windows")]
     {
         for lib in ["ucrtbase.dll\0", "msvcrt.dll\0", "vcruntime140.dll\0"] {
+            // SAFETY: each literal is NUL-terminated and Windows owns the
+            // returned module handle for the process lifetime.
             let handle = unsafe { GetModuleHandleA(lib.as_ptr() as *const i8) };
             if handle.is_null() {
                 continue;
             }
+            // SAFETY: `handle` is non-null and `c_name` is a live CString.
             let addr = unsafe { GetProcAddress(handle, c_name.as_ptr()) };
             if !addr.is_null() {
                 return Some(addr as usize);
             }
         }
-        return None;
+        None
     }
     #[cfg(not(target_os = "windows"))]
     {
+        // SAFETY: `c_name` is NUL-terminated and `RTLD_DEFAULT` requests a
+        // process-wide symbol lookup without transferring ownership.
         let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
         if !addr.is_null() {
             return Some(addr as usize);
         }
+        lookup_known_system_library_symbol(name, c_name.as_c_str())
     }
-
-    lookup_known_system_library_symbol(name, c_name.as_c_str())
 }
 
 /// DBG (CRATONVM_DBG_WATCHREF, extended): RandomizedContext WeakHashMap
@@ -5812,6 +5816,8 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             nest_host_class_name: opts.nest_host_class_name.clone(),
             privileged_define: opts.privileged_define,
             force_loader_faithful_linking: opts.force_loader_faithful_linking,
+            superclass_id_override: opts.superclass_id_override,
+            interface_id_overrides: opts.interface_id_overrides.clone(),
             ..Default::default()
         };
 

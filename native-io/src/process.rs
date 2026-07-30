@@ -307,7 +307,7 @@ fn configure_stdio(
 /// every per-syscall path check the guest is subject to. Spawning an arbitrary
 /// host program (`new ProcessBuilder("/bin/sh").start()`,
 /// `Runtime.exec("C:\\Windows\\System32\\cmd.exe ...")`) is therefore a far
-/// larger escape than the file reads the certified profile is designed to
+/// larger escape than the file reads the confinement profile is designed to
 /// block, and the work-dir validation alone left it wide open.
 ///
 /// Policy:
