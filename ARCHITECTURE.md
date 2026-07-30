@@ -208,7 +208,7 @@ Implements JVMS Ch. 5: loading, linking, and initialization. Extracted into the
 
 ### Memory (`gc/` crate)
 
-Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational collector — but see **"The default does not compact"** below before assuming the Cheney moving young gen is what runs; it is off by default and, on a JIT-warm workload, effectively unreachable. A region-based G1 collector is also present and opt-in selectable via `-XX:+UseG1GC` (experimental; Generational remains the default safety net during G1 maturation — see `docs/feature-designs/concurrent-gc-maturation.md`). ZGC is experimental and feature-gated (`--features zgc`, off by default): a metadata-only simulation plus a real STW mark-sweep heap (`ZgcRealHeap`) that is built but not yet wired into the backend dispatch (`GcBackend`), so neither is a selectable production collector.
+Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational collector with the Cheney moving young gen **enabled** — but see **"When the default does not compact"** below: requesting a moving cycle is not the same as running one, because each cycle must still carry a per-cycle root-coverage proof. A region-based G1 collector is also present and opt-in selectable via `-XX:+UseG1GC` (experimental; Generational remains the default safety net during G1 maturation — see `docs/feature-designs/concurrent-gc-maturation.md`). ZGC is experimental and feature-gated (`--features zgc`, not part of the default feature set): a metadata-only simulation plus a real STW mark-sweep heap (`ZgcRealHeap`) that is built but not yet wired into the backend dispatch (`GcBackend`), so neither is a selectable production collector.
 
 - **`heap.rs`** — Object/array layout and allocation (semi-space).
 - **`gen_heap.rs`** — Generational heap: young gen (copying) + old gen.
@@ -219,18 +219,19 @@ Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the g
 - **`roots.rs`** — Root scanning and pointer remapping.
 - **`old_gen.rs`** — Old generation management.
 
-**The default does not compact.** Two independent gates keep the moving
-(Cheney) young-gen path from running on the default configuration:
+**When the default does not compact.** The flag gate is gone; the per-cycle
+proof is not. Read both before reasoning about allocation-path or GC-pause code.
 
-1. `moving_young` is an **opt-in** flag that defaults to **false** —
-   `moving_young: present(src, "CRATONVM_MOVING_YOUNG")` at
-   `types/src/flags.rs:619`, pinned by the
-   `empty_source_matches_all_documented_defaults` test at `:1657`. Unless
-   `CRATONVM_MOVING_YOUNG` is set in the environment, the moving cycle is
-   never even requested.
-2. Even when it *is* set, every cycle must carry a **per-cycle coverage
-   proof** before it may relocate: `collect_garbage_inner` diverts to the
-   non-moving sweep on `divert_for_incomplete_moving_coverage`, which
+1. `moving_young` is an **opt-out** flag that defaults to **true** —
+   `types/src/flags.rs::DEFAULT_MOVING_YOUNG`, shaped as
+   "`CRATONVM_NO_MOVING_YOUNG` turns it off, `CRATONVM_MOVING_YOUNG` is a
+   retained no-op opt-in", and pinned by
+   `empty_source_matches_all_documented_defaults` and
+   `moving_young_is_an_opt_out_with_a_compatibility_opt_in`. A default
+   `cargo build` therefore *requests* a moving young cycle.
+2. Requesting one is not running one: every cycle must carry a **per-cycle
+   coverage proof** before it may relocate. `collect_garbage_inner` diverts to
+   the non-moving sweep on `divert_for_incomplete_moving_coverage`, which
    `vm/src/memory/roots.rs` computes from
    `conservative_roots::refresh_moving_young_coverage_for_collection()` — every
    live compiled frame's active safepoint must certify
@@ -247,25 +248,24 @@ Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the g
    never run a moving cycle under a live JIT frame, the only case the feature
    exists for. That term and the `CRATONVM_ALLOW_MOVING_YOUNG` flag are gone.)
 
-So what a default `cargo build` actually gives you is a **generational
-non-moving mark-sweep with selective promotion**, not a semi-space copying
-young gen: no young-gen compaction, and fragmentation reclaimed only by
-sweeping the free list. That is a different complexity class from the one
-"Cheney moving young gen" advertises, and it is the behaviour to reason about
-when reading allocation-path or GC-pause code.
+So on a JIT-warm workload a default build can still spend cycles in the
+**generational non-moving mark-sweep with selective promotion** path — that is
+what a nonzero `coverage_fallbacks` count means, and it is the number to read
+before attributing a pause profile to compaction.
 
-Correctness is no longer what blocks the flip. `CRATONVM_MOVING_YOUNG=1` with
-the JIT enabled produces the right answer and runs real moving cycles as of
-2026-07-26 — the heap corruption that blocked it was five codegen sites pushing
-an untagged object reference onto the JIT's simulated operand stack.
-What blocks the flip now is throughput, and by less than it was: on
-Binary-Trees-18 the moving path measures **2.1×** the default sweep (six
-interleaved rounds, min 2905 ms vs 1363 ms), down from 5.0× before the
-pre-cycle object-start walk stopped building a hash set of every object in
-from-space.
-bt18 is the worst case for a copying collector, and it is also the workload
-where the default build cannot run at `-Xmx512m` at all while the compacting
-collector completes.
+Correctness stopped being the blocker on 2026-07-26: the heap corruption was
+five codegen sites pushing an untagged object reference onto the JIT's
+simulated operand stack. Throughput is the **remaining** work, now tracked as
+an optimization program rather than as a precondition, because the memory-
+footprint win decided the flip: on Binary-Trees-18 the moving path measures
+**2.1×** the sweep (six interleaved rounds, min 2905 ms vs 1363 ms), down from
+5.0× before the pre-cycle object-start walk stopped building a hash set of
+every object in from-space — but bt18 at `-Xmx512m` does not complete at all
+without compaction. bt18 is simultaneously the worst case for a copying
+collector and the workload that justifies it. The open items (the `pointer_map`
+`FxHashMap`, the disabled self-call spill elision, and the unpriced
+`jit_frame_record` helper) are itemised in
+[`docs/moving-young-throughput.md`](docs/moving-young-throughput.md).
 
 **Object layout:**
 ```
@@ -543,7 +543,7 @@ instances of this.
 
 | Capability | Where the default lives | Status |
 |------------|-------------------------|--------|
-| `moving_young` | `types/src/flags.rs::DEFAULT_MOVING_YOUNG` | The gate is now structured as opt-out with a compatibility opt-in, but the compiled default is still false. The former independent `allow_moving_young` gate has been deleted. |
+| `moving_young` | `types/src/flags.rs::DEFAULT_MOVING_YOUNG` | **Resolved.** Restructured as opt-out with a compatibility opt-in, and the compiled default is now `true`. The former independent `allow_moving_young` gate has been deleted. Retained here as the worked example of the fix shape, not as an open instance — but note the second gate: a moving cycle still needs its per-cycle coverage proof, so "flag on" and "compaction ran" remain distinct claims. |
 | `use_compressed_oops` | `vm/src/config.rs` | Opt-in, defaults false. Fully wired but never enabled on the default path — and the doc claimed for a while that it was *not* wired, which is the same failure mode in the opposite direction. |
 | `safepoint_reg_spill` | `jit/src/x64.rs:2650` | **Was** the canonical case: several call sites' own comments claimed a register spill as their protection, but that spill "only ran when the SEPARATE `CRATONVM_JIT_SAFEPOINT_REG_SPILL` env var was ALSO set — off by default, so the documented protection never actually happened." Now folded into default-on `precise_maps` and inverted to opt-**out** (`CRATONVM_NO_PRECISE_REG_SPILL`). This is the shape the fix should take. |
 | `precise_maps` register-spill half | `jit/src/x64.rs:2646-2662` | Same item; `precise_maps` was default-on since 2026-07-07 while its register-spill branch was not. A flag being on does not mean all of its branches are. |

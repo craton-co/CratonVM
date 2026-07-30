@@ -147,12 +147,18 @@ running.
 
 ### Tier 5: Experimental / Incomplete (feature-gated)
 
+The `experimental-*` features are no longer part of the `cratonvm-vm` default
+set: an ordinary `cargo build` does not compile them, and each must be requested
+explicitly (`--features experimental-tls`, and so on). `synthetic-jdk` still
+implies `experimental-jmx`, because the legacy synthetic surface includes JMX
+bootstrap classes.
+
 | File(s) | Feature | In default build | Status |
 |---|---|---|---|
-| `serialization.rs` | `experimental-serialization` | YES | Partial — ObjectInputStream/ObjectOutputStream |
-| `aot.rs`, `aot_pipeline.rs` | `experimental-aot` | YES | GraalVM compat stubs |
-| `jmx.rs`, `jmx_openmbean.rs` | `experimental-jmx` | YES | Partial JMX bean registration |
-| `tls.rs`, `tls_impl.rs`, `t27_tls.rs` | `experimental-tls` | YES | TLS/SSL |
+| `serialization.rs` | `experimental-serialization` | **NO** | Partial — ObjectInputStream/ObjectOutputStream |
+| `aot.rs`, `aot_pipeline.rs` | `experimental-aot` | **NO** | GraalVM compat stubs |
+| `jmx.rs`, `jmx_openmbean.rs` | `experimental-jmx` | **NO** (implied by `synthetic-jdk`) | Partial JMX bean registration |
+| `tls.rs`, `tls_impl.rs`, `t27_tls.rs` | `experimental-tls` | **NO** | TLS/SSL |
 | `bc_aes.rs`, `bc_chacha.rs`, `bc_newhope.rs`, `bc_newhope_tables.rs` | `legacy-synthetic-crypto` | **NO** | Old Bouncy Castle replacements |
 | `craton_gpu.rs` | `gpu-offload` | **NO** | GPU marshalling |
 | `jdk25_concurrency.rs`, `jdk25_language.rs`, `jdk25_patterns.rs`, `unsafe_jdk25.rs` | (none) | YES | JDK 25 forward-compat stubs |

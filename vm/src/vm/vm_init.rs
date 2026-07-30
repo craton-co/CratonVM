@@ -2722,6 +2722,28 @@ impl SharedVm {
             );
         }
 
+        // AOT and CDS are explicitly compiled experiments and are no longer in
+        // the default feature set. A build that cannot honour `-XX:AOTMode` /
+        // `-XX:SharedArchiveFile` must say so: silently ignoring the request is
+        // exactly the "capability reads as landed but never runs" failure mode
+        // ARCHITECTURE.md's flag-default checklist exists to prevent.
+        #[cfg(not(feature = "experimental-aot"))]
+        {
+            if !matches!(config.aot_mode, crate::config::AotMode::Off) {
+                tracing::warn!(
+                    "AOT cache requested (-XX:AOTMode) but this build was compiled \
+                     without --features experimental-aot; the request is ignored"
+                );
+            }
+            if !matches!(config.cds_mode, crate::config::CdsMode::Off) {
+                tracing::warn!(
+                    "CDS requested (-XX:SharedArchiveFile / -Xshare) but this build \
+                     was compiled without --features experimental-aot; the request \
+                     is ignored"
+                );
+            }
+        }
+
         // Load CDS archive if configured
         #[cfg(feature = "experimental-aot")]
         if matches!(

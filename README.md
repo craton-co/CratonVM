@@ -21,9 +21,11 @@ install, no `rt.jar`, one self-contained binary.
   NVIDIA GPUs without API changes. Eligibility is intentionally narrow and
   unsupported shapes fall back to CPU (see below).
 - **Generational GC** — young/old generations, card table, selective
-  promotion. The default young collection is a **non-moving sweep**; the
-  moving/compacting young gen is opt-in (`CRATONVM_MOVING_YOUNG`, off by
-  default — see [ARCHITECTURE.md](ARCHITECTURE.md#memory-gc-crate)). Opt-in
+  promotion. The moving/compacting (Cheney) young gen is the **default**, with
+  `CRATONVM_NO_MOVING_YOUNG` as the compatibility opt-out; a cycle that cannot
+  prove complete root coverage diverts to the non-moving sweep rather than
+  relocating (see [ARCHITECTURE.md](ARCHITECTURE.md#memory-gc-crate) and
+  [moving-young throughput](docs/moving-young-throughput.md)). Opt-in
   region-based G1 (`-XX:+UseG1GC`).
 - **Real frameworks run** — Spring, Spring Boot, Tomcat, Hibernate, and H2
   boot and pass large test suites.

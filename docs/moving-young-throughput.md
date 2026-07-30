@@ -148,5 +148,25 @@ None of these changes the conclusion: bt18 is the worst case for a copying
 collector (a very large live set, so copying cost is near its maximum relative
 to sweeping), and at 2.1× on that workload — while being the only configuration
 that completes at `-Xmx512m` — moving-young is no longer disqualified on
-throughput. A default flip still needs a workload mix rather than one
-benchmark.
+throughput.
+
+## Status: the default has flipped; these optimizations have not landed
+
+`types/src/flags.rs::DEFAULT_MOVING_YOUNG` is now `true`, with
+`CRATONVM_NO_MOVING_YOUNG` as the compatibility opt-out. The footprint result
+decided it: a configuration that cannot complete bt18 at `-Xmx512m` is not a
+safe default, whatever its steady-state throughput on a large heap.
+
+So the three residuals above are **open optimization work on the default
+path**, not preconditions for a flip that has not happened yet. They belong to
+the [framework and CPU throughput program](framework-throughput.md), and should
+be read together with the second gate documented in
+[`ARCHITECTURE.md`](../ARCHITECTURE.md#memory-gc-crate): the flag being on does
+not mean a given cycle compacted, so any profile must be read against
+`moving_young: cycles=N coverage_fallbacks=M` before time is attributed to
+compaction.
+
+The workload mix this document originally asked for is still owed. It is now a
+regression-budget question — whether the moving default costs more than its
+footprint win on the named CPU and framework workloads — rather than a go/no-go
+one.

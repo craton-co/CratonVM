@@ -14,15 +14,25 @@ production caveats.
 
 - Tighter HotSpot C2 performance parity, with blocking regression budgets for
   HashMap, Binary Trees, and Regex before optimizing broader benchmark totals.
-- GC throughput improvements on allocation-heavy workloads (Binary Trees);
-  optimize and validate moving-young collection before considering it for the
-  default collector path.
+- GC throughput improvements on allocation-heavy workloads (Binary Trees).
+  Moving-young collection is now the default (`CRATONVM_NO_MOVING_YOUNG` opts
+  out), so its remaining optimizations — the `pointer_map` `FxHashMap`, the
+  disabled self-call spill elision, and the unpriced `jit_frame_record` helper —
+  are work on the default path, tracked in
+  [`docs/moving-young-throughput.md`](docs/moving-young-throughput.md).
 - Repeatable framework-throughput qualification for Spring Boot, Quarkus, and
   Micronaut, following [`docs/framework-throughput.md`](docs/framework-throughput.md).
 - Complete `java.util.concurrent` parity (ForkJoin, ReentrantReadWriteLock,
   Phaser).
 - Bytecode verifier completeness for pre-Java-7 class files.
 - AArch64 JIT backend feature parity with x86-64.
+
+The near-term and medium-term lists below are not stretch goals. Pre-Java-7
+verifier coverage, `java.util.concurrent` parity, AArch64 parity, real-JDK boot
+from a stock `java.base`, JNI function-table and lifecycle coverage, JFR event
+coverage, and JEP 261 module semantics are the unresolved holes that currently
+define what CratonVM can be used for. Read them as the platform's ceiling, not
+as a wish list.
 
 ## Medium-term
 
@@ -59,7 +69,9 @@ Current product limits:
 - Analyzer/lowering coverage remains intentionally narrower than Java:
   non-canonical and nested loop shapes are rejected rather than silently
   offloaded.
-- Self-hosted hardware CI running the `bench-gpu/` suite on real CUDA hardware on every change.
+- There is no self-hosted hardware CI: the `bench-gpu/` suite is not run on real
+  CUDA hardware on every change, so the numbers above are point-in-time
+  measurements rather than a continuously enforced budget.
 
 Closed GPU follow-ups, including asynchronous completion and the JIT-caller
 admission gate, are retained as
