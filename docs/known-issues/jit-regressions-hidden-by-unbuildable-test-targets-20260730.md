@@ -2,10 +2,32 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — regressions confirmed and bisected to a window; not root-caused. |
+| **Status** | RESOLVED 2026-07-30. Every regression below is closed on `dev`; the compile breaks that hid them are fixed. Kept for the lesson, not the bug. |
 | **Category** | VM-CORRECTNESS (JIT IR lowering, inline caches, direct calls, FP remainder) |
 | **Found** | 2026-07-30, while restoring `cargo test --workspace` on `fix/deep-audit-retire-20260730`. |
 | **Window** | Between `c05f85967` (2026-07-27) and `origin/dev` `9b86a9ac1` (2026-07-30). |
+
+## Resolution
+
+Merging `origin/dev` at `cd451facc` closes all of it. After the merge:
+
+```
+cargo test -p cratonvm-jit --test ir_vs_singlepass   89 passed, 0 failed
+cargo test -p cratonvm-jit --lib                   1051 passed, 0 failed
+```
+
+including the `invokeinterface` access violation. The fix was
+`1f040498c fix(jit): revert the unsound getfield/putfield RBC.6 widening`,
+with `5f67725ad` (IR-pipeline tests state their moving-young dependency) and
+`abf40220a` (de-flake the tests that observe process-global JIT state)
+alongside it. Concurrent sessions also fixed the four compile breaks
+independently — `123611c54`, `4d8a39a39`, `4972b3812`.
+
+So the diagnosis below was right about the window and wrong about nothing that
+matters, but it was overtaken within hours. **The regressions were never the
+point.** What is worth keeping is how they stayed invisible, and that is
+unchanged: four independent compile breaks, and a CI job that fails at step 1
+before it builds anything. Read the rest as a case study.
 
 ## What happened
 
