@@ -2477,6 +2477,22 @@ pub fn inline_rbp_tls_disp() -> usize {
     0
 }
 
+/// Segment override used by generated inline frame-record stores.
+///
+/// This is shared with the OSR trampoline emitter in `lib.rs`; keeping the
+/// platform byte in one place prevents that independently emitted prologue
+/// from silently retaining the Windows `gs:` prefix on Linux.
+pub(crate) const fn inline_rbp_tls_segment_prefix() -> u8 {
+    #[cfg(windows)]
+    {
+        0x65
+    }
+    #[cfg(not(windows))]
+    {
+        0x64
+    }
+}
+
 /// VM-side access to the Linux TLS cell used by generated `fs:` stores.
 /// `None` means the startup probe did not enable the inline path.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -15248,10 +15264,7 @@ impl Compiler {
     ///   * `25`       — SIB scale=0 index=none(4) base=none(5) → [disp32].
     ///   * `disp32`   — displacement; effective address = segment base + disp.
     fn emit_mov_tls_disp32_rbp(&mut self, disp32: u32) {
-        #[cfg(windows)]
-        self.buf.emit_byte(0x65); // GS prefix
-        #[cfg(not(windows))]
-        self.buf.emit_byte(0x64); // FS prefix (only called when Linux probe succeeded)
+        self.buf.emit_byte(inline_rbp_tls_segment_prefix());
         self.buf.emit_byte(0x48); // REX.W
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.buf.emit_byte(0x2C); // ModRM: reg=RBP, r/m=SIB
@@ -43408,6 +43421,7 @@ mod flag_and_header_contracts {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn linux_inline_rbp_tls_slot_is_live_and_round_trips() {
+        assert_eq!(inline_rbp_tls_segment_prefix(), 0x64);
         let disp = inline_rbp_tls_disp();
         assert_ne!(
             disp, 0,
