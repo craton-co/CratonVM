@@ -36,8 +36,15 @@ exclude = [
 # for the rationale and the census-driven migration plan.
 # Keep the shipping build surface to production-intended subsystems. Optional
 # experiments remain available explicitly (`--features experimental-*`), and
-# ZGC remains selectable with `--features zgc`; compiling them is no longer
-# part of an ordinary build.
+# ZGC remains selectable with `--features zgc`; compiling them is no longer part
+# of an ordinary build. What that actually removes differs per feature:
+# `experimental-jmx` / `-aot` / `-serialization` gate module declarations in
+# `cratonvm-native-builtins`, so dropping them really stops compiling that code.
+# `experimental-tls` is a no-op alias (NEW-13) kept only so downstream feature
+# requests and `check-cfg` keep resolving — the `javax.net.ssl` implementation
+# is always compiled and registered. The `experimental-features` CI job builds
+# and runs the whole optional surface, because this repository has already lost
+# 1,522 tests to a configuration that nothing compiled.
 default = ["awt"]
 # AWT/Swing/Java2D desktop natives. On by default so the standard build
 # registers them exactly as before. `cratonvm-native-awt` sets

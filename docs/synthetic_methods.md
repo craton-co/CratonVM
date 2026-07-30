@@ -147,18 +147,26 @@ running.
 
 ### Tier 5: Experimental / Incomplete (feature-gated)
 
-The `experimental-*` features are no longer part of the `cratonvm-vm` default
-set: an ordinary `cargo build` does not compile them, and each must be requested
-explicitly (`--features experimental-tls`, and so on). `synthetic-jdk` still
-implies `experimental-jmx`, because the legacy synthetic surface includes JMX
-bootstrap classes.
+The `experimental-*` features left the `cratonvm-vm` default set, so an ordinary
+`cargo build` no longer requests them and each must be asked for explicitly
+(`--features experimental-aot`, and so on). `synthetic-jdk` still implies
+`experimental-jmx`, because the legacy synthetic surface includes JMX bootstrap
+classes.
+
+Whether that actually removes code depends on the feature. In
+`cratonvm-native-builtins`, `jmx`/`jmx_openmbean`, `aot`/`aot_pipeline` and
+`serialization` are `#[cfg]`-gated module declarations, so dropping the feature
+stops compiling them. `experimental-tls` is a **no-op alias** (NEW-13): the
+native-tls-backed `javax.net.ssl` implementation is always compiled and
+registered, and the feature is retained only so downstream requests and
+`check-cfg` keep resolving.
 
 | File(s) | Feature | In default build | Status |
 |---|---|---|---|
 | `serialization.rs` | `experimental-serialization` | **NO** | Partial — ObjectInputStream/ObjectOutputStream |
 | `aot.rs`, `aot_pipeline.rs` | `experimental-aot` | **NO** | GraalVM compat stubs |
 | `jmx.rs`, `jmx_openmbean.rs` | `experimental-jmx` | **NO** (implied by `synthetic-jdk`) | Partial JMX bean registration |
-| `tls.rs`, `tls_impl.rs`, `t27_tls.rs` | `experimental-tls` | **NO** | TLS/SSL |
+| `tls.rs`, `tls_impl.rs`, `t27_tls.rs` | `experimental-tls` (no-op alias) | **YES — always compiled** | TLS/SSL |
 | `bc_aes.rs`, `bc_chacha.rs`, `bc_newhope.rs`, `bc_newhope_tables.rs` | `legacy-synthetic-crypto` | **NO** | Old Bouncy Castle replacements |
 | `craton_gpu.rs` | `gpu-offload` | **NO** | GPU marshalling |
 | `jdk25_concurrency.rs`, `jdk25_language.rs`, `jdk25_patterns.rs`, `unsafe_jdk25.rs` | (none) | YES | JDK 25 forward-compat stubs |
