@@ -1396,6 +1396,7 @@ mod tests {
             jit_card_old_base: 0x1178,
             jit_card_old_end: 0x1180,
             set_throw_bci: 0x1188,
+            service_callee_deopt: 0x1190,
         }
     }
 
@@ -1625,6 +1626,7 @@ mod tests {
             jit_card_old_base: 0,
             jit_card_old_end: 0,
             set_throw_bci: 0,
+            service_callee_deopt: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -1801,7 +1803,7 @@ mod tests {
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
         // And the macro-driven count is the canonical 56.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 56);
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 58);
     }
 
     #[test]
@@ -2083,6 +2085,11 @@ mod tests {
                 56,
                 "set_throw_bci",
                 std::mem::offset_of!(JitRuntimeHelpers, set_throw_bci),
+            ),
+            (
+                57,
+                "service_callee_deopt",
+                std::mem::offset_of!(JitRuntimeHelpers, service_callee_deopt),
             ),
         ];
 

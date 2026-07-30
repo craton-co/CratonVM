@@ -13,7 +13,7 @@ static LZCNT_SUPPORT: AtomicU8 = AtomicU8::new(0);
 static BMI1_SUPPORT: AtomicU8 = AtomicU8::new(0);
 static PCLMUL_SUPPORT: AtomicU8 = AtomicU8::new(0);
 
-pub(crate) fn has_avx2() -> bool {
+pub fn has_avx2() -> bool {
     cached_feature(&AVX2_SUPPORT, detect_avx2)
 }
 
@@ -38,7 +38,7 @@ fn detect_avx2() -> bool {
     false
 }
 
-pub(crate) fn has_sse41() -> bool {
+pub fn has_sse41() -> bool {
     cached_feature(&SSE41_SUPPORT, || cpuid_bit(1, 0, 2, 19))
 }
 
@@ -74,23 +74,23 @@ fn cached_feature(slot: &AtomicU8, detect: impl FnOnce() -> bool) -> bool {
     result
 }
 
-pub(crate) fn has_popcnt() -> bool {
+pub fn has_popcnt() -> bool {
     cached_feature(&POPCNT_SUPPORT, || cpuid_bit(1, 0, 2, 23))
 }
 
-pub(crate) fn has_sse42() -> bool {
+pub fn has_sse42() -> bool {
     cached_feature(&SSE42_SUPPORT, || cpuid_bit(1, 0, 2, 20))
 }
 
-pub(crate) fn has_lzcnt() -> bool {
+pub fn has_lzcnt() -> bool {
     cached_feature(&LZCNT_SUPPORT, || cpuid_bit(0x8000_0001, 0, 2, 5))
 }
 
-pub(crate) fn has_bmi1() -> bool {
+pub fn has_bmi1() -> bool {
     cached_feature(&BMI1_SUPPORT, || cpuid_bit(7, 0, 1, 3))
 }
 
-pub(crate) fn has_pclmulqdq() -> bool {
+pub fn has_pclmulqdq() -> bool {
     cached_feature(&PCLMUL_SUPPORT, || cpuid_bit(1, 0, 2, 1))
 }
 

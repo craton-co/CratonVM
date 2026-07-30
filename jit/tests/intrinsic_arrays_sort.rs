@@ -94,6 +94,8 @@ fn stub_helpers() -> JitRuntimeHelpers {
         region_bounds_addr: 0,
         native_stack_floor_fn: 0,
         ldc_string: s,
+        set_throw_bci: s,
+        service_callee_deopt: s,
     }
 }
 

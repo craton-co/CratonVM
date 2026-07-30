@@ -114,6 +114,8 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         region_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
         native_stack_floor_fn: native_stack_floor as *const () as usize,
         ldc_string: s,
+        set_throw_bci: s,
+        service_callee_deopt: s,
     }
 }
 

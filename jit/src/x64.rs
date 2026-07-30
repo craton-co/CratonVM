@@ -67,7 +67,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 
 mod cpu_features;
-pub(crate) use cpu_features::{
+// Re-exported at the visibility these queries had before the split: the
+// intrinsic-registration tests (`jit/tests/intrinsic_crc32.rs`) assert that a
+// hardware intrinsic registers exactly when the host reports the feature.
+pub use cpu_features::{
     has_avx2, has_bmi1, has_lzcnt, has_pclmulqdq, has_popcnt, has_sse41, has_sse42,
 };
 
