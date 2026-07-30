@@ -5076,6 +5076,18 @@ pub(crate) fn native_cf_then_apply(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if !matches!(ctx.get_field(this, FUT_FIELD_DONE), Value::Int(_)) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniApplyStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(func)),
+            ],
+        );
+    }
     let done = match ctx.get_field(this, FUT_FIELD_DONE) {
         Value::Int(d) => d,
         _ => 0,
@@ -5119,6 +5131,18 @@ pub(crate) fn native_cf_then_accept(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if !matches!(ctx.get_field(this, FUT_FIELD_DONE), Value::Int(_)) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniAcceptStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(consumer)),
+            ],
+        );
+    }
     let done = match ctx.get_field(this, FUT_FIELD_DONE) {
         Value::Int(d) => d,
         _ => 0,

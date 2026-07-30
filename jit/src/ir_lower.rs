@@ -3683,6 +3683,10 @@ mod tests {
     /// helper the pre-2026-07-26 lowerer used for every virtual call.
     #[test]
     fn ic_site_emits_mic_pic_cascade_not_blind_dispatch() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         const MIC: usize = 0x7fff_0000_0000_1000;
         const PIC: usize = 0x7fff_0000_0000_2000;
         let mut ic = HashMap::new();
@@ -3734,6 +3738,10 @@ mod tests {
     /// `ObjectHeader.kind` is what separates them.
     #[test]
     fn ic_cascade_rejects_array_receivers_before_the_class_id_guard() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         const MIC: usize = 0x7fff_0000_0000_1000;
         const PIC: usize = 0x7fff_0000_0000_2000;
         let mut ic = HashMap::new();
@@ -3772,6 +3780,10 @@ mod tests {
     /// helper that populates both.
     #[test]
     fn ic_guards_use_published_slot_offsets() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         use crate::{JitMICSlot, JitPICSlot};
         const MIC: usize = 0x7fff_0000_0000_1000;
         const PIC: usize = 0x7fff_0000_0000_2000;

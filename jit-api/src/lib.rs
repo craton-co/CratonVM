@@ -505,7 +505,23 @@ pub mod npe_action {
 /// JIT may read a field either by name or by computed byte offset; the
 /// default `repr(Rust)` layout is unspecified and the compiler is free to
 /// reorder fields, so a stable C layout is the only sound contract here.
-#[derive(Clone, Copy, Debug)]
+///
+/// `Default` (every field zero) exists for the integration tests in
+/// `jit/tests`, which build this table literally and wire up only the helpers
+/// they exercise. They spread `..Default::default()` so that adding a field
+/// here cannot break all of them at once — it did, for `service_callee_deopt`
+/// and `set_throw_bci`.
+///
+/// Zero is the right default only for the fields whose contract already reads
+/// 0 as unwired (`get_current_thread`, `safepoint_flag_addr`, the TLAB and
+/// card-table offsets, …), where the backend checks for it and falls back.
+/// It is NOT inert for a field the backend reaches via `emit_call_absolute`:
+/// there a 0 is a CALL to a null pointer. If you add a call-target helper,
+/// expect the `jit/tests` tables to need it wired explicitly to their local
+/// trap stub, exactly as `set_throw_bci` / `service_callee_deopt` are.
+/// Production builds always go through `build_helpers`, which populates every
+/// field explicitly.
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct JitRuntimeHelpers {
     pub newarray: usize,
@@ -1802,7 +1818,7 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 56.
+        // And the macro-driven count is the canonical 58.
         assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 58);
     }
 
@@ -2127,7 +2143,7 @@ mod tests {
 
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
-        // The macro must classify every field:
+        // The macro must classify every field.
         // 42 RequiredPtr + 7 OptionalPtr + 9 Offset = 58. A new
         // field whose classification is omitted will fail to compile (the
         // macro requires both arms); this test pins the *counts* so a

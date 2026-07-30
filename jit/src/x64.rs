@@ -2583,6 +2583,14 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // or the collector walks a shadow stack the codegen never pushed to.
     // `parse::present` == the former `var_os(..).is_some()`, so this is
     // behaviour-preserving.
+    // A thread pinning the moving-young policy (see `set_moving_young_override`)
+    // must not read -- or, worse, POPULATE -- this process-wide cache: whichever
+    // test touched it first would otherwise freeze the shadow-stack decision for
+    // every other test in the binary. Recompute instead; the override is never
+    // set in production, so the cached fast path is unchanged there.
+    if MOVING_YOUNG_OVERRIDE.with(|c| c.get()).is_some() {
+        return cratonvm_types::flags().jit.shadow_stack || moving_young_enabled();
+    }
     *G.get_or_init(|| cratonvm_types::flags().jit.shadow_stack || moving_young_enabled())
 }
 
@@ -2614,7 +2622,33 @@ pub fn shadow_stack_maps_enabled() -> bool {
 /// behaviour-preserving today and lets the default be flipped in one place
 /// later. Do NOT re-introduce a local `getenv` here.
 #[inline]
+thread_local! {
+    /// Per-thread override for [`moving_young_enabled`]; `None` = use the
+    /// process flag. Thread-local so parallel tests cannot race each other.
+    static MOVING_YOUNG_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`moving_young_enabled`] for the CURRENT THREAD only.
+///
+/// The optimizing IR tier is gated on `!moving_young_enabled()` (IR publishes
+/// no exact-RBP/safepoint map, so it must stay off while the young generation
+/// can relocate). That makes every IR-routing test depend on a *deployment*
+/// flag rather than on what it actually exercises — and when
+/// `DEFAULT_MOVING_YOUNG` flipped to `true` those tests began asserting against
+/// a pipeline that can no longer run, failing with a bare `left: 0, right: 1`.
+/// Tests that mean "exercise the IR pipeline" call this to say so explicitly.
+///
+/// This does NOT change what production does: nothing calls it outside tests,
+/// and the process flag remains the default on every thread.
+pub fn set_moving_young_override(value: Option<bool>) {
+    MOVING_YOUNG_OVERRIDE.with(|c| c.set(value));
+}
+
 pub fn moving_young_enabled() -> bool {
+    if let Some(forced) = MOVING_YOUNG_OVERRIDE.with(|c| c.get()) {
+        return forced;
+    }
     cratonvm_types::flags().gc.moving_young
 }
 
@@ -8418,7 +8452,7 @@ struct Compiler {
     /// to precisely type this call's own arguments on the operand stack
     /// instead of falling back to the coarse per-method `wide_fp` gate. See
     /// `indy_arg_type_tags`'s doc comment.
-    indy_info: Vec<(usize, usize, u8, Vec<u8>)>,
+    indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
     /// Direct call targets: (bytecode_pc, direct call info).
     /// For invokestatic/invokespecial where the callee is already JIT-compiled.
     direct_calls: Vec<(usize, super::JitDirectCall)>,
@@ -15237,6 +15271,20 @@ impl Compiler {
         // staged ABI arg registers). Done last in the prologue, after params are
         // saved to their homes, so `get_current_thread` (caller-saved clobbers)
         // can't lose an argument. RAX holds the returned thread pointer.
+        // Initialise the cached-thread slot whenever it EXISTS, independently of
+        // whether `get_current_thread` is wired. Both consumers -- the safepoint
+        // push in `emit_shadow_push_for_safepoint` and the epilogue savetop
+        // restore -- gate only on `shadow_enabled && shadow_thread_slot_off != 0`
+        // and rely on the slot READING NULL to skip themselves. Folding this
+        // zeroing into the `get_current_thread != 0` arm broke that invariant:
+        // with the helper unwired the slot kept whatever stack garbage occupied
+        // the frame, the push's null test passed, and it stored a live oop
+        // through a wild pointer (SIGSEGV at `mov %rax,0(%r11)`). Production
+        // always wires the helper, so this was latent there.
+        if self.shadow_enabled && self.shadow_thread_slot_off != 0 {
+            self.emit_xor_reg_self(RAX); // RAX = 0
+            self.emit_store_local(self.shadow_thread_slot_off, RAX);
+        }
         if self.shadow_enabled
             && self.helpers.get_current_thread != 0
             && self.shadow_thread_slot_off != 0
@@ -15254,8 +15302,6 @@ impl Compiler {
             // skip safely. `get_current_thread` is a caller-saved clobber but
             // we are still in the prologue (params already homed), so this is a
             // register-safe place to keep the actual fetch.
-            self.emit_xor_reg_self(RAX); // RAX = 0
-            self.emit_store_local(self.shadow_thread_slot_off, RAX);
             self.shadow_fetch_start = self.buf.pos();
             self.emit_call_absolute(self.helpers.get_current_thread);
             self.emit_store_local(self.shadow_thread_slot_off, RAX);
@@ -24064,6 +24110,24 @@ impl Compiler {
                                 .unwrap_or(false);
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
+                        // A null receiver must become a real Java NPE here, before
+                        // either the inline store or the `jit_putfield_*` helper can
+                        // turn it into a silent no-op. The helper's guard
+                        // (`!plausible_heap_pointer(obj_ptr) { return; }`) exists to
+                        // avoid dereferencing garbage, but it returns WITHOUT raising,
+                        // so a `putfield` on null silently dropped the store and
+                        // execution continued -- see probes/NullPutfieldProbe.java.
+                        //
+                        // This is the same call the inlined-callee `0xb5` arm already
+                        // makes; only the top-level arm was missed when
+                        // `emit_precise_null_check_field_store` landed. Inside a
+                        // protected range under `precise_exception_frames` it records a
+                        // reason-10 precise NPE frame; otherwise it falls back to the
+                        // ordinary null-check stub. NOT emitted on the
+                        // scalar-replaced branch above, whose "objectref" is a dummy
+                        // with no real receiver behind it.
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        self.emit_precise_null_check_field_store();
                         if type_tag == b'L' || type_tag == b'[' {
                             // HIGH-5 / R20: inline the reference-field store on the
                             // barrier-free fast path (CRATONVM_JIT_INLINE_PUTFIELD).
@@ -28980,7 +29044,8 @@ impl Compiler {
                         .indy_info_idx
                         .get(&pc)
                         .map(|&i| self.indy_info[i].clone());
-                    let Some((_pc, arg_slots, ret_type, arg_type_tags)) = info else {
+                    let Some((_pc, arg_slots, ret_type, arg_type_tags, concat_site)) = info
+                    else {
                         // No resolver, or this site couldn't be resolved at
                         // compile time: fail safe and bail the whole method,
                         // exactly like every other CP-resolved metadata miss
@@ -28990,6 +29055,72 @@ impl Compiler {
                     };
 
                     self.flush_scratch_registers();
+
+                    // A `StringConcatFactory` site has a resolved,
+                    // process-lifetime bridge, so call it directly instead of
+                    // taking the uncommon trap below. This is what removes
+                    // RBC.7's premise for the common
+                    // `println("..." + x)`-after-a-loop shape: with no trap at
+                    // the indy bci there is nothing for an OSR frame to resume
+                    // imprecisely, so the OSR artifact keeps running. Every
+                    // other bootstrap kind still falls through to the trap.
+                    let concat_entry =
+                        crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    if concat_site != 0 && concat_entry != 0 && matches!(ret_type, b'L' | b'[') {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                            eprintln!(
+                                "[cratonvm-jitc] indy-concat bridge pc={} args={}",
+                                pc, arg_slots
+                            );
+                        }
+                        let pre_pop_spill = self.next_spill_offset;
+                        let mut arg_slots_vec = Vec::with_capacity(arg_slots);
+                        for _ in 0..arg_slots {
+                            arg_slots_vec.push(self.pop_stack());
+                        }
+                        arg_slots_vec.reverse();
+                        let post_pop_spill = self.next_spill_offset;
+                        if arg_slots > 0 {
+                            let Some(args_end) =
+                                self.checked_spill_range_end(pre_pop_spill, arg_slots)
+                            else {
+                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                                    .is_some()
+                                {
+                                    eprintln!(
+                                        "[cratonvm-jitc] indy-concat bridge spill overflow pc={} base={} args={}",
+                                        pc, pre_pop_spill, arg_slots
+                                    );
+                                }
+                                return false;
+                            };
+                            self.next_spill_offset = args_end;
+                            for (i, slot) in arg_slots_vec.iter().enumerate() {
+                                let offset = pre_pop_spill + ((arg_slots - 1 - i) as i32) * 8;
+                                self.load_slot_to_reg(RAX, *slot);
+                                self.emit_store_local(offset, RAX);
+                            }
+                        }
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.emit_mov_imm64(ARG_REGS[1], concat_site as i64);
+                        if arg_slots > 0 {
+                            self.emit_lea_frame_slot(
+                                ARG_REGS[2],
+                                pre_pop_spill + ((arg_slots as i32) - 1) * 8,
+                            );
+                        } else {
+                            self.emit_xor_reg_self(ARG_REGS[2]);
+                        }
+                        self.emit_mov_imm32_sx(ARG_REGS[3], arg_slots as i32);
+                        self.emit_pre_safepoint_spill();
+                        self.emit_call_absolute(concat_entry);
+                        self.emit_oop_map_for_safepoint();
+                        self.next_spill_offset = post_pop_spill;
+                        self.push_from_rax();
+                        self.mark_top_as_oop();
+                        pc += 5;
+                        continue;
+                    }
 
                     // Unconditional JMP to the shared deopt stub. Mirrors the
                     // conditional String-intrinsic bail edges elsewhere in
@@ -29950,7 +30081,7 @@ pub fn compile_with_param_slots(
     // field doc on the `Compiler` struct. Empty from the legacy `compile()`
     // test wrapper (which also passes no `indy_ops` to `jit_scan` callers, so
     // this is always consistent with an invokedynamic-free method there).
-    indy_info: Vec<(usize, usize, u8, Vec<u8>)>,
+    indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
 ) -> Option<CompiledMethod> {
     let needs_heap = needs_heap || !ldc_string_info.is_empty();
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
@@ -31340,7 +31471,18 @@ pub fn compile_with_param_slots(
     // install sites in vm/src/jit/helpers.rs) consult this flag so every
     // call to such a method stays on a dispatch helper, whose
     // `try_resume_trapped_callee` resolves the trap precisely in place.
-    cm.has_indy_trap = !compiler.indy_info.is_empty();
+    // Only sites that actually lower to a trap count. A fully bridged
+    // method (every indy is a StringConcatFactory call) carries no trap, so it
+    // must not be forced onto the dispatch-helper path for its callers.
+    cm.has_indy_trap = {
+        let concat_entry = crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        compiler
+            .indy_info
+            .iter()
+            .any(|(_pc, _arg_slots, ret_type, _tags, concat_site)| {
+                !(*concat_site != 0 && concat_entry != 0 && matches!(*ret_type, b'L' | b'['))
+            })
+    };
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;
@@ -31788,6 +31930,11 @@ mod tests {
             panic!("JIT test helper called an unimplemented runtime stub");
         }
         let sentinel = unimplemented_stub as *const () as usize; // Cast: address arithmetic
+        // `set_throw_bci` only records the throwing bci in a thread-local and is
+        // called on the throw path of every method carrying an exception check,
+        // so it needs a real no-op rather than the panicking stub.
+        unsafe extern "C" fn record_throw_bci(_bci: i64) {}
+        let throw_bci = record_throw_bci as *const () as usize; // Cast: address arithmetic
         JitRuntimeHelpers {
             newarray: sentinel,
             new_object: sentinel,
@@ -31838,7 +31985,7 @@ mod tests {
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
             throw_exception: sentinel,
-            set_throw_bci: sentinel,
+            set_throw_bci: throw_bci,
             service_callee_deopt: sentinel,
             jit_npe_with_action: sentinel,
             dispatch_threw: sentinel,
@@ -43213,6 +43360,10 @@ mod tests {
     /// is sufficient to prove the per-clone path runs.
     #[test]
     fn test_unroll_mints_per_clone_pic_slots() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        super::set_moving_young_override(Some(false));
         // Not OnceLock-cached (see `direct_jit_callee_calls_enabled`), so
         // setting it here is observed immediately; no other jit test asserts
         // on invoke-info/PIC/MIC-slot counts, so this is safe under parallel

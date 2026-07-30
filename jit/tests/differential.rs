@@ -20,14 +20,6 @@ use cratonvm_jit::x64::{compile, is_jit_compatible};
 use cratonvm_jit_api::JitRuntimeHelpers;
 use std::collections::{HashMap, HashSet};
 
-/// `set_throw_bci` is a `RequiredPtr`, so it cannot be left null, but these
-/// harnesses have no signal state for it to write. The real helper stashes the
-/// bci of a throwing `athrow` for the caller's handler search; discarding it is
-/// the correct no-op here. It must have the real ABI — a zero-argument
-/// `panic!` stub unwinds out of JIT-generated code and faults the process.
-unsafe extern "C" fn test_noop_set_throw_bci(_bci: i64) {}
-
-
 /// Dummy runtime helpers — none of the FP tests invoke heap allocation,
 /// fields, type checks, or method dispatch, so the stub pointer is unused.
 fn dummy_helpers() -> JitRuntimeHelpers {
@@ -35,6 +27,21 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         panic!("JIT differential test invoked an unwired runtime helper");
     }
     let s = stub as *const () as usize;
+    // `set_throw_bci` only records the throwing bci in a thread-local; the
+    // backend calls it on the throw path of EVERY method that has an exception
+    // check, so reaching it is normal rather than a sign of missing wiring.
+    // Give it a real no-op instead of the panicking stub.
+    unsafe extern "C" fn record_throw_bci(_bci: i64) {}
+    let throw_bci = record_throw_bci as *const () as usize;
+    unsafe extern "C" fn deopt_unserviceable_stub(
+        _vm: i64,
+        _info: i64,
+        _args: i64,
+        _n: i64,
+    ) -> i64 {
+        i64::MIN
+    }
+    let deopt_unserviceable = deopt_unserviceable_stub as *const () as usize;
     JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
@@ -93,10 +100,16 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         region_bounds_addr: 0,
         native_stack_floor_fn: 0,
         ldc_string: s,
-        set_throw_bci: test_noop_set_throw_bci as *const () as usize,
-        // `service_callee_deopt` is an `OptionalPtr`: leaving it unwired is a
-        // supported configuration and exercises the JIT's no-helper path.
-        service_callee_deopt: 0,
+        // Reached through emit_call_absolute, so a 0 here is a null CALL
+        // (SIGSEGV), not an inert "unwired" sentinel. Neither is a sign of
+        // missing wiring: `set_throw_bci` just records the throwing bci, and
+        // `service_callee_deopt` is the normal IR direct-call path when a
+        // callee returns the i64::MIN "threw" sentinel. The deopt stub returns
+        // that sentinel unchanged -- exactly what the real helper does for a
+        // vm/info it cannot service -- so the caller propagates the throw.
+        set_throw_bci: throw_bci,
+        service_callee_deopt: deopt_unserviceable,
+        ..Default::default()
     }
 }
 
