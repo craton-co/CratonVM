@@ -131,10 +131,26 @@ FFI.
 artifact upload fails on a missing file, and `docs/COVERAGE.md` says the 85%
 figure is not demonstrated.
 
-**P0 / P0 — Gates.** `synthetic-jdk`, difftest, fuzz-build and coverage lost
+**P0 / P0 — Gates.** difftest, fuzz-build and coverage lost
 `continue-on-error`; Miri and the Markdown link check were added; the stub
-census became the exact ratchet. The honest caveat is above: with step 1 red,
-none of this has ever run to completion.
+census became the exact ratchet; the `synthetic-jdk` compile checks stayed
+blocking and an `experimental-features` job was added.
+
+One promotion was reverted after measuring it. `Test vm (synthetic-jdk)` was
+made blocking on the assumption that the module's old failure set had been
+worked through. It has not:
+
+```
+declared   3927 tests
+reported   2584 (2523 pass, 61 fail)
+then       exit code 1 with NO `test result` line
+```
+
+The harness aborts mid-run, so 1,343 tests never execute and 61 is a floor. A
+step that cannot report a result cannot be a gate, so it is advisory again —
+but now with the measurement, the abort named as the thing to fix first, and an
+explicit order for re-promoting it. The honest caveat above still applies: with
+CI step 1 red, none of these jobs has ever run to completion anyway.
 
 **P1 — Stub ratchet.** 2000-with-16-slack became 157-with-zero-slack, and the
 `docs/internal/stub-ratchet.md` the source pointed at now exists, with the
