@@ -100,9 +100,28 @@ actually is:
 | `native-collections` | 54,000 | `jit-cuda` | 10,000 |
 | `native-io` | 52,000 | remaining 10 | < 7,000 each |
 
-Several individual files are far larger than is comfortable. The two largest
-*production* files are `vm/src/runtime/interpreter.rs` (~47,900 lines) and
-`jit/src/x64.rs` (~42,600).
+Several individual files are far larger than is comfortable. The two worst were
+split on 2026-07-30, at the section banners the files already carried:
+
+- `vm/src/runtime/interpreter.rs` went ~50,500 → ~24,100 lines, with
+  `interpreter/typecheck.rs` (`checkcast`/`instanceof`/`aastore` compatibility),
+  `interpreter/constants.rs` (`ldc` and loader-faithful `CONSTANT_Class`
+  resolution), `interpreter/field_access.rs` (field resolution and invoke
+  argument plumbing), and `interpreter/invoke.rs` (method resolution, dispatch,
+  and the native bridge — ~23,200 lines, still the single largest thing here
+  because method invocation genuinely is one subsystem).
+- `jit/src/x64.rs` went ~44,200 → ~36,200 lines, with each optimization pass in
+  its own module: `x64/licm.rs`, `x64/licm_int.rs`, `x64/bce.rs`,
+  `x64/escape_analysis.rs`, `x64/null_check_elim.rs`, `x64/simd_analysis.rs`,
+  `x64/bytecode_compat.rs`, `x64/reg_encoding.rs`, `x64/switch_validation.rs`,
+  and `x64/cpu_features.rs`. What remains is the emitter and the compilation
+  entry point, which are not a clean seam.
+
+Nothing moved between modules and nothing became more public than it was: each
+child is `mod x; pub use x::*;`, and a glob re-export caps every item at its own
+declared visibility. Note that `hot_files_have_no_production_panics` enumerates
+both directories from disk — a gate that kept scanning only the parent would
+have turned this split into "silently stopped checking most of it".
 
 `vm/src/vm.rs` appears to dwarf both at ~74,200 lines, but that number is
 misleading and this is **not** the file to start reading. Everything from
@@ -143,9 +162,10 @@ measured rebuild or ownership benefit justifies another crate boundary.
 
 The bytecode execution engine.
 
-- **`interpreter.rs`** — Main dispatch loop (~45,000 lines). Each opcode reads
-  operands, manipulates the operand stack and local variables, and advances the
-  program counter.
+- **`interpreter.rs`** — Main dispatch loop (~24,100 lines, plus the
+  `interpreter/` submodules listed above). Each opcode reads operands,
+  manipulates the operand stack and local variables, and advances the program
+  counter.
 
   There are two cooperating dispatch paths:
 
