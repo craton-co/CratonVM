@@ -145,17 +145,32 @@ Each promotion was then actually run. Results:
 | Exact stub ratchet | yes | **157 of 9,320, zero slack** — backed |
 | Markdown link check | added | **98 files** — backed |
 | Miri (`cratonvm-types --lib`) | added | run from this host; see the run log |
-| Fuzz build smoke | yes | **not verified** — needs `cargo-fuzz` + libFuzzer, which is a Linux/macOS toolchain; CI runs it on `ubuntu-latest` |
+| Fuzz build smoke | yes | failed; two real misalignments fixed, `cargo check --all-targets` in `fuzz/` now clean — backed as far as a non-Linux host can show |
 | `Test vm (synthetic-jdk)` | yes | **not backed — reverted**, see below |
 
-The difftest one is worth its own note. It failed identically on `origin/dev`,
-and the stated reason for it having been advisory was wrong: the comment said
-the ledger might not reproduce off the Windows host that captured it, and it
-fails *on* Windows. The real cause was staleness — CratonVM's
-`ClassCastException` message was fixed from internal to source form
-(`java/lang/String` → `java.lang.String`) after the 2026-06-21 capture, so the
-recorded divergence had narrowed and the gate correctly flagged the change.
-Regenerating with the documented procedure makes it clean.
+Two of these are worth their own note, because in both cases the *stated reason*
+for the gate being advisory was wrong, and running it produced a better
+diagnosis than the comment did.
+
+**difftest.** It failed identically on `origin/dev`. The comment said the ledger
+might not reproduce off the Windows host that captured it — it fails *on*
+Windows. The real cause was staleness: CratonVM's `ClassCastException` message
+was fixed from internal to source form (`java/lang/String` →
+`java.lang.String`) after the 2026-06-21 capture, so the recorded divergence had
+narrowed and the gate correctly flagged the change. Regenerating with the
+documented procedure makes it clean.
+
+**fuzz.** "The standalone fuzz workspace and native-builtins feature set are not
+aligned" turned out to be two concrete things. `[patch.crates-io]` is not
+inherited by a standalone workspace, so the fuzz build resolved stock `rustls`
+instead of the vendored CBC copy that supplies the `KeyBlockShape::mac_key_len`
+`t27_tls_cbc.rs` needs, and `cratonvm-native-builtins` did not compile at all.
+And `legacy-synthetic-crypto` — which the fuzz crate enables for
+`fuzz_tls_record` — referenced `crate::crypto::crypto_impl` at five sites, a
+module that does not exist: a comment in `lib.rs` promised a `crypto.rs`
+re-export shim for exactly that back-compat, the shim was removed, and the
+comment and its callers were left behind. The feature had been unbuildable ever
+since. Both fixed.
 
 `Test vm (synthetic-jdk)` was made blocking on the assumption that the module's
 old failure set had been worked through. It has not:
