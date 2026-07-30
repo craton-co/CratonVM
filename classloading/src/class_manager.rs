@@ -6166,6 +6166,28 @@ impl ClassManager {
         }
     }
 
+    /// Retract paths previously added by [`Self::extend_application_classpath`].
+    ///
+    /// Backs `URLClassLoader.close()`: a closed loader must stop serving classes
+    /// and resources it has not already loaded. Classes already defined stay
+    /// defined — HotSpot's `close()` shuts the loader's `URLClassPath`, it does
+    /// not unload anything — so only the search roots go away.
+    ///
+    /// Returns the number of classpath entries actually removed; see
+    /// [`ClassPath::remove_path`] for why that can legitimately be zero.
+    pub fn retract_application_classpath(&mut self, paths: &[String]) -> usize {
+        let mut removed = 0;
+        for path in paths {
+            removed += self.application.remove_path(path);
+        }
+        if removed > 0 {
+            // A name that resolved only through a retracted root must now be
+            // re-resolved (and can legitimately come back absent).
+            self.synthetic_upgrade_absent.clear();
+        }
+        removed
+    }
+
     /// Append paths to the BOOTSTRAP class search path so the classes they
     /// contain are loaded by the bootstrap loader (`ClassLoaderId::Bootstrap`,
     /// i.e. a `null` `Class.getClassLoader()`). Drives
@@ -8196,6 +8218,25 @@ fn is_jdk_class(name: &str) -> bool {
 ///
 /// Most stubs have no fields. Special cases provide the fields that native
 /// implementations expect, so that `new` + `<init>` works correctly.
+/// How many INSTANCE fields a bytecode `new` of the synthesized class `name`
+/// produces.
+///
+/// The gate `t9c_synthetic_field_tables_cover_their_factories`
+/// (`vm/tests/tier1_tests.rs`) compares this against every literal
+/// `alloc_concurrent_synthetic(ctx, "name", n)` site in the tree. The two must
+/// agree, because a native written against the factory shape that writes past
+/// the end of a `new`-created object has its write SILENTLY DISCARDED by
+/// `set_field` â five separate bugs of exactly that shape were found in two
+/// days. Calling the real function rather than parsing its source is what makes
+/// the gate exact: the arms use several different construction styles, and no
+/// regex over them stays honest for long.
+pub fn synthetic_stub_instance_field_count(name: &str) -> usize {
+    synthetic_stub_fields(name)
+        .iter()
+        .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+        .count()
+}
+
 fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileField> {
     use cratonvm_reader::field::ClassFileField;
 
@@ -8219,6 +8260,37 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         }
+    }
+
+    /// Pad a hand-written field list out to `total` INSTANCE fields.
+    ///
+    /// The factory (`alloc_concurrent_synthetic(ctx, name, n)`) and bytecode
+    /// `new` must agree on how many slots an object of a synthesized class has:
+    /// `new` sizes it from THIS table, and a native written against the factory
+    /// shape that writes past the end has its write SILENTLY DISCARDED by
+    /// `set_field`. Five separate bugs of exactly that shape were found in two
+    /// days (`HttpExchange`, `HttpServer`, `sun/net/httpserver/HttpServerImpl`,
+    /// `DatagramSocket`, `DatagramPacket`/`Preferences`), which is why
+    /// `t9c_synthetic_field_tables_cover_their_factories` now enforces the
+    /// invariant for the whole table.
+    ///
+    /// Padding preserves the named slots and their indices exactly and appends
+    /// anonymous ones, so existing `set_field_by_name` and raw-index access both
+    /// keep working.
+    fn pad_to(mut fields: Vec<ClassFileField>, total: usize) -> Vec<ClassFileField> {
+        let existing = fields
+            .iter()
+            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+            .count();
+        for i in existing..total {
+            fields.push(ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc(&format!("_f{i}")),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
+                attributes: vec![],
+            });
+        }
+        fields
     }
 
     match name {
@@ -8469,18 +8541,18 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             attributes: vec![],
         }],
         "java/util/Collections$EmptyEnumeration" => vec![],
-        "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => instance_fields(3),
+        "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => instance_fields(5),
         // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields (data, size)
         "java/util/ArrayList"
         | "java/util/Vector"
         | "java/util/Stack"
-        | "java/util/concurrent/CopyOnWriteArrayList" => instance_fields(2),
+        | "java/util/concurrent/CopyOnWriteArrayList" => instance_fields(4),
         // HashMap/HashSet/ConcurrentHashMap = 3 fields (buckets, size, capacity)
         "java/util/HashMap"
         | "java/util/HashSet"
         | "java/util/EnumMap"
         | "java/util/Hashtable"
-        | "java/util/concurrent/ConcurrentHashMap" => instance_fields(3),
+        | "java/util/concurrent/ConcurrentHashMap" => instance_fields(16),
         // LinkedList = 3 fields (head, tail, size)
         "java/util/LinkedList" => instance_fields(3),
         // LinkedHashMap = 5 fields
@@ -8504,7 +8576,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/util/Optional"
         | "java/util/OptionalInt"
         | "java/util/OptionalLong"
-        | "java/util/OptionalDouble" => instance_fields(1),
+        | "java/util/OptionalDouble" => instance_fields(2),
         // Synthetic math fallbacks mirror the native-builtins layouts.
         "java/math/BigInteger" => instance_fields(2),
         "java/math/BigDecimal" => instance_fields(3),
@@ -8514,10 +8586,10 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/util/Spliterator"
         | "java/util/Spliterator$OfInt"
         | "java/util/Spliterator$OfLong"
-        | "java/util/Spliterator$OfDouble" => instance_fields(2),
+        | "java/util/Spliterator$OfDouble" => instance_fields(3),
         // ---- java.io field layouts ----
         "java/io/FileInputStream" | "java/io/FileOutputStream" => {
-            vec![named_field("fd", "Ljava/io/FileDescriptor;")]
+            pad_to(vec![named_field("fd", "Ljava/io/FileDescriptor;")], 4)
         }
         "java/io/FilterInputStream" => vec![named_field("in", "Ljava/io/InputStream;")],
         "java/io/FilterOutputStream" => vec![named_field("out", "Ljava/io/OutputStream;")],
@@ -8529,7 +8601,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             vec![named_field("out", "Ljava/io/OutputStream;")]
         }
         "java/io/BufferedWriter" => {
-            vec![named_field("out", "Ljava/io/Writer;")]
+            pad_to(vec![named_field("out", "Ljava/io/Writer;")], 3)
         }
         "java/io/DataInputStream" | "java/io/DataOutputStream" => instance_fields(1),
         "java/io/FileDescriptor" => instance_fields(4),
@@ -8643,7 +8715,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         | "java/nio/IntBuffer"
         | "java/nio/LongBuffer"
         | "java/nio/FloatBuffer"
-        | "java/nio/DoubleBuffer" => instance_fields(5),
+        | "java/nio/DoubleBuffer" => instance_fields(6),
         // Charset = 2 fields (name, aliases)
         "java/util/Locale" => {
             let static_locale = |n: &'static str| ClassFileField {
@@ -8654,14 +8726,15 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 descriptor: cratonvm_types::intern_arc("Ljava/util/Locale;"),
                 attributes: vec![],
             };
-            vec![
+            let fields = vec![
                 static_locale("ROOT"),
                 static_locale("ENGLISH"),
                 static_locale("US"),
                 static_locale("CANADA"),
-            ]
+            ];
+            pad_to(fields, 32)
         }
-        "java/nio/charset/Charset" => instance_fields(2),
+        "java/nio/charset/Charset" => instance_fields(3),
         "java/nio/charset/CharsetDecoder" => {
             let field = |n: &'static str, d: &'static str| ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
@@ -8783,12 +8856,12 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // UUID = 2 fields (msb, lsb)
         "java/util/UUID" => instance_fields(2),
         // Date = 1 field (millis since epoch). java.sql date/time subclasses inherit it.
-        "java/util/Date" => instance_fields(1),
+        "java/util/Date" => instance_fields(4),
         // Instant = 2 fields (epochSecond, nano). This matches the synthetic
         // java.time bridge in native-builtins/src/util_time.rs.
         "java/time/Instant" => instance_fields(2),
         // Properties = 4 fields
-        "java/util/Properties" => instance_fields(4),
+        "java/util/Properties" => instance_fields(16),
         // Formatter = 2 fields (output=0, locale=1)
         "java/util/Formatter" => instance_fields(2),
         // DecimalFormat = 4 fields (pattern=0, groupingUsed=1, maxFracDigits=2, minFracDigits=3)
@@ -8897,7 +8970,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             }]
         }
-        "java/lang/Thread$State" => vec![
+        "java/lang/Thread$State" => pad_to(vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC
                     | FieldAccessFlags::STATIC
@@ -8946,18 +9019,21 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
                 attributes: vec![],
             },
-        ],
+        ], 2),
         "java/security/Permission"
         | "java/security/BasicPermission"
         | "java/lang/RuntimePermission"
         | "java/util/PropertyPermission"
         | "java/util/logging/LoggingPermission" => {
-            vec![ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("name"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
-                attributes: vec![],
-            }]
+            pad_to(
+                vec![ClassFileField {
+                    access_flags: FieldAccessFlags::empty(),
+                    name: cratonvm_types::intern_arc("name"),
+                    descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
+                    attributes: vec![],
+                }],
+                2,
+            )
         }
 
         // Atomic types: 1 field (value=0)
@@ -9016,7 +9092,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // ScheduledFuture: 2 fields (result=0, done=1)
         "java/util/concurrent/ScheduledFuture" => instance_fields(2),
         // Future: 2 fields (result=0, done=1)
-        "java/util/concurrent/Future" => instance_fields(2),
+        "java/util/concurrent/Future" => instance_fields(4),
         // StampedLock: 4 fields
         "java/util/concurrent/locks/StampedLock" => instance_fields(4),
         // ConcurrentSkipListMap: 3 fields
@@ -9068,7 +9144,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         | "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure"
         | "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess" => instance_fields(8),
         // StructuredTaskScope$Subtask: 4 fields (state=0, result=1, exception=2, callable=3)
-        "java/util/concurrent/StructuredTaskScope$Subtask" => instance_fields(4),
+        "java/util/concurrent/StructuredTaskScope$Subtask" => instance_fields(5),
         // Joiner: 4 fields (policy=0, results=1, exception=2, completed=3)
         "java/util/concurrent/StructuredTaskScope$Joiner" => instance_fields(4),
         // Config: 3 fields (name=0, threadFactory=1, timeoutMs=2)
@@ -9141,7 +9217,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
-        "java/lang/reflect/Method" => vec![
+        "java/lang/reflect/Method" => pad_to(vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
                 name: cratonvm_types::intern_arc("override"),
@@ -9190,7 +9266,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 descriptor: cratonvm_types::intern_arc("B"),
                 attributes: vec![],
             },
-        ],
+        ], 12),
         "java/lang/reflect/Constructor" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
@@ -9393,6 +9469,16 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             ]
         }
 
+        // `Files.getOwner` on Windows returns one of these. Field NAMES (not
+        // just a count) matter: `nio_owner_principal` writes them with
+        // `set_field_by_name` so the same code works whether this carrier is
+        // synthesized here or loaded from java.base.
+        "sun/nio/fs/WindowsUserPrincipals$User" => vec![
+            named_field("sidString", "Ljava/lang/String;"),
+            named_field("sidType", "I"),
+            named_field("accountName", "Ljava/lang/String;"),
+        ],
+
         // ---- T19.5: sun.nio.ch.Net TCP cluster ----
         // Layouts shared with `native-io::net::register_sun_nio_ch_net`.
         // These classes don't have Java-side instance fields of interest to
@@ -9424,8 +9510,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "sun/nio/ch/SocketChannelImpl" => instance_fields(5),
         "sun/nio/ch/SelectorImpl" => instance_fields(5),
         "sun/nio/ch/SelectionKeyImpl" => instance_fields(5),
-        "java/nio/channels/ServerSocketChannel" => instance_fields(1),
-        "java/nio/channels/SocketChannel" => instance_fields(1),
+        "java/nio/channels/ServerSocketChannel" => instance_fields(5),
+        "java/nio/channels/SocketChannel" => instance_fields(5),
 
         // ---- T19.N1: java.security ProtectionDomain / CodeSource ----
         // Minimal-viable field layouts so `Class.getProtectionDomain0` can
@@ -11024,21 +11110,21 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         ],
         // OptionMap = 1 (entries_arc_handle).  Immutable-after-build; the
         // Long round-trips to `lookup_map(handle)` for every read.
-        "org/xnio/OptionMap" => vec![ClassFileField {
+        "org/xnio/OptionMap" => pad_to(vec![ClassFileField {
             access_flags: FieldAccessFlags::empty(),
             name: cratonvm_types::intern_arc("entriesHandle"),
             descriptor: cratonvm_types::intern_arc("J"),
             attributes: vec![],
-        }],
+        }], 2),
         // OptionMap$Builder = 1 (pending_entries handle).  Mutable until
         // `getMap()` flips `consumed` atomically; subsequent `set()` raises
         // IllegalStateException.
-        "org/xnio/OptionMap$Builder" => vec![ClassFileField {
+        "org/xnio/OptionMap$Builder" => pad_to(vec![ClassFileField {
             access_flags: FieldAccessFlags::empty(),
             name: cratonvm_types::intern_arc("pendingHandle"),
             descriptor: cratonvm_types::intern_arc("J"),
             attributes: vec![],
-        }],
+        }], 2),
         // IoFuture = 3 (status int snapshot, result_slot handle, notifier_list
         // mirror handle).  Real state (AtomicU8, Mutex<FutureState>, Condvar)
         // lives in the process-wide `futures` registry.  Transitions are
@@ -11400,6 +11486,14 @@ fn native_constant_surface_raw_slot_layout_audit() {
     // `alloc_concurrent_synthetic(..., n)` call sites reserve their own
     // capacity. Keep this manifest beside the fallback allocator so a short
     // layout cannot silently reappear while these native surfaces evolve.
+    //
+    // A hand-written manifest catches these eight and only these eight. The
+    // tree-wide form is `t9c_synthetic_field_tables_cover_their_factories`
+    // (`vm/tests/tier1_tests.rs`), which derives the minimum from every literal
+    // `alloc_concurrent_synthetic(ctx, "cls", n)` site rather than a list, and
+    // reads the declared width by CALLING this table. Adding a class here is
+    // still worth doing when its factory count is NOT a literal, which is the
+    // one case the tree-wide gate cannot see.
     for (class, minimum_slots) in [
         ("java/net/DatagramSocket", 4),
         ("java/net/DatagramPacket", 5),

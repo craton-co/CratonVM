@@ -1114,6 +1114,23 @@ pub trait NativeClassAccess {
     /// subsequent `ensure_class_initialized` and `find_resource` calls search them.
     fn register_dynamic_classpath(&mut self, paths: &[String]);
 
+    /// Retract paths previously passed to [`Self::register_dynamic_classpath`].
+    ///
+    /// The other half of `URLClassLoader.close()`: a closed loader must stop
+    /// serving classes and resources it has not already loaded. Classes already
+    /// defined stay defined, matching HotSpot — `close()` shuts the loader's
+    /// `URLClassPath`, it does not unload anything.
+    ///
+    /// Returns the number of classpath entries removed. A path handed to more
+    /// than one live loader is only retracted when the last of them releases it,
+    /// so `0` is a normal answer and not an error.
+    ///
+    /// The default is `0` ("this context cannot retract"), which is the
+    /// behaviour every caller had before the VM implementation existed.
+    fn unregister_dynamic_classpath(&mut self, _paths: &[String]) -> usize {
+        0
+    }
+
     /// Reset per-thread JMM blocked/waited counters when contention monitoring
     /// is enabled. Contexts without a live VM need no bookkeeping.
     fn reset_thread_jmx_contention_stats(&mut self) {}

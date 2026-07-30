@@ -21491,6 +21491,83 @@ fn refresh_stale_object_args(shared: &SharedVm, args: &mut [Value]) {
     }
 }
 
+/// Keeps interpreter invoke arguments live while the slow dispatcher resolves
+/// classes, checks bridges, and may re-enter Java before it builds the callee
+/// frame.
+///
+/// `execute_invoke_kind` pops its arguments into a Rust `Vec<Value>`. That Vec
+/// is not part of the Java root set. A moving collection during the relatively
+/// long slow-dispatch path therefore updates the object everywhere except in
+/// `args`; the later method lookup sees the zeroed from-space header and can
+/// mis-dispatch `Map.get` as `Object.get`. Pin each non-null object in the
+/// thread's collector-scanned native roots and copy the forwarded values back
+/// at every boundary where the dispatcher consumes the Vec again.
+///
+/// The guard uses a raw thread pointer solely so it does not hold a Rust borrow
+/// across the dispatcher. Its lifetime is lexical inside `execute_invoke_kind`,
+/// and Drop restores the exact pin watermark on every return/error path.
+struct InvokeArgsRootGuard {
+    thread: *mut JvmThread,
+    pin_base: usize,
+    object_count: usize,
+}
+
+impl InvokeArgsRootGuard {
+    fn new(thread: &mut JvmThread, args: &[Value]) -> Self {
+        let pin_base = thread.native_pin_roots.len();
+        for value in args {
+            if let Value::Object(Some(obj)) = value {
+                thread.native_pin_roots.push(*obj);
+            }
+        }
+        Self {
+            thread: thread as *mut JvmThread,
+            pin_base,
+            object_count: thread.native_pin_roots.len() - pin_base,
+        }
+    }
+
+    fn refresh(&self, args: &mut [Value]) {
+        // SAFETY: the guard is scoped to the active interpreter invocation;
+        // `thread` remains alive and exclusively owned by that invocation.
+        let thread = unsafe { &*self.thread };
+        let mut pin = self.pin_base;
+        for value in args {
+            if matches!(value, Value::Object(Some(_))) {
+                *value = Value::Object(Some(thread.native_pin_roots[pin]));
+                pin += 1;
+            }
+        }
+        debug_assert_eq!(pin, self.pin_base + self.object_count);
+    }
+
+    fn replace_object_arg(&self, args: &[Value], index: usize, obj: ObjectRef) {
+        let ordinal = args[..=index]
+            .iter()
+            .filter(|value| matches!(value, Value::Object(Some(_))))
+            .count()
+            .checked_sub(1)
+            .expect("replacement invoke argument must already be a non-null object");
+        // SAFETY: same lexical-lifetime argument as `refresh`; the computed
+        // slot belongs to this guard's contiguous pin range.
+        unsafe {
+            let thread = &mut *self.thread;
+            thread.native_pin_roots[self.pin_base + ordinal] = obj;
+        }
+    }
+}
+
+impl Drop for InvokeArgsRootGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `refresh`; nested native calls restore their own later
+        // watermarks before control returns here.
+        unsafe {
+            let thread = &mut *self.thread;
+            thread.native_pin_roots.truncate(self.pin_base);
+        }
+    }
+}
+
 /// Pop `invokevirtual` / `invokespecial` / `invokeinterface` arguments from
 /// the operand stack (slow-path order) and apply `coerce_invoke_arg_for_descriptor`
 /// so cached fast paths match `execute_invoke`.
@@ -22008,6 +22085,7 @@ fn execute_invoke_kind(
             *obj = shared.mem.heap.load_and_forward(*obj);
         }
     }
+    let args_root_guard = InvokeArgsRootGuard::new(thread, &args);
     if crate::runtime::env_cache::dbg_loader_trace()
         && method_class_name.contains("RootReference")
         && method_name.as_ref() == "tryUpdate"
@@ -22258,6 +22336,7 @@ fn execute_invoke_kind(
             None
         };
         if let Some(live) = recovered {
+            args_root_guard.replace_object_arg(&args, 0, live);
             args[0] = Value::Object(Some(live));
         }
     }
@@ -23611,6 +23690,9 @@ fn execute_invoke_kind(
             method_owner_name, method_name, method_descriptor, is_special, invoke_class, invoke_class_resolved, receiver_class_id, recv_loader, current_class_id, cur_loader, dispatch_override
         );
     }
+    // Class/interface resolution above may have triggered a moving collection
+    // while `args` lived only in its Rust Vec. Re-read the remapped pin slots.
+    args_root_guard.refresh(&mut args);
     // Try stackless frame push for bytecode methods (avoids Rust stack recursion)
     // For virtual/special calls, do NOT walk the native hierarchy — subclass
     // bytecode overrides must take priority over parent native overrides.
@@ -23627,6 +23709,7 @@ fn execute_invoke_kind(
         dispatch_override,
     )? {
         CachedCallResult::FramePushed => {
+            args_root_guard.refresh(&mut args);
             if is_special || private_virtual_target.is_some() {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
             } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
@@ -23644,6 +23727,7 @@ fn execute_invoke_kind(
             return Ok(CachedCallResult::FramePushed);
         }
         CachedCallResult::Handled => {
+            args_root_guard.refresh(&mut args);
             if is_special || private_virtual_target.is_some() {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
             } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
@@ -23661,6 +23745,7 @@ fn execute_invoke_kind(
             return Ok(CachedCallResult::Handled);
         }
         CachedCallResult::CacheMiss => {
+            args_root_guard.refresh(&mut args);
             // Exotic case — fall through to recursive dispatch
         }
     }
@@ -36809,11 +36894,16 @@ fn jit_invoke_targets_native_shadow(
     if jit_native_shadow_is_final_wrapper_unbox(&target_class, &method_name, &descriptor) {
         return false;
     }
-    let direct = shared
-        .natives
-        .native_methods
-        .find(&target_class, &method_name, &descriptor)
-        .is_some();
+    // A compiled direct call bypasses the interpreter's native-vs-bytecode
+    // decision. Treat forced real-JDK overrides exactly like registered
+    // native shadows, so a caller of Class's Signature bridge cannot enter
+    // the incompatible JDK bytecode body.
+    let direct = force_native_over_real_jdk_bytecode(&target_class, &method_name, &descriptor)
+        || shared
+            .natives
+            .native_methods
+            .find(&target_class, &method_name, &descriptor)
+            .is_some();
     let inherited = declaring_class.as_ref().is_some_and(|declaring_class| {
         shared
             .natives
@@ -36875,6 +36965,66 @@ fn jit_method_calls_native_shadowed(
         };
         if let Some(cp_idx) = jit_native_shadow_dynamic_invoke_index(&instruction) {
             if jit_invoke_targets_native_shadow(shared, caller_class_id, cp_idx) {
+                return true;
+            }
+        }
+        if next_pc <= pc || next_pc > scan_len {
+            return true;
+        }
+        pc = next_pc;
+    }
+    false
+}
+
+/// Detect forced `Class` generic-metadata bridges in a prospective compiled
+/// caller. They must continue through interpreter dispatch, which chooses the
+/// Signature-attribute native implementation over the real-JDK bytecode.
+fn jit_method_calls_forced_class_generic_metadata(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    code: &[u8],
+    code_len: usize,
+) -> bool {
+    let scan_len = code_len.min(code.len());
+    let scan_code = &code[..scan_len];
+    let mut pc = 0;
+    while pc < scan_len {
+        let (instruction, next_pc) = match Instruction::decode(scan_code, pc) {
+            Ok(decoded) => decoded,
+            Err(_) => return true,
+        };
+        if let Some(cp_idx) = jit_native_shadow_dynamic_invoke_index(&instruction) {
+            let is_forced_generic_metadata = {
+                let cm = shared.classes.class_manager.read();
+                let Some(caller) = cm.get_class(caller_class_id) else {
+                    return true;
+                };
+                let cp = &caller.constant_pool;
+                let (class_index, nat_index) = match cp.get(cp_idx) {
+                    Some(ConstantPoolEntry::MethodReference {
+                        class_index,
+                        name_and_type_index,
+                    })
+                    | Some(ConstantPoolEntry::InterfaceMethodReference {
+                        class_index,
+                        name_and_type_index,
+                    }) => (*class_index, *name_and_type_index),
+                    _ => return true,
+                };
+                matches!(
+                    (cp.get_class_name(class_index), cp.get_name_and_type(nat_index)),
+                    (
+                        Some("java/lang/Class"),
+                        Some((
+                            "getTypeParameters",
+                            "()[Ljava/lang/reflect/TypeVariable;"
+                        ))
+                            | Some(("getGenericInterfaces", "()[Ljava/lang/reflect/Type;"))
+                            | Some(("getGenericSuperclass", "()Ljava/lang/reflect/Type;"))
+                    )
+                )
+            };
+            if is_forced_generic_metadata {
                 return true;
             }
         }
@@ -38511,6 +38661,15 @@ fn try_jit_compile_callee_slow(
     }
 
     let code_attr = method.code()?;
+    if jit_method_calls_forced_class_generic_metadata(
+        shared,
+        callee_class_id,
+        &code_attr.code,
+        code_attr.code.len(),
+    ) {
+        crate::jit::mark_jit_bail_listed(class_name, method_name, descriptor);
+        return None;
+    }
     // jit-invokestatic-clinit-gap fix (2026-07-17): third occurrence of the
     // same gap as the `callee_compiler` (compile-time direct_calls) and
     // `resolve_inline_site` (inlining) closures above -- this is the
@@ -43019,12 +43178,32 @@ fn execute_invokevirtual_cached(
                             &cached.method_descriptor,
                         )
                         .is_some();
+                    // `cached.class_name` is the call site's symbolic owner;
+                    // for an interface call it need not be the concrete
+                    // receiver that this monomorphic cache just validated.
+                    // Consult the receiver ClassId for the java.util virtual
+                    // tier-up exclusion so subtypes reached through List/Map
+                    // or Iterator are covered as well.
+                    let receiver_is_java_util = {
+                        let cm = shared.classes.class_manager.read();
+                        cm.get_class(receiver_class_id)
+                            .is_some_and(|class| class.name.starts_with("java/util/"))
+                    };
                     if !is_special
                         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
                         && !cached.is_synchronized
                         && !has_registered_native
                         && !crate::classloading::any_class_redefined()
                         && !crate::runtime::env_cache::disable_jit()
+                        // The generic-conversion regression reaches a hot
+                        // java.util graph while Spring creates annotation and
+                        // conversion metadata. Its instance-method tier-ups
+                        // are independently JIT-safe at direct/static sites,
+                        // but this cached virtual route can publish a stale
+                        // receiver-specific entry and then spin. Keep only
+                        // this virtual promotion out of java.util; static
+                        // compilation and ordinary direct dispatch remain on.
+                        && !receiver_is_java_util
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
                         // Fast path: already compiled (by this counter or OSR)?
@@ -45833,6 +46012,49 @@ mod wave1_adoption_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invoke_args_root_guard_refreshes_forwarded_pins_and_restores_watermark() {
+        // The guard never dereferences these values; aligned sentinel addresses
+        // are sufficient to model a collector rewriting native pin slots.
+        let obj = |addr: usize| unsafe { ObjectRef::from_raw(addr as *mut u8) };
+        let existing = obj(0x1000);
+        let old_a = obj(0x2000);
+        let old_b = obj(0x3000);
+        let new_a = obj(0x4000);
+        let new_b = obj(0x5000);
+
+        let mut thread = JvmThread::default();
+        thread.native_pin_roots.push(existing);
+        let mut args = [
+            Value::Object(Some(old_a)),
+            Value::Int(7),
+            Value::Object(None),
+            Value::Object(Some(old_b)),
+        ];
+
+        {
+            let guard = InvokeArgsRootGuard::new(&mut thread, &args);
+            assert_eq!(thread.native_pin_roots, vec![existing, old_a, old_b]);
+
+            // Model a moving collector's in-place root rewrite.
+            thread.native_pin_roots[1] = new_a;
+            thread.native_pin_roots[2] = new_b;
+            guard.refresh(&mut args);
+
+            assert!(matches!(args[0], Value::Object(Some(o)) if o == new_a));
+            assert!(matches!(args[1], Value::Int(7)));
+            assert!(matches!(args[2], Value::Object(None)));
+            assert!(matches!(args[3], Value::Object(Some(o)) if o == new_b));
+
+            let replacement = obj(0x6000);
+            guard.replace_object_arg(&args, 0, replacement);
+            guard.refresh(&mut args);
+            assert!(matches!(args[0], Value::Object(Some(o)) if o == replacement));
+        }
+
+        assert_eq!(thread.native_pin_roots, vec![existing]);
+    }
 
     #[test]
     fn class_array_reflection_uses_class_id_backed_natives() {

@@ -9188,7 +9188,8 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(a))) => *a,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let len = ctx.array_length(arr);
+            let arr_pin = ctx.pin_native_root(arr);
+            let len = ctx.array_length(ctx.read_native_pin(arr_pin, arr));
             let trace = crate::nbflags().trace_arrays_hashcode;
             if trace {
                 let mut desc = String::new();
@@ -9196,6 +9197,7 @@ pub fn register_essential_natives_with_shims(
                     if i > 0 {
                         desc.push_str(", ");
                     }
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     match ctx.get_array_element(arr, i) {
                         Value::Object(None) => desc.push_str("null"),
                         Value::Object(Some(o)) => {
@@ -9275,6 +9277,7 @@ pub fn register_essential_natives_with_shims(
             }
             let mut hash = 1i32;
             for i in 0..len {
+                let arr = ctx.read_native_pin(arr_pin, arr);
                 let elem_hash = match ctx.get_array_element(arr, i) {
                     Value::Object(None) => 0,
                     Value::Object(Some(o)) => match ctx.invoke_virtual(o, "hashCode", "()I", &[]) {
@@ -9285,6 +9288,7 @@ pub fn register_essential_natives_with_shims(
                 };
                 hash = hash.wrapping_mul(31).wrapping_add(elem_hash);
             }
+            ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Int(hash)))
         },
     );
@@ -17943,6 +17947,15 @@ pub fn register_essential_natives_with_shims(
 
     // Real-JDK JDBC metadata and StackFrame descriptor consumers are not part
     // of the synthetic phase overlay; register their compatible bridges here.
+    //
+    // `register_p68_jdbc` no longer carries `java/sql/DriverManager` (see
+    // `register_p68_jdbc_driver_manager`): that one IS a concrete class, so a
+    // native on it intercepts, and putting it here made
+    // `DriverManager.getConnection(url)` hand back a rusqlite connection for
+    // every URL — shadowing whatever driver the application registered. The
+    // rest of the surface is registered on `java/sql/*` INTERFACES, which do
+    // not intercept an implementation class, so it reaches only CratonVM's own
+    // synthetic carriers and is what makes `ResultSetMetaData` answer for them.
     crate::phases_late::jdbc::register_p68_jdbc(registry);
     crate::phases_late::reflect_invoke::register_real_jdk_stackwalker_frame_method_type(registry);
     crate::phases_late::charset_buffers::register_real_jdk_charset_contains(registry);
@@ -32145,6 +32158,41 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         native_charset_name,
     );
     registry.register(cs, "aliases", "()Ljava/util/Set;", native_charset_aliases);
+    // `contains(Charset)` is ABSTRACT on `java.nio.charset.Charset`; each
+    // concrete `sun.nio.cs.*` answers for itself. CratonVM's `Charset.forName`
+    // (`native_charset_for_name`, just above) hands back an instance of the
+    // ABSTRACT class, so an `invokevirtual contains` resolved to the abstract
+    // declaration and threw `AbstractMethodError` for every charset in real-JDK
+    // mode — including `StandardCharsets.UTF_8.contains(US_ASCII)`, which
+    // `String.getBytes`-style fast paths and Tomcat's `CharsetUtil` both ask.
+    // Same shape as the CharBuffer abstract-method overrides further down, and
+    // it shares the per-family answer table with the synthetic-jdk registrar
+    // (`phases_late::charset_buffers::charset_contains`) so the two builds
+    // cannot drift.
+    registry.register(
+        cs,
+        "contains",
+        "(Ljava/nio/charset/Charset;)Z",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let Some(Value::Object(Some(other))) = args.get(1).copied() else {
+                // The concrete `sun.nio.cs` bodies are `instanceof` chains, so a
+                // null argument NPEs there too.
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("Charset.contains: null charset".to_string()),
+                }
+                .into());
+            };
+            let a = crate::phases_late::charset_buffers::charset_name_field(ctx, this);
+            let b = crate::phases_late::charset_buffers::charset_name_field(ctx, other);
+            Ok(Some(Value::Int(i32::from(
+                crate::phases_late::charset_buffers::charset_contains(&a, &b),
+            ))))
+        },
+    );
     registry.register(cs, "toString", "()Ljava/lang/String;", native_charset_name);
     registry.register(cs, "equals", "(Ljava/lang/Object;)Z", native_charset_equals);
     registry.register(cs, "hashCode", "()I", native_charset_hash_code);
@@ -33841,6 +33889,110 @@ fn async_worker_pool(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
     }
     *guard = Some((key, pool));
     Some(pool)
+}
+
+/// The async worker pool IF one has already been created — never creates it.
+///
+/// `ForkJoinPool.awaitQuiescence` must not bring a pool into existence just to
+/// observe that it is idle; "no pool" means "nothing was ever submitted", which
+/// is quiescent by definition.
+fn async_worker_pool_existing(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let (key, cached) = (*ASYNC_POOL.lock().unwrap_or_else(|e| e.into_inner()))?;
+    Some(ctx.read_var_handle_root(key).unwrap_or(cached))
+}
+
+/// `ForkJoinPool.awaitQuiescence(long, TimeUnit)`.
+///
+/// IMPLEMENTED (was an unconditional `true`, i.e. a claim that could be false).
+/// `fork`/`invoke`/`submit`/`join` all run inline on the caller, but
+/// `execute(Runnable)` hands the task to a real worker thread through
+/// `spawn_runnable_on_real_thread`, so work genuinely can be outstanding here.
+///
+/// This is registered from `native-builtins` rather than from
+/// `native-collections` (where the old constant lived) for one reason: the pool
+/// to observe is THIS crate's `ASYNC_POOL`, and `native-collections` cannot see
+/// it — the dependency runs the other way. `vm_init` installs this after
+/// `register_concurrent_natives`, so it is the registration that wins.
+///
+/// Quiescent means the executor has no active worker and an empty queue. On
+/// timeout the answer is `false`, which is what the method is specified to
+/// return — and is only reachable now that it can also be true for a reason.
+fn native_forkjoin_await_quiescence(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (this, timeout, unit) — `timeout` is a long, so read the first Long.
+    let timeout = args
+        .iter()
+        .find_map(|v| match v {
+            Value::Long(t) => Some(*t),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let unit_nanos = match args.iter().rev().find_map(|v| match v {
+        Value::Object(Some(o)) => Some(*o),
+        _ => None,
+    }) {
+        Some(unit) => match ctx.invoke_virtual(unit, "toNanos", "(J)J", &[Value::Long(1)]) {
+            Ok(Some(Value::Long(n))) if n > 0 => n,
+            // An unreadable TimeUnit: treat the timeout as nanoseconds rather
+            // than silently collapsing it to zero.
+            _ => 1,
+        },
+        None => 1,
+    };
+    let budget = std::time::Duration::from_nanos(
+        (timeout.max(0) as u128).saturating_mul(unit_nanos.max(1) as u128) as u64,
+    );
+    let start = std::time::Instant::now();
+    loop {
+        let Some(pool) = async_worker_pool_existing(ctx) else {
+            // Nothing was ever handed to a worker thread.
+            return Ok(Some(Value::Int(1)));
+        };
+        let active = match ctx.invoke_virtual(pool, "getActiveCount", "()I", &[]) {
+            Ok(Some(Value::Int(n))) => n,
+            // Cannot observe the pool — fall back to the historical answer
+            // rather than reporting a timeout callers would spin on.
+            _ => return Ok(Some(Value::Int(1))),
+        };
+        let queued = match ctx.invoke_virtual(
+            pool,
+            "getQueue",
+            "()Ljava/util/concurrent/BlockingQueue;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(q)))) => match ctx.invoke_virtual(q, "size", "()I", &[]) {
+                Ok(Some(Value::Int(n))) => n,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        if active <= 0 && queued <= 0 {
+            return Ok(Some(Value::Int(1)));
+        }
+        if start.elapsed() >= budget {
+            return Ok(Some(Value::Int(0)));
+        }
+        // Poll rather than wait on a condition: the executor exposes no
+        // quiescence signal, and the caller has already told us how long it is
+        // willing to wait.
+        ctx.begin_blocking_region();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        ctx.end_blocking_region();
+    }
+}
+
+/// Install the real `ForkJoinPool.awaitQuiescence`, overriding the constant
+/// `native-collections` registers. Must be called AFTER
+/// `register_concurrent_natives` — registration is last-write-wins.
+pub fn register_forkjoin_quiescence(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "java/util/concurrent/ForkJoinPool",
+        "awaitQuiescence",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        native_forkjoin_await_quiescence,
+    );
 }
 
 /// Interrupt every worker thread of a (possibly delegate-wrapped) REAL
@@ -37412,19 +37564,18 @@ fn register_java_lang_extras_natives(registry: &mut NativeMethodRegistry) {
     // No registration needed
 
     // --- StackWalker (stub) ---
-    let sw = "java/lang/StackWalker";
-    registry.register(
-        sw,
-        "getInstance",
-        "()Ljava/lang/StackWalker;",
-        native_stack_walker_get,
-    );
-    registry.register(
-        sw,
-        "getInstance",
-        "(Ljava/lang/StackWalker$Option;)Ljava/lang/StackWalker;",
-        native_stack_walker_get,
-    );
+    // DELETED: a duplicate `StackWalker.getInstance` pair used to live here,
+    // handled by `native_stack_walker_get`, which allocated the walker and wrote
+    // NONE of its fields — no `options`, no `retainClassRef`. This function is
+    // reached only from `register_synthetic_overrides`, which runs AFTER
+    // `register_stack_walker_boot`, so in `--synthetic-jdk` builds the empty
+    // version SHADOWED the real one (`stack_walker::alloc_walker`, which
+    // resolves and writes all three fields) and every walker came back with its
+    // options lost — including `RETAIN_CLASS_REFERENCE`, which
+    // `getCallerClass()` and `StackFrame.getDeclaringClass()` gate on. The
+    // real-JDK build was unaffected because this registrar never runs there.
+    // Same last-registration-wins hazard as the `java.net.http` carriers; one
+    // owner per class.
 
     // --- Thread extras (only methods NOT already registered) ---
     // T1.6.7 — duplicate registration kept in sync with line ~430.
@@ -37621,11 +37772,6 @@ fn native_number_double_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Value::Double(v) => Ok(Some(Value::Double(v))),
         _ => Ok(Some(Value::Double(0.0))),
     }
-}
-
-fn native_stack_walker_get(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", 0);
-    Ok(Some(Value::Object(Some(obj))))
 }
 
 // ===========================================================================
