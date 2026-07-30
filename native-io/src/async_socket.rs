@@ -39,6 +39,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 use parking_lot::{Condvar, Mutex, RwLock};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -2025,6 +2026,103 @@ fn aio_clone_backing_stream(
     }
 }
 
+thread_local! {
+    /// Depth of the inline read-completion chain on this thread (see
+    /// [`try_deliver_ready_read`]). A `CompletionHandler` normally arms the
+    /// next read from inside `completed()`, so delivering inline would
+    /// otherwise recurse for as long as the peer keeps the socket readable and
+    /// grow the Java stack without bound.
+    static INLINE_READY_READ_DEPTH: Cell<u8> = const { Cell::new(0) };
+}
+
+/// How many reads one thread may complete inline before falling back to the
+/// worker pool. Two is enough to collapse the handoff for the "handler arms the
+/// next read and the next frame is already buffered" case that
+/// `TestAsyncMessagesPerformance` measures, while keeping the recursion bounded.
+const INLINE_READY_READ_MAX_DEPTH: u8 = 2;
+
+/// Complete a handler-form read on the calling thread when the socket is
+/// already readable, instead of handing it to a worker.
+///
+/// The normal path costs two thread handoffs per read — the calling thread
+/// queues a `Job::ReadFd`, a pool worker wakes and blocks in `recv`, then the
+/// dispatcher wakes to run the Java `CompletionHandler`. For a WebSocket
+/// conversation on loopback the bytes are usually already in the kernel receive
+/// buffer by the time the handler arms its next read, so both wakes are pure
+/// latency. `TestAsyncMessagesPerformance` asserts that consecutive chunks of
+/// one message arrive < 0.5 ms apart and measured 0.6-1.1 ms
+/// (known-issue tomcat/32.3).
+///
+/// Delivering a completion on the initiating thread is explicitly permitted by
+/// `AsynchronousChannelGroup` ("the completion handler may be invoked directly
+/// by the initiating thread" when the operation completes immediately), and
+/// Tomcat's `Nio2Endpoint` already handles it via its inline-completion guard.
+///
+/// Only taken when `FIONREAD` proves the read cannot block; a `WouldBlock`
+/// raced in anyway simply returns `false` and the caller queues the job as
+/// before. Returns `true` only when the completion has actually been delivered.
+fn try_deliver_ready_read(
+    ctx: &mut dyn NativeContext,
+    stream: &mut TcpStream,
+    length: usize,
+    handler: ObjectRef,
+    attachment: Option<ObjectRef>,
+    buffer: ObjectRef,
+) -> bool {
+    if length == 0 {
+        return false;
+    }
+    let available = crate::net::socket_available_stream(stream)
+        .unwrap_or(0)
+        .max(0) as usize;
+    if available == 0 {
+        return false;
+    }
+    let entered = INLINE_READY_READ_DEPTH.with(|depth| {
+        if depth.get() >= INLINE_READY_READ_MAX_DEPTH {
+            false
+        } else {
+            depth.set(depth.get() + 1);
+            true
+        }
+    });
+    if !entered {
+        return false;
+    }
+
+    // FIONREAD reported at least one byte immediately above, and an
+    // `AsynchronousSocketChannel` permits only one outstanding read at a time,
+    // so no other consumer can drain the socket between the two calls.
+    let mut bytes = vec![0u8; available.min(length)];
+    let outcome = match stream.read(&mut bytes) {
+        Ok(n) if n > 0 => {
+            bytes.truncate(n);
+            Some(ReadOutcome::Bytes(bytes))
+        }
+        Ok(_) => Some(ReadOutcome::Eof),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => None,
+        Err(e) => Some(ReadOutcome::Error(format!("read failed: {e}"))),
+    };
+    let delivered = outcome.is_some();
+    if let Some(outcome) = outcome {
+        // `deliver_read_completion` releases these roots itself.
+        let handler_gref = ctx.add_global_root(handler);
+        let attachment_gref = attachment.map(|a| ctx.add_global_root(a)).unwrap_or(0);
+        let buffer_gref = ctx.add_global_root(buffer);
+        deliver_read_completion(
+            ctx,
+            ReadCompletion {
+                handler_gref,
+                attachment_gref,
+                buffer_gref,
+                outcome,
+            },
+        );
+    }
+    INLINE_READY_READ_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    delivered
+}
+
 /// Future-form `AsynchronousSocketChannel.read(ByteBuffer)`. Unlike the old
 /// Phase-67 registration, this returns before the blocking recv runs, and its
 /// `Future.get(timeout, unit)` therefore owns the timeout contract.
@@ -2209,7 +2307,7 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 
     // Independent read handle either way, so the blocking read does not
     // contend with the application's concurrent writes on the same socket.
-    let stream = match aio_clone_backing_stream(ctx, slot2) {
+    let mut stream = match aio_clone_backing_stream(ctx, slot2) {
         Ok(s) => s,
         Err(e) => {
             post_immediate(ctx, ReadOutcome::Error(format!("read: {e}")));
@@ -2219,6 +2317,11 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     // Honour the timed overload's deadline on the worker's private handle.
     if let Some(d) = read_timeout {
         let _ = stream.set_read_timeout(Some(d));
+    }
+
+    // Already-buffered bytes complete without ever reaching the pool.
+    if try_deliver_ready_read(ctx, &mut stream, length as usize, handler, attachment, bb) {
+        return Ok(Some(Value::Object(None)));
     }
 
     let handler_gref = ctx.add_global_root(handler);

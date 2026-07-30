@@ -3145,6 +3145,15 @@ pub fn set_global_shared_vm_for_hooks(weak: Weak<SharedVm>) {
 /// auto-evicts the per-thread invoke caches via the generation counter;
 /// this closes the loop for the slower symbolic-reference cache.
 fn resolution_invalidate_adapter(class_id: u32) {
+    // Both callers of this hook — `redefine_class` and the synthetic-stub ->
+    // real-bytecode upgrade — can shift instance-field slot indices under an
+    // UNCHANGED `ClassId`. The stub upgrade genuinely does: it overwrites
+    // `Class::fields` / `first_field_index` / `num_total_fields` in place.
+    // Retire every thread's memoised `(ClassId, field name) -> slot` first, and
+    // unconditionally: unlike the caches below, that memo is process-global
+    // rather than owned by a `SharedVm`, so it must be invalidated even when
+    // the VM handle is not wired up yet.
+    crate::vm::vm_exec::bump_field_layout_epoch();
     let weak = match RESOLUTION_INVALIDATE_VM.get() {
         Some(w) => w,
         None => return, // hook fired before VM init wired the handle
