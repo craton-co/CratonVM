@@ -31407,6 +31407,27 @@ pub fn compile_with_param_slots(
     } else {
         Vec::new()
     };
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+        && !(bulk_zero_byte_fill_loops.is_empty()
+            && bulk_set_byte_stride_loops.is_empty()
+            && byte_sieve_loops.is_empty())
+    {
+        eprintln!(
+            "[JIT_GEN] bulk-byte headers: zero-fill={:?} set-stride={:?} sieve={:?}",
+            bulk_zero_byte_fill_loops
+                .iter()
+                .map(|f| f.header_pc)
+                .collect::<Vec<_>>(),
+            bulk_set_byte_stride_loops
+                .iter()
+                .map(|f| f.header_pc)
+                .collect::<Vec<_>>(),
+            byte_sieve_loops
+                .iter()
+                .map(|s| s.header_pc)
+                .collect::<Vec<_>>(),
+        );
+    }
 
     // Loop unrolling: detect small loops suitable for unrolling
     // PGO: use profiled trip counts to guide unroll factor when available.
