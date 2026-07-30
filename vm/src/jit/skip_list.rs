@@ -1876,22 +1876,25 @@ fn should_skip_jit_internal(
         // regression witness for the currently-tested (BigInteger-still-
         // banned) configuration only.
 
-        // HIB-BYTEBUDDY -- FULLY REMOVED 2026-07-29. The initial 2026-07-28
+        // HIB-BYTEBUDDY -- REMOVED FOR GOOD 2026-07-30. The initial 2026-07-28
         // removal used only a 15-class Hibernate sample. A later no-ban run
         // from the older 77389fa06 runtime crashed in 302 classes; its exact
         // witness was an instruction-fetch fault in the middle of
         // `ModifierReviewable$AbstractBase.matchesMask`.
         //
-        // That signature was not a ByteBuddy-specific miscompile. The runtime
-        // predated the JIT code-ownership fixes that stop tier-up publication
-        // from unmapping a body while another thread is still executing it
-        // (3fe14734a, ac300e6f6, and 463bd32e2). Current dev, with no
+        // An instruction-fetch fault at a valid mid-body address is not the
+        // shape a bytecode miscompile takes -- a miscompile yields a wrong
+        // value or a data fault. It is the signature of a compiled body being
+        // unmapped while a live frame still executes it, and that runtime
+        // predated the three JIT code-lifetime fixes now on dev (3fe14734a,
+        // ac300e6f6, 463bd32e2). ByteBuddy is merely the most JIT-churn-heavy
+        // code in the suite -- it retires and republishes artifacts constantly
+        // -- so it is where that defect surfaced first, and the 2026-07-29 ban
+        // re-instatement hid it rather than fixing it. Current dev, with no
         // `net/bytebuddy/` guard, passes the exact 302-class crash manifest in
-        // both JIT and --nojit modes: 1281 found, 1275 started/ok, 0 failed,
-        // 0 aborted, and the same 6 fixture-declared skips in each mode.
-        // Full root-cause and marker accounting:
+        // both JIT and --nojit modes. Full root-cause and marker accounting:
         // `docs/internal/fixed-suite-bugs/hibernate/`
-        // `hib-bytebuddy-reinstated-20260729-FIXED.md`.
+        // `hib-bytebuddy-20260730-FIXED.md`.
         // TEST-HARNESS BLANKET BANS -- REMOVED 2026-07-27. Four blanket
         // package bans lived here together:
         //

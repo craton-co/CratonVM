@@ -1,14 +1,16 @@
-# HIB-BYTEBUDDY (`net/bytebuddy/`) — REMOVED AND FULLY VERIFIED 2026-07-29
+# HIB-BYTEBUDDY (`net/bytebuddy/`) — 2026-07-28 removal rationale (HISTORY ONLY)
 
-**Final status:** the blanket guard remains absent and Byte Buddy is JIT-eligible. The first
-15-class verification was too narrow, but the later 302-crash corpus came from an older runtime
-that could unmap a JIT body while a live frame still executed it. Current `dev` includes the JIT
-code-ownership fixes and passes that exact 302-class manifest in both JIT and `--nojit`, with
-1,275/1,275 started tests passing per mode and zero failures or aborts. See
-`docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-reinstated-20260729-FIXED.md` for the
-root-cause trace and complete marker accounting.
+**SUPERSEDED — do not act on this document.** The topic is closed; the
+authoritative write-up is [`hib-bytebuddy-20260730-FIXED.md`](hib-bytebuddy-20260730-FIXED.md),
+which carries the real root cause (a JIT code-lifetime defect on an older
+runtime, not a Byte Buddy miscompile), the corrected account of the `--nojit`
+HQL residual, and the final validation.
 
-Everything below this line is the original 2026-07-28 removal rationale, kept for history.
+This file is retained only for what it documents about the *original* ban: which
+call chain it covered, the 2026-06-13 symptom, and the (too narrow) 15-class
+sample that motivated the first removal.
+
+Everything below this line is the original 2026-07-28 text.
 
 **Status:** removed (deleted, not commented out), re-verified with a real Hibernate ORM 8.0
 fixture. `net/bytebuddy/` in `vm/src/jit/skip_list.rs` is JIT-eligible.

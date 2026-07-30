@@ -1,12 +1,15 @@
 # Hibernate ORM suite — open known issues
 
-## Resolved (2026-07-29)
+## Resolved (2026-07-30) — retired to `docs/internal/fixed-suite-bugs/hibernate/`
 
-- **HIB-BYTEBUDDY ban fully lifted** — the 302-class crash spike was captured on an older
-  runtime that predated the JIT code-lifetime fixes; reinstating `net/bytebuddy/` only hid that
-  stale-code fault. Current `dev`, with no blanket guard, passes the exact 302-class manifest in
-  both JIT and `--nojit`: 1,275/1,275 started tests pass per mode, with zero failures or aborts.
-  See `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-reinstated-20260729-FIXED.md`.
+- **HIB-BYTEBUDDY ban removed for good.** The 302-class crash spike was an older runtime
+  unmapping a compiled body while a live frame still executed it — an instruction-fetch fault
+  mid-`ModifierReviewable$AbstractBase.matchesMask`, not a Byte Buddy miscompile. Byte Buddy is
+  just the most JIT-churn-heavy code in the suite, so it is where that defect surfaced first, and
+  re-instating the ban hid it. With the three JIT code-lifetime fixes on `dev` and no blanket
+  guard, the exact 302-class manifest passes in both JIT and `--nojit`; a `skip_list` unit test
+  now fails the build if a blanket `net/bytebuddy/` guard is ever re-added.
+  Full write-up: `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`.
 
 ## Open
 

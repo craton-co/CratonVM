@@ -637,14 +637,21 @@ fn native_antlr_array_prediction_context_init_singleton(
 
     let base_pin = ctx.pin_native_root(this);
     let _singleton_pin = ctx.pin_native_root(singleton);
-    if let Some(parent) = parent {
-        ctx.pin_native_root(parent);
-    }
+    // The parent's pin HANDLE has to be kept: pinning alone does not rewrite
+    // the Rust local, so `parent` must be re-read through its own handle after
+    // the two allocations below. Discarding the handle here stored the
+    // pre-move address as the array's parent link, and the closure walk then
+    // followed a dead PredictionContext.
+    let parent_pin = parent.map(|p| ctx.pin_native_root(p));
     let parents_arr = ctx.new_ref_array(pc_class, 1);
     let parents_pin = ctx.pin_native_root(parents_arr);
     let states_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, 1);
     let this = ctx.read_native_pin(base_pin, this);
     let parents_arr = ctx.read_native_pin(parents_pin, parents_arr);
+    let parent = match (parent, parent_pin) {
+        (Some(p), Some(pin)) => Some(ctx.read_native_pin(pin, p)),
+        _ => parent,
+    };
 
     ctx.set_array_element(parents_arr, 0, Value::Object(parent));
     ctx.set_array_element(states_arr, 0, Value::Int(return_state));
@@ -858,11 +865,29 @@ fn antlr_create_parent_array(
     names: AntlrClassNames,
     parents: &[Option<ObjectRef>],
 ) -> Result<ObjectRef, MethodCallFailed> {
+    // GC-SAFETY: `parents` are bare Rust locals captured by the caller, and
+    // both `antlr_pc_class_id` (which can run `PredictionContext`'s `<clinit>`)
+    // and `new_ref_array` can collect. Storing the pre-move addresses linked
+    // dead parents into the context graph, which the closure walk then followed.
+    let pins: Vec<Option<usize>> = parents
+        .iter()
+        .map(|parent| parent.map(|p| ctx.pin_native_root(p)))
+        .collect();
+    let base = pins.iter().flatten().min().copied();
     let pc_class = antlr_pc_class_id(ctx, names)?;
     let arr = ctx.new_ref_array(pc_class, parents.len());
-    for (i, parent) in parents.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Object(*parent));
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, (parent, pin)) in parents.iter().zip(pins.iter()).enumerate() {
+        let current = match (parent, pin) {
+            (Some(p), Some(pin)) => Some(ctx.read_native_pin(*pin, *p)),
+            _ => *parent,
+        };
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.set_array_element(arr, i, Value::Object(current));
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    // `unpin_native_roots` truncates, so release the lowest base we took.
+    ctx.unpin_native_roots(base.unwrap_or(arr_pin));
     Ok(arr)
 }
 
@@ -2261,6 +2286,23 @@ fn antlr_alloc_atn_config(
         config_class,
         ctx.class_num_total_fields(config_class).max(5),
     );
+    // GC-SAFETY: `native_antlr_atn_config_init` below is not allocation-free.
+    // Its `ATNConfig(ATNState,int,PredictionContext)` arm calls
+    // `antlr_semantic_empty_instance`, which runs `SemanticContext$Empty`'s
+    // `<clinit>` on first use; other arms resolve classes the same way. A
+    // moving young collection there relocates the config we just allocated,
+    // and returning the pre-move address handed the ATN simulator a config
+    // whose fields read as unrelated live objects.
+    //
+    // The damage is not confined to the one prediction that hit it: a wrong
+    // config poisons the closure/reach set, whose result is memoized as a DFA
+    // edge, so every later decision that reuses that edge takes the dead
+    // branch. That is what produced the nondeterministic Hibernate HQL
+    // mis-parses -- `<function-or-paren-expression> <comparison-op>` suddenly
+    // becoming "no viable alternative", and staying broken for the rest of the
+    // process (see
+    // `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`).
+    let config_pin = ctx.pin_native_root(config);
     let mut init_args = Vec::with_capacity(ctor_args.len() + 1);
     init_args.push(Value::Object(Some(config)));
     for (arg, pin) in ctor_args.iter().copied().zip(pins.iter()) {
@@ -2272,11 +2314,16 @@ fn antlr_alloc_atn_config(
         });
     }
     native_antlr_atn_config_init(ctx, &init_args)?;
-    for pin in pins {
-        if let Some((_, pin)) = pin {
-            ctx.unpin_native_roots(pin);
-        }
-    }
+    let config = ctx.read_native_pin(config_pin, config);
+    // `unpin_native_roots` TRUNCATES the pin stack, so release only the lowest
+    // base we took; that drops every pin above it, including `config_pin`.
+    let lowest_base = pins
+        .iter()
+        .flatten()
+        .map(|(_, pin)| *pin)
+        .min()
+        .unwrap_or(config_pin);
+    ctx.unpin_native_roots(lowest_base);
     Ok(config)
 }
 
