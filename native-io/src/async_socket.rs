@@ -2036,9 +2036,24 @@ thread_local! {
 }
 
 /// How many reads one thread may complete inline before falling back to the
-/// worker pool. Two is enough to collapse the handoff for the "handler arms the
-/// next read and the next frame is already buffered" case that
-/// `TestAsyncMessagesPerformance` measures, while keeping the recursion bounded.
+/// worker pool. Two is enough: a completion handler normally arms exactly one
+/// follow-on read, so this collapses the handoff for the "next frame is already
+/// buffered" case while keeping the recursion trivially bounded.
+///
+/// Raising it does nothing, which is worth recording so it is not retried.
+/// `CRATONVM_DBG_AIO_INLINE=1` on `TestAsyncMessagesPerformance`:
+///
+/// ```text
+/// cap  2: reads=1500 inline=982  not_ready=27  depth_capped=491
+/// cap 16: reads=1500 inline=1002 not_ready=498 depth_capped=0
+/// ```
+///
+/// The inline rate barely moves (0.655 → 0.668) and SEQ2 is unchanged, because
+/// the reads the cap was turning away are the SAME reads that have no data:
+/// the third read of the test's 8k/8k/4k cycle is issued just before the
+/// server's 50 ms pause. The old `depth_capped=491` was an artefact of this
+/// counter checking the cap before readiness — see [`try_deliver_ready_read`],
+/// which now probes readiness first so the two are attributed correctly.
 const INLINE_READY_READ_MAX_DEPTH: u8 = 2;
 
 /// Complete a handler-form read on the calling thread when the socket is
@@ -2069,6 +2084,16 @@ fn try_deliver_ready_read(
     attachment: Option<ObjectRef>,
     buffer: ObjectRef,
 ) -> bool {
+    // Probe readiness BEFORE the depth check, so a read that is both capped and
+    // has no data is attributed to "not ready" rather than to the cap. Getting
+    // this order wrong reported 491 depth-capped reads that were really just
+    // empty, and sent an earlier round of this work chasing the cap.
+    if socket_ready_bytes(stream) == 0 {
+        if aio_inline_dbg_enabled() {
+            aio_inline_record(&AIO_INLINE_NOT_READY);
+        }
+        return false;
+    }
     let entered = INLINE_READY_READ_DEPTH.with(|depth| {
         if depth.get() >= INLINE_READY_READ_MAX_DEPTH {
             false
@@ -2221,13 +2246,19 @@ fn aio_inline_record(counter: &AtomicUsize) {
 /// use the worker pool" — including the `WouldBlock` that a racing consumer
 /// could still produce — so every caller keeps its existing asynchronous
 /// behaviour whenever this declines.
+/// Bytes `FIONREAD` says are queued, clamped to a `usize`. `0` means "would
+/// block" for the purposes of the ready-read fast paths.
+fn socket_ready_bytes(stream: &TcpStream) -> usize {
+    crate::net::socket_available_stream(stream)
+        .unwrap_or(0)
+        .max(0) as usize
+}
+
 fn try_read_ready_bytes(stream: &mut TcpStream, length: usize) -> Option<FutureOutcome> {
     if length == 0 {
         return None;
     }
-    let available = crate::net::socket_available_stream(stream)
-        .unwrap_or(0)
-        .max(0) as usize;
+    let available = socket_ready_bytes(stream);
     if available == 0 {
         if aio_inline_dbg_enabled() {
             aio_inline_record(&AIO_INLINE_NOT_READY);

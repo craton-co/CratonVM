@@ -1,0 +1,55 @@
+﻿cratonvm-doc32r4-fix4.exe : [cratonvm] 4 per-flag variable(s) set directly; the supported spelling is now: CRATONVM_THR
+EADS=-default-watchdog CRATONVM_REAL=aqs CRATONVM_REAL=net-sockets CRATONVM_JIT=rootsnap-cache
+At line:1 char:855
++ ... TestAsyncMessagesPerformance'); & $exe $a 1>$log 2>"$log.err"; $env:C ...
++                                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([cratonvm] 4 pe...=rootsnap-cache:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-07-30T18:16:59.492289Z  WARN cratonvm_vm::vm::vm_util: Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE p
+opulated (18/18)
+2026-07-30T18:16:59.567412Z  WARN cratonvm_vm::vm::vm_util: Post-clinit fixup: File fs/separator/pathSeparator populate
+d (5/5)
+30-Jul-2026 18:16:59.659 INFO [main] org.apache.catalina.startup.LoggingBaseTest.setUp Starting test case [testAsyncTim
+ing]
+30-Jul-2026 18:16:59.844 WARNING [main] org.apache.catalina.util.SessionIdGeneratorBase.<clinit> The default SHA1PRNG a
+lgorithm for SecureRandom is not supported by this JVM. Using the platform default.
+30-Jul-2026 18:17:05.315 INFO [main] org.apache.coyote.AbstractProtocol.init Initializing ProtocolHandler ["http-nio-12
+7.0.0.1-auto-1"]
+30-Jul-2026 18:17:05.846 INFO [main] org.apache.catalina.core.StandardService.startInternal Starting service [Tomcat]
+30-Jul-2026 18:17:05.848 INFO [main] org.apache.catalina.core.StandardEngine.startInternal Starting Servlet engine: [Ap
+ache Tomcat/12.0.0-M1-dev]
+30-Jul-2026 18:17:06.317 INFO [main] org.apache.coyote.AbstractProtocol.start Starting ProtocolHandler ["http-nio-127.0
+.0.1-auto-1-60943"]
+[DBG_AIO_INLINE] reads=500 inline=324 not_ready=15 depth_capped=161 inline_rate=0.648
+2026-07-30T18:17:20.715166Z  WARN cratonvm_gc::gc_quiescence: [moving-young] fallback #1: reason=compiled-frame-oop-not
+-published — a live JIT frame could not prove a complete rewritable root map, so this young collection runs the NON-MOV
+ING sweep (no compaction, free-list allocation). Persistent fallbacks mean the young generation is not actually a copyi
+ng collector.
+[DBG_AIO_INLINE] reads=1000 inline=655 not_ready=18 depth_capped=327 inline_rate=0.655
+2026-07-30T18:17:28.218246Z  WARN cratonvm_gc::gc_quiescence: [moving-young] fallback #2: reason=compiled-frame-oop-not
+-published — a live JIT frame could not prove a complete rewritable root map, so this young collection runs the NON-MOV
+ING sweep (no compaction, free-list allocation). Persistent fallbacks mean the young generation is not actually a copyi
+ng collector.
+[DBG_AIO_INLINE] reads=1500 inline=982 not_ready=27 depth_capped=491 inline_rate=0.655
+30-Jul-2026 18:17:34.048 INFO [main] org.apache.coyote.AbstractProtocol.pause Pausing ProtocolHandler ["http-nio-127.0.
+0.1-auto-1-60943"]
+30-Jul-2026 18:17:34.080 INFO [main] org.apache.catalina.core.StandardService.stopInternal Stopping service [Tomcat]
+2026-07-30T18:17:34.153803Z  WARN cratonvm_vm::vm::vm_util: Post-clinit fixup: UnsafeConstants populated (5/5)
+30-Jul-2026 18:17:34.139 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [StandardWrapperValve[Container is null]] after stop() had already been called. The second call will be ignored.
+30-Jul-2026 18:17:34.164 INFO [main] org.apache.coyote.AbstractProtocol.stop Stopping ProtocolHandler ["http-nio-127.0.
+0.1-auto-1-60943"]
+30-Jul-2026 18:17:34.185 INFO [main] org.apache.coyote.AbstractProtocol.destroy Destroying ProtocolHandler ["http-nio-1
+27.0.0.1-auto-1-60943"]
+30-Jul-2026 18:17:34.194 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [StandardEngineValve[Container is null]] after stop() had already been called. The second call will be ignored.
+30-Jul-2026 18:17:34.199 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [ErrorReportValve[Container is null]] after stop() had already been called. The second call will be ignored.
+30-Jul-2026 18:17:34.204 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [StandardHostValve[Container is null]] after stop() had already been called. The second call will be ignored.
+30-Jul-2026 18:17:34.215 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [NonLoginAuthenticator[Container is null]] after stop() had already been called. The second call will be ignored.
+30-Jul-2026 18:17:34.220 INFO [main] org.apache.catalina.util.LifecycleBase.stop The stop() method was called on compon
+ent [StandardContextValve[Container is null]] after stop() had already been called. The second call will be ignored.
+[cratonvm] System.exit(1) called вЂ” process terminating
