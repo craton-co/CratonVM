@@ -393,8 +393,29 @@ table at all**, so RBC.6 never applies:
 | `getfield` int on a null receiver | NPE | NPE |
 
 A compiled `putfield` to a null receiver silently drops the store and continues.
-This is independent of the gate above and is **not** fixed by this change — the
-gate revert only stops it being reachable through the protected-range path.
-Tracked separately; the likely fix is to give the top-level `0xb5` arm the same
-`emit_precise_null_check_field_store` its inlined-callee sibling already has,
-taking care not to null-check a scalar-replaced receiver.
+This is independent of the gate above and was not fixed by the revert.
+
+**FIXED 2026-07-30.** The top-level `0xb5` arm now calls
+`emit_precise_null_check_field_store` on its receiver, exactly as its
+inlined-callee sibling already did — the single place that call was missed when
+it landed in `5bf306bb0`. The scalar-replaced branch is deliberately excluded:
+its "objectref" is a dummy with no receiver behind it. Root cause on the helper
+side, for the record: `jit_putfield_*` guards with
+`if !plausible_heap_pointer(obj_ptr) { return; }`, which avoids dereferencing
+garbage but returns **without raising**, so nothing ever threw.
+
+`probes/NullPutfieldProbe.java` now reports NPE on all four rows, matching
+HotSpot. Cost measured interleaved against a pre-fix binary: none on
+`BinTreesClassic` d=18 (base median 2120 ms vs fix 2113 ms, checksum 68332206
+both, host noise ±30% swamping the difference), and ~5-9% only on
+`probes/PutfieldPerfProbe.java`, a deliberately pathological loop that does
+nothing but field stores. An implicit null check (fault + signal translation,
+as HotSpot does) was therefore not pursued — there is no measured cost to
+recover.
+
+**Still open, same defect, different tier:** the IR/C2 lowering in
+`jit/src/ir_lower.rs` (`Op::Store`) documents its own behaviour as "null
+receiver → no-op" and has the identical silent drop. It is unreachable on a
+default build today because the optimizing tier is gated off entirely (see
+`docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`),
+so it must be fixed *before* that gate is lifted, not after.

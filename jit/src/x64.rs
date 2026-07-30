@@ -24258,6 +24258,24 @@ impl Compiler {
                                 .unwrap_or(false);
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
+                        // A null receiver must become a real Java NPE here, before
+                        // either the inline store or the `jit_putfield_*` helper can
+                        // turn it into a silent no-op. The helper's guard
+                        // (`!plausible_heap_pointer(obj_ptr) { return; }`) exists to
+                        // avoid dereferencing garbage, but it returns WITHOUT raising,
+                        // so a `putfield` on null silently dropped the store and
+                        // execution continued -- see probes/NullPutfieldProbe.java.
+                        //
+                        // This is the same call the inlined-callee `0xb5` arm already
+                        // makes; only the top-level arm was missed when
+                        // `emit_precise_null_check_field_store` landed. Inside a
+                        // protected range under `precise_exception_frames` it records a
+                        // reason-10 precise NPE frame; otherwise it falls back to the
+                        // ordinary null-check stub. NOT emitted on the
+                        // scalar-replaced branch above, whose "objectref" is a dummy
+                        // with no real receiver behind it.
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        self.emit_precise_null_check_field_store();
                         if type_tag == b'L' || type_tag == b'[' {
                             // HIGH-5 / R20: inline the reference-field store on the
                             // barrier-free fast path (CRATONVM_JIT_INLINE_PUTFIELD).
