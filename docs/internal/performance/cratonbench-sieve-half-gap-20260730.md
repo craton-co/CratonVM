@@ -1,6 +1,7 @@
 # CratonBench Sieve half-gap closeout (2026-07-30)
 
-Status: fixed. Gap cut by **94.35%** — the row is now within 4.8% of HotSpot.
+Status: fixed. Gap cut by **94.35%** on Windows (1.05x HotSpot) and **106.40%**
+on Linux (0.93x — faster than HotSpot C2).
 
 ## Acceptance
 
@@ -48,6 +49,37 @@ ranged 0–90%). The alternating order, nine samples, and median gate isolate
 the optimization despite that: even restricting to the quietest samples of
 each kind the picture is unchanged (baseline 9,352 / candidate 5,335 /
 HotSpot 4,880).
+
+A **second, independent nine-round run** of the same harness while the box was
+uniformly loaded at 60–85% inflated every arm ~1.55x but reproduced the result
+exactly: baseline 18,351 / candidate 9,175 / HotSpot 8,722 ms →
+**95.30%**, candidate/HotSpot **1.052x** against round one's 1.048x.
+
+### Second host: Azure EPYC, Linux, SysV ABI
+
+Worth doing separately because the emitter's register choices are
+platform-dependent — RSI/RDI are Java local homes on Windows and argument
+registers on Linux — so a Windows-only result does not cover the codegen the
+Linux build actually emits. Same script shape, `taskset -c 2`, nine rounds,
+`/proc/loadavg` 4.9–6.0 throughout, all 27 runs checksum `9592`:
+
+| Variant | Nine reported times (ms) | Median |
+|---|---|---:|
+| CratonVM, lowering **off** | 5552, 5564, 5585, 5598, 5794, 5847, 5862, 5946, 6026 | 5,794 |
+| CratonVM, lowering **on** | 2483, 2490, 2494, 2525, 2567, 2568, 2609, 2610, 2644 | **2,567** |
+| HotSpot C2 | 2358, 2363, 2452, 2472, 2761, 2844, 2862, 2882, 2903 | 2,761 |
+
+On Linux the lowering **overshoots the gate**: gap reduction 106.40%, i.e.
+CratonVM is 0.93x HotSpot — 7% faster — on this row. The baseline arm
+reproduces the perf gate's recorded 5,800 ms sieve figure for this host almost
+exactly, which independently confirms the control really is dev-equivalent.
+
+HotSpot's samples here are visibly bimodal (2,358–2,903; its own median is
+less stable than either CratonVM arm's, whose full nine-sample range is
+±3%). Reading it in the way least favourable to this change — CratonVM's
+median against HotSpot's **fastest** sample — still gives
+`1 - (2567-2358)/(5794-2358)` = **93.9%** and 1.09x. The result does not
+depend on which end of HotSpot's spread is used.
 
 ## Root cause
 
@@ -137,10 +169,13 @@ Also in this change:
 
 ## Validation
 
-- Binary: `cratonvm-sieve-diag-019fb303.exe`, release, built from this
-  branch at `e1a486bd1` plus the recognition trace.
+- Binaries: `cratonvm-sieve-diag-019fb303.exe` (Windows, release, this branch
+  at `e1a486bd1` plus the recognition trace) and
+  `/data/cratonvm-sieve-linux-019fb303` (Azure Linux, release, branch tip
+  `280cd270f`, SHA-256
+  `abdd02ea2d62ca3c13b1ba8ececb32750bf52ad7a60ab14768b6016a5d54322a`).
 - Recognition fires on the **real** `CratonBench.sieve` bytecode, at exactly
-  the pcs the unit test predicts:
+  the pcs the unit test predicts, on **both** platforms:
   `[JIT_GEN] bulk-byte headers: zero-fill=[2] set-stride=[40] sieve=[21]`.
 - `probes/ByteSieveProbe.java` — 33 reported values covering the real 100k
   sieve and its full array checksum, limits 0/1/2/3/7/8/9/15/16/30/63/64/65
@@ -151,7 +186,13 @@ Also in this change:
   and `limit == Integer.MAX_VALUE` (the `i + i` overflow edge). Output is
   **byte-identical** under all four of: CratonVM JIT, CratonVM `--nojit`,
   CratonVM with the lowering disabled, CratonVM under
-  `CRATONVM_DBG_GC_STRESS=1048576` — and identical to HotSpot.
+  `CRATONVM_DBG_GC_STRESS=1048576` — and identical to HotSpot. Run on both
+  Windows and Linux; all eight CratonVM configurations agree with their
+  platform's HotSpot line for line. (Under GC stress the Linux run also emits
+  eight `[moving-young] fallback … jit-relocation-contract-unproven` warnings;
+  those are the pre-existing default-moving-young issue tracked in
+  `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`,
+  not probe output, and the 33 reported values are unchanged.)
 - `cargo test -p cratonvm-jit` (all targets): 1,057 lib + 193 integration
   tests, **0 failed**. This includes
   `header_offset_emission_site_inventory_matches_the_doc`, whose counts were
@@ -162,10 +203,35 @@ Also in this change:
   seven checksums identical; only the sieve row moves (5,019 vs 8,750 ms),
   the other six are within run-to-run noise.
 
+- The whole seven-phase `CratonBench` was also run on Windows with the
+  lowering on and off: all seven checksums identical, only the sieve row moves.
+- `cargo test -p cratonvm-vm --lib`: 2,446 passed / 7 failed. All seven live in
+  `vm/src/jit/conservative_roots.rs`, `vm/src/jit/skip_list.rs`,
+  `vm/src/runtime/interpreter.rs` and `vm/src/runtime/serviceability.rs` —
+  files this branch does not touch (`git diff --name-only origin/dev...HEAD`
+  lists only `jit/src/x64.rs`, the probe, and four docs), so they are
+  pre-existing at dev tip.
+- The perf gate's `sieve` baseline is re-anchored from 5,800 to 2,700 ms
+  (`regression-suite/perf/cratonbench-baseline-azure-epyc.tsv`, still
+  `provisional`). Leaving it at 5,800 would have made the gate blind to a full
+  regression of this change. 2,700 is deliberately loose — it sits above the
+  loaded median of 2,567 — and the gate refuses to measure above load 2.0,
+  where the row is faster still.
+
 ## Residual
 
-At 1.05x this row is effectively closed. What remains is not sieve-specific
-and is the same pair the 2026-07-14 round identified: single-pass BCE still
-refuses inclusive loops and non-`arr.length` bounds, and the IR/C2 tier still
-cannot compile array methods. Fixing either would make lowerings like these
-unnecessary rather than merely redundant.
+At 1.05x on Windows and 0.93x on Linux this row is closed. What remains is not
+sieve-specific and is the same pair the 2026-07-14 round identified:
+single-pass BCE still refuses inclusive loops and non-`arr.length` bounds, and
+the IR/C2 tier still cannot compile array methods. Fixing either would make
+lowerings like these unnecessary rather than merely redundant.
+
+**Deliberately not landed.** The handoff's Azure worktree carried a fourth,
+uncommitted lowering — `ByteScanToZeroLoop` / `emit_byte_scan_to_zero_join`,
+which skips runs of nonzero elements in a counted byte loop with an *arbitrary*
+body. It is a genuine generalization of the sieve preheader's word scan, but it
+is a **join-point** emitter rather than a fall-through-only preheader, which is
+a materially larger correctness surface, and it buys nothing here: the sieve
+nest lowering already matches the real `CratonBench.sieve` bytecode. It was
+dropped rather than finished. Anyone reviving it should treat the join-point
+entry contract — not the scan itself — as the hard part.

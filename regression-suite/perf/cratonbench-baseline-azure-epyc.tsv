@@ -11,7 +11,7 @@
 # phase	baseline_ms	checksum	status	evidence
 arithmetic	3976	5000000003999999995	provisional	pure-kernel OSR reg-homes default-on + R8/R9 operand cache, median-of-7 3976ms (checksum-verified), 2026-07-30
 fib	4450	701408733	provisional	pair-1 best 4417, 2026-07-24
-sieve	5800	9592	provisional	pair-1 best 5759, 2026-07-24
+sieve	2700	9592	provisional	docs/internal/performance/cratonbench-sieve-half-gap-20260730.md — guarded byte-array loop lowerings, 9-round interleaved median 2567ms on THIS host (was 5794 with CRATONVM_JIT_BULK_BYTE_LOOPS=0, i.e. the old 5800 figure reproduces). Measured at load ~5.5, so 2700 is deliberately loose; the gate only ever runs below load 2.0, where it is faster still. Re-anchor on a quiet host.
 matrix	5700	173943680	provisional	pair-1 best 5630, 2026-07-24
 hashmap	4300	1549999915000000	provisional	pair-1 best 4237, 2026-07-24
 stringregex	165	5000050000	provisional	pair-1 best 158, 2026-07-24
