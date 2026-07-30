@@ -57,7 +57,7 @@ on this shared box it is often the only trustworthy one.
   memory-heavy rows more — so ratios, not absolute times, are the durable
   content across host re-provisionings.
 
-### Current table (2026-07-18; HashMap and String/Regex re-measured 2026-07-25, Binary Trees re-validated 2026-07-24)
+### Current table (2026-07-18; HashMap re-measured 2026-07-30, String/Regex 2026-07-25, Binary Trees re-validated 2026-07-24)
 
 | Benchmark                         | JDK 25 C2 | CratonVM  | Ratio |
 |-----------------------------------|-----------|-----------|-------|
@@ -65,49 +65,48 @@ on this shared box it is often the only trustworthy one.
 | Fibonacci(44)                     | 1,719 ms  | 4,790 ms  | 2.79x |
 | Sieve (100K × 20,000)             | 2,851 ms  | 6,508 ms  | 2.28x |
 | Matrix 1280×1280                  | 2,349 ms  | 6,875 ms  | 2.93x |
-| HashMap (10M put/get, isolated)   | 1,039 ms  | 22,077 ms | **21.2x** |
+| HashMap (10M put/get, isolated)   | 1,062 ms  | 1,870 ms  | **1.76x** |
 | String/Regex (100K, isolated)     | 55 ms     | 423 ms    | **7.7x** |
 | Binary Trees (depth 18, isolated) | 176 ms    | 1,468 ms  | 8.34x |
 
 Row notes:
 
-- **HashMap and String/Regex regressed, and it is CratonVM's regression, not
-  the host's.** Re-measured 2026-07-25 with `bench/HashMapOnly.java` and
-  `bench/StringRegexOnly.java` as alternating fresh-process pairs on one pinned
-  core, `-Xmx8g` both sides, every checksum exact (`1549999915000000`,
-  `5000050000`). HashMap 3.73x → **21.2x**, String/Regex 3.57x → **7.7x**.
-  What makes this a CratonVM regression rather than a slower box: on the *same
-  runs* HotSpot reproduced its own recorded numbers — String/Regex **55 vs 54
-  ms** — or beat them — HashMap **1,039 vs 1,471 ms**. CratonVM is 2.2x
-  (String/Regex) to 4.0x (HashMap) off its own 07-18 figures. Scale dependence,
-  same session: HashMap at n=1M is 47 ms vs 2,005 ms (**42.7x**), so the gap is
-  not GC-scaling at the 10M live set — it is worse at the small size.
-  Cross-reference the OPEN items below: this is *not* host load (the same gap
-  reproduces on a quiet host with <1% run-to-run spread) and *not* anything
-  landed since the perf-gate baselines were anchored on 07-24 (the anchor
-  commit `e57f0bc7d` measures identically to current `dev`).
-  The other five rows have no fresh paired HotSpot run and are left at their
-  07-18 values rather than half-updated.
-- **The regression is CONFIRMED and bounded to `a36b9d121..e57f0bc7d`.**
-  `a36b9d121` (07-18, the commit that recorded the 5,488 / 193 ms figures) was
-  rebuilt fat-LTO and run three-way against HotSpot and current `dev`,
-  alternating on one pinned core. The 07-18 binary still reproduces its own
-  recorded numbers; `dev` does not:
+- **RETRACTED 2026-07-30: the HashMap regression this table used to record
+  (`22,077 ms`, `21.2x`, "CONFIRMED and bounded to `a36b9d121..e57f0bc7d`")
+  does not reproduce, and the bisect it recommended has nothing in it.**
+  Measured before any change, `dev` @ `9ac1feffe`, isolated fresh processes,
+  `-Xmx8g`, alternating arms pinned to cpu 15 with `mpstat -P ALL` confirming
+  that core was 90-100% the measuring process:
 
-  | | HotSpot | cratonvm@07-18 | cratonvm@dev | dev vs 07-18 |
-  |---|---|---|---|---|
-  | HashMap 10M | 1,415 ms | 2,827 ms | 25,063 ms | **8.9x slower** |
-  | HashMap 1M | 54 ms | 434 ms | 3,084 ms | **7.1x slower** |
-  | String/Regex 100K | 66 ms | 181 ms | 484 ms | **2.7x slower** |
+  | n | HotSpot | CratonVM `dev` | ratio | what this table said |
+  |---|---:|---:|---:|---|
+  | 1,000,000 | 66 ms | 427 ms | 6.5x | 3,084 ms / 42.7x |
+  | 10,000,000 | 997 ms | 3,523 ms | 3.53x | 22,077 ms / 21.2x |
 
-  String/Regex at 07-18 measures 181 ms against its recorded 193 ms — the old
-  binary is healthy. (This run sat at load ~10, so absolutes are inflated for
-  every arm; the three arms were interleaved, so the *ratios* hold. That the
-  07-18 arm still lands near its recorded value under that load only
-  strengthens the read.) The range is 137 first-parent commits (983 including
-  merged branches), so ~8 bisect steps. **Bisect on HashMap 1M** — it shows the
-  regression at 7.1x, runs in seconds rather than 25 s, and needs no quiet host
-  at that effect size.
+  427 ms at n=1M is within noise of the **434 ms** this same note records for
+  the *healthy* `a36b9d121` (07-18) binary, so there is no 7.1x delta left to
+  bisect for. **Why the 07-25 readings were ~5x too slow is not established.**
+  The obvious candidate — the cpu-13 collision warned about further down this
+  file — was tested directly (same binary, same phase, alternating cpu 13 and
+  cpu 15) and showed **no difference**: 4131/4004 on cpu 13 against 4063/4042
+  on cpu 15. Treat any 07-25-era absolute in this document as unverified until
+  re-measured. Full detail:
+  [`hashmap-half-gap-20260730.md`](docs/internal/performance/hashmap-half-gap-20260730.md).
+
+  String/Regex's 07-25 row is left as recorded — it has not been re-measured
+  and it was the *smaller* of the two claims (3.57x → 7.7x), but it came out of
+  the same session, so it deserves the same scepticism.
+- **HashMap's 1.76x is that corrected baseline plus a real 73.1% gap
+  reduction.** From 4,065 ms to 1,870 ms against HotSpot's 1,062 ms, medians of
+  five interleaved fresh-process runs, every checksum `1549999915000000`. Two
+  causes: the Integer-keyed dense overlay was maintaining a second full
+  `FxHashMap` purely to remember insertion order it could derive from the key
+  (19.7% of the phase in `note_fresh_insert` alone), and a set of per-object
+  fixed costs — `get_header`, the `ObjectRef` provenance bitmap, the
+  single-OS-thread tripwire, `a2dbg::record`, and re-deriving a monomorphic
+  `checkcast`'s answer — that were each an out-of-line call around a no-op or
+  an idempotent update. The host was at load 10-12, so both columns are
+  inflated; the ratio is the durable content.
 - **Fibonacci** is recursion-bound and its recursive self-call compiles to a
   guarded direct call. The 2026-07-30 closeout removed the Linux
   `jit_frame_record` helper from the prologue and both post-recursive-call
@@ -240,6 +239,37 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > that is how the layout-registry win was measured — but say so when reporting,
 > and never quote an LTO=off absolute against a baseline.
 
+> **⚠ THE 2026-07-25 MEASUREMENTS BELOW ARE UNRELIABLE — READ THIS FIRST
+> (added 2026-07-30).** The hashmap arm of this investigation was re-run from
+> scratch on 2026-07-30 and **nothing in it reproduces**. Where this block
+> reports 22.3 s "under *every* methodology tried" and "nothing reproduces 4237
+> ms", the same phase on `dev` @ `9ac1feffe` measures **4,065 ms** (median of 5,
+> cpu 15, `-Xmx8g`, interleaved against HotSpot at 1,062 ms), and n=1M measures
+> 427 ms against the 3,084 ms recorded here. The 4,300 ms baseline this block
+> calls unreproducible is reproduced within 6%.
+>
+> Since the hashmap arm is wrong by ~5x, **the reasoning that generalised from
+> it to the other three rows does not stand either.** Sieve, stringregex and
+> bintrees were not re-measured as part of that work and are simply unknown;
+> a fresh 5-rep interleaved run of all three on 2026-07-30 put bintrees at
+> 1,635 ms (against the 2,023 ms "quiet median" below and its own 1,550 ms
+> anchored baseline) and stringregex at 229 ms (against 457 ms below), which is
+> consistent with the whole series being inflated rather than with four
+> independent row-specific defects.
+>
+> The cause was NOT identified. The candidate explanation — that the gate's
+> default cpu 13 pin collides with other sessions' benchmarks (see the
+> methodology warning at the end of this block) — was tested directly on
+> 2026-07-30 with the same binary alternating cpu 13 and cpu 15, and showed no
+> difference (4131/4004 against 4063/4042). **Do not build on any absolute
+> number in this block without re-measuring it.** See
+> [`hashmap-half-gap-20260730.md`](docs/internal/performance/hashmap-half-gap-20260730.md).
+>
+> The original 2026-07-25 text is kept below, unedited, because it documents
+> what was believed and how it was argued.
+>
+> ---
+>
 > **⚠ OPEN: 4 of the 7 baselines are not reproducible from the commit they were
 > anchored at. It is NOT host load and NOT a regression.** Resolved 2026-07-25 on
 > the Azure EPYC host; both earlier candidate explanations are refuted by
@@ -288,6 +318,11 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > `anchored` bintrees row is the one with a real evidence doc
 > (`bt18-inline-tlab-regression-20260724.md`, 1527–1533 ms); at 2023 ms quiet it
 > is 1.24x off its own doc and is the most tractable thread to pull.
+>
+> *(End of the 2026-07-25 text. The hashmap row was re-anchored to 1,870 ms on
+> 2026-07-30 with the evidence doc the policy above asks for — see the banner at
+> the top of this block for why the "nothing reproduces 4237 ms" premise no
+> longer holds. The other three rows are untouched.)*
 >
 > **Where hashmap's 22 s actually goes** (perf, `-F 199`, quiet core): it is not
 > the layout registry that `994a543bf` fixed for bintrees — that symbol does not

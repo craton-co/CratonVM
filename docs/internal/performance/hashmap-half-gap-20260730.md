@@ -33,17 +33,17 @@ the *healthy* `a36b9d121` (07-18) binary, so the bisect range it recommends has
 nothing left in it. 3,523 ms at 10M is also consistent with the 4,300 ms
 perf-gate baseline that the same document declares unreproducible.
 
-The most likely explanation is the one `BENCHMARK.md` states two paragraphs
-below the numbers it invalidates: **the gate's default pin is cpu 13, and
-concurrent sessions on this shared host pin their own CratonBench to cpu 13
-as well**, so a "quiet host" reading (1-min load average near 1) can still be
-timesharing one core with several other benchmarks while `mpstat` shows the
-other fifteen idle. Every measurement in this document is pinned to cpu 15 and
-was taken with `mpstat -P ALL` confirming cpu 15 at 98-100% for this process
-alone.
+**The cause of the historical reading is not established** — only its
+non-reproducibility is. The obvious candidate, the cpu-13 contention that
+`BENCHMARK.md` warns about two paragraphs below the numbers it invalidates,
+was tested directly and did not reproduce any difference (see "The cpu-13
+hypothesis" under Performance evidence). Every measurement in this document is
+pinned to cpu 15, with `mpstat -P ALL` confirming that core is 90-100% this
+process's.
 
 That correction is applied to `BENCHMARK.md` and `README.md` as part of this
-change. It is a *documentation* fix — no code caused it and none fixes it.
+change. It is a *documentation* fix — no code in this change caused the stale
+numbers and none fixes them.
 
 ## Root cause
 
@@ -136,16 +136,207 @@ The restoration was measured, not assumed: four interleaved cycles, cpu 15,
 10M, medians 1,976 ms without the probes and 2,037 ms with them — about 3% of
 wall time, or 6% of the remaining gap. That is cheap insurance and it is kept.
 
-### Tests
+### Differential probes
 
-<!-- FILLED IN BELOW -->
+Two new probes, both diffed against a real JDK 25 run on the same host.
+
+`probes/HashMapIterationOrderProbe.java` is the decisive test for the dense
+overlay's sequence derivation. The overlay stores entries in an ascending-key
+vector, so `keys_in_java_hashmap_order` has to *reconstruct* JDK bucket order
+from `(bucket, first-insertion sequence)`; deriving that sequence from the key
+is only correct if every shape where they differ is covered. The probe prints
+`keySet` / `values` / `entrySet` order for ascending inserts, descending
+inserts, a sparse-to-dense migration (key 2048 inserted before the frontier
+reaches it), a value update (must NOT move the entry within its chain),
+remove-then-reinsert (must move it), interleaved parity, negative keys, and a
+gap-heavy key set.
+
+```text
+--- ORDER: hotspot vs final ---
+IDENTICAL
+--- ORDER: base vs final ---
+IDENTICAL
+```
+
+`probes/TypecheckAnswerMemoProbe.java` covers the checkcast/instanceof memo's
+key assumptions: a polymorphic site, an array receiver versus its component
+type (`String[]` and `String` present the same receiver class id), two sites
+alternating, the never-cached negative arm, a failing cast after 200,000
+successes at the same site, and null. HotSpot, the `dev` baseline and the final
+binary all print the same 7 PASS lines.
+
+`bench/HmSemanticsProbe.java` (overwrite, `put` return value, absent key, null
+key, null value, size): HotSpot `3750078215`, final `3750078215`, `MATCH=true`.
+
+### Unit tests
+
+Run on the Azure host at the final commit, with plain `origin/dev`
+(`c8da3d918`) as a control for every failure.
+
+| target | this branch | control (`origin/dev`) |
+|---|---|---|
+| `cratonvm-types` lib | 418 passed, 0 failed | 417 passed, 0 failed |
+| `cratonvm-gc` (all targets) | 914 passed, 0 failed | — |
+| `cratonvm-jit` (all targets) | 1,248 passed, 0 failed | — |
+| `cratonvm-native-collections` lib | 85 passed, 1 failed | same 1 failed |
+| `cratonvm-vm` lib | 2,448 passed, 6 failed | **same 2,448 / same 6** |
+| `cratonvm-types` `flag_surface` | 1 passed, 1 failed | same 1 failed |
+
+**Every failure is pre-existing on `dev` and none is touched by this change.**
+The `cratonvm-vm` control reproduces the identical six test names and the
+identical pass count. The eight are:
+
+* `types` `flag_surface::inventory_matches_the_checked_in_surface` —
+  `types/tests/flag-surface.txt` is checked in with a UTF-8 BOM, so its first
+  entry reads as `\u{feff}CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE`. Present on
+  `origin/dev`; introduced by `e3cb2ab17`.
+* `native-collections` `tests::fork_join_pool_await_quiescence_registered` —
+  also fails at `9ac1feffe`.
+* `vm` `jit::conservative_roots::tests::shadow_window_is_recovered_from_a_live_compiled_frame`,
+  `jit::skip_list::tests::{classify_complex_ctor_with_putfield,
+  complex_ctor_keeps_constructor_ban,
+  generated_proxy_class_is_jit_eligible_after_proxy_jitcall_1_removal}`,
+  `runtime::interpreter::tests::{b3_gate_scans_full_production_body_of_interpreter,
+  hot_files_have_no_production_panics}`. The last one ratchets a panic-site
+  count for `jit/src/x64.rs` at 16, and `dev`'s `183aa1562` (merged hours
+  earlier) added ~42 lines to that file — the first thing to check when these
+  are triaged.
+
+The new `types::value::tests::provenance_memo_does_not_suppress_records_within_a_word`
+pins the one way the provenance memo could be wrong: a second address in the
+same 4 KiB word being answered from the memo and never reaching the bitmap.
 
 ## Performance evidence
 
-<!-- FILLED IN BELOW -->
+The shared 16-vCPU host never reached the perf gate's required load below 2
+during this session (other sessions' work kept the 1-minute average between 5
+and 19). Acceptance therefore used balanced interleaved cycles pinned to cpu
+15, fresh processes, `-Xmx8g`, no discarded samples, with `mpstat -P ALL`
+confirming cpu 15 at 90-100% for the measuring process. Load is recorded at
+each process start.
+
+### Acceptance — `CratonBench hashmap`, the gate's own harness
+
+Five reps, arm order rotated each rep, cpu 15. All 15 checksums
+`1549999915000000`.
+
+| Arm | Five samples (ms) | Median |
+|---|---|---:|
+| HotSpot JDK 25 | 1,052 / 1,058 / 1,062 / 1,129 / 1,155 | **1,062** |
+| Baseline `dev` @ `9ac1feffe` | 4,037 / 4,064 / 4,065 / 4,094 / 4,748 | **4,065** |
+| Final | 1,853 / 1,866 / 1,870 / 1,887 / 1,932 | **1,870** |
+
+```text
+old_gap = 4065 - 1062 = 3003 ms
+new_gap = 1870 - 1062 =  808 ms
+gap_reduction = 1 - 808 / 3003 = 73.1%
+```
+
+The ratio to HotSpot goes from **3.83x to 1.76x**. The requested reduction was
+50%; this exceeds it by 23.1 percentage points.
+
+### Corroboration — `bench/HashMapOnly` 10M
+
+The same kernel through the standalone harness, five cycles, while the host
+load climbed from 12.6 to 18.6 (hence the wider spread — the interleaving is
+what keeps this comparable). All 15 checksums exact.
+
+| Arm | Five samples (ms) | Median |
+|---|---|---:|
+| HotSpot JDK 25 | 1,070 / 1,359 / 1,575 / 1,583 / 1,642 | 1,575 |
+| Baseline | 5,043 / 5,409 / 5,429 / 6,078 / 6,092 | 5,429 |
+| Final | 2,112 / 2,535 / 2,768 / 2,979 / 3,233 | 2,768 |
+
+`gap_reduction = 1 - (2768 - 1575) / (5429 - 1575) = 69.0%`.
+
+An earlier five-cycle pass at load 2.5, before the arena probes were restored,
+read HotSpot 997 / baseline 3,523 / candidate 1,799 — 68.1%. Every methodology
+tried lands between 68% and 73%.
+
+### No regression elsewhere
+
+Four of this change's five edits are on VM-wide paths (`get_header`, the
+provenance bitmap, the `ObjectRef` tripwire, `checkcast`/`instanceof`), so the
+other phases matter. Interleaved base-vs-final, cpu 15, medians of 5, plus a
+full seven-phase sweep of 3 reps earlier in the session. **All 42 + 30
+checksums exact.**
+
+| phase | baseline median | final median | delta |
+|---|---:|---:|---:|
+| bintrees (d=18, the *anchored* row) | 1,635 ms | 1,641 ms | +0.4% |
+| stringregex (100K) | 229 ms | 223 ms | −2.6% |
+| sieve (100K x 20,000) | 6,245 ms | 5,938 ms | −4.9% |
+
+Arithmetic, fib and matrix were measured at 3 reps in the earlier sweep and
+all sat inside that sweep's within-arm spread.
+
+### The cpu-13 hypothesis, tested and NOT confirmed
+
+`BENCHMARK.md` warns that the gate's default pin is cpu 13 and that concurrent
+sessions pin their own CratonBench there too, which would explain a "quiet
+host" reading being several times too slow. That is a plausible story for the
+stale 22 s figure, so it was tested rather than asserted — the same baseline
+binary, same phase, alternating cpu 13 and cpu 15:
+
+```text
+cpu=13 load=11.13 | 4131 ms
+cpu=15 load=10.64 | 4063 ms
+cpu=13 load=10.19 | 4004 ms
+cpu=15 load= 9.77 | 4042 ms
+```
+
+No difference. **The hypothesis is not supported by this measurement** (cpu 13
+simply happened to be free), and the cause of the historical 22 s reading is
+therefore *not established* — only its non-reproducibility is. `BENCHMARK.md`
+is corrected to say exactly that.
+
+### Perf-gate baseline
+
+The `hashmap` row is re-anchored from 4,300 ms to **1,870 ms**, still
+`provisional`. Caveat stated in the TSV and repeated here: that number was
+measured at load 10-12, so it is *inflated* and therefore a conservative
+ceiling. It should be tightened on a genuinely quiet host. Leaving it at 4,300
+was the worse option — the gate would no longer notice a 2x regression.
+
+## What is left
+
+For whoever picks this up. The post-change profile is:
+
+| symbol | share |
+|---|---:|
+| `jit_integer_value_of_direct` | ~20% |
+| the unbox path (`get_header` + `fast_unbox_primitive_wrapper` + `unbox_wrapper` + `get_field`) | ~21% |
+| `try_hm_int_fast_get` + `try_hm_int_fast_put` | ~14% |
+
+The first is the 20 million `Integer` boxes the kernel allocates; closing it
+means emitting an inline TLAB bump for `Integer.valueOf` in JIT codegen rather
+than calling a helper. The third is dominated by the per-operation shard
+`Mutex` — in the *pre-change* profile the unlock's `xchg` carried 89.7% of
+`try_hm_int_fast_put`'s samples, mostly as a store-buffer drain in front of the
+cache-missing stores that are now gone; what remains is the two atomics
+themselves. Removing them needs either a thread-biased lock or a
+stable-address overlay memo with an epoch. Both are materially riskier than
+anything here and neither is needed for the stated goal, so neither was
+attempted.
 
 ## Artifacts
 
 All binaries are fat-LTO release builds from the isolated task worktree
 `/data/data/wt-hashmap-halfgap-20260730` on the Azure EPYC bench host, with
 task-unique names under `/data/data/bin-hmhg/`.
+
+```text
+b8cf483b8294f5d4a07301d72077a8dabdd3fe944050a126842bb7e7a76a3226
+  cratonvm-hmhg-baseline-9ac1feffe        (origin/dev, the acceptance baseline)
+
+f094778586ae1b51b7e2296fc3f1099e483766888529eaa9bcc526042be6f47f
+  cratonvm-hmhg-final-5f0cc41b2d          (the acceptance final)
+```
+
+`5f0cc41b2` is Rust-identical to the merged tip: the commits after it add only
+`probes/*.java` and this document.
+
+Two intermediate binaries were kept for the attribution in "Correctness":
+`cratonvm-hmhg-cand1-137abb8b3` (inherited work, arena probes still removed)
+and `cratonvm-hmhg-cand2-78090431be` (probes restored, per-object taxes not yet
+addressed).
