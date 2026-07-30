@@ -9,7 +9,8 @@ export JDK25="${JDK25:-/home/victor/jdk25}"
 export JDK25_WIN="${JDK25_WIN:-/home/victor/jdk25}"
 export CRATONVM_BIN="${CRATONVM_BIN:-/data/data/wt-sprbuglist-20260727/localbin/cratonvm-sprbuglist-20260727.bin}"
 export CRATONVM_DEFAULT_HEAP_MAX_MB="${CRATONVM_DEFAULT_HEAP_MAX_MB:-2048}"
-BATCH="${BATCH:-4}"; HANG="${HANG:-600}"
+# Correctness reruns isolate global compiler/instrumentation state by default.
+BATCH="${BATCH:-1}"; HANG="${HANG:-600}"
 BASE="$HERE/out/$TAG"; mkdir -p "$BASE"; export OUTROOT="$BASE"
 # map FQCN -> module<TAB>class using meta/all-classes.tsv
 awk -F'\t' 'NR==FNR{want[$1]=1;next} ($2 in want){print}' "$LIST" meta/all-classes.tsv > "$BASE/list.tsv"

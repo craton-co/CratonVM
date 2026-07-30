@@ -43038,9 +43038,19 @@ fn execute_invokevirtual_cached(
                     // tier-up exclusion so subtypes reached through List/Map
                     // or Iterator are covered as well.
                     let receiver_is_java_util = {
-                        let cm = shared.classes.class_manager.read();
-                        cm.get_class(receiver_class_id)
-                            .is_some_and(|class| class.name.starts_with("java/util/"))
+                        // This dispatch can run while the current thread still
+                        // owns the class-manager write lock during bootstrap.
+                        // A blocking read here self-deadlocks. If the table is
+                        // busy, conservatively suppress this optional tier-up.
+                        shared
+                            .classes
+                            .class_manager
+                            .try_read()
+                            .map(|cm| {
+                                cm.get_class(receiver_class_id)
+                                    .is_some_and(|class| class.name.starts_with("java/util/"))
+                            })
+                            .unwrap_or(true)
                     };
                     if !is_special
                         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)

@@ -9,7 +9,9 @@ BIN="${CRATONVM_BIN:-/data/data/wt-sprbuglist-20260727/localbin/cratonvm-sprbugl
 CLS="$1"; shift
 MOD=$(awk -F'\t' -v c="$CLS" '$2==c{print $1; exit}' "$HERE/meta/all-classes.tsv")
 [ -n "$MOD" ] || { echo "class not in index: $CLS" >&2; exit 1; }
-CP="$HERE:$(tr -d '\r' < "$MOD/build/cratonvm-testcp.txt")"
+# cratonvm-testcp.txt omits the owning module's main output. Gradle tests use
+# that output before the packaged snapshot JAR, so reproduce the same order.
+CP="$HERE:$MOD/build/classes/java/main:$MOD/build/classes/kotlin/main:$MOD/build/resources/main:$(tr -d '\r' < "$MOD/build/cratonvm-testcp.txt")"
 AF="$(mktemp /tmp/af-XXXXXX.txt)"; { echo "-cp"; echo "$CP"; } > "$AF"
 export CRATONVM_DEFAULT_HEAP_MAX_MB="${CRATONVM_DEFAULT_HEAP_MAX_MB:-2048}"
 echo "[one] mod=$MOD  bin=$BIN" >&2
