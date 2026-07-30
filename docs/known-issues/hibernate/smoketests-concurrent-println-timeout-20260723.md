@@ -121,12 +121,13 @@ from genuinely broken codegen. The two are now separate, and the same line reads
 hot_but_stuck_in_interpreter=1519 (of which ineligible-by-policy=1513, compile-failures=6)
 ```
 
-So **99.6% of the "never compiles" population is banned by design**, not by a
-compiler bug: `org/hibernate/` wholesale (HIB-TEMPORAL.1), `org/h2/`
-(HIB-LONGTAIL.1, `vm/src/jit/skip_list.rs`), and the
+At the time of this measurement, **99.6% of the "never compiles" population was
+banned by design**, not by a compiler bug: `org/hibernate/` wholesale
+(HIB-TEMPORAL.1), `org/h2/` (HIB-LONGTAIL.1, `vm/src/jit/skip_list.rs`), and the
 `AbstractQueuedSynchronizer` `getState`/`setState`/`compareAndSetState` family.
-Those bans stand on their own correctness grounds; they are the reason this
-workload is interpreted, and they are what would have to change.
+HIB-TEMPORAL.1 was fixed and removed on 2026-07-29; the historical percentage
+above must not be read as the current JIT-eligibility profile. The other bans
+stand on their own correctness grounds.
 
 The genuinely broken minority is **six methods**, now listed under their own
 `COMPILE FAILED (not policy — these are bugs)` heading in the same dump
@@ -217,9 +218,11 @@ do not read it as a CHM cost. The allocation rows are clean.
   mutex also presents as CPU-busy, so this rules out *blocking*, not all
   contention; the allocator serialisation found below was exactly such a case.)
 - Logging as the driver — ~10%, quantified above.
-- The Hibernate JIT ban as the cause — lifting it makes things worse, and the
-  ban's own justification (HIB-TEMPORAL.1, a `DdlTypeImpl.getRawTypeName` JIT
-  corruption from 2026-07-08) is a correctness guard, not a throughput one.
+- The then-active Hibernate JIT ban as the cause — lifting it made this
+  historical run worse, and its 2026-07-08 justification was a correctness
+  guard, not a throughput one. HIB-TEMPORAL.1 was subsequently fixed and
+  removed on 2026-07-29; see
+  `docs/internal/jit-bans/hib-temporal-1-retired-20260729.md`.
 - `CRATONVM_JIT_VIRTUAL_TIERUP` — no longer a lever.
 
 ## Prior investigation

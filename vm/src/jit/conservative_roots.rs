@@ -1633,6 +1633,26 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
     if !moving_young_enabled() {
         return true;
     }
+
+    // The generated JIT frame model is not yet a relocation contract.  The
+    // verifier below has now observed all of the ways that assumption fails in
+    // production Hibernate traffic: unregistered entries, unavailable exact
+    // frame bases, and live oops outside the published map.  Detecting one of
+    // those after a cycle has started is necessarily too late to make a copied
+    // from-space safe.  Keep JIT execution fully enabled, but require the
+    // non-moving young sweep whenever compiled artifacts exist until every JIT
+    // frame home is mechanically enumerable and rewritable.
+    //
+    // Interpreter-only executions retain copying young collections.  This is a
+    // VM-wide GC/JIT safety boundary, deliberately not an ANTLR/Hibernate
+    // exception or a JIT eligibility ban.
+    if cratonvm_jit::jit_code_range_count() != 0 {
+        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            cratonvm_gc::gc_quiescence::incomplete_reason::JIT_RELOCATION_UNSUPPORTED,
+        );
+        return false;
+    }
+
     let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_COVERAGE_DBG").is_some();
     let scanner_sp = current_stack_pointer();
     if !dbg_no_prune() {

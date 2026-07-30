@@ -59,11 +59,12 @@ the package is now JIT-eligible under `SkipPolicy::Conservative`.
 **Caveat, stated plainly:** the evidence above is the standalone
 `JaxbQNameProbe`, which is the witness the 2026-07-26 session itself nominated
 and the only reproducer this ban has. The *original* 2026-07-18-era context — a
-full Hibernate mapping-metadata bootstrap — was not re-run here (Hibernate is
-independently kept interpreted by the still-active HIB-TEMPORAL.1 `org/hibernate/`
-ban, so JAXB's graph is not driven from that path under the default policy
-anyway). If a QName self-cast resurfaces from a Hibernate boot, re-open with
-that as the repro rather than this probe.
+full Hibernate mapping-metadata bootstrap — was not re-run here (Hibernate was
+independently kept interpreted by the then-active HIB-TEMPORAL.1
+`org/hibernate/` ban, so JAXB's graph was not driven from that path under the
+default policy anyway). HIB-TEMPORAL.1 was fixed and removed on 2026-07-29. If
+a QName self-cast resurfaces from a Hibernate boot, re-open with that as the
+repro rather than this probe.
 
 ## Related
 

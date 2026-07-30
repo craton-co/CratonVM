@@ -1202,7 +1202,8 @@ fn should_skip_jit_internal(
     // it heavily — Hibernate ORM 8.0's own HQL suite, where every query goes
     // through `org/antlr/v4/runtime/` — as a same-binary A/B over all 57
     // `org.hibernate.orm.test.hql` classes with `org/hibernate/` still banned
-    // (HIB-TEMPORAL.1) so ANTLR was the only variable: byte-identical
+    // at the time (HIB-TEMPORAL.1) so ANTLR was the only variable:
+    // byte-identical
     // per-class ok/failed/aborted counts, 0 failures either way, and the
     // ban-removed binary re-confirmed the same. That also covers this rule's
     // ancestor claim (HIB-ANTLR.1: a JIT-compiled parse leaving
@@ -1521,32 +1522,6 @@ fn should_skip_jit_internal(
         // `is_elidable_construction`; regression net
         // vm/tests/jit_collection_ctor_identity.rs). Full writeup:
         // docs/internal/jsonsmart-parser-jit-retired-20260727.md.
-        // HIB-TEMPORAL.1 (2026-07-08) - Hibernate temporal suite residuals.
-        // The `InstantTests` failure cluster was not a Hibernate data bug: with
-        // default JIT, `DdlTypeImpl.getRawTypeName` saw a null `typeNamePattern`
-        // during `TIMESTAMP_UTC` DDL descriptor registration (37 failures). A cold
-        // standalone `H2Dialect.columnType(3003)` probe matched HotSpot, but
-        // `CRATONVM_TIER_ENABLED=0` removed the type-name-pattern signature, so
-        // this is a JIT-only corruption in the Hibernate DDL/type hot path.
-        //
-        // Narrow bisection found `org/hibernate/type/descriptor/sql/internal/`
-        // as the DDL NPE face, but that exposed intermittent empty-message
-        // `IllegalThreadStateException`, H2 connection `<local4>` NPE, and
-        // `Object.{test,apply}` NoSuchMethodError failures in adjacent temporal
-        // runs. The stable control is interpreting Hibernate bytecode as a
-        // package (repeat `CRATONVM_JIT_DENY=org/hibernate/` runs: 0 failures in
-        // `InstantTests`), matching the existing conservative third-party
-        // fail-closed guards in this file. The helper accepts both slash and
-        // dotted class-name spellings because the JIT eligibility path can see
-        // either shape depending on the caller. Liftable for bisection with
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/hibernate/` or `org.hibernate.` once
-        // the underlying JIT producer is narrowed.
-        if let Some(prefix) = hibernate_temporal_residual_skip_prefix(class_name) {
-            if !package_allowed(prefix, allow_packages) {
-                return Some(SkipReason::RustJvmTestFixture);
-            }
-        }
-
         // JAXB (`org/glassfish/jaxb/`) -- REMOVED 2026-07-27. The ban existed
         // for a self-cast `QName cannot be cast to QName` seen while
         // Hibernate mapping metadata built JAXB's QName-heavy runtime graph,
@@ -2105,8 +2080,8 @@ fn should_skip_jit_internal(
         // heavy real HQL-via-ANTLR parsing), .hql.HQLInsertAndUpdateTest
         // (5 methods), and .type.temporal.InstantTests (204 methods) all
         // ran clean (0 failures, identical to baseline) with
-        // org/antlr/v4/runtime/ JIT-allowed and org/hibernate/ still
-        // banned -- this bans own specific claim (ATNState.transitions
+        // org/antlr/v4/runtime/ JIT-allowed and org/hibernate/ still banned at
+        // the time -- this ban's own specific claim (ATNState.transitions
         // corrupted between two separate HQL parses) does not reproduce.
         // IMPORTANT: org/antlr/v4/runtime/ is ALSO, separately, covered by
         // HIB-LONGTAIL.1 above (same prefix, already confirmed still
@@ -2453,16 +2428,6 @@ fn is_unconditional_hash_miscompile_cluster(class_name: &str, method_name: &str)
             | ("java/util/Objects", "hashCode")
             | ("java/util/Objects", "equals")
     )
-}
-
-fn hibernate_temporal_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
-    const SLASH_PREFIX: &str = "org/hibernate/";
-    const DOT_PREFIX: &str = "org.hibernate.";
-    if class_name.starts_with(SLASH_PREFIX) {
-        Some(SLASH_PREFIX)
-    } else {
-        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
-    }
 }
 
 fn is_snakeyaml_emitter_emit_jit_corruption(class_name: &str, method_name: &str) -> bool {
@@ -3071,67 +3036,22 @@ mod tests {
     }
 
     #[test]
-    fn hibernate_temporal_residual_package_skipped_conservatively() {
+    fn hibernate_temporal_package_is_jit_eligible_after_removal() {
         for cls in [
-            "org/hibernate/dialect/H2Dialect",
             "org/hibernate/type/descriptor/sql/internal/DdlTypeImpl",
-            "org/hibernate/testing/jdbc/SharedDriverManagerConnectionProvider",
-            "org/hibernate/orm/test/type/temporal/InstantTests",
-            "org.hibernate.dialect.H2Dialect",
+            "org.hibernate.testing.jdbc.SharedDriverManagerConnectionProvider",
         ] {
             assert_eq!(
-                check(
-                    cls,
-                    "getRawTypeNames",
-                    false,
-                    true,
-                    SkipPolicy::Conservative
-                ),
-                Some(SkipReason::RustJvmTestFixture),
-                "{cls} should stay interpreted under the conservative Hibernate temporal guard"
+                check(cls, "getRawTypeNames", false, true, SkipPolicy::Conservative),
+                None,
+                "{cls} must be JIT eligible under the conservative policy after \
+                 the HIB-TEMPORAL.1 package ban removal"
+            );
+            assert_eq!(
+                check(cls, "getRawTypeNames", false, true, SkipPolicy::Aggressive),
+                None
             );
         }
-    }
-
-    #[test]
-    fn hibernate_temporal_residual_package_lifts_under_aggressive_policy() {
-        assert_eq!(
-            check(
-                "org/hibernate/type/descriptor/sql/internal/DdlTypeImpl",
-                "getRawTypeNames",
-                false,
-                true,
-                SkipPolicy::Aggressive,
-            ),
-            None,
-            "aggressive policy should lift the Hibernate temporal guard"
-        );
-    }
-
-    #[test]
-    fn hibernate_temporal_residual_package_lifts_with_allow_packages() {
-        assert_eq!(
-            check_with(
-                "org/hibernate/testing/jdbc/SharedDriverManagerConnectionProvider",
-                "onDefaultTimeZoneChange",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["org/hibernate/"],
-            ),
-            None
-        );
-        assert_eq!(
-            check_with(
-                "org.hibernate.testing.jdbc.SharedDriverManagerConnectionProvider",
-                "onDefaultTimeZoneChange",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["org.hibernate."],
-            ),
-            None
-        );
     }
 
     #[test]

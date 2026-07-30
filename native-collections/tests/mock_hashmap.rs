@@ -18,7 +18,7 @@ use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAcc
 use common::{boxed_int, build_registry, call, new_concurrent_hashmap, new_hashmap, MockCtx};
 use cratonvm_native_api::NativeContext;
 use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
-use cratonvm_types::Value;
+use cratonvm_types::{ClassId, Value};
 
 const HM: &str = "java/util/HashMap";
 const CHM: &str = "java/util/concurrent/ConcurrentHashMap";
@@ -104,6 +104,149 @@ fn single_put_get_round_trip() {
     )
     .unwrap();
     assert_eq!(size, Some(Value::Int(1)));
+}
+
+#[test]
+fn lookup_invokes_equals_on_search_key_not_stored_key() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let hm = new_hashmap(&reg, &mut ctx);
+    let stored = ctx.alloc_object(ClassId::new(0), 1);
+    let search = ctx.alloc_object(ClassId::new(0), 1);
+    let value = boxed_int(&mut ctx, 77);
+
+    // Both hashCode() and equals(Object) return a non-zero int in this mock.
+    // The two distinct keys therefore share a bucket and compare equal.
+    ctx.set_invoke_virtual_results(vec![Ok(Some(Value::Int(7)))]);
+    call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[
+            Value::Object(Some(hm)),
+            Value::Object(Some(stored)),
+            value,
+        ],
+    )
+    .unwrap();
+
+    ctx.clear_invoke_virtual_log();
+    ctx.set_invoke_virtual_results(vec![
+        Ok(Some(Value::Int(7))),
+        Ok(Some(Value::Int(1))),
+    ]);
+    let got = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "get",
+        GET,
+        &[Value::Object(Some(hm)), Value::Object(Some(search))],
+    )
+    .unwrap();
+    assert_eq!(got, Some(value));
+
+    let equals_receiver = ctx
+        .invoke_virtual_log()
+        .into_iter()
+        .find(|(_, method, descriptor, _)| {
+            method == "equals" && descriptor == "(Ljava/lang/Object;)Z"
+        })
+        .map(|(receiver, _, _, _)| receiver)
+        .expect("lookup must invoke equals for distinct colliding keys");
+    assert_eq!(
+        equals_receiver,
+        search.as_ptr() as usize,
+        "HashMap requires searchKey.equals(storedKey), not the reverse"
+    );
+}
+
+#[test]
+fn colliding_bucket_requires_full_hash_match_before_equals() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let hm = new_hashmap(&reg, &mut ctx);
+    let stored = ctx.alloc_object(ClassId::new(0), 1);
+    let search = ctx.alloc_object(ClassId::new(0), 1);
+    let first_value = boxed_int(&mut ctx, 11);
+    let second_value = boxed_int(&mut ctx, 22);
+
+    // Spread hashes 1 and 17 both select bucket 1 in the initial 16-slot
+    // table, but OpenJDK must not call equals unless the full stored hash also
+    // matches. Returning true from equals makes a missing hash gate observable.
+    ctx.set_invoke_virtual_results(vec![Ok(Some(Value::Int(1)))]);
+    call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[
+            Value::Object(Some(hm)),
+            Value::Object(Some(stored)),
+            first_value,
+        ],
+    )
+    .unwrap();
+
+    ctx.clear_invoke_virtual_log();
+    ctx.set_invoke_virtual_results(vec![
+        Ok(Some(Value::Int(17))),
+        Ok(Some(Value::Int(1))),
+    ]);
+    let got = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "get",
+        GET,
+        &[Value::Object(Some(hm)), Value::Object(Some(search))],
+    )
+    .unwrap();
+    assert_eq!(got, Some(Value::Object(None)));
+    assert!(
+        ctx.invoke_virtual_log()
+            .iter()
+            .all(|(_, method, _, _)| method != "equals"),
+        "different full hashes in one bucket must bypass equals"
+    );
+
+    ctx.clear_invoke_virtual_log();
+    ctx.set_invoke_virtual_results(vec![
+        Ok(Some(Value::Int(17))),
+        Ok(Some(Value::Int(1))),
+    ]);
+    call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[
+            Value::Object(Some(hm)),
+            Value::Object(Some(search)),
+            second_value,
+        ],
+    )
+    .unwrap();
+    let size = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "size",
+        "()I",
+        &[Value::Object(Some(hm))],
+    )
+    .unwrap();
+    assert_eq!(size, Some(Value::Int(2)));
+    assert!(
+        ctx.invoke_virtual_log()
+            .iter()
+            .all(|(_, method, _, _)| method != "equals"),
+        "put must not overwrite a colliding-bucket key with a different hash"
+    );
 }
 
 #[test]

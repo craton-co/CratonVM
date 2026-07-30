@@ -637,21 +637,14 @@ fn native_antlr_array_prediction_context_init_singleton(
 
     let base_pin = ctx.pin_native_root(this);
     let _singleton_pin = ctx.pin_native_root(singleton);
-    // The parent's pin HANDLE has to be kept: pinning alone does not rewrite
-    // the Rust local, so `parent` must be re-read through its own handle after
-    // the two allocations below. Discarding the handle here stored the
-    // pre-move address as the array's parent link, and the closure walk then
-    // followed a dead PredictionContext.
-    let parent_pin = parent.map(|p| ctx.pin_native_root(p));
+    if let Some(parent) = parent {
+        ctx.pin_native_root(parent);
+    }
     let parents_arr = ctx.new_ref_array(pc_class, 1);
     let parents_pin = ctx.pin_native_root(parents_arr);
     let states_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, 1);
     let this = ctx.read_native_pin(base_pin, this);
     let parents_arr = ctx.read_native_pin(parents_pin, parents_arr);
-    let parent = match (parent, parent_pin) {
-        (Some(p), Some(pin)) => Some(ctx.read_native_pin(pin, p)),
-        _ => parent,
-    };
 
     ctx.set_array_element(parents_arr, 0, Value::Object(parent));
     ctx.set_array_element(states_arr, 0, Value::Int(return_state));
@@ -865,30 +858,29 @@ fn antlr_create_parent_array(
     names: AntlrClassNames,
     parents: &[Option<ObjectRef>],
 ) -> Result<ObjectRef, MethodCallFailed> {
-    // GC-SAFETY: `parents` are bare Rust locals captured by the caller, and
-    // both `antlr_pc_class_id` (which can run `PredictionContext`'s `<clinit>`)
-    // and `new_ref_array` can collect. Storing the pre-move addresses linked
-    // dead parents into the context graph, which the closure walk then followed.
-    let pins: Vec<Option<usize>> = parents
+    let pins: Vec<_> = parents
         .iter()
-        .map(|parent| parent.map(|p| ctx.pin_native_root(p)))
+        .map(|parent| parent.map(|obj| (ctx.pin_native_root(obj), obj)))
         .collect();
-    let base = pins.iter().flatten().min().copied();
-    let pc_class = antlr_pc_class_id(ctx, names)?;
-    let arr = ctx.new_ref_array(pc_class, parents.len());
-    let arr_pin = ctx.pin_native_root(arr);
-    for (i, (parent, pin)) in parents.iter().zip(pins.iter()).enumerate() {
-        let current = match (parent, pin) {
-            (Some(p), Some(pin)) => Some(ctx.read_native_pin(*pin, *p)),
-            _ => *parent,
-        };
-        let arr = ctx.read_native_pin(arr_pin, arr);
-        ctx.set_array_element(arr, i, Value::Object(current));
+    let roots_base = pins.iter().flatten().map(|(pin, _)| *pin).next();
+    let result = (|| {
+        let pc_class = antlr_pc_class_id(ctx, names)?;
+        let arr = ctx.new_ref_array(pc_class, parents.len());
+        for (i, parent) in parents.iter().copied().enumerate() {
+            let parent = match (parent, pins[i]) {
+                (Some(_), Some((pin, fallback))) => {
+                    Some(ctx.read_native_pin(pin, fallback))
+                }
+                _ => None,
+            };
+            ctx.set_array_element(arr, i, Value::Object(parent));
+        }
+        Ok(arr)
+    })();
+    if let Some(base) = roots_base {
+        ctx.unpin_native_roots(base);
     }
-    let arr = ctx.read_native_pin(arr_pin, arr);
-    // `unpin_native_roots` truncates, so release the lowest base we took.
-    ctx.unpin_native_roots(base.unwrap_or(arr_pin));
-    Ok(arr)
+    result
 }
 
 fn antlr_create_singleton_context(
@@ -1025,21 +1017,59 @@ fn antlr_map_put(
     cratonvm_native_collections::native_map_put_pub(ctx, &[Value::Object(Some(map)), key, value])
 }
 
+#[inline]
+fn antlr_pin_value(ctx: &mut dyn NativeContext, value: Value) -> Option<(usize, ObjectRef)> {
+    match value {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn antlr_read_pinned_value(
+    ctx: &dyn NativeContext,
+    value: Value,
+    pin: Option<(usize, ObjectRef)>,
+) -> Value {
+    match pin {
+        Some((handle, fallback)) => {
+            Value::Object(Some(ctx.read_native_pin(handle, fallback)))
+        }
+        None => value,
+    }
+}
+
 fn antlr_double_key_map_get_value(
     ctx: &mut dyn NativeContext,
     map: ObjectRef,
     key1: Value,
     key2: Value,
 ) -> MethodCallResult {
-    let Some(data) = antlr_double_key_map_data(ctx, map) else {
-        return Ok(Some(Value::Object(None)));
-    };
-    let inner = antlr_map_get(ctx, data, key1)?;
-    let inner = match inner {
-        Some(Value::Object(Some(inner))) => inner,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    antlr_map_get(ctx, inner, key2)
+    let roots_base = ctx.pin_native_root(map);
+    let key1_pin = antlr_pin_value(ctx, key1);
+    let key2_pin = antlr_pin_value(ctx, key2);
+    let result = (|| {
+        let map = ctx.read_native_pin(roots_base, map);
+        let Some(data) = antlr_double_key_map_data(ctx, map) else {
+            return Ok(Some(Value::Object(None)));
+        };
+        let data_pin = ctx.pin_native_root(data);
+        let key1 = antlr_read_pinned_value(ctx, key1, key1_pin);
+        let inner = antlr_map_get(ctx, data, key1)?;
+        let inner = match inner {
+            Some(Value::Object(Some(inner))) => inner,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let inner_pin = ctx.pin_native_root(inner);
+        let inner = ctx.read_native_pin(inner_pin, inner);
+        let key2 = antlr_read_pinned_value(ctx, key2, key2_pin);
+        // Retain the data map as well: the first lookup may be the only heap
+        // path to this inner map while native map code is still returning.
+        let _data = ctx.read_native_pin(data_pin, data);
+        antlr_map_get(ctx, inner, key2)
+    })();
+    ctx.unpin_native_roots(roots_base);
+    result
 }
 
 fn antlr_double_key_map_put_value(
@@ -1049,60 +1079,42 @@ fn antlr_double_key_map_put_value(
     key2: Value,
     value: Value,
 ) -> MethodCallResult {
-    let data = antlr_double_key_map_data_or_create(ctx, map)?;
-    let inner_value = antlr_map_get(ctx, data, key1)?;
-    let previous = match inner_value {
-        Some(Value::Object(Some(inner))) => {
-            antlr_map_put(ctx, inner, key2, value)?.unwrap_or(Value::Object(None))
-        }
-        _ => {
-            // Creating the inner map can allocate and move all four objects. Keep
-            // them rooted as one scoped group, then release that group after the
-            // new map is linked from `data`. Previously the three argument pins
-            // were discarded without an unpin, permanently retaining every ANTLR
-            // merge-cache entry and its prediction-context graph.
-            let pins = ctx.pin_native_root(data);
-            let key1_pin = match key1 {
-                Value::Object(Some(key)) => Some((ctx.pin_native_root(key), key)),
-                _ => None,
-            };
-            let key2_pin = match key2 {
-                Value::Object(Some(key)) => Some((ctx.pin_native_root(key), key)),
-                _ => None,
-            };
-            let value_pin = match value {
-                Value::Object(Some(value)) => Some((ctx.pin_native_root(value), value)),
-                _ => None,
-            };
-            let created = (|| {
+    let roots_base = ctx.pin_native_root(map);
+    let key1_pin = antlr_pin_value(ctx, key1);
+    let key2_pin = antlr_pin_value(ctx, key2);
+    let value_pin = antlr_pin_value(ctx, value);
+    let result = (|| {
+        let map = ctx.read_native_pin(roots_base, map);
+        let data = antlr_double_key_map_data_or_create(ctx, map)?;
+        let data_pin = ctx.pin_native_root(data);
+        let data = ctx.read_native_pin(data_pin, data);
+        let key1 = antlr_read_pinned_value(ctx, key1, key1_pin);
+        let inner_value = antlr_map_get(ctx, data, key1)?;
+        let previous = match inner_value {
+            Some(Value::Object(Some(inner))) => {
+                let inner_pin = ctx.pin_native_root(inner);
+                let inner = ctx.read_native_pin(inner_pin, inner);
+                let key2 = antlr_read_pinned_value(ctx, key2, key2_pin);
+                let value = antlr_read_pinned_value(ctx, value, value_pin);
+                antlr_map_put(ctx, inner, key2, value)?.unwrap_or(Value::Object(None))
+            }
+            _ => {
                 let inner = antlr_new_linked_hash_map(ctx)?;
-                let data = ctx.read_native_pin(pins, data);
-                let key1 = match key1_pin {
-                    Some((pin, fallback)) => {
-                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
-                    }
-                    None => key1,
-                };
-                let key2 = match key2_pin {
-                    Some((pin, fallback)) => {
-                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
-                    }
-                    None => key2,
-                };
-                let value = match value_pin {
-                    Some((pin, fallback)) => {
-                        Value::Object(Some(ctx.read_native_pin(pin, fallback)))
-                    }
-                    None => value,
-                };
+                let inner_pin = ctx.pin_native_root(inner);
+                let data = ctx.read_native_pin(data_pin, data);
+                let key1 = antlr_read_pinned_value(ctx, key1, key1_pin);
+                let inner = ctx.read_native_pin(inner_pin, inner);
                 antlr_map_put(ctx, data, key1, Value::Object(Some(inner)))?;
-                antlr_map_put(ctx, inner, key2, value)
-            })();
-            ctx.unpin_native_roots(pins);
-            created?.unwrap_or(Value::Object(None))
-        }
-    };
-    Ok(Some(previous))
+                let inner = ctx.read_native_pin(inner_pin, inner);
+                let key2 = antlr_read_pinned_value(ctx, key2, key2_pin);
+                let value = antlr_read_pinned_value(ctx, value, value_pin);
+                antlr_map_put(ctx, inner, key2, value)?.unwrap_or(Value::Object(None))
+            }
+        };
+        Ok(Some(previous))
+    })();
+    ctx.unpin_native_roots(roots_base);
+    result
 }
 
 fn native_antlr_double_key_map_init(
@@ -2274,35 +2286,36 @@ fn antlr_alloc_atn_config(
     names: AntlrClassNames,
     ctor_args: &[Value],
 ) -> Result<ObjectRef, MethodCallFailed> {
+    let mut roots_base = None;
     let pins: Vec<_> = ctor_args
         .iter()
         .map(|arg| match arg {
-            Value::Object(Some(obj)) => Some((*obj, ctx.pin_native_root(*obj))),
+            Value::Object(Some(obj)) => {
+                let pin = ctx.pin_native_root(*obj);
+                roots_base.get_or_insert(pin);
+                Some((*obj, pin))
+            }
             _ => None,
         })
         .collect();
-    let config_class = ctx.ensure_class_initialized(names.atn_config)?;
+    let config_class = match ctx.ensure_class_initialized(names.atn_config) {
+        Ok(class_id) => class_id,
+        Err(error) => {
+            if let Some(base) = roots_base {
+                ctx.unpin_native_roots(base);
+            }
+            return Err(error);
+        }
+    };
     let config = ctx.alloc_object(
         config_class,
         ctx.class_num_total_fields(config_class).max(5),
     );
-    // GC-SAFETY: `native_antlr_atn_config_init` below is not allocation-free.
-    // Its `ATNConfig(ATNState,int,PredictionContext)` arm calls
-    // `antlr_semantic_empty_instance`, which runs `SemanticContext$Empty`'s
-    // `<clinit>` on first use; other arms resolve classes the same way. A
-    // moving young collection there relocates the config we just allocated,
-    // and returning the pre-move address handed the ATN simulator a config
-    // whose fields read as unrelated live objects.
-    //
-    // The damage is not confined to the one prediction that hit it: a wrong
-    // config poisons the closure/reach set, whose result is memoized as a DFA
-    // edge, so every later decision that reuses that edge takes the dead
-    // branch. That is what produced the nondeterministic Hibernate HQL
-    // mis-parses -- `<function-or-paren-expression> <comparison-op>` suddenly
-    // becoming "no viable alternative", and staying broken for the rest of the
-    // process (see
-    // `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`).
+    // The constructor intrinsic can initialize SemanticContext$Empty and
+    // therefore collect. Keep the newly allocated receiver rooted too; the
+    // argument pins alone do not remap this Rust-local ObjectRef.
     let config_pin = ctx.pin_native_root(config);
+    roots_base.get_or_insert(config_pin);
     let mut init_args = Vec::with_capacity(ctor_args.len() + 1);
     init_args.push(Value::Object(Some(config)));
     for (arg, pin) in ctor_args.iter().copied().zip(pins.iter()) {
@@ -2313,17 +2326,10 @@ fn antlr_alloc_atn_config(
             _ => arg,
         });
     }
-    native_antlr_atn_config_init(ctx, &init_args)?;
+    let init_result = native_antlr_atn_config_init(ctx, &init_args);
     let config = ctx.read_native_pin(config_pin, config);
-    // `unpin_native_roots` TRUNCATES the pin stack, so release only the lowest
-    // base we took; that drops every pin above it, including `config_pin`.
-    let lowest_base = pins
-        .iter()
-        .flatten()
-        .map(|(_, pin)| *pin)
-        .min()
-        .unwrap_or(config_pin);
-    ctx.unpin_native_roots(lowest_base);
+    ctx.unpin_native_roots(roots_base.expect("config pin establishes a root frame"));
+    init_result?;
     Ok(config)
 }
 
@@ -2348,34 +2354,46 @@ fn antlr_parser_rule_transition(
     config: ObjectRef,
     transition: ObjectRef,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
-    let config_pin = ctx.pin_native_root(config);
+    // This path allocates the successor PredictionContext and then the
+    // successor ATNConfig.  All three graph endpoints must survive both
+    // allocations: in particular, `target` is read from `transition` and is
+    // not necessarily reachable from the new context.  Releasing the original
+    // config/transition pins before `antlr_alloc_atn_config` left these Rust
+    // locals stale after a moving-young collection in compiled parser code.
+    let roots_base = ctx.pin_native_root(config);
     let transition_pin = ctx.pin_native_root(transition);
-    let Some(follow_state) = antlr_ref_field(ctx, transition, "followState", 3) else {
-        ctx.unpin_native_roots(config_pin);
-        ctx.unpin_native_roots(transition_pin);
-        return Ok(None);
-    };
-    let context = antlr_atn_config_context(ctx, config);
-    let return_state = antlr_int_field(ctx, follow_state, "stateNumber", 1);
-    let names = antlr_names_for_object(ctx, config);
-    let new_context = antlr_create_singleton_context(ctx, names, context, return_state)?;
-    let config = ctx.read_native_pin(config_pin, config);
-    let transition = ctx.read_native_pin(transition_pin, transition);
-    let target = antlr_transition_target(ctx, transition);
-    ctx.unpin_native_roots(config_pin);
-    ctx.unpin_native_roots(transition_pin);
-    let Some(target) = target else {
-        return Ok(None);
-    };
-    Ok(Some(antlr_alloc_atn_config(
-        ctx,
-        names,
-        &[
-            Value::Object(Some(config)),
-            Value::Object(Some(target)),
-            Value::Object(Some(new_context)),
-        ],
-    )?))
+    let result = (|| {
+        let config = ctx.read_native_pin(roots_base, config);
+        let transition = ctx.read_native_pin(transition_pin, transition);
+        let Some(follow_state) = antlr_ref_field(ctx, transition, "followState", 3) else {
+            return Ok(None);
+        };
+        let context = antlr_atn_config_context(ctx, config);
+        let return_state = antlr_int_field(ctx, follow_state, "stateNumber", 1);
+        let names = antlr_names_for_object(ctx, config);
+        let new_context = antlr_create_singleton_context(ctx, names, context, return_state)?;
+        let new_context_pin = ctx.pin_native_root(new_context);
+
+        let transition = ctx.read_native_pin(transition_pin, transition);
+        let Some(target) = antlr_transition_target(ctx, transition) else {
+            return Ok(None);
+        };
+        let target_pin = ctx.pin_native_root(target);
+        let config = ctx.read_native_pin(roots_base, config);
+        let target = ctx.read_native_pin(target_pin, target);
+        let new_context = ctx.read_native_pin(new_context_pin, new_context);
+        Ok(Some(antlr_alloc_atn_config(
+            ctx,
+            names,
+            &[
+                Value::Object(Some(config)),
+                Value::Object(Some(target)),
+                Value::Object(Some(new_context)),
+            ],
+        )?))
+    })();
+    ctx.unpin_native_roots(roots_base);
+    result
 }
 
 fn antlr_parser_transition_delegate_descriptor(
@@ -2643,17 +2661,38 @@ fn antlr_parser_native_get_epsilon_target(
     }
 }
 
+#[derive(Clone, Copy)]
+struct AntlrClosureRoots {
+    simulator: (usize, ObjectRef),
+    config: (usize, ObjectRef),
+    configs: (usize, ObjectRef),
+    closure_busy: (usize, ObjectRef),
+}
+
+impl AntlrClosureRoots {
+    #[inline]
+    fn read(
+        self,
+        ctx: &dyn NativeContext,
+    ) -> (ObjectRef, ObjectRef, ObjectRef, ObjectRef) {
+        (
+            ctx.read_native_pin(self.simulator.0, self.simulator.1),
+            ctx.read_native_pin(self.config.0, self.config.1),
+            ctx.read_native_pin(self.configs.0, self.configs.1),
+            ctx.read_native_pin(self.closure_busy.0, self.closure_busy.1),
+        )
+    }
+}
+
 fn antlr_parser_closure_checking_stop_state_unrooted(
     ctx: &mut dyn NativeContext,
-    simulator: ObjectRef,
-    config: ObjectRef,
-    configs: ObjectRef,
-    closure_busy: ObjectRef,
+    roots: AntlrClosureRoots,
     collect_predicates: bool,
     full_ctx: bool,
     depth: i32,
     treat_eof_as_epsilon: bool,
 ) -> MethodCallResult {
+    let (mut simulator, mut config, mut configs, mut closure_busy) = roots.read(ctx);
     let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
         return Ok(None);
     };
@@ -2665,8 +2704,9 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
                 let size = antlr_prediction_context_size(ctx, context);
                 for index in 0..size {
                     // A previous recursive edge can collect.  Fetch the
-                    // context again through the rooted config before reading
-                    // this slot instead of retaining a raw graph reference.
+                    // entire graph through the native root frame before
+                    // reading this slot instead of retaining raw Rust locals.
+                    (simulator, config, configs, closure_busy) = roots.read(ctx);
                     let Some(context) = antlr_atn_config_context(ctx, config) else {
                         continue;
                     };
@@ -2675,6 +2715,7 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
                         if full_ctx {
                             let names = antlr_names_for_object(ctx, config);
                             let empty = antlr_empty_instance(ctx, names)?;
+                            (simulator, config, configs, closure_busy) = roots.read(ctx);
                             let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
                                 continue;
                             };
@@ -2687,8 +2728,10 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
                                     Value::Object(Some(empty)),
                                 ],
                             )?;
+                            (simulator, config, configs, closure_busy) = roots.read(ctx);
                             antlr_parser_add_config(ctx, simulator, configs, next_config)?;
                         } else {
+                            (simulator, config, configs, closure_busy) = roots.read(ctx);
                             antlr_parser_closure_impl(
                                 ctx,
                                 simulator,
@@ -2701,9 +2744,20 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
                                 treat_eof_as_epsilon,
                             )?;
                         }
-                    } else if let Some(return_state_obj) =
-                        antlr_parser_atn_state_by_number(ctx, simulator, return_state)?
-                    {
+                    } else {
+                        (simulator, config, configs, closure_busy) = roots.read(ctx);
+                        let Some(return_state_obj) =
+                            antlr_parser_atn_state_by_number(ctx, simulator, return_state)?
+                        else {
+                            continue;
+                        };
+                        // State lookup may dispatch through a non-ArrayList
+                        // implementation. Refresh the context before deriving
+                        // constructor arguments from it.
+                        (simulator, config, configs, closure_busy) = roots.read(ctx);
+                        let Some(context) = antlr_atn_config_context(ctx, config) else {
+                            continue;
+                        };
                         let parent = antlr_prediction_context_parent(ctx, context, index);
                         let semantic_context = antlr_atn_config_semantic_context(ctx, config);
                         let alt = antlr_atn_config_alt(ctx, config);
@@ -2719,6 +2773,7 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
                                 Value::Object(semantic_context),
                             ],
                         )?;
+                        (simulator, config, configs, closure_busy) = roots.read(ctx);
                         antlr_atn_config_set_reaches(ctx, next_config, reaches);
                         antlr_parser_closure_checking_stop_state_impl(
                             ctx,
@@ -2738,11 +2793,13 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
         }
 
         if full_ctx {
+            (simulator, config, configs, closure_busy) = roots.read(ctx);
             antlr_parser_add_config(ctx, simulator, configs, config)?;
             return Ok(None);
         }
     }
 
+    (simulator, config, configs, closure_busy) = roots.read(ctx);
     antlr_parser_closure_impl(
         ctx,
         simulator,
@@ -2759,21 +2816,20 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
 #[allow(clippy::too_many_arguments)]
 fn antlr_parser_closure_unrooted(
     ctx: &mut dyn NativeContext,
-    simulator: ObjectRef,
-    config: ObjectRef,
-    configs: ObjectRef,
-    closure_busy: ObjectRef,
+    roots: AntlrClosureRoots,
     collect_predicates: bool,
     full_ctx: bool,
     depth: i32,
     treat_eof_as_epsilon: bool,
 ) -> MethodCallResult {
+    let (mut simulator, mut config, mut configs, mut closure_busy) = roots.read(ctx);
     let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
         return Ok(None);
     };
 
     if antlr_int_field(ctx, state, "epsilonOnlyTransitions", 3) == 0 {
         antlr_parser_add_config(ctx, simulator, configs, config)?;
+        (simulator, config, configs, closure_busy) = roots.read(ctx);
     }
 
     // `add` can allocate.  Re-read `state` from the rooted config before
@@ -2788,6 +2844,7 @@ fn antlr_parser_closure_unrooted(
             _ => 0,
         };
     for transition_index in 0..transition_count {
+        (simulator, config, configs, closure_busy) = roots.read(ctx);
         if transition_index == 0 {
             let can_drop = match native_antlr_parser_can_drop_loop_entry_edge(
                 ctx,
@@ -2799,6 +2856,7 @@ fn antlr_parser_closure_unrooted(
             if can_drop {
                 continue;
             }
+            (simulator, config, configs, closure_busy) = roots.read(ctx);
         }
 
         // The prior iteration (and the loop-entry predicate above) may have
@@ -2810,7 +2868,7 @@ fn antlr_parser_closure_unrooted(
             continue;
         };
         let transition_pin = ctx.pin_native_root(transition);
-        let transition = ctx.read_native_pin(transition_pin, transition);
+        let mut transition = ctx.read_native_pin(transition_pin, transition);
         let continue_collecting =
             collect_predicates && !antlr_transition_is_action(ctx, transition);
         // `inContext` mirrors real ANTLR's `getEpsilonTarget(config, t, collectPredicates,
@@ -2823,6 +2881,8 @@ fn antlr_parser_closure_unrooted(
         // off a rule with an exhausted (empty) context, wrongly attaching a precedence
         // predicate that real ANTLR would have suppressed — corrupting prediction on the
         // second+ visit to the same left-recursive loop decision within one parse.
+        (simulator, config, configs, closure_busy) = roots.read(ctx);
+        transition = ctx.read_native_pin(transition_pin, transition);
         let Some(next_config) = antlr_parser_native_get_epsilon_target(
             ctx,
             simulator,
@@ -2841,48 +2901,65 @@ fn antlr_parser_closure_unrooted(
         // must remain rooted while the native walk adds it to Java sets and
         // recursively resumes prediction.
         let next_config_pin = ctx.pin_native_root(next_config);
-        let next_config = ctx.read_native_pin(next_config_pin, next_config);
+        let mut next_config = ctx.read_native_pin(next_config_pin, next_config);
 
         let mut next_depth = depth;
         // `getEpsilonTarget` can collect; reload the state through the rooted
         // config before using it below.
+        (simulator, config, configs, closure_busy) = roots.read(ctx);
+        transition = ctx.read_native_pin(transition_pin, transition);
+        next_config = ctx.read_native_pin(next_config_pin, next_config);
         let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
             ctx.unpin_native_roots(transition_pin);
             continue;
         };
         if antlr_state_is_rule_stop(ctx, state) {
             if let Some(dfa) = antlr_parser_dfa(ctx, simulator) {
+                let dfa_pin = ctx.pin_native_root(dfa);
                 if antlr_dfa_is_precedence(ctx, dfa) {
-                    let Some(dfa) = antlr_parser_dfa(ctx, simulator) else {
-                        ctx.unpin_native_roots(transition_pin);
-                        continue;
-                    };
+                    (simulator, config, configs, closure_busy) = roots.read(ctx);
+                    transition = ctx.read_native_pin(transition_pin, transition);
+                    next_config = ctx.read_native_pin(next_config_pin, next_config);
+                    let dfa = ctx.read_native_pin(dfa_pin, dfa);
                     let outermost =
                         antlr_int_field(ctx, transition, "outermostPrecedenceReturn", 1);
                     if Some(outermost) == antlr_dfa_start_rule(ctx, dfa) {
                         antlr_atn_config_set_precedence_suppressed(ctx, next_config);
                     }
                 }
+                ctx.unpin_native_roots(dfa_pin);
             }
+            next_config = ctx.read_native_pin(next_config_pin, next_config);
             let reaches = antlr_atn_config_reaches(ctx, next_config).saturating_add(1);
             antlr_atn_config_set_reaches(ctx, next_config, reaches);
+            (simulator, config, configs, closure_busy) = roots.read(ctx);
+            next_config = ctx.read_native_pin(next_config_pin, next_config);
             if !antlr_set_add_object(ctx, closure_busy, next_config)? {
                 ctx.unpin_native_roots(transition_pin);
                 continue;
             }
+            (simulator, config, configs, closure_busy) = roots.read(ctx);
             antlr_set_field_value(ctx, configs, "dipsIntoOuterContext", 6, Value::Int(1));
             next_depth = next_depth.saturating_sub(1);
-        } else if !antlr_transition_is_epsilon(ctx, transition)
-            && !antlr_set_add_object(ctx, closure_busy, next_config)?
-        {
-            ctx.unpin_native_roots(transition_pin);
-            continue;
+        } else {
+            transition = ctx.read_native_pin(transition_pin, transition);
+            if !antlr_transition_is_epsilon(ctx, transition) {
+                (simulator, config, configs, closure_busy) = roots.read(ctx);
+                next_config = ctx.read_native_pin(next_config_pin, next_config);
+                if !antlr_set_add_object(ctx, closure_busy, next_config)? {
+                    ctx.unpin_native_roots(transition_pin);
+                    continue;
+                }
+            }
         }
 
+        transition = ctx.read_native_pin(transition_pin, transition);
         if antlr_transition_is_rule(ctx, transition) && next_depth >= 0 {
             next_depth = next_depth.saturating_add(1);
         }
 
+        (simulator, config, configs, closure_busy) = roots.read(ctx);
+        next_config = ctx.read_native_pin(next_config_pin, next_config);
         let result = antlr_parser_closure_checking_stop_state_impl(
             ctx,
             simulator,
@@ -2921,16 +2998,15 @@ fn antlr_parser_closure_checking_stop_state_impl(
     let config_pin = ctx.pin_native_root(config);
     let configs_pin = ctx.pin_native_root(configs);
     let closure_busy_pin = ctx.pin_native_root(closure_busy);
-    let simulator = ctx.read_native_pin(pin_base, simulator);
-    let config = ctx.read_native_pin(config_pin, config);
-    let configs = ctx.read_native_pin(configs_pin, configs);
-    let closure_busy = ctx.read_native_pin(closure_busy_pin, closure_busy);
+    let roots = AntlrClosureRoots {
+        simulator: (pin_base, simulator),
+        config: (config_pin, config),
+        configs: (configs_pin, configs),
+        closure_busy: (closure_busy_pin, closure_busy),
+    };
     let result = antlr_parser_closure_checking_stop_state_unrooted(
         ctx,
-        simulator,
-        config,
-        configs,
-        closure_busy,
+        roots,
         collect_predicates,
         full_ctx,
         depth,
@@ -2956,16 +3032,15 @@ fn antlr_parser_closure_impl(
     let config_pin = ctx.pin_native_root(config);
     let configs_pin = ctx.pin_native_root(configs);
     let closure_busy_pin = ctx.pin_native_root(closure_busy);
-    let simulator = ctx.read_native_pin(pin_base, simulator);
-    let config = ctx.read_native_pin(config_pin, config);
-    let configs = ctx.read_native_pin(configs_pin, configs);
-    let closure_busy = ctx.read_native_pin(closure_busy_pin, closure_busy);
+    let roots = AntlrClosureRoots {
+        simulator: (pin_base, simulator),
+        config: (config_pin, config),
+        configs: (configs_pin, configs),
+        closure_busy: (closure_busy_pin, closure_busy),
+    };
     let result = antlr_parser_closure_unrooted(
         ctx,
-        simulator,
-        config,
-        configs,
-        closure_busy,
+        roots,
         collect_predicates,
         full_ctx,
         depth,
@@ -3141,9 +3216,16 @@ fn antlr_parser_merge_cache_or_create(
     let names = antlr_names_for_object(ctx, simulator);
     let simulator_pin = ctx.pin_native_root(simulator);
     let cache = antlr_object_from_result(ctx.new_object(names.double_key_map), "DoubleKeyMap")?;
-    native_antlr_double_key_map_init(ctx, &[Value::Object(Some(cache))])?;
+    let cache_pin = ctx.pin_native_root(cache);
+    let init_result = native_antlr_double_key_map_init(ctx, &[Value::Object(Some(cache))]);
+    if let Err(error) = init_result {
+        ctx.unpin_native_roots(simulator_pin);
+        return Err(error);
+    }
     let simulator = ctx.read_native_pin(simulator_pin, simulator);
+    let cache = ctx.read_native_pin(cache_pin, cache);
     antlr_set_field_value(ctx, simulator, "mergeCache", 5, Value::Object(Some(cache)));
+    let cache = ctx.read_native_pin(cache_pin, cache);
     ctx.unpin_native_roots(simulator_pin);
     Ok(cache)
 }
@@ -3238,70 +3320,91 @@ fn antlr_parser_remove_all_configs_not_in_rule_stop_state(
     configs: ObjectRef,
     look_to_end_of_rule: bool,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    if antlr_atn_config_set_all_rule_stop_states(ctx, configs) {
-        return Ok(configs);
-    }
-    let names = antlr_names_for_object(ctx, configs);
-    let full_ctx = antlr_atn_config_set_full_ctx(ctx, configs);
-    // GC-SAFETY: `configs` is a bare argument and everything below allocates —
-    // the result set, the per-config adds, the epsilon lookups. Root it, then
-    // read each config out of it by index on every pass (see `antlr_config_at`)
-    // rather than snapshotting the set into a Rust `Vec`.
+    let roots_base = ctx.pin_native_root(simulator);
     let configs_pin = ctx.pin_native_root(configs);
-    let result = antlr_new_atn_config_set(ctx, names, full_ctx)?;
-    let result_pin = ctx.pin_native_root(result);
-    let merge_cache = antlr_parser_merge_cache(ctx, simulator);
+    let result = (|| {
+        let mut simulator = ctx.read_native_pin(roots_base, simulator);
+        let configs = ctx.read_native_pin(configs_pin, configs);
+        if antlr_atn_config_set_all_rule_stop_states(ctx, configs) {
+            return Ok(configs);
+        }
+        let names = antlr_names_for_object(ctx, configs);
+        let full_ctx = antlr_atn_config_set_full_ctx(ctx, configs);
+        let result = antlr_new_atn_config_set(ctx, names, full_ctx)?;
+        let result_pin = ctx.pin_native_root(result);
 
-    let configs_len = {
         let configs = ctx.read_native_pin(configs_pin, configs);
-        antlr_atn_config_set_len(ctx, configs)
-    };
-    for config_index in 0..configs_len {
-        let configs = ctx.read_native_pin(configs_pin, configs);
-        let Some(config) = antlr_config_at(ctx, configs, config_index) else {
-            continue;
-        };
-        let state = antlr_ref_field(ctx, config, "state", 0);
-        if state
-            .map(|state| antlr_state_is_rule_stop(ctx, state))
-            .unwrap_or(false)
-        {
-            let result = ctx.read_native_pin(result_pin, result);
-            antlr_atn_config_set_add_impl(ctx, result, config, merge_cache)?;
-        } else if look_to_end_of_rule {
-            if let Some(state) = state {
-                let epsilon_only = match native_antlr_atn_state_only_has_epsilon_transitions(
-                    ctx,
-                    &[Value::Object(Some(state))],
-                )? {
-                    Some(Value::Int(v)) => v != 0,
-                    _ => false,
-                };
-                if epsilon_only && antlr_atn_next_tokens_contains_epsilon(ctx, simulator, state)? {
-                    if let Some(stop_state) =
-                        antlr_parser_rule_stop_state_for(ctx, simulator, state)
+        let config_snapshot: Vec<_> = antlr_atn_config_set_config_vec(ctx, configs)
+            .into_iter()
+            .map(|config| (config, ctx.pin_native_root(config)))
+            .collect();
+        for (config, config_pin) in config_snapshot {
+            let mut config = ctx.read_native_pin(config_pin, config);
+            let state = antlr_ref_field(ctx, config, "state", 0);
+            if state
+                .map(|state| antlr_state_is_rule_stop(ctx, state))
+                .unwrap_or(false)
+            {
+                let result = ctx.read_native_pin(result_pin, result);
+                simulator = ctx.read_native_pin(roots_base, simulator);
+                let merge_cache = antlr_parser_merge_cache(ctx, simulator);
+                antlr_atn_config_set_add_impl(ctx, result, config, merge_cache)?;
+            } else if look_to_end_of_rule {
+                if let Some(state) = state {
+                    let epsilon_only = match native_antlr_atn_state_only_has_epsilon_transitions(
+                        ctx,
+                        &[Value::Object(Some(state))],
+                    )? {
+                        Some(Value::Int(v)) => v != 0,
+                        _ => false,
+                    };
+                    config = ctx.read_native_pin(config_pin, config);
+                    let state = antlr_ref_field(ctx, config, "state", 0);
+                    simulator = ctx.read_native_pin(roots_base, simulator);
+                    if epsilon_only
+                        && state
+                            .map(|state| {
+                                antlr_atn_next_tokens_contains_epsilon(ctx, simulator, state)
+                            })
+                            .transpose()?
+                            .unwrap_or(false)
                     {
-                        // `config` predates the two calls above; re-read it.
-                        let configs = ctx.read_native_pin(configs_pin, configs);
-                        let Some(config) = antlr_config_at(ctx, configs, config_index) else {
-                            continue;
-                        };
-                        let next_config = antlr_alloc_atn_config(
-                            ctx,
-                            names,
-                            &[Value::Object(Some(config)), Value::Object(Some(stop_state))],
-                        )?;
-                        let result = ctx.read_native_pin(result_pin, result);
-                        antlr_atn_config_set_add_impl(ctx, result, next_config, merge_cache)?;
+                        config = ctx.read_native_pin(config_pin, config);
+                        let state = antlr_ref_field(ctx, config, "state", 0);
+                        simulator = ctx.read_native_pin(roots_base, simulator);
+                        if let Some(stop_state) = state.and_then(|state| {
+                            antlr_parser_rule_stop_state_for(ctx, simulator, state)
+                        }) {
+                            config = ctx.read_native_pin(config_pin, config);
+                            let next_config = antlr_alloc_atn_config(
+                                ctx,
+                                names,
+                                &[
+                                    Value::Object(Some(config)),
+                                    Value::Object(Some(stop_state)),
+                                ],
+                            )?;
+                            let result = ctx.read_native_pin(result_pin, result);
+                            simulator = ctx.read_native_pin(roots_base, simulator);
+                            let merge_cache = antlr_parser_merge_cache(ctx, simulator);
+                            antlr_atn_config_set_add_impl(
+                                ctx,
+                                result,
+                                next_config,
+                                merge_cache,
+                            )?;
+                        }
                     }
                 }
             }
         }
-    }
 
-    let result = ctx.read_native_pin(result_pin, result);
-    ctx.unpin_native_roots(configs_pin);
-    Ok(result)
+        let result = ctx.read_native_pin(result_pin, result);
+        ctx.unpin_native_roots(result_pin);
+        Ok(result)
+    })();
+    ctx.unpin_native_roots(roots_base);
+    result
 }
 
 fn native_antlr_parser_compute_reach_set(
@@ -3325,27 +3428,19 @@ fn native_antlr_parser_compute_reach_set(
     let intermediate_pin = ctx.pin_native_root(intermediate);
     let mut skipped_stop_states: Vec<(ObjectRef, usize)> = Vec::new();
 
-    // GC-SAFETY: iterate by index out of the pinned set rather than out of a
-    // Rust snapshot — see `antlr_config_at`. The body allocates every
-    // iteration, so a snapshot's not-yet-visited entries would be dead by the
-    // time the loop reached them.
-    let closure_len = {
-        let closure_set = ctx.read_native_pin(closure_pin, closure_set);
-        antlr_atn_config_set_len(ctx, closure_set)
-    };
-    for config_index in 0..closure_len {
-        let closure_set = ctx.read_native_pin(closure_pin, closure_set);
-        let Some(config) = antlr_config_at(ctx, closure_set, config_index) else {
-            continue;
-        };
+    let closure_set = ctx.read_native_pin(closure_pin, closure_set);
+    let closure_snapshot: Vec<_> = antlr_atn_config_set_config_vec(ctx, closure_set)
+        .into_iter()
+        .map(|config| (config, ctx.pin_native_root(config)))
+        .collect();
+    for (config, config_pin) in closure_snapshot {
+        let mut config = ctx.read_native_pin(config_pin, config);
         let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
             continue;
         };
 
         if antlr_state_is_rule_stop(ctx, state) {
             if full_ctx || token == -1 {
-                // These outlive the loop, so they DO need a lasting root.
-                let config_pin = ctx.pin_native_root(config);
                 skipped_stop_states.push((config, config_pin));
             }
             continue;
@@ -3359,13 +3454,9 @@ fn native_antlr_parser_compute_reach_set(
             _ => 0,
         };
         for transition_index in 0..transition_count {
-            // Everything below allocates, so re-read the config from the
-            // (rooted) set and the state from the refreshed config on every
-            // pass instead of carrying either across the iteration.
-            let closure_set = ctx.read_native_pin(closure_pin, closure_set);
-            let Some(config) = antlr_config_at(ctx, closure_set, config_index) else {
-                continue;
-            };
+            // Matching a previous edge can allocate.  Reacquire the state
+            // from the pinned config before indexing `transitions` again.
+            config = ctx.read_native_pin(config_pin, config);
             let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
                 continue;
             };
@@ -3377,6 +3468,10 @@ fn native_antlr_parser_compute_reach_set(
             let Some(target) = antlr_parser_reachable_target(ctx, this, transition, token)? else {
                 continue;
             };
+            // `reachable_target` can invoke transition bytecode and collect.
+            // Refresh the source config before passing it to the allocating
+            // ATNConfig constructor.
+            config = ctx.read_native_pin(config_pin, config);
             let next_config = antlr_alloc_atn_config(
                 ctx,
                 names,
@@ -3405,14 +3500,12 @@ fn native_antlr_parser_compute_reach_set(
         let closure_busy_pin = ctx.pin_native_root(closure_busy);
         let treat_eof_as_epsilon = token == -1;
         let intermediate = ctx.read_native_pin(intermediate_pin, intermediate);
-        // Index-based for the same reason as the first loop: the closure call
-        // below allocates, so a Rust snapshot's later entries would be dead.
-        let intermediate_len = antlr_atn_config_set_len(ctx, intermediate);
-        for config_index in 0..intermediate_len {
-            let intermediate = ctx.read_native_pin(intermediate_pin, intermediate);
-            let Some(config) = antlr_config_at(ctx, intermediate, config_index) else {
-                continue;
-            };
+        let intermediate_snapshot: Vec<_> = antlr_atn_config_set_config_vec(ctx, intermediate)
+            .into_iter()
+            .map(|config| (config, ctx.pin_native_root(config)))
+            .collect();
+        for (config, config_pin) in intermediate_snapshot {
+            let config = ctx.read_native_pin(config_pin, config);
             let reach_set = ctx.read_native_pin(reach_pin, reach_set);
             let closure_busy = ctx.read_native_pin(closure_busy_pin, closure_busy);
             this = ctx.read_native_pin(base_pin, this);
@@ -3435,6 +3528,7 @@ fn native_antlr_parser_compute_reach_set(
 
     let mut reach = reach.expect("reach set should be initialized");
     if token == -1 {
+        let intermediate = ctx.read_native_pin(intermediate_pin, intermediate);
         let look_to_end_of_rule = reach == intermediate;
         this = ctx.read_native_pin(base_pin, this);
         reach = antlr_parser_remove_all_configs_not_in_rule_stop_state(
@@ -3706,43 +3800,73 @@ fn antlr_config_lookup_get_or_add(
     lookup: ObjectRef,
     config: ObjectRef,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let mut lookup = lookup;
-    let mut config = config;
-    let buckets = match antlr_config_lookup_buckets(ctx, lookup) {
-        Some(buckets) if ctx.array_length(buckets) != 0 => buckets,
-        _ => {
-            let created = antlr_config_lookup_create_buckets(ctx, lookup, config);
-            lookup = created.0;
-            config = created.1;
-            created.2
-        }
-    };
+    let roots_base = ctx.pin_native_root(lookup);
+    let config_pin = ctx.pin_native_root(config);
+    let result = (|| {
+        let mut lookup = ctx.read_native_pin(roots_base, lookup);
+        let mut config = ctx.read_native_pin(config_pin, config);
+        let buckets = match antlr_config_lookup_buckets(ctx, lookup) {
+            Some(buckets) if ctx.array_length(buckets) != 0 => buckets,
+            _ => {
+                let created = antlr_config_lookup_create_buckets(ctx, lookup, config);
+                lookup = created.0;
+                config = created.1;
+                created.2
+            }
+        };
+        let buckets_pin = ctx.pin_native_root(buckets);
 
-    let bucket_index =
-        (antlr_config_key_hash(ctx, config)? as u32 as usize) & (ctx.array_length(buckets) - 1);
-    let bucket = match ctx.get_array_element(buckets, bucket_index) {
-        Value::Object(Some(bucket)) => bucket,
-        _ => return antlr_config_lookup_new_bucket(ctx, lookup, buckets, config, bucket_index),
-    };
+        let hash = antlr_config_key_hash(ctx, config)?;
+        lookup = ctx.read_native_pin(roots_base, lookup);
+        config = ctx.read_native_pin(config_pin, config);
+        let buckets = ctx.read_native_pin(buckets_pin, buckets);
+        let bucket_index = (hash as u32 as usize) & (ctx.array_length(buckets) - 1);
+        let bucket = match ctx.get_array_element(buckets, bucket_index) {
+            Value::Object(Some(bucket)) => bucket,
+            _ => {
+                return antlr_config_lookup_new_bucket(
+                    ctx,
+                    lookup,
+                    buckets,
+                    config,
+                    bucket_index,
+                )
+            }
+        };
+        let bucket_pin = ctx.pin_native_root(bucket);
 
-    let len = ctx.array_length(bucket);
-    for i in 0..len {
-        match ctx.get_array_element(bucket, i) {
-            Value::Object(Some(existing)) => {
-                if antlr_config_key_equal(ctx, existing, config)? {
-                    return Ok(existing);
+        let len = ctx.array_length(bucket);
+        for i in 0..len {
+            lookup = ctx.read_native_pin(roots_base, lookup);
+            config = ctx.read_native_pin(config_pin, config);
+            let bucket = ctx.read_native_pin(bucket_pin, bucket);
+            match ctx.get_array_element(bucket, i) {
+                Value::Object(Some(existing)) => {
+                    let existing_pin = ctx.pin_native_root(existing);
+                    let equal = antlr_config_key_equal(ctx, existing, config)?;
+                    let existing = ctx.read_native_pin(existing_pin, existing);
+                    ctx.unpin_native_roots(existing_pin);
+                    if equal {
+                        return Ok(existing);
+                    }
+                }
+                _ => {
+                    ctx.set_array_element(bucket, i, Value::Object(Some(config)));
+                    let next_n = antlr_config_lookup_n(ctx, lookup).saturating_add(1);
+                    antlr_config_lookup_set_n(ctx, lookup, next_n);
+                    return Ok(config);
                 }
             }
-            _ => {
-                ctx.set_array_element(bucket, i, Value::Object(Some(config)));
-                let next_n = antlr_config_lookup_n(ctx, lookup).saturating_add(1);
-                antlr_config_lookup_set_n(ctx, lookup, next_n);
-                return Ok(config);
-            }
         }
-    }
 
-    antlr_config_lookup_grow_bucket(ctx, lookup, buckets, bucket, config, bucket_index)
+        lookup = ctx.read_native_pin(roots_base, lookup);
+        config = ctx.read_native_pin(config_pin, config);
+        let buckets = ctx.read_native_pin(buckets_pin, buckets);
+        let bucket = ctx.read_native_pin(bucket_pin, bucket);
+        antlr_config_lookup_grow_bucket(ctx, lookup, buckets, bucket, config, bucket_index)
+    })();
+    ctx.unpin_native_roots(roots_base);
+    result
 }
 
 fn antlr_config_list_find(
@@ -3770,62 +3894,99 @@ fn antlr_atn_config_set_add_impl(
     config: ObjectRef,
     merge_cache: Option<ObjectRef>,
 ) -> MethodCallResult {
-    if antlr_int_field(ctx, this, "readonly", 0) != 0 {
-        return Err(RuntimeError::IllegalStateException {
-            message: "This set is readonly".to_string(),
+    // Config lookup, context equality/merge, and ArrayList growth can all
+    // allocate. The Java caller's safe-native pins do not rewrite Rust locals
+    // captured by this nested helper, so retain the whole add operation and
+    // refresh every object used after an allocating sub-call.
+    let roots_base = ctx.pin_native_root(this);
+    let config_pin = ctx.pin_native_root(config);
+    let merge_cache_pin = merge_cache.map(|cache| (ctx.pin_native_root(cache), cache));
+    let result = (|| {
+        let mut this = ctx.read_native_pin(roots_base, this);
+        let mut config = ctx.read_native_pin(config_pin, config);
+        let mut merge_cache = merge_cache_pin
+            .map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
+
+        if antlr_int_field(ctx, this, "readonly", 0) != 0 {
+            return Err(RuntimeError::IllegalStateException {
+                message: "This set is readonly".to_string(),
+            }
+            .into());
         }
-        .into());
-    }
 
-    let semctx = antlr_atn_config_semantic_context(ctx, config);
-    if !antlr_semantic_context_is_empty(ctx, semctx) {
-        antlr_set_field_value(ctx, this, "hasSemanticContext", 5, Value::Int(1));
-    }
-    if antlr_atn_config_outer_context_depth(ctx, config) > 0 {
-        antlr_set_field_value(ctx, this, "dipsIntoOuterContext", 6, Value::Int(1));
-    }
-
-    let existing = if let Some(lookup) = antlr_ref_field(ctx, this, "configLookup", 1) {
-        antlr_config_lookup_get_or_add(ctx, lookup, config)?
-    } else if let Some(configs) = antlr_ref_field(ctx, this, "configs", 2) {
-        antlr_config_list_find(ctx, configs, config)?.unwrap_or(config)
-    } else {
-        config
-    };
-
-    if existing == config {
-        antlr_set_field_value(ctx, this, "cachedHashCode", 8, Value::Int(-1));
-        if let Some(configs) = antlr_ref_field(ctx, this, "configs", 2) {
-            antlr_arraylist_append(ctx, configs, Value::Object(Some(config)))?;
+        let semctx = antlr_atn_config_semantic_context(ctx, config);
+        if !antlr_semantic_context_is_empty(ctx, semctx) {
+            antlr_set_field_value(ctx, this, "hasSemanticContext", 5, Value::Int(1));
+            this = ctx.read_native_pin(roots_base, this);
         }
-        return Ok(Some(Value::Int(1)));
-    }
+        if antlr_atn_config_outer_context_depth(ctx, config) > 0 {
+            antlr_set_field_value(ctx, this, "dipsIntoOuterContext", 6, Value::Int(1));
+            this = ctx.read_native_pin(roots_base, this);
+        }
 
-    let root_is_wildcard = antlr_int_field(ctx, this, "fullCtx", 7) == 0;
-    let existing_context = antlr_atn_config_context(ctx, existing);
-    let config_context = antlr_atn_config_context(ctx, config);
-    let merged = match (existing_context, config_context) {
-        (Some(a), Some(b)) => Some(antlr_merge_contexts(
-            ctx,
-            a,
-            b,
-            root_is_wildcard,
-            merge_cache,
-        )?),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    let reaches = std::cmp::max(
-        antlr_atn_config_reaches(ctx, existing),
-        antlr_atn_config_reaches(ctx, config),
-    );
-    antlr_atn_config_set_reaches(ctx, existing, reaches);
-    if antlr_atn_config_precedence_suppressed(ctx, config) {
-        antlr_atn_config_set_precedence_suppressed(ctx, existing);
-    }
-    antlr_atn_config_set_context(ctx, existing, merged);
-    Ok(Some(Value::Int(1)))
+        let existing_raw = if let Some(lookup) = antlr_ref_field(ctx, this, "configLookup", 1) {
+            antlr_config_lookup_get_or_add(ctx, lookup, config)?
+        } else if let Some(configs) = antlr_ref_field(ctx, this, "configs", 2) {
+            antlr_config_list_find(ctx, configs, config)?.unwrap_or(config)
+        } else {
+            config
+        };
+        config = ctx.read_native_pin(config_pin, config);
+        let existing_was_config = existing_raw == config;
+        let existing_pin = ctx.pin_native_root(existing_raw);
+        this = ctx.read_native_pin(roots_base, this);
+        config = ctx.read_native_pin(config_pin, config);
+        merge_cache = merge_cache_pin
+            .map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
+        let mut existing = if existing_was_config {
+            config
+        } else {
+            ctx.read_native_pin(existing_pin, existing_raw)
+        };
+
+        if existing == config {
+            antlr_set_field_value(ctx, this, "cachedHashCode", 8, Value::Int(-1));
+            this = ctx.read_native_pin(roots_base, this);
+            config = ctx.read_native_pin(config_pin, config);
+            if let Some(configs) = antlr_ref_field(ctx, this, "configs", 2) {
+                antlr_arraylist_append(ctx, configs, Value::Object(Some(config)))?;
+            }
+            return Ok(Some(Value::Int(1)));
+        }
+
+        let root_is_wildcard = antlr_int_field(ctx, this, "fullCtx", 7) == 0;
+        let existing_context = antlr_atn_config_context(ctx, existing);
+        let config_context = antlr_atn_config_context(ctx, config);
+        let merged = match (existing_context, config_context) {
+            (Some(a), Some(b)) => Some(antlr_merge_contexts(
+                ctx,
+                a,
+                b,
+                root_is_wildcard,
+                merge_cache,
+            )?),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        existing = ctx.read_native_pin(existing_pin, existing);
+        config = ctx.read_native_pin(config_pin, config);
+        let reaches = std::cmp::max(
+            antlr_atn_config_reaches(ctx, existing),
+            antlr_atn_config_reaches(ctx, config),
+        );
+        antlr_atn_config_set_reaches(ctx, existing, reaches);
+        existing = ctx.read_native_pin(existing_pin, existing);
+        config = ctx.read_native_pin(config_pin, config);
+        if antlr_atn_config_precedence_suppressed(ctx, config) {
+            antlr_atn_config_set_precedence_suppressed(ctx, existing);
+            existing = ctx.read_native_pin(existing_pin, existing);
+        }
+        antlr_atn_config_set_context(ctx, existing, merged);
+        Ok(Some(Value::Int(1)))
+    })();
+    ctx.unpin_native_roots(roots_base);
+    result
 }
 
 fn native_antlr_atn_config_set_add(
@@ -4615,48 +4776,6 @@ fn antlr_atn_config_set_config_vec(ctx: &mut dyn NativeContext, set: ObjectRef) 
     result
 }
 
-/// Number of configs currently in an `ATNConfigSet`. Pairs with
-/// [`antlr_config_at`] for GC-safe index-based iteration.
-fn antlr_atn_config_set_len(ctx: &mut dyn NativeContext, set: ObjectRef) -> usize {
-    let Some(configs) = antlr_ref_field(ctx, set, "configs", 2) else {
-        return 0;
-    };
-    let Some(data) = antlr_arraylist_data(ctx, configs) else {
-        return 0;
-    };
-    std::cmp::min(antlr_arraylist_size(ctx, configs), ctx.array_length(data))
-}
-
-/// Read config `index` straight out of a **currently rooted** `ATNConfigSet`.
-///
-/// This is the GC-safe way to iterate a config set whose loop body allocates.
-/// [`antlr_atn_config_set_config_vec`] copies the whole set into a Rust `Vec`
-/// first, so configs the loop has not reached yet are unrooted while earlier
-/// iterations run the collector — and pinning one inside its own iteration is
-/// too late, because the address is already dead by then. Rooting the entire
-/// batch up front fixes the staleness but makes every config of every set a GC
-/// root for the whole walk, which inflates the live set on exactly the
-/// allocation-heavy path that provoked the problem.
-///
-/// Re-reading from the (pinned) set each iteration is both correct and O(1) in
-/// roots: the caller keeps only the set rooted, and the element it is about to
-/// use. `set` MUST have been refreshed through its own pin by the caller first.
-fn antlr_config_at(
-    ctx: &mut dyn NativeContext,
-    set: ObjectRef,
-    index: usize,
-) -> Option<ObjectRef> {
-    let configs = antlr_ref_field(ctx, set, "configs", 2)?;
-    let data = antlr_arraylist_data(ctx, configs)?;
-    if index >= ctx.array_length(data) {
-        return None;
-    }
-    match ctx.get_array_element(data, index) {
-        Value::Object(Some(config)) => Some(config),
-        _ => None,
-    }
-}
-
 fn antlr_contexts_equal_opt(
     ctx: &mut dyn NativeContext,
     a: Option<ObjectRef>,
@@ -4893,37 +5012,71 @@ fn antlr_merge_contexts(
     root_is_wildcard: bool,
     merge_cache: Option<ObjectRef>,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    if a == b || antlr_prediction_contexts_equal(ctx, a, b) {
-        return Ok(a);
-    }
-
-    let names = antlr_names_for_object(ctx, a);
-    let a_kind = antlr_object_kind(ctx, a);
-    let b_kind = antlr_object_kind(ctx, b);
-    if antlr_is_singleton_like(a_kind) && antlr_is_singleton_like(b_kind) {
-        return antlr_merge_singletons(ctx, names, a, b, root_is_wildcard, merge_cache);
-    }
-
-    if root_is_wildcard {
-        if a_kind == AntlrPredictionContextKind::Empty {
+    let roots_base = ctx.pin_native_root(a);
+    let b_pin = ctx.pin_native_root(b);
+    let cache_pin = merge_cache.map(|cache| (ctx.pin_native_root(cache), cache));
+    let result = (|| {
+        let read_roots = |ctx: &dyn NativeContext| {
+            (
+                ctx.read_native_pin(roots_base, a),
+                ctx.read_native_pin(b_pin, b),
+                cache_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback)),
+            )
+        };
+        let (mut a, mut b, mut merge_cache) = read_roots(ctx);
+        if a == b || antlr_prediction_contexts_equal(ctx, a, b) {
             return Ok(a);
         }
-        if b_kind == AntlrPredictionContextKind::Empty {
-            return Ok(b);
-        }
-    }
 
-    let a = if antlr_is_singleton_like(a_kind) {
-        antlr_singleton_to_array_context(ctx, names, a)?
-    } else {
-        a
-    };
-    let b = if antlr_is_singleton_like(b_kind) {
-        antlr_singleton_to_array_context(ctx, names, b)?
-    } else {
-        b
-    };
-    antlr_merge_arrays(ctx, names, a, b, root_is_wildcard, merge_cache)
+        let names = antlr_names_for_object(ctx, a);
+        let a_kind = antlr_object_kind(ctx, a);
+        let b_kind = antlr_object_kind(ctx, b);
+        if antlr_is_singleton_like(a_kind) && antlr_is_singleton_like(b_kind) {
+            return antlr_merge_singletons(ctx, names, a, b, root_is_wildcard, merge_cache);
+        }
+
+        if root_is_wildcard {
+            if a_kind == AntlrPredictionContextKind::Empty {
+                return Ok(a);
+            }
+            if b_kind == AntlrPredictionContextKind::Empty {
+                return Ok(b);
+            }
+        }
+
+        let converted_a = if antlr_is_singleton_like(a_kind) {
+            antlr_singleton_to_array_context(ctx, names, a)?
+        } else {
+            a
+        };
+        let converted_a_pin = ctx.pin_native_root(converted_a);
+        (a, b, merge_cache) = read_roots(ctx);
+        let converted_a = if antlr_is_singleton_like(a_kind) {
+            ctx.read_native_pin(converted_a_pin, converted_a)
+        } else {
+            a
+        };
+
+        let converted_b = if antlr_is_singleton_like(b_kind) {
+            antlr_singleton_to_array_context(ctx, names, b)?
+        } else {
+            b
+        };
+        let converted_b_pin = ctx.pin_native_root(converted_b);
+        let converted_a = ctx.read_native_pin(converted_a_pin, converted_a);
+        let converted_b = ctx.read_native_pin(converted_b_pin, converted_b);
+        merge_cache = cache_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
+        antlr_merge_arrays(
+            ctx,
+            names,
+            converted_a,
+            converted_b,
+            root_is_wildcard,
+            merge_cache,
+        )
+    })();
+    ctx.unpin_native_roots(roots_base);
+    result
 }
 
 fn antlr_merge_singletons(
@@ -4934,117 +5087,111 @@ fn antlr_merge_singletons(
     root_is_wildcard: bool,
     merge_cache: Option<ObjectRef>,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    if let Some(previous) = antlr_merge_cache_get(ctx, merge_cache, a, b)? {
-        return Ok(previous);
-    }
-    if let Some(previous) = antlr_merge_cache_get(ctx, merge_cache, b, a)? {
-        return Ok(previous);
-    }
-
-    if let Some(root_merge) = antlr_merge_root_contexts(ctx, names, a, b, root_is_wildcard)? {
-        let root_pin = ctx.pin_native_root(root_merge);
-        let root_merge = ctx.read_native_pin(root_pin, root_merge);
-        antlr_merge_cache_put(ctx, merge_cache, a, b, root_merge)?;
-        let root_merge = ctx.read_native_pin(root_pin, root_merge);
-        ctx.unpin_native_roots(root_pin);
-        return Ok(root_merge);
-    }
-
-    // GC-SAFETY: same contract as `antlr_merge_arrays` — `a`, `b`, and both
-    // parents are bare locals that must outlive the recursive merge and the
-    // context constructors below, each of which allocates. Comparing a
-    // post-merge parent against a pre-merge `a_parent` is also only meaningful
-    // once both have been refreshed.
     let roots_base = ctx.pin_native_root(a);
     let b_pin = ctx.pin_native_root(b);
-    let a_state = antlr_singleton_return_state(ctx, a);
-    let b_state = antlr_singleton_return_state(ctx, b);
-    let a_parent = antlr_singleton_parent(ctx, a);
-    let b_parent = antlr_singleton_parent(ctx, b);
-    let a_parent_pin = a_parent.map(|p| ctx.pin_native_root(p));
-    let b_parent_pin = b_parent.map(|p| ctx.pin_native_root(p));
-
-    if a_state == b_state {
-        let parent = match (a_parent, b_parent) {
-            (Some(pa), Some(pb)) => Some(antlr_merge_contexts(
-                ctx,
-                pa,
-                pb,
-                root_is_wildcard,
-                merge_cache,
-            )?),
-            (None, None) => None,
-            (Some(pa), None) => Some(pa),
-            (None, Some(pb)) => Some(pb),
+    let cache_pin = merge_cache.map(|cache| (ctx.pin_native_root(cache), cache));
+    let result = (|| {
+        let read_roots = |ctx: &dyn NativeContext| {
+            (
+                ctx.read_native_pin(roots_base, a),
+                ctx.read_native_pin(b_pin, b),
+                cache_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback)),
+            )
         };
-        let parent_pin = parent.map(|p| ctx.pin_native_root(p));
-        let parent = antlr_read_pinned_parent(ctx, parent, parent_pin);
-        let a_parent_now = antlr_read_pinned_parent(ctx, a_parent, a_parent_pin);
-        let b_parent_now = antlr_read_pinned_parent(ctx, b_parent, b_parent_pin);
-        if parent == a_parent_now {
-            let a = ctx.read_native_pin(roots_base, a);
-            ctx.unpin_native_roots(roots_base);
-            return Ok(a);
+        let (mut a, mut b, mut merge_cache) = read_roots(ctx);
+        if let Some(previous) = antlr_merge_cache_get(ctx, merge_cache, a, b)? {
+            return Ok(previous);
         }
-        if parent == b_parent_now {
-            let b = ctx.read_native_pin(b_pin, b);
-            ctx.unpin_native_roots(roots_base);
-            return Ok(b);
+        (a, b, merge_cache) = read_roots(ctx);
+        if let Some(previous) = antlr_merge_cache_get(ctx, merge_cache, b, a)? {
+            return Ok(previous);
         }
-        let merged = antlr_create_singleton_context(ctx, names, parent, a_state)?;
-        let merged_pin = ctx.pin_native_root(merged);
-        let a = ctx.read_native_pin(roots_base, a);
-        let b = ctx.read_native_pin(b_pin, b);
-        let merged = ctx.read_native_pin(merged_pin, merged);
-        antlr_merge_cache_put(ctx, merge_cache, a, b, merged)?;
-        let merged = ctx.read_native_pin(merged_pin, merged);
-        ctx.unpin_native_roots(roots_base);
-        return Ok(merged);
-    }
 
-    let a_parent = antlr_read_pinned_parent(ctx, a_parent, a_parent_pin);
-    let b_parent = antlr_read_pinned_parent(ctx, b_parent, b_parent_pin);
-    let single_parent = if a == b {
-        a_parent
-    } else {
-        match (a_parent, b_parent) {
-            (Some(pa), Some(pb)) if antlr_prediction_contexts_equal(ctx, pa, pb) => Some(pa),
-            _ => None,
+        (a, b, merge_cache) = read_roots(ctx);
+        if let Some(root_merge) =
+            antlr_merge_root_contexts(ctx, names, a, b, root_is_wildcard)?
+        {
+            let root_merge_pin = ctx.pin_native_root(root_merge);
+            (a, b, merge_cache) = read_roots(ctx);
+            let root_merge = ctx.read_native_pin(root_merge_pin, root_merge);
+            antlr_merge_cache_put(ctx, merge_cache, a, b, root_merge)?;
+            return Ok(ctx.read_native_pin(root_merge_pin, root_merge));
         }
-    };
 
-    if let Some(parent) = single_parent {
+        (a, b, merge_cache) = read_roots(ctx);
+        let a_state = antlr_singleton_return_state(ctx, a);
+        let b_state = antlr_singleton_return_state(ctx, b);
+        let a_parent = antlr_singleton_parent(ctx, a);
+        let b_parent = antlr_singleton_parent(ctx, b);
+
+        if a_state == b_state {
+            let parent = match (a_parent, b_parent) {
+                (Some(pa), Some(pb)) => Some(antlr_merge_contexts(
+                    ctx,
+                    pa,
+                    pb,
+                    root_is_wildcard,
+                    merge_cache,
+                )?),
+                (None, None) => None,
+                (Some(pa), None) => Some(pa),
+                (None, Some(pb)) => Some(pb),
+            };
+            (a, b, merge_cache) = read_roots(ctx);
+            let a_parent = antlr_singleton_parent(ctx, a);
+            let b_parent = antlr_singleton_parent(ctx, b);
+            if parent == a_parent {
+                return Ok(a);
+            }
+            if parent == b_parent {
+                return Ok(b);
+            }
+            let merged = antlr_create_singleton_context(ctx, names, parent, a_state)?;
+            let merged_pin = ctx.pin_native_root(merged);
+            (a, b, merge_cache) = read_roots(ctx);
+            let merged = ctx.read_native_pin(merged_pin, merged);
+            antlr_merge_cache_put(ctx, merge_cache, a, b, merged)?;
+            return Ok(ctx.read_native_pin(merged_pin, merged));
+        }
+
+        let single_parent = if a == b {
+            a_parent
+        } else {
+            match (a_parent, b_parent) {
+                (Some(pa), Some(pb)) if antlr_prediction_contexts_equal(ctx, pa, pb) => Some(pa),
+                _ => None,
+            }
+        };
+
+        if let Some(parent) = single_parent {
+            let mut states = [a_state, b_state];
+            if a_state > b_state {
+                states = [b_state, a_state];
+            }
+            let merged =
+                antlr_create_array_context(ctx, names, &[Some(parent), Some(parent)], &states)?;
+            let merged_pin = ctx.pin_native_root(merged);
+            (a, b, merge_cache) = read_roots(ctx);
+            let merged = ctx.read_native_pin(merged_pin, merged);
+            antlr_merge_cache_put(ctx, merge_cache, a, b, merged)?;
+            return Ok(ctx.read_native_pin(merged_pin, merged));
+        }
+
         let mut states = [a_state, b_state];
+        let mut parents = [a_parent, b_parent];
         if a_state > b_state {
             states = [b_state, a_state];
+            parents = [b_parent, a_parent];
         }
-        let merged =
-            antlr_create_array_context(ctx, names, &[Some(parent), Some(parent)], &states)?;
+        let merged = antlr_create_array_context(ctx, names, &parents, &states)?;
         let merged_pin = ctx.pin_native_root(merged);
-        let a = ctx.read_native_pin(roots_base, a);
-        let b = ctx.read_native_pin(b_pin, b);
+        (a, b, merge_cache) = read_roots(ctx);
         let merged = ctx.read_native_pin(merged_pin, merged);
         antlr_merge_cache_put(ctx, merge_cache, a, b, merged)?;
-        let merged = ctx.read_native_pin(merged_pin, merged);
-        ctx.unpin_native_roots(roots_base);
-        return Ok(merged);
-    }
-
-    let mut states = [a_state, b_state];
-    let mut parents = [a_parent, b_parent];
-    if a_state > b_state {
-        states = [b_state, a_state];
-        parents = [b_parent, a_parent];
-    }
-    let merged = antlr_create_array_context(ctx, names, &parents, &states)?;
-    let merged_pin = ctx.pin_native_root(merged);
-    let a = ctx.read_native_pin(roots_base, a);
-    let b = ctx.read_native_pin(b_pin, b);
-    let merged = ctx.read_native_pin(merged_pin, merged);
-    antlr_merge_cache_put(ctx, merge_cache, a, b, merged)?;
-    let merged = ctx.read_native_pin(merged_pin, merged);
+        Ok(ctx.read_native_pin(merged_pin, merged))
+    })();
     ctx.unpin_native_roots(roots_base);
-    Ok(merged)
+    result
 }
 
 fn antlr_array_states(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<i32> {
@@ -5091,37 +5238,6 @@ fn antlr_combine_common_parents(ctx: &mut dyn NativeContext, parents: &mut [Opti
     }
 }
 
-/// Root every `Some` entry of a parent vector and return the handles.
-///
-/// The prediction-context merge below snapshots both operands' parent arrays
-/// into plain Rust `Vec`s and then, inside the merge loop, calls
-/// `antlr_merge_contexts` — which allocates. Every unconsumed entry of those
-/// vectors (and every parent already pushed into the result) is a bare
-/// `ObjectRef` at that moment, so a moving young collection leaves the rest of
-/// the merge building a context graph out of dead addresses.
-fn antlr_pin_parent_vec(
-    ctx: &mut dyn NativeContext,
-    parents: &[Option<ObjectRef>],
-) -> Vec<Option<usize>> {
-    parents
-        .iter()
-        .map(|parent| parent.map(|p| ctx.pin_native_root(p)))
-        .collect()
-}
-
-/// Re-read one pinned parent through its handle.
-#[inline]
-fn antlr_read_pinned_parent(
-    ctx: &dyn NativeContext,
-    parent: Option<ObjectRef>,
-    pin: Option<usize>,
-) -> Option<ObjectRef> {
-    match (parent, pin) {
-        (Some(p), Some(handle)) => Some(ctx.read_native_pin(handle, p)),
-        _ => parent,
-    }
-}
-
 fn antlr_merge_arrays(
     ctx: &mut dyn NativeContext,
     names: AntlrClassNames,
@@ -5130,158 +5246,143 @@ fn antlr_merge_arrays(
     root_is_wildcard: bool,
     merge_cache: Option<ObjectRef>,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    if let Some(previous) = antlr_merge_cache_get(ctx, merge_cache, a, b)? {
-        return Ok(previous);
-    }
-    if let Some(previous) = antlr_merge_cache_get(ctx, merge_cache, b, a)? {
-        return Ok(previous);
-    }
-
-    // GC-SAFETY: `a`, `b`, the snapshotted parent vectors, and every merged
-    // parent produced below must survive the allocations performed by the
-    // recursive merge and by the context constructors. `roots_base` is the
-    // lowest handle, so releasing it at every exit drops the whole set.
     let roots_base = ctx.pin_native_root(a);
     let b_pin = ctx.pin_native_root(b);
-    let a_states = antlr_array_states(ctx, a);
-    let b_states = antlr_array_states(ctx, b);
-    let a_parents = antlr_array_parent_vec(ctx, a);
-    let b_parents = antlr_array_parent_vec(ctx, b);
-    let a_parent_pins = antlr_pin_parent_vec(ctx, &a_parents);
-    let b_parent_pins = antlr_pin_parent_vec(ctx, &b_parents);
-    let mut merged_states = Vec::with_capacity(a_states.len() + b_states.len());
-    let mut merged_parents: Vec<Option<ObjectRef>> =
-        Vec::with_capacity(a_states.len() + b_states.len());
-    let mut merged_parent_pins: Vec<Option<usize>> =
-        Vec::with_capacity(a_states.len() + b_states.len());
+    let cache_pin = merge_cache.map(|cache| (ctx.pin_native_root(cache), cache));
+    let result = (|| {
+        let read_roots = |ctx: &dyn NativeContext| {
+            (
+                ctx.read_native_pin(roots_base, a),
+                ctx.read_native_pin(b_pin, b),
+                cache_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback)),
+            )
+        };
+        let read_parent = |ctx: &dyn NativeContext, parent: Option<(usize, ObjectRef)>| {
+            parent.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback))
+        };
 
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < a_states.len() && j < b_states.len() {
-        let a_parent = antlr_read_pinned_parent(
-            ctx,
-            a_parents.get(i).copied().unwrap_or(None),
-            a_parent_pins.get(i).copied().unwrap_or(None),
-        );
-        let b_parent = antlr_read_pinned_parent(
-            ctx,
-            b_parents.get(j).copied().unwrap_or(None),
-            b_parent_pins.get(j).copied().unwrap_or(None),
-        );
-        if a_states[i] == b_states[j] {
-            let payload = a_states[i];
-            let both_empty =
-                payload == ANTLR_EMPTY_RETURN_STATE && a_parent.is_none() && b_parent.is_none();
-            let same_parent = match (a_parent, b_parent) {
-                (Some(pa), Some(pb)) => pa == pb || antlr_prediction_contexts_equal(ctx, pa, pb),
-                _ => false,
-            };
-            let chosen = if both_empty || same_parent {
-                a_parent
-            } else {
-                match (a_parent, b_parent) {
-                    (Some(pa), Some(pb)) => Some(antlr_merge_contexts(
-                        ctx,
-                        pa,
-                        pb,
-                        root_is_wildcard,
-                        merge_cache,
-                    )?),
-                    (Some(pa), None) => Some(pa),
-                    (None, Some(pb)) => Some(pb),
-                    (None, None) => None,
+        let (mut a, mut b, mut merge_cache) = read_roots(ctx);
+        if let Some(previous) = antlr_merge_cache_get(ctx, merge_cache, a, b)? {
+            return Ok(previous);
+        }
+        (a, b, merge_cache) = read_roots(ctx);
+        if let Some(previous) = antlr_merge_cache_get(ctx, merge_cache, b, a)? {
+            return Ok(previous);
+        }
+
+        (a, b, merge_cache) = read_roots(ctx);
+        let a_states = antlr_array_states(ctx, a);
+        let b_states = antlr_array_states(ctx, b);
+        let a_parents: Vec<_> = antlr_array_parent_vec(ctx, a)
+            .into_iter()
+            .map(|parent| parent.map(|parent| (ctx.pin_native_root(parent), parent)))
+            .collect();
+        let b_parents: Vec<_> = antlr_array_parent_vec(ctx, b)
+            .into_iter()
+            .map(|parent| parent.map(|parent| (ctx.pin_native_root(parent), parent)))
+            .collect();
+        let mut merged_states = Vec::with_capacity(a_states.len() + b_states.len());
+        let mut merged_parents: Vec<Option<(usize, ObjectRef)>> =
+            Vec::with_capacity(a_states.len() + b_states.len());
+
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < a_states.len() && j < b_states.len() {
+            let a_parent_pin = a_parents.get(i).copied().unwrap_or(None);
+            let b_parent_pin = b_parents.get(j).copied().unwrap_or(None);
+            let a_parent = read_parent(ctx, a_parent_pin);
+            let b_parent = read_parent(ctx, b_parent_pin);
+            if a_states[i] == b_states[j] {
+                let payload = a_states[i];
+                let both_empty =
+                    payload == ANTLR_EMPTY_RETURN_STATE && a_parent.is_none() && b_parent.is_none();
+                let same_parent = match (a_parent, b_parent) {
+                    (Some(pa), Some(pb)) => {
+                        pa == pb || antlr_prediction_contexts_equal(ctx, pa, pb)
+                    }
+                    _ => false,
+                };
+                if both_empty || same_parent {
+                    merged_parents.push(a_parent_pin);
+                    merged_states.push(payload);
+                } else {
+                    let merged_parent_pin = match (a_parent, b_parent) {
+                        (Some(pa), Some(pb)) => {
+                            let merged_parent = antlr_merge_contexts(
+                                ctx,
+                                pa,
+                                pb,
+                                root_is_wildcard,
+                                merge_cache,
+                            )?;
+                            Some((ctx.pin_native_root(merged_parent), merged_parent))
+                        }
+                        (Some(_), None) => a_parent_pin,
+                        (None, Some(_)) => b_parent_pin,
+                        (None, None) => None,
+                    };
+                    merged_parents.push(merged_parent_pin);
+                    merged_states.push(payload);
+                    (a, b, merge_cache) = read_roots(ctx);
                 }
-            };
-            merged_parent_pins.push(chosen.map(|p| ctx.pin_native_root(p)));
-            merged_parents.push(chosen);
-            merged_states.push(payload);
-            i += 1;
-            j += 1;
-        } else if a_states[i] < b_states[j] {
-            merged_parent_pins.push(a_parent.map(|p| ctx.pin_native_root(p)));
-            merged_parents.push(a_parent);
+                i += 1;
+                j += 1;
+            } else if a_states[i] < b_states[j] {
+                merged_parents.push(a_parent_pin);
+                merged_states.push(a_states[i]);
+                i += 1;
+            } else {
+                merged_parents.push(b_parent_pin);
+                merged_states.push(b_states[j]);
+                j += 1;
+            }
+        }
+
+        while i < a_states.len() {
+            merged_parents.push(a_parents.get(i).copied().unwrap_or(None));
             merged_states.push(a_states[i]);
             i += 1;
-        } else {
-            merged_parent_pins.push(b_parent.map(|p| ctx.pin_native_root(p)));
-            merged_parents.push(b_parent);
+        }
+        while j < b_states.len() {
+            merged_parents.push(b_parents.get(j).copied().unwrap_or(None));
             merged_states.push(b_states[j]);
             j += 1;
         }
-    }
 
-    while i < a_states.len() {
-        let parent = antlr_read_pinned_parent(
-            ctx,
-            a_parents.get(i).copied().unwrap_or(None),
-            a_parent_pins.get(i).copied().unwrap_or(None),
-        );
-        merged_parent_pins.push(parent.map(|p| ctx.pin_native_root(p)));
-        merged_parents.push(parent);
-        merged_states.push(a_states[i]);
-        i += 1;
-    }
-    while j < b_states.len() {
-        let parent = antlr_read_pinned_parent(
-            ctx,
-            b_parents.get(j).copied().unwrap_or(None),
-            b_parent_pins.get(j).copied().unwrap_or(None),
-        );
-        merged_parent_pins.push(parent.map(|p| ctx.pin_native_root(p)));
-        merged_parents.push(parent);
-        merged_states.push(b_states[j]);
-        j += 1;
-    }
+        if merged_parents.len() == 1 && merged_parents.len() < a_states.len() + b_states.len() {
+            let parent = read_parent(ctx, merged_parents[0]);
+            let merged =
+                antlr_create_singleton_context(ctx, names, parent, merged_states[0])?;
+            let merged_pin = ctx.pin_native_root(merged);
+            (a, b, merge_cache) = read_roots(ctx);
+            let merged = ctx.read_native_pin(merged_pin, merged);
+            antlr_merge_cache_put(ctx, merge_cache, a, b, merged)?;
+            return Ok(ctx.read_native_pin(merged_pin, merged));
+        }
 
-    // Refresh the whole result vector before it is consumed: the pushes above
-    // interleaved with allocating merges, so early entries have moved.
-    for (slot, pin) in merged_parents.iter_mut().zip(merged_parent_pins.iter()) {
-        *slot = antlr_read_pinned_parent(ctx, *slot, *pin);
-    }
-
-    if merged_parents.len() == 1 && merged_parents.len() < a_states.len() + b_states.len() {
+        let mut merged_parent_values: Vec<_> = merged_parents
+            .iter()
+            .map(|parent| read_parent(ctx, *parent))
+            .collect();
+        antlr_combine_common_parents(ctx, &mut merged_parent_values);
         let merged =
-            antlr_create_singleton_context(ctx, names, merged_parents[0], merged_states[0])?;
+            antlr_create_array_context(ctx, names, &merged_parent_values, &merged_states)?;
         let merged_pin = ctx.pin_native_root(merged);
-        let a = ctx.read_native_pin(roots_base, a);
-        let b = ctx.read_native_pin(b_pin, b);
+        (a, b, merge_cache) = read_roots(ctx);
         let merged = ctx.read_native_pin(merged_pin, merged);
+        if antlr_prediction_contexts_equal(ctx, merged, a) {
+            antlr_merge_cache_put(ctx, merge_cache, a, b, a)?;
+            return Ok(ctx.read_native_pin(roots_base, a));
+        }
+        if antlr_prediction_contexts_equal(ctx, merged, b) {
+            antlr_merge_cache_put(ctx, merge_cache, a, b, b)?;
+            return Ok(ctx.read_native_pin(b_pin, b));
+        }
         antlr_merge_cache_put(ctx, merge_cache, a, b, merged)?;
-        let merged = ctx.read_native_pin(merged_pin, merged);
-        ctx.unpin_native_roots(roots_base);
-        return Ok(merged);
-    }
-
-    antlr_combine_common_parents(ctx, &mut merged_parents);
-    let merged = antlr_create_array_context(ctx, names, &merged_parents, &merged_states)?;
-    let merged_pin = ctx.pin_native_root(merged);
-    let a = ctx.read_native_pin(roots_base, a);
-    let b = ctx.read_native_pin(b_pin, b);
-    let merged = ctx.read_native_pin(merged_pin, merged);
-    if antlr_prediction_contexts_equal(ctx, merged, a) {
-        let a = ctx.read_native_pin(roots_base, a);
-        let b = ctx.read_native_pin(b_pin, b);
-        antlr_merge_cache_put(ctx, merge_cache, a, b, a)?;
-        let a = ctx.read_native_pin(roots_base, a);
-        ctx.unpin_native_roots(roots_base);
-        return Ok(a);
-    }
-    let merged = ctx.read_native_pin(merged_pin, merged);
-    if antlr_prediction_contexts_equal(ctx, merged, b) {
-        let a = ctx.read_native_pin(roots_base, a);
-        let b = ctx.read_native_pin(b_pin, b);
-        antlr_merge_cache_put(ctx, merge_cache, a, b, b)?;
-        let b = ctx.read_native_pin(b_pin, b);
-        ctx.unpin_native_roots(roots_base);
-        return Ok(b);
-    }
-    let a = ctx.read_native_pin(roots_base, a);
-    let b = ctx.read_native_pin(b_pin, b);
-    let merged = ctx.read_native_pin(merged_pin, merged);
-    antlr_merge_cache_put(ctx, merge_cache, a, b, merged)?;
-    let merged = ctx.read_native_pin(merged_pin, merged);
+        Ok(ctx.read_native_pin(merged_pin, merged))
+    })();
     ctx.unpin_native_roots(roots_base);
-    Ok(merged)
+    result
 }
 
 fn native_antlr_prediction_context_merge(
@@ -6914,6 +7015,35 @@ mod antlr_prediction_context_tests {
         assert_eq!(states, vec![10, 20]);
         let parents = antlr_array_parent_vec(&mut ctx, merged);
         assert_eq!(parents, vec![Some(empty), Some(empty)]);
+    }
+
+    #[test]
+    fn antlr_merge_arrays_preserves_sorted_states_and_shared_parents() {
+        let mut ctx = mock_ctx();
+        let _ = install_classes(&mut ctx);
+        let empty = antlr_empty_instance(&mut ctx, ANTLR_NAMES).unwrap();
+        let a = antlr_create_array_context(
+            &mut ctx,
+            ANTLR_NAMES,
+            &[Some(empty), Some(empty)],
+            &[10, 30],
+        )
+        .unwrap();
+        let b = antlr_create_array_context(
+            &mut ctx,
+            ANTLR_NAMES,
+            &[Some(empty), Some(empty)],
+            &[20, 30],
+        )
+        .unwrap();
+
+        let merged = antlr_merge_contexts(&mut ctx, a, b, false, None).unwrap();
+        assert_eq!(antlr_array_states(&mut ctx, merged), vec![10, 20, 30]);
+        assert_eq!(
+            antlr_array_parent_vec(&mut ctx, merged),
+            vec![Some(empty), Some(empty), Some(empty)]
+        );
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
     }
 
     #[test]

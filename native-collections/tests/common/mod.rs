@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use cratonvm_native_api::{
@@ -59,6 +59,9 @@ pub struct MockCtx {
     next_identity: UnsafeCell<i32>,
     /// Programmable single-shot result for `invoke_virtual`.
     invoke_virtual_result: UnsafeCell<Option<MethodCallResult>>,
+    /// Programmable result sequence for tests that need multiple callbacks
+    /// within one native operation (for example hashCode followed by equals).
+    invoke_virtual_results: UnsafeCell<VecDeque<MethodCallResult>>,
     /// Append-only log of every `invoke_virtual` call made on this
     /// context. Tests that need to observe per-entry callbacks (e.g.
     /// `forEach`) consult this to recover the visit order without
@@ -128,6 +131,7 @@ impl MockCtx {
             identity_hashes: UnsafeCell::new(HashMap::new()),
             next_identity: UnsafeCell::new(hash_base),
             invoke_virtual_result: UnsafeCell::new(None),
+            invoke_virtual_results: UnsafeCell::new(VecDeque::new()),
             invoke_virtual_log: UnsafeCell::new(Vec::new()),
             native_pin_roots: UnsafeCell::new(Vec::new()),
             relocate_pins_on_invoke: UnsafeCell::new(false),
@@ -151,6 +155,13 @@ impl MockCtx {
         // SAFETY: single-threaded test code.
         unsafe {
             *self.invoke_virtual_result.get() = Some(r);
+        }
+    }
+
+    pub fn set_invoke_virtual_results(&self, results: Vec<MethodCallResult>) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            *self.invoke_virtual_results.get() = results.into();
         }
     }
 
@@ -625,8 +636,11 @@ impl cratonvm_native_api::NativeInvokeAccess for MockCtx {
             ("postComplete", "()V") => return Ok(None),
             _ => {}
         }
+        let queue = unsafe { &mut *self.invoke_virtual_results.get() };
         let slot = unsafe { &mut *self.invoke_virtual_result.get() };
-        let result = if let Some(r) = slot.take() {
+        let result = if let Some(r) = queue.pop_front() {
+            r
+        } else if let Some(r) = slot.take() {
             r
         } else {
             Ok(None)

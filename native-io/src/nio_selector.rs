@@ -727,7 +727,14 @@ pub fn selector_register(
     // story.
     #[cfg(not(target_os = "linux"))]
     {
-        st.nudge_blocked_poll();
+        // A registration made before the caller's *first* select must not
+        // leave an internal nudge datagram queued.  WSAPoll then consumes it
+        // as a wakeup and returns zero without observing an already-arrived
+        // UDP reply (JDK DnsClient treats that as its DNS timeout).  A nudge
+        // is only needed for an actually in-flight fixed pollfd snapshot.
+        if st.in_flight_selects != 0 {
+            st.nudge_blocked_poll();
+        }
     }
     Ok(())
 }
@@ -791,7 +798,12 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
     // `SelectorState::nudge_blocked_poll`'s doc comment for the full story.
     #[cfg(not(target_os = "linux"))]
     {
-        st.nudge_blocked_poll();
+        // See selector_register: only an active WSAPoll needs interrupting.
+        // Sending a nudge before select starts would make that next select
+        // return spuriously with zero ready keys.
+        if st.in_flight_selects != 0 {
+            st.nudge_blocked_poll();
+        }
     }
     Ok(())
 }
@@ -1217,6 +1229,11 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
             return Ok(0);
         }
 
+        // Windows WSAPoll receives a fixed pollfd array.  Record the period
+        // after this snapshot is released so registration/interest changes on
+        // another thread can nudge only a poll that is actually blocked.
+        st.in_flight_selects += 1;
+
         let mut pollfds: Vec<Wsapollfd> = Vec::with_capacity(st.keys.len() + 1);
         let mut key_index: Vec<(i32, i32, bool)> = Vec::with_capacity(st.keys.len());
         // net_fds of keys with OP_CONNECT interest backed by a non-blocking
@@ -1328,11 +1345,13 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
                     if let Some(s) = regs.get(&id) {
                         let mut st = s.lock();
                         if !st.open {
+                            st.in_flight_selects = st.in_flight_selects.saturating_sub(1);
                             return Ok(0);
                         }
                         if st.woken {
                             st.woken = false;
                             st.drain_wakeup_udp();
+                            st.in_flight_selects = st.in_flight_selects.saturating_sub(1);
                             return Ok(0);
                         }
                     }
@@ -1346,6 +1365,11 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
         unsafe { WSAPoll(pollfds.as_mut_ptr(), pollfds.len() as u32, timeout_ms) }
     };
     if n < 0 {
+        let regs = selectors().read();
+        if let Some(s) = regs.get(&id) {
+            let mut st = s.lock();
+            st.in_flight_selects = st.in_flight_selects.saturating_sub(1);
+        }
         let err = std::io::Error::last_os_error();
         return Err(ioex(format!("WSAPoll: {err}")));
     }
@@ -1361,6 +1385,7 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
         // JDK wakes that in-flight select and lets it return; only a select
         // that begins after closure throws ClosedSelectorException. Propagating
         // an exception here leaks the teardown race into Tomcat's Poller.
+        st.in_flight_selects = st.in_flight_selects.saturating_sub(1);
         return Ok(0);
     }
 
@@ -1442,6 +1467,7 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
         st.drain_wakeup_udp();
     }
 
+    st.in_flight_selects = st.in_flight_selects.saturating_sub(1);
     Ok(count)
 }
 
