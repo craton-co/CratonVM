@@ -457,28 +457,34 @@ wide 126.7 ms both), and `BinTreesClassic` d=18 shows base median 2608 ms vs fix
 ## Update 2026-07-30 (2) — `timeFull` passes on merit; the residual is a thread-scaling wall
 
 Measured on the Azure Linux build host (16 cores, Temurin 25.0.3, load < 2),
-`origin/dev` @ `fcc723007` versus this branch, **interleaved on one host, three
-rounds each**, because the arms drift seconds run to run. Medians of the real
-class:
+`origin/dev` @ `e255f60fb1` versus this branch merged on top of it,
+**interleaved on one host, three rounds each**, because the arms drift seconds
+run to run. Medians of the real class:
 
 | arm | dev | this branch | change |
 |---|---|---|---|
-| `NoCsCache` (control) | 35.2s | 35.7s | — (see the caveat) |
-| `FullCsCache` | 54.5s | 37.5s | **-31%** |
-| `LazyCsCache` | 237.8s | 158.5s | **-33%** |
+| `NoCsCache` (control) | 35.8s | 39.3s | +10%, unexplained — read the caveat |
+| `FullCsCache` | 49.4s | 37.1s | **-25%** |
+| `LazyCsCache` | 243.3s | 157.8s | **-35%** |
 
-`assertTrue(timeFull < timeNone)` passes in 5 of 6 observed runs (ratio
-1.55 -> 0.96). `assertTrue(timeLazy < timeNone)` still fails, by 4.0x rather
-than 6.8x. **Doc 23 stays OPEN on the second assertion.**
+`assertTrue(timeFull < timeNone)` passes on this branch (37.1s < 39.3s, ratio
+0.94; it was 1.38 on dev). `assertTrue(timeLazy < timeNone)` still fails, by
+4.0x rather than 6.8x. **Doc 23 stays OPEN on the second assertion.**
 
-**Caveat on the control arm.** A first 3-run sample put `NoCsCache` at 35.1s on
-dev and 40.0s on this branch and looked like a systematic 13% regression. It is
-not. The arm was then measured alone (`NoArmOnly` — the arm's code copied
-verbatim) four times per binary: 31.9s vs 31.7s, with individual runs spanning
-**27s-37s on both**. `Charset.forName` is a native here
+**Caveat on the control arm — the `timeFull` margin is thinner than it looks.**
+Within the full class, `NoCsCache` reads 35.6-36.0s on dev and 39.0-39.4s on
+this branch: tight on both sides, three rounds, and it reproduces. Measured
+*alone*, it does not: `NoArmOnly` (the arm's code copied verbatim, four runs per
+binary) gives 31.9s vs 31.7s with individual runs spanning **27s-37s on both**,
+and `ForNameProbe2` shows `Charset.forName` itself unchanged (2641 -> 2635 ns/op
+at one thread, 9281 -> 9232 at ten). `Charset.forName` is a native here
 (`native_charset_for_name`) whose profile is ~14% `RawMutex::lock_slow` on both
-binaries; at that contention three runs cannot resolve 13%. Do not read a single
-triple of this class as a regression signal.
+binaries, and the two profiles are otherwise indistinguishable. So the in-class
+shift is real and repeatable but has no located cause, and it inflates
+`timeNone`, which is the value the passing assertion is compared against. Judge
+the fix on the cached arms: measured against **dev's own** control (35.8s), the
+branch's `FullCsCache` at 37.1s would still be marginally over. What is not in
+doubt is 49.4s -> 37.1s and 243.3s -> 157.8s on the arms the fix targets.
 
 ### What landed
 
@@ -582,13 +588,13 @@ threads and reports ns/op *per thread*:
 
 | probe | dev 1t | dev 10t | branch 1t | branch 10t | HotSpot 1t | HotSpot 10t |
 |---|---|---|---|---|---|---|
-| `HashMap.get(name.toLowerCase(L))` | 1070 | 5231 | 675 | 3654 | 20.2 | 33.1 |
-| `toLowerCase(Locale)` alone | 797 | 4517 | 479 | 3502 | 11.3 | 18.8 |
-| `HashMap.get` alone | 369 | 3679 | 187 | 3837 | 6.6 | 12.7 |
-| `ConcurrentHashMap.get` alone | 1104 | 11888 | 494 | 3675 | 6.8 | 13.1 |
+| `HashMap.get(name.toLowerCase(L))` | 987 | 4891 | 699 | 3563 | 20.2 | 33.1 |
+| `toLowerCase(Locale)` alone | 768 | 4230 | 498 | 3471 | 11.3 | 18.8 |
+| `HashMap.get` alone | 308 | 3810 | 182 | 3943 | 6.6 | 12.7 |
+| `ConcurrentHashMap.get` alone | 1011 | 13081 | 480 | 3452 | 6.8 | 13.1 |
 
-At ten threads all four converge on ~3500-3800 ns/op **regardless of how much
-work the arm does** — a 3.6x spread at one thread collapses to nothing, and
+At ten threads all four converge on ~3500-3900 ns/op **regardless of how much
+work the arm does** — a 3.8x spread at one thread collapses to nothing, and
 aggregate throughput is nearly flat from 1 to 10 threads. HotSpot's spread
 survives. The workload is serialized on something shared, and it is not the map
 and not the case conversion.
