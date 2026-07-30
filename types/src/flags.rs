@@ -461,12 +461,13 @@ pub enum BlockedAccessMode {
 
 /// Compiled-in default for the moving (compacting) young generation.
 ///
-/// # This is the flip
+/// # Default-on contract
 ///
 /// `ARCHITECTURE.md` advertises a "generational semi-space collector (Cheney
 /// moving young gen)". The JIT, root gathering, and collector all now read
 /// [`GcFlags::moving_young`], so this single default switches them together.
-/// `CRATONVM_NO_MOVING_YOUNG` remains a compatibility opt-out.
+/// Keep this `true`: `CRATONVM_NO_MOVING_YOUNG` is the supported compatibility
+/// opt-out and the regression tests below pin both sides of that contract.
 ///
 /// See `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
 pub const DEFAULT_MOVING_YOUNG: bool = true;
@@ -1850,12 +1851,10 @@ mod tests {
     fn empty_source_matches_all_documented_defaults() {
         let f = VmFlags::from_source(&MapSource::empty());
         // Every opt-in flag is off…
-        // `moving_young` is no longer an opt-in — it tracks
-        // `DEFAULT_MOVING_YOUNG`, which is the single constant that flips the
-        // young generation to a copying collector. Assert against the constant,
-        // not against `false`, so the flip does not have to edit this test (and
-        // so this test cannot silently become the thing that blocks it).
-        assert_eq!(f.gc.moving_young, DEFAULT_MOVING_YOUNG);
+        // `moving_young` is no longer an opt-in. Pin the shipped default
+        // directly so an accidental reversion cannot hide behind the constant.
+        assert!(DEFAULT_MOVING_YOUNG);
+        assert!(f.gc.moving_young);
         assert!(!f.gc.card_table_only);
         assert!(!f.gc.dbg_a2);
         assert!(!f.jit.shadow_stack);
@@ -1956,6 +1955,10 @@ mod tests {
     /// never actually enable it in the case it exists for.
     #[test]
     fn moving_young_is_an_opt_out_with_a_compatibility_opt_in() {
+        assert!(
+            VmFlags::from_source(&MapSource::empty()).gc.moving_young,
+            "the shipped generational collector must compact young by default"
+        );
         assert!(!VmFlags::from_source(&src(&[("CRATONVM_NO_MOVING_YOUNG", "1")])).gc.moving_young);
         // Opt-out beats opt-in — "turn it off" must always be honoured.
         let both = VmFlags::from_source(&src(&[

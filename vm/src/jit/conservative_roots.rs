@@ -338,15 +338,12 @@ pub use cratonvm_gc::gc_quiescence::is_active as gc_must_defer;
 /// marking root scan folds those values into the root set, the post-move remap
 /// rewrites them in place, and the young-gen collector is permitted to run the
 /// *moving* (Cheney) cycle even while JIT frames are live (see
-/// `gen_heap.rs` quiescence gate). Off by default: zero codegen change, the
-/// collector keeps deferring to the non-moving sweep under JIT.
+/// `gen_heap.rs` quiescence gate). The standalone shadow-stack knob remains
+/// opt-in; the default moving-young configuration enables the mechanism.
 ///
-/// **EXPERIMENTAL — retained default-off scaffolding (precise-jit-maps-default.md
-/// Step 6, 2026-06-22).** Not the correctness path (that is precise maps +
-/// non-moving sweep); this is the moving-relocation scaffolding for a possible
-/// future moving young gen (`default-moving-young-gen.md`, design / not started),
-/// partial (under-counts bt18) and not to be combined with precise maps. Kept,
-/// not removed; do not enable in production.
+/// The original 2026-06-22 standalone experiment was incomplete. Moving-young
+/// now publishes complete oop homes and uses a per-cycle coverage proof; an
+/// incomplete frame diverts the collection to the non-moving sweep.
 #[inline]
 pub fn shadow_stack_enabled() -> bool {
     use std::sync::OnceLock;
@@ -392,18 +389,16 @@ pub fn shadow_stack_enabled() -> bool {
 ///     config (opt-OUT `CRATONVM_NO_MOVING_YOUNG` over
 ///     `flags::DEFAULT_MOVING_YOUNG`).
 ///
-/// AND-ing them is fail-safe in both directions and closes a live gap: today
-/// `x64` still parses `CRATONVM_MOVING_YOUNG` itself, so without the AND a user
-/// setting `CRATONVM_NO_MOVING_YOUNG` alongside a stale `CRATONVM_MOVING_YOUNG`
-/// would be silently ignored on the codegen side.
+/// AND-ing them is fail-safe in both directions. The centralized x64 projection
+/// and this check make `CRATONVM_NO_MOVING_YOUNG` authoritative even when a
+/// stale `CRATONVM_MOVING_YOUNG` compatibility variable is also present.
 ///
 /// The result is then published to the GC crate, which cannot call into the JIT
 /// crate (`cratonvm-gc` has no `cratonvm-jit` dependency, only a
 /// dev-dependency). So the collector always relocates against the same answer
 /// the codegen compiled for, and no skew between the three layers is
-/// representable. Flipping the default becomes a one-constant change in
-/// `cratonvm_types::flags::DEFAULT_MOVING_YOUNG` once `x64` reads that field
-/// instead of the raw variable — see that constant's docs for the exact patch.
+/// representable. The shipped default is now the single `true` constant in
+/// `cratonvm_types::flags::DEFAULT_MOVING_YOUNG`.
 #[inline]
 pub fn moving_young_enabled() -> bool {
     use std::sync::OnceLock;
@@ -3507,16 +3502,18 @@ mod tests {
         const SHADOW_OFF_IN_THREAD: usize = 24;
         const THREAD_SLOT_OFF: usize = 8;
 
-        let mut slots: Box<[usize]> = vec![0usize; values.len().max(1)].into_boxed_slice();
+        let mut slots: Box<[usize]> =
+            vec![0usize; cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS].into_boxed_slice();
         slots[..values.len()].copy_from_slice(values);
         let base = slots.as_ptr() as usize;
         let top = base + values.len() * 8;
+        let end = base + slots.len() * 8;
 
         // thread[0..] with a ShadowStack {top, end, base} at byte offset 24.
         let mut thread: Box<[usize]> = vec![0usize; 8].into_boxed_slice();
         let ss = SHADOW_OFF_IN_THREAD / 8;
         thread[ss] = top; // TOP_OFFSET  = 0
-        thread[ss + 1] = top; // END_OFFSET  = 8
+        thread[ss + 1] = end; // END_OFFSET  = 8
         thread[ss + 2] = base; // BASE_OFFSET = 16
 
         // frame[..] with the cached thread pointer at [rbp - 8].
