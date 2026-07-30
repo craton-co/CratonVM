@@ -15354,9 +15354,21 @@ impl Compiler {
     }
 
     fn inline_card_mark_available(&self) -> bool {
-        self.helpers.jit_card_table_addr != 0
-            && self.helpers.jit_card_old_base != 0
-            && self.helpers.jit_card_old_end > self.helpers.jit_card_old_base
+        // Keep every old-receiver write on the helper-owned barrier path.
+        //
+        // The inline byte-store sequence is locally sound, but WildFly's real
+        // JIT boot audit observed an old `org/jboss/modules/Module` reference
+        // to a young child on a clean card. A clean card is a correctness
+        // failure: the next minor collection can reclaim that reachable child.
+        // Until the direct emitter has end-to-end coverage for every compiled
+        // store form and card-table lifecycle, `jit_putfield_object` remains
+        // the single source of truth for old-to-young post barriers. Young
+        // receivers still retain their barrier-free direct stores.
+        //
+        // Keep the published metadata in `JitRuntimeHelpers` for a future
+        // verified implementation; merely exposing it must not select the
+        // unsafe fast path.
+        false
     }
 
     /// Emit the generational post-write barrier using `source_reg` and
