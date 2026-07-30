@@ -394,18 +394,27 @@ pub fn real_proxy_super() -> bool {
 // cache entry is reused only while that frame's root shape is unchanged. The
 // real ForkJoinPool lane bypasses both cache reuse and survive-GC remapping.
 //
-// This MUST read the resolved flag, not the presence of
-// `CRATONVM_REAL_FORKJOINPOOL`. Real ForkJoinPool is the default now, so the
-// env var is normally unset — a presence check reported "not the real lane"
-// on exactly the configuration that is the real lane, and silently withdrew
-// the bypass from every default run. `flags().natives.real_forkjoinpool` is
-// the authoritative answer (default true, `CRATONVM_SYNTHETIC_FORKJOINPOOL`
-// opts out, `CRATONVM_REAL_FORKJOINPOOL` opts back in).
-#[inline]
-pub fn real_forkjoinpool() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::flags().natives.real_forkjoinpool)
-}
+// KNOWN GAP — do not "fix" this by switching it to the resolved flag without
+// reading the analysis first. This is a *presence* test on
+// `CRATONVM_REAL_FORKJOINPOOL`, but real ForkJoinPool became the default and
+// that variable is now normally unset, so this predicate answers "was the
+// lane explicitly requested?" while the code above reads it as "are we in the
+// lane?". Under the default it says false on exactly the configuration that
+// IS the real lane, so the bypass no longer fires.
+//
+// Pointing it at `flags().natives.real_forkjoinpool` makes the predicate
+// honest and is therefore the obvious fix. It is also wrong as a standalone
+// change: the flag is default-true, so the bypass would then fire always, the
+// frozen-frame cache would be dead on every run, and
+// `root_snapshot_cache_tests::local_write_invalidates_cached_deep_frame_roots`
+// fails (0 cached roots where it expects 2). Verified, not predicted.
+//
+// Deciding between "the hazard is now universal, so the cache must go" and
+// "the hazard was specific to the opt-in lane, so the bypass needs a narrower
+// trigger" needs GC-stress evidence nobody has gathered. Left as-is
+// deliberately, so the behaviour is unchanged while the question is open. See
+// docs/known-issues/rootsnap-cache-bypass-lost-its-trigger-20260730.md.
+cached_is_set!(real_forkjoinpool, "CRATONVM_REAL_FORKJOINPOOL");
 
 // DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang). Previously
 // default-OFF: `update_root_snapshot` rescans EVERY interpreter frame on every

@@ -65,20 +65,27 @@ the gate works is not.
 
 ## Measured comparison
 
-Same command, same host, `cargo test --workspace --no-fail-fast`, with the four
-compile fixes applied to both sides so the runs are comparable:
+`cargo test --workspace --no-fail-fast`, same host:
 
 | | failing tests |
 |---|--:|
-| `origin/dev` + compile fixes only | 48 |
-| `fix/deep-audit-retire-20260730` | 39 |
+| `origin/dev` + compile fixes only, before `dev` moved | 48 |
+| `fix/deep-audit-retire-20260730`, after merging `dev` at `cd451facc` | 13 |
 
-Nothing on this branch is a new failure. The set difference is 13 fixed
-(`tzdb` × 2, `proxy_selector` env case-sensitivity, the flag-surface inventory,
-both `t11_1_*_safety_comments` gates, and assorted others) against zero
-introduced; `threading::event_loop::tests::t19_6_wake_dedupes_concurrent_calls`
-appears only in the branch run and passes 5/5 in isolation, i.e. it is flaky
-under full-suite load rather than broken.
+**A "39" previously stood in that second row and was wrong.** It was measured
+against a stale `target/release/cratonvm.exe` built before the merge:
+`synthetic_diff.rs::cratonvm_binary()` prefers a release binary over a debug one,
+so every subprocess test in that run validated pre-merge code. Deleting the
+stale binary and rebuilding changed the result.
+
+The lesson is worth more than the number. **Rebuilding the debug tree does not
+invalidate a stale release binary, and the helper silently prefers the stale
+one.** If a suite result disagrees with a change you just made, check the
+binary's timestamp before you re-check your reasoning.
+
+The two sides are also not directly comparable any more: the 48 predates several
+days of `dev` movement, including the RBC.6 revert that closed the regressions
+listed below. Read it as an order of magnitude, not a subtraction.
 
 ## The regressions
 

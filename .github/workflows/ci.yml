@@ -356,5 +356,21 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - name: Run Miri on the core representation crate
-        run: cargo +nightly miri test -p cratonvm-types --lib
+      # Scoped to `heap_types` on purpose. The whole-crate run aborts partway
+      # through on Windows: `intern::tests::concurrent_intern_*` spawns threads
+      # and Miri stops with "can't call foreign function `GetModuleHandleA`",
+      # an unsupported-operation error, not UB. That leaves the crate-wide
+      # invocation unverifiable from a Windows host, and a gate nobody can run
+      # locally before pushing is the failure mode this whole audit is about.
+      #
+      # `heap_types` is the object header, `Value` cell layout and slot
+      # arithmetic — the "core value and pointer representation" this job is
+      # named for, and where the UB actually was: the first run of this gate
+      # rejected `field_cell_layout_matches_value_enum` for transmuting a
+      # padded enum to `[u8; 16]` and claiming every byte was an initialised
+      # integer. 63 tests, verified green under Miri on 2026-07-30.
+      #
+      # To widen it: run the crate-wide command on Linux, and if it is clean
+      # there, drop the filter and say in this comment that it is Linux-only.
+      - name: Run Miri on the core representation module
+        run: cargo +nightly miri test -p cratonvm-types --lib heap_types

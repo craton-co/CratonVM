@@ -66,17 +66,28 @@ already were; the audit's claim there was stale). The stub ratchet is now exact 
 157 of 9,320 registrations, zero slack — and CI runs the whole `synthetic_diff`
 suite rather than five named cases.
 
-The flip left a live bug behind it. `vm/src/runtime/env_cache.rs` answered "are
-we in the real ForkJoinPool lane?" by testing whether `CRATONVM_REAL_FORKJOINPOOL`
-was *present* in the environment. Once real ForkJoinPool became the default that
-variable is normally unset, so the reader returned false on exactly the
-configuration that is the real lane — and the GC root-snapshot cache bypass it
-guards, which exists because those native overrides recursively re-enter Java
-and can expose changing roots to a cache that assumes prefix stability, silently
-stopped firing on every default run. It now reads the resolved flag. The
-lesson generalises: after a default flip, every *presence* test on the old
-opt-in env var is a suspect, because it silently answers the wrong question
-rather than failing.
+The flip left a live bug behind it, and it is **filed, not fixed**.
+`vm/src/runtime/env_cache.rs` answers "are we in the real ForkJoinPool lane?" by
+testing whether `CRATONVM_REAL_FORKJOINPOOL` is *present*. Once real
+ForkJoinPool became the default that variable is normally unset, so the reader
+returns false on exactly the configuration that is the real lane — and the GC
+root-snapshot cache bypass it guards has not fired on a default run since.
+
+Making the predicate honest is a two-line change and it is the wrong one: the
+flag is default-true, so the bypass would fire always, the frozen-frame cache
+would be dead on every run, and
+`root_snapshot_cache_tests::local_write_invalidates_cached_deep_frame_roots`
+fails. That was measured, not predicted — the change was made, the suite caught
+it, and it was reverted. Choosing between "the hazard is universal now, retire
+the cache" and "the hazard was specific to the opt-in lane, narrow the trigger"
+needs GC-stress evidence nobody has. Behaviour is left exactly as it was, with
+the analysis in
+[`../../known-issues/rootsnap-cache-bypass-lost-its-trigger-20260730.md`](../../known-issues/rootsnap-cache-bypass-lost-its-trigger-20260730.md).
+
+The lesson generalises past this one flag: after a default flip, every
+*presence* test on the old opt-in env var is a suspect, because it silently
+starts answering "was this requested?" when the caller asks "is this active?" —
+two questions with the same answer right up until the flip.
 
 **P1 — Experimental features out of the default build. Partly rejected, with
 evidence.** `vm`'s default set is `["awt", "experimental-jmx"]`. A new
@@ -213,6 +224,14 @@ and only `assume_init`-ing the discriminant and payload ranges the test exists
 to pin. That is a live example of the audit's point: a gate added but never run
 is not a gate, and this one found something on the first attempt.
 
+Re-run after the fix, it is clean — 63 tests, 0 failures. The job is scoped to
+`heap_types` rather than the whole crate because the crate-wide run aborts
+partway through on Windows: `intern::tests::concurrent_intern_*` spawns threads
+and Miri stops with "can't call foreign function `GetModuleHandleA`", an
+unsupported-operation error rather than UB. A gate that cannot be run locally
+before pushing is the failure mode this audit is about, so the step is narrowed
+to what is verifiable everywhere, with the widening procedure in its comment.
+
 The repository's own `unsafe`-annotation gates were red the whole time, on this
 branch and on `dev`: `t11_1_interpreter_safety_comments` at 89/105 and
 `t11_1_helpers_safety_comments` at 88/100, against a 90% threshold. Both are now
@@ -256,7 +275,7 @@ Each promotion was then actually run. Results:
 | Semantic differential gate | yes | failed on a stale ledger; ledger refreshed, now **exit 0** — backed |
 | Exact stub ratchet | yes | **157 of 9,320, zero slack** — backed |
 | Markdown link check | added | **164 files** — backed |
-| Miri (`cratonvm-types --lib`) | added | **found real UB on its first run**, fixed — see below |
+| Miri (`cratonvm-types --lib heap_types`) | added | **found real UB on its first run**, fixed; **63 pass, 0 fail** — backed |
 | Fuzz build smoke | yes | failed; two real misalignments fixed, `cargo check --all-targets` in `fuzz/` now clean — backed as far as a non-Linux host can show |
 | `Test vm (synthetic-jdk)` | yes | **not backed — reverted**, see below |
 
@@ -415,8 +434,41 @@ platform's ceiling rather than a wish list.
 
 ## What a reader should not conclude
 
-A green checklist here is not a green build. `cargo fmt --all --check` and
-`cargo test --workspace` both fail on `dev` today, and this branch improves both
-without finishing either — 39 failing tests against `dev`'s 48, none of them
-new. The tracked residuals are the JIT regression set, the Spring CGLIB
-superclass evidence, and the formatting decision.
+A green checklist here is not a green build.
+
+`cargo test --workspace --no-fail-fast` on this branch, after merging `dev` at
+`cd451facc` and rebuilding: **13 failing tests across 6 targets**, out of a suite
+whose `cratonvm-vm --lib` leg alone runs 2,454. For scale, `dev` plus only the
+four compile fixes measured 48 at the start of this work.
+
+Treat that 48 as an order-of-magnitude comparison, not a subtraction. It was
+measured before `dev` moved and before the merge, and the earlier "39" quoted
+here was measured against a **stale `target/release/cratonvm.exe` from before the
+merge** — the test helper prefers a release binary over a debug one, so every
+subprocess test in that run was validating pre-merge code. The number was wrong
+and is withdrawn rather than adjusted.
+
+Of the 13, two are worth naming because they are not what they look like:
+
+- `root_snapshot_cache_tests::local_write_invalidates_cached_deep_frame_roots`
+  was broken *by a fix made on this branch* and is green again after reverting
+  it. See the ForkJoinPool item above — the suite caught it, which is the system
+  working.
+- `config_from_args_fails_loudly_when_no_jdk_is_available` passes alone and
+  fails in-binary: it asserts real behaviour only when it wins the race to
+  initialise the process-wide flag snapshot. Pre-existing, order-dependent, and
+  filed at
+  [`../../known-issues/libcratonvm-no-jdk-test-passes-only-when-it-runs-first-20260730.md`](../../known-issues/libcratonvm-no-jdk-test-passes-only-when-it-runs-first-20260730.md).
+
+The rest are the JIT `skip_list` / `conservative_roots` cluster, two
+class-loader-unload cases, two ConcurrentHashMap cases and a socket timeout —
+none of them touched by this work.
+
+`cargo fmt --all --check` is still red, deliberately, and it is still step 1 of
+CI. **Nothing in this file has ever run in CI**, because the job has not reached
+a build. That is the single most important sentence here.
+
+Tracked residuals: the formatting decision, the Spring CGLIB superclass
+evidence, the ForkJoinPool bypass question, the `libcratonvm` test-isolation
+defect, the `Test vm (synthetic-jdk)` harness abort, and the SbCostProbe gap
+(245 µs against HotSpot's 50 ns).
