@@ -1,9 +1,9 @@
-# WildFly boot: `applicationKS` fails with `no KeyStore JKS implementation for provider` — `Security.getProviders(<filter>)` returns null and `Provider$Service` has no `aliases`
+# WildFly boot: provider-qualified JKS support repaired
 
-**Status:** OPEN, 2026-07-27. Not a regression and not JIT-related — reproduces
-with `--nojit` and with every JIT ban configuration. Found while closing the `org/jboss/as/` JIT ban (the retired
-`modeltypevalidator-validtypes-npe` write-up); this is the only thing standing
-between a real WildFly 32 boot and a clean `WFLYSRV0025`.
+**Status:** FIXED, 2026-07-30. The provider-chain filter and `Provider$Service`
+metadata defects were repaired, and provider-qualified `KeyStore` construction
+now creates a real SPI-backed Java wrapper rather than falling through to the
+incomplete real-JCA provider lookup.
 
 ## Symptom
 
@@ -115,3 +115,22 @@ VMs, rather than from a side-by-side boot.
 Fake-JDK-home `bin/java` + `CRATONVM_JAVA_HOME=/home/victor/jdk25`, then
 `bash standalone.sh -Djboss.server.base.dir=<copy of standalone/configuration
 plus an empty deployments/>`. No JIT flags needed.
+
+## Resolution and validation
+
+`native-builtins/src/jca/provider_chain.rs` now filters
+`Security.getProviders(String)` against its service table, initializes
+`Provider$Service.aliases` and `attributes`, and provides a safe service
+`toString()`. Its provider-qualified `KeyStore` overload resolves the JKS SPI
+and invokes KeyStore's real `(KeyStoreSpi, Provider, String)` constructor, so
+subsequent Java `load()` calls retain the required SPI state.
+
+The dedicated `ElytronKeyStoreProviderProbe` passed on HotSpot JDK 25 and on
+CratonVM in both JIT and `--nojit` modes. It covers JKS and SHA-256 filtering,
+service rendering/enumeration, provider-qualified JKS loading, and both
+Elytron `AtomicLoadKeyStore` factories.
+
+Fresh WildFly 32.0.1.Final boots in JIT and `--nojit` modes no longer report
+`applicationKS`, `WFLYELY00004`, or a JKS `NoSuchAlgorithmException`. The
+runs continue to the unrelated `SecureRandom.getProvider()` null defect in
+`applicationSSC`; that later failure is outside this retired issue.

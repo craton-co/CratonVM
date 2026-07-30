@@ -342,7 +342,7 @@ pub(crate) fn gcpart_probe(addr: usize) -> Vec<(u64, Option<usize>, usize, bool)
     }
 }
 
-fn remap_handle_slots(
+pub(crate) fn remap_handle_slots(
     slots: &mut [Option<ObjectRef>],
     pointer_map: &HashMap<usize, usize>,
 ) -> usize {

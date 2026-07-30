@@ -7072,6 +7072,22 @@ pub(crate) fn p57_trim_file_trailing_separator(path: &str) -> String {
     trimmed.to_string()
 }
 
+/// Match `WindowsPath` construction: an ordinary trailing separator is not a
+/// name element, while every filesystem root keeps its separator. This is
+/// separate from the `java.io.File` helper because virtual filesystem paths
+/// carry opaque encoded roots that must never be rewritten.
+#[cfg(windows)]
+pub(crate) fn p57_trim_path_trailing_separator(path: &str) -> String {
+    if jarfs_decode(path).is_some() || vfs_decode(path).is_some() || !path.ends_with(['/', '\\']) {
+        return path.to_string();
+    }
+    let (root, names) = p57_parse_win_root(path);
+    if root.is_some() && names.is_empty() {
+        return path.to_string();
+    }
+    path.trim_end_matches(['/', '\\']).to_string()
+}
+
 #[cfg(windows)]
 pub(crate) fn p57_windows_absolute_path_string(path: &str) -> String {
     let s = path.replace('\\', "/");
@@ -7284,7 +7300,7 @@ pub(crate) mod p57_win_path_tests {
     //! `sun.nio.fs.WindowsPath` exactly (cross-checked against JDK 25 via the
     //! `PVerify` repro). The parser accepts both `\` and the `/`-canonical
     //! internal form, so both spellings are exercised.
-    use super::{p57_win_is_absolute, p57_win_parent_of};
+    use super::{p57_trim_path_trailing_separator, p57_win_is_absolute, p57_win_parent_of};
     #[allow(unused_imports)]
     use cratonvm_native_api::{
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
@@ -7332,6 +7348,15 @@ pub(crate) mod p57_win_path_tests {
         assert_eq!(p57_win_parent_of("a"), "");
         assert_eq!(p57_win_parent_of("C:\\"), "");
         assert_eq!(p57_win_parent_of("\\\\server\\share\\"), "");
+    }
+
+    #[test]
+    fn path_construction_trims_only_non_root_trailing_separators() {
+        assert_eq!(p57_trim_path_trailing_separator("a\\"), "a");
+        assert_eq!(p57_trim_path_trailing_separator("C:/a/"), "C:/a");
+        assert_eq!(p57_trim_path_trailing_separator("C:/"), "C:/");
+        assert_eq!(p57_trim_path_trailing_separator("\\\\server\\share\\"), "\\\\server\\share\\");
+        assert_eq!(p57_trim_path_trailing_separator("\\"), "\\");
     }
 }
 
@@ -7491,7 +7516,7 @@ pub(crate) fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectR
     let stored = if jarfs_decode(path).is_some() {
         path.to_string()
     } else {
-        path.replace('\\', "/")
+        p57_trim_path_trailing_separator(path).replace('\\', "/")
     };
     #[cfg(not(windows))]
     let stored = path.to_string();

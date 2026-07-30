@@ -454,6 +454,31 @@ fn security_get_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     Ok(Some(Value::Object(Some(arr))))
 }
 
+fn security_get_providers_filtered(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let filter = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let Some((type_str, algorithm)) = filter.split_once('.') else {
+        return Ok(Some(Value::Object(None)));
+    };
+    if type_str.is_empty() || algorithm.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let matches: Vec<(String, f64, &'static str)> = snapshot().into_iter()
+        .filter(|(name, _, _)| get_service_entry(name, type_str, algorithm).is_some())
+        .collect();
+    if matches.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, matches.len());
+    for (i, (name, ver, coverage)) in matches.iter().enumerate() {
+        let provider = make_provider(ctx, name, *ver, coverage);
+        ctx.set_array_element(arr, i, Value::Object(Some(provider)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
 fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name_str = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -1043,6 +1068,10 @@ fn put_service(provider: &str, type_str: &str, algorithm: &str, value: &str) {
 /// make the same provider-service decision as the JDK.
 fn seed_direct_native_engine_services() {
     const SUN: &str = "SUN";
+    for algorithm in ["MD2", "MD5", "SHA-1", "SHA-224", "SHA-256", "SHA-384", "SHA-512", "SHA-512/224", "SHA-512/256", "SHA3-224", "SHA3-256", "SHA3-384", "SHA3-512"] {
+        put_service(SUN, "MessageDigest", algorithm, "sun.security.provider.Native");
+    }
+    put_alias(SUN, "MessageDigest", "SHA256", "SHA-256");
     for algorithm in ["DSA", "ML-DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
         put_service(SUN, "KeyFactory", algorithm, "sun.security.provider.Native");
     }
@@ -1789,7 +1818,11 @@ fn service_classname_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMa
 /// Allocate a `Provider$Service` synthetic populated from a stored
 /// `ServiceEntry`.  Used by `provider_get_service_native` and the
 /// `Cipher.getInstance(algo, providerName)` resolution path.
-fn make_service(ctx: &mut dyn NativeContext, entry: &ServiceEntry, prov: ObjectRef) -> ObjectRef {
+fn make_service(
+    ctx: &mut dyn NativeContext,
+    entry: &ServiceEntry,
+    prov: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     let prov_pin = ctx.pin_native_root(prov);
     let svc0 = alloc_concurrent_synthetic(ctx, "java/security/Provider$Service", 7);
     let svc_pin = ctx.pin_native_root(svc0);
@@ -1805,6 +1838,13 @@ fn make_service(ctx: &mut dyn NativeContext, entry: &ServiceEntry, prov: ObjectR
     let type_s = ctx.read_native_pin(type_pin, type_s0);
     let algo_s = ctx.read_native_pin(algo_pin, algo_s0);
     let class_s = ctx.read_native_pin(class_pin, class_s0);
+
+    let aliases = empty_collection_value(ctx, "emptyList", "()Ljava/util/List;", "java/util/ArrayList")?;
+    let svc = ctx.read_native_pin(svc_pin, svc0);
+    ctx.set_field_by_name(svc, "aliases", aliases);
+    let attributes = empty_collection_value(ctx, "emptyMap", "()Ljava/util/Map;", "java/util/HashMap")?;
+    let svc = ctx.read_native_pin(svc_pin, svc0);
+    ctx.set_field_by_name(svc, "attributes", attributes);
 
     // Real-JDK path — write by field name.
     ctx.set_field_by_name(svc, "provider", Value::Object(Some(prov)));
@@ -1831,7 +1871,7 @@ fn make_service(ctx: &mut dyn NativeContext, entry: &ServiceEntry, prov: ObjectR
         .lock()
         .insert(ih, entry.class_name.clone());
     ctx.unpin_native_roots(prov_pin);
-    svc
+    Ok(svc)
 }
 
 /// `Provider.getService(String type, String algorithm)` native —
@@ -1852,7 +1892,7 @@ fn provider_get_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let prov_name = provider_name_of(ctx, this);
     match get_service_entry(&prov_name, &type_str, &algo) {
         Some(entry) => {
-            let svc = make_service(ctx, &entry, this);
+            let svc = make_service(ctx, &entry, this)?;
             Ok(Some(Value::Object(Some(svc))))
         }
         None => {
@@ -1899,7 +1939,7 @@ fn provider_get_services_native(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let set_pin = ctx.pin_native_root(set);
     for entry in entries {
         let prov = ctx.read_native_pin(this_pin, this);
-        let svc = make_service(ctx, &entry, prov);
+        let svc = make_service(ctx, &entry, prov)?;
         let svc_pin = ctx.pin_native_root(svc);
         let set = ctx.read_native_pin(set_pin, set);
         let svc = ctx.read_native_pin(svc_pin, svc);
@@ -1988,6 +2028,26 @@ fn provider_service_get_class_name(
     Ok(Some(Value::Object(None)))
 }
 
+/// `Provider$Service.toString()` must remain safe for the synthetic service
+/// records returned by the provider chain.  The JDK implementation reaches
+/// fields that synthetic records deliberately do not initialize.
+fn provider_service_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let type_str = provider_service_string_field(ctx, this, "type", 0).unwrap_or_default();
+    let algorithm = provider_service_string_field(ctx, this, "algorithm", 1).unwrap_or_default();
+    let provider = provider_service_provider_obj(ctx, this)
+        .map(|p| provider_name_of(ctx, p))
+        .unwrap_or_else(|| "Provider".to_string());
+    let class_name = provider_service_string_field(ctx, this, "className", 3)
+        .or_else(|| provider_service_class_name_from_registry(ctx, this))
+        .unwrap_or_default();
+    let value = ctx.create_string(&format!("{provider}: {type_str}.{algorithm} -> {class_name}"));
+    Ok(Some(Value::Object(Some(value))))
+}
+
 // ---------------------------------------------------------------------------
 // Real-JCA bring-up — `sun.security.jca.GetInstance` bridge + reflective
 // `Provider$Service.newInstance`.
@@ -2050,7 +2110,7 @@ fn resolve_service(
     let entry = entry?;
     let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
     let prov_obj = make_provider(ctx, provider, ver, coverage);
-    Some(make_service(ctx, &entry, prov_obj))
+    Some(make_service(ctx, &entry, prov_obj).ok()?)
 }
 
 /// `sun.security.jca.GetInstance.getService(String type, String algorithm,
@@ -2870,6 +2930,20 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         provider_service_get_class_name,
     );
 
+    r.register(
+        svc,
+        "toString",
+        "()Ljava/lang/String;",
+        provider_service_to_string,
+    );
+
+    r.register(
+        "java/security/KeyStore",
+        "getInstance",
+        "(Ljava/lang/String;Ljava/security/Provider;)Ljava/security/KeyStore;",
+        key_store_get_instance_with_provider,
+    );
+
     // Real-JCA bring-up: bridge `sun.security.jca.GetInstance.getService` to our
     // provider service map, and instantiate real provider SPIs reflectively.
     // Wired whenever the real SunEC path is reachable — either full real-JCA
@@ -3008,6 +3082,12 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "getProviders",
         "()[Ljava/security/Provider;",
         security_get_providers,
+    );
+    r.register(
+        sec,
+        "getProviders",
+        "(Ljava/lang/String;)[Ljava/security/Provider;",
+        security_get_providers_filtered,
     );
     r.register(
         sec,
@@ -3713,4 +3793,53 @@ mod tests {
             "Provider$Service.getClassName must be registered for SPI instantiation"
         );
     }
+}
+/// Provider-qualified KeyStore construction must produce a real Java wrapper
+/// with a real provider SPI; Elytron calls this overload for `applicationKS`.
+fn key_store_get_instance_with_provider(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let type_ref = obj_arg(args, 0)?;
+    let provider_ref = obj_arg(args, 1)?;
+    let type_name = ctx.read_string(type_ref).unwrap_or_default();
+    let provider_name = read_provider_name_version(ctx, provider_ref)
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
+        .or_else(|| find_service_provider("KeyStore", &type_name))
+        .unwrap_or_default();
+
+    let type_pin = ctx.pin_native_root(type_ref);
+    let provider_pin = ctx.pin_native_root(provider_ref);
+    let result = (|| {
+        let spi = match build_jca_impl(ctx, &provider_name, "KeyStore", &type_name) {
+            Some(Ok(Some(Value::Object(Some(spi))))) => spi,
+            Some(Err(err)) => return Err(err),
+            _ => {
+                return Err(throw_no_such_algorithm(
+                    ctx,
+                    &format!("no KeyStore {type_name} implementation for provider {provider_name}"),
+                ))
+            }
+        };
+        let type_ref = ctx.read_native_pin(type_pin, type_ref);
+        let provider_ref = ctx.read_native_pin(provider_pin, provider_ref);
+        let provider_ref = if provider_name.is_empty() {
+            resolve_or_make_provider(ctx, "SUN")
+        } else {
+            provider_ref
+        };
+        ctx.new_object_initialized(
+            "java/security/KeyStore",
+            "(Ljava/security/KeyStoreSpi;Ljava/security/Provider;Ljava/lang/String;)V",
+            &[
+                Value::Object(Some(spi)),
+                Value::Object(Some(provider_ref)),
+                Value::Object(Some(type_ref)),
+            ],
+        )
+    })();
+    ctx.unpin_native_roots(provider_pin);
+    ctx.unpin_native_roots(type_pin);
+    result
 }

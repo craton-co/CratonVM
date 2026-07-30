@@ -3517,6 +3517,10 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
     desc: &str,
     declaring_class_id: ClassId,
 ) -> cratonvm_types::ObjectRef {
+    let loader_faithful = crate::classloader::loader_aware_resolution()
+        || crate::classloader::defining_loader_for(declaring_class_id.as_u32()).is_some_and(
+            |loader| crate::classloader::url_classloader_isolated_from_app(ctx, loader),
+        );
     // Arrays inherit the defining loader of their reference component
     // (JVMS 5.3.3). ClassManager currently interns array ClassIds globally, so
     // its canonical array mirror would lose a child loader's component identity.
@@ -3524,7 +3528,7 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
     // carries that child loader. native_class_get_component_type below then
     // resolves the component in the same namespace. This preserves the
     // observable Class API without changing the existing VM-wide array layout.
-    if crate::classloader::loader_aware_resolution() && desc.starts_with('[') {
+    if loader_faithful && desc.starts_with('[') {
         let mut component = desc;
         while let Some(rest) = component.strip_prefix('[') {
             component = rest;
@@ -3552,7 +3556,7 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
             }
         }
     }
-    if crate::classloader::loader_aware_resolution() {
+    if loader_faithful {
         if let Some(inner) = desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
             let loader_id = ctx.loader_id_of_class(declaring_class_id);
             // Only user-defined namespaces (>= 3) can hold a per-loader copy;
@@ -7964,6 +7968,69 @@ thread_local! {
     static GET_METHODS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+fn link_isolated_method_signatures(
+    ctx: &mut dyn NativeContext,
+    declaring_class_id: ClassId,
+    methods: &[&MethodMetadata],
+) -> Result<(), MethodCallFailed> {
+    let Some(loader) = crate::classloader::defining_loader_for(declaring_class_id.as_u32()) else {
+        return Ok(());
+    };
+    if !crate::classloader::url_classloader_isolated_from_app(ctx, loader) {
+        return Ok(());
+    }
+    for method in methods {
+        let (_, descriptor) = parse_descriptor_param_and_return(&method.descriptor);
+        let Some(name) = descriptor
+            .trim_start_matches('[')
+            .strip_prefix('L')
+            .and_then(|s| s.strip_suffix(';'))
+        else {
+            continue;
+        };
+        if is_global_resolution_namespace(name) {
+            continue;
+        }
+        let loader_pin = ctx.pin_native_root(loader);
+        let name_obj = ctx.create_string(&name.replace('/', "."));
+        let name_pin = ctx.pin_native_root(name_obj);
+        let loader = ctx.read_native_pin(loader_pin, loader);
+        let name_obj = ctx.read_native_pin(name_pin, name_obj);
+        let loaded = ctx.invoke_virtual(
+            loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(name_obj))],
+        );
+        ctx.unpin_native_roots(name_pin);
+        ctx.unpin_native_roots(loader_pin);
+        let mirror = match loaded {
+            Ok(Some(Value::Object(Some(mirror)))) => mirror,
+            _ => return Err(isolated_loader_class_not_found(ctx, name)),
+        };
+        let mirror_pin = ctx.pin_native_root(mirror);
+        let link_ok = ctx
+            .class_id_from_mirror(mirror)
+            .map(|class_id| ctx.initialize_class(class_id).is_ok())
+            .unwrap_or(true);
+        ctx.unpin_native_roots(mirror_pin);
+        if !link_ok {
+            return Err(isolated_loader_class_not_found(ctx, name));
+        }
+    }
+    Ok(())
+}
+
+fn isolated_loader_class_not_found(ctx: &mut dyn NativeContext, name: &str) -> MethodCallFailed {
+    let exception = crate::jboss_module_loader::alloc_single_message_exception(
+        ctx,
+        "java/lang/NoClassDefFoundError",
+        1,
+        &name.replace('/', "."),
+    );
+    MethodCallFailed::ExceptionThrown(exception)
+}
+
 pub(crate) fn native_class_get_declared_methods(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -8120,6 +8187,8 @@ pub(crate) fn native_class_get_declared_methods(
             }
             visible = reordered;
         }
+
+        link_isolated_method_signatures(ctx, class_id, &visible)?;
 
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");

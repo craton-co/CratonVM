@@ -57,10 +57,13 @@ Opening a scope records the current slot length. Rooting appends a slot.
 Closing truncates to the recorded base, so nested scopes release only their
 own handles.
 
-Every live slot participates in root enumeration. After a moving collection,
-`update_all_roots` rewrites each slot through the collector pointer map
-before mutators resume. Consequently `scope.get(handle)` always reads the
-current address; the handle never caches a heap pointer.
+Every live slot participates in current-thread root enumeration and in both
+cross-thread deposited snapshots (cooperative safepoint and native-blocked).
+After a moving collection, `update_all_roots`, safepoint resume, blocked wake,
+or the leaked-blocked-region safepoint fallback rewrites each owning slot
+through the collector pointer map before that mutator resumes. Consequently
+`scope.get(handle)` always reads the current address; the handle never caches
+a heap pointer.
 
 Root publication follows the same rule as native pins: code that establishes
 a long-lived batch before peer-triggered collection refreshes its deposited

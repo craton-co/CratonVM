@@ -1,5 +1,51 @@
 # Stale refs surfacing on interpreter operand stacks after a nested allocating call — the residual core of the WildFly cid=0 family
 
+Status: **FIXED AND RETIRED 2026-07-30.**
+
+## Final resolution
+
+This report accumulated several symptoms that shared a stale-object detector
+but did not share one producer. The related CratonVM defects are now closed:
+
+1. Re-entrant natives that retained raw `ObjectRef` values were fixed in
+   `8e1162cfa`, `6e10cba68`, and the later native-collection snapshot closure
+   `74a11cc3f`.
+2. Frozen/direct JIT frame ownership and metadata association were repaired by
+   `ec883f519`, `751f65d35`, `80ea8e380`, and `9424d5c77`. Under moving young,
+   raw JIT-to-JIT edges without a callee guard are now disabled.
+3. Moving-root ownership, provider-root ordering, and deferred metadata pins
+   were closed by `6d95774a5`, `a31aecfb4`, and `feb94d5f7`.
+4. The final fatal `java/lang/Object.hasNext/next` route was a native-handle
+   ownership gap. `String.join(CharSequence, Iterable)` correctly held its
+   iterator in a `NativeHandleScope`, but peer collectors did not publish or
+   rewrite handle slots in cooperative snapshots, native-blocked snapshots,
+   ordinary peer resume, blocked wake, or the leaked-blocked-region safepoint
+   fallback. `0fc08097d` makes all five ownership/remap paths symmetric and
+   adds direct tests for both snapshot publication and fallback remapping.
+5. Validation of that repair exposed a separate JIT compiler lock cycle:
+   `try_jit_compile_callee_slow` held the class-manager read guard and the
+   generic-metadata scanner recursively requested another read while a writer
+   was queued. `0fc08097d` passes the existing guard through the scanner and
+   removes the recursive acquisition.
+
+The decisive pre-fix witness used the exact old binary and reproduced fatal
+`java/lang/Object.hasNext/next` dispatch in 3 of 7 sequential no-JIT WildFly
+boots. The first candidate eliminated that signature, then a longer campaign
+found the last leaked-blocked-region handle remap omission via a native
+receiver crash; the final change closes that fifth path as well. See the
+acceptance record at the end of this document for the post-merge matrix.
+
+`WFLYCTL0079` duplicate attribute registration was historically co-located
+here only because it occurred in the same large boot campaigns. It has no
+stale-reference/GC evidence and survived two negative double-dispatch probes.
+It remains separately tracked in
+`docs/known-issues/wildfly/wflyctl0079-duplicate-attribute-registration.md`;
+it is not being mislabeled as fixed by retiring this stale-reference report.
+
+The remainder of this file is the preserved investigation history. Statements
+that an item is “open” below describe the state at the dated checkpoint and
+are superseded by this resolution.
+
 Status: **RE-CHARACTERIZED 2026-07-24 (round 3); fatal member FIXED (producer #11); dominant
 non-fatal producer FIXED (producer #12, `6e10cba68`) — residual family now understood as (at least)
 FIVE distinct items, none yet fixed. MAJOR 2026-07-24 finding (see "MAJOR FINDING" section below):
@@ -528,3 +574,37 @@ described above.
 Harness: fake-JDK-home `bin/java` + `CRATONVM_JAVA_HOME=/home/victor/jdk25`,
 `bash standalone.sh -Djboss.server.base.dir=<copy of standalone/configuration
 plus an empty deployments/>`, 900 s timeout.
+
+## Acceptance record — 2026-07-30
+
+Final merged release: `2cd9c85dc` plus this branch's `494aa83b3`, binary
+`cvm-wildfly-operand-stack-019fb088-merged-v6.bin`, SHA-256
+`0990e18d6b91490bfab96a7110f987a7e969c7ca495027c7ea984fe4149ab386`.
+
+- The exact pre-fix no-JIT WildFly witness reproduced fatal
+  `java/lang/Object.hasNext/next` dispatch in 3 of 7 sequential boots.
+- The native-handle ownership change (`0fc08097d`) passed its five focused
+  Rust regressions, including snapshot publication, ordinary and leaked
+  blocked-region remapping, moving-slot rewrite, invocation-argument pin
+  refresh, and nested scope cleanup during unwinding.
+- The pre-fix JIT audit found an old `org/jboss/modules/Module` reference to
+  a young child on a clean card. `494aa83b3` disables the unproven inline
+  old-receiver card store and returns those writes to `jit_putfield_object`.
+  Its focused JIT barrier test passes.
+- The repaired pre-merge release completed 24/24 JIT WildFly boots with zero
+  `Object.hasNext/next`, stale-receiver, CCE, duplicate-attribute, fatal, and
+  remembered-set-miss counters. The merged release then completed 23 ready
+  JIT boots with the same zero counters; one additional attempt was stopped
+  after an unrelated incoming SecureRandom-provider NPE, whose log has none
+  of this report's markers.
+- No-JIT coverage comprises 21 ready boots on the handle-ownership release
+  plus 8/8 ready boots on the final merged release; all carried zero report
+  counters. Earlier JKS-provider and host-timeout outcomes were retained as
+  separate fixture/infrastructure observations and did not contain a stale
+  reference signature.
+- `HashSetRemoveGcStress` passed on the final merged binary in JIT and no-JIT
+  modes: 8 threads × 2,000 rounds × 12 removals = 192,000 removals per mode.
+
+This is sufficient direct evidence to retire the stale-reference family.
+The unrelated historical `WFLYCTL0079` report remains open in its own
+known-issues document.

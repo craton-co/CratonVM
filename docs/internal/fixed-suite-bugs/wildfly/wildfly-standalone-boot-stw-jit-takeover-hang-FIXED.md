@@ -1056,7 +1056,7 @@ protocol bug:
   `xt_roots`, closing the stale-snapshot window for frozen peers.
 - The remaining non-fatal StringBuilder-chain shape (~3-4%/boot, always healed, 0 fatal in 700+
   boots) is precisely characterized with new always-landed forensics in
-  `../../../known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
+  `wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md`.
 
 Forensic tooling added for this closure (all env-gated): `CRATONVM_DBG_GCPART` (recent pointer-map
 ring probe), `CRATONVM_DBG_ZERO_RANGES` (bulk-zeroing range forensics: sweep-span vs

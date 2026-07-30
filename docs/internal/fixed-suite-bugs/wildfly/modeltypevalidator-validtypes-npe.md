@@ -227,7 +227,7 @@ WARN cratonvm_vm::vm::vm_exec: NoSuchMethodError
 That is a receiver whose header reads all-zero (`ClassId(0)`) or is misread as
 an array, so virtual dispatch resolves against `java/lang/Object` — a *fatal*
 member of the separately-tracked open family in
-`docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`,
+`docs/internal/fixed-suite-bugs/wildfly/wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md`,
 where it is now written up with both call sites. It reproduces with the ban in
 place and under `--nojit`, so it is not evidence about this ban. Each arm also
 produced exactly one SIGSEGV and one-to-two runs that had not finished in 900 s
@@ -332,7 +332,7 @@ javac -cp $MSC MscSetProbe.java     # Class.forName + setAccessible on IdentityH
 
 ## Related
 
-- `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`
+- `docs/internal/fixed-suite-bugs/wildfly/wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md`
   — the open stale-receiver family that owns every residual failure above.
 - `docs/known-issues/wildfly/elytron-keystore-jks-provider-gap-20260727.md`
   — the 5 failed services in every boot, both arms.

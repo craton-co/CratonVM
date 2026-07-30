@@ -436,7 +436,8 @@ pub struct JvmThread {
     //
     /// One entry per live handle slot. A `None` hole is a released
     /// (`handle_scope_pop`-truncated-past or otherwise unrooted) slot; root
-    /// scanning (`memory::roots::collect_roots`) only visits `Some` entries.
+    /// scanning and both cross-thread snapshot paths visit only `Some` entries;
+    /// every ordinary and fallback pointer-map consumer rewrites those entries.
     /// Entries are appended by `handle_root` and released in bulk by
     /// `handle_scope_pop` truncating back to a recorded base — never
     /// reused mid-scope — mirroring `native_pin_roots`' own append/truncate

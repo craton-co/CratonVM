@@ -712,7 +712,7 @@ fn stw_take_over_and_wait(
     // the whole frozen window, and the non-moving sweep zeroed the still-live
     // object in place (WildFly parallel-extension-add: fresh
     // StringBuilder/Reader receivers reading back all-zero — see
-    // docs/known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md).
+    // docs/internal/fixed-suite-bugs/wildfly/wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md).
     // Walk each frozen peer's interpreter frames directly into `xt_roots`.
     //
     // SAFETY: each address was published by its owning thread with the
@@ -3746,6 +3746,10 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         }
     }
     snapshot.extend(thread.native_pin_roots.iter().copied());
+    // Native handle scopes are outside interpreter frames just like the pin
+    // stack. A peer-initiated collection sees this parked thread only through
+    // `root_snapshot`, so publish every live handle slot here as well.
+    snapshot.extend(thread.handle_slots.iter().flatten().copied());
     snapshot.extend(thread.native_alloc_pool.iter().copied());
     if let Some(r) = thread.native_pending_return {
         snapshot.push(r);
@@ -3967,6 +3971,23 @@ mod root_snapshot_cache_tests {
         assert!(
             snapshot.iter().any(|root| root.as_ptr() == obj_addr),
             "updated root snapshot must include the object stored into deep LOCAL[2]"
+        );
+    }
+
+    #[test]
+    fn root_snapshot_includes_live_native_handle_slots() {
+        let shared = SharedVm::new(VmConfig::default());
+        let mut thread = JvmThread::new(ThreadId(0), "handle-snapshot-test");
+        let handled = shared.mem.heap.alloc_object(ClassId::new(9), 0);
+        thread.handle_slots.push(Some(handled));
+
+        update_root_snapshot(&shared, &mut thread);
+
+        let handled_addr = handled.as_ptr();
+        let snapshot = thread.root_snapshot.lock();
+        assert!(
+            snapshot.iter().any(|root| root.as_ptr() == handled_addr),
+            "peer collectors must see objects owned only by a native handle scope"
         );
     }
 }
@@ -4286,6 +4307,9 @@ pub(crate) fn apply_pointer_map_to_thread(
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     }
+    // Cross-thread safepoint-resume counterpart of the handle-slot snapshot
+    // above. The collector remaps the snapshot copy, not this owning table.
+    crate::memory::gc::remap_handle_slots(&mut thread.handle_slots, pointer_map);
     for obj_ref in &mut thread.native_alloc_pool {
         let old_addr = obj_ref.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -36960,8 +36984,14 @@ fn jit_method_calls_native_shadowed(
 /// Detect forced `Class` generic-metadata bridges in a prospective compiled
 /// caller. They must continue through interpreter dispatch, which chooses the
 /// Signature-attribute native implementation over the real-JDK bytecode.
+///
+/// The caller already owns the class-manager read guard while borrowing the
+/// method bytecode. Reuse that guard rather than acquiring a recursive read:
+/// `parking_lot::RwLock` blocks new readers behind a queued writer, so an
+/// outer read + queued class-definition writer + nested read forms a permanent
+/// cycle. WildFly parallel extension boot reliably exercises that ordering.
 fn jit_method_calls_forced_class_generic_metadata(
-    shared: &SharedVm,
+    cm: &crate::classloading::ClassManager,
     caller_class_id: ClassId,
     code: &[u8],
     code_len: usize,
@@ -36976,7 +37006,6 @@ fn jit_method_calls_forced_class_generic_metadata(
         };
         if let Some(cp_idx) = jit_native_shadow_dynamic_invoke_index(&instruction) {
             let is_forced_generic_metadata = {
-                let cm = shared.classes.class_manager.read();
                 let Some(caller) = cm.get_class(caller_class_id) else {
                     return true;
                 };
@@ -38634,8 +38663,10 @@ fn try_jit_compile_callee_slow(
     }
 
     let code_attr = method.code()?;
+    // `cm` is intentionally passed through: do not recursively read-lock the
+    // class manager while this guard and its borrowed method are alive.
     if jit_method_calls_forced_class_generic_metadata(
-        shared,
+        &cm,
         callee_class_id,
         &code_attr.code,
         code_attr.code.len(),
