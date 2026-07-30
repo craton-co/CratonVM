@@ -40,8 +40,9 @@ ratchet, the Markdown link check, the semantic differential gate, the fuzz build
 smoke, coverage generation, and a Miri job over the core representation crate.
 None of them are `continue-on-error`.
 
-**Step 4 is not green today.** `cargo test --workspace` has a residual failure
-set that predates any given change, tracked in
+**Steps 1 and 4 are not green today.** `cargo fmt --all --check` reports over a
+thousand diffs tree-wide, and `cargo test --workspace` has a residual failure
+set that predates any given change. Both are tracked in
 [`docs/known-issues/jit-regressions-hidden-by-unbuildable-test-targets-20260730.md`](docs/known-issues/jit-regressions-hidden-by-unbuildable-test-targets-20260730.md).
 Compare your run against that list rather than against zero, and note in the PR
 which entries you saw — a *new* name in the output is the signal.

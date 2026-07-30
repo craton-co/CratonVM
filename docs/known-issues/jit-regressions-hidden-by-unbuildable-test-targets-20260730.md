@@ -26,6 +26,38 @@ Any one of these fails the whole `cargo test --workspace` invocation at compile
 time, which is why nobody saw the runtime failures underneath. All four are
 fixed on this branch.
 
+### And CI never got that far anyway
+
+`cargo fmt --all --check` is step 1 of `ci.yml`'s `build-and-test` job, with no
+`continue-on-error`. On `origin/dev` it reports **1,050 diffs across 1,008
+files**. The job therefore fails before it builds anything, which is the honest
+explanation for how four compile breaks and ~48 test failures accumulated
+unnoticed: nobody could have been reading a signal that was already red.
+
+This is deliberately *not* fixed here. `cargo fmt --all` would rewrite a
+thousand files in one commit, destroying `git blame` across the whole tree for a
+cosmetic gain, and this repository has been burned by exactly that before. The
+two real options are to reformat crate by crate over several PRs, or to drop the
+gate and stop claiming it. Either is a decision for the maintainers; pretending
+the gate works is not.
+
+## Measured comparison
+
+Same command, same host, `cargo test --workspace --no-fail-fast`, with the four
+compile fixes applied to both sides so the runs are comparable:
+
+| | failing tests |
+|---|--:|
+| `origin/dev` + compile fixes only | 48 |
+| `fix/deep-audit-retire-20260730` | 39 |
+
+Nothing on this branch is a new failure. The set difference is 13 fixed
+(`tzdb` × 2, `proxy_selector` env case-sensitivity, the flag-surface inventory,
+both `t11_1_*_safety_comments` gates, and assorted others) against zero
+introduced; `threading::event_loop::tests::t19_6_wake_dedupes_concurrent_calls`
+appears only in the branch run and passes 5/5 in isolation, i.e. it is flaky
+under full-suite load rather than broken.
+
 ## The regressions
 
 With the targets buildable again, `jit/tests/ir_vs_singlepass.rs` reports 8
