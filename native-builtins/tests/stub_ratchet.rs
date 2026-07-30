@@ -127,10 +127,18 @@ fn synthetic_stub_count_does_not_regress() {
 #[test]
 fn essential_registry_is_populated() {
     let (_synthetic, total) = census();
+    // `> 100` was too weak to be a vacuity guard. The ratchet is a ratio
+    // argument — "157 of 9,320" — and the denominator was never asserted, so
+    // a wiring break that dropped 9,000 registrations would still leave
+    // `total` above 100 and the ratchet green with far fewer stubs. This floor
+    // sits well below the live count (9,320 as of 2026-07-30) so ordinary
+    // churn does not trip it, but a collapse of the surface does.
+    const MIN_TOTAL_REGISTRATIONS: usize = 8_000;
     assert!(
-        total > 100,
-        "register_essential_natives produced only {total} registrations — the census \
-         entrypoint looks broken, which would make the stub-ratchet pass vacuously. \
-         Expected the real-JDK boot path to register thousands of natives."
+        total >= MIN_TOTAL_REGISTRATIONS,
+        "register_essential_natives produced only {total} registrations, below the \
+         {MIN_TOTAL_REGISTRATIONS} floor — the census entrypoint or a whole \
+         registration module looks broken, which would make the stub-ratchet pass \
+         vacuously. Expected the real-JDK boot path to register ~9,300 natives."
     );
 }

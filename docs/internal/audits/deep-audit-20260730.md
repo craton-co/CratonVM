@@ -66,12 +66,33 @@ already were; the audit's claim there was stale). The stub ratchet is now exact 
 157 of 9,320 registrations, zero slack — and CI runs the whole `synthetic_diff`
 suite rather than five named cases.
 
+The flip left a live bug behind it. `vm/src/runtime/env_cache.rs` answered "are
+we in the real ForkJoinPool lane?" by testing whether `CRATONVM_REAL_FORKJOINPOOL`
+was *present* in the environment. Once real ForkJoinPool became the default that
+variable is normally unset, so the reader returned false on exactly the
+configuration that is the real lane — and the GC root-snapshot cache bypass it
+guards, which exists because those native overrides recursively re-enter Java
+and can expose changing roots to a cache that assumes prefix stability, silently
+stopped firing on every default run. It now reads the resolved flag. The
+lesson generalises: after a default flip, every *presence* test on the old
+opt-in env var is a suspect, because it silently answers the wrong question
+rather than failing.
+
 **P1 — Experimental features out of the default build. Partly rejected, with
 evidence.** `vm`'s default set is `["awt", "experimental-jmx"]`. A new
-`experimental-features` CI job compiles and runs the whole optional surface,
-because this repository has already lost 1,522 tests to a configuration nothing
+`experimental-features` CI job compiles and runs the optional surface, because
+this repository has already lost 1,522 tests to a configuration nothing
 compiled, and requests the build cannot honour (`-XX:AOTMode`,
 `-XX:SharedArchiveFile`) now warn instead of silently no-opping.
+
+The job's first version claimed to cover "the whole optional surface" and did
+not: `experimental-t19-diag`, `app-stubs` and `synthetic-quarkus-arc` were
+compiled by *nothing in the repository* — the exact rot the job exists to
+prevent, reintroduced in the commit that added the job. All three are now in it,
+verified compiling locally before the claim was made. `synthetic-jdk` has its
+own job; `gpu-offload` needs hardware and is covered by `cuda-bridge.yml` and
+the self-hosted `gpu-selfhosted.yml`; `legacy-synthetic-crypto` is now checked
+here as well as through the fuzz build.
 
 `experimental-jmx` had to go back. The audit item reasons from the feature's
 *name*; what it actually gates is the `sun.management` native surface, and
@@ -87,20 +108,32 @@ Worth stating plainly, since it is the second time on this branch: an audit item
 that reasons from a name rather than from what the code does will produce a
 change that looks like cleanup and is a regression.
 
-**P1 — Giant files.** Split at the section banners the files already carried:
+**P1 — Giant files.** Split at the section banners the files already carried
+(measured 2026-07-30; "before" is the unsplit parent at the commit the split was
+applied to, not at the audit's snapshot):
 
-| file | before | after |
-|---|--:|--:|
-| `vm/src/runtime/interpreter.rs` | 50,532 | 24,091 |
-| `jit/src/x64.rs` | 44,159 | 36,230 |
+| file | before | after | children |
+|---|--:|--:|--:|
+| `vm/src/runtime/interpreter.rs` | 50,640 | 24,199 | 26,598 in 4 files |
+| `jit/src/x64.rs` | 44,310 | 36,346 | 8,216 in 10 files |
 
-Nothing moved between modules and nothing became more public: each child is
-`mod x; pub use x::*;`, and a glob re-export caps every item at its declared
-visibility. `interpreter/invoke.rs` is still 23,224 lines because method
-invocation genuinely is one subsystem. `hot_files_have_no_production_panics`
-enumerates both split directories from disk — a gate that kept scanning only the
+Nothing moved between modules. On visibility the accurate statement is narrower
+than "nothing became more public": 273 items went from private to `pub(super)`,
+because a helper the parent used must be reachable from the child. Nothing left
+the module and nothing left the crate — no `pub(crate)` became `pub`, no private
+item became `pub`. Each child is `mod x; pub use x::*;`, and a glob re-export
+caps every item at its declared visibility; the one exception is
+`x64/cpu_features.rs`, re-exported through a named list because
+`jit/tests/intrinsic_crc32.rs` consumes those seven queries directly.
+
+`interpreter/invoke.rs` is still 23,316 lines because method invocation
+genuinely is one subsystem. `hot_files_have_no_production_panics` — a unit test
+in `interpreter.rs` itself, not in `vm/tests/` — enumerates both split
+directories from disk at strict zero, and asserts it found files in each, so the
+enumeration cannot silently cover nothing. A gate that kept scanning only the
 parent would have converted the refactor into "silently stopped checking 26,000
-lines".
+lines"; the same trap caught `t11_1_interpreter_safety_comments`, whose reported
+coverage the split moved from 84% to 80% without a line of `unsafe` changing.
 
 **P1 — Lint policy.** Partially addressed. `suspicious_open_options` and
 `cast_slice_from_raw_parts` are `deny` workspace-wide, and `native-io`,
@@ -123,6 +156,35 @@ and continue, which is a silent sandbox gap under a flag with that name.
 `System.loadLibrary`, `Runtime.load*`, Panama/FFM downcalls and `SymbolLookup`
 all route through one `check_host_native_access_or_throw` gate. The docs still
 say plainly this is not an in-process sandbox.
+
+That last sentence was written before it was true. An independent re-read of
+this file against the code found **four natives reaching `find_native_symbol`
+with no gate at all**, all of them in the always-compiled essential registry:
+
+| native | why it matters |
+|---|---|
+| `NativeLibrary.findEntry0` | its `handle` is caller-supplied and is only `lib_index + 1`, a small dense integer — walk 1, 2, 3, … and `dlsym` any library loaded by anyone in the process |
+| `SymbolLookup.loaderLookup` | hands back a lookup with `lib_index == -1` |
+| `SymbolLookup.find` | `-1` means "search every loaded library", so `loaderLookup().find(x)` is an arbitrary-symbol address oracle |
+| `JavaLangAccess.findNative` | the same oracle reached through `SharedSecrets` |
+
+This is address disclosure, not code execution — invoking a downcall still
+passes `require_native_access`. It matters under a SecurityManager policy that
+withholds `loadLibrary.*`: the load side was closed while the read side stayed
+open. All four now pass the same gate as the load paths, which is
+default-permissive, so trusted callers are unaffected.
+
+The gate is `native_symbol_lookups_all_pass_the_host_access_gate`, an
+all-or-nothing source scan over both capabilities — each of the four natives was
+individually plausible and only the *set* was wrong, so the assertion has to be
+over the set. It was verified to fail on removal (deleting one gate names that
+exact file and line) and carries vacuity guards on both the file count and the
+call-site count.
+
+Worth stating because it is the counterpart to the `experimental-jmx` lesson
+below: **that item was wrong in the safe direction and this one was wrong in the
+unsafe direction, and both came from writing down what the design intended
+rather than what the code did.**
 
 **P1 — Duplicated crypto trust paths.** RSA PKCS#1 v1.5 verification is now one
 implementation in `native-builtins-crypto::signature`, shared by the JCA path
@@ -151,13 +213,35 @@ and only `assume_init`-ing the discriminant and payload ranges the test exists
 to pin. That is a live example of the audit's point: a gate added but never run
 is not a gate, and this one found something on the first attempt.
 
-**P1 — README claim.** "Memory-safe by construction" is gone.
+The repository's own `unsafe`-annotation gates were red the whole time, on this
+branch and on `dev`: `t11_1_interpreter_safety_comments` at 89/105 and
+`t11_1_helpers_safety_comments` at 88/100, against a 90% threshold. Both are now
+green at 105/105 and 96/100. Most of the gap was blocks that already stated
+their invariant in prose but did not use the literal `// SAFETY:` token — the
+six `StopTheWorldToken::new()` sites all argue the STW invariant immediately
+above. Two mechanical traps are worth knowing: the gate looks back exactly five
+lines, so a *correct* comment longer than five lines scores as absent, and it
+matches `contains("unsafe {")`, so mid-expression blocks count. One genuine
+defect fell out — the SAFETY contract for `virtual_dispatch_target_for_receiver`
+had been orphaned onto `cv_trace_enabled`, a safe fn about an env-var probe,
+leaving the `unsafe fn` undocumented and the safe one carrying a
+pointer-validity contract it has no pointers for.
+
+**P1 — README claim.** "Memory-safe by construction" is gone from the README —
+and from `docs/PRESENTATION.md`, where it had survived verbatim as a
+customer-facing bullet ("whole categories of classic VM vulnerabilities are
+designed out"), which is the same absolute assurance the finding asked to
+retire, just relocated.
 
 ## Tests and coverage
 
 **P0 — Coverage claims.** No percentage is claimed. Generation is blocking, the
 artifact upload fails on a missing file, and `docs/COVERAGE.md` says the 85%
-figure is not demonstrated.
+figure is not demonstrated. Rewriting `COVERAGE.md` alone was not enough: the
+85% target survived in `.github/pull_request_template.md` — a checkbox every PR
+author ticks — and in `docs/book/src/contributing/testing.md`, the published
+contributor page. Both now match. (`docs/jck-compliance.md` keeps its 85%
+figures; those are JCK area pass rates, a different metric.)
 
 **P0 / P0 — Gates.** difftest, fuzz-build and coverage lost
 `continue-on-error`; Miri and the Markdown link check were added; the stub
@@ -171,7 +255,7 @@ Each promotion was then actually run. Results:
 | `Test native-builtins (synthetic-jdk)` | yes | **3,313 pass, 0 fail** — backed |
 | Semantic differential gate | yes | failed on a stale ledger; ledger refreshed, now **exit 0** — backed |
 | Exact stub ratchet | yes | **157 of 9,320, zero slack** — backed |
-| Markdown link check | added | **98 files** — backed |
+| Markdown link check | added | **164 files** — backed |
 | Miri (`cratonvm-types --lib`) | added | **found real UB on its first run**, fixed — see below |
 | Fuzz build smoke | yes | failed; two real misalignments fixed, `cargo check --all-targets` in `fuzz/` now clean — backed as far as a non-Linux host can show |
 | `Test vm (synthetic-jdk)` | yes | **not backed — reverted**, see below |
@@ -216,8 +300,14 @@ explicit order for re-promoting it. The honest caveat above still applies: with
 CI step 1 red, none of these jobs has ever run to completion anyway.
 
 **P1 — Stub ratchet.** 2000-with-16-slack became 157-with-zero-slack, and the
-`docs/internal/stub-ratchet.md` the source pointed at now exists, with the
-maintained copy public at `docs/contributing/stub-ratchet.md`.
+`docs/internal/stub-ratchet.md` the source pointed at now exists (as a redirect)
+with the maintained copy public at `docs/contributing/stub-ratchet.md`.
+
+The denominator needed pinning too. "157 of 9,320" is a ratio argument, and only
+the numerator was asserted — the total was printed and never checked, behind a
+`total > 100` vacuity guard that a wiring break dropping 9,000 registrations
+would still have passed. The floor is now 8,000, low enough not to trip on
+churn and high enough to catch a collapse.
 
 **P1 — `native-builtins` integration tests.** `tests/registry_contracts.rs`
 adds production-registry contracts and an all-or-nothing surface gate for
@@ -233,8 +323,23 @@ the merge gates" claim.
 
 **P0 — Broken doc graph.** `docs/RELEASE_READINESS.md`,
 `docs/real-raf-segv-root-cause.md`, `docs/synthetic-vs-real-explained.md` and
-`docs/internal/stub-ratchet.md` now exist. `tools/check_markdown_links.py`
-covers every root and `docs/` Markdown file and passes over 98 of them.
+`docs/internal/stub-ratchet.md` now exist.
+
+`tools/check_markdown_links.py` originally covered the repository root, the
+*top level* of `docs/`, and the mdBook tree — 98 files out of 1,644. Every
+`docs/` subdirectory was unchecked, including `docs/contributing/`, which holds
+the stub-ratchet procedure this same audit promotes as the maintained copy. The
+default scope is now `docs/**` recursively, and it validates **164 files**,
+exit 0.
+
+`docs/internal/` stays excluded, deliberately: it is dated archival material
+with ~396 broken links, most pointing at documents that were intentionally
+deleted, and gating CI on it would pressure people to resurrect dead files.
+`--all` still covers everything for an audit pass. Eight real breakages in the
+newly-covered scope were fixed by repointing at the moved targets — four GPU
+docs and two feature-design docs pointed into `docs/internal/` at paths that had
+moved to `docs/internal/fixed-suite-bugs/`, and `docs/feature-designs/deopt-osr.md`
+carried an absolute `file:///C:/craton/...` URL from someone's local machine.
 
 **P0 — Link checker in CI.** Added to `build-and-test`.
 
@@ -252,11 +357,34 @@ covering `tools/`; the two Maven shims consolidated with
 
 **P0 — GPU claims.** "Transparent GPU offload … no annotations and no API
 changes" is now "automatic GPU fast path" with the eligibility subset stated,
-and the roadmap says plainly that there is no self-hosted hardware CI.
+and the roadmap says plainly that there is no self-hosted hardware CI. Fixing
+the README left the claim standing in the two most reader-facing files after it:
+`docs/PRESENTATION.md` ("Java on the GPU. No annotations. No rewrites.",
+"CratonVM asks for nothing", "No code changes") and `BENCHMARK.md` ("offload is
+transparent … no annotations, no API"), plus `docs/gpu/COMPARISON.md` and
+`docs/EMBEDDING.md`. All corrected: a `gpu-driver` build and an explicit `--gpu`
+are required, nothing is needed *at the call site*, the eligible shape is stated
+(static methods over primitive arrays in counted loops), and ineligible shapes
+fall back to the CPU.
 
-**P0 — Published CPU regressions.** A `performance.yml` gate runs the HashMap,
-String/Regex and Binary Trees budgets against the anchored CratonBench
-baselines, and the roadmap orders that work ahead of broader totals.
+**P1 — Crate count and LoC.** "20 → 22 crates" was fixed in the build docs and
+missed in three other files. All now state one measured figure with a
+reproduction recipe: **1,349,978 lines across 702 `.rs` files in the 22
+workspace members**, excluding `target/`, `fuzz/` and vendored code, measured
+2026-07-30. `docs/book/src/introduction.md` had been claiming 880,000 — off by
+35%. `docs/gc-tuning.md` described `gc/src/` as 24 files and ~29k LOC against an
+actual 34 and 62,337.
+
+**P0 — Published CPU regressions.** A `performance.yml` job runs the HashMap,
+String/Regex and Binary Trees budgets against the CratonBench baselines, and the
+roadmap orders that work ahead of broader totals. Three caveats the first
+version of this line elided, all of which matter to anyone reading it as
+coverage: only Binary Trees is *anchored* — HashMap and String/Regex are marked
+`provisional`, which by the baseline file's own definition may be re-anchored
+without an evidence doc. It is not a merge gate: the triggers are
+`workflow_dispatch` and a twice-weekly `schedule`, with no `push` or
+`pull_request`. And it requires a `[self-hosted, linux, cratonvm-perf]` runner
+that `ROADMAP.md` says does not exist, so it has most likely never executed.
 
 **P1 — Moving-young.** The audit asked for the optimization work to finish
 *before* a default flip. The flip had already happened on `dev` —
@@ -265,6 +393,18 @@ at `-Xmx512m` without compaction), while README, ARCHITECTURE, ROADMAP and the
 throughput note all still described it as opt-in. Corrected, with the three
 residuals reframed as open work on the default path and the second gate kept
 explicit: the flag being on does not mean a cycle compacted.
+
+Fixing those four left two more behind — `docs/GC.md` still said "opt-in behind
+`CRATONVM_MOVING_YOUNG`" (wrong twice over: it is the default, and that is not
+the live variable, which is the opt-out `CRATONVM_NO_MOVING_YOUNG`), and
+`docs/flag-census.md` recorded it as "opt-in (default OFF)". The census is
+generated, so the census fix would have been reverted by the next run:
+`tools/flag-census/render.py` hardcoded the stale sentence. The generator is
+fixed, not just its output.
+
+A default flip has now produced doc drift in six places and one live bug — the
+GC root-snapshot bypass under **P0 default synthetic surface** below. That is
+the pattern to watch, not any individual file.
 
 **P1 — Invalidation costs / P1 — framework throughput.** Covered by the
 redefinition work above and by `docs/framework-throughput.md`, which names the
