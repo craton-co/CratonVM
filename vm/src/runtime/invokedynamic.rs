@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use cratonvm_reader::attribute::BootstrapMethod;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
 // `NativeContext` trait brought into scope for `ctx.get_class_mirror(...)` on
@@ -25,6 +26,7 @@ use crate::classloading::resolution::{
 };
 use crate::classloading::ClassId;
 use crate::error::{MethodCallFailed, RuntimeError, VmError};
+use crate::runtime::frame::Frame;
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::{
@@ -112,6 +114,133 @@ struct IndyInfo {
     constant_args: Vec<String>,
     /// Raw CP indices for bootstrap arguments (needed for LambdaMetafactory).
     bootstrap_arg_indices: Vec<u16>,
+}
+
+/// Immutable metadata owned for the lifetime of generated code which directly
+/// invokes a `StringConcatFactory` call site.
+pub struct JitStringConcatSite {
+    recipe: Arc<str>,
+    constant_args: Vec<Arc<str>>,
+    target_descriptor: Arc<str>,
+}
+
+/// Return a stable metadata pointer for a StringConcatFactory site, or `None`
+/// for every other bootstrap.  The allocation is intentionally process-lived:
+/// native code embeds the pointer and no individual compiled artifact owns it.
+pub fn make_jit_string_concat_site_from_parts(
+    pool: &ConstantPool,
+    bootstraps: &[BootstrapMethod],
+    cp_index: u16,
+) -> Option<usize> {
+    let (bsm_index, nat_index) = match pool.get(cp_index)? {
+        ConstantPoolEntry::InvokeDynamic {
+            bootstrap_method_attr_index,
+            name_and_type_index,
+        } => (*bootstrap_method_attr_index, *name_and_type_index),
+        _ => return None,
+    };
+    let (_, descriptor) = pool.get_name_and_type(nat_index)?;
+    let bsm = bootstraps.get(bsm_index as usize)?;
+    let handle = resolve_method_handle_full(pool, bsm.bootstrap_method_ref).ok()?;
+    if handle.class_name.as_ref() != STRING_CONCAT_FACTORY {
+        return None;
+    }
+    let (recipe, constant_args) = if handle.member_name.as_ref() == MAKE_CONCAT_WITH_CONSTANTS {
+        let recipe = bsm
+            .bootstrap_arguments
+            .first()
+            .and_then(|idx| resolve_string_constant(pool, *idx))?;
+        let constants = bsm
+            .bootstrap_arguments
+            .iter()
+            .skip(1)
+            .map(|idx| Arc::from(resolve_concat_constant(pool, *idx).unwrap_or_default()))
+            .collect();
+        (Arc::from(recipe), constants)
+    } else if handle.member_name.as_ref() == MAKE_CONCAT {
+        let recipe: String = std::iter::repeat('\u{0001}')
+            .take(parse_descriptor_args(descriptor).len())
+            .collect();
+        (Arc::from(recipe), Vec::new())
+    } else {
+        return None;
+    };
+    Some(Box::into_raw(Box::new(JitStringConcatSite {
+        recipe,
+        constant_args,
+        target_descriptor: Arc::from(descriptor),
+    })) as usize)
+}
+
+/// Execute the narrow compiled-code concat bridge. Raw slots are descriptor
+/// typed before they enter the normal interpreter concat implementation, so a
+/// category-2 value never gets reclassified from its bits alone.
+pub unsafe fn execute_jit_string_concat_raw(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    site_ptr: usize,
+    args_ptr: *const i64,
+    arg_count: usize,
+) -> Option<ObjectRef> {
+    let site = (site_ptr as *const JitStringConcatSite).as_ref()?;
+    let arg_types = parse_descriptor_args(&site.target_descriptor);
+    if arg_types.len() != arg_count || (arg_count != 0 && args_ptr.is_null()) {
+        return None;
+    }
+    let raw_args = std::slice::from_raw_parts(args_ptr, arg_count);
+    let mut values = Vec::with_capacity(arg_count);
+    for (&raw, ty) in raw_args.iter().zip(arg_types.iter()) {
+        let value = match ty {
+            'J' => Value::Long(raw),
+            'D' => Value::Double(f64::from_bits(raw as u64)),
+            'F' => Value::Float(f32::from_bits(raw as u32)),
+            'L' | '[' => {
+                if raw == 0 {
+                    Value::Object(None)
+                } else {
+                    Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+                }
+            }
+            _ => Value::Int(raw as i32),
+        };
+        values.push(value);
+    }
+    let frame_idx = thread.frames.len();
+    thread.frames.push(Frame::new(
+        crate::classloading::ClassId::new(0),
+        "<jit-indy>".to_owned(),
+        "concat".to_owned(),
+        "()Ljava/lang/String;".to_owned(),
+        None,
+        vec![],
+        vec![],
+        (arg_count as u16).saturating_add(1),
+        0,
+        &[],
+    ));
+    for value in values {
+        if thread.frames[frame_idx].stack.push(value).is_err() {
+            thread.frames.pop();
+            return None;
+        }
+    }
+    let executed = execute_string_concat(
+        shared,
+        thread,
+        frame_idx,
+        &site.recipe,
+        site.constant_args.as_slice(),
+        &site.target_descriptor,
+    );
+    let result = executed
+        .ok()
+        .and_then(|_| thread.frames[frame_idx].stack.pop().ok())
+        .and_then(|v| match v {
+            Value::Object(Some(obj)) => Some(obj),
+            _ => None,
+        });
+    thread.frames.pop();
+    result
 }
 
 /// Execute an invokedynamic instruction.

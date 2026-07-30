@@ -787,10 +787,21 @@ impl GenerationalHeap {
 
     /// Create a generational heap with custom young semi-space and old gen sizes.
     pub fn with_sizes(young_semi_size: usize, old_gen_size: usize) -> Self {
+        let max_young = young_semi_size
+            .max(1024)
+            .saturating_mul(MAX_HEAP_EXPANSION_FACTOR);
+        Self::with_sizes_and_max_young(young_semi_size, old_gen_size, max_young)
+    }
+
+    fn with_sizes_and_max_young(
+        young_semi_size: usize,
+        old_gen_size: usize,
+        max_young_semi_size: usize,
+    ) -> Self {
         let young_semi_size = young_semi_size.max(1024);
         let old_gen_size = old_gen_size.max(1024);
         let threshold = young_semi_size * YOUNG_GC_THRESHOLD_PERCENT / 100;
-        let max_young = young_semi_size * MAX_HEAP_EXPANSION_FACTOR;
+        let max_young = max_young_semi_size.max(young_semi_size);
 
         let old_gen = OldGen::new(old_gen_size);
         let card_table = CardTable::new(old_gen.base_ptr() as usize, old_gen_size);
@@ -952,6 +963,15 @@ impl GenerationalHeap {
     /// The young semi-space can still *grow* up to
     /// `young_semi * MAX_HEAP_EXPANSION_FACTOR` after a low-reclamation
     /// minor GC (see the expansion logic in `collect_garbage_inner`).
+    ///
+    /// A smaller initial semi-space (tried: capped at 512 MiB) was measured
+    /// to be a NET REGRESSION for large `-Xmx` workloads on this collector:
+    /// every young GC that fires under this workload already falls back to
+    /// the non-moving sweep (a separate, pre-existing defect —
+    /// `gc_quiescence`'s `missing-exact-rbp` fallback), so shrinking the
+    /// semispace just multiplies how often that expensive fallback fires,
+    /// which costs more than the page-fault savings recoup. See
+    /// `docs/internal/performance/binarytrees-bt18-half-gap-20260730.md`.
     pub fn with_capacity(total_bytes: usize) -> Self {
         let total = total_bytes.max(4096);
         // Young takes 1/2 of total, split across from+to semi-spaces (so
@@ -11736,15 +11756,20 @@ mod tests {
         );
     }
 
-    /// Regression: `with_capacity` MUST scale the young semi-space linearly
-    /// with the total heap requested — no hidden internal cap.
+    /// Regression: `with_capacity` splits the heap 50/50 (young_semi = 25%
+    /// of total), not the older 25/75 (young_semi = 12.5% of total) split.
     ///
-    /// Commit a98a375 moved the split from 25/75 (young_semi = 12.5% of
-    /// total) to 50/50 (young_semi = 25% of total). This test pins the
-    /// post-commit ratios so a future edit cannot silently regress to an
-    /// arbitrary internal ceiling (the original bug had a 32 MiB cap
-    /// regardless of -Xmx; the fix has *no* ceiling other than the user-
-    /// supplied total).
+    /// Commit a98a375 moved the split from 25/75 to 50/50. This test pins
+    /// the post-commit ratios so a future edit cannot silently regress to
+    /// the original fixed 32 MiB growth ceiling regardless of `-Xmx`.
+    ///
+    /// A later attempt (2026-07-30) to additionally cap the *initial* young
+    /// semi at 512 MiB (to cut eager-paging RSS on large `-Xmx` heaps) was
+    /// measured to be a net wall-clock regression — see
+    /// `docs/internal/performance/binarytrees-bt18-half-gap-20260730.md` —
+    /// because this workload's young GC already always falls back to a
+    /// non-moving sweep, and a smaller semispace just means more of those
+    /// expensive fallbacks. Reverted; `with_capacity` stays uncapped.
     ///
     /// We test the same -Xmx values the orchestrator uses to validate
     /// QuickBenchLong's binary-trees-d18 kernel:
@@ -11752,11 +11777,11 @@ mod tests {
     ///   - 1 GiB heap   → young_semi = 256 MiB
     ///   - 4 GiB heap   → young_semi = 1 GiB
     ///
-    /// Each semi must be exactly `total / 4`; the lower bound (>= the
+    /// Each semi is exactly `total / 4`; the lower bound (>= the
     /// orchestrator's "≥256 MiB at -Xmx 1g" criterion) is also asserted
     /// explicitly so the test fails loudly if someone reinstates a clamp.
     #[test]
-    fn with_capacity_scales_young_semi_with_xmx() {
+    fn with_capacity_preserves_xmx_proportional_young_semi() {
         // -Xmx 256m → 64 MiB young semi (4× larger than the buggy 32 MiB cap)
         let h_256m = GenerationalHeap::with_capacity(256 * 1024 * 1024);
         assert_eq!(
@@ -11783,12 +11808,12 @@ mod tests {
             "with_capacity(1g) young semi must be >= 256 MiB (orchestrator floor)",
         );
 
-        // -Xmx 4g → 1 GiB young semi.
+        // -Xmx 4g → 1 GiB young semi, no cap.
         let h_4g = GenerationalHeap::with_capacity(4_usize * 1024 * 1024 * 1024);
         assert_eq!(
             h_4g.young_semi_capacity(),
             1024 * 1024 * 1024,
-            "with_capacity(4g) must give a 1 GiB young semi",
+            "with_capacity(4g) young semi must be the full proportional 1 GiB, uncapped",
         );
 
         // Tiny test heap (64 KiB): the floor (512 B) does not engage

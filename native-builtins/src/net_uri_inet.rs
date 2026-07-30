@@ -129,9 +129,11 @@ pub(crate) fn os_dns_nameservers_string_uncached() -> String {
                 // A zone-qualified link-local address (`fe80::1%16`) isn't a
                 // usable destination without also carrying the scope id
                 // through our UDP layer — skip it and keep collecting.
-                if let Some(host) = strip_zone_id(line) {
-                    if host.parse::<std::net::IpAddr>().is_ok() {
-                        servers.push(host.to_string());
+                if !line.contains('%') {
+                    if let Some(host) = strip_zone_id(line) {
+                        if host.parse::<std::net::IpAddr>().is_ok() {
+                            servers.push(host.to_string());
+                        }
                     }
                 }
                 continue;
@@ -142,9 +144,11 @@ pub(crate) fn os_dns_nameservers_string_uncached() -> String {
                 if label.to_ascii_lowercase().contains("dns servers") {
                     collecting = true;
                     let value = value[1..].trim();
-                    if let Some(host) = strip_zone_id(value) {
-                        if host.parse::<std::net::IpAddr>().is_ok() {
-                            servers.push(host.to_string());
+                    if !value.contains('%') {
+                        if let Some(host) = strip_zone_id(value) {
+                            if host.parse::<std::net::IpAddr>().is_ok() {
+                                servers.push(host.to_string());
+                            }
                         }
                     }
                 }

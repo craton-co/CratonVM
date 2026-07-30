@@ -349,6 +349,10 @@ mod tests {
     /// receiver is called into a way published for a `Foo` receiver.
     #[test]
     fn hashed_vtable_stub_rejects_array_receivers() {
+        // This test exercises the optimizing IR pipeline, which is gated off
+        // whenever the young generation can relocate. Pin the policy so the
+        // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
+        crate::x64::set_moving_young_override(Some(false));
         let mut buf = ExecutableBuffer::new(4096).expect("buffer");
         emit_hashed_vtable_stub(
             &mut buf,

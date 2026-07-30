@@ -81,23 +81,11 @@ rustls-native-certs = "0.8"
 # The feature is a pure cfg flag in rusqlite (`column_decltype = []`) — it adds
 # no transitive dependency and no C code.
 rusqlite = { version = "0.31", features = ["bundled", "column_decltype"] }
-# zlib-rs is a pure-Rust (no C toolchain, no system library, no vendored C
-# source) reimplementation of zlib that is bit-for-bit compatible with real
-# zlib's DEFLATE output (unlike the default `rust_backend`/miniz_oxide, which
-# is spec-correct DEFLATE but not byte-identical to zlib's specific encoding
-# choices). Enabling it fixes `ResourceHttpRequestHandlerTests
-# ::partialContentByteRangeWithEncodedResource` (expected gzip length 66,
-# CratonVM produced 69 under miniz_oxide) and makes every other flate2
-# consumer in the workspace (this crate's Inflater/Deflater natives, and the
-# `zip` crate used for JAR reading/writing) byte-identical to real
-# zlib/HotSpot output too, verified against `java.util.zip.Deflater`/
-# `GZIPOutputStream` (see docs/known-issues or the fix/gzip-zlib-local branch
-# for the byte-level repro). Cargo feature unification means this single
-# declaration governs the whole workspace's flate2 backend selection —
-# flate2's `ffi/mod.rs` picks `zlib-rs` over `miniz_oxide` at compile time
-# whenever both are enabled, so `zip`'s own default `rust_backend` feature
-# request does not fight this.
-flate2 = { version = "1", features = ["zlib-rs"] }
+# Zipkin verifies the exact bytes from the JDK's GZIPOutputStream, so its
+# Deflater path needs stock zlib rather than merely standards-compliant DEFLATE.
+# `zlib-rs` differs for the large JSON payload; the `zlib` feature below unifies
+# with static `libz-sys` and matches the JDK's encoding choices.
+flate2 = { version = "1", features = ["zlib"] }
 # The real GZIPOutputStream bridge requires stock-zlib's deterministic
 # DEFLATE stream, not merely a standards-compatible stream: Spring Boot's
 # Zipkin sender verifies the exact bytes produced by HotSpot.

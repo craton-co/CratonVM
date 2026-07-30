@@ -7,6 +7,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * JIT-vs-interpreter identity for collections allocated inside a compiled
@@ -29,6 +30,34 @@ import java.util.Set;
  */
 public class JitCollectionCtorIdentity {
     private static final String[] KEYS = {"empty_str", "empty_arr", "empty_obj"};
+    private static volatile Object allocationSink;
+
+    private static final class AllocatingValue {
+        private final int value;
+
+        private AllocatingValue(int value) {
+            this.value = value;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            // ArrayList.equals is a native loop in CratonVM. Force enough
+            // allocation from each element comparison to move the two lists'
+            // backing arrays while that loop is in progress.
+            byte[][] noise = new byte[4][];
+            for (int i = 0; i < noise.length; i++) {
+                noise[i] = new byte[64 * 1024];
+            }
+            allocationSink = noise;
+            return other instanceof AllocatingValue
+                    && value == ((AllocatingValue) other).value;
+        }
+
+        @Override
+        public int hashCode() {
+            return value;
+        }
+    }
 
     private static Map<String, Object> hashMapNoArg() {
         Map<String, Object> m = new HashMap<>();
@@ -60,6 +89,24 @@ public class JitCollectionCtorIdentity {
         return l;
     }
 
+    private static Map<String, Object> concurrentHashMapNoArg() {
+        Map<String, Object> m = new ConcurrentHashMap<>();
+        for (String k : KEYS) m.put(k, k);
+        return m;
+    }
+
+    private static boolean allocatingArrayListEquals() {
+        List<AllocatingValue> a = new ArrayList<>();
+        List<AllocatingValue> b = new ArrayList<>();
+        List<AllocatingValue> different = new ArrayList<>();
+        for (int i = 0; i < 512; i++) {
+            a.add(new AllocatingValue(i));
+            b.add(new AllocatingValue(i));
+            different.add(new AllocatingValue(i == 511 ? -1 : i));
+        }
+        return a.equals(b) && !a.equals(different);
+    }
+
     private static String render(Iterable<?> it) {
         StringBuilder sb = new StringBuilder();
         for (Object o : it) sb.append(o).append('|');
@@ -73,7 +120,8 @@ public class JitCollectionCtorIdentity {
                     || hashMapSized().size() != 3
                     || linkedHashMapNoArg().size() != 3
                     || hashSetNoArg().size() != 3
-                    || arrayListNoArg().size() != 3) {
+                    || arrayListNoArg().size() != 3
+                    || concurrentHashMapNoArg().size() != 3) {
                 throw new IllegalStateException("collection lost entries at iteration " + i);
             }
         }
@@ -82,6 +130,14 @@ public class JitCollectionCtorIdentity {
         System.out.println("r: linkedHashMap=" + render(linkedHashMapNoArg().keySet()));
         System.out.println("r: hashSet=" + render(hashSetNoArg()));
         System.out.println("r: arrayList=" + render(arrayListNoArg()));
+        System.out.println("r: concurrentHashMap="
+                + render(concurrentHashMapNoArg().keySet()));
+        boolean listEquals = allocatingArrayListEquals();
+        if (!listEquals) {
+            throw new IllegalStateException(
+                    "ArrayList.equals lost backing-array identity across allocation");
+        }
+        System.out.println("r: allocatingArrayListEquals=true");
         // A map built entry-by-entry across the warm/observe boundary must
         // agree with a freshly built one — this is the json-smart
         // parse/serialize/re-parse round-trip in miniature.
