@@ -9,18 +9,19 @@ row by at least 50%, while retaining its exact checksum `173943680`.
 
 Final acceptance used `bench/CratonBench.java`, Temurin 25.0.3, `-Xmx8g`, and
 fresh CratonVM processes on Windows 11. The control and candidate were the
-same release binary built from current `origin/dev` `276cac509`; the control
-set only `CRATONVM_JIT_MATRIX_DOT=0`. Runs alternated control/candidate order,
-and no sample was discarded:
+same release binary built from merge commit `d959bbde1`, which contains current
+`origin/dev` `e88f14830`; the control set only
+`CRATONVM_JIT_MATRIX_DOT=0`. Runs alternated control/candidate order, and no
+sample was discarded:
 
 | Variant | Five reported times (ms) | Median |
 |---|---|---:|
-| Matrix-dot lowering disabled | 7,270, 6,443, 6,803, 6,053, 7,477 | 6,803 |
-| Matrix-dot lowering enabled | 3,318, 3,350, 3,052, 3,454, 10,173 | 3,350 |
+| Matrix-dot lowering disabled | 9,407, 11,182, 12,291, 9,844, 9,800 | 9,844 |
+| Matrix-dot lowering enabled | 3,541, 3,545, 4,137, 3,307, 4,836 | 3,545 |
 
-The enabled median is **2.03x faster** and **50.76% lower** than the disabled
+The enabled median is **2.78x faster** and **63.99% lower** than the disabled
 median, clearing the required 50% reduction. All ten executions produced the
-exact checksum. The contended 10,173 ms enabled sample was retained.
+exact checksum.
 
 The host was shared with many concurrent release builds, which explains the
 wide absolute-time spread. Same-binary A/B, alternating order, five samples,
@@ -71,9 +72,9 @@ closed the residual gap.
 ## Validation
 
 - Final release binary:
-  `cratonvm-matrix-candidate-origin276-019fb302.exe`,
+  `cratonvm-matrix-candidate-merged-e88-019fb302.exe`,
   SHA-256
-  `c05de73acfaf2be23882d9bf164581cab1c6ff427a932da420e2cf6d5d151b41`.
+  `235e511a37e5dcc9639cebdf4bfc42e17b05a2e81c04d524671562e6fb1f973c`.
 - The recognition trace reported
   `[JIT_GEN] matrix-dot headers=[31]` for the real
   `CratonBench.matmul` bytecode, with no code-buffer bailout.
