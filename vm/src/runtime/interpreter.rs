@@ -1217,6 +1217,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // "parked" (it doesn't exist). Construct the token directly.
             // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
+            // SAFETY: the STW invariant stated just above holds — every other
+            // mutator is parked at a safepoint (or was forcibly stopped and
+            // conservatively scanned), so this thread is the only mutator and
+            // may assert exclusive heap access.
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let fin_roots = finalizable_roots(shared);
             let result = shared
@@ -1427,6 +1431,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // been forcibly stopped in JIT and conservatively scanned.
                 // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
                 weakref_null_referents_pre_gc(shared);
+                // SAFETY: the STW invariant stated just above holds — every other
+                // mutator is parked at a safepoint (or was forcibly stopped and
+                // conservatively scanned), so this thread is the only mutator and
+                // may assert exclusive heap access.
                 let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
                 let fin_roots = finalizable_roots(shared);
                 let result = shared
@@ -1602,6 +1610,10 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
+        // SAFETY: the STW invariant stated just above holds — every other
+        // mutator is parked at a safepoint (or was forcibly stopped and
+        // conservatively scanned), so this thread is the only mutator and
+        // may assert exclusive heap access.
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let fin_roots = finalizable_roots(shared);
         let result = shared
@@ -1656,6 +1668,10 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                                     // stopped in JIT and conservatively scanned).
                                     // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
+            // SAFETY: the STW invariant stated just above holds — every other
+            // mutator is parked at a safepoint (or was forcibly stopped and
+            // conservatively scanned), so this thread is the only mutator and
+            // may assert exclusive heap access.
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let fin_roots = finalizable_roots(shared);
             let result = shared
@@ -1826,6 +1842,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
+        // SAFETY: the STW invariant stated just above holds — every other
+        // mutator is parked at a safepoint (or was forcibly stopped and
+        // conservatively scanned), so this thread is the only mutator and
+        // may assert exclusive heap access.
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let (result, dead_finalizers) = shared.mem.heap.collect_garbage_with_finalizers(
             &stw,
@@ -1891,6 +1911,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
                                     // stopped in JIT and conservatively scanned).
                                     // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
+            // SAFETY: the STW invariant stated just above holds — every other
+            // mutator is parked at a safepoint (or was forcibly stopped and
+            // conservatively scanned), so this thread is the only mutator and
+            // may assert exclusive heap access.
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let (result, dead_finalizers) = shared.mem.heap.collect_garbage_with_finalizers(
                 &stw,
@@ -2673,6 +2697,10 @@ pub(crate) fn tlab_alloc_byte_array(
             length_u32,
             length_u32,
         );
+        // SAFETY: `ptr` is the base of a TLAB chunk the allocator just
+        // reserved for this object and has not published, so nothing can race
+        // the store. It is header-aligned, at least `size_of::<ObjectHeader>()`
+        // bytes, and uninitialised — hence `ptr::write`, not an assignment.
         unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
     })?;
     use std::sync::atomic::Ordering;
@@ -2690,6 +2718,9 @@ pub(crate) fn tlab_alloc_byte_array(
         length_u32,
         total_size,
     );
+    // SAFETY: `ptr` is the just-initialised object base from the TLAB bump
+    // above — non-null, header-aligned, and its header was written before this
+    // point, so it is a well-formed object reference.
     Some(unsafe { ObjectRef::from_raw(ptr) })
 }
 
@@ -8765,6 +8796,8 @@ fn execute_frame_from_index(
         // `(*hot_fp).code` autorefs through the raw pointer, which the
         // `dangerous_implicit_autorefs` lint denies. The borrow is confined to
         // this statement, so it cannot alias a later `&mut Frame`.
+        // SAFETY: `hot_fp` addresses the live executing frame and is not
+        // invalidated in this push-free region; see the autoref note above.
         let padded_code_len = unsafe { (&(*hot_fp).code).len() };
         debug_assert!(
             padded_code_len >= 2,
@@ -8772,7 +8805,9 @@ fn execute_frame_from_index(
         );
         let code_len = padded_code_len.wrapping_sub(2); // original unpadded length
         if use_fast_path && saved_pc < code_len {
-            let code_ptr = unsafe { (*hot_fp).code.as_ptr() };
+            // SAFETY: same live frame as the `padded_code_len` read above; the
+        // pointer is only read within this push-free region.
+        let code_ptr = unsafe { (*hot_fp).code.as_ptr() };
             // SAFETY: code_ptr points to the method's bytecode array; saved_pc is bounds-checked against code_len above, and the bytecode is padded with 2 trailing bytes.
             let opcode = unsafe { *code_ptr.add(saved_pc) };
             let b1 = unsafe { *code_ptr.add(saved_pc + 1) };
@@ -10910,6 +10945,9 @@ fn execute_frame_from_index(
                         && saved_pc + 14 <= code_len
                         && unsafe { *code_ptr.add(saved_pc + 3) } == 0xb9
                         && unsafe { *code_ptr.add(saved_pc + 8) } == 0xc0
+                        // SAFETY: `saved_pc + 14 <= code_len` was checked
+                        // above, so offsets +3/+8/+11 are all in bounds of the
+                        // frame's padded bytecode buffer.
                         && unsafe { *code_ptr.add(saved_pc + 11) } == 0xb6
                     {
                         let index = frame.stack.pop_unchecked();
@@ -11128,6 +11166,10 @@ fn execute_frame_from_index(
                 })
             };
             let (decoded, next_pc) = decoded_at_pc?;
+            // SAFETY: `fp` is the hoisted pointer to the executing frame,
+            // null-checked at the top of the dispatch region. This region
+            // performs no push, so the frame stack cannot have reallocated and
+            // moved the frame; nothing else references it here.
             unsafe { (*fp).pc = next_pc };
             fallback_decoded = Some(decoded);
         }
@@ -19258,6 +19300,9 @@ mod wave1_adoption_tests {
         assert!(!fp.is_null(), "an in-range index must not yield null");
 
         // Everything the hoisted region reads must match indexing.
+        // SAFETY: `fp` came from `frame_ptr(frame_idx)` with `frame_idx` in
+        // range and was asserted non-null above, and no push has happened
+        // since, so it still addresses the same live frame.
         unsafe {
             assert_eq!((*fp).pc, frames[frame_idx].pc);
             // Explicit `&` — see the note at the `padded_code_len` read: an
@@ -19273,6 +19318,8 @@ mod wave1_adoption_tests {
         // A write through the pointer is observable through the index, and the
         // no-push region did not relocate anything.
         let fp = frames.frame_ptr(frame_idx);
+        // SAFETY: freshly re-derived from the same in-range index, and no push
+        // has occurred, so the pointer is valid and uniquely held here.
         unsafe {
             (*fp).pc = 6;
             (*fp).last_instr_pc = 3;
@@ -19592,6 +19639,9 @@ mod tests {
     fn invoke_args_root_guard_refreshes_forwarded_pins_and_restores_watermark() {
         // The guard never dereferences these values; aligned sentinel addresses
         // are sufficient to model a collector rewriting native pin slots.
+        // SAFETY: test-only. As the comment above says, the guard never
+        // dereferences these refs — they are aligned sentinel addresses used
+        // to model a collector rewriting native pin slots.
         let obj = |addr: usize| unsafe { ObjectRef::from_raw(addr as *mut u8) };
         let existing = obj(0x1000);
         let old_a = obj(0x2000);

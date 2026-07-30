@@ -1396,7 +1396,6 @@ struct VirtualDispatchTarget {
 /// bare/interface fallback to the CP class, publishing that result under the
 /// receiver id would poison later inline-cache hits.
 ///
-/// SAFETY: `vm` must be live; `receiver` must be a valid heap reference.
 /// Residual-6 diagnosis (env-gated, `CRATONVM_TRACE_CLASSVALUE`): true when
 /// the `ClassValue.get(Class)` dispatch-trace probes should fire. Cached so
 /// the hot dispatch path pays two slice compares + one bool load.
@@ -1414,6 +1413,11 @@ fn cv_trace_match(info: &JitInvokeInfo) -> bool {
         && cv_trace_enabled()
 }
 
+// SAFETY: `vm` must be live for the call, and `receiver` must be a valid
+// heap reference — it is dereferenced through `kind_of`/`class_id_of` to read
+// the object header. Callers reach this only from a JIT dispatch site that has
+// already decoded the receiver from an operand slot, so it is non-null and has
+// not been moved by a collection in the interval.
 unsafe fn virtual_dispatch_target_for_receiver(
     vm: &SharedVm,
     receiver: ObjectRef,
@@ -1583,6 +1587,11 @@ unsafe fn try_run_callee_handler(
     })
 }
 
+// SAFETY: `vm` must be live for the call. The body only takes a read lock on
+// the class manager and looks the callee up by name; it dereferences no raw
+// pointer of its own. The `unsafe` marker is the shared JIT-callback contract
+// (the caller is JIT-generated code holding a valid `SharedVm`), not an
+// additional obligation of this function.
 unsafe fn callee_has_exception_table(vm: &SharedVm, info: &JitInvokeInfo) -> bool {
     let cm = vm.classes.class_manager.read();
     let class_id = if info.declaring_class_id == 0 {
@@ -7179,6 +7188,11 @@ unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
     false
 }
 
+// SAFETY: `receiver` must be a non-null pointer to a live object header, and
+// `vm` must be live. The first statement reads the class id straight out of
+// header+0 with `ptr::read`, so a null or stale receiver is undefined
+// behaviour. Callers are JIT fast paths that have already null-checked the
+// receiver at the dispatch site.
 unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
     let cid = std::ptr::read(receiver as usize as *const u32);
     let vm_key = vm as *const SharedVm as usize;
@@ -9342,6 +9356,9 @@ mod tests {
 
     #[test]
     fn compiled_entry_reentrant_wrapper_preserves_no_ctx_abi() {
+        // SAFETY: a plain constant-returning function. It is `unsafe extern
+        // "C"` only so its type matches the compiled-entry ABI the helper
+        // transmutes to; the body touches nothing.
         unsafe extern "C" fn ret_seven() -> i64 {
             7
         }
@@ -9355,6 +9372,8 @@ mod tests {
 
     #[test]
     fn compiled_entry_reentrant_wrapper_preserves_ctx_abi() {
+        // SAFETY: pure integer arithmetic over its two arguments. `unsafe
+        // extern "C"` only to match the with-context compiled-entry ABI.
         unsafe extern "C" fn add_ctx_arg(ctx: i64, arg: i64) -> i64 {
             ctx + arg
         }
@@ -9368,9 +9387,14 @@ mod tests {
 
     #[test]
     fn compiled_entry_reentrant_wrapper_preserves_stack_arg_abi() {
+        // SAFETY: pure integer arithmetic over its arguments. `unsafe extern
+        // "C"` only to match the no-context five-argument entry ABI, which is
+        // what puts the fifth argument on the stack under the Windows x64
+        // convention — the property this test exists to pin.
         unsafe extern "C" fn sum_five(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
             a + b + c + d + e
         }
+        // SAFETY: as above, for the with-context four-argument shape.
         unsafe extern "C" fn sum_ctx_four(ctx: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
             ctx + a + b + c + d
         }
@@ -9384,6 +9408,8 @@ mod tests {
                 &[1, 2, 3, 4, 5],
             )
         };
+        // SAFETY: same entry ABI contract — `sum_ctx_four` is the with-context,
+        // four-argument shape selected by the `true` flag below.
         let with_ctx = unsafe {
             try_call_compiled_entry_reentrant(
                 sum_ctx_four as *const () as usize,

@@ -18719,6 +18719,10 @@ impl JitSynchronizedMonitorGuard {
         // The native pin protects the monitor while the replacement frame is
         // built. Once the frame owns it, normal frame unwinding performs the
         // matching implicit monitorexit.
+        // SAFETY: `self.thread` came from an exclusive `&mut JvmThread` and
+        // this guard is scoped inside that borrow, so the pointer is live and
+        // unaliased. `self.pin_index` indexes a `native_pin_roots` entry this
+        // guard pushed and has not released, so the slot is in range.
         unsafe {
             let thread = &mut *self.thread;
             let monitor = thread.native_pin_roots[self.pin_index];
