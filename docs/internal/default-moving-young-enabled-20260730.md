@@ -18,8 +18,9 @@ every young collection in any process that had compiled a single method still
 ran the non-moving sweep. Measured on `BinTreesClassic 18` at `-Xmx512m`:
 `cycles=0 coverage_fallbacks=66`. Three independent defects produced that, and
 all three are fixed here. The same lane now reports `cycles=25
-coverage_fallbacks=0` with the HotSpot checksum, and completes in ~4.3 s instead
-of ~15.3 s.
+coverage_fallbacks=0` with the HotSpot checksum. Throughput on these workloads
+is unchanged — see "Throughput: neutral" below, including a claim made earlier
+in this document that the final `origin/dev` merge disproved.
 
 ## Defect 1 — a process-wide blanket bypassed the per-cycle proof
 
@@ -123,8 +124,11 @@ test: `direct_self_call_return_is_recognised_only_for_a_real_e8_to_the_entry`.
 
 ## Runtime evidence
 
-Release binary `cvm-myd-r4.exe`, built from this branch under a unique name so
-no measurement can borrow a stale image.
+Release binaries `cvm-myd-r4.exe` (pre-merge) and `cvm-myd-r5.exe` (after the
+final `origin/dev` merge), both built under unique names so no measurement can
+borrow a stale image. The table is the r4 lane sweep; the wall times in it are
+superseded by the interleaved figures below, the cycle/fallback/checksum columns
+are not (r5 reproduces them exactly).
 
 | Lane | Heap / depth | moving cycles | fallbacks | checksum | time |
 |---|---|---:|---:|---|---:|
@@ -137,15 +141,39 @@ no measurement can borrow a stale image.
 
 Three consecutive repeats of the 512m lane returned `cycles=25
 coverage_fallbacks=0` and the HotSpot checksum every time — the engagement is
-deterministic, not a race that happened to land.
+deterministic, not a race that happened to land. The table above was taken
+before the final `origin/dev` merge; after it the cycle counts, fallbacks and
+checksums are identical (25 / 22 / 2 / 1, all zero, all matching).
 
-Five interleaved rounds at 512m on a loaded host gave moving 4,430–6,420 ms and
-`NO_MOVING_YOUNG` 4,719–6,473 ms, while **every** `MOVING_YOUNG_NO_JIT` round
-died with `OutOfMemoryError: Java heap space`. That is the pre-fix default's real
-shape: it reserves the Cheney 50% young-GC headroom (the moving path's trigger)
-and then never compacts, so it collects about twice as often as the non-moving
-policy would and reclaims less each time. Before this delivery the moving-young
-default was *worse than either* of the two configurations it sits between.
+### Throughput: neutral, and an earlier claim here was wrong
+
+On the **pre-merge** tree the `MOVING_YOUNG_NO_JIT` lane took 15,789 ms against
+the default's 4,260 ms, and five interleaved rounds at 512m killed *every*
+`MOVING_YOUNG_NO_JIT` round with `OutOfMemoryError`. That looked like a large
+win and was written up as one.
+
+It does not survive the merge of the 57 `origin/dev` commits that landed during
+this work. Re-measured on the merged tree, five interleaved rounds at 512m:
+
+| lane | rounds (ms) | median |
+|---|---|---:|
+| default (moving, 25 cycles) | 4760, 4226, 3976, 4120, 4220 | 4,220 |
+| `CRATONVM_MOVING_YOUNG_NO_JIT=1` | 4836, 4295, 3978, 3935, 4820 | 4,295 |
+| `CRATONVM_NO_MOVING_YOUNG=1` | 4712, 4171, 4912, 4224, 4279 | 4,279 |
+
+No lane OOMs and the three are indistinguishable. The Hibernate gauntlet says
+the same once the baseline is repeated rather than trusted: default 492 s, then
+blanket 377 s, then **default again 371 s** — the apparent 1.3–1.5× in either
+direction was shared-host load, not the collector.
+
+So on the merged tree this work is **throughput-neutral on these workloads**.
+What it delivers is the property the feature exists for: the young generation
+actually compacts, which is what makes small heaps viable
+(`docs/moving-young-throughput.md` records the case where the non-moving path
+dies with `OutOfMemoryError: young gen exhausted` at `-Xmx512m` and the
+compacting one completes). Anyone quoting a speedup from this change should
+re-measure interleaved, on a quiet host, and repeat the baseline — both of the
+misleading figures above came from not doing that.
 
 ## Cross-thread coverage is still an open obligation (by design)
 
@@ -201,13 +229,12 @@ remaining throughput lever for Tomcat/Spring-shaped workloads.
 - Tomcat `org.apache.catalina.startup.TestTomcat` — `OK (26 tests)`, matching
   the recorded baseline.
 - Hibernate ORM, first 120 classes of `passed.txt`, 4 shards — **119 PASS, 1
-  FAIL**. The single failure,
+  FAIL**, on both the pre-merge and merged trees and in both lanes. The single
+  failure,
   `org.hibernate.orm.test.action.queue.integration.DeferredIdentityGenerationIntegrationTest`,
-  fails identically in the `CRATONVM_MOVING_YOUNG_NO_JIT=1` control lane, so it
-  is pre-existing (it belongs to the open `action.queue` tiering item). The
-  default lane finished in 346 s wall / 1,091,777 ms of class time against the
-  control's 526 s / 1,667,098 ms; the lanes ran back-to-back rather than
-  interleaved, so treat that as indicative of direction, not a calibrated figure.
+  fails identically in the `CRATONVM_MOVING_YOUNG_NO_JIT=1` control, so it is
+  pre-existing (it belongs to the open `action.queue` tiering item). Wall times
+  are in the throughput section above; they carry no signal.
 - Spring Boot was **not** run: the checkout on this box cannot configure
   (`build-plugin/spring-boot-antlib` is missing, so `-RefreshClasspaths` fails
   during Gradle configuration). That is a fixture gap, not VM evidence in either

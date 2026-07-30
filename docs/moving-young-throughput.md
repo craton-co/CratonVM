@@ -163,8 +163,10 @@ slightly light, and the configuration was not the one that ships now. See
 `docs/internal/default-moving-young-enabled-20260730.md`.
 
 Re-measured on 2026-07-30 with the mirror defect and the coverage-proof false
-positives fixed, bt18 at `-Xmx512m` runs 25 moving cycles in ~4.3 s and returns
-the HotSpot checksum, so the 3049 ms figure above is in the right region.
+positives fixed, bt18 at `-Xmx512m` runs 25 moving cycles with a 4,220 ms
+median over five interleaved rounds and returns the HotSpot checksum — and the
+non-moving lanes now measure the same, so the 2.1x this document reports has
+closed on the current tree.
 
 ## Status: the default has flipped; these optimizations have not landed
 

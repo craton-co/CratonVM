@@ -126,17 +126,21 @@ gives up compaction.
 **What changed underneath it.** Until 2026-07-30 this document described a trade
 that was not actually being made: the moving young generation was
 default-*requested* but could never *engage* under JIT, so a process paid the
-optimizing tier for compaction it never received. Two defects caused that (see
-`docs/internal/default-moving-young-enabled-20260730.md`) and both are fixed —
+optimizing tier for compaction it never received. Three defects caused that
+(see `docs/internal/default-moving-young-enabled-20260730.md`) and all are fixed —
 `BinTreesClassic 18` at `-Xmx512m` now runs 25 real Cheney young cycles with
 zero coverage fallbacks. The cost recorded here is now buying something, so the
 comparison a reader should make is three-way, not two-way:
 
 | `-Xmx512m` bt18 | young collector | optimizing tier | result |
 |---|---|---|---|
-| default | moving, 25 cycles | off | ~4.3 s |
-| `CRATONVM_MOVING_YOUNG_NO_JIT=1` (the pre-fix behaviour) | non-moving, on the moving-young heap policy | off | ~15.3 s; OOM under load |
-| `CRATONVM_NO_MOVING_YOUNG=1` | non-moving | **on** | ~5.0 s |
+| default | moving, 25 cycles | off | 4,220 ms |
+| `CRATONVM_MOVING_YOUNG_NO_JIT=1` (the pre-fix behaviour) | non-moving, on the moving-young heap policy | off | 4,295 ms |
+| `CRATONVM_NO_MOVING_YOUNG=1` | non-moving | **on** | 4,279 ms |
+
+Medians of five interleaved rounds. The three are indistinguishable, so on this
+workload the optimizing tier is currently worth nothing measurable either —
+which is itself a reason to price item 1 before assuming it is.
 
 **Item 2 is more tractable than it looks, and for a specific reason — but it is
 still not the answer.** An IR-lowered `CompiledMethod` publishes no `oop_maps`
