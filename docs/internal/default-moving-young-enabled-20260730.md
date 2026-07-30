@@ -23,16 +23,16 @@ fixed-capacity production layout.
   fixture rejected a checked-in UTF-8 BOM before any moving-young assertion;
   this is fixture invalidation, not VM evidence.
 - `cratonvm-gc --lib`: 872 passed, zero failed.
-- `cratonvm-jit --lib moving_young`: 2 passed, zero failed. The complete JIT
-  library run reached 818 explicit passes and 12 unrelated failures before the
-  Windows test process hit `STATUS_ACCESS_VIOLATION` in
+- `cratonvm-jit --lib moving_young`: 2 passed, zero failed. The final complete
+  JIT library run reached 819 explicit passes and 12 unrelated failures before
+  the Windows test process hit `STATUS_ACCESS_VIOLATION` in
   `cooperative_poll_runs_in_a_pure_compiled_method`; it produced no valid final
   suite summary.
 - `cratonvm-vm --lib moving_young`: 9 passed, zero failed.
 - `shadow_window_is_recovered_from_a_live_compiled_frame`: 1 passed. The fixture
   now allocates `DEFAULT_SHADOW_SLOTS` and publishes the real fixed-capacity
   `end`, matching `ShadowStack::ensure_allocated`.
-- Complete `cratonvm-vm --lib`: 2,447 passed, six failed, 111 ignored. The six
+- Complete `cratonvm-vm --lib`: 2,448 passed, six failed, 111 ignored. The six
   failures are unrelated skip-list classification, panic-census, and
   serviceability socket baselines; every moving-young and shadow-window test
   passed.
@@ -40,20 +40,23 @@ fixed-capacity production layout.
 ## Runtime contract and pressure evidence
 
 Release binary: `cratonvm-moving-young-default-019fb305.exe`, SHA-256
-`05DFDCFDEF8D513C49E17BC9D45009AFBC9061DA589A3E9F49D66FB70E3CD171`.
+`66D0368246687D5FE120AF3ACCF8C1A39644D44CB0DC9869ABA54EAFBFE3ACB4`.
 
-All `BinTreesClassic 18` lanes returned `68332206`:
+The pressure lanes returned their HotSpot checksums:
 
 | Lane | Heap | Result | Moving diagnostic |
 |---|---:|---:|---|
-| default JIT | 512m | 68332206 | cycles=1, coverage_fallbacks=30 |
-| default JIT | 8g | 68332206 | cycles=0, coverage_fallbacks=1 |
-| default `--nojit` | 512m | 68332206 | no live-JIT copying cycles counted |
+| default JIT | 512m | 68332206 | requested=true; cycles=0, coverage_fallbacks=64 |
+| default `--nojit` | 128m, depth 16 | 14985902 | 31 non-diverted moving collections |
 | `CRATONVM_NO_MOVING_YOUNG=1`, JIT | 8g | 68332206 | absent, as required |
 
-The 512m JIT lane proves the default path executes a real copying cycle.
-Coverage failures remain fail-closed and visible; the correct checksum across
-both copying and diverted cycles proves the fallback is preserving safety.
+The `--nojit` lane logged
+`moving_young_requested=true divert_non_moving=false` 31 times and therefore
+exercised 31 real Cheney cycles. The counter printed at shutdown is deliberately
+limited to moves with live JIT roots, so it remains zero in that lane. The JIT
+pressure lane proves every unsafe cycle is visibly fail-closed when the merged
+JIT cannot recover an exact frame base; the correct checksum across both moving
+and diverted cycles proves the safety split.
 
 The HotSpot-differential regression suite passed all 18 classes in each of:
 
@@ -86,5 +89,6 @@ Default-on does not authorize relocation by itself. A live compiled frame must
 still publish complete rewritable oop homes for the active safepoint. Missing
 exact frame identity, an unguarded callee, a wide-locals gap, or another
 incomplete proof records a reason and runs the non-moving sweep for that cycle.
-The explicit opt-out overrides the compatibility opt-in and disables moving
-codegen/root/collector behavior together.
+The explicit opt-out overrides the compatibility opt-in for the compiled-frame
+codegen/root/collector contract. Interpreter-only collections remain safely
+relocatable because all of their roots are rewritable.

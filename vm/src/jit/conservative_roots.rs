@@ -3256,10 +3256,10 @@ mod tests {
 
     /// The codegen gate is a veto the config cannot override.
     ///
-    /// `jit/src/x64.rs` still parses `CRATONVM_MOVING_YOUNG` itself rather than
-    /// reading `flags().gc.moving_young`, so a config-side default flip alone
-    /// must NOT be able to switch the collector on. Guards the exact mistake
-    /// that would turn a one-line flip into heap corruption.
+    /// The codegen decision remains authoritative: a config/codegen skew must
+    /// NOT be able to switch the collector on behind frames that emitted no
+    /// rewritable roots. Guards the exact mistake that would turn a default
+    /// change into heap corruption.
     #[test]
     fn codegen_gate_vetoes_moving_young_regardless_of_config() {
         if !cratonvm_jit::x64::moving_young_enabled() {
@@ -3271,10 +3271,9 @@ mod tests {
         }
     }
 
-    /// With moving-young off (the state this gate is in until
-    /// `flags::DEFAULT_MOVING_YOUNG` flips and the codegen reads it), the
-    /// collection-authoritative refresh is a no-op that reports "proven" — the
-    /// coverage machinery must not impose cost or verdicts on the legacy path.
+    /// With moving-young explicitly opted out, the collection-authoritative
+    /// refresh is a no-op that reports "proven" — the coverage machinery must
+    /// not impose cost or verdicts on the compatibility path.
     #[test]
     fn collection_coverage_refresh_is_inert_when_moving_young_is_off() {
         if moving_young_enabled() {

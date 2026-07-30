@@ -39,7 +39,7 @@ default-on/fail-closed contract.
 Acceptance on the uniquely named release binary:
 
 - `cargo check --workspace` passed; GC library tests were 872/872.
-- The complete VM library accounted for 2,564 tests: 2,447 passed, 111 ignored,
+- The complete VM library accounted for 2,565 tests: 2,448 passed, 111 ignored,
   and six unrelated existing failures. All moving-young/root-coverage tests
   passed, including the synthetic shadow-window fixture corrected here to
   satisfy the real fixed-capacity `ShadowStack` invariant.
@@ -47,11 +47,13 @@ Acceptance on the uniquely named release binary:
   default `--nojit`, and explicit `CRATONVM_NO_MOVING_YOUNG=1` JIT modes
   (54/54 class runs).
 - `BinTreesClassic 18` returned the HotSpot checksum `68332206` in every lane.
-  At `--Xmx 512m`, default JIT recorded one real copying cycle and 30 safe
-  coverage fallbacks; at `--Xmx 8g`, explicit opt-out returned the same
-  checksum with the moving diagnostic absent. The fallbacks are expected
-  per-cycle proof failures and demonstrate that default-on does not weaken the
-  relocation safety gate.
+  The final merged JIT build requested moving young on all 64 pressure cycles
+  but safely diverted them because exact compiled-frame identity was
+  unavailable. A `--nojit`, 128m `BinTreesClassic 16` control executed 31
+  non-diverted moving collections and returned the HotSpot checksum `14985902`.
+  At `--Xmx 8g`, explicit opt-out returned `68332206` with the moving diagnostic
+  absent. These lanes prove both the active default and its relocation-safety
+  veto.
 - The real-JDK application gauntlet passed in both JIT and `--nojit`: four
   Spring Boot classes (17 tests per mode), ten Hibernate classes (41 tests per
   mode), and Tomcat `TestTomcat` (26 tests per mode), all with their runner
