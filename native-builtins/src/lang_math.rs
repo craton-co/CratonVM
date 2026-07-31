@@ -3698,6 +3698,37 @@ pub(crate) fn native_wrapper_double_hash_code(
     )))
 }
 
+// Wrapper `equals(Object)` is specified as an **instance test** on the argument
+// (`obj instanceof Integer i && value == i.value`), not a bare field-0 payload
+// compare. These natives own the whole method — the real JDK bytecode never
+// runs — so the type test has to live here. Without it
+// `Boolean.FALSE.equals(new int[] {0})` answered `true`: both operands decoded
+// to `Int(0)`, the wrapper's `value` and the int array's body read through the
+// object-field path. That is what made H2's
+// `TestGetGeneratedKeys.testColumnNotFound` skip generated-key validation
+// entirely, and reading field 0 of an array argument is also what fired the
+// `gen_heap::read_slot: corrupt Value cell` guard — that diagnostic was a
+// symptom of this missing check, not of heap corruption.
+//
+// Every wrapper class is `final`, so `instanceof` is exactly "same class".
+fn wrapper_same_class(
+    ctx: &mut dyn NativeContext,
+    a: cratonvm_types::ObjectRef,
+    b: cratonvm_types::ObjectRef,
+) -> bool {
+    let ca = ctx.class_id_of_object(a);
+    let cb = ctx.class_id_of_object(b);
+    if ca == cb {
+        return true;
+    }
+    // Cold path: distinct ids can still name the same class when more than one
+    // copy is loaded (isolating loaders), so compare names before answering no.
+    match (ctx.class_name_of_id(ca), ctx.class_name_of_id(cb)) {
+        (Some(na), Some(nb)) => na == nb,
+        _ => false,
+    }
+}
+
 // equals for Int-stored wrappers (Integer, Boolean, Character, Byte, Short)
 pub(crate) fn native_wrapper_int_equals(
     ctx: &mut dyn NativeContext,
@@ -3711,6 +3742,9 @@ pub(crate) fn native_wrapper_int_equals(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if !wrapper_same_class(ctx, this, other) {
+        return Ok(Some(Value::Int(0)));
+    }
     let a = ctx.get_field(this, 0);
     let b = ctx.get_field(other, 0);
     Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
@@ -3729,6 +3763,9 @@ pub(crate) fn native_wrapper_long_equals(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if !wrapper_same_class(ctx, this, other) {
+        return Ok(Some(Value::Int(0)));
+    }
     let a = match ctx.get_field(this, 0) {
         Value::Long(v) => v,
         _ => return Ok(Some(Value::Int(0))),
@@ -3753,6 +3790,9 @@ pub(crate) fn native_wrapper_float_equals(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if !wrapper_same_class(ctx, this, other) {
+        return Ok(Some(Value::Int(0)));
+    }
     let a = match ctx.get_field(this, 0) {
         Value::Float(v) => v,
         _ => return Ok(Some(Value::Int(0))),
@@ -3781,6 +3821,9 @@ pub(crate) fn native_wrapper_double_equals(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if !wrapper_same_class(ctx, this, other) {
+        return Ok(Some(Value::Int(0)));
+    }
     let a = match ctx.get_field(this, 0) {
         Value::Double(v) => v,
         _ => return Ok(Some(Value::Int(0))),
@@ -4577,6 +4620,136 @@ mod tests {
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+
+    // -----------------------------------------------------------------------
+    // Wrapper equals(Object) — the argument's TYPE is part of the contract
+    // -----------------------------------------------------------------------
+
+    fn boxed(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        cid: u32,
+        v: Value,
+    ) -> cratonvm_types::ObjectRef {
+        let o = ctx.alloc_object(cratonvm_types::ClassId::new(cid), 1);
+        ctx.set_field(o, 0, v);
+        o
+    }
+
+    #[test]
+    fn wrapper_int_equals_rejects_a_different_class_with_the_same_payload() {
+        let mut ctx = mock_ctx();
+        // Two distinct classes (e.g. Boolean and Integer) both holding Int(0).
+        let a = boxed(&mut ctx, 7, Value::Int(0));
+        let b = boxed(&mut ctx, 9, Value::Int(0));
+        let same = boxed(&mut ctx, 7, Value::Int(0));
+        let other_val = boxed(&mut ctx, 7, Value::Int(1));
+
+        let args = [Value::Object(Some(a)), Value::Object(Some(b))];
+        assert_eq!(
+            native_wrapper_int_equals(&mut ctx, &args).unwrap(),
+            Some(Value::Int(0)),
+            "Boolean.FALSE.equals(Integer.valueOf(0)) must be false"
+        );
+
+        let args = [Value::Object(Some(a)), Value::Object(Some(same))];
+        assert_eq!(
+            native_wrapper_int_equals(&mut ctx, &args).unwrap(),
+            Some(Value::Int(1))
+        );
+
+        let args = [Value::Object(Some(a)), Value::Object(Some(other_val))];
+        assert_eq!(
+            native_wrapper_int_equals(&mut ctx, &args).unwrap(),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn wrapper_int_equals_rejects_an_array_argument() {
+        // The H2 `TestGetGeneratedKeys` failure: `Boolean.FALSE.equals(new
+        // int[] {0})` answered `true` because field 0 of the array decoded as
+        // `Int(0)` — the same read that fired the `read_slot` corrupt-cell
+        // guard. The class test has to reject it before that read happens.
+        let mut ctx = mock_ctx();
+        let this = boxed(&mut ctx, 7, Value::Int(0));
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, 1);
+        ctx.set_array_element(arr, 0, Value::Int(0));
+
+        let args = [Value::Object(Some(this)), Value::Object(Some(arr))];
+        assert_eq!(
+            native_wrapper_int_equals(&mut ctx, &args).unwrap(),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn wrapper_long_equals_also_checks_the_class() {
+        let mut ctx = mock_ctx();
+        let a = boxed(&mut ctx, 11, Value::Long(1));
+        let b = boxed(&mut ctx, 12, Value::Long(1));
+        let same = boxed(&mut ctx, 11, Value::Long(1));
+        assert_eq!(
+            native_wrapper_long_equals(&mut ctx, &[Value::Object(Some(a)), Value::Object(Some(b))])
+                .unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            native_wrapper_long_equals(
+                &mut ctx,
+                &[Value::Object(Some(a)), Value::Object(Some(same))]
+            )
+            .unwrap(),
+            Some(Value::Int(1))
+        );
+    }
+
+    #[test]
+    fn wrapper_float_equals_also_checks_the_class() {
+        let mut ctx = mock_ctx();
+        let a = boxed(&mut ctx, 13, Value::Float(1.0));
+        let b = boxed(&mut ctx, 14, Value::Float(1.0));
+        let same = boxed(&mut ctx, 13, Value::Float(1.0));
+        assert_eq!(
+            native_wrapper_float_equals(
+                &mut ctx,
+                &[Value::Object(Some(a)), Value::Object(Some(b))]
+            )
+            .unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            native_wrapper_float_equals(
+                &mut ctx,
+                &[Value::Object(Some(a)), Value::Object(Some(same))]
+            )
+            .unwrap(),
+            Some(Value::Int(1))
+        );
+    }
+
+    #[test]
+    fn wrapper_double_equals_also_checks_the_class() {
+        let mut ctx = mock_ctx();
+        let a = boxed(&mut ctx, 15, Value::Double(1.0));
+        let b = boxed(&mut ctx, 16, Value::Double(1.0));
+        let same = boxed(&mut ctx, 15, Value::Double(1.0));
+        assert_eq!(
+            native_wrapper_double_equals(
+                &mut ctx,
+                &[Value::Object(Some(a)), Value::Object(Some(b))]
+            )
+            .unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            native_wrapper_double_equals(
+                &mut ctx,
+                &[Value::Object(Some(a)), Value::Object(Some(same))]
+            )
+            .unwrap(),
+            Some(Value::Int(1))
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Float/Double parsing

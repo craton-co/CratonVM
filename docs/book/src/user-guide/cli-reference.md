@@ -26,8 +26,15 @@ For the environment-variable side of configuration, see
 | `--classpath <PATH>` / `-cp` / `-c` / `--cp` | Directories and JARs to search for classes. Separator `;` (Windows) or `:` (Unix). Last occurrence wins. | `.` |
 | `--jar <FILE>` | Run a JAR; main class comes from its manifest. `-cp` is ignored when set. | — |
 | `--Xbootclasspath <PATH>` | Override the bootstrap classpath (advanced). `-Xbootclasspath/a:` (append) and `/p:` (prepend) forms are accepted. | Auto-detected |
-| `--java-home <PATH>` | JDK to use for boot/ext classpath discovery and JMOD loading. Forces real-JDK boot. | `JAVA_HOME` |
-| `--synthetic-jdk` | Force synthetic (Rust) standard library even if a JDK is detected. Wins over `--java-home`. | Auto |
+| `--java-home <PATH>` | JDK to use for boot/ext classpath discovery and JMOD loading. It does not *select* real-JDK mode — that is already the launcher default; it points the selected mode at one installation. | `CRATONVM_JAVA_HOME`, then `JAVA_HOME` |
+| `--real-jdk` | Select the real JDK class library. Already the launcher default; the flag exists so scripts, CI lanes and bug reports can state the choice. Conflicts with `--synthetic-jdk`. | On |
+| `--synthetic-jdk` | Select the synthetic (Rust) standard library. Requires a build with the `synthetic-jdk` Cargo feature. Conflicts with `--real-jdk` and `--jdk-only`. | Off |
+| `--jdk-only` | Real JDK class library with compatibility substitutions **rejected**: real class bytes are authoritative. Implies `--real-jdk`. Conflicts with `--synthetic-jdk`. See [JDK-Only Mode](jdk-only-mode.md). | Off |
+
+The launcher default is real-JDK, fixed at compile time — it is not derived
+from whether a JDK happens to be installed, and a selected mode that is
+unavailable is a hard error rather than a silent switch to the other library.
+See [JDK Modes: Real vs. Synthetic](../getting-started/jdk-modes.md).
 
 ## Heap & GC
 
@@ -65,7 +72,37 @@ see [The JIT Compiler](jit-compiler.md).
 | `--XX:AuditMissingNatives` | Log every `native` method invoked without a Rust implementation; printed on shutdown. |
 | `--dump-missing-natives <FILE>` | Dump the missing-natives audit to JSON. Implies `--XX:AuditMissingNatives`. |
 | `--dump-missing-natives-grouped <FILE>` | As above, grouped by JDK module. |
-| `--dump-native-registry <FILE>` | Dump all registered natives (classified intrinsic / bridge / synthetic-stub) to JSON on shutdown. |
+| `--dump-native-registry <FILE>` | Dump every registered native to JSON on shutdown — kind (intrinsic / bridge / synthetic-stub), registration site, the kind it overwrote, and this run's dispatch count. `"schema_version": 2`; see [Native Methods](../internals/native-methods.md#the-native-registry-census-schema-2). |
+
+## JDK-only mode and its diagnostics
+
+`--jdk-only` selects a *policy*, not a class library: it keeps the real JDK
+and forbids the compatibility substitutions the VM would otherwise make. The
+four diagnostic flags below work **with or without** `--jdk-only` — under the
+default compatibility policy they record what a strict run *would* have
+rejected, which is what makes them a measurement of the distance to strict
+mode rather than a post-mortem of a failed one.
+
+| Flag | Description |
+|------|-------------|
+| `--jdk-only` | Real JDK, compatibility substitutions rejected. Implies `--real-jdk`; conflicts with `--synthetic-jdk`. |
+| `--jdk-only-report <FILE>` | Write the violation/counter report to JSON on shutdown. `"schema_version": 1`. |
+| `--dump-class-origins <FILE>` | Write the class-origin census to JSON on shutdown — how every loaded class came to exist. `"schema_version": 1`. |
+| `--trace-jdk-only` | Report each recorded policy violation to stderr and at `WARN` level, one line per violation. |
+| `--explain-jdk-only` | Print the long-form, operator-facing explanation for each violation, and keep absolute paths in the report files. |
+
+`--explain-jdk-only` disables the path redaction applied to
+`--jdk-only-report`, `--dump-class-origins` and `--dump-native-registry`, so
+those files keep the build machine's directory layout. Do not pass it when
+producing a census intended for committing or for pasting into a bug report.
+
+`--trace-jdk-only` is a **polling** trace today. The launcher drains the two
+append-only violation logs at the points where it holds the VM — immediately
+after VM construction, which is where every registration refusal is produced,
+and again at shutdown. Class-origin violations recorded mid-run therefore
+surface at shutdown, not at the instant they happen.
+
+See [JDK-Only Mode](jdk-only-mode.md).
 
 ## Class Data Sharing & AOT
 

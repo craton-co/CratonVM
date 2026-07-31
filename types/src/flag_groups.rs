@@ -768,6 +768,222 @@ pub fn canonical_spelling(legacy: &str) -> Option<(Group, String)> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Superseded knobs
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A token that still works, but that a command-line flag now expresses better.
+///
+/// This is a **side table**, not a field on [`E`], for two reasons. [`INVENTORY`]
+/// is a `#[rustfmt::skip]` block of ~500 one-line rows whose whole value is that
+/// `grep` can answer questions about it; adding a sixth field would widen every
+/// one of those lines. And `cargo fmt` is banned repository-wide, so a
+/// hand-maintained table cannot be re-flowed after the fact. Supersession is
+/// also rare — one row today — so paying a field on 500 rows to describe one is
+/// the wrong trade.
+///
+/// Note what this is *not*: a deprecation that changes behaviour. The token
+/// keeps expanding to exactly what it always did. The only new thing is a note
+/// the launcher can print.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Superseded {
+    /// The group the token belongs to.
+    pub group: Group,
+    /// The [`E::token`] this row is about.
+    pub token: &'static str,
+    /// Which polarity is superseded. `false` means the `-token` spelling is the
+    /// superseded one, which is the case for `CRATONVM_REAL=-stubs`.
+    pub on: bool,
+    /// What to use instead, spelled as the user would type it.
+    pub prefer: &'static str,
+    /// Why the replacement is not merely a rename. Printed verbatim, so it has
+    /// to read as a sentence fragment after "because".
+    pub because: &'static str,
+}
+
+impl Superseded {
+    /// How the superseded knob is spelled: `CRATONVM_REAL=-stubs`.
+    pub fn spelling(&self) -> String {
+        format!(
+            "{}={}{}",
+            self.group.var(),
+            if self.on { "" } else { "-" },
+            self.token
+        )
+    }
+
+    /// The one-line note the launcher prints, once per run.
+    pub fn note(&self) -> String {
+        format!(
+            "{} still works, but prefer {} because {}",
+            self.spelling(),
+            self.prefer,
+            self.because
+        )
+    }
+}
+
+/// Every superseded knob, exactly once.
+///
+/// `CRATONVM_REAL=-stubs` (legacy `CRATONVM_NO_STUBS`) is a *native-registry*
+/// filter: it drops synthetic-stub natives and nothing else. `--jdk-only` is
+/// the same rule plus the two halves the environment token structurally cannot
+/// reach — class fabrication and the native-vs-bytecode dispatch decision — and
+/// it records structured provenance for each refusal instead of dropping
+/// silently. Contract §9 asks for the note; the token itself is untouched.
+pub const SUPERSEDED: &[Superseded] = &[Superseded {
+    group: Group::REAL,
+    token: "stubs",
+    on: false,
+    prefer: "--jdk-only",
+    because: "the environment token only filters the native registry, and cannot express \
+              the class-loading or dispatch half of the JDK-only contract",
+}];
+
+/// The supersession row for `group`/`token` in the given polarity, if any.
+pub fn superseded_by(group: Group, token: &str, on: bool) -> Option<&'static Superseded> {
+    SUPERSEDED
+        .iter()
+        .find(|s| s.group == group && s.token == token && s.on == on)
+}
+
+/// The supersession notes the *process* environment has earned, in
+/// [`SUPERSEDED`] order.
+///
+/// Reads the process environment directly, so the launcher can print the notes
+/// before it has a resolved source in hand. [`Resolved::superseded`] is the
+/// same answer for an arbitrary [`FlagSource`].
+pub fn process_env_supersessions() -> Vec<&'static Superseded> {
+    supersessions_in(&MapSource::from_process_env())
+}
+
+/// Whether `spec` — the raw comma-separated value of a grouped variable — names
+/// `token` in the `on` polarity.
+///
+/// Mirrors [`resolve`]'s tokenizer exactly (leading `-`/`+`, an optional
+/// `=value`, case-folded), because a note that fires for `-stubs` but not for
+/// ` -STUBS=1 ` would be worse than no note at all.
+fn spec_names(spec: &str, token: &str, on: bool) -> bool {
+    spec.split(',').any(|raw| {
+        let t = raw.trim();
+        if t.is_empty() {
+            return false;
+        }
+        let (this_on, t) = match t.strip_prefix('-') {
+            Some(rest) => (false, rest),
+            None => (true, t.strip_prefix('+').unwrap_or(t)),
+        };
+        let name = match t.split_once('=') {
+            Some((n, _)) => n.trim(),
+            None => t,
+        };
+        this_on == on && name.eq_ignore_ascii_case(token)
+    })
+}
+
+/// The supersession rows `src` has earned, in [`SUPERSEDED`] order.
+///
+/// Fires for the grouped spelling *and* for the legacy key set directly — a
+/// runbook that exports `CRATONVM_NO_STUBS=1` is exactly the reader the note is
+/// written for, and it would never see a note keyed only on the grouped form.
+fn supersessions_in(src: &dyn FlagSource) -> Vec<&'static Superseded> {
+    SUPERSEDED
+        .iter()
+        .filter(|s| {
+            let grouped = src
+                .get(s.group.var())
+                .and_then(|v| v.into_string().ok())
+                .is_some_and(|spec| spec_names(&spec, s.token, s.on));
+            let legacy = lookup(s.group, s.token)
+                .and_then(|e| if s.on { e.on_key } else { e.off_key })
+                .is_some_and(|key| src.get(key).is_some());
+            grouped || legacy
+        })
+        .collect()
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// JDK-only command-line surface
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One command-line flag, as the launcher's parser and its `--help` both need
+/// it.
+///
+/// These are *not* environment variables and deliberately add none: the
+/// fifteen-variable surface this module exists to hold down is a promise, and
+/// `--jdk-only` is a runtime policy chosen per invocation, not a knob a parent
+/// shell should be able to set behind an operator's back. The table lives here
+/// because this is where the launcher already looks for "what may I be
+/// passed", not because these are flag-group members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliFlag {
+    /// The flag as typed, including the leading dashes.
+    pub flag: &'static str,
+    /// Whether the next argument is its value.
+    pub takes_value: bool,
+    /// The `--help` line, verbatim from contract §9.
+    pub help: &'static str,
+}
+
+/// The seven flags of contract §9, in the order §9 lists them.
+///
+/// Help text is copied verbatim from the contract: it is the user-visible
+/// surface the design pinned, and re-wording it here would silently fork the
+/// documentation from the binary.
+pub const JDK_ONLY_CLI_FLAGS: &[CliFlag] = &[
+    CliFlag {
+        flag: "--jdk-only",
+        takes_value: false,
+        help: "Real JDK, reject compatibility stubs and fabricated classes.",
+    },
+    CliFlag {
+        flag: "--real-jdk",
+        takes_value: false,
+        help: "Real JDK with current compatibility behaviour (default).",
+    },
+    CliFlag {
+        flag: "--synthetic-jdk",
+        takes_value: false,
+        help: "Standalone synthetic library; conflicts with both.",
+    },
+    CliFlag {
+        flag: "--jdk-only-report",
+        takes_value: true,
+        help: "Write the JSON violation/counter report.",
+    },
+    CliFlag {
+        flag: "--dump-class-origins",
+        takes_value: true,
+        help: "Write the class-origin census.",
+    },
+    CliFlag {
+        flag: "--trace-jdk-only",
+        takes_value: false,
+        help: "Log every violation as it happens.",
+    },
+    CliFlag {
+        flag: "--explain-jdk-only",
+        takes_value: false,
+        help: "Print the long-form explanation for each violation.",
+    },
+];
+
+/// Flags that `--jdk-only` cannot be combined with.
+///
+/// `--real-jdk` is *not* here: `--jdk-only` implies `JdkMode::Real`, so the two
+/// agree about the image and differ only about substitutions. `--synthetic-jdk`
+/// selects a class library that is nothing but substitutions, which is the one
+/// combination that cannot mean anything (contract §1, §6).
+pub const JDK_ONLY_CONFLICTS_WITH: &[&str] = &["--synthetic-jdk"];
+
+/// The [`CliFlag`] named exactly `flag`, if it is one of §9's.
+///
+/// Exact match only. A caller handling the `--flag=value` spelling splits on
+/// the first `=` before asking.
+pub fn jdk_only_flag(flag: &str) -> Option<&'static CliFlag> {
+    JDK_ONLY_CLI_FLAGS.iter().find(|f| f.flag == flag)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Resolution
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -785,6 +1001,10 @@ pub struct Resolved<'a> {
     /// Tokens named in a grouped variable that no entry claims. A typo here is
     /// the failure mode the old surface hid, so callers should print these.
     pub unknown_tokens: Vec<String>,
+    /// Knobs this source set that a command-line flag now expresses better, in
+    /// [`SUPERSEDED`] order. Advisory only — the tokens keep working, and
+    /// nothing here changes what [`Self::overrides`] says.
+    pub superseded: Vec<&'static Superseded>,
 }
 
 impl FlagSource for Resolved<'_> {
@@ -895,6 +1115,7 @@ pub fn resolve<'a>(src: &'a dyn FlagSource) -> Resolved<'a> {
         overrides,
         legacy_direct,
         unknown_tokens,
+        superseded: supersessions_in(src),
     }
 }
 
@@ -1197,6 +1418,181 @@ mod tests {
             c.resolve().get("CRATONVM_SOMETHING_BRAND_NEW"),
             Some(OsString::from("7"))
         );
+    }
+
+    // ── Supersession (JDK-only mode, contract §9) ──────────────────────────
+
+    /// The load-bearing constraint of the whole supersession change: the token
+    /// keeps doing **exactly** what it did. `--jdk-only` is a superset, but the
+    /// people already exporting `CRATONVM_REAL=-stubs` in runbooks get no
+    /// behaviour change — only a note. If this row ever expanded to a second
+    /// key, every one of those runbooks would quietly start doing something new.
+    #[test]
+    fn stubs_still_expands_to_exactly_one_key() {
+        let c = case(&[("CRATONVM_REAL", "-stubs")]);
+        let r = c.resolve();
+        let one = OsString::from("1");
+        let applied: Vec<(&str, Option<&OsString>)> = r.overrides().collect();
+        assert_eq!(
+            applied,
+            vec![("CRATONVM_NO_STUBS", Some(&one))],
+            "-stubs must set CRATONVM_NO_STUBS=1 and nothing else"
+        );
+    }
+
+    /// This feature is a *command-line* policy. If it ever grows an environment
+    /// variable, the fifteen-name promise is broken and
+    /// `types/tests/flag-surface.txt` needs a matching edit — neither of which
+    /// should happen by accident, so fail here first with a message that says
+    /// what to do about it.
+    #[test]
+    fn jdk_only_adds_no_environment_variable() {
+        let names = INVENTORY
+            .iter()
+            .flat_map(|e| [e.on_key, e.off_key].into_iter().flatten())
+            .chain(SCALARS.iter().copied())
+            .chain(Group::ALL.iter().map(|g| g.var()));
+        for name in names {
+            assert!(
+                !name.contains("JDK_ONLY"),
+                "{name} looks like a JDK-only environment variable. The feature \
+                 is a runtime policy chosen per invocation (contract §9): add a \
+                 CliFlag to JDK_ONLY_CLI_FLAGS instead. If a variable really is \
+                 wanted, types/tests/flag-surface.txt has to gain it in the \
+                 same commit."
+            );
+        }
+        // Supersession is a note about an existing knob, never a new one.
+        for s in SUPERSEDED {
+            assert!(
+                lookup(s.group, s.token).is_some(),
+                "{} supersedes a token that is not in the inventory",
+                s.spelling()
+            );
+        }
+        // And the CLI table is flags, not variables.
+        for f in JDK_ONLY_CLI_FLAGS {
+            assert!(f.flag.starts_with("--"), "{} is not a flag", f.flag);
+            assert!(!f.flag.contains("CRATONVM"), "{} is not a flag", f.flag);
+        }
+    }
+
+    #[test]
+    fn superseded_lookup_is_polarity_sensitive() {
+        let row = superseded_by(Group::REAL, "stubs", false)
+            .expect("CRATONVM_REAL=-stubs is the one superseded knob");
+        assert_eq!(row.prefer, "--jdk-only");
+        assert_eq!(row.spelling(), "CRATONVM_REAL=-stubs");
+        assert!(row.note().contains("CRATONVM_REAL=-stubs"));
+        assert!(row.note().contains("--jdk-only"));
+        assert!(row.note().contains(row.because));
+
+        // `stubs` (positive) asks for the default behaviour and is not
+        // superseded by anything; neither is a token in another group.
+        assert!(superseded_by(Group::REAL, "stubs", true).is_none());
+        assert!(superseded_by(Group::JIT, "stubs", false).is_none());
+        assert!(superseded_by(Group::REAL, "aqs", false).is_none());
+    }
+
+    #[test]
+    fn resolution_reports_the_superseded_spelling_both_ways() {
+        // Grouped spelling.
+        let c = case(&[("CRATONVM_REAL", "aqs,-stubs")]);
+        let r = c.resolve();
+        assert_eq!(r.superseded.len(), 1);
+        assert_eq!(r.superseded[0].prefer, "--jdk-only");
+        // ...and the expansion is untouched by the note.
+        assert_eq!(r.get("CRATONVM_NO_STUBS"), Some(OsString::from("1")));
+
+        // Legacy key exported directly — the runbook case the note exists for.
+        let c = case(&[("CRATONVM_NO_STUBS", "1")]);
+        assert_eq!(c.resolve().superseded.len(), 1);
+
+        // Tokenizer parity with `resolve`: spacing, `+`, `=value` and case.
+        for spec in ["-stubs", " -stubs ", "-STUBS=1", "licm,-stubs"] {
+            assert!(
+                spec_names(spec, "stubs", false),
+                "{spec:?} names -stubs but was not recognised"
+            );
+        }
+        assert!(!spec_names("stubs", "stubs", false));
+        assert!(!spec_names("+stubs", "stubs", false));
+        assert!(!spec_names("-stubsx", "stubs", false));
+
+        // Nothing set: no note. Nagging on a clean environment is how a
+        // deprecation line gets filtered out before the one that matters.
+        assert!(case(&[]).resolve().superseded.is_empty());
+        assert!(case(&[("CRATONVM_REAL", "aqs")])
+            .resolve()
+            .superseded
+            .is_empty());
+    }
+
+    // ── The §9 command-line surface ────────────────────────────────────────
+
+    #[test]
+    fn the_jdk_only_cli_surface_is_the_seven_flags_of_the_contract() {
+        let flags: Vec<&str> = JDK_ONLY_CLI_FLAGS.iter().map(|f| f.flag).collect();
+        assert_eq!(
+            flags,
+            vec![
+                "--jdk-only",
+                "--real-jdk",
+                "--synthetic-jdk",
+                "--jdk-only-report",
+                "--dump-class-origins",
+                "--trace-jdk-only",
+                "--explain-jdk-only",
+            ]
+        );
+
+        let mut unique = flags.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), flags.len(), "a flag is listed twice");
+
+        for f in JDK_ONLY_CLI_FLAGS {
+            assert!(!f.help.is_empty(), "{} has no --help line", f.flag);
+            assert!(
+                f.help.ends_with('.'),
+                "{} help must read as a sentence",
+                f.flag
+            );
+            assert_eq!(
+                jdk_only_flag(f.flag),
+                Some(f),
+                "{} is not findable by its own name",
+                f.flag
+            );
+        }
+
+        // Only the two that name a file take one; a value-taking flag parsed as
+        // a boolean silently swallows the next argument.
+        let with_value: Vec<&str> = JDK_ONLY_CLI_FLAGS
+            .iter()
+            .filter(|f| f.takes_value)
+            .map(|f| f.flag)
+            .collect();
+        assert_eq!(with_value, vec!["--jdk-only-report", "--dump-class-origins"]);
+
+        assert!(jdk_only_flag("--jdk-onlyy").is_none());
+        assert!(jdk_only_flag("--jdk-only-report=x").is_none(), "exact match");
+        assert!(jdk_only_flag("").is_none());
+    }
+
+    #[test]
+    fn jdk_only_conflicts_only_with_the_synthetic_library() {
+        assert_eq!(JDK_ONLY_CONFLICTS_WITH.to_vec(), vec!["--synthetic-jdk"]);
+        for name in JDK_ONLY_CONFLICTS_WITH {
+            assert!(
+                jdk_only_flag(name).is_some(),
+                "{name} is not a flag this table knows about"
+            );
+        }
+        // `--jdk-only` implies JdkMode::Real, so it agrees with `--real-jdk`
+        // about the image and differs only about substitutions.
+        assert!(!JDK_ONLY_CONFLICTS_WITH.contains(&"--real-jdk"));
+        assert!(!JDK_ONLY_CONFLICTS_WITH.contains(&"--jdk-only"));
     }
 
     #[test]

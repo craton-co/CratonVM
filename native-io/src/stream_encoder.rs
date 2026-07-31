@@ -845,6 +845,11 @@ fn flush_pending_surrogate(
     Ok(())
 }
 
+// JDK-ONLY-CLASSIFY: stub — mirror of `stream_decoder.rs`. `sun.nio.cs.
+// StreamEncoder` declares no ACC_NATIVE method in JDK 25 and all 11 resolvable
+// registrations shadow concrete bytecode. Same reasoning, same caveat: these
+// stand in for unimplemented `sun.nio.ch` internals, so removing them from the
+// strict path is only safe once that layer exists.
 pub fn register_stream_encoder_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);

@@ -3937,6 +3937,294 @@ mod math_intrinsic_aliases {
 }
 pub use math_intrinsic_aliases::*;
 
+// ===========================================================================
+// JDK-only mode — the JIT's half of the native-dispatch contract
+//
+// See `docs/feature-designs/jdk-only-mode.md` §1, §7 and §10.
+//
+// # Why this lives here and not behind `resolve_dispatch`
+//
+// `docs/feature-designs/jdk-only-mode.md` §7 names
+// `vm/src/vm/vm_exec.rs::resolve_dispatch` as THE single native-vs-bytecode
+// decision point, and requires the JIT to route through it. This crate
+// **cannot call it**: `cratonvm-vm` depends on `cratonvm-jit`, so the reverse
+// edge would be a dependency cycle (see `jit/Cargo.toml` — the only crates in
+// scope are `types`, `reader` and `jit-api`).
+//
+// Compiled code therefore reaches natives through the VM-implemented helper
+// pointers in `JitRuntimeHelpers` (`invoke_dispatch`, `invoke_virtual_mic`),
+// and *those* are the sites that must call `resolve_dispatch` — they live in
+// `vm/src/jit/helpers.rs`, which this agent does not own. What the JIT crate
+// owns, and what this module governs, is the set of places where the JIT
+// **decides on its own, at compile time, to bypass that helper**:
+//
+//   1. the thin direct-call native helpers (`*_DIRECT_FN` below), which bake a
+//      VM-side reimplementation of a registered native straight into the
+//      emitted `CALL`; and
+//   2. inline-cache publication of an *unowned* entry pointer
+//      (`jit_entry_publishable`), which is how a native/builtin trampoline ends
+//      up being `CALL R11`'d by generated code with no dispatch helper — and
+//      therefore no policy check — anywhere on the path.
+//
+// Under `CompatibilityMode::JdkOnly` both are refused, and the site falls back
+// to the ordinary dispatch helper, which is policy-checked. That is the
+// wave-1-safe answer §10 asks for: refuse to bake, let the checked path handle
+// it. It is never a silent fallback to a stub and never a wild jump — the
+// fallback route is the same one an unresolvable call site already takes today.
+//
+// # Compile time vs execution time
+//
+// A JIT decision is made once, at compile time, and executes for the life of
+// the artifact. A callback bound under one policy must never execute under
+// another. Three properties give that:
+//
+//   * The policy is set once per VM at init (`VmConfig::execution_policy`,
+//     propagated by `build_helpers`) **before** the JIT compiles anything, so
+//     no artifact of that VM is ever compiled under a different policy than it
+//     runs under.
+//   * [`set_jit_execution_policy`] **latches monotonically toward strict**. It
+//     can only ever move `Compatible -> JdkOnly`, never back. So the worst a
+//     second VM in the same process can do is make a *Compatible* VM's later
+//     compilations over-strict (it loses the thin-helper fast paths and pays
+//     the dispatch helper instead). Over-strict costs throughput; it can never
+//     execute a callback the policy forbids. The reverse latch would be
+//     unsound, which is exactly why it does not exist.
+//   * Every refusal is a compile-time *omission*, never a runtime branch in
+//     emitted code, so an already-compiled Compatible artifact is untouched by
+//     a later strictening — it keeps running under the policy it was built for.
+//
+// # Cost in Compatible mode
+//
+// [`jit_is_jdk_only`] is one relaxed `u8` load with no allocation, no
+// formatting and no hashing. Every call to it is on a compile-time path
+// (`try_compile`'s bytecode scan) or on the cold inline-cache *miss* path
+// (`JitMICSlot::update`, which already takes two mutexes). Nothing is added to
+// any emitted instruction sequence, so compiled Compatible code is
+// byte-for-byte what it was.
+//
+// # Process-global, deliberately
+//
+// §2 of the design forbids process globals for this feature. This one is a
+// concession to a pre-existing shape, not a new one: the helper addresses it
+// gates (`INTEGER_VALUE_OF_DIRECT_FN` et al.) are ALREADY process-global
+// `AtomicUsize`s written by `build_helpers`, so a per-VM policy could not gate
+// them coherently anyway. The monotone latch is the only shape that stays
+// correct when two VMs disagree. Making both VM-scoped together is the real
+// fix; see the WAVE2 marker on [`set_jit_execution_policy`].
+// ===========================================================================
+
+/// Latched JIT-visible compatibility mode. `0` = never set (treated as
+/// `Compatible`), `1` = `Compatible`, `2` = `JdkOnly`. Only ever increases.
+static JIT_COMPATIBILITY_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+const JIT_MODE_COMPATIBLE: u8 = 1;
+const JIT_MODE_JDK_ONLY: u8 = 2;
+
+/// Publish the VM's execution policy to the JIT. Called once per VM from
+/// `vm/src/jit/helpers.rs::build_helpers`, **before** the first compilation.
+///
+/// JDK-ONLY-WAVE2: this is process-global where §2 wants per-VM state. It is
+/// latched toward strict so it cannot mis-execute (see the module comment
+/// above), but a Compatible VM sharing a process with a JdkOnly one silently
+/// loses the thin direct-call helpers. The wave-2 replacement is to move the
+/// `*_DIRECT_FN` helper addresses AND this policy into a single per-VM struct
+/// that the compile path already threads, and delete this static with them.
+///
+/// # Do not call this from a unit test in this crate
+///
+/// The latch is process-global and irreversible, and this crate's `mod tests`
+/// shares one test binary. A test that latched `JdkOnly` would make
+/// `jit_entry_publishable` start refusing native inline-cache entries for
+/// every test that happened to run after it — an order-dependent failure. The
+/// policy transition is covered end-to-end by the `--jdk-only` launcher tests
+/// instead, which get a fresh process.
+pub fn set_jit_execution_policy(policy: cratonvm_types::compat::ExecutionPolicy) {
+    let requested = if policy.is_jdk_only() {
+        JIT_MODE_JDK_ONLY
+    } else {
+        JIT_MODE_COMPATIBLE
+    };
+    JIT_COMPATIBILITY_MODE.fetch_max(requested, std::sync::atomic::Ordering::Release);
+}
+
+/// The compatibility mode the JIT is compiling under.
+pub fn jit_compatibility_mode() -> cratonvm_types::compat::CompatibilityMode {
+    if jit_is_jdk_only() {
+        cratonvm_types::compat::CompatibilityMode::JdkOnly
+    } else {
+        cratonvm_types::compat::CompatibilityMode::Compatible
+    }
+}
+
+/// Whether strict JDK-only policy is in force for JIT compilation.
+///
+/// One relaxed byte load. Safe to call from a compile-time scan or a cold
+/// runtime miss path; deliberately never called from emitted code.
+#[inline]
+pub fn jit_is_jdk_only() -> bool {
+    JIT_COMPATIBILITY_MODE.load(std::sync::atomic::Ordering::Relaxed) == JIT_MODE_JDK_ONLY
+}
+
+/// Thin direct-call native binds refused because `JdkOnly` is in force.
+static JDK_ONLY_DIRECT_NATIVE_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Inline-cache publications of an unowned (native/builtin) entry refused
+/// because `JdkOnly` is in force.
+static JDK_ONLY_IC_NATIVE_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of compile-time thin-native direct binds refused under `JdkOnly`.
+pub fn jdk_only_direct_native_refusals() -> u64 {
+    JDK_ONLY_DIRECT_NATIVE_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of inline-cache native-entry publications refused under `JdkOnly`.
+pub fn jdk_only_ic_native_refusals() -> u64 {
+    JDK_ONLY_IC_NATIVE_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Structured violations recorded by the JIT, for `--jdk-only-report`.
+///
+/// Bounded: the JIT records at most [`JDK_ONLY_VIOLATION_CAP`] distinct
+/// entries so a pathological workload cannot grow this without limit. The
+/// counters above stay exact regardless.
+static JDK_ONLY_VIOLATIONS: OnceLock<
+    parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>>,
+> = OnceLock::new();
+
+/// Maximum number of distinct structured violations the JIT retains.
+pub const JDK_ONLY_VIOLATION_CAP: usize = 256;
+
+fn jdk_only_violations() -> &'static parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>>
+{
+    JDK_ONLY_VIOLATIONS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+/// Snapshot of the structured JDK-only violations the JIT recorded this run.
+///
+/// Read by the launcher when building `--jdk-only-report`. Never on a hot path.
+pub fn jdk_only_jit_violations() -> Vec<cratonvm_types::error::JdkOnlyViolation> {
+    let recorded = jdk_only_violations().lock();
+    recorded.as_slice().to_vec()
+}
+
+/// Build and record the violation for a refused thin-native direct bind.
+///
+/// `#[cold]` + `#[inline(never)]`, mirroring `vm_exec.rs`'s reject helpers: the
+/// `String` allocations here exist only on the reject path and are never
+/// reachable in Compatible mode.
+#[cold]
+#[inline(never)]
+fn record_jdk_only_direct_native_refusal(class: &str, method: &str, descriptor: &str) {
+    JDK_ONLY_DIRECT_NATIVE_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut recorded = jdk_only_violations().lock();
+    if recorded.len() >= JDK_ONLY_VIOLATION_CAP {
+        return;
+    }
+    // `NativeShadowsBytecode` is the accurate shape: the thin helper is a
+    // VM-side reimplementation of a registered native standing in front of the
+    // real JDK's own bytecode for the same method (`HashMap.put`,
+    // `Integer.valueOf`, `String.toLowerCase`, …). §1 rule 4 says concrete
+    // bytecode wins, so binding the helper is exactly "a native shadows
+    // bytecode". The kind string names the JIT mechanism rather than a
+    // `NativeKind` because this crate cannot see that enum (it lives in
+    // `native-api`, which `jit` does not depend on); the registry-side census
+    // is authoritative for the registered kind of the same triple.
+    let violation = cratonvm_types::error::JdkOnlyViolation::NativeShadowsBytecode {
+        class: class.to_string(),
+        method: method.to_string(),
+        descriptor: descriptor.to_string(),
+        native_kind: "jit-thin-direct-helper",
+    };
+    if !recorded.contains(&violation) {
+        recorded.push(violation);
+    }
+}
+
+/// Record an inline-cache publication refused because the entry is an unowned
+/// (native/builtin) target and `JdkOnly` is in force. Cold by construction.
+#[cold]
+#[inline(never)]
+fn record_jdk_only_ic_native_refusal() {
+    JDK_ONLY_IC_NATIVE_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Load a thin direct-call native helper address, honouring JDK-only policy.
+///
+/// Returns `0` — the established "not wired, use the generic dispatch helper"
+/// sentinel every one of these sites already handles — when `JdkOnly` is in
+/// force. Under `Compatible` this is a plain relaxed load, identical to the
+/// bare `cell.load(Relaxed)` it replaced.
+///
+/// This runs inside `try_compile`'s compile-time bytecode scan, not in emitted
+/// code, so the policy read costs nothing measurable.
+#[inline]
+fn direct_native_helper(
+    cell: &std::sync::atomic::AtomicUsize,
+    class: &str,
+    method: &str,
+    descriptor: &str,
+) -> usize {
+    let entry = cell.load(std::sync::atomic::Ordering::Relaxed);
+    if entry != 0 && jit_is_jdk_only() {
+        record_jdk_only_direct_native_refusal(class, method, descriptor);
+        return 0;
+    }
+    entry
+}
+
+// ---------------------------------------------------------------------------
+// JDK-ONLY-NOTE — native-dispatch sites reachable from compiled code that this
+// crate cannot fix, recorded here because they are the JIT's obligations even
+// though they live in files this crate does not own. Each one is a path from
+// JIT-compiled machine code into a native callback that never consults
+// `vm/src/vm/vm_exec.rs::resolve_dispatch` and never calls
+// `NativeMethodRegistry::record_invocation`.
+//
+//  1. `vm/src/jit/helpers.rs::jit_invoke_dispatch` and
+//     `jit_invoke_virtual_mic` — the two `JitRuntimeHelpers` entry points every
+//     compiled invoke that is not inlined, intrinsified or directly bound goes
+//     through. These are THE JIT's dispatch path and must be routed through
+//     `resolve_dispatch` (or `resolve_native_dispatch_wave1`, since they decide
+//     native-vs-bytecode from `JitInvokeInfo`'s name triple before method
+//     resolution) and must call `record_invocation`.
+//
+//  2. `vm/src/jit/helpers.rs` JIT-only native fast paths, which resolve natives
+//     by name entirely on their own: the `java/lang/ClassLoader`
+//     `getResource*`-with-null intercept (a bare
+//     `natives.native_methods.find(..)` + `safe_native_call`),
+//     `hashmap_native_callback`, `matcher_native_callback` and
+//     `stringbuilder_native_callback`. Each returns a raw `NativeCallback` with
+//     no `NativeKind`, so none of them can honour §1 rule 3 or rule 4, and none
+//     is counted. These are exactly the "JIT fast path that resolves natives on
+//     its own" the acceptance criterion is aimed at.
+//
+//  3. `vm/src/jit/helpers.rs::build_helpers` — must call
+//     [`set_jit_execution_policy`] with `config.execution_policy()` BEFORE the
+//     first compilation, and should skip the `set_*_direct_fn` registrations
+//     entirely under `JdkOnly` (belt and braces: this crate already refuses to
+//     bind them, but not registering them at all makes the refusal
+//     unreachable rather than merely correct).
+//
+//  4. `cp_elidable_init_resolver` (supplied to `try_compile` by
+//     `vm/src/runtime/interpreter.rs`) decides whether a `<init>` may be
+//     scalar-elided. Eliding a constructor that is shadowed by a registered
+//     native skips the native — the `jit-elidable-ctor-must-check-native-shadow`
+//     defect. The shadow check is on the VM side and needs the same
+//     `resolve_dispatch` treatment.
+//
+//  5. `INDY_STRING_CONCAT_FN` (below) is a `StringConcatFactory` *bootstrap*
+//     bridge, not a native-method dispatch, and the interpreter reaches the
+//     same bridge for the same sites — so gating it in the JIT would move the
+//     call without changing the policy answer, while perturbing
+//     `CompiledMethod::has_indy_trap` (an OSR-correctness input). Left alone
+//     deliberately; the bridge itself is the VM's to review.
+//
+//  6. `MONITOR_ENTER_DIRECT_FN` / `MONITOR_EXIT_DIRECT_FN` are VM monitor
+//     services, not registered natives. Not a dispatch site; no action.
+// ---------------------------------------------------------------------------
+
 /// Process-global pointer to the VM-side
 /// `jit_integer_value_of_direct(vm_ptr, value) -> i64` thin helper,
 /// registered once at VM init (`build_helpers`). Avoids a
@@ -4482,6 +4770,32 @@ pub struct JitDirectCall {
 ///
 /// Hit/miss counters support adaptive recompilation decisions.
 ///
+/// # JDK-ONLY-WAVE2 — this cache stores an entry pointer and no `NativeKind`
+///
+/// `cached_entry_ptr` is a raw address that generated code `CALL R11`s on a
+/// class-id guard hit. When the target is a native/builtin trampoline the slot
+/// has kept the callback and thrown away its kind, so **nothing on the hit path
+/// can re-check policy** — the defining shape
+/// `docs/feature-designs/jdk-only-mode.md` marks for wave 2.
+///
+/// Wave 1 closes it by refusal rather than by storing the kind: under
+/// `JdkOnly`, `jit_entry_publishable` declines to publish an unowned (i.e.
+/// native) entry at all, so the slot never holds one and the site keeps taking
+/// the policy-checked dispatch helper. Storing the kind was rejected for this
+/// wave because it is not free here — this struct is `#[repr(C)]` with three
+/// offsets (`0`, `8`, `16`) baked as immediates into emitted machine code in
+/// `jit/src/x64.rs`, `jit/src/ir_lower.rs` and `jit/src/runtime_lowering.rs`,
+/// and the only population site ([`Self::update`]) is called from
+/// `vm/src/jit/helpers.rs`, which this wave's owner cannot edit; widening the
+/// `update` signature would break it.
+///
+/// Wave 2 should append a `cached_native_kind: AtomicU8` **after** the
+/// generated-code-visible prefix (the tail, next to `compiled_owner`, so no
+/// baked offset moves), populate it from the `NativeKind` the helper already
+/// has at install time, and replace the wave-1 refusal with a kind check —
+/// which restores the native fast path under `JdkOnly` for reviewed bridges and
+/// intrinsics instead of forcing every native receiver onto the helper.
+///
 /// # Memory layout (CRIT-8 prerequisite)
 ///
 /// `#[repr(C)]` plus a fixed field order with explicit padding pins the
@@ -4774,6 +5088,18 @@ pub const JIT_MEGA_ENTRIES: usize = JIT_MEGA_SETS * JIT_MEGA_WAYS;
 /// recompiler upgrades the site to a `JitPICSlot`. If the PIC itself
 /// records > `PIC_TO_MEGA_THRESHOLD` misses after filling all 4
 /// entries, the site is deoptimized to a generic vtable dispatch.
+///
+/// # JDK-ONLY-WAVE2 — same missing-`NativeKind` shape as [`JitMICSlot`]
+///
+/// `entry_ptrs[i]` and `mega_entry_ptrs[i]` are raw addresses with no kind
+/// beside them, so a hit cannot re-check policy. Both install paths funnel
+/// through `jit_entry_publishable`, which under `JdkOnly` refuses unowned
+/// (native/builtin) targets, so wave 1 keeps them empty of natives rather than
+/// letting them hold an unverifiable one. Wave 2 should add a parallel
+/// `needs_context`-style `AtomicU8` kind array — appended at the TAIL, since
+/// `CLASS_ID_OFFSETS` / `ENTRY_PTR_OFFSETS` / `NEEDS_CONTEXT_OFFSETS` /
+/// `MEGA_*_OFFSET` are all baked into emitted code as immediates — and check
+/// the kind instead of refusing outright.
 ///
 /// # Memory layout
 ///
@@ -5666,6 +5992,29 @@ fn jit_entry_publishable(entry: u64, owner: &Option<Arc<CompiledMethod>>) -> boo
     };
     if registered || in_jit_region {
         UNOWNED_IC_ENTRY_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    // JDK-only (`docs/feature-designs/jdk-only-mode.md` §1.3, §7): an unowned
+    // entry is by definition a native/builtin trampoline. Publishing it here
+    // means generated code will `CALL R11` it on every guard hit with NO
+    // dispatch helper on the path — so `resolve_dispatch` never runs, the
+    // registry's `record_invocation` never fires, and a `SyntheticStub`
+    // callback bound before the policy was consulted would execute unnoticed
+    // for the life of the artifact. That is precisely the "stale JIT or
+    // alternate dispatch path" the acceptance criterion forbids, and this crate
+    // cannot re-check the kind here (it holds a raw address, not a
+    // `NativeMethodId`, and does not depend on `native-api`).
+    //
+    // Refuse instead. The slot stays "class cached, target unresolved" — the
+    // exact shape `prepopulate` and the two refusals above already produce — so
+    // the site falls back to `jit_invoke_virtual_mic` / `jit_invoke_dispatch`,
+    // which re-resolves authoritatively under the policy. No silent stub call,
+    // no wild jump, and Compatible mode is untouched: this branch is reached
+    // only on an inline-cache MISS (which already takes two mutexes), and only
+    // after the `owner.is_some()` early return has let every JIT-compiled Java
+    // callee through.
+    if jit_is_jdk_only() {
+        record_jdk_only_ic_native_refusal();
         return false;
     }
     // Allowed, but with no keep-alive. Expected only for native/builtin targets
@@ -7322,8 +7671,19 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
     // This re-gates the edge; it does not fix it. Whoever reopens it needs to
     // make an unguarded callee frame describable to the root scan first, and
     // should re-run this class 14x as the acceptance gate.
-    if x64::moving_young_enabled() {
+    // EXPERIMENT (temporary, 2026-07-31): `CRATONVM_JIT_DIRECT_CALLEE_CALLS=force`
+    // opens the gate under moving-young in the SAME binary, so the crashing and
+    // the clean arm differ only by an environment variable rather than by a
+    // build. Removed once the edge is fixed and the gate reopens for real.
+    let forced = matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS").as_deref(),
+        Ok("force")
+    );
+    if x64::moving_young_enabled() && !forced {
         return false;
+    }
+    if forced {
+        return true;
     }
 
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
@@ -9642,8 +10002,24 @@ fn try_compile_inner(
                         && descriptor
                             == "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;"
                     {
-                        let entry = STRING_LATIN1_LOWER_DIRECT_FN
-                            .load(std::sync::atomic::Ordering::Relaxed);
+                        // JDK-ONLY-WAVE2: hard-coded (class, method,
+                        // descriptor) exception list. Seven of these ladders
+                        // bake a thin VM-side reimplementation of a registered
+                        // native straight into the emitted CALL, bypassing
+                        // `vm_exec::resolve_dispatch` entirely. Wave 1 gates
+                        // them on policy via `direct_native_helper`; wave 2
+                        // should replace the name matching with a resolver
+                        // callback that asks `resolve_dispatch` whether this
+                        // triple is an approved `NativeKind::Intrinsic`, and
+                        // delete the literals. Do NOT delete the list before
+                        // that resolver exists — every entry here is a measured
+                        // hot path.
+                        let entry = direct_native_helper(
+                            &STRING_LATIN1_LOWER_DIRECT_FN,
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                        );
                         if entry != 0 {
                             needs_heap = true;
                             direct_calls.push((
@@ -9666,8 +10042,14 @@ fn try_compile_inner(
                         && method_name == "valueOf"
                         && descriptor == "(I)Ljava/lang/Integer;"
                     {
-                        let entry =
-                            INTEGER_VALUE_OF_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                        // JDK-ONLY-WAVE2: see the marker on the
+                        // `StringLatin1.toLowerCase` bind above — same list.
+                        let entry = direct_native_helper(
+                            &INTEGER_VALUE_OF_DIRECT_FN,
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                        );
                         if entry != 0 {
                             needs_heap = true;
                             direct_calls.push((
@@ -9871,8 +10253,14 @@ fn try_compile_inner(
                     && method_name == "intValue"
                     && descriptor == "()I"
                 {
-                    let entry =
-                        INTEGER_INT_VALUE_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    // JDK-ONLY-WAVE2: see the marker on the
+                    // `StringLatin1.toLowerCase` bind above — same list.
+                    let entry = direct_native_helper(
+                        &INTEGER_INT_VALUE_DIRECT_FN,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                    );
                     if entry != 0 {
                         needs_heap = true;
                         direct_calls.push((
@@ -9894,8 +10282,14 @@ fn try_compile_inner(
                     && method_name == "get"
                     && descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;"
                 {
-                    let entry =
-                        CONCURRENT_HASHMAP_GET_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    // JDK-ONLY-WAVE2: see the marker on the
+                    // `StringLatin1.toLowerCase` bind above — same list.
+                    let entry = direct_native_helper(
+                        &CONCURRENT_HASHMAP_GET_DIRECT_FN,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                    );
                     if entry != 0 {
                         needs_heap = true;
                         direct_calls.push((
@@ -9918,8 +10312,14 @@ fn try_compile_inner(
                     && method_name == "toLowerCase"
                     && descriptor == "(Ljava/util/Locale;)Ljava/lang/String;"
                 {
-                    let entry =
-                        STRING_LOCALE_LOWER_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    // JDK-ONLY-WAVE2: see the marker on the
+                    // `StringLatin1.toLowerCase` bind above — same list.
+                    let entry = direct_native_helper(
+                        &STRING_LOCALE_LOWER_DIRECT_FN,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                    );
                     if entry != 0 {
                         needs_heap = true;
                         direct_calls.push((
@@ -9950,15 +10350,29 @@ fn try_compile_inner(
                     let recognized = if method_name == "put"
                         && descriptor == "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
                     {
+                        // JDK-ONLY-WAVE2: see the marker on the
+                        // `StringLatin1.toLowerCase` bind above — same list.
                         Some((
-                            HASHMAP_PUT_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed),
+                            direct_native_helper(
+                                &HASHMAP_PUT_DIRECT_FN,
+                                &class_name,
+                                &method_name,
+                                &descriptor,
+                            ),
                             2usize,
                         ))
                     } else if method_name == "get"
                         && descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;"
                     {
+                        // JDK-ONLY-WAVE2: see the marker on the
+                        // `StringLatin1.toLowerCase` bind above — same list.
                         Some((
-                            HASHMAP_GET_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed),
+                            direct_native_helper(
+                                &HASHMAP_GET_DIRECT_FN,
+                                &class_name,
+                                &method_name,
+                                &descriptor,
+                            ),
                             1usize,
                         ))
                     } else {

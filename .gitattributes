@@ -1,0 +1,13 @@
+# This repo is developed on Windows with core.autocrlf=true, so tracked files
+# are checked out with CRLF by default. That is fine for sources the toolchain
+# reads, but fatal for a shell script the MSYS/Git-bash `bash` actually
+# executes: every trailing \r ends up inside the token it terminates, so
+# `TIMEOUT="${TIMEOUT:-300}"` yields "300\r" and the first arithmetic
+# comparison against it fails.
+#
+# The Hibernate suite runner and its per-class override table are tracked
+# specifically so they cannot silently vanish (see
+# apps/hib-suite-runner/class-overrides.tsv's header). Pin them to LF so the
+# copy git materialises is the copy that runs.
+apps/hib-suite-runner/run-hib.sh text eol=lf
+apps/hib-suite-runner/class-overrides.tsv text eol=lf

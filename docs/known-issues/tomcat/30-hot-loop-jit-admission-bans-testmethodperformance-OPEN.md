@@ -462,3 +462,77 @@ covers unbridged bootstraps. Ban 2 (RBC.6) — see doc 23, unchanged here. Ban 3
 (constructor) — unchanged. **This document stays OPEN**: the 730x class-level
 gap is untouched, and the next lever is no longer an admission ban at all but
 the per-pc local→location map that `can_osr_enter` needs.
+
+## Adopted 2026-07-31 — two residuals from the retired tomcat/32
+
+[32](../../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md)
+closed; two of its items are this document's family and move here with their
+numbers. **Both come with a correction to this document's own framing**: in
+neither case do the hot methods fail to compile. They compile, and the compiled
+output is ~100x off HotSpot. "Hot methods never compile" is the right story for
+`TestMethodPerformance`'s OSR-denied driving loop; it is the wrong story for
+these two, and reading them through it sends the work at admission gates that
+are not the problem.
+
+### 30.A — `juli.TestOneLineFormatterPerformance.testDateFormat` (was 32.4)
+
+Asserts `DateFormatCache` beats `String.format`, 10^6 iterations each. The test
+feeds `System.nanoTime()` to a formatter cached on `time / 1000`, so it misses
+essentially every call and the miss path — a bare `SimpleDateFormat.format` —
+is what is measured. End to end 2026-07-31, loaded host:
+
+```
+StringFormatImpl        4 730 855 700 ns
+DateFormatCacheImpl   606 794 187 200 ns      -- 128x short
+```
+
+`CRATONVM_DBG_JITC` shows both hot methods compiling —
+`SimpleDateFormat.format` at `len=1708`, `subFormat` at `len=64359` — so this
+is codegen quality, not admission:
+
+| operation | HotSpot | CratonVM |
+|---|---|---|
+| `SimpleDateFormat.format` (same Date) | 2.3–2.5 µs | 250–300 µs |
+| `DateFormatSymbols.getInstance(Locale.US)` | 1.1–1.2 µs | 50–62 µs |
+| `new DateFormatSymbols(Locale.US)` | 0.5–1.1 µs | 28–34 µs |
+
+Closing it needs `SimpleDateFormat.format` at ≲ 4.7 µs, which is where
+`String.format` lands **because on CratonVM that side is a Rust intrinsic**. The
+assertion therefore reduces to "compiled Java must match a Rust intrinsic", and
+**optimising `String.format` makes this test harder to pass** — worth knowing
+before anyone treats the fast side as an improvement target.
+
+Separately actionable but *not* a lever for this test:
+`java/text/DateFormatSymbols.getProviderInstance` fails codegen
+(`compile-bail … backend_attempted=true`, `tier_fail_count=3`), which
+`CRATONVM_DBG_JIT_METHOD_STATS` classifies as "not policy — these are bugs". It
+is reached ~2x per `String.format` call, i.e. it is on the fast side.
+
+Repro: `cratonvm.exe -Xmx2g -cp <probes-out> DateFmtProbe` and
+`… DateSymbolsProbe 1000`.
+
+### 30.B — `TestAsyncMessagesPerformance`'s SEQ2 residual (was 32.3)
+
+32.3's binding SEQ1 assertion was a real defect and is **fixed** (`9f7095ed9`,
+the bulk `ByteBuffer` natives copying one byte per accessor call): SEQ0 4→1 and
+SEQ1 500→86–143 across interleaved reps. What remains is SEQ2 — the gap between
+the 16 KiB message and the 4 KiB message, tolerance 100, actual 495–500 — and
+it is here because it is measured to be general Java throughput.
+
+`CRATONVM_DBG_AIO_INLINE` (`9bef50216`) splits the ~1.3 ms gap, n=1000
+not-ready reads:
+
+```
+wait buckets: <1ms=493  1-10ms=6  >10ms=501  (sub-10ms mean=444us)
+queue_mean=35us   deliver_mean=46us
+```
+
+* **81 µs** is our AIO plumbing (35 queue + 46 deliver) — about 6 %,
+* **444 µs** the worker genuinely blocked waiting for the peer,
+* **~775 µs** client-side Java between the two `onMessage` callbacks.
+
+Thread wake-up is ruled out too: a Semaphore round-trip is 20.5 µs against
+HotSpot's 10.5 µs and `park`/`unpark` is *faster* than HotSpot at 8.1 vs 10.3 µs
+(`probes/ParkPingPongProbe`). The test runs the embedded server and the client
+in one process, so the 444 µs peer turnaround is also our VM executing Tomcat's
+send path. **No further AIO or buffer work will close SEQ2.**
