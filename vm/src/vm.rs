@@ -64718,13 +64718,15 @@ mod tests {
                 Value::Int(0),
                 Value::Int(10),
             ],
-        )
-        .unwrap()
-        .unwrap();
-        match result {
-            Value::Object(None) => {}
-            _ => panic!("M17: defineClass should reject invalid magic number"),
-        }
+        );
+        // The JDK throws on a bad magic number — `IndexOutOfBoundsException` for a bad
+        // range, `ClassFormatError` for bad bytes — it does not return null.
+        // This asserted the null, so it failed against a VM that (correctly)
+        // raises ClassFormatError. Rejecting means throwing.
+        assert!(
+            result.is_err(),
+            "defineClass must reject a bad magic number by throwing, got {result:?}",
+        );
     }
 
     #[test]
@@ -64751,13 +64753,15 @@ mod tests {
                 Value::Int(-1),
                 Value::Int(10),
             ],
-        )
-        .unwrap()
-        .unwrap();
-        match result {
-            Value::Object(None) => {}
-            _ => panic!("M17: defineClass should reject negative offset"),
-        }
+        );
+        // The JDK throws on negative offset — `IndexOutOfBoundsException` for a bad
+        // range, `ClassFormatError` for bad bytes — it does not return null.
+        // This asserted the null, so it failed against a VM that (correctly)
+        // raises IndexOutOfBoundsException. Rejecting means throwing.
+        assert!(
+            result.is_err(),
+            "defineClass must reject negative offset by throwing, got {result:?}",
+        );
     }
 
     #[test]
@@ -64784,13 +64788,15 @@ mod tests {
                 Value::Int(5),
                 Value::Int(10),
             ],
-        )
-        .unwrap()
-        .unwrap();
-        match result {
-            Value::Object(None) => {}
-            _ => panic!("M17: defineClass should reject out-of-bounds offset+length"),
-        }
+        );
+        // The JDK throws on an out-of-bounds offset+length — `IndexOutOfBoundsException` for a bad
+        // range, `ClassFormatError` for bad bytes — it does not return null.
+        // This asserted the null, so it failed against a VM that (correctly)
+        // raises IndexOutOfBoundsException. Rejecting means throwing.
+        assert!(
+            result.is_err(),
+            "defineClass must reject an out-of-bounds offset+length by throwing, got {result:?}",
+        );
     }
 
     // --- M19: Finalizer enqueuing ---
