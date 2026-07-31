@@ -3289,6 +3289,278 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     obj_ref.as_ptr() as i64
 }
 
+/// Stash `msg` as a `java/lang/InternalError` on the JIT pending-exception
+/// channel and return the `0`/null allocation sentinel.
+///
+/// Shared by the two CP-indexed allocation helpers below for the failures that
+/// are not a Java-level `MethodCallFailed` (a missing referencing class, a CP
+/// entry that is not a class reference). Same convention as `jit_alloc_oom`:
+/// the caller's `emit_post_alloc_oom_check()` sees the 0 and routes the stashed
+/// exception through the method's exception table.
+///
+/// # Safety
+/// Calls [`jit_thread_mut`]: same contract — invoke only from a JIT helper on
+/// the thread that installed `JIT_THREAD`, with no other `&mut JvmThread` (and
+/// no live `JitThreadGuard`) outstanding, and with NO class-manager lock held
+/// (constructing the exception re-enters the class manager).
+unsafe fn jit_cp_alloc_internal_error(vm: &SharedVm, msg: &str) -> i64 {
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/InternalError",
+            Some(msg),
+        ) {
+            set_jit_pending_exception(exc);
+        }
+    }
+    0
+}
+
+/// Stash a `MethodCallFailed` on the JIT pending-exception channel and return
+/// the `0`/null allocation sentinel. Mirrors `jit_new_object`'s `<clinit>`
+/// failure arm exactly (a thrown Java exception passes through unchanged; an
+/// internal error is reported as `java/lang/InternalError`).
+fn jit_cp_alloc_stash_failure(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    err: crate::error::MethodCallFailed,
+    context: &str,
+) -> i64 {
+    use crate::error::MethodCallFailed;
+    match err {
+        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(exc),
+        MethodCallFailed::InternalError(vm_err) => {
+            let msg = format!("{context}: {vm_err}");
+            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/InternalError",
+                Some(&msg),
+            ) {
+                set_jit_pending_exception(exc);
+            }
+        }
+    }
+    0
+}
+
+/// Resolve a `new`/`anewarray` constant-pool site at RUN TIME and return the
+/// resolved class id, or `None` after stashing the appropriate pending
+/// exception (the caller then returns the `0`/null allocation sentinel).
+///
+/// This is the run-time half of the cold-`new` fix. The compile-time resolver
+/// (`resolve_jit_new_site`) deliberately never loads a class — running a user
+/// `ClassLoader.loadClass` from inside the compile path is a
+/// deadlock/reentrancy hazard and would load classes the program never would.
+/// So a `new` whose target class had not been loaded yet used to bail the whole
+/// compile, permanently, leaving hot methods carrying a cold
+/// `throw new SomeException(...)` in the interpreter forever
+/// (`docs/internal/jit-compile-bail-unresolved-new-cold-class.md`).
+///
+/// Doing the same resolution HERE is sound for the reason the doc gives: it is
+/// exactly what the interpreter's own `0xbb`/`0xbd` handler does — same thread,
+/// same program point, same loader-faithful resolver, same access check. And it
+/// costs nothing on the hot path: a site whose class IS loaded at compile time
+/// never reaches this helper at all, and even here the second and later
+/// executions take the `find_class_by_name_for_class` fast path with no Java on
+/// the stack.
+///
+/// # Safety
+/// Calls [`jit_thread_mut`]: invoke only from a JIT helper on the thread that
+/// installed `JIT_THREAD`, with no other `&mut JvmThread` live.
+unsafe fn jit_resolve_cp_class(
+    vm: &SharedVm,
+    holder_cid: ClassId,
+    cp_index: u16,
+    check_access: bool,
+) -> Result<ClassId, i64> {
+    // (1) CP text → binary name, plus the already-loaded fast path under one
+    //     read lock. After the first execution of this site the class is loaded,
+    //     so this is all that runs.
+    //
+    //     Every exit from this block DROPS the read lock first and only then
+    //     builds an exception: `create_exception_object` re-enters the class
+    //     manager, and a nested read while a writer is queued deadlocks (see
+    //     the ClassManager nested-read reentrancy pattern). Hence the
+    //     "compute a reason, report after the lock" shape rather than an early
+    //     `return` from inside the block.
+    let resolved_name: Result<(String, Option<ClassId>), String> = {
+        let cm = vm.classes.class_manager.read();
+        match cm.get_class(holder_cid) {
+            None => Err(format!(
+                "JIT CP allocation: referencing class id {} not found",
+                holder_cid.as_u32()
+            )),
+            Some(class) => match class.constant_pool.get_class_name(cp_index) {
+                None => Err(format!(
+                    "JIT CP allocation: invalid class ref at cp#{cp_index} of class id {}",
+                    holder_cid.as_u32()
+                )),
+                Some(name) => {
+                    let name = name.to_string();
+                    let already = cm.find_class_by_name_for_class(&name, holder_cid);
+                    Ok((name, already))
+                }
+            },
+        }
+    };
+    let (class_name, already_loaded) = match resolved_name {
+        Ok(v) => v,
+        Err(msg) => return Err(jit_cp_alloc_internal_error(vm, &msg)),
+    };
+
+    // (2) Not loaded yet — drive the same loader-faithful resolution the
+    //     interpreter's `Instruction::New` does. `emit_post_alloc_oom_check`
+    //     forces `has_dispatch` on every site that can reach here, so
+    //     `JIT_THREAD` is set; the `None` arm is purely defensive.
+    let target_id = match already_loaded {
+        Some(id) => id,
+        None => {
+            let Some((thread, _guard)) = jit_thread_mut() else {
+                return Err(jit_cp_alloc_internal_error(
+                    vm,
+                    &format!("JIT CP allocation: no live JIT thread to resolve {class_name}"),
+                ));
+            };
+            match crate::runtime::interpreter::resolve_class_loader_aware(
+                vm,
+                thread,
+                holder_cid,
+                &class_name,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    let converted = crate::runtime::exceptions::convert_class_not_found(
+                        vm,
+                        thread,
+                        &class_name,
+                        e,
+                    );
+                    return Err(jit_cp_alloc_stash_failure(
+                        vm,
+                        thread,
+                        converted,
+                        &format!("JIT CP allocation: cannot resolve {class_name}"),
+                    ));
+                }
+            }
+        }
+    };
+
+    // (3) JVMS 6.5 `new` / 5.4.4 access check — the interpreter's `new` handler
+    //     runs it, so a `new` compiled through this helper must too. (The
+    //     `anewarray` handler does not, hence the flag.)
+    if check_access {
+        let denied = {
+            let cm = vm.classes.class_manager.read();
+            match (cm.get_class(holder_cid), cm.get_class(target_id)) {
+                (Some(accessor), Some(target)) => {
+                    crate::classloading::access_control::check_class_access(accessor, target)
+                        .err()
+                        .map(|e| e.to_string())
+                }
+                // Defensive: don't invent a denial when either class is missing.
+                _ => None,
+            }
+        };
+        if let Some(message) = denied {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                    vm,
+                    thread,
+                    "java/lang/IllegalAccessError",
+                    Some(&message),
+                ) {
+                    set_jit_pending_exception(exc);
+                }
+            }
+            return Err(0);
+        }
+    }
+
+    Ok(target_id)
+}
+
+/// CP-indexed `new` (0xbb) slow path — see [`jit_resolve_cp_class`] for why
+/// this exists and `jit_api::JitRuntimeHelpers::new_object_cp` for the ABI.
+///
+/// Resolves + access-checks the target class, then falls into
+/// [`jit_new_object`], which owns `<clinit>`, the TLAB/GC retry ladder and the
+/// `0`-on-failure convention. Splitting it this way means the deferred site
+/// behaves identically to a resolved one from the allocation onwards.
+///
+/// SAFETY: called from JIT-compiled code; `vm_ptr` must be a valid `SharedVm`
+/// pointer and `holder_class_id`/`cp_idx` must be the compile-time-baked
+/// referencing class and constant-pool index of this `new` site.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_new_object_cp(
+    vm_ptr: i64,
+    holder_class_id: i64,
+    cp_idx: i64,
+) -> i64 {
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // Cross the Rust<->JIT boundary BEFORE resolving, not just before
+    // allocating: resolution can run a user `ClassLoader.loadClass`, i.e.
+    // arbitrary Java that can itself GC. `jit_new_object` does both of these
+    // too, but it only runs after resolution — leaving the per-thread JIT-scan
+    // cache stale, and the SATB buffer unflushed, for the whole classloader
+    // call.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code that received it from the
+    // interpreter's SharedVm reference (same contract as `jit_new_object`).
+    let vm = &*(vm_ptr as *const SharedVm);
+    let holder_cid = ClassId::new(holder_class_id as u32);
+    let target_id = match jit_resolve_cp_class(vm, holder_cid, cp_idx as u16, true) {
+        Ok(id) => id,
+        Err(sentinel) => return sentinel,
+    };
+    let num_fields = vm
+        .classes
+        .class_manager
+        .read()
+        .get_class(target_id)
+        .map(|c| c.num_total_fields)
+        .unwrap_or(0);
+    jit_new_object(vm_ptr, i64::from(target_id.as_u32()), num_fields as i64)
+}
+
+/// CP-indexed `anewarray` (0xbd) slow path — the `anewarray` sibling of
+/// [`jit_new_object_cp`]. Resolves the COMPONENT class at run time and then
+/// falls into [`jit_anewarray_object`], which owns the negative-length and
+/// OOM conventions.
+///
+/// SAFETY: as [`jit_new_object_cp`], plus `length` is the JVM `int` array
+/// length already on the operand stack.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_anewarray_object_cp(
+    vm_ptr: i64,
+    holder_class_id: i64,
+    cp_idx: i64,
+    length: i64,
+) -> i64 {
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // See `jit_new_object_cp`: resolution can run Java, so cross the boundary
+    // before it, not just before the allocation.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: see `jit_new_object_cp`.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let holder_cid = ClassId::new(holder_class_id as u32);
+    // JVMS §anewarray resolves the component class but performs no `new`-style
+    // access check (that belongs to `new`), matching `Instruction::Anewarray`.
+    let component_id = match jit_resolve_cp_class(vm, holder_cid, cp_idx as u16, false) {
+        Ok(id) => id,
+        Err(sentinel) => return sentinel,
+    };
+    jit_anewarray_object(vm_ptr, i64::from(component_id.as_u32()), length)
+}
+
 /// Post-allocation init shared by the three JIT slow-path allocation arms:
 /// primitive-field default values + JLS §12.6 finalizer registration.
 ///
@@ -11119,6 +11391,12 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,
         new_object: jit_new_object as *const () as usize,
         anewarray_object: jit_anewarray_object as *const () as usize,
+        // Cold-`new` fix: the CP-indexed variants, used for a `new`/`anewarray`
+        // whose target class was not loaded when the method compiled. Always
+        // wired in production — the OptionalPtr classification exists only so
+        // hand-built test tables can leave them 0.
+        new_object_cp: jit_new_object_cp as *const () as usize,
+        anewarray_object_cp: jit_anewarray_object_cp as *const () as usize,
         baload: jit_baload as *const () as usize,
         bastore: jit_bastore as *const () as usize,
         iaload: jit_iaload as *const () as usize,

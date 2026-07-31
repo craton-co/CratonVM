@@ -6846,6 +6846,18 @@ pub fn execute(
                     // extract the real flags from class metadata to enable the skip path.
                     let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
                     let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
+                    // Cold-`new` fix - sites this path cannot resolve at compile
+                    // time. Previously baked as the nonsense sentinel entry
+                    // `(pc, class_id 0, 0 fields, true, true)`, which did NOT
+                    // "make the JIT skip this site and defer to the interpreter"
+                    // as the comment below claimed: the codegen found an entry at
+                    // that pc and compiled an allocation against class id 0. They
+                    // now compile to the CP-indexed helper, which performs the
+                    // real loader-faithful resolution, the JVMS 5.4.4 access
+                    // check and `<clinit>` at the actual program point - the same
+                    // work `Instruction::New` does.
+                    let mut new_deferred_info: Vec<(usize, u32, u16)> = Vec::new();
+                    let mut anewarray_deferred_info: Vec<(usize, u32, u16)> = Vec::new();
                     let is_real_class = shared
                         .classes.class_manager
                         .read()
@@ -6855,7 +6867,7 @@ pub fn execute(
                     if is_real_class && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty())
                     {
                         // Collect class names from constant pool (read lock)
-                        let new_class_names: Vec<(usize, Option<String>)> = {
+                        let new_class_names: Vec<(usize, u16, Option<String>)> = {
                             let cm_lock = shared.classes.class_manager.read();
                             if let Some(class) = cm_lock.get_class(class_id) {
                                 scan.new_ops
@@ -6863,6 +6875,7 @@ pub fn execute(
                                     .map(|&(pc_new, cp_idx)| {
                                         (
                                             pc_new,
+                                            cp_idx,
                                             class
                                                 .constant_pool
                                                 .get_class_name(cp_idx)
@@ -6874,7 +6887,7 @@ pub fn execute(
                                 Vec::new()
                             }
                         };
-                        let arr_class_names: Vec<(usize, Option<String>)> = {
+                        let arr_class_names: Vec<(usize, u16, Option<String>)> = {
                             let cm_lock = shared.classes.class_manager.read();
                             if let Some(class) = cm_lock.get_class(class_id) {
                                 scan.anewarray_ops
@@ -6882,6 +6895,7 @@ pub fn execute(
                                     .map(|&(pc_arr, cp_idx)| {
                                         (
                                             pc_arr,
+                                            cp_idx,
                                             class
                                                 .constant_pool
                                                 .get_class_name(cp_idx)
@@ -6894,7 +6908,7 @@ pub fn execute(
                             }
                         };
                         // Resolve class names to ClassIds (write lock for loading)
-                        for (pc_new, name_opt) in new_class_names {
+                        for (pc_new, cp_idx_new, name_opt) in new_class_names {
                             if let Some(name) = name_opt {
                                 let load_result = shared.load_class_concurrent(&name);
                                 if let Ok(target_id) = load_result {
@@ -6939,19 +6953,21 @@ pub fn execute(
                                             true,
                                         ));
                                     } else {
-                                        new_info.push((pc_new, 0, 0, true, true));
+                                        new_deferred_info
+                                            .push((pc_new, class_id.as_u32(), cp_idx_new));
                                     }
                                 } else {
-                                    new_info.push((pc_new, 0, 0, true, true));
+                                    new_deferred_info.push((pc_new, class_id.as_u32(), cp_idx_new));
                                 }
                             }
                         }
-                        for (pc_arr, name_opt) in arr_class_names {
+                        for (pc_arr, cp_idx_arr, name_opt) in arr_class_names {
                             if let Some(name) = name_opt {
                                 if let Ok(target_id) = shared.load_class_concurrent(&name) {
                                     anewarray_info.push((pc_arr, target_id.as_u32()));
                                 } else {
-                                    anewarray_info.push((pc_arr, 0));
+                                    anewarray_deferred_info
+                                        .push((pc_arr, class_id.as_u32(), cp_idx_arr));
                                 }
                             }
                         }
@@ -7202,7 +7218,9 @@ pub fn execute(
                         typecheck_info,
                         static_field_info,
                         new_info,
+                        new_deferred_info,
                         anewarray_info,
+                        anewarray_deferred_info,
                         invoke_info,
                         direct_calls_early,
                         mic_slots_early,

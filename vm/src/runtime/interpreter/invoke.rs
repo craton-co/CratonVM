@@ -14421,6 +14421,15 @@ pub(super) fn compile_osr_artifact(
             // Resolve new/anewarray info for stackless path (mirrors first JIT site)
             let mut new_info2: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
             let mut anewarray_info2: Vec<(usize, u32)> = Vec::new();
+            // Cold-`new` fix — sites this path cannot resolve at compile time.
+            // Previously they were baked as the nonsense sentinel entry
+            // `(pc, class_id 0, 0 fields, true, true)`: a compiled `new` that
+            // allocated against class id 0 rather than the class the bytecode
+            // names. They now compile to the CP-indexed helper, which does the
+            // real loader-faithful resolution + access check + `<clinit>` at the
+            // actual program point, exactly like `Instruction::New`.
+            let mut new_deferred2: Vec<(usize, u32, u16)> = Vec::new();
+            let mut anewarray_deferred2: Vec<(usize, u32, u16)> = Vec::new();
             let is_real_class2 = shared
                 .classes
                 .class_manager
@@ -14429,7 +14438,7 @@ pub(super) fn compile_osr_artifact(
                 .map(|c| !c.is_synthetic_stub)
                 .unwrap_or(false);
             if is_real_class2 && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty()) {
-                let new_class_names: Vec<(usize, Option<String>)> = {
+                let new_class_names: Vec<(usize, u16, Option<String>)> = {
                     let cm_lock = shared.classes.class_manager.read();
                     if let Some(class) = cm_lock.get_class(class_id) {
                         scan.new_ops
@@ -14437,6 +14446,7 @@ pub(super) fn compile_osr_artifact(
                             .map(|&(pc_new, cp_idx)| {
                                 (
                                     pc_new,
+                                    cp_idx,
                                     class
                                         .constant_pool
                                         .get_class_name(cp_idx)
@@ -14448,7 +14458,7 @@ pub(super) fn compile_osr_artifact(
                         Vec::new()
                     }
                 };
-                let arr_class_names: Vec<(usize, Option<String>)> = {
+                let arr_class_names: Vec<(usize, u16, Option<String>)> = {
                     let cm_lock = shared.classes.class_manager.read();
                     if let Some(class) = cm_lock.get_class(class_id) {
                         scan.anewarray_ops
@@ -14456,6 +14466,7 @@ pub(super) fn compile_osr_artifact(
                             .map(|&(pc_arr, cp_idx)| {
                                 (
                                     pc_arr,
+                                    cp_idx,
                                     class
                                         .constant_pool
                                         .get_class_name(cp_idx)
@@ -14467,7 +14478,7 @@ pub(super) fn compile_osr_artifact(
                         Vec::new()
                     }
                 };
-                for (pc_new, name_opt) in new_class_names {
+                for (pc_new, cp_idx_new, name_opt) in new_class_names {
                     if let Some(name) = name_opt {
                         let load_result = shared.load_class_concurrent(&name);
                         if let Ok(target_id) = load_result {
@@ -14505,19 +14516,22 @@ pub(super) fn compile_osr_artifact(
                                     true,
                                 ));
                             } else {
-                                new_info2.push((pc_new, 0, 0, true, true));
+                                // Inaccessible at compile time — defer, so the
+                                // helper raises the JVMS 5.4.4 IllegalAccessError
+                                // at the site instead of the old class-0 bake.
+                                new_deferred2.push((pc_new, class_id.as_u32(), cp_idx_new));
                             }
                         } else {
-                            new_info2.push((pc_new, 0, 0, true, true));
+                            new_deferred2.push((pc_new, class_id.as_u32(), cp_idx_new));
                         }
                     }
                 }
-                for (pc_arr, name_opt) in arr_class_names {
+                for (pc_arr, cp_idx_arr, name_opt) in arr_class_names {
                     if let Some(name) = name_opt {
                         if let Ok(target_id) = shared.load_class_concurrent(&name) {
                             anewarray_info2.push((pc_arr, target_id.as_u32()));
                         } else {
-                            anewarray_info2.push((pc_arr, 0));
+                            anewarray_deferred2.push((pc_arr, class_id.as_u32(), cp_idx_arr));
                         }
                     }
                 }
@@ -14601,7 +14615,9 @@ pub(super) fn compile_osr_artifact(
                 typecheck_info,
                 static_field_info,
                 new_info2,
+                new_deferred2,
                 anewarray_info2,
+                anewarray_deferred2,
                 invoke_info,
                 direct_calls2,
                 mic_slots2,
@@ -15214,8 +15230,10 @@ pub(super) fn try_osr(
 }
 
 /// CRIT-2 — shared body for the JIT `cp_new_resolver` closures: resolve a
-/// `new`/`anewarray` CP index in `holder_cid`'s constant pool to
-/// `(class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer)`.
+/// `new`/`anewarray` CP index in `holder_cid`'s constant pool to a
+/// [`cratonvm_jit::JitNewSite`] — `Resolved { class_id, num_fields,
+/// has_prim_init, has_finalizer }` when the target class is already loaded,
+/// `Deferred` when it is not (see the COLD-`new` GAP note below).
 ///
 /// The two flags feed the inline-TLAB `new` fast path, which skips the
 /// `jit_post_tlab_init` helper call when BOTH are false — i.e. no
@@ -15226,16 +15244,41 @@ pub(super) fn try_osr(
 /// `crate::jit::helpers::jit_init_primitive_fields`; `has_finalizer` mirrors
 /// the single-class read in `jit_post_tlab_init`. Unresolvable metadata
 /// reports `(true, true)` so the helper call stays in place.
+///
+/// COLD-`new` GAP (2026-07-31): `find_class_by_name_for_class` only sees
+/// ALREADY-LOADED classes — it deliberately does not run a user
+/// `ClassLoader.loadClass` from inside the compile path. A miss therefore used
+/// to return `None`, which bailed the WHOLE compile and, after
+/// `MAX_TIER_FAIL_RETRIES`, left the method interpreted forever. That silently
+/// disqualified every hot method whose only un-taken branch does
+/// `throw new SomeException(...)`: nothing had loaded the exception class yet
+/// (json-smart's `JSONParserBase.readMain` — 293,940 interpreted invocations of
+/// the workload's hottest method). A miss is now reported as
+/// [`cratonvm_jit::JitNewSite::Deferred`] and the site compiles to the
+/// CP-indexed helper, which resolves at run time. `None` stays reserved for a
+/// site no runtime resolution can rescue: the holder class is gone, or the CP
+/// entry at `cp_idx` is not a class reference at all.
 pub(super) fn resolve_jit_new_site(
     cm: &crate::classloading::ClassManager,
     holder_cid: ClassId,
     cp_idx: u16,
-) -> Option<(u32, usize, bool, bool)> {
+) -> Option<cratonvm_jit::JitNewSite> {
+    use cratonvm_jit::JitNewSite;
     let class = cm.get_class(holder_cid)?;
     let class_name = class.constant_pool.get_class_name(cp_idx)?;
-    let target_id = cm.find_class_by_name_for_class(class_name, holder_cid)?;
+    let Some(target_id) = cm.find_class_by_name_for_class(class_name, holder_cid) else {
+        return Some(JitNewSite::Deferred {
+            holder_class_id: holder_cid.as_u32(),
+            cp_idx,
+        });
+    };
     let Some(target) = cm.get_class(target_id) else {
-        return Some((target_id.as_u32(), 0, true, true));
+        return Some(JitNewSite::Resolved {
+            class_id: target_id.as_u32(),
+            num_fields: 0,
+            has_prim_init: true,
+            has_finalizer: true,
+        });
     };
     let num_fields = target.num_total_fields;
     let has_finalizer = target.has_finalizer;
@@ -15255,7 +15298,12 @@ pub(super) fn resolve_jit_new_site(
         }
         cid = c.superclass;
     }
-    Some((target_id.as_u32(), num_fields, has_prim_init, has_finalizer))
+    Some(JitNewSite::Resolved {
+        class_id: target_id.as_u32(),
+        num_fields,
+        has_prim_init,
+        has_finalizer,
+    })
 }
 
 /// Whether constructing `class_id` via its no-arg constructor is *elidable* for
@@ -16048,9 +16096,11 @@ pub(super) fn try_jit_upgrade_with_gate(
             _ => None,
         }
     };
-    // new/anewarray resolver: maps CP index of `new`/`anewarray` to
-    // (class_id_raw, num_fields, has_nonzero_tag_primitive_init, has_finalizer).
-    let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
+    // new/anewarray resolver: maps a CP index of `new`/`anewarray` to a
+    // `JitNewSite` — `Resolved` (class_id, num_fields,
+    // has_nonzero_tag_primitive_init, has_finalizer) when the target class is
+    // already loaded, `Deferred` (holder class id + CP index) when it is not.
+    let new_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitNewSite> {
         let cm = shared.classes.class_manager.read();
         resolve_jit_new_site(&cm, class_id, cp_idx)
     };
@@ -16498,7 +16548,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             };
 
             // new/anewarray resolver for callee's constant pool
-            let c_new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
+            let c_new_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitNewSite> {
                 let cm = shared.classes.class_manager.read();
                 resolve_jit_new_site(&cm, callee_cid, cp_idx)
             };
@@ -17492,7 +17542,7 @@ pub(super) fn try_jit_compile_callee_slow(
             _ => None,
         }
     };
-    let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
+    let new_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitNewSite> {
         let cm = shared.classes.class_manager.read();
         resolve_jit_new_site(&cm, cid, cp_idx)
     };

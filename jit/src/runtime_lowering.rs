@@ -105,7 +105,7 @@ fn emit_call_absolute(buf: &mut ExecutableBuffer, target: usize) {
     buf.emit(&[0xFF, 0xD0]);
 }
 
-fn emit_post_call_frame_republish(buf: &mut ExecutableBuffer, frame_record: usize) {
+pub(crate) fn emit_post_call_frame_republish(buf: &mut ExecutableBuffer, frame_record: usize) {
     if frame_record == 0 {
         return;
     }
@@ -138,6 +138,32 @@ pub(crate) fn emit_new_object_stub(
     emit_load_frame(buf, ENTRY_ABI_REGS[0], context_offset);
     emit_mov_imm64(buf, ENTRY_ABI_REGS[1], u64::from(class_id));
     emit_mov_imm64(buf, ENTRY_ABI_REGS[2], num_fields as u64);
+    emit_call_absolute(buf, target);
+    emit_post_call_frame_republish(buf, frame_record);
+}
+
+/// Emit the CONSTANT-POOL-INDEXED object-allocation stub.
+///
+/// Identical ABI shape to [`emit_new_object_stub`], but the immediates name a
+/// `new` site rather than a class: `(vm_ptr, holder_class_id, cp_idx)`. Used
+/// when the target class was not loaded at compile time, so the helper must
+/// resolve + initialise it on first execution — see
+/// `jit_api::JitRuntimeHelpers::new_object_cp` for why compiling the site this
+/// way is the fix for the "hot method containing a cold `new` never compiles"
+/// gap. Same zero-on-failure convention (`0` = pending exception stashed), so
+/// the caller's existing post-alloc sentinel check covers a failed class
+/// resolution as well as OOM.
+pub(crate) fn emit_new_object_cp_stub(
+    buf: &mut ExecutableBuffer,
+    context_offset: i32,
+    target: usize,
+    holder_class_id: u32,
+    cp_idx: u16,
+    frame_record: usize,
+) {
+    emit_load_frame(buf, ENTRY_ABI_REGS[0], context_offset);
+    emit_mov_imm64(buf, ENTRY_ABI_REGS[1], u64::from(holder_class_id));
+    emit_mov_imm64(buf, ENTRY_ABI_REGS[2], u64::from(cp_idx));
     emit_call_absolute(buf, target);
     emit_post_call_frame_republish(buf, frame_record);
 }

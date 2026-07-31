@@ -461,8 +461,22 @@ struct Compiler {
     /// inlines the header completion (identity-hash + num_slots) and
     /// skips the helper call entirely. See `emit_inline_tlab_new`.
     new_info: Vec<(usize, u32, usize, bool, bool)>,
+    /// DEFERRED `new` (0xbb) sites: `(bytecode_pc, holder_class_id, cp_idx)`.
+    ///
+    /// A `new` whose target class was not loaded when this method was
+    /// compiled. There is no class id or field count to bake, so the site
+    /// compiles to a `new_object_cp` helper call carrying the *referencing*
+    /// class id + the constant-pool index; the helper resolves, initialises
+    /// and allocates on first execution, exactly like the interpreter's 0xbb
+    /// handler. Disjoint from `new_info` by construction (a pc is in exactly
+    /// one of the two). See `jit_api::JitRuntimeHelpers::new_object_cp`.
+    new_deferred_info: Vec<(usize, u32, u16)>,
     /// Resolved `anewarray` (0xbd) metadata: (bytecode_pc, component_class_id_raw).
     anewarray_info: Vec<(usize, u32)>,
+    /// DEFERRED `anewarray` (0xbd) sites: `(bytecode_pc, holder_class_id,
+    /// cp_idx)` — the `anewarray` sibling of `new_deferred_info`, served by
+    /// the `anewarray_object_cp` helper.
+    anewarray_deferred_info: Vec<(usize, u32, u16)>,
     /// Invoke dispatch info: (bytecode_pc, pointer to leaked JitInvokeInfo).
     invoke_info: Vec<(usize, *const JitInvokeInfo)>,
     /// Resolved `invokedynamic` (0xba) call-site info, needed ONLY for
@@ -953,7 +967,9 @@ struct Compiler {
     mic_slots_idx: FxHashMap<usize, usize>,
     pic_slots_idx: FxHashMap<usize, usize>,
     new_info_idx: FxHashMap<usize, usize>,
+    new_deferred_idx: FxHashMap<usize, usize>,
     anewarray_info_idx: FxHashMap<usize, usize>,
+    anewarray_deferred_idx: FxHashMap<usize, usize>,
     typecheck_info_idx: FxHashMap<usize, usize>,
     ldc_info_idx: FxHashMap<usize, usize>,
     ldc_string_info_idx: FxHashMap<usize, usize>,
@@ -1877,7 +1893,9 @@ impl Compiler {
             speculative_bce_guards: Vec::new(),
             speculative_bce_guards_by_header: FxHashMap::default(),
             new_info: Vec::new(),
+            new_deferred_info: Vec::new(),
             anewarray_info: Vec::new(),
+            anewarray_deferred_info: Vec::new(),
             invoke_info: Vec::new(),
             indy_info: Vec::new(),
             direct_calls: Vec::new(),
@@ -1966,7 +1984,9 @@ impl Compiler {
             mic_slots_idx: FxHashMap::default(),
             pic_slots_idx: FxHashMap::default(),
             new_info_idx: FxHashMap::default(),
+            new_deferred_idx: FxHashMap::default(),
             anewarray_info_idx: FxHashMap::default(),
+            anewarray_deferred_idx: FxHashMap::default(),
             typecheck_info_idx: FxHashMap::default(),
             ldc_info_idx: FxHashMap::default(),
             ldc_string_info_idx: FxHashMap::default(),
@@ -2038,10 +2058,21 @@ impl Compiler {
         for (i, e) in self.new_info.iter().enumerate() {
             self.new_info_idx.insert(e.0, i);
         }
+        self.new_deferred_idx.clear();
+        self.new_deferred_idx.reserve(self.new_deferred_info.len());
+        for (i, e) in self.new_deferred_info.iter().enumerate() {
+            self.new_deferred_idx.insert(e.0, i);
+        }
         self.anewarray_info_idx.clear();
         self.anewarray_info_idx.reserve(self.anewarray_info.len());
         for (i, e) in self.anewarray_info.iter().enumerate() {
             self.anewarray_info_idx.insert(e.0, i);
+        }
+        self.anewarray_deferred_idx.clear();
+        self.anewarray_deferred_idx
+            .reserve(self.anewarray_deferred_info.len());
+        for (i, e) in self.anewarray_deferred_info.iter().enumerate() {
+            self.anewarray_deferred_idx.insert(e.0, i);
         }
         self.typecheck_info_idx.clear();
         self.typecheck_info_idx.reserve(self.typecheck_info.len());
@@ -21730,7 +21761,47 @@ impl Compiler {
                             match resolved {
                                 Some(info) => info,
                                 None => {
-                                    return false;
+                                    // Not compile-time resolvable: the target
+                                    // class was not loaded when this method was
+                                    // compiled (the cold `throw new
+                                    // SomeException(...)` shape). Emit the
+                                    // CP-indexed helper, which resolves +
+                                    // initialises + allocates at run time, the
+                                    // way the interpreter's 0xbb handler does.
+                                    // No compile-time class knowledge exists
+                                    // here, so neither the inline TLAB bump nor
+                                    // scalar replacement applies — this site is
+                                    // always the helper call, which is exactly
+                                    // right for a branch that is (by hypothesis)
+                                    // cold.
+                                    let Some(&i) = self.new_deferred_idx.get(&pc) else {
+                                        return false;
+                                    };
+                                    let (_, holder_class_id, cp_idx) = self.new_deferred_info[i];
+                                    if self.helpers.new_object_cp == 0 || !self.needs_heap {
+                                        return false;
+                                    }
+                                    self.emit_pre_safepoint_spill();
+                                    crate::runtime_lowering::emit_new_object_cp_stub(
+                                        &mut self.buf,
+                                        self.heap_local_offset,
+                                        self.helpers.new_object_cp,
+                                        holder_class_id,
+                                        cp_idx,
+                                        self.helpers.frame_record,
+                                    );
+                                    // Same post-call contract as the resolved
+                                    // arm below: GC-triggering safepoint, then
+                                    // the 0/null sentinel guard (the helper
+                                    // reports a failed class resolution,
+                                    // `<clinit>` failure or OOM by stashing a
+                                    // pending exception and returning 0).
+                                    self.emit_oop_map_for_safepoint();
+                                    self.emit_post_alloc_oom_check();
+                                    self.push_from_rax();
+                                    self.mark_top_as_oop();
+                                    pc += 3;
+                                    continue;
                                 }
                             };
 
@@ -21860,7 +21931,42 @@ impl Compiler {
                         .map(|&i| self.anewarray_info[i]);
                     let (_, component_class_id_raw) = match resolved {
                         Some(info) => info,
-                        None => return false, // unresolved — bail to interpreter
+                        None => {
+                            // Component class not loaded at compile time — the
+                            // `anewarray` sibling of the deferred `new` arm
+                            // above. Emit the CP-indexed helper, which resolves
+                            // the component class at run time and then does
+                            // exactly what `jit_anewarray_object` does.
+                            let Some(&i) = self.anewarray_deferred_idx.get(&pc) else {
+                                return false; // genuinely unresolvable — bail
+                            };
+                            let (_, holder_class_id, cp_idx) = self.anewarray_deferred_info[i];
+                            if self.helpers.anewarray_object_cp == 0 || !self.needs_heap {
+                                return false;
+                            }
+                            let count_slot = self.pop_stack();
+                            // jit_anewarray_object_cp(vm, holder_class_id, cp_idx, length)
+                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                            self.emit_mov_imm32_sx(ARG_REGS[1], holder_class_id as i32); // Cast: x86-64 immediate encoding
+                            self.emit_mov_imm32_sx(ARG_REGS[2], cp_idx as i32); // Cast: x86-64 immediate encoding
+                            self.load_slot_to_reg(ARG_REGS[3], count_slot);
+                            self.emit_pre_safepoint_spill();
+                            self.emit_call_absolute(self.helpers.anewarray_object_cp);
+                            // Resolution can run a user `ClassLoader.loadClass`,
+                            // i.e. arbitrary Java on this thread — republish the
+                            // frame afterwards exactly as `emit_new_object_stub`
+                            // does for the `new` side.
+                            crate::runtime_lowering::emit_post_call_frame_republish(
+                                &mut self.buf,
+                                self.helpers.frame_record,
+                            );
+                            self.emit_oop_map_for_safepoint();
+                            self.emit_post_alloc_oom_check();
+                            self.push_from_rax();
+                            self.mark_top_as_oop();
+                            pc += 3;
+                            continue;
+                        }
                     };
                     let count_slot = self.pop_stack();
                     // jit_anewarray_object(heap, component_class_id_raw, length) → i64 array ptr
@@ -22464,7 +22570,11 @@ pub fn compile(
         typecheck_info,
         static_field_info,
         new_info,
+        // Deferred (not-yet-loaded) `new`/`anewarray` sites: the legacy/test
+        // wrapper has no constant pool to defer against, so never any.
+        Vec::new(),
         anewarray_info,
+        Vec::new(),
         invoke_info,
         direct_calls,
         mic_slots,
@@ -22510,7 +22620,9 @@ fn gc_inert_selfrec_candidate(
     code_len: usize,
     field_info: &[(usize, usize, u8)],
     new_info: &[(usize, u32, usize, bool, bool)],
+    new_deferred_info: &[(usize, u32, u16)],
     anewarray_info: &[(usize, u32)],
+    anewarray_deferred_info: &[(usize, u32, u16)],
     invoke_info: &[(usize, *const JitInvokeInfo)],
     direct_calls: &[(usize, super::JitDirectCall)],
     mic_slots: &[(usize, *const super::JitMICSlot)],
@@ -22519,7 +22631,13 @@ fn gc_inert_selfrec_candidate(
 ) -> bool {
     if !gc_inert_selfrec_enabled()
         || !new_info.is_empty()
+        // A deferred `new`/`anewarray` allocates too — the opcode whitelist
+        // below already excludes 0xbb/0xbd, but keep the metadata gate
+        // symmetric with the resolved lists so a future whitelist change
+        // cannot silently admit an allocating body here.
+        || !new_deferred_info.is_empty()
         || !anewarray_info.is_empty()
+        || !anewarray_deferred_info.is_empty()
         || !invoke_info.is_empty()
         || !direct_calls.is_empty()
         || !mic_slots.is_empty()
@@ -22585,7 +22703,13 @@ pub fn compile_with_param_slots(
     static_field_info: Vec<(usize, u32, usize, u8, bool)>,
     // CRIT-2 — see `new_info` field doc on the compiler struct.
     new_info: Vec<(usize, u32, usize, bool, bool)>,
+    // Cold-`new` fix — see `new_deferred_info` on the compiler struct. Sites
+    // whose target class was not loaded at compile time; served by the
+    // CP-indexed `new_object_cp` helper. Disjoint from `new_info`.
+    new_deferred_info: Vec<(usize, u32, u16)>,
     anewarray_info: Vec<(usize, u32)>,
+    // `anewarray` sibling of `new_deferred_info`.
+    anewarray_deferred_info: Vec<(usize, u32, u16)>,
     invoke_info: Vec<(usize, *const JitInvokeInfo)>,
     direct_calls: Vec<(usize, super::JitDirectCall)>,
     mic_slots: Vec<(usize, *const super::JitMICSlot)>,
@@ -22648,7 +22772,9 @@ pub fn compile_with_param_slots(
         code_len,
         &field_info,
         &new_info,
+        &new_deferred_info,
         &anewarray_info,
+        &anewarray_deferred_info,
         &invoke_info,
         &direct_calls,
         &mic_slots,
@@ -23101,7 +23227,9 @@ pub fn compile_with_param_slots(
         && field_info.is_empty()
         && static_field_info.is_empty()
         && new_info.is_empty()
+        && new_deferred_info.is_empty()
         && anewarray_info.is_empty()
+        && anewarray_deferred_info.is_empty()
         && multianewarray_info.is_empty()
         && typecheck_info.is_empty()
         && compact_field_info.is_empty()
@@ -23465,7 +23593,9 @@ pub fn compile_with_param_slots(
         .map(|(pc, off, is_ref)| (pc, (off, is_ref)))
         .collect();
     compiler.new_info = new_info;
+    compiler.new_deferred_info = new_deferred_info;
     compiler.anewarray_info = anewarray_info;
+    compiler.anewarray_deferred_info = anewarray_deferred_info;
     compiler.invoke_info = invoke_info;
     compiler.indy_info = indy_info;
     compiler.direct_calls = direct_calls;
@@ -23790,7 +23920,14 @@ pub fn compile_with_param_slots(
         // the same treatment for the identical reason on the `jit_new_object`
         // side.
         || !compiler.static_field_info.is_empty()
-        || !compiler.new_info.is_empty();
+        || !compiler.new_info.is_empty()
+        // `jit_new_object_cp` / `jit_anewarray_object_cp` need `jit_thread_mut()`
+        // for even more than the resolved helpers do: class RESOLUTION itself
+        // (a possible user `ClassLoader.loadClass`) runs on that thread, not
+        // just `<clinit>`. A null thread there would leave the site unable to
+        // resolve at all.
+        || !compiler.new_deferred_info.is_empty()
+        || !compiler.anewarray_deferred_info.is_empty();
     // Snapshot the frame partition and the label BEFORE `compiler.buf` is moved
     // into the artifact (which partially moves `compiler`).
     let frame_layout = compiler.frame_layout();
@@ -24353,8 +24490,10 @@ mod tests {
             &pure,
             pure.len(),
             &fields,
-            &[],
-            &[],
+            &[], // new_info
+            &[], // new_deferred_info
+            &[], // anewarray_info
+            &[], // anewarray_deferred_info
             &[],
             &[],
             &[],
@@ -24368,8 +24507,10 @@ mod tests {
             &allocates,
             allocates.len(),
             &fields,
-            &[(9, 1, 0, false, false)],
-            &[],
+            &[(9, 1, 0, false, false)], // new_info
+            &[],                        // new_deferred_info
+            &[],                        // anewarray_info
+            &[],                        // anewarray_deferred_info
             &[],
             &[],
             &[],
@@ -24383,8 +24524,10 @@ mod tests {
             &loops,
             loops.len(),
             &fields,
-            &[],
-            &[],
+            &[], // new_info
+            &[], // new_deferred_info
+            &[], // anewarray_info
+            &[], // anewarray_deferred_info
             &[],
             &[],
             &[],
@@ -24695,6 +24838,11 @@ mod tests {
             jit_card_table_addr: 0,
             jit_card_old_base: 0,
             jit_card_old_end: 0,
+            // Unwired (0) — these tests never build a deferred (not-yet-loaded)
+            // `new`/`anewarray` site, and 0 makes the backend refuse one rather
+            // than emit a null CALL, so the tests stay byte-identical.
+            new_object_cp: 0,
+            anewarray_object_cp: 0,
         }
     }
 
@@ -24826,12 +24974,14 @@ mod tests {
             1,
             1,
             false,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            Vec::new(), // multianewarray_info
+            Vec::new(), // field_info
+            Vec::new(), // typecheck_info
+            Vec::new(), // static_field_info
+            Vec::new(), // new_info
+            Vec::new(), // new_deferred_info
+            Vec::new(), // anewarray_info
+            Vec::new(), // anewarray_deferred_info
             Vec::new(),
             Vec::new(),
             Vec::new(),
