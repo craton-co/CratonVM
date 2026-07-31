@@ -7,10 +7,15 @@
 //! IR node, and patches forward branches.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 use super::ir::{Graph, IrType, MemKind, NodeId, Op, SafepointSnapshot, NO_NODE};
 use super::ir_schedule::Schedule;
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo, JitRuntimeHelpers};
+use crate::bailout::{
+    record_bailout, Bailout, BailoutReason, CompileResult, DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_MAX_NODES,
+};
 use crate::deopt::{
     ir_deopt_entry, DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue,
     VirtualObjectState,
@@ -166,18 +171,38 @@ struct Lowerer<'a> {
     graph: &'a Graph,
     schedule: &'a Schedule,
     buf: ExecutableBuffer,
-    /// Maps NodeId → frame offset where its result is stored.
-    node_slot: Vec<i32>,
+    /// Maps NodeId → frame offset where its result is stored, or `None` when
+    /// the node has no location yet.
+    ///
+    /// `Option<NonZeroU32>` rather than `i32`, so "unallocated" is not a
+    /// *value* on the same axis as a real offset. The old representation was
+    /// zero-initialised, and `0` is simultaneously "never allocated" and the
+    /// encoding of `[rbp - 0]` — the saved caller frame pointer. A missed
+    /// allocation therefore lowered to code that read the caller's RBP as
+    /// program data (observed as heap addresses landing in `double[]`
+    /// elements, i.e. silent array mis-sorts). Neither state is representable
+    /// now: `None` cannot be emitted, and a `NonZeroU32` offset cannot be 0.
+    node_slot: Vec<Option<NonZeroU32>>,
     /// Soundness latch (ES SortingDigestTests -Jit on): set when `slot_of`
-    /// is asked for a node that never went through `alloc_slot`. `node_slot`
-    /// is zero-initialised and `first_spill > 0`, so a 0 readback means the
-    /// scheduler never placed the node in an emitted block (observed: the
+    /// is asked for a node that never went through `alloc_slot` (observed: the
     /// pc17 ArrayLoad(Double) feeding a GVN-collapsed loop phi in
-    /// DualPivotQuicksort.insertionSort) — emitting `[rbp - 0]` would read
-    /// the saved caller RBP as a data value (heap addresses stored into
-    /// double[] elements, silent mis-sorts). The lowering entry point checks
-    /// this latch and bails to the single-pass backend instead.
+    /// DualPivotQuicksort.insertionSort — the scheduler never placed the node
+    /// in an emitted block). The lowering entry point checks this latch and
+    /// bails to the single-pass backend instead.
+    ///
+    /// **This latch is now unreachable.** `verify_data_locations` runs BEFORE
+    /// any code is emitted and refuses exactly the graphs that used to trip it
+    /// (a data input that no emitted node defines, or one defined after its
+    /// use), so `slot_of` can no longer meet an unallocated node. It is kept —
+    /// and strengthened, it now carries a structured [`Bailout`] rather than
+    /// one bit — as a belt-and-braces net for a future lowering that allocates
+    /// a slot on some paths only. If it ever fires again, the pre-emission
+    /// verifier has a hole; fix the verifier, not the latch.
     unallocated_slot_use: std::cell::Cell<bool>,
+    /// Structured reason for the first latched failure (the `Bailout` form of
+    /// `unallocated_slot_use`, plus any resource bailout raised from a legacy
+    /// infallible accessor). Read and reported by `lower_inner`.
+    latched_bailout: std::cell::RefCell<Option<Bailout>>,
     /// Next available frame spill offset.
     next_spill: i32,
     /// Maps block index → native code offset (for branch patching).
@@ -400,24 +425,14 @@ impl<'a> Lowerer<'a> {
         // `needs_context` ⇒ the method takes the VM ptr as a hidden first arg
         // and reserves a context slot. `max_call_args` sizes the Java-argument
         // staging region a call marshals its args into before dispatching.
-        let mut needs_context = false;
-        let mut max_call_args = 0usize;
-        for n in &graph.nodes {
-            if matches!(n.op, Op::Call { .. }) {
-                needs_context = true;
-                // inputs = [ctrl, mem, args…]
-                max_call_args = max_call_args.max(n.inputs.len().saturating_sub(2));
-            }
-            if matches!(n.op, Op::LambdaIntToDouble) {
-                needs_context = true;
-            }
-            if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
-                needs_context = true;
-            }
-            if matches!(n.op, Op::New { .. }) {
-                needs_context = true;
-            }
-        }
+        //
+        // Shared with `estimate_frame_bytes`, which `lower_inner` uses to
+        // refuse an over-budget frame BEFORE this constructor reserves it; the
+        // two must see the same needs or the check would bound a different
+        // frame than the one built here.
+        let needs = scan_frame_needs(graph, helpers);
+        let needs_context = needs.needs_context;
+        let max_call_args = needs.max_call_args;
 
         // Frame layout (rbp downward): locals, [context slot], spills, [args
         // staging], 16-byte stack-arg reserve, 32-byte shadow. Reserve slots for
@@ -431,18 +446,37 @@ impl<'a> Lowerer<'a> {
         // `*mut JvmThread`, the shadow stack's base `top` for this push, and
         // the shadow `top` watermark captured at method entry.
         let sp_id_size = 8i32 * 4;
+        // TODO(liveness-slot-reuse): one 8-byte slot per graph node, with no
+        // regard for live-range overlap — a value dead since block 0 still owns
+        // a slot for the whole method. Computing live ranges and packing
+        // non-overlapping values into the same slot belongs here; it is a
+        // separate task from bounding the frame, which is what
+        // `estimate_frame_bytes` / `check_frame_size` now do.
         let spill_size = (max_nodes as i32) * 8;
         let args_stage_size = (max_call_args as i32) * 8;
         let shadow = 32i32;
         let stack_arg_reserve = 16i32;
-        let total = locals_size
-            + context_size
-            + sp_id_size
-            + spill_size
-            + args_stage_size
-            + shadow
-            + stack_arg_reserve;
-        let frame_size = (total + 15) & !15;
+        // The frame is SIZED by the same estimator `lower_inner` bounds against
+        // (`estimate_frame_bytes` + `check_frame_size`), so "the frame we
+        // checked" and "the frame we build" are the same number by
+        // construction rather than by two hand-kept-in-sync expressions. The
+        // check has already refused anything above `DEFAULT_MAX_FRAME_BYTES`
+        // (32 KiB), so every i32 term below is small and cannot overflow —
+        // previously `(max_nodes as i32) * 8` on a pathological graph could.
+        let frame_size = estimate_frame_bytes(num_locals, max_nodes, &needs) as i32;
+        debug_assert_eq!(
+            frame_size,
+            ((locals_size
+                + context_size
+                + sp_id_size
+                + spill_size
+                + args_stage_size
+                + shadow
+                + stack_arg_reserve)
+                + 15)
+                & !15,
+            "estimate_frame_bytes must mirror the frame this constructor lays out",
+        );
 
         // The context slot is the first slot after the locals; spills start
         // after it.
@@ -507,8 +541,9 @@ impl<'a> Lowerer<'a> {
             graph,
             schedule,
             buf,
-            node_slot: vec![0; graph.nodes.len()],
+            node_slot: vec![None; graph.nodes.len()],
             unallocated_slot_use: std::cell::Cell::new(false),
+            latched_bailout: std::cell::RefCell::new(None),
             next_spill: first_spill,
             block_offsets: vec![0; schedule.blocks.len()],
             branch_patches: Vec::new(),
@@ -560,8 +595,41 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Allocate a frame slot for a node result.
-    /// Panics if the spill offset exceeds the allocated frame capacity.
+    /// Latch a structured bailout raised from an infallible legacy accessor.
+    ///
+    /// The first one wins (it is the cause; later ones are consequences of
+    /// continuing to emit into an artifact that is already doomed).
+    /// `lower_inner` takes it and reports it instead of returning a bare
+    /// `None`. Interior mutability because both `&self` (`slot_of`) and
+    /// `&mut self` (`alloc_slot`) accessors latch.
+    fn latch_bailout(&self, bailout: Bailout) {
+        let mut slot = self.latched_bailout.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(bailout);
+        }
+    }
+
+    /// Take the latched bailout, if any.
+    fn take_latched_bailout(&self) -> Option<Bailout> {
+        self.latched_bailout.borrow_mut().take()
+    }
+
+    /// A frame offset that is safe to *emit* against but is not a real
+    /// location: the first spill slot. Returned only by the legacy infallible
+    /// accessors, and only after a bailout has been latched — which makes
+    /// `lower_inner` discard the whole artifact before it can be executed.
+    ///
+    /// It exists so a doomed compile finishes walking the graph without
+    /// panicking and without addressing memory outside the frame. The one
+    /// value it must never be is `0`: that is `[rbp - 0]`, the saved caller
+    /// frame pointer, which is exactly the read this whole change exists to
+    /// make unrepresentable.
+    fn poison_slot(&self) -> i32 {
+        debug_assert!(self.first_spill > 0);
+        self.first_spill
+    }
+
+    /// Allocate a frame slot for a node result, or refuse the compile.
     ///
     /// real-frame-deopt (#6): the deopt stub calls `ir_deopt_entry` while the
     /// frame is live, with `rsp = rbp - frame_size`. The Win64 ABI requires 32
@@ -571,22 +639,48 @@ impl<'a> Lowerer<'a> {
     /// `o <= frame_size - DEOPT_SHADOW_SPACE`. `frame_size` already budgets the
     /// 32-byte shadow (plus a 16-byte stack-arg reserve), so this never rejects
     /// a method the old `o < frame_size` bound accepted.
-    fn alloc_slot(&mut self, id: NodeId) -> i32 {
+    ///
+    /// Exceeding that cap used to be an `assert!`, i.e. a panic on the compiler
+    /// thread — which in a release VM is `fatal runtime error: failed to
+    /// initiate panic` → SIGABRT of the whole process, for what is only a
+    /// *compiler* resource limit. It is now a `FrameTooLarge` bailout: the
+    /// method loses its optimized body and runs in a lower tier, which is
+    /// always semantically valid.
+    fn alloc_slot_checked(&mut self, id: NodeId) -> CompileResult<i32> {
         let offset = self.next_spill;
         // `spill_cap_off` excludes the 32-byte shadow space AND (Gap B) the
         // Java-arg staging region, so a spill never overlaps either. For a
         // no-call method it equals `frame_size - DEOPT_SHADOW_SPACE` — the
         // historical bound, unchanged.
-        assert!(
-            offset <= self.spill_cap_off,
-            "JIT lowerer: spill offset {} exceeds frame capacity {} \
-             (cap {}, less shadow + arg-staging reserve)",
-            offset,
-            self.frame_size,
-            self.spill_cap_off,
-        );
+        if offset > self.spill_cap_off {
+            return Err(Bailout::with_context(
+                BailoutReason::FrameTooLarge {
+                    bytes: offset.max(0) as usize,
+                    limit: self.spill_cap_off.max(0) as usize,
+                },
+                format!(
+                    "spill slot for n{id} past the frame's spill cap \
+                     (frame {} bytes, cap {})",
+                    self.frame_size, self.spill_cap_off
+                ),
+            ));
+        }
+        // `first_spill > 0` and `next_spill` only grows, so this cannot be
+        // `None` — but the conversion is where the "no zero offsets" invariant
+        // is *enforced* rather than assumed, so it is checked, not asserted.
+        let located = u32::try_from(offset)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                Bailout::new(BailoutReason::Internal(
+                    "ir_lower: spill offset 0 would encode [rbp - 0] (saved caller RBP)",
+                ))
+            })?;
+        let cell = self.node_slot.get_mut(id as usize).ok_or_else(|| {
+            Bailout::new(BailoutReason::Internal("ir_lower: node id out of range"))
+        })?;
+        *cell = Some(located);
         self.next_spill += 8;
-        self.node_slot[id as usize] = offset;
         // Relocation contract: a slot becomes publishable the moment the
         // emitting code writes it. `alloc_slot` is called at the point of
         // emission for every node EXCEPT phis, whose slots are reserved up
@@ -595,26 +689,65 @@ impl<'a> Lowerer<'a> {
         if !matches!(self.graph.nodes[id as usize].op, Op::Phi) {
             self.defined_nodes[id as usize] = true;
         }
-        offset
+        Ok(offset)
     }
 
-    /// Get the frame offset for a node's result (must have been allocated).
-    /// A `0` readback means the node was never `alloc_slot`'d — see
-    /// `unallocated_slot_use`; the latch makes the whole lowering bail
-    /// rather than emit a `[rbp - 0]` access to the saved caller RBP.
-    fn slot_of(&self, id: NodeId) -> i32 {
-        let s = self.node_slot[id as usize];
-        if s == 0 {
-            self.unallocated_slot_use.set(true);
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IRSLOT").is_some() {
-                let n = &self.graph.nodes[id as usize];
-                eprintln!(
-                    "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
-                    id, n.op, n.ty, n.inputs, n.bytecode_pc
-                );
+    /// Infallible façade over [`Self::alloc_slot_checked`] for the ~45
+    /// per-opcode emission sites, which are `fn(..) -> ()` and cannot `?`.
+    ///
+    /// On refusal it latches the structured bailout — so `lower_inner` discards
+    /// the artifact and the caller falls back to the single-pass backend — and
+    /// returns the poison slot so the doomed walk finishes without panicking.
+    /// New code should call `alloc_slot_checked` and propagate.
+    fn alloc_slot(&mut self, id: NodeId) -> i32 {
+        match self.alloc_slot_checked(id) {
+            Ok(offset) => offset,
+            Err(bailout) => {
+                self.latch_bailout(bailout);
+                self.poison_slot()
             }
         }
-        s
+    }
+
+    /// The frame offset of a node's result, or a bailout if it has none.
+    ///
+    /// The only read path into `node_slot`. There is no longer a value that
+    /// means "unallocated": an absent location is an `Err`, never `0`.
+    fn slot_of_checked(&self, id: NodeId) -> CompileResult<i32> {
+        match self.node_slot.get(id as usize).copied().flatten() {
+            // `NonZeroU32` ⇒ never 0, and `alloc_slot_checked` bounds it by
+            // `spill_cap_off` ⇒ always inside the frame.
+            Some(off) => Ok(off.get() as i32),
+            None => Err(Bailout::new(BailoutReason::UnallocatedValue { node: id })),
+        }
+    }
+
+    /// Infallible façade over [`Self::slot_of_checked`] for the emission sites.
+    ///
+    /// See `unallocated_slot_use`: this path is unreachable now that
+    /// `verify_data_locations` refuses such graphs before emission starts. If
+    /// it is ever taken, the latch discards the artifact and the caller falls
+    /// back to the single-pass backend — the same outcome as before, but with a
+    /// structured reason attached, and returning the poison slot rather than
+    /// `0` so no `[rbp - 0]` read can be emitted even transiently.
+    fn slot_of(&self, id: NodeId) -> i32 {
+        match self.slot_of_checked(id) {
+            Ok(offset) => offset,
+            Err(bailout) => {
+                self.unallocated_slot_use.set(true);
+                self.latch_bailout(bailout);
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IRSLOT").is_some() {
+                    match self.graph.nodes.get(id as usize) {
+                        Some(n) => eprintln!(
+                            "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
+                            id, n.op, n.ty, n.inputs, n.bytecode_pc
+                        ),
+                        None => eprintln!("[irslot] UNALLOCATED node={id} (out of range)"),
+                    }
+                }
+                self.poison_slot()
+            }
+        }
     }
 
     /// `CRATONVM_JIT_IR_RELOC_EMIT=0` — disable the relocation contract's EMISSION
@@ -693,8 +826,17 @@ fn reloc_emit_enabled() -> bool {
             if !self.defined_nodes[id] || self.graph.nodes[id].ty != IrType::Ref {
                 continue;
             }
-            let off = self.node_slot[id];
-            if off <= 0 || off > i16::MAX as i32 {
+            // `defined_nodes[id]` implies an allocated slot, so `None` here is
+            // an internal inconsistency, not a `Ref` without a home. Treat it
+            // exactly like an unencodable offset: fail closed, publish no map.
+            let off = match self.node_slot[id] {
+                Some(off) => off.get() as i32,
+                None => {
+                    coverable = false;
+                    break;
+                }
+            };
+            if off > i16::MAX as i32 {
                 coverable = false;
                 break;
             }
@@ -768,12 +910,17 @@ fn reloc_emit_enabled() -> bool {
     /// A forward branch can target a merge block whose phis have not yet
     /// been lowered, so the destination slots must exist before any edge
     /// copy is emitted. Phis are skipped by `lower_data_node`.
-    fn prealloc_phi_slots(&mut self) {
+    ///
+    /// Fallible: this is the first thing that can exhaust the frame, and a
+    /// refusal here must reach `lower_inner` as a `FrameTooLarge` bailout
+    /// rather than a panic.
+    fn prealloc_phi_slots(&mut self) -> CompileResult<()> {
         for id in 0..self.graph.nodes.len() {
             if matches!(self.graph.nodes[id].op, Op::Phi) {
-                self.alloc_slot(id as NodeId);
+                self.alloc_slot_checked(id as NodeId)?;
             }
         }
+        Ok(())
     }
 
     /// Resolve the block that produces control token `ctrl` by walking up
@@ -1192,8 +1339,10 @@ fn reloc_emit_enabled() -> bool {
                 matches!(self.graph.nodes[id].op, Op::Phi)
                     && self.graph.nodes[id].ty == IrType::Ref
             })
-            .map(|id| (id, self.node_slot[id]))
-            .filter(|&(_, off)| off > 0)
+            // A phi with no location cannot be zeroed and must not be
+            // published; `prealloc_phi_slots` gives every phi one, so this
+            // filter drops nothing in a well-formed compile.
+            .filter_map(|id| self.node_slot[id].map(|off| (id, off.get() as i32)))
             .collect();
         for (id, off) in refs {
             // MOV qword [rbp - off], 0
@@ -3248,23 +3397,24 @@ fn reloc_emit_enabled() -> bool {
                 // The prologue stored param `idx` at `[rbp - (idx+1)*8]`. If
                 // the Param node was also scheduled it has its own spill slot
                 // holding the same value; prefer that, else the prologue slot.
-                let slot = self.node_slot[node_id as usize];
-                let off = if slot != 0 {
-                    slot
-                } else {
-                    ((idx as i32) + 1) * 8
+                let off = match self.node_slot.get(node_id as usize).copied().flatten() {
+                    Some(slot) => slot.get() as i32,
+                    None => ((idx as i32) + 1) * 8,
                 };
                 Self::typed_stack_slot(-off, node.ty)
             }
             _ => {
-                let slot = self.node_slot[node_id as usize];
-                if slot != 0 {
-                    Self::typed_stack_slot(-slot, node.ty)
-                } else {
+                match self.node_slot.get(node_id as usize).copied().flatten() {
+                    Some(slot) => Self::typed_stack_slot(-(slot.get() as i32), node.ty),
                     // No machine location assigned (unscheduled / dead in this
                     // naive lowerer). A real resolver would never see this for
                     // a value that is live at the safepoint; first-cut fallback.
-                    FrameValue::Undefined
+                    //
+                    // Note this is a deopt *description*, not an emitted
+                    // access: `Undefined` costs a whole-method re-run, it never
+                    // reads `[rbp - 0]`. That is why a missing location is
+                    // tolerated here and refused in `slot_of`.
+                    None => FrameValue::Undefined,
                 }
             }
         }
@@ -3812,6 +3962,347 @@ fn reloc_emit_enabled() -> bool {
         points.dedup_by_key(|p| p.native_offset);
         points
     }
+}
+
+// ── Resource bounds (checked BEFORE anything is reserved) ────────────
+//
+// The lowerer used to size its frame straight from `graph.nodes.len()` — one
+// 8-byte spill slot per node, unconditionally — and then `assert!` its way out
+// if a slot fell past the cap. Two problems: `max_nodes * 8` on a pathological
+// graph overflows the `i32` frame arithmetic before any check runs, and the
+// assertion is a panic on the compiler thread for what is only a compiler
+// resource limit. Both are now decided up front, from the same numbers the
+// frame is actually built from.
+
+/// What a graph demands of the frame beyond its own spills. Shared by
+/// [`Lowerer::new`] (which builds the frame) and [`estimate_frame_bytes`]
+/// (which bounds it), so the checked size and the built size cannot drift.
+struct FrameNeeds {
+    /// The method takes the VM context pointer as a hidden first argument and
+    /// reserves a frame slot for it.
+    needs_context: bool,
+    /// Widest outgoing Java-argument list staged for a call.
+    max_call_args: usize,
+}
+
+/// Scan the graph for the call/allocation shapes that widen the frame.
+fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
+    let mut needs_context = false;
+    let mut max_call_args = 0usize;
+    for n in &graph.nodes {
+        if matches!(n.op, Op::Call { .. }) {
+            needs_context = true;
+            // inputs = [ctrl, mem, args…]
+            max_call_args = max_call_args.max(n.inputs.len().saturating_sub(2));
+        }
+        if matches!(n.op, Op::LambdaIntToDouble) {
+            needs_context = true;
+        }
+        if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
+            needs_context = true;
+        }
+        if matches!(n.op, Op::New { .. }) {
+            needs_context = true;
+        }
+    }
+    FrameNeeds {
+        needs_context,
+        max_call_args,
+    }
+}
+
+/// Estimated peak frame requirement, in bytes, for a method the lowerer would
+/// build with `num_locals` locals, `max_nodes` spill reservations and `needs`.
+///
+/// Mirrors [`Lowerer::new`]'s layout exactly — locals, optional context slot,
+/// the four reserved bookkeeping slots, the spill reservation, the outgoing
+/// argument staging area, the 16-byte stack-argument reserve and the 32-byte
+/// ABI shadow space, rounded up to the 16-byte stack alignment — but in
+/// saturating `usize` arithmetic, so a graph big enough to overflow the
+/// constructor's `i32` math is *counted* rather than wrapped. `usize::MAX`
+/// therefore reads as "far too large", which is exactly what
+/// [`check_frame_size`] concludes.
+///
+/// TODO(liveness-slot-reuse): the `max_nodes * 8` term assumes every value in
+/// the graph is live simultaneously. With live ranges computed, values whose
+/// ranges do not overlap share a slot and this term collapses towards the peak
+/// live count. That is a separate change; this function is the place that
+/// would then report the smaller number.
+fn estimate_frame_bytes(num_locals: usize, max_nodes: usize, needs: &FrameNeeds) -> usize {
+    let locals = num_locals.saturating_mul(8);
+    let context = if needs.needs_context { 8 } else { 0 };
+    // safepoint id, cached thread pointer, shadow save-base, shadow save-top.
+    let bookkeeping = 8usize * 4;
+    let spills = max_nodes.saturating_mul(8);
+    let args_stage = needs.max_call_args.saturating_mul(8);
+    let shadow = 32usize;
+    let stack_arg_reserve = 16usize;
+    let total = locals
+        .saturating_add(context)
+        .saturating_add(bookkeeping)
+        .saturating_add(spills)
+        .saturating_add(args_stage)
+        .saturating_add(shadow)
+        .saturating_add(stack_arg_reserve);
+    // 16-byte alignment, saturating rather than wrapping at the top end.
+    total.saturating_add(15) & !15usize
+}
+
+/// Refuse a graph whose node count exceeds the compile-time budget.
+///
+/// Defence in depth: `lib.rs` already screens on `ir::IR_MAX_GRAPH_NODES`
+/// before building a schedule. This restates the bound at the point that
+/// *allocates* per node, so a future caller that skips the screen cannot
+/// reserve an unbounded frame.
+fn check_graph_size(node_count: usize, limit: usize) -> CompileResult<()> {
+    if node_count > limit {
+        return Err(Bailout::new(BailoutReason::GraphTooLarge {
+            nodes: node_count,
+            limit,
+        }));
+    }
+    Ok(())
+}
+
+/// Refuse a frame estimate that exceeds the frame budget.
+///
+/// The bound is a correctness bound, not a stack-consumption policy: this file
+/// encodes oop-map slot offsets as `i16`, so a reference living past
+/// `i16::MAX` is *unrepresentable* in the map the collector reads. See
+/// [`DEFAULT_MAX_FRAME_BYTES`].
+fn check_frame_size(frame_bytes: usize, limit: usize) -> CompileResult<()> {
+    if frame_bytes > limit {
+        return Err(Bailout::new(BailoutReason::FrameTooLarge {
+            bytes: frame_bytes,
+            limit,
+        }));
+    }
+    Ok(())
+}
+
+// ── Pre-emission location verification ───────────────────────────────
+
+/// True for the IR types that occupy a frame slot, i.e. the inputs a lowering
+/// reads through [`Lowerer::slot_of`]. `Control`, `Memory` and `Void` inputs
+/// are edges, not values, and never have a location.
+fn is_value_ty(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::Int | IrType::Long | IrType::Float | IrType::Double | IrType::Ref
+    )
+}
+
+/// True iff lowering this op assigns its result a frame slot.
+///
+/// Must stay in step with `lower_data_node`'s match arms: every arm that calls
+/// `alloc_slot` is listed here, plus `Op::Phi` (reserved up front by
+/// `prealloc_phi_slots`). Ops that reach `lower_data_node`'s catch-all — they
+/// emit nothing — are deliberately absent, because a value read from one of
+/// them has no location either.
+fn op_defines_result_slot(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Const(_)
+            | Op::ConstF(_)
+            | Op::Param(_)
+            | Op::Phi
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::Cmp(_)
+            | Op::LCmp
+            | Op::FCmp { .. }
+            | Op::I2L
+            | Op::L2I
+            | Op::I2F
+            | Op::I2D
+            | Op::L2F
+            | Op::L2D
+            | Op::F2I
+            | Op::F2L
+            | Op::F2D
+            | Op::D2I
+            | Op::D2L
+            | Op::D2F
+            | Op::Load(_)
+            | Op::ArrayLoad(_)
+            | Op::ArrayStore(_)
+            | Op::New { .. }
+            | Op::Call { .. }
+            | Op::LambdaIntToDouble
+    )
+}
+
+/// Refuse, *before a single byte is emitted*, any graph in which some node the
+/// lowerer will emit reads a value that has no frame location at that point.
+///
+/// This is the structural fix for the `[rbp - 0]` defect. The observed failure
+/// (ES `SortingDigestTests` with the IR tier on) was a `pc17 ArrayLoad(Double)`
+/// feeding a GVN-collapsed loop phi: the scheduler placed the phi but not the
+/// load, so the load had no slot, and `slot_of` handed back the
+/// zero-initialised entry — `[rbp - 0]`, the saved caller frame pointer, read
+/// as a `double`. The old detection was a sticky bit consulted *after* the
+/// whole body had been emitted.
+///
+/// Three ways a data input can fail to have a location; all three are the same
+/// bailout:
+///
+///  1. the defining node is in no emitted block (dead, or a scheduler
+///     omission) — it never reaches `lower_data_node`, so nothing allocates;
+///  2. its op emits nothing (`lower_data_node`'s catch-all), so even though it
+///     is scheduled it defines no slot;
+///  3. it is emitted, but *after* the use — every location here is created at
+///     the point of emission, so a later definition is as absent as no
+///     definition.
+///
+/// Phis are exempt from (3): their slots are reserved by `prealloc_phi_slots`
+/// before any block is lowered, precisely so a forward branch can copy into
+/// one. Phi *inputs* are exempt too — they are written by predecessor edge
+/// copies, not read in the phi's own block — so only (1) and (2) apply to them.
+///
+/// Rejecting here can only lose graphs that the `unallocated_slot_use` latch
+/// already rejected after the fact, so it costs no coverage; what it buys is
+/// that the refusal happens before emission, where a mutation that drops a
+/// node from the schedule is caught by construction rather than by a bit that
+/// someone must remember to check.
+///
+/// Known residual (why the latch is kept rather than deleted): a phi's value
+/// inputs are consumed by `emit_phi_copies` at the *predecessor's* terminator,
+/// not in the phi's own block, so their ordering constraint is per-CFG-edge —
+/// reconstructing it here would duplicate `block_of_ctrl`'s walk. A def that
+/// reached its edge copy too late would still be caught by the latch, one
+/// phase later. Every *placement* failure — the class that produced the
+/// observed bug — is caught here.
+fn verify_data_locations(graph: &Graph, schedule: &Schedule) -> CompileResult<()> {
+    // Emission order: blocks in index order; within a block, its data nodes in
+    // scheduled order, then its terminator. This is exactly `lower_inner`'s
+    // `for block_idx in 0..blocks.len() { lower_block(block_idx) }`.
+    let mut emit_index: Vec<Option<usize>> = vec![None; graph.nodes.len()];
+    let mut seq = 0usize;
+    for block in &schedule.blocks {
+        for &node_id in &block.nodes {
+            if let Some(cell) = emit_index.get_mut(node_id as usize) {
+                *cell = Some(seq);
+            }
+            seq += 1;
+        }
+        if let Some(term) = block.terminator {
+            if let Some(cell) = emit_index.get_mut(term as usize) {
+                *cell = Some(seq);
+            }
+            seq += 1;
+        }
+    }
+
+    let check_user = |user: NodeId| -> CompileResult<()> {
+        let node = match graph.nodes.get(user as usize) {
+            Some(n) => n,
+            None => {
+                return Err(Bailout::new(BailoutReason::Internal(
+                    "ir_lower: schedule names a node outside the graph",
+                )))
+            }
+        };
+        let user_is_phi = matches!(node.op, Op::Phi);
+        for &input in &node.inputs {
+            if input == NO_NODE {
+                continue;
+            }
+            let def = match graph.nodes.get(input as usize) {
+                Some(d) => d,
+                None => {
+                    return Err(Bailout::new(BailoutReason::Internal(
+                        "ir_lower: node input outside the graph",
+                    )))
+                }
+            };
+            // Control / memory edges carry no value and are never `slot_of`'d.
+            if !is_value_ty(def.ty) {
+                continue;
+            }
+            if !op_defines_result_slot(&def.op) {
+                // (1) dead / (2) no lowering ⇒ no location, ever.
+                return Err(Bailout::with_context(
+                    BailoutReason::UnallocatedValue { node: input },
+                    format!(
+                        "n{input} ({:?}, {:?}) is read by n{user} ({:?}) but its \
+                         lowering assigns no frame slot",
+                        def.op, def.ty, node.op
+                    ),
+                ));
+            }
+            let def_seq = match emit_index.get(input as usize).copied().flatten() {
+                Some(s) => s,
+                None => {
+                    // Phis are reserved before emission, so "not in any emitted
+                    // block" is still fatal for them: nothing would write the
+                    // slot. Report the same way.
+                    return Err(Bailout::with_context(
+                        BailoutReason::UnallocatedValue { node: input },
+                        format!(
+                            "n{input} ({:?}) is read by n{user} ({:?}) but is in no \
+                             emitted block",
+                            def.op, node.op
+                        ),
+                    ));
+                }
+            };
+            if user_is_phi || matches!(def.op, Op::Phi) {
+                // Phi slots exist before the first block is lowered, and a
+                // phi's own inputs are consumed by predecessor edge copies
+                // rather than read in the phi's block — neither is an
+                // ordering constraint.
+                continue;
+            }
+            let use_seq = emit_index
+                .get(user as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(usize::MAX);
+            if def_seq >= use_seq {
+                return Err(Bailout::with_context(
+                    BailoutReason::UnallocatedValue { node: input },
+                    format!(
+                        "n{input} ({:?}) is emitted at position {def_seq}, after its \
+                         use by n{user} ({:?}) at position {use_seq}",
+                        def.op, node.op
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    for block in &schedule.blocks {
+        for &node_id in &block.nodes {
+            check_user(node_id)?;
+        }
+        if let Some(term) = block.terminator {
+            check_user(term)?;
+        }
+    }
+    Ok(())
+}
+
+/// Funnel every refusal in this file through one place: count it, then return
+/// the `None` the public entry points have always returned, which is the
+/// caller's signal to run the method in a lower tier. A compiler refusal must
+/// never terminate the VM.
+fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_BAILOUT").is_some() {
+        eprintln!("[ir-bailout] {bailout}");
+    }
+    record_bailout(&bailout);
+    None
 }
 
 // ── Public entry point ───────────────────────────────────────────────

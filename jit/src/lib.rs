@@ -82,12 +82,14 @@
 
 pub mod aarch64;
 pub mod aarch64_backend;
+pub mod bailout;
 pub mod deopt;
 pub mod escape_analysis;
 pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
 pub mod ir_schedule;
+pub mod ir_verify;
 pub mod loop_analysis;
 pub mod null_check_elim;
 pub mod pgo;
@@ -7117,6 +7119,42 @@ fn build_scalar_replacement_map(
     ir_lower::ScalarReplacementMap { objects }
 }
 
+/// Verify `graph` and, on failure, record a structured bailout.
+///
+/// Returns `true` when the graph must **not** be lowered. The caller's
+/// response to `true` is to do nothing — the IR pipeline's failure path is
+/// "fall out of the `if let Some(graph)` arm and let the single-pass backend
+/// below compile the method", which is always semantically valid because the
+/// optimizing tier is an optimization, never a requirement.
+///
+/// This is the adapter the P0 "JIT correctness" lane of
+/// `docs/known-issues/deep-research-vm-c2.md` asks for: `verify_graph` returns
+/// `Result`, the compile path returns `Option`, and rather than change the
+/// signature of anything already in the pipeline the conversion happens here,
+/// at the call site. The bailout is *counted* (`bailout::bailout_counts`) so
+/// "how often does the verifier reject a graph, and for what?" is answerable
+/// without parsing debug logs — the review's "measure compilation quality"
+/// item. It is only *printed* under the existing `ir_stage_reporting()` flag,
+/// because a bailout is a quality signal, not a fault.
+fn ir_verify_reject(
+    graph: &ir::Graph,
+    phase: &str,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    match ir_verify::verify_graph(graph, phase, ir_verify::VerifyOptions::from_env()) {
+        Ok(()) => false,
+        Err(b) => {
+            bailout::record_bailout(&b);
+            if ir_stage_reporting() {
+                eprintln!("[ir] verifier rejected {class_name}.{method_name}{descriptor}: {b}");
+            }
+            true
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compilation entry point
 // ---------------------------------------------------------------------------
@@ -9419,7 +9457,26 @@ fn try_compile_inner(
                 // Branchy-IR explicitly disabled (CRATONVM_NO_IR_BRANCHY) and
                 // reassoc off → fall through to the single-pass backend below.
             } else {
+                // P0 "JIT correctness" (docs/known-issues/deep-research-vm-c2.md):
+                // the IR verifier runs after every mutating pass when
+                // `ir_verify::verify_enabled()` (debug builds, or
+                // `CRATONVM_JIT_VERIFY_IR=1`), and unconditionally immediately
+                // before lowering. `ir_verify_bail` latches the first rejection
+                // and steers the method down the pipeline's existing failure
+                // path — falling through to the single-pass backend below.
+                // Nothing on the success path changes.
+                let mut ir_verify_bail = false;
+
                 ir_optimize::optimize(&mut graph);
+                if ir_verify::verify_enabled() {
+                    ir_verify_bail |= ir_verify_reject(
+                        &graph,
+                        "post-optimize",
+                        &cached.class_name,
+                        &cached.method_name,
+                        &cached.method_descriptor,
+                    );
+                }
 
                 // Guard-surviving scalar replacement (Front 3.2): metadata for
                 // scalar-replaced objects so the IR lowerer can emit a
@@ -9473,6 +9530,19 @@ fn try_compile_inner(
                                 Some(build_scalar_replacement_map(&graph, &id_map, &ea_result));
                         }
                         apply_ea_to_ir(&mut graph, &id_map, &ea_result);
+                        // `apply_ea_to_ir` is a mutating pass: it kills the
+                        // scalar-replaced allocation, its stores and its loads,
+                        // and rewires their consumers. Verify the result under
+                        // the same per-pass gate as `ir_optimize`.
+                        if ir_verify::verify_enabled() {
+                            ir_verify_bail |= ir_verify_reject(
+                                &graph,
+                                "post-escape-analysis",
+                                &cached.class_name,
+                                &cached.method_name,
+                                &cached.method_descriptor,
+                            );
+                        }
                     }
                 }
 
@@ -9490,7 +9560,26 @@ fn try_compile_inner(
                         cached.class_name, cached.method_name
                     );
                 }
-                if !has_live_new_array {
+                // Unconditional pre-lowering verification. This is the gate the
+                // review's exit criterion names: "invalid IR or ABI state
+                // causes a deterministic compilation bailout, never silent
+                // wrong code, panic, or native crash". It runs BEFORE
+                // `ir_schedule::schedule`, not just before `lower_inner`,
+                // because the scheduler indexes `graph.nodes` by raw `NodeId`
+                // and would itself panic on the dangling edge the verifier is
+                // there to catch. `CRATONVM_JIT_VERIFY_IR=0` is the kill switch
+                // — see `ir_verify::pre_lower_verify_disabled`.
+                if !has_live_new_array && !ir_verify_bail && !ir_verify::pre_lower_verify_disabled()
+                {
+                    ir_verify_bail |= ir_verify_reject(
+                        &graph,
+                        "pre-lower",
+                        &cached.class_name,
+                        &cached.method_name,
+                        &cached.method_descriptor,
+                    );
+                }
+                if !has_live_new_array && !ir_verify_bail {
                     let schedule = ir_schedule::schedule(&graph);
                     // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
                     // optimizing IR (C2) lowerer the profiled branch bias so it can
