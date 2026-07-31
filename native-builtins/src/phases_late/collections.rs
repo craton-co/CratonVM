@@ -1569,21 +1569,56 @@ pub(crate) fn native_p64_sm_seq_entry_set(
 // LHM layout: buckets=0, size=1, capacity=2, head=3, tail=4
 // LHM node: key=0, value=1, hash=2, next=3, before=4, after=5
 
+/// First or last entry of a `SequencedMap`, read through the PUBLIC surface.
+///
+/// The `firstEntry`/`lastEntry` accessors used to read raw slots — head at 3,
+/// tail at 4, and each node's key/value at fields 0 and 1. The live
+/// `LinkedHashMap` in `cratonvm-native-collections` matches none of that: its
+/// nodes are `hash, key, value` (so field 0 is the HASH, not the key) and its
+/// head/tail live in a name-keyed overlay rather than those slots. Both
+/// accessors therefore returned null for every map built through `put`.
+///
+/// Iterating `entrySet()` is layout-independent, preserves the map's
+/// insertion order, and returns the map's own `Map.Entry` objects.
+fn p64_seq_map_edge_entry(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    want_last: bool,
+) -> MethodCallResult {
+    let entries = match ctx.invoke_virtual(this, "entrySet", "()Ljava/util/Set;", &[])? {
+        Some(Value::Object(Some(s))) => s,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let it = match ctx.invoke_virtual(entries, "iterator", "()Ljava/util/Iterator;", &[])? {
+        Some(Value::Object(Some(i))) => i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut found = Value::Object(None);
+    loop {
+        match ctx.invoke_virtual(it, "hasNext", "()Z", &[])? {
+            Some(Value::Int(1)) => {}
+            _ => break,
+        }
+        let next = ctx
+            .invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        if matches!(next, Value::Object(None)) {
+            break;
+        }
+        found = next;
+        if !want_last {
+            break;
+        }
+    }
+    Ok(Some(found))
+}
+
 pub(crate) fn native_p64_lhm_first_entry(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match ctx.get_field(this, 3) {
-        // head
-        Value::Object(Some(head)) => {
-            let key = ctx.get_field(head, 0);
-            let val = ctx.get_field(head, 1);
-            let entry = p64_make_entry(ctx, key, val);
-            Ok(Some(Value::Object(Some(entry))))
-        }
-        _ => Ok(Some(Value::Object(None))),
-    }
+    p64_seq_map_edge_entry(ctx, this, false)
 }
 
 pub(crate) fn native_p64_lhm_last_entry(
@@ -1591,16 +1626,7 @@ pub(crate) fn native_p64_lhm_last_entry(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match ctx.get_field(this, 4) {
-        // tail
-        Value::Object(Some(tail)) => {
-            let key = ctx.get_field(tail, 0);
-            let val = ctx.get_field(tail, 1);
-            let entry = p64_make_entry(ctx, key, val);
-            Ok(Some(Value::Object(Some(entry))))
-        }
-        _ => Ok(Some(Value::Object(None))),
-    }
+    p64_seq_map_edge_entry(ctx, this, true)
 }
 
 pub(crate) fn native_p64_lhm_seq_key_set(
