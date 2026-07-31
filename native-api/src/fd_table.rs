@@ -3317,4 +3317,152 @@ mod tests {
             _ => unreachable!(),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Capability-checked openers
+    // -----------------------------------------------------------------------
+
+    use crate::capability::{Capability, CapabilityMode, CapabilitySet, Scope, VmId};
+
+    fn caps(mode: CapabilityMode, grants: &str) -> CapabilitySet {
+        let mut set = CapabilitySet::new(VmId::from_raw(0xFD_0001), mode);
+        assert!(
+            set.grant_from_list(grants).is_empty(),
+            "test grant list must parse"
+        );
+        set
+    }
+
+    #[test]
+    fn permissive_checked_openers_behave_exactly_like_the_raw_ones() {
+        let path = temp_file_with("hello");
+        let table = FileDescriptorTable::new();
+        let policy = caps(CapabilityMode::Permissive, "");
+        let fd = table
+            .open_read_checked(&policy, &path)
+            .expect("permissive allows everything");
+        let mut buf = [0u8; 8];
+        let n = table.read_bytes(fd, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enforce_denies_an_ungranted_read_without_touching_the_filesystem() {
+        let path = temp_file_with("secret");
+        let table = FileDescriptorTable::new();
+        let policy = caps(CapabilityMode::Enforce, "file-read:/definitely/elsewhere");
+
+        let err = table
+            .open_read_checked(&policy, &path)
+            .expect_err("path is outside the grant");
+        match err {
+            FdCapabilityError::Denied(d) => {
+                assert_eq!(d.capability, crate::capability::CapabilityKind::FileRead);
+                assert_eq!(d.vm, VmId::from_raw(0xFD_0001));
+            }
+            FdCapabilityError::Io(e) => panic!("expected a denial, got io error {e}"),
+        }
+        // No fd was consumed by the refused open: the next successful open
+        // gets the very next descriptor after the reserved 0/1/2.
+        let permissive = caps(CapabilityMode::Permissive, "");
+        let fd = table.open_read_checked(&permissive, &path).unwrap();
+        assert_eq!(fd, 3, "a denied open must not reserve a descriptor");
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enforce_denies_a_write_that_would_have_created_the_file() {
+        let path = temp_path("cap_denied_create");
+        assert!(!std::path::Path::new(&path).exists());
+        let table = FileDescriptorTable::new();
+        let policy = caps(CapabilityMode::Enforce, "file-read:*");
+
+        assert!(matches!(
+            table.open_write_checked(&policy, &path, false),
+            Err(FdCapabilityError::Denied(_))
+        ));
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "a denied write must not create the file — the check runs before the syscall"
+        );
+    }
+
+    #[test]
+    fn a_granted_path_prefix_admits_files_under_it() {
+        let path = temp_file_with("granted");
+        let dir = std::env::temp_dir();
+        let table = FileDescriptorTable::new();
+        let mut policy = CapabilitySet::new(VmId::from_raw(0xFD_0002), CapabilityMode::Enforce);
+        policy.grant(Capability::FileRead(Scope::path(&dir.to_string_lossy())));
+
+        let fd = table
+            .open_read_checked(&policy, &path)
+            .expect("the temp dir prefix must admit a file inside it");
+        table.close(fd).unwrap();
+
+        // ...and a traversal out of it is refused even though it is spelled
+        // as a child of the granted prefix.
+        let escape = format!("{}/../etc/passwd", dir.to_string_lossy());
+        assert!(matches!(
+            table.open_read_checked(&policy, &escape),
+            Err(FdCapabilityError::Denied(_))
+        ));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_write_open_requires_both_capabilities() {
+        let path = temp_file_with("rw");
+        let table = FileDescriptorTable::new();
+        // Read-only grant: an fd that can also write must be refused.
+        let read_only = caps(CapabilityMode::Enforce, "file-read:*");
+        assert!(matches!(
+            table.open_read_write_checked(&read_only, &path, false),
+            Err(FdCapabilityError::Denied(_))
+        ));
+        let both = caps(CapabilityMode::Enforce, "file-read:*;file-write:*");
+        let fd = table
+            .open_read_write_checked(&both, &path, false)
+            .expect("both granted");
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn network_openers_are_gated_on_the_endpoint() {
+        let table = FileDescriptorTable::new();
+        let policy = caps(CapabilityMode::Enforce, "network:127.0.0.1:0-65535");
+        // Wrong host — refused before any connect is attempted, so this test
+        // does no I/O at all.
+        assert!(matches!(
+            table.open_tcp_connect_checked(&policy, "169.254.169.254:80"),
+            Err(FdCapabilityError::Denied(_))
+        ));
+        // A UDP socket with no bind address cannot name an endpoint, so the
+        // narrow grant must refuse it (fail closed).
+        assert!(matches!(
+            table.open_udp_checked(&policy, None),
+            Err(FdCapabilityError::Denied(_))
+        ));
+        // A loopback listener on an ephemeral port is inside the grant.
+        let fd = table
+            .open_tcp_listener_checked(&policy, "127.0.0.1:0")
+            .expect("granted endpoint");
+        table.close(fd).unwrap();
+    }
+
+    #[test]
+    fn a_denial_maps_to_permission_denied_for_io_only_call_sites() {
+        let table = FileDescriptorTable::new();
+        let policy = caps(CapabilityMode::Enforce, "");
+        let err = table
+            .open_read_checked(&policy, "/anything")
+            .expect_err("empty enforce set denies everything");
+        let as_io: io::Error = err.into();
+        assert_eq!(as_io.kind(), io::ErrorKind::PermissionDenied);
+        assert!(as_io.to_string().contains("file-read"), "{as_io}");
+    }
 }

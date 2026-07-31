@@ -792,8 +792,8 @@ pub fn validate_attribute_shape(name: &str, body: &[u8]) -> Result<(), ClassRead
             // max_stack + max_locals + code_length headers.
             let _max_stack = buf.read_u16()?;
             let _max_locals = buf.read_u16()?;
-            let code_length = buf.read_u32()? as usize;
-            const MAX_CODE_LENGTH: usize = 65535;
+            let code_length = wire_len_to_usize("Code code_length", buf.read_u32()?)?;
+            const MAX_CODE_LENGTH: usize = crate::limits::MAX_CODE_LENGTH;
             if code_length == 0 || code_length > MAX_CODE_LENGTH {
                 return Err(ClassReaderError::InvalidClassData {
                     message: format!(
@@ -806,8 +806,10 @@ pub fn validate_attribute_shape(name: &str, body: &[u8]) -> Result<(), ClassRead
             // than the actual body".
             let _ = buf.read_bytes(code_length)?;
             let exception_table_length = buf.read_u16()? as usize;
-            const ET_ENTRY_SIZE: usize = 8;
-            let _ = buf.read_bytes(exception_table_length * ET_ENTRY_SIZE)?;
+            const ET_ENTRY_SIZE: usize = EXCEPTION_TABLE_ENTRY_SIZE;
+            let et_span =
+                checked_span("Code exception_table", exception_table_length, ET_ENTRY_SIZE)?;
+            let _ = buf.read_bytes(et_span)?;
             // Nested attributes — walk the headers and recurse for shape.
             let attributes_count = buf.read_u16()? as usize;
             for _ in 0..attributes_count {
@@ -1224,14 +1226,16 @@ fn decode_attribute_body(
             // which silently allocated a fresh `ArcInner<[u8]>` and
             // memcpy'd the slice — the parent Arc was *not* shared.
             // See round5-reader.md CRIT-1.)
-            let start = body_offset + buf.position();
+            let start = checked_end("StackMapTable offset", body_offset, buf.position())?;
             let _ = buf.read_bytes(length)?;
             // Defense-in-depth: even though `validate_attribute_shape`
             // already walks the outer body, derive this slice via
             // `try_new` so an OOB range surfaces as `InvalidClassData`
             // rather than panicking (round-11 off-by-`buf.position()`
-            // regression).
-            let entries = ByteView::try_new(source.clone(), start..start + length)?;
+            // regression). `checked_end` covers the range arithmetic
+            // itself so a wrapped `end` can never present as in-bounds.
+            let end = checked_end("StackMapTable range", start, length)?;
+            let entries = ByteView::try_new(source.clone(), start..end)?;
             Attribute::StackMapTable { entries }
         }
         "BootstrapMethods" => {
@@ -1524,11 +1528,12 @@ fn decode_attribute_body(
             // used `Arc::from(&source[range])` here, which allocated a
             // fresh `ArcInner<[u8]>` + memcpy'd the slice; the parent
             // Arc was *not* shared. See round5-reader.md CRIT-1.)
-            let start = body_offset + buf.position();
+            let start = checked_end("Unknown attribute offset", body_offset, buf.position())?;
             let _ = buf.read_bytes(length)?;
             // Defense-in-depth: see `StackMapTable` arm — runtime-
             // derived offset/length must not panic on OOB.
-            let data = ByteView::try_new(source.clone(), start..start + length)?;
+            let end = checked_end("Unknown attribute range", start, length)?;
+            let data = ByteView::try_new(source.clone(), start..end)?;
             // Round 7 audit fix (MED #7): `name` is already an
             // interned `Arc<str>` (the caller passed in the canonical
             // pool-interned arc); just refcount-bump instead of
@@ -1652,9 +1657,9 @@ fn decode_code_body(
     let max_stack = buf.read_u16()?;
     let max_locals = buf.read_u16()?;
 
-    let code_length = buf.read_u32()? as usize;
+    let code_length = wire_len_to_usize("Code code_length", buf.read_u32()?)?;
     // JVM spec 4.7.3: code_length must be > 0 and <= 65535.
-    const MAX_CODE_LENGTH: usize = 65535;
+    const MAX_CODE_LENGTH: usize = crate::limits::MAX_CODE_LENGTH;
     if code_length == 0 || code_length > MAX_CODE_LENGTH {
         return Err(ClassReaderError::InvalidClassData {
             message: format!(
@@ -1670,13 +1675,16 @@ fn decode_code_body(
     // used `Arc::from(&source[range])` here, which silently allocated
     // a fresh `ArcInner<[u8]>` + memcpy; the parent Arc was *not*
     // shared. See round5-reader.md CRIT-1.)
-    let code_start = body_offset + buf.position();
+    let code_start = checked_end("Code offset", body_offset, buf.position())?;
     let _ = buf.read_bytes(code_length)?;
     // Defense-in-depth: the runtime-derived `code_start..code_start +
     // code_length` range goes through `try_new` so a malformed Code
     // body produces `InvalidClassData` instead of aborting the process
-    // (the round-11 panic shipped from this very call site).
-    let code = ByteView::try_new(source.clone(), code_start..code_start + code_length)?;
+    // (the round-11 panic shipped from this very call site). The range
+    // arithmetic itself is `checked_end` so it cannot wrap into a range
+    // that then passes the bounds test.
+    let code_end = checked_end("Code range", code_start, code_length)?;
+    let code = ByteView::try_new(source.clone(), code_start..code_end)?;
 
     // Round 7 audit fix (MED #6 / round-4 #4): bulk slice parse of the
     // ExceptionTable — replaces four per-`u16` `read_u16()` calls per
@@ -1685,9 +1693,11 @@ fn decode_code_body(
     // checked-slice bounds check and a `try_into().unwrap()`; the bulk
     // version does one bounds check for the whole table.
     let exception_table_length = buf.read_u16()? as usize;
-    const ET_ENTRY_SIZE: usize = 8; // four u16 fields
-    let et_bytes = buf.read_bytes(exception_table_length * ET_ENTRY_SIZE)?;
-    let mut exception_table = Vec::with_capacity(exception_table_length.min(PREALLOC_CAP));
+    const ET_ENTRY_SIZE: usize = EXCEPTION_TABLE_ENTRY_SIZE; // four u16 fields
+    let et_span = checked_span("Code exception_table", exception_table_length, ET_ENTRY_SIZE)?;
+    let et_capacity = bounded_capacity(exception_table_length, ET_ENTRY_SIZE, buf.remaining());
+    let et_bytes = buf.read_bytes(et_span)?;
+    let mut exception_table = Vec::with_capacity(et_capacity);
     for chunk in et_bytes.chunks_exact(ET_ENTRY_SIZE) {
         exception_table.push(ExceptionTableEntry {
             start_pc: u16::from_be_bytes([chunk[0], chunk[1]]),
@@ -1877,9 +1887,18 @@ fn decode_target_info(
             let len_bytes = buf.read_bytes(2)?;
             let len_copy: [u8; 2] = [len_bytes[0], len_bytes[1]];
             let table_length = u16::from_be_bytes(len_copy);
-            let byte_count = 6 * table_length as usize;
+            // `checked_span` rather than a bare `6 *`: the product is
+            // u16-bounded today, but the multiplication is the exact shape
+            // that wraps to a short span if the field ever widens.
+            let byte_count = checked_span(
+                "type_annotation localvar_target",
+                table_length as usize,
+                LOCALVAR_TARGET_ENTRY_SIZE,
+            )?;
+            // Reserve from the bytes we actually got, not from the declared
+            // length: `read_bytes` has already proved the input holds them.
             let body = buf.read_bytes(byte_count)?;
-            let mut data = Vec::with_capacity(2 + byte_count);
+            let mut data = Vec::with_capacity(2 + body.len());
             data.extend_from_slice(&len_copy);
             data.extend_from_slice(body);
             Ok(data)

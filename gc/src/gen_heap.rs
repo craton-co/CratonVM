@@ -4589,7 +4589,41 @@ impl GenerationalHeap {
         // via its local `merge_skips`. Both inputs are ascending & disjoint.
         let start_skips = {
             let mut v = young_from.free_blocks_sorted();
-            v.extend(self.jit_tlab_skip_offsets(young_base, young_base + young_used));
+            let tails = self.jit_tlab_skip_offsets(young_base, young_base + young_used);
+            // TLAB AUDIT TRIPWIRE (docs/gc/tlab-and-card-audit.md §1, defect
+            // T-3). We are on the MOVING path: from-space is about to be
+            // evacuated, swapped and reset. A published reserved tail means
+            // some ALIVE thread still owns a TLAB `[cursor, end)` in the arena
+            // being reset, and that thread is not one of the OS-frozen in-JIT
+            // peers — freezing a peer makes the VM call
+            // `mark_moving_young_coverage_incomplete`, which would have sent
+            // this cycle down the non-moving path instead. So the owner is a
+            // parked or blocked mutator that reached its exclusion point
+            // WITHOUT retiring, and after the swap its stale cursor bump-
+            // allocates into memory the collector has already handed back.
+            //
+            // The walk itself is correct either way (the tail is skipped, not
+            // parsed), so this is a diagnostic rather than a diversion: turning
+            // a live moving cycle into a sweep on a heuristic would be a worse
+            // trade than naming the offending transition. Rate-limited; the
+            // first occurrence is always visible.
+            if !tails.is_empty() {
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        tails = tails.len(),
+                        "[tlab-audit] a MOVING young collection is running with {} published \
+                         reserved TLAB tail(s). No in-JIT peer was frozen (that would have \
+                         forced the non-moving sweep), so an alive mutator left a TLAB \
+                         un-retired across its exclusion point — after the semispace swap its \
+                         cursor points into recycled memory. Occurrence #{}.",
+                        tails.len(),
+                        n,
+                    );
+                }
+            }
+            v.extend(tails);
             v.sort_by_key(|&(off, _)| off);
             v
         };
