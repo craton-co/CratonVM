@@ -819,6 +819,15 @@ impl MockNativeContext {
         }
     }
 
+    /// Give this context its own VM identity, so a per-VM policy installed
+    /// for it (capabilities, and anything else keyed on `vm_identity()`) is
+    /// invisible to the other mock contexts in the suite, which all report
+    /// the default `0`. See `vm_identity_override`.
+    #[allow(dead_code)]
+    pub(crate) fn set_vm_identity(&self, id: usize) {
+        self.vm_identity_override.set(id);
+    }
+
     /// CGLIB-η: declare that `class_id` belongs to the given raw loader
     /// (using the `loader_id_of_class` encoding: 0=Bootstrap,
     /// 1=Extension, 2=Application, N>=3=UserDefined(N)).
@@ -2399,6 +2408,13 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
     fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
         let statics = unsafe { &mut *self.static_fields_override.get() };
         statics.insert((class_id.as_u32(), field_index), value);
+    }
+
+    /// Overrides the trait default (`0`) with whatever `set_vm_identity`
+    /// installed, so a test can own a private VM identity. Untouched contexts
+    /// still report `0`.
+    fn vm_identity(&self) -> usize {
+        self.vm_identity_override.get()
     }
 
     fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {

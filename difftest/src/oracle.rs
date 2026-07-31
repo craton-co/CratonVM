@@ -2,40 +2,75 @@
 // Copyright 2024-2026 Craton Software Company
 
 //! The diff oracle: compare two [`Observation`](crate::ledger::Observation)s
-//! per channel, normalize, and classify (design §3.3).
+//! per **dimension**, normalize, and classify (design §3.3).
 //!
-//! Channels and their comparison discipline:
-//! - **exit code** — exact match;
-//! - **uncaught exception identity** — `fqcn` exact, `message` exact after
-//!   normalization, `top_frames` compared *in order* (so reversed-stacktrace
-//!   bugs surface);
+//! Dimensions and their comparison discipline (each independently reported, so
+//! a divergence names which one moved — see [`Channel`]):
+//! - **exit code** — exact match; a CratonVM timeout is a distinct, never-
+//!   matching token, so a hang can never read as a clean exit;
+//! - **exception presence** — one side threw and the other did not;
+//! - **exception type** — `fqcn`, exact;
+//! - **exception message** — exact after normalization;
+//! - **exception frames** — compared *in order*, so reversed-stacktrace bugs
+//!   surface as an ordering diff;
 //! - **stdout** — exact after normalization (strict by default; a seed must
 //!   *declare* it needs a normalizer);
-//! - **stderr (non-exception)** — loose / contextual.
+//! - **stderr (non-exception)** — gated only under the profile modes'
+//!   normalizer, after the VM's own diagnostics are removed;
+//! - **checksum** — the program's own declared quantities
+//!   ([`crate::checksum`]), compared on **un-normalized** stdout so no
+//!   normalization rule can launder them.
 //!
-//! ## Status: Step 1
+//! ## Normalization is a named rule set, never a buried regex
 //!
-//! [`parse_exception`] and the four-channel [`compare`] are wired (strict
-//! equality). The opt-in normalizers (path/hash/thread-id stripping, line
-//! sorting) are declared but inert — strict line-ending hygiene is the only
-//! transform applied, so nothing can silently mask a real diff. Joining the
-//! per-mode verdicts into a `Classification` (`JitOnly`, …) is Step 2.
+//! Every transform this module can apply is a [`crate::normalize::
+//! NormalizationRule`] with a documented target, justification and risk. The
+//! [`Normalizer`] here is only a selection of which rules are on; the rules
+//! themselves, their order, and the argument for each live next to their
+//! implementation. `strict()` selects none of them beyond line-ending hygiene,
+//! so the committed gate baseline still judges byte-exact output.
 
+use crate::checksum::{self, Checksums};
 use crate::ledger::{Channel, Classification, JvmException, Observation};
+use crate::normalize::{self, NormalizationRule};
 use crate::runner::Mode;
 
-/// Per-channel normalization knobs. The **default is strict** (every knob
-/// off): a seed must explicitly opt into a normalizer via its header pragma so
-/// we never silently mask a real divergence (design §3.3).
+pub use crate::normalize::{normalize_line_endings, strip_ansi};
+
+/// Per-dimension normalization knobs — a **selection** over
+/// [`crate::normalize::ORDER`], not an implementation.
+///
+/// The **default is strict** (every knob off): a seed must explicitly opt into
+/// a rule via its header pragma so we never silently mask a real divergence
+/// (design §3.3). Each field names the rule it enables, and that rule's
+/// `justification` / `risk` is the argument for turning it on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Normalizer {
-    /// Strip absolute filesystem paths.
+    /// [`normalize::ABSOLUTE_PATH`] — strip absolute filesystem paths, keeping
+    /// the basename.
     pub strip_paths: bool,
-    /// Mask `0x<hex>` blobs and `Object.toString` identity hashes (`@<hash>`).
+    /// [`normalize::IDENTITY_HASH`] + [`normalize::HEX_ADDRESS`] — mask
+    /// `Object.toString` identity hashes (`@<hash>`) and `0x<hex>` blobs.
     pub mask_hashes: bool,
-    /// Mask thread ids.
+    /// [`normalize::THREAD_ID`] — mask thread / process ids.
     pub mask_thread_ids: bool,
-    /// Sort output lines (only for explicitly-tagged nondeterministic seeds).
+    /// [`normalize::TIMESTAMP`] — mask ISO-8601 wall-clock timestamps.
+    ///
+    /// Off even under `jdk_only()`: `java.time` formatting is itself a live
+    /// bug area for this VM, and a rule that erases the digits would erase the
+    /// finding with them.
+    pub mask_timestamps: bool,
+    /// [`normalize::PATH_SEPARATOR`] — rewrite `\` to `/` inside path-shaped
+    /// tokens, so a ledger row captured on Windows is readable on Linux.
+    pub normalize_path_separators: bool,
+    /// [`normalize::FRAME_LINE_NUMBERS`] — mask `Foo.java:<n>` inside frames.
+    ///
+    /// The most dangerous rule in the set (this VM has had real wrong-bci
+    /// bugs), so it is never enabled by a built-in profile: only a seed that
+    /// crosses into JDK internals asks for it, explicitly.
+    pub mask_frame_line_numbers: bool,
+    /// [`normalize::SORT_LINES`] — sort output lines (only for explicitly-
+    /// tagged nondeterministic seeds; erases every ordering bug).
     pub sort_lines: bool,
     /// **stderr only**: drop CratonVM's own diagnostic chatter — ANSI colour
     /// codes, `tracing` lines from `cratonvm_*` targets, and the `[cratonvm]` /
@@ -83,87 +118,78 @@ impl Normalizer {
         }
     }
 
-    /// Apply normalization to one captured stream.
+    /// The rules this normalizer applies to a **shared** stream (stdout, and
+    /// an exception message), in [`normalize::ORDER`].
     ///
-    /// Applies the always-safe line-ending hygiene
-    /// ([`normalize_line_endings`]); the opt-in transforms above are declared
-    /// but inert until a later step wires them (each gated behind its flag, so
-    /// strict mode stays byte-exact). `strip_vm_diagnostics` is **not** applied
-    /// here — it is stderr-only, see [`apply_stderr`](Self::apply_stderr).
+    /// Deriving the list from the single ordered table — rather than open-
+    /// coding the sequence here — is what keeps "which rules ran" answerable
+    /// from a report: [`describe`](Self::describe) prints exactly what
+    /// [`apply`](Self::apply) did.
+    pub fn active_rules(&self) -> Vec<&'static NormalizationRule> {
+        normalize::ORDER
+            .iter()
+            .filter(|r| !r.stderr_only && self.selects(r.id))
+            .collect()
+    }
+
+    /// The rules this normalizer applies to a captured **stderr**: the
+    /// stderr-only pair first (ANSI, then VM diagnostics — the tracing lines
+    /// are colourised, so a match on `cratonvm_` has to happen after the escape
+    /// codes are gone), then the shared rules.
+    pub fn active_stderr_rules(&self) -> Vec<&'static NormalizationRule> {
+        normalize::ORDER
+            .iter()
+            .filter(|r| self.selects(r.id))
+            .collect()
+    }
+
+    /// Whether this normalizer selects the rule named `id`.
+    fn selects(&self, id: &str) -> bool {
+        match id {
+            // Always on: line-ending hygiene is applied at capture time too.
+            "line-endings" => true,
+            "identity-hash" | "hex-address" => self.mask_hashes,
+            "thread-id" => self.mask_thread_ids,
+            "timestamp" => self.mask_timestamps,
+            "path-separator" => self.normalize_path_separators,
+            "absolute-path" => self.strip_paths,
+            "frame-line-numbers" => self.mask_frame_line_numbers,
+            "sort-lines" => self.sort_lines,
+            "ansi" | "vm-diagnostics" => self.strip_vm_diagnostics,
+            _ => false,
+        }
+    }
+
+    /// A one-line, human-readable description of the active rule set, for the
+    /// header of a run/gate report. A reader must be able to see, without
+    /// reading the source, which transforms stood between the two VMs.
+    pub fn describe(&self) -> String {
+        let ids: Vec<&str> = self.active_stderr_rules().iter().map(|r| r.id).collect();
+        format!(
+            "normalization: {} | stderr {}",
+            ids.join(","),
+            if self.gate_stderr { "gated" } else { "ungated" }
+        )
+    }
+
+    /// Apply normalization to one captured stream (stdout, or an exception
+    /// message).
+    ///
+    /// `strip_vm_diagnostics` is **not** applied here — it is stderr-only, see
+    /// [`apply_stderr`](Self::apply_stderr).
     pub fn apply(&self, s: &str) -> String {
-        let normalized = normalize_line_endings(s);
-        if self.sort_lines {
-            let mut lines: Vec<&str> = normalized.lines().collect();
-            lines.sort_unstable();
-            return lines.join("\n");
-        }
-        normalized
+        self.active_rules()
+            .into_iter()
+            .fold(s.to_string(), |acc, r| r.apply(&acc))
     }
 
-    /// Apply normalization to a captured **stderr**.
-    ///
-    /// Identical to [`apply`](Self::apply) unless `strip_vm_diagnostics` is
-    /// set, in which case ANSI escapes are removed first and every surviving
-    /// VM-diagnostic line is dropped. Order matters: the tracing lines are
-    /// colourised, so a match on `cratonvm_` has to happen *after* the escape
-    /// codes are gone.
+    /// Apply normalization to a captured **stderr**: as [`apply`](Self::apply),
+    /// plus the two stderr-only rules when `strip_vm_diagnostics` is set.
     pub fn apply_stderr(&self, s: &str) -> String {
-        if !self.strip_vm_diagnostics {
-            return self.apply(s);
-        }
-        let plain = strip_ansi(s);
-        let kept: Vec<&str> = plain.lines().filter(|l| !is_vm_diagnostic(l)).collect();
-        self.apply(&kept.join("\n"))
+        self.active_stderr_rules()
+            .into_iter()
+            .fold(s.to_string(), |acc, r| r.apply(&acc))
     }
-}
-
-/// Remove ANSI/VT escape sequences (`ESC [ … final-byte`, and a bare `ESC`
-/// followed by one byte) so a colourised tracing line can be matched on its
-/// text. Non-escape bytes pass through untouched.
-pub fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek().copied() {
-            // CSI: consume parameter/intermediate bytes up to the final byte.
-            Some('[') => {
-                chars.next();
-                for c in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            // Any other two-byte escape.
-            Some(_) => {
-                chars.next();
-            }
-            None => {}
-        }
-    }
-    out
-}
-
-/// Whether an (ANSI-stripped) stderr line is CratonVM's own diagnostic chatter
-/// rather than program output.
-///
-/// Three shapes, all of them things HotSpot has no counterpart for:
-/// `tracing` records naming a `cratonvm_*` target, and the two bracketed
-/// prefixes the VM prints on its own (`[cratonvm]`, `[NativeBridge]`).
-fn is_vm_diagnostic(line: &str) -> bool {
-    let t = line.trim();
-    t.contains("[cratonvm]") || t.contains("[NativeBridge]") || t.contains("cratonvm_")
-}
-
-/// CRLF→LF and trailing-whitespace trim, so a stray platform `\r` cannot
-/// masquerade as a behavioral divergence. Lifted from
-/// `vm/tests/intrinsic_diff.rs`'s `normalize`.
-pub fn normalize_line_endings(s: &str) -> String {
-    s.replace("\r\n", "\n").trim_end().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -247,14 +273,21 @@ impl Verdict {
     }
 }
 
-/// Compare two observations under `normalizer`.
+/// Compare two observations under `normalizer`, one **dimension at a time**.
 ///
-/// Hard channels (any disagreement is a divergence): **exit code**, **uncaught
-/// exception identity** (fqcn exact, message exact-after-normalize, frames in
-/// order), and **stdout** (exact after normalize). A CratonVM **timeout** while
+/// Every gated dimension is judged independently and contributes its own
+/// [`ChannelDiff`], so a divergence report says *which* observable moved rather
+/// than "these two runs differ". Hard dimensions (any disagreement is a
+/// divergence): exit code, exception presence / type / message / frames,
+/// stdout, and the program's declared checksums. A CratonVM **timeout** while
 /// HotSpot finished is reported on the exit-code channel (`<timeout>`). stderr
-/// is contextual and not gated here (warnings differ legitimately) — exception
-/// identity is the gated slice of stderr.
+/// is contextual and gated only under the profile modes' normalizer, because
+/// CratonVM's warnings legitimately differ from HotSpot's silence.
+///
+/// The `cratonvm` / `hotspot` field names are positional: the first argument is
+/// whatever is under test and the second is the reference. [`crate::crossmode`]
+/// reuses this to compare two CratonVM paths against *each other*, where
+/// neither side is HotSpot.
 pub fn compare(cratonvm: &Observation, hotspot: &Observation, normalizer: &Normalizer) -> Verdict {
     let mut diffs = Vec::new();
 
@@ -269,10 +302,12 @@ pub fn compare(cratonvm: &Observation, hotspot: &Observation, normalizer: &Norma
         });
     }
 
-    // Uncaught exception identity.
-    if let Some(diff) = compare_exception(&cratonvm.exception, &hotspot.exception, normalizer) {
-        diffs.push(diff);
-    }
+    // Uncaught exception: presence, then type / message / frames.
+    diffs.extend(compare_exception(
+        &cratonvm.exception,
+        &hotspot.exception,
+        normalizer,
+    ));
 
     // stdout (strict after normalization).
     let c_out = normalizer.apply(&cratonvm.stdout);
@@ -283,6 +318,16 @@ pub fn compare(cratonvm: &Observation, hotspot: &Observation, normalizer: &Norma
             cratonvm: c_out,
             hotspot: h_out,
         });
+    }
+
+    // Program-declared checksums, read from **un-normalized** stdout.
+    //
+    // This is the guard against a normalization rule laundering a real result:
+    // `sort-lines` or `hex-address` can make the stdout dimension agree, but
+    // they cannot reach the checksum, so the divergence still surfaces — and
+    // names the quantity rather than the byte offset.
+    if let Some(diff) = compare_checksums(cratonvm, hotspot) {
+        diffs.push(diff);
     }
 
     // stderr — gated only under the profile modes' normalizer, and only after
@@ -304,6 +349,41 @@ pub fn compare(cratonvm: &Observation, hotspot: &Observation, normalizer: &Norma
     } else {
         Verdict::Diverge(diffs)
     }
+}
+
+/// The declared checksums of an observation's stdout, read through line-ending
+/// hygiene only — no maskable rule may touch them.
+pub fn checksums_of(o: &Observation) -> Checksums {
+    checksum::extract(&normalize_line_endings(&o.stdout))
+}
+
+/// Compare the two sides' declared checksums. `None` when they agree (including
+/// when neither program declared any, in which case the dimension is simply
+/// absent rather than vacuously passing).
+fn compare_checksums(cratonvm: &Observation, hotspot: &Observation) -> Option<ChannelDiff> {
+    let c = checksums_of(cratonvm);
+    let h = checksums_of(hotspot);
+    let names = checksum::differing_names(&c, &h);
+    if names.is_empty() {
+        return None;
+    }
+    // Report only the differing names: a seed declaring twenty checksums must
+    // not bury the one that moved.
+    let pick = |sums: &Checksums| {
+        names
+            .iter()
+            .map(|n| match sums.get(n) {
+                Some(v) => format!("{n}={v}"),
+                None => format!("{n}=<not declared>"),
+            })
+            .collect::<Vec<String>>()
+            .join("\n")
+    };
+    Some(ChannelDiff {
+        channel: Channel::Checksum,
+        cratonvm: pick(&c),
+        hotspot: pick(&h),
+    })
 }
 
 /// Whether two observations are equal on the **gated** observables — stdout

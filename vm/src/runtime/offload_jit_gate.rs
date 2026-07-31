@@ -133,13 +133,25 @@ use crate::classloading::ClassId;
 use crate::vm::SharedVm;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
-/// Process-lifetime cache of admission verdicts, keyed by the caller
-/// method's `(ClassId, method_index_in_class)` — the same stable key
-/// [`crate::runtime::offload::OffloadCache`] uses. See the module docs'
-/// "Design" section for why this is never invalidated.
-static GATE_CACHE: OnceLock<RwLock<FxHashMap<(ClassId, u16), bool>>> = OnceLock::new();
+/// Process-lifetime cache of admission verdicts, keyed by the owning VM's
+/// identity plus the caller method's `(ClassId, method_index_in_class)` — the
+/// same stable key [`crate::runtime::offload::OffloadCache`] uses. See the
+/// module docs' "Design" section for why this is never invalidated.
+///
+/// PER-VM STATE (P0, `docs/architecture/per-vm-state.md`). The `vm_identity`
+/// component is load-bearing, not decorative: `ClassId`s are allocated per-VM
+/// (`ClassStore::next_id` returns `self.classes.len()`), so with two VMs live
+/// `(ClassId(7), 3)` names two unrelated methods. Without the VM key, the
+/// second VM would read the first VM's verdict and either deny JIT admission
+/// to a method with no offloadable `invokestatic` (a silent throughput cliff)
+/// or — the dangerous direction — admit a method the analyzer would have
+/// blocked. The verdict is a function of the method's bytecode, which lives in
+/// a specific VM's class store, so the VM has to be part of the key.
+type GateKey = (usize, ClassId, u16);
 
-fn cache() -> &'static RwLock<FxHashMap<(ClassId, u16), bool>> {
+static GATE_CACHE: OnceLock<RwLock<FxHashMap<GateKey, bool>>> = OnceLock::new();
+
+fn cache() -> &'static RwLock<FxHashMap<GateKey, bool>> {
     GATE_CACHE.get_or_init(|| RwLock::new(FxHashMap::default()))
 }
 
@@ -156,7 +168,7 @@ pub fn caller_blocks_jit(shared: &SharedVm, class_id: ClassId, method_index: u16
     if !shared.config.gpu_offload_enabled {
         return false;
     }
-    let key = (class_id, method_index);
+    let key: GateKey = (shared.vm_identity, class_id, method_index);
     if let Some(&verdict) = cache().read().get(&key) {
         return verdict;
     }

@@ -324,38 +324,44 @@ pub fn reset_raw_memory_gate_memo() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::mock_ctx;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_native_api::{
         capability_audit, install_capabilities, uninstall_capabilities, CapabilityKind,
         CapabilitySet, VmId,
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    /// `MockNativeContext::vm_identity()` is the default `0` for every mock, and
-    /// `install_capabilities` is keyed on exactly that — so two capability
-    /// tests running concurrently would install over each other. Serialize
-    /// them, the same shape as `panama::tests::NATIVE_ACCESS_TEST_LOCK`.
-    fn capability_test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    /// Hands out a VM identity nothing else in the suite uses.
+    ///
+    /// `install_capabilities` is a process-global index keyed on
+    /// `vm_identity()`, and every other mock context in the crate reports the
+    /// default `0`. Installing an `Enforce` policy under `0` would be visible
+    /// to every test running in parallel and could refuse *their* I/O. A
+    /// private identity per test keeps the blast radius at zero and lets these
+    /// tests run unserialized.
+    fn ctx_with_private_vm() -> (MockNativeContext, VmId) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0xCA9_0001);
+        let raw = NEXT.fetch_add(1, Ordering::Relaxed);
+        let ctx = mock_ctx();
+        ctx.set_vm_identity(raw);
+        (ctx, VmId::from_raw(raw))
     }
 
-    /// Install `set` for the mock's VM for the duration of the guard.
+    /// Installs a policy for one VM and removes it on drop.
     struct PolicyGuard {
         vm: VmId,
-        _lock: MutexGuard<'static, ()>,
     }
 
     impl PolicyGuard {
         fn install(set: CapabilitySet) -> PolicyGuard {
-            let lock = capability_test_lock();
             let vm = set.vm();
             install_capabilities(Arc::new(set));
+            // The raw-memory memo is keyed by VM, so a private identity is
+            // already a miss — reset anyway so a policy re-installed for the
+            // same VM inside one test is picked up.
             reset_raw_memory_gate_memo();
-            PolicyGuard { vm, _lock: lock }
+            PolicyGuard { vm }
         }
     }
 
@@ -366,11 +372,8 @@ mod tests {
         }
     }
 
-    /// The VM the mock context reports.
-    const MOCK_VM: VmId = VmId::from_raw(0);
-
-    fn policy(mode: CapabilityMode, grants: &str) -> CapabilitySet {
-        let mut set = CapabilitySet::new(MOCK_VM, mode);
+    fn policy(vm: VmId, mode: CapabilityMode, grants: &str) -> CapabilitySet {
+        let mut set = CapabilitySet::new(vm, mode);
         if !grants.is_empty() {
             let bad = set.grant_from_list(grants);
             assert!(bad.is_empty(), "unparseable grants: {bad:?}");
@@ -378,7 +381,7 @@ mod tests {
         set
     }
 
-    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+    static TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
 
     fn temp_path(tag: &str) -> String {
         let n = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -397,9 +400,9 @@ mod tests {
         std::fs::write(path, bytes).expect("temp file must be writable");
     }
 
-    /// How many times the audit recorded `kind` with any scope.
-    fn recorded(kind: CapabilityKind) -> u64 {
-        capability_audit(MOCK_VM)
+    /// How many checks the audit recorded for `kind`, across every scope.
+    fn recorded(vm: VmId, kind: CapabilityKind) -> u64 {
+        capability_audit(vm)
             .map(|r| {
                 r.uses
                     .iter()
@@ -411,16 +414,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // No policy at all — the configuration every existing test runs in
+    // No policy at all — the configuration the whole suite runs in today
     // -----------------------------------------------------------------------
 
     #[test]
     fn no_policy_installed_means_the_helpers_are_the_raw_openers() {
-        let _lock = capability_test_lock();
-        uninstall_capabilities(MOCK_VM);
-        reset_raw_memory_gate_memo();
-
-        let ctx = mock_ctx();
+        let (ctx, vm) = ctx_with_private_vm();
         let path = temp_path("nopolicy");
         write_file(&path, b"craton");
 
@@ -429,13 +428,14 @@ mod tests {
         let n = ctx.fd_table().read_bytes(fd, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"craton");
         let _ = ctx.fd_table().close(fd);
-        let _ = std::fs::remove_file(&path);
 
+        gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS)
+            .expect("raw memory is ungated when no policy is installed");
         assert!(
-            gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS).is_ok(),
-            "raw memory is ungated when no policy is installed"
+            capability_audit(vm).is_none(),
+            "no policy means nothing to report"
         );
-        assert!(capability_audit(MOCK_VM).is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     // -----------------------------------------------------------------------
@@ -444,86 +444,76 @@ mod tests {
 
     #[test]
     fn permissive_allows_a_read_and_changes_nothing_observable() {
-        let ctx = mock_ctx();
+        let (ctx, vm) = ctx_with_private_vm();
         let path = temp_path("permissive");
         write_file(&path, b"0123456789");
 
         // Baseline: the raw opener, no policy installed.
-        let (baseline_bytes, baseline_len) = {
-            let _lock = capability_test_lock();
-            uninstall_capabilities(MOCK_VM);
+        let mut baseline = [0u8; 10];
+        let baseline_len = {
             let fd = ctx.fd_table().open_read(&path).unwrap();
-            let mut buf = [0u8; 10];
-            let n = ctx.fd_table().read_bytes(fd, &mut buf).unwrap();
+            let n = ctx.fd_table().read_bytes(fd, &mut baseline).unwrap();
             let _ = ctx.fd_table().close(fd);
-            (buf, n)
+            n
         };
 
-        // Same operation through the gate, under a Permissive policy with no
-        // grants at all. Same fd semantics, same bytes, same success.
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Permissive, ""));
+        // The same operation through the gate under a `Permissive` policy with
+        // no grants at all: same success, same length, same bytes.
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Permissive, ""));
         let fd = open_read_gated(&ctx, &path).expect("permissive must allow");
-        let mut buf = [0u8; 10];
-        let n = ctx.fd_table().read_bytes(fd, &mut buf).unwrap();
+        let mut gated = [0u8; 10];
+        let n = ctx.fd_table().read_bytes(fd, &mut gated).unwrap();
         let _ = ctx.fd_table().close(fd);
 
         assert_eq!(n, baseline_len, "gated read returned a different length");
-        assert_eq!(buf, baseline_bytes, "gated read returned different bytes");
-
-        // And the use was recorded, so the audit report is not silent.
+        assert_eq!(gated, baseline, "gated read returned different bytes");
         assert!(
-            recorded(CapabilityKind::FileRead) >= 1,
+            recorded(vm, CapabilityKind::FileRead) >= 1,
             "permissive must still record the file-read"
         );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn permissive_records_the_normalized_path_scope_and_the_native_call_site() {
-        let ctx = mock_ctx();
-        let path = temp_path("scope");
+    fn track_caller_names_the_calling_native_not_the_helper() {
+        let (ctx, vm) = ctx_with_private_vm();
+        let path = temp_path("site");
         write_file(&path, b"x");
 
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Permissive, ""));
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Permissive, ""));
         let fd = open_read_gated(&ctx, &path).unwrap();
         let _ = ctx.fd_table().close(fd);
 
-        let report = capability_audit(MOCK_VM).expect("a policy is installed");
+        let report = capability_audit(vm).expect("a policy is installed");
         let row = report
             .uses
             .iter()
             .find(|u| u.capability.kind() == CapabilityKind::FileRead)
             .expect("file-read must appear in the report");
-        // `#[track_caller]` must carry through the helper: the recorded site is
-        // this test file, not capability_gate's internals.
         assert!(
             row.first_site.file.ends_with("capability_gate.rs"),
-            "first site should be the calling native, got {}",
+            "the recorded site should be the caller, got {}",
             row.first_site
         );
         let _ = std::fs::remove_file(&path);
     }
 
     // -----------------------------------------------------------------------
-    // Audit — allows, records, and tallies what an Enforce flip would refuse
+    // Audit — allows, records, and prices the Enforce flip
     // -----------------------------------------------------------------------
 
     #[test]
     fn audit_allows_but_tallies_the_ungranted_use() {
-        let ctx = mock_ctx();
+        let (ctx, vm) = ctx_with_private_vm();
         let path = temp_path("audit");
         write_file(&path, b"audit");
 
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Audit, ""));
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Audit, ""));
         let fd = open_read_gated(&ctx, &path).expect("audit mode must still allow");
         let _ = ctx.fd_table().close(fd);
 
-        let report = capability_audit(MOCK_VM).expect("a policy is installed");
-        assert_eq!(
-            report.mode,
-            CapabilityMode::Audit,
-            "the report must name the mode it ran in"
-        );
+        let report = capability_audit(vm).expect("a policy is installed");
+        assert_eq!(report.mode, CapabilityMode::Audit);
         assert!(report.total_checks() >= 1, "audit mode must record the use");
         assert!(
             report.total_ungranted() >= 1,
@@ -534,14 +524,14 @@ mod tests {
 
     #[test]
     fn audit_counts_every_raw_memory_access_not_just_the_first() {
-        let ctx = mock_ctx();
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Audit, ""));
+        let (ctx, vm) = ctx_with_private_vm();
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Audit, ""));
 
         for _ in 0..5 {
             gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS).expect("audit allows");
         }
         assert_eq!(
-            recorded(CapabilityKind::RawMemory),
+            recorded(vm, CapabilityKind::RawMemory),
             5,
             "Audit mode takes the Checked arm and must not memoize"
         );
@@ -549,16 +539,16 @@ mod tests {
 
     #[test]
     fn permissive_raw_memory_records_the_capability_then_goes_transparent() {
-        let ctx = mock_ctx();
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Permissive, ""));
+        let (ctx, vm) = ctx_with_private_vm();
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Permissive, ""));
 
         for _ in 0..64 {
             gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS).expect("permissive allows");
         }
         // Present in the report (so the capability is discoverable) but counted
-        // once per thread, which is the documented trade — see the doc comment.
+        // once per thread — the documented trade on `gate_raw_memory`.
         assert_eq!(
-            recorded(CapabilityKind::RawMemory),
+            recorded(vm, CapabilityKind::RawMemory),
             1,
             "permissive raw-memory is recorded once per thread by design"
         );
@@ -570,11 +560,12 @@ mod tests {
 
     #[test]
     fn enforce_denies_an_ungranted_read() {
-        let ctx = mock_ctx();
+        let (ctx, vm) = ctx_with_private_vm();
         let path = temp_path("denyread");
         write_file(&path, b"secret");
 
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, "file-read:/nowhere"));
+        let _guard =
+            PolicyGuard::install(policy(vm, CapabilityMode::Enforce, "file-read:/nowhere"));
         let err = open_read_gated(&ctx, &path).expect_err("enforce must refuse");
         assert!(
             matches!(err, FdCapabilityError::Denied(_)),
@@ -584,35 +575,36 @@ mod tests {
     }
 
     #[test]
-    fn a_denied_read_reserves_no_descriptor() {
-        let ctx = mock_ctx();
-        let path = temp_path("nofd");
-        write_file(&path, b"secret");
+    fn a_denied_open_is_refused_before_the_syscall() {
+        let (ctx, vm) = ctx_with_private_vm();
+        // A path that does not exist. The *raw* opener answers `NotFound` (it
+        // reached `fs::File::open`); the gated opener must answer `Denied`
+        // instead, which is only possible if the check ran first — so no fd
+        // was reserved and no syscall was issued.
+        let path = temp_path("missing");
+        assert!(matches!(
+            ctx.fd_table().open_read(&path).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::NotFound)
+        ));
 
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, "file-read:/nowhere"));
-        // Two probes of the fd counter around the denial: an fd reserved by the
-        // refused open would show up as a gap between them.
-        let before = ctx.fd_table().open_read(&path).unwrap();
-        let denied = open_read_gated(&ctx, &path);
-        let after = ctx.fd_table().open_read(&path).unwrap();
-        assert!(denied.is_err());
-        assert_eq!(
-            after,
-            before + 1,
-            "the denied open must not have consumed an fd"
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Enforce, ""));
+        assert!(
+            matches!(
+                open_read_gated(&ctx, &path),
+                Err(FdCapabilityError::Denied(_))
+            ),
+            "the refusal must precede the open, so it cannot surface as NotFound"
         );
-        let _ = ctx.fd_table().close(before);
-        let _ = ctx.fd_table().close(after);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn a_denied_write_creates_no_file() {
-        let ctx = mock_ctx();
+        let (ctx, vm) = ctx_with_private_vm();
         let path = temp_path("nocreate");
         assert!(!std::path::Path::new(&path).exists());
 
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, "file-write:/nowhere"));
+        let _guard =
+            PolicyGuard::install(policy(vm, CapabilityMode::Enforce, "file-write:/nowhere"));
         let denied = open_write_gated(&ctx, &path, false);
         assert!(matches!(denied, Err(FdCapabilityError::Denied(_))));
         assert!(
@@ -623,14 +615,13 @@ mod tests {
 
     #[test]
     fn enforce_admits_a_granted_path_and_refuses_a_traversal_out_of_it() {
-        let ctx = mock_ctx();
-        let dir = std::env::temp_dir();
-        let root = dir.to_string_lossy().into_owned();
+        let (ctx, vm) = ctx_with_private_vm();
+        let root = std::env::temp_dir().to_string_lossy().into_owned();
         let path = temp_path("granted");
         write_file(&path, b"ok");
 
         let grants = format!("file-read:{root}");
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, &grants));
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Enforce, &grants));
 
         let fd = open_read_gated(&ctx, &path).expect("a file under the granted root is admitted");
         let _ = ctx.fd_table().close(fd);
@@ -649,14 +640,14 @@ mod tests {
 
     #[test]
     fn read_write_open_needs_both_capabilities() {
-        let ctx = mock_ctx();
+        let (ctx, vm) = ctx_with_private_vm();
         let root = std::env::temp_dir().to_string_lossy().into_owned();
         let path = temp_path("rwboth");
         write_file(&path, b"rw");
 
-        // Read granted, write not.
-        let grants = format!("file-read:{root}");
-        let guard = PolicyGuard::install(policy(CapabilityMode::Enforce, &grants));
+        // Read granted, write not: the fd could still write, so this is refused.
+        let read_only = format!("file-read:{root}");
+        let guard = PolicyGuard::install(policy(vm, CapabilityMode::Enforce, &read_only));
         assert!(
             matches!(
                 open_read_write_gated(&ctx, &path, false),
@@ -666,8 +657,8 @@ mod tests {
         );
         drop(guard);
 
-        let grants = format!("file-read:{root};file-write:{root}");
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, &grants));
+        let both = format!("file-read:{root};file-write:{root}");
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Enforce, &both));
         let fd = open_read_write_gated(&ctx, &path, false).expect("both granted");
         let _ = ctx.fd_table().close(fd);
         let _ = std::fs::remove_file(&path);
@@ -675,38 +666,40 @@ mod tests {
 
     #[test]
     fn enforce_denies_an_ungranted_bind_and_binds_nothing() {
-        let ctx = mock_ctx();
+        let (ctx, vm) = ctx_with_private_vm();
         let _guard = PolicyGuard::install(policy(
+            vm,
             CapabilityMode::Enforce,
             "network:127.0.0.1:9000-9100",
         ));
-        // Port 0 is outside the granted range.
-        let denied = open_tcp_listener_gated(&ctx, "127.0.0.1:0");
+        // Port 0 is outside the granted range, so the bind never happens.
         assert!(
-            matches!(denied, Err(FdCapabilityError::Denied(_))),
-            "bind outside the granted port range must be refused"
+            matches!(
+                open_tcp_listener_gated(&ctx, "127.0.0.1:0"),
+                Err(FdCapabilityError::Denied(_))
+            ),
+            "a bind outside the granted port range must be refused"
         );
         assert!(
-            recorded(CapabilityKind::Network) >= 1,
+            recorded(vm, CapabilityKind::Network) >= 1,
             "the refused bind must still be recorded"
         );
     }
 
     #[test]
     fn enforce_denies_raw_memory_and_keeps_denying_it() {
-        let ctx = mock_ctx();
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, ""));
+        let (ctx, vm) = ctx_with_private_vm();
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Enforce, ""));
         for _ in 0..3 {
             let err = gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS)
                 .expect_err("enforce with no raw-memory grant must refuse");
-            // The refusal is a SecurityException-shaped failure.
             assert!(
                 format!("{err:?}").contains("SecurityException"),
-                "denial must map to SecurityException, got {err:?}"
+                "a denial must map to SecurityException, got {err:?}"
             );
         }
         assert_eq!(
-            recorded(CapabilityKind::RawMemory),
+            recorded(vm, CapabilityKind::RawMemory),
             3,
             "Enforce must not memoize the verdict away"
         );
@@ -714,23 +707,24 @@ mod tests {
 
     #[test]
     fn a_raw_memory_grant_admits_the_unsafe_address_scope() {
-        let ctx = mock_ctx();
+        let (ctx, vm) = ctx_with_private_vm();
         let grants = format!("raw-memory:{RAW_MEMORY_UNSAFE_ADDRESS}");
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, &grants));
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Enforce, &grants));
         gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS).expect("the exact scope is granted");
     }
 
     #[test]
-    fn process_spawn_and_foreign_gates_record_their_scopes() {
-        let ctx = mock_ctx();
-        let _guard = PolicyGuard::install(policy(CapabilityMode::Audit, ""));
+    fn spawn_and_foreign_gates_record_a_scope_that_round_trips_as_a_grant() {
+        let (ctx, vm) = ctx_with_private_vm();
+        let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Audit, ""));
 
         gate_process_spawn(&ctx, "/bin/sh").expect("audit allows");
         gate_foreign_upcall(&ctx, "com.example.Callback::onEvent").expect("audit allows");
         gate_foreign_downcall(&ctx, "snprintf").expect("audit allows");
+        gate_library_load(&ctx, "ssl").expect("audit allows");
         gate_network(&ctx, "example.invalid:443").expect("audit allows");
 
-        let report = capability_audit(MOCK_VM).unwrap();
+        let report = capability_audit(vm).unwrap();
         let grants = report.suggested_grants();
         assert!(grants.contains("process-spawn:"), "{grants}");
         assert!(
@@ -738,6 +732,19 @@ mod tests {
             "{grants}"
         );
         assert!(grants.contains("foreign-downcall:snprintf"), "{grants}");
+        assert!(grants.contains("library-load:ssl"), "{grants}");
         assert!(grants.contains("network:example.invalid:443"), "{grants}");
+
+        // The derived grant list, loaded into a fresh `Enforce` set, admits
+        // exactly what the run did — the gates and the report agree.
+        let (ctx2, vm2) = ctx_with_private_vm();
+        let _guard2 = PolicyGuard::install(policy(vm2, CapabilityMode::Enforce, &grants));
+        gate_process_spawn(&ctx2, "/bin/sh").expect("derived grant must admit the spawn");
+        gate_foreign_downcall(&ctx2, "snprintf").expect("derived grant must admit the downcall");
+        assert!(
+            gate_foreign_downcall(&ctx2, "system").is_err(),
+            "the derived grant must not admit a symbol the run never used"
+        );
     }
 }
+

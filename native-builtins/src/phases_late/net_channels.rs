@@ -43,7 +43,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             let addr_obj = args.first().copied().unwrap_or(Value::Object(None));
             let addr_str = p98_extract_socket_addr(ctx, addr_obj);
             let mut sc_obj = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
-            match ctx.fd_table().open_tcp_connect(&addr_str) {
+            match crate::capability_gate::open_tcp_connect_gated(&*ctx, &addr_str) {
                 Ok(fd) => {
                     ctx.set_field(sc_obj, 0, Value::Int(1));
                     ctx.set_field(sc_obj, 1, Value::Int(1));
@@ -77,7 +77,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         }
         let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
         let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-        match ctx.fd_table().open_tcp_connect(&addr_str) {
+        match crate::capability_gate::open_tcp_connect_gated(&*ctx, &addr_str) {
             Ok(fd) => {
                 ctx.set_field(this, 0, Value::Int(1));
                 // Pin across the create_string below — a moving young GC there
@@ -261,7 +261,10 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             if crate::nbflags().dbg_nio_bind {
                 eprintln!("[NIO_BIND] ssc.bind 1-arg addr='{}'", addr_str);
             }
-            match ctx.fd_table().open_tcp_listener(&addr_str) {
+            // GAP I6: server-socket bind was ungated — binding is an authority
+            // in its own right (a listener on 0.0.0.0 exposes the host), not a
+            // weaker form of connecting.
+            match crate::capability_gate::open_tcp_listener_gated(&*ctx, &addr_str) {
                 Ok(fd) => {
                     ctx.set_field(this, 1, Value::Int(1));
                     ctx.set_field(this, 2, Value::Int(fd as i32));
@@ -281,6 +284,11 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                         }
                     }
                     Ok(Some(Value::Object(Some(this))))
+                }
+                // A capability refusal is a `SecurityException`, not the
+                // `IOException` a failed bind raises.
+                Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+                    Err(denied.into())
                 }
                 Err(e) => {
                     if crate::nbflags().dbg_nio_bind {
@@ -314,7 +322,8 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                     addr_str, backlog
                 );
             }
-            match ctx.fd_table().open_tcp_listener(&addr_str) {
+            // GAP I6 — see the 1-arg `bind` above.
+            match crate::capability_gate::open_tcp_listener_gated(&*ctx, &addr_str) {
                 Ok(fd) => {
                     ctx.set_field(this, 1, Value::Int(1));
                     ctx.set_field(this, 2, Value::Int(fd as i32));
@@ -332,6 +341,10 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                         }
                     }
                     Ok(Some(Value::Object(Some(this))))
+                }
+                // A capability refusal is a `SecurityException`.
+                Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+                    Err(denied.into())
                 }
                 Err(e) => {
                     if crate::nbflags().dbg_nio_bind {

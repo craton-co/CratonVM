@@ -137,7 +137,9 @@ impl JitVerifyConfig {
     /// that has already been folded into the two lanes it seeds.
     #[inline]
     pub fn any_optional_lane(&self) -> bool {
-        self.check_types || self.check_frame_states || self.check_memory_chain
+        self.check_types
+            || self.check_frame_states
+            || self.check_memory_chain
             || self.check_arena_order
     }
 }
@@ -449,6 +451,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_schedule_still_seeds_the_two_lanes_it_was_split_into() {
+        let alias = JitVerifyConfig::from_source(&src(&[("CRATONVM_JIT_VERIFY_SCHEDULE", "1")]));
+        assert!(alias.check_memory_chain);
+        assert!(alias.check_arena_order);
+
+        // An explicit lane wins over the alias in both directions.
+        let narrowed = JitVerifyConfig::from_source(&src(&[
+            ("CRATONVM_JIT_VERIFY_SCHEDULE", "1"),
+            ("CRATONVM_JIT_VERIFY_ARENA_ORDER", "0"),
+        ]));
+        assert!(narrowed.check_memory_chain);
+        assert!(!narrowed.check_arena_order);
+
+        let widened =
+            JitVerifyConfig::from_source(&src(&[("CRATONVM_JIT_VERIFY_MEMORY_CHAIN", "1")]));
+        assert!(!widened.check_schedule);
+        assert!(widened.check_memory_chain);
+        assert!(!widened.check_arena_order);
+    }
+
+    #[test]
     fn metrics_ring_of_zero_falls_back_rather_than_blinding_the_ring() {
         let zero = JitMetricsConfig::from_source(&src(&[("CRATONVM_JIT_METRICS_RING", "0")]));
         assert_eq!(zero.ring_capacity, None);
@@ -466,7 +489,8 @@ mod tests {
         let empty = JitMetricsConfig::from_source(&src(&[("CRATONVM_JIT_METRICS_OUT", "")]));
         assert_eq!(empty.out_path(), None);
 
-        let set = JitMetricsConfig::from_source(&src(&[("CRATONVM_JIT_METRICS_OUT", "/tmp/j.jsonl")]));
+        let path = src(&[("CRATONVM_JIT_METRICS_OUT", "/tmp/j.jsonl")]);
+        let set = JitMetricsConfig::from_source(&path);
         assert_eq!(set.out_path(), Some(OsStr::new("/tmp/j.jsonl")));
     }
 
@@ -489,15 +513,17 @@ mod tests {
         );
 
         for word in ["0", "false", "off"] {
-            let c = ThreadStressConfig::from_source(&src(&[("CRATONVM_STRESS_THREAD_STATES", word)]));
-            assert!(!c.checks_enabled(true), "{word:?} must stand the tripwire down");
+            let s = src(&[("CRATONVM_STRESS_THREAD_STATES", word)]);
+            let c = ThreadStressConfig::from_source(&s);
+            assert!(!c.checks_enabled(true), "{word:?} must disarm it");
             assert!(!c.violations_are_fatal());
         }
 
         // Unlike `tristate_word`, an unrecognised value here is *on* — the read
         // site is `Ok(_) => true`.
         for word in ["1", "yes", "banana"] {
-            let c = ThreadStressConfig::from_source(&src(&[("CRATONVM_STRESS_THREAD_STATES", word)]));
+            let s = src(&[("CRATONVM_STRESS_THREAD_STATES", word)]);
+            let c = ThreadStressConfig::from_source(&s);
             assert!(c.checks_enabled(false), "{word:?} must arm the tripwire");
             assert!(c.violations_are_fatal());
         }
@@ -531,6 +557,8 @@ mod tests {
 
         assert!(c.jit_verify.check_types);
         assert!(!c.jit_verify.check_schedule);
+        assert!(!c.jit_verify.check_memory_chain);
+        assert!(!c.jit_verify.check_arena_order);
         assert!(c.jit_metrics.enabled);
         assert_eq!(c.jit_metrics.ring_capacity_or(256), 64);
         assert!(c.gc_metrics.card_metrics);

@@ -370,9 +370,13 @@ fn arrstore_check(
 fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool {
     use parking_lot::Mutex;
     use std::sync::OnceLock;
-    static MEMO: OnceLock<Mutex<std::collections::HashMap<u32, bool>>> = OnceLock::new();
+    // PER-VM STATE (P0, `docs/architecture/per-vm-state.md`): the memo answers
+    // "does this ClassId's name match the EC watch list?", and `ClassId`s are
+    // allocated per-VM, so the key must carry `vm_identity` or a second VM
+    // reads the first VM's verdict for an unrelated class.
+    static MEMO: OnceLock<Mutex<std::collections::HashMap<(usize, u32), bool>>> = OnceLock::new();
     let memo = MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let key = cid.as_u32();
+    let key = (shared.vm_identity, cid.as_u32());
     if let Some(&v) = memo.lock().get(&key) {
         return v;
     }

@@ -1005,7 +1005,7 @@ pub fn record_g1_cycle(
     degraded: u32,
 ) {
     debug_assert!(
-        degraded & !g1_degraded::ALL == 0,
+        (degraded & !g1_degraded::ALL) == 0,
         "record_g1_cycle: degraded mask {degraded:#x} has bits outside g1_degraded::ALL — \
          a new flag was added without extending ALL (and therefore without a label)"
     );

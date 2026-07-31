@@ -1456,7 +1456,8 @@ impl Graph {
     ///
     /// `O(nodes + edges + snapshot slots)`. Called automatically whenever a
     /// mutation finds the lists stale; public so a pass that is about to do
-    /// many rewrites can pay for it up front.
+    /// many rewrites can pay for it up front. An explicit rebuild also turns
+    /// tracking back on if [`Graph::set_use_tracking`] had turned it off.
     pub fn rebuild_use_lists(&mut self) {
         let num_nodes = self.nodes.len();
         self.uses.tracking = true;
@@ -1517,11 +1518,7 @@ impl Graph {
     /// exclusions (snapshot slots do not count).
     pub fn use_count(&self, id: NodeId) -> u32 {
         if self.use_lists_current() {
-            return self
-                .uses
-                .users
-                .get(id as usize)
-                .map_or(0, |u| u.len() as u32);
+            return self.uses.users.get(id as usize).map_or(0, |u| u.len() as u32);
         }
         if id == NO_NODE {
             return 0;
@@ -1823,10 +1820,7 @@ impl Graph {
         }
 
         for (si, sp) in self.safepoints.iter().enumerate() {
-            let halves = [
-                (SlotKind::Local, &sp.locals),
-                (SlotKind::Stack, &sp.stack),
-            ];
+            let halves = [(SlotKind::Local, &sp.locals), (SlotKind::Stack, &sp.stack)];
             for (kind, values) in halves {
                 for (k, &v) in values.iter().enumerate() {
                     if v == NO_NODE || (v as usize) >= num_nodes {
@@ -5475,5 +5469,519 @@ mod tests {
             assert_ne!(id, NO_NODE);
             assert!(g.is_valid_id(id));
         }
+    }
+
+    // ── Compact edge lists (`Inputs`) ────────────────────────────────
+
+    /// `Inputs` must behave like the `Vec<NodeId>` it replaced, including the
+    /// spill from the inline buffer to the heap and back down again.
+    #[test]
+    fn test_inputs_matches_vec_semantics_including_spill() {
+        let mut v: Vec<NodeId> = Vec::new();
+        let mut i = Inputs::new();
+        assert!(i.is_empty());
+        assert_eq!(i.len(), 0);
+        assert!(!i.is_spilled());
+
+        // Push past the inline bound; the two stay identical throughout.
+        for k in 0..(INLINE_INPUTS as NodeId * 3) {
+            v.push(k);
+            i.push(k);
+            assert_eq!(i.as_slice(), v.as_slice(), "after push {k}");
+            assert_eq!(i.len(), v.len());
+        }
+        assert!(
+            i.is_spilled(),
+            "{} entries must have spilled past the inline bound of {}",
+            i.len(),
+            INLINE_INPUTS
+        );
+
+        // Slice access, indexing, iteration, `contains`, equality with a Vec.
+        assert_eq!(i[2], v[2]);
+        assert_eq!(i.first().copied(), Some(0));
+        assert_eq!(&i[1..3], &v[1..3]);
+        assert!(i.contains(&(INLINE_INPUTS as NodeId)));
+        assert_eq!(i.iter().sum::<NodeId>(), v.iter().sum::<NodeId>());
+        assert_eq!(i, v);
+        assert_eq!(i.to_vec(), v);
+
+        // Mutation through the slice.
+        i.as_mut_slice()[0] = 77;
+        v[0] = 77;
+        assert_eq!(i.as_slice(), v.as_slice());
+
+        while let Some(x) = v.pop() {
+            assert_eq!(i.pop(), Some(x));
+            assert_eq!(i.as_slice(), v.as_slice());
+        }
+        assert_eq!(i.pop(), None);
+
+        // The inline boundary itself.
+        let mut j = Inputs::new();
+        for k in 0..INLINE_INPUTS as NodeId {
+            j.push(k);
+            assert!(!j.is_spilled(), "{} entries still fit inline", j.len());
+        }
+        j.push(99);
+        assert!(j.is_spilled());
+        assert_eq!(j.len(), INLINE_INPUTS + 1);
+        j.clear();
+        assert!(j.is_empty());
+
+        // Conversions.
+        let from_vec = Inputs::from(vec![1u32, 2, 3]);
+        assert_eq!(from_vec, vec![1u32, 2, 3]);
+        assert_eq!(from_vec.clone().into_vec(), vec![1u32, 2, 3]);
+        let collected: Inputs = (0..8u32).collect();
+        assert_eq!(collected.len(), 8);
+        assert!(collected.is_spilled());
+        assert_eq!(format!("{:?}", from_vec), "[1, 2, 3]");
+    }
+
+    // ── Incremental def-use edges ────────────────────────────────────
+
+    /// A deterministic LCG — the randomized graphs must be reproducible so a
+    /// failure can be replayed.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 {
+                0
+            } else {
+                self.next() % n
+            }
+        }
+    }
+
+    /// A graph of `n` nodes with random edges into earlier nodes, some
+    /// `NO_NODE` holes, and a handful of safepoint snapshots.
+    fn random_graph(seed: u64, n: usize) -> Graph {
+        let mut g = empty_graph();
+        let mut rng = Lcg(seed);
+        g.add(Op::Start, IrType::Control, vec![], None);
+        for i in 1..n {
+            let arity = rng.below(7) as usize;
+            let mut inputs: Vec<NodeId> = Vec::with_capacity(arity);
+            for _ in 0..arity {
+                // One slot in eight is an undefined placeholder.
+                if rng.below(8) == 0 {
+                    inputs.push(NO_NODE);
+                } else {
+                    inputs.push(rng.below(i as u64) as NodeId);
+                }
+            }
+            let op = if arity == 0 {
+                Op::Const(rng.below(64) as i64)
+            } else {
+                Op::Add
+            };
+            g.add(op, IrType::Int, inputs, None);
+        }
+        for s in 0..6usize {
+            let mut locals: Vec<NodeId> = Vec::new();
+            let mut stack: Vec<NodeId> = Vec::new();
+            for _ in 0..4 {
+                locals.push(if rng.below(4) == 0 {
+                    NO_NODE
+                } else {
+                    rng.below(n as u64) as NodeId
+                });
+            }
+            for _ in 0..2 {
+                stack.push(rng.below(n as u64) as NodeId);
+            }
+            g.safepoints.push(SafepointSnapshot {
+                bci: s,
+                locals,
+                stack,
+            });
+        }
+        g
+    }
+
+    /// Every node and every snapshot slot, compared field by field.
+    fn assert_same_graph(a: &Graph, b: &Graph, what: &str) {
+        assert_eq!(a.nodes.len(), b.nodes.len(), "{what}: node count");
+        for (id, (x, y)) in a.nodes.iter().zip(b.nodes.iter()).enumerate() {
+            assert_eq!(x.op, y.op, "{what}: node {id} op");
+            assert_eq!(x.ty, y.ty, "{what}: node {id} type");
+            assert_eq!(
+                x.inputs.as_slice(),
+                y.inputs.as_slice(),
+                "{what}: node {id} inputs"
+            );
+            assert_eq!(x.bytecode_pc, y.bytecode_pc, "{what}: node {id} pc");
+        }
+        assert_eq!(
+            a.safepoints.len(),
+            b.safepoints.len(),
+            "{what}: safepoint count"
+        );
+        for (si, (x, y)) in a.safepoints.iter().zip(b.safepoints.iter()).enumerate() {
+            assert_eq!(x.bci, y.bci, "{what}: safepoint {si} bci");
+            assert_eq!(x.locals, y.locals, "{what}: safepoint {si} locals");
+            assert_eq!(x.stack, y.stack, "{what}: safepoint {si} stack");
+        }
+    }
+
+    /// A chain: node `i` is `Add(i-1, i-2)`, so every node has exactly two
+    /// inputs and (in the interior) exactly two users. The shape makes the
+    /// operation counts below exact rather than approximate.
+    fn chain_graph(n: usize) -> Graph {
+        assert!(n >= 4);
+        let mut g = empty_graph();
+        g.add(Op::Start, IrType::Control, vec![], None);
+        g.add(Op::Const(1), IrType::Int, vec![], None);
+        g.add(Op::Const(2), IrType::Int, vec![], None);
+        for i in 3..n {
+            g.add(
+                Op::Add,
+                IrType::Int,
+                vec![(i - 1) as NodeId, (i - 2) as NodeId],
+                None,
+            );
+        }
+        g.exit = (n - 1) as NodeId;
+        g
+    }
+
+    /// Use lists follow `add`, `replace_all_uses` and `kill`, and the counts
+    /// they report are the counts the historical scan reported.
+    #[test]
+    fn test_use_lists_maintained_across_add_replace_kill() {
+        let mut g = empty_graph();
+        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = g.add(Op::Const(2), IrType::Int, vec![], None);
+        g.rebuild_use_lists();
+        assert!(g.use_lists_valid());
+
+        // `add` records the new node's edges.
+        let s = g.add(Op::Add, IrType::Int, vec![a, b], None);
+        let t = g.add(Op::Add, IrType::Int, vec![a, a], None);
+        assert!(g.use_lists_valid(), "add keeps the lists current");
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert_eq!(g.use_count(a), 3, "one edge from s, two from t");
+        assert_eq!(g.use_count(b), 1);
+        assert_eq!(g.use_counts(), vec![3, 1, 0, 0]);
+        let mut users = g.users_of(a);
+        users.sort_unstable();
+        assert_eq!(users, vec![s, t]);
+
+        // `replace_all_uses` moves every edge, including the doubled one.
+        g.replace_all_uses(a, b);
+        assert!(g.use_lists_valid());
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert_eq!(g.use_count(a), 0);
+        assert_eq!(g.use_count(b), 4);
+        assert!(g.users_of(a).is_empty());
+
+        // `kill` drops the dead node's outgoing edges.
+        g.kill(t);
+        assert!(g.use_lists_valid());
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert_eq!(g.use_count(b), 2);
+        assert_eq!(g.users_of(b), vec![s]);
+        assert_eq!(g.use_counts(), vec![0, 2, 0, 0]);
+    }
+
+    /// Snapshot slots are use edges too: they are recorded, rewritten and
+    /// verified alongside input edges.
+    #[test]
+    fn test_use_lists_track_safepoint_slots() {
+        let mut g = empty_graph();
+        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = g.add(Op::Const(2), IrType::Int, vec![], None);
+        g.rebuild_use_lists();
+
+        g.push_safepoint(SafepointSnapshot {
+            bci: 0,
+            locals: vec![a, NO_NODE],
+            stack: vec![a, b],
+        });
+        assert!(g.use_lists_valid(), "push_safepoint keeps the lists current");
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert_eq!(g.safepoint_users_of(a).len(), 2);
+        assert_eq!(
+            g.use_count(a),
+            0,
+            "snapshot slots are not input edges and never were"
+        );
+
+        g.replace_all_uses(a, b);
+        assert_eq!(g.safepoints[0].locals[0], b);
+        assert_eq!(g.safepoints[0].locals[1], NO_NODE, "a hole stays a hole");
+        assert_eq!(g.safepoints[0].stack[0], b);
+        assert_eq!(g.safepoints[0].stack[1], b);
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert!(g.safepoint_users_of(a).is_empty());
+        assert_eq!(g.safepoint_users_of(b).len(), 3);
+
+        // The tracked slot writer keeps the lists current …
+        assert!(g.set_safepoint_slot(0, SlotKind::Local, 1, a));
+        assert!(g.use_lists_valid());
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        g.replace_all_uses(a, b);
+        assert_eq!(g.safepoints[0].locals[1], b);
+
+        // … while a snapshot pushed through the public field demotes the next
+        // mutation to the scan, which is exactly the point of the guard.
+        g.safepoints.push(SafepointSnapshot {
+            bci: 1,
+            locals: vec![b],
+            stack: vec![],
+        });
+        assert!(!g.use_lists_valid());
+        g.replace_all_uses(b, a);
+        assert_eq!(g.safepoints[1].locals[0], a, "the scan still rewrote it");
+        assert!(g.use_lists_valid(), "the scan re-derived the lists");
+        assert_eq!(g.verify_use_lists(), Ok(()));
+    }
+
+    /// `verify_use_lists` is the safety net for the invariant, so it has to
+    /// actually fail on a broken list — in both directions.
+    #[test]
+    fn test_verify_use_lists_catches_a_corrupted_list() {
+        let mut g = chain_graph(12);
+        g.rebuild_use_lists();
+        assert_eq!(g.verify_use_lists(), Ok(()));
+
+        // A use that the graph does not have.
+        g.uses.users[4].push_untracked(11);
+        assert!(
+            g.verify_use_lists().is_err(),
+            "an invented use must be reported"
+        );
+        g.rebuild_use_lists();
+        assert_eq!(g.verify_use_lists(), Ok(()));
+
+        // A use the graph has but the list lost.
+        g.uses.users[4].clear_untracked();
+        let err = g.verify_use_lists().expect_err("a dropped use is a bug");
+        assert!(err.contains("node 4"), "unexpected message: {err}");
+
+        // A snapshot slot the list never learned about.
+        g.rebuild_use_lists();
+        g.push_safepoint(SafepointSnapshot {
+            bci: 0,
+            locals: vec![5],
+            stack: vec![],
+        });
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        g.uses.sp_users[5].clear();
+        assert!(g.verify_use_lists().is_err(), "a dropped slot is a bug");
+    }
+
+    /// An edge written through the public `Node::inputs` field cannot notify
+    /// the use lists, so it must demote the next mutation to the full scan
+    /// rather than be silently missed.
+    #[test]
+    fn test_direct_field_writes_demote_to_the_scan() {
+        let mut g = chain_graph(20);
+        g.rebuild_use_lists();
+        assert!(g.use_lists_valid());
+
+        // A brand new edge to node 3, invisible to the lists.
+        g.nodes[5].inputs.push(3);
+        assert!(!g.use_lists_valid(), "the epoch guard must notice");
+
+        g.replace_all_uses(3, 4);
+        assert!(
+            !g.nodes.iter().any(|n| n.inputs.contains(&3)),
+            "the untracked edge must have been rewritten too"
+        );
+        assert!(g.use_lists_valid(), "the scan re-derived the lists");
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert_eq!(g.use_counts(), {
+            g.nodes
+                .iter()
+                .fold(vec![0u32; g.nodes.len()], |mut acc, n| {
+                    for &i in n.inputs.as_slice() {
+                        if (i as usize) < acc.len() {
+                            acc[i as usize] += 1;
+                        }
+                    }
+                    acc
+                })
+        });
+    }
+
+    /// The incremental rewrite must produce the *same graph* as the historical
+    /// full scan on graphs it did not choose, for replacements it did not
+    /// choose. `set_use_tracking(false)` is the reference implementation: it is
+    /// the pre-existing scan, byte for byte.
+    #[test]
+    fn test_replace_all_uses_matches_the_full_scan_on_random_graphs() {
+        for seed in 0..24u64 {
+            let n = 24 + (seed as usize % 40);
+            let mut reference = random_graph(seed, n);
+            let mut incremental = random_graph(seed, n);
+            assert_same_graph(&reference, &incremental, "construction");
+
+            reference.set_use_tracking(false);
+            incremental.rebuild_use_lists();
+
+            let mut rng = Lcg(seed ^ 0xa5a5_5a5a);
+            for round in 0..16 {
+                let old = rng.below(n as u64) as NodeId;
+                let new = rng.below(n as u64) as NodeId;
+
+                // The tracked graph goes first, from a known-current state:
+                // mutating the *reference* graph bumps the shared edge epoch
+                // (its `kill` clears inputs through the public path), which
+                // would otherwise demote every incremental step to a scan and
+                // quietly stop testing the thing under test.
+                incremental.ensure_use_lists();
+                assert!(incremental.use_lists_valid());
+                incremental.replace_all_uses(old, new);
+                assert_eq!(
+                    incremental.verify_use_lists(),
+                    Ok(()),
+                    "seed {seed} round {round}"
+                );
+                reference.replace_all_uses(old, new);
+                assert_same_graph(
+                    &reference,
+                    &incremental,
+                    &format!("seed {seed} round {round} ({old} → {new})"),
+                );
+                assert_eq!(
+                    incremental.use_counts(),
+                    reference.use_counts(),
+                    "seed {seed} round {round}"
+                );
+
+                // Interleave the other mutators so the lists are exercised
+                // against a moving graph, not a frozen one.
+                if round % 4 == 3 {
+                    let victim = rng.below(n as u64) as NodeId;
+                    let holder = rng.below(n as u64) as NodeId;
+                    let val = rng.below(n as u64) as NodeId;
+                    incremental.ensure_use_lists();
+                    incremental.kill(victim);
+                    incremental.push_input(holder, val);
+                    let fresh_i = incremental.add(Op::Add, IrType::Int, vec![old, new], None);
+                    assert_eq!(
+                        incremental.verify_use_lists(),
+                        Ok(()),
+                        "seed {seed} round {round} after mutation"
+                    );
+                    reference.kill(victim);
+                    reference.push_input(holder, val);
+                    let fresh_r = reference.add(Op::Add, IrType::Int, vec![old, new], None);
+                    assert_eq!(fresh_r, fresh_i);
+                    assert_same_graph(
+                        &reference,
+                        &incremental,
+                        &format!("seed {seed} round {round} after mutation"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The measurement the review asked for, made by construction rather than
+    /// by timing: how many node-input slots does one `replace_all_uses` touch?
+    ///
+    /// The chain graph has `n - 3` two-input nodes, so a full scan examines
+    /// `E = 2·(n-3)` slots *per call*, whatever the replacement is. The
+    /// incremental walk visits only the users of the replaced node — exactly
+    /// two of them, of two inputs each — so it examines 4 slots per call
+    /// regardless of `n`. With `R = 8` replacements:
+    ///
+    /// | nodes  | E      | scan `R·E` | incremental `R·4` | ratio  |
+    /// |--------|--------|-----------:|------------------:|-------:|
+    /// | 100    | 194    | 1 552      | 32                | 48.5×  |
+    /// | 1 000  | 1 994  | 15 952     | 32                | 498×   |
+    /// | 5 000  | 9 994  | 79 952     | 32                | 2 498× |
+    /// | 20 000 | 39 994 | 319 952    | 32                | 9 998× |
+    ///
+    /// The incremental cost is independent of graph size; the scan is linear
+    /// in it. (Real passes also pay one rebuild per untracked edit — asserted
+    /// to be zero here — so the end-to-end win on a mutation-heavy pass is
+    /// bounded by how often the pass writes edges through the public field.)
+    #[test]
+    fn test_replace_all_uses_slot_counts_by_graph_size() {
+        // Eight replacement targets, 8 apart, so no target is a user of
+        // another and each rewrite is independent of the ones before it.
+        const ROUNDS: usize = 8;
+        let targets: Vec<NodeId> = (0..ROUNDS).map(|k| (10 + 8 * k) as NodeId).collect();
+
+        for &n in &[100usize, 1_000, 5_000, 20_000] {
+            let edges = 2 * (n - 3) as u64;
+
+            // Reference: the historical full scan.
+            let mut scan = chain_graph(n);
+            scan.set_use_tracking(false);
+            scan.reset_use_list_stats();
+            for &t in &targets {
+                scan.replace_all_uses(t, 1);
+            }
+            assert_eq!(
+                scan.use_list_slots_examined(),
+                ROUNDS as u64 * edges,
+                "the scan examines every input slot on every call (n = {n})"
+            );
+
+            // Incremental: only the users of the replaced node.
+            let mut inc = chain_graph(n);
+            inc.rebuild_use_lists();
+            inc.reset_use_list_stats();
+            for &t in &targets {
+                inc.replace_all_uses(t, 1);
+            }
+            assert_eq!(
+                inc.use_list_slots_examined(),
+                ROUNDS as u64 * 4,
+                "two users of two inputs each, per call (n = {n})"
+            );
+            assert_eq!(
+                inc.use_list_rebuilds(),
+                0,
+                "no rebuild is needed once the lists are current (n = {n})"
+            );
+
+            // Same work, same graph.
+            assert_same_graph(&scan, &inc, &format!("n = {n}"));
+            assert_eq!(inc.verify_use_lists(), Ok(()));
+            assert_eq!(inc.use_counts(), scan.use_counts());
+        }
+    }
+
+    /// A builder-produced graph arrives with its def-use edges already
+    /// current: every edge the builder writes goes through a tracked mutator,
+    /// so the first optimization rewrite is incremental without a warm-up
+    /// scan.
+    #[test]
+    fn test_builder_graphs_arrive_with_current_use_lists() {
+        // iload_0; iload_1; iadd; ireturn
+        let code = [0x1a, 0x1b, 0x60, 0xac, 0, 0];
+        let graph = build_ir(&code, 4, 2, 2);
+        assert!(
+            graph.use_lists_valid(),
+            "the builder must not leave the lists stale"
+        );
+        assert_eq!(graph.verify_use_lists(), Ok(()));
+        let scanned = {
+            let mut counts = vec![0u32; graph.nodes.len()];
+            for node in &graph.nodes {
+                for &inp in node.inputs.as_slice() {
+                    if (inp as usize) < counts.len() {
+                        counts[inp as usize] += 1;
+                    }
+                }
+            }
+            counts
+        };
+        assert_eq!(graph.use_counts(), scanned);
     }
 }

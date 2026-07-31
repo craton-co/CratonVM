@@ -4079,6 +4079,12 @@ fn native_wildfly_security_manager_get_property_privileged(
     }
 }
 
+/// Per-call-site capability gates for this crate's native surface.
+///
+/// `grep capability_gate:: native-builtins/src` is the complete list of gated
+/// sites here; `docs/security/capability-wiring.md` records which of the audit
+/// rows in `docs/security/native-capabilities.md` they close.
+pub mod capability_gate;
 pub mod case_map;
 pub mod lang_class;
 pub mod lang_string;

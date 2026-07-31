@@ -1109,25 +1109,44 @@ fn pin_value_for_native_call(shared: &SharedVm, roots: &mut Vec<ObjectRef>, v: &
     }
 }
 
-/// `java.lang.Object`'s `ClassId`, resolved once and cached lock-free
-/// thereafter. `java.lang.Object` is always loaded before any bytecode runs
-/// (it roots the class hierarchy the VM needs to bootstrap), so in practice
-/// the lookup below succeeds on the very first call — but if it were ever to
-/// return `None`, nothing is cached and the next call retries the real
-/// lookup rather than permanently disabling the stale-receiver check.
+/// `java.lang.Object`'s `ClassId`, resolved once per (host thread, VM) and
+/// cached lock-free thereafter. `java.lang.Object` is always loaded before any
+/// bytecode runs (it roots the class hierarchy the VM needs to bootstrap), so
+/// in practice the lookup below succeeds on the very first call — but if it
+/// were ever to return `None`, nothing is cached and the next call retries the
+/// real lookup rather than permanently disabling the stale-receiver check.
+///
+/// PER-VM STATE (P0, `docs/architecture/per-vm-state.md`). This was a
+/// process-global `OnceLock<ClassId>`. `ClassId`s are allocated per-VM
+/// (`ClassStore::next_id` returns `self.classes.len()`), so with two VMs live
+/// the first VM to boot pinned ITS `java/lang/Object` id for the whole
+/// process; the second VM then compared its own receivers' ids against a
+/// foreign VM's id. The only caller is
+/// `recover_stale_lambda_receiver_from_native_pins`'s `stale_object_receiver`
+/// test, so the failure mode is silent: a genuinely-stale `Object`-typed
+/// receiver stops being recovered (spurious `NoSuchMethodError`), or an
+/// ordinary receiver is misclassified as stale and the native-pin scan runs on
+/// every virtual call. Keyed by `shared.vm_identity` it cannot alias, and the
+/// cache is a thread-local `Cell` exactly like the two wrapper-class caches
+/// below (same shape, same `(vm_identity, ClassId)` key convention).
 #[inline]
 fn object_class_id(shared: &SharedVm) -> Option<ClassId> {
-    use std::sync::OnceLock;
-    static OBJECT_CLASS_ID: OnceLock<ClassId> = OnceLock::new();
-    if let Some(id) = OBJECT_CLASS_ID.get() {
-        return Some(*id);
+    thread_local! {
+        static OBJECT_CLASS_ID: std::cell::Cell<Option<(usize, ClassId)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    let vm_key = shared.vm_identity;
+    if let Some((cached_vm, id)) = OBJECT_CLASS_ID.with(|c| c.get()) {
+        if cached_vm == vm_key {
+            return Some(id);
+        }
     }
     let resolved = shared
         .classes
         .class_manager
         .read()
         .find_bootstrap_class_by_name("java/lang/Object")?;
-    let _ = OBJECT_CLASS_ID.set(resolved); // races are harmless; loser just re-resolves next time
+    OBJECT_CLASS_ID.with(|c| c.set(Some((vm_key, resolved))));
     Some(resolved)
 }
 

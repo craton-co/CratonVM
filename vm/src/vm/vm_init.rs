@@ -3362,20 +3362,73 @@ impl SharedVm {
 // `fn(u32)` hook (see `install_resolution_invalidate_hook`) when the
 // bytecode of a class is replaced in place. The hook has no captured
 // state, so we bridge it to the VM-owned `SharedVm::resolution_cache`
-// through this module-private `OnceLock<Weak<SharedVm>>`.
+// through this module-private registry.
 //
-// The pattern mirrors `crate::runtime::vtable::global_vtable_manager`.
+// PER-VM STATE (P0, `docs/architecture/per-vm-state.md`). This used to be a
+// `OnceLock<Weak<SharedVm>>` — **first VM wins forever**. That was wrong even
+// for the SEQUENTIAL embedding case: create VM A, drop it, create VM B, and
+// every `redefine_class` in VM B fired a hook that upgraded VM A's dead
+// `Weak`, returned early, and left VM B's `ResolutionCache` / `LinkResolver`
+// holding pre-redefine `(declaring_class_id, index)` pairs. Stale resolution
+// after a redefine is silent wrong behaviour, not a perf loss.
+//
+// The hook signature is `fn(u32)` with no VM parameter, so the adapter cannot
+// know WHICH VM's class was redefined. Invalidation, unlike installation, is
+// safe to over-apply: dropping a cache entry only costs a re-resolve. So the
+// registry holds every live VM and each adapter fans out to all of them. In
+// the single-VM case (the overwhelmingly common one) the registry has exactly
+// one entry and behaviour is bit-identical to the old `OnceLock`.
+//
+// See `crate::runtime::vtable::install_global_vtable_manager` for the one
+// remaining hook that CANNOT be fixed this way: vtable *installation* is not
+// idempotent across VMs, so fanning out would corrupt rather than over-apply.
 
-static RESOLUTION_INVALIDATE_VM: OnceLock<Weak<SharedVm>> = OnceLock::new();
+type SharedVmRegistry = parking_lot::Mutex<Vec<Weak<SharedVm>>>;
+
+static RESOLUTION_INVALIDATE_VMS: OnceLock<SharedVmRegistry> = OnceLock::new();
+
+fn shared_vm_hook_registry() -> &'static SharedVmRegistry {
+    RESOLUTION_INVALIDATE_VMS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+/// Snapshot the live VMs registered for captureless-`fn` hook bridging.
+///
+/// Prunes dead `Weak`s while it walks, and returns owning `Arc`s so callers
+/// can drop the registry lock before doing any VM work — the adapters below
+/// take VM-internal locks (`resolution_cache`, `jit_cache`, `class_manager`),
+/// and holding the registry lock across those would invert the lock order.
+fn live_hook_vms() -> Vec<Arc<SharedVm>> {
+    let mut reg = shared_vm_hook_registry().lock();
+    let mut live = Vec::with_capacity(reg.len());
+    reg.retain(|weak| match weak.upgrade() {
+        Some(shared) => {
+            live.push(shared);
+            true
+        }
+        None => false,
+    });
+    live
+}
 
 /// Publish the `Weak<SharedVm>` handle that `resolution_invalidate_adapter`
 /// upgrades to invalidate the per-VM `ResolutionCache` on redefine.
 ///
-/// Called from `Vm::new` right after `self_arc` is populated. Idempotent
-/// (first call wins) — repeated calls from per-test fixtures are silently
-/// ignored.
+/// Called from `Vm::new` right after `self_arc` is populated. Registering the
+/// same VM twice is a no-op; dead entries from previously-dropped VMs are
+/// pruned on every call, so a long-lived process that creates and destroys
+/// many VMs does not accumulate them.
 pub fn set_global_shared_vm_for_hooks(weak: Weak<SharedVm>) {
-    let _ = RESOLUTION_INVALIDATE_VM.set(weak);
+    let Some(shared) = weak.upgrade() else {
+        return; // already dead; nothing to bridge
+    };
+    let mut reg = shared_vm_hook_registry().lock();
+    reg.retain(|existing| existing.strong_count() > 0);
+    let already = reg
+        .iter()
+        .any(|existing| existing.upgrade().is_some_and(|s| Arc::ptr_eq(&s, &shared)));
+    if !already {
+        reg.push(weak);
+    }
 }
 
 /// The `ResolutionInvalidateHook` adapter handed to
@@ -3387,31 +3440,30 @@ pub fn set_global_shared_vm_for_hooks(weak: Weak<SharedVm>) {
 /// auto-evicts the per-thread invoke caches via the generation counter;
 /// this closes the loop for the slower symbolic-reference cache.
 fn resolution_invalidate_adapter(class_id: u32) {
-    let weak = match RESOLUTION_INVALIDATE_VM.get() {
-        Some(w) => w,
-        None => return, // hook fired before VM init wired the handle
-    };
-    let shared = match weak.upgrade() {
-        Some(s) => s,
-        None => return, // VM has been dropped; nothing to invalidate
-    };
     let cid = crate::classloading::ClassId::new(class_id);
-    shared
-        .classes
-        .resolution_cache
-        .write()
-        .invalidate_class(cid);
-    // Round 8 audit fix (CRIT #3): the `LinkResolver` reflective cache
-    // was missing from the redefine-invalidation cascade. Without
-    // this, any cached `(class, name, descriptor)` triple resolved
-    // before a `RedefineClasses` continues to return the
-    // pre-redefine `(declaring_class_id, index)` pair — pointing at
-    // a method index that may now refer to a different method body
-    // (or, after a field shape change, a stale field slot).
-    // `LinkResolver::invalidate_class` mirrors
-    // `ResolutionCache::invalidate_class` (drops by key-class OR
-    // resolved-declaring-class match).
-    shared.classes.link_resolver.invalidate_class(cid);
+    // Fan out to every live VM: the hook carries no VM identity, and
+    // over-invalidating another VM's cache costs a re-resolve, whereas
+    // under-invalidating our own is a stale-resolution correctness bug.
+    // With one VM registered (the normal case) this is the same single
+    // invalidation the pre-registry code performed.
+    for shared in live_hook_vms() {
+        shared
+            .classes
+            .resolution_cache
+            .write()
+            .invalidate_class(cid);
+        // Round 8 audit fix (CRIT #3): the `LinkResolver` reflective cache
+        // was missing from the redefine-invalidation cascade. Without
+        // this, any cached `(class, name, descriptor)` triple resolved
+        // before a `RedefineClasses` continues to return the
+        // pre-redefine `(declaring_class_id, index)` pair — pointing at
+        // a method index that may now refer to a different method body
+        // (or, after a field shape change, a stale field slot).
+        // `LinkResolver::invalidate_class` mirrors
+        // `ResolutionCache::invalidate_class` (drops by key-class OR
+        // resolved-declaring-class match).
+        shared.classes.link_resolver.invalidate_class(cid);
+    }
 }
 
 /// The `JitInvalidateHook` adapter handed to
@@ -3453,20 +3505,19 @@ fn resolution_invalidate_adapter(class_id: u32) {
 /// `clear_all` retires evicted methods rather than freeing their code
 /// immediately, so any still-active frame stays valid.
 fn jit_invalidate_adapter(class_id: u32) {
-    let weak = match RESOLUTION_INVALIDATE_VM.get() {
-        Some(w) => w,
-        None => return, // hook fired before VM init wired the handle
-    };
-    let shared = match weak.upgrade() {
-        Some(s) => s,
-        None => return, // VM has been dropped; nothing to invalidate
-    };
-    let evicted = shared.jit.jit_cache.write().clear_all();
-    if evicted > 0 {
-        tracing::debug!(
-            "JIT: fully invalidated {evicted} method(s) due to a class layout \
-             change (class_id={class_id})"
-        );
+    // Same fan-out rationale as `resolution_invalidate_adapter`: the hook has
+    // no VM identity, and `clear_all` retires rather than frees, so evicting
+    // another VM's compiled code is a recompile cost, not a hazard. Missing
+    // our OWN VM's eviction after a layout change is a live use of compiled
+    // field offsets that no longer describe the class.
+    for shared in live_hook_vms() {
+        let evicted = shared.jit.jit_cache.write().clear_all();
+        if evicted > 0 {
+            tracing::debug!(
+                "JIT: fully invalidated {evicted} method(s) due to a class layout \
+                 change (class_id={class_id})"
+            );
+        }
     }
 }
 
@@ -3475,19 +3526,27 @@ fn jit_invalidate_adapter(class_id: u32) {
 /// Resolves a raw `ClassId` to `(class_name, num_total_fields)` so the
 /// heap's out-of-bounds field-access diagnostic (`gen_heap::set_field` /
 /// `get_field`) can print actionable class identity instead of a bare
-/// numeric id. Reuses the `RESOLUTION_INVALIDATE_VM` weak handle — both
-/// hooks are plain captureless `fn` pointers bridged to the VM-owned
-/// `SharedVm` through the same `OnceLock`.
+/// numeric id. Reuses the same live-VM registry — all three hooks are plain
+/// captureless `fn` pointers bridged to the VM-owned `SharedVm` through it.
 ///
-/// Returns `None` before the VM handle is wired, after the VM is dropped,
-/// or for a class id that is not registered in the class store.
+/// Returns `None` before any VM handle is wired, after every registered VM has
+/// been dropped, or for a class id that no live VM has in its class store.
+///
+/// This is a diagnostic-only lookup, so answering from the first VM that has
+/// the id is acceptable: `ClassId`s are allocated per-VM (`ClassStore::next_id`
+/// is `self.classes.len()`), so with two VMs live the same numeric id names two
+/// different classes and the name printed may belong to the other VM. The
+/// alternative — printing nothing — is strictly worse for a crash diagnostic.
+/// Callers must not treat this as an authoritative class lookup.
 fn class_info_adapter(class_id: u32) -> Option<(String, usize)> {
-    let weak = RESOLUTION_INVALIDATE_VM.get()?;
-    let shared = weak.upgrade()?;
     let cid = crate::classloading::ClassId::new(class_id);
-    let cm = shared.classes.class_manager.read();
-    let class = cm.class_store.get(cid)?;
-    Some((class.name.to_string(), class.num_total_fields))
+    for shared in live_hook_vms() {
+        let cm = shared.classes.class_manager.read();
+        if let Some(class) = cm.class_store.get(cid) {
+            return Some((class.name.to_string(), class.num_total_fields));
+        }
+    }
+    None
 }
 
 impl SharedVm {

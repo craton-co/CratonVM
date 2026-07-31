@@ -4526,17 +4526,12 @@ fn ctrl_block_of(graph: &Graph, schedule: &Schedule, mut ctrl: NodeId) -> Option
     None
 }
 
-/// Set bit `i`; returns true iff it was previously clear.
+/// Set bit `i`. Out-of-range indices are ignored rather than panicking: the
+/// planner runs on a graph nothing has verified yet.
 #[inline]
-fn bits_insert(bits: &mut [u64], i: usize) -> bool {
-    let (w, mask) = (i / 64, 1u64 << (i % 64));
-    match bits.get_mut(w) {
-        Some(word) => {
-            let was = *word & mask != 0;
-            *word |= mask;
-            !was
-        }
-        None => false,
+fn bits_insert(bits: &mut [u64], i: usize) {
+    if let Some(word) = bits.get_mut(i / 64) {
+        *word |= 1u64 << (i % 64);
     }
 }
 
@@ -4677,7 +4672,7 @@ fn plan_slots(
         let mut local_def = vec![0u64; words];
         for b in 0..nb {
             let base = b * words;
-            local_def.iter_mut().for_each(|w| *w = 0);
+            local_def.fill(0);
             let block = &schedule.blocks[b];
             for u in block.nodes.iter().copied().chain(block.terminator) {
                 let ui = u as usize;
@@ -7411,8 +7406,9 @@ mod tests {
                 .overlaps(aliased.range[second].expect("range")),
             "precondition: consecutive chain links overlap",
         );
-        aliased.node_color[second] = aliased.node_color[first];
-        aliased.class[second] = aliased.class[first];
+        let (donor_color, donor_class) = (aliased.node_color[first], aliased.class[first]);
+        aliased.node_color[second] = donor_color;
+        aliased.class[second] = donor_class;
         let err = verify_slot_colouring(&graph, &schedule, &aliased)
             .expect_err("an aliased pair must be refused");
         assert_eq!(err.category(), "internal");
@@ -7423,7 +7419,8 @@ mod tests {
 
         // (b) A reference on a primitive's word.
         let mut mixed = plan_slots(&graph, &schedule, None);
-        mixed.node_color[adds[2]] = mixed.node_color[adds[0]];
+        let shared = mixed.node_color[adds[0]];
+        mixed.node_color[adds[2]] = shared;
         mixed.class[adds[2]] = Some(SlotClass::Ref);
         mixed.class[adds[0]] = Some(SlotClass::Prim);
         let err = verify_slot_colouring(&graph, &schedule, &mixed)
@@ -7444,7 +7441,8 @@ mod tests {
 
         // (d) A colour outside the reservation the frame was sized from.
         let mut oversized = plan_slots(&graph, &schedule, None);
-        oversized.node_color[adds[0]] = Some(oversized.slots as u32 + 1);
+        let beyond = oversized.slots as u32 + 1;
+        oversized.node_color[adds[0]] = Some(beyond);
         assert!(verify_slot_colouring(&graph, &schedule, &oversized).is_err());
     }
 
