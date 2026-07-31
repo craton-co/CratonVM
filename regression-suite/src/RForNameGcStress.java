@@ -52,6 +52,35 @@ public class RForNameGcStress {
         }
     }
 
+    /**
+     * Overrides the two-argument `loadClass(String, boolean)` and NOT the
+     * single-argument one, so `Class.forName`'s native takes the
+     * `receiver_overrides_load_class_resolve` branch rather than the
+     * single-arg-override shortcut. Also allocates before delegating.
+     */
+    static final class ResolveChurningLoader extends ClassLoader {
+        long churn;
+
+        ResolveChurningLoader(ClassLoader parent) {
+            super(parent);
+        }
+
+        @Override
+        protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            List<String> scratch = new ArrayList<>(8);
+            for (int i = 0; i < 8; i++) scratch.add(name + '@' + i);
+            churn += scratch.get(7).length();
+            return super.loadClass(name, resolve);
+        }
+    }
+
+    /** Overrides nothing — exercises the base parent-first delegation path. */
+    static final class PlainLoader extends ClassLoader {
+        PlainLoader(ClassLoader parent) {
+            super(parent);
+        }
+    }
+
     static final String[] NAMES = {
         "java.lang.String",
         "java.util.HashMap",
@@ -64,17 +93,28 @@ public class RForNameGcStress {
     public static void main(String[] args) throws Exception {
         final int rounds = args.length > 0 ? Integer.parseInt(args[0]) : 400;
 
-        ChurningLoader loader = new ChurningLoader(RForNameGcStress.class.getClassLoader());
+        ClassLoader app = RForNameGcStress.class.getClassLoader();
+        ChurningLoader loader = new ChurningLoader(app);
+        ResolveChurningLoader resolveLoader = new ResolveChurningLoader(app);
+        PlainLoader plain = new PlainLoader(app);
+        ClassLoader[] loaders = { loader, resolveLoader, plain, app };
         long nameLen = 0;
         for (int r = 0; r < rounds; r++) {
-            for (String n : NAMES) {
-                // Build the name String fresh each time so it is a young object
-                // the collector will relocate, exactly like Hibernate's.
-                String name = new StringBuilder(n).toString();
-                Class<?> c = Class.forName(name, true, loader);
-                check(c != null, "forName returned null for " + n);
-                check(n.equals(c.getName()), "forName(" + n + ") resolved to " + c.getName());
-                nameLen += c.getName().length();
+            for (ClassLoader cl : loaders) {
+                for (String n : NAMES) {
+                    // Build the name String fresh each time so it is a young
+                    // object the collector will relocate, exactly like
+                    // Hibernate's `ClassLoaderServiceImpl.classForName`.
+                    String name = new StringBuilder(n).toString();
+                    Class<?> c = Class.forName(name, true, cl);
+                    check(c != null, "forName returned null for " + n);
+                    check(n.equals(c.getName()), "forName(" + n + ") resolved to " + c.getName());
+                    nameLen += c.getName().length();
+                    // Also drive ClassLoader.loadClass directly.
+                    Class<?> d = cl.loadClass(new StringBuilder(n).toString());
+                    check(n.equals(d.getName()), "loadClass(" + n + ") resolved to " + d.getName());
+                    nameLen += d.getName().length();
+                }
             }
         }
 
@@ -92,7 +132,7 @@ public class RForNameGcStress {
         }
 
         System.out.println("CK rounds=" + rounds + " nameLen=" + nameLen
-                + " cnfe=" + cnfe + " churn=" + (loader.churn > 0));
+                + " cnfe=" + cnfe + " churn=" + (loader.churn > 0 && resolveLoader.churn > 0));
         System.out.println("PASS RForNameGcStress (" + checks + " checks)");
     }
 }
