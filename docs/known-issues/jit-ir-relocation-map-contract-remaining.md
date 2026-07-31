@@ -405,3 +405,44 @@ separate conclusions in this investigation have now come from instrumentation
 that was not actually running — zero fallbacks with no live IR frame, zero IR
 bodies, and now zero refusals. Absence of output is not evidence until the
 output path is known to work.
+
+## Redone with verification: `ir_compatible` is NOT reached
+
+The reason reporting was re-applied, and this time verified in the tree that was
+actually built (`grep -c ir_reject jit/src/ir.rs` → 10 = 9 sites + the helper;
+dev confirmed at 0; binary rebuilt after). On `BinTreesClassic 16` with
+`CRATONVM_DBG_IR_COMPILES=1`:
+
+    refusals seen: 0
+    IR bodies:     0
+
+Both zero, with the reporting code demonstrably compiled in. That combination is
+what makes it informative: had `ir_compatible` been called it must either return
+`true` — producing an IR body — or `false`, which now logs. Neither occurred, so
+**`ir_compatible` is never reached**; the `&&` chain in `try_compile_inner`
+short-circuits before it.
+
+Caveat worth stating rather than glossing: this is inference from a double
+absence, and the session's own history is three wrong conclusions drawn from
+absences. There is still no *positive* control — no observation of the
+diagnostic firing on a case known to be refused. The inference is sound only
+because the refusal branch and the success branch have distinct, mutually
+exclusive observable outcomes and neither appeared.
+
+That leaves the two conjuncts ahead of it in
+`if optimize && !moving_young_disables_optimizing_tier() && ir::ir_compatible(..)`:
+
+* `optimize` false on whatever path compiles these methods. Three call sites
+  pass a literal `true` (`helpers.rs:7170`, `invoke.rs:16445`, `:16598`), but
+  those are the inline-dispatch and early-compile routes; the background
+  tier-up route takes `optimize` as a parameter (`try_jit_compile_callee`) and
+  its value at the hot-method path was never traced to a literal.
+* `moving_young_disables_optimizing_tier()` true. It should be `false` by
+  construction, but it is `pub` and its `tracing::warn!` fires only on the
+  first call — easily missed.
+
+**Next step, and it is one line each:** log both at the top of
+`try_compile_inner`, behind `CRATONVM_DBG_IR_COMPILES`. That is a positive
+control as well as the answer — if neither line appears, `try_compile_inner`
+itself is not on the path, which would be a third possibility nobody has
+considered.
