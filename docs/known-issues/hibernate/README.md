@@ -27,9 +27,9 @@ No doc was moved or newly filed for any of these three — do not re-open them
 as regressions on a future ABORTED sighting without first checking whether
 HotSpot aborts the same tests for the same reason.
 
-## HANG classes in the fresh 4548-class run (2026-07-31) — one real harness gap, one stale binary
+## HANG classes in the fresh 4548-class run (2026-07-31) — one real harness gap, two stale-binary/contention margins
 
-Two more classes report `HANG` (`process-died rc=124`) in the same
+Four more classes report `HANG` (`process-died rc=124`) in the same
 2026-07-30/31 categorize run:
 
 - **[`boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` — the runner's per-class timeout accommodation is gone](qualfiedtablenaming-runner-timeout-floor-lost-20260731.md).**
@@ -63,6 +63,26 @@ Two more classes report `HANG` (`process-died rc=124`) in the same
   marginal-timing class into a `HANG`, not a code defect. No doc needs
   correcting; this is the already-understood "timeout-marginal class +
   contended host" pattern, now additionally resolved on `dev` tip.
+
+- **`batch.BatchTest` and `batchfetch.DynamicBatchFetchTest` — same
+  "timeout-marginal class + contended host" pattern; moving-young mechanism
+  explicitly ruled out.** Both are long-tracked members of
+  `../../internal/fixed-suite-bugs/hibernate/hib-120s-junit-timeout-cluster-20260716.md`'s
+  generic interpreter/JDBC-throughput cluster (previously confirmed passing
+  clean at 98-126s on a quiet host). Solo repro this session across three
+  configurations -- the categorize run's own binary, that same binary with
+  `CRATONVM_NO_MOVING_YOUNG=1`, and a fresh binary containing the 2026-07-30
+  moving-young-liveness fix (`11901e9a6`) that measurably speeds up
+  `OracleInlineMutationStrategyIdTest` above -- all three land within seconds
+  of each other (213-255s) and trip the identical Hibernate-internal 120s
+  per-method `TimeoutException`; `CRATONVM_GC_STATS=1` printed **zero** `[GC]`
+  lines in any of the three, i.e. neither class ever triggers a young
+  collection, so a fix that only pays off when a moving collection is
+  requested cannot help either one. Unlike `OracleInlineMutationStrategyIdTest`,
+  these two are **not** sped up by the fresh binary. Conclusion: unchanged
+  "generic throughput margin, contended-host-dependent" verdict, not the
+  moving-young tax, not reopened. See the hib-120s doc's own 2026-07-30/31
+  recurrence section for the full A/B table.
 
 ## Resolved (2026-07-30) — retired to `docs/internal/fixed-suite-bugs/hibernate/`
 
