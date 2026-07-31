@@ -36,6 +36,10 @@ use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::threading::monitor::MonitorTable;
 use crate::threading::thread_registry::ThreadRegistry;
 use crate::types::{ObjectRef, Value};
+// `crate::classloading` is a re-export shim that does not forward
+// `class_origin`, so the census row type is named through the source crate
+// directly rather than by widening that shim (which another agent owns).
+use cratonvm_classloading::class_origin::ClassOriginEntry;
 use cratonvm_types::compat::CompatibilityMode;
 
 // ---------------------------------------------------------------------------
@@ -2631,17 +2635,14 @@ impl SharedVm {
         // support bundle or a `-version` paste says which substitution policy
         // produced it, without anyone having to find the flags line.
         //
-        // Under `Compatible` the value stays *exactly* `"mixed mode"` — this
-        // string is compared literally by tests and by the differential
-        // harness, and the default path must be byte-for-byte unchanged
-        // (jdk-only-mode.md §10).
+        // The list is built by [`vm_info_mode_list`], which the launcher's
+        // `-version` banner also calls — the property and the banner used to
+        // spell the policy two different ways, and one function is the only
+        // way that stays fixed. Under `Compatible` the value stays *exactly*
+        // `"mixed mode"` (jdk-only-mode.md §10).
         sys_props.insert(
             "java.vm.info".to_string(),
-            if config.compatibility_mode.is_jdk_only() {
-                "mixed mode, jdk-only".to_string()
-            } else {
-                "mixed mode".to_string()
-            },
+            vm_info_mode_list(config.compatibility_mode).to_string(),
         );
         sys_props.insert(
             "java.vm.specification.name".to_string(),
@@ -3718,15 +3719,22 @@ impl SharedVm {
         self.config.compatibility_mode
     }
 
-    /// JDK feature version this VM reports, parsed back out of the
-    /// `java.specification.version` system property so the census cannot
-    /// disagree with what Java code sees. `"25"` → `Some(25)`; a
-    /// legacy-shaped `"1.8"` → `Some(1)`, which is the same reading the
-    /// property itself offers.
-    fn jdk_feature_version(&self) -> Option<u32> {
-        let props = self.system_properties.read();
-        let raw = props.get("java.specification.version")?;
-        raw.split('.').next().unwrap_or(raw).trim().parse().ok()
+    /// Feature version of the **runtime image** this VM is running against, for
+    /// the report's `jdk_feature` (`jdk-only-mode.md` §9).
+    ///
+    /// Read from `$JAVA_HOME/release`, and `None` when there is no configured
+    /// `java_home` to read it from. Deliberately NOT
+    /// `java.specification.version`: that property is a fixed `"25"` this VM
+    /// reports to Java code regardless of which image is mounted, so using it
+    /// here would report `25` for a run against a JDK 21 image — and the one
+    /// thing every consumer does with `jdk_feature` is treat it as *image
+    /// identity*. `tools/jdk-only-blockers/blockers.py` puts it in the artifact
+    /// file name because "no static source review can produce an exhaustive
+    /// missing-method list across JDK versions"; naming a JDK 21 census
+    /// `jdk-25-*` is worse than refusing to name it. `None` makes that tool
+    /// stop and ask for `--jdk-feature N`, which is the correct failure.
+    pub fn jdk_feature_version(&self) -> Option<u32> {
+        jdk_feature_from_release_file(self.config.java_home.as_deref()?)
     }
 
     /// Synthetic-stub census: dump every registered native with its
@@ -3736,9 +3744,16 @@ impl SharedVm {
     /// Thin wrapper over [`SharedVm::dump_native_census_json`] with
     /// `verbose = false` (registration sites redacted). The name, parameter
     /// list and `(intrinsic, bridge, synthetic-stub)` return are **unchanged**
-    /// on purpose: `--dump-native-registry`, the stub ratchet and several
-    /// tests call this exact signature, and the schema-2 upgrade is a change
-    /// to the file's *contents*, not to its Rust surface.
+    /// on purpose: in-crate tests and embedders call this exact signature, and
+    /// the schema-2 upgrade is a change to the file's *contents*, not to its
+    /// Rust surface. `redacted` is the right default for a caller that has no
+    /// way to express `--explain-jdk-only`.
+    ///
+    /// The counts it returns are **registrations**, counted over the same
+    /// `registrations` vector `NativeMethodRegistry::dump_registrations`
+    /// iterates — superseded rows included, one row per `register()` call — so
+    /// they stay numerically identical to schema 1 and the stub ratchet's
+    /// exact 157 `synthetic-stub` baseline is unaffected by the schema bump.
     pub fn dump_native_registry_json(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -3801,28 +3816,40 @@ impl SharedVm {
     /// is deterministic run to run. Hand-serialized (no serde_json), mirroring
     /// `dump_missing_natives_json`. Returns the per-kind registration counts.
     ///
-    /// ## Relationship to `vm-cli`'s `write_native_census_json`
+    /// ## The only native-census writer
     ///
-    /// `--dump-native-registry` is served by the **launcher's** writer, not
-    /// this one; this is the embedded / in-process path, which has no launcher
-    /// and no `--explain-jdk-only` flag. The two agree on `schema_version`, on
-    /// the `NativeKind::as_str()` / `ClassOrigin::as_str()` tag vocabulary, on
-    /// the `counts` and `invocations` blocks and on every per-row field name,
-    /// so `difftest::census` parses either. They differ in exactly three ways,
-    /// all deliberate:
+    /// `--dump-native-registry` is served by **this** function: `vm-cli`'s
+    /// `write_jdk_only_dumps` calls it directly. There used to be a second,
+    /// independently written schema-2 writer in `vm-cli/src/main.rs`, which is
+    /// a genuine consumer hazard — one `schema_version` with two shapes means a
+    /// reader that works against one silently mis-reads the other. The three
+    /// places the two disagreed were resolved as follows.
     ///
-    /// * this writer adds a top-level `"mode"`; the launcher prints the mode on
-    ///   its own status line instead;
-    /// * the launcher's tie-break for duplicate triples is `registered_by`,
-    ///   this one's is registration order (see above);
-    /// * the launcher emits `"real_declaring_method": null` — it runs at
-    ///   shutdown and (reasonably) refuses to resolve names through the
-    ///   ordinary loading path, which would load hundreds of classes the run
-    ///   never touched and change the census it is reporting. This writer fills
-    ///   the object in **without that risk**, because it only consults classes
-    ///   the run already loaded: `get_loaded_class_id` is a lookup, not an
-    ///   initiating load, so `"loaded": false` is a real answer ("this run
-    ///   never loaded the class") rather than a probe declined.
+    /// * **Top-level `"mode"` is kept.** It is additive (no consumer keys off
+    ///   the object's shape: `difftest::census` finds the row array by scanning
+    ///   for objects carrying `kind`, and CI / `scripts/jdk-only-census.sh`
+    ///   grep the `counts` block), and it is what lets `registry-real.json` and
+    ///   `registry-no-stubs.json` be told apart from their contents. Diffing
+    ///   those two files is the entire point of the census script; a census
+    ///   that cannot say which policy produced it is a footgun.
+    /// * **Registration order is kept as the tie-break** for duplicate triples,
+    ///   i.e. the stable sort above rather than the launcher's
+    ///   `(class, name, descriptor, registered_by)`. Two reasons. It is the
+    ///   overwrite chronology, which is the fact the untangling wave needs and
+    ///   which `registered_by` order destroys; and `registered_by` can be an
+    ///   absolute build path, so sorting on it makes *row order* depend on the
+    ///   build machine even though the emitted value is redacted — the opposite
+    ///   of diff-stable. `census()` documents registration order, and
+    ///   `slice::sort_by` is stable, so this order is deterministic.
+    /// * **`real_declaring_method` is filled in**, where the launcher emitted
+    ///   `null` on the (correct) principle that a census must not perturb what
+    ///   it measures. Filling it here carries none of that risk:
+    ///   `get_loaded_class_id` is a lookup through `&self`, not an initiating
+    ///   load, so nothing is loaded to answer the question and `"loaded":
+    ///   false` is a real answer ("this run never loaded the class") rather
+    ///   than a probe declined. Caveat worth knowing when reading the column:
+    ///   the lookup is requester-less, so for a name no built-in loader has
+    ///   defined it can answer from a lone user-defined loader's copy.
     pub fn dump_native_census_json(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -3974,17 +4001,19 @@ impl SharedVm {
     /// stub-upgrade window, so all three are needed for a total order.
     /// Returns the row count.
     ///
-    /// Deliberately the **same schema, sort key, seeded counts and field
-    /// order** as `vm-cli`'s `write_class_origins_json`. Two writers exist
-    /// because the launcher owns the `--dump-class-origins` flag while the
-    /// embedded / in-process path has no launcher at all; a run's census must
-    /// not depend on which of the two produced it, so change one and change
-    /// the other. The single intentional difference: the launcher redacts
-    /// embedded absolute paths in `name` / `reason` / `requested_by` unless
-    /// `--explain-jdk-only` is passed, which this entry point cannot do
-    /// because it has no verbose parameter to key off — an embedder that
-    /// needs redaction should ask the launcher, or pass the rows through
-    /// [`redact_registration_site`] itself.
+    /// The **only** class-origin writer: `--dump-class-origins` calls this,
+    /// and so does any embedder. `vm-cli` used to carry an independently
+    /// written copy; the one difference worth keeping from it was the
+    /// redaction, which is why this entry point now takes `verbose` instead of
+    /// telling embedders to redact the rows themselves. `verbose` is
+    /// `--explain-jdk-only`: **false redacts, and false is the default** for
+    /// every caller that cannot express the flag.
+    ///
+    /// Redaction covers `name`, `reason` and `requested_by` (via
+    /// [`redact_absolute_paths`]), because all three can carry an absolute path
+    /// out of a `CompatibilityStub` reason or a requester attribution, and this
+    /// file gets committed as a baseline and pasted into issues. `origin` is a
+    /// closed tag vocabulary and is never redacted.
     ///
     /// Emitted in **both** modes: under `Compatible` the origins are recorded
     /// but nothing is refused (§5), which is what makes the census meaningful
@@ -3992,53 +4021,10 @@ impl SharedVm {
     pub fn dump_class_origins_json(
         &self,
         path: impl AsRef<std::path::Path>,
+        verbose: bool,
     ) -> std::io::Result<usize> {
         let mut rows = self.classes.class_manager.read().dump_class_origins();
-        rows.sort_by(|a, b| {
-            (&a.name, a.loader_id, &a.origin).cmp(&(&b.name, b.loader_id, &b.origin))
-        });
-
-        let mut counts: std::collections::BTreeMap<String, u64> = CLASS_ORIGIN_TAGS
-            .iter()
-            .map(|tag| ((*tag).to_string(), 0u64))
-            .collect();
-        for row in &rows {
-            *counts.entry(row.origin.clone()).or_insert(0) += 1;
-        }
-
-        let mut out = String::with_capacity(256 + 160 * rows.len());
-        out.push_str("{\n  \"schema_version\": 1,\n  \"counts\": {\n");
-        for (tag, n) in &counts {
-            out.push_str(&format!("    {}: {n},\n", json_escape(tag)));
-        }
-        out.push_str(&format!("    \"total\": {}\n", rows.len()));
-        out.push_str("  },\n  \"classes\": [");
-        for (i, row) in rows.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str("\n    {\n");
-            out.push_str(&format!("      \"name\": {},\n", json_escape(&row.name)));
-            out.push_str(&format!("      \"origin\": {},\n", json_escape(&row.origin)));
-            match &row.reason {
-                Some(r) => out.push_str(&format!("      \"reason\": {},\n", json_escape(r))),
-                None => out.push_str("      \"reason\": null,\n"),
-            }
-            match &row.requested_by {
-                Some(r) => out.push_str(&format!("      \"requested_by\": {},\n", json_escape(r))),
-                None => out.push_str("      \"requested_by\": null,\n"),
-            }
-            out.push_str(&format!(
-                "      \"real_bytes_found\": {},\n",
-                row.real_bytes_found
-            ));
-            out.push_str(&format!("      \"loader_id\": {}\n", row.loader_id));
-            out.push_str("    }");
-        }
-        if !rows.is_empty() {
-            out.push_str("\n  ");
-        }
-        out.push_str("]\n}\n");
+        let out = render_class_origins_json(&mut rows, verbose);
 
         use std::io::Write;
         let mut file = std::fs::File::create(path)?;
@@ -4065,41 +4051,54 @@ impl SharedVm {
     /// }
     /// ```
     ///
-    /// `violations` concatenates the registry's refused registrations (§4)
-    /// with the class manager's origin violations (§5), registry first, each
-    /// rendered by `JdkOnlyViolation::to_json()` so the wire shape is owned by
-    /// the type rather than re-derived here.
+    /// The **only** report writer: `--jdk-only-report` calls this. `verbose` is
+    /// `--explain-jdk-only`; **false redacts and is the default**, applied
+    /// post-hoc to each rendered body because `JdkOnlyViolation::to_json()`
+    /// (unlike `render()`) has no `verbose` parameter and threading one through
+    /// `types` is not this file's call.
+    ///
+    /// `violations` unions the registry's refused registrations (§4) with the
+    /// class manager's origin violations (§5), each rendered by
+    /// `JdkOnlyViolation::to_json()` so the wire shape is owned by the type
+    /// rather than re-derived here, and **sorted by `(kind, summary)`**.
+    ///
+    /// Sorting rather than preserving recording order is the opposite of the
+    /// choice [`SharedVm::dump_native_census_json`] makes, and for a reason
+    /// that does not apply here: native registrations all happen on the boot
+    /// thread and their relative order *is* the fact (the `overwrote` chain),
+    /// whereas class-origin violations are recorded from arbitrary application
+    /// threads, so recording order is genuinely nondeterministic and carries no
+    /// meaning worth preserving. Sorting is what makes two runs of the same
+    /// program produce byte-identical reports.
     ///
     /// The four class counters are a **partition** of the ten
-    /// `ClassOrigin::as_str()` tags — every row lands in exactly one bucket, so
-    /// their sum is the row count and no class can go missing between this
-    /// summary and `--dump-class-origins`. `user-defined` counts as an
-    /// application class (application bytes, whoever defined them);
-    /// `generated_classes` is `vm-array` + `hidden-class` + `generated-lambda`
-    /// + `generated-proxy` + `reflection-accessor` + `vm-internal`, i.e. every
-    /// origin a conforming JVM produces without a class file (§1 item 6).
-    /// `compatibility-stub` keeps its own counter and is never folded in with
-    /// the legitimate generated origins — conflating those two is exactly the
-    /// confusion this feature exists to end.
+    /// `ClassOrigin::as_str()` tags — see [`fold_origin_buckets`]. Their sum is
+    /// the row count, so no class can go missing between this summary and
+    /// `--dump-class-origins`.
     ///
-    /// This fold is deliberately identical to `vm-cli`'s `fold_origin_buckets`
-    /// (agent B). Two writers exist because the launcher owns the flag and the
-    /// embedded/in-process path has no launcher; they must not disagree about
-    /// arithmetic.
+    /// `counts` carries exactly the seven keys §9 spells and no more: no
+    /// `total_classes`, no `vm_internal_classes`. A reader that needs either
+    /// can add the partition up or read the class-origin census, and every
+    /// extra key here is one more thing the two artefacts can disagree about.
     ///
-    /// Returns the number of violations written, so the caller can decide
-    /// whether to exit non-zero without re-reading the file.
+    /// Returns `(violations, compatibility_classes)` — the violation count so
+    /// the caller can decide whether to exit non-zero without re-reading the
+    /// file, and the compatibility-class count because that is the number the
+    /// launcher reports on its status line and §11 gates on.
     pub fn dump_jdk_only_report_json(
         &self,
         path: impl AsRef<std::path::Path>,
-    ) -> std::io::Result<usize> {
+        verbose: bool,
+    ) -> std::io::Result<(usize, usize)> {
         use cratonvm_native_api::NativeKind;
 
+        // `(kind, summary, body)`: the first two are the sort key, the third is
+        // what gets written.
         let registry = &self.natives.native_methods;
-        let mut violations: Vec<String> = registry
+        let mut violations: Vec<(String, String, String)> = registry
             .refused_registrations()
             .iter()
-            .map(|v| v.to_json())
+            .map(|v| (v.kind().to_string(), v.summary(), v.to_json()))
             .collect();
         // One L10 acquisition for both questions the class manager answers
         // here — the census and the violation list must describe the same
@@ -4108,28 +4107,36 @@ impl SharedVm {
         let (origins, origin_violations) = {
             let cm = self.classes.class_manager.read();
             let origins = cm.dump_class_origins();
-            let violations: Vec<String> =
-                cm.origin_violations().iter().map(|v| v.to_json()).collect();
+            let violations: Vec<(String, String, String)> = cm
+                .origin_violations()
+                .iter()
+                .map(|v| (v.kind().to_string(), v.summary(), v.to_json()))
+                .collect();
             (origins, violations)
         };
         violations.extend(origin_violations);
+        violations.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let violations: Vec<String> = violations
+            .into_iter()
+            .map(|(_, _, body)| {
+                if verbose {
+                    body
+                } else {
+                    redact_absolute_paths(&body)
+                }
+            })
+            .collect();
 
-        let mut by_origin: std::collections::BTreeMap<&str, u64> =
-            std::collections::BTreeMap::new();
-        for row in &origins {
-            *by_origin.entry(row.origin.as_str()).or_insert(0) += 1;
-        }
-        let count_of = |tag: &str| by_origin.get(tag).copied().unwrap_or(0);
-        let boot_image = count_of("boot-image");
-        // `user-defined` is application bytes, whoever called defineClass.
-        let application = count_of("application-class-path") + count_of("user-defined");
-        let generated = count_of("vm-array")
-            + count_of("hidden-class")
-            + count_of("generated-lambda")
-            + count_of("generated-proxy")
-            + count_of("reflection-accessor")
-            + count_of("vm-internal");
-        let compatibility = count_of("compatibility-stub");
+        let buckets = fold_origin_buckets(&origins);
+        debug_assert_eq!(
+            buckets.total(),
+            origins.len() as u64,
+            "the origin fold must be a partition — no class may fall between buckets"
+        );
+        let boot_image = buckets.boot_image;
+        let application = buckets.application;
+        let generated = buckets.generated;
+        let compatibility = buckets.compatibility;
 
         let mut out = String::with_capacity(512 + 128 * violations.len());
         out.push_str("{\n  \"schema_version\": 1,\n");
@@ -4147,8 +4154,7 @@ impl SharedVm {
                 out.push(',');
             }
             out.push_str("\n    ");
-            // Re-indent the violation body so nested objects stay readable —
-            // and so this file is byte-identical to `vm-cli`'s writer.
+            // Re-indent the violation body so nested objects stay readable.
             out.push_str(&v.replace('\n', "\n    "));
         }
         if !violations.is_empty() {
@@ -4179,7 +4185,7 @@ impl SharedVm {
         let mut file = std::fs::File::create(path)?;
         file.write_all(out.as_bytes())?;
         file.sync_all()?;
-        Ok(violations.len())
+        Ok((violations.len(), compatibility as usize))
     }
 
     /// NEW-10: append a missing-native entry to the audit log,
@@ -4518,6 +4524,301 @@ pub(crate) fn redact_registration_site(site: &str) -> String {
         Some((_, tail)) if !tail.is_empty() => format!("<redacted>/{tail}"),
         _ => "<redacted>".to_string(),
     }
+}
+
+/// The JDK feature version of the runtime image rooted at `java_home`, read
+/// from its `release` file's `JAVA_VERSION=` line.
+///
+/// Returns `None` rather than guessing. `jdk_feature` is used to interpret a
+/// violation ("does this JDK even declare that method?") and to key the
+/// per-image blocker artifacts, so a fabricated number is worse than an absent
+/// one — `null` reads as "not measured", a wrong `25` reads as a fact.
+///
+/// `"25"`, `"25.0.1"`, `"21.0.4+7-LTS"` → the feature; legacy `"1.8.0_402"`
+/// → `8`.
+pub fn jdk_feature_from_release_file(java_home: &str) -> Option<u32> {
+    let text = std::fs::read_to_string(std::path::Path::new(java_home).join("release")).ok()?;
+    let raw = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("JAVA_VERSION="))?;
+    let value = raw.trim().trim_matches('"');
+    let mut parts = value.split(['.', '-', '+', '_']);
+    let first: u32 = parts.next()?.parse().ok()?;
+    if first == 1 {
+        parts.next()?.parse().ok()
+    } else {
+        Some(first)
+    }
+}
+
+/// The `java.vm.info` execution-mode list for `mode` — and the same list the
+/// launcher's `-version` banner prints (`jdk-only-mode.md` §9).
+///
+/// ONE function, called from both places, because the property and the banner
+/// used to spell the policy two different ways (`"mixed mode, jdk-only"` vs
+/// `compatibility=jdk-only`) and nothing kept them in step. They still use two
+/// *conventions*, deliberately, and both are load-bearing:
+///
+/// * **`java.vm.info` is HotSpot's convention, verbatim**: a comma-separated
+///   list of execution-mode tokens (`"mixed mode"`, `"mixed mode, sharing"`),
+///   read by Java code and printed by tools straight after the VM name. It
+///   cannot carry a `key=value` token without breaking that shape, and under
+///   `Compatible` it must stay byte-for-byte `"mixed mode"` because the
+///   differential harness compares it literally (§10). Strict mode therefore
+///   *appends a token* instead of restructuring the value.
+/// * **The banner adds `compatibility=<mode>`** on top of this same list,
+///   because a banner is grepped by scripts that must not have to parse a
+///   comma list, and because `-version` prints it *before any VM exists*, so
+///   it cannot read the property it has to agree with.
+///
+/// What must agree is the spelling and the position of the policy token: both
+/// say `jdk-only`, both put it immediately after `mixed mode`.
+pub fn vm_info_mode_list(mode: CompatibilityMode) -> &'static str {
+    if mode.is_jdk_only() {
+        "mixed mode, jdk-only"
+    } else {
+        "mixed mode"
+    }
+}
+
+/// Replace absolute filesystem paths embedded in `text` with
+/// `<redacted>/<basename>`.
+///
+/// Contract §9: "absolute paths are redacted unless `--explain-jdk-only` is
+/// passed". Distinct from [`redact_registration_site`], which redacts a string
+/// that *is* a path; this one hunts paths inside prose — a
+/// `ClassOrigin::CompatibilityStub` reason, a `requested_by` attribution, a
+/// rendered `JdkOnlyViolation` body. A census file is routinely attached to a
+/// bug report; a build-agent home directory or a developer's user name is not
+/// information the report needs, but the file *name* usually is.
+///
+/// Lives here rather than in `vm-cli` because the census writers moved into
+/// this file and the launcher still needs the same function for its
+/// `--trace-jdk-only` lines; two copies of a redaction rule is how a redaction
+/// rule stops being applied. Deliberately regex-free (no dependency) and
+/// deliberately conservative:
+///
+/// * only **rooted** runs are candidates — a leading `/`, or a `C:\` / `C:/`
+///   drive prefix. Internal-form class names and method descriptors
+///   (`java/lang/String`, `(Ljava/lang/Object;)V`) are not rooted and are left
+///   alone, which matters because every violation body is full of them;
+/// * a candidate needs at least **two** separators before it is rewritten, so
+///   `/tmp` and a bare `/` survive while `/home/user/app.jar` does not;
+/// * the run is applied to already-escaped JSON, where a Windows separator
+///   appears as `\\`; consecutive separators count once.
+pub fn redact_absolute_paths(text: &str) -> String {
+    let b = text.as_bytes();
+    // Characters that may precede a path: anything that is not part of a word.
+    // This is what keeps `Ljava/lang/String;` (preceded by `L`) out.
+    let boundary = |c: u8| {
+        matches!(
+            c,
+            b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'(' | b'[' | b'{' | b'=' | b',' | b'<'
+        )
+    };
+    // Characters that end a run.
+    let terminator = |c: u8| {
+        matches!(
+            c,
+            b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b')' | b']' | b'}' | b',' | b';' | b'>'
+        )
+    };
+
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        let at_boundary = i == 0 || boundary(b[i - 1]);
+        let rooted_unix = b[i] == b'/';
+        let rooted_windows = i + 2 < b.len()
+            && b[i].is_ascii_alphabetic()
+            && b[i + 1] == b':'
+            && (b[i + 2] == b'\\' || b[i + 2] == b'/');
+        if at_boundary && (rooted_unix || rooted_windows) {
+            let mut end = i;
+            while end < b.len() && !terminator(b[end]) {
+                end += 1;
+            }
+            // Trailing sentence punctuation belongs to the prose, not the path.
+            while end > i && matches!(b[end - 1], b'.' | b':') {
+                end -= 1;
+            }
+            if let Some(redacted) = redact_one_path(&text[i..end]) {
+                out.push_str(&redacted);
+                i = end;
+                continue;
+            }
+        }
+        // Not a path: copy one whole UTF-8 character.
+        let step = utf8_char_len(b[i]);
+        let step = step.min(b.len() - i);
+        out.push_str(&text[i..i + step]);
+        i += step;
+    }
+    out
+}
+
+/// Byte length of the UTF-8 character starting with `first`.
+fn utf8_char_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
+}
+
+/// `<redacted>/<basename>` for a rooted run with >= 2 separators; `None` when
+/// the run is too shallow to be worth hiding.
+fn redact_one_path(run: &str) -> Option<String> {
+    let mut separators = 0usize;
+    let mut prev_was_separator = false;
+    let mut basename = "";
+    let mut segment_start = 0usize;
+    for (idx, ch) in run.char_indices() {
+        if ch == '/' || ch == '\\' {
+            if !prev_was_separator {
+                separators += 1;
+                if idx > segment_start {
+                    basename = &run[segment_start..idx];
+                }
+            }
+            prev_was_separator = true;
+            segment_start = idx + ch.len_utf8();
+        } else {
+            prev_was_separator = false;
+        }
+    }
+    if segment_start < run.len() {
+        basename = &run[segment_start..];
+    }
+    if separators < 2 || basename.is_empty() {
+        return None;
+    }
+    Some(format!("<redacted>/{basename}"))
+}
+
+/// A JSON string literal, path-redacted unless `verbose`.
+fn json_string(value: &str, verbose: bool) -> String {
+    let escaped = json_escape(value);
+    if verbose {
+        escaped
+    } else {
+        redact_absolute_paths(&escaped)
+    }
+}
+
+/// `null`, or a (possibly redacted) JSON string literal.
+fn json_opt_string(value: Option<&str>, verbose: bool) -> String {
+    match value {
+        Some(v) => json_string(v, verbose),
+        None => "null".to_string(),
+    }
+}
+
+/// The four coarse class buckets the JDK-only report's `counts` block carries
+/// (contract §9).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OriginBuckets {
+    pub(crate) boot_image: u64,
+    pub(crate) application: u64,
+    pub(crate) generated: u64,
+    pub(crate) compatibility: u64,
+}
+
+impl OriginBuckets {
+    pub(crate) fn total(self) -> u64 {
+        self.boot_image + self.application + self.generated + self.compatibility
+    }
+}
+
+/// Fold the ten `ClassOrigin::as_str()` tags into the report's four buckets.
+///
+/// The fold is a **partition**: every row lands in exactly one bucket, so
+/// [`OriginBuckets::total`] equals the row count and a class can never be lost
+/// between `--dump-class-origins` and the report's summary. `user-defined`
+/// counts as an application class (application bytes, whoever called
+/// `defineClass`); the five VM-created origins plus `vm-internal` count as
+/// generated — no class file, but a legitimate generation origin (§1 item 6).
+///
+/// `compatibility-stub` keeps its own bucket and is never folded in with the
+/// legitimate generated origins: conflating those two is exactly the confusion
+/// this feature exists to end.
+pub(crate) fn fold_origin_buckets(rows: &[ClassOriginEntry]) -> OriginBuckets {
+    let mut buckets = OriginBuckets::default();
+    for row in rows {
+        match row.origin.as_str() {
+            "boot-image" => buckets.boot_image += 1,
+            "application-class-path" | "user-defined" => buckets.application += 1,
+            "vm-array" | "hidden-class" | "generated-lambda" | "generated-proxy"
+            | "reflection-accessor" | "vm-internal" => buckets.generated += 1,
+            "compatibility-stub" => buckets.compatibility += 1,
+            // An unknown tag means the origin vocabulary grew. Count it as
+            // generated rather than dropping it: an unclassified class must
+            // still show up in the totals.
+            _ => buckets.generated += 1,
+        }
+    }
+    buckets
+}
+
+/// Serialize the class-origin census. Split out of
+/// [`SharedVm::dump_class_origins_json`] so the sort order, the seeded `counts`
+/// block and the redaction can be unit-tested without booting a VM.
+///
+/// `rows` is sorted in place by `(name, loader_id, origin)`.
+pub(crate) fn render_class_origins_json(rows: &mut [ClassOriginEntry], verbose: bool) -> String {
+    // A class name legitimately appears once per defining loader, and twice
+    // with different origins during an in-place stub-upgrade window, so all
+    // three fields are needed for a total order.
+    rows.sort_by(|a, b| (&a.name, a.loader_id, &a.origin).cmp(&(&b.name, b.loader_id, &b.origin)));
+
+    let mut counts: std::collections::BTreeMap<String, u64> = CLASS_ORIGIN_TAGS
+        .iter()
+        .map(|tag| ((*tag).to_string(), 0u64))
+        .collect();
+    for row in rows.iter() {
+        *counts.entry(row.origin.clone()).or_insert(0) += 1;
+    }
+
+    let mut out = String::with_capacity(256 + 160 * rows.len());
+    out.push_str("{\n  \"schema_version\": 1,\n  \"counts\": {\n");
+    for (tag, n) in &counts {
+        out.push_str(&format!("    {}: {n},\n", json_escape(tag)));
+    }
+    out.push_str(&format!("    \"total\": {}\n", rows.len()));
+    out.push_str("  },\n  \"classes\": [");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("\n    {\n");
+        // `name` is redacted like the other two: a `CompatibilityStub` for a
+        // class named after a jar entry can carry the jar's absolute path.
+        out.push_str(&format!(
+            "      \"name\": {},\n",
+            json_string(&row.name, verbose)
+        ));
+        out.push_str(&format!("      \"origin\": {},\n", json_escape(&row.origin)));
+        out.push_str(&format!(
+            "      \"reason\": {},\n",
+            json_opt_string(row.reason.as_deref(), verbose)
+        ));
+        out.push_str(&format!(
+            "      \"requested_by\": {},\n",
+            json_opt_string(row.requested_by.as_deref(), verbose)
+        ));
+        out.push_str(&format!(
+            "      \"real_bytes_found\": {},\n",
+            row.real_bytes_found
+        ));
+        out.push_str(&format!("      \"loader_id\": {}\n", row.loader_id));
+        out.push_str("    }");
+    }
+    if !rows.is_empty() {
+        out.push_str("\n  ");
+    }
+    out.push_str("]\n}\n");
+    out
 }
 
 impl SharedVm {
@@ -7004,6 +7305,142 @@ mod tests {
         );
         // Nothing recognisable left to keep.
         assert_eq!(redact_registration_site("/"), "<redacted>");
+    }
+
+    /// Prose-embedded path redaction, the other half of §9's redaction rule.
+    /// Migrated here with the census writers it serves, so the rule and its
+    /// test stay in the same crate.
+    #[test]
+    fn absolute_paths_are_redacted_to_their_basename() {
+        let unix = redact_absolute_paths("refused at /home/ci-agent/work/app.jar (boot)");
+        assert!(unix.contains("<redacted>/app.jar"), "{unix}");
+        assert!(!unix.contains("ci-agent"), "{unix}");
+
+        let windows = redact_absolute_paths("source C:\\Users\\victor\\build\\app.jar");
+        assert!(windows.contains("<redacted>/app.jar"), "{windows}");
+        assert!(!windows.contains("victor"), "{windows}");
+
+        // Already JSON-escaped text: the separator arrives doubled.
+        let escaped = redact_absolute_paths("\"C:\\\\Users\\\\victor\\\\app.jar\"");
+        assert!(escaped.contains("<redacted>/app.jar"), "{escaped}");
+        assert!(!escaped.contains("victor"), "{escaped}");
+
+        // Internal-form names and descriptors are not paths and must survive
+        // verbatim — every violation body is full of them.
+        let names = "java/lang/String.charAt(I)C and (Ljava/lang/Object;)V";
+        assert_eq!(redact_absolute_paths(names), names);
+        // Too shallow to be worth hiding.
+        assert_eq!(redact_absolute_paths("in /tmp now"), "in /tmp now");
+    }
+
+    #[test]
+    fn json_escape_quotes_and_escapes() {
+        assert_eq!(json_escape("plain"), "\"plain\"");
+        assert_eq!(json_escape("a\"b"), "\"a\\\"b\"");
+        assert_eq!(json_escape("c:\\x"), "\"c:\\\\x\"");
+        assert_eq!(json_escape("l1\nl2\tt"), "\"l1\\nl2\\tt\"");
+        assert_eq!(json_escape("\u{1}"), "\"\\u0001\"");
+        assert_eq!(json_opt_string(None, true), "null");
+        assert_eq!(json_opt_string(Some("x"), true), "\"x\"");
+    }
+
+    fn origin_row(name: &str, origin: &str, loader_id: u32) -> ClassOriginEntry {
+        ClassOriginEntry {
+            name: name.to_string(),
+            origin: origin.to_string(),
+            reason: None,
+            requested_by: None,
+            real_bytes_found: false,
+            loader_id,
+        }
+    }
+
+    /// The report's four class counters must be a partition of the ten origin
+    /// tags: every tag lands in exactly one bucket, so the sum is the row count
+    /// and no class can go missing between the census and the summary.
+    #[test]
+    fn origin_buckets_partition_every_row() {
+        let rows: Vec<ClassOriginEntry> = CLASS_ORIGIN_TAGS
+            .iter()
+            .map(|tag| origin_row(&format!("x/{tag}"), tag, 0))
+            .collect();
+        let buckets = fold_origin_buckets(&rows);
+        assert_eq!(buckets.boot_image, 1);
+        // application-class-path + user-defined
+        assert_eq!(buckets.application, 2);
+        // vm-array, hidden-class, generated-lambda, generated-proxy,
+        // reflection-accessor, vm-internal
+        assert_eq!(buckets.generated, 6);
+        assert_eq!(buckets.compatibility, 1);
+        assert_eq!(
+            buckets.total(),
+            rows.len() as u64,
+            "the fold must be a partition — no class may fall between buckets"
+        );
+    }
+
+    #[test]
+    fn class_origin_census_is_sorted_counted_and_redacted() {
+        let mut rows = vec![
+            ClassOriginEntry {
+                name: "org/jboss/logging/Logger".into(),
+                origin: "compatibility-stub".into(),
+                reason: Some("enterprise-prefix fallback".into()),
+                requested_by: Some("/home/ci-agent/work/app.jar".into()),
+                real_bytes_found: false,
+                loader_id: 0,
+            },
+            origin_row("com/example/Main", "application-class-path", 2),
+            origin_row("java/lang/String", "boot-image", 0),
+            origin_row("com/example/Main", "application-class-path", 1),
+            origin_row("[I", "vm-array", 0),
+        ];
+        let n = rows.len();
+        let text = render_class_origins_json(&mut rows, false);
+
+        // Sorted by (name, loader_id, origin).
+        let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        assert!(at("\"[I\"") < at("\"com/example/Main\""));
+        assert!(at("\"com/example/Main\"") < at("\"java/lang/String\""));
+        assert!(at("\"java/lang/String\"") < at("\"org/jboss/logging/Logger\""));
+        // The loader tiebreak: the two `com/example/Main` rows are ordered by
+        // defining loader, not by insertion.
+        assert!(at("\"loader_id\": 1") < at("\"loader_id\": 2"));
+
+        // Every tag is present, so "zero" is stated rather than implied.
+        for tag in CLASS_ORIGIN_TAGS {
+            assert!(text.contains(&format!("\"{tag}\":")), "counts omit {tag}");
+        }
+        assert!(text.contains("\"compatibility-stub\": 1"), "{text}");
+        assert!(text.contains("\"boot-image\": 1"), "{text}");
+        assert!(text.contains("\"application-class-path\": 2"), "{text}");
+        assert!(text.contains("\"hidden-class\": 0"), "{text}");
+        assert!(text.contains(&format!("\"total\": {n}")), "{text}");
+        assert!(text.contains("\"schema_version\": 1"), "{text}");
+
+        // Redaction is on by default (no --explain-jdk-only here).
+        assert!(text.contains("<redacted>/app.jar"), "{text}");
+        assert!(!text.contains("ci-agent"), "{text}");
+
+        // ...and off under --explain-jdk-only.
+        let verbose = render_class_origins_json(&mut rows, true);
+        assert!(verbose.contains("/home/ci-agent/work/app.jar"), "{verbose}");
+    }
+
+    /// The `java.vm.info` property and the launcher's `-version` banner read
+    /// the same function, so the policy token can only ever be spelled once.
+    /// Compatible mode must stay byte-for-byte HotSpot's value (§10).
+    #[test]
+    fn vm_info_mode_list_spells_the_policy_once() {
+        assert_eq!(vm_info_mode_list(CompatibilityMode::Compatible), "mixed mode");
+        assert_eq!(
+            vm_info_mode_list(CompatibilityMode::JdkOnly),
+            "mixed mode, jdk-only"
+        );
+        // The token is the mode's own wire spelling, appended to the list —
+        // never a re-spelling of it.
+        assert!(vm_info_mode_list(CompatibilityMode::JdkOnly)
+            .ends_with(CompatibilityMode::JdkOnly.as_str()));
     }
 
     #[cfg(feature = "experimental-debug")]

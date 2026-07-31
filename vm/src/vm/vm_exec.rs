@@ -23629,6 +23629,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: cratonvm_classloading::ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,

@@ -46,6 +46,42 @@ fn maybe_dump_jit_method_stats() {
     }
 }
 
+/// The `--help` long form: the short `about` (the doc comment on [`Args`])
+/// plus a summary of the seven mode / JDK-only diagnostic flags.
+///
+/// Spelled as a `const` rather than extra doc-comment lines because clap
+/// reflows a derived doc comment into paragraphs, which would destroy the
+/// alignment of the table below. The wording is contract §9 of
+/// `docs/feature-designs/jdk-only-mode.md`; keep the two in step.
+const LONG_ABOUT: &str = "\
+CratonVM - A Java Virtual Machine implemented in Rust.
+
+Executes Java programs by loading and interpreting `.class` files.
+
+Usage: cratonvm [OPTIONS] <CLASS_NAME> [ARGS]...
+       cratonvm [OPTIONS] --jar <FILE.jar> [ARGS]...
+
+Class library and compatibility policy:
+  --real-jdk                    Real JDK class library with today's compatibility
+                                behaviour (bridges, intrinsics AND compatibility
+                                shims). This is the default.
+  --synthetic-jdk               Standalone synthetic class library (~5,200 Rust
+                                stubs). Conflicts with --real-jdk and --jdk-only.
+  --jdk-only                    Real JDK, and real class bytes are authoritative:
+                                no fabricated compatibility class and no
+                                synthetic-stub native. Implies --real-jdk.
+
+JDK-only diagnostics (all four work in either compatibility mode, so a
+default run can be censused before strict mode is switched on):
+  --jdk-only-report <FILE>      Write the JSON violation/counter report.
+  --dump-class-origins <FILE>   Write the class-origin census (one row per
+                                loaded class, with its provenance).
+  --trace-jdk-only              Log every recorded violation to stderr.
+  --explain-jdk-only            Print the long-form explanation for each
+                                violation, and leave absolute paths unredacted
+                                in the reports.
+";
+
 /// CratonVM - A Java Virtual Machine implemented in Rust.
 ///
 /// Executes Java programs by loading and interpreting `.class` files.
@@ -53,7 +89,7 @@ fn maybe_dump_jit_method_stats() {
 /// Usage: cratonvm [OPTIONS] <CLASS_NAME> [ARGS]...
 ///        cratonvm [OPTIONS] --jar <FILE.jar> [ARGS]...
 #[derive(Parser, Debug)]
-#[command(name = "cratonvm", version, about)]
+#[command(name = "cratonvm", version, about, long_about = LONG_ABOUT)]
 struct Args {
     /// The fully qualified class name to execute (e.g., com.example.Main).
     class_name: Option<String>,
@@ -154,6 +190,65 @@ struct Args {
     #[arg(long = "real-jdk")]
     real_jdk: bool,
 
+    /// Strict compatibility policy: real JDK class bytes are authoritative.
+    ///
+    /// Implies `--real-jdk` (a real runtime image is required — there is no
+    /// silent fallback) and additionally forbids the two substitutions the
+    /// default mode allows: no fabricated compatibility class
+    /// (`ClassOrigin::CompatibilityStub`) may be minted, and no
+    /// `NativeKind::SyntheticStub` may be registered. Reviewed bridges and
+    /// intrinsics, arrays, hidden classes, lambdas, proxies and reflection
+    /// accessors all remain legal — they are products of a conforming JVM,
+    /// not compatibility substitutions.
+    ///
+    /// Conflicts with `--synthetic-jdk`: the synthetic library IS the set of
+    /// substitutions this flag forbids, so the pair selects a VM with no
+    /// usable class library.
+    ///
+    /// Wave 1 is measurement-first: violations that cannot yet be enforced
+    /// safely are recorded and counted rather than fatal. Pair with
+    /// `--jdk-only-report` to see them. See
+    /// docs/feature-designs/jdk-only-mode.md.
+    #[arg(long = "jdk-only", conflicts_with = "synthetic_jdk")]
+    jdk_only: bool,
+
+    /// Write the JDK-only violation/counter report to the given JSON file.
+    ///
+    /// Schema (`schema_version` 1): `{ mode, jdk_feature, violations[],
+    /// counts{} }`, where `counts` carries the four class-origin buckets and
+    /// the three per-`NativeKind` invocation totals. Violations are sorted so
+    /// the file is diff-stable, and absolute paths are redacted unless
+    /// `--explain-jdk-only` is also passed.
+    ///
+    /// Works in either compatibility mode: in the default `compatible` mode
+    /// the report is a census of what strict mode *would* reject.
+    #[arg(long = "jdk-only-report", value_name = "FILE")]
+    jdk_only_report: Option<String>,
+
+    /// Write the class-origin census to the given JSON file.
+    ///
+    /// Schema: `{ schema_version, counts{<origin-tag>: n, total},
+    /// classes: [{name, origin, reason, requested_by, real_bytes_found,
+    /// loader_id}] }`, one row per class the class manager holds, sorted by
+    /// `(name, loader_id, origin)`. The `origin` tags are the stable
+    /// `ClassOrigin::as_str()` spellings (`boot-image`, `vm-array`,
+    /// `generated-lambda`, `compatibility-stub`, ...).
+    #[arg(long = "dump-class-origins", value_name = "FILE")]
+    dump_class_origins: Option<String>,
+
+    /// Log each JDK-only violation to stderr as it is picked up.
+    ///
+    /// The violation logs are drained once immediately after VM init (which
+    /// is when registration refusals happen) and again at shutdown.
+    #[arg(long = "trace-jdk-only")]
+    trace_jdk_only: bool,
+
+    /// Print the long-form, operator-facing explanation for each JDK-only
+    /// violation instead of the one-line summary, and leave absolute paths
+    /// unredacted in the reports and census files.
+    #[arg(long = "explain-jdk-only")]
+    explain_jdk_only: bool,
+
     /// Enable Panama FFI native access (mirrors JDK `--enable-native-access`).
     ///
     /// With native access disabled (the default after the security fix),
@@ -228,10 +323,20 @@ struct Args {
 
     /// Synthetic-stub census: dump every registered native with its
     /// classification (intrinsic / bridge / synthetic-stub) to the given
-    /// JSON file on VM shutdown. Schema:
-    /// `{ "counts": {...}, "natives": [{class, name, descriptor, kind}...] }`,
-    /// sorted for byte-stable output. Use this to verify the default build is
-    /// synthetic-stub-free. See docs/synthetic-vs-real-explained.md.
+    /// JSON file on VM shutdown. Schema (`schema_version` 2):
+    /// `{ "mode", "counts": {...}, "invocations": {...},
+    /// "natives": [{class, name, descriptor, kind, registered_by, overwrote,
+    /// invocations, real_declaring_method}...] }`, sorted by
+    /// `(class, name, descriptor)` with a stable sort, so duplicate triples
+    /// stay in registration order — the overwrite chronology — and the file is
+    /// byte-stable across machines. `counts` counts *registrations* (schema 1's
+    /// block, unchanged, so the stub ratchet still reads it); `invocations` is
+    /// the separate per-kind dispatch total. Use this to verify the default
+    /// build is synthetic-stub-free, and (via `invocations`) that no synthetic
+    /// stub was dispatched. Absolute registration-site paths are redacted
+    /// unless `--explain-jdk-only` is also passed. See
+    /// docs/synthetic-vs-real-explained.md and
+    /// docs/feature-designs/jdk-only-mode.md §9.
     #[arg(long = "dump-native-registry", value_name = "FILE")]
     dump_native_registry: Option<String>,
 
@@ -775,6 +880,11 @@ const VALUE_TAKING_OPTS: &[&str] = &[
     "--dump-missing-natives",
     "--dump-missing-natives-grouped",
     "--dump-native-registry",
+    // JDK-only mode (docs/feature-designs/jdk-only-mode.md §9). Both take a
+    // path; `--jdk-only`, `--trace-jdk-only` and `--explain-jdk-only` are
+    // booleans and need no entry.
+    "--jdk-only-report",
+    "--dump-class-origins",
     "--jdwp-port",
     "--add-reads",
     "--add-exports",
@@ -1686,11 +1796,34 @@ fn scan_requested_jdk_mode(argv: &[String]) -> cratonvm_vm::config::JdkMode {
         }
         match a.as_str() {
             "--synthetic-jdk" => mode = cratonvm_vm::config::JdkMode::Synthetic,
-            "--real-jdk" => mode = cratonvm_vm::config::JdkMode::Real,
+            // `--jdk-only` selects a *policy*, but it also requires the real
+            // class library (contract §9: "--jdk-only implies JdkMode::Real").
+            // The banner must say so, or `cratonvm --jdk-only -version` would
+            // report whichever library the bare default names.
+            "--real-jdk" | "--jdk-only" => mode = cratonvm_vm::config::JdkMode::Real,
             _ => {}
         }
     }
     mode
+}
+
+/// Resolve the requested compatibility mode from raw argv, for the version
+/// banner. The counterpart of [`scan_requested_jdk_mode`], and equally
+/// non-authoritative: [`resolve_compatibility_mode`] decides for the run.
+///
+/// A conflicting `--jdk-only --synthetic-jdk` pair is not diagnosed here — the
+/// banner is a report, not a gate, and the real diagnosis (which names both
+/// flags and the fix) happens in `run()`.
+fn scan_requested_compatibility_mode(argv: &[String]) -> cratonvm_vm::config::CompatibilityMode {
+    for a in argv.iter().skip(1) {
+        if a == "--" {
+            break;
+        }
+        if a == "--jdk-only" {
+            return cratonvm_vm::config::CompatibilityMode::JdkOnly;
+        }
+    }
+    cratonvm_vm::config::CompatibilityMode::Compatible
 }
 
 /// Pick up an explicit `--java-home <PATH>` / `--java-home=<PATH>` from raw
@@ -1719,19 +1852,39 @@ fn scan_explicit_java_home(argv: &[String]) -> Option<String> {
 fn version_banner(
     query: VersionQuery,
     mode: cratonvm_vm::config::JdkMode,
+    compatibility: cratonvm_vm::config::CompatibilityMode,
     explicit_java_home: Option<&str>,
 ) -> String {
     use cratonvm_vm::config as cfg;
     let version = env!("CARGO_PKG_VERSION");
 
     if query == VersionQuery::Full {
-        return format!("cratonvm full version \"{version}\" ({mode})\n");
+        return format!(
+            "cratonvm full version \"{version}\" ({mode}, {})\n",
+            compatibility.as_str()
+        );
     }
 
     let mut out = String::new();
     out.push_str(&format!("cratonvm version \"{version}\"\n"));
+    // The `java -version` second line. HotSpot fills this parenthetical from
+    // `java.vm.info`, so the execution-mode list here is the one
+    // `cratonvm_vm::vm::vm_info_mode_list` will put in that property — the same
+    // function, so the banner and the property cannot spell the policy two
+    // different ways (they used to: `mixed mode, jdk-only` vs
+    // `compatibility=jdk-only`).
+    //
+    // The banner then adds `compatibility=<mode>` on top, which the property
+    // deliberately does NOT carry. Two reasons it belongs here and not there:
+    // a banner is grepped by scripts that must not have to parse a comma list,
+    // and `-version` prints before any VM exists, so this line cannot read the
+    // property it has to agree with. Machine readers grep for
+    // `compatibility=jdk-only`. Under `Compatible` the whole line is
+    // byte-for-byte what it has always been (jdk-only-mode.md §10).
     out.push_str(&format!(
-        "CratonVM (build {version}, mixed mode, sharing)\n"
+        "CratonVM (build {version}, {}, sharing, compatibility={})\n",
+        cratonvm_vm::vm::vm_info_mode_list(compatibility),
+        compatibility.as_str()
     ));
     out.push_str(&format!(
         "JDK class library: {mode} — {}\n",
@@ -1763,6 +1916,10 @@ fn version_banner(
     if query == VersionQuery::Internal {
         out.push('\n');
         out.push_str(&format!("jdk.mode.active                = {mode}\n"));
+        out.push_str(&format!(
+            "jdk.compatibility.mode          = {}\n",
+            compatibility.as_str()
+        ));
         out.push_str(&format!(
             "jdk.mode.default.launcher       = {}\n",
             cfg::LAUNCHER_DEFAULT_JDK_MODE
@@ -1830,6 +1987,266 @@ fn resolve_jdk_mode(
             Ok((mode, Some(home)))
         }
     }
+}
+
+// ===========================================================================
+// JDK-only mode (docs/feature-designs/jdk-only-mode.md §9).
+//
+// The launcher owns three things for this feature: resolving the policy flag
+// into a `CompatibilityMode`, draining the violation logs for `--trace-jdk-only`
+// / `--explain-jdk-only`, and writing the three census artefacts that
+// `difftest`'s `census.rs` parses. Everything below is hand-rolled JSON in the
+// style of `SharedVm::dump_missing_natives_json`, sorted so the files are
+// diff-stable against a committed baseline.
+// ===========================================================================
+
+/// Authoritative compatibility-policy resolution.
+///
+/// Runs **before** [`resolve_jdk_mode`] deliberately. Both flag pairs are
+/// mutually exclusive, but they are exclusive for different reasons, and the
+/// user deserves the specific one: `--jdk-only --synthetic-jdk` is a *policy*
+/// conflict (the synthetic library is made of exactly the substitutions
+/// `--jdk-only` forbids), whereas `--real-jdk --synthetic-jdk` is a *library*
+/// conflict. Resolving the policy first means the policy diagnosis wins;
+/// resolving the library first would report "two different standard-library
+/// implementations", which is true but unhelpful.
+fn resolve_compatibility_mode(
+    jdk_only: bool,
+    synthetic_flag: bool,
+) -> Result<cratonvm_vm::config::CompatibilityMode> {
+    use cratonvm_vm::config::CompatibilityMode;
+
+    // clap enforces this via `conflicts_with`; keep the check so a future
+    // argv-preprocessing change can't quietly make one flag win.
+    if jdk_only && synthetic_flag {
+        bail!(
+            "--jdk-only and --synthetic-jdk cannot be combined.\n\
+             \n\
+             --jdk-only means real JDK class bytes are authoritative: no \
+             fabricated compatibility class and no synthetic-stub native may be \
+             registered or invoked. The synthetic class library is ~5,200 such \
+             stubs, so the combination selects a VM with no usable class \
+             library.\n\
+             \n\
+             Pass --jdk-only against a real JDK (--java-home <PATH>), or drop \
+             --jdk-only and keep --synthetic-jdk for the standalone library."
+        );
+    }
+
+    Ok(if jdk_only {
+        CompatibilityMode::JdkOnly
+    } else {
+        CompatibilityMode::Compatible
+    })
+}
+
+/// Contract §9: `CRATONVM_REAL=-stubs` keeps working as a native-registry
+/// filter, but it cannot express the class-loading or dispatch half of the
+/// policy — it drops synthetic-stub *registrations* and says nothing about
+/// fabricated classes or about a stub shadowing real bytecode. A run that asked
+/// for it almost certainly wanted `--jdk-only`, so say so once.
+///
+/// Both spellings are checked: the expanded per-knob key (which
+/// `flag_groups::expand_process_env` writes back into the environment during
+/// `main()`) and the raw grouped token, so the note still fires if the
+/// expansion order ever changes or the variable is set after expansion.
+fn note_no_stubs_env_without_jdk_only(jdk_only: bool) {
+    if jdk_only {
+        return;
+    }
+    let expanded = std::env::var_os("CRATONVM_NO_STUBS").is_some();
+    let raw_token = std::env::var("CRATONVM_REAL")
+        .map(|v| {
+            v.split(',')
+                .any(|t| matches!(t.trim(), "-stubs" | "no-stubs" | "stubs=off"))
+        })
+        .unwrap_or(false);
+    if !(expanded || raw_token) {
+        return;
+    }
+    eprintln!(
+        "[cratonvm] CRATONVM_REAL=-stubs drops synthetic-stub native \
+         registrations only. It cannot reject a fabricated compatibility class, \
+         and it cannot stop a registered native from shadowing real bytecode. \
+         For the full policy pass --jdk-only (add --jdk-only-report <FILE> to \
+         census what it would reject)."
+    );
+}
+
+/// The JDK feature version of the runtime image, read from
+/// `$JAVA_HOME/release`'s `JAVA_VERSION=` line.
+///
+/// Thin adapter over `cratonvm_vm::vm::jdk_feature_from_release_file`, which is
+/// the same function `SharedVm::jdk_feature_version` uses to fill the report's
+/// `jdk_feature`. It lives in `vm` so a `--trace-jdk-only` line and the report
+/// written at the end of the same run cannot disagree about which JDK they are
+/// talking about. `None` rather than a guess: a fabricated number is worse than
+/// an absent one — `null` reads as "not measured", a wrong `25` reads as a fact.
+fn detect_jdk_feature(java_home: Option<&str>) -> Option<u32> {
+    cratonvm_vm::vm::jdk_feature_from_release_file(java_home?)
+}
+
+// JDK-ONLY CENSUS WRITERS: there are none here any more, on purpose.
+//
+// This file used to carry its own schema-2 native census, class-origin census
+// and JDK-only report, written independently of the ones in
+// `vm/src/vm/vm_init.rs`. Two writers stamping the same `schema_version` with
+// two different shapes is a consumer hazard, not a redundancy: a reader that
+// works against one silently mis-reads the other. The `vm` writers survived
+// (they can fill `real_declaring_method` from already-loaded classes without
+// perturbing the census, which the launcher could not), and
+// `write_jdk_only_dumps` below now calls them. The launcher's contributions —
+// path redaction under `--explain-jdk-only`, the `(kind, summary)` violation
+// sort, the `OriginBuckets` partition — moved with them.
+//
+// The JSON helpers (`json_escape`, `json_string`, `json_opt_string`) and the
+// path redaction went the same way. `redact_absolute_paths` is imported back
+// from `cratonvm_vm::vm` for the `--trace-jdk-only` lines below, so the trace
+// and the artefacts cannot disagree about what counts as a private path.
+
+/// How far each append-only violation log has already been reported.
+///
+/// JDK-ONLY-NOTE: `--trace-jdk-only` is a **poll**, not a live trace. The two
+/// recording sites (`ClassManager::origin_violations`,
+/// `NativeMethodRegistry::refused_registrations`) are append-only vectors, so
+/// the launcher can only drain them at the points it holds the VM: right after
+/// `Vm::new` (which is when registration refusals actually happen — draining
+/// only at shutdown would report them minutes late, after the failure they
+/// caused) and again at shutdown. A genuinely live trace needs a VM-scoped sink
+/// installed at the recording sites themselves; that is a wave-2 change to
+/// `classloading` and `native-api`, not something the launcher can fake.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ViolationWatermark {
+    origins: usize,
+    registrations: usize,
+}
+
+/// One trace line for a violation.
+///
+/// `--explain-jdk-only` selects the long-form operator report (which the
+/// contract requires to end with the `--real-jdk` fallback hint) and keeps
+/// absolute paths; otherwise the one-line summary, redacted.
+fn render_violation(
+    violation: &cratonvm_types::error::JdkOnlyViolation,
+    jdk_feature: Option<u32>,
+    explain: bool,
+) -> String {
+    if explain {
+        violation.render(jdk_feature, true)
+    } else {
+        // The same redaction the census writers apply, from the same function
+        // in `vm`: a traced violation and the report row for that violation
+        // must not disagree about what counts as a private path.
+        cratonvm_vm::vm::redact_absolute_paths(&violation.summary())
+    }
+}
+
+/// Print every violation recorded since the last drain.
+fn trace_jdk_only_violations(
+    shared: &cratonvm_vm::SharedVm,
+    watermark: &mut ViolationWatermark,
+    phase: &str,
+    explain: bool,
+) {
+    let jdk_feature = detect_jdk_feature(shared.config.java_home.as_deref());
+    let mut lines: Vec<String> = Vec::new();
+    {
+        let class_manager = shared.classes.class_manager.read();
+        let recorded = class_manager.origin_violations();
+        for violation in recorded.iter().skip(watermark.origins) {
+            lines.push(render_violation(violation, jdk_feature, explain));
+        }
+        watermark.origins = recorded.len();
+    }
+    {
+        let refused = shared.natives.native_methods.refused_registrations();
+        for violation in refused.iter().skip(watermark.registrations) {
+            lines.push(render_violation(violation, jdk_feature, explain));
+        }
+        watermark.registrations = refused.len();
+    }
+    for line in lines {
+        eprintln!("[cratonvm][jdk-only:{phase}] {line}");
+    }
+}
+
+/// Write whichever of the three census artefacts were requested.
+///
+/// Called from every exit path that has a live VM, including the failing ones:
+/// `difftest` categorises a *failing* strict run from these files, so a run that
+/// dies on the violation it was launched to find must still leave the census
+/// behind. Writes at most once per process (first caller wins — the failure
+/// path is the informative one).
+fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
+    if args.dump_class_origins.is_none()
+        && args.dump_native_registry.is_none()
+        && args.jdk_only_report.is_none()
+    {
+        return;
+    }
+    static WRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WRITTEN.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+
+    // `--explain-jdk-only` is the one flag that turns redaction OFF. Every
+    // writer below takes it explicitly and redacts when it is false, which is
+    // the default; there is no path that reaches a writer without deciding.
+    let verbose = args.explain_jdk_only;
+    let mode = shared.config.compatibility_mode;
+
+    // Each writer does its own locking and its own row snapshotting, inside
+    // `vm`, where the registry and the class manager live. The launcher used to
+    // copy the rows out here into local mirror types; that mirror is what
+    // allowed the two implementations to drift, and copying twice bought
+    // nothing — the writers already release every borrow before touching the
+    // filesystem, and the report takes ONE class-manager acquisition for both
+    // the census and the violation list so the two describe the same instant.
+    if let Some(path) = &args.dump_class_origins {
+        match shared.dump_class_origins_json(path, verbose) {
+            Ok(n) => eprintln!("[cratonvm] wrote {n} class-origin rows to {path}"),
+            Err(e) => {
+                eprintln!("[cratonvm] warning: could not write class-origin census to {path}: {e}")
+            }
+        }
+    }
+
+    if let Some(path) = &args.dump_native_registry {
+        match shared.dump_native_census_json(path, verbose) {
+            Ok((intrinsic, bridge, stub)) => eprintln!(
+                "[cratonvm] wrote native registry census (schema 2) to {path} \
+                 (intrinsic={intrinsic}, bridge={bridge}, synthetic-stub={stub})"
+            ),
+            Err(e) => eprintln!(
+                "[cratonvm] warning: could not write native registry JSON to {path}: {e}"
+            ),
+        }
+    }
+
+    if let Some(path) = &args.jdk_only_report {
+        match shared.dump_jdk_only_report_json(path, verbose) {
+            Ok((violations, compatibility_classes)) => eprintln!(
+                "[cratonvm] wrote {} JDK-only report to {path} ({violations} violation(s), \
+                 {compatibility_classes} compatibility class(es))",
+                mode.as_str(),
+            ),
+            Err(e) => {
+                eprintln!("[cratonvm] warning: could not write JDK-only report to {path}: {e}")
+            }
+        }
+    }
+}
+
+/// Shutdown half of the JDK-only surface: drain the violation logs one last
+/// time, then write the census files.
+///
+/// Called from the clean shutdown path **and** from each failing path that
+/// still has a VM, so a strict-mode failure is categorisable.
+fn finish_jdk_only(args: &Args, shared: &cratonvm_vm::SharedVm, watermark: &mut ViolationWatermark) {
+    if args.trace_jdk_only || args.explain_jdk_only {
+        trace_jdk_only_violations(shared, watermark, "shutdown", args.explain_jdk_only);
+    }
+    write_jdk_only_dumps(args, shared);
 }
 
 fn resolve_watchdog_timeout(
@@ -1912,8 +2329,9 @@ fn run() -> Result<()> {
     // all route through `version_banner` instead.
     if let Some((query, token)) = scan_version_query(&argv) {
         let mode = scan_requested_jdk_mode(&argv);
+        let compatibility = scan_requested_compatibility_mode(&argv);
         let java_home = scan_explicit_java_home(&argv);
-        let banner = version_banner(query, mode, java_home.as_deref());
+        let banner = version_banner(query, mode, compatibility, java_home.as_deref());
         // HotSpot writes the single-dash forms to stderr (build tools scrape
         // `java -version` from there) and the double-dash forms to stdout.
         if query.to_stdout(&token) {
@@ -2383,13 +2801,42 @@ fn run() -> Result<()> {
     // `-version` banner and the fatal-error path. `--java-home` no longer
     // *selects* real-JDK mode (it is already the default) — it only points
     // the (already selected) real-JDK mode at a specific installation.
+    //
+    // The compatibility *policy* (`--jdk-only`) is resolved FIRST, so that
+    // `--jdk-only --synthetic-jdk` is diagnosed as the policy conflict it is
+    // rather than as the generic "two standard libraries" conflict
+    // `resolve_jdk_mode` would report for the same argv.
     // ---------------------------------------------------------------
-    let (jdk_mode, resolved_java_home) = resolve_jdk_mode(
+    let compatibility_mode = resolve_compatibility_mode(args.jdk_only, args.synthetic_jdk)?;
+    note_no_stubs_env_without_jdk_only(args.jdk_only);
+    let (jdk_mode, resolved_java_home) = match resolve_jdk_mode(
         args.synthetic_jdk,
-        args.real_jdk,
+        // Contract §9: `--jdk-only` implies `JdkMode::Real`. It composes with
+        // an explicit `--real-jdk` (both select the same library) and is
+        // rejected above alongside `--synthetic-jdk`.
+        args.real_jdk || args.jdk_only,
         config.java_home.as_deref(),
-    )?;
+    ) {
+        Ok(resolved) => resolved,
+        Err(e) if args.jdk_only => {
+            return Err(e.context(
+                "--jdk-only requires a real JDK runtime image: real class bytes are \
+                 authoritative under this policy, so there is nothing to fall back \
+                 to. Point the launcher at an installation with --java-home <PATH>, \
+                 or drop --jdk-only to run with the default compatibility behaviour.",
+            ));
+        }
+        Err(e) => return Err(e),
+    };
     config = config.with_jdk_mode(jdk_mode);
+    config = config.with_compatibility_mode(compatibility_mode);
+    // Backstop for the same conflict: `resolve_compatibility_mode` guards the
+    // launcher's own flags, `validate_compatibility` guards the assembled
+    // config (which an embedder or a future argv rewrite could reach another
+    // way). Cheap, and it keeps the invariant with the type that owns it.
+    config
+        .validate_compatibility()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     // Pin the validated JDK root onto the config so boot-classpath
     // discovery inside the VM resolves the same installation this launcher
     // validated, instead of re-running the environment probe and possibly
@@ -2404,8 +2851,24 @@ fn run() -> Result<()> {
         resolved_java_home.map(|p| p.to_string_lossy().into_owned()),
     ));
     tracing::info!("{}", active_jdk_mode_line());
+    tracing::info!("compatibility mode: {}", compatibility_mode.as_str());
     if args.verbose_class || args.verbose_gc {
         eprintln!("[cratonvm] {}", active_jdk_mode_line());
+        eprintln!(
+            "[cratonvm] compatibility mode: {}",
+            compatibility_mode.as_str()
+        );
+    }
+    if compatibility_mode.is_jdk_only() {
+        // Wave 1 is measurement-first (contract §10): only class fabrication
+        // and stub registration actually enforce. Say so, so a clean run is
+        // not mistaken for a fully-enforced one.
+        eprintln!(
+            "[cratonvm] --jdk-only: real class bytes are authoritative. Wave-1 \
+             enforcement covers class fabrication and synthetic-stub \
+             registration; remaining violations are recorded and counted. Pass \
+             --jdk-only-report <FILE> for the census."
+        );
     }
 
     // AOT configuration
@@ -2630,6 +3093,21 @@ fn run() -> Result<()> {
 
     // Create VM and execute main method
     let mut vm = Vm::new(config);
+
+    // JDK-only: drain the violation logs now, not only at shutdown. Native
+    // registration refusals all happen inside `Vm::new`, so this is their real
+    // time of occurrence — reporting them at shutdown would print them after
+    // whatever failure they caused. See `ViolationWatermark` for why this is a
+    // poll rather than a live trace.
+    let mut jdk_only_watermark = ViolationWatermark::default();
+    if args.trace_jdk_only {
+        trace_jdk_only_violations(
+            &vm.shared,
+            &mut jdk_only_watermark,
+            "vm-init",
+            args.explain_jdk_only,
+        );
+    }
 
     // BUG-03 — publish the main thread's TLAB address now that `vm` is at its
     // final, address-stable location on the `main-vm` thread. This lets the
@@ -3013,6 +3491,11 @@ fn run() -> Result<()> {
     // class. See the comment on the `initPhase1` block above for why
     // this ordering matters in real-JDK mode.
     if let Err(e) = vm.load_class(&class_name) {
+        // JDK-only: this is the likeliest strict-mode failure — the main class
+        // (or something it needs) was refused rather than fabricated. The
+        // census must survive it, or `difftest` cannot categorise the failure
+        // it was launched to produce.
+        finish_jdk_only(&args, &vm.shared, &mut jdk_only_watermark);
         // `class_name` is in internal slash form here; the inner error `e`
         // typically embeds that same slash-form name, so render both dotted so
         // the message doesn't show the class two ways (`com.example.Main` then
@@ -3083,6 +3566,7 @@ fn run() -> Result<()> {
             &java_agents,
         );
         if let Err(e) = res {
+            finish_jdk_only(&args, &vm.shared, &mut jdk_only_watermark);
             bail!("javaagent premain aborted VM: {e}");
         }
     }
@@ -3107,6 +3591,7 @@ fn run() -> Result<()> {
                 .map(|s| s.to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".into());
+            finish_jdk_only(&args, &vm.shared, &mut jdk_only_watermark);
             bail!("main() panicked: {msg}");
         }
     };
@@ -3130,23 +3615,15 @@ fn run() -> Result<()> {
         }
     }
 
-    // Synthetic-stub census: full native registry with kind tags.
-    if let Some(path) = &args.dump_native_registry {
-        match vm.shared.dump_native_registry_json(path) {
-            Ok((n_intrinsic, n_bridge, n_stub)) => {
-                eprintln!(
-                    "[cratonvm] wrote native registry census to {path} \
-                     (intrinsic={n_intrinsic}, bridge={n_bridge}, \
-                     synthetic-stub={n_stub})"
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "[cratonvm] warning: could not write native registry JSON to {path}: {e}"
-                );
-            }
-        }
-    }
+    // JDK-only census artefacts: the class-origin dump, the schema-2 native
+    // registry census and the violation report, all three written by the
+    // `SharedVm` methods that own them (`dump_class_origins_json`,
+    // `dump_native_census_json`, `dump_jdk_only_report_json`) — the launcher
+    // supplies the paths and the `--explain-jdk-only` flag and nothing else.
+    // Written unconditionally, exactly like the missing-natives dump above, so
+    // a program that threw still produces a census. The failing paths earlier
+    // in this function write them too.
+    finish_jdk_only(&args, &vm.shared, &mut jdk_only_watermark);
 
     // T2.1.3: grouped-by-module census.
     if let Some(path) = &args.dump_missing_natives_grouped {
@@ -4013,6 +4490,24 @@ fn main() {
             shown.join(" ")
         );
     }
+    // Env tokens that a launcher flag now supersedes — notably
+    // `CRATONVM_REAL=-stubs`, which `--jdk-only` covers and extends (contract
+    // §9). Printed beside the `legacy_direct` line above because it is the same
+    // class of message ("your configuration has a newer spelling"), and once
+    // each: a token that supersedes twice is still one fact.
+    // …except when the run already passes the flag the note recommends: the
+    // only supersession today is `CRATONVM_REAL=-stubs` -> `--jdk-only`.
+    if !scan_requested_compatibility_mode(&early_argv).is_jdk_only() {
+        let mut noted: Vec<String> = Vec::new();
+        for superseded in cratonvm_types::flag_groups::process_env_supersessions() {
+            let note = superseded.note().to_string();
+            if noted.iter().any(|seen| *seen == note) {
+                continue;
+            }
+            eprintln!("[cratonvm] {note}");
+            noted.push(note);
+        }
+    }
 
     // Hardware-fault diagnostics. On Windows a SEGV/access violation is a
     // structured exception that bypasses the Rust panic hook below entirely;
@@ -4424,7 +4919,8 @@ fn clamp_ergonomic_heap(basis: u64, cap: u64) -> usize {
 mod tests {
     use super::*;
     use cratonvm_vm::config::{
-        JdkMode, EMBEDDED_DEFAULT_JDK_MODE, LAUNCHER_DEFAULT_JDK_MODE, SYNTHETIC_JDK_COMPILED_IN,
+        CompatibilityMode, JdkMode, EMBEDDED_DEFAULT_JDK_MODE, LAUNCHER_DEFAULT_JDK_MODE,
+        SYNTHETIC_JDK_COMPILED_IN,
     };
 
     // -----------------------------------------------------------------------
@@ -4548,18 +5044,34 @@ mod tests {
     /// it must name the active class library.
     #[test]
     fn version_banner_names_the_jdk_mode() {
-        let banner = version_banner(VersionQuery::Version, JdkMode::Synthetic, None);
+        let banner = version_banner(
+            VersionQuery::Version,
+            JdkMode::Synthetic,
+            CompatibilityMode::Compatible,
+            None,
+        );
         assert!(banner.contains("cratonvm version"), "{banner}");
         assert!(banner.contains("synthetic-jdk"), "{banner}");
-        let banner = version_banner(VersionQuery::Version, JdkMode::Real, None);
+        let banner = version_banner(
+            VersionQuery::Version,
+            JdkMode::Real,
+            CompatibilityMode::Compatible,
+            None,
+        );
         assert!(banner.contains("real-jdk"), "{banner}");
     }
 
     #[test]
     fn internal_version_reports_both_defaults_and_the_search_path() {
-        let banner = version_banner(VersionQuery::Internal, JdkMode::Real, None);
+        let banner = version_banner(
+            VersionQuery::Internal,
+            JdkMode::Real,
+            CompatibilityMode::Compatible,
+            None,
+        );
         for needle in [
             "jdk.mode.active",
+            "jdk.compatibility.mode",
             "jdk.mode.default.launcher",
             "jdk.mode.default.embedded",
             "jdk.mode.synthetic_compiled_in",
@@ -5959,4 +6471,143 @@ mod tests {
         let parsed = Args::try_parse_from(stage4).expect("clap must accept `-Xint Main`");
         assert_eq!(parsed.class_name.as_deref(), Some("Main"));
     }
+
+    // -----------------------------------------------------------------------
+    // JDK-only mode (docs/feature-designs/jdk-only-mode.md §9)
+    //
+    // These pin the launcher half of the contract: the flag surface other
+    // crates (difftest) already invoke, the conflict *ordering* that decides
+    // which of two true diagnoses the user sees, the redaction rule, and the
+    // shape/order of the census files difftest parses.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn jdk_only_flag_surface_matches_the_contract() {
+        let parsed = Args::try_parse_from(argv(&[
+            "cratonvm",
+            "--jdk-only",
+            "--jdk-only-report",
+            "report.json",
+            "--dump-class-origins",
+            "origins.json",
+            "--dump-native-registry",
+            "natives.json",
+            "--trace-jdk-only",
+            "--explain-jdk-only",
+            "Main",
+        ]))
+        .expect("the seven §9 flags must parse together");
+        assert!(parsed.jdk_only);
+        assert!(parsed.trace_jdk_only);
+        assert!(parsed.explain_jdk_only);
+        assert_eq!(parsed.jdk_only_report.as_deref(), Some("report.json"));
+        assert_eq!(parsed.dump_class_origins.as_deref(), Some("origins.json"));
+        assert_eq!(parsed.dump_native_registry.as_deref(), Some("natives.json"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+
+        // Composes with the (redundant but legal) explicit library selection…
+        let both = Args::try_parse_from(argv(&["cratonvm", "--jdk-only", "--real-jdk", "Main"]))
+            .expect("--jdk-only and --real-jdk select the same library");
+        assert!(both.jdk_only && both.real_jdk);
+
+        // …and conflicts with the other library.
+        assert!(
+            Args::try_parse_from(argv(&["cratonvm", "--jdk-only", "--synthetic-jdk", "Main"]))
+                .is_err(),
+            "--jdk-only --synthetic-jdk must be rejected by clap"
+        );
+
+        // Both value-taking flags must be known to the pre-clap separator
+        // inserter, or their path argument is mistaken for the main class.
+        assert!(VALUE_TAKING_OPTS.contains(&"--jdk-only-report"));
+        assert!(VALUE_TAKING_OPTS.contains(&"--dump-class-origins"));
+
+        // The long help names every one of them.
+        for flag in [
+            "--real-jdk",
+            "--synthetic-jdk",
+            "--jdk-only",
+            "--jdk-only-report",
+            "--dump-class-origins",
+            "--trace-jdk-only",
+            "--explain-jdk-only",
+        ] {
+            assert!(LONG_ABOUT.contains(flag), "long_about omits {flag}");
+        }
+    }
+
+    /// The banner is printed before clap runs, so `--jdk-only` has to be
+    /// visible to the raw-argv scan — both as "which class library" (it implies
+    /// real) and as "which policy".
+    #[test]
+    fn jdk_only_is_visible_to_the_pre_clap_banner_scan() {
+        assert_eq!(
+            scan_requested_jdk_mode(&tokens(&["cratonvm", "--jdk-only", "Main", "--"])),
+            JdkMode::Real
+        );
+        assert_eq!(
+            scan_requested_compatibility_mode(&tokens(&["cratonvm", "--jdk-only", "Main", "--"])),
+            CompatibilityMode::JdkOnly
+        );
+        // A program argument is not a launcher flag.
+        assert_eq!(
+            scan_requested_compatibility_mode(&tokens(&["cratonvm", "Main", "--", "--jdk-only"])),
+            CompatibilityMode::Compatible
+        );
+
+        let strict = version_banner(
+            VersionQuery::Version,
+            JdkMode::Real,
+            CompatibilityMode::JdkOnly,
+            None,
+        );
+        assert!(
+            strict.contains("compatibility=jdk-only"),
+            "the build line must name the policy: {strict}"
+        );
+        // ...and the execution-mode list must be the one `java.vm.info` will
+        // carry, so the banner and the property agree on the policy token.
+        assert!(
+            strict.contains(cratonvm_vm::vm::vm_info_mode_list(CompatibilityMode::JdkOnly)),
+            "the banner must spell the mode list the way java.vm.info does: {strict}"
+        );
+        let default = version_banner(
+            VersionQuery::Version,
+            JdkMode::Real,
+            CompatibilityMode::Compatible,
+            None,
+        );
+        assert!(default.contains("compatibility=compatible"), "{default}");
+        // Compatible mode's banner is byte-for-byte what it always was (§10).
+        assert!(default.contains("mixed mode, sharing"), "{default}");
+        assert!(!default.contains("jdk-only"), "{default}");
+    }
+
+    /// Ordering matters: `--jdk-only --synthetic-jdk` is a policy conflict, and
+    /// resolving the policy before the library is what makes the user see that
+    /// diagnosis rather than the generic library one.
+    #[test]
+    fn compatibility_resolution_reports_the_policy_conflict() {
+        assert_eq!(
+            resolve_compatibility_mode(false, false).expect("default is compatible"),
+            CompatibilityMode::Compatible
+        );
+        assert_eq!(
+            resolve_compatibility_mode(true, false).expect("--jdk-only alone is fine"),
+            CompatibilityMode::JdkOnly
+        );
+        let err = resolve_compatibility_mode(true, true).expect_err("the pair must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--jdk-only"), "{msg}");
+        assert!(msg.contains("--synthetic-jdk"), "{msg}");
+        // The specific (policy) diagnosis, not `resolve_jdk_mode`'s generic
+        // "two different standard-library implementations" one.
+        assert!(!msg.contains("mutually exclusive"), "{msg}");
+    }
+
+    // The census writers, the JSON helpers, the origin-bucket fold and the
+    // path redaction all moved to `vm/src/vm/vm_init.rs` when the two
+    // implementations were collapsed to one; their tests moved with them
+    // (`cargo test -p cratonvm-vm`). What stays testable here is the launcher's
+    // own job: flag parsing, mode resolution, and the banner.
 }

@@ -37,6 +37,11 @@ install, no `rt.jar`, one self-contained binary.
 - **Observability & hardening** — Java Flight Recorder, bytecode
   verification, opt-in I/O confinement and network egress policy
   ([docs/SECURITY_HARDENING.md](docs/SECURITY_HARDENING.md)).
+- **Provenance instrumentation (`--jdk-only`)** — an internal diagnostic that
+  makes every compatibility substitution a counted, attributed event, so the
+  gap between "runs on CratonVM" and "runs on the real class bytes" is
+  measurable rather than assumed. Not a supported runtime mode; `--real-jdk`
+  stays the default (see below).
 
 ## Performance
 
@@ -140,12 +145,52 @@ cratonvm [OPTIONS] --jar <FILE.jar> [ARGS]...
 | `--noverify`, `--Xverify <MODE>` | Bytecode verification policy (`none` / `remote` / `all`). |
 | `--java-home <PATH>` | Boot from a specific JDK's `java.base`. |
 | `--synthetic-jdk` | Force the built-in Rust standard library even when a JDK is detected. |
+| `--jdk-only` | Diagnostic strict mode: real JDK class bytes are authoritative. Implies `--real-jdk`, conflicts with `--synthetic-jdk`. May fail where the default passes — see below. |
 | `--Xbootclasspath <PATH>` | Override the bootstrap classpath (advanced). |
 | `-V`, `--version` / `--help` | Version / full option list. |
 
 Every command above is verified against the current binary. `--gpu` and the
 other GPU options require a `--features gpu-driver` build — see
 [docs/gpu/README.md](docs/gpu/README.md).
+
+## JDK-only mode (`--jdk-only`) — internal diagnostic
+
+Where CratonVM cannot yet run the JDK's own code, it substitutes: a native
+Rust implementation, or occasionally a fabricated stand-in class. That is what
+makes the VM useful today, and it is also why "it runs" and "it runs the real
+class bytes" are different claims. `--jdk-only` is the instrument that tells
+them apart — it asks the VM to treat real JDK class bytes as authoritative and
+to report every substitution it would otherwise have made silently.
+
+**Read the status honestly:**
+
+- It is an **internal diagnostic stage**, not a supported runtime mode, and
+  not a compatibility guarantee. The default is and remains `--real-jdk`;
+  nothing here changes a default run.
+- The current wave is **instrumentation and measurement, not deletion**. Only
+  two things are actually enforced today: class fabrication, and the
+  *registration* of synthetic-stub natives. The remaining dispatch-side rules
+  are **counted and reported**, not yet refused.
+- A `--jdk-only` run is **expected to fail on programs that pass under
+  `--real-jdk`**. That failure is the measurement, not a regression in your
+  program.
+- It requires a real JDK image and never falls back.
+
+A/B a program to see what it depends on:
+
+```bash
+./target/release/cratonvm -cp . MyApp                                   # default: --real-jdk
+./target/release/cratonvm --jdk-only --jdk-only-report report.json -cp . MyApp
+```
+
+The report names each violation with the class involved and, where the kind of
+violation has them, the method, descriptor, class origin and attempted native
+kind. `--dump-class-origins <FILE>` adds the per-class provenance census.
+
+Details: [docs/CONFIG.md](docs/CONFIG.md#jdk-only-mode) (flags and modes),
+[docs/jdk-only-migration.md](docs/jdk-only-migration.md) (operator guide),
+[docs/feature-designs/jdk-only-mode.md](docs/feature-designs/jdk-only-mode.md)
+(the design contract — a proposal, not a statement that a wave has landed).
 
 ## Limitations
 
@@ -180,6 +225,9 @@ other GPU options require a `--features gpu-driver` build — see
 - [docs/EMBEDDING.md](docs/EMBEDDING.md) — embedding CratonVM in your application
 - [docs/SECURITY_HARDENING.md](docs/SECURITY_HARDENING.md) — sandboxing and hardening
 - [docs/CONFIG.md](docs/CONFIG.md) — configuration reference
+- [docs/jdk-only-migration.md](docs/jdk-only-migration.md) — `--jdk-only`
+  operator guide; the rest of the JDK-only docset is indexed from
+  [docs/README.md](docs/README.md)
 
 ## Building & Testing
 

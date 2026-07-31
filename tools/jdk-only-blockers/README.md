@@ -27,6 +27,15 @@ generated against JDK 25 says nothing about JDK 21.
 Runtime dumps written by `cratonvm`. All five are optional; each one that is
 absent degrades the result and is named in the output (see *Partial results*).
 
+> **All dumps must come from the same VM run under the same compatibility
+> policy.** A registry census, a class-origin census, an unresolved-native list
+> and a violation report describe *one booted VM*. Feeding this tool a
+> permissive registry together with a strict class census pairs two different
+> worlds; the blocker list that comes out is wrong in a way that looks fine.
+> The tool cannot detect the mix — the dumps carry no run identity — so the
+> caller is responsible for the pairing. Use `scripts/jdk-only-census.sh`,
+> which runs each policy exactly once and names every dump after its policy.
+
 | `blockers.py` flag | `cratonvm` flag | Supplies |
 |---|---|---|
 | `--native-registry` | `--dump-native-registry` | every registration still classified `synthetic-stub`, with `registered_by`, `overwrote`, `invocations` |
@@ -195,6 +204,32 @@ never silently close a blocker.
 
 ## Running it
 
+### The supported driver
+
+```bash
+export JAVA_HOME=/path/to/jdk25
+sh scripts/jdk-only-census.sh                 # generate
+BLOCKERS=check  sh scripts/jdk-only-census.sh # generate + ratchet
+BLOCKERS=update sh scripts/jdk-only-census.sh # generate + refresh the baseline
+BLOCKERS=off    sh scripts/jdk-only-census.sh # dumps only
+```
+
+The census script boots the VM once per policy — each run emitting all four
+dumps — and then calls this tool once per coherent set:
+
+| dump set | policy | artifacts land in |
+|---|---|---|
+| `registry-real.json`, `missing-real-by-module.json`, `classes-real.json`, `report-real.json` | `--real-jdk` | `target/jdk-only-audit/` |
+| `registry-strict.json`, `missing-strict-by-module.json`, `classes-strict.json`, `report-strict.json` | `--jdk-only` | `target/jdk-only-audit/strict/` |
+
+The `real` pair is the canonical §6 artifact and the only one ratcheted:
+`baselines/` holds one pair per JDK feature version, so ratcheting a second
+policy against it would compare two different worlds. The script always passes
+`--jdk-feature` explicitly, read from `$JAVA_HOME/release`, rather than letting
+it be inferred from a report a failing strict run may never have written.
+
+### By hand
+
 ```bash
 export JAVA_HOME=/path/to/jdk25
 mkdir -p target/jdk-only-audit
@@ -298,6 +333,14 @@ The tool needs only `python3` and the dump files; it does not build anything.
 It fits either as a step in an existing job that already provisions a JDK, or as
 its own job.
 
+The `jdk-only-audit` job already runs `sh scripts/jdk-only-census.sh`, which
+generates both artifact pairs. Turning that step into a ratchet is one
+environment variable — `BLOCKERS: check` — and needs no new step; the script
+exits 5 and names the reason when the open set grows. Until a baseline pair is
+committed for the image CI pins, `check` correctly refuses (there is nothing to
+ratchet against), so commit `baselines/jdk-25-*.json` first. The equivalent
+standalone step is:
+
 ```yaml
       - name: JDK-only blocker artifacts
         run: |
@@ -341,7 +384,13 @@ Notes for whoever wires this up (this directory does not own `.github/`):
 
 ```bash
 python tools/jdk-only-blockers/selftest.py
+# or, from the same entry point as the census itself:
+sh scripts/jdk-only-census.sh --selftest
 ```
+
+`--selftest` is handled before every prerequisite check in the census script,
+so it needs no `cratonvm` binary and no `JAVA_HOME` — it is safe in a lint or
+docs job that provisions neither.
 
 51 assertions over synthetic dumps in both emitter shapes: generation,
 determinism (byte-identical reruns, no CRLF, no absolute paths), the ratchet

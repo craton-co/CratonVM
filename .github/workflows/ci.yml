@@ -362,6 +362,407 @@ jobs:
       - name: Run the semantic differential gate
         run: cargo run -p cratonvm-difftest --bin cratonvm-difftest -- gate --corpus difftest/seeds
 
+  # Hermetic self-test for the JDK-only blocker generator
+  # (`tools/jdk-only-blockers/blockers.py`, the tool that derives the design-§6
+  # artifacts the `jdk-only` job below uploads). 51 assertions over synthetic
+  # dumps in both emitter shapes: generation, determinism (byte-identical
+  # reruns, no CRLF, no absolute paths in a file that gets committed as a
+  # baseline), the ratchet — including that a never-invoked stub still fails it,
+  # and that an extra *allowed* generated class does not — the status ledger,
+  # and every degraded-input path.
+  #
+  # ITS OWN CHEAP JOB, DELIBERATELY. `--selftest` is handled before every
+  # prerequisite check in scripts/jdk-only-census.sh, so this needs no cargo
+  # build, no Rust toolchain, no JDK image, no cratonvm binary and no network —
+  # it is a stdlib-only python run of a few seconds. Putting it in
+  # `build-and-test` would make it wait on a full workspace build, and putting it
+  # in the `jdk-only` matrix would pay for a JDK and a Rust build four times to
+  # learn the same hermetic fact.
+  #
+  # BLOCKING, unlike the advisory `jdk-only` job below. Neither of that job's two
+  # reasons to be advisory applies here: this depends on no runtime image, no
+  # committed baseline and no strict-mode corpus, so it is deterministic today.
+  # If it ever goes red, the generator is broken, and every artifact that job
+  # produces is then untrustworthy. Runner images ship python3; if one does not,
+  # the script exits 3 and names the interpreters it tried, which is the right
+  # failure rather than a silent skip.
+  jdk-only-blockers-selftest:
+    name: JDK-only blocker generator self-test (hermetic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test (no build, no JDK, no network)
+        shell: bash
+        run: sh scripts/jdk-only-census.sh --selftest
+
+  # JDK-only mode (`--jdk-only`), per docs/feature-designs/jdk-only-mode.md.
+  # "Real class bytes are authoritative": no fabricated compatibility classes,
+  # no `NativeKind::SyntheticStub` registered or invoked.
+  #
+  # ADVISORY (`continue-on-error: true`) ON PURPOSE. Two independent reasons:
+  #
+  #  1. Wave 1 is measurement, not deletion (design §10). 157 synthetic-stub
+  #     natives are still registered on the default path, and the strict
+  #     class-loading refusals mean a `--jdk-only` run is *expected* to fail on
+  #     real workloads right now. The census is how that failure is measured.
+  #  2. The design's own acceptance criterion (§11) makes the zero-stub census
+  #     blocking only once "the strict corpus shows no new HotSpot divergence" —
+  #     i.e. once difftest/seeds-jdk-only is deterministic across both OS legs.
+  #     Promote this job by deleting `continue-on-error` at that point, together
+  #     with un-ignoring `strict_mode_refuses_nothing` in
+  #     `native-builtins/tests/stub_ratchet.rs`.
+  #
+  # For the avoidance of doubt about the neighbouring jobs: the "Synthetic-stub
+  # ratchet" step in `build-and-test` is BLOCKING today — it runs in a job that
+  # provisions JDK 25 and carries no `continue-on-error`, and it asserts an
+  # exact ceiling (`synthetic <= BASELINE_SYNTHETIC_STUBS`, SLACK = 0) plus a
+  # separate, much weaker `total >= 8_000` floor. There are exactly TWO
+  # `continue-on-error: true` items in this file: the advisory
+  # `cargo test -p cratonvm-vm --lib --features synthetic-jdk` step, and this
+  # job. Nothing here weakens either, and the hermetic
+  # `jdk-only-blockers-selftest` job above is blocking.
+  #
+  # JDK MATRIX IS A PROPOSAL, NOT EXISTING COVERAGE. Every other job in this
+  # file pins `java-version: '25'`, so JDK 21 is currently tested by nothing at
+  # all. The 21 leg is here because "real class bytes are authoritative" is a
+  # claim about a *specific* runtime image — a boot-image layout or module set
+  # that differs between 21 and 25 shows up as a class-origin census diff and
+  # nowhere else. If the 21 leg proves noisy for reasons unrelated to strict
+  # mode, drop it from THIS matrix rather than adding 21 elsewhere; widening
+  # JDK coverage repo-wide is a separate decision.
+  #
+  # Inputs this job depends on, and their state as of this commit — every one of
+  # them is landing in the same wave, which is a third reason to stay advisory:
+  #   * `--jdk-only`, `--dump-class-origins`, `--jdk-only-report`,
+  #     `--dump-native-registry` (vm-cli, §9): PRESENT.
+  #   * `jdk-only-jit` / `jdk-only-nojit` difftest mode labels: PRESENT.
+  #   * `CompatibilityMode` / registry census / `ClassOrigin` (§§3-5): PRESENT.
+  #   * `CRATONVM_ARGS` forwarding in `regression-suite/run.sh`: NOT PRESENT.
+  #     See the note on that step — it is currently a compatible-mode run.
+  jdk-only:
+    name: JDK-only mode (advisory) ${{ matrix.os }} / JDK ${{ matrix.java }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        java: ['21', '25']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK ${{ matrix.java }} (the runtime image under audit)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+
+      # The census script drives the real launcher, and the difftest gate needs
+      # its own binary; both are debug builds because this job measures
+      # provenance, not throughput.
+      - name: Build cratonvm + difftest
+        run: cargo build -p cratonvm-cli -p cratonvm-difftest
+
+      # The hermetic half: no JDK image, no subprocess, no Cargo feature. These
+      # four targets are the cross-crate contract (design §§4, 5, 7) and the
+      # strict half of the stub ratchet. Add `--test jdk_only_config` here when
+      # `vm/tests/jdk_only_config.rs` (design §6, VmConfig validation) lands.
+      - name: Strict-mode unit and integration tests
+        shell: bash
+        run: |
+          cargo test -p cratonvm-native-api    --test jdk_only_registry
+          cargo test -p cratonvm-classloading  --test jdk_only_class_origin
+          cargo test -p cratonvm-vm            --test jdk_only_dispatch
+          cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
+
+      # The booted-VM half.
+      #
+      # The script runs the VM ONCE PER POLICY and emits all four dumps on each
+      # run, with the policy in every file name — so a registry census and a
+      # class census that appear in the same artifact always describe the same
+      # booted process. (The previous layout paired a stub-dropped registry with
+      # a compatible-run class census; that mix looks fine and is wrong.)
+      #
+      #   real   (--real-jdk)  registry-real.json    missing-real-by-module.json
+      #                        classes-real.json     report-real.json
+      #   strict (--jdk-only)  registry-strict.json  missing-strict-by-module.json
+      #                        classes-strict.json   report-strict.json
+      #
+      # plus three byte-identical ALIASES OF THE STRICT SET kept for older
+      # consumers — registry-no-stubs.json, class-origins.json,
+      # jdk-only-report.json — and the design-§6 blocker pair
+      # `jdk-<feature>-{missing-natives,synthetic-dependencies}.json`, generated
+      # by tools/jdk-only-blockers/blockers.py from the *real* dump set at the
+      # output root and from the *strict* dump set under `strict/`.
+      #
+      # A non-zero VM exit is not a script failure here; only a missing artifact
+      # is. Script exit codes: 3 prerequisite missing (nothing ran), 4 a required
+      # dump was not written, 5 blocker generation or the ratchet failed.
+      #
+      # BLOCKERS is left at its default (`generate`). Python is what the derived
+      # artifacts need, and every hosted runner ships python3, so the default is
+      # the right one here: `BLOCKERS=off` would declare the §6 artifacts
+      # deliberately omitted, and they are not — they are the triage material
+      # this job exists to produce.
+      #
+      # THE RATCHET IS NOT ENABLED, AND ITS PRECONDITION IS NOT MET. Turning it
+      # on is one line — add `env: {BLOCKERS: check}` to this step — after which
+      # the script ratchets the `real` blocker pair against
+      # tools/jdk-only-blockers/baselines/ and exits 5 when the open set grows.
+      # That directory contains only `.gitkeep` today, and blockers.py correctly
+      # refuses `--check` with exit 2 (surfaced as census exit 5) when no
+      # baseline exists for the JDK feature under test. The precondition is a
+      # committed pair — baselines/jdk-<feature>-missing-natives.json and
+      # baselines/jdk-<feature>-synthetic-dependencies.json — produced by a real
+      # `BLOCKERS=update` run against the image this job pins. Never written by
+      # hand, and never from a partial run (blockers.py refuses that too). The
+      # artifacts are only valid for the image that produced them, so each
+      # matrix leg needs its own committed pair.
+      - name: JDK-only census (registry, class origins, missing natives)
+        shell: bash
+        run: |
+          rc=0
+          sh scripts/jdk-only-census.sh || rc=$?
+          echo "CENSUS_RC=$rc" >> "$GITHUB_ENV"
+          case "$rc" in
+            0)
+              echo "census: every artifact was produced."
+              ;;
+            5)
+              # Exit 5 is only reachable AFTER the script has verified that every
+              # required dump exists, so the four censuses are complete and the
+              # acceptance gates below are worth running against them. What is
+              # missing is the derived §6 blocker pair. In the script's own
+              # words that "is a gap in this run, not a clean result", so it must
+              # not pass silently — but failing here would skip the gates and the
+              # upload, so the non-zero exit is deferred to the last step of this
+              # job.
+              echo "::error::jdk-only-census.sh exited 5: the dumps were written, but the"
+              echo "  design-§6 blocker artifacts were not generated (no python interpreter,"
+              echo "  an undeterminable JDK feature version, or blockers.py itself failed)."
+              echo "  Hosted runners ship python3, so this is a real regression, not an"
+              echo "  expected environment gap. The dumps are complete; the gates below run"
+              echo "  and the job is failed by its final step."
+              ;;
+            *)
+              echo "::error::jdk-only-census.sh exited $rc (3 = a prerequisite is missing and"
+              echo "  nothing ran; 4 = the VM ran but a required dump was not written)."
+              echo "  There is no coherent dump set to assert on; failing now."
+              exit "$rc"
+              ;;
+          esac
+
+      # ACCEPTANCE CRITERION (design §11): the final native registry in strict
+      # mode contains zero SyntheticStub entries. Re-derived here from the
+      # artifact rather than trusting the script's own summary line, so the gate
+      # and the human-readable summary can disagree loudly.
+      #
+      # POLICY, NAMED EXPLICITLY: registry-strict.json is the --jdk-only run's
+      # own census. registry-no-stubs.json is a byte-identical alias of it (the
+      # script copies strict -> alias), and registry-real.json is the permissive
+      # run — asserting zero against *that* would be a gate that can never pass,
+      # and mixing the two is the exact defect the per-policy rename fixed. Read
+      # the policy-suffixed name so the file this gate reads says which world it
+      # came from.
+      - name: Assert zero synthetic-stub natives in the strict registry
+        shell: bash
+        run: |
+          f=target/jdk-only-audit/registry-strict.json
+          if [ ! -s "$f" ]; then
+            echo "::error::$f was not produced; the strict run did not get far enough to census."
+            exit 1
+          fi
+          # Schema 2 carries "synthetic-stub" TWICE as a numeric key: once in
+          # `counts` (REGISTRATIONS — what §11 gates on) and once in
+          # `invocations` (dispatches). Scope the read to the `counts` block
+          # instead of letting `head -n 1` depend on which block happens to be
+          # serialized first.
+          block=$(sed -n '/"counts"[[:space:]]*:[[:space:]]*{/,/^[[:space:]]*}/p' "$f")
+          if [ -z "$block" ]; then
+            echo "::error::$f has no readable \"counts\" block. That is not a zero —"
+            echo "the schema changed, or the dump is truncated."
+            exit 1
+          fi
+          n=$(printf '%s\n' "$block" \
+              | sed -n 's/.*"synthetic-stub"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+              | head -n 1)
+          if [ -z "$n" ]; then
+            echo "::error::$f carries no \"synthetic-stub\" count. A census without the"
+            echo "count is not a zero — the schema changed, or the dump is truncated."
+            exit 1
+          fi
+          echo "strict registry synthetic-stub natives: $n"
+          if [ "$n" -ne 0 ]; then
+            echo "::error::$n synthetic-stub native(s) survived --jdk-only. Every one of them"
+            echo "shadows real JDK bytecode. Make it a Bridge/Intrinsic or delete it; see"
+            echo "docs/feature-designs/jdk-only-mode.md \$4."
+            exit 1
+          fi
+
+      # ACCEPTANCE CRITERION (design §11): zero ClassOrigin::CompatibilityStub
+      # classes. Arrays, hidden classes, lambdas, proxies and reflection
+      # accessors carry their own origins and are explicitly allowed, so this
+      # counts the one forbidden tag rather than "anything VM-generated".
+      #
+      # POLICY, NAMED EXPLICITLY: classes-strict.json is the --jdk-only run's
+      # class census; class-origins.json is a byte-identical alias of it, and
+      # classes-real.json is the permissive run, which legitimately contains
+      # compatibility classes today. Reading the policy-suffixed name is what
+      # keeps this gate from being pointed at the wrong world.
+      - name: Assert zero compatibility classes in the class-origin census
+        shell: bash
+        run: |
+          f=target/jdk-only-audit/classes-strict.json
+          if [ ! -s "$f" ]; then
+            echo "::error::$f was not produced (--dump-class-origins wrote nothing)."
+            exit 1
+          fi
+          # Read the `counts` block, NOT `grep -c '"compatibility-stub"'`: the
+          # tag also appears once per offending row, so an occurrence count
+          # reports N+1.
+          block=$(sed -n '/"counts"[[:space:]]*:[[:space:]]*{/,/^[[:space:]]*}/p' "$f")
+          if [ -z "$block" ]; then
+            echo "::error::$f has no readable \"counts\" block; it is not evidence of a zero."
+            exit 1
+          fi
+          n=$(printf '%s\n' "$block" \
+              | sed -n 's/.*"compatibility-stub"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+              | head -n 1)
+          if [ -z "$n" ]; then
+            # `counts` is seeded from the full ClassOrigin tag vocabulary
+            # (CLASS_ORIGIN_TAGS / render_class_origins_json in
+            # vm/src/vm/vm_init.rs), so `"compatibility-stub": 0` is STATED, not
+            # implied by an absent key. Defaulting an absent key to zero here —
+            # as this step used to — would turn a schema break or a truncated
+            # dump into a silently passing gate.
+            echo "::error::$f has a \"counts\" block with no \"compatibility-stub\" key."
+            echo "That key is seeded to 0 for every run, so its absence means the schema"
+            echo "changed or the dump is truncated. It is not a zero."
+            exit 1
+          fi
+          echo "compatibility-stub classes: $n"
+          if [ "$n" -ne 0 ]; then
+            echo "::error::$n fabricated compatibility class(es) under --jdk-only. Real class"
+            echo "bytes are authoritative: the loader must raise ClassNotFoundException /"
+            echo "NoClassDefFoundError instead of fabricating. See jdk-only-mode.md \$5."
+            grep -n '"compatibility-stub"' "$f" | head -n 40
+            exit 1
+          fi
+
+      # PRECONDITION, NOT YET MET: as of this commit `regression-suite/run.sh`
+      # invokes the VM as
+      #   "$CV" --java-home "$JDK" -cp "$BUILD" "$c"
+      # and never reads CRATONVM_ARGS, so this step currently runs the ordinary
+      # compatible-mode suite and the env var below is inert. Another agent in
+      # this wave is adding the forwarding; until it lands, treat a green result
+      # here as "compatible mode still passes", NOT as "the suite passes under
+      # --jdk-only". Re-check line ~48 of run.sh before quoting this step as
+      # strict-mode evidence.
+      #
+      # run.sh defaults CV to target/release/cratonvm[.exe]; this job builds
+      # debug, so point CV at it explicitly rather than paying for a release
+      # build.
+      - name: Regression suite under --jdk-only
+        shell: bash
+        env:
+          CRATONVM_ARGS: --jdk-only
+        run: |
+          CV=target/debug/cratonvm
+          [ -x "$CV" ] || CV=target/debug/cratonvm.exe
+          CV="$CV" bash regression-suite/run.sh
+
+      # Semantic differential gate over the strict-mode seed corpus
+      # (difftest/seeds-jdk-only: lambda identity, dynamic proxies, reflection
+      # accessors, a missing optional dependency — the four shapes where a
+      # fabricated class or a stub native would silently substitute for the real
+      # thing). Both strict modes are run because a divergence that appears only
+      # with the JIT on is a JIT bug, not a policy bug, and the mode split is
+      # what tells them apart.
+      #
+      # `jdk-only-jit` / `jdk-only-nojit` are new mode labels landing with this
+      # wave; `Mode::from_label` rejects unknown labels, so this step fails
+      # loudly (and advisorily) until the runner learns them.
+      - name: Semantic differential gate (strict modes)
+        shell: bash
+        run: >
+          cargo run -p cratonvm-difftest --bin cratonvm-difftest --
+          gate --corpus difftest/seeds-jdk-only
+          --modes jdk-only-jit,jdk-only-nojit
+
+      # `if: always()` on purpose: the artifacts are most valuable exactly when
+      # a step above failed — the registry diff (real vs strict) and the
+      # missing-native work list ARE the triage material, and re-running a failed
+      # job to get them back is a wasted cycle. `if-no-files-found: warn` because
+      # a strict run that dies during boot legitimately produces nothing, and
+      # failing the upload would mask the real error.
+      #
+      # BOTH POLICIES, WHOLE. A failing job used to ship five files: the strict
+      # aliases plus two `real` dumps, with no `classes-real.json`,
+      # `report-real.json`, `missing-strict-by-module.json` or `report-strict.json`
+      # — i.e. neither policy's dump set was complete, and the real-vs-strict diff
+      # that motivates this job could not be reconstructed from the artifact. All
+      # eight per-policy dumps are listed below, the three back-compat aliases are
+      # kept (a downstream reader may still expect them), and the design-§6
+      # blocker pairs are included for both policies: the top-level pair is
+      # generated from the `real` dump set, the `strict/` pair from the strict
+      # one. `jdk-*` is globbed because the JDK feature version is part of the
+      # file name and varies with the matrix leg.
+      #
+      # Deliberately NOT globbing `target/jdk-only-audit/**`: that would sweep in
+      # the compiled probe under `probe/` and turn an evidence bundle into a build
+      # directory dump.
+      - name: Upload JDK-only audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jdk-only-audit-${{ matrix.os }}-jdk${{ matrix.java }}
+          path: |
+            target/jdk-only-audit/registry-real.json
+            target/jdk-only-audit/missing-real-by-module.json
+            target/jdk-only-audit/classes-real.json
+            target/jdk-only-audit/report-real.json
+            target/jdk-only-audit/registry-strict.json
+            target/jdk-only-audit/missing-strict-by-module.json
+            target/jdk-only-audit/classes-strict.json
+            target/jdk-only-audit/report-strict.json
+            target/jdk-only-audit/registry-no-stubs.json
+            target/jdk-only-audit/class-origins.json
+            target/jdk-only-audit/jdk-only-report.json
+            target/jdk-only-audit/jdk-*-missing-natives.json
+            target/jdk-only-audit/jdk-*-synthetic-dependencies.json
+            target/jdk-only-audit/strict/jdk-*-missing-natives.json
+            target/jdk-only-audit/strict/jdk-*-synthetic-dependencies.json
+            target/jdk-only-audit/*.stderr.txt
+            target/jdk-only-audit/*.stdout.txt
+          if-no-files-found: warn
+
+      # The deferred half of the census exit-code contract, and the last step in
+      # the job on purpose: everything above has run and the evidence is already
+      # uploaded. Exit 5 means the dumps were complete but the design-§6 blocker
+      # artifacts were not produced — a gap, not a clean result — so the job must
+      # end non-zero rather than green. (This job is advisory, so that shows up
+      # as a red step inside a job that does not fail the workflow; when the job
+      # is promoted per §11 it becomes a real failure with no further change.)
+      # `if: always()` so a failing gate above does not skip it.
+      - name: Fail on a deferred census gap (exit 5)
+        if: always()
+        shell: bash
+        run: |
+          rc="${CENSUS_RC:-not-run}"
+          echo "jdk-only-census.sh exit status: $rc"
+          if [ "$rc" = "5" ]; then
+            echo "::error::The design-§6 blocker artifacts are missing from this run"
+            echo "(jdk-<feature>-missing-natives.json / -synthetic-dependencies.json)."
+            echo "See the census step's log for which of the three causes fired."
+            exit 1
+          fi
+
   # Fuzz build smoke. Keeping this blocking prevents the standalone harness and
   # the native-builtins feature set from drifting.
   fuzz-smoke:
