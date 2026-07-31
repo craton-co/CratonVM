@@ -175,6 +175,32 @@ module. The bug was never that one specific test was missing; it was that no
 test ran in the suite runners' resolve at all.
 
 ## Verification
+**Post-removal convergence — the point of the change.** Both binaries rebuilt
+from the final source and re-probed:
+
+| binary | resolve | probe vs HotSpot 25 |
+| --- | --- | --- |
+| `-p cratonvm-cli` release | overrides absent (as before) | **identical** |
+| `-p cratonvm-cli -p libcratonvm` | overrides now also absent | **identical** |
+
+So the two builds no longer run different serialization code, and the code they
+now share is the JDK's own. `[NativeBridge] unregistered native methods` count is
+0 in both.
+
+**The sibling bug's own repros, re-run on the final source** (this branch also
+carries the `latestUserDefinedLoader0` ungate, so both fixes are verified
+together on one binary):
+
+| suite | classes | result |
+| --- | --- | --- |
+| H2 | `TestPreparedStatement`, `TestObjectDataType`, `TestSampleApps` | exit 0, 0 `UnsatisfiedLinkError`, stdout **identical** to HotSpot 25 |
+| Spring | `MethodMatchersTests`, `AopUtilsTests`, `JdkDynamicProxyTests`, `CglibProxyTests`, `StaticApplicationContextTests`, `TransactionInterceptorTests`, `JCacheJavaConfigTests` | **7/7 `status=OK`**, 0 mentions of the native |
+
+That Spring set is a cross-module sample of the 63-class blast radius, run A/B
+against a fix-free control built the same day: **7 FAIL → 7 OK**, 3–5 mentions of
+`latestUserDefinedLoader0` per class in the control and 0 in the fixed run. It
+independently corroborates the sibling report's full 63-class run.
+
 - `cargo test -p cratonvm-vm --test t14_system_conformance` — 12/12 pass.
 - `cargo test -p cratonvm-native-builtins --lib` (default resolve, the one
   suites get) — **3147 passed, 0 failed**.
