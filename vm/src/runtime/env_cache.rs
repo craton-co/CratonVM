@@ -19,14 +19,140 @@
 //! the first time it is read and serve every subsequent query from the
 //! cached `OnceLock`. Setting the variable after the first read will have
 //! no effect — same semantics as `runtime::exceptions::iae_trace_enabled`,
-//! which has used this pattern since the original audit.
+//! which has used this pattern since the original audit. A test that needs a
+//! different value uses `flags::with_thread_overrides`, which every helper
+//! here honours; see "Test overrides" below.
 //!
 //! Each helper is `#[inline]` so the cold first-call cost (one `getenv`
 //! plus the `OnceLock::get_or_init` CAS) is paid exactly once per flag,
 //! and steady-state cost collapses to a relaxed load of the `OnceLock`.
+//!
+//! # Test overrides
+//!
+//! This is a *second* latch, stacked on the process-wide
+//! [`cratonvm_types::flags`] snapshot — which latches too, on the first read of
+//! any flag. `flags::with_thread_overrides` can defeat the snapshot but not a
+//! memo that has already answered, so every helper here goes through
+//! [`memoized`], which recomputes from source while an override is installed
+//! and never populates its `OnceLock` in that window. See
+//! `docs/internal/libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
 
+use cratonvm_types::flags::{MemoSlot, MEMO_UNSET};
 use std::collections::HashSet;
 use std::sync::OnceLock;
+
+/// A memoised `bool`, invalidated when a test override is installed.
+///
+/// This is what keeps the memo from being a second, deeper latch than the one
+/// `flags::override_thread` exists to escape.
+///
+/// The hot path is one relaxed load and a compare — the same shape the
+/// `OnceLock` had, and the reason the override check lives in the *writer*
+/// ([`MemoSlot::publish`]) rather than here: these predicates are read from the
+/// interpreter's per-bytecode path, where asking "is an override installed?"
+/// on every read measured at +1.15% of `execute_instruction`.
+#[inline]
+fn slot_bool<F: FnOnce() -> bool>(slot: &'static MemoSlot, compute: F) -> bool {
+    let state = slot.load();
+    if state == MEMO_UNSET {
+        return derive_bool(slot, compute);
+    }
+    state == MEMO_TRUE
+}
+
+/// [`slot_bool`]'s cold arm: runs once per flag per process, and on every read
+/// while an override is installed (because `publish` declines to store then).
+///
+/// `compute` is `impl FnOnce`, NOT a `fn` pointer. Every closure here captures
+/// nothing, so as a generic it is a ZST and costs the hot path no argument at
+/// all; taking `fn() -> bool` instead makes each call site materialise the
+/// pointer before the branch that almost never needs it, and measured
+/// **+0.85%** of interpreter instructions against this form's +0.24%.
+#[cold]
+#[inline(never)]
+fn derive_bool<F: FnOnce() -> bool>(slot: &'static MemoSlot, compute: F) -> bool {
+    let value = compute();
+    slot.publish(if value { MEMO_TRUE } else { MEMO_FALSE });
+    value
+}
+
+/// [`slot_bool`] for an `Option<bool>`, using a third encoded state.
+#[inline]
+fn slot_opt_bool<F: FnOnce() -> Option<bool>>(slot: &'static MemoSlot, compute: F) -> Option<bool> {
+    match slot.load() {
+        MEMO_UNSET => derive_opt_bool(slot, compute),
+        MEMO_NONE => None,
+        v => Some(v == MEMO_TRUE),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn derive_opt_bool<F: FnOnce() -> Option<bool>>(
+    slot: &'static MemoSlot,
+    compute: F,
+) -> Option<bool> {
+    let value = compute();
+    slot.publish(match value {
+        None => MEMO_NONE,
+        Some(false) => MEMO_FALSE,
+        Some(true) => MEMO_TRUE,
+    });
+    value
+}
+
+/// Encodings for [`MemoSlot`]; `MEMO_UNSET` (0) is reserved by the slot itself.
+const MEMO_FALSE: u8 = 1;
+const MEMO_TRUE: u8 = 2;
+const MEMO_NONE: u8 = 3;
+
+/// Serve `cache`, except while a [`cratonvm_types::flags`] test override is
+/// installed — then recompute from source.
+///
+/// For the handful of memos whose value does not fit a [`MemoSlot`]'s `u8`
+/// (a threshold, a pattern list, a selector). None of them are on the
+/// per-bytecode path, so paying the `overrides_active` load per read is fine
+/// here; the two properties that matter are the same as for `publish`:
+///
+/// * While an override is live the `OnceLock` is **not populated**. Populating
+///   it would capture the override's value for the rest of the process and
+///   poison every later reader — strictly worse than the bug being fixed.
+/// * The recompute path is `#[cold]` and out of line.
+#[inline]
+fn memoized_with<T: Copy, F: FnOnce() -> T>(cache: &'static OnceLock<T>, compute: F) -> T {
+    if cratonvm_types::flags::overrides_active() {
+        return recompute(compute);
+    }
+    *cache.get_or_init(compute)
+}
+
+/// Reference-returning sibling of [`memoized_with`], for
+/// [`real_bytecode_selector`] — the one memo whose value is not `Copy`.
+///
+/// The override arm leaks, which is what lets it hand back a `&'static` at all.
+/// That parse is cold enough for it not to matter, and it only ever happens
+/// under a test override. `field_watch_class_matches` deliberately does NOT use
+/// this: it is called per watched field access, so it builds its list on the
+/// stack instead.
+#[inline]
+fn memoized_ref<T: 'static, F: FnOnce() -> T>(
+    cache: &'static OnceLock<T>,
+    compute: F,
+) -> &'static T {
+    if cratonvm_types::flags::overrides_active() {
+        return Box::leak(Box::new(recompute(compute)));
+    }
+    cache.get_or_init(compute)
+}
+
+/// The override-active arm, out of line so the production path pays nothing but
+/// the branch — `#[inline(never)]` is what keeps each caller's closure body out
+/// of its own hot function.
+#[cold]
+#[inline(never)]
+fn recompute<T, F: FnOnce() -> T>(compute: F) -> T {
+    compute()
+}
 
 /// Build a boolean predicate that returns `true` iff the named env var is
 /// **set** (any value, including the empty string), matching the semantics
@@ -35,8 +161,10 @@ macro_rules! cached_is_set {
     ($name:ident, $env:literal) => {
         #[inline]
         pub fn $name() -> bool {
-            static CACHE: OnceLock<bool> = OnceLock::new();
-            *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os($env).is_some())
+            static CACHE: MemoSlot = MemoSlot::new();
+            slot_bool(&CACHE, || {
+                cratonvm_types::flags::runtime_var_os($env).is_some()
+            })
         }
     };
 }
@@ -51,8 +179,8 @@ macro_rules! cached_is_ok {
     ($name:ident, $env:literal) => {
         #[inline]
         pub fn $name() -> bool {
-            static CACHE: OnceLock<bool> = OnceLock::new();
-            *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var($env).is_ok())
+            static CACHE: MemoSlot = MemoSlot::new();
+            slot_bool(&CACHE, || cratonvm_types::flags::runtime_var($env).is_ok())
         }
     };
 }
@@ -80,7 +208,7 @@ pub fn disable_jit() -> bool {
 #[inline]
 pub fn jit_invocation_threshold() -> u32 {
     static CACHE: OnceLock<u32> = OnceLock::new();
-    *CACHE.get_or_init(|| {
+    memoized_with(&CACHE, || {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_THRESHOLD")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
@@ -116,9 +244,13 @@ fn parse_osr_backedge_enabled(raw: Option<&str>) -> bool {
 
 #[inline]
 pub fn osr_backedge_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        parse_osr_backedge_enabled(cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR").ok().as_deref())
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        parse_osr_backedge_enabled(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -228,7 +360,7 @@ pub fn loader_aware_resolution() -> bool {
 #[inline]
 pub fn tier_osr_backedge() -> Option<u32> {
     static CACHE: OnceLock<Option<u32>> = OnceLock::new();
-    *CACHE.get_or_init(|| {
+    memoized_with(&CACHE, || {
         cratonvm_types::flags::runtime_var("CRATONVM_TIER_OSR_BACKEDGE")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
@@ -258,10 +390,12 @@ pub fn tier_osr_backedge() -> Option<u32> {
 /// suspicious newarray-loop corruption ever resurfaces. Read once and cached.
 #[inline]
 pub fn osr_newarray_allowed() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_OSR_NEWARRAY") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_OSR_NEWARRAY") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     })
 }
 
@@ -276,10 +410,12 @@ pub fn osr_newarray_allowed() -> bool {
 /// disables intrinsics.
 #[inline]
 pub fn intrinsics_disabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_DISABLE_INTRINSICS") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_DISABLE_INTRINSICS") {
+            Ok(v) => !v.is_empty() && v != "0",
+            Err(_) => false,
+        }
     })
 }
 
@@ -320,10 +456,12 @@ pub fn set_show_code_details_in_exception_messages(on: bool) {
 #[inline]
 fn show_code_details_explicit() -> Option<bool> {
     // Explicit env override wins (interim developer knob), parsed once.
-    static ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env = *ENV.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_HELPFUL_NPE_OPCODES") {
-        Ok(v) => Some(!v.is_empty() && v != "0"),
-        Err(_) => None,
+    static ENV: MemoSlot = MemoSlot::new();
+    let env = slot_opt_bool(&ENV, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_HELPFUL_NPE_OPCODES") {
+            Ok(v) => Some(!v.is_empty() && v != "0"),
+            Err(_) => None,
+        }
     });
     if env.is_some() {
         return env;
@@ -374,14 +512,16 @@ pub fn helpful_npe_opcodes() -> bool {
 /// be cheap. Must stay in lockstep with `native_builtins::real_proxy_super()`.
 #[inline]
 pub fn real_proxy_super() -> bool {
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_REAL_PROXY_SUPER") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
+    static GATE: MemoSlot = MemoSlot::new();
+    slot_bool(&GATE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_REAL_PROXY_SUPER") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            }
+            // Unset (the default): real `java.lang.reflect.Proxy` super.
+            Err(_) => true,
         }
-        // Unset (the default): real `java.lang.reflect.Proxy` super.
-        Err(_) => true,
     })
 }
 
@@ -426,12 +566,14 @@ pub fn real_proxy_super() -> bool {
 // without). Off-switch for diagnosis/bisection: `CRATONVM_ROOTSNAP_CACHE=0`.
 #[inline]
 pub fn rootsnap_cache() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_ROOTSNAP_CACHE") {
-        // Explicit opt-out only: `0` / `false` disable; unset or any other
-        // value (incl. `1`, empty) enables.
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ROOTSNAP_CACHE") {
+            // Explicit opt-out only: `0` / `false` disable; unset or any other
+            // value (incl. `1`, empty) enables.
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     })
 }
 
@@ -458,13 +600,13 @@ pub fn rootsnap_cache() -> bool {
 // without). Off-switch: `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC=0`.
 #[inline]
 pub fn rootsnap_cache_survive_gc() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(
-        || match cratonvm_types::flags::runtime_var("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC") {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
-        },
-    )
+        }
+    })
 }
 
 cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
@@ -501,10 +643,12 @@ cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
 // default.
 #[inline]
 pub fn bg_compile() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_BG_COMPILE") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_BG_COMPILE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     })
 }
 // wire-tiered-manager Step 4 (PGO handoff C1 → C2): opt-in profile collection.
@@ -543,12 +687,14 @@ cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
 // Off-switch for diagnosis/bisection: `CRATONVM_JIT_VIRTUAL_TIERUP=0`.
 #[inline]
 pub fn jit_virtual_tierup() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_TIERUP") {
-        // Explicit opt-out only: `0` / `false` disable; unset or any other
-        // value enables.
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_TIERUP") {
+            // Explicit opt-out only: `0` / `false` disable; unset or any other
+            // value enables.
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     })
 }
 /// `CRATONVM_NATIVE_STRING_REGEX` — route `String.replaceAll` / `replaceFirst`
@@ -569,12 +715,14 @@ pub fn jit_virtual_tierup() -> bool {
 /// classes; the opt-out is the safety net if an app hits a regex-feature gap.
 #[inline]
 pub fn native_string_regex() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_STRING_REGEX") {
-        // Explicit opt-out only: `0` / `false` disable; unset or any other
-        // value (incl. `1`, empty) enables.
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_STRING_REGEX") {
+            // Explicit opt-out only: `0` / `false` disable; unset or any other
+            // value (incl. `1`, empty) enables.
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     })
 }
 
@@ -611,12 +759,14 @@ pub fn native_string_regex() -> bool {
 /// standalone benchmark (see docs/known-issues for the measurement).
 #[inline]
 pub fn native_matcher_find() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_MATCHER_FIND") {
-        // Explicit opt-out only: `0` / `false` disable; unset or any other
-        // value (incl. `1`, empty) enables.
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_MATCHER_FIND") {
+            // Explicit opt-out only: `0` / `false` disable; unset or any other
+            // value (incl. `1`, empty) enables.
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     })
 }
 cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
@@ -660,13 +810,13 @@ cached_is_set!(ctor_fix_dbg, "CRATONVM_DBG_CTOR_FIX");
 /// keep the switch so the next such question costs one run, not one build.
 #[inline]
 pub fn trivial_getter_fast_path() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(
-        || match cratonvm_types::flags::runtime_var("CRATONVM_TRIVIAL_GETTER") {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_TRIVIAL_GETTER") {
             Ok(v) => !matches!(v.trim(), "0" | "off" | "false" | "no"),
             Err(_) => true,
-        },
-    )
+        }
+    })
 }
 
 /// `CRATONVM_TRIVIAL_GETTER_VERIFY` — cross-check every trivial-accessor fast
@@ -765,9 +915,12 @@ cached_is_set!(dbg_dupcall_filter, "CRATONVM_DBG_DUPCALL_FILTER");
 /// environ lock and linearly scans environ, so this alone was ~10% of the
 /// CratonBench `hashmap` phase (10M virtual calls). Same class of bug as the
 /// `CRATONVM_DBG_BLOCKGC` note in `vm_exec.rs`. Keep this predicate as the
-/// left operand: a `OnceLock<bool>` read is cheaper than the string compare,
+/// left operand: a `MemoSlot` read is cheaper than the string compare,
 /// so it short-circuits the common (unset) case in a single load.
-cached_is_set!(invoke_virtual_entry_trace, "CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE");
+cached_is_set!(
+    invoke_virtual_entry_trace,
+    "CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE"
+);
 
 // ── PERF 2026-07-25: the five `getenv` hogs found by an LD_PRELOAD tally ──
 //
@@ -787,7 +940,7 @@ cached_is_set!(invoke_virtual_entry_trace, "CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE"
 // the `getenv` (which takes the process environ lock and linearly scans
 // environ) ran unconditionally and the cheap test could never short-circuit
 // it. Together they were ~11% of the phase's CPU. Caching is the fix; keep
-// these predicates as the left operand, since a `OnceLock<bool>` read is
+// these predicates as the left operand, since a `MemoSlot` read is
 // cheaper than the string compares they guard.
 cached_is_set!(dbg_mh_stack, "CRATONVM_DBG_MH_STACK");
 cached_is_set!(dbg_mh_adapter, "CRATONVM_DBG_MH_ADAPTER");
@@ -871,8 +1024,8 @@ cached_is_set!(baos_dbg, "CRATON_BAOS_DBG");
 /// are folded in here too so the single gate covers every field-diagnostic path.
 #[inline]
 pub fn any_field_diag() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
         field_addr_dbg()
             || badrecv_dbg()
             || hashtableofint_trace()
@@ -900,17 +1053,21 @@ cached_is_ok!(charset_dbg, "CRATONVM_DBG_CHARSET");
 /// `... .as_deref() == Some("1")`).
 #[inline]
 pub fn strict_swallows() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_STRICT_SWALLOWS") {
-        Ok(v) => v == "1",
-        Err(_) => false,
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_STRICT_SWALLOWS") {
+            Ok(v) => v == "1",
+            Err(_) => false,
+        }
     })
 }
 
 #[inline]
 pub fn jit_scalar_new() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0"))
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0")
+    })
 }
 
 /// C1→C2 supersede (default-ON): after the background worker publishes a C1
@@ -921,34 +1078,42 @@ pub fn jit_scalar_new() -> bool {
 /// pre-supersede behaviour) — the safety net while the upgrade soaks.
 #[inline]
 pub fn c2_supersede() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var("CRATONVM_C2_SUPERSEDE").map_or(true, |v| v != "0" && v != "false")
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_C2_SUPERSEDE")
+            .map_or(true, |v| v != "0" && v != "false")
     })
 }
 
 #[inline]
 pub fn jit_ir_call() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"))
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0")
+    })
 }
 
 #[inline]
 pub fn jit_ir_call_special() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"))
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL_SPECIAL")
+            .map_or(true, |v| v != "0")
+    })
 }
 
 #[inline]
 pub fn jit_ir_long() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"))
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0")
+    })
 }
 
 #[inline]
 pub fn jit_ir_call_virtual() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL_VIRTUAL")
             .map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
     })
@@ -956,14 +1121,18 @@ pub fn jit_ir_call_virtual() -> bool {
 
 #[inline]
 pub fn jit_ir_fp() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"))
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0")
+    })
 }
 
 #[inline]
 pub fn inline_allow_static() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_INLINE_ALLOW_STATIC").is_some())
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_INLINE_ALLOW_STATIC").is_some()
+    })
 }
 
 // NOTE (real-cdi-bean-container Step 3): the former `real_spring_startup()` gate
@@ -1104,8 +1273,7 @@ cached_is_set!(dbg_field_watch, "CRATONVM_DBG_FIELD_WATCH");
 /// every existing invocation behaves exactly as before.
 #[inline]
 pub fn field_watch_class_matches(name: &str) -> bool {
-    static CACHE: OnceLock<Vec<String>> = OnceLock::new();
-    let pats = CACHE.get_or_init(|| {
+    fn patterns() -> Vec<String> {
         let raw =
             cratonvm_types::flags::runtime_var("CRATONVM_DBG_FIELD_WATCH").unwrap_or_default();
         let trimmed = raw.trim();
@@ -1118,11 +1286,21 @@ pub fn field_watch_class_matches(name: &str) -> bool {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect()
-    });
-    if pats.is_empty() {
-        return name.contains("Page") || name.contains("RootReference");
     }
-    pats.iter().any(|p| name.contains(p.as_str()))
+    fn matches(pats: &[String], name: &str) -> bool {
+        if pats.is_empty() {
+            return name.contains("Page") || name.contains("RootReference");
+        }
+        pats.iter().any(|p| name.contains(p.as_str()))
+    }
+    // Not `memoized_ref`: this is called per watched field access, and that
+    // helper leaks its recomputation. Build the list on the stack instead —
+    // the override arm is test-only and already off any path that matters.
+    if cratonvm_types::flags::overrides_active() {
+        return matches(&patterns(), name);
+    }
+    static CACHE: OnceLock<Vec<String>> = OnceLock::new();
+    matches(CACHE.get_or_init(patterns), name)
 }
 cached_is_set!(dbg_watchref, "CRATONVM_DBG_WATCHREF");
 cached_is_set!(dbg_asserteq, "CRATONVM_DBG_ASSERTEQ");
@@ -1138,7 +1316,7 @@ cached_is_set!(
 #[inline]
 pub fn real_bytecode_selector() -> &'static RealSelector {
     static CACHE: OnceLock<RealSelector> = OnceLock::new();
-    CACHE.get_or_init(|| {
+    memoized_ref(&CACHE, || {
         let real = cratonvm_types::flags::runtime_var("CRATONVM_REAL").ok();
         let jca_legacy = cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_JCA")
             .map(|v| !v.is_empty())
@@ -1169,6 +1347,77 @@ mod tests {
     /// `types/src/flags.rs` resolves with a compound default. Either the flag
     /// default is a bare presence test (the two agree), or the call sites must
     /// read the resolved flag instead of a presence test.
+    /// The memo must not be a *second* latch behind the flag snapshot.
+    ///
+    /// Every helper in this file is read through `memoized_with`, which
+    /// recomputes while a `flags` override is installed. This test forces the
+    /// memo to populate FIRST (the state a real test binary is always in by the
+    /// time it runs), then checks the override still wins.
+    ///
+    /// `CRATONVM_FRAME_TRACE` is the probe: `cached_is_set!`, read on every
+    /// frame push/pop, and inert unless set.
+    #[test]
+    fn an_override_beats_an_already_populated_memo() {
+        // Populate the memo from the ambient environment.
+        let latched = super::frame_trace();
+        assert!(
+            !latched,
+            "the test environment must not have CRATONVM_FRAME_TRACE set"
+        );
+
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_FRAME_TRACE", Some("1"))],
+            || {
+                assert!(
+                    super::frame_trace(),
+                    "the memo swallowed the override — it is a second latch again"
+                );
+            },
+        );
+
+        assert!(
+            !super::frame_trace(),
+            "the memo must not have latched the override's value"
+        );
+    }
+
+    /// The same, for a hand-written helper that reads a *value* rather than
+    /// testing presence, and whose default is ON.
+    #[test]
+    fn an_override_beats_the_memo_for_value_flags() {
+        assert!(super::bg_compile(), "bg_compile defaults ON; memo now warm");
+        cratonvm_types::flags::with_thread_overrides(&[("CRATONVM_BG_COMPILE", Some("0"))], || {
+            assert!(!super::bg_compile());
+        });
+        assert!(super::bg_compile(), "the guard must restore the default");
+
+        let base = super::jit_invocation_threshold();
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_THRESHOLD", Some("7"))],
+            || assert_eq!(super::jit_invocation_threshold(), 7),
+        );
+        assert_eq!(super::jit_invocation_threshold(), base);
+    }
+
+    /// A thread-scoped override must not leak into a neighbouring test's view
+    /// of the memo — the property that makes thread scope the safe default.
+    #[test]
+    fn a_thread_override_does_not_publish_through_the_shared_memo() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_FRAME_TRACE", Some("1"))],
+            || {
+                assert!(super::frame_trace());
+                let elsewhere = std::thread::spawn(super::frame_trace)
+                    .join()
+                    .expect("probe thread");
+                assert!(
+                    !elsewhere,
+                    "another thread saw this thread's override through the memo"
+                );
+            },
+        );
+    }
+
     #[test]
     fn no_presence_predicate_shadows_a_compound_flag_default() {
         const ENV_CACHE_SRC: &str = include_str!("env_cache.rs");

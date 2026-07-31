@@ -138,15 +138,57 @@ line is indistinguishable from a working one.
 Verified non-vacuous by planting an offending file and confirming the failure
 names it.
 
-## Limitation, deliberately not closed
+## The second latch — closed 2026-07-31
 
-`vm/src/runtime/env_cache.rs` memoises ~37 hot flags in their own `OnceLock`s
-*downstream* of the snapshot. An override reaches those only before their first
-read in the process. That is by design — they are read from interpreter and JIT
-hot paths and the memoisation is what keeps them free — and the two tests that
-depend on it (`jit_deep_recursion_fault_recovery`, and the `bg_compile` route)
-install their override before VM creation and hold it for the whole test. The
-override hooks document the limitation.
+`vm/src/runtime/env_cache.rs` memoised ~90 hot flags in their own `OnceLock`s
+*downstream* of the snapshot, so an override reached them only before their
+first read in the process. This was originally filed as a documented
+limitation; it is now fixed, because "install the override before the first
+read" is the same order-dependence this whole document is about, one layer
+down.
+
+The memo is now **invalidated by the writer** rather than **re-validated by the
+reader**. `flags::MemoSlot` holds its value inline in one `AtomicU8`; installing
+or dropping a `FlagOverride` walks every registered slot and resets it, and
+`MemoSlot::publish` declines to store while an override is live (so nothing
+latches an override's value and poisons the process). The registry `Mutex` is
+what makes "no override is live" and "store" one step against a concurrent
+install.
+
+Five memos whose value does not fit a `u8` — a threshold, an OSR back-edge
+count, a pattern list, a selector — keep a `flags::overrides_active()` check per
+read instead. None are on the per-bytecode path.
+
+### Why the writer pays, with numbers
+
+Measured with callgrind (`BinT 17 --nojit`, pure interpreter, 5 samples per arm,
+run-to-run spread 0.008–0.013%), against the same commit built in the same
+target dir:
+
+| design | Ir vs base | of steady-state interpreter work |
+|---|---|---|
+| `overrides_active()` on every read | +0.507% | +0.909% |
+| `MemoSlot`, invalidated by the writer | **+0.240%** | **+0.431%** |
+| `MemoSlot` with `fn()` instead of `impl FnOnce` | +0.850% | +1.52% |
+
+That last row is worth keeping: making the cold arm take a `fn` pointer rather
+than a ZST closure looks like it should shrink code, and instead each *hot* call
+site has to materialise the pointer before the branch that almost never needs
+it. Same shape as
+`docs/internal/.../per-object-fixed-tax-outlined-gate` — a default-inert gate
+still costs whatever its call site has to set up.
+
+**Wall clock could not resolve any of this.** On the shared build host the
+`--nojit` baseline alone spread 24% run-to-run, and two 12-round interleaved
+sweeps of the same pair of binaries disagreed in sign (+0.8%, then −5.8%).
+Instruction counts are the measurement of record here; the JIT-on arms
+(`CratonBench fib`, `bintrees`) showed no signal either way. Every checksum
+matched across every arm.
+
+The residual +0.43% of interpreter instructions is the honest price of making
+~90 flags overridable. It buys the last layer of the vacuous-test family:
+`jit_deep_recursion_fault_recovery` and `wp8_10_jboss_modules_smoke` no longer
+depend on installing their override before the first read.
 
 ## Verification
 
