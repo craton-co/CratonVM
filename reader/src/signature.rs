@@ -508,6 +508,20 @@ pub fn parse_field_signature(sig: &str) -> Option<TypeSig> {
 // keep memory cost predictable: the parsed AST is a few hundred bytes
 // at most per signature, so 8 K entries ≈ a few MB worst-case. Below
 // the cap inserts are O(1); at the cap we evict the oldest entry.
+//
+// SECURITY / CORRECTNESS: the cache key is `(shape, string)`, NOT the
+// string alone. The three grammar entry points accept three *different*
+// languages that overlap on some strings and disagree on others:
+// `()V` is a valid method signature and an invalid field/class one;
+// `Ljava/lang/Object;` is valid as all three. When the key was the bare
+// string, the shape-agnostic `Invalid` verdict cached by one shape was
+// returned verbatim to the other two — an invalid *field* signature
+// poisoned a later *class*-signature lookup of the same string, so the
+// cached path returned `None` where the uncached path returns `Some`.
+// (Found by the `fuzz_jni_descriptor` target, which had to flush the
+// cache and restrict itself to one shape per input to work around it.)
+// Keying by shape makes each entry answer exactly the question it was
+// computed for.
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -515,6 +529,21 @@ use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 
 const SIGNATURE_CACHE_CAP: usize = 8192;
+
+/// Which of the three signature grammars a cache entry was produced by.
+///
+/// Part of the cache key: the same string can be valid under one grammar
+/// and invalid under another, so a verdict is only meaningful together
+/// with the shape that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SigShape {
+    Class,
+    Method,
+    Field,
+}
+
+/// Cache key: the signature shape plus the signature string.
+type SigKey = (SigShape, Arc<str>);
 
 /// Parsed forms returned by the cached parse APIs. Mirrors the three
 /// grammar entry points (class / method / field) so the cache can be
@@ -528,13 +557,17 @@ pub enum ParsedSignature {
     /// The signature string failed to parse. Cached so a hot loop of
     /// "is this signature valid?" probes (verifier, JVMTI agents) does
     /// not re-walk the parser every call.
+    ///
+    /// This verdict is only meaningful for the *shape* that produced it,
+    /// which is why the cache key carries the shape: `()V` is invalid as
+    /// a field signature and valid as a method signature.
     Invalid,
 }
 
 struct SignatureCacheInner {
-    map: FxHashMap<Arc<str>, ParsedSignature>,
+    map: FxHashMap<SigKey, ParsedSignature>,
     /// FIFO order for eviction; the front is the oldest entry.
-    order: VecDeque<Arc<str>>,
+    order: VecDeque<SigKey>,
 }
 
 impl SignatureCacheInner {
@@ -545,7 +578,7 @@ impl SignatureCacheInner {
         }
     }
 
-    fn insert(&mut self, key: Arc<str>, value: ParsedSignature) {
+    fn insert(&mut self, key: SigKey, value: ParsedSignature) {
         // Perf/correctness: dedup the recency queue on re-insert.
         //
         // Previously `order` was unconditionally `push_back`'d on every
@@ -579,10 +612,18 @@ impl SignatureCacheInner {
             // duplicate behind. Linear scan, but the cache is small and
             // re-inserts of an already-present key are the cold path (a true
             // hit short-circuits before `insert` is ever called).
-            if let Some(idx) = self.order.iter().position(|k| **k == *key) {
+            //
+            // The shape is part of the key, so the match must compare it too:
+            // the same string cached under two shapes owns two independent
+            // recency slots and neither may steal the other's.
+            if let Some(idx) = self
+                .order
+                .iter()
+                .position(|k| k.0 == key.0 && *k.1 == *key.1)
+            {
                 self.order.remove(idx);
             }
-            self.order.push_back(Arc::clone(&key));
+            self.order.push_back(key.clone());
             self.map.insert(key, value);
             return;
         }
@@ -591,7 +632,7 @@ impl SignatureCacheInner {
                 self.map.remove(&victim);
             }
         }
-        self.order.push_back(Arc::clone(&key));
+        self.order.push_back(key.clone());
         self.map.insert(key, value);
     }
 }
@@ -603,11 +644,16 @@ fn signature_cache() -> &'static Mutex<SignatureCacheInner> {
 
 /// Internal probe — returns the cached entry as an owned value (so the
 /// lock is released before any further work). `None` means "no entry
-/// for this signature"; `Some(ParsedSignature::Invalid)` means "we
-/// have previously parsed this string and it was invalid".
-fn cache_probe(sig: &Arc<str>) -> Option<ParsedSignature> {
+/// for this signature *under this shape*"; `Some(ParsedSignature::Invalid)`
+/// means "we have previously parsed this string under this shape and it
+/// was invalid".
+///
+/// The shape is part of the key: a verdict recorded for one grammar says
+/// nothing about the other two.
+fn cache_probe(shape: SigShape, sig: &Arc<str>) -> Option<ParsedSignature> {
+    let key = (shape, Arc::clone(sig));
     let cache = signature_cache().lock();
-    cache.map.get(sig).cloned()
+    cache.map.get(&key).cloned()
 }
 
 /// Parse a class signature, consulting the global signature cache.
@@ -617,12 +663,13 @@ fn cache_probe(sig: &Arc<str>) -> Option<ParsedSignature> {
 /// allocation, so a hit is a single hash + pointer compare with no
 /// extra allocations.
 pub fn parse_class_signature_cached(sig: &Arc<str>) -> Option<Arc<ClassSig>> {
-    match cache_probe(sig) {
+    match cache_probe(SigShape::Class, sig) {
         Some(ParsedSignature::Class(c)) => return Some(c),
         Some(ParsedSignature::Invalid) => return None,
-        // Same signature was previously parsed as a different shape —
-        // extremely unusual; fall through and re-parse without
-        // updating the cache to avoid thrash.
+        // Unreachable: the shape is part of the key, so a `Class` lookup
+        // can only ever find a `Class` or `Invalid` entry. Kept as a
+        // defensive fall-through — re-parse without touching the cache
+        // rather than returning a wrong-shaped answer.
         Some(_) => return parse_class_signature(sig).map(Arc::new),
         None => {}
     }
@@ -638,11 +685,14 @@ pub fn parse_class_signature_cached(sig: &Arc<str>) -> Option<Arc<ClassSig>> {
     match parsed {
         Some(c) => {
             let arc = Arc::new(c);
-            cache.insert(Arc::clone(sig), ParsedSignature::Class(Arc::clone(&arc)));
+            cache.insert(
+                (SigShape::Class, Arc::clone(sig)),
+                ParsedSignature::Class(Arc::clone(&arc)),
+            );
             Some(arc)
         }
         None => {
-            cache.insert(Arc::clone(sig), ParsedSignature::Invalid);
+            cache.insert((SigShape::Class, Arc::clone(sig)), ParsedSignature::Invalid);
             None
         }
     }
@@ -650,9 +700,10 @@ pub fn parse_class_signature_cached(sig: &Arc<str>) -> Option<Arc<ClassSig>> {
 
 /// Parse a method signature, consulting the global signature cache.
 pub fn parse_method_signature_cached(sig: &Arc<str>) -> Option<Arc<MethodSig>> {
-    match cache_probe(sig) {
+    match cache_probe(SigShape::Method, sig) {
         Some(ParsedSignature::Method(m)) => return Some(m),
         Some(ParsedSignature::Invalid) => return None,
+        // Unreachable — see `parse_class_signature_cached`.
         Some(_) => return parse_method_signature(sig).map(Arc::new),
         None => {}
     }
@@ -665,11 +716,14 @@ pub fn parse_method_signature_cached(sig: &Arc<str>) -> Option<Arc<MethodSig>> {
     match parsed {
         Some(m) => {
             let arc = Arc::new(m);
-            cache.insert(Arc::clone(sig), ParsedSignature::Method(Arc::clone(&arc)));
+            cache.insert(
+                (SigShape::Method, Arc::clone(sig)),
+                ParsedSignature::Method(Arc::clone(&arc)),
+            );
             Some(arc)
         }
         None => {
-            cache.insert(Arc::clone(sig), ParsedSignature::Invalid);
+            cache.insert((SigShape::Method, Arc::clone(sig)), ParsedSignature::Invalid);
             None
         }
     }
@@ -677,9 +731,10 @@ pub fn parse_method_signature_cached(sig: &Arc<str>) -> Option<Arc<MethodSig>> {
 
 /// Parse a field signature, consulting the global signature cache.
 pub fn parse_field_signature_cached(sig: &Arc<str>) -> Option<Arc<TypeSig>> {
-    match cache_probe(sig) {
+    match cache_probe(SigShape::Field, sig) {
         Some(ParsedSignature::Field(t)) => return Some(t),
         Some(ParsedSignature::Invalid) => return None,
+        // Unreachable — see `parse_class_signature_cached`.
         Some(_) => return parse_field_signature(sig).map(Arc::new),
         None => {}
     }
@@ -692,11 +747,14 @@ pub fn parse_field_signature_cached(sig: &Arc<str>) -> Option<Arc<TypeSig>> {
     match parsed {
         Some(t) => {
             let arc = Arc::new(t);
-            cache.insert(Arc::clone(sig), ParsedSignature::Field(Arc::clone(&arc)));
+            cache.insert(
+                (SigShape::Field, Arc::clone(sig)),
+                ParsedSignature::Field(Arc::clone(&arc)),
+            );
             Some(arc)
         }
         None => {
-            cache.insert(Arc::clone(sig), ParsedSignature::Invalid);
+            cache.insert((SigShape::Field, Arc::clone(sig)), ParsedSignature::Invalid);
             None
         }
     }
@@ -909,6 +967,119 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Shape-keyed cache regressions.
+    //
+    // Before the fix the cache was keyed on the signature string alone and
+    // `ParsedSignature::Invalid` carried no shape, so the first shape to
+    // reject a string poisoned the other two on the cached path. Each test
+    // below primes the cache with a rejecting shape, then asserts the
+    // accepting shape still agrees with its uncached twin. Every test uses
+    // a signature string unique to itself so the shared global cache cannot
+    // race with sibling tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn field_invalid_verdict_does_not_poison_class_lookup() {
+        // `Lsup;Liface;` is a legal ClassSignature (superclass + one
+        // superinterface) but NOT a legal FieldSignature: a field signature
+        // is a single ReferenceTypeSignature, so the second `L...;` is
+        // trailing garbage.
+        let s = "Lpoison/field2class/Sup;Lpoison/field2class/Iface;";
+        let key: Arc<str> = Arc::from(s);
+
+        // Ground truth from the uncached parsers.
+        assert!(parse_field_signature(s).is_none());
+        assert!(parse_class_signature(s).is_some());
+
+        // Prime the cache with the FIELD rejection...
+        assert!(parse_field_signature_cached(&key).is_none());
+        // ...then the CLASS lookup must still succeed. Without the
+        // shape-keyed cache this returned `None` from the poisoned
+        // `Invalid` entry.
+        let class_sig = parse_class_signature_cached(&key)
+            .expect("class lookup must not inherit the field-shaped Invalid verdict");
+        assert_eq!(class_sig.interfaces.len(), 1);
+        // And the field verdict is still remembered correctly.
+        assert!(parse_field_signature_cached(&key).is_none());
+    }
+
+    #[test]
+    fn class_invalid_verdict_does_not_poison_method_lookup() {
+        // `()L...;` is a legal MethodSignature and an illegal ClassSignature
+        // (a class signature cannot start with `(`).
+        let s = "()Lpoison/class2method/Marker;";
+        let key: Arc<str> = Arc::from(s);
+
+        assert!(parse_class_signature(s).is_none());
+        assert!(parse_method_signature(s).is_some());
+
+        assert!(parse_class_signature_cached(&key).is_none());
+        let method_sig = parse_method_signature_cached(&key)
+            .expect("method lookup must not inherit the class-shaped Invalid verdict");
+        assert!(method_sig.param_types.is_empty());
+        assert!(parse_class_signature_cached(&key).is_none());
+    }
+
+    #[test]
+    fn method_invalid_verdict_does_not_poison_field_lookup() {
+        // A bare class type is a legal FieldSignature and an illegal
+        // MethodSignature (no parameter list).
+        let s = "Lpoison/method2field/Marker;";
+        let key: Arc<str> = Arc::from(s);
+
+        assert!(parse_method_signature(s).is_none());
+        assert!(parse_field_signature(s).is_some());
+
+        assert!(parse_method_signature_cached(&key).is_none());
+        let field_sig = parse_field_signature_cached(&key)
+            .expect("field lookup must not inherit the method-shaped Invalid verdict");
+        assert!(matches!(*field_sig, TypeSig::Class { .. }));
+        assert!(parse_method_signature_cached(&key).is_none());
+    }
+
+    #[test]
+    fn valid_verdict_is_not_shared_across_shapes_either() {
+        // The dual of the tests above: a *valid* entry cached under one
+        // shape must not be served to another shape. `Ljava/lang/Object;`
+        // parses as both a field and a class signature but the two ASTs are
+        // different types, and it is not a method signature at all.
+        let s = "Lpoison/valid/Marker;";
+        let key: Arc<str> = Arc::from(s);
+
+        let field_sig = parse_field_signature_cached(&key).expect("valid field signature");
+        assert!(matches!(*field_sig, TypeSig::Class { .. }));
+        let class_sig = parse_class_signature_cached(&key).expect("valid class signature");
+        assert!(class_sig.interfaces.is_empty());
+        assert!(
+            parse_method_signature_cached(&key).is_none(),
+            "a field/class-shaped hit must not make this a method signature"
+        );
+        // Repeat probes (now all served from the cache) keep their verdicts.
+        assert!(parse_field_signature_cached(&key).is_some());
+        assert!(parse_class_signature_cached(&key).is_some());
+        assert!(parse_method_signature_cached(&key).is_none());
+    }
+
+    #[test]
+    fn shapes_occupy_independent_cache_slots() {
+        // Same string, three shapes → three entries, and the recency queue
+        // stays in lockstep with the map (the dedup must compare the shape
+        // as well as the bytes).
+        let mut cache = SignatureCacheInner::new();
+        let k: Arc<str> = Arc::from("Lshape/Slots;");
+        for shape in [SigShape::Class, SigShape::Method, SigShape::Field] {
+            cache.insert((shape, Arc::clone(&k)), ParsedSignature::Invalid);
+        }
+        assert_eq!(cache.map.len(), 3, "each shape owns its own entry");
+        assert_eq!(cache.order.len(), cache.map.len());
+
+        // Re-inserting one shape refreshes only that shape's slot.
+        cache.insert((SigShape::Class, Arc::clone(&k)), ParsedSignature::Invalid);
+        assert_eq!(cache.map.len(), 3);
+        assert_eq!(cache.order.len(), 3);
+    }
+
     #[test]
     fn reinsert_keeps_order_and_map_in_lockstep() {
         // Regression for the LRU dedup fix: re-inserting an already-present
@@ -918,7 +1089,7 @@ mod tests {
         let mut cache = SignatureCacheInner::new();
         let k: Arc<str> = Arc::from("Ldedup/Marker;");
 
-        cache.insert(Arc::clone(&k), ParsedSignature::Invalid);
+        cache.insert((SigShape::Field, Arc::clone(&k)), ParsedSignature::Invalid);
         assert_eq!(cache.map.len(), 1);
         assert_eq!(cache.order.len(), 1);
 
@@ -926,9 +1097,9 @@ mod tests {
         // Arc allocation carrying the same bytes — the map keys by content,
         // so the dedup must match on content, not pointer identity).
         for _ in 0..100 {
-            cache.insert(Arc::clone(&k), ParsedSignature::Invalid);
+            cache.insert((SigShape::Field, Arc::clone(&k)), ParsedSignature::Invalid);
             let fresh_alloc: Arc<str> = Arc::from("Ldedup/Marker;");
-            cache.insert(fresh_alloc, ParsedSignature::Invalid);
+            cache.insert((SigShape::Field, fresh_alloc), ParsedSignature::Invalid);
         }
 
         // The map still holds exactly one entry and the recency queue is in

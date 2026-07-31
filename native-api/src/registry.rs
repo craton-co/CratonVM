@@ -4448,6 +4448,29 @@ pub struct NativeMethodRegistry {
     /// registered for multiple triples (e.g. compiler function merging), the
     /// first-seen triple is the resolved name, exactly as before.
     name_index: FxHashMap<usize, usize>,
+    /// This VM's capability policy, or `None` when the embedder installed none.
+    ///
+    /// A **field**, not a process global, for exactly the reason
+    /// [`compatibility_mode`](Self) is: a policy shared between two `SharedVm`s
+    /// in one process is the cross-VM interference
+    /// `crate::capability` exists to remove. `Arc` because the same policy
+    /// object is also reachable from every native through
+    /// [`CapabilityCheck`](crate::capability::CapabilityCheck), and the audit
+    /// log must be one log, not two.
+    ///
+    /// `None` is the default and costs one null check in `register()` and one
+    /// in [`check_dispatch_capability`](Self::check_dispatch_capability).
+    capabilities: Option<Arc<crate::capability::CapabilitySet>>,
+    /// `slot index -> capability kind` for the handful of registered natives
+    /// that definitionally exercise a capability
+    /// ([`classify_native`](crate::capability::classify_native)).
+    ///
+    /// Sparse on purpose: of ~3,100 registrations only a few dozen classify,
+    /// so this is a small map rather than a byte on the `Copy` `NativeSlot`
+    /// that the `find`/`find_with_kind` hot path copies by value. Populated in
+    /// `register()` only when a policy is installed — with no policy there is
+    /// nothing to check and the map stays empty.
+    sensitive_slots: FxHashMap<u32, crate::capability::CapabilityKind>,
 }
 
 impl NativeMethodRegistry {
@@ -4497,7 +4520,77 @@ impl NativeMethodRegistry {
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
             ),
+            // No policy until an embedder installs one: today's behaviour
+            // exactly. See `capabilities` field doc.
+            capabilities: None,
+            sensitive_slots: FxHashMap::default(),
         }
+    }
+
+    /// Install this VM's capability policy.
+    ///
+    /// Call **once at VM init, before the `register_*` population pass** — this
+    /// gates `register()`, and it is what populates the dispatch-side
+    /// classification map, so a policy installed afterwards leaves the already-
+    /// registered natives unclassified. `&mut self` is the enforcement:
+    /// dispatch only ever holds `&`, so a running native cannot swap the
+    /// policy out from under the gate.
+    ///
+    /// Pass the same `Arc` to
+    /// [`install_capabilities`](crate::capability::install_capabilities) so
+    /// per-call-site gates reached through `NativeContext` share one audit log
+    /// with the registry.
+    pub fn set_capabilities(&mut self, caps: Arc<crate::capability::CapabilitySet>) {
+        self.capabilities = Some(caps);
+    }
+
+    /// This VM's capability policy, if one was installed.
+    #[inline]
+    pub fn capabilities(&self) -> Option<&Arc<crate::capability::CapabilitySet>> {
+        self.capabilities.as_ref()
+    }
+
+    /// The capability a registered native definitionally exercises, or `None`
+    /// for the ~3,100 that exercise none (and for every registration accepted
+    /// before a policy was installed).
+    #[inline]
+    pub fn capability_of_id(
+        &self,
+        id: NativeMethodId,
+    ) -> Option<crate::capability::CapabilityKind> {
+        self.sensitive_slots.get(&(id.index() as u32)).copied()
+    }
+
+    /// Dispatch-side capability gate: check the capability class of the native
+    /// behind `id` before invoking it.
+    ///
+    /// This is the coarse safety net under the per-call-site gates. It can only
+    /// report [`Scope::Any`](crate::capability::Scope::Any) — at this point the
+    /// arguments have not been decoded, so there is no path or host to name —
+    /// which means an `Enforce` deployment must hold the unscoped grant (e.g.
+    /// `process-spawn:*`) for the class of native to dispatch at all, and the
+    /// per-call-site gate then applies the scoped decision. Its value is
+    /// coverage: it fires for every native in
+    /// [`classify_native`](crate::capability::classify_native), including ones
+    /// whose implementation has no gate of its own yet.
+    ///
+    /// With no policy installed this is one `Option` discriminant test.
+    #[inline]
+    #[track_caller]
+    pub fn check_dispatch_capability(
+        &self,
+        id: NativeMethodId,
+    ) -> Result<(), crate::capability::CapabilityDenied> {
+        let Some(caps) = self.capabilities.as_ref() else {
+            return Ok(());
+        };
+        let Some(kind) = self.capability_of_id(id) else {
+            return Ok(());
+        };
+        caps.check(crate::capability::Capability::of(
+            kind,
+            crate::capability::Scope::Any,
+        ))
     }
 
     /// Override the strict no-stubs mode programmatically (e.g. for tests or a
@@ -5184,6 +5277,28 @@ impl NativeMethodRegistry {
         // dispatch path reached the native, and preserving true async
         // semantics for a real pool's `execute()` (not just synchronous
         // fallback).
+        // CAPABILITY GATE (`NativeRegister`). Deliberately the LAST drop arm:
+        // every arm above answers "should this native exist at all in this
+        // build", which is a compatibility question; this one answers "is this
+        // VM permitted to install native code for this triple", which is a
+        // security question, and it must see exactly the set of registrations
+        // that would otherwise be accepted.
+        //
+        // Under the default (no policy installed) this is one `Option`
+        // discriminant test per registration and nothing else — the ~3,100
+        // boot registrations pay a predicted not-taken branch.
+        //
+        // A refusal RETURNS WITHOUT INSERTING, like the JDK-only arm: nothing
+        // reaches `registrations` / `categories` / `provenance` / `slots`, so
+        // the refused triple never appears in the census and `generation()`
+        // does not move. The denial is recorded in the capability audit log,
+        // which is where an operator looks for it.
+        if let Some(caps) = self.capabilities.as_ref() {
+            let request = crate::capability::Capability::native_register(class_name, method_name);
+            if caps.check(request).is_err() {
+                return;
+            }
+        }
         let key = native_method_hash(class_name, method_name, descriptor);
         // With 128-bit composite keys, collisions on our keyspace are
         // vanishingly unlikely. We keep a cheap `debug_assert!` as
@@ -5283,6 +5398,33 @@ impl NativeMethodRegistry {
                 self.slot_invocations
                     .push(std::sync::atomic::AtomicU64::new(0));
                 self.slot_by_key.insert(key, idx);
+            }
+        }
+        // CAPABILITY: classify the slot once, here, so the dispatch-side gate
+        // (`check_dispatch_capability`) is an integer map lookup rather than a
+        // per-invocation string match. Populated only when a policy is
+        // installed — with none there is nothing to gate, and the map stays
+        // empty and unallocated.
+        //
+        // Kept adjacent to the slot publication above because it is keyed by
+        // the slot index, and re-registration of a triple UPDATES the slot in
+        // place: recomputing here keeps the classification tracking whichever
+        // triple currently owns the slot.
+        if self.capabilities.is_some() {
+            let slot_index = match prior_slot {
+                Some(idx) => idx,
+                None => (self.slots.len() - 1) as u32,
+            };
+            match crate::capability::classify_native(class_name, method_name) {
+                Some(kind) => {
+                    self.sensitive_slots.insert(slot_index, kind);
+                }
+                None => {
+                    // A re-registration may have replaced a sensitive triple
+                    // with a non-sensitive one; drop the stale classification
+                    // rather than leaving the slot gated for the wrong reason.
+                    self.sensitive_slots.remove(&slot_index);
+                }
             }
         }
         // AUDIT 2026-05-17 (Fix 5): also populate the class-agnostic

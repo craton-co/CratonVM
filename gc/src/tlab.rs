@@ -162,7 +162,46 @@ impl Tlab {
         if c == 0 || e == 0 || c >= e {
             return None;
         }
+        // TLAB AUDIT (docs/gc/tlab-and-card-audit.md): the consumer of this
+        // pair, `GenerationalHeap::jit_tlab_skip_offsets`, SILENTLY DROPS any
+        // region whose start is not 8-aligned. A dropped region is not a
+        // conservative degrade — the sweep then walks the un-retired tail as if
+        // it held objects, which is the exact desync `reserved_tail` exists to
+        // prevent. Every production allocation path calls
+        // `alloc_initialized(_, 8, _)`, so the cursor is 8-aligned by
+        // convention; nothing enforced it, and `Tlab::alloc` is public with a
+        // caller-supplied alignment.
+        //
+        // Debug builds name the violation. Release builds round the published
+        // start UP to the next 8-byte boundary, which is the fail-safe
+        // direction: the published span shrinks by at most 7 bytes of
+        // inter-object padding (never into a live object, because the padding
+        // follows the last allocation), and the region survives the consumer's
+        // alignment filter instead of vanishing from it.
+        debug_assert!(
+            c & 7 == 0,
+            "Tlab::reserved_tail: cursor {c:#x} is not 8-aligned — \
+             GenerationalHeap::jit_tlab_skip_offsets would DROP this region and the \
+             non-moving sweep would walk the un-retired tail as objects. Every \
+             allocation into a TLAB must use align >= 8.",
+        );
+        let c = (c + 7) & !7usize;
+        if c >= e {
+            return None;
+        }
         Some((c, e))
+    }
+
+    /// Has this TLAB been retired (or never refilled)?
+    ///
+    /// The single predicate the retire protocol is stated in terms of: a
+    /// retired TLAB owns no backing memory, publishes no reserved tail, and
+    /// serves no allocation. [`Self::retire`] establishes all three and is
+    /// idempotent, so a transition path that retires twice (thread termination
+    /// after a safepoint park, say) is correct rather than merely tolerated.
+    #[inline]
+    pub fn is_retired(&self) -> bool {
+        self.start.is_null() && self.cursor.is_null() && self.end.is_null()
     }
 }
 
@@ -324,6 +363,16 @@ impl Tlab {
     /// (`unsafe impl Send`, never shared). For TLABs that are already
     /// empty (start/cursor/end null), the filler call short-circuits via
     /// the leading null check inside `install_tail_filler`.
+    /// # Idempotence (TLAB audit, `docs/gc/tlab-and-card-audit.md`)
+    ///
+    /// `retire` is idempotent and **must stay so**. Several transition paths can
+    /// retire the same TLAB twice with no synchronisation between them — a
+    /// thread that parks at a safepoint (`safepoint_check` retires), is then
+    /// selected as the next GC initiator (`maybe_gc` retires), and finally
+    /// terminates (`thread_start`'s teardown retires) runs three retires with
+    /// no refill in between. The second and third are no-ops because
+    /// `install_tail_filler` short-circuits on a null cursor and the three
+    /// stores are already-null stores.
     pub fn retire(&mut self) {
         // SAFETY: see method-level note — backing memory valid, single owner.
         unsafe {
@@ -332,6 +381,21 @@ impl Tlab {
         self.start = std::ptr::null_mut();
         self.cursor = std::ptr::null_mut();
         self.end = std::ptr::null_mut();
+        // Arms the "sized before retired" tripwire in `next_refill_size`.
+        self.pressure.retired_since_refill = true;
+        // Post-condition, asserted rather than assumed: the whole cross-thread
+        // STW protocol reads "a parked or blocked peer has already retired its
+        // TLAB, therefore `reserved_tail()` is `None`, therefore it contributes
+        // no skip region" (`ThreadRegistry::tlab_addr`'s safety note). If a
+        // future edit made `retire` leave any of the three pointers live, the
+        // collector would publish a skip region for a TLAB whose backing arena
+        // is about to be reset.
+        debug_assert!(
+            self.is_retired() && self.reserved_tail().is_none(),
+            "Tlab::retire must leave the TLAB owning nothing and publishing no \
+             reserved tail — the STW census assumes exactly that of every parked \
+             and blocked peer",
+        );
     }
 
     /// Round-5 #9 / round-7 #9 — Install a synthetic `int[]` filler object
@@ -381,6 +445,19 @@ impl Tlab {
         let aligned = (cursor_addr + 7) & !7;
         let end_addr = self.end as usize;
         if aligned >= end_addr {
+            // Fewer than 8 bytes of unaligned slack remain — there is no room
+            // for even the GAP-filler sentinel. TLAB AUDIT: consume the slack
+            // anyway so this function is TOTAL, i.e. every exit path leaves
+            // `cursor == end`. Callers (and `retire`'s post-condition) treat
+            // "the filler was installed" as "the TLAB publishes no reserved
+            // tail"; leaving `cursor < end` here made that false for the one
+            // case where the slack is unaligned, so `reserved_tail()` would
+            // still hand the collector a sub-8-byte span. Reachable only if
+            // something allocated with `align < 8` (no production path does —
+            // see `reserved_tail`'s debug assertion), and the bytes being
+            // consumed are inter-object padding after the last allocation, so
+            // nothing live is covered.
+            self.cursor = self.end;
             return;
         }
 
@@ -513,6 +590,25 @@ impl Tlab {
     /// tracker distinguish "nobody allocated" from "the JIT allocated and did
     /// not tell you".
     pub fn next_refill_size(&mut self) -> usize {
+        // TLAB AUDIT (docs/gc/tlab-and-card-audit.md): "size first, THEN retire"
+        // is a prose contract with a silent failure mode. `consumed_bytes()` is
+        // `cursor - start`, and `retire()` nulls both — so a caller that
+        // retires first gets `consumed == 0`, which is exactly the input that
+        // reintroduces the one-way shrink ratchet this signal exists to close
+        // (see this method's doc comment). Nothing distinguishes that from a
+        // genuinely idle thread, so the bug is invisible: the TLAB just gets
+        // smaller every refill, forever.
+        //
+        // `retired_since_refill` is set by `retire` and cleared by
+        // `begin_refill`, so the assertion fires precisely on the misordering
+        // and never on the legitimate "fresh thread, never refilled" call.
+        debug_assert!(
+            !self.pressure.retired_since_refill,
+            "Tlab::next_refill_size called on a RETIRED TLAB — the adaptive sizer \
+             reads the live `cursor - start` span, which retire() has already \
+             zeroed, so a JIT-drained TLAB reads as idle and ratchets down to \
+             MIN_TLAB_SIZE forever. Size the outgoing TLAB BEFORE retiring it.",
+        );
         let consumed = self.consumed_bytes();
         self.pressure.next_refill_size_with_consumed(consumed)
     }
@@ -648,6 +744,18 @@ pub struct TlabPressureTracker {
     /// CRIT-1 fix: was `parking_lot::Mutex<Instant>`. There is no
     /// second writer — the field is exclusive to the owning thread.
     refill_started_at: Instant,
+    /// TLAB AUDIT — has the owning [`Tlab`] been retired since the last
+    /// [`Self::begin_refill`]?
+    ///
+    /// Diagnostic only: it exists so [`Tlab::next_refill_size`] can
+    /// `debug_assert!` the "size the outgoing TLAB BEFORE retiring it" ordering
+    /// that the refill protocol depends on and that nothing else can detect
+    /// (the misordering degrades silently into the JIT-blind shrink ratchet).
+    /// A plain `bool` rather than a `#[cfg(debug_assertions)]` field so the
+    /// struct has one shape in every build; it is cold and the `Tlab` layout the
+    /// JIT depends on (`cursor`/`end` at offsets 0 and 8) is unaffected, since
+    /// the tracker sits after `start`.
+    retired_since_refill: bool,
 }
 
 impl TlabPressureTracker {
@@ -659,6 +767,7 @@ impl TlabPressureTracker {
             alloc_count: 0,
             large_alloc_count: 0,
             refill_started_at: Instant::now(),
+            retired_since_refill: false,
         }
     }
 
@@ -687,6 +796,9 @@ impl TlabPressureTracker {
         self.alloc_count = 0;
         self.large_alloc_count = 0;
         self.refill_started_at = Instant::now();
+        // A fresh TLAB lifetime: the outgoing one has been sized and replaced,
+        // so the "sized before retired" tripwire is disarmed again.
+        self.retired_since_refill = false;
     }
 
     /// Compute the next TLAB refill size based on the heuristic.
@@ -1308,6 +1420,225 @@ mod tests {
             tlab.next_refill_size() >= bytes,
             "a JIT-drained TLAB must not shrink through the Tlab wrapper"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // TLAB audit (docs/gc/tlab-and-card-audit.md) — retire / publish
+    // ---------------------------------------------------------------
+
+    /// Helper: an 8-aligned span of exactly `bytes` usable bytes, plus the
+    /// `Vec` that owns the backing allocation (which the caller must keep
+    /// alive — moving the `Vec` does not move its heap buffer, so the returned
+    /// pointer stays valid).
+    ///
+    /// `Tlab::new` requires an 8-aligned `end`, so `bytes` must be a multiple
+    /// of 8 and the base is rounded up inside a buffer with 8 bytes of slack.
+    fn aligned_buffer(bytes: usize) -> (Vec<u8>, *mut u8, usize) {
+        assert_eq!(bytes % 8, 0, "TLAB spans are 8-aligned at both ends");
+        let mut buf = vec![0u8; bytes + 8];
+        let raw = buf.as_mut_ptr();
+        let base = ((raw as usize + 7) & !7) as *mut u8;
+        (buf, base, bytes)
+    }
+
+    /// `retire` is idempotent, and every repeat leaves the same observable
+    /// state. The transition graph really does retire twice with no refill in
+    /// between: a thread parks at a safepoint (`safepoint_check` retires), is
+    /// then chosen as the next GC initiator (`maybe_gc` retires) and finally
+    /// terminates (`thread_start` retires). If the second retire re-ran the
+    /// tail filler over a now-null cursor, or resurrected a publishable tail,
+    /// the STW census's "a parked peer publishes no skip region" assumption
+    /// would be false.
+    #[test]
+    fn retire_is_idempotent_and_publishes_no_tail() {
+        let (_owner, base, usable) = aligned_buffer(4096);
+        let mut tlab = unsafe { Tlab::new(base, usable) };
+        tlab.alloc(64, 8).unwrap();
+        assert!(tlab.reserved_tail().is_some(), "a live TLAB has a tail");
+
+        for round in 0..3 {
+            tlab.retire();
+            assert!(tlab.is_retired(), "retire round {round}");
+            assert!(
+                tlab.reserved_tail().is_none(),
+                "a retired TLAB must publish no skip region (round {round})",
+            );
+            assert!(tlab.is_empty());
+            assert_eq!(tlab.remaining(), 0);
+            assert_eq!(tlab.consumed_bytes(), 0);
+            assert!(tlab.alloc(1, 8).is_none(), "round {round}");
+        }
+    }
+
+    /// Retiring an EMPTY TLAB — the state a thread is in between its park and
+    /// its next allocation — must also be a no-op rather than a null
+    /// dereference inside the tail filler. Every abrupt-transition path
+    /// (`begin_blocking_region`, thread termination, the JIT allocation
+    /// helpers) can reach a TLAB that a previous transition already retired.
+    #[test]
+    fn retire_on_an_already_empty_tlab_is_a_noop() {
+        let mut tlab = Tlab::empty();
+        assert!(tlab.is_retired());
+        tlab.retire();
+        tlab.retire();
+        assert!(tlab.is_retired());
+        assert!(tlab.reserved_tail().is_none());
+    }
+
+    /// The abrupt-transition case the whole retire protocol exists for: a
+    /// thread is bump-allocating (including through the JIT's inline path,
+    /// which moves `cursor` without telling this file) and is then forced
+    /// through a transition — blocking native, termination, forced GC — at an
+    /// arbitrary point. After the transition's `retire` there must be no
+    /// unretired tail at ANY of those points, and the bytes between the last
+    /// object and the TLAB end must be covered by a filler the heap walker can
+    /// stride in O(1).
+    #[test]
+    fn abrupt_transition_at_any_cursor_leaves_no_unretired_tail() {
+        use crate::heap::{ObjectHeader, ObjectKind, HEADER_SIZE};
+
+        // Sweep the cursor across the whole TLAB in 8-byte steps, including the
+        // three interesting boundaries: a full-size `int[]` filler still fits,
+        // exactly `HEADER_SIZE` remains, and a sub-header gap remains.
+        let size = 512;
+        for consumed in (0..=size).step_by(8) {
+            let (_owner, base, usable) = aligned_buffer(size);
+            let mut tlab = unsafe { Tlab::new(base, usable) };
+            // Simulate the JIT's inline bump: move the cursor directly, exactly
+            // as `emit_inline_tlab_new` does, so nothing in this file has seen
+            // the allocations.
+            if consumed > 0 {
+                tlab.alloc(consumed, 8).expect("cursor sweep fits");
+            }
+            let tail_before = tlab.remaining();
+
+            tlab.retire();
+
+            assert!(
+                tlab.reserved_tail().is_none(),
+                "consumed={consumed}: an abruptly-transitioned thread must leave \
+                 no reserved tail for the collector to trip over",
+            );
+            assert!(tlab.is_retired(), "consumed={consumed}");
+
+            // And the tail is walkable: either a full `int[]` filler covering
+            // exactly the remaining bytes, or the sub-header GAP sentinel.
+            if tail_before >= HEADER_SIZE {
+                // SAFETY: `base + consumed` is inside the (still-owned) buffer,
+                // 8-aligned, and holds the filler header retire just wrote.
+                let hdr = unsafe { &*((base as usize + consumed) as *const ObjectHeader) };
+                assert_eq!(hdr.class_id, TLAB_FILLER_CLASS_ID, "consumed={consumed}");
+                assert_eq!(hdr.kind, ObjectKind::Array, "consumed={consumed}");
+                assert_eq!(
+                    HEADER_SIZE + (hdr.array_length() as usize) * 4,
+                    tail_before,
+                    "consumed={consumed}: the filler must cover the tail EXACTLY, \
+                     or the walker resumes off the object grid",
+                );
+            } else if tail_before > 0 {
+                // SAFETY: as above; the gap sentinel is two `u32`s.
+                let (cid, len) = unsafe {
+                    let p = (base as usize + consumed) as *const u32;
+                    (std::ptr::read(p), std::ptr::read(p.add(1)))
+                };
+                assert_eq!(cid, GAP_FILLER_CLASS_ID.as_u32(), "consumed={consumed}");
+                assert_eq!(len as usize, tail_before, "consumed={consumed}");
+            }
+        }
+    }
+
+    /// `reserved_tail` is what the cross-thread STW scan publishes as a skip
+    /// region, and `GenerationalHeap::jit_tlab_skip_offsets` silently DROPS a
+    /// region whose start is not 8-aligned — after which the sweep walks the
+    /// un-retired tail as objects. Production allocates with `align >= 8`, so
+    /// the invariant holds; it held only by convention until this assertion.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "not 8-aligned")]
+    fn reserved_tail_rejects_a_misaligned_cursor_in_debug_builds() {
+        let (_owner, base, usable) = aligned_buffer(256);
+        let mut tlab = unsafe { Tlab::new(base, usable) };
+        // `align = 1` is the only way to get here, and no production path uses
+        // it — this is the tripwire firing, which is the point.
+        tlab.alloc(3, 1).unwrap();
+        let _ = tlab.reserved_tail();
+    }
+
+    /// The published tail is exactly `[cursor, end)` for an aligned cursor —
+    /// the collector must skip the reserved bytes and *only* the reserved
+    /// bytes, or it either walks into raw TLAB memory (too small) or hides live
+    /// objects from the sweep (too large).
+    #[test]
+    fn reserved_tail_is_exactly_the_unallocated_span() {
+        let (_owner, base, usable) = aligned_buffer(1024);
+        let mut tlab = unsafe { Tlab::new(base, usable) };
+        tlab.alloc(128, 8).unwrap();
+        assert_eq!(
+            tlab.reserved_tail(),
+            Some((base as usize + 128, base as usize + usable)),
+        );
+
+        // Consuming the TLAB exactly to its end publishes nothing.
+        tlab.alloc(usable - 128, 8).unwrap();
+        assert_eq!(tlab.remaining(), 0);
+        assert!(tlab.reserved_tail().is_none());
+    }
+
+    /// Installing the tail filler must be TOTAL: every exit path leaves
+    /// `cursor == end`, so `reserved_tail()` is `None` afterwards. The
+    /// sub-8-byte-slack path used to return with `cursor < end` still true,
+    /// which left a publishable span the filler had not covered.
+    #[test]
+    fn install_tail_filler_always_consumes_the_tlab() {
+        for consumed in [0usize, 8, 40, 56, 64] {
+            let (_owner, base, usable) = aligned_buffer(64);
+            let mut tlab = unsafe { Tlab::new(base, usable) };
+            if consumed > 0 {
+                tlab.alloc(consumed, 8).unwrap();
+            }
+            unsafe {
+                tlab.install_tail_filler(TLAB_FILLER_CLASS_ID);
+            }
+            assert_eq!(tlab.remaining(), 0, "consumed={consumed}");
+            assert!(tlab.reserved_tail().is_none(), "consumed={consumed}");
+        }
+    }
+
+    /// The adaptive sizer must be consulted BEFORE the TLAB is retired: after
+    /// `retire` the `cursor - start` span it reads is zero, which is exactly
+    /// the input that reintroduces the JIT-blind one-way shrink ratchet. The
+    /// refill path honours the ordering; nothing detected a violation until
+    /// this tripwire.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "RETIRED TLAB")]
+    fn sizing_a_retired_tlab_trips_the_ordering_assertion() {
+        let (_owner, base, usable) = aligned_buffer(64 * 1024);
+        let mut tlab = unsafe { Tlab::new(base, usable) };
+        tlab.alloc(1024, 8).unwrap();
+        tlab.retire();
+        let _ = tlab.next_refill_size();
+    }
+
+    /// ...and the legitimate ordering (size, then retire, then install a fresh
+    /// TLAB) must not trip it, on either a fresh or a recycled TLAB.
+    #[test]
+    fn sizing_before_retiring_is_accepted() {
+        let (_owner, base, usable) = aligned_buffer(64 * 1024);
+        let mut tlab = unsafe { Tlab::new(base, usable) };
+        // Drain it the way compiled code does — raw cursor bump only.
+        tlab.cursor = unsafe { tlab.start.add(usable) };
+        let requested = tlab.next_refill_size();
+        assert!(requested >= MIN_TLAB_SIZE);
+        tlab.retire();
+
+        // The replacement is a brand-new `Tlab`, whose tracker starts a fresh
+        // refill window — so the tripwire is disarmed again.
+        let (_owner2, base2, usable2) = aligned_buffer(64 * 1024);
+        let mut next = unsafe { Tlab::new(base2, usable2) };
+        next.begin_refill(usable2);
+        next.alloc(64, 8).unwrap();
+        let _ = next.next_refill_size();
     }
 
     #[test]

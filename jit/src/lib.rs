@@ -91,6 +91,7 @@ pub mod ir_optimize;
 pub mod ir_schedule;
 pub mod ir_verify;
 pub mod loop_analysis;
+pub mod metrics;
 pub mod null_check_elim;
 pub mod pgo;
 pub mod platform;
@@ -7143,10 +7144,21 @@ fn ir_verify_reject(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
+    // `metrics::current_phase` charges this verification run to whichever
+    // compilation is innermost on this thread. A thread-local hook rather than
+    // a new parameter precisely because this function has three call sites in
+    // `try_compile_inner` and the task's constraint is "do not change any
+    // signature". It is a no-op (and reads no clock) unless
+    // `CRATONVM_JIT_METRICS=1`.
+    let _metrics_phase = metrics::current_phase(metrics::Phase::Verify);
     match ir_verify::verify_graph(graph, phase, ir_verify::VerifyOptions::from_env()) {
         Ok(()) => false,
         Err(b) => {
             bailout::record_bailout(&b);
+            // Attribution, not duplication: `record_bailout` above owns the
+            // process-wide category counters; this attaches the same bailout to
+            // *this* method and *this* phase in the per-compilation report.
+            metrics::note_current_bailout(&b, phase);
             if ir_stage_reporting() {
                 eprintln!("[ir] verifier rejected {class_name}.{method_name}{descriptor}: {b}");
             }
@@ -8512,6 +8524,20 @@ fn try_compile_inner(
     backend_attempted: &mut bool,
     self_call_identity_stable: bool,
 ) -> Option<CompiledMethod> {
+    // C2-review P0 "Measure compilation quality": one structured
+    // `metrics::CompilationReport` per compilation, published when this handle
+    // drops. `Drop` is deliberate — this function has ~40 `return None` exits
+    // (every `jitc_bail!`, the scan reject, the `?` on the single-pass
+    // backend), and publishing from the destructor covers all of them without
+    // touching a single control-flow edge. Off unless `CRATONVM_JIT_METRICS=1`,
+    // in which case `begin` is one relaxed atomic load and no allocation.
+    let metrics = metrics::CompileRecorder::begin(
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+        optimize,
+    );
+
     // Architecture-specific backend selection.
     // On ARM64 (aarch64), the ARM64 backend would be used instead of x64.
     // Both x64 and ARM64 backends have bytecode→native compilation pipelines.
@@ -8628,6 +8654,10 @@ fn try_compile_inner(
         };
     }
 
+    // Phase 1 (scan/parse). The guard also covers the `return None` arm below:
+    // a scan reject is a real compilation that spent real time, and its report
+    // should say so.
+    let metrics_scan = metrics.phase(metrics::Phase::Scan);
     let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
         Some(s) => s,
         None => {
@@ -8650,6 +8680,7 @@ fn try_compile_inner(
             return None;
         }
     };
+    drop(metrics_scan);
 
     // RBC.6 (RELAXED, see docs/feature-designs/jit-local-exception-handlers.md)
     // — this gate used to unconditionally refuse any method that combines
@@ -8818,7 +8849,13 @@ fn try_compile_inner(
     // Under `CRATONVM_DBG_JITC` / `CRATONVM_DBG_IR_COMPILES` each candidate now
     // reports which term declined it. Evaluated lazily (and only under the
     // flag) so the default path pays nothing.
-    if ir_stage_reporting() {
+    //
+    // C2-review P0 "Measure compilation quality": the same verdict is the
+    // per-method report's `admission` field, so "why did the optimizing tier
+    // never see method X?" is answerable structurally instead of by grepping
+    // this line out of stderr. `metrics.is_enabled()` is one relaxed atomic
+    // load, and the verdict is still built only when somebody will read it.
+    if ir_stage_reporting() || metrics.is_enabled() {
         let verdict = if !optimize {
             "optimize=false — the C1/fast tier was requested, not C2".to_string()
         } else if moving_young_disables_optimizing_tier() {
@@ -8846,10 +8883,13 @@ fn try_compile_inner(
                 )
             }
         };
-        eprintln!(
-            "[ir] admission {}.{}{}: {verdict}",
-            cached.class_name, cached.method_name, cached.method_descriptor,
-        );
+        metrics.set_admission(&verdict);
+        if ir_stage_reporting() {
+            eprintln!(
+                "[ir] admission {}.{}{}: {verdict}",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
     }
     if optimize
         // IR lowering has no exact-RBP or safepoint-map publication, so a
@@ -8946,6 +8986,11 @@ fn try_compile_inner(
             // double literals (`1.5`, `3.14`, …) no longer bail.
             || (ir_emit_fp && fp_in_body(code, code_len)))
     {
+        // Every conjunct above passed: the optimizing pipeline is entered. The
+        // report records this before anything can decline, so a later
+        // `enter_single_pass` is recognisable as a FALL-THROUGH rather than a
+        // method that was never a C2 candidate at all.
+        metrics.enter_optimizing_pipeline();
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
@@ -9383,7 +9428,17 @@ fn try_compile_inner(
                 }
             }
         }
+        // Phase 2 (build). `nodes_built` is recorded straight after, so the
+        // report can separate "the front end refused this bytecode" (build
+        // returned None, `nodes_built` stays unmeasured) from "the graph was
+        // built and then rejected for size".
+        let metrics_build = metrics.phase(metrics::Phase::Build);
         let built = builder.build(code, code_len);
+        drop(metrics_build);
+        if let Some(g) = built.as_ref() {
+            metrics.set_nodes_built(g.nodes.len());
+            metrics.phase_nodes(metrics::Phase::Build, 0, g.nodes.len());
+        }
         // jit-inlining-and-ir-calls — tier-4 compile-time guard.
         // `ir_compatible`'s bytecode budget rose from 200 to HotSpot's 8000-byte
         // HugeMethodLimit, which is the right *admission* rule but a poor proxy
@@ -9407,6 +9462,19 @@ fn try_compile_inner(
                         ir::IR_MAX_GRAPH_NODES,
                     );
                 }
+                // This *is* `BailoutReason::GraphTooLarge`; the check predates
+                // `bailout.rs` and still signals with a bare `None`. Recording
+                // it on the report (and not through `bailout::record_bailout`)
+                // names the reason without changing what the process-wide
+                // counters count — converting the signal itself belongs to the
+                // owner of this gate.
+                metrics.note_bailout_reason(
+                    bailout::BailoutReason::GraphTooLarge {
+                        nodes: g.nodes.len(),
+                        limit: ir::IR_MAX_GRAPH_NODES,
+                    },
+                    "post-build",
+                );
                 None
             }
             other => other,
@@ -9467,7 +9535,21 @@ fn try_compile_inner(
                 // Nothing on the success path changes.
                 let mut ir_verify_bail = false;
 
+                // Phase 3 (optimize). `ir_optimize::optimize` is opaque — GVN,
+                // DCE, reassociation, LICM and unrolling all run inside it and
+                // it publishes no per-pass boundary — so this is one row, not
+                // one row per pass. The before/after node counts are still the
+                // useful number: they are what `ir_lower::estimate_frame_bytes`
+                // multiplies by 8 to size the frame.
+                let metrics_optimize = metrics.phase(metrics::Phase::Optimize);
+                let metrics_nodes_before_optimize = graph.nodes.len();
                 ir_optimize::optimize(&mut graph);
+                drop(metrics_optimize);
+                metrics.phase_nodes(
+                    metrics::Phase::Optimize,
+                    metrics_nodes_before_optimize,
+                    graph.nodes.len(),
+                );
                 if ir_verify::verify_enabled() {
                     ir_verify_bail |= ir_verify_reject(
                         &graph,
@@ -9489,6 +9571,13 @@ fn try_compile_inner(
                 // Convert IR graph to escape analysis graph, run analysis,
                 // and apply scalar replacement / lock elision to the IR graph.
                 {
+                    // Phase 4 (escape analysis). Dropped explicitly before the
+                    // post-EA verifier run below so the two phases do not
+                    // double-charge each other; on the path where EA changes
+                    // nothing it drops at the end of this block instead, which
+                    // is still EA-only work.
+                    let metrics_ea = metrics.phase(metrics::Phase::EscapeAnalysis);
+                    let metrics_nodes_before_ea = graph.nodes.len();
                     let (ea_graph, id_map) = escape_analysis_from_ir(&graph);
                     let ea_result = escape_analysis::analyze_escapes(&ea_graph);
                     // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
@@ -9530,6 +9619,9 @@ fn try_compile_inner(
                                 Some(build_scalar_replacement_map(&graph, &id_map, &ea_result));
                         }
                         apply_ea_to_ir(&mut graph, &id_map, &ea_result);
+                        // Stop charging EA here: the verifier run below is its
+                        // own phase and must not be billed to escape analysis.
+                        drop(metrics_ea);
                         // `apply_ea_to_ir` is a mutating pass: it kills the
                         // scalar-replaced allocation, its stores and its loads,
                         // and rewires their consumers. Verify the result under
@@ -9544,6 +9636,14 @@ fn try_compile_inner(
                             );
                         }
                     }
+                    // Recorded on BOTH paths — EA that scalar-replaced nothing
+                    // still ran, and `nodes_before == nodes_after` is the
+                    // finding, not a missing measurement.
+                    metrics.phase_nodes(
+                        metrics::Phase::EscapeAnalysis,
+                        metrics_nodes_before_ea,
+                        graph.nodes.len(),
+                    );
                 }
 
                 // Arrays still use the baseline tier's specialized allocation
@@ -9580,7 +9680,24 @@ fn try_compile_inner(
                     );
                 }
                 if !has_live_new_array && !ir_verify_bail {
+                    // The graph the lowerer will actually see. `live_nodes` is
+                    // the non-`Op::Dead` count: the gap against `nodes` is dead
+                    // arena the optimizer left behind, and `ir_lower` reserves
+                    // 8 frame bytes per ARENA node, so that gap is also frame
+                    // bytes paid for values that no longer exist.
+                    metrics.set_graph_at_lower(
+                        graph.nodes.len(),
+                        graph
+                            .nodes
+                            .iter()
+                            .filter(|n| !matches!(n.op, ir::Op::Dead))
+                            .count(),
+                        graph.safepoints.len(),
+                    );
+                    // Phase 6 (schedule).
+                    let metrics_schedule = metrics.phase(metrics::Phase::Schedule);
                     let schedule = ir_schedule::schedule(&graph);
+                    drop(metrics_schedule);
                     // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
                     // optimizing IR (C2) lowerer the profiled branch bias so it can
                     // pick each `Op::If`'s fall-through edge from the C1/interpreter
@@ -9609,7 +9726,15 @@ fn try_compile_inner(
                     // guard-surviving scalar-replacement map (Front 3.2) to the
                     // shared lowering body. `sr_map` is `None` unless
                     // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL` are set.
-                    if let Some(mut compiled) = ir_lower::lower_inner(
+                    // Phase 7 (lower). `lower_inner` selects instructions,
+                    // encodes them and installs the executable buffer in one
+                    // call, which is why `Phase::Encode` and `Phase::Install`
+                    // report "not measured" for this path rather than 0.
+                    // Hoisted out of the `if let` (same call, same arguments,
+                    // same control flow) purely so the timer can stop before
+                    // the post-lowering bookkeeping below.
+                    let metrics_lower = metrics.phase(metrics::Phase::Lower);
+                    let lowered = ir_lower::lower_inner(
                         &graph,
                         &schedule,
                         num_params,
@@ -9619,7 +9744,9 @@ fn try_compile_inner(
                         sr_map.as_ref(),
                         &ir_direct_calls,
                         &ir_ic_slots,
-                    ) {
+                    );
+                    drop(metrics_lower);
+                    if let Some(mut compiled) = lowered {
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
                         // for the code's lifetime, and mark the method as using
@@ -9696,6 +9823,11 @@ fn try_compile_inner(
                                 cached.class_name, cached.method_name, cached.method_descriptor,
                             );
                         }
+                        // Optimizing-tier success: harvest code bytes, frame
+                        // bytes, oop-map and deopt-metadata sizes, and the
+                        // code-cache occupancy, from the finished artifact.
+                        // Reads public accessors only; cannot perturb it.
+                        metrics.installed(&compiled);
                         return Some(compiled);
                     }
                     if ir_stage_reporting() {
@@ -9708,6 +9840,14 @@ fn try_compile_inner(
             } // end else (IR-lowering path)
         }
     }
+
+    // Control reaches here either because the optimizing pipeline was never
+    // admitted, or because it was entered and declined (an unbuildable graph,
+    // a verifier rejection, a surviving `NewArray`, a lowerer bail). The
+    // recorder already knows which — `enter_single_pass` flags the second case
+    // as a fall-through, which is what makes "the C2 tier produced no bodies"
+    // separable from "the C2 tier was never asked".
+    metrics.enter_single_pass();
 
     // Resolve multianewarray entries
     let mut mna_info = Vec::new();
@@ -10849,6 +10989,10 @@ fn try_compile_inner(
             })
             .collect(),
     );
+    // Phase 10 (single-pass backend). Like `lower_inner`, this one call does
+    // selection, encoding and buffer install together. The guard also covers
+    // the `?` below: a backend bail is a compilation that spent this time.
+    let metrics_single_pass = metrics.phase(metrics::Phase::SinglePass);
     let mut compiled = x64::compile_with_param_slots(
         code,
         code_len,
@@ -10881,6 +11025,7 @@ fn try_compile_inner(
         &despec_method_key,
         indy_info,
     )?;
+    drop(metrics_single_pass);
 
     compiled._jit_strings = owned_strings;
     compiled._jit_invoke_infos = owned_invoke_infos;
@@ -10926,6 +11071,10 @@ fn try_compile_inner(
         }
     }
 
+    // Single-pass success: same harvest as the optimizing path. `installed`
+    // takes the artifact's own `used_ir_backend` as the authority on which
+    // backend produced it, so the recorded path cannot drift from the truth.
+    metrics.installed(&compiled);
     Some(compiled)
 }
 

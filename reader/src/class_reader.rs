@@ -14,23 +14,22 @@ use crate::class_reader_error::ClassReaderError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::byte_view::SharedBytes;
 use crate::field::ClassFileField;
+// Resource limits and the checked-arithmetic helpers that enforce them all
+// live in one place — see `reader/src/limits.rs` and
+// `docs/security/reader/limits.md` for the inventory.
+use crate::limits::{bounded_capacity, ensure_count_fits, MIN_CONSTANT_POOL_ENTRY_BYTES};
 use crate::method::ClassFileMethod;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
 const CLASS_FILE_MAGIC: u32 = 0xCAFEBABE;
 
-/// Safety cap for `Vec::with_capacity` to avoid excessive pre-allocation on
-/// malformed class files.  The actual count (bounded by u16) may exceed this;
-/// the Vec will simply grow on demand.
-const PREALLOC_CAP: usize = 1024;
-
 /// Maximum count for constant pool, methods, fields, interfaces, exception
 /// table entries, and attributes.  Per JVM spec these are u16 fields, so the
 /// hard upper bound is 65 535.  We validate against this limit *before*
 /// allocating to prevent a crafted class file with huge counts from causing
 /// an out-of-memory denial-of-service.
-const MAX_CP_SIZE: u16 = u16::MAX; // 65 535 — JVM spec §4.1
+const MAX_CP_SIZE: u16 = crate::limits::MAX_CONSTANT_POOL_COUNT; // 65 535 — JVM spec §4.1
 const MAX_FIELD_COUNT: u16 = u16::MAX;
 const MAX_METHOD_COUNT: u16 = u16::MAX;
 const MAX_INTERFACE_COUNT: u16 = u16::MAX;
@@ -38,6 +37,22 @@ const MAX_ATTRIBUTE_COUNT: u16 = u16::MAX;
 // MAX_EXCEPTION_TABLE_COUNT was used by the eager `Code` parser; that parser
 // now lives in `attribute.rs` (called on-demand via `LazyAttribute::decode`),
 // so the constant is no longer needed here.
+
+// Smallest possible on-the-wire size of one entry in each of the top-level
+// tables. These are the multipliers that turn a declared count into "the
+// input is too short to contain this table", so preallocation is bounded by
+// the *file*, not by a number typed into a two-byte field.
+//
+//   interfaces[]  — one u2 constant-pool index          (JVMS §4.1)
+//   field_info    — access_flags, name_index,
+//                   descriptor_index, attributes_count  (JVMS §4.5)
+//   method_info   — same four u2 fields                 (JVMS §4.6)
+//   attribute_info— attribute_name_index (u2) +
+//                   attribute_length (u4)               (JVMS §4.7)
+const INTERFACE_ENTRY_BYTES: usize = 2;
+const FIELD_ENTRY_BYTES: usize = 8;
+const METHOD_ENTRY_BYTES: usize = 8;
+const ATTRIBUTE_HEADER_BYTES: usize = 6;
 
 /// Validate that a section count does not exceed the given limit.
 fn validate_count(label: &str, count: u16, limit: u16) -> Result<(), ClassReaderError> {
@@ -137,8 +152,19 @@ pub fn read_class_shared(source: SharedBytes) -> Result<ClassFile, ClassReaderEr
     // Interfaces
     let interfaces_count = buf.read_u16()?;
     validate_count("interfaces", interfaces_count, MAX_INTERFACE_COUNT)?;
-    let mut interfaces: Vec<Arc<str>> =
-        Vec::with_capacity((interfaces_count as usize).min(PREALLOC_CAP));
+    // Reject a declared count the remaining bytes cannot possibly hold
+    // BEFORE reserving for it — see `limits::ensure_count_fits`.
+    ensure_count_fits(
+        "interfaces",
+        interfaces_count as usize,
+        INTERFACE_ENTRY_BYTES,
+        buf.remaining(),
+    )?;
+    let mut interfaces: Vec<Arc<str>> = Vec::with_capacity(bounded_capacity(
+        interfaces_count as usize,
+        INTERFACE_ENTRY_BYTES,
+        buf.remaining(),
+    ));
     for _ in 0..interfaces_count {
         let iface_index = buf.read_u16()?;
         let iface_name = constant_pool
@@ -153,7 +179,17 @@ pub fn read_class_shared(source: SharedBytes) -> Result<ClassFile, ClassReaderEr
     // Fields
     let fields_count = buf.read_u16()?;
     validate_count("fields", fields_count, MAX_FIELD_COUNT)?;
-    let mut fields = Vec::with_capacity((fields_count as usize).min(PREALLOC_CAP));
+    ensure_count_fits(
+        "fields",
+        fields_count as usize,
+        FIELD_ENTRY_BYTES,
+        buf.remaining(),
+    )?;
+    let mut fields = Vec::with_capacity(bounded_capacity(
+        fields_count as usize,
+        FIELD_ENTRY_BYTES,
+        buf.remaining(),
+    ));
     for _ in 0..fields_count {
         fields.push(read_field(&mut buf, &constant_pool, &source)?);
     }

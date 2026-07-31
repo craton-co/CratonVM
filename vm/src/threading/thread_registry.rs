@@ -883,6 +883,16 @@ impl ThreadRegistry {
                 by_java_tid.remove(&java_tid);
             }
         }
+        // P1 shadow record — the `-> Terminated` edge. `mark_dead` is NOT
+        // always self-called: `ThreadRegistry::join` (below) marks the joinee
+        // dead from the *joining* thread. `record_transition_for` therefore
+        // records only when the calling thread's cell is bound to this id, so
+        // a peer's termination can never be attributed to the caller.
+        crate::threading::thread_state::record_transition_for(
+            thread_id.0,
+            crate::threading::thread_state::ThreadExecState::Terminated,
+            "thread_registry::mark_dead",
+        );
     }
 
     /// Aliasing-proof identity lookup: registry `ThreadId` by the Java-side
@@ -963,6 +973,16 @@ impl ThreadRegistry {
         if let Some(entry) = threads.get(&thread_id) {
             entry.stw_ready.store(true, Ordering::Release);
         }
+        drop(threads);
+        // P1 shadow record — the `Starting -> JavaRunning` edge. Always
+        // self-called by the freshly spawned carrier (`vm/src/vm/vm_exec.rs`
+        // `thread_start` and the virtual-thread first-mount arm), inside
+        // `GcBarrier::run_if_no_stw_requested`, so binding here is safe.
+        crate::threading::thread_state::bind_current_thread(thread_id.0);
+        crate::threading::thread_state::record_transition(
+            crate::threading::thread_state::ThreadExecState::JavaRunning,
+            "thread_registry::mark_stw_ready",
+        );
     }
 
     /// Block the calling OS thread until the target thread finishes.
