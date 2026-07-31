@@ -381,6 +381,11 @@ pub struct ReadCompletion {
     buffer_gref: usize,
     /// What to deliver.
     outcome: ReadOutcome,
+    /// When the worker's blocking `read` returned, i.e. when this completion
+    /// became deliverable. `Some` only under `CRATONVM_DBG_AIO_INLINE`. The
+    /// dispatcher subtracts it on delivery so OUR wake latency can be told
+    /// apart from time spent waiting on the peer — see [`aio_latency_report`].
+    ready_at: Option<std::time::Instant>,
 }
 
 /// Result parked by a Future-form read or write.  The worker threads never
@@ -504,7 +509,17 @@ fn deliver_read_completion(ctx: &mut dyn NativeContext, c: ReadCompletion) {
         attachment_gref,
         buffer_gref,
         outcome,
+        ready_at,
     } = c;
+    if let Some(ready) = ready_at {
+        // Worker parked this the instant its blocking read returned; everything
+        // since is the worker→dispatcher handoff, i.e. latency we own.
+        aio_latency_record(
+            &AIO_DELIVER_NS,
+            &AIO_DELIVER_N,
+            std::time::Instant::now().saturating_duration_since(ready),
+        );
+    }
     dbg_aio!(
         "HREAD  deliver handler_gref={handler_gref} outcome={}",
         match &outcome {
@@ -873,6 +888,11 @@ enum Job {
         handler_gref: usize,
         attachment_gref: usize,
         buffer_gref: usize,
+        /// When the VM thread queued this, under `CRATONVM_DBG_AIO_INLINE`
+        /// only. The worker subtracts it on pick-up to expose the queue→worker
+        /// leg, which `wait` cannot see (it starts once the worker is already
+        /// in `read`) and which is entirely ours.
+        queued_at: Option<std::time::Instant>,
     },
     /// Future-form read against an fd_table-backed channel.  The returned
     /// CompletableFuture and target ByteBuffer stay globally rooted until the
@@ -1237,7 +1257,15 @@ fn handle_job(job: Job) -> Result<(), String> {
             handler_gref,
             attachment_gref,
             buffer_gref,
+            queued_at,
         } => {
+            if let Some(queued) = queued_at {
+                aio_latency_record(
+                    &AIO_QUEUE_NS,
+                    &AIO_QUEUE_N,
+                    std::time::Instant::now().saturating_duration_since(queued),
+                );
+            }
             // Blocking read on the cloned handle. The clone is private to this
             // worker, so we hold its lock for the duration without blocking the
             // application's writes (which go through the original fd entry).
@@ -1246,11 +1274,17 @@ fn handle_job(job: Job) -> Result<(), String> {
                 std::thread::current().id()
             );
             let mut buf = vec![0u8; len.max(1)];
+            let blocked_from = aio_inline_dbg_enabled().then(std::time::Instant::now);
             let read_res = {
                 let s = stream.lock();
                 let mut r = &*s;
                 r.read(&mut buf)
             };
+            let ready_at = blocked_from.map(|started| {
+                let now = std::time::Instant::now();
+                aio_wait_record(now.saturating_duration_since(started));
+                now
+            });
             dbg_aio!(
                 "HREAD  worker result handler_gref={handler_gref} result={:?} thread={:?}",
                 match &read_res {
@@ -1274,6 +1308,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                 attachment_gref,
                 buffer_gref,
                 outcome,
+                ready_at,
             });
         }
         Job::ReadFutureFd {
@@ -2131,6 +2166,9 @@ fn try_deliver_ready_read(
                 attachment_gref,
                 buffer_gref,
                 outcome,
+                // Delivered on the initiating thread — there is no handoff to
+                // measure, and counting it would dilute the worker-path mean.
+                ready_at: None,
             },
         );
     }
@@ -2224,6 +2262,97 @@ fn aio_inline_dbg_enabled() -> bool {
 static AIO_INLINE_TAKEN: AtomicUsize = AtomicUsize::new(0);
 static AIO_INLINE_NOT_READY: AtomicUsize = AtomicUsize::new(0);
 static AIO_INLINE_DEPTH_CAPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// Split of where a NOT-READY read's latency goes, under
+/// `CRATONVM_DBG_AIO_INLINE`.
+///
+/// `try_deliver_ready_read` only helps reads whose bytes have already arrived.
+/// For the rest the caller queues a `Job::ReadFd`, a worker blocks in `read`,
+/// and the dispatcher then wakes to run the Java `CompletionHandler` — so the
+/// observed gap is `wait` (genuinely waiting on the peer, not ours to fix) plus
+/// `deliver` (worker→dispatcher handoff, which is). Without the split, a gap
+/// dominated by peer turnaround is indistinguishable from one dominated by our
+/// own wake latency, and tomcat/32.3's SEQ2 could not be attributed to either.
+/// `wait` is BIMODAL whenever the peer alternates bursts with pauses, so a mean
+/// over it answers nothing: `TestAsyncMessagesPerformance` has one read per
+/// cycle waiting out a deliberate 50 ms pause and one waiting ~1 ms for the
+/// next message, and their mean (~25 ms) is a number no read ever experienced.
+/// Bucketing separates them. `queue` is the third term the mean hid entirely —
+/// time from the VM thread queueing `Job::ReadFd` to a worker actually
+/// entering `read`, which is ours and is invisible in `wait`.
+static AIO_WAIT_NS: AtomicUsize = AtomicUsize::new(0);
+static AIO_WAIT_N: AtomicUsize = AtomicUsize::new(0);
+static AIO_WAIT_LT1MS: AtomicUsize = AtomicUsize::new(0);
+static AIO_WAIT_1_10MS: AtomicUsize = AtomicUsize::new(0);
+static AIO_WAIT_GT10MS: AtomicUsize = AtomicUsize::new(0);
+static AIO_WAIT_SHORT_NS: AtomicUsize = AtomicUsize::new(0);
+static AIO_QUEUE_NS: AtomicUsize = AtomicUsize::new(0);
+static AIO_QUEUE_N: AtomicUsize = AtomicUsize::new(0);
+static AIO_DELIVER_NS: AtomicUsize = AtomicUsize::new(0);
+static AIO_DELIVER_N: AtomicUsize = AtomicUsize::new(0);
+
+fn aio_latency_record(
+    total: &AtomicUsize,
+    count: &AtomicUsize,
+    d: std::time::Duration,
+) {
+    total.fetch_add(d.as_nanos().min(usize::MAX as u128) as usize, Ordering::Relaxed);
+    let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 500 == 0 {
+        aio_latency_report();
+    }
+}
+
+fn aio_wait_record(d: std::time::Duration) {
+    let ns = d.as_nanos().min(usize::MAX as u128) as usize;
+    AIO_WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+    if ns < 1_000_000 {
+        AIO_WAIT_LT1MS.fetch_add(1, Ordering::Relaxed);
+        AIO_WAIT_SHORT_NS.fetch_add(ns, Ordering::Relaxed);
+    } else if ns < 10_000_000 {
+        AIO_WAIT_1_10MS.fetch_add(1, Ordering::Relaxed);
+        AIO_WAIT_SHORT_NS.fetch_add(ns, Ordering::Relaxed);
+    } else {
+        AIO_WAIT_GT10MS.fetch_add(1, Ordering::Relaxed);
+    }
+    let n = AIO_WAIT_N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 500 == 0 {
+        aio_latency_report();
+    }
+}
+
+fn aio_latency_report() {
+    let mean = |ns: &AtomicUsize, n: &AtomicUsize| {
+        let c = n.load(Ordering::Relaxed);
+        if c == 0 {
+            0
+        } else {
+            ns.load(Ordering::Relaxed) / c / 1000
+        }
+    };
+    let lt1 = AIO_WAIT_LT1MS.load(Ordering::Relaxed);
+    let m1_10 = AIO_WAIT_1_10MS.load(Ordering::Relaxed);
+    let gt10 = AIO_WAIT_GT10MS.load(Ordering::Relaxed);
+    let short_n = lt1 + m1_10;
+    let short_mean = if short_n == 0 {
+        0
+    } else {
+        AIO_WAIT_SHORT_NS.load(Ordering::Relaxed) / short_n / 1000
+    };
+    eprintln!(
+        "[DBG_AIO_LATENCY] not_ready_reads n={} | wait buckets: <1ms={} 1-10ms={} >10ms={} \
+         (sub-10ms mean={}us) | queue_mean={}us (n={}) deliver_mean={}us (n={})",
+        AIO_WAIT_N.load(Ordering::Relaxed),
+        lt1,
+        m1_10,
+        gt10,
+        short_mean,
+        mean(&AIO_QUEUE_NS, &AIO_QUEUE_N),
+        AIO_QUEUE_N.load(Ordering::Relaxed),
+        mean(&AIO_DELIVER_NS, &AIO_DELIVER_N),
+        AIO_DELIVER_N.load(Ordering::Relaxed),
+    );
+}
 
 fn aio_inline_record(counter: &AtomicUsize) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -2397,6 +2526,7 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
             attachment_gref: ag,
             buffer_gref: 0,
             outcome,
+            ready_at: None,
         });
     };
 
@@ -2452,6 +2582,7 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
             handler_gref,
             attachment_gref,
             buffer_gref,
+            queued_at: aio_inline_dbg_enabled().then(std::time::Instant::now),
         })
         .is_err()
     {
@@ -2461,6 +2592,7 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
             attachment_gref,
             buffer_gref,
             outcome: ReadOutcome::Error("read: aio worker pool unavailable".to_string()),
+            ready_at: None,
         });
     }
     Ok(Some(Value::Object(None)))

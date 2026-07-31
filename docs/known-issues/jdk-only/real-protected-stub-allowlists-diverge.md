@@ -1,16 +1,25 @@
 # The real-protected-stub class allow-list exists twice and the two copies are **not** identical — one includes `java/util/StringJoiner`, the other deliberately omits it
 
-**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31. **DANGEROUS:
-the divergence is intentional, undocumented at one of the two sites, and means
-the cold and warm dispatch paths make different decisions for the same class.**
-Wave 2 must **reconcile** these, not assume they are copies of each other.
+**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31, re-verified
+against the re-landed tree the same day. **The divergence is intentional and
+means the cold and warm dispatch paths make different decisions for the same
+class.** Wave 2 must **reconcile** these, not assume they are copies of each
+other.
+
+*Re-ranked from tier-1 #7 to #8.* The original filing's sharpest hazard was that
+the including copy carried **no** comment saying the other copy differed, so a
+reader who found it first could not know. The re-land fixed that: both copies
+now cross-reference each other and both say "RECONCILE, not assume". The
+divergence itself is untouched, so the item stays in tier 1 — it still produces
+different dispatch verdicts for the same class on two paths — but it is no
+longer a trap for an unwarned reader.
 
 ## What is wrong
 
 "Which `NativeKind::SyntheticStub` natives must yield to loaded real bytecode"
 is answered by a hard-coded class allow-list. There are two of them.
 
-### Copy A — `vm/src/vm/vm_exec.rs`, inside `invoke_or_native` (~line 13235)
+### Copy A — `vm/src/vm/vm_exec.rs`, inside `invoke_or_native` (marker ~13569, `matches!` at ~13578)
 
 ```rust
 let real_protected_stub = synthetic_stub_native
@@ -31,9 +40,16 @@ let real_protected_stub = synthetic_stub_native
         ));
 ```
 
-**11 classes.**
+**11 classes.** Its `JDK-ONLY-WAVE2` marker now says, in terms:
 
-### Copy B — `vm/src/runtime/interpreter/invoke.rs`, `real_protected_stub_class` (~line 10558)
+> real-protected-stub class allow-list, **COPY 1 OF 2**. The other copy is
+> `real_protected_stub_class` in `vm/src/runtime/interpreter/invoke.rs`, and the
+> two are NOT identical: this one includes `java/util/StringJoiner`, that one
+> deliberately omits it. **Wave 2 must RECONCILE them**, not assume they are the
+> same list and delete one; deleting either without the other desynchronises the
+> two dispatch paths for this exact class.
+
+### Copy B — `vm/src/runtime/interpreter/invoke.rs`, `real_protected_stub_class` (marker ~10592, `fn` at ~10600)
 
 Same eleven, minus `java/util/StringJoiner`, which is replaced in place by a
 21-line comment explaining the omission:
@@ -51,36 +67,43 @@ Same eleven, minus `java/util/StringJoiner`, which is replaced in place by a
 > reverts the NEW path-1 (interpreter `try_stackless_invoke`) preference added
 > here, back to the proven-safe pre-existing behavior.
 
-**10 classes.**
+**10 classes.** Its own marker mirrors Copy A's: *"COPY 2 OF 2 … the two are not
+identical … Wave 2 must RECONCILE them — decide what StringJoiner should do on
+both paths — not assume they are duplicates and delete one."*
 
 So: on a vtable *miss*, `StringJoiner`'s synthetic natives yield to real
 bytecode. On the interpreter's stackless/cached path, they do not. That is a
-deliberate, load-bearing asymmetry — and **Copy A carries no comment saying so.**
-A reader who finds Copy A first has no way to know Copy B exists, let alone
-differs.
+deliberate, load-bearing asymmetry, now documented at both ends.
 
 The referenced write-up is
 `docs/internal/fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`.
-Note the in-code comment still points at the pre-move path
+The in-code comment still points at the pre-move path
 `docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md`,
-which no longer exists — a stale reference worth fixing in the same change.
+which no longer exists — a stale reference worth fixing in the same change. It
+survived the re-land; the same stale-path family is catalogued in
+[additional wave-2 markers §13](additional-wave2-markers-not-in-the-original-inventory.md).
 
-## Not two copies — one list, one derived list, and three inline predicates
+## Not two copies — one list, one derived list, and four inline predicates
 
 The class list has two copies. The *predicate* built on it has more:
 
-* `synthetic_stub_should_yield_to_real_bytecode` (`invoke.rs` ~10516) — the full
-  helper: `kind == SyntheticStub` → `real_protected_stub_class(class)` →
+* `synthetic_stub_should_yield_to_real_bytecode` (`invoke.rs` ~10529) — the
+  public helper. It now delegates to a new sibling,
+  `synthetic_stub_kind_should_yield_to_real_bytecode` (~10550), which is the
+  same predicate for callers that already resolved the `NativeKind` — the
+  five-step body (`kind == SyntheticStub` → `real_protected_stub_class(class)` →
   class loaded and `!is_synthetic_stub` → `find_method_recursive` →
-  `!m.is_native() && m.code().is_some()`.
-* `invoke_or_native` (`vm_exec.rs` ~13235–13270) — the same five steps written
+  `!m.is_native() && m.code().is_some()`) lives there now. The split is a
+  re-land improvement: it exists to avoid a second full triple hash, and it
+  means the *body* is written once even though the *class term* still is not.
+* `invoke_or_native` (`vm_exec.rs` ~13569–13615) — the same five steps written
   out inline against Copy A.
-* `try_stackless_invoke`'s direct-native step (`invoke.rs` ~11645) — inlined,
-  calls Copy B for the class term.
-* `populate_invoke_cache` (`invoke.rs` ~12501) — inlined, calls Copy B; the
-  helper's own doc comment explains why (*"cannot call the full helper while
+* `try_stackless_invoke`'s direct-native step (`invoke.rs` ~11629) — inlined,
+  reaches Copy B through the helper.
+* `populate_invoke_cache` (`invoke.rs` ~12818) — inlined, calls Copy B directly;
+  the helper's own doc comment explains why (*"cannot call the full helper while
   holding the class-manager read lock"*).
-* The `VirtualNative` cache-hit path (`invoke.rs` ~21919) — calls Copy B as a
+* The `VirtualNative` cache-hit path (`invoke.rs` ~22250) — calls Copy B as a
   cheap pre-filter, then the full helper. See
   [cached invoke targets drop the `NativeKind`](cached-invoke-targets-drop-the-nativekind.md).
 
@@ -111,9 +134,8 @@ scope.
    which is what forces the asymmetry. Until then, a merged list is a choice
    between reintroducing a known crash and reverting a known fix.
 3. Once every SyntheticStub native carries an honest kind, delete both lists and
-   the five inline predicates, and let `resolve_dispatch` decide from
-   `NativeKind` + `Method::code()`. The wave-1 marker on Copy A states the same
-   plan and adds: *"the two must die together."*
+   the four inline predicates, and let `resolve_dispatch` decide from
+   `NativeKind` + `Method::code()`. Both wave-1 markers state the same plan.
 
 ## How to verify a fix
 
@@ -139,8 +161,8 @@ scope.
 * **Removing `StringJoiner` from Copy A** to match Copy B hands `StringJoiner`
   back to synthetic natives on the cold path, whose 5-field fake layout against
   the real 7-field class makes `add()` a silent no-op (documented in
-  `native-api/src/registry.rs`'s `drop_real_layout_synthetic` note). Silently
-  empty joins, no error.
+  `native-api/src/registry.rs`'s `drop_real_layout_synthetic` note, ~4391).
+  Silently empty joins, no error.
 * **Deleting both lists before the kinds are honest** hands every mis-tagged
   bridge back to bytecode that may not exist.
 
