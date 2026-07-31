@@ -376,3 +376,283 @@ Note the shape of the mistake being avoided here: "the tier is off" was inferred
 twice from an absence (no IR bodies, then no live IR frames) without checking
 which conjunct produced it. The absence is the same in all cases; only the
 reason distinguishes them, and nothing currently reports the reason.
+
+## Retraction: the "ir_compatible never called" result was a harness error
+
+An attempt to add per-conjunct rejection reporting to `ir_compatible` produced
+"zero refusals AND zero IR bodies", which was read as proof that the `&&` chain
+short-circuits before `ir_compatible` — i.e. that `optimize` is false on the
+path that compiles hot methods.
+
+**That reading is void.** The patch never reached the tree that was built. The
+script targeted `C:\craton\CratonVM\jit\src\ir.rs` (backslashes) and the `sed`
+meant to redirect it to the task worktree matched on forward slashes, so it
+silently did nothing. The diagnostic was applied to the dev worktree three times
+over and to the task worktree never; the binary under test contained no
+reporting at all, so "zero refusals" only means "nothing was instrumented".
+
+Both trees have been reverted. Nothing is known about which conjunct fires.
+
+The narrowing in the section above still stands on its own evidence — three call
+sites pass `optimize = true` literally, and the moving-young term is `false` by
+construction — so `ir_compatible` remains the prime suspect. It is just not yet
+demonstrated.
+
+**When redoing this:** apply the patch, then *verify it is in the tree you are
+about to build* (`grep -c ir_reject jit/src/ir.rs`) before building, and confirm
+the built binary emits at least one line on a method you know is refused. Three
+separate conclusions in this investigation have now come from instrumentation
+that was not actually running — zero fallbacks with no live IR frame, zero IR
+bodies, and now zero refusals. Absence of output is not evidence until the
+output path is known to work.
+
+## Redone with verification: `ir_compatible` is NOT reached
+
+The reason reporting was re-applied, and this time verified in the tree that was
+actually built (`grep -c ir_reject jit/src/ir.rs` → 10 = 9 sites + the helper;
+dev confirmed at 0; binary rebuilt after). On `BinTreesClassic 16` with
+`CRATONVM_DBG_IR_COMPILES=1`:
+
+    refusals seen: 0
+    IR bodies:     0
+
+Both zero, with the reporting code demonstrably compiled in. That combination is
+what makes it informative: had `ir_compatible` been called it must either return
+`true` — producing an IR body — or `false`, which now logs. Neither occurred, so
+**`ir_compatible` is never reached**; the `&&` chain in `try_compile_inner`
+short-circuits before it.
+
+Caveat worth stating rather than glossing: this is inference from a double
+absence, and the session's own history is three wrong conclusions drawn from
+absences. There is still no *positive* control — no observation of the
+diagnostic firing on a case known to be refused. The inference is sound only
+because the refusal branch and the success branch have distinct, mutually
+exclusive observable outcomes and neither appeared.
+
+That leaves the two conjuncts ahead of it in
+`if optimize && !moving_young_disables_optimizing_tier() && ir::ir_compatible(..)`:
+
+* `optimize` false on whatever path compiles these methods. Three call sites
+  pass a literal `true` (`helpers.rs:7170`, `invoke.rs:16445`, `:16598`), but
+  those are the inline-dispatch and early-compile routes; the background
+  tier-up route takes `optimize` as a parameter (`try_jit_compile_callee`) and
+  its value at the hot-method path was never traced to a literal.
+* `moving_young_disables_optimizing_tier()` true. It should be `false` by
+  construction, but it is `pub` and its `tracing::warn!` fires only on the
+  first call — easily missed.
+
+**Next step, and it is one line each:** log both at the top of
+`try_compile_inner`, behind `CRATONVM_DBG_IR_COMPILES`. That is a positive
+control as well as the answer — if neither line appears, `try_compile_inner`
+itself is not on the path, which would be a third possibility nobody has
+considered.
+
+## ANSWERED: two causes, and `ir_compatible` is not either of them
+
+A probe at the top of `try_compile_inner` (verified in the built tree first)
+printing `optimize` and `moving_young_disables_optimizing_tier()`.
+`BinTreesClassic 16`, `CRATONVM_DBG_IR_COMPILES=1`:
+
+    2x  optimize=false  moving_young_disables_tier=false
+    1x  optimize=true   moving_young_disables_tier=false
+    refusals: 0   IR bodies: 0
+
+Three findings, and the first two retract earlier sections:
+
+1. **`moving_young_disables_tier=false` on every call.** The gate this branch
+   scoped is genuinely open. That part works.
+2. **Most compiles ask for `optimize=false`.** Two of the three calls are the
+   ordinary tier-up route requesting the single-pass backend *by design*. So
+   "the optimizing tier never runs" is substantially just "it is rarely
+   requested" — not a bug in the admission chain at all, and not something the
+   relocation contract can affect.
+3. **The one `optimize=true` call produced neither a refusal nor a body.**
+   Since `ir_reject` now logs every `ir_compatible` refusal, and no refusal was
+   logged, `ir_compatible` **passed** — and the compile was then rejected by a
+   conjunct AFTER it in the same `if`. The chain continues past `ir_compatible`
+   into the STUB-S8 exception-table condition and the rest; one of those is the
+   real refusal, and none of them are instrumented.
+
+So the suspect list has moved twice — first to `ir_compatible`, now past it —
+and each move came from adding one observation rather than one hypothesis.
+
+### Next
+
+Instrument the conjuncts AFTER `ir_compatible` in `try_compile_inner`'s `if`,
+the same way (`ir_reject`-style, one call per condition). That names the actual
+refusal for the `optimize=true` case in a single run.
+
+Then, separately, decide whether finding (2) matters: if the tier-up path is
+meant to request C2 for hot methods and does not, that is a much larger
+throughput question than the relocation contract, and it belongs in the
+tiered-manager work (`docs/feature-designs/wire-tiered-manager.md`), not here.
+The relocation contract is ready for whichever methods do reach the IR backend.
+
+### The post-`ir_compatible` conjuncts, narrowed by inspection
+
+The chain continues (jit/src/lib.rs, after `ir::ir_compatible(&scan)`):
+
+```
+&& !(exc_table_c2_disabled() && !cached.exception_table.is_empty())
+&& !precise_exception_frames
+&& ((!method_uses_category2(..) && !method_uses_fp(..)) || <long/FP clauses>)
+… and more past that
+```
+
+Two are ruled out by inspection for the observed `optimize=true` case
+(`BinTreesClassic.itemCheck`):
+
+* `exc_table_c2_disabled()` reads `CRATONVM_JIT_NO_EXC_TABLE_C2`, which is
+  opt-in and unset, so that term is `true`;
+* `precise_exception_frames` is set only where RBC.6 fires — a handler reading a
+  local it never wrote. `itemCheck` has no `try`/`catch` at all, so it cannot.
+
+And `itemCheck(TreeNode) -> int` is category-2-free and FP-free, so the third
+clause should hold too. **So the refusal is in a conjunct further down than the
+ones read here**, and inspection has run out — the remaining terms need the same
+one-call-per-condition instrumentation, not more reading.
+
+That is the whole of the remaining work on this thread, and it is mechanical:
+add an `ir_reject`-style call to each conjunct from `exc_table_c2_disabled`
+onward, rebuild (verifying the patch is in the tree first — see the retraction
+above), and run `BinTreesClassic 16` once. The refusal names itself.
+
+Worth keeping in view while doing it: finding (2) above means this only ever
+affects the *rare* `optimize=true` compile. Even fully fixed, the contract
+covers whichever methods reach the IR backend — which today is close to none,
+because the tier-up path requests C1 by design. **Whether that is right is the
+larger and more valuable question**, and it lives in the tiered-manager work,
+not here.
+
+### Resolved by construction: the admission chain PASSES; the pipeline bails inside
+
+Reading the condition to its end (`jit/src/lib.rs`, the `if` closes at the
+`{` before `let num_params = prologue_param_slots;`), the full chain is:
+
+```
+if optimize
+    && !moving_young_disables_optimizing_tier()
+    && ir::ir_compatible(&scan)
+    && !(exc_table_c2_disabled() && !cached.exception_table.is_empty())
+    && !precise_exception_frames
+    && ((!cat2 && !fp) || (ir_emit_long && !fp) || (ir_emit_fp && fp_in_body))
+```
+
+For the observed `optimize=true` case, `BinTreesClassic.itemCheck`:
+
+| conjunct | value | why |
+|---|---|---|
+| `optimize` | true | observed |
+| `!moving_young_disables_optimizing_tier()` | true | observed (`=false`) |
+| `ir::ir_compatible(&scan)` | true | no refusal logged, and every refusal now logs |
+| `!(exc_table_c2_disabled() && …)` | true | that variable is opt-in and unset |
+| `!precise_exception_frames` | true | only set where RBC.6 fires; `itemCheck` has no handler |
+| `(!cat2 && !fp)` | true | `itemCheck(TreeNode) -> int` is category-2-free and FP-free |
+
+**All six pass.** So the block IS entered and the IR pipeline is run — and no
+body results, which means it bails *inside* build → schedule → lower and returns
+`None`, after which the caller silently falls through to single-pass.
+
+`lower_inner` alone has three such bails, each already commented as a
+"soundness bail": `unallocated_slot_use` (a node emitted with no frame slot),
+`buf.overflowed()` (an under-estimated buffer), and the earlier `ir_compatible`
+paths. `IrBuilder::build` can return `None` too. **None of them log.**
+
+So the search is over and the target is named: it is not the admission chain at
+all, it is a silent `None` from the IR pipeline itself. Instrument those bail
+sites — they are few, all already marked in comments — and one run names it.
+
+This also explains, without any further measurement, why every probe in this
+investigation saw zero IR bodies while `cargo test -p cratonvm-jit` exercises IR
+heavily: the tests call `lower()` on graphs they construct directly, bypassing
+the build-from-bytecode step where the production bail happens.
+
+## FOUND: `IrBuilder::build` returns `None` — the pipeline bails at stage one
+
+Instrumented the three silent bails (`IrBuilder::build`, `lower_inner`'s
+`unallocated_slot_use` and `buf.overflowed`), verified present in the built tree,
+one run of `BinTreesClassic 16`:
+
+    [ir] try_compile_inner BinTreesClassic.itemCheck optimize=true moving_young_disables_tier=false
+    1x  BAIL IrBuilder::build returned None for BinTreesClassic.itemCheck
+    IR bodies: 0
+
+So the complete chain, end to end, is now known:
+
+1. **Most compiles never ask for C2** — the tier-up path passes
+   `optimize=false` by design. Nothing about the IR backend is involved.
+2. **The rare `optimize=true` compile passes the entire admission chain** —
+   including `ir_compatible`, and including the moving-young gate this branch
+   scoped, which is `false` exactly as intended.
+3. **`IrBuilder::build` then returns `None`** — graph construction from bytecode
+   refuses the method, before scheduling or lowering is ever reached.
+
+`itemCheck` is `static int itemCheck(TreeNode) { if (t.left == null) return
+t.item; return t.item + itemCheck(t.left) - itemCheck(t.right); }` — recursion,
+a null test, two `getfield`s. If the builder cannot construct a graph for that,
+the population it *can* build for is very small, which is consistent with every
+observation in this investigation.
+
+### What this means for the relocation contract
+
+It is not the blocker and never was. The contract is implemented, sound and
+fail-closed; it will cover whichever methods reach the IR backend. What is
+missing is upstream of it by two stages: methods rarely request C2, and the
+builder refuses the ones that do.
+
+### Next, and it is a different piece of work
+
+`IrBuilder::build` returns a bare `Option`, so its refusal is as unnamed as
+`ir_compatible`'s was before this session. Give it a reason the same way — the
+`_ => return None` in its opcode loop is the obvious first suspect — and run the
+same probe. That names the unsupported construct in one run.
+
+Then the real question is a scoping one, not a debugging one: is the IR builder
+*meant* to handle ordinary recursive field-accessing methods? If yes this is a
+gap worth closing and the optimizing tier is largely inert today. If no, the
+tier is narrower than the surrounding documentation implies, and several open
+throughput documents that assume C2 participation need re-reading — including
+this branch's own retracted "C2 tier restored" claim.
+
+## NAMED: `newarray` (0xbc) is unsupported, and admission disagrees with the builder
+
+Naming the builder's catch-all refusal the same way:
+
+    [ir] BAIL IrBuilder::build unsupported opcode 0xbc at pc 2
+    [ir] BAIL IrBuilder::build returned None for IrRelocProbe.step
+
+`0xbc` is `newarray` — **primitive array allocation**. `IrRelocProbe.step`
+opens with `new int[6]`, so the builder refuses it at pc 2, before anything else
+in the method is even looked at.
+
+**The admission predicate and the builder disagree.** `ir_compatible` carries
+`IR_MAX_ALLOCATIONS` budgets for `scan.new_ops` and `scan.anewarray_ops` — i.e.
+it is written as though allocation is supported and merely capped — and it
+admits the method. `IrBuilder::build` then refuses it on the first primitive
+array allocation. Every such method pays a full admission pass, a graph-build
+attempt, and a silent fallback to single-pass.
+
+That is the whole reason this took a session to find: two components with
+different ideas of what the IR tier accepts, and neither of them said so out
+loud.
+
+`BinTreesClassic.itemCheck` bails from a DIFFERENT path — it printed the
+`returned None` line but no opcode line, so its refusal is one of the builder's
+other ~19 `return None` sites, not the opcode catch-all. Those remain unnamed;
+the same one-line treatment will name them.
+
+### The decision this surfaces
+
+`newarray` is not exotic. If the optimizing tier cannot build a graph for a
+method that allocates a primitive array, its addressable population is very
+small, and that is a scoping question rather than a bug:
+
+* if the IR builder is *meant* to handle allocation, `newarray` is a gap worth
+  closing and `ir_compatible`'s allocation budgets are currently lying;
+* if it is not, then `ir_compatible` should refuse these methods up front —
+  cheaply, and visibly — instead of admitting them into a build that cannot
+  succeed, and the surrounding documentation that treats C2 as a general tier
+  needs correcting.
+
+Either way the fix belongs with the IR builder's owners. The relocation contract
+is downstream of all of it and is ready.
