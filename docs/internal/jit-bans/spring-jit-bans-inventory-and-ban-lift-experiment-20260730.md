@@ -315,6 +315,46 @@ and a per-method ban hides that instead of surfacing it.
   `complex_ctor_keeps_constructor_ban`,
   `generated_proxy_class_is_jit_eligible_after_proxy_jitcall_1_removal`),
   verified by an A/B against the pristine copy.
-* This document, moved from `docs/known-issues/jit-bans/` to
-  `docs/internal/jit-bans/` per the "known-issues holds only UNFIXED bugs"
-  convention.
+* This document. Parts 1-2 were drafted under
+  `docs/known-issues/jit-bans/` and never committed there; it lands directly
+  in `docs/internal/jit-bans/` because the bugs it documents are now fixed
+  ("known-issues holds only UNFIXED bugs").
+* `docs/known-issues/stackwalker-getdeclaringclass-null-regression-20260730.md`
+  and
+  `docs/known-issues/springboot-basicerrorcontroller-checkcast-abort-20260731.md`
+  — the two ban-independent regressions found while doing this, filed so
+  retiring this doc does not drop them.
+
+## Part 4 — post-merge re-verification, and a dev regression found on the way
+
+The branch was merged with `origin/dev` at `376114f635` before pushing and
+everything above re-run on the merged build (`cratonvm-merged-20260730.bin`).
+
+Clean, unchanged:
+
+| Check | Merged build |
+|---|---|
+| `cargo test --release -p cratonvm-vm --lib skip_list` | 76 passed / 0 failed |
+| `JavacConsolidationProbe 200` | OK 200/200, 2 runs |
+| `H2AliasProbe 60` | OK 60/60, 2 runs |
+| `JavacLoopRepro2 60` | OK 60/60 |
+| the ten Spring AOT classes | identical to the pre-merge table above |
+| `grep -c 'return Some(SkipReason::'` | 22 here vs 33 on `origin/dev` — exactly the 11 removed, and the merge added no replacement gate |
+
+**Not clean: `BasicErrorControllerIntegrationTests` is broken on
+`origin/dev` `376114f635` itself.** It aborts the VM with `internal error:
+checkcast: not an object reference` — coincidentally the same shape as
+`SPRINGBOOT-HTTP-HEADER-COMPARATOR.1`'s symptom, which is why this was chased
+down rather than assumed. It is **not** caused by the ban removal:
+
+| Binary | Bans | Runs | Aborts | Partial failures | Clean |
+|---|---|---|---|---|---|
+| dev `9ac1feffe`, gates deleted | removed | 12 | 0 | 0 | 12 |
+| dev `376114f635` **pristine** | **all 11 present** | 12 | 5 | 3 | 4 |
+| dev `376114f635` + this branch | removed | 12 | 5 | 4 | 3 |
+
+The pristine-dev control was built from a detached worktree at
+`376114f635` with no changes of any kind, and fails at the same rate. So the
+regression arrived on `dev` between `9ac1feffe` and `376114f635`; this branch
+neither causes nor worsens it. Written up separately as
+`docs/known-issues/springboot-basicerrorcontroller-checkcast-abort-20260731.md`.
