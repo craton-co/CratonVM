@@ -6847,16 +6847,16 @@ mod tests {
         };
         crate::metrics::set_enabled_for_test(false);
 
+        // `Measured::Value(n)` is distinguishable from `NotMeasured` at every
+        // `n`, so this equality proves the wiring on its own — the planner's
+        // arithmetic is pinned separately by
+        // `non_overlapping_values_share_a_frame_slot`.
         assert_eq!(
             published.peak_live_values,
             crate::metrics::Measured::Value(expected as u32),
             "lower_inner must publish SlotPlan::peak_live"
         );
-        assert!(
-            expected > 0,
-            "the probe method has live values, so a zero peak would mean the \
-             planner, not the wiring, is broken"
-        );
+        assert!(published.to_json().contains("\"peak_live_values\":"));
     }
 
     #[test]
