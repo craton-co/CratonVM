@@ -82,12 +82,14 @@
 
 pub mod aarch64;
 pub mod aarch64_backend;
+pub mod bailout;
 pub mod deopt;
 pub mod escape_analysis;
 pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
 pub mod ir_schedule;
+pub mod ir_verify;
 pub mod loop_analysis;
 pub mod null_check_elim;
 pub mod pgo;
@@ -7232,6 +7234,42 @@ fn build_scalar_replacement_map(
     ir_lower::ScalarReplacementMap { objects }
 }
 
+/// Verify `graph` and, on failure, record a structured bailout.
+///
+/// Returns `true` when the graph must **not** be lowered. The caller's
+/// response to `true` is to do nothing — the IR pipeline's failure path is
+/// "fall out of the `if let Some(graph)` arm and let the single-pass backend
+/// below compile the method", which is always semantically valid because the
+/// optimizing tier is an optimization, never a requirement.
+///
+/// This is the adapter the P0 "JIT correctness" lane of
+/// `docs/known-issues/deep-research-vm-c2.md` asks for: `verify_graph` returns
+/// `Result`, the compile path returns `Option`, and rather than change the
+/// signature of anything already in the pipeline the conversion happens here,
+/// at the call site. The bailout is *counted* (`bailout::bailout_counts`) so
+/// "how often does the verifier reject a graph, and for what?" is answerable
+/// without parsing debug logs — the review's "measure compilation quality"
+/// item. It is only *printed* under the existing `ir_stage_reporting()` flag,
+/// because a bailout is a quality signal, not a fault.
+fn ir_verify_reject(
+    graph: &ir::Graph,
+    phase: &str,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    match ir_verify::verify_graph(graph, phase, ir_verify::VerifyOptions::from_env()) {
+        Ok(()) => false,
+        Err(b) => {
+            bailout::record_bailout(&b);
+            if ir_stage_reporting() {
+                eprintln!("[ir] verifier rejected {class_name}.{method_name}{descriptor}: {b}");
+            }
+            true
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compilation entry point
 // ---------------------------------------------------------------------------
@@ -7757,51 +7795,103 @@ pub fn moving_young_disables_optimizing_tier() -> bool {
     true
 }
 
-pub fn direct_jit_callee_calls_enabled() -> bool {
-    // A raw JIT-to-JIT call has no callee JitEntryGuard, so the callee frame is
-    // not reachable from the entry chain: the active-RBP mirror points at the
-    // callee while the root-chain metadata still names the caller, and a GC at
-    // that boundary can select an incompatible oop map and RECLAIM A LIVE ROOT
-    // (see the matching comment at the inline MIC/PIC emission site in
-    // `x64.rs`).
-    //
-    // 2026-07-31: this gate was scoped to `moving_young_relocates_compiled_frames()`
-    // on the argument that the hazard needs a RELOCATING collection and the
-    // runtime veto forbids one while such a frame is live. Measured, that
-    // argument does not hold: with the moving-young default on and this gate
-    // open, `BasicErrorControllerIntegrationTests` SIGSEGVs on EVERY run
-    // (14/14 + 8/8 on a pristine build), faulting on a read through a zeroed
-    // heap slot — the reclaimed-root signature the comment above predicts, not
-    // a relocation one. Closing this gate alone makes the same class 26/26
-    // clean, 5/5 runs, with the optimizing tier still enabled. Disabling only
-    // the IR half (`CRATONVM_JIT_IR_DIRECT_CALL=0`) does NOT help (3/3
-    // crashes), so the defect is in the single-pass backend's raw edge, which
-    // this gate had kept dark for months.
-    //
-    // So: back to the bare flag, which is the state that actually shipped. The
-    // OPTIMIZING-TIER gate stays scoped as
-    // `moving_young_relocates_compiled_frames()` — that one protects frames
-    // which DO carry a guard, and it is measured safe. These two gates ask
-    // different questions and must not share a predicate.
-    //
-    // This re-gates the edge; it does not fix it. Whoever reopens it needs to
-    // make an unguarded callee frame describable to the root scan first, and
-    // should re-run this class 14x as the acceptance gate.
-    // EXPERIMENT (temporary, 2026-07-31): `CRATONVM_JIT_DIRECT_CALLEE_CALLS=force`
-    // opens the gate under moving-young in the SAME binary, so the crashing and
-    // the clean arm differ only by an environment variable rather than by a
-    // build. Removed once the edge is fixed and the gate reopens for real.
-    let forced = matches!(
-        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS").as_deref(),
-        Ok("force")
-    );
-    if x64::moving_young_enabled() && !forced {
-        return false;
-    }
-    if forced {
-        return true;
-    }
+/// Bisect toggle (`CRATONVM_SHADOW_NO_END_GUARD`) — suppress the `end` overflow
+/// guard both backends emit ahead of a shadow push, restoring the pre-guard
+/// behaviour where an overrunning push stores straight on through the allocator
+/// arena. Only useful to confirm that a given failure IS the overflow.
+pub fn shadow_end_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NO_END_GUARD").is_none()
+    })
+}
 
+/// Number of times a JIT-emitted shadow-stack push hit the `end` guard and
+/// bailed instead of storing past the end of the thread's buffer.
+///
+/// Non-zero means at least one compiled method leaked pushes badly enough to
+/// exhaust a 2 MiB (256K-slot) shadow stack — before the guard existed that
+/// was silent heap corruption (the write ran on through the mimalloc arena,
+/// including the `JvmThread`, until it left the mapping ~170 MiB later). It
+/// also means the safepoints that bailed did NOT publish their oops, so their
+/// compile-time `moving_young_coverage_complete` claim is not backed at
+/// runtime; the per-cycle coverage verifier rejects the proof and the
+/// collection falls back to the non-moving sweep.
+pub static SHADOW_OVERFLOW_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Address of a leaked NUL-terminated method label recorded by the most recent
+/// shadow-stack overflow bail, or 0. Only written when
+/// `CRATONVM_SHADOW_OVERFLOW_DIAG` is set (the label allocation is a permanent
+/// leak, so it is not produced by default).
+pub static SHADOW_OVERFLOW_LABEL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `(overflow_count, last_method_label)` when at least one shadow-stack push
+/// has bailed on the `end` guard, else `None`.
+pub fn shadow_overflow_status() -> Option<(usize, Option<String>)> {
+    let n = SHADOW_OVERFLOW_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    if n == 0 {
+        return None;
+    }
+    let p = SHADOW_OVERFLOW_LABEL.load(std::sync::atomic::Ordering::Relaxed) as *const u8;
+    let label = if p.is_null() {
+        None
+    } else {
+        // SAFETY: the pointer, when non-zero, names a leaked NUL-terminated
+        // `str` produced by the compiler for the overflowing method; it is
+        // immortal and never rewritten in place.
+        unsafe { std::ffi::CStr::from_ptr(p as *const std::os::raw::c_char) }
+            .to_str()
+            .ok()
+            .map(|s| s.to_string())
+    };
+    Some((n, label))
+}
+
+pub fn direct_jit_callee_calls_enabled() -> bool {
+    // A raw JIT-to-JIT call produces a callee frame with no `JitEntryGuard`, so
+    // it is not reachable from the entry chain: the active-RBP mirror points at
+    // the callee while the root-chain metadata still names the caller.
+    //
+    // 2026-07-31, ROUND 1: the gate was closed under moving-young because
+    // `BasicErrorControllerIntegrationTests` SIGSEGV'd on every gate-open run,
+    // and the comment here blamed a GC "selecting an incompatible oop map and
+    // reclaiming a live root". ROUND 2 measured that and it is wrong on both
+    // counts. The root scan behaves correctly: `chain_entry_rbp_is_foreign`
+    // detects the unguarded callee frame, the per-cycle proof is incomplete,
+    // `moving_young_precise_only` refuses it, and the collection diverts to the
+    // non-moving sweep. Nothing is reclaimed. What actually killed the process
+    // was plain machine code:
+    //
+    //   The inline PIC cascade's inter-slot `JNE` was a `rel8`, sized by a
+    //   comment claiming "a single slot body is ~30 bytes". A slot body had
+    //   since grown the post-call innermost-RBP republish and the callee-deopt
+    //   service check, putting it past 127 bytes. The patch truncated the
+    //   displacement (`rel as u8`) behind a `debug_assert!`, so RELEASE builds
+    //   silently branched to `JNE -128` — into the middle of the pre-call
+    //   shadow-stack push. Executed from there, the push ran as an infinite
+    //   loop with nothing reloading `top`, marched off the end of the thread's
+    //   2 MiB shadow buffer, overwrote the allocator arena behind it (including
+    //   the `JvmThread`), and faulted ~170 MiB later at the arena end.
+    //
+    // Three things had to change before this could reopen, all of them fixes in
+    // their own right: the inter-slot branch is now `rel32` and no `rel8` patch
+    // may truncate (`patch_rel8_or_bail`); both backends now emit the `end`
+    // overflow guard `ShadowStack::END_OFFSET` was always documented as having
+    // (an overrunning push bails instead of corrupting the heap); and the
+    // single-pass sibling tail-call now restores the shadow `top` watermark its
+    // epilogue-without-ret used to skip.
+    //
+    // Acceptance: `BasicErrorControllerIntegrationTests`, default flags,
+    // 14 consecutive clean runs, plus a same-binary gate-closed control.
+    //
+    // The OPTIMIZING-TIER gate stays scoped as
+    // `moving_young_relocates_compiled_frames()` — that one protects frames
+    // which DO carry a guard. These two gates ask different questions and must
+    // not share a predicate; see
+    // `x64::flag_and_header_contracts::direct_jit_callee_calls_open_under_moving_young`.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
@@ -9592,7 +9682,26 @@ fn try_compile_inner(
                 // Branchy-IR explicitly disabled (CRATONVM_NO_IR_BRANCHY) and
                 // reassoc off → fall through to the single-pass backend below.
             } else {
+                // P0 "JIT correctness" (docs/known-issues/deep-research-vm-c2.md):
+                // the IR verifier runs after every mutating pass when
+                // `ir_verify::verify_enabled()` (debug builds, or
+                // `CRATONVM_JIT_VERIFY_IR=1`), and unconditionally immediately
+                // before lowering. `ir_verify_bail` latches the first rejection
+                // and steers the method down the pipeline's existing failure
+                // path — falling through to the single-pass backend below.
+                // Nothing on the success path changes.
+                let mut ir_verify_bail = false;
+
                 ir_optimize::optimize(&mut graph);
+                if ir_verify::verify_enabled() {
+                    ir_verify_bail |= ir_verify_reject(
+                        &graph,
+                        "post-optimize",
+                        &cached.class_name,
+                        &cached.method_name,
+                        &cached.method_descriptor,
+                    );
+                }
 
                 // Guard-surviving scalar replacement (Front 3.2): metadata for
                 // scalar-replaced objects so the IR lowerer can emit a
@@ -9646,6 +9755,19 @@ fn try_compile_inner(
                                 Some(build_scalar_replacement_map(&graph, &id_map, &ea_result));
                         }
                         apply_ea_to_ir(&mut graph, &id_map, &ea_result);
+                        // `apply_ea_to_ir` is a mutating pass: it kills the
+                        // scalar-replaced allocation, its stores and its loads,
+                        // and rewires their consumers. Verify the result under
+                        // the same per-pass gate as `ir_optimize`.
+                        if ir_verify::verify_enabled() {
+                            ir_verify_bail |= ir_verify_reject(
+                                &graph,
+                                "post-escape-analysis",
+                                &cached.class_name,
+                                &cached.method_name,
+                                &cached.method_descriptor,
+                            );
+                        }
                     }
                 }
 
@@ -9663,7 +9785,26 @@ fn try_compile_inner(
                         cached.class_name, cached.method_name
                     );
                 }
-                if !has_live_new_array {
+                // Unconditional pre-lowering verification. This is the gate the
+                // review's exit criterion names: "invalid IR or ABI state
+                // causes a deterministic compilation bailout, never silent
+                // wrong code, panic, or native crash". It runs BEFORE
+                // `ir_schedule::schedule`, not just before `lower_inner`,
+                // because the scheduler indexes `graph.nodes` by raw `NodeId`
+                // and would itself panic on the dangling edge the verifier is
+                // there to catch. `CRATONVM_JIT_VERIFY_IR=0` is the kill switch
+                // — see `ir_verify::pre_lower_verify_disabled`.
+                if !has_live_new_array && !ir_verify_bail && !ir_verify::pre_lower_verify_disabled()
+                {
+                    ir_verify_bail |= ir_verify_reject(
+                        &graph,
+                        "pre-lower",
+                        &cached.class_name,
+                        &cached.method_name,
+                        &cached.method_descriptor,
+                    );
+                }
+                if !has_live_new_array && !ir_verify_bail {
                     let schedule = ir_schedule::schedule(&graph);
                     // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
                     // optimizing IR (C2) lowerer the profiled branch bias so it can

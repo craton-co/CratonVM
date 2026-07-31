@@ -18,4 +18,8 @@ pub mod bc_aes;
 pub mod bc_chacha;
 pub mod bc_newhope;
 mod bc_newhope_tables;
+/// The fail-loud error type shared by every kernel in this crate. See
+/// `docs/security/crypto-failure-contract.md` for the rule it enforces:
+/// a cryptographic kernel never encodes failure as ordinary output.
+pub mod failure;
 pub mod signature;

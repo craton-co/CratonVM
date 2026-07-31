@@ -331,6 +331,20 @@ fn uds_dbg(args: std::fmt::Arguments<'_>) {
     }
 }
 
+/// A null `SocketAddress` handed to a *connect* is a `NullPointerException`,
+/// not an `IOException`: the JDK routes every `connect` through
+/// `sun.nio.ch.Net.checkAddress`, whose first statement is
+/// `Objects.requireNonNull(sa)`. Code that wraps a connect in
+/// `catch (IOException)` must not silently absorb its own null-target bug.
+/// (`bind(null)`, by contrast, is a legal request for an automatically
+/// assigned address — see `sc_bind` / `ssc_bind`.)
+fn null_socket_address(op: &str) -> MethodCallFailed {
+    RuntimeError::NullPointerException {
+        message: Some(format!("{op}: null SocketAddress")),
+    }
+    .into()
+}
+
 /// Thrown when a caller asks for a Unix-domain socket on a platform where
 /// this build has no AF_UNIX support. Matches the JDK, which raises
 /// `UnsupportedOperationException` from `ServerSocketChannel.open(UNIX)`.
@@ -1573,28 +1587,37 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// later connect honour a configured outbound-port range.
 fn sc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_or_none(args, 0).ok_or_else(|| ioex("bind: null channel"))?;
-    let sa = obj_or_none(args, 1).ok_or_else(|| ioex("bind: null SocketAddress"))?;
     if read_reg_id(ctx, this).is_some() {
         return Err(ioex("bind: channel is already bound or connected"));
     }
-    // Binding the *client* end of a Unix-domain connection to an explicit path
-    // (giving the socket a name of its own) is a JDK capability nothing in the
-    // supported workloads uses, and the INET decoder below would mangle the
-    // address into a bogus host:port. Reject it plainly instead. An unnamed
-    // client socket — the normal case, and what `connect()` produces — needs
-    // no bind at all.
-    if decode_unix_socket_address(ctx, sa)?.is_some() {
-        return Err(RuntimeError::UnsupportedOperationException {
-            message: "Binding a Unix domain SocketChannel to an explicit path is not supported"
-                .into(),
+    // `SocketChannel.bind(null)` is SPECIFIED as "bind to an address that is
+    // assigned automatically" (the wording `NetworkChannel.bind` uses for
+    // every channel type). Rejecting the null turned the documented "let the
+    // OS pick my local endpoint" call into an IOException.
+    let bind_text = match obj_or_none(args, 1) {
+        None => "0.0.0.0:0".to_string(),
+        Some(sa) => {
+            // Binding the *client* end of a Unix-domain connection to an
+            // explicit path (giving the socket a name of its own) is a JDK
+            // capability nothing in the supported workloads uses, and the INET
+            // decoder below would mangle the address into a bogus host:port.
+            // Reject it plainly instead. An unnamed client socket — the normal
+            // case, and what `connect()` produces — needs no bind at all.
+            if decode_unix_socket_address(ctx, sa)?.is_some() {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message:
+                        "Binding a Unix domain SocketChannel to an explicit path is not supported"
+                            .into(),
+                }
+                .into());
+            }
+            let (host, port) = decode_socket_address(ctx, sa)?;
+            if host.is_empty() {
+                format!("0.0.0.0:{port}")
+            } else {
+                format!("{host}:{port}")
+            }
         }
-        .into());
-    }
-    let (host, port) = decode_socket_address(ctx, sa)?;
-    let bind_text = if host.is_empty() {
-        format!("0.0.0.0:{port}")
-    } else {
-        format!("{host}:{port}")
     };
     let bind_addr = bind_text
         .to_socket_addrs()
@@ -1605,7 +1628,7 @@ fn sc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let local_port = stream
         .local_addr()
         .map(|a| a.port() as i32)
-        .unwrap_or(port as i32);
+        .unwrap_or(bind_addr.port() as i32);
     let blocking = read_blocking_flag(ctx, this);
     let id = tcp_register(TcpHandle::Bound(stream));
     tcp_blocking_state().write().insert(id, blocking);
@@ -2043,7 +2066,7 @@ fn sc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let sa = match obj_or_none(args, 1) {
         Some(o) => o,
-        None => return Err(ioex("connect: null SocketAddress")),
+        None => return Err(null_socket_address("connect")),
     };
     let blocking = read_blocking_flag(ctx, this);
     let ok = sc_connect_inner(ctx, this, sa, blocking)?;
@@ -2063,7 +2086,7 @@ fn sc_blocking_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let sa = match obj_or_none(args, 1) {
         Some(o) => o,
-        None => return Err(ioex("blockingConnect: null SocketAddress")),
+        None => return Err(null_socket_address("blockingConnect")),
     };
     let ok = sc_connect_inner(ctx, this, sa, true)?;
     if !ok {
@@ -3153,13 +3176,21 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("bind: null channel")),
     };
-    let sa = match obj_or_none(args, 1) {
-        Some(o) => o,
-        None => return Err(ioex("bind: null SocketAddress")),
-    };
     // arg[2] is the backlog — std::net::TcpListener picks its own, but the
     // AF_UNIX path issues `listen()` itself and does honour it.
     let backlog = int_arg(args, 2).max(0);
+
+    // `ServerSocketChannel.bind(null)` / `bind(null, backlog)` is SPECIFIED:
+    // "If the local address is null then the socket will be bound to an
+    // address that is assigned automatically." (Same wording on
+    // `ServerSocket.bind`, which reaches this native through
+    // `ss_wrapper_bind`.) Rejecting it with an IOException broke the ordinary
+    // "listen on an ephemeral port on every interface" idiom.
+    let Some(sa) = obj_or_none(args, 1) else {
+        let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .map_err(|e| map_err("0.0.0.0:0", e))?;
+        return ssc_finish_bind(ctx, this, listener, 0);
+    };
 
     if let Some(path) = decode_unix_socket_address(ctx, sa)? {
         return ssc_bind_unix(ctx, this, &path, backlog);
@@ -3178,10 +3209,23 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         single_bind_addr(&host, port).map_err(|e| map_err(&format!("{host}:{port}"), e))?
     };
     let listener = TcpListener::bind(bind_addr).map_err(|e| map_err(&bind_addr.to_string(), e))?;
+    ssc_finish_bind(ctx, this, listener, port as i32)
+}
+
+/// Shared tail of every INET `ServerSocketChannel.bind`: apply the channel's
+/// blocking mode to the fresh listener, register it, and record the id + the
+/// port the OS actually assigned. `requested_port` is only the fallback for a
+/// `local_addr()` that fails.
+fn ssc_finish_bind(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    listener: TcpListener,
+    requested_port: i32,
+) -> MethodCallResult {
     let local_port = listener
         .local_addr()
         .map(|a| a.port() as i32)
-        .unwrap_or(port as i32);
+        .unwrap_or(requested_port);
     let blocking = read_blocking_flag(ctx, this);
     if !blocking {
         listener
@@ -3723,6 +3767,26 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             c,
             "bind",
             "(Ljava/net/SocketAddress;)Ljava/nio/channels/NetworkChannel;",
+            ssc_bind,
+        );
+        // COVARIANT RETURN (the SocketChannel loop above documents the same
+        // hazard for `bind`/`setOption`): `ServerSocketChannel.bind` narrows
+        // `NetworkChannel.bind`'s return type, so `ssc.bind(addr)` compiles to
+        // `...)Ljava/nio/channels/ServerSocketChannel;` — the descriptor a
+        // textbook `ServerSocketChannel.open().bind(new InetSocketAddress(0))`
+        // uses. That triple was NOT registered here, so in synthetic-JDK mode
+        // the stale 1-arg synthetic in
+        // `native-builtins/phases_late/net_channels.rs` (registered earlier,
+        // and therefore not overwritten) won: it recorded its listener in the
+        // fd table + object field 2, while `accept()` below reads the
+        // identity-keyed `chan_fields` table — so every 1-arg bind was
+        // followed by `accept: server channel not bound`. Register the
+        // covariant descriptor so the whole ServerSocketChannel surface comes
+        // from one implementation.
+        r.register(
+            c,
+            "bind",
+            "(Ljava/net/SocketAddress;)Ljava/nio/channels/ServerSocketChannel;",
             ssc_bind,
         );
         r.register(

@@ -1,0 +1,162 @@
+# Miri, extended scope (parser + metadata crates).
+#
+# RELATIONSHIP TO THE MIRI JOB IN ci.yml
+# --------------------------------------
+# ci.yml already has a BLOCKING Miri job, deliberately scoped to
+# `cargo +nightly miri test -p cratonvm-types --lib heap_types` -- the object
+# header, `Value` cell layout and slot arithmetic. That scope was chosen
+# because it is the part that can be kept green from a Windows developer box:
+# the crate-wide run aborts on `intern::tests::concurrent_intern_*` with
+# "can't call foreign function `GetModuleHandleA`", which is an
+# unsupported-operation error rather than a UB finding, and a gate nobody can
+# reproduce locally is worse than no gate.
+#
+# THIS workflow does not touch that job. It widens the scope to the two crates
+# that are pure data processing -- `cratonvm-reader` (class-file parsing) and
+# all of `cratonvm-types` -- and accepts that the result is noisy, because a
+# noisy report is still the only source of the finding it exists to catch. The
+# first run of the ci.yml gate rejected `field_cell_layout_matches_value_enum`
+# for transmuting a padded enum to `[u8; 16]` and claiming every byte was an
+# initialised integer; that class of bug is invisible to every other tool in
+# this repository, and it is not confined to one module.
+#
+# NON-BLOCKING (`continue-on-error: true`). Two reasons, both structural:
+#   * Miri's unsupported-operation errors are not defects. Any test that spawns
+#     a thread on Windows, opens a file, or calls into the platform will stop
+#     the run with an error that says nothing about correctness.
+#   * Miri interprets; it does not execute. Nothing that matters most in this
+#     VM can run here at all (see the scope note below).
+#
+# WHAT MIRI CANNOT COVER HERE -- STATED PLAINLY SO A GREEN RUN IS NOT OVERSOLD
+# ---------------------------------------------------------------------------
+#   * EXECUTABLE MEMORY. The JIT maps pages, writes x86-64 encodings into them
+#     and jumps there. Miri has no CPU: generated code cannot be executed, so no
+#     JIT-compiled path is reachable under Miri, ever. This is the same blind
+#     spot the sanitizer legs have, for a different reason.
+#   * FFI. Native shims, the C ABI in `libcratonvm`, and any `extern "C"` call
+#     into the platform are unsupported operations. `cratonvm-native-*`,
+#     `cratonvm-vm` and `libcratonvm` are therefore out of scope by
+#     construction, not by choice.
+#   * GC. Root scanning walks real thread stacks and rewrites real addresses.
+#     Miri's memory model has no notion of either.
+#   * THREADS + platform calls. Miri supports spawning threads, but any
+#     platform call made from one (`GetModuleHandleA`, as ci.yml records) ends
+#     the run.
+#
+# So: a green run here means "the parsing and metadata layer's `unsafe` blocks
+# hold up under a UB-checking interpreter". That is a genuinely useful fact
+# about the layer that reads untrusted class files. It is not a statement about
+# the VM.
+#
+# TO PROMOTE: fix or `#[cfg_attr(miri, ignore)]` the unsupported-operation
+# tests one at a time (with a comment naming the unsupported operation), get a
+# crate to a clean crate-wide run, then move THAT crate into the blocking job in
+# ci.yml and remove it from here. Do not promote by widening the ci.yml job to
+# this scope in one step.
+
+name: Miri (extended)
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: miri-extended-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  miri-extended:
+    name: Miri extended (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    # DIAGNOSTIC. The blocking Miri signal lives in ci.yml; see the header.
+    continue-on-error: true
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # One leg per crate so an unsupported operation in one cannot hide the
+        # other's findings -- Miri stops the whole run on the first such error.
+        crate: [cratonvm-reader, cratonvm-types]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: miri-extended
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+
+      - name: Record the Miri and toolchain versions
+        run: |
+          rustc +nightly -Vv
+          cargo +nightly miri --version
+
+      - name: cargo miri test -p ${{ matrix.crate }} --lib
+        shell: bash
+        env:
+          # `-Zmiri-disable-isolation`: the reader's tests read fixture files
+          # from disk and query the clock. Isolation would fail them for
+          # touching the host, which is not a UB finding.
+          #
+          # `-Zmiri-ignore-leaks`: several structures in `cratonvm-types` are
+          # immortal by design (the interner, the metadata/loader/mirror pin
+          # tables). Under Miri they read as leaks for the same reason LSan
+          # needs suppressions for them -- see
+          # scripts/evidence/asan-suppressions.txt, which documents the same
+          # four allocations.
+          #
+          # Stacked/Tree Borrows is left at Miri's DEFAULT on purpose: the
+          # aliasing model is the main reason to run Miri on a codebase that
+          # builds `&mut` from raw pointers, and disabling it would leave this
+          # job checking almost nothing.
+          MIRIFLAGS: '-Zmiri-disable-isolation -Zmiri-ignore-leaks'
+        run: |
+          set +e
+          mkdir -p target/miri-extended
+          cargo +nightly miri test -p ${{ matrix.crate }} --lib \
+            2>&1 | tee "target/miri-extended/${{ matrix.crate }}.log"
+          rc=${PIPESTATUS[0]}
+          echo "miri exit status: $rc" \
+            | tee -a "target/miri-extended/${{ matrix.crate }}.log"
+
+      - name: Classify the outcome
+        if: always()
+        shell: bash
+        run: |
+          log="target/miri-extended/${{ matrix.crate }}.log"
+          out="target/miri-extended/${{ matrix.crate }}-summary.txt"
+          {
+            echo "Miri extended summary: ${{ matrix.crate }}"
+            echo "commit: ${GITHUB_SHA:-unknown}"
+            echo ""
+            # The distinction that decides whether a red leg is actionable.
+            ub=$(grep -c 'Undefined Behavior' "$log" 2>/dev/null || echo 0)
+            unsup=$(grep -c 'unsupported operation' "$log" 2>/dev/null || echo 0)
+            echo "Undefined Behavior findings : $ub   <- REAL DEFECTS, triage these"
+            echo "unsupported operation stops : $unsup   <- Miri limitation, not a defect"
+            echo ""
+            if [ "$ub" != "0" ]; then
+              echo "First UB finding:"
+              grep -A 12 'Undefined Behavior' "$log" 2>/dev/null | head -n 20
+            fi
+            echo ""
+            echo "Scope reminder: JIT-generated code, FFI and GC root scanning"
+            echo "cannot run under Miri at all. See this workflow's header."
+          } | tee "$out"
+
+      - name: Upload Miri logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: miri-extended-${{ matrix.crate }}
+          path: target/miri-extended/
+          if-no-files-found: warn
