@@ -263,3 +263,39 @@ complete and sound — publication is real, `cycles=25 coverage_fallbacks=0` and
 checksum `68332206` show relocation working through the contract, and the
 emission side costs ~1.4%. What is missing is not code, it is a measurement that
 can see the reader side.
+
+## A purpose-built probe still does not discriminate — and that is the finding
+
+`bench/IrRelocProbe.java` was written to have all four properties the section
+above demands: IR-eligible shape, a live `Ref` held across a recursive call and
+read after it, allocation on every frame, and depth so many such frames are live
+at once. Two lanes, `CRATONVM_JIT_IR_RELOC_MAPS` 0 vs 1:
+
+    -Xmx256m, depth 40, 40k iters   both lanes: cycles=1  coverage_fallbacks=0
+    -Xmx64m,  depth 60, 300k iters  both lanes: cycles=61 coverage_fallbacks=0
+
+61 young collections with a deep recursive stack of exactly the intended shape,
+and the claim still makes no difference. With the claim OFF every IR frame's map
+says "not covered", so **if an IR frame had been live at any of those 61
+collections the OFF lane had to record a fallback.** Zero in both lanes means no
+IR frame was live at any of them.
+
+So the reader-side cost cannot be measured this way, and the reason is more
+interesting than the number would have been: **IR frames appear not to be live
+at young collections in these workloads at all.** Two candidate explanations,
+and the next step is to tell them apart — the second would mean the contract is
+correct but currently unreachable, which changes what it is worth:
+
+1. `step` is not being IR-compiled (check with `CRATONVM_DBG_JIT_METHOD_STATS`
+   and the `IR_LOWER_COMPILES` counter; `ir::ir_compatible` rejects on `athrow`,
+   `invokedynamic` and the invoke/field caps, and the optimizing tier has to be
+   reached at all);
+2. IR-compiled methods are systematically not on the stack when a collection
+   happens — e.g. allocation slow paths route through frames the IR tier does
+   not produce, so the collection is always initiated below an IR frame rather
+   than within one.
+
+Until one of those is settled, flipping the default is unjustifiable in both
+directions: there is no evidence it costs anything, and no evidence it buys
+anything either. The implementation stands, sound and opt-in; what is missing is
+not code and not a timing run, it is knowing whether the path is reachable.
