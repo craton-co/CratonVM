@@ -161,10 +161,10 @@ jobs:
       #
       #   before   reported 2584 of 3927 (2523 pass, 61 fail), then exit 1 with
       #            NO `test result` line — 1,343 tests never executed
-      #   now      test result: FAILED. 3743 passed; 80 failed; 115 ignored
-      #            (3743+80+115 = 3938, every test accounted for, exit 101)
+      #   now      test result: FAILED. 3748 passed; 75 failed; 115 ignored
+      #            (3748+75+115 = 3938, every test accounted for, exit 101)
       #
-      # So 61 was a floor twice over: the real total was 173, now down to 80.
+      # So 61 was a floor twice over: the real total was 173, now down to 75.
       # Measured AFTER merging origin/dev (140 commits; the merge added 12
       # tests, hence 3938 rather than 3926).
       #
@@ -189,7 +189,7 @@ jobs:
       #
       # TWO things still block promotion. Both are measured:
       #
-      #  1. 80 failing tests. The systemic causes are exhausted. The tail is
+      #  1. 75 failing tests. The systemic causes are exhausted. The tail is
       #     individual, and a chunk of it is NOT missing work — it is work that
       #     was deliberately UNDONE, so "implementing" it would be a regression:
       #       * `java/util/Timer` — the synthetic natives were deleted because
@@ -225,6 +225,23 @@ jobs:
       #     raw `Value::Int`. Printing the actual value in the assertion
       #     settled in one run what two rounds of reading the dispatcher had
       #     got backwards.)
+      #
+      #     One REAL VM defect found while triaging, not yet fixed:
+      #     `java/security/KeyPairGenerator.generateKeyPair` is registered
+      #     TWICE — the real JCA implementation in `jca/key_factory.rs`
+      #     (reached from lib.rs:18038) and a legacy stub in
+      #     `phases_early::register_phase53_security` (reached from
+      #     lib.rs:22648). The stub registers LAST and therefore WINS, so every
+      #     caller gets 1-field keys holding an empty byte array instead of the
+      #     JCA keys carrying algorithm and size. That is the
+      #     synthetic-stub-shadows-real-implementation hazard, in production
+      #     code and not only in tests (`m22_rsa_keygen`, `m22_ecdsa_keygen`,
+      #     `m22_rsa_sign_into_buffer`, `m22_ecdsa_different_keys_fail_verify`
+      #     are the symptom). Fixing it means retiring the whole phase53
+      #     KeyPairGenerator block so JCA owns the class — its `initialize`
+      #     writes a side table the JCA `generateKeyPair` reads, so removing
+      #     only the one registration would leave the two halves mismatched.
+      #     Wants crypto-suite verification, not a one-line edit.
       #
       #     The rest
       #     is ~38 individual `assertion left == right` divergences plus
