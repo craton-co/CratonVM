@@ -69247,7 +69247,11 @@ mod tests {
         // Register threads with Java Thread objects, verify enumerate fills array.
         let shared = p86_shared_with_builtins();
 
-        // Create Java Thread objects and register them
+        // Create Java Thread objects and register them. Both must name the
+        // group they belong to, or `ThreadGroup.enumerate` correctly reports
+        // none: a thread's membership is a property of the thread, not of the
+        // registry. Slot 1 is the synthetic `(name, group)` shape
+        // `tg_of_thread` falls back to when a receiver has no field names.
         let t1_obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let t2_obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         shared
@@ -69261,6 +69265,8 @@ mod tests {
 
         let mut thread = JvmThread::new(ThreadId(0), "main");
         let tg = alloc_receiver(&shared, &mut thread, "java/lang/ThreadGroup", 3);
+        shared.mem.heap.set_field(t1_obj, 1, Value::Object(Some(tg)));
+        shared.mem.heap.set_field(t2_obj, 1, Value::Object(Some(tg)));
         let name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,

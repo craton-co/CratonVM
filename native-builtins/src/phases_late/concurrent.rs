@@ -5818,6 +5818,19 @@ pub(crate) fn tg_get_field(
     result
 }
 
+/// Slot fallback for a SYNTHETIC `Thread`'s owning group.
+///
+/// `tg_of_thread` resolves the group by NAME (`holder.group`, or `group`
+/// directly), which is right for a real-JDK `Thread`. A synthetically
+/// allocated one has no field names at all — `ensure_synthetic_class` mints
+/// unnamed slots — so the lookup yields nothing and the thread appears to
+/// belong to no group, making `ThreadGroup.enumerate` report zero.
+///
+/// Consulted ONLY after both name lookups fail, so a real `Thread` never
+/// reaches it and the two paths cannot disagree about the same object. Slot 1
+/// mirrors the synthetic `(name, group)` shape the VM's own thread mirrors use.
+const SYNTHETIC_THREAD_GROUP_SLOT: usize = 1;
+
 pub(crate) fn tg_of_thread(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Option<ObjectRef> {
     let pin = ctx.pin_native_root(thread);
     let thread = ctx.read_native_pin(pin, thread);
@@ -5835,7 +5848,15 @@ pub(crate) fn tg_of_thread(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Op
         _ => {
             let thread = ctx.read_native_pin(pin, thread);
             match ctx.get_field_by_name(thread, "group") {
-                Value::Object(group) => group,
+                Value::Object(Some(group)) => Some(group),
+                // Neither `holder.group` nor `group` resolved: a synthetic
+                // Thread with no field names. See the constant above.
+                _ if ctx.object_num_fields(thread) > SYNTHETIC_THREAD_GROUP_SLOT => {
+                    match ctx.get_field(thread, SYNTHETIC_THREAD_GROUP_SLOT) {
+                        Value::Object(group) => group,
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         }
