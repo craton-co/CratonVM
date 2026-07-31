@@ -60307,9 +60307,16 @@ mod tests {
     /// Scanner/StringReader/StringWriter registered.
     #[test]
     fn phase51_registrations() {
+        // Must mirror what the VM actually builds. This asserted registrations
+        // that span crates — `java/io/StringReader` and `StringWriter` live in
+        // `cratonvm-native-io`, not `native-builtins` — while constructing a
+        // registry from `register_builtins` alone, so it could never see them.
+        // `vm_init` registers all three groups; so does this.
         let registry = {
             let mut r = crate::native::registry::NativeMethodRegistry::new();
             crate::native::builtins::register_builtins(&mut r);
+            crate::native::io::register_io_natives(&mut r);
+            crate::native::collections::register_collections_natives(&mut r);
             r
         };
         assert!(registry

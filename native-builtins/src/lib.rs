@@ -19303,6 +19303,58 @@ pub fn register_essential_natives_with_shims(
     }
     register_tzdb_offset_natives_for(registry, "sun/util/calendar/ZoneInfo");
     register_tzdb_offset_natives_for(registry, "java/util/SimpleTimeZone");
+    // The abstract base too. Only the two concrete subclasses above carried the
+    // offset family, so anything holding a `TimeZone`-typed reference — which
+    // is how the API is normally used — had no `getRawOffset`. A subclass
+    // receiver still resolves its own exact-class registration first; this is
+    // the fallback for the base.
+    register_tzdb_offset_natives_for(registry, "java/util/TimeZone");
+
+    // `TimeZone.getID()` reads the `ID` field, exactly as the real base-class
+    // method does, so it is faithful for every subclass that inherits it.
+    registry.register(
+        "java/util/TimeZone",
+        "getID",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "ID") {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+            // Synthetic TimeZones built by `getDefault` below keep the id in
+            // slot 0; a real one that never had `ID` populated reports UTC
+            // rather than null, which callers concatenate into messages.
+            if ctx.object_num_fields(this) > 0 {
+                if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
+                    return Ok(Some(Value::Object(Some(s))));
+                }
+            }
+            Ok(Some(Value::Object(Some(ctx.create_string("UTC")))))
+        },
+    );
+
+    // `TimeZone.getDefault()` — the VM runs on UTC unless the embedder says
+    // otherwise (`user.timezone`), and returning null here made every
+    // `TimeZone.getDefault().getID()` NPE.
+    registry.register(
+        "java/util/TimeZone",
+        "getDefault",
+        "()Ljava/util/TimeZone;",
+        |ctx, _args| {
+            let id = cratonvm_types::flags::runtime_var("user.timezone")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "UTC".to_string());
+            let tz = alloc_concurrent_synthetic(ctx, "java/util/TimeZone", 1);
+            let s = ctx.create_string(&id);
+            ctx.set_field(tz, 0, Value::Object(Some(s)));
+            let _ = ctx.set_field_by_name(tz, "ID", Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(tz))))
+        },
+    );
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
         "getZoneInfo",

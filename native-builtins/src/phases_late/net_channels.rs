@@ -600,6 +600,16 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
 
     // SelectionKey = 4-field synthetic (channel=0, selector=1, interestOps=2, readyOps=3)
     let sk = "java/nio/channels/SelectionKey";
+
+    // The four public interest-op constants. They are `static final int`s, so
+    // they register with the FIELD descriptor "I" rather than a method one.
+    // Every `SelectionKey` instance method below existed, but nothing could
+    // name the bits they take: `key.interestOps(SelectionKey.OP_READ)` had no
+    // way to reach the value 1. The values are fixed by the JDK spec.
+    r.register(sk, "OP_READ", "I", |_ctx, _args| Ok(Some(Value::Int(1))));
+    r.register(sk, "OP_WRITE", "I", |_ctx, _args| Ok(Some(Value::Int(4))));
+    r.register(sk, "OP_CONNECT", "I", |_ctx, _args| Ok(Some(Value::Int(8))));
+    r.register(sk, "OP_ACCEPT", "I", |_ctx, _args| Ok(Some(Value::Int(16))));
     r.register(
         sk,
         "channel",
