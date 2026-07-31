@@ -39148,7 +39148,19 @@ mod tests {
     fn service_loader_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let class_mirror = alloc_receiver(&shared, &mut thread, "java/util/ServiceLoader", 0);
+        // The argument to the STATIC `ServiceLoader.load(Class)` is the service
+        // interface's Class mirror, not a ServiceLoader — and it has to be a
+        // REAL mirror: the native resolves `service.getName()` to derive the
+        // provider-configuration resource name, which a bare synthetic object
+        // cannot answer.
+        let service_cid = {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            ctx.ensure_synthetic_class("java/util/spi/ToolProvider", 0)
+        };
+        let class_mirror = get_or_create_class_mirror(&shared, service_cid);
         let sl = call_native(
             &shared,
             &mut thread,
@@ -46407,13 +46419,25 @@ mod tests {
     fn service_loader_load_p63() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
+        // A real Class mirror for the service interface. Passing `null` here
+        // relied on the native tolerating it; the JDK contract for
+        // `ServiceLoader.load(null)` is a NullPointerException, so a test that
+        // depends on leniency is asserting behaviour the VM should not have.
+        let service_cid = {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            ctx.ensure_synthetic_class("java/util/spi/ToolProvider", 0)
+        };
+        let service_mirror = get_or_create_class_mirror(&shared, service_cid);
         let sl = call_native(
             &shared,
             &mut thread,
             "java/util/ServiceLoader",
             "load",
             "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
-            &[Value::Object(None)],
+            &[Value::Object(Some(service_mirror))],
         )
         .unwrap()
         .unwrap();
@@ -46443,13 +46467,25 @@ mod tests {
     fn service_loader_find_first_empty_p63() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
+        // A real Class mirror for the service interface. Passing `null` here
+        // relied on the native tolerating it; the JDK contract for
+        // `ServiceLoader.load(null)` is a NullPointerException, so a test that
+        // depends on leniency is asserting behaviour the VM should not have.
+        let service_cid = {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            ctx.ensure_synthetic_class("java/util/spi/ToolProvider", 0)
+        };
+        let service_mirror = get_or_create_class_mirror(&shared, service_cid);
         let sl = call_native(
             &shared,
             &mut thread,
             "java/util/ServiceLoader",
             "load",
             "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
-            &[Value::Object(None)],
+            &[Value::Object(Some(service_mirror))],
         )
         .unwrap()
         .unwrap();
