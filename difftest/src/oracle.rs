@@ -760,19 +760,26 @@ mod tests {
 
     #[test]
     fn a_checksum_survives_an_over_normalizing_stdout_rule() {
-        // The false-negative guard. `sort-lines` makes the two transcripts
-        // compare equal; the checksum is read from un-normalized stdout, so the
-        // real disagreement still surfaces — and only on the checksum channel.
-        let a = obs("x\ny\n##DIFFTEST-CHECKSUM## total 1\n", "", Some(0));
-        let b = obs("y\nx\n##DIFFTEST-CHECKSUM## total 2\n", "", Some(0));
+        // The false-negative guard, and the reason the checksum is read from
+        // un-normalized stdout. Two runs computed different digests; the seed
+        // prints them in `0x…` form, so `mask_hashes` rewrites both to
+        // `0x<addr>` and the stdout dimension goes quiet. The checksum
+        // dimension does not — and it is the only one that fires, so the report
+        // says exactly what happened.
+        let a = obs("##DIFFTEST-CHECKSUM## total 0xdeadbeef\n", "", Some(0));
+        let b = obs("##DIFFTEST-CHECKSUM## total 0xcafebabe\n", "", Some(0));
         let n = Normalizer {
-            sort_lines: true,
+            mask_hashes: true,
             ..Normalizer::strict()
         };
+        assert!(
+            n.apply(&a.stdout) == n.apply(&b.stdout),
+            "the rule must genuinely have hidden the stdout diff"
+        );
         assert_eq!(
             channels(&compare(&a, &b, &n)),
             vec![Channel::Checksum],
-            "sort-lines hid the stdout diff; the checksum must not be hidden too"
+            "an over-normalizing rule hid the stdout diff; the checksum must not be hidden too"
         );
     }
 

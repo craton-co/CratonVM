@@ -663,7 +663,7 @@ impl CoverageMatrix {
 
         let axes_without_a_mode = PathAxis::all()
             .iter()
-            .filter(|a| !driven.contains(a))
+            .filter(|a| !driven.contains(*a))
             .map(|a| a.label().to_string())
             .collect();
 

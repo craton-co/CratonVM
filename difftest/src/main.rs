@@ -199,6 +199,42 @@ struct MinArgs {
     jdk: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct MatrixArgs {
+    /// Directory of programs to scan (default: `difftest/corpus`).
+    #[arg(long)]
+    corpus: Option<PathBuf>,
+
+    /// The mode list the matrix's axis columns are computed for. Defaults to
+    /// the full execution-path contract, so a gap in the output is a gap in the
+    /// *corpus* rather than in the run configuration.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "nojit,interp-decoded,direct-emit,ir-jit,osr-eager,no-osr,forced-deopt",
+        value_parser = parse_one_mode
+    )]
+    modes: Vec<Mode>,
+
+    /// Where to write the machine-readable matrix (default:
+    /// `difftest/coverage-matrix.json`).
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// List every `(opcode, form)` row that is not covered on every axis.
+    #[arg(long)]
+    show_gaps: bool,
+
+    /// Explicit JDK home (else `DIFFTEST_JAVA_HOME`, else PATH) — used only to
+    /// find `javac` for `.java` seeds.
+    #[arg(long)]
+    jdk: Option<PathBuf>,
+
+    /// Hard per-compile timeout in seconds.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT.as_secs())]
+    timeout_secs: u64,
+}
+
 /// clap per-value parser for `--modes`.
 fn parse_one_mode(s: &str) -> Result<Mode, String> {
     Mode::from_label(s.trim()).ok_or_else(|| format!("unknown mode {s:?}"))
@@ -257,6 +293,7 @@ fn main() -> ExitCode {
         Cmd::Mutate(args) => cmd_mutate(&args),
         Cmd::Min(args) => cmd_min(&args),
         Cmd::Gate(args) => cmd_gate(&args),
+        Cmd::Matrix(args) => cmd_matrix(&args),
     }
 }
 
@@ -273,6 +310,7 @@ fn cmd_run(args: &RunArgs) -> ExitCode {
         modes.join(","),
         config.timeout.as_secs()
     );
+    print_normalization_banner(&config.modes);
 
     let summary = match harness::run_corpus(&config) {
         Ok(s) => s,
@@ -324,6 +362,131 @@ fn cmd_run(args: &RunArgs) -> ExitCode {
 
     // `run` is a report, not a gate: a successful run exits 0 regardless of
     // divergences (the `gate` subcommand is what fails CI on them).
+    ExitCode::from(exit::OK)
+}
+
+/// Print, per distinct normalizer in play, exactly which named rules stood
+/// between the two VMs.
+///
+/// A reader of a divergence report has to be able to answer "was anything
+/// rewritten before this comparison?" without reading the source. Printing the
+/// rule ids at the top of every run is the cheapest way to make an
+/// over-normalization visible: a rule that should not be on is on the first
+/// line of the log.
+fn print_normalization_banner(modes: &[Mode]) {
+    let mut seen: Vec<String> = Vec::new();
+    for m in modes {
+        let described = Normalizer::for_mode(*m).describe();
+        if !seen.contains(&described) {
+            seen.push(described);
+        }
+    }
+    for line in seen {
+        println!("  {line}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// matrix — C2 review P0 (opcode / execution-path coverage)
+// ---------------------------------------------------------------------------
+
+/// Generate the coverage matrix from the corpus's own class files.
+///
+/// `.java` seeds are compiled here with the same `javac` the differential run
+/// uses, so the matrix describes the exact bytes that run executes. A corpus of
+/// bare `.class` files needs no JDK at all.
+fn cmd_matrix(args: &MatrixArgs) -> ExitCode {
+    let corpus = args.corpus.clone().unwrap_or_else(default_corpus);
+    let out = args.out.clone().unwrap_or_else(|| {
+        runner::workspace_root()
+            .join("difftest")
+            .join("coverage-matrix.json")
+    });
+    let programs = harness::discover_programs(&corpus);
+    if programs.is_empty() {
+        eprintln!(
+            "cratonvm-difftest matrix: corpus {} is empty — bootstrap, exit {} (non-fatal).",
+            corpus.display(),
+            exit::BOOTSTRAP
+        );
+        return ExitCode::from(exit::BOOTSTRAP);
+    }
+
+    let needs_javac = programs
+        .iter()
+        .any(|p| p.extension().and_then(|s| s.to_str()) == Some("java"));
+    if needs_javac && !runner::java_available(args.jdk.as_deref()) {
+        eprintln!(
+            "cratonvm-difftest matrix: javac not found and the corpus has .java seeds — \
+             bootstrap, exit {} (non-fatal).",
+            exit::BOOTSTRAP
+        );
+        return ExitCode::from(exit::BOOTSTRAP);
+    }
+
+    // One scratch dir of compiled classes, pid-namespaced like the runner's.
+    let workdir = std::env::temp_dir().join(format!("difftest_matrix_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&workdir);
+    let timeout = Duration::from_secs(args.timeout_secs);
+    let mut unscannable: Vec<(String, String)> = Vec::new();
+
+    for source in &programs {
+        let name = source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if source.extension().and_then(|s| s.to_str()) == Some("java") {
+            if let Err(e) = runner::compile_java(source, &workdir, args.jdk.as_deref(), timeout) {
+                unscannable.push((name, e.to_string()));
+            }
+        } else {
+            let dest = workdir.join(source.file_name().unwrap_or_default());
+            if let Err(e) = std::fs::copy(source, &dest) {
+                unscannable.push((name, e.to_string()));
+            }
+        }
+    }
+
+    let (scans, mut failed) = matrix::scan_class_dir(&workdir);
+    unscannable.append(&mut failed);
+    let m = CoverageMatrix::build(scans, &args.modes, unscannable);
+
+    print!("{}", m.render());
+    if args.show_gaps {
+        for row in &m.rows {
+            let uncovered = row.uncovered();
+            if !uncovered.is_empty() {
+                println!(
+                    "  GAP  {} ({}) [{}] — uncovered: {}",
+                    row.name,
+                    row.form,
+                    row.programs.join(","),
+                    uncovered.join(", ")
+                );
+            }
+        }
+    }
+
+    match m.to_json() {
+        Ok(json) => {
+            if let Some(parent) = out.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&out, json) {
+                Ok(()) => println!("wrote matrix: {}", out.display()),
+                Err(e) => eprintln!(
+                    "cratonvm-difftest matrix: could not write {}: {e}",
+                    out.display()
+                ),
+            }
+        }
+        Err(e) => eprintln!("cratonvm-difftest matrix: could not serialize the matrix: {e}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&workdir);
+    // The matrix is a report, not a gate: a coverage gap is a backlog item, not
+    // a build failure, and failing here would make adding an axis a red build.
     ExitCode::from(exit::OK)
 }
 
@@ -709,6 +872,7 @@ fn cmd_gate(args: &RunArgs) -> ExitCode {
         }
     };
 
+    print_normalization_banner(&config.modes);
     let report = harness::gate(&summary, &ledger);
     print!("{}", harness::render_gate(&report));
     let code = report.exit_code();

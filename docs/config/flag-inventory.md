@@ -76,11 +76,11 @@ cratonvm-types`:
 
 | | count |
 |---|---|
-| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 689 |
-| exact string literals (i.e. actually named by code, not prose) | 655 |
-| **declared** in `flag_groups::INVENTORY` + scalars + group variables | **644** |
+| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 692 |
+| exact string literals (i.e. actually named by code, not prose) | 658 |
+| **declared** in `flag_groups::INVENTORY` + scalars + group variables | **647** |
 | declared before this pass | 576 |
-| declared by this pass | **68** |
+| declared by this pass | **71** |
 | allowlisted as intentionally undeclared | 11 |
 | user-facing names an operator has to learn | 15 |
 
@@ -155,18 +155,19 @@ only one half is a collector walking a shadow stack the codegen never pushed to.
 
 ## What was declared in this pass
 
-68 variables, 68 new tokens, no change to any observable default. Every entry
+71 variables, 71 new tokens, no change to any observable default. Every entry
 below was read against its call site before being written down; the *Parser*
 column names the exact idiom at that site.
 
-Five of the 68 were not in the original brief and were found by running the new
+Eight of the 71 were not in the original brief and were found by running the new
 guard while writing this document: `CRATONVM_JIT_VERIFY_MEMORY_CHAIN`,
 `CRATONVM_JIT_VERIFY_ARENA_ORDER` and `CRATONVM_DBG_IR_SLOTS` arrived from a
 concurrent `jit` change, and `CRATONVM_GPU_CRITICAL_WAIT_MS` /
-`CRATONVM_GPU_CRITICAL_LEASE_MS` from a concurrent `cuda-bridge` change, all
-within the same session. That rate — five new undeclared flags in one afternoon
-on one branch — is the argument for the guard being a test rather than a
-convention.
+`CRATONVM_GPU_CRITICAL_LEASE_MS` from a concurrent `cuda-bridge` change, and
+`CRATONVM_PHASE_ACCOUNTING` / `_OUT` / `_JFR` from a concurrent `jfr` change —
+all within the same session. That rate — eight new undeclared flags in one
+afternoon on one branch — is the argument for the guard being a test rather
+than a convention.
 
 ### JIT IR verifier — `jit/src/ir_verify.rs`
 
@@ -283,6 +284,20 @@ bypasses the snapshot, and because the name is not a literal it is invisible to
 `flag_declaration_guard.rs` and to `check-surface.sh`. These two were found by
 reading the file, not by the guard. Declaring them fixes the reachability half;
 Stage 1 of the migration fixes the read.
+
+### Phase accounting — `jfr/src/phase.rs`
+
+| Variable | Token | Parser | Default |
+|---|---|---|---|
+| `CRATONVM_PHASE_ACCOUNTING` | `DBG=phase-accounting` | level word: `1`/`true`/`on`/`coarse` → coarse, `fine` → fine, anything else off | off |
+| `CRATONVM_PHASE_ACCOUNTING_OUT` | `DBG=phase-accounting-out` | non-empty path | none |
+| `CRATONVM_PHASE_ACCOUNTING_JFR` | `DBG=phase-accounting-jfr` | non-empty path | none |
+
+Already read through `runtime_var_os` and already named by `pub const FLAG_*`
+items, so declaring them costs nothing and buys `CRATONVM_DBG=phase-accounting=fine`.
+The enable gate is the fourth distinct "level word" parser in the tree and is
+deliberately left in `jfr` — a `Level` enum is that crate's vocabulary, and the
+typed config's job is to hand it the string, not to learn its grammar.
 
 ### Threading — `vm/src/threading/thread_state.rs`
 
@@ -538,18 +553,20 @@ applies to `flag_env_mutation_guard.rs`.
    `runtime_var_os` (which passes non-declared names straight through, so it is
    behaviour-neutral) or an explicit exemption in the script. Routing is the
    better answer: it makes the boundary the only door.
-3. **`docs/CONFIG.md` and `docs/flag-tokens.md` do not yet list the 68 new
+3. **`docs/CONFIG.md` and `docs/flag-tokens.md` do not yet list the 71 new
    tokens.** `check-surface.sh` check 2 only fails when the *docs* name a token
    the inventory lacks, not the reverse, so this is not blocking — but the
-   documented surface is now 68 tokens behind the code.
+   documented surface is now 71 tokens behind the code.
 4. **Two `env_flag` helpers survive** in `jit/src/ir_verify.rs` and
    `jit/src/metrics.rs`. They are byte-identical to each other and to
    `parse::tristate_word`. Stage 3 steps 4–5 remove them.
-5. **`jit/`, `vm/` and `cuda-bridge/` were changing while this inventory was
-   taken.** Five variables appeared mid-pass and are declared:
+5. **`jit/`, `vm/`, `cuda-bridge/` and `jfr/` were changing while this
+   inventory was taken.** Eight variables appeared mid-pass and are declared:
    `CRATONVM_JIT_VERIFY_MEMORY_CHAIN`, `CRATONVM_JIT_VERIFY_ARENA_ORDER`,
    `CRATONVM_DBG_IR_SLOTS`, `CRATONVM_GPU_CRITICAL_WAIT_MS`,
-   `CRATONVM_GPU_CRITICAL_LEASE_MS`. Line numbers in this document will drift;
+   `CRATONVM_GPU_CRITICAL_LEASE_MS`, `CRATONVM_PHASE_ACCOUNTING`,
+   `CRATONVM_PHASE_ACCOUNTING_OUT`, `CRATONVM_PHASE_ACCOUNTING_JFR`.
+   Line numbers in this document will drift;
    the file and function names will not. Re-run
    `cargo test -p cratonvm-types --test flag_declaration_guard` after merging —
    it is the cheapest way to find what landed in the meantime.
@@ -563,7 +580,7 @@ applies to `flag_env_mutation_guard.rs`.
 
 ## Full inventory
 
-655 rows: 644 declared, 11 allowlisted. Generated — see
+658 rows: 647 declared, 11 allowlisted. Generated — see
 [How to regenerate](#how-to-regenerate).
 
 | Variable | Group | Canonical spelling | Shape | Default | Class | Latched | Read in |
@@ -1112,6 +1129,9 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_OSR_EXIT_AFTER` | DBG | `CRATONVM_DBG=osr-exit-after` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_OSR_EXIT_TEST` | DBG | `CRATONVM_DBG=osr-exit-test` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_OSR_NEWARRAY` | JIT | `CRATONVM_JIT=osr-newarray` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_PHASE_ACCOUNTING` | DBG | `CRATONVM_DBG=phase-accounting` | opt-in | off | diag | snapshot | jfr |
+| `CRATONVM_PHASE_ACCOUNTING_JFR` | DBG | `CRATONVM_DBG=phase-accounting-jfr` | opt-in | off | diag | snapshot | jfr |
+| `CRATONVM_PHASE_ACCOUNTING_OUT` | DBG | `CRATONVM_DBG=phase-accounting-out` | opt-in | off | diag | snapshot | jfr |
 | `CRATONVM_PRECISE_COVERAGE_PIN` | JIT | `CRATONVM_JIT=precise-coverage-pin` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` | GC | `CRATONVM_GC=promotion-oom-guard-broad` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_QUICKEN_STATS` | DBG | `CRATONVM_DBG=quicken-stats` | opt-in | off | diag | snapshot | reader |

@@ -801,6 +801,24 @@ mod tests {
     }
 
     #[test]
+    fn every_channel_has_a_unique_stable_label() {
+        // The labels are what a divergence report prints, so they are a
+        // compatibility surface: a reader (and a CI log grep) must be able to
+        // tell `exception-type` from `exception-message`.
+        let labels: Vec<&str> = Channel::all().iter().map(|c| c.label()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "duplicate channel label");
+        assert_eq!(labels.len(), 8);
+        // The serde spelling and the report spelling must not drift apart.
+        for c in Channel::all() {
+            let json = serde_json::to_string(c).unwrap();
+            assert_eq!(json, format!("\"{}\"", c.label()), "{c:?}");
+        }
+    }
+
+    #[test]
     fn observation_empty_is_inert() {
         let o = Observation::empty();
         assert!(!o.timed_out);

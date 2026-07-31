@@ -12869,6 +12869,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -12929,6 +12930,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -12977,6 +12979,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -13059,6 +13062,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -16415,6 +16419,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let c = g.add(ir::Op::Const(42), ir::IrType::Int, vec![], None);
@@ -16444,6 +16449,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let alloc = g.add(

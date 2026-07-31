@@ -1230,6 +1230,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -1248,6 +1249,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -1643,14 +1645,14 @@ mod tests {
         let compact = Node {
             op: Op::ArrayLength,
             ty: IrType::Int,
-            inputs: vec![7],
+            inputs: vec![7].into(),
             bytecode_pc: None,
         };
         assert!(!is_memory_token_input(&compact, 1));
         let full = Node {
             op: Op::ArrayLength,
             ty: IrType::Int,
-            inputs: vec![1, 2, 3],
+            inputs: vec![1, 2, 3].into(),
             bytecode_pc: None,
         };
         assert!(is_memory_token_input(&full, 1));
@@ -1728,6 +1730,7 @@ mod tests {
                 locals: vec![5, NO_NODE, 900],
                 stack: vec![1234],
             }],
+            uses: Default::default(),
         };
         g.add(Op::Phi, IrType::Int, vec![NO_NODE, 3], None);
         g.add(Op::Return, IrType::Void, vec![u32::MAX - 1], None);
@@ -1743,6 +1746,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         assert!(verify_graph(&g, "empty", VerifyOptions::all()).is_err());
     }

@@ -18,8 +18,8 @@ use crate::bailout::{
     DEFAULT_MAX_NODES,
 };
 use crate::deopt::{
-    ir_deopt_entry, DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue,
-    VirtualObjectState,
+    ir_deopt_entry, DeoptAction, DeoptReason, DeoptVerifier, DeoptimizationPoint, EliminatedValue,
+    EliminationCause, FrameState, FrameValue, MethodFrameLimits, OopCoverage, VirtualObjectState,
 };
 use cratonvm_types::{ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
 
@@ -71,10 +71,14 @@ const _: () = assert!(
 // When escape analysis scalar-replaces an `Op::New` (the allocation is elided,
 // its field loads redirected to the stored values), the object no longer exists
 // in the JIT frame — but it may still be live at a deopt point. The default
-// behaviour resolves its (now-`Op::Dead`) snapshot slot to `FrameValue::Undefined`,
-// forcing a whole-method re-run. With this map threaded into the lowerer, such a
-// slot instead lowers to a `FrameValue::VirtualObject`, which the VM's
-// `materialize_virtual_objects` consumer rebuilds on a precise resume.
+// behaviour resolves its (now-`Op::Dead`) snapshot slot to
+// `FrameValue::MaterializationRequired`, which refuses the precise resume and
+// forces a whole-method re-run. (It used to resolve to `FrameValue::Undefined`,
+// which every resume sink maps to `Value::Int(0)` — so a reference local came
+// back as `null` with no error at all. See `frame_value_for_object`.) With this
+// map threaded into the lowerer, such a slot instead lowers to a
+// `FrameValue::VirtualObject`, which the VM's `materialize_virtual_objects`
+// consumer rebuilds on a precise resume.
 //
 // Built by `lib.rs::build_scalar_replacement_map` from the escape-analysis result
 // (so `class_id`/`num_fields`/`field_values` are captured before the `Op::New` is
@@ -3410,7 +3414,17 @@ fn reloc_emit_enabled() -> bool {
         if node_id == NO_NODE {
             return FrameValue::Undefined;
         }
-        let node = &self.graph.nodes[node_id as usize];
+        // Checked, not indexed. A snapshot slot naming an id past the end of the
+        // arena means the snapshot and the graph being lowered disagree — the
+        // one situation where panicking is worst, because it takes the VM down
+        // from the compiler thread. Answer with the honest "this slot's value is
+        // gone and I cannot describe it", which is unresumable by construction
+        // (`frame_state_is_resumable`) rather than a fabricated zero.
+        let Some(node) = self.graph.nodes.get(node_id as usize) else {
+            return FrameValue::MaterializationRequired(EliminatedValue::unknown(
+                EliminationCause::Unclassified,
+            ));
+        };
         match node.op {
             // Integer / long constants need no machine location. A cat-1 `int`
             // constant resolves to `Int`; a cat-2 `long` constant resolves to
@@ -3446,14 +3460,35 @@ fn reloc_emit_enabled() -> bool {
             _ => {
                 match self.node_slot.get(node_id as usize).copied().flatten() {
                     Some(slot) => Self::typed_stack_slot(-(slot.get() as i32), node.ty),
-                    // No machine location assigned (unscheduled / dead in this
-                    // naive lowerer). A real resolver would never see this for
-                    // a value that is live at the safepoint; first-cut fallback.
+                    // No machine location assigned. Two OPPOSITE situations wear
+                    // the same shape here, and spelling them the same way is how
+                    // a scalar-replaced reference local reconstructs as `null`
+                    // with no error anywhere (every resume sink maps `Undefined`
+                    // to `Value::Int(0)`):
+                    //
+                    //   * the producer is `Op::Dead` — some pass (escape
+                    //     analysis' `apply_ea_to_ir`, DCE) DELETED the value the
+                    //     interpreter will read. That is
+                    //     `MaterializationRequired`: unresumable by construction,
+                    //     so the deopt is refused and the method re-runs, instead
+                    //     of resuming with a fabricated zero. The cause is
+                    //     `Unclassified` because this generic slot resolver
+                    //     cannot tell which pass retired the node —
+                    //     `frame_value_for_object` knows, and says so.
+                    //   * the producer is live but unscheduled in this naive
+                    //     lowerer. Genuinely without a location; keep the
+                    //     historical `Undefined`.
                     //
                     // Note this is a deopt *description*, not an emitted
-                    // access: `Undefined` costs a whole-method re-run, it never
-                    // reads `[rbp - 0]`. That is why a missing location is
-                    // tolerated here and refused in `slot_of`.
+                    // access: neither answer reads `[rbp - 0]`. That is why a
+                    // missing location is tolerated here and refused in
+                    // `slot_of`.
+                    None if matches!(node.op, Op::Dead) => {
+                        FrameValue::MaterializationRequired(EliminatedValue::new(
+                            node_id,
+                            EliminationCause::Unclassified,
+                        ))
+                    }
                     None => FrameValue::Undefined,
                 }
             }
@@ -3472,6 +3507,30 @@ fn reloc_emit_enabled() -> bool {
     /// FP-slot resume wired (Slice C), an FP value may now be live at a deopt
     /// guard. `Void`/`Control`/`Memory` are never live data slots, so they map to
     /// `Unsupported`.
+    /// The refusal every [`Self::frame_value_for_object`] bail returns: "escape
+    /// analysis deleted this object, and I could not describe how to rebuild it
+    /// here".
+    ///
+    /// Carries the producer node and the allocated class so the compiler report
+    /// can name *which* allocation at *which* site the deopt path cannot undo —
+    /// the difference between an actionable finding and an anonymous "cannot
+    /// resume". `cause` distinguishes the plain
+    /// [`EliminationCause::ScalarReplacedObject`] bails (no deopt block, a
+    /// non-dominating allocation/store, an unresolvable field) from
+    /// [`EliminationCause::NestedVirtualObject`] (the object is describable, but
+    /// one of its fields is itself virtual and v1 emits no nested graphs).
+    fn eliminated_object(
+        new_id: NodeId,
+        info: &VirtualObjectInfo,
+        cause: EliminationCause,
+    ) -> FrameValue {
+        FrameValue::MaterializationRequired(EliminatedValue::allocation(
+            new_id,
+            info.class_id,
+            cause,
+        ))
+    }
+
     fn typed_stack_slot(off: i32, ty: IrType) -> FrameValue {
         match ty {
             IrType::Ref => FrameValue::StackSlotRef(off),
@@ -3866,8 +3925,10 @@ fn reloc_emit_enabled() -> bool {
     /// Lower a scalar-replaced object (`new_id`, an eliminated `Op::New`) that is
     /// live in a deopt snapshot slot into a `FrameValue::VirtualObject` (its
     /// first occurrence in this frame) or `VirtualObjectRef` (a later, shared
-    /// occurrence). Bails to `FrameValue::Undefined` (⇒ safe whole-method re-run)
-    /// unless every soundness condition holds:
+    /// occurrence). Bails to
+    /// [`FrameValue::MaterializationRequired`] (⇒ the deopt is refused and the
+    /// method takes the safe whole-method re-run) unless every soundness
+    /// condition holds:
     ///   * a deopt block is known, and the `Op::New` + every eliminated field
     ///     store **strictly dominate** it — so each field genuinely holds its
     ///     recorded value at the deopt bci (a deopt *before* a store would
@@ -3875,8 +3936,17 @@ fn reloc_emit_enabled() -> bool {
     ///   * no field value is itself another scalar-replaced (virtual) object —
     ///     nested virtual graphs are a deferred follow-up (v1);
     ///   * every field value resolves to a real machine/const `FrameValue`
-    ///     (never `Undefined`/`Unsupported`), which `resolve_value` makes
-    ///     concrete from machine state at deopt time.
+    ///     (never `Undefined`/`Unsupported`/`MaterializationRequired`), which
+    ///     `resolve_value` makes concrete from machine state at deopt time.
+    ///
+    /// Every bail below used to be spelled `FrameValue::Undefined`, and that was
+    /// the last silent-null producer in this pipeline: the slot describes an
+    /// object escape analysis DELETED, the interpreter *will* read it, and every
+    /// resume sink maps `Undefined` to `Value::Int(0)` — i.e. `null` for a
+    /// reference local, with no error and no refusal. `MaterializationRequired`
+    /// says the same thing honestly and is unresumable by construction (see the
+    /// `deopt` module's "Eliminated vs. undefined" section), so the wrong value
+    /// becomes a refused deopt instead.
     fn frame_value_for_object(
         &self,
         new_id: NodeId,
@@ -3887,7 +3957,15 @@ fn reloc_emit_enabled() -> bool {
         let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some();
         let info = match sr.objects.get(&new_id) {
             Some(i) => i,
-            None => return FrameValue::Undefined,
+            // Unreachable through `resolve_frame_state` (which only calls here
+            // for a key it just found), so the class id is not recoverable —
+            // record the producer alone rather than invent a `class_id`.
+            None => {
+                return FrameValue::MaterializationRequired(EliminatedValue::new(
+                    new_id,
+                    EliminationCause::ScalarReplacedObject,
+                ))
+            }
         };
         let db = match deopt_block {
             Some(b) => b,
@@ -3895,7 +3973,7 @@ fn reloc_emit_enabled() -> bool {
                 if dbg {
                     eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: no deopt block for bci");
                 }
-                return FrameValue::Undefined;
+                return Self::eliminated_object(new_id, info, EliminationCause::ScalarReplacedObject);
             }
         };
         // The allocation and every field store must have executed before the
@@ -3915,7 +3993,7 @@ fn reloc_emit_enabled() -> bool {
                     self.schedule.node_to_block.get(info.new_ctrl as usize)
                 );
             }
-            return FrameValue::Undefined;
+            return Self::eliminated_object(new_id, info, EliminationCause::ScalarReplacedObject);
         }
         for &store_ctrl in &info.store_ctrls {
             if !self.schedule.node_strictly_dominates_block(store_ctrl, db) {
@@ -3926,7 +4004,11 @@ fn reloc_emit_enabled() -> bool {
                         self.schedule.node_to_block.get(store_ctrl as usize)
                     );
                 }
-                return FrameValue::Undefined;
+                return Self::eliminated_object(
+                    new_id,
+                    info,
+                    EliminationCause::ScalarReplacedObject,
+                );
             }
         }
         // A later occurrence of an already-defined object is a back/shared edge.
@@ -3946,14 +4028,33 @@ fn reloc_emit_enabled() -> bool {
                         if dbg {
                             eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: field {i} is nested virtual (node {vnode})");
                         }
-                        return FrameValue::Undefined; // nested virtual — deferred
+                        // nested virtual — deferred (v1 emits no nested graphs)
+                        return Self::eliminated_object(
+                            new_id,
+                            info,
+                            EliminationCause::NestedVirtualObject,
+                        );
                     }
                     let fv = self.frame_value_for(vnode);
-                    if matches!(fv, FrameValue::Undefined | FrameValue::Unsupported) {
+                    // `MaterializationRequired` joins the refusal set: a field
+                    // whose own producer was deleted must not be stored into a
+                    // materialized object (`frame_state_is_resumable` documents
+                    // that the producers, i.e. here, refuse such a field rather
+                    // than let it through inside a `VirtualObject`).
+                    if matches!(
+                        fv,
+                        FrameValue::Undefined
+                            | FrameValue::Unsupported
+                            | FrameValue::MaterializationRequired(_)
+                    ) {
                         if dbg {
                             eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: field {i} node {vnode} -> {fv:?}");
                         }
-                        return FrameValue::Undefined;
+                        return Self::eliminated_object(
+                            new_id,
+                            info,
+                            EliminationCause::ScalarReplacedObject,
+                        );
                     }
                     fv
                 }
@@ -5400,6 +5501,94 @@ pub(crate) fn lower_inner(
     let first_spill = lowerer.first_spill;
     let spill_cap_off = lowerer.spill_cap_off;
     let frame_size = lowerer.frame_size;
+
+    // ── Install-time deopt-metadata verification ─────────────────────
+    //
+    // The metadata is checked BEFORE the artifact becomes a `CompiledMethod`,
+    // because a frame that cannot be reconstructed is only discoverable at
+    // runtime otherwise — at a guard, on a VM thread, with the frame already
+    // half torn down. Bailing here is always semantically valid (the method
+    // takes the single-pass backend or the interpreter); installing code whose
+    // deopt map disagrees with its oop map is not.
+    //
+    // Which lanes are active is decided by which data this backend actually
+    // has, so every check that fires is one this file can be held to:
+    //
+    //   * **scope** — `resolve_frame_state` records `method_key: String::new()`
+    //     (the lowerer does not know the method's identity; deopt resume keys on
+    //     the running `CompiledMethod`), so the limits are registered under that
+    //     same empty key. `code_len`/`max_locals`/`max_stack` are saturated: the
+    //     bytecode length and `max_stack` never reach this function, and
+    //     `num_locals` is not a bound a hand-built graph's snapshots respect.
+    //     What the lane does buy is the `UnknownMethod` check — the day inlined
+    //     caller scopes start carrying real method keys, they must arrive with
+    //     limits rather than silently skipping every per-scope check.
+    //   * **removed-node** — every `Op::Dead` id, cross-checked against the
+    //     scalar-replacement map's keys as the ones a `VirtualObject` recipe is
+    //     allowed to name. This is the lane that catches a recipe built from a
+    //     stale graph.
+    //   * **oop-map agreement** — one `OopCoverage` per emitted `OopMapEntry`,
+    //     keyed by native offset. `emit_safepoint_map` currently pushes entries
+    //     with `native_pc_offset: 0` (the relocation path matches them by the
+    //     safepoint id in the frame slot, not by pc), and registering every map
+    //     under key `0` would compare deopt points against an arbitrary map, so
+    //     only anchored entries are registered. The lane therefore arms itself
+    //     the moment this backend starts anchoring its maps to native offsets.
+    //   * **structural** — always on.
+    let mut verifier = DeoptVerifier::new()
+        .with_method(MethodFrameLimits::new(
+            String::new(),
+            u32::MAX,
+            u16::MAX,
+            u16::MAX,
+        ))
+        .with_removed_nodes(
+            graph
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| matches!(n.op, Op::Dead))
+                .map(|(id, _)| id as u32),
+        );
+    if let Some(sr) = sr_map {
+        verifier = verifier.with_materializable_nodes(sr.objects.keys().copied());
+    }
+    for entry in &oop_maps {
+        if entry.native_pc_offset != 0 {
+            verifier = verifier.with_oop_map(
+                entry.native_pc_offset,
+                OopCoverage {
+                    frame_slot_offsets: entry.frame_slot_offsets.clone(),
+                    // The IR lowerer keeps every live value in a frame slot; it
+                    // never publishes a reference in a GPR.
+                    registers: Vec::new(),
+                    moving_young_coverage_complete: entry.moving_young_coverage_complete,
+                },
+            );
+        }
+    }
+    // Both sets are checked. `deopt_points` is the sorted, native-offset-keyed
+    // list `find_deopt_point` binary-searches; `deopt_boxes` are the boxes baked
+    // into the emitted guards, and those are the frame states a *live* deopt
+    // actually reconstructs from. Each box is verified on its own — they are not
+    // one sorted sequence, so checking them as a slice would report a bogus
+    // ordering violation.
+    for point in &deopt_boxes {
+        if let Err(bailout) = verifier.verify(std::slice::from_ref(&**point)) {
+            return refuse(bailout);
+        }
+    }
+    if let Err(bailout) = verifier.verify(&deopt_points) {
+        return refuse(bailout);
+    }
+
+    // The liveness colouring's peak — the number of values simultaneously live
+    // at the busiest program point — is exactly what
+    // `CompilationReport::peak_live_values` asks for, and this is the only place
+    // in the compiler that computes it. Recorded through the thread-local hook
+    // rather than a parameter because `lower_inner`'s signature is pinned (see
+    // `metrics::note_current_peak_live_values`); a no-op when metrics are off.
+    crate::metrics::note_current_peak_live_values(slot_plan.peak_live);
 
     let buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is

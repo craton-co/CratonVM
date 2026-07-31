@@ -696,6 +696,7 @@ mod tests {
             entry: NO_NODE,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let a = graph.add(Op::Const(1), IrType::Int, vec![], None); // 0
         let b = graph.add(Op::Const(2), IrType::Int, vec![], None); // 1
@@ -717,6 +718,7 @@ mod tests {
             entry: NO_NODE,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let base = graph.add(Op::Const(0), IrType::Int, vec![], None);
         let mut prev = base;

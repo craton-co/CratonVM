@@ -425,7 +425,7 @@ pub enum WaitOutcome {
         keepalive_addrs: Vec<usize>,
         /// How long the oldest outstanding token had been held.
         longest_held: Duration,
-        /// Up to [`MAX_NAMED_HOLDERS`] holders, oldest first. A stall
+        /// Up to `MAX_NAMED_HOLDERS` holders, oldest first. A stall
         /// names its holder here rather than in a post-mortem.
         holders: Vec<TokenFacts>,
         /// `true` when more holders existed than `holders` could carry.
@@ -1052,7 +1052,7 @@ impl Registry {
     }
 
     /// Tokens the registry has revoked, newest last, capped at
-    /// [`REAP_LOG_CAPACITY`].
+    /// `REAP_LOG_CAPACITY` (16).
     pub fn reaped_tokens(&self) -> Vec<TokenFacts> {
         self.reap_log().iter().cloned().collect()
     }

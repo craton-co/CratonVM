@@ -3221,7 +3221,7 @@ fn pe_upcall_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // `pe_downcall_invoke`. Revert this one line if a workload needs the old
     // laxity; the capability check below is behaviour-neutral on its own.
     require_native_access(ctx, "upcallHandle")?;
-    let upcall_target = upcall_target_name(ctx, target);
+    let upcall_target = upcall_target_name(&*ctx, target);
     crate::capability_gate::gate_foreign_upcall(&*ctx, &upcall_target)?;
     // args[3] = Arena — used to bound the closure's lifetime; for
     // simplicity we leak the closure and rely on the registry until
@@ -3320,7 +3320,7 @@ fn pe_upcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // GAP F4: invoking an upcall stub was ungated. The `ForeignUpcall` check is
     // permissive by default; the scope is the callback's class, resolved after
     // the slot lookup so an unknown slot still reports "slot not found".
-    let upcall_target = upcall_target_name(ctx, target);
+    let upcall_target = upcall_target_name(&*ctx, target);
     crate::capability_gate::gate_foreign_upcall(&*ctx, &upcall_target)?;
 
     // Unmarshal args from the Object[] array

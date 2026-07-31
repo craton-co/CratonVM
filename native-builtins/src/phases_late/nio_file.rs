@@ -5484,7 +5484,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // VM. Route through the capability gate, which runs the check
             // before the fd is reserved and before the syscall. With no policy
             // installed (today's default) this is the same call as before.
-            let open_result = if writable {
+            let gated = if writable {
                 crate::capability_gate::open_read_write_gated(&*ctx, &p, create)
             } else {
                 // Read-only request: try read+write first (a seekable fd), and
@@ -5495,17 +5495,26 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Ok(fd) => Ok(fd),
                     Err(_) => crate::capability_gate::open_read_gated(&*ctx, &p),
                 }
-            }
-            .map_err(std::io::Error::from);
-            let fd_id = open_result.map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    RuntimeError::NoSuchFileException { path: p.clone() }
-                } else {
-                    RuntimeError::IOException {
-                        message: format!("Cannot open {}: {}", p, e),
-                    }
+            };
+            let fd_id = match gated {
+                Ok(fd) => fd,
+                // A refusal is a `SecurityException`. It must NOT become
+                // `NoSuchFileException`: callers such as
+                // `FileSystemResource.readableChannel()` catch that one and
+                // recover, which would silently swallow the policy decision.
+                Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+                    return Err(denied.into())
                 }
-            })?;
+                Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
+                    return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                        RuntimeError::NoSuchFileException { path: p.clone() }.into()
+                    } else {
+                        MethodCallFailed::from(RuntimeError::IOException {
+                            message: format!("Cannot open {}: {}", p, e),
+                        })
+                    })
+                }
+            };
             if truncate && writable {
                 let _ = ctx.fd_table().rw_set_length(fd_id, 0);
             }

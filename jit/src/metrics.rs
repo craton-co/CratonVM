@@ -782,6 +782,25 @@ pub fn current_phase(phase: Phase) -> PhaseTimer {
     PhaseTimer::new(current(), phase)
 }
 
+/// Record the peak simultaneously-live value count against the innermost
+/// in-flight compilation on this thread.
+///
+/// The hook for `ir_lower::lower_inner`, which is the only place in the compiler
+/// that computes this number ([`crate::ir_lower`]'s liveness-based frame-slot
+/// colouring produces it as a by-product) and whose signature is pinned, so it
+/// cannot take a recorder parameter. Same shape and same reason as
+/// [`note_current_bailout`].
+pub fn note_current_peak_live_values(n: usize) {
+    let Some(state) = current() else {
+        return;
+    };
+    // The `Result<RefMut<..>, _>` scrutinee is a temporary whose drop would
+    // otherwise run after `state`; the trailing semicolon ends its scope first.
+    if let Ok(mut report) = state.report.try_borrow_mut() {
+        report.peak_live_values = Measured::Value(n.min(u32::MAX as usize) as u32);
+    };
+}
+
 /// Attribute `bailout` to the innermost in-flight compilation on this thread.
 ///
 /// Does **not** touch [`crate::bailout`]'s process-wide counters — the call

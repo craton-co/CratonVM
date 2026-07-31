@@ -419,6 +419,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "pb", on_key: Some("CRATONVM_DBG_PB"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pbe", on_key: Some("CRATONVM_DBG_PBE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pbstart", on_key: Some("CRATONVM_DBG_PBSTART"), off_key: None, off_word: None },
+    // `jfr::phase` — phase accounting. The enable gate takes a *level*
+    // (`1`/`true`/`on`/`coarse`, or `fine`), and the two sinks take paths:
+    // `CRATONVM_DBG=phase-accounting=fine,phase-accounting-out=/tmp/p.json`.
+    E { group: Group::DBG, token: "phase-accounting", on_key: Some("CRATONVM_PHASE_ACCOUNTING"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "phase-accounting-jfr", on_key: Some("CRATONVM_PHASE_ACCOUNTING_JFR"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "phase-accounting-out", on_key: Some("CRATONVM_PHASE_ACCOUNTING_OUT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "picocli-style", on_key: Some("CRATONVM_DBG_PICOCLI_STYLE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "popint", on_key: Some("CRATONVM_DBG_POPINT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "precise", on_key: Some("CRATONVM_DBG_PRECISE"), off_key: None, off_word: None },

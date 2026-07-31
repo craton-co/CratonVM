@@ -3105,19 +3105,19 @@ mod tests {
         nodes.push(Node {
             op: Op::Const(a),
             ty,
-            inputs: vec![],
+            inputs: vec![].into(),
             bytecode_pc: None,
         });
         nodes.push(Node {
             op: Op::Const(b),
             ty,
-            inputs: vec![],
+            inputs: vec![].into(),
             bytecode_pc: None,
         });
         nodes.push(Node {
             op,
             ty,
-            inputs: vec![0, 1],
+            inputs: vec![0, 1].into(),
             bytecode_pc: None,
         });
         try_fold(&nodes, 2)
@@ -3128,13 +3128,13 @@ mod tests {
         nodes.push(Node {
             op: Op::Const(a),
             ty,
-            inputs: vec![],
+            inputs: vec![].into(),
             bytecode_pc: None,
         });
         nodes.push(Node {
             op,
             ty,
-            inputs: vec![0],
+            inputs: vec![0].into(),
             bytecode_pc: None,
         });
         try_fold(&nodes, 1)
@@ -3264,6 +3264,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Void, vec![], None);
         g.entry = start;
@@ -3856,6 +3857,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         g.entry = start;
@@ -3891,6 +3893,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         g.entry = start;
@@ -4175,6 +4178,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         g.entry = start;
