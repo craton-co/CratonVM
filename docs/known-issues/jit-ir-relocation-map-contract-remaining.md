@@ -566,3 +566,50 @@ This also explains, without any further measurement, why every probe in this
 investigation saw zero IR bodies while `cargo test -p cratonvm-jit` exercises IR
 heavily: the tests call `lower()` on graphs they construct directly, bypassing
 the build-from-bytecode step where the production bail happens.
+
+## FOUND: `IrBuilder::build` returns `None` — the pipeline bails at stage one
+
+Instrumented the three silent bails (`IrBuilder::build`, `lower_inner`'s
+`unallocated_slot_use` and `buf.overflowed`), verified present in the built tree,
+one run of `BinTreesClassic 16`:
+
+    [ir] try_compile_inner BinTreesClassic.itemCheck optimize=true moving_young_disables_tier=false
+    1x  BAIL IrBuilder::build returned None for BinTreesClassic.itemCheck
+    IR bodies: 0
+
+So the complete chain, end to end, is now known:
+
+1. **Most compiles never ask for C2** — the tier-up path passes
+   `optimize=false` by design. Nothing about the IR backend is involved.
+2. **The rare `optimize=true` compile passes the entire admission chain** —
+   including `ir_compatible`, and including the moving-young gate this branch
+   scoped, which is `false` exactly as intended.
+3. **`IrBuilder::build` then returns `None`** — graph construction from bytecode
+   refuses the method, before scheduling or lowering is ever reached.
+
+`itemCheck` is `static int itemCheck(TreeNode) { if (t.left == null) return
+t.item; return t.item + itemCheck(t.left) - itemCheck(t.right); }` — recursion,
+a null test, two `getfield`s. If the builder cannot construct a graph for that,
+the population it *can* build for is very small, which is consistent with every
+observation in this investigation.
+
+### What this means for the relocation contract
+
+It is not the blocker and never was. The contract is implemented, sound and
+fail-closed; it will cover whichever methods reach the IR backend. What is
+missing is upstream of it by two stages: methods rarely request C2, and the
+builder refuses the ones that do.
+
+### Next, and it is a different piece of work
+
+`IrBuilder::build` returns a bare `Option`, so its refusal is as unnamed as
+`ir_compatible`'s was before this session. Give it a reason the same way — the
+`_ => return None` in its opcode loop is the obvious first suspect — and run the
+same probe. That names the unsupported construct in one run.
+
+Then the real question is a scoping one, not a debugging one: is the IR builder
+*meant* to handle ordinary recursive field-accessing methods? If yes this is a
+gap worth closing and the optimizing tier is largely inert today. If no, the
+tier is narrower than the surrounding documentation implies, and several open
+throughput documents that assume C2 participation need re-reading — including
+this branch's own retracted "C2 tier restored" claim.
