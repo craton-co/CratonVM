@@ -13313,35 +13313,42 @@ mod tests {
         assert_eq!(cm.can_osr_enter(0), cm.can_osr_enter_with(0, allow));
     }
 
-    /// With the kill switch OFF (the default), a dead mask no longer stops
-    /// `osr_enter` before the trampoline — it reaches the trampoline, which
-    /// skips seeding the masked locals. The stub body here is a bare `RET`, so
-    /// entering it is safe and the call returns `Some`.
+    /// `osr_enter`'s dead-mask short-circuit, pinned on the one side a unit
+    /// test can pin.
+    ///
+    /// Only the REFUSING side is assertable here. Admitting means actually
+    /// running `osr_trampoline`, which builds a frame (pushes rbp, subtracts
+    /// `osr_frame_size`, spills the callee-saved set at `osr_callee_saved_base`)
+    /// and jumps to the target — so a stub body has to be a real compiled
+    /// method with matching frame metadata, not a bare `RET`. Entering a `RET`
+    /// stub returns into the middle of the trampoline's own prologue and
+    /// access-violates; an earlier version of this test did exactly that and
+    /// took the whole `cratonvm-jit` binary down with 0xC0000005.
+    ///
+    /// The admitted path's coverage is `probes/OsrDeadLocalProbe.java`, which
+    /// executes eight real coalescing shapes end to end and checksums every
+    /// result against HotSpot. The decision itself is pinned above by
+    /// `test_can_osr_enter_dead_masked_entry_both_sides`.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_osr_enter_reaches_trampoline_with_dead_mask() {
-        if !osr_dead_local_entry_allowed() {
-            // CRATONVM_JIT_OSR_DEAD_LOCALS=0 in this environment: the historical
-            // refusal is what is under test instead.
-            let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
-            buf.emit(&[0xC3]);
-            let mut cm = CompiledMethod::new(buf);
-            cm.osr_pc_to_native = Some(vec![0]);
-            cm.osr_dead_mask = Some(vec![0x80]);
-            assert_eq!(unsafe { cm.osr_enter(0, &[], 0, 0) }, None);
-            return;
-        }
+    fn test_osr_enter_refuses_dead_mask_under_the_kill_switch() {
         let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
-        buf.emit(&[0xC3]); // RET
+        buf.emit(&[0xC3]); // RET — never entered on this path.
         let mut cm = CompiledMethod::new(buf);
         cm.osr_pc_to_native = Some(vec![0]);
         cm.osr_dead_mask = Some(vec![0x80]);
-        cm.osr_num_locals = 0;
 
-        assert!(
-            unsafe { cm.osr_enter(0, &[], 0, 0) }.is_some(),
-            "a non-zero dead mask must no longer short-circuit osr_enter"
-        );
+        if osr_dead_local_entry_allowed() {
+            // Default: the refusal is gone, so there is nothing to assert that
+            // does not require entering the stub. Assert the decision instead.
+            assert!(cm.can_osr_enter_with(0, true));
+        } else {
+            assert_eq!(
+                unsafe { cm.osr_enter(0, &[], 0, 0) },
+                None,
+                "CRATONVM_JIT_OSR_DEAD_LOCALS=0 must still bail before the trampoline"
+            );
+        }
     }
 
     /// A crash handler must be able to tell "no compiled body covers this
