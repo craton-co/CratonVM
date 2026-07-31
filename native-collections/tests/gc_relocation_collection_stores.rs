@@ -311,3 +311,46 @@ fn arraydeque_grows_under_relocation() {
         Some(Value::Int(64))
     );
 }
+
+/// `native_lhm_entry_set` builds the view with N+2 allocations in a loop while
+/// holding the map, the set, the view backing and every collected key/value in
+/// bare Rust locals.
+#[test]
+fn linked_hashmap_entry_set_builds_under_relocation() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let map = construct_under_relocation(&reg, &mut ctx, LHM, 8);
+    let map = fill_map_under_relocation(&reg, &mut ctx, LHM, map, 24);
+
+    let pin = ctx.pin_native_root(map);
+    ctx.set_relocate_pins_on_alloc(true);
+    let set = match call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "entrySet",
+        "()Ljava/util/Set;",
+        &[Value::Object(Some(map))],
+    )
+    .unwrap()
+    {
+        Some(Value::Object(Some(set))) => set,
+        other => panic!("expected an entrySet, got {other:?}"),
+    };
+    ctx.set_relocate_pins_on_alloc(false);
+    let _map = ctx.read_native_pin(pin, map);
+
+    assert_eq!(
+        call(
+            &reg,
+            &mut ctx,
+            "java/util/HashSet",
+            "size",
+            "()I",
+            &[Value::Object(Some(set))]
+        )
+        .unwrap(),
+        Some(Value::Int(24)),
+        "entrySet lost entries built across relocating allocations"
+    );
+}
