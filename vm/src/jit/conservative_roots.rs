@@ -346,15 +346,12 @@ pub use cratonvm_gc::gc_quiescence::is_active as gc_must_defer;
 /// marking root scan folds those values into the root set, the post-move remap
 /// rewrites them in place, and the young-gen collector is permitted to run the
 /// *moving* (Cheney) cycle even while JIT frames are live (see
-/// `gen_heap.rs` quiescence gate). Off by default: zero codegen change, the
-/// collector keeps deferring to the non-moving sweep under JIT.
+/// `gen_heap.rs` quiescence gate). The standalone shadow-stack knob remains
+/// opt-in; the default moving-young configuration enables the mechanism.
 ///
-/// **EXPERIMENTAL — retained default-off scaffolding (precise-jit-maps-default.md
-/// Step 6, 2026-06-22).** Not the correctness path (that is precise maps +
-/// non-moving sweep); this is the moving-relocation scaffolding for a possible
-/// future moving young gen (`default-moving-young-gen.md`, design / not started),
-/// partial (under-counts bt18) and not to be combined with precise maps. Kept,
-/// not removed; do not enable in production.
+/// The original 2026-06-22 standalone experiment was incomplete. Moving-young
+/// now publishes complete oop homes and uses a per-cycle coverage proof; an
+/// incomplete frame diverts the collection to the non-moving sweep.
 #[inline]
 pub fn shadow_stack_enabled() -> bool {
     use std::sync::OnceLock;
@@ -362,8 +359,24 @@ pub fn shadow_stack_enabled() -> bool {
     // `CRATONVM_MOVING_YOUNG` implies the shadow-stack root scan + remap: the
     // moving young gen relies on the complete precise map the shadow stack now
     // publishes (see `moving_young_enabled`).
+    //
+    // This formula MUST stay identical to the emission side,
+    // `jit::x64::shadow_stack_maps_enabled`, or the collector walks a shadow
+    // stack the codegen never pushed to. Both were tried scoped to
+    // `JIT_PUBLISHES_RELOCATION_CONTRACT` and both were reverted together: the
+    // scoping measured as no-change (see that function's comment), and moving
+    // one side of this agreement is not worth doing for an unmeasurable win.
+    // `CRATONVM_JIT_MY_SHADOW_EMISSION=0` drops the moving-young implication on
+    // BOTH sides at once; see `jit::x64::shadow_emission_moving_implication_enabled`.
+    // This expression must stay character-for-character equivalent to the
+    // emission side's.
     *ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some()
+            || (moving_young_enabled()
+                && match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SHADOW_EMISSION") {
+                    Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                    Err(_) => true,
+                })
     })
 }
 
@@ -400,18 +413,16 @@ pub fn shadow_stack_enabled() -> bool {
 ///     config (opt-OUT `CRATONVM_NO_MOVING_YOUNG` over
 ///     `flags::DEFAULT_MOVING_YOUNG`).
 ///
-/// AND-ing them is fail-safe in both directions and closes a live gap: today
-/// `x64` still parses `CRATONVM_MOVING_YOUNG` itself, so without the AND a user
-/// setting `CRATONVM_NO_MOVING_YOUNG` alongside a stale `CRATONVM_MOVING_YOUNG`
-/// would be silently ignored on the codegen side.
+/// AND-ing them is fail-safe in both directions. The centralized x64 projection
+/// and this check make `CRATONVM_NO_MOVING_YOUNG` authoritative even when a
+/// stale `CRATONVM_MOVING_YOUNG` compatibility variable is also present.
 ///
 /// The result is then published to the GC crate, which cannot call into the JIT
 /// crate (`cratonvm-gc` has no `cratonvm-jit` dependency, only a
 /// dev-dependency). So the collector always relocates against the same answer
 /// the codegen compiled for, and no skew between the three layers is
-/// representable. Flipping the default becomes a one-constant change in
-/// `cratonvm_types::flags::DEFAULT_MOVING_YOUNG` once `x64` reads that field
-/// instead of the raw variable — see that constant's docs for the exact patch.
+/// representable. The shipped default is now the single `true` constant in
+/// `cratonvm_types::flags::DEFAULT_MOVING_YOUNG`.
 #[inline]
 pub fn moving_young_enabled() -> bool {
     use std::sync::OnceLock;
@@ -695,9 +706,30 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         // Keep only entries that could still be live (spill region at or
         // above the scanner SP). Entries below it have provably returned.
         v.retain(|e| e.entry_sp >= scanner_sp);
-        // Mirror tracks whatever entry is top after pruning.
-        reload_top_rbp_cache(&v);
-        before - v.len()
+        let pruned = before - v.len();
+        // Mirror tracks whatever entry is top after pruning — but ONLY when
+        // pruning actually changed the top.
+        //
+        // This reload used to be unconditional, and that single line is what
+        // kept the moving young generation switched off. The mirror is written
+        // by each compiled prologue (`mov gs:[disp], rbp`, or the
+        // `jit_frame_record` helper); `PreciseFrameInfo::exact_rbp` is only a
+        // SNAPSHOT of it, taken in `push_entry_full` when an entry stops being
+        // top. For the entry that is *currently* top nothing has ever written
+        // that field, so it still holds the `0` from `enter_with_compiled`.
+        //
+        // `refresh_moving_young_coverage_for_current_thread` calls this
+        // function first and then reads the mirror. With the unconditional
+        // reload, a no-op prune overwrote the live RBP with that `0` on the way
+        // in, and the coverage proof then failed itself with MISSING_EXACT_RBP
+        // — measured as 100% of fallbacks (67/67 on `BinTreesClassic 18` at
+        // `-Xmx512m`, 58/58 at depth 16, 2/2 at depth 14) with `top_rbp=0x0`
+        // logged for a frame that had 7 oop maps and a live sp-id slot. Nothing
+        // was wrong with the frame; the verifier had erased its own input.
+        if pruned > 0 {
+            reload_top_rbp_cache(&v);
+        }
+        pruned
     });
     if pruned > 0 {
         // Chain mutation = JIT boundary: invalidate the per-thread scan cache.
@@ -1149,7 +1181,31 @@ fn moving_young_frame_live_hi(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> 
 ///
 /// The outward RBP-chain walk is unaffected: it resolves every ancestor from
 /// its return address, which is correct regardless.
-fn chain_entry_rbp_is_foreign(exact_rbp: usize, entry_sp: usize, scanner_sp: usize) -> bool {
+///
+/// # The direct self-call exception
+///
+/// "Entered from compiled code" is not by itself a reason to give up: it only
+/// matters when the frame belongs to a method the entry does not name. A
+/// compiled method that recurses does so through a direct `E8 rel32` CALL back
+/// to its OWN entry (`x64.rs`, `self_call_patches`), pushing no guard — so a
+/// recursive workload leaves the mirror pointing at an inner activation of the
+/// very method the entry names, and `info.compiled_method` describes that frame
+/// exactly. Rejecting it costs every moving cycle for no safety gain: measured
+/// on `BinTreesClassic`, whose `itemCheck`/`bottomUpTree` recursion made this
+/// the reason for 100% of fallbacks (82/82 at depth 18, 59/59 at 16, 2/2 at 14)
+/// once the exact-RBP defect above it was fixed.
+///
+/// The exception is recognised from the machine code, not inferred from which
+/// direct-call features happen to be gated off: the return address must lie in
+/// the entry's own body AND the five bytes ending there must be a direct CALL
+/// whose target is that body's entry point. Anything else — an indirect call,
+/// a call from a different method, bytes that cannot be read — stays foreign.
+fn chain_entry_rbp_is_foreign(
+    exact_rbp: usize,
+    entry_sp: usize,
+    scanner_sp: usize,
+    cm: *const cratonvm_jit::CompiledMethod,
+) -> bool {
     if exact_rbp == 0 || exact_rbp & 0x7 != 0 {
         return false;
     }
@@ -1160,7 +1216,46 @@ fn chain_entry_rbp_is_foreign(exact_rbp: usize, entry_sp: usize, scanner_sp: usi
     // live JIT stack band, bounded by `scanner_sp` / `entry_sp` exactly as the
     // neighbouring chain walks do.
     let ret_addr = unsafe { ((exact_rbp + 8) as *const usize).read() };
-    cratonvm_jit::lookup_jit_code_range(ret_addr).is_some()
+    let Some(caller_cm) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+        // A non-JIT caller is the ordinary boundary frame this entry was pushed
+        // for. Not foreign.
+        return false;
+    };
+    if caller_cm as *const cratonvm_jit::CompiledMethod != cm {
+        return true;
+    }
+    // The caller is the entry's own method. That is a recursive activation iff
+    // the call really was the direct self-call form.
+    // SAFETY: `cm` is Arc-owned by the JIT cache while any of its frames is
+    // live, which is the precondition for being on this chain at all.
+    let entry_ptr = unsafe { (*cm).entry_ptr() } as usize;
+    !returned_from_direct_self_call(ret_addr, entry_ptr)
+}
+
+/// Whether the five bytes ending at `ret_addr` are `E8 rel32` with the target
+/// `entry_ptr` — i.e. `ret_addr` is the return address of a direct self-call.
+///
+/// Fails closed: a return address too close to the method entry to hold the
+/// instruction, an opcode that is not `E8`, or a displacement that resolves
+/// anywhere other than `entry_ptr` all answer `false`.
+fn returned_from_direct_self_call(ret_addr: usize, entry_ptr: usize) -> bool {
+    // The call instruction lies between the method entry and the return
+    // address, so a return address within 5 bytes of the entry cannot be one.
+    if entry_ptr == 0 || ret_addr < entry_ptr.saturating_add(5) {
+        return false;
+    }
+    // SAFETY: `[ret_addr - 5, ret_addr)` lies inside the executable buffer of
+    // the compiled method that `lookup_jit_code_range(ret_addr)` resolved, at
+    // or above its entry point, and that buffer is kept alive by the live frame
+    // whose return address this is. Code pages are readable.
+    let opcode = unsafe { ((ret_addr - 5) as *const u8).read() };
+    if opcode != 0xE8 {
+        return false;
+    }
+    let rel = unsafe { ((ret_addr - 4) as *const i32).read_unaligned() };
+    // `E8 rel32` targets `next_instruction + rel32`, and `ret_addr` IS the next
+    // instruction.
+    ret_addr.wrapping_add(rel as usize) == entry_ptr
 }
 
 fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> bool {
@@ -1387,7 +1482,7 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
                 unverified = true;
                 continue;
             }
-            if chain_entry_rbp_is_foreign(rbp, entry_sp, scanner_sp) {
+            if chain_entry_rbp_is_foreign(rbp, entry_sp, scanner_sp, info.compiled_method) {
                 // `info.compiled_method` does NOT describe the frame now
                 // standing at `exact_rbp` -- an unguarded JIT->JIT call, or the
                 // inline MIC/PIC cascade, published its own (deeper) base
@@ -1521,6 +1616,21 @@ fn band_verify_disabled() -> bool {
     *OFF.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY").is_some())
 }
 
+/// `CRATONVM_MOVING_YOUNG_NO_JIT` — re-arm the process-wide JIT relocation
+/// boundary: refuse every moving young collection while ANY compiled code
+/// exists, without consulting the per-frame coverage proof.
+///
+/// This was the hard-coded behaviour between `86e69e848` (2026-07-29) and the
+/// default-on closeout; see [`refresh_moving_young_coverage_for_current_thread`]
+/// for why the per-cycle proof is the authority instead. Kept as a knob because
+/// it is the one setting that makes "is this a moving-young defect?" a
+/// single-variable experiment, and because it is the correct emergency lever if
+/// a workload ever exposes an obligation the verifier does not model.
+fn moving_young_no_jit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_JIT").is_some())
+}
+
 /// Scan one compiled frame's band `[rbp - frame_size, rbp)` for a word that
 /// lands in a published young semispace and is absent from `published`.
 ///
@@ -1634,19 +1744,33 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
         return true;
     }
 
-    // The generated JIT frame model is not yet a relocation contract.  The
-    // verifier below has now observed all of the ways that assumption fails in
-    // production Hibernate traffic: unregistered entries, unavailable exact
-    // frame bases, and live oops outside the published map.  Detecting one of
-    // those after a cycle has started is necessarily too late to make a copied
-    // from-space safe.  Keep JIT execution fully enabled, but require the
-    // non-moving young sweep whenever compiled artifacts exist until every JIT
-    // frame home is mechanically enumerable and rewritable.
+    // Process-wide JIT relocation boundary (added 2026-07-29, `86e69e848`).
     //
-    // Interpreter-only executions retain copying young collections.  This is a
-    // VM-wide GC/JIT safety boundary, deliberately not an ANTLR/Hibernate
-    // exception or a JIT eligibility ban.
-    if cratonvm_jit::jit_code_range_count() != 0 {
+    // When armed, the mere EXISTENCE of compiled code — not a specific unproven
+    // frame — forces every young collection onto the non-moving sweep. It was
+    // added after a Hibernate corruption chase in which the verifier below
+    // observed unregistered entries, unavailable exact frame bases, and live
+    // oops outside the published map, on the argument that discovering a gap
+    // mid-scan is too late to repair that cycle.
+    //
+    // That argument does not describe how this code is wired. This function is
+    // the collection's PRE-cycle proof: `roots.rs::collect_roots` calls it (via
+    // `refresh_moving_young_coverage_for_collection`) *before* the collector
+    // picks a young path, and `gen_heap::collect_garbage_inner` diverts on the
+    // published verdict. A gap found here has always been found in time. What
+    // the blanket actually bought was insurance against the verifier itself
+    // missing an obligation — at the price of making moving-young unreachable
+    // in every process that ever compiles a method, i.e. every real workload:
+    // measured on `BinTreesClassic 18` at `-Xmx512m`, 66 of 66 young cycles
+    // fell back, all of them attributed to this branch and none to a real
+    // obligation.
+    //
+    // So it is a policy knob rather than a hard-coded law, and the per-cycle
+    // proof is the default authority. `CRATONVM_MOVING_YOUNG_NO_JIT=1` restores
+    // the blanket for a bisect or an emergency — the same fail-closed
+    // direction, no longer the only available setting.
+    if moving_young_no_jit() && cratonvm_jit::jit_code_range_count() != 0 {
+
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
             cratonvm_gc::gc_quiescence::incomplete_reason::JIT_RELOCATION_UNSUPPORTED,
         );
@@ -1713,7 +1837,12 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 complete = false;
                 continue;
             }
-            if chain_entry_rbp_is_foreign(exact_rbp, entry.entry_sp, scanner_sp) {
+            if chain_entry_rbp_is_foreign(
+                exact_rbp,
+                entry.entry_sp,
+                scanner_sp,
+                info.compiled_method,
+            ) {
                 // The recorded RBP is a deeper frame reached by a direct
                 // JIT->JIT call that pushed no guard, so `cm` does not describe
                 // it and nothing here can. Relocating would strand that frame's
@@ -2423,6 +2552,13 @@ pub fn set_top_frame_base(rbp: usize) {
 
 /// Sync `TOP_RBP` to the current top entry's saved `exact_rbp` (or 0 when the
 /// chain is empty). Called after pop/retain so the mirror tracks the new top.
+///
+/// **Only call this when the top entry actually CHANGED.** The mirror is the
+/// live value (the prologue's inline `mov gs:[disp], rbp` writes it and nothing
+/// writes `exact_rbp`); the field is only a snapshot taken when an entry stops
+/// being top. Reloading the field over an unchanged top therefore replaces a
+/// live RBP with a stale one — `0` for an entry that has been top since it was
+/// pushed, which is the common case. See `prune_returned_jit_entries`.
 #[inline]
 fn reload_top_rbp_cache(v: &[JitFrameChainEntry]) {
     let val = v
@@ -2507,7 +2643,12 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
                 // refuses to move in that case, so this is belt-and-braces —
                 // but remapping a frame with another method's oop map is the
                 // exact corruption being fixed, so never do it.
-                && !chain_entry_rbp_is_foreign(info.exact_rbp, entry_sp, scanner_sp)
+                && !chain_entry_rbp_is_foreign(
+                    info.exact_rbp,
+                    entry_sp,
+                    scanner_sp,
+                    info.compiled_method,
+                )
             {
                 // SAFETY: `info.compiled_method` came from the live chain entry
                 // and is kept alive by the JIT cache while the frame is active.
@@ -2839,7 +2980,12 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
         // so the true caller is still scanned precisely, and
         // `scan_compiled_frame_bands` covers the unidentified frame
         // conservatively.
-        if !chain_entry_rbp_is_foreign(info.exact_rbp, info.frame_base, scanner_sp) {
+        if !chain_entry_rbp_is_foreign(
+            info.exact_rbp,
+            info.frame_base,
+            scanner_sp,
+            info.compiled_method,
+        ) {
             scan_active_oop_map_at_rbp(info.exact_rbp, cm, heap, out);
         }
 
@@ -2920,7 +3066,8 @@ fn scan_compiled_frame_bands(
     // `[scanner_sp, rbp)` covers all of it and nothing above it. Parent frames
     // are identified through the child frame's return address either way.
     let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
-    let mut innermost_is_foreign = chain_entry_rbp_is_foreign(rbp, entry_sp, scanner_sp);
+    let mut innermost_is_foreign =
+        chain_entry_rbp_is_foreign(rbp, entry_sp, scanner_sp, info.compiled_method);
     let mut frames = 0usize;
     while frames < 4096 {
         frames += 1;
@@ -3281,10 +3428,10 @@ mod tests {
 
     /// The codegen gate is a veto the config cannot override.
     ///
-    /// `jit/src/x64.rs` still parses `CRATONVM_MOVING_YOUNG` itself rather than
-    /// reading `flags().gc.moving_young`, so a config-side default flip alone
-    /// must NOT be able to switch the collector on. Guards the exact mistake
-    /// that would turn a one-line flip into heap corruption.
+    /// The codegen decision remains authoritative: a config/codegen skew must
+    /// NOT be able to switch the collector on behind frames that emitted no
+    /// rewritable roots. Guards the exact mistake that would turn a default
+    /// change into heap corruption.
     #[test]
     fn codegen_gate_vetoes_moving_young_regardless_of_config() {
         if !cratonvm_jit::x64::moving_young_enabled() {
@@ -3296,10 +3443,9 @@ mod tests {
         }
     }
 
-    /// With moving-young off (the state this gate is in until
-    /// `flags::DEFAULT_MOVING_YOUNG` flips and the codegen reads it), the
-    /// collection-authoritative refresh is a no-op that reports "proven" — the
-    /// coverage machinery must not impose cost or verdicts on the legacy path.
+    /// With moving-young explicitly opted out, the collection-authoritative
+    /// refresh is a no-op that reports "proven" — the coverage machinery must
+    /// not impose cost or verdicts on the compatibility path.
     #[test]
     fn collection_coverage_refresh_is_inert_when_moving_young_is_off() {
         if moving_young_enabled() {
@@ -3307,6 +3453,61 @@ mod tests {
         }
         assert!(refresh_moving_young_coverage_for_collection());
         assert!(refresh_moving_young_coverage_for_current_thread());
+    }
+
+    /// The innermost-RBP mirror is the LIVE value; `PreciseFrameInfo::exact_rbp`
+    /// is only a snapshot taken when an entry stops being top. A prune that
+    /// removes nothing must therefore leave the mirror alone.
+    ///
+    /// This is the regression test for the defect that kept the moving young
+    /// generation switched off for every JIT process: `prune_returned_jit_entries`
+    /// reloaded the mirror from that snapshot unconditionally, so a no-op prune
+    /// replaced the prologue's live RBP with the `0` the top entry has carried
+    /// since `enter_with_compiled`. `refresh_moving_young_coverage_for_current_thread`
+    /// prunes and *then* reads the mirror, so it destroyed its own input and
+    /// reported MISSING_EXACT_RBP on 100% of cycles.
+    #[test]
+    fn a_no_op_prune_does_not_clobber_the_live_rbp_mirror() {
+        let cm = dummy_compiled_method();
+        // Deep enough that the prune's `entry_sp >= scanner_sp` test keeps it.
+        let entry_sp = current_stack_pointer() + 4096;
+        push_entry_full(JitFrameChainEntry {
+            entry_sp,
+            precise: Some(PreciseFrameInfo {
+                compiled_method: &cm as *const cratonvm_jit::CompiledMethod,
+                frame_base: entry_sp,
+                entry_ptr: cm.entry_ptr(),
+                // Exactly what `enter_with_compiled` stores: the prologue
+                // publishes the real RBP into the mirror, never into here.
+                exact_rbp: 0,
+            }),
+        });
+
+        // Stand in for the compiled prologue's `mov gs:[disp], rbp`.
+        let live_rbp = entry_sp - 512;
+        top_rbp_set(live_rbp);
+
+        let pruned = prune_returned_jit_entries(current_stack_pointer());
+        assert_eq!(pruned, 0, "the entry is above the scanner SP, so nothing returned");
+        assert_eq!(
+            top_rbp_get(),
+            live_rbp,
+            "a prune that removed nothing must not reload the mirror from the \
+             top entry's stale snapshot — that erases the only record of the \
+             innermost frame base and fails the moving-young coverage proof",
+        );
+
+        // And the proof's own read path sees it.
+        JIT_ENTRY_CHAIN.with(|c| {
+            let mut v = c.borrow_mut();
+            flush_top_rbp_cache_to_chain(v.as_mut_slice());
+            assert_eq!(
+                v.last().and_then(|e| e.precise.as_ref()).map(|i| i.exact_rbp),
+                Some(live_rbp),
+            );
+        });
+
+        let _ = pop_jit_entry();
     }
 
     /// `other_thread_in_jit()` is the cross-thread proof obligation's trigger.
@@ -3531,20 +3732,51 @@ mod tests {
         cm: cratonvm_jit::CompiledMethod,
     }
 
+    /// Build a frame + `JvmThread` + `ShadowStack` triple satisfying the EXACT
+    /// invariant `shadow_window_from_frame` checks.
+    ///
+    /// That matters more than it looks. This fixture used to allocate a buffer
+    /// only `values.len()` slots wide and alias `end` to `top`, which was fine
+    /// while the resolver merely required non-null 8-aligned words. It is not
+    /// fine since the SIGSEGV hardening (a `base` of `0x5555_0000_0004` walked
+    /// as a shadow window): the resolver now demands the real
+    /// `ShadowStack::ensure_allocated` shape — `end - base` EXACTLY
+    /// `DEFAULT_SHADOW_SLOTS * 8`, `top` inside `[base, end]`. A three-slot
+    /// buffer fails that, so every test built on this fixture was resolving
+    /// `None`:
+    ///
+    ///   * `shadow_window_is_recovered_from_a_live_compiled_frame` failed
+    ///     outright (`window must resolve`) — that is how this was found;
+    ///   * `nulled_thread_slot_publishes_nothing_rather_than_proving_everything`,
+    ///     `shadow_window_is_unresolvable_without_the_layout_offsets`,
+    ///     `shadow_window_rejects_an_unaligned_base` and
+    ///     `shadow_window_rejects_a_window_wider_than_the_backing_buffer`
+    ///     all still PASSED — vacuously. Each asserts `is_none()`, and the
+    ///     fixture was already `None` before the mutation each one applies.
+    ///     Four tests were asserting nothing.
+    ///
+    /// The buffer is now full-size and `end` is derived rather than aliased;
+    /// `values` occupy the published prefix `[base, top)`.
     fn fake_shadow_thread(values: &[usize], thread_is_null: bool) -> FakeShadowThread {
         const SHADOW_OFF_IN_THREAD: usize = 24;
         const THREAD_SLOT_OFF: usize = 8;
+        use cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS;
 
-        let mut slots: Box<[usize]> = vec![0usize; values.len().max(1)].into_boxed_slice();
+        assert!(
+            values.len() <= DEFAULT_SHADOW_SLOTS,
+            "fixture cannot publish more slots than the real buffer holds"
+        );
+        let mut slots: Box<[usize]> = vec![0usize; DEFAULT_SHADOW_SLOTS].into_boxed_slice();
         slots[..values.len()].copy_from_slice(values);
         let base = slots.as_ptr() as usize;
         let top = base + values.len() * 8;
+        let end = base + DEFAULT_SHADOW_SLOTS * 8;
 
         // thread[0..] with a ShadowStack {top, end, base} at byte offset 24.
         let mut thread: Box<[usize]> = vec![0usize; 8].into_boxed_slice();
         let ss = SHADOW_OFF_IN_THREAD / 8;
         thread[ss] = top; // TOP_OFFSET  = 0
-        thread[ss + 1] = top; // END_OFFSET  = 8
+        thread[ss + 1] = end; // END_OFFSET  = 8
         thread[ss + 2] = base; // BASE_OFFSET = 16
 
         // frame[..] with the cached thread pointer at [rbp - 8].
@@ -3660,6 +3892,70 @@ mod tests {
         assert!(
             shadow_window_from_frame(f.rbp, &f.cm).is_none(),
             "a window wider than the buffer is not a shadow window",
+        );
+    }
+
+    /// The direct self-call decoder is what distinguishes "a recursive
+    /// activation of the method this entry names" (describable, and the shape
+    /// every recursive Java workload produces) from "some other method's frame"
+    /// (not describable — stay foreign, take the non-moving sweep).
+    ///
+    /// It reads machine code, so it is pinned against hand-built bytes rather
+    /// than against whichever direct-call features are gated off today.
+    #[test]
+    fn direct_self_call_return_is_recognised_only_for_a_real_e8_to_the_entry() {
+        // 16 bytes of "method body": a 5-byte `E8 rel32` at offset 6 that
+        // targets offset 0, so the return address is entry + 11.
+        let mut body = [0x90u8; 16];
+        let entry = body.as_ptr() as usize;
+        let call_at = 6usize;
+        let ret = entry + call_at + 5;
+        // rel32 = target - next_instruction = entry - ret
+        let rel = (entry as isize - ret as isize) as i32;
+        body[call_at] = 0xE8;
+        body[call_at + 1..call_at + 5].copy_from_slice(&rel.to_le_bytes());
+
+        assert!(
+            returned_from_direct_self_call(ret, entry),
+            "E8 whose displacement resolves to the method entry IS a self-call",
+        );
+        assert!(
+            !returned_from_direct_self_call(ret, entry + 8),
+            "the same instruction targeting a different entry is not a self-call",
+        );
+        // An indirect call (`FF /2`, e.g. `call rax`) occupies fewer bytes and
+        // never encodes its target, so the byte five back is body filler.
+        assert!(
+            !returned_from_direct_self_call(entry + 3, entry),
+            "a return address whose preceding bytes are not E8 must stay foreign",
+        );
+        assert!(
+            !returned_from_direct_self_call(entry + 2, entry),
+            "a return address too close to the entry to hold a CALL is not one",
+        );
+        assert!(
+            !returned_from_direct_self_call(ret, 0),
+            "no entry pointer means nothing can be proven",
+        );
+    }
+
+    /// The third arm of the same invariant, and the one that silently voided
+    /// this module's other shadow tests for a while: `end - base` must be
+    /// EXACTLY the fixed buffer size. A `[base, end)` pair that is merely
+    /// *plausible* — aligned, ordered, with `top` inside it — is still not a
+    /// `ShadowStack` if it is the wrong width, and reading three words out of
+    /// an arbitrary stack slot is exactly the SIGSEGV this check exists to
+    /// prevent.
+    #[test]
+    fn shadow_window_rejects_a_buffer_of_the_wrong_size() {
+        let mut f = fake_shadow_thread(&[0x1111, 0x2222], false);
+        let ss = 24 / 8; // SHADOW_OFF_IN_THREAD / 8, END_OFFSET = 8
+        // Shrink `end` to just past `top`: ordered, aligned, `top` in range —
+        // and the exact shape the old fixture built by accident.
+        f._thread[ss + 1] = f._thread[ss];
+        assert!(
+            shadow_window_from_frame(f.rbp, &f.cm).is_none(),
+            "end - base must be exactly DEFAULT_SHADOW_SLOTS * 8",
         );
     }
 

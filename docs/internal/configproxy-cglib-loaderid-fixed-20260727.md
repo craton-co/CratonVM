@@ -338,6 +338,9 @@ touch (`git diff HEAD origin/dev -- vm/src/jit/skip_list.rs` is empty):
   the first re-verification: a JIT-ban removal landed on `dev` while its test
   still asserts the old policy (here `$ProxyN` classes are expected to be
   JIT-eligible but still return `Some(JdkDynamicProxyTrampoline)`).
+  **Resolved 2026-07-30** — this read was right, and the direction is that the
+  NEWER ban (SPR-PROXY.1) stands; the test is inverted to pin it. See
+  [`dev-stale-jit-tests-fixed-20260730.md`](dev-stale-jit-tests-fixed-20260730.md).
 
 **Unrelated drive-by, needed to run any of the above:** a `dev` commit added
 `Class::record_object_methods` without updating six **test-only**

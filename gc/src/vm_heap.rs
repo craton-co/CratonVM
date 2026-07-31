@@ -1282,7 +1282,7 @@ impl VmHeap {
     /// holds a live JIT frame — the steady state at a 500-invocation JIT
     /// threshold; compaction's correctness blocker closed 2026-07-26
     /// (`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
-    /// but moving-young remains opt-in on throughput grounds. Under a
+    /// and moving-young is now the default. Under a
     /// non-moving, fragmenting heap "unused bytes" and "bytes an
     /// allocation can actually obtain" diverge without bound: a heap can be 60%
     /// unused and still fail a modest allocation because no single free run is
@@ -1812,6 +1812,19 @@ impl VmHeap {
     pub fn print_gc_summary(&self) {
         if let VmHeap::G1(g1) = self {
             g1.print_gc_summary();
+        }
+        // Collection COUNTS, unconditionally. Without these the summary is not
+        // comparable across configurations: the moving-young line below only
+        // prints when moving-young is requested, so a `CRATONVM_NO_MOVING_YOUNG`
+        // run printed nothing at all and "did this config collect more?" — the
+        // first question to ask about an allocation-heavy regression — could not
+        // be answered from a log. Cheap: two relaxed loads at shutdown.
+        if let VmHeap::Generational(h) = self {
+            let s = h.stats().snapshot();
+            eprintln!(
+                "[GC] generational: minor={} major={}",
+                s.minor_gc_count, s.major_gc_count,
+            );
         }
         let fallbacks = crate::gc_quiescence::moving_young_coverage_fallback_count();
         if crate::gc_quiescence::moving_young_enabled() || fallbacks > 0 {

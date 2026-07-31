@@ -805,7 +805,7 @@ struct Compiler {
     /// that survive the call un-spilled, PLUS any oop the JIT's per-slot oop
     /// tracking fails to classify. Fully conservative — the scanner re-validates
     /// each qword via `heap.is_object_address`, so non-oop register values are
-    /// ignored. No post-call reload is needed under the default non-moving young
+    /// ignored. No post-call reload is needed under the opt-out non-moving young
     /// sweep (the object is never relocated, so the register stays valid).
     /// Gated `CRATONVM_JIT_SAFEPOINT_REG_SPILL`; off → byte-identical default
     /// path (no slots reserved, no stores).
@@ -2982,7 +2982,24 @@ impl Compiler {
         if self.failed {
             return;
         }
-        if moving_young_enabled() {
+        // Bisect lever, default = current behaviour. `CRATONVM_JIT_MY_SCRATCH_FLUSH=0`
+        // drops this flush when relocation is vetoed anyway.
+        //
+        // Why it is a candidate: this runs at EVERY GC-capable safepoint under
+        // `moving_young`, and it is one of the few remaining costs that
+        // `CRATONVM_NO_MOVING_YOUNG=1` removes but the relocation-scoped
+        // admission gates do not. The `type.temporal` Hibernate classes still
+        // exceed the 300 s cap on default flags while passing under that
+        // variable, so a residual of this shape is unaccounted for. Shadow
+        // push/reload has already been eliminated as the cause (measured
+        // no-change; see `shadow_stack_maps_enabled`), which leaves this and
+        // the self-call spill-elision proof.
+        //
+        // The non-moving path has never called this and is the historically
+        // correct configuration, so `0` returns to known-good codegen rather
+        // than inventing a new one. Kept default-ON until measured on a quiet
+        // host — the box had eight other sessions' VMs running when this landed.
+        if moving_young_enabled() && scratch_flush_at_safepoint_enabled() {
             self.flush_scratch_registers();
         }
         // Capture the live-frame bound for the map this safepoint will record.
@@ -3075,11 +3092,13 @@ impl Compiler {
         if self.failed {
             return;
         }
-        if self.shadow_enabled || moving_young_enabled() {
+        // Must mirror `can_elide_self_call_register_spill` exactly — see the
+        // note there. Both read `self_call_moving_proof_enabled()`.
+        if self.shadow_enabled || self_call_moving_proof_enabled() {
             let coverage_complete = self.moving_young_safepoint_coverage_complete();
             let live_oop_home_count = self.collect_live_oop_homes().len();
             if !moving_oop_free_self_call_is_publishable(
-                moving_young_enabled(),
+                self_call_moving_proof_enabled(),
                 coverage_complete,
                 live_oop_home_count,
             ) {
@@ -3277,9 +3296,13 @@ impl Compiler {
             return false;
         }
 
-        if self.shadow_enabled || moving_young_enabled() {
+        // `self_call_moving_proof_enabled()` rather than `moving_young_enabled()`:
+        // the paired emitter `emit_safepoint_metadata_only` reads the SAME
+        // predicate and fails the compile closed if the two ever disagree, so
+        // they must move together. Default-identical to the old expression.
+        if self.shadow_enabled || self_call_moving_proof_enabled() {
             return moving_oop_free_self_call_is_publishable(
-                moving_young_enabled(),
+                self_call_moving_proof_enabled(),
                 self.moving_young_safepoint_coverage_complete(),
                 self.collect_live_oop_homes().len(),
             );
@@ -21582,6 +21605,46 @@ impl Compiler {
                     }
                     self.emit_osr_exit_map_at_reason(pc, crate::deopt::DeoptReason::UnreachedCode);
 
+                    // This trap is UNCONDITIONAL: every execution of this bci
+                    // deopts. So if the snapshot just built cannot be
+                    // materialised back into an interpreter frame, the method
+                    // is guaranteed to fail on its first compiled call --
+                    // `build_deopt_frame_inner` returns `None` and the resume
+                    // sink refuses with `precise deoptimization unavailable
+                    // ... refusing side-effecting replay`, a hard
+                    // `InternalError` rather than a slow path.
+                    //
+                    // The usual producer of an unmaterialisable slot here is
+                    // the coarse `wide_fp` gate in the snapshot's operand-stack
+                    // loop: in a method that touches any long/float/double, a
+                    // non-oop stack entry that is NOT one of this call site own
+                    // arguments has no per-entry width source and is recorded
+                    // `Unsupported`. javac `ClassReader.readInnerClasses` is
+                    // the canonical shape -- `optPoolEntry(int, IntFunction,
+                    // Object)` leaves an `int` underneath the lambda argument,
+                    // so the indy-arg tags type the top entry but not that one.
+                    //
+                    // Compiling such a method is strictly worse than
+                    // interpreting it, so bail the whole compile. This is what
+                    // the per-method SPRING-TESTCOMPILER / HIB-STOREDPROC-JIT
+                    // bans did by hand for the javac family; deciding it from
+                    // the snapshot itself covers every method with this shape
+                    // rather than the ones somebody happened to hit.
+                    let unresumable_trap = self
+                        .deopt_points
+                        .last()
+                        .is_some_and(|p| {
+                            !crate::deopt::frame_state_is_resumable(&p.frame_state)
+                        });
+                    if unresumable_trap {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                            eprintln!(
+                                "[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}"
+                            );
+                        }
+                        self.buf.mark_overflowed();
+                    }
+
                     let patch = self.emit_jmp_rel32_patch();
                     self.deopt_stubs.push((patch, pc, 8)); // 8 = DEOPT_REASON_UNREACHED_CODE
 
@@ -36328,11 +36391,21 @@ mod tests {
         // whenever the young generation can relocate. Pin the policy so the
         // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
         super::set_moving_young_override(Some(false));
-        // Not OnceLock-cached (see `direct_jit_callee_calls_enabled`), so
-        // setting it here is observed immediately; no other jit test asserts
-        // on invoke-info/PIC/MIC-slot counts, so this is safe under parallel
-        // `cargo test`.
-        std::env::set_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS", "1");
+        // `CRATONVM_JIT_DIRECT_CALLEE_CALLS` is a *declared* flag, served from
+        // the process-wide snapshot that latches on the first read of any flag
+        // (`cratonvm_types::flags`). `set_var` here therefore did nothing at
+        // all once any earlier test in this binary had touched a flag — the
+        // assertions below were riding on the flag's default (enabled) rather
+        // than on the value this test asked for, and would have silently
+        // stopped testing the direct-callee path the day that default flipped.
+        // The override pins it for real, on this thread only, so it cannot
+        // perturb a parallel test.
+        let _direct_callee_calls = cratonvm_types::flags::override_thread(
+            cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+                "CRATONVM_JIT_DIRECT_CALLEE_CALLS",
+                Some("1"),
+            )]),
+        );
         use crate::JitInvokeInfo;
         // Bytecode: a counted loop with a single invokevirtual.
         //
@@ -36457,7 +36530,6 @@ mod tests {
         // vm_ptr+1 ≤ ARG_REGS.len()). So 3 fresh MIC slots should be
         // minted (one per copy).
         let method = compiled.expect("invokevirtual-in-loop must compile");
-        std::env::remove_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS");
         // The compiled method does NOT carry the caller-supplied
         // PIC slot in its _jit_pic_slots (that vector is owned by
         // the caller in the production path; in this test the box
@@ -36818,16 +36890,62 @@ mod flag_and_header_contracts {
         );
     }
 
+    /// The relocation-safety gates must ask "can a relocating collection see a
+    /// compiled frame?", which is strictly narrower than "is moving-young on?".
+    /// Equating the two is what switched the optimizing tier off by default.
+    #[test]
+    fn relocates_compiled_frames_implies_moving_young_but_not_conversely() {
+        assert!(
+            !moving_young_relocates_compiled_frames() || moving_young_enabled(),
+            "relocation of compiled frames must imply the moving young gen is on"
+        );
+        assert_eq!(
+            moving_young_relocates_compiled_frames(),
+            moving_young_enabled() && cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT,
+            "the predicate must be exactly `moving_young && JIT_PUBLISHES_RELOCATION_CONTRACT` — \
+             the same constant the runtime veto in conservative_roots reads, or the veto and \
+             these gates can drift apart"
+        );
+    }
+
+    /// While the JIT publishes no relocation contract, the runtime vetoes
+    /// moving-young for the whole process as soon as any compiled code exists.
+    /// The optimizing tier must therefore NOT be disabled by the moving-young
+    /// default — that trade bought nothing. Pins the regression that
+    /// `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+    /// describes.
+    #[test]
+    fn optimizing_tier_is_not_disabled_while_relocation_is_vetoed() {
+        if cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT {
+            // Contract landed: the gates are supposed to be armed again.
+            return;
+        }
+        assert!(
+            !moving_young_relocates_compiled_frames(),
+            "with no published relocation contract, no compiled frame can be live during a \
+             relocating young collection, so the IR/direct-call gates must be open regardless \
+             of the moving-young default"
+        );
+    }
+
     /// `CRATONVM_SHADOW_STACK` is likewise read by `jit`, `gc` and `vm`; the
     /// emission side and the root-scan side must agree or the collector walks
     /// a shadow stack the codegen never pushed to. Moving-young implies it.
+    ///
+    /// Deliberately still the BARE flag, not the relocation-scoped predicate:
+    /// scoping it was tried, measured as no-change, and reverted rather than
+    /// move one side of an exact agreement for nothing. See
+    /// `shadow_stack_maps_enabled`.
     #[test]
     fn shadow_stack_maps_enabled_is_central_flag_or_moving_young() {
         assert_eq!(
             shadow_stack_maps_enabled(),
-            cratonvm_types::flags().jit.shadow_stack || moving_young_enabled(),
-            "shadow-stack codegen must be gated on the shared flag (plus the moving-young \
-             implication), not on a crate-private getenv"
+            cratonvm_types::flags().jit.shadow_stack
+                || (moving_young_enabled() && shadow_emission_moving_implication_enabled()),
+            "shadow-stack codegen must be gated on the shared flag plus the moving-young \
+             implication (itself bisectable via CRATONVM_JIT_MY_SHADOW_EMISSION), not on a \
+             crate-private getenv. `vm::jit::conservative_roots::shadow_stack_enabled` must \
+             spell the SAME expression — they are two halves of one agreement"
         );
     }
 

@@ -76,10 +76,10 @@ const PROMOTION_AGE: u8 = 3;
 /// GC threshold: trigger minor GC when young from-space usage exceeds this %.
 const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 
-/// The default non-moving young collector does not need Cheney-copy headroom:
+/// The opt-out non-moving young collector does not need Cheney-copy headroom:
 /// it reclaims dead spans in place and falls back to allocation-failure GC for
 /// fragmentation.  Let transient allocation fill most of the active semi-space
-/// before paying the O(heap) mark/sweep cost.  The moving-young opt-in retains
+/// before paying the O(heap) mark/sweep cost.  The default moving path retains
 /// the conservative 50% trigger above so the to-space can hold all survivors.
 /// Keeping a 10% reserve also leaves room for TLAB refill granularity and avoids
 /// turning every near-capacity refill into an allocation-failure collection.
@@ -96,6 +96,25 @@ const NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT: usize = 90;
 #[inline]
 fn sweep_anchor_stride() -> usize {
     crate::gc_flags().gc_sweep_anchor_stride
+}
+
+/// DBG (`CRATONVM_DBG_YOUNG_TRIGGER=1`): print every 4096th young-GC trigger
+/// evaluation so a wedged run can be told apart from a genuinely full heap —
+/// `live` is `cursor - free_list`, the metric the trigger actually uses.
+fn young_trigger_debug(used: usize, free_list: usize, live: usize, threshold: usize, non_moving: bool) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_YOUNG_TRIGGER").is_some()) {
+        return;
+    }
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n % 4096 != 0 {
+        return;
+    }
+    eprintln!(
+        "[young-trigger] n={n} cursor={}MB free_list={}MB live={}MB threshold={}MB non_moving={non_moving}",
+        used / 1048576, free_list / 1048576, live / 1048576, threshold / 1048576,
+    );
 }
 
 #[inline]
@@ -123,6 +142,34 @@ const fn young_gc_trigger_bytes(
 /// frame, which is the only case the feature exists for. A live JIT frame now
 /// forces the non-moving sweep exactly when moving-young is not in effect;
 /// when it IS in effect, the per-cycle coverage proof decides, not a flag.
+///
+/// # Why `moving_young_requested` is not the whole answer
+///
+/// Requesting moving-young does not make the next cycle moving. While
+/// [`cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT`] is `false`,
+/// `conservative_roots::refresh_moving_young_coverage_for_current_thread`
+/// vetoes moving-young for the whole process as soon as any compiled code
+/// exists, so a cycle taken with a live JIT frame — which is exactly what the
+/// `jit_active || unregistered || jit_allocation_frame` term above requires —
+/// is **guaranteed** to divert to the non-moving sweep. Saying otherwise costs
+/// real throughput and buys nothing:
+///
+/// the answer here picks the young-GC *trigger*. `false` selects the Cheney
+/// threshold, which must reserve the unused semi-space as worst-case survivor
+/// headroom; `true` selects `NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT` (90%),
+/// because an in-place sweep needs no headroom. So on a default JIT run the
+/// heap was collecting at the copying-collector's early threshold and then
+/// diverting every one of those collections to the in-place sweep — roughly
+/// double the collections, each a whole-heap sweep, for a copy that never
+/// happened. Allocation-heavy workloads feel it directly: it is what kept
+/// `type.temporal` over its cap (>1500 s vs 777 s under
+/// `CRATONVM_NO_MOVING_YOUNG=1`) after four codegen suspects had been
+/// eliminated by bisection.
+///
+/// Fail-safe direction: this must only report `true` when the sweep is
+/// *certain*, since a moving cycle taken against the 90% trigger could exhaust
+/// its copy reserve. The veto provides that certainty, and both halves read the
+/// same constant, so they cannot disagree.
 #[inline]
 const fn next_young_gc_is_guaranteed_non_moving(
     jit_active: bool,
@@ -133,7 +180,8 @@ const fn next_young_gc_is_guaranteed_non_moving(
 ) -> bool {
     !force_moving
         && (jit_active || unregistered_jit_frame || jit_allocation_frame)
-        && !moving_young_requested
+        && (!moving_young_requested
+            || !cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT)
 }
 
 /// "Humongous" object threshold as a percentage of the young semi-space
@@ -751,6 +799,24 @@ pub struct GenerationalHeap {
     /// [`alloc_young_initialized`] hard-aborts a process whose heap is
     /// almost entirely garbage.
     young_spill_pressure: std::sync::atomic::AtomicBool,
+    /// Anti-livelock state for the young-GC trigger: the `minor_gc_count` the
+    /// trigger last sampled a post-collection live figure at, and the live
+    /// floor derived from it (`0` = no floor, use the ordinary threshold).
+    ///
+    /// The young collector that runs while compiled code exists is the
+    /// NON-MOVING sweep, which reclaims dead spans in place and can only
+    /// promote selectively — so it cannot shrink a live young set that has
+    /// grown past the trigger. Without a floor, `needs_gc` then answers true
+    /// on essentially every allocation forever: the VM sweeps continuously,
+    /// each sweep frees a sliver, and the mutator stops making progress.
+    /// Measured on `RequestMappingMessageConversionIntegrationTests`
+    /// (spring-webflux): wedged at test 151/160 with live=511 MB against a
+    /// 512 MB trigger, ~0 forward progress over 8+ minutes at the default
+    /// 4 GB heap, while the same run completes in 9m26s at 6 GB (where the
+    /// bigger semi-space keeps live under the trigger). See
+    /// [`Self::needs_gc_with_jit_allocation_frame`].
+    young_trigger_seen_gc_count: std::sync::atomic::AtomicU64,
+    young_trigger_floor: std::sync::atomic::AtomicUsize,
     /// BUG-03 — absolute `(cursor, end)` reserved-tail regions of TLABs
     /// belonging to peer threads that the cross-thread STW JIT root scan
     /// forcibly stopped while they were executing JIT code. Such a peer never
@@ -849,6 +915,8 @@ impl GenerationalHeap {
             stats: HeapStats::default(),
             force_promote_all: std::sync::atomic::AtomicBool::new(false),
             young_spill_pressure: std::sync::atomic::AtomicBool::new(false),
+            young_trigger_seen_gc_count: std::sync::atomic::AtomicU64::new(0),
+            young_trigger_floor: std::sync::atomic::AtomicUsize::new(0),
             jit_tlab_skip_regions: Mutex::new(Vec::new()),
         };
         // Publish the initial region bounds so the lock-free
@@ -3469,7 +3537,7 @@ impl GenerationalHeap {
         // remains the hard backstop against fragmentation under-collection.
         let live = used.saturating_sub(from.free_list_bytes());
         // Cheney copying needs the unused half as worst-case survivor
-        // headroom. The default non-moving collector instead sweeps in place,
+        // headroom. The opt-out non-moving collector instead sweeps in place,
         // so it can safely use the active semi-space almost to capacity.
         // Only select the larger threshold when the next normal young cycle is
         // guaranteed to take that path. In particular, `--nojit` collections
@@ -3486,7 +3554,35 @@ impl GenerationalHeap {
             *self.young_gc_threshold.lock(),
             non_moving_young,
         );
-        live >= threshold
+        young_trigger_debug(used, from.free_list_bytes(), live, threshold, non_moving_young);
+        // Anti-livelock floor. Sample `live` once per completed collection (the
+        // first `needs_gc` after `minor_gc_count` moves): if a collection just
+        // ran and left the live set AT OR ABOVE the trigger, collecting again
+        // immediately cannot help — the non-moving sweep has no way to move that
+        // data out of young — so require a further 1/16 of capacity of genuine
+        // growth first. The floor is capped at the non-moving trigger
+        // (`NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT`), so collection is deferred,
+        // never abandoned, and allocation failure remains the hard backstop
+        // (`alloc_object` spills to old gen, then GCs and retries).
+        let gc_count = self.stats.minor_gc_count.load(Ordering::Relaxed);
+        // Plain load/store rather than a `swap`: this runs on the allocation
+        // trigger path, and an unconditional read-modify-write on a shared
+        // cacheline is exactly what that path should not pay. Two threads
+        // racing here both compute the same floor from the same arena, so the
+        // lost update is harmless.
+        if self.young_trigger_seen_gc_count.load(Ordering::Relaxed) != gc_count {
+            self.young_trigger_seen_gc_count
+                .store(gc_count, Ordering::Relaxed);
+            let capacity = from.capacity();
+            let floor = if live >= threshold {
+                live.saturating_add(capacity / 16)
+                    .min(capacity * NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT / 100)
+            } else {
+                0
+            };
+            self.young_trigger_floor.store(floor, Ordering::Relaxed);
+        }
+        live >= threshold.max(self.young_trigger_floor.load(Ordering::Relaxed))
     }
 
     /// Total bytes currently allocated across young and old generations.
@@ -11888,14 +11984,40 @@ mod tests {
         // arch-2026-07-26: moving-young alone is now sufficient. There is no
         // second `CRATONVM_ALLOW_MOVING_YOUNG` opt-in to also satisfy — the
         // per-cycle coverage proof, not a flag, decides at collection time.
+        //
+        // ...but "requested" is not "will happen". While the JIT publishes no
+        // relocation contract the process-wide veto guarantees these cycles take
+        // the sweep, so the trigger must size for the sweep. Both states are
+        // pinned here so this test stays honest when the constant flips.
+        if cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT {
+            assert!(
+                !next_young_gc_is_guaranteed_non_moving(true, false, true, true, false),
+                "with a published relocation contract a requested moving cycle can really \
+                 move, so the trigger must preserve Cheney copy headroom",
+            );
+            assert!(
+                !next_young_gc_is_guaranteed_non_moving(true, true, true, true, false),
+                "moving-young sizes for the copy even with an unregistered frame flagged \
+                 (that cycle may fall back, but the trigger must not assume it will)",
+            );
+        } else {
+            assert!(
+                next_young_gc_is_guaranteed_non_moving(true, false, true, true, false),
+                "without a published relocation contract, a cycle with a live JIT frame is \
+                 VETOED to the non-moving sweep — sizing it for a Cheney copy that cannot \
+                 happen just doubles the collection count (trigger 500 vs 900 here)",
+            );
+            assert!(
+                next_young_gc_is_guaranteed_non_moving(true, true, true, true, false),
+                "an unregistered frame is still a live compiled frame, so the veto applies \
+                 and the sweep is still guaranteed",
+            );
+        }
+        // Independent of the contract: no live compiled frame ⇒ no veto ⇒ the
+        // cycle really may move, so keep the copy headroom.
         assert!(
-            !next_young_gc_is_guaranteed_non_moving(true, false, true, true, false),
-            "moving-young must preserve Cheney copy headroom without a second opt-in",
-        );
-        assert!(
-            !next_young_gc_is_guaranteed_non_moving(true, true, true, true, false),
-            "moving-young sizes for the copy even with an unregistered frame flagged \
-             (that cycle may fall back, but the trigger must not assume it will)",
+            !next_young_gc_is_guaranteed_non_moving(false, false, false, true, false),
+            "a JIT-quiescent cycle is not vetoed and may move, so it must size for the copy",
         );
         assert!(
             !next_young_gc_is_guaranteed_non_moving(true, false, true, false, true),

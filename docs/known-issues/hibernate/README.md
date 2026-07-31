@@ -1,15 +1,30 @@
 # Hibernate ORM suite — open known issues
 
-## Resolved (2026-07-29)
+## Resolved (2026-07-30) — retired to `docs/internal/fixed-suite-bugs/hibernate/`
 
-- **HIB-BYTEBUDDY ban re-instated** — the 2026-07-28 removal of the `net/bytebuddy/` blanket JIT
-  ban was premature (15-class sample too narrow); a full 4548-class run surfaced 302 CRASH-status
-  classes as a result. Re-instated the ban, reran all 302: 298/302 (98.7%) now PASS, zero crashes.
-  See `hib-bytebuddy-reinstated-20260729-FIXED.md`. The
-  stale removal doc (`hib-bytebuddy-removed-20260728.md`, still in this directory) is marked
-  SUPERSEDED — do not act on its original claim.
+- **HIB-BYTEBUDDY ban removed for good.** The 302-class crash spike was an older runtime
+  unmapping a compiled body while a live frame still executed it — an instruction-fetch fault
+  mid-`ModifierReviewable$AbstractBase.matchesMask`, not a Byte Buddy miscompile. Byte Buddy is
+  just the most JIT-churn-heavy code in the suite, so it is where that defect surfaced first, and
+  the 2026-07-29 re-instatement hid it rather than fixing it. With the three JIT code-lifetime
+  fixes on `dev` and no blanket guard, the exact 302-class manifest passes in **both** modes:
+  301 PASS / 1 assumption-abort / 0 FAIL / 0 CRASH / 0 HANG, identical counts in each. A
+  `skip_list` unit test now fails the build if a blanket `net/bytebuddy/` guard is ever re-added.
+  Full write-up: `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`.
 
 ## Open
+
+- [Native ANTLR intrinsics lose object roots under the moving young collector](antlr-native-roots-moving-young-hql-misparse-20260730.md)
+  (OPEN; root cause identified, many instances fixed across two independent efforts) —
+  `ASTParserLoadingTest` rejects valid HQL nondeterministically. `antlr_intrinsics.rs` holds raw
+  `ObjectRef` locals and whole `Vec<ObjectRef>` config snapshots across allocating calls, so a
+  moving young collection links dead addresses into the parser graph; the poisoned config is then
+  memoized as a DFA edge, which is why one mis-timed collection breaks a whole grammar path for
+  the rest of the process. **Not** the trivial-accessor fast path that was blamed and deleted on
+  2026-07-29: the verifier reports zero field-resolution divergences, and
+  `CRATONVM_NO_MOVING_YOUNG=1` passes 106/106. The 302-class corpus is clean on the current tree,
+  but the unsafe idiom is still the file's default style — the doc recommends a scoped handle type
+  to make it unrepresentable rather than further per-site auditing.
 
 - [`action.queue` GRAPH-default tests — blocked by flush-planner throughput](../../internal/fixed-suite-bugs/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md)
   (OPEN; one of two root causes fixed) — real-JDK CratonVM defaults

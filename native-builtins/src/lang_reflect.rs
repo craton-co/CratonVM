@@ -87,6 +87,10 @@ pub(crate) fn native_method_try_set_accessible(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `trySetAccessible` reports failure instead of throwing.
+    if crate::lang_class::check_class_loader_define_class_is_encapsulated(ctx, this).is_err() {
+        return Ok(Some(Value::Int(0)));
+    }
     crate::lang_class::write_method_accessible_external(ctx, this, true);
     Ok(Some(Value::Int(1)))
 }
@@ -96,6 +100,10 @@ pub(crate) fn native_field_try_set_accessible(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `trySetAccessible` reports failure instead of throwing.
+    if crate::lang_class::check_class_loader_define_class_is_encapsulated(ctx, this).is_err() {
+        return Ok(Some(Value::Int(0)));
+    }
     crate::lang_class::write_field_accessible_external(ctx, this, true);
     Ok(Some(Value::Int(1)))
 }
@@ -105,6 +113,10 @@ pub(crate) fn native_constructor_try_set_accessible(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `trySetAccessible` reports failure instead of throwing.
+    if crate::lang_class::check_class_loader_define_class_is_encapsulated(ctx, this).is_err() {
+        return Ok(Some(Value::Int(0)));
+    }
     crate::lang_class::write_constructor_accessible_external(ctx, this, true);
     Ok(Some(Value::Int(1)))
 }
@@ -116,6 +128,10 @@ pub(crate) fn native_accessible_try_set_accessible(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `trySetAccessible` reports failure instead of throwing.
+    if crate::lang_class::check_class_loader_define_class_is_encapsulated(ctx, this).is_err() {
+        return Ok(Some(Value::Int(0)));
+    }
     // We don't know which subtype the receiver is — try all three writers.
     crate::lang_class::write_method_accessible_external(ctx, this, true);
     crate::lang_class::write_field_accessible_external(ctx, this, true);
@@ -129,6 +145,16 @@ pub(crate) fn native_accessible_set_accessible(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let flag = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
+    if flag {
+        if let Err(msg) =
+            crate::lang_class::check_class_loader_define_class_is_encapsulated(ctx, this)
+        {
+            return Err(
+                cratonvm_types::error::RuntimeError::InaccessibleObjectException { message: msg }
+                    .into(),
+            );
+        }
+    }
     crate::lang_class::write_method_accessible_external(ctx, this, flag);
     crate::lang_class::write_field_accessible_external(ctx, this, flag);
     crate::lang_class::write_constructor_accessible_external(ctx, this, flag);

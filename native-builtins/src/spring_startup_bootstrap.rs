@@ -78,17 +78,81 @@ fn construct_real_standard_environment(ctx: &mut dyn NativeContext) -> Option<Ob
     let env_class = "org/springframework/core/env/StandardEnvironment";
     let env = match ctx.new_object(env_class) {
         Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
+        other => {
+            report_env_bootstrap_failure(&format!("new_object failed: {other:?}"));
+            return None;
+        }
     };
     // GC-safety: the `<init>` invocation below can itself allocate (it runs
     // `customizePropertySources`); pin `env` and re-read the forwarded
     // reference before returning it.
     let env_pin = ctx.pin_native_root(env);
-    ctx.invoke(env_class, "<init>", "()V", &[Value::Object(Some(env))])
-        .ok()?;
+    let init = ctx.invoke(env_class, "<init>", "()V", &[Value::Object(Some(env))]);
+    if let Err(e) = init {
+        ctx.unpin_native_roots(env_pin);
+        // Do NOT swallow this. The caller's fallback is a SYNTHETIC
+        // `StandardEnvironment` allocated without running any constructor, so
+        // every field initialiser — `AbstractEnvironment.logger` among them —
+        // stays null, and the first `setActiveProfiles` on it dies with a bare
+        // `NullPointerException: ... because "this.logger" is null` from
+        // `AbstractContextLoader.prepareContext`, hundreds of frames and one
+        // swallowed exception away from whatever actually broke here.
+        let what = describe_thrown(ctx, &e);
+        report_env_bootstrap_failure(&format!("StandardEnvironment.<init> threw {what}"));
+        return None;
+    }
     let env = ctx.read_native_pin(env_pin, env);
     ctx.unpin_native_roots(env_pin);
     Some(env)
+}
+
+/// Render a thrown Java exception as `class: message`, so the warning below
+/// names the actual failure instead of a heap address.
+fn describe_thrown(
+    ctx: &mut dyn NativeContext,
+    e: &cratonvm_types::error::MethodCallFailed,
+) -> String {
+    let cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) = e else {
+        return format!("{e:?}");
+    };
+    let cid = ctx.class_id_of_object(*exc);
+    let class = ctx
+        .class_name_of_id(cid)
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let msg = match ctx.get_field_by_name(*exc, "detailMessage") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    };
+    match msg {
+        Some(m) => format!("{class}: {m}"),
+        None => class,
+    }
+}
+
+/// Announce a failure to build the REAL `StandardEnvironment`, once per
+/// distinct reason.
+///
+/// This is on stderr unconditionally rather than behind a debug gate: reaching
+/// the synthetic fallback means the process is about to run with an
+/// Environment that has no logger, no `systemProperties` and no
+/// `systemEnvironment`, and every downstream symptom of that is
+/// unrecognisable. One line naming the real cause is worth far more than the
+/// silence it replaces. `CRATONVM_QUIET_ENV_FALLBACK=1` suppresses it.
+fn report_env_bootstrap_failure(reason: &str) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    if std::env::var("CRATONVM_QUIET_ENV_FALLBACK").is_ok_and(|v| v != "0") {
+        return;
+    }
+    let seen = SEEN.get_or_init(|| Mutex::new(Default::default()));
+    let mut guard = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.insert(reason.to_string()) {
+        eprintln!(
+            "[cratonvm] WARNING: falling back to a SYNTHETIC StandardEnvironment \
+             (no logger / systemProperties / systemEnvironment) because {reason}"
+        );
+    }
 }
 
 fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {

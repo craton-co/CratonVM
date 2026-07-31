@@ -11652,20 +11652,28 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Set an env var for testing
-        std::env::set_var("CRATONVM_TEST_VAR", "hello");
-
+        // `System.getenv` resolves through `flags::runtime_var`, and
+        // `CRATONVM_TEST_VAR` is a *declared* flag — so it is answered from the
+        // process-wide snapshot, not from `environ`. `set_var` here therefore
+        // only worked if this test happened to be the first thing in this
+        // binary to read any flag, which in a test module this size it never
+        // is. Override the snapshot for this thread instead.
         let key = create_java_string(&shared, "CRATONVM_TEST_VAR");
-        let result = call_native(
-            &shared,
-            &mut thread,
-            "java/lang/System",
-            "getenv",
-            "(Ljava/lang/String;)Ljava/lang/String;",
-            &[Value::Object(Some(key))],
-        )
-        .unwrap()
-        .unwrap();
+        let result = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_TEST_VAR", Some("hello"))],
+            || {
+                call_native(
+                    &shared,
+                    &mut thread,
+                    "java/lang/System",
+                    "getenv",
+                    "(Ljava/lang/String;)Ljava/lang/String;",
+                    &[Value::Object(Some(key))],
+                )
+                .unwrap()
+                .unwrap()
+            },
+        );
 
         match result {
             Value::Object(Some(sr)) => {
@@ -11674,9 +11682,6 @@ mod tests {
             }
             _ => panic!("expected string"),
         }
-
-        // Clean up
-        std::env::remove_var("CRATONVM_TEST_VAR");
     }
 
     #[test]

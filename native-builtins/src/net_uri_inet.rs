@@ -95,11 +95,135 @@ pub(crate) fn native_urlconnection_set_content_handler_factory(
 /// precisely because the value is stable — so one probe per VM is the right
 /// granularity. [`os_dns_nameservers_string_uncached`] keeps the parsing
 /// logic directly testable without the latch.
+///
+/// Only a NON-EMPTY answer is latched. An empty one means "we could not read
+/// the configuration", and that is not a conclusion worth remembering for the
+/// life of the process: an empty resolver config is not inert — JNDI's
+/// `DnsContextFactory.serversForUrls` falls back to the literal `"localhost"`,
+/// so every lookup then queries 127.0.0.1:53 and times out. Latching that once
+/// is exactly how a transient probe failure turned into a VM that could never
+/// resolve a name again (see [`win_iphlpapi`]). Re-probing is cheap now that
+/// the primary source is a direct API call rather than a process spawn.
 pub(crate) fn os_dns_nameservers_string() -> String {
-    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CACHED
-        .get_or_init(os_dns_nameservers_string_uncached)
-        .clone()
+    static CACHED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    if let Ok(guard) = CACHED.lock() {
+        if let Some(cached) = guard.as_ref() {
+            return cached.clone();
+        }
+    }
+    let probed = os_dns_nameservers_string_uncached();
+    if !probed.is_empty() {
+        if let Ok(mut guard) = CACHED.lock() {
+            *guard = Some(probed.clone());
+        }
+    }
+    probed
+}
+
+/// Windows IP Helper (`iphlpapi!GetNetworkParams`) binding — the same API the
+/// real JDK's `loadDNSconfig0` uses, and the primary source for
+/// [`os_dns_nameservers_string_uncached`].
+///
+/// This exists because the `ipconfig /all` fork below is **not reliable when
+/// the VM has no attached console**: launched from a console-less parent (a
+/// hidden-window process, a service, or any `ProcessStartInfo` with redirected
+/// stdio — which is exactly how `apps/spring-boot-suite-runner` starts every
+/// class), the child produced no usable output, the probe answered "no
+/// nameservers", and because the answer is latched in a `OnceLock` the whole
+/// VM ran with an empty resolver config for its entire life. JNDI's
+/// `DnsContextFactory.serversForUrls` then falls back to the literal
+/// `"localhost"` (see its `if (!platformServers.isEmpty())` branch), so every
+/// lookup queried 127.0.0.1:53, where nothing listens, and timed out after the
+/// full retry ladder (~15s). That is what made
+/// `PropertiesMongoConnectionDetailsTests.protocolCanBeConfigured` /
+/// `MongoAutoConfigurationTests.configuresProtocol` fail under the suite
+/// runner while passing in an interactive shell.
+///
+/// A direct API call has none of those failure modes: no process spawn, no
+/// console, no locale-dependent label text to parse.
+#[cfg(target_os = "windows")]
+mod win_iphlpapi {
+    /// `IP_ADDRESS_STRING` / `IP_MASK_STRING` — a NUL-terminated dotted-quad.
+    #[repr(C)]
+    struct IpAddressString {
+        string: [u8; 16],
+    }
+
+    /// `IP_ADDR_STRING` — singly-linked list node of addresses.
+    #[repr(C)]
+    struct IpAddrString {
+        next: *mut IpAddrString,
+        ip_address: IpAddressString,
+        ip_mask: IpAddressString,
+        context: u32,
+    }
+
+    /// `FIXED_INFO` (iptypes.h). `MAX_HOSTNAME_LEN`/`MAX_DOMAIN_NAME_LEN` are
+    /// 128 and `MAX_SCOPE_ID_LEN` is 256, each declared with `+ 4` slack.
+    #[repr(C)]
+    struct FixedInfo {
+        host_name: [u8; 132],
+        domain_name: [u8; 132],
+        current_dns_server: *mut IpAddrString,
+        dns_server_list: IpAddrString,
+        node_type: u32,
+        scope_id: [u8; 260],
+        enable_routing: u32,
+        enable_proxy: u32,
+        enable_dns: u32,
+    }
+
+    #[link(name = "iphlpapi")]
+    extern "system" {
+        fn GetNetworkParams(fixed_info: *mut FixedInfo, out_buf_len: *mut u32) -> u32;
+    }
+
+    const ERROR_SUCCESS: u32 = 0;
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+
+    /// Configured IPv4 DNS servers, in order, de-duplicated. Empty on any
+    /// failure — the caller falls back to the `ipconfig` parse.
+    pub(super) fn nameservers() -> Vec<String> {
+        // SAFETY: the two calls follow `GetNetworkParams`'s documented
+        // size-probe-then-fill protocol. The buffer is over-allocated to the
+        // length the API itself asked for and is `u64`-backed so the
+        // `FixedInfo` cast is correctly aligned. Every pointer walked
+        // afterwards comes from inside that same buffer, which outlives the
+        // walk.
+        unsafe {
+            let mut len: u32 = 0;
+            let probe = GetNetworkParams(std::ptr::null_mut(), &mut len);
+            if probe != ERROR_BUFFER_OVERFLOW && probe != ERROR_SUCCESS {
+                return Vec::new();
+            }
+            let bytes = (len as usize).max(std::mem::size_of::<FixedInfo>());
+            let mut buf = vec![0u64; bytes.div_ceil(8)];
+            let mut len = (buf.len() * 8) as u32;
+            let info = buf.as_mut_ptr().cast::<FixedInfo>();
+            if GetNetworkParams(info, &mut len) != ERROR_SUCCESS {
+                return Vec::new();
+            }
+            let mut out: Vec<String> = Vec::new();
+            let mut node: *const IpAddrString = &raw const (*info).dns_server_list;
+            while !node.is_null() {
+                let raw = &(*node).ip_address.string;
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                if let Ok(text) = std::str::from_utf8(&raw[..end]) {
+                    let text = text.trim();
+                    // 0.0.0.0 is what the API reports for "none configured".
+                    if !text.is_empty()
+                        && text != "0.0.0.0"
+                        && text.parse::<std::net::IpAddr>().is_ok()
+                        && !out.iter().any(|s| s == text)
+                    {
+                        out.push(text.to_string());
+                    }
+                }
+                node = (*node).next;
+            }
+            out
+        }
+    }
 }
 
 /// The uncached probe behind [`os_dns_nameservers_string`]. Split out so the
@@ -107,6 +231,15 @@ pub(crate) fn os_dns_nameservers_string() -> String {
 pub(crate) fn os_dns_nameservers_string_uncached() -> String {
     #[cfg(target_os = "windows")]
     {
+        // Primary source: the IP Helper API (see [`win_iphlpapi`] for why the
+        // `ipconfig` fork below cannot be the primary one). The fork is kept
+        // as a fallback so a machine whose servers this API does not report
+        // (e.g. IPv6-only configurations, which `GetNetworkParams` omits)
+        // behaves no worse than before.
+        let via_api = win_iphlpapi::nameservers();
+        if !via_api.is_empty() {
+            return via_api.join(" ");
+        }
         let output = match std::process::Command::new("ipconfig").arg("/all").output() {
             Ok(o) if o.status.success() => o,
             _ => return String::new(),
@@ -1922,18 +2055,23 @@ mod new2_net_tests {
 
     // ---------------- DNS-config probe caching ----------------
 
-    /// `os_dns_nameservers_string` forks `ipconfig /all` on Windows. The
-    /// natives behind `sun/net/dns/ResolverConfigurationImpl.init0` and
-    /// `.loadDNSconfig0` call it under the JDK's resolver-config refresh
-    /// path, so an unlatched probe re-paid a process spawn every refresh.
+    /// `os_dns_nameservers_string` probes the platform resolver configuration
+    /// on Windows. The natives behind `sun/net/dns/ResolverConfigurationImpl.init0`
+    /// and `.loadDNSconfig0` call it under the JDK's resolver-config refresh
+    /// path, so an unlatched probe re-paid the whole cost every refresh.
     /// The cache must be stable and must not change the answer.
+    ///
+    /// Only a non-empty answer is latched — see `os_dns_nameservers_string`'s
+    /// own doc for why remembering "no nameservers" is actively harmful. This
+    /// test holds either way: with servers configured both calls return the
+    /// latched list; with none, both return the same empty string.
     #[test]
     fn os_dns_nameservers_is_cached_and_matches_uncached_probe() {
         let first = os_dns_nameservers_string();
         let second = os_dns_nameservers_string();
         assert_eq!(
             first, second,
-            "the DNS-nameserver probe must be latched, not re-run per call"
+            "a resolved DNS-nameserver list must be latched, not re-run per call"
         );
         assert_eq!(
             first,
