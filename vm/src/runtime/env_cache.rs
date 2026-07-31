@@ -442,7 +442,7 @@ pub fn rootsnap_cache() -> bool {
 // remapping its cached roots through the collection's `pointer_map`, instead of
 // discarding the whole cache on every `collection_count` bump. The cache holds
 // object ADDRESSES; a collection only invalidates them if it RELOCATED the
-// object — and even the default non-moving young sweep relocates via selective
+// object — and even the non-moving young sweep relocates via selective
 // promotion (young→old), so the plain gen gate rebuilds the cache on nearly
 // every collection during an allocation-heavy deploy. Remapping (the same proven
 // operation that relocates frame locals) lets the cache survive. Fail-safe:
@@ -629,6 +629,36 @@ cached_is_set!(ctor_direct_call_disabled, "CRATONVM_NO_CTOR_DIRECT_CALL");
 cached_is_set!(ctor_fix_dbg, "CRATONVM_DBG_CTOR_FIX");
 
 // ── Frame-trace and interpreter hot-path flags ──────────────────────────
+
+/// `CRATONVM_TRIVIAL_GETTER` — off-switch for `execute_invokevirtual_cached`'s
+/// stackless `aload_0; getfield; <x>return` accessor fast path. `0`/`off`/
+/// `false`/`no` disables it; anything else (including unset) leaves it on.
+///
+/// The fast path reimplements the `getfield` opcode's value semantics, so a
+/// divergence between the two would be a silent-wrong-value bug rather than a
+/// crash. It is also the single biggest change to `--nojit` allocation and
+/// safepoint timing on accessor-heavy workloads, which makes it the first
+/// suspect whenever an interpreter-only run starts producing nondeterministic
+/// wrong answers. Being able to A/B it within ONE binary is what let the
+/// Hibernate HQL mis-parse be attributed to the moving young collector instead
+/// (see `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`);
+/// keep the switch so the next such question costs one run, not one build.
+#[inline]
+pub fn trivial_getter_fast_path() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_TRIVIAL_GETTER") {
+            Ok(v) => !matches!(v.trim(), "0" | "off" | "false" | "no"),
+            Err(_) => true,
+        },
+    )
+}
+
+/// `CRATONVM_TRIVIAL_GETTER_VERIFY` — cross-check every trivial-accessor fast
+/// path hit against the loader-aware `getfield` resolver and report any
+/// divergence. Expensive (it performs the full resolution the fast path exists
+/// to avoid); diagnostic use only.
+cached_is_set!(trivial_getter_verify, "CRATONVM_TRIVIAL_GETTER_VERIFY");
 
 cached_is_set!(frame_trace, "CRATONVM_FRAME_TRACE");
 cached_is_set!(iae_trace_os, "CRATONVM_IAE_TRACE");
