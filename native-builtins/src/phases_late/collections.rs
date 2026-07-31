@@ -1483,10 +1483,16 @@ pub(crate) fn native_p64_ll_get_first(
         }
         .into());
     }
-    match ctx.get_field(this, 0) {
-        Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, 2))),
-        _ => Ok(Some(Value::Object(None))),
-    }
+    // Read through the list surface. The raw-slot walk this replaced assumed
+    // head at 0 / tail at 1 and the node's element at field 2; the live
+    // LinkedList uses element 0, next 1, prev 2 and keeps head/tail behind
+    // name-keyed accessors — the same mismatch that made `reversed()` return
+    // an empty list. These two are currently shadowed by
+    // `cratonvm-native-collections`' own registrations, so the bug was latent
+    // rather than observable; fixed so a change in registration order cannot
+    // silently surface it.
+    let idx = if size > 0 { 0 } else { 0 };
+    ctx.invoke_virtual(this, "get", "(I)Ljava/lang/Object;", &[Value::Int(idx)])
 }
 
 pub(crate) fn native_p64_ll_get_last(
@@ -1504,10 +1510,16 @@ pub(crate) fn native_p64_ll_get_last(
         }
         .into());
     }
-    match ctx.get_field(this, 1) {
-        Value::Object(Some(tail)) => Ok(Some(ctx.get_field(tail, 2))),
-        _ => Ok(Some(Value::Object(None))),
-    }
+    // Read through the list surface. The raw-slot walk this replaced assumed
+    // head at 0 / tail at 1 and the node's element at field 2; the live
+    // LinkedList uses element 0, next 1, prev 2 and keeps head/tail behind
+    // name-keyed accessors — the same mismatch that made `reversed()` return
+    // an empty list. These two are currently shadowed by
+    // `cratonvm-native-collections`' own registrations, so the bug was latent
+    // rather than observable; fixed so a change in registration order cannot
+    // silently surface it.
+    let idx = if size > 0 { size - 1 } else { 0 };
+    ctx.invoke_virtual(this, "get", "(I)Ljava/lang/Object;", &[Value::Int(idx)])
 }
 
 // --- SequencedMap helpers ---
