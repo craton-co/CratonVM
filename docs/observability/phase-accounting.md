@@ -432,8 +432,9 @@ outside the crate opens a span, so a run today reports 100% unattributed. This
 section is the ordered list of edits that make it real. Every item is outside
 `jfr/`.
 
-Line numbers are against `feat/c2-review-remediation` at the time of writing;
-verify the anchor text before editing.
+Line numbers are against `feat/c2-review-remediation` at `a8ce5a2f9`; every one
+below was re-verified against that commit. Several crates are under concurrent
+edit, so match on the quoted **anchor text**, not the number.
 
 ### 10.1 DONE: the three flags are declared
 
@@ -487,14 +488,11 @@ JIT method stats.
 
 ```rust
     // Delegate the compile-phase breakdown rather than re-timing it; see
-    // docs/observability/phase-accounting.md §1.
+    // docs/observability/phase-accounting.md §1. `MetricsSummary::phase_totals_ns`
+    // (jit/src/metrics.rs:1217) is already `Vec<(&'static str, u64)>`, which is
+    // exactly the argument shape.
     let summary = cratonvm_jit::metrics::summary();
-    let phases: Vec<(&str, u64)> = summary
-        .phase_totals_ns
-        .iter()
-        .map(|(name, ns)| (*name, *ns))
-        .collect();
-    cratonvm_jfr::phase::set_compilation_breakdown(&phases);
+    cratonvm_jfr::phase::set_compilation_breakdown(&summary.phase_totals_ns);
     if let Some(outcome) = cratonvm_jfr::phase::emit_configured_sinks() {
         eprintln!("{}", outcome.report.summary_line());
         if let Some((path, Err(e))) = &outcome.json {
@@ -516,8 +514,8 @@ report would require an unrelated flag.
 | # | File:line | Anchor | Edit |
 |---|---|---|---|
 | 3 | `vm-cli/src/main.rs:3188` | `let mut vm = Vm::new(config);` | wrap: `let _p = cratonvm_jfr::phase::enter(Category::VmStartup); let mut vm = Vm::new(config); drop(_p);` — a block is cleaner than a `drop`, but `vm` must outlive the span |
-| 4 | `vm/src/vm/vm_init.rs:6579` | first statement of `Vm::new` | alternative to #3 if `vm-cli` is not the only launcher: `let _p = cratonvm_jfr::phase::enter(Category::VmStartup);` at the top of the function body. Do **one** of #3 / #4, not both — they would nest, which is correct but pointless |
-| 5 | `vm-cli/src/main.rs:4830` | immediately after `let result = run();` | `let _p = cratonvm_jfr::phase::enter(Category::VmShutdown);` held to the end of the block, so teardown is charged rather than unattributed |
+| 4 | `vm/src/vm/vm_init.rs:6575` | first statement of `pub fn new(config: VmConfig)` | alternative to #3 if `vm-cli` is not the only launcher: `let _p = cratonvm_jfr::phase::enter(Category::VmStartup);` at the top of the function body. Do **one** of #3 / #4, not both — they would nest, which is correct but pointless |
+| 5 | `vm-cli/src/main.rs:4829` | immediately after `let result = run();` | `let _p = cratonvm_jfr::phase::enter(Category::VmShutdown);` held to the end of the block, so teardown is charged rather than unattributed |
 
 `libcratonvm` embedders bypass `vm-cli` entirely; #4 is the variant that covers
 them, and `mark_process_start()` then has to move into
@@ -566,7 +564,7 @@ interpretation, which at `fine` subtracts back out into `interpretation`.
 | # | File:line | Anchor | Edit |
 |---|---|---|---|
 | 15 | `jit/src/lib.rs:8957` | next to `let metrics = metrics::CompileRecorder::begin(...)` in `try_compile_inner` | `let _p = cratonvm_jfr::phase::enter(Category::Compilation);` — same lifetime as the recorder, which is what makes `compilation_delta_ns` meaningful |
-| 16 | `jit/src/tiered.rs:1546` | in `compiler_loop`, around the `core.wake.wait(&mut q)` block (the inner `loop` that parks) | `Category::Idle` — without this the compiler thread reads as ~100% unattributed and drags the cross-thread aggregate down |
+| 16 | `jit/src/tiered.rs:1552` | in `compiler_loop`, around the `core.wake.wait(&mut q)` call (the inner `loop` that parks) | `Category::Idle` — without this the compiler thread reads as ~100% unattributed and drags the cross-thread aggregate down |
 | 17 | `vm/src/runtime/interpreter/invoke.rs:18401` | top of `background_compile_task` | `Category::Compilation` (the VM-side half of the compile the worker runs) |
 | 18 | `vm/src/runtime/interpreter/invoke.rs:17303` | top of `try_jit_compile_callee` | `Category::Compilation` if compiled synchronously, `Category::CompileQueueWait` around any blocking wait for a background result |
 | 19 | `vm/src/runtime/interpreter/invoke.rs:18146` | the `emit_compilation_event_arc` site — the publication point in `try_jit_compile_callee` | `Category::CodeInstall`, around the cache insert / entry publication that precedes it |
@@ -596,11 +594,21 @@ Sites 23–25 are inside `gc` and nest inside 21/22; that is correct and gives
 
 | # | File:line | Anchor | Edit |
 |---|---|---|---|
-| 28 | `vm/src/runtime/interpreter/invoke.rs:4537` | `invoke_cached_native_callback_impl` — bracket the same region as the existing `native_ring::record_enter` (line 4547) / `record_exit` (line 4553) pair | `Category::NativeCall` |
-| 29 | `vm/src/runtime/interpreter/invoke.rs:12416` | the second native path, documented there as *not* going through the enter/exit ring | `Category::NativeCall` — without it this path's time is charged to the enclosing executor category, which is exactly the mis-attribution the review is about |
+| 28 | `vm/src/vm/vm_exec.rs:1338` | top of `fn safe_native_call_impl` | `let _p = cratonvm_jfr::phase::enter(Category::NativeCall);` |
 
-Site 28 is the highest-frequency instrumentation point in the plan. Measure it:
-if two clock reads per native call moves the benchmark, demote `native_call` to
+**One site, not several.** `safe_native_call_impl` is the single choke point:
+`safe_native_call` (`vm/src/vm/vm_exec.rs:1316`) and
+`safe_native_call_prevalidated_objects` (`:1329`) are both one-line wrappers
+around it, and every interpreter dispatch path reaches it —
+`invoke_cached_native_callback_impl`
+(`vm/src/runtime/interpreter/invoke.rs:4537`) calls one or the other, and
+`invoke_cached_intrinsic` (`:12420`) reaches it too, as its own doc comment
+records ("`safe_native_call` already records the native ring enter/exit").
+Instrumenting the two dispatch sites separately instead would miss any third
+caller and would nest redundantly.
+
+This is the highest-frequency instrumentation point in the plan. Measure it: if
+two clock reads per native call moves the benchmark, demote `native_call` to
 `fine` by adding it to `Category::active_at`'s `Level::Fine` arm.
 
 ### 10.11 Ordering
