@@ -1877,15 +1877,15 @@ JIT call, which limits allocation-heavy workloads.
   single JIT-compiled method completes without OOM under the default
   heap, with compaction observably running.
 
-### NEW-13. Real `javax.net.ssl` (deshadow experimental-tls)
+### NEW-13. Real `javax.net.ssl` (deshadow the TLS feature flag)
 
-Phase E and NEW-2 established that TLS works via `native-tls` but is
+Phase E and NEW-2 established that TLS works via `native-tls` but was
 gated behind `experimental-tls` and shadowed by `phases_late.rs::register_p68_ssl`.
-The real `rustls` or `native-tls` integration is not in the default
-build.
 
-- NEW-13.1 Promote `native-tls` from `experimental-tls` feature to the
-  default feature set.
+- NEW-13.1 **DONE.** `native-tls` is compiled and registered unconditionally,
+  so the flag gates nothing. Renamed `deprecated-noop-tls` on 2026-07-30 to say
+  so out loud, with `experimental-tls` kept as a back-compat alias; both are
+  slated for removal in 0.4.
 - NEW-13.2 Implement `SSLContext.init` to actually wire a
   `TrustManagerFactory` / `KeyManagerFactory` into a real `native_tls::TlsConnector`
   (not the current placeholder that stores field values).
@@ -2205,7 +2205,7 @@ Ranked by how many "any Java app" failure modes each unblocks:
 | `java.sql` JDBC | Real `rusqlite`-backed (NEW-14) | 65% |
 | Module system (JPMS) | Parsed, but `opens`/`exports` not enforced (NEW-19 pending) | 35% |
 | `invokedynamic` / MethodHandle | LambdaMetafactory, StringConcatFactory, condy | 55% |
-| Crypto / TLS | `experimental-tls` always on; `experimental-crypto` partial | 30% |
+| Crypto / TLS | TLS always compiled (its feature flag gates nothing); crypto partial | 30% |
 | `java.lang.ref.*` | Soft/Weak/Phantom/Cleaner real (NEW-17), finalize integrated | 80% |
 | JVMTI / JFR / JDWP | Frameworks present, event coverage partial | 35% |
 | Bench / perf gates | NEW-20 delivered; SPECjvm hookup pending NEW-1 | 50% |

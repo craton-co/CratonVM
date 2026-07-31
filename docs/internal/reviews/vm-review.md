@@ -330,10 +330,11 @@ file (`vm_benchmarks.rs`), Criterion harness.
   (line 14-21) exists but does not cross-link the per-stub status (the
   `audit_missing_natives` mechanism in `vm_init.rs:46-65` is undocumented
   outside source).
-- README does not call out the **`experimental-*` features** (`experimental-tls`,
-  `legacy-synthetic-crypto`, `experimental-jmx`, `experimental-serialization`,
+- README does not call out the **optional features** (`deprecated-noop-tls`,
+  `legacy-synthetic-crypto`, `management`, `experimental-serialization`,
   `experimental-aot`, `experimental-debug`) — users picking custom feature
-  sets have no document to consult.
+  sets have no document to consult. (The first and third were named
+  `experimental-tls` / `experimental-jmx` before 2026-07-30.)
 - Crash-handler module doc mentions the async-signal-safety concern in a
   comment (`crash_handler.rs:309-310`) but `docs/internal/` has no parent
   document explaining the threat model or the migration plan.

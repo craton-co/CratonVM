@@ -4106,7 +4106,7 @@ pub mod util_time;
 pub mod charset;
 pub mod classloader_value_sidetable;
 pub mod jfr;
-#[cfg(feature = "experimental-jmx")]
+#[cfg(feature = "management")]
 pub mod jmx;
 pub mod panama;
 pub mod panama_libffi;
@@ -4490,7 +4490,7 @@ pub use xml_xerces::*;
 pub(crate) mod test_utils;
 
 use http2::*;
-#[cfg(feature = "experimental-jmx")]
+#[cfg(feature = "management")]
 use jmx::*;
 use lang_class::*;
 use lang_invoke::*;
@@ -22796,7 +22796,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     crate::lang_invoke::register_t28_method_handle_completeness(registry);
 
     // --- Phase 8.4: JMX (Java Management Extensions) ---
-    #[cfg(feature = "experimental-jmx")]
+    #[cfg(feature = "management")]
     {
         register_jmx_natives(registry);
         // Pure-synthetic-JDK mode has no real `java.management` module, so the
