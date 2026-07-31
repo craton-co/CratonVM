@@ -54,6 +54,35 @@ measures 50–62 µs against HotSpot's 1.1–1.2 µs.
 sits on `String.format`, which is that test's *fast* side — the side the
 assertion races against. Speeding it up makes that test **harder**. Fix it
 because a hot JDK method failing codegen is a defect worth understanding, and
-because `String.format` is broadly hot across the suites; not for tomcat/32.4,
-which is a codegen-quality problem tracked in
-[30](../tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md).
+because `String.format` is broadly hot across the suites.
+
+## Update 2026-07-31 — not the cause on the SLOW side either, measured
+
+The obvious next thought is that the *other* compile-bails on that path make
+`SimpleDateFormat.format` slow. `CRATONVM_DBG=jit-method-stats` on
+`DateFormatPatternProbe` lists six:
+
+```
+100015  tier_fail_count=3  java/text/DateFormatSymbols.getProviderInstance(...)
+ 40000  tier_fail_count=3  sun/util/locale/provider/CalendarDataUtility.retrieveFieldValueName(...)
+ 39495  tier_fail_count=3  java/text/DecimalFormat.format(JLjava/text/Format$StringBuf;...)
+  1972  tier_fail_count=3  java/text/NumberFormat.getInstance(...)
+  1498  tier_fail_count=3  sun/util/locale/provider/JRELocaleProviderAdapter.getNumberFormatProvider()
+   999  tier_fail_count=3  java/text/DecimalFormatSymbols.clone()
+```
+
+**They are not the cause.** `probes/SdfOnlyProbe.java` runs
+`SimpleDateFormat.format` and nothing else, with pattern `"ss"` — a single
+2-digit numeric field, which reaches none of them — and costs **51 µs with
+`hot_but_stuck_in_interpreter=0`**: zero compile failures anywhere on the path,
+and still 870× HotSpot's 59 ns. (The counts above are also partly the probe's
+own direct calls, not `SimpleDateFormat`'s — `DecimalFormat.format`'s 39 495 is
+close to that probe's own 40 000 explicit invocations.)
+
+The cost is the generic-dispatch round trips the format performs. See
+[30 § Adopted](../../internal/fixed-suite-bugs/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32-and-where-they-went)
+and [raw JIT-to-JIT](../jit-raw-jit-to-jit-shadow-stack-overflow-20260731.md),
+which now carries that work.
+
+So: fix this because a hot JDK method failing codegen is a real defect. Stop
+citing it as a lever for any date-formatting throughput test — on either side.

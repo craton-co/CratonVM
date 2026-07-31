@@ -5,6 +5,27 @@ JIT-to-JIT calls whenever the moving young generation is on. Three real defects
 found while investigating this are FIXED and shipped; the edge itself is not yet
 safe to reopen.
 
+> **This gate now carries the throughput residuals of tomcat known-issue 30**
+> (2026-07-31), which closed once all three of its admission bans were settled
+> and every remaining item root-caused here — see
+> [30 § Adopted](../internal/fixed-suite-bugs/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32-and-where-they-went).
+> With this gate closed, **every `invokevirtual` from compiled code takes
+> `jit_invoke_dispatch`**, the generic helper: measured at 992 ns monomorphic
+> and 6 027 ns polymorphic against HotSpot's 5 and 9 ns, and 12 981 ns for a
+> nested chain like `Calendar.get` (HotSpot 13 ns). `CRATONVM_DBG=mic-prof`
+> logs 99 373 `[DISP_TRACE]` entries for a 50 000-iteration loop over two tiny
+> accessors.
+>
+> **Reopening this gate is necessary but NOT sufficient**, which is worth
+> knowing before sizing the work. Forcing it with
+> `CRATONVM_JIT_DIRECT_CALLEE_CALLS=force` buys **1.8×** on that path and no
+> more, because the direct route admits only `invokestatic` and non-`<init>`
+> `invokespecial` (`jit/src/lib.rs`, the `ir_direct && (is_static || is_special)`
+> guard). There is no `final` / CHA devirtualization, so `invokevirtual` keeps
+> taking the helper either way — including calls to methods declared `final`,
+> which cannot be overridden and are trivially bindable. **Two prerequisites,
+> not one.**
+
 Supersedes the hypothesis recorded in
 `jit/src/lib.rs::direct_jit_callee_calls_enabled` and in
 `vm/src/jit/conservative_roots.rs::chain_entry_rbp_is_foreign`, which framed the
