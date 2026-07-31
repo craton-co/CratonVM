@@ -1,5 +1,36 @@
 # `qualfiedTableNaming` package — 2 HANGs in the 2026-07-21 "passed" rerun: one is a known-tradeoff timeout gap (NOT a regression), the other does not reproduce solo (likely host-noise)
 
+> **CORRECTION 2026-07-31 — the "Resolved 2026-07-22" section below is FALSE as of the
+> current tree; `DefaultCatalogAndSchemaTest` HANGs again, exactly as this doc's original
+> (pre-"Resolved") diagnosis predicts.** The fresh full 4548-class suite run
+> `apps/hib-suite-runner/runs/categorize-20260730-225515` (8 shards, binary
+> `CratonVM-hib-local-0712-v3` @ `8e8a7b8cd`, `dev` merged with the real ByteBuddy fix)
+> reports this exact class `HANG` / `process-died rc=124` again
+> (`results.tsv` idx 70, `ms=0`). Solo repro this session confirms the process is
+> genuinely, continuously CPU-bound (not stalled) for 5+ minutes straight with zero stdout
+> progress past the DDL-bootstrap stage — the identical "clean but slow" signature this
+> doc already established, not a new symptom.
+>
+> **Why:** the "Resolved 2026-07-22" section's claim — that `run-hib.sh` was updated to
+> give this one class a 3600-second timeout floor and force `--nojit` — is not true of the
+> `run-hib.sh` in this repo today. The current script (`apps/hib-suite-runner/run-hib.sh`)
+> applies exactly one flat `TIMEOUT="${TIMEOUT:-300}"` to every class in `run_shard()`
+> (`timeout "$TIMEOUT" "$CV_BIN" ...`), with no per-class table, no `--nojit` override, and
+> no mention of `DefaultCatalogAndSchemaTest` anywhere in the file (verified by direct
+> read and `grep`). `apps/` is wholly gitignored (`.gitignore:12: apps/`), so this script
+> carries no commit history in this repo — whatever local copy implemented the
+> 2026-07-22 accommodation was never durably captured anywhere tracked, and has since been
+> lost (plausibly via one of `apps/`'s own documented silent-truncation / stale-backup-restore
+> incidents — see the "Data-loss note" in `docs/known-issues/hibernate/README.md`, where the
+> harness driver files were once recovered from a `hib-suite-runner.tar` backup dated weeks
+> *before* 2026-07-22).
+>
+> **This is a harness/tooling regression, not a VM regression.** The underlying correctness
+> fix this doc is actually about — the `MutableBigInteger` AIOOBE quarantine (`41cdfdf94`) —
+> is unrelated, still intact, and not in question. Full write-up, current evidence, and the
+> re-implementation recommendation:
+> [`docs/known-issues/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731.md`](../../../known-issues/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731.md).
+
 Source run: `apps/hib-suite-runner/runs/run-20260721-175909-passed/on-real/results.tsv`
 (shard-3 / shard-4 `raw.log`), binary from worktree `CratonVM-hib-local-0712`
 (branch `test/hib-local-0712`, merged with `origin/dev` @ `7aed580f0`), 6
@@ -163,6 +194,12 @@ claim (no AIOOBE) but is now cross-referenced from this doc for the
 mistake this run's `HANG` status for a correctness regression.
 
 ## Resolved 2026-07-22
+
+> **This section is no longer true — see the correction banner at the top of this doc
+> (2026-07-31). The `run-hib.sh` change described immediately below does not exist in the
+> current `apps/hib-suite-runner/run-hib.sh`.** Retained verbatim as historical record of
+> what was believed fixed and how; do not treat the runner behavior described here as
+> current.
 
 The runner now gives `DefaultCatalogAndSchemaTest` a finite 3600-second
 class-level floor instead of applying the unsuitable five-minute suite default.
