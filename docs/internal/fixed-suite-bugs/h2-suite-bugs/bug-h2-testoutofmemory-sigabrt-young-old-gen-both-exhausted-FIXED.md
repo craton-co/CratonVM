@@ -209,8 +209,11 @@ build aborts on the first one in both modes.
   heap-pressure-dependent crash this class reaches after ~9-13 minutes, in
   roughly one long run in two to three. Reproduced on **unmodified `dev`** at
   `--Xmx 512m` with a byte-identical register signature, so it is neither this
-  record's abort nor the heap-budget follow-up. Filed as
-  `docs/known-issues/gc-class-mirror-sigsegv-under-sustained-heap-pressure.md`.
+  record's abort nor the heap-budget follow-up. **FIXED** 2026-07-31 in a follow-up: the GC own corrupt-header
+  diagnostic Debug-formatted an `ObjectKind` whose byte was not a valid
+  discriminant, so the derived `Debug` read a `&str` past the end of the
+  variant-name table. Retired to
+  `docs/internal/fixed-suite-bugs/gc-corrupt-header-diagnostic-debug-formats-invalid-enum-sigsegv-FIXED.md`.
 
 * **`gen_heap::set_field: out-of-bounds field write dropped` on a
   `java/lang/Object` with `num_slots=0`** — appears in the post-OOM region that
