@@ -6042,6 +6042,291 @@ pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// JDK-only policy for the JIT's own by-name native fast paths
+// (`docs/feature-designs/jdk-only-mode.md` §1, §7, §10)
+//
+// The JIT crate cannot call the shared resolver: `jit/Cargo.toml` depends on
+// `types`/`reader`/`jit-api` but NOT on `cratonvm-native-api` or `cratonvm-vm`,
+// and it cannot, because `vm` depends on `jit`. So every path from compiled
+// machine code into a native callback runs through a VM-implemented function
+// pointer whose body lives in THIS file. That makes these helpers the JIT's
+// half of the §7 contract.
+//
+// # Where the policy check lives, and why it is not on the hot path
+//
+// Almost every by-name fast path in this file is **resolved once per call
+// site** and then cached (`OBJECT_NATIVE_DISPATCH_CACHE`,
+// `INTEGER_NATIVE_DISPATCH_CACHE`). The policy is fixed for a VM's lifetime,
+// so the whole decision is hoisted to that cold cache-fill edge:
+//
+//   * **Compatible** — [`admit_jit_fast_native`] returns the caller's own
+//     callback unchanged. It never consults the kind, never asks the class
+//     manager anything, and never builds a violation. The only thing it adds
+//     is one `resolve_id` (a triple hash) at fill time, paid once per call
+//     site, in exchange for a census handle. Dispatch is bit-for-bit what it
+//     was, plus the one relaxed increment below.
+//
+//   * **JdkOnly** — the strict arm is `#[cold] #[inline(never)]`. When policy
+//     refuses, the fast path simply **does not become a cache entry**, so the
+//     hot path never grows a strict-mode branch at all: the call falls through
+//     to the generic `crate::vm::invoke_or_native` tail, which agent E already
+//     routed through `resolve_native_dispatch_wave1` and which raises the
+//     structured `VmError::JdkOnly(..)`. The refusal is therefore never a
+//     silent fallback to the stub and never a wild jump — it is a decision to
+//     stop optimizing and let the single authoritative resolver adjudicate.
+//     That is the wave-1-safe answer §10 asks for, and it is the same shape
+//     the JIT crate itself already uses for its thin direct-call helpers.
+//
+// Refusing here can only ever be *more* conservative than dispatching here:
+// the generic path resolves the same triple with strictly more information
+// (a real `&Class` and `&Method`), so it can never be wrong where this fast
+// path would have been right.
+//
+// The two exceptions to "cached, so pay at fill time" are documented at their
+// own call sites, because each needed a different hoist:
+//
+//   * `jit_invoke_virtual_mic`'s exact-receiver **Matcher** leaf re-decides on
+//     every dispatch by design, so it gets a single
+//     `dispatch_policy(vm).is_jdk_only()` gate rather than per-call admission.
+//   * the **`ClassLoader.getResource*`-with-null** intercept in the same
+//     function also resolves per call, but only a `null` resource name reaches
+//     it — the JVM-mandated NPE path — so it can afford full admission inline.
+//
+// # Why a kind-discarding `find` is the actual bypass
+//
+// The pre-existing code called `NativeMethodRegistry::find`, which throws the
+// `NativeKind` away. Policy is *defined* on the kind — `SyntheticStub` is the
+// one kind §1.3 forbids invoking — so a lookup that discards it cannot enforce
+// anything, whatever it does afterwards. Every site below now resolves through
+// `resolve_id` + `callback_of`/`kind_of_id`, which keeps the kind AND yields
+// the `NativeMethodId` the §4 census needs.
+// ---------------------------------------------------------------------------
+
+/// Structured JDK-only violations recorded by the JIT runtime helpers.
+///
+/// Bounded and deduplicated, exactly like `cratonvm_jit`'s own
+/// `JDK_ONLY_VIOLATIONS`: a pathological workload must not be able to grow
+/// this without limit. The counter below stays exact regardless.
+static JDK_ONLY_HELPER_VIOLATIONS: std::sync::OnceLock<
+    parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>>,
+> = std::sync::OnceLock::new();
+
+/// Maximum number of distinct structured violations these helpers retain.
+pub const JDK_ONLY_HELPER_VIOLATION_CAP: usize = 256;
+
+/// Times a JIT by-name native fast path was refused because `JdkOnly` is in
+/// force. Includes both outright `Reject`s and §7-step-3 yields to bytecode.
+static JDK_ONLY_FASTPATH_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn jdk_only_helper_violations(
+) -> &'static parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>> {
+    JDK_ONLY_HELPER_VIOLATIONS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+/// Snapshot of the structured JDK-only violations the JIT runtime helpers
+/// recorded this run. Read when building `--jdk-only-report`; never hot.
+///
+/// This is the runtime-helper counterpart to
+/// `cratonvm_jit::jdk_only_jit_violations()` (compile-time refusals). The two
+/// lists are disjoint and both belong in the report.
+pub fn jdk_only_jit_helper_violations() -> Vec<cratonvm_types::error::JdkOnlyViolation> {
+    let recorded = jdk_only_helper_violations().lock();
+    recorded.as_slice().to_vec()
+}
+
+/// Number of JIT by-name native fast-path admissions refused under `JdkOnly`.
+pub fn jdk_only_jit_fastpath_refusals() -> u64 {
+    JDK_ONLY_FASTPATH_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record one refused fast-path admission, with its structured violation when
+/// the resolver produced one.
+///
+/// `#[cold] #[inline(never)]`, mirroring `vm_exec.rs`'s reject helpers: the
+/// `String` allocations a `JdkOnlyViolation` owns live only on this path, and
+/// this path is unreachable in `Compatible` mode.
+#[cold]
+#[inline(never)]
+fn record_jdk_only_fastpath_refusal(
+    violation: Option<cratonvm_types::error::JdkOnlyViolation>,
+) -> Option<(
+    cratonvm_native_api::NativeCallback,
+    Option<cratonvm_native_api::NativeMethodId>,
+)> {
+    JDK_ONLY_FASTPATH_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(violation) = violation {
+        let mut recorded = jdk_only_helper_violations().lock();
+        if recorded.len() < JDK_ONLY_HELPER_VIOLATION_CAP && !recorded.contains(&violation) {
+            recorded.push(violation);
+        }
+    }
+    None
+}
+
+/// Whether concrete bytecode exists for this triple — the §7 step-3 input a
+/// name triple cannot answer.
+///
+/// Deliberately shaped like `invoke_or_native`'s own `has_real` probe in
+/// `vm/src/vm/vm_exec.rs` so the two sites cannot drift into disagreeing about
+/// what "has bytecode" means. Only ever called from the strict arm below, so
+/// the class-manager read lock and the hierarchy walk are off the hot path and
+/// off every `Compatible` path.
+#[cold]
+#[inline(never)]
+fn jit_fast_native_has_bytecode(
+    vm: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let cm = vm.classes.class_manager.read();
+    cm.get_loaded_class_id(class_name)
+        .and_then(|cid| {
+            cm.get_class(cid).and_then(|cls| {
+                if cls.is_synthetic_stub {
+                    None
+                } else {
+                    crate::classloading::find_method_recursive(
+                        cid,
+                        method_name,
+                        descriptor,
+                        &cm.class_store,
+                    )
+                    .map(|(m, _)| !m.is_native() && m.code().is_some())
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The `JdkOnly` arm of [`admit_jit_fast_native`]. Cold by construction.
+#[cold]
+#[inline(never)]
+fn jdk_only_admit_jit_fast_native(
+    vm: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    callback: cratonvm_native_api::NativeCallback,
+    id: Option<cratonvm_native_api::NativeMethodId>,
+) -> Option<(
+    cratonvm_native_api::NativeCallback,
+    Option<cratonvm_native_api::NativeMethodId>,
+)> {
+    let registry = &vm.natives.native_methods;
+    // The resolver is handed the FAST-PATH callback tagged with the REGISTERED
+    // kind. Policy is a property of the registration; the callback is only the
+    // thing that runs if policy admits it. Pairing them this way is what lets
+    // an admitted decision keep the fast path's specialized callback (e.g. the
+    // real-layout `Matcher.find` intrinsic) instead of silently swapping in a
+    // differently-shaped one.
+    //
+    // No registration at all (`id == None`) yields `native == None`, the
+    // resolver answers `None`, and the fast path is refused. That is the right
+    // answer: a VM-side reimplementation the registry has never heard of
+    // cannot be policy-audited, so it must not stand in front of real bytes.
+    let native = id
+        .and_then(|id| registry.kind_of_id(id))
+        .map(|kind| (callback, kind));
+    let bytecode_available = jit_fast_native_has_bytecode(vm, class_name, method_name, descriptor);
+    match crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::dispatch_policy(vm),
+        class_name,
+        method_name,
+        descriptor,
+        native,
+        // `compat_native_wins` — this site's pre-existing compatibility
+        // verdict. Reaching here at all *is* that verdict: the caller has
+        // already matched the name triple against its fast-path table and
+        // guarded the exact receiver class, which is precisely "today, a
+        // registered native wins here".
+        true,
+        bytecode_available,
+    ) {
+        // §1.3 — a fake may not be invoked under `--jdk-only`.
+        Some(crate::vm::DispatchDecision::Reject(violation)) => {
+            record_jdk_only_fastpath_refusal(Some(violation))
+        }
+        Some(decision) => match decision.native_callback() {
+            Some(cb) => Some((cb, id)),
+            // `Bytecode` is unreachable from the name-only adapter (it has no
+            // `&Method` to borrow), but refusing rather than asserting keeps a
+            // future resolver change from turning into a JIT miscompile.
+            None => record_jdk_only_fastpath_refusal(None),
+        },
+        // "No opinion": §7 step 3 (concrete bytecode beats this bridge), or
+        // nothing registered. Refuse the optimization; the generic tail runs
+        // the real bytes.
+        None => record_jdk_only_fastpath_refusal(None),
+    }
+}
+
+/// Policy admission + census handle for one of the JIT's by-name native fast
+/// paths. Called at **cache-fill** time only — see the banner above.
+///
+/// Returns the callback to install and the `NativeMethodId` the dispatch edge
+/// should count against, or `None` to decline the fast path entirely (the
+/// caller then falls through to generic, policy-checked dispatch).
+#[inline]
+fn admit_jit_fast_native(
+    vm: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    callback: cratonvm_native_api::NativeCallback,
+) -> Option<(
+    cratonvm_native_api::NativeCallback,
+    Option<cratonvm_native_api::NativeMethodId>,
+)> {
+    // One triple hash, once per call site, to obtain the census handle. This is
+    // the `resolve_id` + `callback_of`/`kind_of_id` shape the §7 routing note
+    // in `vm_exec.rs` names as the replacement for a kind-discarding `find`:
+    // the id is what makes the dispatch-edge increment a single relaxed add
+    // rather than a second full lookup.
+    let id = vm
+        .natives
+        .native_methods
+        .resolve_id(class_name, method_name, descriptor);
+    admit_jit_fast_native_resolved(vm, class_name, method_name, descriptor, callback, id)
+}
+
+/// [`admit_jit_fast_native`] for callers that already hold the
+/// `NativeMethodId` (because their fast-path callback *came* from the
+/// registry), so the triple is hashed once rather than twice at fill time.
+#[inline]
+fn admit_jit_fast_native_resolved(
+    vm: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    callback: cratonvm_native_api::NativeCallback,
+    id: Option<cratonvm_native_api::NativeMethodId>,
+) -> Option<(
+    cratonvm_native_api::NativeCallback,
+    Option<cratonvm_native_api::NativeMethodId>,
+)> {
+    if crate::vm::dispatch_policy(vm).is_jdk_only() {
+        return jdk_only_admit_jit_fast_native(vm, class_name, method_name, descriptor, callback, id);
+    }
+    Some((callback, id))
+}
+
+/// Count one native dispatch on a JIT fast-path edge (§4 census).
+///
+/// One `Option` test plus one relaxed `fetch_add` on an id resolved at
+/// cache-fill time. No allocation, no hashing, no lock, no string comparison —
+/// all of that was hoisted to the cold admission above. The acceptance
+/// criterion for `--jdk-only` is *zero* `SyntheticStub` invocations through
+/// **any** path, and an uncounted path is an unverifiable one.
+#[inline]
+fn count_jit_native_dispatch(vm: &SharedVm, id: Option<cratonvm_native_api::NativeMethodId>) {
+    if let Some(id) = id {
+        vm.natives.native_methods.record_invocation(id);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Invoke dispatch helpers
 // ---------------------------------------------------------------------------
 
@@ -6059,6 +6344,12 @@ struct NativeDispatchCache {
     receiver_class_id: u32,
     callback: cratonvm_native_api::NativeCallback,
     kind: ObjectNativeKind,
+    /// §4 census handle for the registry slot this entry dispatches, resolved
+    /// once by [`admit_jit_fast_native`] at cache-fill time. `None` only when
+    /// the registry has no slot for the triple, which under `JdkOnly` cannot
+    /// happen (admission refuses that case) and under `Compatible` just means
+    /// the dispatch is uncountable, exactly as it was before.
+    native_id: Option<cratonvm_native_api::NativeMethodId>,
 }
 
 #[derive(Clone, Copy)]
@@ -6082,6 +6373,8 @@ enum IntegerNativeKind {
 struct IntegerNativeDispatchCache {
     kind: IntegerNativeKind,
     callback: cratonvm_native_api::NativeCallback,
+    /// §4 census handle — see [`NativeDispatchCache::native_id`].
+    native_id: Option<cratonvm_native_api::NativeMethodId>,
 }
 
 // Thread-local map from JitInvokeInfo pointer -> cached JIT entry.
@@ -6646,19 +6939,43 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         let integer_native = match cached {
             Some(entry) => entry,
             None => {
+                // Cold, once per call site. The `(kind, callback)` table is
+                // unchanged; `admit_jit_fast_native` then asks the registry
+                // what `java/lang/Integer.valueOf`/`intValue` are actually
+                // registered as and lets `resolve_native_dispatch_wave1`
+                // decide. Under `Compatible` it hands the same callback back
+                // and adds only the census handle; under `JdkOnly` a refusal
+                // caches `None`, so the boxing fast path simply stops existing
+                // at this site and every call falls through to the generic,
+                // policy-checked tail. No strict-mode branch is added to the
+                // dispatch path itself.
                 let entry = match (info.class_name, info.method_name, info.descriptor) {
                     ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => {
-                        Some(IntegerNativeDispatchCache {
+                        admit_jit_fast_native(
+                            vm,
+                            "java/lang/Integer",
+                            info.method_name,
+                            info.descriptor,
+                            cratonvm_native_builtins::intrinsics::integer::intrinsic_integer_value_of,
+                        )
+                        .map(|(callback, native_id)| IntegerNativeDispatchCache {
                             kind: IntegerNativeKind::ValueOf,
-                            callback: cratonvm_native_builtins::intrinsics::integer::intrinsic_integer_value_of,
+                            callback,
+                            native_id,
                         })
                     }
-                    ("java/lang/Integer", "intValue", "()I") => {
-                        Some(IntegerNativeDispatchCache {
-                            kind: IntegerNativeKind::IntValue,
-                            callback: cratonvm_native_builtins::intrinsics::integer::intrinsic_integer_int_value,
-                        })
-                    }
+                    ("java/lang/Integer", "intValue", "()I") => admit_jit_fast_native(
+                        vm,
+                        "java/lang/Integer",
+                        info.method_name,
+                        info.descriptor,
+                        cratonvm_native_builtins::intrinsics::integer::intrinsic_integer_int_value,
+                    )
+                    .map(|(callback, native_id)| IntegerNativeDispatchCache {
+                        kind: IntegerNativeKind::IntValue,
+                        callback,
+                        native_id,
+                    }),
                     _ => None,
                 };
                 INTEGER_NATIVE_DISPATCH_CACHE.with(|cache| {
@@ -7034,18 +7351,31 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                                 .unwrap_or(false)
                         };
                         if is_exact_receiver {
+                            // Cold, once per call site. Each of these three
+                            // resolvers now applies JDK-only policy internally
+                            // (see `admit_jit_fast_native`) and returns the
+                            // §4 census handle alongside the callback. A
+                            // `None` under `JdkOnly` means "policy declined
+                            // this optimization": nothing is cached, and the
+                            // call falls through to the generic
+                            // `invoke_or_native` tail below, which is the
+                            // single authoritative resolver and raises the
+                            // structured `VmError::JdkOnly(..)` if the triple
+                            // is genuinely unrunnable. Never a stub, never a
+                            // wild jump.
                             let callback = match kind {
-                                ObjectNativeKind::HashMap => hashmap_native_callback(info),
-                                ObjectNativeKind::Matcher => matcher_native_callback(info),
+                                ObjectNativeKind::HashMap => hashmap_native_callback(vm, info),
+                                ObjectNativeKind::Matcher => matcher_native_callback(vm, info),
                                 ObjectNativeKind::StringBuilder => {
                                     stringbuilder_native_callback(vm, info)
                                 }
                             };
-                            if let Some(callback) = callback {
+                            if let Some((callback, native_id)) = callback {
                                 let entry = NativeDispatchCache {
                                     receiver_class_id,
                                     callback,
                                     kind,
+                                    native_id,
                                 };
                                 OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| {
                                     cache.borrow_mut().insert(info_key, entry);
@@ -7334,6 +7664,39 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
     invoke_kind: 3,
     declaring_class_id: 0,
 };
+
+// ---------------------------------------------------------------------------
+// Thin direct-call native helpers (`jit_integer_value_of_direct`,
+// `jit_integer_int_value_direct`, `jit_hashmap_put_direct`,
+// `jit_hashmap_get_direct`, `jit_string_latin1_to_lower_direct`,
+// `jit_string_locale_to_lower_direct`, `jit_concurrent_hashmap_get_direct`).
+//
+// Each is a VM-side reimplementation of a registered native, baked straight
+// into the emitted `CALL` — no dispatch helper, and so no policy check, on the
+// path. None of them carries an internal JDK-only check, deliberately: under
+// `JdkOnly` they are unreachable, gated twice and both gates upstream of any
+// code that could execute.
+//
+//  1. `build_helpers` does not register their addresses at all under
+//     `JdkOnly`, so the `*_DIRECT_FN` cells stay `0` — the established
+//     "not wired, use the generic dispatch helper" sentinel.
+//  2. `jit::direct_native_helper` refuses to bind a non-zero address once
+//     `set_jit_execution_policy` has latched strict, and records a
+//     `NativeShadowsBytecode` violation when it does.
+//
+// Adding a third, per-invocation check inside these bodies would put a policy
+// read on the hottest boxing/collection paths in the VM to defend against a
+// state that cannot occur. If either gate above is ever removed, this comment
+// is the reason these bodies look unguarded.
+//
+// JDK-ONLY-WAVE2: these helpers should not need a policy gate at all. What
+// must replace the arrangement above: the compile-time recognition in
+// `jit::try_compile` should ask the shared resolver whether the triple's
+// registered native may shadow bytecode, instead of the JIT crate carrying a
+// latched process-global mirror of the policy because it cannot see
+// `NativeKind`. That is the same layering fix `jit/src/lib.rs`'s own WAVE2
+// marker on `set_jit_execution_policy` describes.
+// ---------------------------------------------------------------------------
 
 /// Thin direct-call target for JIT `invokestatic Integer.valueOf(I)` sites
 /// (registered into `cratonvm_jit::INTEGER_VALUE_OF_DIRECT_FN` by
@@ -8028,8 +8391,32 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
     )
 }
 
+/// §4 census wrapper around [`call_integer_native_raw_inner`].
+///
+/// `Some` is "this edge delivered the native's semantics" — which includes the
+/// two arms that deliberately never touch `entry.callback` (the TLAB wrapper
+/// allocation and the direct `intValue` field read). Those are open-coded
+/// copies of the registered intrinsic, so from the census's point of view the
+/// native was dispatched; not counting them would leave exactly the kind of
+/// unverifiable path the acceptance criterion is written against. Every `None`
+/// return is an argument-shape guard that runs before any of it.
 #[inline]
 fn call_integer_native_raw(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    entry: IntegerNativeDispatchCache,
+) -> Option<i64> {
+    let result = call_integer_native_raw_inner(vm, thread, info, args_slice, entry);
+    if result.is_some() {
+        count_jit_native_dispatch(vm, entry.native_id);
+    }
+    result
+}
+
+#[inline]
+fn call_integer_native_raw_inner(
     vm: &SharedVm,
     thread: &mut JvmThread,
     info: &JitInvokeInfo,
@@ -8137,17 +8524,41 @@ fn hashmap_native_arg_count(info: &JitInvokeInfo) -> Option<usize> {
     }
 }
 
+/// Resolve the exact-layout `HashMap` fast-path native for this site, subject
+/// to JDK-only policy. Called once per call site, at cache-fill time.
+///
+/// The callbacks here are **hard-coded VM-side implementations**, not registry
+/// lookups — which is precisely why this needed routing: nothing about the
+/// bare `match` could tell whether `java/util/HashMap.put` is registered as a
+/// reviewed `Intrinsic`, an ordinary `Bridge` in front of real JDK bytecode,
+/// or a `SyntheticStub` that §1.3 forbids invoking outright.
+/// [`admit_jit_fast_native`] asks the registry for the kind and lets
+/// `resolve_native_dispatch_wave1` answer; `Compatible` keeps the exact
+/// callback this function always returned.
 #[inline]
-fn hashmap_native_callback(info: &JitInvokeInfo) -> Option<cratonvm_native_api::NativeCallback> {
-    match (info.method_name, info.descriptor) {
+fn hashmap_native_callback(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<(
+    cratonvm_native_api::NativeCallback,
+    Option<cratonvm_native_api::NativeMethodId>,
+)> {
+    let callback = match (info.method_name, info.descriptor) {
         ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") => {
-            Some(cratonvm_native_collections::native_hashmap_put_exact)
+            cratonvm_native_collections::native_hashmap_put_exact
         }
         ("get", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
-            Some(cratonvm_native_collections::native_hashmap_get_exact)
+            cratonvm_native_collections::native_hashmap_get_exact
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    admit_jit_fast_native(
+        vm,
+        "java/util/HashMap",
+        info.method_name,
+        info.descriptor,
+        callback,
+    )
 }
 
 #[inline]
@@ -8164,12 +8575,58 @@ fn matcher_native_arg_count(info: &JitInvokeInfo) -> Option<usize> {
     }
 }
 
+/// The pre-existing, policy-free `Matcher` fast-path lookup: the operator's
+/// `native_matcher_find()` opt-out and a two-`&'static str` match, nothing
+/// else. No registry access, no lock, no hashing.
+///
+/// This is the body `matcher_native_callback` used to have, kept verbatim for
+/// the ONE caller that re-decides on every dispatch — `jit_invoke_virtual_mic`'s
+/// exact-receiver Matcher leaf. That caller hoists the JDK-only question out to
+/// a single `dispatch_policy(vm).is_jdk_only()` gate instead of paying policy
+/// per call; see the long comment at its call site for why, and for the
+/// `JDK-ONLY-WAVE2` marker covering the census gap that leaves.
+///
+/// Every *cached* caller must use [`matcher_native_callback`] instead.
 #[inline]
-fn matcher_native_callback(info: &JitInvokeInfo) -> Option<cratonvm_native_api::NativeCallback> {
+fn matcher_native_callback_uncached(
+    info: &JitInvokeInfo,
+) -> Option<cratonvm_native_api::NativeCallback> {
     if !crate::runtime::env_cache::native_matcher_find() {
         return None;
     }
     cratonvm_native_builtins::matcher_realjdk_native_callback(info.method_name, info.descriptor)
+}
+
+/// Resolve the real-layout `Matcher` fast-path native for this site, subject
+/// to JDK-only policy. Called once per call site, at cache-fill time.
+///
+/// The `native_matcher_find()` env gate stays the FIRST question asked: it is
+/// the operator's existing opt-out and JDK-only must never make a disabled
+/// fast path reappear. Policy is then layered on top of that verdict, never
+/// under it.
+///
+/// These natives are registered `NativeKind::Intrinsic` (see the long
+/// `keep_real_matcher_find_fastpath` banner in `native-builtins/src/lib.rs`),
+/// so §1.4's reviewed-intrinsic exception admits them and the 19x real-JDK
+/// `Matcher.find` fast path survives `--jdk-only` intact on this cached route.
+/// That answer comes out of the registry, not out of an assumption here —
+/// which is the point.
+#[inline]
+fn matcher_native_callback(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<(
+    cratonvm_native_api::NativeCallback,
+    Option<cratonvm_native_api::NativeMethodId>,
+)> {
+    let callback = matcher_native_callback_uncached(info)?;
+    admit_jit_fast_native(
+        vm,
+        "java/util/regex/Matcher",
+        info.method_name,
+        info.descriptor,
+        callback,
+    )
 }
 
 #[inline]
@@ -8187,14 +8644,33 @@ fn stringbuilder_native_arg_count(info: &JitInvokeInfo) -> Option<usize> {
 /// registry's 3-string hash) — cached per callsite afterwards, exactly like
 /// the HashMap/Matcher kinds. Returns `None` (no caching, generic dispatch)
 /// when no native is registered for the triple.
+///
+/// This was a bare `NativeMethodRegistry::find`, which discards the
+/// `NativeKind` — so it could not tell a reviewed intrinsic from a
+/// `SyntheticStub` and could not honour §1.3 or §1.4. It now resolves through
+/// `resolve_id` + `callback_of`, whose semantics the registry documents as
+/// *identical* to `find` (descriptor-quirk fallback included), so `Compatible`
+/// mode gets the same callback from the same lookup — plus the
+/// `NativeMethodId` the census needs and the kind policy needs.
 #[inline]
 fn stringbuilder_native_callback(
     vm: &SharedVm,
     info: &JitInvokeInfo,
-) -> Option<cratonvm_native_api::NativeCallback> {
-    vm.natives
-        .native_methods
-        .find("java/lang/StringBuilder", info.method_name, info.descriptor)
+) -> Option<(
+    cratonvm_native_api::NativeCallback,
+    Option<cratonvm_native_api::NativeMethodId>,
+)> {
+    let registry = &vm.natives.native_methods;
+    let id = registry.resolve_id("java/lang/StringBuilder", info.method_name, info.descriptor)?;
+    let callback = registry.callback_of(id)?;
+    admit_jit_fast_native_resolved(
+        vm,
+        "java/lang/StringBuilder",
+        info.method_name,
+        info.descriptor,
+        callback,
+        Some(id),
+    )
 }
 
 /// Invoke a cached StringBuilder native from raw JIT argument slots.
@@ -8284,7 +8760,7 @@ fn call_object_native_raw(
     args_slice: &[i64],
     entry: NativeDispatchCache,
 ) -> Option<i64> {
-    match entry.kind {
+    let result = match entry.kind {
         ObjectNativeKind::HashMap => {
             call_hashmap_native_raw(vm, thread, info, receiver_ref, args_slice, entry.callback)
         }
@@ -8299,7 +8775,19 @@ fn call_object_native_raw(
             args_slice,
             entry.callback,
         ),
+    };
+    // §4 census, counted on the dispatching edge.
+    //
+    // `Some` is exactly "the native ran": each of the three leaves returns
+    // `None` only from an argument-shape guard taken BEFORE
+    // `safe_native_call_prevalidated_objects`, and returns `Some` on both the
+    // `Ok` and the `Err` (native threw) arms after it. Counting here rather
+    // than inside each leaf keeps the census on one line instead of threaded
+    // through three signatures, and cannot count a call that did not happen.
+    if result.is_some() {
+        count_jit_native_dispatch(vm, entry.native_id);
     }
+    result
 }
 
 /// Invoke a cached HashMap bridge directly from raw JIT argument slots.
@@ -8823,12 +9311,40 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 )
         )
     {
-        if let Some(callback) = vm.natives.native_methods.find(
-            "java/lang/ClassLoader",
-            info.method_name,
-            info.descriptor,
-        ) {
+        // §7 routing. This was a bare `NativeMethodRegistry::find`, which
+        // discards the `NativeKind` and so could not tell a reviewed intrinsic
+        // from a `SyntheticStub` — the exact shape §1.3 forbids invoking. It
+        // now resolves kind-aware and goes through the shared admission
+        // helper, which also yields the §4 census handle.
+        //
+        // Unlike the three cached fast paths, this site resolves per call —
+        // but it is guarded by `args_slice[1] == 0`, i.e. only a `null`
+        // resource name reaches it, which is the JVM-mandated NPE path and
+        // never hot. The full policy round trip is affordable here precisely
+        // because this edge is an error path, not a throughput path.
+        //
+        // Declining (`None`) falls through to the ordinary MIC resolution
+        // below — byte-for-byte what already happened whenever `find` returned
+        // `None`, and a path that ends in `invoke_or_native`, which is itself
+        // policy-checked.
+        let loader_native = vm
+            .natives
+            .native_methods
+            .resolve_id("java/lang/ClassLoader", info.method_name, info.descriptor)
+            .and_then(|id| {
+                let callback = vm.natives.native_methods.callback_of(id)?;
+                admit_jit_fast_native_resolved(
+                    vm,
+                    "java/lang/ClassLoader",
+                    info.method_name,
+                    info.descriptor,
+                    callback,
+                    Some(id),
+                )
+            });
+        if let Some((callback, native_id)) = loader_native {
             let values = decode_values();
+            count_jit_native_dispatch(vm, native_id);
             return match crate::vm::safe_native_call(vm, thread, callback, &values) {
                 Ok(Some(Value::Int(v))) => v as i64,
                 Ok(Some(Value::Long(v))) => v,
@@ -8867,10 +9383,40 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // path every `find`/`start`/`end`/`group` hit decodes a heap-allocated
     // `Vec<Value>`, retries a compile probe, and performs generic virtual/native
     // resolution. Guarding the exact receiver class preserves subclass
-    // overrides; the feature gate in `matcher_native_callback` preserves the
-    // native opt-out, and class redefinition keeps using the generic resolver.
-    if !class_was_redefined(vm, receiver_class_id) {
-        if let Some(callback) = matcher_native_callback(info) {
+    // overrides; the feature gate in `matcher_native_callback_uncached`
+    // preserves the native opt-out, and class redefinition keeps using the
+    // generic resolver.
+    //
+    // §7 routing — this leaf is the one HOT by-name native fast path in this
+    // file that is not memoized per call site: it re-decides on every
+    // dispatch, by design, because deciding used to be two `&'static str`
+    // compares (the `ClassLoader` intercept above is also unmemoized, but only
+    // a null resource name reaches it, so it can afford the real thing). That
+    // is why it gets a **hoisted** policy gate instead of the per-site admission
+    // the other three use. `dispatch_policy(vm).is_jdk_only()` is two field
+    // reads and a compare — no lock, no allocation, and above all no string
+    // hashing — where calling `admit_jit_fast_native` here would put a
+    // three-string registry hash (and, in strict mode, a class-manager read
+    // lock plus a hierarchy walk) on a documented 19x hot path.
+    //
+    // Under `JdkOnly` the leaf is skipped wholesale and `Matcher.find` falls
+    // through to the generic `invoke_or_native` tail — the same route it took
+    // before this fast path existed, and one that is policy-checked and
+    // resolves the very same registered `Intrinsic`. Skipping is strictly
+    // conservative: a disabled optimization cannot invoke a `SyntheticStub`,
+    // so this edge contributes zero to the acceptance criterion by
+    // construction, no matter what is registered.
+    //
+    // JDK-ONLY-WAVE2: this edge is therefore **uncounted** for the §4 census
+    // in `Compatible` mode (in `JdkOnly` it is unreachable, so there is
+    // nothing to count). What must replace it: a per-call-site memo of the
+    // admitted `(callback, NativeMethodId)` decision — keyed on `info_ptr`
+    // like `OBJECT_NATIVE_DISPATCH_CACHE`, or on eight `NativeCallSite` cells
+    // (one per Matcher triple, which is what that type exists for) — so the
+    // census increment becomes one relaxed add and the strict path regains
+    // the fast route instead of merely being safe without it.
+    if !class_was_redefined(vm, receiver_class_id) && !crate::vm::dispatch_policy(vm).is_jdk_only() {
+        if let Some(callback) = matcher_native_callback_uncached(info) {
             if is_exact_matcher_class(vm, receiver_class_id) {
                 if let Some(result) =
                     call_matcher_native_raw(vm, thread, info, receiver_ref, args_slice, callback)
@@ -11277,30 +11823,92 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         jit_disarm_savebase_watch as *const () as usize,
     );
 
+    // §7/§10 — publish this VM's execution policy to the JIT BEFORE anything
+    // else here, and in particular before the first compilation.
+    //
+    // Ordering is the whole point. `cratonvm_jit::set_jit_execution_policy`
+    // gates two compile-time mechanisms that would otherwise bake a native
+    // call into machine code with no policy check anywhere on the path: the
+    // thin direct-call helpers registered immediately below, and inline-cache
+    // publication of an unowned (native/builtin) entry pointer. A JIT decision
+    // is made once and then executes for the life of the artifact, so a
+    // callback bound before the policy arrives would keep running under a
+    // policy that forbids it. Setting it first makes that unrepresentable: no
+    // artifact of this VM is ever compiled under a policy other than the one
+    // it runs under.
+    //
+    // `process_vm()` is published by `Vm::new()` before any bytecode runs (see
+    // the `safepoint_flag_addr` note below, which relies on the same fact), and
+    // compilation only starts once the interpreter is executing bytecode — so
+    // by the time a real JIT compile can trigger this function, the policy is
+    // available. `None` (a unit test calling `build_helpers()` with no VM)
+    // leaves the JIT's latch untouched, which it already treats as
+    // `Compatible`; that is the pre-existing behaviour for such tests and the
+    // conservative direction is unavailable to us here anyway, since there is
+    // no VM to ask.
+    //
+    // The latch itself only ever moves toward strict, so this call can never
+    // relax a policy another VM in the same process already installed.
+    let jdk_only = match crate::native::jni::process_vm() {
+        Some(shared) => {
+            let policy = shared.config.execution_policy();
+            cratonvm_jit::set_jit_execution_policy(policy);
+            policy.is_jdk_only()
+        }
+        None => false,
+    };
+
     // `Integer.valueOf(I)` / `Integer.intValue()` thin direct-call helpers —
     // same no-ABI-change registration pattern as the savebase watch helpers
     // above. See `jit_integer_value_of_direct` / `jit_integer_int_value_direct`
     // and the recognition in `jit::try_compile`.
-    cratonvm_jit::set_integer_value_of_direct_fn(jit_integer_value_of_direct as *const () as usize);
+    //
+    // Every helper in this block is a **VM-side reimplementation of a
+    // registered native** that the JIT bakes straight into the emitted `CALL`.
+    // Under `JdkOnly` that is `NativeShadowsBytecode` by construction (§1 rule
+    // 4: concrete bytecode wins), so they are not registered at all. Belt and
+    // braces: `jit::direct_native_helper` already refuses to *bind* a non-zero
+    // address once the policy is latched, and leaving the address at `0` makes
+    // that refusal unreachable rather than merely correct — one fewer way for
+    // a compile path to reach a baked native. `0` is the established "not
+    // wired, use the generic dispatch helper" sentinel every one of these
+    // recognition sites already handles, so the fallback is the ordinary
+    // policy-checked `jit_invoke_dispatch` route, not a stub and not a wild
+    // jump.
+    //
+    // Deliberately NOT skipped under `JdkOnly`:
+    //  * `set_indy_string_concat_fn` — a `StringConcatFactory` *bootstrap*
+    //    bridge, not a native-method dispatch. The interpreter reaches the same
+    //    bridge for the same sites, so gating it would move the call without
+    //    changing the policy answer, while perturbing
+    //    `CompiledMethod::has_indy_trap` (an OSR-correctness input).
+    //  * `set_monitor_direct_fns` — VM monitor services, not registered
+    //    natives. Not a dispatch site.
+    // Both exclusions match `jit/src/lib.rs`'s own JDK-ONLY-NOTE items 5 and 6.
     cratonvm_jit::set_indy_string_concat_fn(jit_indy_string_concat as *const () as usize);
-    cratonvm_jit::set_integer_int_value_direct_fn(
-        jit_integer_int_value_direct as *const () as usize,
-    );
     cratonvm_jit::set_monitor_direct_fns(
         jit_monitor_enter as *const () as usize,
         jit_monitor_exit as *const () as usize,
     );
-    cratonvm_jit::set_hashmap_put_direct_fn(jit_hashmap_put_direct as *const () as usize);
-    cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
-    cratonvm_jit::set_string_latin1_lower_direct_fn(
-        jit_string_latin1_to_lower_direct as *const () as usize,
-    );
-    cratonvm_jit::set_string_locale_lower_direct_fn(
-        jit_string_locale_to_lower_direct as *const () as usize,
-    );
-    cratonvm_jit::set_concurrent_hashmap_get_direct_fn(
-        jit_concurrent_hashmap_get_direct as *const () as usize,
-    );
+    if !jdk_only {
+        cratonvm_jit::set_integer_value_of_direct_fn(
+            jit_integer_value_of_direct as *const () as usize,
+        );
+        cratonvm_jit::set_integer_int_value_direct_fn(
+            jit_integer_int_value_direct as *const () as usize,
+        );
+        cratonvm_jit::set_hashmap_put_direct_fn(jit_hashmap_put_direct as *const () as usize);
+        cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
+        cratonvm_jit::set_string_latin1_lower_direct_fn(
+            jit_string_latin1_to_lower_direct as *const () as usize,
+        );
+        cratonvm_jit::set_string_locale_lower_direct_fn(
+            jit_string_locale_to_lower_direct as *const () as usize,
+        );
+        cratonvm_jit::set_concurrent_hashmap_get_direct_fn(
+            jit_concurrent_hashmap_get_direct as *const () as usize,
+        );
+    }
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
         crate::native::jni::process_vm()

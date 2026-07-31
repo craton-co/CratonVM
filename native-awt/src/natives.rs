@@ -569,6 +569,14 @@ fn get_double(args: &[Value], idx: usize) -> f64 {
 // Registration
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Nothing in this file sets a
+// category; every registration below inherits whatever ambient category the
+// caller left in place. Today that is `Bridge`, supplied wholesale by
+// `lib.rs::register_awt_natives`'s `with_category(Bridge, register_all)`.
+// Per-group verdicts are annotated on each `register_*_natives` below and were
+// derived from `javap -p -s` against JDK 25; they are static evidence only and
+// must be confirmed with schema-v2 `invocations` counts before any group is
+// retagged. See docs/jdk-only-ambient-category-audit.md.
 pub fn register_all(registry: &mut NativeMethodRegistry) {
     register_toolkit_natives(registry);
     register_headless_natives(registry);
@@ -677,6 +685,15 @@ fn build_headless_toolkit(ctx: &mut dyn NativeContext) -> MethodCallResult {
     Ok(tk)
 }
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Mixed group, must be split before
+// any retag. `Toolkit.initIDs()V` and `sun/java2d/Disposer.initIDs()V` ARE
+// ACC_NATIVE in JDK 25 and an empty body is the spec-correct implementation for
+// a VM that resolves fields by name → bridge. But `Toolkit.getScreenSize`,
+// `getScreenResolution`, `sync` and `beep` are *abstract* on `java.awt.Toolkit`,
+// so registering natives on them intercepts every Toolkit subclass (the
+// `Abstract*`-interception hazard), and `sun/awt/SunToolkit.getDefaultToolkit`
+// does not exist in the image at all → compatibility shim. Evidence needed:
+// per-triple `invocations` under a headless AWT run.
 fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
     // KEEP (deliberate no-op): `initIDs` caches JNI field/method IDs for the
     // native disposer thread. CratonVM resolves fields by name and has no JNI
@@ -771,6 +788,14 @@ fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
 /// together does not run cleanly under the partial bootstrap. Registering
 /// `getLocalGraphicsEnvironment` as a native lets us reproduce the exact JDK
 /// headless wiring without depending on the `LocalGE` static initializer.
+// JDK-ONLY-CLASSIFY: bridge — `sun/awt/PlatformGraphicsInfo.hasDisplays0()Z` is
+// ACC_NATIVE in JDK 25: it is the display probe, an OS boundary with no
+// bytecode fallback, and answering `false` is the truthful answer for a VM with
+// no display backend. The four sibling registrations in this function
+// (`getDefaultHeadlessProperty`, `getDefaultHeadlessMessage`, and the
+// `GraphicsEnvironment` entries) have concrete bytecode in the image and are
+// JDK-ONLY-CLASSIFY: stub — they restate a policy the real bytecode already
+// derives from `hasDisplays0`. Split this function before retagging.
 fn register_headless_natives(registry: &mut NativeMethodRegistry) {
     // sun.awt.PlatformGraphicsInfo.getDefaultHeadlessProperty()Z — the JDK
     // consults this when `java.awt.headless` is unset. On a host with no
@@ -879,6 +904,13 @@ fn build_local_graphics_environment(ctx: &mut dyn NativeContext) -> MethodCallRe
 // Component natives
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: stub — all 11 registrations (`setBounds`, `setVisible`,
+// `setEnabled`, `repaint`, `requestFocus`, `getWidth`, `getHeight`, …) target
+// `java.awt.Component` methods that have concrete bytecode in JDK 25.
+// `Component` declares exactly one ACC_NATIVE method, `initIDs()V`, and this
+// group does not register it. These re-implement class-library behaviour over
+// the crate's Rust peer model, so under JdkOnly the real bytecode must win.
+// They are currently tagged `Bridge` only because `register_all` inherits it.
 fn register_component_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/Component", "setBounds", "(IIII)V", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
@@ -1090,6 +1122,11 @@ fn register_component_natives(registry: &mut NativeMethodRegistry) {
 // Frame natives
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: stub — `java.awt.Frame`'s only ACC_NATIVE method is
+// `initIDs()V`, which this group does not register. Four of the six entries
+// have concrete bytecode; `toFront()V` and `toBack()V` are declared on
+// `java.awt.Window`, not `Frame`, so those two registrations never match a
+// method on the real class and are dead against a real JDK image.
 fn register_frame_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "java/awt/Frame",
@@ -1146,6 +1183,14 @@ fn register_frame_natives(registry: &mut NativeMethodRegistry) {
 // Graphics2D natives
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: stub — 27 drawing primitives registered three times over
+// (`java/awt/Graphics2D`, `sun/java2d/SunGraphics2D`, `java/awt/Graphics`).
+// `java.awt.Graphics` declares NO native method in JDK 25; these are a software
+// rasterizer standing in for the Java2D pipeline, i.e. an incomplete
+// re-implementation of class-library behaviour, not a VM/OS boundary. Note the
+// loop registers the same (name, descriptor) on an abstract superclass and its
+// implementations, so the tag chosen here decides dispatch for every
+// `Graphics` subclass a user program defines.
 fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
     for class in &[
         "java/awt/Graphics2D",
@@ -1946,6 +1991,14 @@ fn encode_rendered_image(
     image.encode(format).map_err(imageio_io_error)
 }
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Mixed group, must be split. Seven
+// entries are genuine bridges: `com/sun/imageio/plugins/jpeg/JPEGImageReader`'s
+// `initJPEGImageReader`, `setSource`, `resetReader`, `resetLibraryState`,
+// `disposeReader` and the `initReaderIDs`/`initWriterIDs` pair are all
+// ACC_NATIVE in JDK 25 and back libjpeg, which this VM does not link. The
+// remaining 15 (`BufferedImage.createGraphics`, `getRGB`/`setRGB`, …) have
+// concrete bytecode and are stubs; `BufferedImage.flush()V` is inherited from
+// `java.awt.Image` and does not exist on `BufferedImage` itself.
 fn register_image_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/image/BufferedImage", "<init>", "(III)V", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
@@ -2684,6 +2737,12 @@ fn posted_awt_event_from_java(ctx: &dyn NativeContext, event_obj: ObjectRef) -> 
     }
 }
 
+// JDK-ONLY-CLASSIFY: stub — all 7 target `java.awt.EventQueue` /
+// `java.awt.event.*` methods with concrete bytecode in JDK 25. The event pump
+// here synthesizes events for a VM with no display; that is compatibility
+// behaviour standing in for a windowing system, not a bridge to one. A real
+// bridge would appear once `platform/` is wired and would live on the
+// `sun.awt.*` peer natives, which are ACC_NATIVE.
 fn register_event_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "java/awt/EventQueue",
@@ -2943,6 +3002,12 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
 // Font natives
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: stub — all 12 target `java.awt.Font` /
+// `java.awt.FontMetrics` methods with concrete bytecode in JDK 25. Font metrics
+// are computed here from the crate's own tables rather than from a platform
+// font engine, so these are approximations of class-library behaviour. The
+// platform boundary in the real JDK sits below this, in `sun.font.*`
+// ACC_NATIVE methods that this crate does not register.
 fn register_font_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "java/awt/Font",
@@ -3112,6 +3177,11 @@ fn register_font_natives(registry: &mut NativeMethodRegistry) {
 // Swing natives
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: stub — javax.swing is pure Java; not one method in this
+// group is ACC_NATIVE in JDK 25. 15 of the 16 registrations shadow concrete
+// bytecode, and the `JOptionPane.showInputDialog` entry does not match any
+// descriptor on the real class. Swing on a real JDK image should run its own
+// bytecode down to the AWT peer layer.
 fn register_swing_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "javax/swing/UIManager",
@@ -3333,6 +3403,13 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
 // Clipboard natives
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. All 3 target methods with concrete
+// bytecode in JDK 25, which argues stub; but a system clipboard IS an OS
+// resource, and the real JDK reaches it through `sun.awt.datatransfer` peers
+// that this VM does not implement. Whether these should become bridges on the
+// peer classes or be deleted so the real bytecode fails cleanly cannot be
+// decided from source. Evidence needed: `invocations` from a run that actually
+// touches `Toolkit.getSystemClipboard`.
 fn register_clipboard_natives(registry: &mut NativeMethodRegistry) {
     use crate::clipboard::{get_clipboard, ClipboardKind};
 

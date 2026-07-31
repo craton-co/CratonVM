@@ -63,10 +63,76 @@ Each registered native is classified by kind:
 - **Synthetic stub** — a standalone Rust implementation used when there's no real
   JDK class to run.
 
+Registrations deliberately **overwrite by triple**: a later
+`(class, name, descriptor)` registration replaces an earlier one in place, and
+the last write wins. That is how subsystem-specific passes refine the boot
+registrations, and until schema 2 the replaced entry left no trace at all.
+
 You can dump the full classified registry at runtime with
 `--dump-native-registry`, and audit which natives a program *needs but lacks*
 with `--XX:AuditMissingNatives` — see [Debugging &
 Diagnostics](../user-guide/debugging.md).
+
+### The native registry census (schema 2)
+
+`--dump-native-registry <FILE>` writes `"schema_version": 2`. Schema 1 carried
+only `{class, name, descriptor, kind}` — enough to *count* stubs, not enough to
+retire any. Schema 2 adds the provenance that makes a row actionable:
+
+```json
+{
+  "schema_version": 2,
+  "counts": { "bridge": 0, "intrinsic": 0, "synthetic-stub": 0, "total": 0 },
+  "natives": [
+    {
+      "class": "java/lang/Object",
+      "name": "hashCode",
+      "descriptor": "()I",
+      "kind": "intrinsic",
+      "registered_by": "<redacted>/lib.rs:1234",
+      "overwrote": null,
+      "invocations": 0,
+      "real_declaring_method": null
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `kind` | `intrinsic`, `bridge` or `synthetic-stub` — the `NativeKind` tag. |
+| `registered_by` | The `register()` **call site**, `file:line`, captured with `#[track_caller]` rather than a string built at registration time. It names the `register_*` pass that produced the entry. `null` if no site was recorded. |
+| `overwrote` | The `NativeKind` this registration replaced in place, or `null` when it replaced nothing. This is the supersession history that was previously unrecoverable. |
+| `invocations` | Runtime **dispatches** this run, not registrations. `0` means removing the entry would cost this workload nothing. |
+| `real_declaring_method` | Reserved. Currently emitted as `null` on every row — see below. |
+
+`counts` is seeded with all three kinds, so a stub-free census still emits
+`"synthetic-stub": 0` and a gate can assert on the key's value rather than on
+its absence. Rows are sorted by `(class, name, descriptor, registered_by)` so
+the file is byte-stable and can be committed as a baseline; the registration
+order the registry returns internally is deliberately *not* stable across
+builds.
+
+Two caveats to read the columns correctly:
+
+- **`invocations` is a lower bound.** It is incremented on the dispatch paths
+  that hold a native slot handle (the interpreter's invoke paths and
+  `vm_exec`). The warm cached virtual-native path, the JIT's native thunk and
+  the paths that resolve a native by name only carry no slot handle, so their
+  calls are not counted. A `0` is evidence, not proof.
+- **`real_declaring_method` is a known, deliberate gap.** The intended object
+  answers "does the real JDK image declare this exact triple, is it
+  `ACC_NATIVE`, does it carry a `Code` attribute" — the fact that separates a
+  legitimate bridge from a stub shadowing real bytecode. Answering it needs a
+  *non-initiating* lookup against the boot image; resolving it through the
+  ordinary class-loading path at shutdown would load hundreds of classes the
+  run never touched and change what the census reports about itself. The key
+  is emitted with a `null` value rather than invented, so a consumer can tell
+  "not answerable yet" from "schema changed".
+
+`registered_by` paths are redacted to `<redacted>/<basename>:<line>` unless
+`--explain-jdk-only` is passed, so a census stays diffable across hosts and
+carries no developer's home directory into a bug report.
 
 `cratonvm-native-awt` registrations are classified as **Bridge** natives:
 they satisfy native entry points reached by real JDK AWT/Swing/Java2D classes.
@@ -83,6 +149,11 @@ per-subsystem for differential testing — see
 [Configuration](../user-guide/configuration.md). The project's direction is
 bytecode-first: prefer running real `.class` files for application-visible types
 over synthetic stubs.
+
+`--jdk-only` is that direction expressed as a runtime policy: under it a
+`SyntheticStub` may be neither registered nor invoked, while reviewed
+intrinsics and bridges remain allowed. See [JDK-Only
+Mode](../user-guide/jdk-only-mode.md).
 
 ## Adding a native method
 
