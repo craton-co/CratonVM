@@ -20,7 +20,7 @@
 // (faster non-cryptographic hash, safe because keys are trusted internal
 // data: ClassId, interned class names, etc.).
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1117,6 +1117,46 @@ static ANY_CLASS_REDEFINED: AtomicBool = AtomicBool::new(false);
 #[inline]
 pub fn any_class_redefined() -> bool {
     ANY_CLASS_REDEFINED.load(Ordering::Relaxed)
+}
+
+/// Generation of the class-name -> `ClassId` mapping.
+///
+/// Bumped by every mutation of `loaded_classes` — `loaded_classes_insert`,
+/// `loaded_classes_remove`, and the bulk `retain` in
+/// `unload_user_classes_inner` — which together are the only state
+/// `get_loaded_class_id`, `get_loaded_class_id_for_requester` and
+/// `find_unique_class_by_name` consult. (`user_loaders`, the other input to
+/// the custom-loader fallback, is only ever extended in the same block as an
+/// insert, so the insert hook covers it.)
+///
+/// This exists so a cache whose validity condition is *"this name still
+/// resolves to this `ClassId`"* can be revalidated with one atomic load
+/// instead of taking the `class_manager` read lock.
+/// [`any_class_redefined`] does NOT stand in for it: redefinition changes a
+/// class's *contents* in place and leaves the name mapping alone, whereas a
+/// second loader defining the same name changes the mapping while redefining
+/// nothing. Nor do the JIT's `jit_cache_generation` / `jit_supersede_epoch`,
+/// which track compiled-code lifetime and never move for a plain class
+/// definition.
+///
+/// Never reset; wraps only after 2^64 definitions.
+static CLASS_DEFINITION_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Current [`CLASS_DEFINITION_EPOCH`]. One `Acquire` load — free on x86.
+///
+/// A reader that observes a *changed* epoch also observes every mapping
+/// mutation the bumping writer made before it, because the writer bumps with
+/// `Release` while holding the `class_manager` write lock.
+#[inline]
+pub fn class_definition_epoch() -> u64 {
+    CLASS_DEFINITION_EPOCH.load(Ordering::Acquire)
+}
+
+/// Record that the class-name -> `ClassId` mapping changed. Called from the
+/// three mutation sites while the `class_manager` write lock is held.
+#[inline]
+fn bump_class_definition_epoch() {
+    CLASS_DEFINITION_EPOCH.fetch_add(1, Ordering::Release);
 }
 
 /// C1→C2 supersede epoch. Bumped by the VM's background compile worker each
@@ -4989,7 +5029,12 @@ impl ClassManager {
         // happen to share the same resolution namespace.
         self.loaded_classes.retain(|_, id| !ids.contains(id));
         // Removal here is by ClassId set, not by key, so there is no
-        // per-entry hook to decrement the name index through.
+        // per-entry hook to decrement the name index through — and, for the
+        // same reason, no `loaded_classes_remove` call to carry the
+        // definition-epoch bump. Bump it here instead: unloading a loader is
+        // exactly the case where a name stops resolving to the `ClassId` a
+        // cache memoized it against.
+        bump_class_definition_epoch();
         self.rebuild_name_definitions();
         self.vtable_descriptors.retain(|id, _| !ids.contains(id));
         self.skip_bytecode_verification
@@ -6530,6 +6575,7 @@ impl ClassManager {
     ) -> Option<ClassId> {
         let name = Arc::clone(&key.1);
         let displaced = self.loaded_classes.insert(key, id);
+        bump_class_definition_epoch();
         if let Some(old) = displaced {
             release_name_definition(&mut self.name_definitions, &name, old);
         }
@@ -6546,6 +6592,9 @@ impl ClassManager {
     /// step.
     fn loaded_classes_remove(&mut self, key: &(ClassLoaderId, Arc<str>)) -> Option<ClassId> {
         let removed = self.loaded_classes.remove(key);
+        if removed.is_some() {
+            bump_class_definition_epoch();
+        }
         if let Some(old) = removed {
             release_name_definition(&mut self.name_definitions, &key.1, old);
         }
