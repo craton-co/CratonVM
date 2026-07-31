@@ -13773,7 +13773,18 @@ mod tests {
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
             quickened: std::sync::OnceLock::new(),
         };
-        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let mut helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        // `lower_inner` refuses a graph whose `new`/field ops have no helper to
+        // call. Those guards used to be unreachable here because escape
+        // analysis elided the allocation and folded its loads and stores away;
+        // it no longer does (an allocation named by a safepoint slot is not
+        // elided unless the scalar-deopt path is on), so `Op::New`, `Op::Load`
+        // and `Op::Store` all survive to lowering. A real VM never presents a
+        // null helper; supply the three this graph reaches. The compiled code
+        // is never executed by this test, only inspected for routing.
+        helpers.new_object = 1;
+        helpers.getfield = 1;
+        helpers.putfield_int = 1;
         let new_resolver = |cp: u16| -> Option<(u32, usize, bool, bool)> {
             if cp == 1 {
                 Some((7, 1, false, false))

@@ -433,7 +433,12 @@ mod tests {
     #[test]
     fn checked_end_rejects_wraparound() {
         assert!(checked_end("test", usize::MAX, 1).is_err());
-        assert!(checked_end("test", usize::MAX - 1, 2).is_ok());
+        // Exactly-representable end is the last accepted case: the largest
+        // legal result is `usize::MAX` itself, so `start + len` may reach it
+        // but not pass it.
+        assert!(checked_end("test", usize::MAX - 1, 1).is_ok());
+        assert!(checked_end("test", usize::MAX - 2, 2).is_ok());
+        assert!(checked_end("test", usize::MAX - 1, 2).is_err());
         assert!(checked_end("test", usize::MAX - 1, 3).is_err());
         assert_eq!(checked_end("test", 10, 0).unwrap(), 10);
     }

@@ -1150,6 +1150,14 @@ impl Graph {
     /// the same either way: both paths rewrite exactly the slots whose current
     /// value is `old`, and nodes are neither created, removed nor reordered.
     pub fn replace_all_uses(&mut self, old: NodeId, new_id: NodeId) {
+        // Self-replacement is a graph no-op, but it is NOT a use-list no-op on
+        // the tracked path: rewriting a slot to `old` leaves it matching `old`,
+        // so every visit of a multi-edge user counts the same hits again and
+        // re-pushes them. A user with k edges then accrues k² entries. Nothing
+        // in the graph changes, so return before either path runs.
+        if old == new_id {
+            return;
+        }
         // `old == NO_NODE` (or an out-of-range id) has no use list to walk: the
         // scan would rewrite every *undefined* slot, which is a different
         // operation. Preserve it exactly by scanning.

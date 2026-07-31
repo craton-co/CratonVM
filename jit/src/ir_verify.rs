@@ -390,6 +390,29 @@ impl Violations {
 /// Returns `Err(Bailout { reason: BailoutReason::IrVerification(..), .. })`
 /// listing every violation found. Never panics, never mutates.
 pub fn verify_graph(graph: &Graph, phase: &str, opts: VerifyOptions) -> CompileResult<()> {
+    // An UNBUILT graph makes no claims, so it cannot violate any.
+    //
+    // `ir_build` can abandon a method partway (an unsupported opcode, a shape
+    // the builder declines) and leave behind the entry skeleton alone — `Start`,
+    // its projections, the parameters, and any constants already interned — with
+    // no terminator and `exit` never assigned. That is not a severed graph; it
+    // is a graph that was never finished, and the pipeline discards it through
+    // its own bail path.
+    //
+    // Verifying it anyway is actively harmful: the caller accumulates the
+    // verdict with `ir_verify_bail |= …`, so a stub from an abandoned attempt
+    // poisons a LATER successful build of the same method and silently drops it
+    // out of the optimizing tier. That regression is what this guard prevents.
+    //
+    // A genuinely severed terminator is still caught: `check_control` reports
+    // "no Op::Return is reachable from the entry" whenever a `Return` exists but
+    // cannot be reached, and that case does not land here.
+    let unbuilt = graph.exit == crate::ir::NO_NODE
+        && !graph.nodes.iter().any(|n| matches!(n.op, Op::Return));
+    if unbuilt {
+        return Ok(());
+    }
+
     let mut v = Violations::new();
 
     // Structural lane — always on.
