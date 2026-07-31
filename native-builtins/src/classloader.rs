@@ -2032,10 +2032,38 @@ fn cl_load_class_base_delegation(
     __result
 }
 
+/// GC-SAFETY wrapper. The delegation body below dispatches arbitrary Java
+/// several times — the parent's `loadClass`, the receiver's `findClass`
+/// override, `ensure_class_initialized`'s `<clinit>`, and exception
+/// construction — and keeps using `this` and `name_obj` afterwards. Both are
+/// bare Rust locals: `safe_native_call` pins the native's ARGS and the
+/// collector remaps those pins, but nothing rewrites these copies. Hibernate
+/// reaches exactly this path through `ClassLoaderServiceImpl.classForName` ->
+/// `AggregatedClassLoader` (which is `super(null)` and overrides `findClass`
+/// to iterate scoped child loaders), which is where `CRATONVM_DBG_STALE_OBJREF`
+/// caught a stale deref. Root both for the whole body and re-read them after
+/// every dispatch. See
+/// docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md.
 fn cl_load_class_base_delegation_inner(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     name_obj: ObjectRef,
+    internal: &str,
+) -> MethodCallResult {
+    let this_pin = ctx.pin_native_root(this);
+    let name_pin = ctx.pin_native_root(name_obj);
+    let result =
+        cl_load_class_base_delegation_rooted(ctx, this, this_pin, name_obj, name_pin, internal);
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+fn cl_load_class_base_delegation_rooted(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    this_pin: usize,
+    name_obj: ObjectRef,
+    name_pin: usize,
     internal: &str,
 ) -> MethodCallResult {
     let internal = internal.to_string();
@@ -2210,12 +2238,17 @@ fn cl_load_class_base_delegation_inner(
         // before any global fallback, exactly as parent-first delegation
         // requires (notably DynamicClassLoader -> forked test loader).
         if is_user_defined_loader(ctx, parent) {
-            match ctx.invoke_virtual(
+            let delegated = ctx.invoke_virtual(
                 parent,
                 "loadClass",
                 "(Ljava/lang/String;)Ljava/lang/Class;",
                 &[Value::Object(Some(name_obj))],
-            ) {
+            );
+            // The dispatch above ran arbitrary Java: everything captured
+            // before it is a pre-move address on the fall-through path.
+            let this = ctx.read_native_pin(this_pin, this);
+            let name_obj = ctx.read_native_pin(name_pin, name_obj);
+            match delegated {
                 Ok(Some(Value::Object(Some(mirror)))) => {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
@@ -2288,6 +2321,11 @@ fn cl_load_class_base_delegation_inner(
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(name_obj))],
         );
+        // `findClass` is the loader's own Java override (Hibernate's
+        // AggregatedClassLoader iterates its scoped child loaders here) —
+        // refresh before the fall-through arms reuse either local.
+        let this = ctx.read_native_pin(this_pin, this);
+        let _name_obj = ctx.read_native_pin(name_pin, name_obj);
         match result {
             Ok(Some(Value::Object(Some(_)))) => return result,
             // A miss from URLClassLoader's own native URL/HTTP search is
