@@ -498,6 +498,23 @@ struct ObjKeyEntry {
     /// inheriting the dead object's overlay state. Stored as the raw `ClassId`
     /// numeric value so the registry stays a plain `Send` struct.
     class_id: u32,
+    /// Owning VM/heap, from `NativeContext::vm_identity`.
+    ///
+    /// This registry is process-global, but heap addresses, identity hashes and
+    /// class ids are only unique *within* one VM — and Rust tests routinely
+    /// stand up several independent `Vm`s in one process. Without this field the
+    /// `class_id` disambiguator above silently fails between them: every
+    /// hand-built test receiver is allocated under `ClassId::new(0)`, so two
+    /// different VMs' collections colliding on a 32-bit identity hash look
+    /// exactly like one object that relocated, and the lone-slot fast path
+    /// rebinds the newcomer onto the other VM's slot. The newcomer then reads
+    /// that VM's overlay entries — including raw `ObjectRef`s pointing into a
+    /// foreign heap — and the first `set_field` through one of them faults.
+    ///
+    /// `vm_identity`'s own contract states the rule ("native side caches that
+    /// store heap `ObjectRef`s must scope entries to this value"); some twenty
+    /// call sites across `native-builtins` already do. This registry did not.
+    vm: usize,
 }
 
 // PERF (registry-shard): the identity-hash registry was a SINGLE global
@@ -659,6 +676,9 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     let hash = ctx.identity_hash_code(this) as u32;
     let ptr = this.as_ptr() as usize;
     let class_id = ctx.class_id_of_object(this).as_u32();
+    // Every comparison below is scoped to the calling VM: pointers, identity
+    // hashes and class ids are only unique within one heap. See `ObjKeyEntry::vm`.
+    let vm = ctx.vm_identity();
 
     // PERF (registry-shard): lock only this hash's shard, not a process-global
     // mutex, so concurrent side-table ops on different hashes don't serialize.
@@ -669,7 +689,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     //    production a GC-relocated object is resolved here too — the post-GC
     //    `gc_update_collection_overlay_refs` pass advances every relocated slot's
     //    `last_ptr` to the new address before the object is next observed.
-    if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
+    if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr && s.vm == vm) {
         return register_overlay_owner_key(ptr, pack_obj_key(hash, slot.generation));
     }
 
@@ -688,18 +708,42 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     //        inherit the dead object's slot. Re-key the slot to a fresh
     //        generation and clear the dead object's stale overlay entries so the
     //        newcomer starts clean and cannot alias the freed collection's state.
-    if slots.len() == 1 {
-        if slots[0].class_id == class_id {
-            slots[0].last_ptr = ptr;
-            return register_overlay_owner_key(ptr, pack_obj_key(hash, slots[0].generation));
+    //
+    //    Restricted to slots belonging to THIS VM. A lone slot owned by another
+    //    VM is not an ambiguity to resolve: that VM may still be live, so its
+    //    entry must be neither rebound (case 2a — it would hand us its overlay,
+    //    foreign `ObjectRef`s and all) nor cleared (case 2b — it would delete
+    //    state still in use). Such a slot falls through to case 3, where the
+    //    newcomer gets a fresh generation and the two coexist.
+    //    Counted in place rather than collected: this runs on every TreeMap /
+    //    TreeSet / LinkedHashMap / LinkedList side-table op on every thread, so
+    //    it must not allocate. The scan stops as soon as a second slot for this
+    //    VM proves the lone-occupant case does not apply, and in the ordinary
+    //    single-VM case `slots` holds one entry anyway.
+    let mut mine_idx = None;
+    let mut mine_count = 0usize;
+    for (i, s) in slots.iter().enumerate() {
+        if s.vm == vm {
+            mine_count += 1;
+            mine_idx = Some(i);
+            if mine_count > 1 {
+                break;
+            }
+        }
+    }
+    if mine_count == 1 {
+        let i = mine_idx.expect("mine_count == 1 implies an index was recorded");
+        if slots[i].class_id == class_id {
+            slots[i].last_ptr = ptr;
+            return register_overlay_owner_key(ptr, pack_obj_key(hash, slots[i].generation));
         }
         // Different-class recycle: re-key + clear the stale overlay state.
-        let stale_key = pack_obj_key(hash, slots[0].generation);
-        let stale_owner = slots[0].last_ptr;
+        let stale_key = pack_obj_key(hash, slots[i].generation);
+        let stale_owner = slots[i].last_ptr;
         let generation = next_generation(slots);
-        slots[0].last_ptr = ptr;
-        slots[0].generation = generation;
-        slots[0].class_id = class_id;
+        slots[i].last_ptr = ptr;
+        slots[i].generation = generation;
+        slots[i].class_id = class_id;
         // Release the shard lock before touching the overlay tables: overlay
         // read/write paths take this shard lock (via `widened_obj_key`), never
         // the reverse, so dropping it first keeps the lock order one-directional
@@ -718,6 +762,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         last_ptr: ptr,
         generation,
         class_id,
+        vm,
     });
     register_overlay_owner_key(ptr, pack_obj_key(hash, generation))
 }

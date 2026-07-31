@@ -540,6 +540,31 @@ mod tests {
 
     // -- Phase 8 Part 1: Step 2 — StringBuilder tests --
 
+    /// The native registry every [`call_native`] below resolves against.
+    ///
+    /// Built once per process rather than once per call. It holds ~3,000
+    /// registrations and `call_native` runs on the order of 10,000 times
+    /// across this module, so rebuilding it per call was the dominant cost of
+    /// the whole binary: the `linked_` filter drops from 100s to 33s, and the
+    /// full suite from 56 minutes to roughly 19. That matters because 56
+    /// minutes is over the CI step's `timeout-minutes: 20` — the step could
+    /// not pass on time even at zero failures.
+    ///
+    /// Sharing is sound because the registry is immutable once built and
+    /// `find` takes `&self`: the per-VM state a native touches arrives through
+    /// the `NativeContext` argument at call time, not through the registry.
+    /// Measured behaviour-neutral, not just argued: full runs with and without
+    /// this hoist reported the same 67 failures and stopped at the same test.
+    static TEST_NATIVE_REGISTRY: std::sync::LazyLock<
+        crate::native::registry::NativeMethodRegistry,
+    > = std::sync::LazyLock::new(|| {
+        let mut r = crate::native::registry::NativeMethodRegistry::new();
+        crate::native::builtins::register_builtins(&mut r);
+        crate::native::io::register_io_natives(&mut r);
+        crate::native::collections::register_collections_natives(&mut r);
+        r
+    });
+
     /// Helper to call a native method by (class, name, descriptor).
     fn call_native(
         shared: &Arc<SharedVm>,
@@ -549,14 +574,7 @@ mod tests {
         descriptor: &str,
         args: &[Value],
     ) -> crate::error::MethodCallResult {
-        let registry = {
-            let mut r = crate::native::registry::NativeMethodRegistry::new();
-            crate::native::builtins::register_builtins(&mut r);
-            crate::native::io::register_io_natives(&mut r);
-            crate::native::collections::register_collections_natives(&mut r);
-            r
-        };
-        let callback = registry
+        let callback = TEST_NATIVE_REGISTRY
             .find(class, method, descriptor)
             .unwrap_or_else(|| panic!("{class}.{method}{descriptor} not registered"));
         let mut ctx = NativeContextImpl { shared, thread };
@@ -28704,6 +28722,54 @@ mod tests {
         assert_eq!(broken, Value::Int(0));
     }
 
+    /// Poll `getNumberWaiting` until it reaches `want`, then return; fail the
+    /// test rather than hang if it never gets there. Used by the
+    /// `CyclicBarrier` tests below to hand off between the party threads and
+    /// the main thread without a sleep-and-hope.
+    ///
+    /// Sleeps rather than spinning: each poll goes through `call_native`, which
+    /// rebuilds the whole native registry, so a hot loop here would burn the
+    /// cores the party threads need to reach their `await` in the first place.
+    fn cb_await_waiting_count(shared: &Arc<SharedVm>, barrier: ObjectRef, want: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut thread = JvmThread::new(ThreadId(900), "cb-poll");
+        loop {
+            let waiting = call_native(
+                shared,
+                &mut thread,
+                "java/util/concurrent/CyclicBarrier",
+                "getNumberWaiting",
+                "()I",
+                &[Value::Object(Some(barrier))],
+            )
+            .unwrap()
+            .unwrap();
+            if waiting == Value::Int(want) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "getNumberWaiting stuck at {waiting:?}, expected {want}",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// `await()` is a rendezvous: it blocks until every party has arrived.
+    ///
+    /// This test used to call `await()` three times on ONE thread and assert
+    /// it returned 2, then 1, then 0. That only passed against the original
+    /// stub, which returned the arrival index WITHOUT waiting — see the
+    /// `cb_await_inner` doc comment in `native-builtins`, which records the
+    /// non-waiting behaviour as "wrong for any real barrier user once the
+    /// storage works". When the native was corrected to actually block, this
+    /// test was left behind and deadlocked on its first `await()`, holding a
+    /// libtest worker thread for the rest of the run.
+    ///
+    /// The barrier contract is now exercised the only way it can be: three
+    /// parties on three threads. Each gets a distinct arrival index and the
+    /// set of them is exactly {2, 1, 0}, which subsumes the old assertion
+    /// without depending on which thread arrives first.
     #[test]
     fn cyclic_barrier_await_sequence() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -28720,8 +28786,31 @@ mod tests {
         )
         .unwrap();
 
-        // First await: returns parties - 1 = 2
-        let idx = call_native(
+        // Two parties block; the third (this thread) trips the barrier.
+        let parties: Vec<_> = (1..3u64)
+            .map(|i| {
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    let mut t = JvmThread::new(ThreadId(i), "party");
+                    call_native(
+                        &shared,
+                        &mut t,
+                        "java/util/concurrent/CyclicBarrier",
+                        "await",
+                        "()I",
+                        &[Value::Object(Some(barrier))],
+                    )
+                    .unwrap()
+                    .unwrap()
+                })
+            })
+            .collect();
+
+        // Do not trip the barrier until both other parties are parked —
+        // otherwise this thread could arrive first and block forever.
+        cb_await_waiting_count(&shared, barrier, 2);
+
+        let mut indices = vec![call_native(
             &shared,
             &mut thread,
             "java/util/concurrent/CyclicBarrier",
@@ -28730,36 +28819,26 @@ mod tests {
             &[Value::Object(Some(barrier))],
         )
         .unwrap()
-        .unwrap();
-        assert_eq!(idx, Value::Int(2));
+        .unwrap()];
+        for p in parties {
+            indices.push(p.join().expect("party thread panicked"));
+        }
 
-        // Second await: returns 1
-        let idx = call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/CyclicBarrier",
-            "await",
-            "()I",
-            &[Value::Object(Some(barrier))],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(idx, Value::Int(1));
+        let mut indices: Vec<i32> = indices
+            .into_iter()
+            .map(|v| match v {
+                Value::Int(i) => i,
+                other => panic!("await returned {other:?}, expected Int"),
+            })
+            .collect();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            vec![0, 1, 2],
+            "each party must get a distinct arrival index",
+        );
 
-        // Third await: all arrived, returns 0 and resets
-        let idx = call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/CyclicBarrier",
-            "await",
-            "()I",
-            &[Value::Object(Some(barrier))],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(idx, Value::Int(0));
-
-        // After trip, waiting count is 0
+        // After the trip the generation is reset.
         let waiting = call_native(
             &shared,
             &mut thread,
@@ -28773,6 +28852,14 @@ mod tests {
         assert_eq!(waiting, Value::Int(0));
     }
 
+    /// `reset()` releases a party that is already parked in `await()`.
+    ///
+    /// Same history as `cyclic_barrier_await_sequence`: the old version
+    /// called `await()` on the main thread with `parties = 2` and relied on
+    /// it returning immediately, so it deadlocked once the native began
+    /// honouring the rendezvous. Resetting a barrier nobody is waiting on
+    /// also tested nothing — the interesting case is precisely the one with
+    /// a parked waiter, which is what this now sets up.
     #[test]
     fn cyclic_barrier_reset() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -28789,18 +28876,23 @@ mod tests {
         )
         .unwrap();
 
-        // One await
-        call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/CyclicBarrier",
-            "await",
-            "()I",
-            &[Value::Object(Some(barrier))],
-        )
-        .unwrap();
+        // One of two parties arrives and parks.
+        let waiter = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut t = JvmThread::new(ThreadId(1), "party");
+                call_native(
+                    &shared,
+                    &mut t,
+                    "java/util/concurrent/CyclicBarrier",
+                    "await",
+                    "()I",
+                    &[Value::Object(Some(barrier))],
+                )
+            })
+        };
+        cb_await_waiting_count(&shared, barrier, 1);
 
-        // Reset
         call_native(
             &shared,
             &mut thread,
@@ -28810,6 +28902,12 @@ mod tests {
             &[Value::Object(Some(barrier))],
         )
         .unwrap();
+
+        // The reset must release the parked party rather than strand it.
+        waiter
+            .join()
+            .expect("waiting party panicked")
+            .expect("reset should release the parked party");
 
         let waiting = call_native(
             &shared,
@@ -37255,11 +37353,24 @@ mod tests {
         assert_eq!(cancelled, Value::Int(1));
     }
 
+    /// `exchange` is a two-party rendezvous: each side blocks until a partner
+    /// arrives, and each receives the value the *other* deposited.
+    ///
+    /// The old version called `exchange` twice on a single thread and asserted
+    /// the first call returned null — i.e. that depositing a value without a
+    /// partner completes immediately. That is the pre-rendezvous stub's
+    /// behaviour; `exchanger_do_exchange` now parks the first arrival until a
+    /// partner shows up, so the single-threaded version blocked forever and
+    /// held a libtest worker for the remainder of the run.
+    ///
+    /// It also allocated the receiver with ONE field while the protocol writes
+    /// slot 0 (value) and slot 1 (state). The receiver is now allocated with
+    /// the three the real `Exchanger` layout has (arena, ncpu, bound).
     #[test]
     fn exchanger_basic() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ex = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let ex = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -37269,42 +37380,41 @@ mod tests {
             &[Value::Object(Some(ex))],
         )
         .unwrap();
-        let val = {
+        let (hello, world) = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
                 thread: &mut thread,
             };
-            ctx.create_string("hello")
+            (ctx.create_string("hello"), ctx.create_string("world"))
         };
-        let prev = call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/Exchanger",
-            "exchange",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[Value::Object(Some(ex)), Value::Object(Some(val))],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(prev, Value::Object(None));
-        let val2 = {
-            let mut ctx = NativeContextImpl {
-                shared: &shared,
-                thread: &mut thread,
-            };
-            ctx.create_string("world")
+
+        let party = |tid: u64, mine: ObjectRef| {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut t = crate::threading::JvmThread::new(
+                    crate::threading::ThreadId(tid),
+                    "exchanger-party",
+                );
+                call_native(
+                    &shared,
+                    &mut t,
+                    "java/util/concurrent/Exchanger",
+                    "exchange",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[Value::Object(Some(ex)), Value::Object(Some(mine))],
+                )
+                .unwrap()
+                .unwrap()
+            })
         };
-        let prev2 = call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/Exchanger",
-            "exchange",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[Value::Object(Some(ex)), Value::Object(Some(val2))],
-        )
-        .unwrap()
-        .unwrap();
-        assert!(matches!(prev2, Value::Object(Some(_))));
+        let a = party(1, hello);
+        let b = party(2, world);
+
+        // Each side gets the other's value — that is the whole contract.
+        let got_a = a.join().expect("exchanger party A panicked");
+        let got_b = b.join().expect("exchanger party B panicked");
+        assert_eq!(got_a, Value::Object(Some(world)));
+        assert_eq!(got_b, Value::Object(Some(hello)));
     }
 
     // ===== Phase 52 tests =====

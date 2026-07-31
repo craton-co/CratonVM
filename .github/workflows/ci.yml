@@ -135,26 +135,96 @@ jobs:
 
       # ADVISORY, with a measurement rather than a guess.
       #
-      # This step was promoted to blocking during the 2026-07-30 audit sweep on
-      # the assumption that the module's old failure set had been worked
-      # through. It has not. Measured on this branch, Windows, JDK 25:
+      # The deterministic abort this comment used to describe is FIXED
+      # (2026-07-30); a second, INDEPENDENT one is not. Measured on Windows,
+      # JDK 25, across four full runs:
       #
-      #   declared   3927 tests
-      #   reported   2584 (2523 pass, 61 fail)
-      #   then       exit code 1 with NO `test result` line
+      #   before   reported 2584 of 3927 (2523 pass, 61 fail), then exit 1
+      #            with NO `test result` line — 1,343 tests never executed
+      #   after    test result: FAILED. 3638 passed; 173 failed; 115 ignored
+      #            (3638+173+115 = 3926, every test accounted for, exit 101)
       #
-      # The harness aborts mid-run, so 1,343 tests never execute and the 61 is a
-      # floor, not a total. That is the same non-exiting-harness defect this
-      # step has carried since the module was made to compile again, and a step
-      # that cannot report a result cannot be a gate.
+      # That clean run is reproducible but NOT reliable: two of the three
+      # subsequent full runs died in `vm::tests::logging_extras_p71` instead.
+      # See blocker 3 — it is the same class of defect and the run cannot be
+      # called a gate until it is fixed too.
+      #
+      # So 61 was indeed a floor: the real number is 173. What killed the run
+      # was a process-global cache that ignored a documented VM-scoping rule.
+      # `native-collections`' `widened_obj_key` resolves collection side-table
+      # keys through a global identity-hash registry and treated a matching
+      # class id as proof that a colliding entry was "the same object after a
+      # GC relocation". Every hand-built test receiver in this module is
+      # allocated under `ClassId::new(0)` and every test builds its own
+      # `SharedVm`, so two VMs' LinkedHashMaps colliding on a 32-bit identity
+      # hash looked exactly like one relocated object; the second VM inherited
+      # the first's overlay entries, raw `ObjectRef`s into a foreign heap
+      # included, and faulted on the first `set_field` through one. Scoping
+      # the registry by `NativeContext::vm_identity` — the rule that method's
+      # own doc comment states, and that ~20 `native-builtins` call sites
+      # already follow — fixes it.
+      #
+      # THREE things still block promotion. All are measured, none is a guess:
+      #
+      #  1. 173 failing tests. Triage of the full set:
+      #       34  natives the test asserts are registered, that production
+      #           deliberately does NOT register in synthetic-jdk mode (the
+      #           real-AQS default retires the synthetic ReentrantLock /
+      #           Semaphore / ReentrantReadWriteLock natives; COWAL `<init>`
+      #           was dropped so the real JDK ctor initialises `lock`). These
+      #           tests assert a retired contract and cannot pass as written —
+      #           they use `ClassId::new(0)` receivers, so the real bytecode
+      #           they would need has nothing to run against. Rewrite-vs-delete
+      #           is a judgement call about what coverage is still wanted.
+      #       62  `assertion left == right` — semantic divergences, individual
+      #           triage.
+      #       44  `unwrap()` on an `Err` — mostly thrown exceptions.
+      #       33  assorted. Some are real VM bugs rather than stale tests:
+      #           `g67_fork_increments_completed_count` hits a live
+      #           `unreachable!("self_arc is set during Vm::new")`, the four
+      #           `p90_jfr_*` tests record zero events, and the three
+      #           `m16_jackson_*` tests serialize every field as its zero value.
+      #       Five (`jit::skip_list` x3, `shadow_window_is_recovered_...`, and
+      #       the two `threading::forkjoin`) match the pre-existing dev unit
+      #       baseline and are not specific to this feature flag.
+      #
+      #  2. Runtime. 56 minutes per full run before `call_native` was changed
+      #     to stop rebuilding the whole ~3,000-entry native registry on every
+      #     call; roughly 19 after. The `timeout-minutes: 20` below is why that
+      #     mattered — the step could not pass on time even at zero failures,
+      #     and 19 is still not comfortable. Revisit the timeout when 1 and 3
+      #     are done and the real wall-clock on Linux runners is known.
+      #
+      #  3. A SECOND crash, intermittent, same root-cause family as the one
+      #     fixed above, and currently the reason a full run cannot be trusted.
+      #     `vm::tests::logging_extras_p71` dies with an
+      #     EXCEPTION_ACCESS_VIOLATION in `get_or_create_logger` ->
+      #     `jul_logger_handlers_clear`, reading a dead VM's logger address:
+      #     `logmanager.rs`'s `logger_registry` and its `tomcat_juli_` /
+      #     `jboss_` siblings cache raw heap addresses by logger name in
+      #     process-global maps commented "SAFETY: singleton-style lifetime",
+      #     which stops holding the moment a second `Vm` exists. The same
+      #     tables feed the GC root scan (`for &addr in logger_registry()...
+      #     push_addr(addr)`), so a foreign VM's address is also being handed
+      #     to the collector as a root — a second corruption vector.
+      #     `vm::tests::log*` is visibly flaky on this account: two runs of the
+      #     same binary and filter gave 5-passed/1-failed then 4-passed/2-failed.
+      #     Same fix as `widened_obj_key`: scope by `vm_identity`. Larger here —
+      #     six-plus registries, ~28 call sites, and the root-scan loops need to
+      #     filter to the current VM, so it wants its own carefully-verified
+      #     pass rather than a rushed one.
+      #
+      # Note the measurements above are Windows; this job runs on ubuntu-latest
+      # and the Linux behaviour has NOT been cross-checked. The abort itself was
+      # platform-independent (a logic bug in shared code), but the exit-code
+      # masking discussed below is Windows-only.
       #
       # The `cargo check --all-targets` step above is what is blocking, and it
       # is what stops the module silently rotting out of compilability again —
       # the failure mode that cost this repository 1,522 tests once already.
       #
-      # To promote this: fix the abort first (the process must reach a `test
-      # result` line), then drive the failures to zero, then drop
-      # `continue-on-error`. Do not drop it while either is outstanding.
+      # To promote this: clear 1, 2 and 3, confirm a clean `test result` line
+      # on Linux, then drop `continue-on-error`. Do not drop it before then.
       - name: Test vm (synthetic-jdk, advisory — see comment)
         continue-on-error: true
         timeout-minutes: 20
