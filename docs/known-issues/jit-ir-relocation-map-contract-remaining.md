@@ -40,14 +40,37 @@ Mirror `x64::emit_shadow_push` / `emit_shadow_reload` in `ir_lower.rs`:
    into `frame_slot_offsets`. Safe to emit where `emit_safepoint_map` is called
    today (top of the `Op::Call` arm): R10/R11/RAX are free there because
    argument staging and the ABI register loads have not happened yet.
-4. **Reload**, after the call — and this is the trap: **it must follow the store
-   of the call's result to its slot.** The reload needs a scratch temp for
-   frame-resident homes and the single-pass backend uses RAX, which is exactly
-   where the return value is. The `Op::Call` arm has four routes
-   (`emit_self_recursive_call`, `emit_direct_cross_call`,
-   `emit_inline_cache_call`, generic dispatch) and each `return`s early, so the
-   reload cannot simply be appended after the `match` — either give the routes a
-   common tail or emit it per route after their result store.
+4. **Reload**, after the call. The obvious-looking trap here **dissolves**, and
+   the resolution matters because it is what makes the rest mechanical:
+
+   * The single-pass backend uses RAX as the scratch temp for frame-resident
+     homes, which collides with the return value and would force the reload
+     after the result store. **IR does not have to.** RCX (and RDX/R8/R9) held
+     outgoing arguments and are dead the instant the call returns, so using
+     **RCX as the temp leaves RAX untouched** and the reload can be emitted
+     immediately after the call, before anything stores the result.
+   * The four routes do not need four insertions. `emit_call_return_check` is
+     called as the *first* thing after the call by three of them
+     (`emit_direct_cross_call` :1349, `emit_inline_cache_call` :1700, generic
+     dispatch :2506) — emit the reload at the top of that function and all three
+     are covered at one site. Note it clobbers R10 itself, so the reload (which
+     also wants R10) must come first, not interleaved.
+   * The fourth route, `emit_self_recursive_call`, does not call it. Simplest
+     sound handling: do not push for that route and mark its map not-covered.
+     The `invoke_kind == 4` test already happens at the top of the `Op::Call`
+     arm, so decide there and pass a `publish: bool` into `emit_safepoint_map`
+     (or clear the flag afterwards via `self.oop_maps.last_mut()`).
+
+   Encodings needed, all rbp/R10/R11-relative, none of which exist in
+   `ir_lower` yet: `MOV R10,[rbp-d32]` `4C 8B 95`, `MOV R11,[R10+d32]`
+   `4D 8B 9A`, `MOV [rbp-d32],R11` `4C 89 9D`, `MOV RCX,[rbp-d32]` `48 8B 8D`,
+   `MOV [R11],RCX` `49 89 0B`, `MOV RCX,[R11]` `49 8B 0B`,
+   `MOV [rbp-d32],RCX` `48 89 8D`, `LEA R11,[R11+8]` `4D 8D 5B 08`,
+   `MOV [R10+d32],R11` `4D 89 9A`, `TEST R10,R10` `4D 85 D2`, `JE rel32`
+   `0F 84`. Hand-encoded GC-critical codegen: assert the emitted bytes in a
+   unit test before running anything, and validate relocation end to end on a
+   quiet host (`cycles=N` with `coverage_fallbacks=0` AND the bt18 checksum
+   `68332206`) before flipping the flag.
 5. Flip `moving_young_coverage_complete` to the `coverable` value already
    computed in `emit_safepoint_map`.
 
