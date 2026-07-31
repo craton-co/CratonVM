@@ -39,15 +39,24 @@
 //! splits on the first one) and no `FieldType` renders as a bare `V`, so
 //! re-serialising is unambiguous in both directions.
 //!
-//! **Cache-comparison caveat.** `reader/src/signature.rs` memoizes all three
-//! signature shapes in *one* map keyed by the signature string
-//! (`ParsedSignature::{Class,Method,Field,Invalid}`). A string that is an
-//! invalid *field* signature but a valid *class* signature therefore gets a
-//! sticky `Invalid` verdict that the class-shaped cached parser returns
-//! without re-parsing. Comparing cached against uncached across *different*
-//! shapes would fire on that pre-existing aliasing rather than on a real
-//! bug, so this target compares exactly one shape per input and flushes the
-//! cache immediately beforehand.
+//! **Cross-shape cache comparison.** `reader/src/signature.rs` memoizes all
+//! three signature shapes in *one* map keyed by the signature string, but
+//! every verdict it stores is shape-qualified — including the rejection,
+//! which is `ParsedSignature::Invalid { class, method, field }` and not a
+//! bare `Invalid`. So a cached entry recorded by one entry point never
+//! answers for another: on a shape mismatch a success falls through to an
+//! uncached re-parse, and a rejection short-circuits only the shape that
+//! recorded it.
+//!
+//! That was not always true, which is why this target asks the way it does.
+//! An unqualified `Invalid` meant whichever shape probed a string first
+//! poisoned it for the other two, and `<T:Ljava/lang/Object;>L…;` — a valid
+//! *class* signature and an invalid *field* signature — then read back as
+//! `None` from the class-shaped cached parser if anything had asked for it
+//! as a field first. Generic type information disappeared as a function of
+//! lookup order, silently. This target therefore compares **all three
+//! shapes per input** against their uncached twins and rotates the order it
+//! asks in, because that bug was reachable only through one ordering.
 //!
 //! Not covered here: JNI *symbol-name mangling* (`Java_pkg_Cls_meth__Sig`).
 //! `jni_short_name` / `jni_long_name` live in `vm/src/vm/vm_object.rs:1671`
@@ -56,8 +65,9 @@
 //! string functions. See `README.md`.
 //!
 //! Per-input layout:
-//!   * byte 0 — shape selector (component type + which signature shape the
-//!     cached/uncached differential covers this iteration).
+//!   * byte 0 — shape selector: `% COMPONENTS.len()` picks the component
+//!     type, and the digits above that pick the order in which the
+//!     cached/uncached differential visits the three signature shapes.
 //!   * byte 1 — repeat scale for the unterminated-`L` case.
 //!   * bytes 2.. — free-form descriptor text for the panic-only phase.
 //!
@@ -111,6 +121,30 @@ const COMPONENTS: [&str; 12] = [
     "Ljava/lang/String;",
     "L;",
     "[I",
+];
+
+/// One of the three signature grammars the cached/uncached differential
+/// covers. The grammars are not nested — a string can be valid under one
+/// and garbage under another — which is exactly what makes the order the
+/// shapes are asked in worth varying.
+#[derive(Clone, Copy)]
+enum Shape {
+    Class,
+    Method,
+    Field,
+}
+
+/// Every order the three shapes can be asked in. The cache aliasing bug
+/// that motivated this differential was reachable only when the shape that
+/// rejects the string was asked before the shape that accepts it, so a
+/// fixed order would have missed it half the time.
+const SHAPE_ORDERS: [[Shape; 3]; 6] = [
+    [Shape::Class, Shape::Method, Shape::Field],
+    [Shape::Class, Shape::Field, Shape::Method],
+    [Shape::Method, Shape::Class, Shape::Field],
+    [Shape::Method, Shape::Field, Shape::Class],
+    [Shape::Field, Shape::Class, Shape::Method],
+    [Shape::Field, Shape::Method, Shape::Class],
 ];
 
 /// Assert that `ft` survives a `Display` → `parse` round trip.
@@ -304,32 +338,42 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // -------------------------------------------------------------------
-    // Cached vs uncached signature parsers — one shape per input.
+    // Cached vs uncached signature parsers — all three shapes per input.
     //
-    // The cache is flushed first so neither an earlier iteration nor a
-    // different signature shape can supply the verdict (see the
-    // cache-comparison caveat in the module docs). Flushing also keeps the
-    // harness's own memory flat, on top of the parser's internal
-    // `SIGNATURE_CACHE_CAP`.
+    // Deliberately NOT flushed between the three shapes: the point is that
+    // asking one shape must not change what another answers, whichever
+    // order they are asked in (see the cross-shape note in the module
+    // docs). The order rotates with the input so all six permutations are
+    // reachable — the aliasing bug this guards against only ever fired when
+    // the invalid shape was asked first.
+    //
+    // The oracle compares the parsed values, not just success/failure: a
+    // cache that returned the right verdict but the wrong AST would satisfy
+    // an `is_some()` comparison.
     // -------------------------------------------------------------------
-    signature::clear_signature_cache();
     let key: Arc<str> = Arc::from(free_form.as_str());
-    match selector % 3 {
-        0 => assert_eq!(
-            signature::parse_field_signature(&free_form).is_some(),
-            signature::parse_field_signature_cached(&key).is_some(),
-            "cached and uncached field-signature parsers disagree"
-        ),
-        1 => assert_eq!(
-            signature::parse_class_signature(&free_form).is_some(),
-            signature::parse_class_signature_cached(&key).is_some(),
-            "cached and uncached class-signature parsers disagree"
-        ),
-        _ => assert_eq!(
-            signature::parse_method_signature(&free_form).is_some(),
-            signature::parse_method_signature_cached(&key).is_some(),
-            "cached and uncached method-signature parsers disagree"
-        ),
+    for shape in SHAPE_ORDERS[(selector / COMPONENTS.len()) % SHAPE_ORDERS.len()] {
+        match shape {
+            Shape::Field => assert_eq!(
+                signature::parse_field_signature(&free_form).as_ref(),
+                signature::parse_field_signature_cached(&key).as_deref(),
+                "cached and uncached field-signature parsers disagree"
+            ),
+            Shape::Class => assert_eq!(
+                signature::parse_class_signature(&free_form).as_ref(),
+                signature::parse_class_signature_cached(&key).as_deref(),
+                "cached and uncached class-signature parsers disagree"
+            ),
+            Shape::Method => assert_eq!(
+                signature::parse_method_signature(&free_form).as_ref(),
+                signature::parse_method_signature_cached(&key).as_deref(),
+                "cached and uncached method-signature parsers disagree"
+            ),
+        }
     }
+    // Flush only once the whole input is done. `SIGNATURE_CACHE_CAP` already
+    // bounds the entry count, but a fuzzer input runs to `MAX_INPUT`, so
+    // retaining thousands of them would let the harness's own footprint
+    // dwarf the parser under test.
     signature::clear_signature_cache();
 });
