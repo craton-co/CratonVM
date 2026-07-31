@@ -613,3 +613,46 @@ gap worth closing and the optimizing tier is largely inert today. If no, the
 tier is narrower than the surrounding documentation implies, and several open
 throughput documents that assume C2 participation need re-reading — including
 this branch's own retracted "C2 tier restored" claim.
+
+## NAMED: `newarray` (0xbc) is unsupported, and admission disagrees with the builder
+
+Naming the builder's catch-all refusal the same way:
+
+    [ir] BAIL IrBuilder::build unsupported opcode 0xbc at pc 2
+    [ir] BAIL IrBuilder::build returned None for IrRelocProbe.step
+
+`0xbc` is `newarray` — **primitive array allocation**. `IrRelocProbe.step`
+opens with `new int[6]`, so the builder refuses it at pc 2, before anything else
+in the method is even looked at.
+
+**The admission predicate and the builder disagree.** `ir_compatible` carries
+`IR_MAX_ALLOCATIONS` budgets for `scan.new_ops` and `scan.anewarray_ops` — i.e.
+it is written as though allocation is supported and merely capped — and it
+admits the method. `IrBuilder::build` then refuses it on the first primitive
+array allocation. Every such method pays a full admission pass, a graph-build
+attempt, and a silent fallback to single-pass.
+
+That is the whole reason this took a session to find: two components with
+different ideas of what the IR tier accepts, and neither of them said so out
+loud.
+
+`BinTreesClassic.itemCheck` bails from a DIFFERENT path — it printed the
+`returned None` line but no opcode line, so its refusal is one of the builder's
+other ~19 `return None` sites, not the opcode catch-all. Those remain unnamed;
+the same one-line treatment will name them.
+
+### The decision this surfaces
+
+`newarray` is not exotic. If the optimizing tier cannot build a graph for a
+method that allocates a primitive array, its addressable population is very
+small, and that is a scoping question rather than a bug:
+
+* if the IR builder is *meant* to handle allocation, `newarray` is a gap worth
+  closing and `ir_compatible`'s allocation budgets are currently lying;
+* if it is not, then `ir_compatible` should refuse these methods up front —
+  cheaply, and visibly — instead of admitting them into a build that cannot
+  succeed, and the surrounding documentation that treats C2 as a general tier
+  needs correcting.
+
+Either way the fix belongs with the IR builder's owners. The relocation contract
+is downstream of all of it and is ready.
