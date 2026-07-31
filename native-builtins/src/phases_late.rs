@@ -5373,13 +5373,122 @@ pub(crate) fn register_phase69_natives(registry: &mut NativeMethodRegistry) {
 
 // =============================================================================
 // java.lang.ref.Cleaner — Java 9
-// 1-field synthetic (daemon=0 Int)
 // =============================================================================
 
-// P69-Cleaner-realfix: the synthetic `java.lang.ref.Cleaner` model
-// (backing-array layout + `alloc_cleaner`) has been removed.  Real-JDK
-// `Cleaner.create()` now runs unmodified once Thread `holder` is
-// populated — see `register_p69_cleaner` for the full rationale.
+// P69-Cleaner-realfix: the REAL `java.lang.ref.Cleaner` bytecode runs
+// unmodified once Thread `holder` is populated — see `register_p69_cleaner`
+// for the full rationale. The synthetic model below is the fallback for the
+// runs that have no `java.lang.ref.Cleaner` bytecode at all (synthetic-JDK
+// mode, and the real-JDK fallback that resolves the class to a stub).
+//
+// NEW-17 synthetic `java.lang.ref.Cleaner` object model:
+//
+//   slot 0 : `Object[]` — every live `Cleanable` this Cleaner minted.
+//   slot 1 : `Int`      — number of entries in use inside slot 0.
+//
+// Slot 0 is not bookkeeping, it is a GC ROOT. The `ReferenceProcessor` records
+// only the Cleanable's raw ADDRESS and is not itself a root, so without a
+// strong reference the Cleanable is collected before (or together with) its
+// referent and the cleanup action never runs. Holding the Cleanable does NOT
+// keep the referent alive: the referent is reachable from the Cleanable only
+// through the phantom entry inside the reference processor.
+const CLEANER_LIST: usize = 0;
+const CLEANER_COUNT: usize = 1;
+const CLEANER_FIELDS: usize = 2;
+const CLEANER_INITIAL_CAPACITY: usize = 16;
+
+// `java.lang.ref.Cleaner$Cleanable` — the SAME three-slot shape that
+// `native-io/src/direct_buffer.rs`, `native-builtins/src/servlet.rs` and
+// `vm::runtime::interpreter::run_cleaner_actions` already agree on. Do not
+// renumber without updating all four.
+//   slot 0 : `Object` — the Runnable cleanup action (nulled once it has run)
+//   slot 1 : `Int`    — cleaned flag (0 = pending, 1 = already run)
+//   slot 2 : `Int`    — index inside the owning Cleaner's list, or -1
+pub(crate) const CLEANABLE_ACTION: usize = 0;
+pub(crate) const CLEANABLE_CLEANED: usize = 1;
+pub(crate) const CLEANABLE_INDEX: usize = 2;
+pub(crate) const CLEANABLE_FIELDS: usize = 3;
+
+/// `ReferenceType::Cleaner` in `NativeContext::discover_reference`'s wire
+/// encoding — see `vm/src/vm/vm_exec.rs::discover_reference`
+/// (0=Weak, 1=Soft, 2=Phantom, 3=Cleaner).
+pub(crate) const REF_TYPE_CLEANER: u8 = 3;
+
+/// Ensure `cleaner`'s backing list has room for one more `Cleanable`,
+/// allocating it (or doubling it) when it does not.
+///
+/// Returns the refreshed `cleaner` reference: the array allocation is a GC
+/// point that can relocate it (native stale-local family).
+fn cleaner_reserve(ctx: &mut dyn NativeContext, cleaner: ObjectRef) -> ObjectRef {
+    if ctx.object_num_fields(cleaner) < CLEANER_FIELDS {
+        return cleaner;
+    }
+    let count = ctx
+        .get_field(cleaner, CLEANER_COUNT)
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
+    let list = match ctx.get_field(cleaner, CLEANER_LIST) {
+        Value::Object(Some(a)) => Some(a),
+        _ => None,
+    };
+    let capacity = list.map_or(0, |a| ctx.array_length(a));
+    if count < capacity {
+        return cleaner;
+    }
+    let grown_capacity = if capacity == 0 {
+        CLEANER_INITIAL_CAPACITY
+    } else {
+        capacity.saturating_mul(2)
+    };
+    // GC SAFETY: `new_array` can collect and relocate both the Cleaner and the
+    // list we are about to copy out of; pin and re-read through the pins.
+    let cleaner_pin = ctx.pin_native_root(cleaner);
+    let list_pin = list.map(|a| ctx.pin_native_root(a));
+    let grown = ctx.new_array(ArrayElementType::Reference, grown_capacity);
+    let cleaner = ctx.read_native_pin(cleaner_pin, cleaner);
+    let list = match (list, list_pin) {
+        (Some(a), Some(pin)) => Some(ctx.read_native_pin(pin, a)),
+        _ => None,
+    };
+    ctx.unpin_native_roots(cleaner_pin);
+    if let Some(old) = list {
+        for i in 0..count.min(capacity) {
+            let entry = ctx.get_array_element(old, i);
+            ctx.set_array_element(grown, i, entry);
+        }
+    }
+    ctx.set_field(cleaner, CLEANER_LIST, Value::Object(Some(grown)));
+    cleaner
+}
+
+/// Append `cleanable` to `cleaner`'s backing list and return the index it
+/// landed at, or -1 when the Cleaner has no usable list (e.g. a real-JDK
+/// `Cleaner` object that never went through our `create`).
+///
+/// Deliberately allocation-free — `cleaner_reserve` must have run first — so
+/// the caller can hand the Cleanable's raw address to the reference processor
+/// afterwards without a GC point in between.
+fn cleaner_append(ctx: &mut dyn NativeContext, cleaner: ObjectRef, cleanable: ObjectRef) -> i32 {
+    if ctx.object_num_fields(cleaner) < CLEANER_FIELDS {
+        return -1;
+    }
+    let count = ctx
+        .get_field(cleaner, CLEANER_COUNT)
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
+    let list = match ctx.get_field(cleaner, CLEANER_LIST) {
+        Value::Object(Some(a)) => a,
+        _ => return -1,
+    };
+    if count >= ctx.array_length(list) {
+        return -1;
+    }
+    ctx.set_array_element(list, count, Value::Object(Some(cleanable)));
+    ctx.set_field(cleaner, CLEANER_COUNT, Value::Int(count as i32 + 1));
+    count as i32
+}
 
 pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
     // P69-Cleaner-realfix: the synthetic `Cleaner.create`/`register`/
@@ -5407,7 +5516,25 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
         "create",
         "()Ljava/lang/ref/Cleaner;",
         |ctx, _args| {
-            let cleaner = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", 1);
+            let cleaner = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", CLEANER_FIELDS);
+            // The previous version allocated a bare 1-slot object and stopped
+            // there, so `register` had nowhere to keep its Cleanables alive
+            // and every registered cleanup action was collectible before it
+            // could run. Seed the backing list here.
+            //
+            // Only stamp our slot model onto a class we actually own: a REAL
+            // `java.lang.ref.Cleaner` has its own layout (`impl`) and its
+            // bytecode wins over this SyntheticStub registration, but a
+            // defensive check costs one class lookup per `Cleaner.create()`
+            // and keeps a real object from being corrupted if the dispatcher
+            // ever routes here.
+            if ctx.is_class_synthetic_stub("java/lang/ref/Cleaner")
+                && ctx.object_num_fields(cleaner) >= CLEANER_FIELDS
+            {
+                let cleaner = cleaner_reserve(ctx, cleaner);
+                ctx.set_field(cleaner, CLEANER_COUNT, Value::Int(0));
+                return Ok(Some(Value::Object(Some(cleaner))));
+            }
             Ok(Some(Value::Object(Some(cleaner))))
         },
     );
@@ -5422,23 +5549,58 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
         "register",
         "(Ljava/lang/Object;Ljava/lang/Runnable;)Ljava/lang/ref/Cleaner$Cleanable;",
         |ctx, args| {
-            // GC SAFETY: pin the action across the Cleanable allocation — a
-            // moving young GC there relocates it (native stale-local family).
+            let cleaner = match args.first() {
+                Some(Value::Object(Some(cleaner))) => *cleaner,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let referent = match args.get(1) {
+                Some(Value::Object(Some(referent))) => Some(*referent),
+                _ => None,
+            };
             let action = match args.get(2) {
                 Some(Value::Object(Some(action))) => Some(*action),
                 _ => None,
             };
-            let action_pin = action.map(|a| (ctx.pin_native_root(a), a));
-            let cleanable = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner$Cleanable", 3);
-            let action = match action_pin {
-                Some((handle, a)) => Value::Object(Some(ctx.read_native_pin(handle, a))),
-                None => Value::Object(None),
+            // GC SAFETY: every allocation below is a collection point that can
+            // relocate all three of these — pin now, re-read through the pins
+            // afterwards (native stale-local family).
+            let pin_base = ctx.pin_native_root(cleaner);
+            let referent_pin = referent.map(|r| ctx.pin_native_root(r));
+            let action_pin = action.map(|a| ctx.pin_native_root(a));
+
+            // Grow the Cleaner's list BEFORE the Cleanable exists, so nothing
+            // allocates between minting the Cleanable and handing its raw
+            // address to the reference processor.
+            let cleaner = ctx.read_native_pin(pin_base, cleaner);
+            let cleaner = cleaner_reserve(ctx, cleaner);
+
+            let cleanable_class = "java/lang/ref/Cleaner$Cleanable";
+            let cleanable = alloc_concurrent_synthetic(ctx, cleanable_class, CLEANABLE_FIELDS);
+
+            let cleaner = ctx.read_native_pin(pin_base, cleaner);
+            let referent = match (referent, referent_pin) {
+                (Some(r), Some(pin)) => Some(ctx.read_native_pin(pin, r)),
+                _ => None,
             };
-            ctx.set_field(cleanable, 0, action);
-            ctx.set_field(cleanable, 1, Value::Int(0)); // not yet cleaned
-            ctx.set_field(cleanable, 2, Value::Int(-1)); // no ref id
-            if let Some((handle, _)) = action_pin {
-                ctx.unpin_native_roots(handle);
+            let action = match (action, action_pin) {
+                (Some(a), Some(pin)) => Some(ctx.read_native_pin(pin, a)),
+                _ => None,
+            };
+            ctx.unpin_native_roots(pin_base);
+
+            ctx.set_field(cleanable, CLEANABLE_ACTION, Value::Object(action));
+            ctx.set_field(cleanable, CLEANABLE_CLEANED, Value::Int(0)); // not yet cleaned
+            let index = cleaner_append(ctx, cleaner, cleanable);
+            ctx.set_field(cleanable, CLEANABLE_INDEX, Value::Int(index));
+
+            // The Cleanable IS the phantom reference object: once `referent`
+            // becomes unreachable the processor pushes this address into
+            // `ReferenceProcessingResult::cleaner_actions`, `CleanerThread`
+            // queues it, and `interpreter::run_cleaner_actions` invokes
+            // `run()V` on slot 0. Registering nothing here — what this native
+            // used to do — is why no `Cleaner.register` action ever fired.
+            if let Some(referent) = referent {
+                ctx.discover_reference(REF_TYPE_CLEANER, cleanable, referent, None);
             }
             Ok(Some(Value::Object(Some(cleanable))))
         },
@@ -5467,20 +5629,20 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
             }
             // Slot 1 is the shared cleaned flag; honour and set it so a later
             // GC drain skips this cleanable instead of re-running the action.
-            if fields > 1 {
-                if matches!(ctx.get_field(this, 1), Value::Int(1)) {
+            if fields > CLEANABLE_CLEANED {
+                if matches!(ctx.get_field(this, CLEANABLE_CLEANED), Value::Int(1)) {
                     return Ok(None);
                 }
-                ctx.set_field(this, 1, Value::Int(1));
+                ctx.set_field(this, CLEANABLE_CLEANED, Value::Int(1));
             }
-            let action = match ctx.get_field(this, 0) {
+            let action = match ctx.get_field(this, CLEANABLE_ACTION) {
                 Value::Object(Some(action)) => action,
                 _ => return Ok(None),
             };
             // Clear the slot BEFORE dispatching: the nested call can move
             // `this`, and a re-entrant `clean()` from inside the action must
             // find nothing left to run.
-            ctx.set_field(this, 0, Value::Object(None));
+            ctx.set_field(this, CLEANABLE_ACTION, Value::Object(None));
             ctx.invoke_virtual(action, "run", "()V", &[])?;
             Ok(None)
         },

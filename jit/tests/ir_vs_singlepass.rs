@@ -934,6 +934,83 @@ fn ir_vs_singlepass_conditional_early_return() {
     );
 }
 
+/// `ifnull` / `if_acmpeq` must compare all 64 bits of a reference.
+///
+/// The IR `Op::Cmp` was written for the int comparisons and emitted a 32-bit
+/// `CMP EAX, ECX`. A heap pointer whose low word happens to be zero would then
+/// test equal to null, and two objects exactly 4 GiB apart would test equal to
+/// each other — a silently wrong branch, not a crash. The operands here are
+/// deliberately chosen so a 32-bit compare gives the opposite answer.
+#[test]
+fn ir_vs_singlepass_ifnull_compares_all_64_bits() {
+    // int isNull(Object a) { return a == null ? 0 : 1; }
+    check(
+        "isNull",
+        "(Ljava/lang/Object;)I",
+        vec![
+            0x2a, 0xc6, 0x00, 0x05, // aload_0; ifnull +5 → 6
+            0x04, 0xac, // iconst_1; ireturn
+            0x03, 0xac, // iconst_0; ireturn
+        ],
+        1,
+        1,
+        &[
+            (vec![0], 0),
+            (vec![0x7f_1234_5678], 1),
+            // Low 32 bits are zero: a 32-bit compare calls this null.
+            (vec![0x1_0000_0000], 1),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_if_acmp_compares_all_64_bits() {
+    // int same(Object a, Object b) { return a == b ? 1 : 0; }
+    check(
+        "same",
+        "(Ljava/lang/Object;Ljava/lang/Object;)I",
+        vec![
+            0x2a, 0x2b, 0xa5, 0x00, 0x05, // aload_0; aload_1; if_acmpeq +5 → 7
+            0x03, 0xac, // iconst_0; ireturn
+            0x04, 0xac, // iconst_1; ireturn
+        ],
+        2,
+        2,
+        &[
+            (vec![0x7f_1234_5678, 0x7f_1234_5678], 1),
+            (vec![0x7f_1234_5678, 0x7f_1234_5680], 0),
+            // Differ only above bit 32: a 32-bit compare calls these equal.
+            (vec![0x1_0000_0000, 0x2_0000_0000], 0),
+            (vec![0, 0], 1),
+        ],
+    );
+}
+
+/// `aconst_null` + `areturn`: both were unlowered, so any method returning an
+/// object — or terminating a structure with a null literal — was refused at
+/// stage one of the optimizing pipeline.
+#[test]
+fn ir_vs_singlepass_aconst_null_areturn() {
+    // Object pick(Object a, int flag) { return flag != 0 ? a : null; }
+    // `check` compares the low 32 bits, which is enough to tell the returned
+    // pointer from null here.
+    check(
+        "pick",
+        "(Ljava/lang/Object;I)Ljava/lang/Object;",
+        vec![
+            0x1b, 0x99, 0x00, 0x05, // iload_1; ifeq +5 → 6
+            0x2a, 0xb0, // aload_0; areturn
+            0x01, 0xb0, // aconst_null; areturn
+        ],
+        2,
+        2,
+        &[
+            (vec![0x7f_1234_5678, 1], 0x1234_5678),
+            (vec![0x7f_1234_5678, 0], 0),
+        ],
+    );
+}
+
 #[test]
 fn ir_vs_singlepass_two_branch_three_returns() {
     // int sgn3(int a) { if (a<0) return -1; if (a>0) return 1; return 0; }

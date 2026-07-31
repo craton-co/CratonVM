@@ -113,6 +113,7 @@ pre-session numbers from `header-shrink.md` §6.6 are in parentheses):
 
 | Site | What it emits | Form |
 | --- | --- | --- |
+| `jit/src/ir_lower.rs:1186` (new 2026-07-31) | guarded inline compact `getfield`, `HEADER_SIZE + packed_body_offset` | disp32 |
 | `jit/src/ir_lower.rs:1930` (1887) | field address, `HEADER_SIZE + field_index * SLOT_SIZE` | disp32 |
 | `jit/src/ir_lower.rs:1966` (1923) | field **tag** address, same formula | disp32 |
 | `jit/src/ir_lower.rs:2014` (1971) | `MOVSS/MOVSD XMM0,[RAX+RCX*n+HEADER_SIZE]` | **disp8** |
@@ -121,7 +122,7 @@ pre-session numbers from `header-shrink.md` §6.6 are in parentheses):
 | `jit/src/lib.rs:3236` (3186) | `(HEADER_SIZE + body_off) as i32` — compact string field **payload** address | disp32 |
 | `jit/src/lib.rs:3210` (3226) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32` — legacy string field cell | disp32 |
 
-**All seven already read the shared constants, not literals** — no site needed
+**All eight already read the shared constants, not literals** — no site needed
 converting. The hazards are the ones the inventory was supposed to surface and
 did not:
 

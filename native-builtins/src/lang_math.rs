@@ -3716,6 +3716,23 @@ fn wrapper_same_class(
     a: cratonvm_types::ObjectRef,
     b: cratonvm_types::ObjectRef,
 ) -> bool {
+    // An ARRAY's header stores its COMPONENT class id, not an id of its own
+    // (the same convention the `VirtualNative` cache gate in
+    // `interpreter/invoke.rs` guards against for receivers). Comparing raw
+    // class ids therefore answers "same class" for `Foo` vs `Foo[]` — so
+    // `wrapperInstance.equals(someFooArray)` passed this gate and the callers
+    // below read slot 0 of the ARRAY through the legacy 16-byte field path,
+    // decoding two adjacent 8-byte element references as a single `Value`.
+    // That is what produced the `gen_heap::read_slot: corrupt Value cell
+    // (out-of-range discriminant)` reports in
+    // docs/known-issues/h2/bug-h2-testgetgeneratedkeys-corrupt-value-cell-hib-cv-32-family.md:
+    // the heap was intact (a valid `String[2]`), the READER used the wrong
+    // accessor. An array is never a boxed primitive wrapper, so decline.
+    if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array
+        || ctx.heap_kind_of(b) == cratonvm_types::ObjectKind::Array
+    {
+        return false;
+    }
     let ca = ctx.class_id_of_object(a);
     let cb = ctx.class_id_of_object(b);
     if ca == cb {
@@ -3745,8 +3762,19 @@ pub(crate) fn native_wrapper_int_equals(
     if !wrapper_same_class(ctx, this, other) {
         return Ok(Some(Value::Int(0)));
     }
-    let a = ctx.get_field(this, 0);
-    let b = ctx.get_field(other, 0);
+    // Require the stored value to actually BE an int, exactly as
+    // `native_wrapper_long_equals` below already does for `Value::Long`. A
+    // raw `Value` comparison treats "both reads decoded as something else"
+    // (a non-wrapper receiver, or the benign `Object(None)` the `gen_heap`
+    // guards substitute for an out-of-bounds/undecodable slot) as EQUAL.
+    let a = match ctx.get_field(this, 0) {
+        Value::Int(v) => v,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let b = match ctx.get_field(other, 0) {
+        Value::Int(v) => v,
+        _ => return Ok(Some(Value::Int(0))),
+    };
     Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
 }
 
@@ -4679,6 +4707,34 @@ mod tests {
         assert_eq!(
             native_wrapper_int_equals(&mut ctx, &args).unwrap(),
             Some(Value::Int(0))
+        );
+    }
+
+    /// Residual of the class-id gate: an ARRAY's header stores its
+    /// COMPONENT class id, so a `Foo[]` reports the same class id as a plain
+    /// `Foo` and the id compare alone still lets `fooWrapper.equals(fooArray)`
+    /// through to the field reads. The primitive-array case above is caught
+    /// only because a primitive array reports `ClassId(0)`; a REFERENCE array
+    /// whose component class is the receiver's own class is not. Exercised
+    /// here with matching ids on both sides, so only the array-kind test can
+    /// decline it.
+    #[test]
+    fn wrapper_int_equals_rejects_a_reference_array_with_the_receivers_class_id() {
+        let mut ctx = mock_ctx();
+        let this = boxed(&mut ctx, 0, Value::Int(0));
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
+        assert_eq!(
+            ctx.class_id_of_object(this),
+            ctx.class_id_of_object(arr),
+            "precondition: the class-id compare alone cannot tell these apart"
+        );
+
+        let args = [Value::Object(Some(this)), Value::Object(Some(arr))];
+        assert_eq!(
+            native_wrapper_int_equals(&mut ctx, &args).unwrap(),
+            Some(Value::Int(0)),
+            "an array argument must be declined before its body is read as a \
+             tagged Value cell"
         );
     }
 

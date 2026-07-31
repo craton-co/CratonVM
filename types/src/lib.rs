@@ -27,6 +27,7 @@ pub mod metadata_pin;
 pub mod mirror_pin;
 pub mod narrow_oop;
 pub mod reflective_probe;
+pub mod striped_counter;
 mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};

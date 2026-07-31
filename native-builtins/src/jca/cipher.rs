@@ -98,7 +98,7 @@ use crate::{alloc_concurrent_synthetic, obj_arg};
 // `expected object reference, got double` on read-back.  The
 // side-table keeps the storage independent of the real-JDK class
 // layout — it works in both modes and is cheap (single
-// `RwLock<FxHashMap<i32, CipherState>>` lookup; no allocation per
+// `RwLock<FxHashMap<CipherKey, CipherState>>` lookup; no allocation per
 // call).
 //
 // Round-13 C13 fix: keys are GC-stable identity hash codes (see
@@ -154,9 +154,25 @@ struct CipherState {
     pbe_iterations: u32,
 }
 
-static CIPHER_TABLE: RwLock<Option<FxHashMap<i32, CipherState>>> = RwLock::new(None);
+/// VM-scoped, GC-stable side-table key: `(vm_identity, identity_hash_code)`.
+///
+/// The `vm_identity` component is NOT optional. An `identityHashCode` is unique
+/// only *within one heap*, but `CIPHER_TABLE` is a process-global `static`;
+/// Rust tests (and any embedder) create several independent `Vm`s in one
+/// process, so a bare-`i32` key let VM B's `Cipher` read VM A's mode / key
+/// bytes / IV / accumulated plaintext whenever their identity hashes collided.
+/// `NativeContext::vm_identity`'s own doc states the rule ("Native side caches
+/// ... must scope entries to this value", `native-api/src/registry.rs`); the
+/// same omission in native-collections' `widened_obj_key` aliased two VMs'
+/// collections and aborted the process.
+///
+/// `CipherState` holds only plain Rust data (`String`/`Vec<u8>`/ints) and never
+/// an `ObjectRef`, so no collector scan/remap companion is required.
+type CipherKey = (usize, i32);
 
-fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<i32, CipherState>) -> R) -> R {
+static CIPHER_TABLE: RwLock<Option<FxHashMap<CipherKey, CipherState>>> = RwLock::new(None);
+
+fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<CipherKey, CipherState>) -> R) -> R {
     // Round-9 MED-2: parking_lot — no poison handling.
     let mut g = CIPHER_TABLE.write();
     if g.is_none() {
@@ -165,7 +181,7 @@ fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<i32, CipherState>) -> R) ->
     f(g.as_mut().expect("table just initialised"))
 }
 
-fn with_table_read<R>(f: impl FnOnce(&FxHashMap<i32, CipherState>) -> R) -> R {
+fn with_table_read<R>(f: impl FnOnce(&FxHashMap<CipherKey, CipherState>) -> R) -> R {
     // Round-9 MED-2: parking_lot — no poison handling.
     let g = CIPHER_TABLE.read();
     match g.as_ref() {
@@ -178,9 +194,10 @@ fn with_table_read<R>(f: impl FnOnce(&FxHashMap<i32, CipherState>) -> R) -> R {
 /// `NativeContext::identity_hash_code` so the entry survives moving-GC
 /// compaction; the underlying `HashCodeTable::update_after_gc` remaps
 /// codes whenever objects are relocated.  See the module-level Round-13
-/// C13 note for why this matters.
-fn obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
-    ctx.identity_hash_code(obj)
+/// C13 note for why this matters.  The `vm_identity` component keeps two
+/// `Vm`s in the same process from sharing entries -- see [`CipherKey`].
+fn obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> CipherKey {
+    (ctx.vm_identity(), ctx.identity_hash_code(obj))
 }
 
 /// `<clinit>` no-op — used to mark a real-JDK class as initialized
@@ -452,7 +469,9 @@ fn rsa_key_components(
         }
     }
     // Synthetic keys — resolve via the crypto_impl key_id.
-    let id = crate::crypto_impl::rsa_realkey_map_get(ctx.identity_hash_code(key))
+    // The map is keyed `(vm_identity, identity_hash)`: an identity hash is
+    // unique only within one heap, and the map is a process-global static.
+    let id = crate::crypto_impl::rsa_realkey_map_get(ctx.vm_identity(), ctx.identity_hash_code(key))
         .or_else(|| match ctx.get_field(key, 3) {
             Value::Long(i) => Some(i as u64),
             Value::Int(i) => Some(i as u64),
@@ -593,7 +612,7 @@ fn accumulate_slice(
 /// post-`init` state), and return it.
 fn finish_cipher_bytes(
     ctx: &mut dyn NativeContext,
-    table_key: i32,
+    table_key: CipherKey,
     bytes: &[u8],
 ) -> MethodCallResult {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());

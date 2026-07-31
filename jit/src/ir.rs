@@ -1013,13 +1013,37 @@ impl IrBuilder {
     }
 
     fn iconst(&mut self, val: i64) -> NodeId {
-        // Check if we already have this constant (simple dedup)
+        // Check if we already have this constant (simple dedup).
+        //
+        // The type is part of the identity: `aconst_null` also materialises
+        // `Op::Const(0)`, typed `Ref` so the safepoint maps publish its slot.
+        // Deduping on the opcode alone would hand that reference-typed node
+        // back for every later `iconst(0)` — an integer comparison operand
+        // would then be published as a live oop, and `Op::Cmp` would widen to
+        // a 64-bit compare on it.
         for (i, node) in self.graph.nodes.iter().enumerate() {
-            if node.op == Op::Const(val) {
+            if node.op == Op::Const(val) && node.ty == IrType::Int {
                 return i as NodeId;
             }
         }
         self.graph.add(Op::Const(val), IrType::Int, vec![], None)
+    }
+
+    /// `aconst_null` — the null reference, as a `Ref`-typed `Op::Const(0)`.
+    ///
+    /// Typed `Ref` rather than `Int` for two reasons: `emit_safepoint_map`
+    /// publishes exactly the `Ref`-typed defined nodes (a published null is
+    /// harmless and keeps the frame's oop set complete), and `Op::Cmp` selects
+    /// its operand width from the operand types — a reference comparison must
+    /// be 64-bit. Deduped separately from the integer constants; see
+    /// [`Self::iconst`].
+    fn aconst_null(&mut self) -> NodeId {
+        for (i, node) in self.graph.nodes.iter().enumerate() {
+            if node.op == Op::Const(0) && node.ty == IrType::Ref {
+                return i as NodeId;
+            }
+        }
+        self.graph.add(Op::Const(0), IrType::Ref, vec![], None)
     }
 
     fn lconst(&mut self, val: i64) -> NodeId {
@@ -1417,6 +1441,18 @@ impl IrBuilder {
 
             let op = code[pc];
             match op {
+                // aconst_null — push the null reference.
+                //
+                // Absent until 2026-07-31, and it cost more than its size
+                // suggests: `BinTreesClassic.bottomUpTree` was refused at its
+                // first `aconst_null`, and a null literal is unavoidable in any
+                // method that builds or terminates a reference structure. See
+                // `Self::aconst_null` for why the node is `Ref`-typed.
+                0x01 => {
+                    let c = self.aconst_null();
+                    self.push(c);
+                    pc += 1;
+                }
                 // iconst_m1..iconst_5
                 0x02..=0x08 => {
                     let val = (op as i64) - 3;
@@ -2189,14 +2225,35 @@ impl IrBuilder {
                         Some(&fi) => fi,
                         None => return ir_build_bail(line!(), pc),
                     };
-                    if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+                    // Reference fields (`L…;` / `[…`) read through the SAME
+                    // `jit_getfield` helper: it already returns the raw pointer
+                    // for a compact reference slot (0 for null, and an
+                    // implausible word degraded to null), and `i64::MIN` stays
+                    // unambiguous because no plausible heap pointer can equal
+                    // it. Only the node type differs — `Ref`, so every
+                    // safepoint map publishes the result slot as a rewritable
+                    // root. `ir_lower::lower_inner` refuses the graph when the
+                    // helper is absent (the unit-test stub table), because the
+                    // inline displacement fallback decodes an int cell.
+                    //
+                    // This was the single largest builder refusal measured on a
+                    // real workload (66 of 141 on a Hibernate class): a
+                    // reference field read is most of what object-oriented Java
+                    // does.
+                    let is_ref_field = matches!(type_tag, b'L' | b'[');
+                    if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') && !is_ref_field {
                         return ir_build_bail(line!(), pc);
                     }
                     let base = self.pop();
                     let offset = self.iconst(field_index as i64);
+                    let (mem_kind, ty) = if is_ref_field {
+                        (MemKind::Ref, IrType::Ref)
+                    } else {
+                        (MemKind::Int, IrType::Int)
+                    };
                     let load = self.graph.add(
-                        Op::Load(MemKind::Int),
-                        IrType::Int,
+                        Op::Load(mem_kind),
+                        ty,
                         vec![self.ctrl, self.mem, base, offset],
                         Some(pc),
                     );
@@ -2566,6 +2623,57 @@ impl IrBuilder {
                     pc += 3;
                 }
 
+                // ifnull (0xc6) / ifnonnull (0xc7) — compare a reference
+                // against null; if_acmpeq (0xa5) / if_acmpne (0xa6) — compare
+                // two references. Structurally identical to the int forms
+                // above; the operands are `Ref`-typed, and `ir_lower`'s
+                // `Op::Cmp` selects a 64-bit CMP when either operand is, so a
+                // pointer whose low 32 bits happen to be zero is not mistaken
+                // for null.
+                0xa5 | 0xa6 | 0xc6 | 0xc7 => {
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                    let target_pc = (pc as i32 + offset) as usize;
+                    let (a, b) = if op == 0xc6 || op == 0xc7 {
+                        let val = self.pop();
+                        (val, self.aconst_null())
+                    } else {
+                        let b = self.pop();
+                        let a = self.pop();
+                        (a, b)
+                    };
+                    let cc = if op == 0xc6 || op == 0xa5 {
+                        CmpOp::Eq
+                    } else {
+                        CmpOp::Ne
+                    };
+                    let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![a, b], pc);
+                    let if_node =
+                        self.graph
+                            .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
+                    let true_ctrl =
+                        self.graph
+                            .add(Op::Proj(0), IrType::Control, vec![if_node], Some(pc));
+                    let false_ctrl =
+                        self.graph
+                            .add(Op::Proj(1), IrType::Control, vec![if_node], Some(pc));
+
+                    let saved_locals = self.locals.clone();
+                    let saved_stack = self.stack.clone();
+                    let saved_mem = self.mem;
+
+                    // True edge → target
+                    self.ctrl = true_ctrl;
+                    self.add_merge_predecessor(target_pc);
+
+                    // False edge → fall-through
+                    self.ctrl = false_ctrl;
+                    self.locals = saved_locals;
+                    self.stack = saved_stack;
+                    self.mem = saved_mem;
+
+                    pc += 3;
+                }
+
                 // goto
                 0xa7 => {
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
@@ -2585,7 +2693,14 @@ impl IrBuilder {
                 // (it blocks every control node), and `eliminate_dead_nodes`
                 // roots from ALL returns (rooting only from `graph.exit` would
                 // delete the other return paths — see its comment).
-                0xac => {
+                // areturn (0xb0) shares this arm: `Op::Return` loads the value's
+                // frame slot into RAX and tears the frame down, which is the
+                // same ABI for a reference as for an int — the single-pass
+                // backend returns a raw pointer in RAX too. It was simply never
+                // wired, and it is the second-largest builder refusal on a real
+                // workload (25 of 141 on a Hibernate class): any method that
+                // returns an object was refused at its return.
+                0xac | 0xb0 => {
                     let val = self.pop();
                     let ret =
                         self.graph
@@ -3493,14 +3608,50 @@ mod tests {
     }
 
     #[test]
-    fn test_ir_getfield_bails_on_non_int_field() {
-        // A reference field (`L…;`) is not int-category → build bails.
-        let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+    fn test_ir_getfield_builds_a_ref_typed_load_for_a_reference_field() {
+        // A reference field (`L…;`) reads through the same checked helper and
+        // yields a `Ref`-typed `Op::Load(MemKind::Ref)`. The TYPE is the part
+        // that matters beyond "it builds": `emit_safepoint_map` publishes
+        // exactly the `Ref`-typed nodes, so an `Int`-typed load of a reference
+        // would leave a live oop out of every map.
+        //
+        // This used to assert the opposite — that the builder bails — which
+        // was the single largest exclusion in the optimizing tier (66 of 141
+        // builder refusals on a Hibernate class).
+        let code = [0x2a, 0xb4, 0x00, 0x02, 0xb0, 0, 0]; // aload_0; getfield; areturn
         let mut builder = IrBuilder::new(1, 1);
         let mut fi = HashMap::new();
         fi.insert(1usize, (0usize, b'L'));
         builder.set_field_info(fi);
-        assert!(builder.build(&code, 5).is_none());
+        let graph = builder
+            .build(&code, 5)
+            .expect("a reference-field getfield must build");
+        let load = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Load(MemKind::Ref)))
+            .expect("the reference field must lower to Op::Load(MemKind::Ref)");
+        assert_eq!(load.ty, IrType::Ref);
+    }
+
+    #[test]
+    fn test_ir_getfield_still_bails_on_a_wide_field() {
+        // `J`/`D`/`F` fields have no IR load lowering: the helper returns the
+        // int payload, and a category-2 value additionally needs the wide
+        // operand-stack shape. Still refused, and refused HERE rather than
+        // deeper in the pipeline.
+        for tag in [b'J', b'D', b'F'] {
+            let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+            let mut builder = IrBuilder::new(1, 1);
+            let mut fi = HashMap::new();
+            fi.insert(1usize, (0usize, tag));
+            builder.set_field_info(fi);
+            assert!(
+                builder.build(&code, 5).is_none(),
+                "field tag {} must not build",
+                tag as char
+            );
+        }
     }
 
     #[test]
