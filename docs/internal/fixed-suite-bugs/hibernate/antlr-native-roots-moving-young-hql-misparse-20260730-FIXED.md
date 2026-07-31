@@ -127,12 +127,20 @@ host (`cratonvm-antlrbase-20260731.exe` / `cratonvm-antlrfix2-20260731.exe`):
 | Arm | dev baseline | converted |
 |---|---|---|
 | `ASTParserLoadingTest` ×6, `--nojit` | 106/106 | 106/106 |
-| `ASTParserLoadingTest` ×8, JIT, interleaved A/B | see "the `?1` failure" below | see below |
+| `ASTParserLoadingTest` ×8, JIT, interleaved A/B | 8×106/106 | 8×106/106 |
 | `HqlParseStress` 250×14 parses, {jit,nojit} × {default, `GC_STRESS=4M`} | 0 misparsed | 0 misparsed |
 | `HqlParseStress`, jit × `GC_STRESS=1M` | timeout at 1800s | timeout at 1800s |
 | Hibernate `others` corpus (141 classes), `--nojit`, 4 shards | reference | **byte-identical per-class status** |
 | `cargo build --release --workspace` | clean | clean |
 | `cargo test -p cratonvm-native-builtins` | 3153 pass | 3153 pass (incl. the new guard) |
+| after merging 35 newer `dev` commits: rebuild + `cargo test` | — | clean, 3158 pass |
+| after that merge: `ASTParserLoadingTest` ×3, `--nojit` | — | 106/106 |
+
+The JIT row is an interleaved A/B — both binaries started together, so each run
+pair saw the same host load. Wall times track each other run for run (265/266,
+182/183, 235/239, 464/465, 552/554, 598/598, 523/523, 529/528 seconds), which is
+what makes "no difference in outcome" meaningful rather than a coincidence of
+scheduling.
 
 The corpus row is the strongest no-regression evidence: `diff` of
 `(class, status)` over all 141 classes is empty

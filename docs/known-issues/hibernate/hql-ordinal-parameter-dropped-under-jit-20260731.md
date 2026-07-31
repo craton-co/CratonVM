@@ -4,7 +4,8 @@
 is searchable and the probe that can catch it exists.
 
 **Witness:** `org.hibernate.orm.test.hql.ASTParserLoadingTest#testComponentNullnessChecks`,
-JIT mode, 1 failure in 6 runs (2026-07-31, `cratonvm-antlrfix-20260731.exe`).
+JIT mode, 1 failure in 14 runs (2026-07-31, `cratonvm-antlrfix-20260731.exe`).
+Not reproduced since.
 
 ## Symptom
 
@@ -38,15 +39,20 @@ when it blamed (and deleted) the trivial-accessor fast path.
 
 ## What is known
 
-* Only reproduced in JIT mode. Never seen in six `--nojit` runs of the same
-  class, nor in the 141-class `others` corpus (`--nojit`), nor on the dev
-  baseline in any arm run so far.
+* Seen **once, in 14 JIT runs** of the class on the converted binary. The
+  follow-up interleaved A/B — 8 JIT runs per binary, started together so both
+  saw the same host load — was **8/8 clean on both** the converted binary and
+  the dev baseline. So it did not recur, and there is no evidence either way
+  about whether the baseline carries it: 8 clean baseline runs cannot rule out
+  a 1-in-14 event.
+* Never seen in six `--nojit` runs of the same class, nor in the 141-class
+  `others` corpus (`--nojit`).
 * The failing run had 6 `[moving-young] fallback` warnings versus 1-4 in the
   passing runs — i.e. *more* of its young collections ran the NON-MOVING sweep,
   which is the opposite of what a relocation defect needs. Weak signal, one
   sample.
-* Reproduction rate is roughly 1 in 6 full-class runs, each ~7 minutes. That is
-  too slow to bisect against.
+* Reproduction rate is roughly 1 in 14 full-class runs, each 3-10 minutes. That
+  is far too slow and too rare to bisect against directly.
 
 ## How to hunt it
 

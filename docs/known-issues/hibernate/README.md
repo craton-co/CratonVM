@@ -124,7 +124,8 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
 - [HQL ordinal parameter silently dropped — `ordinal parameters []` under JIT](hql-ordinal-parameter-dropped-under-jit-20260731.md)
   (OPEN; observed once, cause not located) — `ASTParserLoadingTest#testComponentNullnessChecks`
-  failed 1 run in 6 under JIT with `No parameter labelled '?1' in query with ordinal parameters []`.
+  failed 1 run in 14 under JIT with `No parameter labelled '?1' in query with ordinal parameters []`
+  and has not recurred (a follow-up 8-run interleaved A/B was clean on both binaries).
   The query parses without a syntax error but its ordinal parameter never reaches
   `ParameterMetadataImpl`, so this is a *missing production*, not the rejected-parse shape of the
   (now fixed) ANTLR moving-young root defect — zero `SyntaxException`s appeared in any of the
