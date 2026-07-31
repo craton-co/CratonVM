@@ -95,6 +95,20 @@ jobs:
 
       # Exact synthetic-stub ratchet. The committed baseline is intentionally
       # slack-free, so newly introduced application-visible stubs fail CI.
+      # `cargo test --workspace` above does NOT exercise the feature set a
+      # suite runner gets. `libcratonvm` and `cratonvm-embed` enable
+      # `experimental-serialization` / `-aot` / `-debug` by default, and a
+      # workspace-wide resolve unifies those onto `cratonvm-native-builtins`
+      # for every member — including `cratonvm-cli`. A plain
+      # `cargo build --release -p cratonvm-cli` resolves without them.
+      #
+      # That split is how `jdk/internal/misc/VM.latestUserDefinedLoader0()`
+      # stayed registered in CI while every H2/Hibernate suite build threw
+      # `UnsatisfiedLinkError` on it. A `-p`-scoped test run resolves features
+      # the same way the suite build does, so gaps of that shape fail here.
+      - name: Default-feature native registry surface (no workspace unification)
+        run: cargo test -p cratonvm-native-builtins --lib context_class_loader_tests
+
       - name: Synthetic-stub ratchet
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
