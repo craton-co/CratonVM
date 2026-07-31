@@ -10,6 +10,7 @@
 pub mod access_flags;
 mod class_id;
 pub mod compact_value;
+pub mod compat;
 pub mod error;
 pub mod field_layout;
 pub mod field_watch;
@@ -30,6 +31,14 @@ mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};
+// The JDK-only policy token. `types` is the only crate that `native-api`,
+// `classloading`, `vm` and `vm-cli` all already depend on, so the shared
+// `CompatibilityMode` / `ExecutionPolicy` pair lives here (design contract
+// `docs/feature-designs/jdk-only-mode.md` §2). Re-exported at the crate root
+// as well as under `compat::` because `vm/src/config.rs` re-exports it onward
+// as `pub use cratonvm_types::compat::{CompatibilityMode, ExecutionPolicy};`
+// and several call sites name it as `cratonvm_types::CompatibilityMode`.
+pub use compat::{CompatibilityMode, ExecutionPolicy};
 #[cfg(any(test, debug_assertions))]
 pub use field_layout::clear_class_layouts;
 pub use field_layout::{
@@ -92,6 +101,28 @@ mod tests {
         let _ = ClassLoaderId::Bootstrap;
         let _ = ClassLoaderId::Extension;
         let _ = ClassLoaderId::Application;
+    }
+
+    /// `compat.rs` is only reachable because of the `pub mod compat;` above.
+    /// Without it the module is orphaned: `native-api`, `classloading`, `vm`
+    /// and `vm-cli` all name `cratonvm_types::compat::CompatibilityMode`, and
+    /// every one of them fails to compile. The root re-export is the second
+    /// half — `vm/src/config.rs` re-exports it onward, so dropping it is the
+    /// same class of silent breakage the heap-constant test below guards.
+    #[test]
+    fn reexport_compat_policy() {
+        assert_eq!(CompatibilityMode::default(), CompatibilityMode::Compatible);
+        assert!(CompatibilityMode::JdkOnly.is_jdk_only());
+        assert_eq!(CompatibilityMode::JdkOnly.as_str(), "jdk-only");
+
+        let policy = ExecutionPolicy::jdk_only();
+        assert!(policy.is_jdk_only());
+        assert!(policy.real_jdk);
+        assert!(!ExecutionPolicy::default().is_jdk_only());
+
+        // The two paths to the same type must be the same type, not a copy.
+        let via_module: compat::CompatibilityMode = CompatibilityMode::JdkOnly;
+        assert_eq!(via_module, CompatibilityMode::JdkOnly);
     }
 
     #[test]

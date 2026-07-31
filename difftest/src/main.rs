@@ -77,7 +77,9 @@ struct RunArgs {
     #[arg(long)]
     corpus: Option<PathBuf>,
 
-    /// Comma-separated CratonVM modes to fan out across.
+    /// Comma-separated CratonVM modes to fan out across: `jit-on`, `nojit`,
+    /// `no-intrinsics`, `moving-gc`, `low-jit-threshold`, `jdk-only-jit`,
+    /// `jdk-only-nojit`, `real-compatible-jit`, `real-compatible-nojit`.
     #[arg(
         long,
         value_delimiter = ',',
@@ -220,6 +222,8 @@ impl RunArgs {
             update_ledger: self.update_ledger,
             determinism_check: self.check_determinism,
             reconfirm: self.reconfirm,
+            // Probed once per corpus by the harness.
+            jdk_feature: None,
         }
     }
 }
@@ -656,8 +660,25 @@ fn cmd_gate(args: &RunArgs) -> ExitCode {
         return ExitCode::from(exit::BOOTSTRAP);
     }
 
-    // The committed known-divergence ledger. A missing file or a legacy-schema
-    // file is treated as an empty baseline (every divergence is then "new").
+    // A ledger written by a *newer* build cannot be read as an empty baseline:
+    // that would judge every one of its rows as a new divergence and report a
+    // confident, wrong verdict. Refuse loudly instead.
+    if let Some(v) = Ledger::schema_version_of(&config.ledger) {
+        if v > ledger::LEDGER_SCHEMA_VERSION {
+            eprintln!(
+                "cratonvm-difftest gate: {} is schema_version {v}, newer than this build's {} — \
+                 upgrade cratonvm-difftest. exit {} (non-fatal).",
+                config.ledger.display(),
+                ledger::LEDGER_SCHEMA_VERSION,
+                exit::BOOTSTRAP
+            );
+            return ExitCode::from(exit::BOOTSTRAP);
+        }
+    }
+
+    // The committed known-divergence ledger. A missing or malformed file is
+    // treated as an empty baseline (every divergence is then "new"); a
+    // schema-1 file loads and migrates in place.
     let ledger = match Ledger::load(&config.ledger) {
         Ok(Some(l)) => l,
         Ok(None) => Ledger::new(host_tag(), captured_at(), "unknown".into()),

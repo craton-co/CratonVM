@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "host": "windows-x86_64",
   "captured_at": "epoch:1785436557",
   "jdk": "openjdk version \"25.0.3\" 2026-04-21 LTS",
@@ -27,7 +27,9 @@
       },
       "status": "known",
       "first_seen": "2026-06-21",
-      "linked_doc": "ExceptionId residual known divergences after the JEP-358 NPE fix (vm exceptions.rs block-start reconstruction): CCE lacks HotSpot module/loader detail + uses slashed names; charAt SIOOBE has no detail message. NPE now byte-identical."
+      "linked_doc": "ExceptionId residual known divergences after the JEP-358 NPE fix (vm exceptions.rs block-start reconstruction): CCE lacks HotSpot module/loader detail + uses slashed names; charAt SIOOBE has no detail message. NPE now byte-identical.",
+      "jdk_profile": "compatible",
+      "jdk_feature": 25
     }
   ]
 }

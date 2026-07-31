@@ -247,6 +247,7 @@ fn make_minimal_class(name: &str, id: ClassId) -> Class {
         enclosing_method: None,
         hidden: false,
         module_name: None,
+        origin: cratonvm_classloading::ClassOrigin::VmInternal,
         is_synthetic_stub: false,
         has_finalizer: false,
         code_source: None,
