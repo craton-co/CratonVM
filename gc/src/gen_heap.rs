@@ -7610,8 +7610,8 @@ impl GenerationalHeap {
                     eprintln!(
                         "[quiesce] FIRST corruption: quiescence depth={} enter_count={} leave_count={}",
                         crate::gc_quiescence::depth(),
-                        crate::gc_quiescence::ENTER_COUNT.load(Ordering::Relaxed),
-                        crate::gc_quiescence::LEAVE_COUNT.load(Ordering::Relaxed),
+                        crate::gc_quiescence::ENTER_COUNT.get(),
+                        crate::gc_quiescence::LEAVE_COUNT.get(),
                     );
                 }
                 tracing::warn!(

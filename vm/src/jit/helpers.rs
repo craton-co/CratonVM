@@ -1549,6 +1549,183 @@ fn flush_class_identity_dispatch_memos() {
     });
 }
 
+/// Flush the per-thread caches that hold RAW compiled entry pointers, so a
+/// probe cannot call a body that has since been superseded or invalidated.
+///
+/// Both dispatch helpers publish into `VIRTUAL_DISPATCH_CACHE`, so both must
+/// run this before probing it — `jit_invoke_virtual_mic` uses it for callees
+/// the machine-code MIC/PIC cascade is barred from holding (see its
+/// consult site). Two thread-local compares on the steady-state path.
+fn flush_raw_entry_dispatch_caches() {
+    // Every compiled publication/invalidation advances this generation. Flush
+    // raw-entry dispatch caches before probing them, both to pick up tier
+    // replacements and to release their code owners after invalidation.
+    let generation = cratonvm_jit::jit_cache_generation();
+    DISPATCH_CACHE_JIT_GENERATION.with(|seen| {
+        if seen.get() != generation {
+            seen.set(generation);
+            DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+            VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+        }
+    });
+    // Retain the older supersede epoch as a compatibility signal for tiering
+    // paths that may advance it independently of a cache replacement. The
+    // general JIT generation above is the lifetime-safety mechanism.
+    let epoch = crate::classloading::jit_supersede_epoch();
+    DISPATCH_CACHE_SUPERSEDE_EPOCH.with(|e| {
+        if e.get() != epoch {
+            e.set(epoch);
+            DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+            VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+        }
+    });
+}
+
+/// May a callee that declares an exception table be published into the
+/// machine-code MIC/PIC after all?
+///
+/// The ban exists because the inline cascade in `jit/src/x64.rs` CALLs the
+/// cached entry directly, so an `i64::MIN` deopt/exception sentinel from the
+/// callee had no Rust frame to notice it and route it through the *callee's*
+/// own exception table — it surfaced at the caller's epilogue as the caller's
+/// own deopt.
+///
+/// That hole is closed. `Compiler::emit_inline_callee_deopt_check` is emitted
+/// after **every** inline direct-entry CALL (both PIC slots and the MIC arm)
+/// and hands a sentinel to `jit_service_callee_deopt`, which is a thin wrapper
+/// over the same [`handle_compiled_callee_deopt_sentinel`] every helper arm
+/// uses. It landed later, for the H2 `MVMap`/`DataType.read` case, and the ban
+/// was never revisited against it. Cost on the hit path is a `MOV imm64` +
+/// `CMP` + a not-taken `JNE`.
+///
+/// Keeping the ban is not free: nothing ever writes the MIC's class id for
+/// such a callee, so *every* call to it lands in the cache-miss arm — a
+/// compile probe, an exception-table probe and `invoke_or_native`, forever.
+/// That is the whole of doc 23's residual `LazyCsCache` gap
+/// (`probes/LazyArmVariants.java` V7 vs V8: identical delegates differing only
+/// by a never-taken `try`/`catch`, 8362 vs 45613 ns/op at ten threads).
+///
+/// **The ban is nevertheless kept ON by default**, because lifting it buys
+/// nothing measurable once the Rust-level cache above exists. A/B on one
+/// binary, three interleaved rounds on an idle host, ten threads
+/// (`probes/LazyArmVariants.java`, ns/op):
+///
+/// | variant                | ban kept          | ban lifted        |
+/// |------------------------|-------------------|-------------------|
+/// | V0 real `CharsetCache` | 11545/9865/9683   | 9272/10737/9441   |
+/// | V8 delegate with `try` | 9705/9779/9855    | 8740/10229/9278   |
+///
+/// Indistinguishable. Doc 23's own precedent applies: a change that carries a
+/// correctness risk for zero measured throughput does not land. What is
+/// recorded here is that the *reason* for the ban has expired, so the next
+/// person can lift it on evidence rather than re-deriving the argument —
+/// set `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1` to try.
+fn mic_publish_exception_table_callees() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH").is_some()
+    })
+}
+
+/// Opt-out for the Rust-level compiled-entry cache the virtual-MIC helper uses
+/// for exception-table callees, so one binary can be A/B'd against itself.
+fn mic_rust_entry_cache_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE").is_none()
+    })
+}
+
+/// Call this site's compiled callee out of the per-thread entry cache the
+/// virtual-MIC helper keeps for callees the machine-code caches are barred
+/// from holding. `None` means no usable entry — resolve normally.
+///
+/// # Why this cache exists
+///
+/// A callee that declares an exception table can never be published into the
+/// MIC or the PIC: the inline cascade in `jit/src/x64.rs` machine-CALLs the
+/// raw entry, and nothing on that route can run
+/// [`handle_compiled_callee_deopt_sentinel`] to send the callee's own trap
+/// through the callee's own table. The MIC slot therefore never gets a class
+/// id either, so every call to such a callee took the *cache-miss* arm — a
+/// compile probe, an exception-table probe, and `invoke_or_native` — forever,
+/// and the compiled body that was sitting in the JIT cache was never entered.
+///
+/// This map is a plain thread-local the inline cascade cannot see, so a hit
+/// runs the compiled body *and* keeps the sentinel routing. It is the same
+/// trade `jit_invoke_dispatch`'s virtual arm already makes for its own callees
+/// (see the long note at its consult site).
+///
+/// Measured with `probes/LazyArmVariants.java`, whose V7/V8 pair differs only
+/// by a never-taken `try`/`catch` in the delegate — the shape of
+/// `CharsetCache.getCharset` — at ten threads: 8901 vs 44859 ns/op before,
+/// with both delegates confirmed compiled either way.
+///
+/// SAFETY: same contract as the surrounding helper — `vm`/`info`/`args_slice`
+/// are the live values the JIT caller passed, and `thread` is this thread's
+/// exclusive borrow.
+#[inline]
+unsafe fn try_mic_rust_cached_entry(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    info_ptr: i64,
+    receiver_cid: u32,
+    vm_ptr: i64,
+    args_slice: &[i64],
+) -> Option<i64> {
+    if !mic_rust_entry_cache_enabled() || !direct_virtual_compiled_callee_entry_enabled() {
+        return None;
+    }
+    let (entry, needs_ctx) = VIRTUAL_DISPATCH_CACHE.with(|dc| {
+        dc.borrow()
+            .get(&(info_ptr as usize, receiver_cid))
+            .map(|c| (c.entry, c.needs_context))
+    })?;
+    let rc = try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice)?;
+    if rc == i64::MIN {
+        if let Some(v) = handle_compiled_callee_deopt_sentinel(
+            vm,
+            thread,
+            info,
+            ClassId::new(receiver_cid),
+            args_slice,
+        ) {
+            return Some(v);
+        }
+    }
+    Some(rc)
+}
+
+/// Publish a compiled entry into the cache [`try_mic_rust_cached_entry`] reads.
+///
+/// `pin_jit_entry` is the only keep-alive for the raw pointer stored here, so
+/// a failure to pin simply means the entry is not cached — never a dangling
+/// one.
+fn publish_mic_rust_cached_entry(
+    info_ptr: i64,
+    receiver_cid: u32,
+    entry_ptr: usize,
+    needs_ctx: bool,
+) {
+    if !mic_rust_entry_cache_enabled() || entry_ptr == 0 {
+        return;
+    }
+    let Some(owner) = cratonvm_jit::pin_jit_entry(entry_ptr) else {
+        return;
+    };
+    VIRTUAL_DISPATCH_CACHE.with(|dc| {
+        dc.borrow_mut().insert(
+            (info_ptr as usize, receiver_cid),
+            DispatchCache {
+                entry: entry_ptr,
+                needs_context: needs_ctx,
+                _owner: Some(owner),
+            },
+        );
+    });
+}
+
 /// [`virtual_dispatch_target_for_receiver`] *plus* the `globally_named`
 /// round-trip test, both served from a per-thread memo.
 ///
@@ -6850,32 +7027,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
         VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
     }
-    // Every compiled publication/invalidation advances this generation. Flush
-    // raw-entry dispatch caches before probing them, both to pick up tier
-    // replacements and to release their code owners after invalidation.
-    {
-        let generation = cratonvm_jit::jit_cache_generation();
-        DISPATCH_CACHE_JIT_GENERATION.with(|seen| {
-            if seen.get() != generation {
-                seen.set(generation);
-                DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
-                VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
-            }
-        });
-    }
-    // Retain the older supersede epoch as a compatibility signal for tiering
-    // paths that may advance it independently of a cache replacement. The
-    // general JIT generation above is the lifetime-safety mechanism.
-    {
-        let epoch = crate::classloading::jit_supersede_epoch();
-        DISPATCH_CACHE_SUPERSEDE_EPOCH.with(|e| {
-            if e.get() != epoch {
-                e.set(epoch);
-                DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
-                VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
-            }
-        });
-    }
+    flush_raw_entry_dispatch_caches();
 
     // A JIT call-site's CP owner is often an interface. Resolve once on the
     // actual receiver class, then cache and directly enter the compiled
@@ -9394,7 +9546,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             let pic = &*(pic_ptr as *const JitPICSlot);
             pic.clear_entries();
         }
+        VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
     }
+    // This helper publishes raw compiled entries into `VIRTUAL_DISPATCH_CACHE`
+    // for callees the MIC/PIC cannot hold, so it owes that cache the same
+    // generation/supersede revalidation `jit_invoke_dispatch` does.
+    flush_raw_entry_dispatch_caches();
     let cached_cid = mic
         .cached_class_id
         .load(std::sync::atomic::Ordering::Acquire);
@@ -9543,11 +9700,21 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         let dispatch_target =
             virtual_dispatch_target_cached(vm, receiver_ref, info, info_ptr as usize);
         let cacheable_receiver = dispatch_target.cacheable_receiver;
+        let globally_named = dispatch_target.globally_named;
         // An entryless slot can be retargeted by another thread after the
         // class-id probe above. Its cached class name is therefore not a
         // coherent companion to this receiver; resolve from the receiver
         // itself until there is a callable entry to use.
         let class_name = dispatch_target.class_name;
+
+        // See `try_mic_rust_cached_entry`.
+        if cacheable_receiver && globally_named && !redefine_jit_quiesced {
+            if let Some(rc) = try_mic_rust_cached_entry(
+                vm, thread, info, info_ptr, receiver_cid, vm_ptr, args_slice,
+            ) {
+                return rc;
+            }
+        }
         if cv_trace {
             eprintln!(
                 "[cv-mic-hit-noentry] resolved_class={} recv_cid={} cacheable={}",
@@ -9603,9 +9770,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             // inline MIC/PIC cascade would machine-CALL it, letting the trap's
             // sentinel + stashed frame bail through the compiled caller's
             // epilogue past the only point able to resume it precisely.
-            if !mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info)
-                && !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
+            let callee_barred_by_table = !mic_publish_exception_table_callees()
+                && mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info);
+            let callee_has_indy_trap =
+                compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor);
+            if callee_barred_by_table
+                && !callee_has_indy_trap
+                && cacheable_receiver
+                && globally_named
             {
+                publish_mic_rust_cached_entry(info_ptr, receiver_cid, entry_ptr, needs_ctx);
+            }
+            if !callee_barred_by_table && !callee_has_indy_trap {
                 // Publish through `update`, never with a raw store: `update` is
                 // the only writer that also resolves and RETAINS the callee's
                 // `Arc<CompiledMethod>` in the slot's `compiled_owner`.
@@ -9714,12 +9890,24 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     let dispatch_target =
         virtual_dispatch_target_cached(vm, receiver_ref, info, info_ptr as usize);
     let cacheable_receiver = dispatch_target.cacheable_receiver;
+    let globally_named = dispatch_target.globally_named;
     let class_name = dispatch_target.class_name;
     if cv_trace {
         eprintln!(
             "[cv-mic-miss] resolved_class={} recv_cid={} cacheable={}",
             class_name, receiver_cid, cacheable_receiver
         );
+    }
+
+    // This, not the entryless-hit arm, is where a barred callee lands: nothing
+    // ever writes the MIC's class id for it, so its slot stays empty and every
+    // call is a "miss". See `try_mic_rust_cached_entry`.
+    if cacheable_receiver && globally_named && !redefine_jit_quiesced {
+        if let Some(rc) = try_mic_rust_cached_entry(
+            vm, thread, info, info_ptr, receiver_cid, vm_ptr, args_slice,
+        ) {
+            return rc;
+        }
     }
 
     mic_prof::bump(&mic_prof::MIC_MISS);
@@ -9753,13 +9941,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // A machine-code MIC/PIC call has no interpreter boundary at which the
     // callee's local handler can be resumed. Leave such callees on the checked
     // helper path; ordinary handler-free callees retain the raw-entry fast path.
-    if cacheable_receiver
-        && !mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info)
-        // jit-invokedynamic-groovy-regression fix — see the matching gate in
-        // the cache-hit branch above: an indy-trap-bearing artifact must stay
-        // on the dispatch helper, never in a machine-called MIC/PIC entry.
-        && !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
-    {
+    let callee_barred_by_table = !mic_publish_exception_table_callees()
+        && mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info);
+    // jit-invokedynamic-groovy-regression fix — see the matching gate in the
+    // cache-hit branch above: an indy-trap-bearing artifact must stay on the
+    // dispatch helper, never in a machine-called MIC/PIC entry.
+    let callee_has_indy_trap =
+        compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor);
+    if callee_barred_by_table && !callee_has_indy_trap && cacheable_receiver && globally_named {
+        publish_mic_rust_cached_entry(info_ptr, receiver_cid, entry_ptr as usize, needs_ctx);
+    }
+    if cacheable_receiver && !callee_barred_by_table && !callee_has_indy_trap {
         // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
         mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
 
