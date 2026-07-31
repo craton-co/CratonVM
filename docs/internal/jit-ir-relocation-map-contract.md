@@ -1,3 +1,227 @@
+# IR relocation map contract — closed
+
+**Status: ✅ CLOSED (2026-07-31).** The optimizing tier's frames now prove a
+complete rewritable root map, and the moving young generation relocates while
+they are live. Measured end to end, with a probe that discriminates.
+
+Retired from `docs/known-issues/jit-ir-relocation-map-contract-remaining.md`.
+That document's investigation history is preserved below the fold, including
+its retractions, because three of its measurements said nothing and one of its
+stated blockers was not a blocker at all.
+
+## What the contract is
+
+Before a young collection may RELOCATE while a compiled frame is live, that
+frame must let the collector rewrite every reference it holds. Naming the
+references is not enough: `conservative_roots::scan_oop_slots` reads each slot
+named by `OopMapEntry::frame_slot_offsets` and pushes the `ObjectRef` **value**
+into the root vector, which marks the object but gives the collector no way to
+write the new address back. The rewritable homes come from the shadow stack —
+`published_shadow_values`, cross-checked against the frame band by
+`band_has_unpublished_young_word`.
+
+So `moving_young_coverage_complete: true` asserts *publication*, not
+*enumeration*. The verifier is fail-closed: no matching map is a refusal, not
+an absence of objections.
+
+## Result
+
+`bench/IrEscapeProbe.java`, depth 60, 100 000 iterations, `-Xmx64m`,
+`CRATONVM_JIT_FORCE_C2=1`. Interleaved, five reps per lane, one binary:
+
+| lane | cycles | coverage_fallbacks | ms |
+|---|---:|---:|---|
+| `CRATONVM_JIT_IR_RELOC_EMIT=0` | 0 | 14 | 2316, 2543, 2377, 2469, 2411 |
+| default (contract on) | 14 | 0 | 2327, 2524, 2463, 2505, 2521 |
+
+**Every collection, both directions, all five reps.** The lever that turns the
+contract off turns relocation off with it; the lever that turns it on relocates
+on every cycle. This is the discrimination the previous document kept failing
+to get, and it is what makes the timings mean anything.
+
+Medians 2411 ms vs 2505 ms — about 4%. Read it as the price of a different
+collector, not as overhead: the ON lane performs 14 *relocating* young
+collections where the OFF lane performs 14 non-moving sweeps.
+
+Correctness anchors on the same binary: `BinTreesClassic 18` at `-Xmx512m`
+returns `68332206` both by default and under `CRATONVM_JIT_FORCE_C2=1` (with
+`cycles=25 coverage_fallbacks=0` in both), and `--nojit` bt16 at `-Xmx128m`
+returns `14985902`. `cargo test -p cratonvm-jit`: 1061 lib + every integration
+target, 0 failed.
+
+## Why it had never executed, in the order the failures surfaced
+
+Each of these presented identically — as an absence. That is the through-line
+of the whole investigation and the reason it took four attempts to get a real
+measurement: nothing reported *which* absence.
+
+### 1. No IR body was produced at all
+
+Three independent refusals, all silent:
+
+* **`optimize=false`.** The tier is chosen outside the `cratonvm-jit` crate,
+  and in a default run almost every compile request is C1. A probe cannot
+  reach IR codegen by being shaped correctly. `CRATONVM_JIT_FORCE_C2=1`
+  (default off) now requests the optimizing tier for every compile. It changes
+  WHICH tier compiles a method, never what a compiled method does — the
+  pipeline still falls back to single-pass for anything it cannot lower.
+* **`compact_ref_fields_enabled()` is default TRUE, and `IrBuilder::build`
+  refused every `getfield` and `putfield` under it.** This was the largest
+  exclusion in the tier by a wide margin — it removes most object-oriented
+  Java. The stated reason applies to only ONE of `Op::Load`'s two lowerings:
+  the inline `HEADER_SIZE + field_index * SLOT_SIZE` displacement, which a
+  compact object does not obey. The other routes through `jit_getfield`, which
+  resolves the packed offset from the receiver's registered layout. The
+  constraint now lives in `ir_lower::lower_inner`, which refuses only when
+  compact layout is on AND the helper address is absent — a synthetic
+  unit-test table. `Op::Store` gained the matching path through
+  `jit_putfield_int`, keeping the null check inline so a null receiver still
+  deopts and throws rather than silently dropping the store.
+* **`ir_compatible` admitted up to 16 `anewarray` sites into a pipeline with
+  no arm for 0xbd.** Admission and the builder disagreed, so every
+  array-allocating method paid admission plus a full graph build before a
+  silent bail. Arrays are now refused up front, with a reason. (`Op::NewArray`
+  is still an unimplemented stub — see "Still open" — but it is not a
+  prerequisite for this contract, which was the previous document's closing
+  claim.)
+
+The `IR_MAX_ALLOCATIONS` comment asserting "the IR has NO allocation lowering"
+was stale: an escaping `Op::New` lowers through the shared
+`emit_new_object_stub`, the same runtime-lowering stub the baseline tier uses.
+Only ARRAY allocation is missing.
+
+### 2. `missing-exact-rbp` — the collector could not locate the frame
+
+With bodies finally produced, the first probe run reported `cycles=0
+coverage_fallbacks=14, missing-exact-rbp=14`: every young collection diverted
+before the verifier ever looked at an oop map.
+
+`PreciseFrameInfo::exact_rbp` is only ever a snapshot of the precise-maps
+innermost-RBP mirror, which each compiled prologue writes. The IR prologue
+never wrote it. It now emits the same nine-byte
+`MOV <seg>:[disp32], RBP` the single-pass backend emits, from the same
+`inline_rbp_tls_disp()` source of truth, plus the helper fallback for targets
+with no usable TLS displacement.
+
+A callee publishes its OWN rbp on entry, so the mirror must be restored after
+every call. That is emitted at the top of `emit_call_return_check` (the choke
+point three of the four dispatch routes share) and explicitly in
+`emit_self_recursive_call`, which bypasses it.
+
+### 3. Reference PARAMETER homes were never published
+
+Next reason: `compiled-frame-oop-not-published`.
+`CRATONVM_MOVING_YOUNG_BAND_DBG` named the two rejected words — `off=8
+region=java-local` and `off=56 region=operand-spill`, holding the SAME
+reference. The prologue stores each incoming argument to `[rbp - (idx+1)*8]`
+and that word keeps holding it for the whole frame; `Op::Param`'s spill slot is
+a copy. The map was built by scanning defined `Ref`-typed NODES, and a
+parameter home is not a node result.
+
+The band scan is conservative, so one unpublished young word anywhere in the
+live band refuses the whole cycle. Every safepoint map now begins with the
+reference-parameter homes.
+
+### 4. The reader could not find what the writer published
+
+Still `compiled-frame-oop-not-published`, and this one is the sharpest lesson
+in the file: `cm.shadow_thread_slot_off`, `cm.shadow_savebase_slot_off` and
+`cm.shadow_off_in_thread` were never set on the IR `CompiledMethod`. Without
+them `shadow_window_from_frame` returns `None`, `published_shadow_values`
+yields the empty set, and **every published word reads back as unpublished** —
+a fully correct publication is indistinguishable from no publication at all.
+
+With those three assigned, the first run reported `cycles=2
+coverage_fallbacks=0` and `[ir-reloc] safepoint id=1 slots=[8, 56]
+coverable=true published=true`.
+
+## Diagnostics added, and why they are permanent
+
+The pipeline had four stages that could decline a method, and all four declined
+in silence with the identical observable. Under `CRATONVM_DBG_JITC` or
+`CRATONVM_DBG_IR_COMPILES` each now names itself:
+
+* `try_compile_inner` reports which admission term declined a candidate,
+  including `optimize=false`;
+* `ir_compatible` reports the refused conjunct;
+* `IrBuilder::build` reports the refusing site by `line!()`, and the opcode
+  catch-all reports the bytecode it has no lowering for;
+* the live-`Op::NewArray` check and `ir_lower::lower_inner` report too.
+
+`CRATONVM_DBG_IR_RELOC` dumps each safepoint's slot list with `coverable` /
+`published`, which is what distinguished failure 3 from failure 4.
+
+## Corrections to the retired document
+
+* **`CRATONVM_JIT_IR_RELOC_MAPS` does not exist in the tree.** The retired
+  document described the coverage claim as gated behind it and default-off.
+  The claim is unconditional: `coverable && (published || slots.is_empty())`.
+  Any A/B run against that variable measured nothing. `CRATONVM_JIT_IR_RELOC_EMIT`
+  is real and is the lever used above.
+* **The "~1.4% emission cost" measured nothing.** There were no IR bodies to
+  emit into. Likewise the reader-side null result, and `cycles=25
+  coverage_fallbacks=0` on bt18 was the SINGLE-PASS path proving its own
+  coverage.
+* **`newarray` was not the blocker.** The retired document closed on "array
+  allocation was never wired into IR" as the one thing standing between the
+  contract and execution. Object allocation was already supported; the actual
+  blockers were the three refusals in §1 and the three contract gaps in
+  §§2–4, none of which involve arrays.
+* The `ZonedDateTimeTest` timeouts blamed on this work in attempts 1–3 were
+  that class's own bimodality. That correction stands.
+
+## Still open (not this contract)
+
+* **`Op::NewArray` is an unimplemented stub.** `newarray` (0xbc) and
+  `anewarray` (0xbd) have no arm in `IrBuilder::build`, and the node type is
+  constructed nowhere. Both are now refused with a reason instead of silently.
+  Closing it means lowering array allocation to the allocation helper with a
+  GC-capable safepoint — which routes through the very machinery this document
+  closes, so the contract is a prerequisite for that work rather than the
+  reverse.
+* **C2 is almost never requested in a default run.** `optimize=false` on nearly
+  every compile is a tier-selection question, tracked with the wire-tiered-manager
+  work, not here. Until it is answered, the optimizing tier's real-workload
+  coverage stays near zero regardless of what it can lower, and
+  `CRATONVM_JIT_FORCE_C2=1` is the only way to exercise it.
+* **The ASTParser 376→138 s and Oracle 322→93 s improvements credited to
+  "C2 tier restored" (`f78b72670`) still need re-attributing.** The optimizing
+  tier emitted nothing at the time, so they cannot have come from it;
+  `direct_jit_callee_calls_enabled`, scoped in the same commit, is the
+  candidate.
+* **`JIT_PUBLISHES_RELOCATION_CONTRACT` stays `false`, deliberately.** Its own
+  doc comment lists what a flip requires, and IR safepoint maps are only the
+  first item — unregistered JIT frames on the stack, unavailable exact frame
+  bases, unbounded spill bands and the cross-thread handshake
+  (`CROSS_THREAD_JIT_PEER`) must all hold in production traffic too. This work
+  supplies that first item and nothing beyond it. Note also that the flip is
+  not a pure improvement: the constant re-arms
+  `moving_young_disables_optimizing_tier()`, so setting it today would switch
+  the optimizing tier back OFF under the default moving-young configuration.
+  None of that affects the result above, which is measured on the per-cycle
+  per-frame proof — the default authority since the blanket veto became the
+  opt-in `CRATONVM_MOVING_YOUNG_NO_JIT`.
+
+## Reproduce
+
+```bash
+CRATONVM_JIT_FORCE_C2=1 CRATONVM_GC_STATS=1 cratonvm -Xmx64m -cp bench IrEscapeProbe 60 100000
+```
+
+Expect `[GC] moving_young: cycles=14 coverage_fallbacks=0`. Add
+`CRATONVM_JIT_IR_RELOC_EMIT=0` for the control lane and expect `cycles=0
+coverage_fallbacks=14`. If the two lanes agree, the probe is not exercising the
+contract — check `CRATONVM_DBG_IR_COMPILES=1` for an actual IR body first, and
+do not read the timings until they disagree.
+
+---
+
+# Investigation history (retired)
+
+Kept verbatim from `docs/known-issues/jit-ir-relocation-map-contract-remaining.md`.
+Read it with the corrections above: several of its measurements are
+retracted there, and its closing diagnosis (array allocation) was wrong.
+
 # IR relocation map contract — frame side done, publication side remaining
 
 **Status: 🟡 PARTIAL.** The maps, safepoint ids and frame layout are implemented
