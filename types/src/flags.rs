@@ -67,7 +67,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1871,6 +1871,123 @@ pub fn flags() -> &'static VmFlags {
     FLAGS.get_or_init(VmFlags::from_env)
 }
 
+/// Whether any [`FlagOverride`] is currently installed, anywhere in the
+/// process.
+///
+/// **For downstream memo layers.** `vm/src/runtime/env_cache.rs` memoises ~90
+/// hot flags on top of this snapshot, so a test override would otherwise be
+/// invisible to them: the memo latches on first read and never consults
+/// [`flags()`] again. A memo whose value is not `Copy`-cheap enough for
+/// [`MemoSlot`] consults this and recomputes from source while it is true.
+///
+/// A memo must NOT populate itself while this is true, or it would latch an
+/// override's value permanently and poison the rest of the process.
+#[inline]
+pub fn overrides_active() -> bool {
+    OVERRIDES_LIVE.load(Ordering::Relaxed) != 0
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Invalidatable memo slots
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One downstream memo of a flag, which installing an override invalidates.
+///
+/// # Why this exists rather than "just check [`overrides_active`]"
+///
+/// `vm/src/runtime/env_cache.rs` memoises ~90 flags that are read from the
+/// interpreter's per-bytecode path. Having each read ask "is an override
+/// installed?" measured at **+1.15% of `execute_instruction`** — the reader
+/// pays, forever, for a question whose answer is no in every real VM process.
+///
+/// So the cost moves to the writer instead. A slot holds its value inline in
+/// one `AtomicU8`, a read is a single relaxed load, and installing or dropping
+/// a [`FlagOverride`] walks every registered slot and resets it to unset. The
+/// memo then re-derives on its next read, and while the override is live
+/// [`publish`](Self::publish) declines to store, so nothing latches.
+///
+/// The encoding above `UNSET` is the caller's: `env_cache` uses 1/2 for
+/// `false`/`true` and 1/2/3 for `None`/`Some(false)`/`Some(true)`. Anything
+/// that does not fit a `u8` keeps the [`overrides_active`] check — none of
+/// those are on the per-bytecode path.
+#[derive(Debug)]
+pub struct MemoSlot {
+    state: AtomicU8,
+}
+
+/// The "not yet derived" state of a [`MemoSlot`]; every other value is the
+/// caller's own encoding.
+pub const MEMO_UNSET: u8 = 0;
+
+/// Every [`MemoSlot`] that has published at least once, so an override can
+/// find it. Written only on a memo's cold path and by override install/drop.
+static MEMO_SLOTS: std::sync::Mutex<Vec<&'static MemoSlot>> = std::sync::Mutex::new(Vec::new());
+
+impl MemoSlot {
+    /// A slot that has not derived its value yet.
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(MEMO_UNSET),
+        }
+    }
+
+    /// The memoised value, or [`MEMO_UNSET`] if it must be derived.
+    ///
+    /// The whole point of the type: one relaxed load of a static that is
+    /// dirtied only by a test installing an override. Deliberately returns the
+    /// raw byte rather than an `Option<u8>` — `u8` has no niche, so the
+    /// `Option` costs a discriminant materialisation on the hottest read in
+    /// the interpreter (worth 0.2% of `execute_instruction`, measured).
+    #[inline]
+    pub fn load(&self) -> u8 {
+        self.state.load(Ordering::Relaxed)
+    }
+
+    /// Memoise `value`, unless an override is installed.
+    ///
+    /// Registers the slot so a later override can reset it. Takes the registry
+    /// lock, which is what makes "no override is live" and "store" one step
+    /// with respect to a concurrent [`override_thread`] — without that, an
+    /// override installed between the check and the store would find the slot
+    /// already walked and leave a stale base value behind it.
+    ///
+    /// # Panics
+    ///
+    /// If `value` is [`MEMO_UNSET`] — that would encode "derive me again" and
+    /// spin the cold path forever.
+    pub fn publish(&'static self, value: u8) {
+        assert!(value != MEMO_UNSET, "MEMO_UNSET is not a publishable value");
+        let mut slots = MEMO_SLOTS.lock().unwrap_or_else(|p| p.into_inner());
+        if overrides_active() {
+            return;
+        }
+        if !slots.iter().any(|s| std::ptr::eq(*s, self)) {
+            slots.push(self);
+        }
+        self.state.store(value, Ordering::Relaxed);
+    }
+}
+
+impl Default for MemoSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reset every registered memo, and apply `delta` to the live-override count
+/// under the same lock so a concurrent [`MemoSlot::publish`] cannot interleave.
+fn invalidate_memos(delta: isize) {
+    let slots = MEMO_SLOTS.lock().unwrap_or_else(|p| p.into_inner());
+    if delta > 0 {
+        OVERRIDES_LIVE.fetch_add(1, Ordering::Release);
+    } else {
+        OVERRIDES_LIVE.fetch_sub(1, Ordering::Release);
+    }
+    for slot in slots.iter() {
+        slot.state.store(MEMO_UNSET, Ordering::Relaxed);
+    }
+}
+
 /// Which threads a [`FlagOverride`] applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverrideScope {
@@ -1907,7 +2024,7 @@ impl Drop for FlagOverride {
                 PROCESS_OVERRIDE.store(self.previous, Ordering::Release);
             }
         }
-        OVERRIDES_LIVE.fetch_sub(1, Ordering::Release);
+        invalidate_memos(-1);
     }
 }
 
@@ -1955,7 +2072,7 @@ fn as_raw(cfg: Option<&'static VmFlags>) -> *mut VmFlags {
 /// `cfg` is leaked, so this is for tests and not for a hot loop.
 pub fn override_thread(cfg: VmFlags) -> FlagOverride {
     let leaked: &'static VmFlags = Box::leak(Box::new(cfg));
-    OVERRIDES_LIVE.fetch_add(1, Ordering::Release);
+    invalidate_memos(1);
     let previous = THREAD_OVERRIDE.with(|slot| slot.replace(Some(leaked)));
     FlagOverride {
         scope: OverrideScope::Thread,
@@ -1977,7 +2094,7 @@ pub fn override_thread(cfg: VmFlags) -> FlagOverride {
 /// Same `env_cache` limitation and same leak as [`override_thread`].
 pub fn override_process(cfg: VmFlags) -> FlagOverride {
     let leaked: &'static VmFlags = Box::leak(Box::new(cfg));
-    OVERRIDES_LIVE.fetch_add(1, Ordering::Release);
+    invalidate_memos(1);
     let previous = PROCESS_OVERRIDE.swap(as_raw(Some(leaked)), Ordering::AcqRel);
     FlagOverride {
         scope: OverrideScope::Process,
@@ -2702,7 +2819,10 @@ mod tests {
     #[test]
     fn thread_override_wins_after_the_snapshot_has_latched() {
         let _lock = process_override_lock();
-        assert!(declared_flag_names().contains(PROBE), "probe must be declared");
+        assert!(
+            declared_flag_names().contains(PROBE),
+            "probe must be declared"
+        );
         let latched = probe();
         with_thread_overrides(&[(PROBE, Some("/scoped/repo"))], || {
             assert_eq!(probe().as_deref(), Some("/scoped/repo"));
