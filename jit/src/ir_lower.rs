@@ -237,6 +237,29 @@ struct Lowerer<'a> {
     needs_context: bool,
     /// Frame offset of the saved VM context pointer (valid iff `needs_context`).
     context_slot_off: i32,
+    /// Frame offset of the reserved safepoint-id slot (see the layout comment
+    /// in `new`). Non-zero for every IR frame; the relocation contract needs it
+    /// so the collector can tell which `OopMapEntry` describes this frame right
+    /// now, rather than unioning every map in the method (unsound to relocate).
+    sp_id_slot_off: i32,
+    /// Byte size of the Java-locals region, for the published `FrameLayout`.
+    locals_size: i32,
+    /// First operand-spill offset, i.e. the exclusive top of the reserved
+    /// locals region (locals + context + sp-id).
+    first_spill: i32,
+    /// Per-safepoint oop maps published for the moving-young relocation
+    /// contract. An empty vector means "no precise coverage", which
+    /// `conservative_roots` reads as a refusal — the fail-closed direction.
+    oop_maps: Vec<super::OopMapEntry>,
+    /// Nodes whose frame slot has been WRITTEN by already-emitted code. A
+    /// `Ref` node's slot is uninitialised stack garbage until its defining node
+    /// is emitted, so publishing it before then would hand the collector a
+    /// bogus root out of the previous frame's leftovers.
+    defined_nodes: Vec<bool>,
+    /// Monotonic safepoint id. Starts at 1: `sp_id_slot_off == 0` is the
+    /// "no slot" sentinel on the reader side, and a zero id in the slot means
+    /// "this frame has not reached a safepoint yet".
+    next_sp_id: u32,
     /// Frame offset of `arg[0]` in the Java-argument staging region a call
     /// marshals its args into; `arg[i]` lives at `args_stage_top_off - i*8`
     /// (increasing address), and `args_ptr = rbp - args_stage_top_off`.
@@ -354,12 +377,19 @@ impl<'a> Lowerer<'a> {
         // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
         let locals_size = (num_locals as i32) * 8;
         let context_size = if needs_context { 8 } else { 0 };
+        // One extra reserved slot for the safepoint id (see below).
+        let sp_id_size = 8i32;
         let spill_size = (max_nodes as i32) * 8;
         let args_stage_size = (max_call_args as i32) * 8;
         let shadow = 32i32;
         let stack_arg_reserve = 16i32;
-        let total =
-            locals_size + context_size + spill_size + args_stage_size + shadow + stack_arg_reserve;
+        let total = locals_size
+            + context_size
+            + sp_id_size
+            + spill_size
+            + args_stage_size
+            + shadow
+            + stack_arg_reserve;
         let frame_size = (total + 15) & !15;
 
         // The context slot is the first slot after the locals; spills start
@@ -391,7 +421,14 @@ impl<'a> Lowerer<'a> {
         } else {
             0
         };
-        let first_spill = (num_locals as i32 + 1 + if needs_context { 1 } else { 0 }) * 8;
+        // Relocation contract: one reserved slot holding the id of the
+        // safepoint this frame is currently stopped at. `conservative_roots`
+        // reads `[rbp - cm.sp_id_slot_off]` and matches it against `oop_maps`
+        // to find the map for the ACTIVE safepoint — a union-of-all-maps is
+        // unsound for relocation. Zero would mean "no slot", so ids start at 1.
+        let sp_id_slot_off = (num_locals as i32 + 1 + if needs_context { 1 } else { 0 }) * 8;
+        let first_spill =
+            (num_locals as i32 + 2 + if needs_context { 1 } else { 0 }) * 8;
         let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
         let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
 
@@ -422,6 +459,12 @@ impl<'a> Lowerer<'a> {
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
             context_slot_off,
+            sp_id_slot_off,
+            locals_size,
+            first_spill,
+            oop_maps: Vec::new(),
+            defined_nodes: vec![false; graph.nodes.len()],
+            next_sp_id: 1,
             args_stage_top_off,
             spill_cap_off,
             call_exc_patches: Vec::new(),
@@ -463,6 +506,14 @@ impl<'a> Lowerer<'a> {
         );
         self.next_spill += 8;
         self.node_slot[id as usize] = offset;
+        // Relocation contract: a slot becomes publishable the moment the
+        // emitting code writes it. `alloc_slot` is called at the point of
+        // emission for every node EXCEPT phis, whose slots are reserved up
+        // front by `prealloc_phi_slots` and written later by edge copies —
+        // those are marked separately, after the prologue zeroes them.
+        if !matches!(self.graph.nodes[id as usize].op, Op::Phi) {
+            self.defined_nodes[id as usize] = true;
+        }
         offset
     }
 
@@ -484,6 +535,118 @@ impl<'a> Lowerer<'a> {
         }
         s
     }
+
+    // ── Moving-young relocation contract ─────────────────────────────────
+    //
+    // What `conservative_roots` demands of a compiled frame before a young
+    // collection may RELOCATE while that frame is live:
+    //
+    //   1. a non-zero `sp_id_slot_off`, and the id of the active safepoint
+    //      stored there, so the exact map can be found (never a union);
+    //   2. an `OopMapEntry` whose `bytecode_pc` equals that id and whose
+    //      `moving_young_coverage_complete` is set. **No matching entry is a
+    //      refusal**, not an absence of objections;
+    //   3. `frame_slot_offsets` naming every frame slot that holds a live
+    //      reference, so each can be rewritten in place;
+    //   4. a `frame_layout` + `live_frame_hi` precise enough that the band scan
+    //      can tell storage this frame resumes from apart from dead spill and
+    //      outgoing-argument scratch.
+    //
+    // The IR lowerer is unusually well placed to satisfy this: it "keeps all
+    // live values in frame slots" (see `emit_safepoint_poll`), so unlike the
+    // single-pass backend there are no register-resident oops to chase — the
+    // complete root set at a safepoint is a set of frame offsets.
+
+    /// Emit the safepoint-id store and record the map for a GC-capable point.
+    ///
+    /// Call immediately BEFORE the call or allocation that can reach a
+    /// collection, and before allocating the result slot of that node — the
+    /// result slot is not written until the call returns, so publishing it as a
+    /// live reference beforehand would hand the collector uninitialised memory.
+    ///
+    /// This ALWAYS stores an id and ALWAYS records a map, even when coverage
+    /// cannot be established. Skipping either would leave the slot holding the
+    /// id of an *earlier* safepoint, and the collector would then match a map
+    /// describing a different program point and relocate against it. A map with
+    /// `moving_young_coverage_complete: false` is the fail-closed answer: the
+    /// verifier finds the entry, sees the flag, and diverts to the non-moving
+    /// sweep for that cycle.
+    fn emit_safepoint_map(&mut self, live_hi: i32) {
+        if self.sp_id_slot_off <= 0 {
+            return;
+        }
+        // `live_ref_slots` returns an empty vector for two different reasons —
+        // a genuinely oop-free safepoint, and a slot it could not describe.
+        // Distinguish them, because the first is complete coverage and the
+        // second is a refusal.
+        let mut coverable = true;
+        // Read only by the pending publication step; see the map below.
+        let _ = &coverable;
+        let mut slots: Vec<i16> = Vec::new();
+        for id in 0..self.defined_nodes.len() {
+            if !self.defined_nodes[id] || self.graph.nodes[id].ty != IrType::Ref {
+                continue;
+            }
+            let off = self.node_slot[id];
+            if off <= 0 || off > i16::MAX as i32 {
+                coverable = false;
+                break;
+            }
+            let off = off as i16;
+            if !slots.contains(&off) {
+                slots.push(off);
+            }
+        }
+        if !coverable {
+            slots.clear();
+        }
+
+        let id = self.next_sp_id;
+        self.next_sp_id = self.next_sp_id.wrapping_add(1);
+        // MOV qword [rbp - sp_id_slot_off], imm32 (sign-extended; ids are small)
+        self.buf.emit(&[0x48, 0xC7, 0x85]);
+        self.buf.emit(&(-self.sp_id_slot_off).to_le_bytes());
+        self.buf.emit(&id.to_le_bytes());
+
+        self.oop_maps.push(super::OopMapEntry {
+            // The relocation path matches on the id in the frame slot, not on
+            // this; `close_safepoint_map` fills it once the call is emitted.
+            native_pc_offset: 0,
+            bytecode_pc: id,
+            frame_slot_offsets: slots,
+            // DELIBERATELY `false` — the map above is necessary but not
+            // sufficient, and claiming otherwise would be a lie the collector
+            // acts on.
+            //
+            // `moving_young_coverage_complete` asserts that the shadow stack
+            // has been PUBLISHED with every live oop of this frame, not merely
+            // that we can name their slots. `conservative_roots` checks the
+            // claim by scanning the frame band for any relocatable word absent
+            // from `published_shadow_values` — and the IR backend pushes
+            // nothing to the shadow stack, so every such word is absent.
+            //
+            // Setting `true` here was measured and reverted: it makes the
+            // verifier skip its cheap early-out and run the full band scan on
+            // every live frame at every collection, only to reject
+            // (`compiled-frame-oop-not-published`). On `ZonedDateTimeTest` that
+            // took a 302 s pass to a >1200 s timeout while still never
+            // relocating. Worse, it was only ever *safe* because the band scan
+            // happened to catch the false claim — soundness resting on a
+            // verifier catching a lie the producer told, rather than on the
+            // producer telling the truth.
+            //
+            // What remains, and it is the whole of it: emit the shadow push
+            // before each safepoint and the reload after, over exactly the
+            // offsets in `frame_slot_offsets` (mirroring
+            // `x64::emit_shadow_push` / `emit_shadow_reload`), then set this to
+            // `coverable`. Everything else the contract needs — the sp-id slot
+            // and its store, the per-safepoint map, the frame layout, the
+            // zeroed `Ref` phi slots — is in place and exercised below.
+            moving_young_coverage_complete: false,
+            live_frame_hi: live_hi,
+        });
+    }
+
 
     // ── Phi resolution (BUG FIX [jit-irlower #2]) ────────────────────────
     //
@@ -626,6 +789,42 @@ impl<'a> Lowerer<'a> {
                 break;
             }
             self.store_abi_reg(abi_regs[abi_idx], ((i as i32) + 1) * 8); // local_offset(i)
+        }
+        self.zero_ref_phi_slots();
+    }
+
+    /// Zero the frame slot of every `Ref`-typed phi, and mark those slots
+    /// publishable.
+    ///
+    /// Phi slots are reserved by `prealloc_phi_slots` before any code runs and
+    /// are written later, by the edge copy of whichever predecessor is taken.
+    /// A safepoint reached on a path that has not yet written one would
+    /// otherwise see the previous frame's leftovers through a slot the oop map
+    /// claims is a live reference — the collector would then follow, and
+    /// rewrite, a garbage word.
+    ///
+    /// Zeroing makes the unwritten state a null reference, which every root
+    /// consumer already handles, so the whole phi set becomes safe to publish
+    /// unconditionally. The alternative — proving per-safepoint which phis are
+    /// written on every path reaching it — is a dataflow problem for a handful
+    /// of stores. Only `Ref` phis are zeroed; a primitive phi read before its
+    /// write would be a lowering bug, not a GC one, and zeroing it would hide
+    /// that.
+    fn zero_ref_phi_slots(&mut self) {
+        let refs: Vec<(usize, i32)> = (0..self.graph.nodes.len())
+            .filter(|&id| {
+                matches!(self.graph.nodes[id].op, Op::Phi)
+                    && self.graph.nodes[id].ty == IrType::Ref
+            })
+            .map(|id| (id, self.node_slot[id]))
+            .filter(|&(_, off)| off > 0)
+            .collect();
+        for (id, off) in refs {
+            // MOV qword [rbp - off], 0
+            self.buf.emit(&[0x48, 0xC7, 0x85]);
+            self.buf.emit(&(-off).to_le_bytes());
+            self.buf.emit(&0u32.to_le_bytes());
+            self.defined_nodes[id] = true;
         }
     }
 
@@ -2201,6 +2400,16 @@ impl<'a> Lowerer<'a> {
                 self.store_rax(slot);
             }
             Op::Call { info_ptr } => {
+                // Relocation contract: publish the map for this GC-capable
+                // point BEFORE `alloc_slot`. Every route out of this arm can
+                // reach a collection, and `alloc_slot` marks the call's own
+                // result slot defined — but that slot is not written until the
+                // call RETURNS, so covering it here would publish whatever the
+                // previous frame left at that offset as a live reference.
+                // `live_frame_hi` is the spill cursor as it stands now, i.e.
+                // before this node's result slot is carved.
+                let sp_live_hi = self.next_spill;
+                self.emit_safepoint_map(sp_live_hi);
                 let slot = self.alloc_slot(id);
                 let num_args = node.inputs.len().saturating_sub(2);
                 // fib44-fix follow-up: invoke_kind 4 marks a self-recursive call
@@ -3359,6 +3568,14 @@ pub(crate) fn lower_inner(
     // hidden first arg, so it must be invoked via `try_call_with_context`.
     let needs_context = lowerer.needs_context;
 
+    // Relocation-contract values, read off the lowerer before `buf` moves out.
+    let sp_id_slot_off = lowerer.sp_id_slot_off;
+    let oop_maps = std::mem::take(&mut lowerer.oop_maps);
+    let locals_size = lowerer.locals_size;
+    let first_spill = lowerer.first_spill;
+    let spill_cap_off = lowerer.spill_cap_off;
+    let frame_size = lowerer.frame_size;
+
     let buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
     // non-panicking: on capacity exhaustion it sets a sticky `overflowed` flag
@@ -3377,6 +3594,53 @@ pub(crate) fn lower_inner(
     let mut cm = CompiledMethod::new(buf);
     cm.deopt_points = deopt_points;
     cm._deopt_point_boxes = deopt_boxes;
+
+    // ── Moving-young relocation contract ────────────────────────────────
+    //
+    // Publish what `conservative_roots` needs to decide, per frame, whether a
+    // relocating young collection may proceed while this frame is live. Before
+    // this the IR backend published NOTHING — no maps, no frame layout, no
+    // safepoint-id slot — and an empty `oop_maps` reads as "no precise
+    // coverage", so every live IR frame forced the non-moving sweep. That is
+    // also why the optimizing tier was gated off under moving-young.
+    //
+    // The frame the lowerer builds, from `rbp` downward:
+    //
+    //     locals | [context] | sp-id | spills … | arg staging | argrsv | shadow
+    //     ^0       ^locals    ^       ^first_spill            ^spill_cap_off
+    //
+    // `callee_saved_lo` names the start of the region the verifier must NOT
+    // inspect. The IR prologue saves no callee-saved registers (it uses only
+    // caller-saved scratch), so that region here is not a register save area
+    // but the outgoing-argument staging, the stack-arg reserve and the ABI
+    // shadow space — scratch this frame never resumes from, and full of dead
+    // argument words. That is exactly the role the field plays on the reader
+    // side (`band_slot_is_verifiable` skips everything at or above it).
+    cm.sp_id_slot_off = sp_id_slot_off;
+    cm.oop_maps = oop_maps;
+    cm.osr_frame_size = frame_size;
+    cm.frame_layout = super::FrameLayout {
+        java_locals_hi: locals_size,
+        // No LICM hoists, no scalar-replacement slots and no per-safepoint
+        // blind GPR spill in this backend: empty ranges (`hi == lo`), which
+        // `is_register_image` and `region_name` both read as "absent".
+        ref_hoist_lo: 0,
+        ref_hoist_hi: 0,
+        arith_lo: 0,
+        arith_hi: 0,
+        scalar_lo: 0,
+        scalar_hi: 0,
+        locals_hi: first_spill,
+        spill_lo: first_spill,
+        spill_hi: spill_cap_off,
+        callee_saved_lo: spill_cap_off,
+        callee_saved_hi: frame_size,
+        xmm_saved_lo: 0,
+        xmm_saved_hi: 0,
+        reg_spill_lo: 0,
+        reg_spill_hi: 0,
+        frame_size,
+    };
     if needs_context {
         cm.needs_context = true;
     }
