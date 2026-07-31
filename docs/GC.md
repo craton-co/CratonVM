@@ -156,9 +156,17 @@ collection's copy-time budget), `-XX:MaxHeapSize`,
 ## Backend details worth knowing
 
 **Generational.** Young is a pair of semi-spaces with TLAB bump
-allocation; while any thread holds a JIT frame the young collection is a
-non-moving sweep with selective promotion (this is the load-bearing
-reason conservative JIT roots are safe here). That default young
+allocation. A live JIT frame does **not** by itself force the non-moving
+sweep: moving-young is on by default, and each cycle diverts to the
+sweep only if its per-cycle coverage proof fails, if `promotion_oom_risk`
+is honoured, or if `System.gc()` requested a full cycle. A JIT-warm
+workload may legitimately spend most cycles non-moving — but that is a
+*measured* fallback rate, not a rule, and the running process states its
+own answer through `gc_metrics::collector_decision_report()`. (The older
+"any JIT frame ⇒ non-moving" rule was the pre-2026-07-26 behaviour and is
+reachable today only under `CRATONVM_NO_MOVING_YOUNG` or
+`CRATONVM_MOVING_YOUNG_NO_JIT=1`; the evidence is in
+[the TLAB/card audit §3.2](gc/tlab-and-card-audit.md).) That default young
 collection is PARALLEL in two phases. The transitive closure is drained
 by several workers over a lock-free mark bitmap (one bit per 8 bytes of
 from-space) — sound because the phase is pure and read-only on a frozen
@@ -195,7 +203,9 @@ JIT-held-oop corruption is fixed, and it is now the **default**
 on is not the same as a cycle having compacted: every cycle must carry
 its own root-coverage proof, and one that cannot prove complete coverage
 diverts to the non-moving sweep rather than relocating — so read
-`moving_young: cycles=N coverage_fallbacks=M` before attributing any
+`moving_young: cycles=N coverage_fallbacks=M`, and the
+`[GC] decision #N:` line rendered by
+`gc_metrics::collector_decision_report()`, before attributing any
 cost or behaviour to compaction.
 Old gen is a free-list
 allocator collected by a VM-driven concurrent cycle (initial mark STW →
