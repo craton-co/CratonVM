@@ -4672,6 +4672,83 @@ mod tests {
         .to_vec()
     }
 
+    /// A self-recursive call must not PUBLISH to the shadow stack.
+    ///
+    /// That route bypasses `emit_call_return_check`, the one site that emits
+    /// the matching reload, so a push emitted here is never retracted: the
+    /// thread's shadow `top` advances once per execution of the site and a
+    /// recursive method walks it off the end of the shadow stack, after which
+    /// the next push writes through into whatever follows the mapping. It
+    /// presented as a SIGSEGV inside the C allocator's free list, on an
+    /// unrelated thread, the moment reference field reads made
+    /// `BinTreesClassic.itemCheck` IR-eligible.
+    ///
+    /// The lowerer used to emit the push and then "withdraw the claim" by
+    /// clearing `pending_shadow` — which suppressed the RELOAD, not the push.
+    #[test]
+    fn self_recursive_call_emits_no_unmatched_shadow_push() {
+        crate::x64::set_moving_young_override(Some(false));
+        // static int f(Obj o, int n) { return f(o, n); }
+        // aload_0; iload_1; invokestatic #2; ireturn
+        let code = [0x2a, 0x1b, 0xb8, 0x00, 0x02, 0xac, 0x00, 0x00];
+        let info: &'static JitInvokeInfo = Box::leak(Box::new(JitInvokeInfo {
+            class_name: "pkg/Obj",
+            method_name: "f",
+            descriptor: "(Lpkg/Obj;I)I",
+            num_jit_args: 2,
+            return_type: b'I',
+            invoke_kind: 4, // the direct self-recursive route
+            declaring_class_id: 0,
+        }));
+        let mut builder = IrBuilder::new(2, 2);
+        builder.set_param_types(&[IrType::Ref, IrType::Int]);
+        let mut invoke_info = HashMap::new();
+        invoke_info.insert(2usize, (info as *const JitInvokeInfo as usize, 2usize, b'I'));
+        builder.set_invoke_info(invoke_info);
+        let graph = builder.build(&code, 6).expect("IR build of self-recursive call");
+        let schedule = ir_schedule::schedule(&graph);
+
+        // The shadow machinery is live only when the thread helper is wired,
+        // so a stub table with a zero `get_current_thread` would make this
+        // test vacuous. Give it sentinels.
+        let mut helpers = no_helpers();
+        helpers.get_current_thread = 0x7fff_0000_0000_3000;
+        helpers.shadow_stack_offset_in_thread = 0x40;
+        helpers.self_call_stack_guard = 0x7fff_0000_0000_4000;
+
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let cm = lower_inner(
+            &graph,
+            &schedule,
+            2,
+            2,
+            &helpers,
+            &empty_hints,
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact,
+        )
+        .expect(
+            "the self-recursive body must lower — an imbalance now makes \
+             lower_inner discard it, so a None here means the push came back",
+        );
+        let bytes = cm.code_bytes();
+        // `MOV R11, [R10 + ss_top]` — the push's read of the live `top`, and
+        // the one byte sequence unique to the push (the reload reads the
+        // saved base with `MOV R11, [rbp - savebase]`, `4C 8B 9D`).
+        assert_eq!(
+            count_seq(bytes, &[0x4D, 0x8B, 0x9A]),
+            0,
+            "a self-recursive call site must emit no shadow push: nothing on \
+             that route ever retracts it"
+        );
+        crate::x64::set_moving_young_override(None);
+    }
+
     /// A planned inline-cache site must emit the full three-tier cascade:
     /// the receiver null check, ONE class-id load, the monomorphic guard, three
     /// polymorphic guards, four `CALL R11` cached-entry calls, and the
