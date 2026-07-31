@@ -372,7 +372,10 @@ edge — disabling the edge does not change the crash — and is filed separatel
 
 Whoever reopens the edge should re-run `TestMapperPerformance` — the whole
 class, not two of its nine hostnames — as a second acceptance signal alongside
-the Spring class above.
+the Spring class above. The edge now has its own document,
+[jit-raw-jit-to-jit-shadow-stack-overflow-20260731](jit-raw-jit-to-jit-shadow-stack-overflow-20260731.md),
+which supersedes the reclaimed-root framing above; this table is what reopening
+it is worth on a real Tomcat class.
 
 ## Correction 2026-07-31 — "the optimizing tier does run on default flags" is not what it sounds like
 
