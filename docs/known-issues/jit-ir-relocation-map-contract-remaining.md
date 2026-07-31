@@ -656,3 +656,38 @@ small, and that is a scoping question rather than a bug:
 
 Either way the fix belongs with the IR builder's owners. The relocation contract
 is downstream of all of it and is ready.
+
+## Verified: `Op::NewArray` is dead scaffolding — array allocation was never wired in
+
+Checking whether `newarray` support might be a small delta on existing
+`anewarray` machinery: it is not. `ir::Op::NewArray { element_type }` is
+**declared and never constructed, and never lowered** — no `Op::NewArray`
+appears anywhere in `ir.rs`'s builder or in `ir_lower.rs`. So reference-array
+allocation is not supported either; the variant is an unimplemented stub.
+
+That settles the scoping question raised above, and settles it against
+`ir_compatible`: its `IR_MAX_ALLOCATIONS` budgets for `new_ops` and
+`anewarray_ops` gate a capability the builder does not have at all. They are not
+"capped", they are absent.
+
+So closing this is a genuine feature: construct the node in `IrBuilder::build`,
+lower it in `ir_lower` to the allocation helper, and — because allocation is a
+GC-capable point — give it a safepoint, which means routing it through the very
+`emit_safepoint_map` / `emit_shadow_push` machinery this branch added. The
+relocation contract is a prerequisite for that work, not a consequence of it.
+
+**Deliberately not attempted here.** A new allocation path in a JIT, with a
+GC-capable safepoint, is not something to write against an exhausted context and
+validate with a checksum. It belongs with the IR builder's owners, and it wants
+the same acceptance the rest of this file asks for: instrument first, confirm the
+diagnostic fires, then measure.
+
+### Summary of the whole chain, for whoever picks this up
+
+| stage | state |
+|---|---|
+| moving-young gate on the C2 tier | scoped; verified open (`moving_young_disables_tier=false`) |
+| tier-up requesting C2 | mostly `optimize=false` **by design** |
+| `ir_compatible` | passes (and now names its refusals) |
+| `IrBuilder::build` | **refuses `newarray` 0xbc**; `Op::NewArray` unimplemented |
+| IR relocation map contract | implemented, sound, fail-closed, merged, unexercised |
