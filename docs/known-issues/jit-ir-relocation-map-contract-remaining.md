@@ -132,3 +132,48 @@ Bisecting these needs one lever per item and a quiet host; each
 `ZonedDateTimeTest` datapoint is 5-20 minutes and the box has other tenants.
 Do not re-land any of it on the strength of unit tests and bt18 alone — both
 were green for the reverted version.
+
+## Attempt 3, and the measurement error underneath attempts 1-3
+
+Attempt 3 added the single-pass backend's lazy prologue (`shadow_pushed_any`):
+the `get_current_thread` fetch is emitted, then overwritten with `0x90` when the
+method turns out never to publish, so offsets recorded during lowering stay
+valid. `ZonedDateTimeTest` still timed out.
+
+Three hypotheses, three wrong — which is the signal that the method was wrong,
+not just the guesses. Collecting every `ZonedDateTimeTest` datapoint from this
+session:
+
+| run | IR work present? | result |
+|---|---|---|
+| `FINAL-default` (in a 5-class sweep) | **no** | TIMEOUT 900 s |
+| `Z-default-gc` (standalone) | **no** | PASS 306 s |
+| `MERGED-final` (in a sweep) | **no** | PASS 302 s |
+| `IRMAP-final` | yes, claim on | TIMEOUT 1200 s |
+| `ZDT-after-withdraw` | yes, claim off | NORESULT 301 s |
+| `PUB-validate` | yes, publication | TIMEOUT 1200 s |
+| `GATED-zdt` | yes, claim gated off | TIMEOUT 900 s |
+| `LAZY-zdt` | yes, lazy prologue | TIMEOUT 900 s |
+
+**This class is bimodal — roughly 300 s or past 900 s — with the IR work absent.**
+Two of the three pre-IR runs pass and one times out. So every attribution in
+attempts 1-3 rests on comparing one sample against one sample of a bimodal
+distribution, which cannot support any of the conclusions drawn from it. The two
+reverts may have been unnecessary; equally, publication may be fine or may not
+be. Nothing here decides it.
+
+It also has a distinct third outcome — a silent early exit with no `@@RESULT`
+after a normal shutdown (`NORESULT` above, and once at 663 s pre-IR) — which is
+unexplained and may be the same underlying instability.
+
+**Before any further work on this contract**, fix the measurement:
+
+* characterise the class first — 5+ standalone runs on a quiet host with the IR
+  work absent, to get the pass rate and the distribution. If it is genuinely
+  bimodal, it cannot be the acceptance gate at all;
+* pick a deterministic proxy for the emission cost instead. The cost hypothesis
+  is "per method ENTRY", so a microbenchmark over many short-lived compiled
+  calls (`CalleeTierUpProbe` shape) measures it directly, in seconds, with
+  repeats — rather than inferring it from one 15-minute suite run;
+* keep `ASTParserLoadingTest` as the stable large-workload control: it was 138 s
+  in every configuration tried, including both publication attempts.
