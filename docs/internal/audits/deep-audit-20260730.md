@@ -480,8 +480,14 @@ One of the 11 is worth naming because it is not what it looks like:
 `config_from_args_fails_loudly_when_no_jdk_is_available` passes alone and fails
 in-binary. It asserts real behaviour only when it wins the race to initialise
 the process-wide flag snapshot, so its harness's environment override is a
-no-op the rest of the time. Pre-existing, order-dependent, and filed at
-[`../../known-issues/libcratonvm-no-jdk-test-passes-only-when-it-runs-first-20260730.md`](../../known-issues/libcratonvm-no-jdk-test-passes-only-when-it-runs-first-20260730.md).
+no-op the rest of the time. Pre-existing and order-dependent.
+
+**FIXED 2026-07-30**, along with ten more sites in the same family — two of
+which were live defects, not merely latent ones. `cratonvm_types::flags` now
+carries a scoped override (`with_thread_overrides` / `with_process_overrides`)
+that wins over the latched snapshot, and `types/tests/flag_env_mutation_guard.rs`
+fails the build if a new `set_var` of a declared flag appears. Write-up:
+[`../libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`](../libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md).
 
 The other 10 are the JIT `skip_list` / `conservative_roots` cluster, two
 class-loader-unload cases, two ConcurrentHashMap cases and the attach-listener
