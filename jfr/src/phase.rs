@@ -758,10 +758,7 @@ fn close_span(token: u64) {
             }
         }
         if state.stack.is_empty() {
-            state
-                .account
-                .open_root_start_ns_biased
-                .store(0, Ordering::Relaxed);
+            state.account.open_root_start_ns_biased.store(0, Ordering::Relaxed);
         }
     });
 }
@@ -850,10 +847,7 @@ pub struct ThreadPhases {
 impl ThreadPhases {
     /// Self time for one category.
     pub fn category_ns(&self, category: Category) -> u64 {
-        self.categories
-            .get(category.index())
-            .map(|(_, ns)| *ns)
-            .unwrap_or(0)
+        lookup_ns(&self.categories, category)
     }
 
     /// `(unattributed + over_attributed) / wall`, or `0.0` for a zero-length
@@ -947,10 +941,7 @@ impl PhaseReport {
 
     /// Per-category self time summed over threads.
     pub fn total_ns(&self, category: Category) -> u64 {
-        self.totals
-            .get(category.index())
-            .map(|(_, ns)| *ns)
-            .unwrap_or(0)
+        lookup_ns(&self.totals, category)
     }
 
     /// One JSON object. Hand-rolled: this crate has no serialization
@@ -1015,7 +1006,8 @@ impl PhaseReport {
         let _ = write!(s, ",\"compilation_delta_ns\":{}", self.compilation_delta_ns);
         let _ = write!(
             s,
-            ",\"anomalies\":{{\"out_of_order_closes\":{},\"open_spans\":{},\"threads_dropped\":{}}}",
+            ",\"anomalies\":{{\"out_of_order_closes\":{},\"open_spans\":{},\
+             \"threads_dropped\":{}}}",
             self.anomalies.out_of_order_closes,
             self.anomalies.open_spans,
             self.anomalies.threads_dropped,
@@ -1032,6 +1024,25 @@ impl PhaseReport {
     /// `residual_ppm` is parts per million rather than a percentage for the
     /// same reason.
     pub fn summary_line(&self) -> String {
+        // Fall back to the cross-thread aggregate when nothing claimed the
+        // basis, so a report is never silently all-zeroes.
+        let attributed = match &self.primary {
+            Some(t) => t.attributed_ns,
+            None => self.attributed_ns,
+        };
+        let open = match &self.primary {
+            Some(t) => t.open_ns,
+            None => self.open_ns,
+        };
+        let unattributed = match &self.primary {
+            Some(t) => t.unattributed_ns,
+            None => self.unattributed_ns,
+        };
+        let over = match &self.primary {
+            Some(t) => t.over_attributed_ns,
+            None => self.over_attributed_ns,
+        };
+        let ppm = residual_ppm(self.residual_ns(), self.basis_wall_ns());
         let mut s = String::with_capacity(512);
         let _ = write!(
             s,
@@ -1041,28 +1052,21 @@ impl PhaseReport {
             self.level.name(),
             self.schema_version,
             self.basis_wall_ns(),
-            self.primary.as_ref().map(|t| t.attributed_ns).unwrap_or(0),
-            self.primary.as_ref().map(|t| t.open_ns).unwrap_or(0),
-            self.primary
-                .as_ref()
-                .map(|t| t.unattributed_ns)
-                .unwrap_or(0),
-            self.primary
-                .as_ref()
-                .map(|t| t.over_attributed_ns)
-                .unwrap_or(0),
-            residual_ppm(self.residual_ns(), self.basis_wall_ns()),
+            attributed,
+            open,
+            unattributed,
+            over,
+            ppm,
             u8::from(self.reconciles()),
             self.threads.len(),
             self.anomalies.out_of_order_closes,
             self.anomalies.threads_dropped,
         );
         for category in Category::ALL {
-            let ns = self
-                .primary
-                .as_ref()
-                .map(|t| t.category_ns(category))
-                .unwrap_or_else(|| self.total_ns(category));
+            let ns = match &self.primary {
+                Some(t) => t.category_ns(category),
+                None => self.total_ns(category),
+            };
             let _ = write!(s, " {}_ns={}", category.name(), ns);
         }
         s
@@ -1075,7 +1079,25 @@ fn residual_ppm(residual_ns: u64, wall_ns: u64) -> u64 {
     if wall_ns == 0 {
         return 0;
     }
-    ((residual_ns as u128).saturating_mul(1_000_000) / wall_ns as u128).min(u64::MAX as u128) as u64
+    let scaled = (residual_ns as u128).saturating_mul(1_000_000) / wall_ns as u128;
+    scaled.min(u64::MAX as u128) as u64
+}
+
+/// Read one category's value out of a `Category::ALL`-ordered pair list.
+fn lookup_ns(pairs: &[(&'static str, u64)], category: Category) -> u64 {
+    match pairs.get(category.index()) {
+        Some((_, ns)) => *ns,
+        None => 0,
+    }
+}
+
+/// Sum one field over every thread, saturating.
+fn sum_threads(threads: &[ThreadPhases], pick: impl Fn(&ThreadPhases) -> u64) -> u64 {
+    let mut total: u64 = 0;
+    for t in threads {
+        total = total.saturating_add(pick(t));
+    }
+    total
 }
 
 fn json_pairs(list: &[(&'static str, u64)]) -> String {
@@ -1208,10 +1230,9 @@ pub fn report() -> PhaseReport {
         let open_ns = account
             .open_ns(now_rel, attributed_ns)
             .min(wall_ns.saturating_sub(attributed_ns.min(wall_ns)));
-        let unattributed_ns = wall_ns
-            .saturating_sub(attributed_ns)
-            .saturating_sub(open_ns);
-        let over_attributed_ns = attributed_ns.saturating_add(open_ns).saturating_sub(wall_ns);
+        let charged = attributed_ns.saturating_add(open_ns);
+        let unattributed_ns = wall_ns.saturating_sub(charged);
+        let over_attributed_ns = charged.saturating_sub(wall_ns);
         let open_spans = account.open_depth.load(Ordering::Relaxed);
         let out_of_order_closes = account.out_of_order.load(Ordering::Relaxed);
 
@@ -1238,31 +1259,19 @@ pub fn report() -> PhaseReport {
         });
     }
 
-    let thread_wall_ns = threads
-        .iter()
-        .fold(0u64, |acc, t| acc.saturating_add(t.wall_ns));
-    let attributed_ns = threads
-        .iter()
-        .fold(0u64, |acc, t| acc.saturating_add(t.attributed_ns));
-    let open_ns = threads
-        .iter()
-        .fold(0u64, |acc, t| acc.saturating_add(t.open_ns));
-    let unattributed_ns = threads
-        .iter()
-        .fold(0u64, |acc, t| acc.saturating_add(t.unattributed_ns));
-    let over_attributed_ns = threads
-        .iter()
-        .fold(0u64, |acc, t| acc.saturating_add(t.over_attributed_ns));
+    let thread_wall_ns = sum_threads(&threads, |t| t.wall_ns);
+    let attributed_ns = sum_threads(&threads, |t| t.attributed_ns);
+    let open_ns = sum_threads(&threads, |t| t.open_ns);
+    let unattributed_ns = sum_threads(&threads, |t| t.unattributed_ns);
+    let over_attributed_ns = sum_threads(&threads, |t| t.over_attributed_ns);
     let primary = threads.iter().find(|t| t.primary).cloned();
 
     let compilation_breakdown = compilation_breakdown();
-    let breakdown_total: u64 = compilation_breakdown
-        .iter()
-        .fold(0u64, |acc, (_, ns)| acc.saturating_add(*ns));
-    let compilation_total = totals
-        .get(Category::Compilation.index())
-        .map(|(_, ns)| *ns)
-        .unwrap_or(0);
+    let mut breakdown_total: u64 = 0;
+    for (_, ns) in &compilation_breakdown {
+        breakdown_total = breakdown_total.saturating_add(*ns);
+    }
+    let compilation_total = lookup_ns(&totals, Category::Compilation);
     let compilation_delta_ns = breakdown_total as i128 - compilation_total as i128;
 
     PhaseReport {
@@ -1459,6 +1468,11 @@ pub fn report_to_events(
     }
 
     if let Some(type_id) = summary_id {
+        let ppm = residual_ppm(report.residual_ns(), report.basis_wall_ns());
+        let basis_thread = match &report.primary {
+            Some(t) => t.thread_id,
+            None => 0,
+        };
         let mut fields = EventFields::with_capacity(8);
         fields.push(EventValue::Str(report.level.name()));
         fields.push(EventValue::Long(clamp_i64(report.basis_wall_ns())));
@@ -1466,20 +1480,13 @@ pub fn report_to_events(
         fields.push(EventValue::Long(clamp_i64(report.open_ns)));
         fields.push(EventValue::Long(clamp_i64(report.unattributed_ns)));
         fields.push(EventValue::Long(clamp_i64(report.over_attributed_ns)));
-        fields.push(EventValue::Long(clamp_i64(residual_ppm(
-            report.residual_ns(),
-            report.basis_wall_ns(),
-        ))));
+        fields.push(EventValue::Long(clamp_i64(ppm)));
         fields.push(EventValue::Boolean(report.reconciles()));
         events.push(EventInstance {
             type_id,
             start_time: chunk_start_ns,
             end_time: chunk_start_ns.saturating_add(report.process_wall_ns),
-            thread_id: report
-                .primary
-                .as_ref()
-                .map(|t| t.thread_id)
-                .unwrap_or(0),
+            thread_id: basis_thread,
             fields,
         });
     }
@@ -1701,6 +1708,11 @@ mod tests {
         set_level_for_test(Level::Coarse);
         reset_for_test();
 
+        // Register the thread account first: its one-time cost (registry lock,
+        // Arc allocation, thread-name copy) would otherwise land between
+        // `outer_start` and the first frame's own clock read and read as lost
+        // time.
+        mark_process_start();
         let outer_start = Instant::now();
         {
             let _outer = enter(Category::JavaExecution);
@@ -1896,21 +1908,22 @@ mod tests {
 
         const THREADS: usize = 8;
         const SPANS: usize = 25;
-        let handles: Vec<_> = (0..THREADS)
-            .map(|i| {
-                std::thread::Builder::new()
-                    .name(format!("phase-test-{i}"))
-                    .spawn(|| {
-                        for _ in 0..SPANS {
-                            let _outer = enter(Category::JavaExecution);
-                            spin_ns(20_000);
-                            let _inner = enter(Category::GcPause);
-                            spin_ns(20_000);
-                        }
-                    })
-                    .expect("spawn")
-            })
-            .collect();
+
+        fn worker() {
+            for _ in 0..SPANS {
+                let _outer = enter(Category::JavaExecution);
+                spin_ns(20_000);
+                let _inner = enter(Category::GcPause);
+                spin_ns(20_000);
+            }
+        }
+
+        let mut handles = Vec::new();
+        for i in 0..THREADS {
+            let name = format!("phase-test-{i}");
+            let builder = std::thread::Builder::new().name(name);
+            handles.push(builder.spawn(worker).expect("spawn"));
+        }
         for h in handles {
             h.join().expect("join");
         }
@@ -1931,19 +1944,14 @@ mod tests {
         );
         // Every worker thread is its own account, and each one's parts sum to
         // its own wall clock.
-        let workers: Vec<&ThreadPhases> = report
-            .threads
-            .iter()
-            .filter(|t| t.name.starts_with("phase-test-"))
-            .collect();
-        assert_eq!(workers.len(), THREADS);
-        for t in workers {
-            assert_eq!(
-                t.attributed_ns + t.open_ns + t.unattributed_ns,
-                t.wall_ns,
-                "thread {} does not reconcile",
-                t.name
-            );
+        let mut workers = 0usize;
+        for t in &report.threads {
+            if !t.name.starts_with("phase-test-") {
+                continue;
+            }
+            workers += 1;
+            let parts = t.attributed_ns + t.open_ns + t.unattributed_ns;
+            assert_eq!(parts, t.wall_ns, "thread {} does not reconcile", t.name);
             assert_eq!(t.over_attributed_ns, 0);
             assert!(
                 t.attributed_ns <= t.wall_ns,
@@ -1953,6 +1961,7 @@ mod tests {
                 t.wall_ns
             );
         }
+        assert_eq!(workers, THREADS);
 
         set_level_for_test(Level::Off);
         reset_for_test();
@@ -1976,18 +1985,16 @@ mod tests {
         let report = report();
         let doc = report.to_json();
 
-        assert_eq!(
-            json_u64(&doc, "schema_version"),
-            Some(PHASE_ACCOUNTING_SCHEMA_VERSION as u64)
-        );
+        let want_schema = PHASE_ACCOUNTING_SCHEMA_VERSION as u64;
+        assert_eq!(json_u64(&doc, "schema_version"), Some(want_schema));
         assert_eq!(json_str(&doc, "level"), Some("fine"));
-        assert_eq!(json_u64(&doc, "process_wall_ns"), Some(report.process_wall_ns));
+        let want_wall = report.process_wall_ns;
+        assert_eq!(json_u64(&doc, "process_wall_ns"), Some(want_wall));
         assert_eq!(json_u64(&doc, "attributed_ns"), Some(report.attributed_ns));
-        assert_eq!(
-            json_u64(&doc, "unattributed_ns"),
-            Some(report.unattributed_ns)
-        );
-        assert_eq!(json_u64(&doc, "thread_wall_ns"), Some(report.thread_wall_ns));
+        let want_unattributed = report.unattributed_ns;
+        assert_eq!(json_u64(&doc, "unattributed_ns"), Some(want_unattributed));
+        let want_thread_wall = report.thread_wall_ns;
+        assert_eq!(json_u64(&doc, "thread_wall_ns"), Some(want_thread_wall));
         // Every category key is present even at zero, so two runs diff cleanly.
         for c in Category::ALL {
             assert!(
@@ -2000,10 +2007,8 @@ mod tests {
         assert!(doc.contains("\"scan\":11"));
         assert!(doc.contains("\"build\":22"));
         assert!(doc.contains("\"lower\":33"));
-        assert_eq!(
-            report.compilation_delta_ns,
-            66 - report.total_ns(Category::Compilation) as i128,
-        );
+        let compiled_ns = report.total_ns(Category::Compilation) as i128;
+        assert_eq!(report.compilation_delta_ns, 66 - compiled_ns);
         // Balanced braces: a hand-rolled encoder's most likely failure.
         assert_eq!(
             doc.chars().filter(|c| *c == '{').count(),
@@ -2059,15 +2064,13 @@ mod tests {
         set_level_for_test(Level::Coarse);
         reset_for_test();
 
-        std::thread::Builder::new()
-            .name("we\"ird\n\tname".to_string())
-            .spawn(|| {
-                let _s = enter(Category::NativeCall);
-                spin_ns(10_000);
-            })
-            .expect("spawn")
-            .join()
-            .expect("join");
+        let name = "we\"ird\n\tname".to_string();
+        let builder = std::thread::Builder::new().name(name);
+        let handle = builder.spawn(|| {
+            let _s = enter(Category::NativeCall);
+            spin_ns(10_000);
+        });
+        handle.expect("spawn").join().expect("join");
 
         let doc = report().to_json();
         assert!(doc.contains("we\\\"ird\\n\\tname"), "thread name not escaped");
@@ -2096,11 +2099,8 @@ mod tests {
         }
 
         let report = report();
-        let path = std::env::temp_dir().join(format!(
-            "cratonvm-phase-accounting-{}-{:?}.jfr",
-            std::process::id(),
-            std::thread::current().id(),
-        ));
+        let name = format!("cratonvm-phase-accounting-{}.jfr", std::process::id());
+        let path = std::env::temp_dir().join(name);
         let bytes = write_jfr_report(&path, &report).expect("jfr write");
         assert!(bytes > 0);
 
@@ -2121,9 +2121,8 @@ mod tests {
                 e.type_id.0
             );
         }
-        let summary_id = registry
-            .find_by_name(PHASE_SUMMARY_EVENT)
-            .expect("summary type registered");
+        let summary_id = registry.find_by_name(PHASE_SUMMARY_EVENT);
+        let summary_id = summary_id.expect("summary type registered");
         assert_eq!(
             events.iter().filter(|e| e.type_id == summary_id).count(),
             1,
@@ -2147,11 +2146,8 @@ mod tests {
             spin_ns(100_000);
         }
         let report = report();
-        let path = std::env::temp_dir().join(format!(
-            "cratonvm-phase-accounting-{}-{:?}.json",
-            std::process::id(),
-            std::thread::current().id(),
-        ));
+        let name = format!("cratonvm-phase-accounting-{}.json", std::process::id());
+        let path = std::env::temp_dir().join(name);
         write_json_report(&path, &report).expect("json write");
         let body = std::fs::read_to_string(&path).expect("read back");
         assert!(body.trim_end().starts_with('{'));

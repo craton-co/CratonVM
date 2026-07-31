@@ -28520,6 +28520,575 @@ mod tests {
         assert_eq!(result, 424242, "null receiver must route to the helper");
     }
 
+    // -----------------------------------------------------------------------
+    // G1-2 — the inline reference-store fast paths must not elide the
+    // collector's post-write barrier on a backend that publishes no region
+    // bounds. `docs/gc/g1-audit.md` §8.1: under G1 a young region held out of
+    // the collection set by a JNI pin is reachable ONLY through its remembered
+    // set, so an inline store that skips `post_write_barrier_rset` loses the
+    // edge and the next pause frees a live referent.
+    // -----------------------------------------------------------------------
+
+    /// Does the emitted code contain `value` as a little-endian 8-byte
+    /// immediate? `emit_mov_imm64` bakes the bounds-table address this way for
+    /// the region-containment guard, so its presence/absence distinguishes the
+    /// full guard from the bare trusted-oop null test.
+    fn code_contains_u64(compiled: &CompiledMethod, value: usize) -> bool {
+        // Cast: address → the exact 8-byte immediate the encoder emitted
+        let needle = (value as u64).to_le_bytes();
+        compiled.code_bytes().windows(8).any(|w| *w == needle)
+    }
+
+    /// Number of CALLs to `target` in the emitted code. `emit_call_absolute`
+    /// emits `E8 rel32` when the target is within ±2GB of the call site and a
+    /// `MOV RAX, imm64` + `CALL RAX` form beyond it, so both encodings are
+    /// counted. The scan is not instruction-aligned, which can only ever
+    /// over-count — good enough to assert "the barrier call IS emitted".
+    fn calls_to(compiled: &CompiledMethod, target: usize) -> usize {
+        let code = compiled.code_bytes();
+        // Cast: buffer base address for resolving rel32 displacements
+        let base = code.as_ptr() as usize;
+        let mut n = 0usize;
+        for i in 0..code.len().saturating_sub(4) {
+            if code[i] != 0xE8 {
+                continue;
+            }
+            let disp = i32::from_le_bytes([code[i + 1], code[i + 2], code[i + 3], code[i + 4]]);
+            let next = base.wrapping_add(i).wrapping_add(5);
+            // Cast: sign-extend the rel32 for wrapping address arithmetic
+            if next.wrapping_add(disp as isize as usize) == target {
+                n += 1;
+            }
+        }
+        if code_contains_u64(compiled, target) {
+            n += 1;
+        }
+        n
+    }
+
+    /// A fake, 8-byte-aligned "compact young object" that every inline
+    /// reference-`putfield` header test accepts: `GC_FLAG_COMPACT` set,
+    /// `GC_FLAG_OLD_GEN` clear, four slots, and a NULL reference cell at
+    /// compact body offset 0.
+    ///
+    /// Deliberately NOT a `GenerationalHeap` allocation: these tests need the
+    /// receiver's header bits and the published region bounds to vary
+    /// independently, and a real heap couples them.
+    fn fake_compact_young_object() -> Box<[u64; 8]> {
+        let mut o = Box::new([0u64; 8]);
+        // SAFETY: `o` is 64 bytes and 8-byte aligned (a `[u64; 8]`); both
+        // writes land inside it — `GC_FLAGS_OFFSET` is 7 and
+        // `NUM_SLOTS_OFFSET` is 12, and the reference cell is [32, 40).
+        unsafe {
+            let p = o.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
+            *p.add(cratonvm_types::GC_FLAGS_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
+            std::ptr::write_unaligned(
+                p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32, // Cast: header field
+                4u32,
+            );
+        }
+        o
+    }
+
+    /// Read the 8-byte compact reference cell (body offset 0) of a fake object.
+    fn fake_object_ref_cell(o: &[u64; 8]) -> usize {
+        // HEADER_SIZE == 32 == 4 * 8, so the cell is word 4.
+        o[4] as usize // Cast: raw stored pointer word
+    }
+
+    /// `region_bounds_are_live` must read the TABLE, not its address.
+    ///
+    /// This is finding 2 of the audit in executable form: `region_bounds_addr`
+    /// is the address of a process-global static and is therefore always
+    /// non-zero, so the `!= 0` test the emitters used to key on is a constant
+    /// true and not a backend gate at all.
+    #[test]
+    fn region_bounds_are_live_reads_the_table_not_its_address() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BOUNDS: [AtomicUsize; 6] = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+        let addr = BOUNDS.as_ptr() as usize; // Cast: static address → helpers-table field
+
+        // The G1/ZGC shape: the static exists (non-zero ADDRESS — exactly what
+        // `region_bounds_addr != 0` tested) but nothing was ever published.
+        assert_ne!(addr, 0, "a static's address is never zero");
+        assert!(
+            !region_bounds_are_live(addr),
+            "an all-zero table is the G1/ZGC shape and must NOT read as live"
+        );
+
+        // Unwired table: JIT unit tests, and any embedding that never set it.
+        assert!(!region_bounds_are_live(0));
+
+        // A degenerate empty range is not a live region.
+        BOUNDS[0].store(0x1000, Ordering::Release);
+        BOUNDS[1].store(0x1000, Ordering::Release);
+        assert!(!region_bounds_are_live(addr));
+
+        // A real published range — the Generational shape.
+        BOUNDS[1].store(0x2000, Ordering::Release);
+        assert!(region_bounds_are_live(addr));
+
+        // Any ONE of the three pairs is enough (here: old gen only).
+        BOUNDS[0].store(0, Ordering::Release);
+        BOUNDS[1].store(0, Ordering::Release);
+        BOUNDS[4].store(0x8000, Ordering::Release);
+        BOUNDS[5].store(0x9000, Ordering::Release);
+        assert!(region_bounds_are_live(addr));
+
+        // `GenerationalHeap::drop` re-zeroes the table.
+        BOUNDS[4].store(0, Ordering::Release);
+        BOUNDS[5].store(0, Ordering::Release);
+        assert!(
+            !region_bounds_are_live(addr),
+            "a torn-down heap must read as not-live again"
+        );
+    }
+
+    /// Top-level compact reference `putfield`: the barrier-free inline store is
+    /// reachable ONLY while the receiver is inside a published region.
+    ///
+    /// Case 1 is the G1-2 regression: a receiver that is young, compact, in
+    /// bounds by construction, and whose old value is null — i.e. every
+    /// condition the fast path keys on — must still take
+    /// `jit_putfield_object` when the backend published no bounds, because
+    /// "young ⇒ no post barrier" is a generational statement and G1's
+    /// JNI-pinned young regions are outside the collection set.
+    ///
+    /// Case 3 pins the elision that IS correct and must be preserved: SATB has
+    /// nothing to log for a null old value.
+    #[test]
+    fn inline_ref_putfield_fast_path_is_gated_on_published_region_bounds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BOUNDS: [AtomicUsize; 6] = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        /// Marker barrier helper: records that the full-barrier path ran and
+        /// deliberately does NOT perform the store, so a fast-path store and a
+        /// helper store are trivially distinguishable.
+        unsafe extern "C" fn marker_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        // void setRef(Object this, Object v) { this.f = v; }
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x2b, // 1: aload_1
+            0xb5, 0x00, 0x01, // 2: putfield #1 (reference)
+            0xb1, // 5: return
+            0, 0,
+        ];
+        let code_len = 6;
+        let field_info = vec![(2usize, 0usize, b'L')];
+        let mut helpers = test_helpers();
+        helpers.putfield_object = marker_putfield_object as *const () as usize; // Cast: fn → helpers slot
+        helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
+
+        // Compact layout for the site: pc 2, body offset 0, reference field.
+        set_pending_compact_field_info(vec![(2, 0, true)]);
+        let compiled = compile(
+            &code,
+            code_len,
+            2,
+            2,
+            true, // needs_heap — the reference putfield helper takes it
+            Vec::new(),
+            field_info,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(), // pic_slots — no PIC sites
+            Vec::new(), // ldc_info
+            Vec::new(), // ldc2w_info
+            HashMap::new(),
+            HashMap::new(),
+            &helpers,
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .expect("reference putfield must compile");
+
+        // Shape: the full-barrier call is emitted exactly once, as the bail
+        // target every guarded arm branches to.
+        assert_eq!(
+            calls_to(&compiled, helpers.putfield_object),
+            1,
+            "the inline arm must emit exactly one CALL to the barrier helper"
+        );
+
+        let mut obj = fake_compact_young_object();
+        let val = Box::new([0u64; 8]);
+        let obj_addr = obj.as_mut_ptr() as usize; // Cast: receiver address
+        let val_addr = val.as_ptr() as usize; // Cast: stored reference
+
+        // 1. G1/ZGC shape — table all zero. Young + compact + null old value,
+        //    and the fast path must STILL not be taken.
+        assert!(!region_bounds_are_live(helpers.region_bounds_addr));
+        CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: JIT-compiled code from valid bytecode in an executable mmap;
+        // the receiver is a live 64-byte aligned buffer shaped like an object
+        // header and the marker helper performs no store.
+        unsafe {
+            compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "unpublished bounds (the G1/ZGC shape) must route the store to the \
+             full-barrier helper even for a young receiver — G1-2"
+        );
+        assert_eq!(
+            fake_object_ref_cell(&obj),
+            0,
+            "the inline store must not have run"
+        );
+
+        // 2. Generational shape — publish a range covering the receiver.
+        let page = obj_addr & !0xFFF;
+        BOUNDS[0].store(page, Ordering::Release);
+        BOUNDS[1].store(page + 0x10000, Ordering::Release);
+        assert!(region_bounds_are_live(helpers.region_bounds_addr));
+
+        // 3. Null old value ⇒ nothing for SATB to log ⇒ the elision is correct
+        //    and must be preserved: the barrier helper is NOT called.
+        CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: as above.
+        unsafe {
+            compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            0,
+            "a young, compact, in-bounds receiver with a NULL old value keeps \
+             the barrier-free fast path"
+        );
+        assert_eq!(
+            fake_object_ref_cell(&obj),
+            val_addr,
+            "the inline store must have written the reference cell"
+        );
+
+        // 4. Non-null OLD value ⇒ SATB has something to log ⇒ helper.
+        CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: as above.
+        unsafe {
+            compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "a non-null old value must take the SATB pre-barrier helper"
+        );
+
+        // 5. Old-generation receiver ⇒ helper (card / RSet), even with a null
+        //    old value and live bounds.
+        obj[4] = 0;
+        // SAFETY: `obj` is the 64-byte buffer built above; byte 7 is its
+        // `gc_flags` header byte.
+        unsafe {
+            let p = obj.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
+            *p.add(cratonvm_types::GC_FLAGS_OFFSET) =
+                cratonvm_types::GC_FLAG_COMPACT | cratonvm_types::GC_FLAG_OLD_GEN;
+        }
+        CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: as above.
+        unsafe {
+            compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "an old-generation receiver must take the full-barrier helper"
+        );
+    }
+
+    /// The trusted-oop receiver substitution replaces the region-containment
+    /// guard with a bare null test — and the containment guard is precisely
+    /// what routes every receiver to the full-barrier helper on a backend that
+    /// publishes no bounds. So the substitution is legal only when bounds are
+    /// actually live (audit finding 1).
+    ///
+    /// Proven structurally: with an unpublished table the emitter must still
+    /// bake the bounds-table address as the guard's `MOV RDX, imm64` operand;
+    /// with a published one it may drop the guard (and the method gets shorter).
+    #[test]
+    fn trusted_oop_receiver_substitution_requires_live_bounds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BOUNDS: [AtomicUsize; 6] = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+        let mut helpers = test_helpers();
+        helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
+        let bounds_addr = helpers.region_bounds_addr;
+
+        // void setRef(Object this, Object v) { this.f = v; }  — `aload_0`
+        // marks the receiver as a proven oop, and a non-empty `method_key` is
+        // the other half of `receiver_is_trusted_oop`, so the substitution is
+        // eligible at this site. The legacy `compile` wrapper passes `""` and
+        // could never reach it, hence `compile_with_param_slots` here.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x2b, // 1: aload_1
+            0xb5, 0x00, 0x01, // 2: putfield #1 (reference)
+            0xb1, // 5: return
+            0, 0,
+        ];
+        let compile_it = |helpers: &JitRuntimeHelpers| {
+            compile_with_param_slots(
+                &code,
+                6,
+                2,
+                2,
+                true,
+                Vec::new(),
+                vec![(2usize, 0usize, b'L')],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(), // pic_slots
+                Vec::new(),
+                Vec::new(), // ldc_string_info
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                helpers,
+                std::collections::HashSet::new(),
+                HashMap::new(),
+                None, // string_layout
+                &[],
+                0,
+                0b11, // param_oop_mask: both parameters are references
+                vec![(2usize, 0u32, true)],
+                "T.setRef:(Ljava/lang/Object;)V", // non-empty ⇒ trusted-oop eligible
+                Vec::new(),
+            )
+            .expect("reference putfield must compile")
+        };
+
+        // G1/ZGC shape: no bounds published at emission time.
+        assert!(!region_bounds_are_live(bounds_addr));
+        let g1 = compile_it(&helpers);
+
+        // Generational shape: bounds live at emission time.
+        BOUNDS[0].store(0x1000, Ordering::Release);
+        BOUNDS[1].store(0x2000, Ordering::Release);
+        assert!(region_bounds_are_live(bounds_addr));
+        let generational = compile_it(&helpers);
+
+        // The containment guard bakes the table address as a 64-bit immediate
+        // (`emit_mov_imm64` only uses the imm64 form above `i32::MAX`, which is
+        // where any real static lands), so its presence is an exact readout of
+        // which receiver check was emitted.
+        if bounds_addr > i32::MAX as usize {
+            assert!(
+                code_contains_u64(&g1, bounds_addr),
+                "unpublished bounds must keep the full containment guard — G1-2. \
+                 A failure here means the trusted-oop substitution is being taken \
+                 on a backend that publishes nothing, which loses G1's RSet edge."
+            );
+            assert!(
+                !code_contains_u64(&generational, bounds_addr),
+                "live bounds must still allow the cheap trusted-oop null test. A \
+                 failure here means either the gate is now unconditionally strict \
+                 (a throughput regression on Generational) or this site stopped \
+                 qualifying as `receiver_is_trusted_oop` — check `method_key`, \
+                 `stack_oop_marks_exact` and the aload_0 oop mark before assuming \
+                 the barrier gate regressed."
+            );
+        }
+
+        assert!(
+            generational.code_bytes().len() < g1.code_bytes().len(),
+            "with live bounds the trusted-oop null test replaces the six-compare \
+             containment guard, so the method must be strictly shorter \
+             (live={}, unpublished={})",
+            generational.code_bytes().len(),
+            g1.code_bytes().len()
+        );
+
+        // Both shapes still keep the full-barrier helper as the bail target.
+        assert_eq!(calls_to(&g1, helpers.putfield_object), 1);
+        assert_eq!(calls_to(&generational, helpers.putfield_object), 1);
+    }
+
+    /// `emit_inline_fresh_ctor_compact_ref_putfield` had NO receiver guard at
+    /// all, so on a non-publishing backend it wrote the reference inline and
+    /// dropped the collector's post-write barrier entirely. It must now take
+    /// the helper whenever bounds are not live, and keep the fast path when
+    /// they are.
+    #[test]
+    fn fresh_ctor_ref_putfield_takes_the_full_barrier_when_bounds_are_not_live() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BOUNDS: [AtomicUsize; 6] = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn marker_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        // Caller: void f(Object o, Object v) { o.<init>(v); }
+        let caller: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x2b, // 1: aload_1
+            0xb7, 0x00, 0x01, // 2: invokespecial #1 → inline site
+            0xb1, // 5: return
+            0, 0,
+        ];
+        // Callee: <init>(Object v) { this.f = v; } — the fresh-ctor first store.
+        let make_site = || {
+            let mut site = make_inline_site(
+                &[0x2a, 0x2b, 0xb5, 0x00, 0x01, 0xb1],
+                2,     // callee_max_locals: this + v
+                2,     // callee_num_args: this + v
+                false, // instance method
+                b'V',
+            );
+            site.method_name = "<init>".to_string();
+            site.descriptor = "(Ljava/lang/Object;)V".to_string();
+            site.field_info = vec![(2usize, 0usize, b'L')];
+            site.compact_field_info = vec![(2usize, 0u32, true)];
+            site.needs_heap = true;
+            let mut sites = HashMap::new();
+            sites.insert(2usize, site);
+            sites
+        };
+
+        let mut helpers = test_helpers();
+        helpers.putfield_object = marker_putfield_object as *const () as usize; // Cast: fn → slot
+        helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
+
+        let compile_it = |helpers: &JitRuntimeHelpers| {
+            compile(
+                &caller,
+                6,
+                2,
+                2,
+                true,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(), // pic_slots
+                Vec::new(), // ldc_info
+                Vec::new(), // ldc2w_info
+                HashMap::new(),
+                HashMap::new(),
+                helpers,
+                std::collections::HashSet::new(),
+                make_site(),
+                None, // string_layout
+            )
+            .expect("inlined <init> reference putfield must compile")
+        };
+
+        // 1. G1/ZGC shape at emission time → the emitter routes to the helper.
+        assert!(!region_bounds_are_live(helpers.region_bounds_addr));
+        let g1 = compile_it(&helpers);
+
+        // 2. Generational shape at emission time → the fast path is emitted.
+        BOUNDS[0].store(0x1000, Ordering::Release);
+        BOUNDS[1].store(0x2000, Ordering::Release);
+        assert!(region_bounds_are_live(helpers.region_bounds_addr));
+        let generational = compile_it(&helpers);
+
+        assert_eq!(
+            calls_to(&g1, helpers.putfield_object),
+            1,
+            "the barrier call must be emitted"
+        );
+        assert!(
+            g1.code_bytes().len() < generational.code_bytes().len(),
+            "the unpublished-bounds compile is the bare helper call, with no \
+             inline store at all (unpublished={}, live={})",
+            g1.code_bytes().len(),
+            generational.code_bytes().len()
+        );
+
+        // The fresh-ctor emitter has no containment guard, so its runtime
+        // behaviour does not depend on the table's state — only on which shape
+        // was emitted. Run both against identical receivers.
+        let val = Box::new([0u64; 8]);
+        let val_addr = val.as_ptr() as usize; // Cast: stored reference
+
+        let mut obj_g1 = fake_compact_young_object();
+        let obj_g1_addr = obj_g1.as_mut_ptr() as usize; // Cast: receiver address
+        CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: JIT-compiled code from valid bytecode in an executable mmap;
+        // the receiver is a live 64-byte aligned object-shaped buffer and the
+        // marker helper performs no store.
+        unsafe {
+            g1.call_with_heap(0, &[obj_g1_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "a fresh-ctor reference store must take the collector's barrier when \
+             the backend publishes no region bounds — G1-2"
+        );
+        assert_eq!(
+            fake_object_ref_cell(&obj_g1),
+            0,
+            "the inline store must not have run"
+        );
+
+        let mut obj_gen = fake_compact_young_object();
+        let obj_gen_addr = obj_gen.as_mut_ptr() as usize; // Cast: receiver address
+        CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: as above.
+        unsafe {
+            generational.call_with_heap(0, &[obj_gen_addr as i64, val_addr as i64]);
+            // Cast: JIT ABI
+        }
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            0,
+            "with live bounds a young compact fresh-ctor store keeps its \
+             barrier-free inline path"
+        );
+        assert_eq!(
+            fake_object_ref_cell(&obj_gen),
+            val_addr,
+            "the inline store must have written the reference cell"
+        );
+    }
+
     #[test]
     fn test_getfield_long() {
         // Method: long getY(Object this) { return this.y; }

@@ -23,8 +23,9 @@
 //!
 //! ## Normalization is a named rule set, never a buried regex
 //!
-//! Every transform this module can apply is a [`crate::normalize::
-//! NormalizationRule`] with a documented target, justification and risk. The
+//! Every transform this module can apply is a
+//! [`NormalizationRule`](crate::normalize::NormalizationRule) with a documented
+//! target, justification and risk. The
 //! [`Normalizer`] here is only a selection of which rules are on; the rules
 //! themselves, their order, and the argument for each live next to their
 //! implementation. `strict()` selects none of them beyond line-ending hygiene,

@@ -3507,6 +3507,17 @@ fn reloc_emit_enabled() -> bool {
     /// FP-slot resume wired (Slice C), an FP value may now be live at a deopt
     /// guard. `Void`/`Control`/`Memory` are never live data slots, so they map to
     /// `Unsupported`.
+    fn typed_stack_slot(off: i32, ty: IrType) -> FrameValue {
+        match ty {
+            IrType::Ref => FrameValue::StackSlotRef(off),
+            IrType::Int => FrameValue::StackSlot(off),
+            IrType::Long => FrameValue::StackSlotLong(off),
+            IrType::Float => FrameValue::StackSlotFloat(off),
+            IrType::Double => FrameValue::StackSlotDouble(off),
+            _ => FrameValue::Unsupported,
+        }
+    }
+
     /// The refusal every [`Self::frame_value_for_object`] bail returns: "escape
     /// analysis deleted this object, and I could not describe how to rebuild it
     /// here".
@@ -3529,17 +3540,6 @@ fn reloc_emit_enabled() -> bool {
             info.class_id,
             cause,
         ))
-    }
-
-    fn typed_stack_slot(off: i32, ty: IrType) -> FrameValue {
-        match ty {
-            IrType::Ref => FrameValue::StackSlotRef(off),
-            IrType::Int => FrameValue::StackSlot(off),
-            IrType::Long => FrameValue::StackSlotLong(off),
-            IrType::Float => FrameValue::StackSlotFloat(off),
-            IrType::Double => FrameValue::StackSlotDouble(off),
-            _ => FrameValue::Unsupported,
-        }
     }
 
     /// Resolve the `FrameState` for `bci` from its recorded safepoint
@@ -3973,7 +3973,11 @@ fn reloc_emit_enabled() -> bool {
                 if dbg {
                     eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: no deopt block for bci");
                 }
-                return Self::eliminated_object(new_id, info, EliminationCause::ScalarReplacedObject);
+                return Self::eliminated_object(
+                    new_id,
+                    info,
+                    EliminationCause::ScalarReplacedObject,
+                );
             }
         };
         // The allocation and every field store must have executed before the
@@ -5764,6 +5768,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -5812,6 +5817,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -6397,6 +6403,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -6464,6 +6471,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -6587,17 +6595,267 @@ mod tests {
     #[test]
     fn test_scalar_deopt_bails_when_store_not_dominating() {
         // Guard in the SAME block as the New/store → strict dominance fails (v1
-        // conservatively rejects same-block ordering) → bail to Undefined → the
-        // resume falls back to a safe whole-method re-run.
-        let (g, sr_map, _newo) = build_sr_deopt_graph(true, false);
+        // conservatively rejects same-block ordering). The bail names the
+        // eliminated allocation instead of claiming the slot is undefined, so
+        // the resume is REFUSED (safe whole-method re-run) rather than served a
+        // fabricated `Int(0)` — which for this reference local would be `null`.
+        let (g, sr_map, newo) = build_sr_deopt_graph(true, false);
         let schedule = ir_schedule::schedule(&g);
         let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
             .expect("lower");
         let locals = deopt_locals_at(&cm, 10);
         assert_eq!(
             locals[1],
+            FrameValue::MaterializationRequired(EliminatedValue::allocation(
+                newo,
+                7,
+                EliminationCause::ScalarReplacedObject,
+            )),
+            "a non-dominating store must bail to MaterializationRequired, naming \
+             the producer node and the class it allocated"
+        );
+        let fs = &cm
+            ._deopt_point_boxes
+            .iter()
+            .find(|p| p.bci == 10)
+            .expect("deopt box at bci 10")
+            .frame_state;
+        assert!(
+            !crate::deopt::frame_state_is_resumable(fs),
+            "the frame must be unresumable, which is what turns the old silent \
+             null into a refused deopt"
+        );
+        assert_eq!(crate::deopt::count_materialization_required(fs), 1);
+    }
+
+    /// Every remaining bail in `frame_value_for_object` — not just the
+    /// dominance one — must name the elimination rather than spell it
+    /// `Undefined`. The nested-virtual bail additionally carries its own cause,
+    /// so a compiler report can distinguish "escape analysis left me nothing to
+    /// rebuild from" (fix the dominance gate) from "the recipe exists but v1
+    /// emits no nested graphs" (implement nested virtual objects).
+    #[test]
+    fn scalar_deopt_nested_virtual_field_bails_with_its_own_cause() {
+        let (mut g, mut sr_map, newo) = build_sr_deopt_graph(false, false);
+        // Make field 0's value itself a scalar-replaced object: add a second
+        // dead `Op::New` and register it in the map, then point the first
+        // object's only field at it.
+        let inner = g.add(Op::Dead, IrType::Ref, vec![], None);
+        sr_map.objects.insert(
+            inner,
+            VirtualObjectInfo {
+                class_id: 9,
+                num_fields: 0,
+                field_values: vec![],
+                new_ctrl: 1, // Proj(0) — the entry control, dominates everything
+                store_ctrls: vec![],
+            },
+        );
+        sr_map
+            .objects
+            .get_mut(&newo)
+            .expect("outer object")
+            .field_values = vec![Some(inner)];
+
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
+        assert_eq!(
+            deopt_locals_at(&cm, 10)[1],
+            FrameValue::MaterializationRequired(EliminatedValue::allocation(
+                newo,
+                7,
+                EliminationCause::NestedVirtualObject,
+            )),
+            "a nested virtual field must bail with NestedVirtualObject, not \
+             ScalarReplacedObject and not Undefined"
+        );
+    }
+
+    /// A `NO_NODE` snapshot slot is the one case that is *genuinely* undefined —
+    /// the local was never stored on any path reaching this bci, so the verifier
+    /// guarantees the interpreter cannot read it and `Value::Int(0)` is correct.
+    /// It must keep resolving to `Undefined`; widening the eliminated marker to
+    /// cover it would make every method with an unwritten local unresumable.
+    #[test]
+    fn no_node_snapshot_slot_stays_undefined() {
+        let (mut g, sr_map, _newo) = build_sr_deopt_graph(false, false);
+        // locals were [cond, o]; append an unwritten slot.
+        g.safepoints
+            .iter_mut()
+            .find(|s| s.bci == 10)
+            .expect("snapshot at bci 10")
+            .locals
+            .push(NO_NODE);
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
+        let locals = deopt_locals_at(&cm, 10);
+        assert_eq!(
+            locals[2],
             FrameValue::Undefined,
-            "same-block store must bail to Undefined (safe re-run)"
+            "an unwritten local is genuinely undefined, not eliminated"
+        );
+        // And it does NOT block the resume — only the eliminated marker does.
+        assert!(crate::deopt::frame_state_is_resumable(&FrameState {
+            method_key: String::new(),
+            bci: 10,
+            locals: vec![FrameValue::Undefined],
+            stack: vec![],
+            monitors: vec![],
+            caller: None,
+        }));
+    }
+
+    /// `frame_value_for` used to index `graph.nodes` directly, so a snapshot slot
+    /// naming an id past the end of the arena panicked — on the compiler thread,
+    /// which takes the VM down. It must bail to the unresumable marker instead.
+    #[test]
+    fn out_of_range_snapshot_node_id_bails_instead_of_panicking() {
+        let (mut g, _sr_map, _newo) = build_sr_deopt_graph(false, false);
+        let past_end = g.nodes.len() as NodeId + 7;
+        g.safepoints
+            .iter_mut()
+            .find(|s| s.bci == 10)
+            .expect("snapshot at bci 10")
+            .locals
+            .push(past_end);
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower(&g, &schedule, 1, 3, &no_helpers()).expect("lower");
+        let locals = deopt_locals_at(&cm, 10);
+        assert_eq!(
+            locals[2],
+            FrameValue::MaterializationRequired(EliminatedValue::unknown(
+                EliminationCause::Unclassified,
+            )),
+            "an out-of-range node id must resolve to the unresumable marker"
+        );
+    }
+
+    /// The install-time verifier must reject metadata whose reference slot the
+    /// oop map does not cover — the disagreement that leaves a live reference
+    /// invisible to a relocating collector. Built here directly (rather than
+    /// through `lower_inner`) because this backend does not yet anchor its oop
+    /// maps to native offsets, so the agreement lane has nothing to join on in a
+    /// real compile; the wiring in `lower_inner` arms the moment it does.
+    #[test]
+    fn install_verifier_rejects_an_oop_map_deopt_map_disagreement() {
+        use crate::deopt::{DeoptAction, DeoptReason};
+
+        let point = |locals: Vec<FrameValue>| DeoptimizationPoint {
+            native_offset: 0x40,
+            bci: 3,
+            reason: DeoptReason::NullCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: 3,
+                locals,
+                stack: vec![],
+                monitors: vec![],
+                caller: None,
+            },
+        };
+        // The map covers [rbp-40]; deopt spells that word as StackSlotRef(-40).
+        let verifier = DeoptVerifier::new().with_oop_map(0x40, OopCoverage::complete([40]));
+        assert!(
+            verifier
+                .verify(std::slice::from_ref(&point(vec![FrameValue::StackSlotRef(
+                    -40
+                )])))
+                .is_ok(),
+            "a covered reference slot must pass"
+        );
+        let err = verifier
+            .verify(std::slice::from_ref(&point(vec![FrameValue::StackSlotRef(
+                -48,
+            )])))
+            .expect_err("an uncovered reference slot must bail the install");
+        assert!(
+            err.to_string().contains("oop map"),
+            "the bailout must say which agreement broke, got: {err}"
+        );
+    }
+
+    /// A `VirtualObject` recipe may only name a removed node the emitter also
+    /// registered as materializable. Naming a node the optimizer retired without
+    /// a recipe means the metadata was built from a stale graph, and the artifact
+    /// must not install.
+    #[test]
+    fn install_verifier_rejects_a_recipe_for_an_unmaterializable_removed_node() {
+        use crate::deopt::{DeoptAction, DeoptReason};
+
+        let point = DeoptimizationPoint {
+            native_offset: 0x10,
+            bci: 1,
+            reason: DeoptReason::DivByZero,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: 1,
+                locals: vec![FrameValue::VirtualObject(VirtualObjectState {
+                    id: 12,
+                    class_id: 3,
+                    num_fields: 1,
+                    field_values: vec![FrameValue::Int(0)],
+                })],
+                stack: vec![],
+                monitors: vec![],
+                caller: None,
+            },
+        };
+        assert!(
+            DeoptVerifier::new()
+                .with_removed_nodes([12u32])
+                .with_materializable_nodes([12u32])
+                .verify(std::slice::from_ref(&point))
+                .is_ok(),
+            "a removed node registered as materializable is exactly what a \
+             VirtualObject slot is allowed to name"
+        );
+        assert!(
+            DeoptVerifier::new()
+                .with_removed_nodes([12u32])
+                .verify(std::slice::from_ref(&point))
+                .is_err(),
+            "a removed node with no recipe must bail the install"
+        );
+    }
+
+    /// `lower_inner` publishes the slot planner's peak-liveness figure to the
+    /// per-compilation report. The number itself is `plan_slots`' business; what
+    /// this pins is that the metric is no longer `NotMeasured` after a compile,
+    /// which is what made it useless to a reader.
+    #[test]
+    fn peak_live_values_reaches_the_compilation_report() {
+        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
+        crate::metrics::set_enabled_for_test(true);
+
+        // int f(int a, int b) { return a + b; } — two live params at the Add.
+        let code = [0x1a, 0x1b, 0x60, 0xac, 0, 0];
+        let builder = IrBuilder::new(2, 2);
+        let graph = builder.build(&code, 4).expect("build");
+        let schedule = ir_schedule::schedule(&graph);
+        let expected = plan_slots(&graph, &schedule, None).peak_live;
+
+        let published = {
+            let rec = crate::metrics::CompileRecorder::begin("IrLowerPeak", "f", "(II)I", true);
+            lower(&graph, &schedule, 2, 2, &no_helpers()).expect("lower");
+            rec.snapshot().expect("in-flight snapshot")
+        };
+        crate::metrics::set_enabled_for_test(false);
+
+        assert_eq!(
+            published.peak_live_values,
+            crate::metrics::Measured::Value(expected as u32),
+            "lower_inner must publish SlotPlan::peak_live"
+        );
+        assert!(
+            expected > 0,
+            "the probe method has live values, so a zero peak would mean the \
+             planner, not the wiring, is broken"
         );
     }
 
@@ -6624,13 +6882,25 @@ mod tests {
 
     #[test]
     fn test_scalar_deopt_disabled_without_map() {
-        // With `sr_map = None` (the default), the dead-New slot resolves to
-        // Undefined exactly as before — byte-identical to the prior producer.
-        let (g, _sr_map, _newo) = build_sr_deopt_graph(false, false);
+        // With `sr_map = None` (the default), no `VirtualObject` recipe is
+        // emitted — but the slot still describes an object escape analysis
+        // deleted, so it resolves to the unresumable marker rather than to
+        // `Undefined`. This is the DEFAULT-configuration half of the silent-null
+        // fix: `apply_ea_to_ir` runs whether or not `CRATONVM_SCALAR_DEOPT` is
+        // set, so an ordinary production compile reaches exactly this path.
+        // `Unclassified` because the generic slot resolver only knows the
+        // producer is `Op::Dead`, not which pass retired it.
+        let (g, _sr_map, newo) = build_sr_deopt_graph(false, false);
         let schedule = ir_schedule::schedule(&g);
         let cm = lower(&g, &schedule, 1, 3, &no_helpers()).expect("lower");
         let locals = deopt_locals_at(&cm, 10);
-        assert_eq!(locals[1], FrameValue::Undefined);
+        assert_eq!(
+            locals[1],
+            FrameValue::MaterializationRequired(EliminatedValue::new(
+                newo,
+                EliminationCause::Unclassified,
+            )),
+        );
     }
 
     #[test]
@@ -6738,6 +7008,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -7029,6 +7300,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -7068,6 +7340,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -7256,6 +7529,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         }
     }
 

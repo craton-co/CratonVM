@@ -1326,9 +1326,21 @@ impl MetricsSummary {
 // ── Test helpers ─────────────────────────────────────────────────────
 
 #[cfg(test)]
-fn set_enabled_for_test(on: bool) {
+pub(crate) fn set_enabled_for_test(on: bool) {
     ENABLED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
 }
+
+/// Serializes every test that touches the process-wide enable flag or the
+/// report ring.
+///
+/// Module-level and `pub(crate)` rather than private to `mod tests`, because the
+/// enable flag is one process-wide `AtomicU8`: `ir_lower`'s end-to-end wiring
+/// test (`peak_live_values_reaches_the_compilation_report`) flips the same flag
+/// from another module, and a lock the tests here cannot share with it would
+/// serialize nothing — the `set_enabled_for_test(false)` that ends each test
+/// below would disable collection in the middle of that one.
+#[cfg(test)]
+pub(crate) static METRICS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 // ── Tests ────────────────────────────────────────────────────────────
 
@@ -1341,8 +1353,9 @@ mod tests {
     /// touches either takes this first, so they serialize against each other
     /// (they cannot serialize against an unrelated `lib.rs` compile test, which
     /// is why the assertions below are written to tolerate foreign reports
-    /// wherever they cannot exclude them).
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// wherever they cannot exclude them). Defined one level up as
+    /// [`METRICS_TEST_LOCK`] so `ir_lower`'s wiring test shares it.
+    use super::METRICS_TEST_LOCK as TEST_LOCK;
 
     fn sample(class: &str, outcome: Outcome, path: CompilerPath) -> CompilationReport {
         let mut r = CompilationReport::new(class, "m", "()I", true);
