@@ -33,10 +33,59 @@ fn compact_ws(src: &str) -> String {
     src.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// Byte offsets of every `register(` **call site** for this triple in the
+/// whitespace-free source. Each offset points at the `r` of `register(`.
+///
+/// The `register(` prefix is load-bearing: `native-builtins/src/lib.rs` also
+/// contains unit tests that assert on the same triples via
+/// `registry.find("class", "method", "descriptor")`, and matching the bare
+/// tuple would let one of those satisfy `registers()` even after the real
+/// registration was deleted.
+fn register_sites(compact: &str, class: &str, method: &str, desc: &str) -> Vec<usize> {
+    let needle = format!("register(\"{class}\",\"{method}\",\"{desc}\"");
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = compact[from..].find(&needle) {
+        out.push(from + rel);
+        from += rel + 1;
+    }
+    out
+}
+
 /// True if the (whitespace-free) source contains a
 /// `register("class", "method", "descriptor", ...)` call in any wrapping.
 fn registers(compact: &str, class: &str, method: &str, desc: &str) -> bool {
-    compact.contains(&format!("\"{class}\",\"{method}\",\"{desc}\""))
+    !register_sites(compact, class, method, desc).is_empty()
+}
+
+/// True if the `register(` call site at `site` carries a `#[cfg(...)]`
+/// attribute — i.e. it can be compiled out of some build configuration.
+///
+/// Anchored on the call itself rather than "is there a `#[cfg(` anywhere
+/// earlier in the statement": walk back over the receiver (`registry.`), then
+/// peel trailing `#[...]` attribute groups. Scanning the whole preceding
+/// statement would false-positive on any *comment* that quotes a `#[cfg(...)]`
+/// line — and the comment above `latestUserDefinedLoader0`, the native this
+/// check exists for, does exactly that.
+fn register_site_is_cfg_gated(compact: &str, site: usize) -> bool {
+    let head = &compact[..site];
+    let bytes = head.as_bytes();
+    let mut i = head.len();
+    if i > 0 && bytes[i - 1] == b'.' {
+        i -= 1; // the `.` of `registry.register(`
+        while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            i -= 1;
+        }
+    }
+    let mut tail = &head[..i];
+    while tail.ends_with(']') {
+        let Some(open) = tail.rfind("#[") else { break };
+        if tail[open..].starts_with("#[cfg(") {
+            return true;
+        }
+        tail = &tail[..open];
+    }
+    false
 }
 
 /// The ~240 chars following a `"class","method"` registration key in the
@@ -176,6 +225,53 @@ fn t14_all_vm_natives_registered() {
         VM_NATIVES.len(),
         VM_NATIVES.len(),
     );
+}
+
+// ===========================================================================
+// T14.3b — no VM native is compiled out of a default build
+// ===========================================================================
+
+/// `t14_all_vm_natives_registered` is a source-text scan, so it reports a
+/// registration as present even when a `#[cfg(feature = "...")]` attribute
+/// compiles it out. That false green is exactly how
+/// `jdk/internal/misc/VM.latestUserDefinedLoader0()` shipped unregistered for
+/// weeks: it sat behind `#[cfg(any(feature = "experimental-serialization",
+/// feature = "synthetic-jdk"))]`, neither of which is a default feature of
+/// `cratonvm-vm` or `cratonvm-cli`, so every plain
+/// `cargo build --release -p cratonvm-cli` threw `UnsatisfiedLinkError` on
+/// each `ObjectInputStream.readObject()` of an ordinary class.
+///
+/// This test closes the gap for the whole `VM_NATIVES` list: a triple whose
+/// every `register(` call site carries a `#[cfg(...)]` is a failure, whatever
+/// the condition. If some future VM native genuinely must be optional, add it
+/// to an explicit allow-list here with a written reason rather than deleting
+/// the check.
+#[test]
+fn t14_vm_natives_not_feature_gated() {
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
+    let mut gated: Vec<String> = Vec::new();
+
+    for &(method, descriptor) in VM_NATIVES {
+        let sites = register_sites(&compact, "jdk/internal/misc/VM", method, descriptor);
+        if sites.is_empty() {
+            continue; // absence is t14_all_vm_natives_registered's job
+        }
+        if !sites
+            .iter()
+            .any(|&site| !register_site_is_cfg_gated(&compact, site))
+        {
+            gated.push(format!("{method}{descriptor}"));
+        }
+    }
+
+    assert!(
+        gated.is_empty(),
+        "T14: {} VM native registration(s) are behind a #[cfg(...)] and so are \
+         absent from a default build:\n  {}",
+        gated.len(),
+        gated.join("\n  "),
+    );
+    eprintln!("[T14.3b] \u{2713} No jdk/internal/misc/VM native is feature-gated");
 }
 
 // ===========================================================================
