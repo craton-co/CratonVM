@@ -611,6 +611,24 @@ fn with_foreign_thread<R>(f: impl FnOnce(&mut JvmThread) -> R) -> Option<R> {
 /// coordinator/creating thread. A **foreign attached** thread is already modelled
 /// as in-native (GC-blocked) between its JNI calls, so this is a no-op for it
 /// (double-counting would corrupt the barrier accounting).
+///
+/// CENSUS-RECONCILE (2026-07-31): this used to bump ONLY the barrier's anonymous
+/// `threads_blocked` counter. Production STW does not compute `expected` from
+/// that counter — it computes it from the IDENTITY census
+/// (`request_stw_counted_with_live_blocked` ->
+/// `ThreadRegistry::alive_count_blocked_and_os_tids`, `runtime/interpreter.rs`),
+/// which excludes exactly the alive+`stw_ready` threads publishing
+/// `in_blocked_region == true`. A registered thread that declared itself
+/// host-native was therefore STILL counted in `expected` while parked in a host
+/// `join()` it will not return from — the very hang this function exists to
+/// prevent, and the exact shape the always-on `[gcbarrier-tripwire]` in
+/// `stw_take_over_and_wait` reports ("a thread called
+/// `mark_blocked_region_enter()` WITHOUT first depositing a root snapshot ...
+/// invisible to the production STW census but still occupies an `expected` slot
+/// no arrival can ever satisfy"). Publishing the identity half first — via the
+/// same `mark_native_thread_blocked` + `mark_blocked_region_enter` +
+/// `arrive_and_wait_auto` sequence `VmNativeThreadBlocker` (`vm/src/vm/vm_exec.rs`)
+/// already uses for VM-registered native carrier threads — closes it.
 pub fn host_thread_enter_native() -> bool {
     if is_foreign_attached() {
         // Already auto-managed as idle-blocked between calls; nothing to do.
@@ -620,17 +638,45 @@ pub fn host_thread_enter_native() -> bool {
         Some(s) => s,
         None => return false,
     };
+    // Identity of the calling host thread, if the VM registered it (the
+    // creating thread is `ThreadId(0)`, published by `Vm::new`). `None` means
+    // this OS thread is in no registry entry at all, so it is absent from
+    // `alive_count` and occupies no `expected` slot — the counter-only path
+    // below is then exactly right.
+    let tid = shared
+        .threads
+        .thread_registry
+        .thread_id_for_current_os_tid();
+    if let Some(tid) = tid {
+        // Raise the identity flag BEFORE the counter, matching every other
+        // blocking-region entry (`deposit_root_snapshot` then
+        // `mark_blocked_region_enter`). A census serialized before this sees a
+        // running mutator and counts us — `pre_stw` + `arrive_and_wait_auto`
+        // below then supply the arrival it is waiting for; one serialized
+        // after sees the flag and excludes us.
+        //
+        // `mark_native_thread_blocked` also empties the published root
+        // snapshot, which is the contract stated above: a thread parked in
+        // HOST code holds no live Java roots. (Its `java.lang.Thread` mirror
+        // is not affected — that is a strong root of every alive registry
+        // entry, `memory/roots.rs` step 10b.)
+        shared.threads.thread_registry.mark_native_thread_blocked(tid);
+    }
     let pre_stw = shared.mem.gc_barrier.mark_blocked_region_enter();
     if pre_stw {
         // A stop-the-world was already active when we incremented the blocked
-        // count, so `request_stw` had counted this thread in `expected` (it was
-        // a live, non-blocked mutator at that instant). Arrive exactly once so
-        // the initiator's `wait_for_all` can complete. The id only selects "am I
-        // the initiator" — a thread declaring itself in-native is never the
-        // initiator — and a non-foreign caller here is the creating thread (id 0).
-        // GCAUDIT-0711-FIX (finding 1a): auto for uniformity - this call
-        // site never raises in_blocked_region, so it resolves identically.
-        let _ = shared.mem.gc_barrier.arrive_and_wait_auto(ThreadId(0));
+        // count. Whether it counted us in `expected` depends on which side of
+        // the flag raise above its census landed, which is NOT decidable here
+        // — so resolve it from that pause's own exclusion snapshot
+        // (GCAUDIT-0711-FIX finding 1a): `auto` arrives exactly once if the
+        // census counted us, and only waits the pause out if it excluded us.
+        // The fallback id is unchanged from the pre-fix behaviour: for an
+        // unregistered caller it only answers "am I the initiator", and such a
+        // thread never is.
+        let _ = shared
+            .mem
+            .gc_barrier
+            .arrive_and_wait_auto(tid.unwrap_or(ThreadId(0)));
     }
     true
 }
@@ -639,6 +685,19 @@ pub fn host_thread_enter_native() -> bool {
 /// the mutator population (it will wait out any in-flight stop-the-world first).
 /// Must balance exactly one prior `host_thread_enter_native`. No-op for a foreign
 /// attached thread (auto-managed) or when no VM exists.
+///
+/// CENSUS-RECONCILE (2026-07-31): symmetric half of the fix described on
+/// [`host_thread_enter_native`]. This used to drop only the anonymous counter,
+/// so a thread that HAD been excluded by the identity census resumed with its
+/// `in_blocked_region` flag still raised — permanently invisible to every later
+/// pause (a running mutator that no collection waits for) and never draining the
+/// blocked-window fixup those pauses accumulated for it. The sequence below is
+/// the canonical one every blocking native uses
+/// (`NativeContextImpl::end_blocking_region`, `vm/src/vm/vm_exec.rs`): drop the
+/// counter (waiting out the pause we were excluded from), then clear the
+/// identity flag through `leave_blocked_region_flagged`, which performs the
+/// clear under the same barrier-lock hold that proved no pause is active — the
+/// window a bare `store(false)` leaves open is finding 1(c)'s corruption family.
 pub fn host_thread_leave_native() -> bool {
     if is_foreign_attached() {
         return true;
@@ -647,7 +706,33 @@ pub fn host_thread_leave_native() -> bool {
         Some(s) => s,
         None => return false,
     };
+    let tid = shared
+        .threads
+        .thread_registry
+        .thread_id_for_current_os_tid();
     shared.mem.gc_barrier.mark_blocked_region_leave();
+    if let Some(tid) = tid {
+        if let Some(gc_block_state) = shared.threads.thread_registry.gc_block_state_of(tid) {
+            shared
+                .mem
+                .gc_barrier
+                .leave_blocked_region_flagged(tid, &gc_block_state.in_blocked_region);
+        }
+        // Drain the blocked-window side tables now that the flag is down and
+        // no further fold can target us. This is the host-thread analogue of
+        // `check_post_block_gc`'s fixup application: there is nothing to apply
+        // it TO (the deposited snapshot was emptied at enter, and a host thread
+        // owns no interpreter frames while parked outside the VM), so the
+        // accumulated map is discarded — `mark_native_thread_unblocked` reports
+        // a non-empty one under `CRATONVM_DBG_BLOCKGC`, which is the signal
+        // that a caller broke the "no live Java roots while parked" contract.
+        // Its own `store(false)` is a no-op here: the barrier already cleared
+        // the flag above.
+        shared
+            .threads
+            .thread_registry
+            .mark_native_thread_unblocked(tid);
+    }
     true
 }
 

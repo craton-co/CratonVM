@@ -2807,6 +2807,29 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         }
         .check_post_block_gc();
     } else {
+        // CENSUS-RECONCILE (2026-07-31): the bare store survives ONLY because
+        // this arm's `GcBlockState` is virgin, which makes it a no-op — the
+        // reasoning was prose, so pin it. If the precondition ever breaks, the
+        // store becomes a genuine finding-1(c) flag clear performed outside the
+        // barrier lock (a pause requested in the window both excludes this
+        // thread and lets it run), and the accumulated fixup is dropped
+        // unapplied. Both are silent; `check_post_block_gc` (the `resumed` arm
+        // above) is the correct handler and the assert names it.
+        debug_assert!(
+            !thread
+                .gc_block_state
+                .in_blocked_region
+                .load(std::sync::atomic::Ordering::Acquire),
+            "first-mount continuation must have a virgin GcBlockState \
+             (in_blocked_region already down); a raised flag here needs \
+             check_post_block_gc, not a bare store",
+        );
+        debug_assert!(
+            thread.gc_block_state.fixup.lock().is_empty(),
+            "first-mount continuation must have a virgin GcBlockState \
+             (empty fixup); a non-empty one is a blocked-window remap this \
+             bare store would drop unapplied",
+        );
         thread
             .gc_block_state
             .in_blocked_region
@@ -4631,6 +4654,28 @@ impl NativeThreadBlocker for VmNativeThreadBlocker {
 
     fn leave_blocked(&self) {
         self.shared.mem.gc_barrier.mark_blocked_region_leave();
+        // CENSUS-RECONCILE (2026-07-31): clear the IDENTITY flag through the
+        // barrier, not with `mark_native_thread_unblocked`'s bare
+        // `store(false)`. `mark_blocked_region_leave` above only waits out the
+        // pause that was active when it ran; a pause requested in the window
+        // between that and the store would both EXCLUDE this thread (its
+        // census reads the still-raised flag) and let it run — finding 1(c)'s
+        // "excluded but running mutator" corruption window.
+        // `leave_blocked_region_flagged` closes it by clearing under the same
+        // lock hold that proved no pause is active. The
+        // `mark_native_thread_unblocked` call is kept for its side-table drain
+        // (fixup / slot_origins / snapshot); its own store is then a no-op.
+        if let Some(gc_block_state) = self
+            .shared
+            .threads
+            .thread_registry
+            .gc_block_state_of(self.thread_id)
+        {
+            self.shared
+                .mem
+                .gc_barrier
+                .leave_blocked_region_flagged(self.thread_id, &gc_block_state.in_blocked_region);
+        }
         self.shared
             .threads
             .thread_registry

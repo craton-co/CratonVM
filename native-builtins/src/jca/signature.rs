@@ -1528,4 +1528,224 @@ mod tests {
              not fall through to the synthetic empty-signature stub; got {r:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // P0 — "a security API never encodes failure as ordinary output"
+    //
+    // Every "must raise" case below has a "must still work" twin using a real
+    // RSA key, so the suite cannot be satisfied by refusing everything. The
+    // genuine-negative case (a real signature that really does not match) is
+    // asserted to stay a `false` with NO exception.
+    // -----------------------------------------------------------------------
+
+    /// One 1024-bit RSA key pair for the whole module — key generation is the
+    /// expensive part and the tests only need *a* usable key.
+    fn shared_rsa_key_id() -> u64 {
+        use std::sync::OnceLock;
+        static ID: OnceLock<u64> = OnceLock::new();
+        *ID.get_or_init(|| {
+            let (public_key, private_key) = crypto_impl::Rsa::generate_keypair(1024);
+            let id = crypto_impl::rsa_key_next_id();
+            crypto_impl::rsa_key_store(
+                id,
+                crypto_impl::RsaKeyPairData {
+                    public_key,
+                    private_key,
+                },
+            );
+            id
+        })
+    }
+
+    /// A stand-in `Key` object carrying `key_id` in slot 3, which is where
+    /// `extract_key_id_from_key` reads a synthetic key's handle from.
+    fn key_object(ctx: &mut crate::test_utils::MockNativeContext, key_id: u64) -> ObjectRef {
+        let cid = ctx.ensure_class_initialized("java/security/Key").unwrap();
+        let key = ctx.alloc_object(cid, 8);
+        ctx.set_field(key, 3, Value::Long(key_id as i64));
+        key
+    }
+
+    /// The classification helper must not drift away from the two `match`es it
+    /// summarises: every algorithm `sign_dispatch` handles must be reported as
+    /// natively dispatched, and every one it does not must not be.
+    #[test]
+    fn natively_dispatched_matches_the_dispatch_arms() {
+        // Handled by both dispatch tables.
+        for alg in [
+            SIG_SHA256_RSA,
+            SIG_PSS_SHA256,
+            SIG_PSS_SHA384,
+            SIG_PSS_SHA512,
+            SIG_SHA256_ECDSA,
+            SIG_SHA384_ECDSA,
+            SIG_ED25519,
+        ] {
+            assert!(natively_dispatched(alg), "alg {alg} has a dispatch arm");
+        }
+        // Not handled — these reach the `_ => None` arm and must be reported
+        // as such so the refusal message is accurate.
+        for alg in [
+            SIG_SHA384_RSA,
+            SIG_SHA512_RSA,
+            SIG_SHA1_RSA,
+            SIG_SHA512_ECDSA,
+            SIG_SHA256_DSA,
+            SIG_SHA1_DSA,
+            SIG_MLDSA,
+            -1,
+        ] {
+            assert!(
+                !natively_dispatched(alg),
+                "alg {alg} has no dispatch arm and must not be claimed as one"
+            );
+        }
+    }
+
+    /// The `Option` contract the whole fix rests on: `None` means "never
+    /// checked", `Some(false)` means "checked, and it does not match".
+    #[test]
+    fn verify_dispatch_distinguishes_never_checked_from_did_not_match() {
+        let id = shared_rsa_key_id();
+        let msg = b"the message that was signed";
+        let sig = sign_dispatch(SIG_SHA256_RSA, id, msg).expect("a registered key must sign");
+        assert!(!sig.is_empty(), "a real signature is never zero-length");
+
+        // MUST STILL WORK.
+        assert_eq!(
+            verify_dispatch(SIG_SHA256_RSA, id, msg, &sig),
+            Some(true),
+            "the signature this key just produced must verify"
+        );
+        // PRESERVED NEGATIVE — a forgery is `Some(false)`, not an error.
+        let mut forged = sig.clone();
+        forged[0] ^= 0xff;
+        assert_eq!(
+            verify_dispatch(SIG_SHA256_RSA, id, msg, &forged),
+            Some(false)
+        );
+        assert_eq!(
+            verify_dispatch(SIG_SHA256_RSA, id, b"a different message", &sig),
+            Some(false)
+        );
+        // NEVER CHECKED — an unregistered handle and an unsupported algorithm
+        // are both `None`, and neither may be collapsed into `false`.
+        assert_eq!(verify_dispatch(SIG_SHA256_RSA, u64::MAX, msg, &sig), None);
+        assert_eq!(verify_dispatch(SIG_SHA1_DSA, id, msg, &sig), None);
+        assert_eq!(sign_dispatch(SIG_SHA256_RSA, u64::MAX, msg), None);
+        assert_eq!(sign_dispatch(SIG_SHA1_DSA, id, msg), None);
+    }
+
+    /// MUST STILL WORK, at the native-call level: sign then verify through the
+    /// registered natives, and confirm a tampered signature comes back as a
+    /// plain `false` with no exception.
+    #[test]
+    fn native_sign_verify_round_trip_and_genuine_mismatch_is_false() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let id = shared_rsa_key_id();
+
+        let signing_key = key_object(&mut ctx, id);
+        let signer = make_inited_sig(&mut ctx, "SHA256withRSA", Some(signing_key), false);
+        let sig_arr = match sig_sign(&mut ctx, &[Value::Object(Some(signer))]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            other => panic!("sign() must succeed for a registered key, got {other:?}"),
+        };
+        let sig_bytes = read_byte_array_full(&mut ctx, sig_arr);
+        assert!(!sig_bytes.is_empty(), "sign() must not return an empty array");
+
+        // Genuine positive.
+        let verify_key = key_object(&mut ctx, id);
+        let verifier = make_inited_sig(&mut ctx, "SHA256withRSA", Some(verify_key), true);
+        let good = alloc_byte_array(&mut ctx, &sig_bytes);
+        assert_eq!(
+            sig_verify(
+                &mut ctx,
+                &[Value::Object(Some(verifier)), Value::Object(Some(good))]
+            )
+            .unwrap(),
+            Some(Value::Int(1))
+        );
+
+        // PRESERVED NEGATIVE: tampered bits are what a forgery looks like.
+        // This is the real security decision and must stay a `false`.
+        let mut tampered = sig_bytes.clone();
+        tampered[0] ^= 0xff;
+        let verify_key2 = key_object(&mut ctx, id);
+        let verifier2 = make_inited_sig(&mut ctx, "SHA256withRSA", Some(verify_key2), true);
+        let bad = alloc_byte_array(&mut ctx, &tampered);
+        assert_eq!(
+            sig_verify(
+                &mut ctx,
+                &[Value::Object(Some(verifier2)), Value::Object(Some(bad))]
+            )
+            .unwrap(),
+            Some(Value::Int(0)),
+            "a real digest mismatch must remain a `false`, not become an exception"
+        );
+    }
+
+    /// MUST RAISE: `verify()` with a key this VM cannot use answered `false`
+    /// before — indistinguishable, at the call site, from a forged signature.
+    #[test]
+    fn native_verify_with_an_unusable_key_raises_instead_of_returning_false() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        // Slot 3 left at 0: no such handle in `crypto_impl`'s RSA key store.
+        let verifier = make_inited_sig(&mut ctx, "SHA256withRSA", None, true);
+        let sig = alloc_byte_array(&mut ctx, &[1, 2, 3, 4]);
+        let err = sig_verify(
+            &mut ctx,
+            &[Value::Object(Some(verifier)), Value::Object(Some(sig))],
+        )
+        .expect_err("an unanswerable verify must raise, not report a mismatch");
+        assert_signature_exception(&mut ctx, err);
+    }
+
+    /// MUST RAISE: `sign()` used to hand back an empty `byte[]` — a caller
+    /// storing that ships an unsigned artefact believing it signed one.
+    #[test]
+    fn native_sign_with_an_unusable_key_raises_instead_of_returning_an_empty_signature() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let signer = make_inited_sig(&mut ctx, "SHA256withRSA", None, false);
+        let err = sig_sign(&mut ctx, &[Value::Object(Some(signer))])
+            .expect_err("an unanswerable sign must raise, not return an empty signature");
+        assert_signature_exception(&mut ctx, err);
+    }
+
+    /// MUST RAISE: an algorithm with no native arm at all (SHA-512withECDSA is
+    /// mapped by `algo_idx` but has no `sign_dispatch`/`verify_dispatch` arm)
+    /// and EC routing off. Uses the dispatch layer directly so the test does
+    /// not depend on the real-SPI routing flags.
+    #[test]
+    fn an_algorithm_with_no_backend_is_never_reported_as_a_mismatch() {
+        assert_eq!(
+            verify_dispatch(SIG_SHA512_ECDSA, shared_rsa_key_id(), b"m", b"s"),
+            None,
+            "an algorithm with no backend must not answer the verification question"
+        );
+    }
+
+    fn assert_signature_exception(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        err: cratonvm_types::error::MethodCallFailed,
+    ) {
+        use cratonvm_types::error::MethodCallFailed;
+        match err {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                let cid = ctx.class_id_of_object(exc);
+                assert_eq!(
+                    ctx.class_name_of_id(cid).as_deref(),
+                    Some(SIGNATURE_EXCEPTION),
+                    "the refusal must be the exception sign()/verify() declare"
+                );
+            }
+            // `throw_jca_exc`'s fallback arm — still loud, still not a value.
+            MethodCallFailed::InternalError(e) => {
+                let text = format!("{e}");
+                assert!(
+                    text.contains("IllegalArgumentException"),
+                    "unexpected fallback: {text}"
+                );
+            }
+        }
+    }
 }
