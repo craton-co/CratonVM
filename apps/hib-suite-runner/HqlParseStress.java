@@ -27,7 +27,10 @@ import org.hibernate.grammars.hql.HqlParser;
  * number of young collections the parse is exposed to.
  *
  * <p>usage: {@code HqlParseStress [iterations]} — prints
- * {@code @@HQLSTRESS iters=N errors=M} and exits non-zero on any misparse.
+ * {@code @@HQLSTRESS iters=N queries=Q misparsed=M} and exits non-zero on any
+ * misparse. On success it returns normally rather than calling
+ * {@code System.exit(0)}, so the VM's shutdown GC summary is printed — see
+ * {@code main}.
  */
 public final class HqlParseStress {
 
@@ -78,7 +81,15 @@ public final class HqlParseStress {
             "@@HQLSTRESS iters=" + iterations
                 + " queries=" + QUERIES.length
                 + " misparsed=" + misparsed.size());
-        System.exit(misparsed.isEmpty() ? 0 : 1);
+        // Return normally on success rather than System.exit(0). The VM prints
+        // its GC summary (`[GC] generational: minor=N`, `[GC] moving_young:
+        // cycles=N`) during orderly shutdown only, and those lines are the only
+        // way to tell a run that actually exercised the collector from one where
+        // the GC-stress lever was inert — which is exactly the mistake this
+        // probe exists to avoid making. `System.exit` skips them.
+        if (!misparsed.isEmpty()) {
+            System.exit(1);
+        }
     }
 
     /**
