@@ -6535,9 +6535,13 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         // bare local, so every store below must use a re-read reference.
         let this_pin = ctx.pin_native_root(this);
         let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+        let buckets_pin = ctx.pin_native_root(buckets);
+        let this = ctx.read_native_pin(this_pin, this);
+        let buckets = ctx.read_native_pin(buckets_pin, buckets);
+        ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        // The store above is a GC point (write barrier); refresh before reusing.
         let this = ctx.read_native_pin(this_pin, this);
         ctx.unpin_native_roots(this_pin);
-        ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
         set_map_size(ctx, this, 0);
         let cname = ctx
             .class_name_of_id(ctx.class_id_of_object(this))
@@ -6559,11 +6563,17 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // Legacy synthetic layout — what every other native HashMap op expects.
     // GC-safety: same hazard as the Hashtable branch above — `alloc_ref_array`
     // can collect, and every field store from here on uses `this`.
+    // A reference-typed store is itself a GC point: its write barrier can
+    // allocate a remembered-set entry and complete a young collection (see
+    // the `map_resize` chain-cursor fix). Keep both pins live and re-read
+    // across every such store, not just across the allocation.
     let this_pin = ctx.pin_native_root(this);
     let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+    let buckets_pin = ctx.pin_native_root(buckets);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    let this = ctx.read_native_pin(this_pin, this);
     set_map_size(ctx, this, 0);
     // S111r29: Resolve the JDK `table` slot (descriptor `[Ljava/util/HashMap$Node;`)
     // and store the bucket array there. Writing `Int(MAP_DEFAULT_CAPACITY)` to
@@ -6579,9 +6589,13 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
     if let Some(slot) = table_slot {
         if slot < ctx.object_num_fields(this) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let buckets = ctx.read_native_pin(buckets_pin, buckets);
             ctx.set_field(this, slot, Value::Object(Some(buckets)));
         }
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     if table_slot != Some(MAP_FIELD_CAPACITY) {
         ctx.set_field(
             this,
@@ -6643,11 +6657,17 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // which is what `new HashSet<>(...)`'s backing map goes through — never
     // got the same treatment, so the bucket-array store below could land on a
     // stale receiver and leave the fresh map with no table at all.
+    // A reference-typed store is itself a GC point: its write barrier can
+    // allocate a remembered-set entry and complete a young collection (see
+    // the `map_resize` chain-cursor fix). Keep both pins live and re-read
+    // across every such store, not just across the allocation.
     let this_pin = ctx.pin_native_root(this);
     let (buckets, cap) = alloc_bucket_table(ctx, cap);
+    let buckets_pin = ctx.pin_native_root(buckets);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    let this = ctx.read_native_pin(this_pin, this);
     set_map_size(ctx, this, 0);
     // S111r29: see `native_map_init` for rationale. Mirror the bucket array
     // into the JDK `table` slot so `HashMap.resize()` bytecode sees an array
@@ -6656,9 +6676,13 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
     if let Some(slot) = table_slot {
         if slot < ctx.object_num_fields(this) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let buckets = ctx.read_native_pin(buckets_pin, buckets);
             ctx.set_field(this, slot, Value::Object(Some(buckets)));
         }
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     if table_slot != Some(MAP_FIELD_CAPACITY) {
         ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     }
