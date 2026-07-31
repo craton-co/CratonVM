@@ -161,10 +161,16 @@ jobs:
       #
       #   before   reported 2584 of 3927 (2523 pass, 61 fail), then exit 1 with
       #            NO `test result` line — 1,343 tests never executed
-      #   now      test result: FAILED. 3748 passed; 75 failed; 115 ignored
-      #            (3748+75+115 = 3938, every test accounted for, exit 101)
+      #   now      test result: FAILED. 3763 passed; 60 failed; 115 ignored
+      #            (3763+60+115 = 3938, every test accounted for, exit 101)
       #
-      # So 61 was a floor twice over: the real total was 173, now down to 75.
+      # So 61 was a floor twice over: the real total was 173, now down to 60.
+      #
+      # The count moves by +/-1 between runs: `p86_chm_concurrent_iteration`
+      # passes in isolation AND within a `p86_` filtered run, but fails under
+      # full-suite load. A load-dependent flake like that would make the
+      # promoted gate red intermittently, so it needs fixing before promotion
+      # regardless of where the total lands.
       # Measured AFTER merging origin/dev (140 commits; the merge added 12
       # tests, hence 3938 rather than 3926).
       #
@@ -189,7 +195,7 @@ jobs:
       #
       # TWO things still block promotion. Both are measured:
       #
-      #  1. 75 failing tests. The systemic causes are exhausted. The tail is
+      #  1. 60 failing tests. The systemic causes are exhausted. The tail is
       #     individual, and a chunk of it is NOT missing work — it is work that
       #     was deliberately UNDONE, so "implementing" it would be a regression:
       #       * `java/util/Timer` — the synthetic natives were deleted because
