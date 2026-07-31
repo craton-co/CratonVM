@@ -1067,6 +1067,30 @@ impl VmHeap {
         }
     }
 
+    /// Bytes the TENURED space can still absorb — the "is the heap actually
+    /// wedged?" half of the GC-overhead limit (see
+    /// `interpreter::note_gc_productivity`).
+    ///
+    /// The freed-bytes threshold on its own cannot tell a genuine
+    /// retained-allocation death spiral (survivors promoted into an old
+    /// generation that is already full, so nothing drains) from a young
+    /// generation that simply has nothing to promote while old gen sits nearly
+    /// empty. The distinguishing fact is whether old gen can still absorb a
+    /// young drain, which is a question about the OLD generation specifically,
+    /// not about total fullness: in the spiral the young semi is emptied every
+    /// cycle, so *total* fullness parks near young/total and never looks
+    /// exhausted — which is exactly why a total-fullness gate was rejected.
+    ///
+    /// Non-generational backends have no separate tenured space; report their
+    /// whole-heap headroom, which for a single-space collector is the same
+    /// question.
+    pub fn old_gen_headroom(&self) -> usize {
+        match self {
+            VmHeap::Generational(h) => h.old_gen_capacity().saturating_sub(h.old_gen_used()),
+            _ => self.heap_capacity().saturating_sub(self.allocated_bytes()),
+        }
+    }
+
     /// Run a garbage collection cycle.
     ///
     /// The `stw` parameter is type-level proof that the caller is in a

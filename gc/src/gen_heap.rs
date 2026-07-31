@@ -6470,18 +6470,38 @@ impl GenerationalHeap {
         // `CRATONVM_SELECTIVE_PROMOTE` gate is now redundant (always-on) but kept
         // accepted for compatibility. This path runs only here, in the JIT-active
         // non-moving sweep, so it never affects the no-JIT moving Cheney.
-        // xt-hardening (2026-07-03): do NOT evacuate on cycles where the JIT
-        // root coverage is known-incomplete (forcibly-frozen peers, helper
-        // windows, or reserved TLAB tails present — the VM marks the cycle
-        // via `mark_moving_young_coverage_incomplete`). A frozen peer's
-        // registers can hold ONLY a derived/interior pointer to an object
-        // whose base is reachable via precise heap edges: the base is not
-        // pin-by-value protected (interior addresses don't resolve to roots),
-        // gets evacuated, its young source zeroed and re-served, and the
-        // resumed peer keeps loading/storing through the stale derived
-        // pointer. Retention for one cycle is always safe; the flag is
-        // per-cycle so ordinary (single-threaded / cooperative) collections
-        // keep the bt18-critical drain.
+        // xt-hardening (2026-07-03): do NOT evacuate on cycles that scanned
+        // UN-REWRITABLE PEER STATE — a forcibly OS-suspended in-JIT peer, or a
+        // blocked peer's JIT helper window. Such a peer's registers can hold
+        // ONLY a derived/interior pointer to an object whose base is reachable
+        // via precise heap edges: the base is not pin-by-value protected
+        // (interior addresses don't resolve to roots), gets evacuated, its young
+        // source zeroed and re-served, and the resumed peer keeps loading /
+        // storing through the stale derived pointer. Retention for one cycle is
+        // always safe; the flag is per-cycle so ordinary (single-threaded /
+        // cooperative) collections keep the bt18-critical drain.
+        //
+        // HIB-GCOVERHEAD-HALFFULL.1 (2026-07-31): this gate used to read
+        // `moving_young_coverage_incomplete()`, which in July 2026 had exactly
+        // one caller — the cross-thread takeover path above — and so meant the
+        // same thing. It does not any more. arch-2026-07-26 reused that flag for
+        // the entirely separate question "may the COPYING collector relocate
+        // this cycle?", and once moving-young became the default it was set on
+        // essentially every JIT-active collection (`UNPUBLISHED_FRAME_OOP`,
+        // `MISSING_EXACT_RBP`, `unregistered-jit-frame-on-stack`, …). Selective
+        // promotion — the non-moving sweep's ONLY young→old drain — therefore
+        // switched itself off VM-wide, and since the non-moving sweep is also
+        // the default collector under a live JIT frame, the young generation
+        // could never drain at all. Young filled with live objects, every forced
+        // GC freed a sliver, the GC-overhead streak latched, and the VM raised
+        // `OutOfMemoryError` on a 49 %-full heap with 570 MB free.
+        //
+        // Those coverage reasons are NOT this hazard: they describe frames the
+        // conservative scan still walks on this thread's stack, and selective
+        // promotion is safe under exactly that regime because it pins by raw
+        // slot VALUE (a conservative false positive pins a random object; it can
+        // never mis-relocate one). Read the narrow predicate instead — see
+        // `gc_quiescence::unrewritable_peer_state` for the full fault line.
         // No object can satisfy `gc_age + 1 >= PROMOTION_AGE` until it has
         // survived `PROMOTION_AGE - 1` prior minor collections. Skip the two
         // guaranteed-no-op full-arena promotion walks at heap startup.
@@ -6489,7 +6509,7 @@ impl GenerationalHeap {
             >= u64::from(PROMOTION_AGE.saturating_sub(1));
         let selective_on = promotion_age_reachable
             && !gc_flags().no_selective_promote
-            && !crate::gc_quiescence::moving_young_coverage_incomplete();
+            && !crate::gc_quiescence::unrewritable_peer_state();
         if selective_on {
             let is_y = |a: usize| -> bool { a >= from_base && a < from_end && (a & 0x7) == 0 };
 
@@ -13366,6 +13386,83 @@ mod tests {
 
         assert_eq!(result.stats.objects_copied, 0);
         assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
+    }
+
+    /// HIB-GCOVERHEAD-HALFFULL.1 regression, at the collector.
+    ///
+    /// Selective promotion is the non-moving sweep's ONLY young→old drain, and
+    /// the non-moving sweep is the default collector under a live JIT frame. So
+    /// on a cycle whose moving-young coverage is unproven for an ordinary
+    /// this-thread reason — `UNPUBLISHED_FRAME_OOP`, the single most common
+    /// reason in production — the drain must still run. When it did not, young
+    /// filled with live objects that could never leave it, every forced GC freed
+    /// a sliver, and the VM raised `OutOfMemoryError` on a half-empty heap.
+    ///
+    /// `XT_TAKEOVER` is the control: promotion must still switch off there, or
+    /// this "fix" would just be a revert of the 2026-07-03 xt-hardening.
+    #[test]
+    fn selective_promotion_runs_under_an_unproven_frame_map_but_not_a_frozen_peer() {
+        // `reason` -> objects promoted after enough cycles to reach
+        // PROMOTION_AGE. The root itself is pinned by value (as every root is),
+        // so the drain is observed on the heap-interior object it references.
+        fn promoted_under(reason: usize) -> u64 {
+            let heap = small_gen_heap();
+            let monitors = NoOpMonitors;
+
+            let obj_a = heap.alloc_object(ClassId::new(1), 1);
+            let obj_b = heap.alloc_object(ClassId::new(2), 1);
+            heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+            heap.set_field(obj_b, 0, Value::Int(4242));
+
+            crate::gc_quiescence::publish_moving_young_enabled(true);
+            crate::gc_quiescence::clear_force_non_moving_jit_roots();
+            crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+            crate::gc_quiescence::enter();
+
+            let mut roots = vec![obj_a];
+            // Comfortably past PROMOTION_AGE: aging happens inside the
+            // selective-promotion pass itself, so a gate that is off produces
+            // no age bumps and the count stays at zero however long we run.
+            for _ in 0..(PROMOTION_AGE as usize + 4) {
+                crate::gc_quiescence::begin_moving_young_coverage_cycle();
+                crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(reason);
+                let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+                assert_eq!(
+                    result.stats.objects_copied, 0,
+                    "an unproven cycle must never run the COPYING collector, \
+                     whatever it decides about promotion",
+                );
+            }
+
+            crate::gc_quiescence::leave();
+            crate::gc_quiescence::begin_moving_young_coverage_cycle();
+            crate::gc_quiescence::publish_moving_young_enabled(false);
+
+            // The graph must survive either way — a drain that loses an object
+            // is not a fix.
+            match heap.get_field(roots[0], 0) {
+                Value::Object(Some(b)) => {
+                    assert_eq!(heap.get_field(b, 0).as_int(), Some(4242));
+                }
+                other => panic!("A's field should still reference B, got {other:?}"),
+            }
+            heap.stats().snapshot().objects_promoted
+        }
+
+        assert!(
+            promoted_under(crate::gc_quiescence::incomplete_reason::UNPUBLISHED_FRAME_OOP) > 0,
+            "an unproven compiled-frame oop map must NOT disable selective \
+             promotion: it is the young generation's only drain under a live JIT \
+             frame, and switching it off wedges young full of live objects \
+             (HIB-GCOVERHEAD-HALFFULL.1 — OutOfMemoryError on a 49%-full heap)",
+        );
+        assert_eq!(
+            promoted_under(crate::gc_quiescence::incomplete_reason::XT_TAKEOVER),
+            0,
+            "a forcibly-frozen in-JIT peer MUST still suppress promotion: its \
+             registers can hold a derived/interior pointer whose base \
+             pin-by-value does not protect (xt-hardening 2026-07-03)",
+        );
     }
 
     #[test]
