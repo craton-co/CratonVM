@@ -155,6 +155,36 @@ pub fn open_udp_gated(
 }
 
 // ---------------------------------------------------------------------------
+// Error translation
+// ---------------------------------------------------------------------------
+
+/// Turn a gated-open failure into the exception the call site should throw.
+///
+/// The two halves of [`FdCapabilityError`] are genuinely different and must not
+/// be collapsed:
+///
+/// * a **refusal** happened *before* the syscall and must not be retried, so it
+///   surfaces as the `SecurityException` `CapabilityDenied` converts to,
+///   carrying the kind, the scope, the VM and the gate's source location;
+/// * an **I/O failure** keeps the exact `IOException` message the call site
+///   already produced, so nothing that catches or matches on it changes.
+///
+/// `io_message` is only invoked on the I/O arm, so building the message costs
+/// nothing on the success and refusal paths.
+pub fn translate_open_failure(
+    err: FdCapabilityError,
+    io_message: impl FnOnce(&std::io::Error) -> String,
+) -> MethodCallFailed {
+    match err {
+        FdCapabilityError::Denied(denied) => denied.into(),
+        FdCapabilityError::Io(io) => cratonvm_types::error::RuntimeError::IOException {
+            message: io_message(&io),
+        }
+        .into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bare capability gates (for sites that do not go through the fd table)
 // ---------------------------------------------------------------------------
 

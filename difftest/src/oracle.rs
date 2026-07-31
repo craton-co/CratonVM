@@ -411,34 +411,77 @@ fn exit_token(o: &Observation) -> String {
     }
 }
 
-/// Compare two optional exceptions; returns a `ChannelDiff` on disagreement.
-/// fqcn and ordered frames are exact; the message is compared after the
-/// normalizer (so a path/hash in a message can be masked when opted in).
+/// Compare two optional exceptions across the four exception dimensions.
+///
+/// * **presence** — one side threw and the other did not. This short-circuits:
+///   when only one side has an exception there is nothing to compare its type
+///   or message against, and reporting three more diffs against `<none>` would
+///   triple-count one finding.
+/// * **type** — `fqcn`, exact. Never normalized: a class name is a semantic
+///   observable, and no rule in the set has any business rewriting one.
+/// * **message** — exact after the normalizer, so a masked path or identity
+///   hash inside a message can be neutralized when a seed opts in.
+/// * **frames** — compared *in order*, one per line, each normalized (this is
+///   the dimension `frame-line-numbers` exists for).
 fn compare_exception(
     cratonvm: &Option<JvmException>,
     hotspot: &Option<JvmException>,
     normalizer: &Normalizer,
-) -> Option<ChannelDiff> {
-    let render = |e: &Option<JvmException>| match e {
-        None => "<none>".to_string(),
-        Some(ex) => format!(
-            "{}: {} [{}]",
-            ex.fqcn,
-            normalizer.apply(&ex.message),
-            ex.top_frames.join(" / ")
-        ),
+) -> Vec<ChannelDiff> {
+    let summarize = |e: &JvmException| format!("{}: {}", e.fqcn, e.message);
+    let (c, h) = match (cratonvm, hotspot) {
+        (None, None) => return Vec::new(),
+        (Some(c), None) => {
+            return vec![ChannelDiff {
+                channel: Channel::Exception,
+                cratonvm: summarize(c),
+                hotspot: "<none>".to_string(),
+            }]
+        }
+        (None, Some(h)) => {
+            return vec![ChannelDiff {
+                channel: Channel::Exception,
+                cratonvm: "<none>".to_string(),
+                hotspot: summarize(h),
+            }]
+        }
+        (Some(c), Some(h)) => (c, h),
     };
-    let c = render(cratonvm);
-    let h = render(hotspot);
-    if c != h {
-        Some(ChannelDiff {
-            channel: Channel::Exception,
-            cratonvm: c,
-            hotspot: h,
-        })
-    } else {
-        None
+
+    let mut diffs = Vec::new();
+    if c.fqcn != h.fqcn {
+        diffs.push(ChannelDiff {
+            channel: Channel::ExceptionType,
+            cratonvm: c.fqcn.clone(),
+            hotspot: h.fqcn.clone(),
+        });
     }
+    let c_msg = normalizer.apply(&c.message);
+    let h_msg = normalizer.apply(&h.message);
+    if c_msg != h_msg {
+        diffs.push(ChannelDiff {
+            channel: Channel::ExceptionMessage,
+            cratonvm: c_msg,
+            hotspot: h_msg,
+        });
+    }
+    let render_frames = |e: &JvmException| {
+        e.top_frames
+            .iter()
+            .map(|f| normalizer.apply(f))
+            .collect::<Vec<String>>()
+            .join("\n")
+    };
+    let c_frames = render_frames(c);
+    let h_frames = render_frames(h);
+    if c_frames != h_frames {
+        diffs.push(ChannelDiff {
+            channel: Channel::ExceptionFrames,
+            cratonvm: c_frames,
+            hotspot: h_frames,
+        });
+    }
+    diffs
 }
 
 /// One CratonVM mode's outcome, distilled for classification: did it diverge

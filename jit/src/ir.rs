@@ -5801,18 +5801,20 @@ mod tests {
         );
         assert!(g.use_lists_valid(), "the scan re-derived the lists");
         assert_eq!(g.verify_use_lists(), Ok(()));
-        assert_eq!(g.use_counts(), {
-            g.nodes
-                .iter()
-                .fold(vec![0u32; g.nodes.len()], |mut acc, n| {
-                    for &i in n.inputs.as_slice() {
-                        if (i as usize) < acc.len() {
-                            acc[i as usize] += 1;
-                        }
-                    }
-                    acc
-                })
-        });
+        assert_eq!(g.use_counts(), scanned_use_counts(&g));
+    }
+
+    /// `use_counts` as it was written before the use lists existed.
+    fn scanned_use_counts(g: &Graph) -> Vec<u32> {
+        let mut counts = vec![0u32; g.nodes.len()];
+        for node in &g.nodes {
+            for &inp in node.inputs.as_slice() {
+                if (inp as usize) < counts.len() {
+                    counts[inp as usize] += 1;
+                }
+            }
+        }
+        counts
     }
 
     /// The incremental rewrite must produce the *same graph* as the historical

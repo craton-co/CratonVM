@@ -14064,4 +14064,207 @@ mod tests {
             8 * 1000 * 48
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Per-VM state (P0 / P1 — `docs/architecture/per-vm-state.md`)
+    // -----------------------------------------------------------------------
+    //
+    // The hook registry is process-global, so these tests serialize against
+    // each other and assert only on the VMs THEY created (never on the total
+    // registry length, which a concurrently-running test may inflate) — the
+    // same discipline `memory::native_roots`'s tests use.
+
+    /// Serializes the tests below, which mutate the process-global
+    /// `RESOLUTION_INVALIDATE_VMS` registry.
+    static HOOK_REGISTRY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn registry_contains(shared: &Arc<SharedVm>) -> bool {
+        live_hook_vms()
+            .iter()
+            .any(|live| Arc::ptr_eq(live, shared))
+    }
+
+    /// Everything that keys process-global state per VM (`object_class_id`'s
+    /// thread-local cache, `offload_jit_gate`'s `GateKey`, `interpreter`'s EC
+    /// watch memo, `invokedynamic`'s lambda-singleton cache) rests on this one
+    /// fact. If two live VMs could ever share a `vm_identity`, every one of
+    /// those keys silently aliases again.
+    #[test]
+    fn vm_identity_is_unique_per_shared_vm() {
+        let a = Arc::new(SharedVm::new(VmConfig::default()));
+        let b = Arc::new(SharedVm::new(VmConfig::default()));
+        assert_ne!(
+            a.vm_identity, b.vm_identity,
+            "two concurrently-live VMs must not share a vm_identity"
+        );
+    }
+
+    /// A `ClassId` names a DIFFERENT class in each VM (`ClassStore::next_id`
+    /// is `self.classes.len()`, which restarts at 0 per VM), so any cache
+    /// keyed on a bare `ClassId` aliases across VMs. This asserts the fix
+    /// shape: prefixing the key with `vm_identity` separates them.
+    #[test]
+    fn vm_keyed_class_ids_do_not_collide_across_vms() {
+        let a = Arc::new(SharedVm::new(VmConfig::default()));
+        let b = Arc::new(SharedVm::new(VmConfig::default()));
+
+        let bare = ClassId::new(7);
+        let key_a = (a.vm_identity, bare);
+        let key_b = (b.vm_identity, bare);
+
+        assert_ne!(
+            key_a, key_b,
+            "the same numeric ClassId in two VMs must produce two distinct keys"
+        );
+
+        let mut cache: HashMap<(usize, ClassId), &'static str> = HashMap::new();
+        cache.insert(key_a, "vm-a-class");
+        cache.insert(key_b, "vm-b-class");
+        assert_eq!(cache.get(&key_a).copied(), Some("vm-a-class"));
+        assert_eq!(cache.get(&key_b).copied(), Some("vm-b-class"));
+    }
+
+    /// EVIDENCE for the security-manager finding
+    /// (`native-builtins/src/security_manager.rs`, `SECURITY_MANAGER`).
+    ///
+    /// The var-handle root registry lives in `SharedVm::mem` (see
+    /// `vm::realms::heap_realm::HeapRealm::var_handle_roots`), i.e. it is
+    /// PER-VM. A native subsystem that caches `(identity_key, ObjectRef)` in a
+    /// PROCESS-GLOBAL slot and re-reads the current address with
+    /// `ctx.read_var_handle_root(key).unwrap_or(cached)` therefore misses in
+    /// every VM except the one that installed it — and silently falls back to
+    /// the raw `cached` address, which that VM's GC neither scans nor rewrites.
+    /// Under a moving young GC that is a use-after-move, not a policy leak.
+    ///
+    /// This test pins the property the fallback depends on, so the security
+    /// manager's per-VM ownership cannot be "fixed" by re-adding a shared
+    /// registry without this failing.
+    #[test]
+    fn var_handle_roots_are_per_vm_so_a_global_cached_ref_cannot_be_remapped() {
+        let a = Arc::new(SharedVm::new(VmConfig::default()));
+        let b = Arc::new(SharedVm::new(VmConfig::default()));
+
+        // A never-dereferenced, 8-byte-aligned synthetic address standing in
+        // for a SecurityManager instance allocated in VM A's heap.
+        // SAFETY: non-null and aligned; only ever compared by pointer value.
+        let sm_in_vm_a = unsafe { ObjectRef::from_raw(0x5EC0_0000usize as *mut u8) };
+        let identity_key: i32 = 0x5EC0;
+
+        a.mem
+            .var_handle_roots
+            .write()
+            .insert(identity_key, sm_in_vm_a);
+
+        assert_eq!(
+            a.mem
+                .var_handle_roots
+                .read()
+                .get(&identity_key)
+                .copied(),
+            Some(sm_in_vm_a),
+            "the installing VM must see its own var-handle root"
+        );
+        assert!(
+            b.mem
+                .var_handle_roots
+                .read()
+                .get(&identity_key)
+                .is_none(),
+            "VM B must NOT resolve VM A's var-handle key — the `unwrap_or(cached)` \
+             fallback in a process-global singleton therefore hands VM B a raw, \
+             unrooted, un-remappable reference into VM A's heap"
+        );
+    }
+
+    /// Regression: the redefine-invalidation bridge used to be a
+    /// `OnceLock<Weak<SharedVm>>`, so the FIRST VM ever created owned the hook
+    /// for the life of the process. Registering a second VM was silently
+    /// dropped, and every `RedefineClasses` in that VM left its own
+    /// `ResolutionCache` / `LinkResolver` serving pre-redefine
+    /// `(declaring_class_id, index)` pairs.
+    #[test]
+    fn hook_registry_reaches_every_live_vm_not_just_the_first() {
+        let _guard = HOOK_REGISTRY_TEST_LOCK.lock();
+
+        let first = Arc::new(SharedVm::new(VmConfig::default()));
+        let second = Arc::new(SharedVm::new(VmConfig::default()));
+
+        set_global_shared_vm_for_hooks(Arc::downgrade(&first));
+        set_global_shared_vm_for_hooks(Arc::downgrade(&second));
+
+        assert!(
+            registry_contains(&first),
+            "the first-registered VM must stay reachable"
+        );
+        assert!(
+            registry_contains(&second),
+            "a VM registered AFTER another must still receive hook callbacks — \
+             the old OnceLock silently ignored it"
+        );
+
+        // The adapters must not panic or deadlock with several VMs live; they
+        // take VM-internal locks, so this also exercises the "snapshot the
+        // registry, then drop its lock" ordering in `live_hook_vms`.
+        resolution_invalidate_adapter(0);
+        jit_invalidate_adapter(0);
+    }
+
+    /// Registering the same VM twice must not double it in the registry, or
+    /// every redefine would invalidate that VM's caches twice.
+    #[test]
+    fn hook_registry_registration_is_idempotent() {
+        let _guard = HOOK_REGISTRY_TEST_LOCK.lock();
+
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        set_global_shared_vm_for_hooks(Arc::downgrade(&shared));
+        set_global_shared_vm_for_hooks(Arc::downgrade(&shared));
+        set_global_shared_vm_for_hooks(Arc::downgrade(&shared));
+
+        let occurrences = live_hook_vms()
+            .iter()
+            .filter(|live| Arc::ptr_eq(live, &shared))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "a VM registered three times must appear exactly once"
+        );
+    }
+
+    /// Teardown isolation: dropping one VM must prune only that VM's entry and
+    /// leave every other registered VM reachable. (This is also what stops a
+    /// long-lived embedding that creates and destroys many VMs from
+    /// accumulating dead `Weak`s.)
+    #[test]
+    fn dropping_one_vm_leaves_the_other_registered() {
+        let _guard = HOOK_REGISTRY_TEST_LOCK.lock();
+
+        let survivor = Arc::new(SharedVm::new(VmConfig::default()));
+        let doomed = Arc::new(SharedVm::new(VmConfig::default()));
+        set_global_shared_vm_for_hooks(Arc::downgrade(&survivor));
+        set_global_shared_vm_for_hooks(Arc::downgrade(&doomed));
+
+        let doomed_weak = Arc::downgrade(&doomed);
+        drop(doomed);
+        assert!(
+            doomed_weak.upgrade().is_none(),
+            "the registry must hold a Weak, never an Arc — otherwise a dropped \
+             VM is kept alive forever by the hook bridge"
+        );
+
+        assert!(
+            registry_contains(&survivor),
+            "tearing down one VM must not unregister the others"
+        );
+        // ...and the pruned entry must be gone, not merely un-upgradable.
+        let still_listed = live_hook_vms().len();
+        let after_second_sweep = live_hook_vms().len();
+        assert_eq!(
+            still_listed, after_second_sweep,
+            "live_hook_vms must prune dead entries so repeated sweeps are stable"
+        );
+
+        // Firing the hooks with a dead entry already swept must be a no-op,
+        // not a panic.
+        resolution_invalidate_adapter(0);
+    }
 }

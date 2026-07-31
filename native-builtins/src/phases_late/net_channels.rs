@@ -1475,11 +1475,12 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                 "127.0.0.1:80".into()
             };
             // Blocking TCP connect
-            let fd_id = ctx.fd_table().open_tcp_connect(&addr_str).map_err(|e| {
-                RuntimeError::IOException {
-                    message: format!("connect failed: {}", e),
-                }
-            })?;
+            let fd_id = crate::capability_gate::open_tcp_connect_gated(&*ctx, &addr_str)
+                .map_err(|e| {
+                    crate::capability_gate::translate_open_failure(e, |io| {
+                        format!("connect failed: {io}")
+                    })
+                })?;
             ctx.set_field(this, 0, Value::Int(1)); // connected
             ctx.set_field(this, 2, Value::Int(fd_id as i32));
             ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Object(None)));
