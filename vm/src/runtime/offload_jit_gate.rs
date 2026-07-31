@@ -133,10 +133,7 @@ use crate::classloading::ClassId;
 use crate::vm::SharedVm;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
-/// Process-lifetime cache of admission verdicts, keyed by the owning VM's
-/// identity plus the caller method's `(ClassId, method_index_in_class)` — the
-/// same stable key [`crate::runtime::offload::OffloadCache`] uses. See the
-/// module docs' "Design" section for why this is never invalidated.
+/// `(vm_identity, ClassId, method_index_in_class)`.
 ///
 /// PER-VM STATE (P0, `docs/architecture/per-vm-state.md`). The `vm_identity`
 /// component is load-bearing, not decorative: `ClassId`s are allocated per-VM
@@ -149,6 +146,11 @@ use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 /// a specific VM's class store, so the VM has to be part of the key.
 type GateKey = (usize, ClassId, u16);
 
+/// Process-lifetime cache of admission verdicts, keyed by [`GateKey`] — the
+/// same stable `(ClassId, method_index)` pair
+/// [`crate::runtime::offload::OffloadCache`] uses, prefixed with the owning
+/// VM. See the module docs' "Design" section for why this is never
+/// invalidated.
 static GATE_CACHE: OnceLock<RwLock<FxHashMap<GateKey, bool>>> = OnceLock::new();
 
 fn cache() -> &'static RwLock<FxHashMap<GateKey, bool>> {

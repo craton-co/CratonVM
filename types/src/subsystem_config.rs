@@ -30,10 +30,10 @@
 //!
 //! # Migrating a call site
 //!
-//! A call site that reads `cratonvm_types::flags::runtime_var_os("CRATONVM_X")`
-//! is already inside the declared-flag boundary and already sees the snapshot;
-//! moving it here buys **typing**, not correctness. A call site that reads
-//! `std::env::var("CRATONVM_X")` is not, and moving it here is a behaviour fix.
+//! A call site that reads `cratonvm_types::flags::runtime_var_os` is already
+//! inside the declared-flag boundary and already sees the snapshot; moving it
+//! here buys **typing**, not correctness. A call site that reaches `std::env`
+//! directly is not inside that boundary, and moving it here is a behaviour fix.
 //! `docs/config/flag-inventory.md` lists both kinds and the order to take them
 //! in.
 //!

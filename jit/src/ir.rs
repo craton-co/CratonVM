@@ -22,6 +22,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Node identity ────────────────────────────────────────────────────
 
@@ -438,22 +439,26 @@ impl Op {
 
 /// Number of edges an [`Inputs`] list stores inline before spilling to the heap.
 ///
-/// Picked from the arity of the node constructors in this file (every
-/// `Graph::add` call site, counted mechanically):
+/// Picked from the arity of the node constructors in this file — every
+/// non-test `Graph::add` call site, counted mechanically:
 ///
-/// | inputs | constructors | examples |
-/// |--------|--------------|----------|
-/// | 0      | 28           | `Const`, `ConstF`, `Param`, `Start` |
-/// | 1      | 10           | `Proj`, `Neg`, the `I2L`/`L2I`/… conversions |
-/// | 2      | 9            | `Add`/`Sub`/`Mul`/`Cmp`, `Return [ctrl, val]`, `If [ctrl, cmp]` |
-/// | 4      | 3            | `Load [ctrl, mem, base, offset]` |
-/// | 5      | 3            | `Store [ctrl, mem, base, offset, value]` |
+/// | inputs | call sites | constructors |
+/// |--------|-----------:|--------------|
+/// | 0      | 6          | `Const`, `ConstF`, `Param`, `Start` |
+/// | 1      | 10         | `Proj`, `Neg`, the `I2L`/`L2I`/… conversions |
+/// | 2      | 7          | `Add`/`Sub`/`Mul`/`Cmp`, `Return [ctrl, val]`, `If [ctrl, cmp]` |
+/// | 3      | 0          | — |
+/// | 4      | 3          | `Load [ctrl, mem, base, offset]` |
+/// | 5      | 3          | `Store [ctrl, mem, base, offset, value]` |
 ///
-/// plus three variable-arity families: `Phi` (`1 + preds`), `Merge`/`Region`
-/// (`preds`) and `Call` (`2 + args`). A capacity of **5** therefore covers
-/// every fixed-arity constructor in the IR — including the widest one,
+/// 29 fixed-arity sites, none wider than 5, plus 11 variable-arity ones: `Phi`
+/// (`1 + preds`, 3 sites), `Merge`/`Region` (`preds`) and `Op::Call`
+/// (`[ctrl, mem, args…]`, i.e. `2 + args`). A capacity of **5** therefore
+/// covers every fixed-arity constructor in the IR — including the widest one,
 /// `Op::Store` — a φ over up to four predecessors, and a call with up to three
-/// arguments. Only genuinely wide merges and many-argument calls spill.
+/// arguments. Only genuinely wide merges and many-argument calls spill. (The
+/// *dynamic* distribution is even more concentrated: `Op::Const` and
+/// `Op::Param` nodes dominate a real graph and carry no edges at all.)
 ///
 /// The capacity is free in memory terms: the spilled variant carries a `Vec`
 /// (24 bytes on 64-bit), so any inline buffer up to that size rounds to the
@@ -476,7 +481,24 @@ thread_local! {
     /// conservative in the safe direction: an unrelated graph's edit only
     /// costs one rebuild, never correctness.
     static EDGE_EPOCH: Cell<u64> = Cell::new(1);
+
+    /// Identity of this thread, so a graph cannot mistake *another* thread's
+    /// epoch for its own.
+    ///
+    /// The epoch is per-thread (a process-wide counter would let one compiler
+    /// thread's edge write invalidate every other thread's use lists, which
+    /// costs a rebuild per pass and gives back the whole win). A graph is
+    /// `Send`, though, so it could in principle be stamped on one thread, made
+    /// stale there, and then consulted on a thread whose counter happens to
+    /// hold the same value. Pairing the epoch with a thread token makes that
+    /// coincidence impossible: a graph reconciled on another thread simply
+    /// reads as stale.
+    static THREAD_TOKEN: u64 = NEXT_THREAD_TOKEN.fetch_add(1, Ordering::Relaxed);
 }
+
+/// Source of the per-thread tokens. Never 0, so `UseLists::new()` (owner 0)
+/// can never be mistaken for a reconciled state.
+static NEXT_THREAD_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Note an untracked edge write. See [`EDGE_EPOCH`].
 #[inline]
@@ -488,6 +510,12 @@ fn bump_edge_epoch() {
 #[inline]
 fn edge_epoch() -> u64 {
     EDGE_EPOCH.with(|e| e.get())
+}
+
+/// This thread's identity. See [`THREAD_TOKEN`].
+#[inline]
+fn thread_token() -> u64 {
+    THREAD_TOKEN.with(|t| *t)
 }
 
 /// A node's edge list: up to [`INLINE_INPUTS`] ids stored inline, spilling to
@@ -881,7 +909,7 @@ impl SafepointSnapshot {
 
 /// Which half of a [`SafepointSnapshot`] a slot lives in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SlotKind {
+pub enum SafepointSlotKind {
     /// `SafepointSnapshot::locals`
     Local,
     /// `SafepointSnapshot::stack`
@@ -901,7 +929,7 @@ pub struct SafepointSlot {
     /// Index into `Graph::safepoints`.
     pub snapshot: u32,
     /// Which half of the snapshot.
-    pub kind: SlotKind,
+    pub kind: SafepointSlotKind,
     /// Index within that half.
     pub slot: u32,
 }
@@ -944,6 +972,8 @@ pub struct UseLists {
     valid: bool,
     /// Value of [`EDGE_EPOCH`] when the lists were last reconciled.
     epoch: u64,
+    /// [`THREAD_TOKEN`] of the thread that reconciled them. 0 = never.
+    owner: u64,
     /// `Graph::safepoints.len()` when the lists were last reconciled.
     sp_len: usize,
     /// An edge names an id past the end of the arena. Such an edge is invisible
@@ -965,11 +995,27 @@ impl UseLists {
             tracking: true,
             valid: false,
             epoch: 0,
+            owner: 0,
             sp_len: 0,
             dangling: false,
             examined: 0,
             rebuilds: 0,
         }
+    }
+
+    /// Record that the lists now describe the graph, as of this thread and
+    /// this edge epoch.
+    #[inline]
+    fn stamp(&mut self) {
+        self.epoch = edge_epoch();
+        self.owner = thread_token();
+    }
+
+    /// True when nothing has written an edge outside the mutators since the
+    /// last [`UseLists::stamp`], on this thread.
+    #[inline]
+    fn stamped(&self) -> bool {
+        self.owner == thread_token() && self.epoch == edge_epoch()
     }
 
     /// Drop the derived state (keeps the counters and the master switch).
@@ -1084,7 +1130,7 @@ impl Graph {
                 for &inp in nodes[id as usize].inputs.as_slice() {
                     uses.record_input(inp, id, num_nodes);
                 }
-                self.uses.epoch = edge_epoch();
+                self.uses.stamp();
             }
         }
         id
@@ -1162,8 +1208,8 @@ impl Graph {
                 None => continue,
             };
             let cell = match r.kind {
-                SlotKind::Local => sp.locals.get_mut(r.slot as usize),
-                SlotKind::Stack => sp.stack.get_mut(r.slot as usize),
+                SafepointSlotKind::Local => sp.locals.get_mut(r.slot as usize),
+                SafepointSlotKind::Stack => sp.stack.get_mut(r.slot as usize),
             };
             match cell {
                 Some(v) if *v == old => {
@@ -1179,7 +1225,7 @@ impl Graph {
         self.uses.examined += examined;
         // Nothing here bumped the epoch (`slots_mut` is the untracked path), but
         // re-read it rather than assume: an unrelated graph may have moved it.
-        self.uses.epoch = edge_epoch();
+        self.uses.stamp();
     }
 
     /// The historical full scan, plus (when tracking is on) a rebuild of the
@@ -1235,13 +1281,13 @@ impl Graph {
                     let slot = if k < locals {
                         SafepointSlot {
                             snapshot: si as u32,
-                            kind: SlotKind::Local,
+                            kind: SafepointSlotKind::Local,
                             slot: k as u32,
                         }
                     } else {
                         SafepointSlot {
                             snapshot: si as u32,
-                            kind: SlotKind::Stack,
+                            kind: SafepointSlotKind::Stack,
                             slot: (k - locals) as u32,
                         }
                     };
@@ -1262,7 +1308,7 @@ impl Graph {
             self.uses.sp_len = self.safepoints.len();
             self.uses.valid = true;
             self.uses.rebuilds += 1;
-            self.uses.epoch = edge_epoch();
+            self.uses.stamp();
         }
     }
 
@@ -1293,7 +1339,7 @@ impl Graph {
                 }
                 self.uses.users[inp as usize].swap_remove_first_untracked(id);
             }
-            self.uses.epoch = edge_epoch();
+            self.uses.stamp();
         }
     }
 
@@ -1435,7 +1481,7 @@ impl Graph {
     fn use_lists_current(&self) -> bool {
         self.uses.tracking
             && self.uses.valid
-            && self.uses.epoch == edge_epoch()
+            && self.uses.stamped()
             && self.uses.users.len() == self.nodes.len()
             && self.uses.sp_len == self.safepoints.len()
     }
@@ -1480,7 +1526,7 @@ impl Graph {
                         v,
                         SafepointSlot {
                             snapshot: si as u32,
-                            kind: SlotKind::Local,
+                            kind: SafepointSlotKind::Local,
                             slot: k as u32,
                         },
                         num_nodes,
@@ -1491,7 +1537,7 @@ impl Graph {
                         v,
                         SafepointSlot {
                             snapshot: si as u32,
-                            kind: SlotKind::Stack,
+                            kind: SafepointSlotKind::Stack,
                             slot: k as u32,
                         },
                         num_nodes,
@@ -1502,7 +1548,7 @@ impl Graph {
         self.uses.sp_len = self.safepoints.len();
         self.uses.valid = true;
         self.uses.rebuilds += 1;
-        self.uses.epoch = edge_epoch();
+        self.uses.stamp();
     }
 
     /// Make the def-use edges current, deriving them if they are not.
@@ -1571,8 +1617,8 @@ impl Graph {
                 for &r in list {
                     let live = self.safepoints.get(r.snapshot as usize).and_then(|sp| {
                         match r.kind {
-                            SlotKind::Local => sp.locals.get(r.slot as usize),
-                            SlotKind::Stack => sp.stack.get(r.slot as usize),
+                            SafepointSlotKind::Local => sp.locals.get(r.slot as usize),
+                            SafepointSlotKind::Stack => sp.stack.get(r.slot as usize),
                         }
                         .copied()
                     });
@@ -1588,7 +1634,7 @@ impl Graph {
                 if v == id {
                     out.push(SafepointSlot {
                         snapshot: si as u32,
-                        kind: SlotKind::Local,
+                        kind: SafepointSlotKind::Local,
                         slot: k as u32,
                     });
                 }
@@ -1597,7 +1643,7 @@ impl Graph {
                 if v == id {
                     out.push(SafepointSlot {
                         snapshot: si as u32,
-                        kind: SlotKind::Stack,
+                        kind: SafepointSlotKind::Stack,
                         slot: k as u32,
                     });
                 }
@@ -1631,7 +1677,7 @@ impl Graph {
                 self.uses.users[old as usize].swap_remove_first_untracked(node);
             }
             self.uses.record_input(new, node, num_nodes);
-            self.uses.epoch = edge_epoch();
+            self.uses.stamp();
         } else {
             bump_edge_epoch();
         }
@@ -1648,7 +1694,7 @@ impl Graph {
         self.nodes[node as usize].inputs.push_untracked(new);
         if current {
             self.uses.record_input(new, node, num_nodes);
-            self.uses.epoch = edge_epoch();
+            self.uses.stamp();
         } else {
             bump_edge_epoch();
         }
@@ -1674,7 +1720,7 @@ impl Graph {
             for &inp in nodes[node as usize].inputs.as_slice() {
                 uses.record_input(inp, node, num_nodes);
             }
-            self.uses.epoch = edge_epoch();
+            self.uses.stamp();
         } else {
             bump_edge_epoch();
         }
@@ -1701,7 +1747,7 @@ impl Graph {
                     v,
                     SafepointSlot {
                         snapshot: si,
-                        kind: SlotKind::Local,
+                        kind: SafepointSlotKind::Local,
                         slot: k as u32,
                     },
                     num_nodes,
@@ -1712,14 +1758,14 @@ impl Graph {
                     v,
                     SafepointSlot {
                         snapshot: si,
-                        kind: SlotKind::Stack,
+                        kind: SafepointSlotKind::Stack,
                         slot: k as u32,
                     },
                     num_nodes,
                 );
             }
             self.uses.sp_len = self.safepoints.len();
-            self.uses.epoch = edge_epoch();
+            self.uses.stamp();
         }
     }
 
@@ -1732,7 +1778,7 @@ impl Graph {
     pub fn set_safepoint_slot(
         &mut self,
         snapshot: usize,
-        kind: SlotKind,
+        kind: SafepointSlotKind,
         slot: usize,
         new: NodeId,
     ) -> bool {
@@ -1743,8 +1789,8 @@ impl Graph {
             None => return false,
         };
         let cell = match kind {
-            SlotKind::Local => sp.locals.get_mut(slot),
-            SlotKind::Stack => sp.stack.get_mut(slot),
+            SafepointSlotKind::Local => sp.locals.get_mut(slot),
+            SafepointSlotKind::Stack => sp.stack.get_mut(slot),
         };
         let cell = match cell {
             Some(c) => c,
@@ -1761,7 +1807,7 @@ impl Graph {
                 },
                 num_nodes,
             );
-            self.uses.epoch = edge_epoch();
+            self.uses.stamp();
         }
         // The stale entry left on the previous value is harmless: every rewrite
         // re-checks the slot before touching it (see `UseLists`).
@@ -1820,7 +1866,10 @@ impl Graph {
         }
 
         for (si, sp) in self.safepoints.iter().enumerate() {
-            let halves = [(SlotKind::Local, &sp.locals), (SlotKind::Stack, &sp.stack)];
+            let halves = [
+                (SafepointSlotKind::Local, &sp.locals),
+                (SafepointSlotKind::Stack, &sp.stack),
+            ];
             for (kind, values) in halves {
                 for (k, &v) in values.iter().enumerate() {
                     if v == NO_NODE || (v as usize) >= num_nodes {
@@ -5727,7 +5776,7 @@ mod tests {
         assert_eq!(g.safepoint_users_of(b).len(), 3);
 
         // The tracked slot writer keeps the lists current …
-        assert!(g.set_safepoint_slot(0, SlotKind::Local, 1, a));
+        assert!(g.set_safepoint_slot(0, SafepointSlotKind::Local, 1, a));
         assert!(g.use_lists_valid());
         assert_eq!(g.verify_use_lists(), Ok(()));
         g.replace_all_uses(a, b);
@@ -5973,17 +6022,6 @@ mod tests {
             "the builder must not leave the lists stale"
         );
         assert_eq!(graph.verify_use_lists(), Ok(()));
-        let scanned = {
-            let mut counts = vec![0u32; graph.nodes.len()];
-            for node in &graph.nodes {
-                for &inp in node.inputs.as_slice() {
-                    if (inp as usize) < counts.len() {
-                        counts[inp as usize] += 1;
-                    }
-                }
-            }
-            counts
-        };
-        assert_eq!(graph.use_counts(), scanned);
+        assert_eq!(graph.use_counts(), scanned_use_counts(&graph));
     }
 }

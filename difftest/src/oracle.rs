@@ -583,6 +583,15 @@ mod tests {
         }
     }
 
+    /// The channels a verdict reported, in report order — the shape every
+    /// "planted divergence" test below asserts on.
+    fn channels(v: &Verdict) -> Vec<Channel> {
+        match v {
+            Verdict::Agree => Vec::new(),
+            Verdict::Diverge(d) => d.iter().map(|c| c.channel).collect(),
+        }
+    }
+
     #[test]
     fn line_endings_normalized() {
         assert_eq!(normalize_line_endings("a\r\nb\r\n"), "a\nb");
@@ -633,8 +642,41 @@ mod tests {
         }
     }
 
+    // -- one planted divergence per dimension --------------------------------
+    //
+    // The harness's own soundness property: each dimension must *independently*
+    // detect a divergence planted in it alone, and must name itself when it
+    // does. A dimension that only ever fires together with `stdout` is not a
+    // dimension, it is a duplicate.
+
     #[test]
-    fn exception_type_mismatch_is_caught() {
+    fn exit_code_divergence_is_caught_alone() {
+        let a = obs("same", "", Some(0));
+        let b = obs("same", "", Some(1));
+        assert_eq!(
+            channels(&compare(&a, &b, &Normalizer::strict())),
+            vec![Channel::ExitCode]
+        );
+    }
+
+    #[test]
+    fn exception_presence_divergence_is_caught_alone() {
+        // One VM threw, the other exited cleanly. Reported once, on the
+        // presence channel — not three times against `<none>`.
+        let a = obs(
+            "",
+            "Exception in thread \"main\" java.lang.IllegalStateException: boom\n",
+            Some(1),
+        );
+        let b = obs("", "", Some(1));
+        assert_eq!(
+            channels(&compare(&a, &b, &Normalizer::strict())),
+            vec![Channel::Exception]
+        );
+    }
+
+    #[test]
+    fn exception_type_divergence_is_caught_alone() {
         let a = obs(
             "",
             "Exception in thread \"main\" java.lang.ClassCastException: x\n",
@@ -645,10 +687,121 @@ mod tests {
             "Exception in thread \"main\" java.lang.IllegalStateException: x\n",
             Some(1),
         );
-        let v = compare(&a, &b, &Normalizer::strict());
-        match v {
-            Verdict::Diverge(d) => assert!(d.iter().any(|c| c.channel == Channel::Exception)),
-            Verdict::Agree => panic!("expected exception divergence"),
+        assert_eq!(
+            channels(&compare(&a, &b, &Normalizer::strict())),
+            vec![Channel::ExceptionType],
+            "a wrong type must not be reported as a message or frame diff"
+        );
+    }
+
+    #[test]
+    fn exception_message_divergence_is_caught_alone() {
+        // The committed `ExceptionId` shape: right type, right frames, a
+        // message missing HotSpot's module/loader detail.
+        let a = obs(
+            "",
+            "Exception in thread \"main\" java.lang.ClassCastException: \
+             java.lang.String cannot be cast to java.lang.Integer\n\tat X.main(X.java:3)\n",
+            Some(1),
+        );
+        let b = obs(
+            "",
+            "Exception in thread \"main\" java.lang.ClassCastException: \
+             class java.lang.String cannot be cast to class java.lang.Integer \
+             (in module java.base)\n\tat X.main(X.java:3)\n",
+            Some(1),
+        );
+        assert_eq!(
+            channels(&compare(&a, &b, &Normalizer::strict())),
+            vec![Channel::ExceptionMessage]
+        );
+    }
+
+    #[test]
+    fn exception_frame_order_divergence_is_caught_alone() {
+        // Same type, same message, frames in the wrong order — the reversed-
+        // stack-trace bug this dimension exists for.
+        let a = obs(
+            "",
+            "Exception in thread \"main\" java.lang.IllegalStateException: x\n\
+             \tat A.a(A.java:1)\n\tat B.b(B.java:2)\n",
+            Some(1),
+        );
+        let b = obs(
+            "",
+            "Exception in thread \"main\" java.lang.IllegalStateException: x\n\
+             \tat B.b(B.java:2)\n\tat A.a(A.java:1)\n",
+            Some(1),
+        );
+        assert_eq!(
+            channels(&compare(&a, &b, &Normalizer::strict())),
+            vec![Channel::ExceptionFrames]
+        );
+    }
+
+    #[test]
+    fn checksum_divergence_is_caught_and_names_the_quantity() {
+        let a = obs("##DIFFTEST-CHECKSUM## arith 111\n", "", Some(0));
+        let b = obs("##DIFFTEST-CHECKSUM## arith 222\n", "", Some(0));
+        match compare(&a, &b, &Normalizer::strict()) {
+            Verdict::Diverge(d) => {
+                // stdout moved too (the declaration is on stdout), but the
+                // checksum dimension is what names the quantity.
+                let sum = d
+                    .iter()
+                    .find(|c| c.channel == Channel::Checksum)
+                    .expect("checksum channel");
+                assert_eq!(sum.cratonvm, "arith=111");
+                assert_eq!(sum.hotspot, "arith=222");
+            }
+            Verdict::Agree => panic!("expected a checksum divergence"),
+        }
+    }
+
+    #[test]
+    fn a_checksum_survives_an_over_normalizing_stdout_rule() {
+        // The false-negative guard. `sort-lines` makes the two transcripts
+        // compare equal; the checksum is read from un-normalized stdout, so the
+        // real disagreement still surfaces — and only on the checksum channel.
+        let a = obs("x\ny\n##DIFFTEST-CHECKSUM## total 1\n", "", Some(0));
+        let b = obs("y\nx\n##DIFFTEST-CHECKSUM## total 2\n", "", Some(0));
+        let n = Normalizer {
+            sort_lines: true,
+            ..Normalizer::strict()
+        };
+        assert_eq!(
+            channels(&compare(&a, &b, &n)),
+            vec![Channel::Checksum],
+            "sort-lines hid the stdout diff; the checksum must not be hidden too"
+        );
+    }
+
+    #[test]
+    fn matching_checksums_are_not_a_dimension() {
+        // Neither declaring, and both declaring the same value, must be silent
+        // — a vacuous pass is not evidence.
+        let a = obs("plain\n", "", Some(0));
+        let b = obs("plain\n", "", Some(0));
+        assert!(compare(&a, &b, &Normalizer::strict()).agrees());
+        let c = obs("##DIFFTEST-CHECKSUM## k v\n", "", Some(0));
+        let d = obs("##DIFFTEST-CHECKSUM## k v\n", "", Some(0));
+        assert!(compare(&c, &d, &Normalizer::strict()).agrees());
+    }
+
+    #[test]
+    fn identical_observations_report_no_divergence_on_any_dimension() {
+        // The other half of every dimension test: a same-input/same-output pair
+        // must be silent on all eight channels, under every built-in profile.
+        let stderr = "Exception in thread \"main\" java.lang.IllegalStateException: x\n\
+                      \tat A.a(A.java:1)\n";
+        let a = obs("out\n##DIFFTEST-CHECKSUM## k 1\n", stderr, Some(1));
+        let b = a.clone();
+        for n in [Normalizer::strict(), Normalizer::jdk_only()] {
+            assert!(
+                compare(&a, &b, &n).agrees(),
+                "identical observations diverged under {}",
+                n.describe()
+            );
         }
     }
 
@@ -822,6 +975,112 @@ mod tests {
                 assert_eq!(n, Normalizer::strict(), "{}", m.label());
             }
         }
+    }
+
+    #[test]
+    fn strict_selects_only_line_ending_hygiene() {
+        let n = Normalizer::strict();
+        let ids: Vec<&str> = n.active_rules().iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec!["line-endings"]);
+        assert_eq!(n.active_stderr_rules().len(), 1);
+        // Every opt-in knob is off, including the three added for the C2 review.
+        assert!(!n.mask_timestamps);
+        assert!(!n.normalize_path_separators);
+        assert!(!n.mask_frame_line_numbers);
+        assert!(n.describe().contains("line-endings"));
+        assert!(n.describe().contains("ungated"));
+    }
+
+    #[test]
+    fn jdk_only_selects_the_two_stderr_rules_in_order() {
+        let n = Normalizer::jdk_only();
+        let ids: Vec<&str> = n.active_stderr_rules().iter().map(|r| r.id).collect();
+        // ANSI must precede vm-diagnostics: the tracing lines are colourised,
+        // so a match on `cratonvm_` only works once the escapes are gone.
+        assert_eq!(ids, vec!["ansi", "vm-diagnostics", "line-endings"]);
+        // The stderr-only pair never touches stdout.
+        let shared: Vec<&str> = n.active_rules().iter().map(|r| r.id).collect();
+        assert_eq!(shared, vec!["line-endings"]);
+        assert!(n.describe().contains("stderr gated"));
+    }
+
+    #[test]
+    fn each_knob_selects_exactly_its_own_rules() {
+        let cases: [(Normalizer, &[&str]); 6] = [
+            (
+                Normalizer {
+                    mask_hashes: true,
+                    ..Normalizer::strict()
+                },
+                &["line-endings", "identity-hash", "hex-address"],
+            ),
+            (
+                Normalizer {
+                    mask_thread_ids: true,
+                    ..Normalizer::strict()
+                },
+                &["line-endings", "thread-id"],
+            ),
+            (
+                Normalizer {
+                    mask_timestamps: true,
+                    ..Normalizer::strict()
+                },
+                &["line-endings", "timestamp"],
+            ),
+            (
+                Normalizer {
+                    normalize_path_separators: true,
+                    ..Normalizer::strict()
+                },
+                &["line-endings", "path-separator"],
+            ),
+            (
+                Normalizer {
+                    strip_paths: true,
+                    ..Normalizer::strict()
+                },
+                &["line-endings", "absolute-path"],
+            ),
+            (
+                Normalizer {
+                    mask_frame_line_numbers: true,
+                    ..Normalizer::strict()
+                },
+                &["line-endings", "frame-line-numbers"],
+            ),
+        ];
+        for (n, expected) in cases {
+            let mut ids: Vec<&str> = n.active_rules().iter().map(|r| r.id).collect();
+            let mut want: Vec<&str> = expected.to_vec();
+            ids.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(ids, want, "{}", n.describe());
+        }
+    }
+
+    #[test]
+    fn an_opted_in_rule_neutralizes_only_its_target_in_a_real_comparison() {
+        // End to end: two runs that differ *only* in an identity hash agree
+        // under `mask_hashes`, and a run that differs in a real value still
+        // diverges under the same normalizer.
+        let n = Normalizer {
+            mask_hashes: true,
+            ..Normalizer::strict()
+        };
+        let a = obs("java.lang.Object@1b6d3586\nvalue=7", "", Some(0));
+        let b = obs("java.lang.Object@7ffe0102\nvalue=7", "", Some(0));
+        assert!(compare(&a, &b, &n).agrees());
+
+        let c = obs("java.lang.Object@7ffe0102\nvalue=8", "", Some(0));
+        assert_eq!(
+            channels(&compare(&a, &c, &n)),
+            vec![Channel::Stdout],
+            "masking the hash must not mask the value"
+        );
+        // …and under the strict normalizer the hash difference is a divergence
+        // again, which is what makes the rule an explicit opt-in.
+        assert!(!compare(&a, &b, &Normalizer::strict()).agrees());
     }
 
     #[test]

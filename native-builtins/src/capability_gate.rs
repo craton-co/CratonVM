@@ -222,6 +222,18 @@ pub fn gate_foreign_downcall(
     ctx.check_capability_or_throw(Capability::foreign_downcall(symbol))
 }
 
+/// Gate a named raw-memory operation on a path that is **not** per-element hot.
+///
+/// The FFM `MemorySegment` accessors go through here rather than through
+/// [`gate_raw_memory`]: each already takes a policy read-lock and a
+/// `SecurityManager` check per call, so the full check is noise, and — more
+/// importantly — each accessor reports its **own** name, which the single-slot
+/// memo in [`gate_raw_memory`] could not preserve.
+#[track_caller]
+pub fn gate_raw_memory_named(ctx: &dyn NativeContext, op: &str) -> Result<(), MethodCallFailed> {
+    ctx.check_capability_or_throw(Capability::raw_memory(op))
+}
+
 /// Gate a native-library load on `LibraryLoad(name)`.
 #[track_caller]
 pub fn gate_library_load(ctx: &dyn NativeContext, name: &str) -> Result<(), MethodCallFailed> {

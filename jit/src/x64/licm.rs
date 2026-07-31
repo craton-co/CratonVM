@@ -270,26 +270,6 @@ pub fn precise_jit_maps_enabled() -> bool {
     })
 }
 
-/// Default-on inline reference-`putfield` fast path.
-///
-/// When on, a `putfield` of a reference field emits an inline 16-byte `Value`
-/// store INSTEAD of the `jit_putfield_object` helper CALL when the field's OLD
-/// value is null (`payload == 0`, so no SATB snapshot is needed). Young
-/// receivers require no post barrier; old generational receivers use the
-/// inline atomic card mark. Collector-specific G1/ZGC barriers and non-null
-/// old values retain the validated helper. This is the canonical
-/// fresh-object-initialisation pattern (`n.left = newChild`) that dominates
-/// allocation-heavy code (object binarytrees). Opt out with
-/// `CRATONVM_NO_JIT_INLINE_PUTFIELD`; the former
-/// `CRATONVM_JIT_INLINE_PUTFIELD` opt-in is accepted as a compatibility no-op.
-///
-/// INT-6 (GC audit 2026-07-10): the YOUNG test reads `GC_FLAG_OLD_GEN`, which
-/// only the GENERATIONAL backend maintains — under G1/ZGC every object read
-/// as "young" and the fast path elided G1's RSet post-barrier for Old→young
-/// stores. Both inline arms now prepend the guarded-getfield receiver check
-/// (null/alignment/published-region containment): G1/ZGC never publish
-/// region bounds, so every receiver bails to the full-barrier helper there,
-/// making the switch safe to enable on any backend.
 /// Whether narrow oops force every compact-field access through the helpers.
 ///
 /// The inline compact-field fast paths bake an 8-byte reference load/store at a
@@ -304,11 +284,115 @@ pub fn narrow_oops_block_inline_fields() -> bool {
     narrow_oops_enabled()
 }
 
+/// Default-on inline reference-`putfield` fast path.
+///
+/// When on, a `putfield` of a reference field emits an inline 16-byte `Value`
+/// store INSTEAD of the `jit_putfield_object` helper CALL when the field's OLD
+/// value is null (`payload == 0`, so no SATB snapshot is needed). Young
+/// receivers require no post barrier; old generational receivers use the
+/// inline atomic card mark. Collector-specific G1/ZGC barriers and non-null
+/// old values retain the validated helper. This is the canonical
+/// fresh-object-initialisation pattern (`n.left = newChild`) that dominates
+/// allocation-heavy code (object binarytrees). Opt out with
+/// `CRATONVM_NO_JIT_INLINE_PUTFIELD`; the former
+/// `CRATONVM_JIT_INLINE_PUTFIELD` opt-in is accepted as a compatibility no-op.
+///
+/// INT-6 (GC audit 2026-07-10), **as corrected by G1-2** (`docs/gc/g1-audit.md`
+/// §8.1, 2026-07-31). The previous wording claimed the guarded-getfield
+/// receiver check was prepended by "both inline arms"; three emitters did not
+/// have it, and the `region_bounds_addr != 0` test it named is not a backend
+/// gate. The real premise, and its exceptions:
+///
+/// **Premise.** The YOUNG test reads `GC_FLAG_OLD_GEN`, and "young receiver ⇒
+/// no post barrier" is a GENERATIONAL statement: a minor collection copies the
+/// whole young space, so a young→young edge needs no record. It is NOT a G1
+/// statement. Under G1 a young region is normally in the collection set and is
+/// scanned wholesale — but a region held OUT of the CSet by a JNI pin is
+/// reachable only through its remembered set, so an inline store that skips
+/// `post_write_barrier_rset` loses that edge and the next pause frees a live
+/// referent (`docs/gc/g1-audit.md` §2, §5).
+///
+/// **What actually gates the backend.** NOT `helpers.region_bounds_addr != 0`:
+/// that field is the ADDRESS of the process-global `JIT_REGION_BOUNDS` static
+/// (`gc/src/gen_heap.rs`), assigned unconditionally by
+/// `vm/src/jit/helpers.rs`, hence a constant `true`. The discriminator is the
+/// table's CONTENT — only `GenerationalHeap::store_region_bounds_locked` ever
+/// writes it — which is what [`region_bounds_are_live`] reads. The
+/// guarded-getfield receiver check (null / alignment / published-region
+/// containment) is then the machinery that turns "bounds all zero" into "every
+/// receiver takes the full-barrier helper".
+///
+/// **Exceptions, all closed 2026-07-31 (G1-2):**
+///
+/// * the two top-level reference-`putfield` arms substituted
+///   `emit_trusted_oop_receiver_check` — a bare null test with no containment
+///   check — whenever the receiver's operand-stack type was a proven oop. That
+///   substitution is now additionally conditional on
+///   [`region_bounds_are_live`];
+/// * `emit_inline_fresh_ctor_compact_ref_putfield` emitted no receiver guard at
+///   all. It now takes the helper outright when bounds are not live, and a null
+///   test when they are;
+/// * `emit_inline_body_compact_ref_putfield` always had the full containment
+///   check and was already safe; it now short-circuits straight to the helper
+///   when bounds are not live instead of emitting a guard that can never pass.
+///
+/// Net effect: under a non-publishing backend (G1/ZGC) NO inline
+/// reference-store fast path is reachable, so every JIT reference store runs
+/// the collector's own barrier — which is the only formulation implementable in
+/// the emitter, since G1's pin state (`G1Region::pin_count`, behind the
+/// `regions` mutex) has no lock-free per-region byte the JIT could test.
+/// `CRATONVM_NO_JIT_INLINE_PUTFIELD=1` remains the belt-and-braces kill switch.
 pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_INLINE_PUTFIELD").is_none()
+    })
+}
+
+/// Does the GC backend have LIVE heap-region bounds published right now?
+///
+/// G1-2 (`docs/gc/g1-audit.md` §8.1). This is the predicate the inline
+/// reference-store emitters need and `helpers.region_bounds_addr != 0` is not.
+/// That field holds the address of the process-global `JIT_REGION_BOUNDS`
+/// static (`gc/src/gen_heap.rs`), which `vm/src/jit/helpers.rs` assigns from
+/// `cratonvm_gc::jit_region_bounds_addr()` unconditionally — the static always
+/// exists, so the `!= 0` test is a constant `true` in any real VM and says
+/// nothing about the collector.
+///
+/// What distinguishes the backends is the table's CONTENT. The only writer is
+/// `GenerationalHeap::store_region_bounds_locked`, called at construction and
+/// at every GC start/end and never storing zeros;
+/// `VmHeap::jit_card_table_info` shows the same split from the other side
+/// (`Some` for `Generational`, `None` for `G1`/`Zgc`). Under G1/ZGC the six
+/// words therefore stay `0` for the process's life.
+///
+/// Fail-safe in both race directions: a compile that observes the table before
+/// the first publish, or after `GenerationalHeap::drop` re-zeroes it, merely
+/// reports "not live" and the caller takes the full-barrier helper.
+///
+/// `bounds_addr == 0` (the JIT unit-test helper table, and any embedding that
+/// never wired the field) is likewise "not live" — and checking it here is what
+/// keeps a caller from baking a `MOV RDX, 0` + `CMP RAX, [RDX]` containment
+/// guard that would fault at run time.
+pub fn region_bounds_are_live(bounds_addr: usize) -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if bounds_addr == 0 {
+        return false;
+    }
+    // SAFETY: `bounds_addr` is non-zero here and is only ever set from
+    // `cratonvm_gc::jit_region_bounds_addr()` — the address of the `'static`
+    // `JIT_REGION_BOUNDS: JitRegionBoundsTable` whose sole field is
+    // `[AtomicUsize; 6]` and which lives for the whole process — or, in this
+    // crate's tests, from a `static [AtomicUsize; 6]`. Both are valid,
+    // aligned and initialised for the six atomic loads below, and the loads
+    // race-freely pair with the collector's `Release` stores.
+    let words = unsafe { &*(bounds_addr as *const [AtomicUsize; 6]) };
+    // words = [yf_base, yf_end, yt_base, yt_end, og_base, og_end]
+    (0..3).any(|i| {
+        let base = words[i * 2].load(Ordering::Acquire);
+        let end = words[i * 2 + 1].load(Ordering::Acquire);
+        base != 0 && end > base
     })
 }
 

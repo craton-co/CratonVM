@@ -2038,11 +2038,14 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
 
         // Connect
         let fd_id = if use_tls {
+            // `open_tls_connect` has no `_checked` twin on `FileDescriptorTable`,
+            // so gate the endpoint explicitly before the connect.
+            crate::capability_gate::gate_network(&*ctx, &format!("{}:{}", host, port))?;
             ctx.fd_table().open_tls_connect(&host, port)
                 .map_err(|e| RuntimeError::IOException { message: e.to_string() })?
         } else {
-            ctx.fd_table().open_tcp_connect(&format!("{}:{}", host, port))
-                .map_err(|e| RuntimeError::IOException { message: e.to_string() })?
+            crate::capability_gate::open_tcp_connect_gated(&*ctx, &format!("{}:{}", host, port))
+                .map_err(|e| crate::capability_gate::translate_open_failure(e, |io| io.to_string()))?
         };
 
         // Generate WebSocket key (16 random bytes, base64-encoded)
@@ -2794,12 +2797,11 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     let ms = "java/net/MulticastSocket";
     r.register(ms, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id =
-            ctx.fd_table()
-                .open_udp(Some("0.0.0.0:0"))
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("MulticastSocket bind failed: {}", e),
-                })?;
+        let fd_id = crate::capability_gate::open_udp_gated(&*ctx, Some("0.0.0.0:0")).map_err(|e| {
+            crate::capability_gate::translate_open_failure(e, |io| {
+                format!("MulticastSocket bind failed: {io}")
+            })
+        })?;
         ctx.set_field(this, 0, Value::Int(0));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(0));
@@ -2814,12 +2816,11 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let bind_addr = format!("0.0.0.0:{}", port);
-        let fd_id =
-            ctx.fd_table()
-                .open_udp(Some(&bind_addr))
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("MulticastSocket bind failed: {}", e),
-                })?;
+        let fd_id = crate::capability_gate::open_udp_gated(&*ctx, Some(&bind_addr)).map_err(|e| {
+            crate::capability_gate::translate_open_failure(e, |io| {
+                format!("MulticastSocket bind failed: {io}")
+            })
+        })?;
         ctx.set_field(this, 0, Value::Int(port));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(0));
@@ -4721,7 +4722,8 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
                 let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
                 let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-                match ctx.fd_table().open_tcp_listener(&addr_str) {
+                // GAP I6 — server-socket bind is its own authority.
+                match crate::capability_gate::open_tcp_listener_gated(&*ctx, &addr_str) {
                     Ok(fd) => {
                         ctx.set_field(ssc, 1, Value::Int(1));
                         ctx.set_field(ssc, 2, Value::Int(fd as i32));
@@ -4735,19 +4737,21 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                         return Ok(None);
                     }
                     Err(e) => {
-                        return Err(RuntimeError::IOException {
-                            message: format!("bind {addr_str}: {e}"),
-                        }
-                        .into());
+                        return Err(crate::capability_gate::translate_open_failure(e, |io| {
+                            format!("bind {addr_str}: {io}")
+                        }));
                     }
                 }
             }
         }
         // Plain ServerSocket path — bind a real TcpListener via s2_alloc_listener.
+        // GAP I6 (second half): this path never touches `fd_table`, so it needs
+        // the bare endpoint gate — `open_tcp_listener_gated` cannot reach it.
         use crate::servlet::s2_alloc_listener;
         use std::net::TcpListener;
         let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
         let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+        crate::capability_gate::gate_network(&*ctx, &addr_str)?;
         match TcpListener::bind(&addr_str) {
             Ok(listener) => {
                 let actual_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(0);
@@ -4774,7 +4778,8 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
                 let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
                 let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-                if let Ok(fd) = ctx.fd_table().open_tcp_listener(&addr_str) {
+                // GAP I6 — see the 1-arg `bind` above.
+                if let Ok(fd) = crate::capability_gate::open_tcp_listener_gated(&*ctx, &addr_str) {
                     ctx.set_field(ssc, 1, Value::Int(1));
                     ctx.set_field(ssc, 2, Value::Int(fd as i32));
                     let port = ctx
@@ -4788,10 +4793,12 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                 return Ok(None);
             }
         }
+        // GAP I6 (second half) — this path never touches `fd_table`.
         use crate::servlet::s2_alloc_listener;
         use std::net::TcpListener;
         let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
         let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+        crate::capability_gate::gate_network(&*ctx, &addr_str)?;
         match TcpListener::bind(&addr_str) {
             Ok(listener) => {
                 let actual_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(0);

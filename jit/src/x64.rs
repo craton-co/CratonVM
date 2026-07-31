@@ -8737,6 +8737,28 @@ impl Compiler {
         vec![self.emit_jcc_rel32_patch(0x84)] // JZ -> checked helper
     }
 
+    /// The full-barrier route every inline reference-`putfield` arm falls back
+    /// to: `jit_putfield_object(heap, obj, field_index, value)`, which performs
+    /// the SATB pre-barrier and the collector's OWN post-write barrier — G1's
+    /// `post_write_barrier_rset` included, which is the remembered-set edge a
+    /// JNI-pinned (CSet-excluded) young region is reachable only through.
+    ///
+    /// Factored out for G1-2 so the "bounds are not live ⇒ take the helper"
+    /// short-circuit is literally the same instruction sequence as the bail
+    /// target the fast paths already patch to.
+    fn emit_ref_putfield_helper_call(
+        &mut self,
+        obj_slot: StackSlot,
+        val_slot: StackSlot,
+        field_index: usize,
+    ) {
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+        self.load_slot_to_reg(ARG_REGS[3], val_slot);
+        self.emit_call_absolute(self.helpers.putfield_object);
+    }
+
     /// Emit a compact reference-field store with a barrier-free fast path and
     /// the validated helper as its slow path.
     ///
@@ -8755,6 +8777,19 @@ impl Compiler {
         compact_body_offset: u32,
     ) {
         let cell_off = (HEADER_SIZE + compact_body_offset as usize) as i32;
+
+        // G1-2: no published bounds ⇒ no generational card metadata ⇒ the
+        // "young receiver needs no post barrier" premise does not hold (G1's
+        // RSet edge into a JNI-pinned, CSet-excluded region would be lost).
+        // The containment guard below would reject every receiver anyway with
+        // an all-zero table, and with an unwired table it would bake a
+        // `MOV RDX,0` + `CMP RAX,[RDX]` that faults — so take the helper
+        // outright instead of emitting an inline path that can never run.
+        if !region_bounds_are_live(self.helpers.region_bounds_addr) {
+            self.emit_ref_putfield_helper_call(obj_slot, val_slot, field_index);
+            return;
+        }
+
         let mut bail: Vec<usize> = Vec::new();
 
         self.load_slot_to_reg(RAX, obj_slot);
@@ -8802,11 +8837,7 @@ impl Compiler {
         for b in bail {
             self.patch_rel32_to_here(b);
         }
-        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
-        self.load_slot_to_reg(ARG_REGS[3], val_slot);
-        self.emit_call_absolute(self.helpers.putfield_object);
+        self.emit_ref_putfield_helper_call(obj_slot, val_slot, field_index);
 
         self.patch_rel32_to_here(oob);
         self.patch_rel32_to_here(done);
@@ -8822,6 +8853,17 @@ impl Compiler {
     /// in bounds. A young compact receiver needs no barrier; the only runtime
     /// checks retained are the per-object compact flag (synthetic allocations
     /// can still use legacy cells) and old-generation bit (allocation spill).
+    ///
+    /// G1-2 (`docs/gc/g1-audit.md` §8.1): "a young compact receiver needs no
+    /// barrier" is a GENERATIONAL claim. This emitter used to state it with no
+    /// receiver guard whatsoever — not even the null test its two sibling
+    /// emitters have — so on a backend that publishes no region bounds it wrote
+    /// the reference inline and lost the collector's post-write barrier. Under
+    /// G1 that is the JNI-pinned-young-region remembered-set edge (a pinned
+    /// region is excluded from the CSet, so its rset is the ONLY way in), i.e. a
+    /// use-after-free. It now takes the helper outright when
+    /// [`region_bounds_are_live`] is false, and when it is true it emits the
+    /// same null test the trusted-oop arms emit.
     fn emit_inline_fresh_ctor_compact_ref_putfield(
         &mut self,
         obj_slot: StackSlot,
@@ -8830,9 +8872,28 @@ impl Compiler {
         compact_body_offset: u32,
     ) {
         let cell_off = (HEADER_SIZE + compact_body_offset as usize) as i32;
+
+        // G1-2: bounds not live ⇒ not the generational backend ⇒ every
+        // reference store must run the collector's own post-write barrier.
+        if !region_bounds_are_live(self.helpers.region_bounds_addr) {
+            self.emit_ref_putfield_helper_call(obj_slot, val_slot, field_index);
+            return;
+        }
+
         let mut bail: Vec<usize> = Vec::new();
 
         self.load_slot_to_reg(RAX, obj_slot);
+        // G1-2: receiver guard, consistent with the other two emitters. The
+        // full containment check is deliberately NOT repeated here — with
+        // bounds live the backend is Generational, and this receiver is the
+        // `new`-produced uninitialized object the JVM verifier requires for
+        // `<init>` (see the precondition above), so the remaining exceptional
+        // case is null. It is unreachable in practice (the caller already
+        // emitted `emit_precise_null_check_field_store`) and therefore costs a
+        // perfectly-predicted not-taken branch; without it a null receiver
+        // faulted on the `gc_flags` header read below instead of reaching the
+        // helper's defined no-op semantics.
+        bail.extend(self.emit_trusted_oop_receiver_check());
         self.emit_test_mem8_imm8(
             RAX,
             cratonvm_types::GC_FLAGS_OFFSET as i32,
@@ -8858,11 +8919,7 @@ impl Compiler {
         for b in bail {
             self.patch_rel32_to_here(b);
         }
-        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
-        self.load_slot_to_reg(ARG_REGS[3], val_slot);
-        self.emit_call_absolute(self.helpers.putfield_object);
+        self.emit_ref_putfield_helper_call(obj_slot, val_slot, field_index);
 
         self.patch_rel32_to_here(done);
     }
@@ -16697,20 +16754,36 @@ impl Compiler {
                                 // which ONLY the Generational backend maintains —
                                 // under G1/ZGC every object reads as "young" and
                                 // the fast path would skip G1's RSet post-barrier
-                                // for an Old→young store (edge lost, referent
-                                // freed live at the next young pause). G1/ZGC
-                                // publish no region bounds (table all zeros), so
-                                // this guard routes EVERY receiver to the full-
-                                // barrier helper there; under Generational it
-                                // adds the same three containment compares the
-                                // guarded getfield already pays.
-                                bail.extend(if receiver_is_trusted_oop {
-                                    self.emit_trusted_oop_receiver_check()
-                                } else {
-                                    self.emit_guarded_getfield_receiver_check(
-                                        self.helpers.region_bounds_addr,
-                                    )
-                                });
+                                // (edge lost, referent freed live at the next
+                                // pause: Old→young after G1-1, and young→young
+                                // into a JNI-pinned, CSet-excluded region even
+                                // after it). G1/ZGC publish no region bounds
+                                // (table all zeros), so this guard routes EVERY
+                                // receiver to the full-barrier helper there;
+                                // under Generational it adds the same three
+                                // containment compares the guarded getfield
+                                // already pays.
+                                //
+                                // G1-2: the trusted-oop substitution below drops
+                                // exactly the containment compares that make the
+                                // above true, so it is legal ONLY when the
+                                // backend really has bounds published — which is
+                                // the table's CONTENT, not `region_bounds_addr
+                                // != 0` (the address of a process-global static,
+                                // always non-zero). See `region_bounds_are_live`.
+                                bail.extend(
+                                    if receiver_is_trusted_oop
+                                        && region_bounds_are_live(
+                                            self.helpers.region_bounds_addr,
+                                        )
+                                    {
+                                        self.emit_trusted_oop_receiver_check()
+                                    } else {
+                                        self.emit_guarded_getfield_receiver_check(
+                                            self.helpers.region_bounds_addr,
+                                        )
+                                    },
+                                );
                                 // LEGACY receiver (no GC_FLAG_COMPACT) → helper: the
                                 // compact 8-byte cell offset is only valid for a
                                 // genuinely-compact object. A class with a registered
@@ -16788,17 +16861,29 @@ impl Compiler {
                                 // GC_FLAG_OLD_GEN, which ONLY the Generational
                                 // backend maintains — under G1/ZGC every object
                                 // reads as "young" and this fast path would elide
-                                // G1's RSet post-barrier for an Old→young store.
-                                // G1/ZGC publish no region bounds (table all
-                                // zeros), so every receiver bails to the full-
-                                // barrier helper there.
-                                bail.extend(if receiver_is_trusted_oop {
-                                    self.emit_trusted_oop_receiver_check()
-                                } else {
-                                    self.emit_guarded_getfield_receiver_check(
-                                        self.helpers.region_bounds_addr,
-                                    )
-                                });
+                                // G1's RSet post-barrier (Old→young before G1-1;
+                                // young→young into a JNI-pinned, CSet-excluded
+                                // region after it). G1/ZGC publish no region
+                                // bounds (table all zeros), so every receiver
+                                // bails to the full-barrier helper there.
+                                //
+                                // G1-2: same reasoning as the compact arm above —
+                                // the trusted-oop substitution removes the
+                                // containment compares, so it is conditional on
+                                // the bounds table actually holding live bounds.
+                                bail.extend(
+                                    if receiver_is_trusted_oop
+                                        && region_bounds_are_live(
+                                            self.helpers.region_bounds_addr,
+                                        )
+                                    {
+                                        self.emit_trusted_oop_receiver_check()
+                                    } else {
+                                        self.emit_guarded_getfield_receiver_check(
+                                            self.helpers.region_bounds_addr,
+                                        )
+                                    },
+                                );
                                 // old-gen receiver → helper (card barrier). gc_flags is
                                 // the exported gc_flags byte; GC_FLAG_OLD_GEN == bit 0.
                                 if !self.inline_card_mark_available() {

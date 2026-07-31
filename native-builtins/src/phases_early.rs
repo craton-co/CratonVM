@@ -20122,13 +20122,12 @@ fn p54_huc_do_request(
 
     // Connect via fd_table
     let addr_str = format!("{}:{}", host, effective_port);
-    let fd_id = match ctx.fd_table().open_tcp_connect(&addr_str) {
+    let fd_id = match crate::capability_gate::open_tcp_connect_gated(&*ctx, &addr_str) {
         Ok(fd) => fd,
         Err(e) => {
-            return Err(RuntimeError::IOException {
-                message: format!("Connection failed: {}", e),
-            }
-            .into())
+            return Err(crate::capability_gate::translate_open_failure(e, |io| {
+                format!("Connection failed: {io}")
+            }))
         }
     };
     ctx.set_field(this, 3, Value::Int(fd_id as i32));

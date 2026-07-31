@@ -229,6 +229,11 @@ fn require_native_access(ctx: &mut dyn NativeContext, op: &str) -> Result<(), Me
         .into());
     }
     crate::security_manager::check_host_native_access_or_throw(ctx, "foreign")?;
+    // Audit row M3 / work-list item 18: one edit here gives every raw-address
+    // `MemorySegment` accessor a `RawMemory` capability check, and each passes
+    // its own `op`, so the audit report names the accessor rather than a single
+    // undifferentiated "foreign" row. Permissive by default — this only records.
+    crate::capability_gate::gate_raw_memory_named(&*ctx, op)?;
     Ok(())
 }
 
@@ -2330,6 +2335,10 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Value::Long(n) => n,
         _ => 0,
     };
+    // Work-list item 14. The symbol name is not carried on the handle, so the
+    // scope is the target address — which is what a denial needs to report and
+    // what an operator would have to grant. Permissive by default.
+    crate::capability_gate::gate_foreign_downcall(&*ctx, &format!("0x{fn_addr:x}"))?;
     let descriptor = match ctx.get_field(handle, 1) {
         Value::Object(Some(d)) => d,
         _ => {
@@ -3178,6 +3187,17 @@ unsafe extern "C" fn upcall_dispatch(
     };
 }
 
+/// A scope for an upcall stub: the class of the Java target it dispatches into.
+///
+/// A `ForeignUpcall` denial that cannot say *which* callback was refused is not
+/// actionable, and this is the narrowest name reachable here — the stub's
+/// descriptor is a layout list, not a method signature. Falls back to
+/// `<unknown>` so a denial always names something.
+fn upcall_target_name(ctx: &dyn NativeContext, target: ObjectRef) -> String {
+    ctx.class_name_of_id(ctx.class_id_of_object(target))
+        .unwrap_or_else(|| "<unknown>".to_string())
+}
+
 /// `Linker.upcallHandle(target, descriptor, arena)` — build a libffi
 /// closure that dispatches into a Java MethodHandle. Returns a
 /// MemorySegment whose address is the closure's extern "C" trampoline.
@@ -3187,6 +3207,22 @@ fn pe_upcall_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let _linker = obj_arg(args, 0)?;
     let target = obj_arg(args, 1)?;
     let descriptor = obj_arg(args, 2)?;
+
+    // GAP F3. This function had **no** native-access gate at all, while the
+    // downcall path fails closed — yet it is the more dangerous direction: it
+    // hands native code a real extern "C" trampoline into Java. `docs/CONFIG.md`
+    // already documents `Linker.upcallHandle` as consulting the access
+    // registry; it did not. Restore the documented behaviour, then record the
+    // `ForeignUpcall` capability (permissive by default).
+    //
+    // BEHAVIOUR CHANGE — the only one in this pass: with
+    // `--enable-native-access` absent, `upcallHandle` now throws
+    // `IllegalCallerException` instead of succeeding, matching
+    // `pe_downcall_invoke`. Revert this one line if a workload needs the old
+    // laxity; the capability check below is behaviour-neutral on its own.
+    require_native_access(ctx, "upcallHandle")?;
+    let upcall_target = upcall_target_name(ctx, target);
+    crate::capability_gate::gate_foreign_upcall(&*ctx, &upcall_target)?;
     // args[3] = Arena — used to bound the closure's lifetime; for
     // simplicity we leak the closure and rely on the registry until
     // the JVM exits. A NEW-17 cleaner could be added if needed.
@@ -3280,6 +3316,12 @@ fn pe_upcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             .ok_or_else(|| RuntimeError::IllegalStateException {
                 message: format!("Upcall slot {} not found", slot),
             })?;
+
+    // GAP F4: invoking an upcall stub was ungated. The `ForeignUpcall` check is
+    // permissive by default; the scope is the callback's class, resolved after
+    // the slot lookup so an unknown slot still reports "slot not found".
+    let upcall_target = upcall_target_name(ctx, target);
+    crate::capability_gate::gate_foreign_upcall(&*ctx, &upcall_target)?;
 
     // Unmarshal args from the Object[] array
     let call_args: Vec<Value> = if args.len() > 1 {
@@ -5533,6 +5575,11 @@ mod tests {
     /// guard, and verify the dispatch reaches Java's invoke_virtual.
     #[test]
     fn new18_upcall_libffi_closure_dispatches_to_java() {
+        // GAP F3: `pe_upcall_handle` now goes through `require_native_access`,
+        // exactly like the downcall path (and exactly as docs/CONFIG.md has
+        // always described `Linker.upcallHandle`). Grant it for this test, the
+        // same way `new18_downcall_variadic_snprintf` does.
+        let _na = NativeAccessGuard::enable();
         let mut ctx = mock_ctx();
 
         // Descriptor: int(int, int)

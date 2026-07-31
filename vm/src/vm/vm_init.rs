@@ -3258,11 +3258,11 @@ impl SharedVm {
         // cached field/method/call-site/condy resolution that refers to
         // (or was resolved into) the redefined class.
         //
-        // Order: this must be installed BEFORE the `RESOLUTION_INVALIDATE_VM`
-        // weak handle is populated below in `Vm::new` (where `self_arc` is
-        // set), but installing the hook here is fine — the adapter's
-        // `if let Some(vm) = ...upgrade()` falls through to a no-op until
-        // the weak handle is wired.
+        // Order: this must be installed BEFORE this VM is added to the
+        // `RESOLUTION_INVALIDATE_VMS` registry below in `Vm::new` (where
+        // `self_arc` is set), but installing the hook here is fine — the
+        // adapter iterates `live_hook_vms()`, which is empty until the first
+        // VM is registered, so it falls through to a no-op.
         cratonvm_classloading::install_resolution_invalidate_hook(resolution_invalidate_adapter);
 
         // Found while investigating the guarded-inline-getfield SIGSEGV
@@ -3447,11 +3447,7 @@ fn resolution_invalidate_adapter(class_id: u32) {
     // With one VM registered (the normal case) this is the same single
     // invalidation the pre-registry code performed.
     for shared in live_hook_vms() {
-        shared
-            .classes
-            .resolution_cache
-            .write()
-            .invalidate_class(cid);
+        shared.classes.resolution_cache.write().invalidate_class(cid);
         // Round 8 audit fix (CRIT #3): the `LinkResolver` reflective cache
         // was missing from the redefine-invalidation cascade. Without
         // this, any cached `(class, name, descriptor)` triple resolved
@@ -6594,12 +6590,15 @@ impl Vm {
         crate::native::jni::set_process_vm(&shared);
 
         // Round 4 audit fix (CRIT) — publish the same weak handle to the
-        // module-private slot used by `resolution_invalidate_adapter` so
+        // module-private registry used by `resolution_invalidate_adapter` so
         // JVMTI `RedefineClasses` can reach back into
         // `shared.classes.resolution_cache` and drop stale resolutions.
-        // Idempotent — first writer wins, repeated calls (e.g. test
-        // fixtures that build multiple Vms in-process) are silently
-        // ignored, which matches the global vtable hook pattern.
+        //
+        // Idempotent PER VM, and every registered VM is reached — NOT
+        // "first writer wins". That older behaviour meant a second `Vm` built
+        // in the same process (a test fixture, or a real embedding) never had
+        // its own resolution/link/JIT caches invalidated on redefine. See
+        // `docs/architecture/per-vm-state.md` §3 (V2).
         set_global_shared_vm_for_hooks(Arc::downgrade(&shared));
 
         // obsaudit D14 (2026-07-26): bridge `runtime::jvmti::JvmtiEventManager`
@@ -14079,9 +14078,7 @@ mod tests {
     static HOOK_REGISTRY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     fn registry_contains(shared: &Arc<SharedVm>) -> bool {
-        live_hook_vms()
-            .iter()
-            .any(|live| Arc::ptr_eq(live, shared))
+        live_hook_vms().iter().any(|live| Arc::ptr_eq(live, shared))
     }
 
     /// Everything that keys process-global state per VM (`object_class_id`'s
@@ -14156,20 +14153,12 @@ mod tests {
             .insert(identity_key, sm_in_vm_a);
 
         assert_eq!(
-            a.mem
-                .var_handle_roots
-                .read()
-                .get(&identity_key)
-                .copied(),
+            a.mem.var_handle_roots.read().get(&identity_key).copied(),
             Some(sm_in_vm_a),
             "the installing VM must see its own var-handle root"
         );
         assert!(
-            b.mem
-                .var_handle_roots
-                .read()
-                .get(&identity_key)
-                .is_none(),
+            b.mem.var_handle_roots.read().get(&identity_key).is_none(),
             "VM B must NOT resolve VM A's var-handle key — the `unwrap_or(cached)` \
              fallback in a process-global singleton therefore hands VM B a raw, \
              unrooted, un-remappable reference into VM A's heap"
@@ -14221,7 +14210,7 @@ mod tests {
         set_global_shared_vm_for_hooks(Arc::downgrade(&shared));
 
         let occurrences = live_hook_vms()
-            .iter()
+            .into_iter()
             .filter(|live| Arc::ptr_eq(live, &shared))
             .count();
         assert_eq!(

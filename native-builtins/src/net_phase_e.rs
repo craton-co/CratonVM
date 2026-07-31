@@ -4664,6 +4664,9 @@ fn re2_bind_listener(
 ) -> MethodCallResult {
     let ip = resolve_host(host)?;
     let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
+    // GAP I6: `java.net.ServerSocket` binds a `TcpListener` directly rather
+    // than through `fd_table`, so it needs the bare endpoint gate.
+    crate::capability_gate::gate_network(&*ctx, &addr.to_string())?;
     let listener = TcpListener::bind(addr).map_err(|e| {
         // Must be a concrete `java.net.BindException`, not a generic
         // IOException with "BindException" as a text prefix — real code
@@ -11886,10 +11889,10 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ds, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd = ctx
-            .fd_table()
-            .open_udp(Some("0.0.0.0:0"))
-            .map_err(|e| ioex(format!("UDP open: {e}")))?;
+        // GAP I6 (UDP half): a datagram bind is a network authority too.
+        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some("0.0.0.0:0")).map_err(|e| {
+            crate::capability_gate::translate_open_failure(e, |io| format!("UDP open: {io}"))
+        })?;
         let port = ctx
             .fd_table()
             .udp_local_addr(fd)
@@ -11908,10 +11911,10 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let addr_spec = format!("0.0.0.0:{port}");
-        let fd = ctx
-            .fd_table()
-            .open_udp(Some(&addr_spec))
-            .map_err(|e| ioex(format!("UDP bind: {e}")))?;
+        // GAP I6 (UDP half).
+        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some(&addr_spec)).map_err(|e| {
+            crate::capability_gate::translate_open_failure(e, |io| format!("UDP bind: {io}"))
+        })?;
         let actual_port = ctx
             .fd_table()
             .udp_local_addr(fd)
@@ -11935,10 +11938,11 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             }
             _ => "0.0.0.0".to_string(),
         };
-        let fd = ctx
-            .fd_table()
-            .open_udp(Some(&format!("{host}:{port}")))
-            .map_err(|e| ioex(format!("UDP bind: {e}")))?;
+        // GAP I6 (UDP half).
+        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some(&format!("{host}:{port}")))
+            .map_err(|e| {
+                crate::capability_gate::translate_open_failure(e, |io| format!("UDP bind: {io}"))
+            })?;
         let actual_port = ctx
             .fd_table()
             .udp_local_addr(fd)
