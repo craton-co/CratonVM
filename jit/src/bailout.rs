@@ -68,12 +68,18 @@ pub const DEFAULT_MAX_NODES: usize = crate::ir::IR_MAX_GRAPH_NODES;
 /// stack-consumption policy, so it is the default the
 /// [`BailoutReason::FrameTooLarge`] check should carry.
 ///
-/// Note the deliberate tension with [`DEFAULT_MAX_NODES`]: `ir_lower` reserves
-/// one 8-byte spill slot per node, so a graph *at* the node limit implies a
-/// ~160 KiB frame, five times this bound. That is the liveness-based
-/// slot-reuse item in the same review ("the current lowerer reserves
-/// `max_nodes * 8` bytes for spills, regardless of live-range overlap"); until
-/// it lands, a method can only approach this limit with a far smaller graph.
+/// Note how this interacts with [`DEFAULT_MAX_NODES`]. `ir_lower` used to
+/// reserve one 8-byte spill slot per *arena* node, so a graph at the node limit
+/// implied a ~160 KiB frame — five times this bound — and a method could only
+/// approach the limit with a far smaller graph. The liveness-based slot-reuse
+/// item from the same review ("the current lowerer reserves `max_nodes * 8`
+/// bytes for spills, regardless of live-range overlap") has since landed:
+/// `ir_lower::plan_slots` colours values whose live ranges do not overlap into
+/// one slot, and `estimate_frame_bytes` budgets that coloured slot count. The
+/// spill term is therefore bounded by peak simultaneous liveness, not by graph
+/// size, so the two limits are now independent — a large graph with a narrow
+/// live set fits comfortably, and a graph whose colouring still overflows is
+/// declined here rather than by the node cap.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = i16::MAX as usize + 1;
 
 // ── Reasons ──────────────────────────────────────────────────────────

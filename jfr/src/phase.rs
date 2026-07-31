@@ -420,9 +420,8 @@ fn epoch() -> Instant {
 }
 
 fn since_epoch_ns(at: Instant) -> u64 {
-    at.saturating_duration_since(epoch())
-        .as_nanos()
-        .min(u64::MAX as u128) as u64
+    let nanos = at.saturating_duration_since(epoch()).as_nanos();
+    nanos.min(u64::MAX as u128) as u64
 }
 
 /// Seed the process epoch and claim the calling thread as the reconciliation
@@ -441,12 +440,9 @@ pub fn mark_process_start() {
     }
     let _ = epoch();
     let _ = with_or_init_state(|state| {
-        let _ = registry().primary_thread_id.compare_exchange(
-            0,
-            state.account.thread_id,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        let id = state.account.thread_id;
+        let primary = &registry().primary_thread_id;
+        let _ = primary.compare_exchange(0, id, Ordering::Relaxed, Ordering::Relaxed);
     });
 }
 
@@ -522,7 +518,8 @@ impl ThreadAccount {
         }
         let root_start = biased - 1;
         let elapsed = now_rel.saturating_sub(root_start);
-        let charged_since = attributed.saturating_sub(self.attributed_at_root_open.load(Ordering::Relaxed));
+        let at_open = self.attributed_at_root_open.load(Ordering::Relaxed);
+        let charged_since = attributed.saturating_sub(at_open);
         elapsed.saturating_sub(charged_since)
     }
 }
@@ -550,9 +547,8 @@ impl Drop for ThreadState {
         // Whatever is still open at thread exit is charged to nothing; its
         // time becomes unattributed, which is the honest reading of "this
         // thread went away mid-phase".
-        self.account
-            .end_ns
-            .store(since_epoch_ns(Instant::now()), Ordering::Relaxed);
+        let now_rel = since_epoch_ns(Instant::now());
+        self.account.end_ns.store(now_rel, Ordering::Relaxed);
     }
 }
 
@@ -598,9 +594,8 @@ fn new_thread_state() -> Option<ThreadState> {
     drop(accounts);
     // First thread to record is the basis unless `mark_process_start` already
     // claimed one.
-    let _ = reg
-        .primary_thread_id
-        .compare_exchange(0, thread_id, Ordering::Relaxed, Ordering::Relaxed);
+    let primary = &reg.primary_thread_id;
+    let _ = primary.compare_exchange(0, thread_id, Ordering::Relaxed, Ordering::Relaxed);
     Some(ThreadState {
         account,
         stack: Vec::with_capacity(8),
@@ -714,15 +709,11 @@ fn open_span(category: Category) -> PhaseSpan {
         state.next_token = state.next_token.wrapping_add(1);
         let now = Instant::now();
         if state.stack.is_empty() {
-            let rel = since_epoch_ns(now);
-            state
-                .account
-                .attributed_at_root_open
-                .store(state.account.attributed_ns.load(Ordering::Relaxed), Ordering::Relaxed);
-            state
-                .account
-                .open_root_start_ns_biased
-                .store(rel.saturating_add(1), Ordering::Relaxed);
+            let rel = since_epoch_ns(now).saturating_add(1);
+            let account = &state.account;
+            let charged = account.attributed_ns.load(Ordering::Relaxed);
+            account.attributed_at_root_open.store(charged, Ordering::Relaxed);
+            account.open_root_start_ns_biased.store(rel, Ordering::Relaxed);
         }
         state.account.open_depth.fetch_add(1, Ordering::Relaxed);
         state.stack.push(Frame {

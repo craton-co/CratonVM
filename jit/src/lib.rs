@@ -9962,8 +9962,12 @@ fn try_compile_inner(
                 // DCE, reassociation, LICM and unrolling all run inside it and
                 // it publishes no per-pass boundary — so this is one row, not
                 // one row per pass. The before/after node counts are still the
-                // useful number: they are what `ir_lower::estimate_frame_bytes`
-                // multiplies by 8 to size the frame.
+                // useful number, but they are no longer a frame-size figure:
+                // `ir_lower::estimate_frame_bytes` multiplies the
+                // liveness-COLOURED slot count (`SlotPlan::slots`) by 8, not the
+                // node count. Shrinking the graph therefore shrinks the frame
+                // only when it also shrinks peak simultaneous liveness — which
+                // is what the report's `peak_live_values` is for.
                 let metrics_optimize = metrics.phase(metrics::Phase::Optimize);
                 let metrics_nodes_before_optimize = graph.nodes.len();
                 ir_optimize::optimize(&mut graph);
@@ -10109,9 +10113,10 @@ fn try_compile_inner(
                 if !has_live_new_array && !ir_verify_bail {
                     // The graph the lowerer will actually see. `live_nodes` is
                     // the non-`Op::Dead` count: the gap against `nodes` is dead
-                    // arena the optimizer left behind, and `ir_lower` reserves
-                    // 8 frame bytes per ARENA node, so that gap is also frame
-                    // bytes paid for values that no longer exist.
+                    // arena the optimizer left behind. That gap no longer costs
+                    // frame bytes — `ir_lower::plan_slots` colours by live range
+                    // and only nodes that actually take a slot get one — so it is
+                    // now a statement about the optimizer's leftovers alone.
                     metrics.set_graph_at_lower(
                         graph.nodes.len(),
                         graph

@@ -7,6 +7,10 @@ eyeball the diff" loop that produced nearly every bug found and fixed during
 this project's manual bug-hunt history.
 
 Full design: [`docs/feature-designs/differential-fuzzer.md`](../docs/feature-designs/differential-fuzzer.md).
+Operator guide — every dimension, every normalization rule and its risk, the
+execution-path mode axis, how to read the coverage matrix, and how to tell a
+harness false positive from a real VM divergence:
+[`docs/testing/differential.md`](../docs/testing/differential.md).
 
 > **Status: Steps 0-7 wired.** `run` A/Bs the corpus across the CratonVM mode
 > matrix vs HotSpot and auto-classifies each divergence; `gate` adds the
