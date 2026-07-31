@@ -9098,6 +9098,20 @@ fn try_compile_inner(
                         // bailed out of IR to single-pass never reaches here, so it
                         // keeps the constructor default `false`.
                         compiled.used_ir_backend = true;
+                        // `used_ir_backend` was written and never read at
+                        // runtime, so "did the optimizing tier produce any body
+                        // in this run?" had no answer outside `cfg(test)`. That
+                        // is what left the IR relocation contract unfalsifiable:
+                        // a probe showing `coverage_fallbacks=0` cannot be told
+                        // apart from a probe where IR never compiled anything.
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES")
+                            .is_some()
+                        {
+                            eprintln!(
+                                "[ir] optimizing backend produced a body for {}.{}{}",
+                                cached.class_name, cached.method_name, cached.method_descriptor
+                            );
+                        }
                         // wire-tiered-manager Step 3 telemetry (test-only):
                         // records that the optimizing IR path — not the
                         // single-pass C1 backend — produced this body, so the
