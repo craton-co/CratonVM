@@ -230,3 +230,42 @@ The superseded write-up is preserved in git history at
   interpreter half of that family.
 * `vm/src/runtime/interpreter/invoke.rs`'s `try_stackless_invoke` "T15"
   comment (array class names rewritten to `java/lang/Object`).
+
+## Possible residual observed 2026-07-31, after this fix landed
+
+Seen while quantifying a separate H2 throughput problem
+(`docs/known-issues/h2/bug-h2-testmultithread-concurrent-insert-throughput-timeout.md`)
+on a binary built from `dev` @ `4a48f12cb6`, i.e. one that **contains** this
+fix: a 25-thread × 1000-row JDBC insert/commit probe had **all 25 threads** fail
+with
+
+```
+org.h2.jdbc.JdbcSQLNonTransientException: General error:
+  "java.lang.CloneNotSupportedException"; SQL statement:
+COMMIT [50000-249]
+```
+
+i.e. the same `CloneNotSupportedException`, on the same H2 `COMMIT` →
+`TransactionStore` → `VersionedBitSet` path this doc covers, ~348 s into the run.
+
+It is **intermittent and thread-count-dependent**, which is why it did not show
+up in this doc's own verification:
+
+* 25 threads × 1000 rows — all 25 threads failed.
+* 25 threads × 200 rows, same binary, same probe — `failed=0`.
+* `org.h2.test.db.TestMultiThread` itself (25 threads × 1000 rows) on the same
+  binary — no `CloneNotSupportedException` at all; it failed on H2's own
+  5-minute future timeout instead.
+* `org.h2.test.db.TestCompatibility` on the same binary — passes (`rc=0`) both
+  JIT-on and `--nojit`, where before this fix it failed with exactly this
+  exception under JIT-on.
+
+So the fix is clearly effective for the deterministic cases; something in the
+same dispatch path still slips through when many threads are active. No stack
+was captured (the probe only recorded `toString()` on the failing run, and the
+re-run with stack printing did not reproduce). Worth a targeted rerun with
+`printStackTrace` at 25 × 1000 before assuming it is the same mechanism.
+
+Repro used:
+`docs/internal/repros/h2-insert-scale-20260731/H2InsertScaleProbe.java`, invoked
+as `H2InsertScaleProbe <abs-dir> 25 1000`.

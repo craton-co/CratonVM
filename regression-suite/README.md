@@ -34,6 +34,33 @@ The script exits non-zero if any class fails, so it is CI-ready.
 **Env overrides:** `CV=<cratonvm.exe>` · `JDK=<jdk home>` ·
 `ONLY="RJitGc RCrypto"` (run a subset) · `TIMEOUT=<seconds>`.
 
+## JDK-only corpus
+
+A second class list, `SUITE=jdk-only`, drives the strict-mode corpus described
+in [`docs/feature-designs/jdk-only-mode.md`](../docs/feature-designs/jdk-only-mode.md).
+The vector-to-blocker mapping (against
+[`docs/jdk-only-runtime-services.md`](../docs/jdk-only-runtime-services.md)),
+the determinism rules and the corpus's own known limitations live in
+[`jdk-only-coverage.txt`](jdk-only-coverage.txt).
+
+```bash
+SUITE=jdk-only CRATONVM_ARGS="--jdk-only" bash regression-suite/run.sh
+SUITE=all RELEASES="17 21 25" bash regression-suite/run.sh
+```
+
+**Additional env overrides:** `CRATONVM_ARGS="--jdk-only"` (extra launcher args;
+empty by default, in which case the CratonVM invocation is unchanged) ·
+`SUITE=core|jdk-only|all` (default `core` — the historical set, unchanged) ·
+`RELEASES="17 21 25"` (javac `--release` matrix; empty by default, i.e. one
+pass with no `--release` flag) · `JDK17=` / `JDK21=` / `JDK25=` (optional
+per-release JDK homes; a release with no usable javac is skipped with a
+message, not failed).
+
+`regression-suite/modules/` holds a real named module built into
+`build-modules/` for `RJdkModule`; `regression-suite/resources/` is staged into
+`build/` so `RJdkServices` discovers its providers through a real
+`META-INF/services` resource.
+
 ## How a class passes
 
 A class **PASSES** when, on CratonVM, it: (1) exits 0, (2) prints its
@@ -42,6 +69,13 @@ deterministic output lines (`PASS …` / `CK …`) are byte-identical to HotSpot
 HotSpot is the oracle — no golden values are hard-coded; any JIT/GC miscompile
 that changes a checksum, or any behavioural divergence, fails the diff. (If
 `java` is absent the cross-VM diff is skipped and only the in-VM asserts run.)
+
+The one exception is a vector whose **correct** outcome differs between
+compatibility modes. Those get an explicit per-mode golden in
+[`expect/`](expect/README.txt), which replaces the HotSpot oracle for that class
+in that mode. No such golden is shipped today; the single mode-divergent vector
+(`RJdkStrict`) is instead only *scheduled* under `--jdk-only`, and prints a
+`SKIP` line with the reason otherwise.
 
 Each source file is self-contained (default package, only JDK classes) and
 runnable on its own: `cratonvm -cp build RJitGc`.
@@ -63,12 +97,45 @@ runnable on its own: `cratonvm -cp build RJitGc`.
 | `RJitGc` | hot int/long/float/double loops (JIT+OSR), **binary-tree alloc + GC churn**, megamorphic dispatch, array bounds — all checksum-diffed vs HotSpot |
 | `RConcurrent` | threads, atomics, locks, `ConcurrentHashMap`, executors, futures, latches — **not in the default set** (see Known gaps) |
 
+### JDK-only corpus (`SUITE=jdk-only`)
+
+| Class | Area |
+|-------|------|
+| `RJdkHello` | bootstrap, `System` streams and properties, `PrintStream`, `String` incl. interning and a UTF‑16 body |
+| `RJdkCollections` | `ArrayList` (incl. `subList` view), `HashMap`/`TreeMap`/`LinkedHashMap`, iterators, streams, `Optional` |
+| `RJdkRecords` | records + sealed classes: `Record`/`PermittedSubclasses` attributes, `getRecordComponents`, canonical constructor |
+| `RJdkLambdas` | `invokedynamic`, `LambdaMetafactory` (incl. `altMetafactory`), bridges, captured values — **and `Function.identity()`**, a named P0 |
+| `RJdkHandles` | `MethodHandle` lookup/adaptation/access checks, `VarHandle` field, static, array and atomic access |
+| `RJdkProxy` | proxy generation, invocation handlers, `invokeDefault`, exception wrapping, loader identity and caching |
+| `RJdkHidden` | `Lookup.defineHiddenClass`, NESTMATE vs non-nestmate, nestmate private access, nest shape |
+| `RJdkReflect` | members, `setAccessible`, the **reflection inflation/accessor** path, annotations, serialization incl. `Externalizable` |
+| `RJdkJmx` | `ObjectName` canonicalisation, MBean register/attributes/operations/notifications/queries, platform MXBeans — named P0 |
+| `RJdkServices` | class-path `ServiceLoader`: `META-INF/services` discovery, `stream()`, `reload()`, `ServiceConfigurationError` |
+| `RJdkModule` | a real named module on `--module-path`: descriptor, reads, exports vs opens, encapsulated resources, module service providers |
+| `RJdkExecutors` | fixed pool, futures, cancellation, `invokeAll`/`invokeAny`, thread factory, rejection policies, scheduled executor, interruption, `CompletableFuture` |
+| `RJdkForkJoin` | `RecursiveTask`/`RecursiveAction`/`CountedCompleter`, parallel streams, worker exceptions, quiescence |
+| `RJdkAqs` | `ReentrantLock` (hold counts, `lockInterruptibly`), `Condition`, `ReentrantReadWriteLock`, `StampedLock`, a custom `AbstractQueuedSynchronizer` |
+| `RJdkProcess` | `ProcessHandle` current/parent/children/info/liveness/`onExit`, child process exit code and forcible kill — named P1 |
+| `RJdkNio` | `Files`/`Path`, `RandomAccessFile`, `FileChannel` incl. **memory mapping** and locks, buffers, `Selector`, **asynchronous close** |
+| `RJdkNet` | DNS, loopback TCP echo, socket options, `SO_TIMEOUT`, close-during-read, loopback UDP |
+| `RJdkSecurity` | digest/HMAC/AES‑GCM/PBKDF2 KATs, `SecureRandom` invariants, RSA sign/verify + key encoding, `SSLContext`/`SSLEngine`, provider lookup |
+| `RJdkJni` | `ACC_NATIVE` metadata, `java.util.zip` native handles, `System.loadLibrary`, unbound natives, reference identity across GC |
+| `RJdkFailure` | missing class, **real `NoSuchMethodError`/`NoClassDefFoundError`** (via a same-length constant-pool patch into a hidden class), missing native, missing module, unsupported platform services |
+| `RJdkStrict` | mode-**divergent** probes: no fabricated `org.jboss`/`io.quarkus`/`io.smallrye` classes, no `Function$Identity` stand-in, real `ProcessHandle` bytes, bytecode beats native — **`--jdk-only` only** |
+
 ## Extending
 
 Add a `src/RFoo.java` that prints `PASS RFoo (<n> checks)` on success (throw /
 `System.exit(1)` on failure; print any cross-VM-verified values on `CK …`
-lines), then add `RFoo` to the `CLASSES` list in `run.sh`. Keep each class
-fast (well under a second) and deterministic.
+lines), then add `RFoo` to the `CLASSES_CORE` list in `run.sh` (or
+`CLASSES_JDKONLY` for a strict-mode vector). Keep each class fast (well under a
+second) and deterministic.
+
+**Determinism is not optional** — the suite diffs two VMs byte for byte, so any
+wall-clock value, pid, port, host name, absolute path, unsorted hash-map
+iteration, unseeded random draw, generated class name or non-ASCII stdout byte
+is an immediate false failure. The full rule list, and the reasoning behind
+each, is at the bottom of [`jdk-only-coverage.txt`](jdk-only-coverage.txt).
 
 ## Known gaps (intentionally not asserted)
 
