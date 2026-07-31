@@ -21673,6 +21673,29 @@ pub(super) fn execute_invokevirtual_cached(
                         // this virtual promotion out of java.util; static
                         // compilation and ordinary direct dispatch remain on.
                         && !receiver_is_java_util
+                        // A handler-bearing callee must never be entered by a
+                        // DIRECT compiled call. `execute_jit_call_decoded`
+                        // below has no interpreter boundary at which the
+                        // callee's own exception table can be resumed, so an
+                        // implicit NPE/AIOOBE raised inside it bails out
+                        // through THIS caller's epilogue, past the only point
+                        // able to route it — leaving a pending exceptional
+                        // frame the caller cannot resume. On an embedded server
+                        // that surfaces as a request that never completes
+                        // (`MultipartAutoConfigurationTests`).
+                        //
+                        // `try_jit_upgrade_with_gate` already refuses these,
+                        // and so do the MIC/PIC and OSR direct-call sites
+                        // (`mic_callee_has_exception_table`,
+                        // `osr_callee_declares_handlers`). This route was the
+                        // gap: under `bg_compile` — the DEFAULT — the worker
+                        // publishes and the `jit_cache` probe below promotes
+                        // the site without consulting the gate, which is the
+                        // only reason `jit_virtual_tierup` had to be turned off
+                        // wholesale. `exception_table` is carried on the
+                        // callee's own cache entry, so this costs one field
+                        // read, not a class-manager lookup.
+                        && cached.exception_table.is_empty()
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
                         // Fast path: already compiled (by this counter or OSR)?

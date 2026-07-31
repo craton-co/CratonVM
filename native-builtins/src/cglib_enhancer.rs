@@ -59,7 +59,7 @@ use std::sync::{Mutex, OnceLock};
 
 use cratonvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
-use cratonvm_types::Value;
+use cratonvm_types::{ObjectRef, Value};
 
 /// Monotonic counter for generating unique enhancer subclass names. Mirrors
 /// CGLIB's own `KeyFactory.generateName` counter.
@@ -3967,6 +3967,195 @@ fn native_spring_naming_policy_get_class_name(
     Ok(Some(Value::Object(Some(out))))
 }
 
+/// Spring's marker interface for a class loader that can define classes on
+/// behalf of a caller (`publicDefineClass`) and can name the loader an
+/// enhanced class should really land in (`getOriginalClassLoader`).
+const SMART_CLASS_LOADER_IFACE: &str = "org/springframework/core/SmartClassLoader";
+
+/// True when `class_id` — or any class/interface above it — is Spring's
+/// `SmartClassLoader`.
+fn implements_smart_class_loader(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+) -> bool {
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut stack = vec![class_id];
+    while let Some(cid) = stack.pop() {
+        if !seen.insert(cid.as_u32()) {
+            continue;
+        }
+        if ctx.class_name_of_id(cid).as_deref() == Some(SMART_CLASS_LOADER_IFACE) {
+            return true;
+        }
+        for iface in ctx.class_interfaces(cid) {
+            stack.push(iface);
+        }
+        if let Some(sup) = ctx.superclass_of(cid) {
+            stack.push(sup);
+        }
+    }
+    false
+}
+
+/// Port of `ConfigurationClassEnhancer.reliesOnPackageVisibility`: a config
+/// class that is package-private, or that declares a package-private
+/// constructor or `@Bean` method, can only be subclassed from its OWN loader's
+/// runtime package — so the enhanced subclass must be defined there no matter
+/// which loader the caller asked for.
+fn relies_on_package_visibility(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+) -> bool {
+    const ACC_PUBLIC: u16 = 0x0001;
+    const ACC_PROTECTED: u16 = 0x0004;
+    const VISIBLE: u16 = ACC_PUBLIC | ACC_PROTECTED;
+
+    if ctx.class_access_flags(class_id) & VISIBLE == 0 {
+        return true;
+    }
+    let methods = ctx.declared_methods(class_id);
+    if methods
+        .iter()
+        .any(|m| m.name == "<init>" && m.access_flags & VISIBLE == 0)
+    {
+        return true;
+    }
+    // Only a package-private/private method can force the fallback, so the
+    // (expensive) `@Bean` annotation walk is worth doing for those alone.
+    let hidden: Vec<(String, String)> = methods
+        .iter()
+        .filter(|m| {
+            m.name != "<init>" && m.name != "<clinit>" && m.access_flags & VISIBLE == 0
+        })
+        .map(|m| (m.name.clone(), m.descriptor.clone()))
+        .collect();
+    hidden
+        .into_iter()
+        .any(|(name, descriptor)| method_carries_bean(ctx, class_id, &name, &descriptor))
+}
+
+/// CratonVM namespace id for a `ClassLoader` object, normalised so it can be
+/// compared against `NativeContext::loader_id_of_class`.
+///
+/// `loader_namespace_id` answers `0` ("the global/application namespace") for
+/// every BUILT-IN loader, while `loader_id_of_class` reports the application
+/// loader as `2` — the two conventions have to be reconciled before an
+/// equality test means anything. `None` is the bootstrap loader (`0` in both).
+fn loader_namespace_for_object(ctx: &mut dyn NativeContext, cl: Option<ObjectRef>) -> u32 {
+    match cl {
+        Some(obj) => match crate::classloader::loader_namespace_id(ctx, obj) {
+            0 => 2,
+            id => id,
+        },
+        None => 0,
+    }
+}
+
+/// Decide which loader namespace the enhanced subclass belongs in, mirroring
+/// the arbitration `ConfigurationClassEnhancer.enhance` performs before it
+/// hands the job to CGLIB.
+///
+/// Spring passes the loader it WANTS the proxy in; whether the proxy actually
+/// lands there depends on three further questions, and this native replacement
+/// for `enhance` has to answer all three itself (measured against HotSpot with
+/// `probes/CceProbe.java`, which prints the real answer for each of the four
+/// loaders `ConfigurationClassEnhancerTests` uses):
+///
+///  1. **Is it a different loader at all?** `classLoader == configClass
+///     .getClassLoader()` is the common case and short-circuits everything.
+///  2. **Does the loader name a different original?** A `SmartClassLoader`
+///     answers `getOriginalClassLoader()`; Spring's own `OverridingClassLoader`
+///     and the tests' `CustomSmartClassLoader` return their PARENT, which is
+///     where the proxy then goes.
+///  3. **Would the proxy see the same superclass there?** Package visibility
+///     (`reliesOnPackageVisibility`) rules out a foreign loader outright, and
+///     even for a public config class a loader that defines its OWN copy of the
+///     superclass (exactly what `OverridingClassLoader` does) must not be used:
+///     real CGLIB's define fails there and `createClass`'s fallback re-runs the
+///     generation against the config class's own loader. Asking the loader to
+///     `loadClass` the superclass name is the same question the JVM asks when
+///     it resolves `super_class` at define time.
+///
+/// Returns the namespace id to define into. Nothing else has to be recorded:
+/// `Class.getClassLoader()` already resolves a user-defined namespace id back
+/// to its loader object (`native_class_get_class_loader`'s `loader_type >= 3`
+/// arm), so defining into the namespace IS the attribution.
+fn resolve_define_loader(
+    ctx: &mut dyn NativeContext,
+    super_class_id: cratonvm_types::ClassId,
+    super_name: &str,
+    super_loader_id: u32,
+    requested: Value,
+) -> u32 {
+    let requested_obj = match requested {
+        Value::Object(Some(obj)) => obj,
+        _ => return super_loader_id,
+    };
+    let pin = ctx.pin_native_root(requested_obj);
+    let mut cl = Some(ctx.read_native_pin(pin, requested_obj));
+    let mut id = loader_namespace_for_object(ctx, cl);
+
+    // (2) A SmartClassLoader gets to redirect to its "original" loader.
+    if id != super_loader_id {
+        if let Some(obj) = cl {
+            let obj = ctx.read_native_pin(pin, obj);
+            let cl_cid = ctx.class_id_of_object(obj);
+            if implements_smart_class_loader(ctx, cl_cid) {
+                let obj = ctx.read_native_pin(pin, obj);
+                if let Ok(Some(Value::Object(orig))) = ctx.invoke_virtual(
+                    obj,
+                    "getOriginalClassLoader",
+                    "()Ljava/lang/ClassLoader;",
+                    &[],
+                ) {
+                    cl = orig;
+                    id = loader_namespace_for_object(ctx, cl);
+                }
+            }
+        }
+    }
+
+    // (3a) Package visibility pins the proxy to the config class's loader.
+    if id != super_loader_id && relies_on_package_visibility(ctx, super_class_id) {
+        ctx.unpin_native_roots(pin);
+        return super_loader_id;
+    }
+
+    // (3b) A loader that would resolve the superclass to a DIFFERENT class
+    // cannot host the proxy.
+    if id != super_loader_id {
+        if let Some(obj) = cl {
+            let obj = ctx.read_native_pin(pin, obj);
+            let dotted = super_name.replace('/', ".");
+            let name_obj = ctx.create_string(&dotted);
+            let obj = ctx.read_native_pin(pin, obj);
+            let resolved = ctx.invoke_virtual(
+                obj,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[Value::Object(Some(name_obj))],
+            );
+            let same = match resolved {
+                Ok(Some(Value::Object(Some(mirror)))) => {
+                    crate::lang_class::mirror_class_id(ctx, mirror) == Some(super_class_id)
+                }
+                _ => false,
+            };
+            ctx.unpin_native_roots(pin);
+            return if same { id } else { super_loader_id };
+        }
+    }
+
+    ctx.unpin_native_roots(pin);
+    // A null "original" loader (bootstrap) is not a namespace this enhancer
+    // can define into — keep the config class's own loader.
+    if cl.is_some() {
+        id
+    } else {
+        super_loader_id
+    }
+}
+
 fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = receiver, args[1] = config Class, args[2] = ClassLoader.
     //
@@ -4017,7 +4206,26 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         }
     };
     let super_loader_id = ctx.loader_id_of_class(super_class_id) as u32;
-    let cache_key = (super_loader_id, super_name.clone());
+
+    // `enhance(configClass, classLoader)`'s third argument is not advisory:
+    // a public config class asked for in a foreign loader really is defined
+    // THERE, and `enhancedClass.getClassLoader()` is asserted on
+    // (`ConfigurationClassEnhancerTests.withPublicClass`). Everything this
+    // native has to weigh before agreeing to that is in
+    // `resolve_define_loader`; the answer then keys the name counter, the
+    // class cache and the define itself, all of which are per-namespace.
+    let requested_loader = args.get(2).cloned().unwrap_or(Value::Object(None));
+    let mirror_pin = ctx.pin_native_root(cls_mirror);
+    let define_loader_id = resolve_define_loader(
+        ctx,
+        super_class_id,
+        &super_name,
+        super_loader_id,
+        requested_loader,
+    );
+    let cls_mirror = ctx.read_native_pin(mirror_pin, cls_mirror);
+    ctx.unpin_native_roots(mirror_pin);
+    let cache_key = (define_loader_id, super_name.clone());
 
     // Real CGLIB caches the generated proxy class per superclass and
     // returns the SAME `Class` on a repeat `enhance()` call instead of
@@ -4129,7 +4337,7 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     // the full 40-method class run.
     let mut attempt = 0u32;
     let (mut new_name, mut bytes) =
-        build_enhancer_class(super_loader_id, &super_name, &bean_methods, &ctor_descriptors);
+        build_enhancer_class(define_loader_id, &super_name, &bean_methods, &ctor_descriptors);
 
     let (cid, new_name, bytes_arc) = loop {
         let opts = DefineClassFull {
@@ -4138,7 +4346,7 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             ..Default::default()
         };
         let bytes_arc = std::sync::Arc::new(std::mem::take(&mut bytes));
-        match ctx.define_class_full(&new_name, &bytes_arc, super_loader_id, opts) {
+        match ctx.define_class_full(&new_name, &bytes_arc, define_loader_id, opts) {
             Ok(cid) => break (cid, new_name, bytes_arc),
             // Belt and braces for any remaining way the name can already be
             // taken in the target namespace (a loader that delegates the name to
@@ -4152,13 +4360,13 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             Err(msg) if attempt < 16 && msg.contains("already defined") => {
                 attempt += 1;
                 let (retry_name, retry_bytes) = build_enhancer_class(
-                    super_loader_id,
+                    define_loader_id,
                     &super_name,
                     &bean_methods,
                     &ctor_descriptors,
                 );
                 eprintln!(
-                    "[CCE] enhance: {new_name} already defined in loader {super_loader_id} — retrying as {retry_name}",
+                    "[CCE] enhance: {new_name} already defined in loader {define_loader_id} — retrying as {retry_name}",
                 );
                 new_name = retry_name;
                 bytes = retry_bytes;
@@ -4178,7 +4386,7 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         .insert(cache_key, (cid, new_name.clone(), bytes_arc.clone()));
     let mirror = ctx.get_class_mirror(cid);
     eprintln!(
-        "[CCE] enhance: defined {new_name} (super={super_name}, loader={super_loader_id}, marker={SPRING_MARKER_IFACE}, intercepted @Bean methods={})",
+        "[CCE] enhance: defined {new_name} (super={super_name}, loader={define_loader_id}, marker={SPRING_MARKER_IFACE}, intercepted @Bean methods={})",
         bean_methods.len(),
     );
     notify_generated_class_handler(ctx, receiver_loader_id, &new_name, &bytes_arc);

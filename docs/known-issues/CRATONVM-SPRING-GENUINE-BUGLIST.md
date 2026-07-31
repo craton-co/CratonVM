@@ -361,6 +361,106 @@ the top twenty afterwards.
 
 ## Closed in the sixth session (2026-07-30)
 
+Branch `fix/spring-2tests-20260730`, worktree `/data/data/wt-spr2t-20260730`,
+binaries `localbin/cv-spr2t-v*.bin`, runner copy `/data/data/spr2t-runner`.
+Both classes the third/fourth sessions had written off as fixture artefacts
+turned out to have a real VM bug behind them.
+
+| class | before | after |
+|---|--:|--:|
+| `context.annotation.ConfigurationClassEnhancerTests` | 4/5 | **5/5** |
+| `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | 0/160, then TIMEOUT | **160/160** at the DEFAULT heap |
+
+### `ConfigurationClassEnhancerTests.withPublicClass` — the enhancer ignored the requested loader
+
+The third session recorded this one as failing "identically on HotSpot in this
+checkout". It does — but only because `KRun` does not pass
+`--add-opens java.base/java.lang=ALL-UNNAMED`. Spring's CGLIB fork says so in
+`ReflectUtils.defineClass` itself ("Avoid through JVM startup with
+--add-opens=java.base/java.lang=ALL-UNNAMED"): without it the reflective
+`ClassLoader.defineClass` is inaccessible and the generated class falls back to
+the neighbour-class loader. **With** the flag HotSpot is 5/5, so the flag — not
+the assertion — was the artefact.
+
+CratonVM answered the config class's own loader for all four loaders because
+`cce_enhance` (`native-builtins/src/cglib_enhancer.rs`, a native replacement for
+`ConfigurationClassEnhancer.enhance`) never read its `classLoader` argument at
+all. It now performs the same arbitration `enhance` does, measured against
+HotSpot with `probes/CceProbe.java`, which prints the real answer per loader:
+
+| loader | HotSpot (with `--add-opens`) | why |
+|---|---|---|
+| `URLClassLoader` | the loader itself | public config class, plain delegation |
+| `OverridingClassLoader` | its PARENT | it defines its OWN copy of the superclass |
+| `CustomSmartClassLoader` | its PARENT | `SmartClassLoader.getOriginalClassLoader()` |
+| `BasicSmartClassLoader` | the loader itself | `publicDefineClass`, no local override |
+
+So the native now: resolves a `SmartClassLoader` through
+`getOriginalClassLoader()`; falls back to the config class's loader when
+`reliesOnPackageVisibility` holds (package-private class, constructor or
+`@Bean` method — this is what keeps `withNonPublic*` at PARENT); and otherwise
+asks the target loader to `loadClass` the superclass name, using it only when
+the answer is the SAME class the JVM would resolve at define time. The chosen
+namespace then keys the `$$SpringCGLIB$$<n>` counter, the class cache and the
+define, so `Class.getClassLoader()` reports the loader Spring asked for
+(`native_class_get_class_loader`'s `loader_type >= 3` arm already maps a
+namespace id back to its loader object — no extra attribution needed).
+
+### `RequestMappingMessageConversionIntegrationTests` — two bugs, neither a linkage bug
+
+The fourth session called this one a heap-sizing artefact ("160/160 at a 6 GB
+heap"). On current `dev` it is **0/160**, and the 6 GB dependency is a real GC
+livelock:
+
+1. **`Socket.setOption` refused every not-yet-connected socket.** Apache
+   HttpClient 5's `DefaultHttpClientConnectionOperator.configureSocket` sets
+   `TCP_KEEPIDLE`/`TCP_KEEPINTERVAL`/`TCP_KEEPCOUNT` through `jdk.net.Sockets`
+   BEFORE `Socket.connect` — Spring's `RestClient` picks that request factory
+   whenever httpclient5 is on the classpath, so this failed all 160 tests with
+   *"Socket.setOption: socket is not connected"*. HotSpot allows it:
+   `Socket.getImpl()` runs `createImpl(true)`, so the fd exists before connect
+   and the option is still in effect afterwards. `net_phase_e.rs` now retains
+   such options in `SockSide::pending_options` and applies them when `connect`
+   publishes the stream — the same retained-setting treatment `read_timeout_ms`
+   already had — and `getOption` answers from that retention. A CLOSED socket
+   still raises. Repro: `probes/SockCfgProbe.java` (HotSpot prints
+   `preconnect setOption OK`, CratonVM used to print `THREW`), end-to-end
+   `probes/RcProbe.java`.
+
+2. **The young-GC trigger livelocked against a sweep that cannot get under
+   it.** With that fixed the class still wedged at test 151/160 at the default
+   4 GB heap — ~zero forward progress for 8+ minutes at 200% CPU. It is not
+   "slow": `CRATONVM_DBG_YOUNG_TRIGGER=1` (new) shows
+   `cursor=1023MB free_list=512MB live=511MB threshold=512MB`, i.e. the live
+   young set sits one megabyte above the trigger. Any collection that runs
+   while compiled code exists is forced onto the NON-MOVING sweep
+   (`conservative_roots::refresh_moving_young_coverage_for_current_thread`
+   marks `JIT_RELOCATION_UNSUPPORTED` whenever `jit_code_range_count() != 0`),
+   which reclaims in place and cannot move that live set out of young — so
+   `needs_gc` stayed true on essentially every allocation. `gen_heap.rs` now
+   samples `live` once per completed collection and, when a collection leaves
+   it at or above the trigger, requires a further 1/16 of capacity of real
+   growth before collecting again, capped at
+   `NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT` so collection is deferred and never
+   abandoned (allocation failure → old-gen spill → GC-and-retry is still the
+   backstop). Result: **160/160 in 8–11 min at the stock 4 GB default**, no
+   fallback storm. `bench/BinTreesClassic 18` is unchanged (checksum
+   68332206; 2404/2640 ms after vs 2537/2503 ms before, same loaded host).
+
+HotSpot reference for the class: 160/160 in 12.3 s, peak RSS 545 MB.
+CratonVM after the fixes: 160/160, peak RSS 2.6 GB. The remaining ~40x wall
+clock and ~5x footprint are the standing interpreter/GC gap, not this class.
+
+### Noted while verifying, NOT caused by these fixes
+
+`context.aot.ApplicationContextAotGeneratorTests` (8/40) and
+`test.context.aot.TestContextAotGeneratorIntegrationTests` (0/4) both failed on
+current `dev` while these fixes were being verified, and both reproduce
+identically on a binary built from pristine `dev` (`e255f60fb1`). That is the
+loader-blind `StackWalker.StackFrame.getDeclaringClass()` bug the AOT-cluster
+session diagnosed and fixed — see *First: everything was broken, and not by
+this cluster* below.
+
 | item | before | after |
 |---|--:|--:|
 | chunk 3 — `bean.override.BeanOverrideHandlerTests` (AssertJ soft assertions) | 39/42 | **42/42** (= HotSpot) |
