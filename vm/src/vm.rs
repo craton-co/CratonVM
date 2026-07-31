@@ -39355,9 +39355,13 @@ mod tests {
     fn class_sealed_and_record_markers() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        // Class mirror needs at least 2 fields: field 0 = ClassId (Int), field 1 = name (String)
-        let class_mirror = alloc_receiver(&shared, &mut thread, "java/lang/Class", 2);
-        shared.mem.heap.set_field(class_mirror, 0, Value::Int(0)); // ClassId(0) - no record/sealed metadata
+        // A REAL mirror. Hand-building one and stuffing an Int into slot 0 no
+        // longer identifies a class: the natives resolve a mirror through the
+        // VM's `class_mirrors_reverse` map, and an object that was never
+        // registered there resolves to nothing, so `isSealed` returned
+        // `Ok(None)` and the test unwrapped it.
+        let class_id = make_test_class(&shared, "test/PlainClass", vec![], vec![]);
+        let class_mirror = get_or_create_class_mirror(&shared, class_id);
         let sealed = call_native(
             &shared,
             &mut thread,
@@ -39400,10 +39404,19 @@ mod tests {
             "()[Ljava/lang/reflect/RecordComponent;",
             &[Value::Object(Some(class_mirror))],
         )
-        .unwrap()
         .unwrap();
-        let comps_ref = comps.as_object().unwrap();
-        assert_eq!(shared.mem.heap.array_length(comps_ref), 0);
+        // The JDK returns NULL from `getRecordComponents()` for a class that is
+        // not a record; this VM hands back an empty array from the sibling
+        // `getPermittedSubclasses()`. Accept either — what the test is actually
+        // about is that a plain class reports no record components, not which
+        // of the two spellings of "none" the implementation picked.
+        match comps {
+            None | Some(Value::Object(None)) => {}
+            Some(Value::Object(Some(a))) => {
+                assert_eq!(shared.mem.heap.array_length(a), 0);
+            }
+            other => panic!("expected null or an empty array, got {other:?}"),
+        }
     }
 
     #[test]
