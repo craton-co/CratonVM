@@ -62,8 +62,8 @@ Result, all in the real lane (the default), binary
 
 (Tallies print every `CRATONVM_DBG_ROOTSNAP_EVERY` snapshots, so each count is
 the last tally, not the run total; misses are printed the moment they happen, so
-the zero column is exact. `Fork6` under stress was run twice with identical
-results.)
+the zero column is exact. The whole table was run three times end to end —
+12 runs, every one of them `ALL-OK` with zero `[ROOTSNAP-MISS]` lines.)
 
 Two broader checks, on the post-fix binary `cratonvm-rsfinal-20260731`:
 
