@@ -478,3 +478,41 @@ Ordered. Each item is a precondition for the next being meaningful.
    JIT-warm workload** and confirm the new `[GC] g1 cycle` line reports
    `degraded=none` across a full mixed sequence. Any other value is a
    reclamation the collector silently declined to make.
+
+## 10. The G1-2 fix costs the fresh-ctor inline store, and that is not avoidable by elision
+
+Closing G1-2 routes every JIT reference store to `jit_putfield_object`
+whenever the backend does not publish live region bounds — i.e. under G1 and
+ZGC. The measurable cost falls on `emit_inline_fresh_ctor_compact_ref_putfield`,
+the `n.left = newChild` shape that dominates allocation-heavy code
+(binarytrees). An inline 8-byte store becomes a helper call. Generational is
+byte-identical; G1 is opt-in and experimental, so this is the right trade — but
+it should be measured under the reliability gate rather than assumed small.
+
+**The obvious optimisation does not work.** It is tempting to elide the post
+barrier for a *freshly allocated* receiver: an old-to-young edge needs an OLD
+source, and a just-allocated object is young by construction. That reasoning
+fails under G1 for a specific reason:
+
+- pinning is **region-granular**, not object-granular (`G1Region::pin_count`,
+  `pin_region(idx)`), and a pinned young region is **excluded from the CSet**
+  (`g1.rs` CSet construction: "all Eden + Survivor regions (skip pinned …)");
+- the allocation path does **not** filter pinned regions — neither
+  `refill_tlab` nor `alloc_in_region` consults `pinned`.
+
+So a fresh allocation can land in a region that is (or becomes) pinned, that
+region is then not evacuated, and it is reachable only through its remembered
+set. Eliding the barrier there loses the edge — the same failure class as G1-1.
+
+**The real recovery path is the inline card mark, not elision.**
+`Compiler::inline_card_mark_available()` (`jit/src/x64.rs`) is a deliberate
+constant `false`, not an oversight: a WildFly JIT boot audit observed an old
+`org/jboss/modules/Module` reference to a young child left on a CLEAN card,
+which lets the next minor collection reclaim a reachable object. Every
+`if self.inline_card_mark_available()` branch is therefore unreachable and
+`emit_inline_card_mark_regs` carries a `debug_assert!` on the same predicate as
+a "never call this" tripwire. The `false` arm is in every case the one that
+routes to the helper, so the disable is fail-safe. Re-enabling it — with
+end-to-end coverage for every compiled store form and the card-table lifecycle —
+is what would give G1 back an inline post barrier, for old and fresh receivers
+alike.

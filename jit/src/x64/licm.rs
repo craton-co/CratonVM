@@ -289,9 +289,15 @@ pub fn narrow_oops_block_inline_fields() -> bool {
 /// When on, a `putfield` of a reference field emits an inline 16-byte `Value`
 /// store INSTEAD of the `jit_putfield_object` helper CALL when the field's OLD
 /// value is null (`payload == 0`, so no SATB snapshot is needed). Young
-/// receivers require no post barrier; old generational receivers use the
-/// inline atomic card mark. Collector-specific G1/ZGC barriers and non-null
-/// old values retain the validated helper. This is the canonical
+/// receivers require no post barrier. Old receivers take the helper: the
+/// inline atomic card mark is emitted only when `inline_card_mark_available()`
+/// is true, and that predicate is deliberately a constant `false` — a WildFly
+/// JIT boot audit observed an old `org/jboss/modules/Module` reference to a
+/// young child left on a CLEAN card, which lets the next minor collection
+/// reclaim a reachable object. `jit_putfield_object` is therefore the single
+/// source of truth for old-to-young post barriers until the inline sequence
+/// has end-to-end coverage. Collector-specific G1/ZGC barriers and non-null
+/// old values also retain the validated helper. This is the canonical
 /// fresh-object-initialisation pattern (`n.left = newChild`) that dominates
 /// allocation-heavy code (object binarytrees). Opt out with
 /// `CRATONVM_NO_JIT_INLINE_PUTFIELD`; the former
