@@ -1,0 +1,142 @@
+# JDK-only mode — open wave-2 work list
+
+**Status:** OPEN. Filed 2026-07-31 from wave-1 implementation findings;
+re-verified against the re-landed tree the same day.
+
+Normative contract: [`docs/feature-designs/jdk-only-mode.md`](../../feature-designs/jdk-only-mode.md)
+(owned by the orchestrator; do not edit). Wave 1 is **measurement, not
+deletion** (contract §10). Everything in this directory is a gap wave 1
+deliberately deferred rather than papered over, with the evidence that makes it
+actionable.
+
+Related non-known-issue docs: [`docs/jdk-only-runtime-services.md`](../../jdk-only-runtime-services.md),
+[`docs/jdk-only-audit.md`](../../jdk-only-audit.md),
+[`docs/jdk-only-native-review.md`](../../jdk-only-native-review.md),
+[`docs/jdk-only-migration.md`](../../jdk-only-migration.md),
+[`docs/jdk-only-ambient-category-audit.md`](../../jdk-only-ambient-category-audit.md),
+[`docs/jdk-only-object-layout-audit.md`](../../jdk-only-object-layout-audit.md).
+The last two did not exist when these records were first written and are the
+evidence base for items 1 and 2.
+
+---
+
+## Citation status — read this before trusting a `file:line`
+
+These records were first written on 2026-07-31 against a working tree whose
+uncommitted wave-1 edits were then destroyed by an external `git restore`. The
+work was **re-landed** into this worktree (`C:\craton\wt-jdk-only`, branch
+`feat/jdk-only-mode`) by fresh agents. The re-land is equivalent in design and
+different in detail: line numbers moved, several helpers were renamed, and a few
+constructs were replaced by differently-shaped ones.
+
+Every `file:line` in this directory has since been re-verified against the
+re-landed tree and corrected. What that pass established:
+
+* **Anchor on the marker tag, not the number.** Wave-2 sites carry
+  `// JDK-ONLY-WAVE2:`, deferred observations carry `// JDK-ONLY-NOTE:`,
+  per-registrar category verdicts carry `// JDK-ONLY-CLASSIFY:`, and
+  field-slot verdicts carry `// JDK-ONLY-LAYOUT:`. Those tags are stable; the
+  numbers are not.
+* **The dispatch resolver re-land left exactly 14 `JDK-ONLY-WAVE2` markers**
+  across `vm/src/vm/vm_exec.rs` (6) and `vm/src/runtime/interpreter/invoke.rs`
+  (8). They are enumerated in the records that own them. Two of the fourteen
+  are a **cross-linked pair** for the `java/lang/String` policy that both say,
+  in terms, that they must be deleted together; two more are the
+  real-protected-stub allow-list copies, both now annotated *"RECONCILE, not
+  assume"*.
+* **Several wave-1 gaps closed during the re-land.** The most significant:
+  `real_declaring_method` is now populated rather than `null`; the two
+  divergent schema-2 census writers were unified into one; the JIT's inline
+  caches now refuse to publish native entries under `JdkOnly`; the JIT's
+  by-name native fast paths are policy-checked and counted. Each affected
+  record says so where it applies, and the ranking below reflects the move.
+* **`vm-cli/src/main.rs` was being edited while this pass ran.** Its citations
+  are given by function and marker name only.
+* Claims that could not be re-verified are marked **UNVERIFIED** inline rather
+  than deleted or asserted.
+
+---
+
+## Ranked work list
+
+Ranked by *danger*, not by effort. The first tier causes **silent wrong
+behaviour** — no exception, no log line, no failing test.
+
+### Tier 1 — silent misbehaviour
+
+| # | Record | Why it is dangerous |
+|---|---|---|
+| 1 | [`NativeKind` is ambient and defaults to `SyntheticStub`](native-kind-is-ambient-and-defaults-to-syntheticstub.md) | `register()` takes no kind; it is inherited from a mutable registry field defaulting to `SyntheticStub`. The dominant defect is the **opposite** of under-tagging: 1,195 `native-collections` registrations are tagged `Bridge` by a single `set_category` line, and **not one** of them targets an `ACC_NATIVE` method. Under-tagging is real too and already caused one boot regression (2026-07-14, `java.util.Properties`). Both directions are silent at the point of the mistake. |
+| 2 | [Fabricated object layouts leak into native code](fabricated-object-layouts-leak-into-native-code.md) | Index-based field access against assumed synthetic layouts. On real bytes the index still resolves and points at a different field. `StringJoiner.add()` silently no-ops; `EnumSet.of()` returns an object with a null iterator. Two `breaks-under-strict` and two `unknown` sites are marked; three whole crates were never swept. |
+| 3 | [The forced-native `String` policy exists in three places, in disagreeing forms](forced-native-string-policy-two-lists-that-disagree.md) | A 21-name positive list (cold path) versus a 7-pair exclusion (warm path), plus a JIT direct-call ladder. The disagreement has already made a landed, measured h2-bnf performance fix into **statically unreachable code**. |
+| 4 | [`ensure_synthetic_class` cannot enforce policy, only record it](ensure-synthetic-class-cannot-enforce-only-record.md) | Returns a bare `ClassId`, so under `--jdk-only` it records the violation and fabricates anyway, across 52 live non-test call sites in 27 files. The fallible siblings now exist but have **zero callers**, so nothing changed operationally. Strict boot *silently loses* `Enumeration$Impl` / `Comparator$Native` instead of failing. |
+| 5 | [VM-internal classes are mislabelled `CompatibilityStub`](vm-internal-classes-mislabelled-compatibility-stub.md) | `AnonymousObject$N` and `Proxy$Instance` are stamped `CompatibilityStub` to avoid flipping the derived `is_synthetic_stub` bool that 181 read sites across 20 files depend on. Correct deferral — but it makes contract §11's zero-stub criterion unachievable by construction, and two of those read sites gate native-vs-bytecode dispatch. |
+| 6 | [Cached invoke targets drop the `NativeKind`](cached-invoke-targets-drop-the-nativekind.md) | `CachedInvokeTarget::{Native,VirtualNative}` store a callback and no kind, so a cache *hit* cannot re-apply the policy. The hit path re-derives it by name — but only for classes on a hard-coded allow-list; everything else is served unchecked. The re-land closed the counting half for the **static** cached path only; the virtual one, which is the high-volume one, is still uncounted by design. |
+| 7 | [The `ThreadPoolExecutor.execute` receiver-shape case is copied eight times](threadpoolexecutor-execute-receiver-shape-special-case-copies.md) | Wave 1's markers name four. There are **eight** dispatch sites in the `vm` crate plus one unconditional `force_native` arm they all exist to override. A mechanical "delete every marked site" sweep leaves half the duplication enforcing a policy the other half no longer applies. The marker undercount is unchanged by the re-land. |
+| 8 | [The real-protected-stub allow-lists diverge](real-protected-stub-allowlists-diverge.md) | Two copies, 11 classes vs 10: one includes `java/util/StringJoiner`, the other deliberately omits it with a documented heap-corruption reason. Wave 2 must **reconcile**, not merge; both naive directions reintroduce a known defect. *Demoted from 7 to 8:* the re-land added the missing cross-reference to the including copy, so the "a reader who finds one has no way to know the other exists" trap is retired. The divergence itself is untouched. |
+
+### Tier 2 — the instruments the tier-1 items must be measured with
+
+| # | Record | Why it matters |
+|---|---|---|
+| 9 | [The observability surface has two remaining holes](observability-surface-has-three-unfilled-holes.md) | Of the three originally filed, one closed during the re-land: `real_declaring_method` is now populated from a non-initiating lookup, and the two divergent schema-2 writers were unified into one. Still open: (a) `ClassOriginEntry::requested_by` is `null` — the requester is known to the interpreter, not `ClassManager`; (b) `--trace-jdk-only` polls two append-only logs, so mid-run class-origin violations surface at shutdown. |
+| 10 | [`System.exit(N)` bypasses the JDK-only census entirely](system-exit-bypasses-the-jdk-only-census.md) | The launcher writes the census at four failure sites, but `std::process::exit` never unwinds and none of the four is reached. The runs most likely to need the census — a strict boot that gives up and exits — are exactly the runs that produce none. The one existing hook cannot safely take the class-manager lock from an arbitrary Java thread. |
+
+### Cross-cutting
+
+| # | Record | Contents |
+|---|---|---|
+| 11 | [Additional wave-2 markers not in the original inventory](additional-wave2-markers-not-in-the-original-inventory.md) | 13 further findings, re-verified and re-scored against the re-land. Four of them moved materially: the JIT's inline caches are now closed-by-refusal under `JdkOnly` rather than unchecked; the JIT's by-name native fast paths are policy-checked and counted; `build_helpers` now publishes the policy before the first compile; and the three documentation-gap items are all closed. Still open: the process-global JIT policy and `JNI_NATIVE_METHODS`, the seven thin direct-call ladders (two of them in the `String` family), the interface-substitution map, the `redefine_immune_*` predicates, `check_override`'s 217-disjunct / ~2,650-line chain, and three stale doc paths in load-bearing comments. |
+
+---
+
+## Dependency order for wave 2
+
+The items are not independent. The order that avoids doing work twice:
+
+1. **Item 9** — finish the instruments. The `real_declaring_method` column now
+   exists, which unblocks item 1's reclassification; `requested_by` and a live
+   trace are what remain, and item 4's migration needs the first of those to be
+   a work list rather than a list of names.
+2. **Item 10** — make the census survive `System.exit`. Every item below is
+   evidence-driven, and the evidence is currently lost for a whole class of
+   runs.
+3. **Item 1** — make every native's kind an explicit, per-registration fact.
+   `registered_by` provenance is already captured (`#[track_caller]` landed), so
+   "chosen" and "inherited" can now be told apart in the census. Nothing else in
+   tier 1 can be done safely before this: items 3, 6, 7, 8 and item 11 §4/§11
+   all end with "let `resolve_dispatch` decide from `NativeKind` +
+   `Method::code()`", which requires the kinds to be true.
+4. **Items 6 and 11 §1 together** — store the kind (and a `NativeMethodId`) in
+   both the interpreter's invoke cache and the JIT's MIC/PIC slots. Doing one
+   alone buys nothing, and the JIT side is currently paying for the gap with a
+   blanket refusal that costs `JdkOnly` runs every inline-cached native call.
+5. **Items 3, 7, 8, and item 11 §4/§8/§9/§11** — delete the hard-coded lists,
+   each with its own regression corpus.
+6. **Items 4 and 5** — migrate the `ensure_synthetic_class` callers to the
+   fallible/generated entry points that already exist, correct the VM-internal
+   origins, then delete `is_synthetic_stub`.
+7. **Item 2** — finish the layout sweep across `native-builtins`,
+   `native-collections`, `native-io` and `vm/src/native/`. Independent of the
+   rest and can run in parallel, but it is the item most likely to surface new
+   blockers.
+
+## Standing constraints for anyone working this list
+
+* `native-builtins/tests/stub_ratchet.rs` asserts `BASELINE_SYNTHETIC_STUBS =
+  157` **exactly**, with `SLACK = 0`, and separately asserts only
+  `total >= 8_000` as a vacuity floor. The floor is not a claim about the exact
+  total — do not cite one. The strict-mode siblings in the same file assert
+  zero `SyntheticStub` registrations and `strict_total >= 7_500`; that second
+  number is a collapse detector, not a measurement, for the same reason.
+* `Compatible` mode must remain byte-for-byte unchanged (contract §5, §10). Most
+  of the dangerous mistakes catalogued here are `Compatible`-mode behaviour
+  changes made while intending to fix strict mode.
+* No process globals for this feature's state (contract §2). Two of the items in
+  this directory are existing violations; do not add a third.
+* **JMX and `java.util.function.Function$Identity` are already retagged
+  `Bridge`** and are *not* among the residual 157. Any plan that starts from
+  "retag JMX" is working from a stale report. `Function$Identity` has a
+  *successor* defect instead — see item 1.
+* `docs/known-issues/` holds **unfixed** issues only. A record moves to
+  `docs/internal/` when it is fixed, not when it is planned.

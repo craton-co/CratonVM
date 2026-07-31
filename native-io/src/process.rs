@@ -2164,6 +2164,16 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // Registration
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: bridge — process control is one of the categories
+// jdk-only-native-review.md §5 names explicitly, and the evidence agrees: 8 of
+// the statically resolvable triples here are ACC_NATIVE in JDK 25
+// (`ProcessHandleImpl.getCurrentPid0`, `isAlive0`, `waitForProcessExit0`,
+// `destroy0`, the `ProcessImpl` spawn entry points). A subprocess cannot be
+// created or reaped from bytecode, and the live `std::process::Child` lives in
+// this crate's table, so these must survive `--jdk-only`. Most of this
+// function's remaining registrations use a class name this static audit could
+// not resolve; confirm them from the schema-v2 census rather than assuming the
+// whole function inherits the verdict.
 /// Register every WP1.12-owned subprocess native.  Called from
 /// `register_io_natives` at VM boot.
 pub fn register_process_natives(registry: &mut NativeMethodRegistry) {

@@ -429,7 +429,7 @@ along.
 
 **Reaching it takes TWO gates open, not one.** Besides the optimizing tier
 being off by default (see
-`jit-optimizing-tier-disabled-by-moving-young-default.md`), the IR *builder*
+`docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`), the IR *builder*
 bails out of `putfield` whenever `compact_ref_fields_enabled()` — which
 defaults to **true** (`Err(_) => true` in `types/src/field_layout.rs`). So the
 repro needs both:

@@ -105,8 +105,21 @@ fn emit_call_absolute(buf: &mut ExecutableBuffer, target: usize) {
     buf.emit(&[0xFF, 0xD0]);
 }
 
-fn emit_post_call_frame_republish(buf: &mut ExecutableBuffer, frame_record: usize) {
+pub(crate) fn emit_post_call_frame_republish(buf: &mut ExecutableBuffer, frame_record: usize) {
     if frame_record == 0 {
+        return;
+    }
+    // Prefer the inline TLS store: the prologue publishes RBP with one
+    // segment-relative MOV into this exact slot, and this is the value-identical
+    // inverse. It costs 9 bytes and no call, versus a PUSH/SUB/CALL/ADD/POP
+    // sequence — which matters because every raw JIT-to-JIT call site now pays
+    // it, and an inline-cache site emits up to five of them.
+    let disp = crate::x64::inline_rbp_tls_disp();
+    if disp != 0 {
+        buf.emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+        // MOV <seg>:[disp32], RBP — REX.W + 89 /r + ModRM(00,RBP,SIB) + SIB(abs).
+        buf.emit(&[0x48, 0x89, 0x2C, 0x25]);
+        buf.emit(&(disp as u32).to_le_bytes());
         return;
     }
     buf.emit_byte(0x50); // PUSH RAX (preserve Java return)

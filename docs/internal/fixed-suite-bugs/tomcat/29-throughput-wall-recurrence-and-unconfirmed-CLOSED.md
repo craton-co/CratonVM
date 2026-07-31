@@ -333,7 +333,7 @@ start/stop or deploy/undeploy cycles — evidence, not new:
 > exception-handler-safety gate (triggered by its `synchronized` block's
 > javac-generated monitor handler). Full analysis, probe table, and fix
 > directions:
-> [30](30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md).
+> [30](../../../known-issues/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md).
 > **Worth running the same check over the classes above** —
 > `CRATONVM_DBG_JITC=1 CRATONVM_DBG_RBC6=1` names the gate in one run. It is
 > the obvious next step for `TestMapperPerformance`, whose 19–41× gap on a

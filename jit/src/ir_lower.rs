@@ -257,6 +257,9 @@ struct Lowerer<'a> {
     /// see [`Lowerer::emit_safepoint_map`].
     ref_param_homes: Vec<i16>,
     shadow_savebase_slot_off: i32,
+    /// Shadow `top` captured at method entry; restored by every exit. See the
+    /// layout comment in `Lowerer::new`.
+    shadow_savetop_slot_off: i32,
     /// `get_current_thread` helper; `0` when unwired (the JIT unit tests' stub
     /// table). Every shadow site is gated on it — dereferencing a thread
     /// pointer that was never fetched would read stack garbage.
@@ -272,6 +275,34 @@ struct Lowerer<'a> {
     thread_fetch_span: Option<(usize, usize)>,
     /// Did any safepoint actually emit a shadow push?
     shadow_pushed_any: bool,
+    /// Compact-layout metadata for the instance fields this method reads:
+    /// `bytecode_pc → (packed byte offset from the object body, is_reference,
+    /// descriptor tag)`. Empty ⇒ every `Op::Load` takes the checked helper.
+    ///
+    /// Present for the same reason the single-pass backend carries it: routing
+    /// every field read through `jit_getfield` costs a boundary note, a region
+    /// walk and a 16-byte atomic cell read on one of the hottest operations a
+    /// JIT emits. The single-pass backend measured that at 4.7x on bintrees-16
+    /// when the hardening first landed; the IR tier still paid it, which is why
+    /// a forced-C2 bt18 ran 1.85x slower than the C1 body it replaced.
+    compact_fields: HashMap<usize, (u32, bool, u8)>,
+    /// Address of the GC's published `JIT_REGION_BOUNDS` table, for the guarded
+    /// receiver check. Zero ⇒ no inline field read (the guard cannot be
+    /// emitted, so the helper stays).
+    region_bounds_addr: usize,
+    /// Emitted shadow push / reload sequence counts.
+    ///
+    /// Every push must have exactly one reload: a push advances the thread's
+    /// shadow `top`, and only the reload retracts it. An unmatched push walks
+    /// `top` forward once per execution of that site — which for a recursive
+    /// method means until it runs off the end of the shadow stack and starts
+    /// writing into whatever is mapped next (observed as heap corruption
+    /// inside the C allocator, not as anything resembling a JIT fault). The
+    /// self-recursive route did exactly this. `lower_inner` refuses to publish
+    /// a body when these disagree, so the failure mode is a compile that falls
+    /// back to single-pass instead of a corrupted process.
+    shadow_pushes: usize,
+    shadow_reloads: usize,
     /// Byte size of the Java-locals region, for the published `FrameLayout`.
     locals_size: i32,
     /// First operand-spill offset, i.e. the exclusive top of the reserved
@@ -375,6 +406,7 @@ impl<'a> Lowerer<'a> {
         sr_map: Option<&'a ScalarReplacementMap>,
         direct_calls: &'a HashMap<usize, (usize, bool)>,
         ic_slots: &'a HashMap<usize, (usize, usize)>,
+        compact_fields: &HashMap<usize, (u32, bool, u8)>,
     ) -> Self {
         // Frame homes of the reference PARAMETERS, in `[rbp - off]` form. Every
         // safepoint map republishes these; see `emit_safepoint_map`.
@@ -424,9 +456,10 @@ impl<'a> Lowerer<'a> {
         // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
         let locals_size = (num_locals as i32) * 8;
         let context_size = if needs_context { 8 } else { 0 };
-        // Three extra reserved slots: the safepoint id, the cached
-        // `*mut JvmThread`, and the shadow stack's base `top` for this push.
-        let sp_id_size = 8i32 * 3;
+        // Four extra reserved slots: the safepoint id, the cached
+        // `*mut JvmThread`, the shadow stack's base `top` for this push, and
+        // the shadow `top` watermark captured at method entry.
+        let sp_id_size = 8i32 * 4;
         let spill_size = (max_nodes as i32) * 8;
         let args_stage_size = (max_call_args as i32) * 8;
         let shadow = 32i32;
@@ -483,7 +516,19 @@ impl<'a> Lowerer<'a> {
         // here, so an intervening unbalanced push cannot drift it (the
         // single-pass backend's spring-bug-10 fix; same hazard applies here).
         let shadow_savebase_slot_off = (base + 2) * 8;
-        let first_spill = (base + 3) * 8;
+        // The shadow `top` at METHOD ENTRY. Every exit restores it, unwinding
+        // any push this activation did not pop. Without it an abnormal exit
+        // (the `i64::MIN` exception/deopt sentinel, which jumps straight to the
+        // shared bail stub and skips the matching reload) leaks its push
+        // FOREVER: nothing else retracts `top` once a raw JIT-to-JIT call has
+        // removed the Rust boundary whose `restore_jit_thread` used to heal it.
+        // The single-pass backend has always done this (`emit_epilogue`'s
+        // savetop-restore); this tier never did, and leaked ~4 slots per
+        // sentinel return until the 256K-slot stack ran off its end and the
+        // unguarded push stored past the mapping. See
+        // `x64.rs::Compiler::emit_epilogue` for the mechanism this mirrors.
+        let shadow_savetop_slot_off = (base + 3) * 8;
+        let first_spill = (base + 4) * 8;
         let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
         let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
 
@@ -519,11 +564,16 @@ impl<'a> Lowerer<'a> {
             shadow_thread_slot_off,
             ref_param_homes,
             shadow_savebase_slot_off,
+            shadow_savetop_slot_off,
             get_current_thread: helpers.get_current_thread,
             shadow_off_in_thread: helpers.shadow_stack_offset_in_thread as i32,
             pending_shadow: Vec::new(),
             thread_fetch_span: None,
             shadow_pushed_any: false,
+            compact_fields: compact_fields.clone(),
+            region_bounds_addr: helpers.region_bounds_addr,
+            shadow_pushes: 0,
+            shadow_reloads: 0,
             locals_size,
             first_spill,
             oop_maps: Vec::new(),
@@ -879,6 +929,16 @@ fn reloc_emit_enabled() -> bool {
             }
             self.store_abi_reg(abi_regs[abi_idx], ((i as i32) + 1) * 8); // local_offset(i)
         }
+        // Zero the cached-thread and watermark slots BEFORE the fetch. The
+        // fetch is erased (NOP'd) by `finish_lazy_thread_fetch` when the method
+        // publishes nothing, and every consumer below is null-guarded on the
+        // thread slot — so it must read 0, not uninitialised stack. The
+        // single-pass backend zero-initialises for exactly this reason (see the
+        // incident writeup on `x64.rs::Compiler::emit_epilogue`).
+        if self.get_current_thread != 0 && self.shadow_thread_slot_off > 0 {
+            self.emit_zero_frame_slot(self.shadow_thread_slot_off);
+            self.emit_zero_frame_slot(self.shadow_savetop_slot_off);
+        }
         self.emit_frame_record();
         self.fetch_current_thread();
         self.zero_ref_phi_slots();
@@ -995,6 +1055,27 @@ fn reloc_emit_enabled() -> bool {
         self.emit_mov_reg_imm64(RAX, self.get_current_thread as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         self.store_rax(self.shadow_thread_slot_off);
+        // Capture the entry watermark, inside the erasable span: a method that
+        // publishes nothing has no push to unwind, so the capture goes away
+        // with the fetch and the (zeroed) thread slot makes every exit's
+        // restore skip through its null guard.
+        if self.shadow_savetop_slot_off > 0 {
+            let ss_top = self.shadow_off_in_thread;
+            // MOV R10, [rbp - thread_slot]
+            self.buf.emit(&[0x4C, 0x8B, 0x95]);
+            self.buf.emit(&(-self.shadow_thread_slot_off).to_le_bytes());
+            // TEST R10, R10 ; JE skip
+            self.buf.emit(&[0x4D, 0x85, 0xD2]);
+            self.buf.emit(&[0x0F, 0x84]);
+            let skip = self.buf.pos();
+            self.buf.emit(&[0, 0, 0, 0]);
+            // MOV R11, [R10 + ss_top] ; MOV [rbp - savetop], R11
+            self.buf.emit(&[0x4D, 0x8B, 0x9A]);
+            self.buf.emit(&ss_top.to_le_bytes());
+            self.buf.emit(&[0x4C, 0x89, 0x9D]);
+            self.buf.emit(&(-self.shadow_savetop_slot_off).to_le_bytes());
+            self.patch_rel32_to_here(skip);
+        }
         self.thread_fetch_span = Some((start, self.buf.pos()));
     }
 
@@ -1071,7 +1152,161 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&[0x4D, 0x89, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
         self.patch_rel32_to_here(skip);
+        self.shadow_pushes += 1;
         true
+    }
+
+    /// Guarded inline read of a compact instance field, with the checked
+    /// `jit_getfield` helper as the slow path. Returns `false` when the site is
+    /// not eligible, leaving the caller's helper-only lowering in place.
+    ///
+    /// Why this exists: routing every field read through the helper costs a
+    /// JIT-boundary note, an `is_object_address` region walk and a 16-byte
+    /// atomic cell read. When that hardening first landed on the single-pass
+    /// backend it cost 4.7x on bintrees-16, which is why that backend grew the
+    /// guarded inline path (`guarded_inline_getfield_enabled`). The IR tier
+    /// never got one, and it is the measured reason a forced-C2 `bt18` ran
+    /// **1.85x slower** than the single-pass body it replaced (3614-3762 ms vs
+    /// 6436-7013 ms, five interleaved reps) once reference field reads made
+    /// real methods IR-eligible. An optimizing tier that reads fields more
+    /// expensively than the baseline tier cannot be worth selecting.
+    ///
+    /// The shape mirrors `x64.rs`'s arm exactly, and deliberately keeps the
+    /// property that stops the stale-receiver SIGSEGV: never dereference a
+    /// receiver that is not null-free, 8-aligned and inside a published GC
+    /// region. Everything else — null, unaligned, out-of-heap, a legacy
+    /// (non-compact) instance of a compact class, or a width this arm does not
+    /// emit — branches to the helper, whose NPE / `i64::MIN` semantics are
+    /// unchanged. The one simplification against the single-pass version: the
+    /// legacy-layout receiver takes the helper rather than a second inline
+    /// path.
+    fn emit_inline_compact_getfield(
+        &mut self,
+        node_pc: Option<usize>,
+        node_ty: IrType,
+        base: NodeId,
+        field_index: i64,
+        slot: i32,
+    ) -> bool {
+        if self.getfield == 0 {
+            return false;
+        }
+        let Some(pc) = node_pc else {
+            return false;
+        };
+        let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&pc) else {
+            return false;
+        };
+        if crate::x64::narrow_oops_block_inline_fields() {
+            return false;
+        }
+        let raw_mode = crate::x64::inline_getfield_enabled();
+        let guarded = crate::x64::guarded_inline_getfield_enabled() && self.region_bounds_addr != 0;
+        if !raw_mode && !guarded {
+            return false;
+        }
+        // The node type and the resolved descriptor must agree. They can only
+        // disagree through a resolver that fabricated a compact slot — the
+        // WildFly Host Controller SIGSEGV — and the consequence of trusting it
+        // here would be a 32-bit sign-extended load of half a pointer.
+        let ref_node = node_ty == IrType::Ref;
+        let ref_tag = matches!(type_tag, b'L' | b'[');
+        if ref_node != ref_tag || ref_tag != c_is_ref {
+            return false;
+        }
+        if !ref_node && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+            return false;
+        }
+
+        let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+        let mut slow: Vec<usize> = Vec::new();
+
+        self.load_to_rax(self.slot_of(base));
+        // 1. null → slow (the helper raises the NPE).
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+        slow.push(self.emit_jcc_rel32(0x84)); // JZ
+        if guarded && !raw_mode {
+            // 2. alignment: the low three bits must be clear.
+            self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+            self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
+            slow.push(self.emit_jcc_rel32(0x85)); // JNZ
+                                                  // 3. containment in one of the three published regions.
+                                                  //    RDX = &JIT_REGION_BOUNDS = [b0, e0, b1, e1, b2, e2].
+            self.emit_mov_reg_imm64(RDX, self.region_bounds_addr as u64);
+            self.emit_cmp_rax_mem_rdx(0);
+            let below_b0 = self.emit_jcc_rel32(0x82); // JB → try region 1
+            self.emit_cmp_rax_mem_rdx(8);
+            let ok0 = self.emit_jcc_rel32(0x82); // JB → inside region 0
+            self.patch_rel32_to_here(below_b0);
+            self.emit_cmp_rax_mem_rdx(16);
+            let below_b1 = self.emit_jcc_rel32(0x82); // JB → try region 2
+            self.emit_cmp_rax_mem_rdx(24);
+            let ok1 = self.emit_jcc_rel32(0x82); // JB → inside region 1
+            self.patch_rel32_to_here(below_b1);
+            self.emit_cmp_rax_mem_rdx(32);
+            slow.push(self.emit_jcc_rel32(0x82)); // JB → slow
+            self.emit_cmp_rax_mem_rdx(40);
+            slow.push(self.emit_jcc_rel32(0x83)); // JAE → slow
+            self.patch_rel32_to_here(ok0);
+            self.patch_rel32_to_here(ok1);
+        }
+        // 4. per-OBJECT compactness. A class with a registered compact layout
+        //    can still have legacy 16-byte-cell instances (an allocation whose
+        //    `num_fields` disagrees with the layout falls back to the uniform
+        //    plan), and reading one at the packed offset yields a mangled
+        //    {tag, half-pointer} word.
+        self.buf.emit(&[0xF6, 0x80]); // TEST byte [RAX + disp32], imm8
+        self.buf
+            .emit(&(cratonvm_types::GC_FLAGS_OFFSET as i32).to_le_bytes());
+        self.buf.emit_byte(cratonvm_types::GC_FLAG_COMPACT);
+        slow.push(self.emit_jcc_rel32(0x84)); // JZ → slow (legacy instance)
+
+        // 5. the read itself. A compact reference field is the bare 8-byte
+        //    pointer at the cell base; a primitive is its tagless descriptor
+        //    width.
+        if ref_node {
+            self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX + disp32]
+            self.buf.emit(&cell_off.to_le_bytes());
+        } else {
+            match type_tag {
+                b'Z' => self.buf.emit(&[0x48, 0x0F, 0xB6, 0x80]), // MOVZX RAX, byte
+                b'B' => self.buf.emit(&[0x48, 0x0F, 0xBE, 0x80]), // MOVSX RAX, byte
+                b'C' => self.buf.emit(&[0x48, 0x0F, 0xB7, 0x80]), // MOVZX RAX, word
+                b'S' => self.buf.emit(&[0x48, 0x0F, 0xBF, 0x80]), // MOVSX RAX, word
+                _ => self.buf.emit(&[0x48, 0x63, 0x80]),          // MOVSXD RAX, dword
+            }
+            self.buf.emit(&cell_off.to_le_bytes());
+        }
+        self.buf.emit_byte(0xE9); // JMP rel32 → done
+        let done_patch = self.buf.pos();
+        self.buf.emit(&[0; 4]);
+
+        // --- slow path: the checked helper, byte-identical to the arm this
+        //     replaces, including the sentinel bail. ---
+        for p in slow {
+            self.patch_rel32_to_here(p);
+        }
+        self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as u64);
+        self.emit_mov_reg_imm64(RAX, self.getfield as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub
+        let exc_patch = self.buf.pos();
+        self.buf.emit(&[0; 4]);
+        self.call_exc_patches.push(exc_patch);
+
+        self.patch_rel32_to_here(done_patch);
+        self.store_rax(slot);
+        true
+    }
+
+    /// `CMP RAX, [RDX + disp32]` — REX.W + 3B /r, ModRM(mod=10, reg=RAX, rm=RDX).
+    fn emit_cmp_rax_mem_rdx(&mut self, disp: i32) {
+        self.buf.emit(&[0x48, 0x3B, 0x82]);
+        self.buf.emit(&disp.to_le_bytes());
     }
 
     /// Copy the (possibly rewritten) published values back into their frame
@@ -1117,6 +1352,7 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&[0x4D, 0x89, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
         self.patch_rel32_to_here(skip);
+        self.shadow_reloads += 1;
     }
 
 
@@ -1226,7 +1462,42 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&neg.to_le_bytes());
     }
 
+    /// `MOV qword [rbp - off], 0` (mod=10 disp32, /0).
+    fn emit_zero_frame_slot(&mut self, off: i32) {
+        self.buf.emit(&[0x48, 0xC7, 0x85]);
+        self.buf.emit(&(-off).to_le_bytes());
+        self.buf.emit(&0i32.to_le_bytes());
+    }
+
+    /// Restore the shadow `top` captured at method entry, unwinding any push
+    /// this activation did not pop. Mirrors the single-pass backend's epilogue.
+    /// R10/R11 are caller-saved and dead at every exit; RAX (the return value,
+    /// or the `i64::MIN` sentinel on the bail path) is untouched.
+    fn emit_shadow_savetop_restore(&mut self) {
+        if self.get_current_thread == 0
+            || self.shadow_thread_slot_off <= 0
+            || self.shadow_savetop_slot_off <= 0
+        {
+            return;
+        }
+        let ss_top = self.shadow_off_in_thread;
+        // MOV R10, [rbp - thread_slot] ; TEST R10,R10 ; JE skip
+        self.buf.emit(&[0x4C, 0x8B, 0x95]);
+        self.buf.emit(&(-self.shadow_thread_slot_off).to_le_bytes());
+        self.buf.emit(&[0x4D, 0x85, 0xD2]);
+        self.buf.emit(&[0x0F, 0x84]);
+        let skip = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // MOV R11, [rbp - savetop] ; MOV [R10 + ss_top], R11
+        self.buf.emit(&[0x4C, 0x8B, 0x9D]);
+        self.buf.emit(&(-self.shadow_savetop_slot_off).to_le_bytes());
+        self.buf.emit(&[0x4D, 0x89, 0x9A]);
+        self.buf.emit(&ss_top.to_le_bytes());
+        self.patch_rel32_to_here(skip);
+    }
+
     fn emit_epilogue(&mut self) {
+        self.emit_shadow_savetop_restore();
         // add rsp, frame_size
         self.buf.emit(&[0x48, 0x81, 0xC4]);
         self.buf.emit(&self.frame_size.to_le_bytes());
@@ -2420,8 +2691,21 @@ fn reloc_emit_enabled() -> bool {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 self.load_to_rcx(self.slot_of(node.inputs[1]));
-                // CMP EAX, ECX
-                self.buf.emit(&[0x39, 0xC8]);
+                // CMP EAX, ECX — 32-bit for the int comparisons this node was
+                // introduced for. A REFERENCE comparison (`ifnull`,
+                // `if_acmpeq`) must compare all 64 bits: a heap pointer whose
+                // low word happens to be zero would otherwise test equal to
+                // null, and two distinct objects 4 GiB apart would test equal
+                // to each other. Selected from the operand types, so an int
+                // compare keeps the shorter encoding.
+                let ref_cmp = matches!(self.graph.nodes[node.inputs[0] as usize].ty, IrType::Ref)
+                    || matches!(self.graph.nodes[node.inputs[1] as usize].ty, IrType::Ref);
+                if ref_cmp {
+                    // CMP RAX, RCX
+                    self.buf.emit(&[0x48, 0x39, 0xC8]);
+                } else {
+                    self.buf.emit(&[0x39, 0xC8]);
+                }
                 // SETcc AL — three bytes: `0F 9x C0`.
                 //
                 // BUG FIX [jit-irlower #1]: `x64_cc()` returns the *near-Jcc*
@@ -2571,12 +2855,15 @@ fn reloc_emit_enabled() -> bool {
                 // `Self::patch_or_bail` / `patch_rel32_to_here`.
                 Self::patch_or_bail(&mut self.buf, jnz_patch, rel);
             }
-            // getfield read — `Op::Load`. The IR builder emits only
-            // `Op::Load(MemKind::Int)` (int-category instance fields, slice 1
-            // of the field/call frontier), so this lowers the single-pass
-            // inline-getfield ABI exactly: null receiver → 0, else MOVSXD the
-            // 32-bit `Value::Int` payload. inputs = [ctrl, mem, base, offset]
-            // where `offset` is a `Const(field_index)`.
+            // getfield read — `Op::Load`. The builder emits
+            // `Op::Load(MemKind::Int)` for the int-category fields and
+            // `Op::Load(MemKind::Ref)` for reference fields; both read through
+            // the checked `jit_getfield` helper, which returns the int payload
+            // or the raw pointer according to the receiver's registered layout.
+            // The inline fallback below is int-only and layout-naive, and
+            // `lower_inner` refuses any graph that would need it for a
+            // reference load. inputs = [ctrl, mem, base, offset] where `offset`
+            // is a `Const(field_index)`.
             Op::Load(_) => {
                 let slot = self.alloc_slot(id);
                 let base = node.inputs[2];
@@ -2585,6 +2872,21 @@ fn reloc_emit_enabled() -> bool {
                     Op::Const(v) => v,
                     _ => 0,
                 };
+                // Guarded inline read of a compact field, with the checked
+                // helper as the slow path — the same trade the single-pass
+                // backend makes. Returns false when this site is not eligible
+                // (no resolved compact slot, no published region bounds, gate
+                // off, or a width this arm does not emit), leaving the helper
+                // path below untouched.
+                if self.emit_inline_compact_getfield(
+                    node.bytecode_pc,
+                    node.ty,
+                    base,
+                    field_index,
+                    slot,
+                ) {
+                    return;
+                }
                 if self.getfield != 0 {
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
                     self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
@@ -2793,17 +3095,27 @@ fn reloc_emit_enabled() -> bool {
                 // the whole compile. `lower_data_node` has no post-`match` code,
                 // so an early `return` here fully handles the node.
                 if unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind } == 4 {
-                    // This route bypasses `emit_call_return_check`, so nothing
-                    // would reload the published values afterwards and the
-                    // frame would keep pre-relocation addresses. Withdraw the
-                    // claim for this safepoint and drop the pending homes; the
-                    // collector then diverts to the non-moving sweep whenever
-                    // such a frame is live, which is correct if unambitious.
+                    // This route bypasses `emit_call_return_check`, so the
+                    // shared post-call reload never runs here. Withdraw the
+                    // coverage claim — the reload below restores the homes but
+                    // this route cannot promise a relocating collector anything
+                    // — and then emit the reload explicitly.
+                    //
+                    // Dropping `pending_shadow` instead (the original) withdrew
+                    // the claim but left the PUSH that `emit_safepoint_map`
+                    // above had already emitted, with nothing to pop it. Every
+                    // execution of a self-recursive direct call then leaked its
+                    // published oops permanently, and a recursive method in a
+                    // hot loop walked the thread's 2 MiB shadow stack off its
+                    // end within a second — storing across the heap behind it,
+                    // because no backend emits the `end` guard the shadow-stack
+                    // design documents. That is what made the raw JIT-to-JIT
+                    // gate unsafe to open; this route only exists when it is.
                     if let Some(last) = self.oop_maps.last_mut() {
                         last.moving_young_coverage_complete = false;
                     }
-                    self.pending_shadow.clear();
                     self.emit_self_recursive_call(&node.inputs, slot, num_args);
+                    self.emit_shadow_reload();
                     return;
                 }
                 // IR direct-call lowering: a statically-bound site whose callee
@@ -3469,10 +3781,10 @@ fn reloc_emit_enabled() -> bool {
             return;
         }
         let stub_off = self.buf.pos();
-        self.buf.emit(&[0x48, 0x81, 0xC4]); // add rsp, frame_size
-        self.buf.emit(&self.frame_size.to_le_bytes());
-        self.buf.emit_byte(0x5D); // pop rbp
-        self.buf.emit_byte(0xC3); // ret
+        // Shares the method epilogue so the shadow `top` watermark is restored
+        // here too — this is the path a callee's `i64::MIN` exception/deopt
+        // sentinel takes, skipping the call site's matching shadow reload.
+        self.emit_epilogue();
         let patches = std::mem::take(&mut self.call_exc_patches);
         for p in patches {
             let rel = stub_off as i32 - (p as i32 + 4);
@@ -3770,8 +4082,18 @@ pub fn lower(
     let empty: HashMap<usize, bool> = HashMap::new();
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
     lower_inner(
-        graph, schedule, num_params, num_locals, helpers, &empty, None, &no_direct, &no_ic,
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        &empty,
+        None,
+        &no_direct,
+        &no_ic,
+        &no_compact,
     )
 }
 
@@ -3790,6 +4112,7 @@ pub fn lower_with_branch_hints(
 ) -> Option<CompiledMethod> {
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
     lower_inner(
         graph,
         schedule,
@@ -3800,6 +4123,7 @@ pub fn lower_with_branch_hints(
         None,
         &no_direct,
         &no_ic,
+        &no_compact,
     )
 }
 
@@ -3820,8 +4144,18 @@ pub fn lower_with_scalar_deopt(
     let empty: HashMap<usize, bool> = HashMap::new();
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
     lower_inner(
-        graph, schedule, num_params, num_locals, helpers, &empty, sr_map, &no_direct, &no_ic,
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        &empty,
+        sr_map,
+        &no_direct,
+        &no_ic,
+        &no_compact,
     )
 }
 
@@ -3846,6 +4180,10 @@ pub(crate) fn lower_inner(
     // virtual / interface site served from an inline cache. Empty ⇒ every such
     // site keeps the historical helper dispatch.
     ic_slots: &HashMap<usize, (usize, usize)>,
+    // Guarded inline field reads: `pc → (packed body offset, is_reference,
+    // descriptor tag)` for every resolved compact instance field. Empty ⇒ every
+    // `Op::Load` takes the checked helper, as it always did.
+    compact_fields: &HashMap<usize, (u32, bool, u8)>,
 ) -> Option<CompiledMethod> {
     // A live object allocation is now supported by the common allocation
     // stub. A zero helper pointer is only possible in synthetic unit-test
@@ -3879,6 +4217,20 @@ pub(crate) fn lower_inner(
         if needs_getfield_helper || needs_putfield_helper {
             return None;
         }
+    }
+    // A REFERENCE field read has only one correct lowering: the helper. The
+    // inline displacement fallback decodes a 16-byte int cell at
+    // `HEADER_SIZE + index*SLOT_SIZE`, which for a reference slot yields the
+    // discriminant word rather than the pointer — a fabricated address the
+    // frame would then publish as a root. Refuse the graph outright rather
+    // than emit it, independently of the compact-layout switch above.
+    if helpers.getfield == 0
+        && graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::Load(MemKind::Ref)))
+    {
+        return None;
     }
     // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
     // lowering: an arithmetic node emits well under 32 bytes, but a single
@@ -3914,6 +4266,7 @@ pub(crate) fn lower_inner(
         sr_map,
         direct_calls,
         ic_slots,
+        compact_fields,
     );
 
     // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
@@ -3950,6 +4303,27 @@ pub(crate) fn lower_inner(
     // `[rbp - 0]`, i.e. the saved caller RBP, as a data value. Discard the
     // artifact and let the caller fall back to the single-pass backend.
     if lowerer.unallocated_slot_use.get() {
+        return None;
+    }
+
+    // Soundness bail: every emitted shadow PUSH must have exactly one emitted
+    // RELOAD. The push advances the thread's shadow `top`; only the reload
+    // retracts it. An unmatched push leaks a few slots per execution of that
+    // site, so a recursive method walks `top` off the end of the shadow stack
+    // and the next push writes into whatever follows the mapping. That
+    // presents as heap corruption in an unrelated allocator, arbitrarily far
+    // from the JIT — the self-recursive call route did it, and it took a
+    // gdb backtrace showing ASCII bytes in a mimalloc free-list header to
+    // attribute. A static count is enough (both are emitted per site, not per
+    // path), and refusing the body is strictly better than shipping it.
+    if lowerer.shadow_pushes != lowerer.shadow_reloads {
+        if crate::ir_stage_reporting() {
+            eprintln!(
+                "[ir] lower_inner refused: {} shadow pushes vs {} reloads — \
+                 an unmatched push leaks the thread's shadow top",
+                lowerer.shadow_pushes, lowerer.shadow_reloads
+            );
+        }
         return None;
     }
 
@@ -4351,6 +4725,7 @@ mod tests {
 
         let empty_hints: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
         lower_inner(
             &graph,
             &schedule,
@@ -4361,10 +4736,94 @@ mod tests {
             None,
             &no_direct,
             ic,
+            &no_compact,
         )
         .expect("virtual-call method must lower")
         .code_bytes()
         .to_vec()
+    }
+
+    /// A self-recursive call must not PUBLISH to the shadow stack.
+    ///
+    /// That route bypasses `emit_call_return_check`, the one site that emits
+    /// the matching reload, so a push emitted here is never retracted: the
+    /// thread's shadow `top` advances once per execution of the site and a
+    /// recursive method walks it off the end of the shadow stack, after which
+    /// the next push writes through into whatever follows the mapping. It
+    /// presented as a SIGSEGV inside the C allocator's free list, on an
+    /// unrelated thread, the moment reference field reads made
+    /// `BinTreesClassic.itemCheck` IR-eligible.
+    ///
+    /// The lowerer used to emit the push and then "withdraw the claim" by
+    /// clearing `pending_shadow` — which suppressed the RELOAD, not the push.
+    #[test]
+    fn self_recursive_call_balances_its_shadow_push_and_reload() {
+        crate::x64::set_moving_young_override(Some(false));
+        // static int f(Obj o, int n) { return f(o, n); }
+        // aload_0; iload_1; invokestatic #2; ireturn
+        let code = [0x2a, 0x1b, 0xb8, 0x00, 0x02, 0xac, 0x00, 0x00];
+        let info: &'static JitInvokeInfo = Box::leak(Box::new(JitInvokeInfo {
+            class_name: "pkg/Obj",
+            method_name: "f",
+            descriptor: "(Lpkg/Obj;I)I",
+            num_jit_args: 2,
+            return_type: b'I',
+            invoke_kind: 4, // the direct self-recursive route
+            declaring_class_id: 0,
+        }));
+        let mut builder = IrBuilder::new(2, 2);
+        builder.set_param_types(&[IrType::Ref, IrType::Int]);
+        let mut invoke_info = HashMap::new();
+        invoke_info.insert(2usize, (info as *const JitInvokeInfo as usize, 2usize, b'I'));
+        builder.set_invoke_info(invoke_info);
+        let graph = builder.build(&code, 6).expect("IR build of self-recursive call");
+        let schedule = ir_schedule::schedule(&graph);
+
+        // The shadow machinery is live only when the thread helper is wired,
+        // so a stub table with a zero `get_current_thread` would make this
+        // test vacuous. Give it sentinels.
+        let mut helpers = no_helpers();
+        helpers.get_current_thread = 0x7fff_0000_0000_3000;
+        helpers.shadow_stack_offset_in_thread = 0x40;
+        helpers.self_call_stack_guard = 0x7fff_0000_0000_4000;
+
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let cm = lower_inner(
+            &graph,
+            &schedule,
+            2,
+            2,
+            &helpers,
+            &empty_hints,
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact,
+        )
+        .expect(
+            "the self-recursive body must lower — an imbalance now makes \
+             lower_inner discard it, so a None here means the push came back",
+        );
+        // Lowering at all is most of the assertion: `lower_inner` counts the
+        // emitted pushes against the emitted reloads and DISCARDS the body when
+        // they disagree, so a `None` above is exactly the bug this test exists
+        // for. What remains to check is that the retraction is really emitted
+        // on this route rather than inherited from a choke point it never
+        // reaches: `MOV RCX, [R11]` reads a published value back, and only the
+        // reload does that. (Deliberately not an exact count — the prologue's
+        // own `top` watermark shares the push's encoding, so counting pushes
+        // here measures the prologue too.)
+        let bytes = cm.code_bytes();
+        assert!(
+            count_seq(bytes, &[0x49, 0x8B, 0x0B]) >= 1,
+            "the self-recursive route bypasses emit_call_return_check, so it \
+             must emit its own shadow reload — without it every execution of \
+             the site advances the thread's shadow top and nothing retracts it"
+        );
+        crate::x64::set_moving_young_override(None);
     }
 
     /// A planned inline-cache site must emit the full three-tier cascade:

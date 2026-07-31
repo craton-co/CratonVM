@@ -37,20 +37,59 @@ pub struct Normalizer {
     pub mask_thread_ids: bool,
     /// Sort output lines (only for explicitly-tagged nondeterministic seeds).
     pub sort_lines: bool,
+    /// **stderr only**: drop CratonVM's own diagnostic chatter — ANSI colour
+    /// codes, `tracing` lines from `cratonvm_*` targets, and the `[cratonvm]` /
+    /// `[NativeBridge]` prefixed notices. Never applied to stdout, which stays
+    /// byte-exact.
+    pub strip_vm_diagnostics: bool,
+    /// Compare stderr as a gated channel. Off for every historical mode:
+    /// CratonVM's warnings legitimately differ from HotSpot's silence, and
+    /// gating them would turn the whole corpus red. On for the profile modes,
+    /// where a strict refusal *is* the observable and it is printed to stderr.
+    pub gate_stderr: bool,
 }
 
 impl Normalizer {
     /// The strict (no-op beyond line-ending hygiene) normalizer.
+    ///
+    /// Byte-identical to Step 1's: every knob off, stdout exact, stderr
+    /// ungated. The historical modes must keep judging exactly what they judged
+    /// before this feature existed.
     pub fn strict() -> Self {
         Self::default()
     }
 
+    /// The normalizer for a JDK-only / real-compatible run: stderr is gated,
+    /// after the VM's own diagnostics are removed from it.
+    ///
+    /// stdout is deliberately left strict — a policy refusal that changed a
+    /// program's *output* is a plain divergence and must be caught as one.
+    pub fn jdk_only() -> Self {
+        Self {
+            strip_vm_diagnostics: true,
+            gate_stderr: true,
+            ..Self::default()
+        }
+    }
+
+    /// The normalizer `mode` is compared under: [`jdk_only`](Self::jdk_only)
+    /// for the four profile modes, [`strict`](Self::strict) for every
+    /// historical one.
+    pub fn for_mode(mode: Mode) -> Self {
+        if mode.collects_census() {
+            Self::jdk_only()
+        } else {
+            Self::strict()
+        }
+    }
+
     /// Apply normalization to one captured stream.
     ///
-    /// Step 1 applies **only** the always-safe line-ending hygiene
+    /// Applies the always-safe line-ending hygiene
     /// ([`normalize_line_endings`]); the opt-in transforms above are declared
     /// but inert until a later step wires them (each gated behind its flag, so
-    /// strict mode stays byte-exact).
+    /// strict mode stays byte-exact). `strip_vm_diagnostics` is **not** applied
+    /// here — it is stderr-only, see [`apply_stderr`](Self::apply_stderr).
     pub fn apply(&self, s: &str) -> String {
         let normalized = normalize_line_endings(s);
         if self.sort_lines {
@@ -60,6 +99,64 @@ impl Normalizer {
         }
         normalized
     }
+
+    /// Apply normalization to a captured **stderr**.
+    ///
+    /// Identical to [`apply`](Self::apply) unless `strip_vm_diagnostics` is
+    /// set, in which case ANSI escapes are removed first and every surviving
+    /// VM-diagnostic line is dropped. Order matters: the tracing lines are
+    /// colourised, so a match on `cratonvm_` has to happen *after* the escape
+    /// codes are gone.
+    pub fn apply_stderr(&self, s: &str) -> String {
+        if !self.strip_vm_diagnostics {
+            return self.apply(s);
+        }
+        let plain = strip_ansi(s);
+        let kept: Vec<&str> = plain.lines().filter(|l| !is_vm_diagnostic(l)).collect();
+        self.apply(&kept.join("\n"))
+    }
+}
+
+/// Remove ANSI/VT escape sequences (`ESC [ … final-byte`, and a bare `ESC`
+/// followed by one byte) so a colourised tracing line can be matched on its
+/// text. Non-escape bytes pass through untouched.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            // CSI: consume parameter/intermediate bytes up to the final byte.
+            Some('[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // Any other two-byte escape.
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// Whether an (ANSI-stripped) stderr line is CratonVM's own diagnostic chatter
+/// rather than program output.
+///
+/// Three shapes, all of them things HotSpot has no counterpart for:
+/// `tracing` records naming a `cratonvm_*` target, and the two bracketed
+/// prefixes the VM prints on its own (`[cratonvm]`, `[NativeBridge]`).
+fn is_vm_diagnostic(line: &str) -> bool {
+    let t = line.trim();
+    t.contains("[cratonvm]") || t.contains("[NativeBridge]") || t.contains("cratonvm_")
 }
 
 /// CRLF→LF and trailing-whitespace trim, so a stray platform `\r` cannot
@@ -188,6 +285,20 @@ pub fn compare(cratonvm: &Observation, hotspot: &Observation, normalizer: &Norma
         });
     }
 
+    // stderr — gated only under the profile modes' normalizer, and only after
+    // the VM's own diagnostics have been removed from it.
+    if normalizer.gate_stderr {
+        let c_err = normalizer.apply_stderr(&cratonvm.stderr);
+        let h_err = normalizer.apply_stderr(&hotspot.stderr);
+        if c_err != h_err {
+            diffs.push(ChannelDiff {
+                channel: Channel::Stderr,
+                cratonvm: c_err,
+                hotspot: h_err,
+            });
+        }
+    }
+
     if diffs.is_empty() {
         Verdict::Agree
     } else {
@@ -204,6 +315,8 @@ pub fn gated_eq(a: &Observation, b: &Observation, normalizer: &Normalizer) -> bo
     exit_token(a) == exit_token(b)
         && normalizer.apply(&a.stdout) == normalizer.apply(&b.stdout)
         && a.exception == b.exception
+        && (!normalizer.gate_stderr
+            || normalizer.apply_stderr(&a.stderr) == normalizer.apply_stderr(&b.stderr))
 }
 
 /// Render the exit channel: a timed-out run never matches a clean exit.
@@ -257,24 +370,35 @@ pub struct ModeVerdict {
     pub timed_out: bool,
     /// Exited by signal/abort (no exit code, and not a timeout).
     pub crashed: bool,
+    /// The run enforced the strict policy **and** recorded a violation under
+    /// it. False for a compatible run, whose census records what a strict run
+    /// *would* have rejected — a measurement, not a violation.
+    pub jdk_only_violation: bool,
 }
 
 /// Classify a divergence from the per-mode verdict map (design §3.3) — the
 /// automation of the manual `--nojit` bisection. Returns `None` when **every**
-/// mode agreed with HotSpot.
+/// mode agreed with HotSpot and none recorded a policy violation.
 ///
 /// Decision order:
 /// 1. **Hang** — any mode timed out (dominates; the most urgent bucket).
-/// 2. **Crash** — any mode exited by signal/abort.
-/// 3. **JitOnly** — the interpreter (`nojit`) ran and *agreed*, but a JIT-
+/// 2. **JdkOnlyViolation** — a `--jdk-only` run recorded a policy violation.
+///    Ranked above `Crash` because it *names the cause*: a strict run that
+///    aborted on a `MissingNative` is a policy finding with a known fix, not an
+///    unexplained crash to be bisected.
+/// 3. **Crash** — any mode exited by signal/abort.
+/// 4. **JitOnly** — the interpreter (`nojit`) ran and *agreed*, but a JIT-
 ///    enabled mode (`jit-on` / `low-jit-threshold`) diverged ⇒ a JIT bug.
-/// 4. **GcMode** — `jit-on` and `nojit` both agree, but a GC mode (`moving-gc`)
+/// 5. **GcMode** — `jit-on` and `nojit` both agree, but a GC mode (`moving-gc`)
 ///    diverged ⇒ the divergence is GC-specific.
-/// 5. **Universal** — otherwise (the bug is in the shared interpreter/native
+/// 6. **Universal** — otherwise (the bug is in the shared interpreter/native
 ///    path, present with and without the JIT).
 pub fn classify(modes: &[ModeVerdict]) -> Option<Classification> {
     if modes.iter().any(|m| m.timed_out) {
         return Some(Classification::Hang);
+    }
+    if modes.iter().any(|m| m.jdk_only_violation) {
+        return Some(Classification::JdkOnlyViolation);
     }
     if modes.iter().any(|m| m.crashed) {
         return Some(Classification::Crash);
@@ -423,6 +547,7 @@ mod tests {
             diverged,
             timed_out: false,
             crashed: false,
+            jdk_only_violation: false,
         }
     }
 
@@ -483,5 +608,167 @@ mod tests {
         let d = first_diff("a\nb\nc", "a\nX\nc");
         assert_eq!(d, Some((2, "b".to_string(), "X".to_string())));
         assert_eq!(first_diff("same", "same"), None);
+    }
+
+    // -- profile-mode normalization ------------------------------------------
+
+    /// A real captured CratonVM stderr: colourised `tracing` lines plus the
+    /// VM's own bracketed notices (lifted from the committed ledger's
+    /// `ExceptionId` row).
+    const VM_CHATTER: &str = concat!(
+        "\u{1b}[2m2026-07-30T18:35:56.284528Z\u{1b}[0m \u{1b}[33m WARN\u{1b}[0m ",
+        "\u{1b}[2mcratonvm_vm::vm::vm_object\u{1b}[0m\u{1b}[2m:\u{1b}[0m ",
+        "[NativeBridge] 1 unregistered native methods:\n",
+        "[cratonvm] main-vm run() returned Ok — VM main exiting normally\n"
+    );
+
+    #[test]
+    fn strict_normalizer_is_byte_identical_to_step_1() {
+        let n = Normalizer::strict();
+        assert!(!n.gate_stderr);
+        assert!(!n.strip_vm_diagnostics);
+        assert_eq!(n, Normalizer::default());
+        // stdout and stderr both get line-ending hygiene and nothing else — the
+        // VM chatter is preserved verbatim, because a historical mode's
+        // recorded stderr must not change shape.
+        assert_eq!(n.apply("a\r\nb\r\n"), "a\nb");
+        assert_eq!(n.apply_stderr(VM_CHATTER), normalize_line_endings(VM_CHATTER));
+        assert!(n.apply_stderr(VM_CHATTER).contains("\u{1b}["));
+    }
+
+    #[test]
+    fn strict_normalizer_does_not_gate_stderr() {
+        // The historical behaviour: stderr differs wildly and is not judged.
+        let a = obs("42", "[cratonvm] chatter", Some(0));
+        let b = obs("42", "", Some(0));
+        assert!(compare(&a, &b, &Normalizer::strict()).agrees());
+    }
+
+    #[test]
+    fn jdk_only_normalizer_strips_ansi_and_vm_lines() {
+        let n = Normalizer::jdk_only();
+        assert!(n.gate_stderr && n.strip_vm_diagnostics);
+        assert_eq!(n.apply_stderr(VM_CHATTER), "");
+        // A program's own stderr survives; only VM chatter goes.
+        let mixed = format!("{VM_CHATTER}real program stderr\n");
+        assert_eq!(n.apply_stderr(&mixed), "real program stderr");
+    }
+
+    #[test]
+    fn jdk_only_normalizer_leaves_stdout_byte_exact() {
+        // stdout must never be laundered: a policy refusal that changed the
+        // program's output is a plain divergence and has to be caught as one.
+        let n = Normalizer::jdk_only();
+        let noisy = "[cratonvm] this came from the program\ncratonvm_vm printed this";
+        assert_eq!(n.apply(noisy), noisy);
+    }
+
+    #[test]
+    fn jdk_only_normalizer_gates_stderr_after_stripping() {
+        let n = Normalizer::jdk_only();
+        // Chatter-only stderr vs HotSpot's silence: agrees.
+        let a = obs("42", VM_CHATTER, Some(0));
+        let b = obs("42", "", Some(0));
+        assert!(compare(&a, &b, &n).agrees(), "VM chatter alone is not a diff");
+
+        // A real refusal message on stderr is a Stderr-channel divergence.
+        let c = obs("42", "jdk-only: refused java/foo/Bar", Some(0));
+        match compare(&c, &b, &n) {
+            Verdict::Diverge(d) => {
+                assert_eq!(d.len(), 1);
+                assert_eq!(d[0].channel, Channel::Stderr);
+                assert_eq!(d[0].cratonvm, "jdk-only: refused java/foo/Bar");
+            }
+            Verdict::Agree => panic!("a strict refusal on stderr must be gated"),
+        }
+    }
+
+    #[test]
+    fn for_mode_gates_only_the_four_profile_modes() {
+        for &m in Mode::all() {
+            let n = Normalizer::for_mode(m);
+            assert_eq!(
+                n.gate_stderr,
+                m.collects_census(),
+                "{} stderr gating",
+                m.label()
+            );
+            if m.collects_census() {
+                assert_eq!(n, Normalizer::jdk_only(), "{}", m.label());
+            } else {
+                assert_eq!(n, Normalizer::strict(), "{}", m.label());
+            }
+        }
+    }
+
+    #[test]
+    fn gated_eq_ignores_stderr_unless_the_normalizer_gates_it() {
+        let a = obs("42", "[cratonvm] chatter", Some(0));
+        let b = obs("42", "different chatter entirely", Some(0));
+        assert!(gated_eq(&a, &b, &Normalizer::strict()));
+        // Under the profile normalizer, chatter is stripped from both, so they
+        // still match — drift is judged on what's left.
+        assert!(gated_eq(&a, &b, &Normalizer::jdk_only()));
+        let c = obs("42", "a real message", Some(0));
+        assert!(!gated_eq(&a, &c, &Normalizer::jdk_only()));
+        assert!(gated_eq(&a, &c, &Normalizer::strict()));
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences_only() {
+        assert_eq!(strip_ansi("\u{1b}[2mdim\u{1b}[0m"), "dim");
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\u{1b}[38;5;196mred\u{1b}[0m!"), "red!");
+        // Brackets that aren't escapes stay put.
+        assert_eq!(strip_ansi("[cratonvm] ok"), "[cratonvm] ok");
+    }
+
+    // -- classification ranking ----------------------------------------------
+
+    fn violating(mode: Mode, diverged: bool) -> ModeVerdict {
+        ModeVerdict {
+            jdk_only_violation: true,
+            ..mv(mode, diverged)
+        }
+    }
+
+    #[test]
+    fn classify_jdk_only_violation_outranks_crash_but_not_hang() {
+        // Rank: Hang > JdkOnlyViolation > Crash > JitOnly > GcMode > Universal.
+        let mut crash = violating(Mode::JdkOnlyJit, true);
+        crash.crashed = true;
+        assert_eq!(classify(&[crash]), Some(Classification::JdkOnlyViolation));
+
+        let mut hang = violating(Mode::JdkOnlyJit, true);
+        hang.timed_out = true;
+        assert_eq!(classify(&[hang]), Some(Classification::Hang));
+    }
+
+    #[test]
+    fn classify_jdk_only_violation_outranks_the_bisection_labels() {
+        // A JIT-shaped bisection that also tripped the policy is reported as
+        // the policy finding: the violation names the cause.
+        let modes = [
+            violating(Mode::JdkOnlyJit, true),
+            mv(Mode::JdkOnlyNoJit, false),
+        ];
+        assert_eq!(classify(&modes), Some(Classification::JdkOnlyViolation));
+    }
+
+    #[test]
+    fn classify_violation_on_an_agreeing_run_is_still_reported() {
+        // Wave 1 is measurement (contract §10): a violation that did not change
+        // behaviour is still recorded. The gate's exit code does not move —
+        // that is `GateReport::strict_violations`' job, not this label's.
+        let modes = [violating(Mode::JdkOnlyJit, false)];
+        assert_eq!(classify(&modes), Some(Classification::JdkOnlyViolation));
+    }
+
+    #[test]
+    fn classify_compatible_modes_never_report_a_violation() {
+        // A compatible run records *would-be* refusals, which are never a
+        // violation — so the historical labels are untouched.
+        let modes = [mv(Mode::JitOn, true), mv(Mode::NoJit, false)];
+        assert_eq!(classify(&modes), Some(Classification::JitOnly));
     }
 }

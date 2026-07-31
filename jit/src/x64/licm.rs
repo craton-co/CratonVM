@@ -757,10 +757,24 @@ pub(super) unsafe fn read_fs_qword(offset: isize) -> usize {
 pub fn shadow_stack_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    // `CRATONVM_MOVING_YOUNG` implies the shadow-stack codegen: the moving young
-    // gen requires a COMPLETE, rewritable precise root map (see
-    // `moving_young_enabled` and `collect_live_oop_homes`), so turning it on also
-    // turns on the push/reload emission.
+    // 2026-07-31 — the `moving_young_enabled() &&` term is REMOVED. It used to
+    // read "`CRATONVM_MOVING_YOUNG` implies the shadow-stack codegen", which is
+    // true of what the moving collector NEEDS but was wrong as a definition of
+    // when the codegen is REQUIRED: the shadow stack is how a JIT frame's live
+    // references become visible to the collector at all, and that is not a
+    // property of which young collector runs. Keyed on moving-young, the
+    // documented opt-out `CRATONVM_NO_MOVING_YOUNG=1` silently withdrew root
+    // publication, and that lane faulted on a zeroed heap slot within seconds
+    // of real work — Hibernate `ZonedDateTimeTest` / `OffsetDateTimeTest` in
+    // 1-3 s on a pristine dev build, and the Windows `DateSymbolsProbe` repro.
+    // Restoring publication with `CRATONVM_SHADOW_STACK=1` and changing nothing
+    // else made the same runs clean, which is the single-variable proof.
+    // See `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+    //
+    // The DEFAULT path is unchanged: moving-young is on by default, so this
+    // already evaluated true. `CRATONVM_JIT_MY_SHADOW_EMISSION=0` remains the
+    // joint opt-out and now switches the emission off outright rather than
+    // switching off an implication.
     //
     // NOT scoped to `moving_young_relocates_compiled_frames`, deliberately.
     // Scoping it is *arguable* on the same invariant the admission gates use —
@@ -785,11 +799,10 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // set in production, so the cached fast path is unchanged there.
     if MOVING_YOUNG_OVERRIDE.with(|c| c.get()).is_some() {
         return cratonvm_types::flags().jit.shadow_stack
-            || (moving_young_enabled() && shadow_emission_moving_implication_enabled());
+            || shadow_emission_moving_implication_enabled();
     }
     *G.get_or_init(|| {
-        cratonvm_types::flags().jit.shadow_stack
-            || (moving_young_enabled() && shadow_emission_moving_implication_enabled())
+        cratonvm_types::flags().jit.shadow_stack || shadow_emission_moving_implication_enabled()
     })
 }
 
@@ -852,14 +865,24 @@ pub fn moving_young_enabled() -> bool {
     cratonvm_types::flags().gc.moving_young
 }
 
-/// `CRATONVM_JIT_MY_SCRATCH_FLUSH` — bisect lever for the scratch-register
-/// flush `emit_pre_safepoint_spill_impl` performs at every GC-capable safepoint
-/// under moving-young. Default ON (current behaviour); `0` drops it.
+/// `CRATONVM_JIT_MY_SCRATCH_FLUSH` — opt-out for the scratch-register flush
+/// `emit_pre_safepoint_spill_impl` performs at every GC-capable safepoint.
+/// Default ON. **`0` is known-unsafe**, kept only as an A/B control.
 ///
-/// Exists to attribute the residual moving-young throughput cost that the
-/// relocation-scoped admission gates do NOT remove — see the call site. Do not
-/// flip the default without a quiet-host measurement on the `type.temporal`
-/// Hibernate classes, which are the workload that shows the residual.
+/// It arrived as a bisect lever for a residual moving-young throughput cost,
+/// and as a lever it has answered: `BinTreesClassic 18` @512m, five
+/// interleaved reps, `0` moves nothing (median 4117 ms against a 4281 ms
+/// default, ranges overlapping in both directions). There is no cost here
+/// worth carrying a risk for.
+///
+/// What it does carry is ROOT VISIBILITY — it spills operand-stack values
+/// living in caller-saved scratch registers, which the callee-saved blind
+/// spill never covers, into the frame slots the conservative scan reads. The
+/// call site gates it additionally on `moving_young_enabled()`; making it
+/// unconditional was tried as a fix for the crashing non-moving lane and
+/// **reverted** (it turned that lane's clean shadow-on configuration into a
+/// deterministic SIGILL). See the call site and
+/// `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
 pub fn scratch_flush_at_safepoint_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SCRATCH_FLUSH") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),

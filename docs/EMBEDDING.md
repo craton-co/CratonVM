@@ -110,6 +110,7 @@ All names below are exported by `libcratonvm` and declared in `cratonvm.h`.
 | Function | Purpose |
 |---|---|
 | `cratonvm_create(const JavaVMInitArgs*)` | Build + bootstrap a VM; returns an owning `CratonVm*` (NULL on failure). |
+| `cratonvm_create_with_compatibility(args, compatibility_mode)` | `cratonvm_create` with the compatibility mode stated as an explicit `CRATONVM_COMPATIBILITY_*` value instead of an option string. |
 | `cratonvm_destroy(CratonVm*)` | Drop the VM and free the handle. NULL is a no-op. |
 | `cratonvm_load_class(vm, name, out_class)` | Load/link a class by internal name (`"java/lang/System"`). |
 | `cratonvm_invoke_static(vm, cls, method, sig, args, n)` | Call a static method by descriptor (`"(I)I"`). |
@@ -119,7 +120,16 @@ All names below are exported by `libcratonvm` and declared in `cratonvm.h`.
 | `cratonvm_object_class` / `cratonvm_class_name` | Runtime class of an object / its internal name. |
 | `cratonvm_field_count` / `cratonvm_field_index` | Field layout-slot count / resolve a field name to a slot. |
 | `cratonvm_get_field` / `cratonvm_set_field` (and `*_by_name`) | Read/write an instance field (writes are GC-barrier correct). |
+| `cratonvm_compatibility_mode(vm)` | The compatibility mode a live VM is actually running under; `-1` (never a mode value) on a null/invalid handle. |
+| `cratonvm_compatibility_mode_supported(mode)` | Capability probe — **needs no VM**: `1` when this build understands the mode, `-1` when it is not a `CRATONVM_COMPATIBILITY_*` value at all (`0` is reserved for a known-but-unhonourable mode). |
 | `cratonvm_last_error(vm)` / `cratonvm_clear_error(vm)` | This thread's pending error message. |
+
+Two `int`-typed constants (an anonymous `enum` in `cratonvm.h`) name the
+compatibility modes: `CRATONVM_COMPATIBILITY_COMPATIBLE` (`0`) and
+`CRATONVM_COMPATIBILITY_JDK_ONLY` (`1`). Their numeric values are a published,
+stable, **append-only** ABI — deliberately not a `cratonvm_jboolean`, so a third
+enforcement posture can be added later without breaking a compiled host. See
+[Choosing a compatibility mode](#choosing-a-compatibility-mode) below.
 
 `CratonValue` is a `#[repr(C)]` tagged POD (`tag` + 8-byte `payload`): `INT`,
 `LONG`, `FLOAT`/`DOUBLE` (bit-cast), `OBJECT` (a `CratonRef`, `0` == null),
@@ -170,9 +180,18 @@ types and not ABI-portable).
 For a **Rust** host, depend on `cratonvm-embed` instead of reaching into
 `cratonvm-vm` directly. It is a thin, **curated, semver-stable facade**: it
 re-exports *exactly* the supported types (`Vm`, `SharedVm`, `VmConfig`, `Value`,
-`ObjectRef`, `ClassId`, `MethodCallFailed`, `JvmThread`, …) and adds the few
-conveniences an embedder always reaches for, so your `Cargo.toml` does not pin
-the whole internal VM crate's surface as your compatibility contract.
+`ObjectRef`, `ClassId`, `MethodCallFailed`, `MethodCallResult`, `VmError`,
+`JvmThread`, `ThreadId`, `StackTraceFrame`, `CompatibilityMode`,
+`ExecutionPolicy`, `JdkMode`) and adds the few conveniences an embedder always
+reaches for, so your `Cargo.toml` does not pin the whole internal VM crate's
+surface as your compatibility contract.
+
+`CompatibilityMode`, `ExecutionPolicy` and `JdkMode` are the configuration-policy
+tokens — see [Choosing a compatibility mode](#choosing-a-compatibility-mode).
+They are re-exported so a host can *name* the types
+`VmConfig::with_compatibility_mode`, `VmConfig::with_jdk_mode` and
+`VmConfig::execution_policy` deal in; before they were added, an embedder could
+not name the policy type without depending on `cratonvm-vm` directly.
 
 ```toml
 [dependencies]
@@ -261,6 +280,143 @@ embedder is [`vm-cli/src/main.rs`](../vm-cli/src/main.rs).
 
 ---
 
+## Choosing a compatibility mode
+
+*Compatibility mode* selects **which substitutions the VM may make**. It is
+orthogonal to the JDK mode (`--real-jdk` / `--synthetic-jdk`), which selects
+**which class library the VM boots**; the two are set independently on both
+paths.
+
+| Mode | C constant | Rust | Meaning |
+|---|---|---|---|
+| Compatible | `CRATONVM_COMPATIBILITY_COMPATIBLE` (`0`) | `CompatibilityMode::Compatible` | Today's behaviour: bridges, intrinsics **and** compatibility shims. The default on every entry point — the flat API, `JNI_CreateJavaVM`, the Rust facade and the `cratonvm` launcher alike. |
+| JDK-only | `CRATONVM_COMPATIBILITY_JDK_ONLY` (`1`) | `CompatibilityMode::JdkOnly` | Real JDK class bytes are authoritative: no class fabricated without real bytes, no synthetic-stub native registered or invoked. Requires a real JDK runtime image. |
+
+> **Maturity — this is an internal diagnostic, not a production mode.** JDK-only
+> is at stage 1 of 4 of its rollout, and wave 1 is instrumentation and
+> measurement rather than enforcement: only class fabrication and
+> synthetic-native *registration* actually refuse today, while the remaining
+> dispatch paths are counted, not blocked. An embedder that turns it on should
+> expect failures on programs that run fine under `--real-jdk` — that is the
+> signal the mode exists to produce, not a bug in the host program. See
+> [`docs/jdk-only-migration.md`](jdk-only-migration.md) for the operator guide
+> and [`docs/feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md)
+> for the normative contract.
+
+### Rules that are easy to get wrong
+
+- **The default is `Compatible`, and you reach it by doing nothing.** Strict mode
+  is never inferred from a Cargo feature, from `CRATONVM_REAL` /
+  `CRATONVM_NO_STUBS`, or from what the host machine has installed: those select
+  a native-registry filter only and cannot express the class-loading or dispatch
+  half of the contract, so promoting one to strict mode would produce a run
+  enforcing rules its embedder never asked for.
+- **`JdkMode` is asymmetric between entry points; compatibility mode is not —
+  and that is deliberate.** `VmConfig::default()` (the embedding / in-tree-test
+  path) is `JdkMode::Synthetic`, while `VmConfig::for_launcher()` /
+  `with_host_jdk_default()` — the base config both C entry points build on — is
+  `JdkMode::Real`, because the two entry points genuinely want different class
+  libraries. They **agree** on compatibility mode (`Compatible`) because neither
+  may silently *want* strictness. Do not "align" the second split with the first.
+- **An unknown ABI integer is rejected, never clamped to `COMPATIBLE`.** A host
+  compiled against a newer header and run against an older library is told so
+  (`unknown compatibility mode 2: expected 0 (compatible) or 1 (jdk-only)`)
+  rather than silently getting the loose policy it thought it had opted out of.
+- **Explicit `COMPATIBLE` together with a `--jdk-only` option string is a
+  contradiction error, not a precedence rule.** Both are explicit statements of
+  policy, so picking one would mean a host that assembled its options from two
+  places (a config file and a call site, say) runs under a policy neither half
+  asked for. `CRATONVM_COMPATIBILITY_JDK_ONLY` alongside `--jdk-only` agrees and
+  is accepted.
+- **`--jdk-only` does not rewrite the JDK mode.** The base config is already
+  real-JDK, so `--jdk-only` on its own lands on real + strict; quietly forcing
+  `JdkMode::Real` would erase the `--synthetic-jdk` conflict that validation
+  exists to report.
+- **Validation runs before the JDK-availability check.** `--jdk-only` with
+  `--synthetic-jdk` is wrong on a machine with a perfect JDK installation and
+  wrong on one with none, so the verdict is a property of the *request* rather
+  than of what happens to be installed on the host.
+
+### How a bad request surfaces
+
+| Path | Failure |
+|---|---|
+| Flat C API | `cratonvm_create` / `cratonvm_create_with_compatibility` return `NULL`; `cratonvm_last_error(NULL)` carries the reason, prefixed with the failing entry point's name. The strict-plus-`--synthetic-jdk` conflict is verbatim the `invalid configuration: …` text the launcher prints — the rule is called, not re-derived. |
+| JNI Invocation API | `JNI_CreateJavaVM` returns `JNI_ERR` (an unsupported JNI version is still `JNI_EVERSION`). It reports no message; use the flat API when you want the diagnostic text. |
+| Rust facade | `VmConfig::validate_compatibility()` returns `Err(VmError::InvalidConfiguration(_))`, whose `Display` is that same text. |
+
+### C: explicit policy, plus a read-back
+
+```c
+#include "cratonvm.h"
+#include <stdio.h>
+
+int main(void) {
+    /* Capability probe: needs no VM, so it answers "does this build know the
+     * mode?" without the trial-and-error of a failed create. Combined with
+     * dlsym it also covers libraries that predate the symbol entirely. */
+    if (cratonvm_compatibility_mode_supported(CRATONVM_COMPATIBILITY_JDK_ONLY) != 1) {
+        fprintf(stderr, "this libcratonvm does not know JDK-only mode\n");
+        return 1;
+    }
+
+    JavaVMInitArgs args = { JNI_VERSION_1_8, 0, NULL, /*ignoreUnrecognized=*/1 };
+
+    /* State the policy as a first-class argument: a C host has no command line,
+     * and JavaVMInitArgs is often assembled far from the call site. */
+    CratonVm *vm = cratonvm_create_with_compatibility(&args, CRATONVM_COMPATIBILITY_JDK_ONLY);
+    if (!vm) { fprintf(stderr, "%s\n", cratonvm_last_error(NULL)); return 1; }
+
+    /* Read back what you got, rather than trusting what you asked for. */
+    printf("compatibility mode = %d\n", (int)cratonvm_compatibility_mode(vm)); /* 1 */
+
+    cratonvm_destroy(vm);
+    return 0;
+}
+```
+
+### C: the option-string route (the only one for `JNI_CreateJavaVM`)
+
+`JNI_CreateJavaVM` takes nothing but a `JavaVMInitArgs`, so the `--jdk-only`
+option string is the **only** route to strict mode there. It is spelled exactly
+as the launcher flag, so a command line pasted into `JavaVMInitArgs` behaves
+identically. `cratonvm_create` accepts it too.
+
+```c
+JavaVMOption opts[1] = { { (char *)"--jdk-only", NULL } };
+JavaVMInitArgs args = { JNI_VERSION_1_8, 1, opts, /*ignoreUnrecognized=*/0 };
+
+JavaVM *jvm = NULL;
+JNIEnv *env = NULL;
+if (JNI_CreateJavaVM(&jvm, (void **)&env, &args) != JNI_OK) {
+    /* JNI_ERR — e.g. --jdk-only paired with --synthetic-jdk, or no real JDK. */
+    return 1;
+}
+```
+
+### Rust: `VmConfig` + `validate_compatibility`
+
+```rust
+use cratonvm_embed::{CompatibilityMode, ExecutionPolicy, Vm, VmConfig};
+
+// with_host_jdk_default() is the launcher's base config: real JDK, deterministic.
+let config = VmConfig::with_host_jdk_default()
+    .with_compatibility_mode(CompatibilityMode::JdkOnly);
+assert!(config.is_jdk_only());
+
+// Call this once, before Vm::new. Strict mode plus the synthetic class library
+// is a VmError::InvalidConfiguration naming both conflicting flags.
+config.validate_compatibility().expect("real JDK + JDK-only is coherent");
+
+// The resolved policy token the native registry and class manager read at init.
+let policy: ExecutionPolicy = config.execution_policy();
+assert!(policy.is_jdk_only() && policy.real_jdk);
+
+let mut vm = Vm::new(config);
+```
+
+---
+
 ## Limitations / what's not done
 
 This is an evolving surface. Be aware of the following:
@@ -288,6 +444,13 @@ This is an evolving surface. Be aware of the following:
 - **Init phases are caller-driven.** `cratonvm_create` / `Vm::new` bootstrap to a
   usable state for static-method invocation, but a full `main()`-style run still
   drives `System.initPhaseN` the way `vm-cli` does.
+- **JDK-only mode is a diagnostic, not a production posture.** The
+  `CRATONVM_COMPATIBILITY_JDK_ONLY` / `CompatibilityMode::JdkOnly` surface is
+  complete and stable, but the policy behind it is at stage 1 of 4: only class
+  fabrication and synthetic-native registration enforce, and the remaining
+  dispatch paths are counted rather than blocked. An embedder that enables it
+  should expect failures where `--real-jdk` succeeds — see
+  [Choosing a compatibility mode](#choosing-a-compatibility-mode).
 - **Header/ABI stability.** The C ABI is intentionally opaque-handle-based to
   keep it a stable compatibility surface; the `cratonvm-embed` facade is the
   semver-stable Rust contract. Prefer them over depending on `cratonvm-vm`
@@ -341,4 +504,8 @@ For the state of the offload path itself (independent of this embedding-surface 
   in-depth Rust-embedding guide (`VmConfig`, natives, locking, safepoints).
 - [`docs/feature-designs/embedding-api.md`](feature-designs/embedding-api.md) —
   the layered design, risks, and what has landed.
+- [`docs/jdk-only-migration.md`](jdk-only-migration.md) — the JDK-only operator
+  and migration guide (rollout stage, flag matrix, reading a violation).
+- [`docs/feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md) —
+  the normative JDK-only semantics and cross-crate contract.
 - [`vm-cli/src/main.rs`](../vm-cli/src/main.rs) — the reference embedder.

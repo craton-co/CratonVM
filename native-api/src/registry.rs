@@ -54,7 +54,8 @@ fn real_forkjoinpool_enabled() -> bool {
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::compat::CompatibilityMode;
+use cratonvm_types::error::{JdkOnlyViolation, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectKind};
 use cratonvm_types::{ObjectRef, Value};
@@ -4140,6 +4141,57 @@ impl NativeKind {
             NativeKind::SyntheticStub => "synthetic-stub",
         }
     }
+
+    /// Whether this kind may be registered/invoked under `mode`
+    /// (`docs/feature-designs/jdk-only-mode.md` §1.3, §4, 2026-07-31).
+    ///
+    /// `SyntheticStub` is the ONLY kind `JdkOnly` rejects. `Bridge` and
+    /// `Intrinsic` are both explicitly allowed by §1 ("native code may cross VM
+    /// boundaries or provide proven intrinsics"), so this is deliberately not
+    /// "everything except a reviewed allowlist" — the review is a human process
+    /// recorded in the census, not a predicate here.
+    ///
+    /// Kept `#[inline]` and total: dispatch calls it per native invocation, and
+    /// under `Compatible` it must collapse to a constant `true`.
+    #[inline]
+    pub fn allowed_in(self, mode: CompatibilityMode) -> bool {
+        match mode {
+            CompatibilityMode::Compatible => true,
+            CompatibilityMode::JdkOnly => !matches!(self, NativeKind::SyntheticStub),
+        }
+    }
+}
+
+/// One row of the schema-version-2 native census
+/// (`docs/feature-designs/jdk-only-mode.md` §4).
+///
+/// Schema v1 was `dump_registrations()`'s `(class, method, descriptor, kind)`
+/// tuple, which could not answer either of the two questions the JDK-only gate
+/// actually asks: *who* registered a stub (so it can be deleted at the source)
+/// and *whether anything called it* (so a stub nobody dispatches is not treated
+/// as a live blocker). Both were previously unrecoverable after boot — the
+/// registration log kept only the triple, and re-registration of a triple
+/// last-write-wins into the slot with no history at all.
+///
+/// One row per *registration*, not per slot: a triple registered twice appears
+/// twice, in registration order, and only the surviving row carries the
+/// invocation count (see [`NativeMethodRegistry::census`]).
+#[derive(Debug, Clone)]
+pub struct NativeCensusEntry {
+    pub class: String,
+    pub name: String,
+    pub descriptor: String,
+    pub kind: NativeKind,
+    /// Registration site, when recorded (`"native-builtins/src/lib.rs:1234"`).
+    /// `None` only for rows registered before provenance tracking existed —
+    /// currently unreachable, but the contract keeps the `Option`.
+    pub registered_by: Option<String>,
+    /// Kind of the entry this registration overwrote, if any. `Some` means this
+    /// row superseded an earlier registration of the identical triple.
+    pub overwrote: Option<NativeKind>,
+    /// Times this slot was dispatched through any path this run. `0` on a
+    /// superseded row: the count belongs to whoever currently owns the slot.
+    pub invocations: u64,
 }
 
 /// Registry of native method implementations.
@@ -4185,11 +4237,52 @@ struct NativeSlot {
     reg_index: u32,
 }
 
+/// Where one accepted registration came from, index-parallel with
+/// `registrations` / `categories`.
+///
+/// `&'static Location` is two words and is produced by the compiler from the
+/// `#[track_caller]` shim on `register()` — no allocation, no `format!`, no
+/// string at all until [`NativeMethodRegistry::census`] asks. That matters
+/// because boot runs ~3,100 registrations and the census is requested by
+/// roughly nobody: the same reasoning that moved the native-ring name map to
+/// `name_index` + `flush_native_ring_names` (see that field doc).
+struct RegistrationProvenance {
+    /// `file()`/`line()` of the `register(...)` call. Formatted only in
+    /// `census()`.
+    site: &'static core::panic::Location<'static>,
+    /// Kind of the slot this registration displaced, captured BEFORE the
+    /// in-place slot update rewrites it. That history is otherwise
+    /// unrecoverable — `register()` is documented last-registration-wins and
+    /// the slot keeps no predecessor — and the JDK-only plan needs it to tell
+    /// "this triple was always a bridge" from "a stub was promoted to a bridge
+    /// after the fact" when auditing the census.
+    overwrote: Option<NativeKind>,
+}
+
 pub struct NativeMethodRegistry {
     /// Dense slot table. `slots[i]` is the resolved native for
     /// `NativeMethodId(i)`. Append-only: entries are updated in place on
     /// re-registration and never removed, which is what makes handles stable.
     slots: Vec<NativeSlot>,
+    /// Per-slot dispatch counter, **index-parallel with `slots`** and grown in
+    /// the single `None` arm of `register()` that pushes a slot.
+    ///
+    /// Deliberately NOT a field on [`NativeSlot`]. `NativeSlot` is
+    /// `#[derive(Copy, Clone)]` and is copied by value out of the table on the
+    /// `find` / `find_with_kind` hot path (`slot_for_exact` hands back a `&`,
+    /// both callers immediately destructure `slot.callback`/`slot.kind`); an
+    /// `AtomicU64` is not `Copy`, so putting the counter there would force
+    /// every dispatch lookup to carry the registry borrow's lifetime instead of
+    /// two plain machine words. A parallel `Vec` keeps the counter off the
+    /// dispatch struct entirely — the counter is touched only by
+    /// [`record_invocation`](Self::record_invocation), which is a separate
+    /// bounds-checked index.
+    ///
+    /// A superseded registration does not get its own counter: re-registering a
+    /// triple updates the slot in place (that is what keeps handles valid), so
+    /// the accumulated count carries over to the new owner. See
+    /// [`invocations_of_kind`](Self::invocations_of_kind).
+    slot_invocations: Vec<std::sync::atomic::AtomicU64>,
     /// 128-bit `(class, method, descriptor)` digest -> slot index. A hit here
     /// is a *candidate*, not an answer: `slot_index_for_key` re-checks the full
     /// triple before returning the slot.
@@ -4237,9 +4330,14 @@ pub struct NativeMethodRegistry {
     ///     had (see `classloading/src/class_manager.rs`, `loaded_classes` field
     ///     doc, "Round 4 audit fix (CRIT)") before it was deleted.
     ///
-    /// Index-parallel with `categories`. Only *accepted* registrations are
-    /// pushed — every drop arm in `register()` returns before this point.
+    /// Index-parallel with `categories` and `provenance`. Only *accepted*
+    /// registrations are pushed — every drop arm in `register()` (including the
+    /// JDK-only refusal) returns before this point.
     registrations: Vec<(Box<str>, Box<str>, Box<str>)>,
+    /// Registration site + displaced kind, index-parallel with `registrations`
+    /// and `categories`. See [`RegistrationProvenance`]; materialized into
+    /// strings only by [`census`](Self::census).
+    provenance: Vec<RegistrationProvenance>,
     /// AUDIT 2026-05-17 (Fix 5): O(1) index keyed by the 128-bit hash
     /// of `(method_name, descriptor)` (class portion omitted). Used by
     /// `find_by_method_descriptor` to avoid the O(N) linear scan over
@@ -4263,6 +4361,33 @@ pub struct NativeMethodRegistry {
     /// errors. `Intrinsic` and `Bridge` registrations are never affected.
     /// See docs/synthetic-vs-real-explained.md.
     drop_synthetic_stubs: bool,
+    /// VM-scoped strict policy (`docs/feature-designs/jdk-only-mode.md` §4,
+    /// 2026-07-31). Set once at VM init by
+    /// [`set_compatibility_mode`](Self::set_compatibility_mode), before the
+    /// `register_*` population pass.
+    ///
+    /// A **field**, not a process global, on purpose: §2 forbids process
+    /// globals for this feature, and this repo has already shipped the failure
+    /// it is protecting against — process-global native caches leaking state
+    /// across two `SharedVm`s in one test process.
+    ///
+    /// Relationship to `drop_synthetic_stubs`: `JdkOnly` is a strict superset.
+    /// `CRATONVM_NO_STUBS` silently drops the same bucket; `JdkOnly`
+    /// additionally records a structured, attributed
+    /// `JdkOnlyViolation::SyntheticNativeRegistered` in
+    /// [`refused`](Self::refused_registrations). Both arms are live and
+    /// independent — the env var keeps working with `Compatible` set.
+    ///
+    /// In `Compatible` (the default) the only cost anywhere is one field load
+    /// and a discriminant compare at the top of `register()`; nothing in
+    /// dispatch reads it.
+    compatibility_mode: CompatibilityMode,
+    /// Registrations refused by the `JdkOnly` arm of `register()`, in
+    /// registration order. Empty in `Compatible` mode. This is the wave-1
+    /// deliverable: §10 is "measurement, not deletion" everywhere except class
+    /// fabrication (§5) and stub registration (§4) — this vector is the §4 half
+    /// of the evidence, and the CLI report renders it.
+    refused: Vec<JdkOnlyViolation>,
     /// Real-JDK mode: drop synthetic natives whose hardcoded field-slot layout
     /// corrupts the *real* JDK object. Currently `java/util/StringJoiner`,
     /// `java/io/StringReader`, `java/util/EnumSet`, `LinkedBlockingDeque`, and
@@ -4332,6 +4457,9 @@ impl NativeMethodRegistry {
         const BOOT_REGISTRATION_HINT: usize = 4096;
         Self {
             slots: Vec::with_capacity(BOOT_REGISTRATION_HINT),
+            // Index-parallel with `slots`; sized identically so the ~3,100 boot
+            // pushes never reallocate.
+            slot_invocations: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             slot_by_key: FxHashMap::with_capacity_and_hasher(
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
@@ -4343,6 +4471,7 @@ impl NativeMethodRegistry {
             registry_epoch: NEXT_REGISTRY_EPOCH
                 .fetch_add(REGISTRY_EPOCH_STRIDE, std::sync::atomic::Ordering::Relaxed),
             registrations: Vec::with_capacity(BOOT_REGISTRATION_HINT),
+            provenance: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             by_method_desc: FxHashMap::with_capacity_and_hasher(
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
@@ -4354,6 +4483,13 @@ impl NativeMethodRegistry {
             // dropped so calls hit real bytecode or a clear error.
             drop_synthetic_stubs: cratonvm_types::flags::runtime_var_os("CRATONVM_NO_STUBS")
                 .is_some_and(|v| !v.is_empty()),
+            // JDK-only policy is a CLI/init decision, never an env var: it must
+            // be identical for every registry in a process-hosted multi-VM run
+            // only if the caller says so. Default `Compatible` keeps today's
+            // behaviour byte-for-byte (§1, "--real-jdk (default) keeps today's
+            // behaviour exactly").
+            compatibility_mode: CompatibilityMode::Compatible,
+            refused: Vec::new(),
             drop_real_layout_synthetic: false,
             // PERF: deferred native-ring name index. Sized like the other boot
             // maps so the ~3,100 boot inserts don't rehash/grow.
@@ -4375,6 +4511,32 @@ impl NativeMethodRegistry {
     /// being dropped).
     pub fn drops_synthetic_stubs(&self) -> bool {
         self.drop_synthetic_stubs
+    }
+
+    /// Set the VM-scoped strict policy
+    /// (`docs/feature-designs/jdk-only-mode.md` §4). Call **once at VM init,
+    /// before the `register_*` population pass** — this gates `register()`, so
+    /// flipping it afterwards leaves whatever was already accepted in place and
+    /// produces a registry that is neither honestly compatible nor honestly
+    /// strict. `&mut self` is the enforcement: dispatch only ever holds `&`.
+    ///
+    /// Does not touch `drop_synthetic_stubs`; the `CRATONVM_NO_STUBS` env
+    /// reading in `new()` is independent and still applies.
+    pub fn set_compatibility_mode(&mut self, mode: CompatibilityMode) {
+        self.compatibility_mode = mode;
+    }
+
+    /// The VM-scoped strict policy in force. One field load — callers on
+    /// dispatch-adjacent paths may read it per call.
+    #[inline]
+    pub fn compatibility_mode(&self) -> CompatibilityMode {
+        self.compatibility_mode
+    }
+
+    /// Registrations refused because of `JdkOnly`, in registration order.
+    /// Always empty under `Compatible`.
+    pub fn refused_registrations(&self) -> &[JdkOnlyViolation] {
+        &self.refused
     }
 
     /// Enable real-JDK-mode dropping of synthetic natives whose hardcoded
@@ -4432,7 +4594,76 @@ impl NativeMethodRegistry {
             .collect()
     }
 
+    /// Schema-v2 census (`docs/feature-designs/jdk-only-mode.md` §4): every
+    /// accepted registration with its provenance and dispatch count. Order
+    /// follows registration order; callers sort for diff-stable output.
+    ///
+    /// This is the slow, cold, allocating counterpart to
+    /// [`dump_registrations`](Self::dump_registrations) — one `String` per
+    /// field per row, ~3,100 rows. It runs at most once per VM, from a CLI dump
+    /// or the CI gate. Nothing on any hot path calls it.
+    ///
+    /// **Superseded rows.** A triple registered twice yields two rows, in
+    /// registration order, but only ONE slot (re-registration updates in
+    /// place). The one-pass `reg_index -> slot` reverse map below decides which
+    /// row owns the counter: the current owner reports the triple's full count,
+    /// every superseded row reports `0`. Splitting the count between them is
+    /// impossible — the counter never knew about the handover — and attributing
+    /// it to both would double the gate's `synthetic_stub_invocations` total.
+    pub fn census(&self) -> Vec<NativeCensusEntry> {
+        // Reverse of `NativeSlot::reg_index`. One pass over `slots`
+        // (<= registrations.len()), then O(1) per row — not a scan per row.
+        let mut owner_slot: Vec<Option<u32>> = vec![None; self.registrations.len()];
+        for (slot_idx, slot) in self.slots.iter().enumerate() {
+            if let Some(cell) = owner_slot.get_mut(slot.reg_index as usize) {
+                *cell = Some(slot_idx as u32);
+            }
+        }
+        self.registrations
+            .iter()
+            .enumerate()
+            .map(|(reg_index, (class, name, descriptor))| {
+                let prov = self.provenance.get(reg_index);
+                let invocations = owner_slot
+                    .get(reg_index)
+                    .copied()
+                    .flatten()
+                    .and_then(|slot_idx| self.slot_invocations.get(slot_idx as usize))
+                    .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                NativeCensusEntry {
+                    class: class.to_string(),
+                    name: name.to_string(),
+                    descriptor: descriptor.to_string(),
+                    // `categories` is index-parallel with `registrations`; the
+                    // fallback is unreachable and picks the conservative kind
+                    // (matching `current_category`'s default) so a hypothetical
+                    // desync can only ever over-report stubs, never hide one.
+                    kind: self
+                        .categories
+                        .get(reg_index)
+                        .copied()
+                        .unwrap_or(NativeKind::SyntheticStub),
+                    // The one and only place a provenance string is formatted.
+                    registered_by: prov.map(|p| format!("{}:{}", p.site.file(), p.site.line())),
+                    overwrote: prov.and_then(|p| p.overwrote),
+                    invocations,
+                }
+            })
+            .collect()
+    }
+
     /// Register a native method implementation.
+    ///
+    /// `#[track_caller]` (2026-07-31, JDK-only §4): the ~40 `register_*`
+    /// functions across `native-builtins` / `native-collections` / … are the
+    /// only thing that knows where a stub is declared, and after boot that
+    /// information was gone. The attribute is a caller-ABI change with no
+    /// signature change — every call site keeps compiling — and costs the
+    /// caller two words of `&'static Location` at the call, not a `format!`.
+    /// The string is built only if [`census`](Self::census) or the JDK-only
+    /// refusal path actually needs it.
+    #[track_caller]
     pub fn register(
         &mut self,
         class_name: &str,
@@ -4440,6 +4671,49 @@ impl NativeMethodRegistry {
         descriptor: &str,
         callback: NativeCallback,
     ) {
+        // JDK-only strict policy (docs/feature-designs/jdk-only-mode.md §4,
+        // wave 1, 2026-07-31). Deliberately placed BEFORE the
+        // `drop_synthetic_stubs` arm below rather than folded into it: the two
+        // answer different questions and must stay separable. `CRATONVM_NO_STUBS`
+        // is an operator's blunt "make the whole SyntheticStub bucket vanish"
+        // switch and is silent by design; `JdkOnly` is a *policy* that has to
+        // produce attributed, structured evidence (§10 is "measurement, not
+        // deletion"). Merging them would mean either the env var suddenly starts
+        // allocating a violation per drop, or JdkOnly loses its provenance —
+        // and the arm below is load-bearing for a documented real-JDK bootstrap
+        // regression (java.home), so it is left byte-for-byte alone.
+        //
+        // Compatible mode pays exactly one field load plus a discriminant
+        // compare here, and the `allowed_in` call is short-circuited away.
+        if self.compatibility_mode == CompatibilityMode::JdkOnly
+            && !self.current_category.allowed_in(CompatibilityMode::JdkOnly)
+        {
+            // Reuse the existing `CRATONVM_DBG_DROPPED_STUBS` switch (added
+            // 2026-07-14 for the mis-tagged-category bisection) with a distinct
+            // tag, so an operator debugging "why did this native disappear" sets
+            // ONE env var and sees both mechanisms. The tags differ because the
+            // remedies differ: `[DROPPED-STUB]` means "unset CRATONVM_NO_STUBS",
+            // `[JDK-ONLY-REFUSED]` means "this stub is a real JDK-only blocker,
+            // go implement or re-tag it".
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DROPPED_STUBS").is_some() {
+                eprintln!("[JDK-ONLY-REFUSED] {class_name}.{method_name}{descriptor}");
+            }
+            // This is the one place a provenance string is built eagerly, and it
+            // is bounded by the number of refusals (which the gate drives to
+            // zero), not by the ~3,100 registrations.
+            let site = core::panic::Location::caller();
+            self.refused
+                .push(JdkOnlyViolation::SyntheticNativeRegistered {
+                    class: class_name.to_string(),
+                    method: method_name.to_string(),
+                    descriptor: descriptor.to_string(),
+                    registered_by: Some(format!("{}:{}", site.file(), site.line())),
+                });
+            // Return WITHOUT inserting: nothing is pushed to `registrations` /
+            // `categories` / `provenance` / `slots`, so the refused triple never
+            // appears in the census and `generation()` does not move.
+            return;
+        }
         // Strict no-stubs mode: drop synthetic-stub registrations entirely so
         // the call falls through to real bytecode or a clear error instead of a
         // fake. Bridges and intrinsics are always registered. (See the
@@ -4964,6 +5238,21 @@ impl NativeMethodRegistry {
         // `Intrinsic` — takes effect, matching the previous `insert`-not-
         // -`or_insert` semantics of the removed `category_by_key` map.
         self.categories.push(self.current_category);
+        // Provenance, index-parallel with the two pushes above. `overwrote` is
+        // read HERE — before the `match prior_slot` arm below rewrites
+        // `slot.kind` in place — because that is the last moment the displaced
+        // kind exists anywhere. `register()` is last-registration-wins and the
+        // slot keeps no predecessor, so a read after the update would report the
+        // new kind as its own predecessor.
+        //
+        // `Location::caller()` is a compile-time constant threaded in by
+        // `#[track_caller]`: no allocation, no formatting. `format!` happens
+        // only in `census()`.
+        let overwrote = prior_slot.and_then(|idx| self.slots.get(idx as usize).map(|s| s.kind));
+        self.provenance.push(RegistrationProvenance {
+            site: core::panic::Location::caller(),
+            overwrote,
+        });
         // Publish into the dense slot table. Re-registration of a key we have
         // already seen UPDATES THE EXISTING SLOT IN PLACE rather than appending
         // a new one: that is what makes a `NativeMethodId` handed out earlier
@@ -4985,6 +5274,14 @@ impl NativeMethodRegistry {
                     kind: category,
                     reg_index: reg_index as u32,
                 });
+                // The ONLY place `slot_invocations` grows — it must stay
+                // index-parallel with `slots`, and `slots` only ever grows in
+                // this arm (the `Some` arm updates in place, which is what keeps
+                // an already-issued `NativeMethodId` valid). Keeping the two
+                // pushes adjacent is the same discipline the
+                // `registrations`/`classes_with_natives` pair documents above.
+                self.slot_invocations
+                    .push(std::sync::atomic::AtomicU64::new(0));
                 self.slot_by_key.insert(key, idx);
             }
         }
@@ -5194,6 +5491,71 @@ impl NativeMethodRegistry {
     #[inline]
     pub fn kind_of_id(&self, id: NativeMethodId) -> Option<NativeKind> {
         self.slots.get(id.index()).map(|slot| slot.kind)
+    }
+
+    /// Count one dispatch of `id`. Called by every dispatch path immediately
+    /// before invoking it (`docs/feature-designs/jdk-only-mode.md` §4).
+    ///
+    /// # Cost
+    ///
+    /// One bounds-checked index into `slot_invocations` and one **relaxed**
+    /// `fetch_add`. No allocation, no lock, no hashing, no string comparison —
+    /// the caller already holds the `NativeMethodId`, so there is nothing left
+    /// to resolve. `&self`, because every dispatch path holds only `&` on the
+    /// registry; that is why the counter is an atomic and not a `u64`.
+    ///
+    /// `Relaxed` is correct and deliberate: the census is a *tally*, read once
+    /// at the end of the run, and no other memory is published through it.
+    /// Anything stronger would put a fence on the native-dispatch path to buy
+    /// an ordering nobody reads.
+    ///
+    /// An out-of-range `id` — a handle from a different registry, the shape
+    /// `callback_of`/`kind_of_id` already answer `None` for — is **ignored**,
+    /// never a panic. Dispatch must not be able to abort the VM on a stale
+    /// memo.
+    #[inline]
+    pub fn record_invocation(&self, id: NativeMethodId) {
+        if let Some(counter) = self.slot_invocations.get(id.index()) {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Dispatches recorded against `id` this run, or `None` if the handle does
+    /// not belong to this registry. O(1).
+    #[inline]
+    pub fn invocations_of_id(&self, id: NativeMethodId) -> Option<u64> {
+        self.slot_invocations
+            .get(id.index())
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Total dispatches recorded for slots currently classified `kind`
+    /// (`docs/feature-designs/jdk-only-mode.md` §4). The CI gate reads this with
+    /// `NativeKind::SyntheticStub` and asserts zero.
+    ///
+    /// **Derived, not maintained.** Three per-kind global counters would make
+    /// this O(1), but at the price of a SECOND contended atomic RMW on every
+    /// native dispatch: `record_invocation`'s per-slot `fetch_add` is spread
+    /// across ~3,100 independent cache lines, whereas a per-kind global is one
+    /// line every thread in the VM would ping-pong. This scan is ~3,100 relaxed
+    /// loads, run once, cold, at report time. The hot path wins.
+    ///
+    /// **Consequence of deriving it, by design:** the kind comes from the
+    /// slot's *current* classification, and a re-registration of the same triple
+    /// under a different kind rewrites that slot in place while its counter
+    /// keeps accumulating. So a triple registered as `SyntheticStub`, invoked,
+    /// then re-registered as `Bridge` reports its pre-promotion invocations
+    /// under `Bridge`. That is the honest reading of "which kind is this slot
+    /// now", it errs toward under-reporting stubs only in the direction where a
+    /// stub was *fixed*, and `census()` still shows the supersession via
+    /// `overwrote`.
+    pub fn invocations_of_kind(&self, kind: NativeKind) -> u64 {
+        self.slots
+            .iter()
+            .zip(self.slot_invocations.iter())
+            .filter(|(slot, _)| slot.kind == kind)
+            .map(|(_, counter)| counter.load(std::sync::atomic::Ordering::Relaxed))
+            .sum()
     }
 
     /// The `(class, method, descriptor)` triple that currently owns `id`.
@@ -5445,6 +5807,16 @@ impl NativeMethodRegistry {
     /// existing registration on `to_class` is overwritten (matching
     /// the behavior of `register` itself, which re-registers silently
     /// when the triple is identical).
+    ///
+    /// Deliberately NOT `#[track_caller]` (2026-07-31, JDK-only §4 provenance).
+    /// Propagating the caller here would attribute every aliased row to the
+    /// JDBC registrar that asked for the alias, which is a lie: nobody wrote
+    /// those `CallableStatement` registrations, this loop synthesized them. Left
+    /// off, `Location::caller()` inside `register()` resolves to the
+    /// `self.register(...)` line below, so a census row reading
+    /// `native-api/src/registry.rs:<alias_class>` is self-describing —
+    /// "this native exists because of an alias, delete the source registration
+    /// instead".
     pub fn alias_class(&mut self, from_class: &str, to_class: &str) {
         // Collect first to avoid mutating while iterating, and to drop
         // the immutable borrow on `self.registrations` before we call
@@ -6506,5 +6878,200 @@ mod tests {
         assert!(registry.callback_of(bogus).is_none());
         assert!(registry.kind_of_id(bogus).is_none());
         assert!(registry.triple_of(bogus).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // JDK-only mode (docs/feature-designs/jdk-only-mode.md §4), 2026-07-31
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn allowed_in_rejects_only_synthetic_stubs_under_jdk_only() {
+        // §1.3 forbids exactly one kind. Bridges cross VM boundaries and
+        // intrinsics are semantics-preserving, so both survive strict mode —
+        // pinned here because a well-meaning "strict means fewer natives"
+        // tightening of this predicate would silently unboot every real-JDK run.
+        for kind in [
+            NativeKind::Intrinsic,
+            NativeKind::Bridge,
+            NativeKind::SyntheticStub,
+        ] {
+            assert!(
+                kind.allowed_in(CompatibilityMode::Compatible),
+                "{kind:?} must be allowed in Compatible"
+            );
+        }
+        assert!(NativeKind::Intrinsic.allowed_in(CompatibilityMode::JdkOnly));
+        assert!(NativeKind::Bridge.allowed_in(CompatibilityMode::JdkOnly));
+        assert!(!NativeKind::SyntheticStub.allowed_in(CompatibilityMode::JdkOnly));
+    }
+
+    #[test]
+    fn jdk_only_refuses_synthetic_stub_registration_with_provenance() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.set_compatibility_mode(CompatibilityMode::JdkOnly);
+        assert_eq!(registry.compatibility_mode(), CompatibilityMode::JdkOnly);
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("j/J", "fake", "()I", dummy_native);
+        });
+
+        // Refused means NOT INSERTED anywhere: no callback, no census row, and
+        // `generation()` must not move (a bumped generation would invalidate
+        // every live `NativeCallSite` memo for a registration that never
+        // happened).
+        assert!(registry.find("j/J", "fake", "()I").is_none());
+        assert!(registry.census().is_empty());
+        assert_eq!(registry.len(), 0);
+
+        match registry.refused_registrations() {
+            [JdkOnlyViolation::SyntheticNativeRegistered {
+                class,
+                method,
+                descriptor,
+                registered_by,
+            }] => {
+                assert_eq!(class, "j/J");
+                assert_eq!(method, "fake");
+                assert_eq!(descriptor, "()I");
+                // `#[track_caller]` must name the `register(...)` call site in
+                // THIS file, not `register`'s own body in registry.rs.
+                let site = registered_by.as_deref().expect("provenance recorded");
+                assert!(
+                    site.contains("registry.rs:"),
+                    "expected a file:line site, got {site}"
+                );
+            }
+            other => panic!("expected exactly one refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jdk_only_keeps_bridges_and_intrinsics_and_compatible_keeps_stubs() {
+        let mut strict = NativeMethodRegistry::new();
+        strict.set_compatibility_mode(CompatibilityMode::JdkOnly);
+        strict.with_category(NativeKind::Bridge, |r| {
+            r.register("j/J", "syscall", "()I", dummy_native);
+        });
+        strict.with_category(NativeKind::Intrinsic, |r| {
+            r.register("j/J", "fast", "()I", dummy_native_2);
+        });
+        assert!(strict.find("j/J", "syscall", "()I").is_some());
+        assert!(strict.find("j/J", "fast", "()I").is_some());
+        assert!(strict.refused_registrations().is_empty());
+
+        // Compatible is the default and must be unchanged (§1: "--real-jdk
+        // (default) keeps today's behaviour exactly"), including the ambient
+        // `SyntheticStub` category that `register()` inherits when nobody sets
+        // one.
+        let mut compatible = NativeMethodRegistry::new();
+        assert_eq!(
+            compatible.compatibility_mode(),
+            CompatibilityMode::Compatible
+        );
+        compatible.register("j/J", "fake", "()I", dummy_native);
+        assert!(compatible.find("j/J", "fake", "()I").is_some());
+        assert_eq!(
+            compatible.kind_of("j/J", "fake", "()I"),
+            Some(NativeKind::SyntheticStub)
+        );
+        assert!(compatible.refused_registrations().is_empty());
+    }
+
+    #[test]
+    fn record_invocation_is_per_slot_and_ignores_foreign_ids() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("c/C", "a", "()I", dummy_native);
+            r.register("c/C", "b", "()I", dummy_native_2);
+        });
+        let a = registry.resolve_id("c/C", "a", "()I").expect("registered");
+        let b = registry.resolve_id("c/C", "b", "()I").expect("registered");
+
+        assert_eq!(registry.invocations_of_id(a), Some(0));
+        registry.record_invocation(a);
+        registry.record_invocation(a);
+        registry.record_invocation(b);
+        assert_eq!(registry.invocations_of_id(a), Some(2));
+        assert_eq!(registry.invocations_of_id(b), Some(1));
+
+        // A handle from another registry (or a stale memo) must be a silent
+        // no-op, never a panic — this runs on the native-dispatch path.
+        let foreign = NativeMethodId::from_u32(9_999);
+        registry.record_invocation(foreign);
+        assert!(registry.invocations_of_id(foreign).is_none());
+        assert_eq!(registry.invocations_of_kind(NativeKind::Bridge), 3);
+    }
+
+    #[test]
+    fn invocations_of_kind_follows_the_slots_current_kind() {
+        // Documents the deliberate consequence of DERIVING per-kind totals by
+        // scanning instead of keeping three global counters (which would add a
+        // second contended RMW to every native dispatch): a slot re-registered
+        // under a different kind carries its accumulated count over to the new
+        // kind. Asserted, not merely commented, so a future switch to
+        // maintained counters has to confront the behaviour change.
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("p/P", "m", "()I", dummy_native);
+        });
+        let id = registry.resolve_id("p/P", "m", "()I").expect("registered");
+        registry.record_invocation(id);
+        registry.record_invocation(id);
+        assert_eq!(registry.invocations_of_kind(NativeKind::SyntheticStub), 2);
+        assert_eq!(registry.invocations_of_kind(NativeKind::Bridge), 0);
+
+        // Promote the same triple to a bridge: same slot, same counter.
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("p/P", "m", "()I", dummy_native_2);
+        });
+        assert_eq!(
+            registry.resolve_id("p/P", "m", "()I"),
+            Some(id),
+            "re-registration must update the slot in place"
+        );
+        assert_eq!(registry.invocations_of_kind(NativeKind::SyntheticStub), 0);
+        assert_eq!(registry.invocations_of_kind(NativeKind::Bridge), 2);
+    }
+
+    #[test]
+    fn census_reports_provenance_and_zeroes_superseded_rows() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("s/S", "m", "()I", dummy_native);
+        });
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("s/S", "m", "()I", dummy_native_2);
+        });
+        let id = registry.resolve_id("s/S", "m", "()I").expect("registered");
+        registry.record_invocation(id);
+        registry.record_invocation(id);
+        registry.record_invocation(id);
+
+        let census = registry.census();
+        assert_eq!(census.len(), 2, "one row per registration, not per slot");
+
+        // Row 0: the superseded stub. It knows it was first (`overwrote: None`)
+        // and reports zero invocations — the count belongs to whoever owns the
+        // slot now, and double-attributing it would inflate the CI gate's
+        // synthetic-stub total.
+        assert_eq!(census[0].class, "s/S");
+        assert_eq!(census[0].name, "m");
+        assert_eq!(census[0].descriptor, "()I");
+        assert_eq!(census[0].kind, NativeKind::SyntheticStub);
+        assert_eq!(census[0].overwrote, None);
+        assert_eq!(census[0].invocations, 0);
+
+        // Row 1: the current owner. `overwrote` is the history that was
+        // previously unrecoverable — it is read before the in-place slot update.
+        assert_eq!(census[1].kind, NativeKind::Bridge);
+        assert_eq!(census[1].overwrote, Some(NativeKind::SyntheticStub));
+        assert_eq!(census[1].invocations, 3);
+
+        for row in &census {
+            let site = row.registered_by.as_deref().expect("provenance recorded");
+            assert!(
+                site.contains("registry.rs:"),
+                "expected a file:line site, got {site}"
+            );
+        }
     }
 }

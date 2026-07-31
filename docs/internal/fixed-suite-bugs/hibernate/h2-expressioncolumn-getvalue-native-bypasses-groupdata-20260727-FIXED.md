@@ -329,7 +329,7 @@ anything:
    class.** `8e8a7b8cd` is an ancestor of current `dev` but does **not**
    contain `f78b72670` (scopes the relocation-safety gate so the optimizing
    C2/IR tier runs again — see
-   `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`)
+   `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`)
    or `11901e9a6` (fixes the moving-young veto to key on frame liveness
    instead of compiled-code existence), both merged into `dev` via `edd95bc89`
    after this binary was built. With both fixes, this exact class runs in

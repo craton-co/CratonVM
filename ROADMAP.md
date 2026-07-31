@@ -36,7 +36,9 @@ as a wish list.
 
 ## Medium-term
 
-- Real-JDK boot path stability: load `java.base` JMOD as primary stdlib.
+- Real-JDK boot path stability: load `java.base` JMOD as primary stdlib. The
+  instrument for measuring how far that has actually got is the JDK-only mode
+  section below.
 - JNI: full function-table coverage and OnLoad/OnUnload protocol.
 - JCK compliance run on Java SE 25 (see [docs/legal.md](docs/legal.md)).
 - Concurrent garbage collector (G1 maturity, ZGC experimentation).
@@ -48,6 +50,109 @@ as a wish list.
 - Module system: full JEP 261 resolution semantics.
 - GPU offload — see the dedicated section below.
 - Project Panama foreign linker maturity.
+
+## JDK-only mode (`--jdk-only`)
+
+`--jdk-only` is a runtime policy declaring that **real JDK class bytes are
+authoritative**: no non-array class is fabricated without real bytes, no
+synthetic-stub native is registered or invoked, and concrete bytecode beats a
+registered native unless that native is a reviewed intrinsic. It is orthogonal
+to `--real-jdk` / `--synthetic-jdk`, which choose which class library boots.
+Normative contract:
+[`docs/feature-designs/jdk-only-mode.md`](docs/feature-designs/jdk-only-mode.md).
+
+It exists to answer a question the rest of this roadmap cannot: *how much of a
+program's execution is real class-library behaviour, and how much is CratonVM
+standing in for it?* Everything above about real-JDK boot, `java.util.concurrent`
+parity, JNI, and module semantics is measured by this mode's censuses.
+
+### Staged rollout
+
+Four stages. **Stage 1 is where the feature is today** — the stage names and
+the gates for stages 2-4 are a proposal recorded here so that "stage 1 of 4",
+which several documents already cite, resolves to something specific.
+
+| Stage | Meaning | Gate to leave it |
+|---|---|---|
+| **1. Internal diagnostic** *(current)* | Instrumentation and measurement. Only class fabrication and synthetic-native **registration** enforce; the remaining dispatch paths are counted, not blocked. A program that runs fine under `--real-jdk` may fail here — that is the intended signal. Not a compatibility guarantee, and not a supported runtime mode. | Every tier-1 item below closed; every native-vs-bytecode dispatch path (interpreter warm and cold, JIT, reflection, JNI, method handles) routed through `resolve_dispatch` and counted; the census's `real_declaring_method` probe filled in so classification stops being guesswork. |
+| **2. Experimental** | `--jdk-only` refuses on every dispatch path, not just registration and fabrication. Failures are structured and actionable. | The 21-vector strict corpus (`SUITE=jdk-only`) green on both OS legs; the advisory `jdk-only` CI job promoted by deleting its `continue-on-error`, which its own comment ties to `difftest/seeds-jdk-only` being deterministic across both legs. |
+| **3. Preview** | The compatibility surface is gone rather than merely refused: zero `SyntheticStub` entries in the final registry, zero `CompatibilityStub` non-array classes. | `BASELINE_SYNTHETIC_STUBS` driven from 157 to 0 in `native-builtins/tests/stub_ratchet.rs`, with `strict_mode_refuses_nothing` un-ignored in the same change; `Class::is_synthetic_stub` deleted once its readers move to `ClassOrigin`. |
+| **4. Stable** | A supported runtime mode with a compatibility claim behind it. | The full acceptance criteria in contract §11, including no new HotSpot divergence on the strict differential corpus, and a **blocking** zero-stub census gate rather than an advisory one. |
+
+Two notes on the gates, so they are not read as more than they are:
+
+- **The blocking/advisory split is already real and should not be confused.**
+  The synthetic-stub ratchet step in `build-and-test` is **blocking** today — it
+  runs in a job that provisions a JDK and carries no `continue-on-error`. The
+  new `jdk-only` job is advisory on purpose, because at stage 1 a strict run is
+  *expected* to fail on real workloads.
+- **The JDK matrix is a proposal, not existing coverage.** Every other CI job
+  pins JDK 25, so JDK 21 is currently tested by nothing at all. "Real class
+  bytes are authoritative" is a claim about a *specific* runtime image, and a
+  boot-image or module-set difference between feature versions shows up as a
+  class-origin census diff and nowhere else — which is why the advisory job
+  proposes a second leg. Widening JDK coverage repo-wide is a separate decision.
+
+### Wave-2 work required before the mode is complete
+
+Ranked by **danger, not effort**, and tracked in
+[`docs/known-issues/jdk-only/README.md`](docs/known-issues/jdk-only/README.md),
+which carries the evidence for each. Nothing in either tier is closed.
+
+**Tier 1 — causes silent wrong behaviour.** No exception, no log line, no
+failing test. These are the reason the mode cannot advance past stage 1, and
+they are dangerous in the *default* `compatible` mode too, not only under
+`--jdk-only`:
+
+1. **`NativeKind` is ambient and defaults to `SyntheticStub`.** `register()`
+   takes no kind; it is inherited from a mutable registry field. A genuine
+   bridge registered outside a `with_category` scope is silently classified a
+   stub — and then dropped under `CRATONVM_NO_STUBS` / `--jdk-only`. A stub
+   created by omission has no syntactic marker, so a grep-based census
+   undercounts by construction. This already caused one boot regression
+   (2026-07-14). Everything else in this tier ends with "let `resolve_dispatch`
+   decide from the kind", so this must land first.
+2. **Fabricated object layouts leak into native code.** Index-based field access
+   against assumed synthetic layouts still resolves against real bytes, pointing
+   at a *different* field. Two confirmed sites break under strict mode; three
+   crates were never swept.
+3. **The forced-native `String` policy exists in three disagreeing copies** — a
+   positive list on one path, an exclusion list on another, and thin direct-call
+   ladders baked into JIT-emitted code. The disagreement has already made a
+   landed, measured performance fix statically unreachable.
+4. **`ensure_synthetic_class` can record a violation but cannot enforce one.**
+   It returns a bare `ClassId`, so under `--jdk-only` it records and fabricates
+   anyway, across 64 call sites in 28 files.
+5. **VM-internal classes are mislabelled `CompatibilityStub`** to avoid flipping
+   the derived `is_synthetic_stub` bool, which makes the stage-3 zero-stub
+   criterion unachievable by construction.
+6. **Cached invoke targets drop the `NativeKind`,** so a cache *hit* cannot
+   re-apply the policy and is uncounted. The JIT's inline-cache slots have the
+   same hole; fixing either alone buys nothing.
+7. **The real-protected-stub allow-lists diverge** (11 classes vs 10, with a
+   documented heap-corruption reason behind the difference). Wave 2 must
+   reconcile them; both naive merge directions reintroduce a known defect.
+8. **The `ThreadPoolExecutor.execute` receiver-shape special case is copied
+   eight times.** A mechanical "delete every marked site" sweep leaves half the
+   duplication enforcing a policy the other half no longer applies.
+
+**Tier 2 — the instruments tier 1 must be measured with.** The census's
+`real_declaring_method` is `null` on every row, `ClassOriginEntry::requested_by`
+is `null`, and `--trace-jdk-only` is a poll rather than a live trace. None
+causes wrong behaviour; all three are why the tier-1 items say "needs runtime
+evidence from the census".
+
+Beyond those, the per-service-area blockers that stop broad real-class execution
+— `String` dispatch, thread/executor semantics, ForkJoin worker execution,
+`ProcessHandle`, reflection accessors, JNI binding, JPMS, NIO — are inventoried
+with their current evidence in
+[`docs/jdk-only-runtime-services.md`](docs/jdk-only-runtime-services.md).
+
+Two standing constraints on all of it: the default `compatible` mode must remain
+**byte-for-byte unchanged** (most of the dangerous mistakes catalogued so far
+were `compatible`-mode behaviour changes made while intending to fix strict
+mode), and no process-global state may be added for this feature — two existing
+globals are already logged as violations to remove.
 
 ## GPU offload
 
@@ -110,6 +215,10 @@ are aiming at, and may shift as priorities change.
   and Phaser, with the corresponding JDK conformance tests passing.
 - **Real-JDK boot** - make the `java.base` JMOD load path the default stdlib
   source, booting a stock `java.base` without fallback.
+- **JDK-only mode** - reach stage 4 (stable) as defined above: a zero-stub,
+  zero-fabricated-class strict run held by a blocking CI gate. The measurable
+  intermediate is the frozen synthetic-stub baseline, currently 157, and the
+  count of dispatch paths not yet routed through `resolve_dispatch`.
 
 ## How to influence the roadmap
 

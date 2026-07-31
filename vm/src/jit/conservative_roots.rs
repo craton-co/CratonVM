@@ -370,13 +370,22 @@ pub fn shadow_stack_enabled() -> bool {
     // BOTH sides at once; see `jit::x64::shadow_emission_moving_implication_enabled`.
     // This expression must stay character-for-character equivalent to the
     // emission side's.
+    //
+    // 2026-07-31 — the `moving_young_enabled() &&` term is REMOVED, on BOTH
+    // sides in the same change. Publication is how a JIT frame's live
+    // references become visible to the collector at all; that is not a
+    // property of which young collector runs. Keyed on moving-young, the
+    // documented opt-out `CRATONVM_NO_MOVING_YOUNG=1` withdrew it, and that
+    // lane faulted on a zeroed heap slot within seconds of real work.
+    // Restoring publication with `CRATONVM_SHADOW_STACK=1` and changing
+    // nothing else made the same runs clean. See
+    // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
     *ENABLED.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some()
-            || (moving_young_enabled()
-                && match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SHADOW_EMISSION") {
-                    Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-                    Err(_) => true,
-                })
+            || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SHADOW_EMISSION") {
+                Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                Err(_) => true,
+            }
     })
 }
 
@@ -765,6 +774,15 @@ pub struct JitEntryGuard {
     /// Depth at the moment of construction; used as a sanity check on drop.
     depth_at_push: usize,
     active_class_id: Option<u32>,
+    /// Native-allocation unwind permission suspended for the duration of this
+    /// compiled frame, restored on drop. A JIT frame carries no unwind
+    /// information, so a panic raised beneath one would terminate the process
+    /// instead of reaching the `catch_unwind` that would have converted it into
+    /// a Java exception (the same constraint that makes `jit_throw_aioobe`
+    /// signal through a thread-local instead of panicking). `0` — the case
+    /// where no native call is in flight — means nothing was written and
+    /// nothing needs restoring. See `crate::runtime::native_oom`.
+    saved_native_unwind: u32,
 }
 
 impl JitEntryGuard {
@@ -783,6 +801,7 @@ impl JitEntryGuard {
         Self {
             depth_at_push,
             active_class_id: None,
+            saved_native_unwind: crate::runtime::native_oom::suspend_for_jit(),
         }
     }
 
@@ -821,6 +840,7 @@ impl JitEntryGuard {
         Self {
             depth_at_push,
             active_class_id: cratonvm_types::jit_activation::enter(cm.entry_ptr() as usize),
+            saved_native_unwind: crate::runtime::native_oom::suspend_for_jit(),
         }
     }
 }
@@ -846,6 +866,12 @@ impl Drop for JitEntryGuard {
         );
         if let Some(class_id) = self.active_class_id.take() {
             cratonvm_types::jit_activation::exit(class_id);
+        }
+        // Restore the native-allocation unwind permission this compiled frame
+        // suspended. `0` means the entry wrote nothing (no native call was in
+        // flight), so the common pure-JIT path skips the write entirely.
+        if self.saved_native_unwind != 0 {
+            crate::runtime::native_oom::restore(self.saved_native_unwind);
         }
     }
 }
