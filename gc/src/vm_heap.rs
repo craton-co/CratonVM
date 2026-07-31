@@ -1813,6 +1813,19 @@ impl VmHeap {
         if let VmHeap::G1(g1) = self {
             g1.print_gc_summary();
         }
+        // Collection COUNTS, unconditionally. Without these the summary is not
+        // comparable across configurations: the moving-young line below only
+        // prints when moving-young is requested, so a `CRATONVM_NO_MOVING_YOUNG`
+        // run printed nothing at all and "did this config collect more?" — the
+        // first question to ask about an allocation-heavy regression — could not
+        // be answered from a log. Cheap: two relaxed loads at shutdown.
+        if let VmHeap::Generational(h) = self {
+            let s = h.stats().snapshot();
+            eprintln!(
+                "[GC] generational: minor={} major={}",
+                s.minor_gc_count, s.major_gc_count,
+            );
+        }
         let fallbacks = crate::gc_quiescence::moving_young_coverage_fallback_count();
         if crate::gc_quiescence::moving_young_enabled() || fallbacks > 0 {
             // Both numbers, always. A correct answer while `cycles == 0` means
