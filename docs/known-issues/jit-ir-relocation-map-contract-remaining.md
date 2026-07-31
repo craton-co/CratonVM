@@ -299,3 +299,47 @@ Until one of those is settled, flipping the default is unjustifiable in both
 directions: there is no evidence it costs anything, and no evidence it buys
 anything either. The implementation stands, sound and opt-in; what is missing is
 not code and not a timing run, it is knowing whether the path is reachable.
+
+## Resolved: the optimizing tier produces ZERO bodies at runtime
+
+`used_ir_backend` was written and never read outside `cfg(test)`, so "did the
+optimizing tier produce any body in this run?" had no runtime answer — which is
+precisely what made every probe above unfalsifiable. `CRATONVM_DBG_IR_COMPILES=1`
+now prints one line per IR-produced body. On `IrRelocProbe` (`-Xmx64m`, depth 60,
+100k iters, 20 young collections):
+
+    IR bodies total: 0
+    [GC] moving_young: cycles=20 coverage_fallbacks=0
+
+**Zero.** So explanation (1) is the answer: no IR frame was live at any
+collection because the IR backend compiled nothing at all. The contract code has
+never executed in any probe in this investigation.
+
+Three earlier numbers must be re-read in that light, and none of them says what
+it appeared to:
+
+* the "~1.4% emission cost" measured nothing — there were no IR bodies to emit
+  into;
+* `cycles=25 coverage_fallbacks=0` on bt18 is the SINGLE-PASS path proving its
+  own coverage, not IR;
+* the reader-side null is likewise vacuous.
+
+`cargo test -p cratonvm-jit` exercises IR heavily (`ir_vs_singlepass` 89/0), so
+the pipeline works when driven directly. What does not happen is the *runtime*
+reaching it. Candidates, in order:
+
+1. `ir::ir_compatible` rejecting these methods — `IrRelocProbe::step` contains
+   `new` and `invokevirtual`, both admitted in principle, but the caps and the
+   `has_athrow` / `indy_ops` rejections are worth printing per candidate;
+2. the tiered manager never calling `try_compile` with `optimize = true` in a
+   default run, so the gate this session opened is downstream of a decision that
+   never selects C2 at all.
+
+**This supersedes the "C2 tier restored" claim** from the gate-scoping work
+(`f78b72670`). That change is still right — the gate was guarding an unreachable
+hazard — but the ASTParser 376->138 s and Oracle 322->93 s improvements cannot
+have come from the optimizing tier if it emits nothing. The other gate scoped in
+the same commit, `direct_jit_callee_calls_enabled`, is the likely source and
+should be credited (and re-measured) separately.
+
+Next step is (2): instrument the tier decision, not the backend.
