@@ -1453,10 +1453,23 @@ pub fn make_iterator_from_array(
     snapshot_array: ObjectRef,
     size: usize,
 ) -> MethodCallResult {
+    // GC-SAFETY: `alloc_synthetic` can run the iterator class's `<clinit>` and
+    // allocate, which relocates the snapshot array the caller handed us. Root
+    // it across the allocation and read both halves of the new graph back
+    // through their pins. Covered by
+    // `gc_native_pins::generic_snapshot_iterator_roots_array_and_shell_across_allocation`.
+    let array_pin = ctx.pin_native_root(snapshot_array);
     let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
     ctx.set_field(itr, 0, Value::Object(Some(snapshot_array)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.set_field(itr, 1, Value::Int(0));
+    let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.set_field(itr, 2, Value::Int(size as i32));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(array_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -29124,15 +29137,33 @@ fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     // ArrayDeque$Itr: field 0 = snapshot array, field 1 = cursor,
     // field 2 = backing ArrayDeque (so Iterator.remove() can mutate it).
+    // GC-SAFETY: `elems` are bare locals snapshotted out of the deque, and both
+    // `alloc_ref_array` and `alloc_synthetic` can collect — which moves the
+    // deque itself, the elements, and the array. Root the whole graph and read
+    // every part back through its pin before storing it. Covered by
+    // `gc_native_pins::array_deque_iterator_roots_snapshot_graph_across_allocations`.
+    let this_pin = ctx.pin_native_root(this);
     let elems = ad_collect_elements(ctx, this);
+    let elem_pins: Vec<usize> = elems.iter().map(|e| pin_value(ctx, *e)).collect();
     let arr = alloc_ref_array(ctx, elems.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, e) in elems.iter().enumerate() {
-        ctx.set_array_element(arr, i, *e);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let value = read_pinned_elem(ctx, elem_pins[i], *e);
+        ctx.set_array_element(arr, i, value);
     }
     let itr = alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.set_field(itr, 1, Value::Int(0));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(itr, 2, Value::Object(Some(this)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -41396,9 +41427,19 @@ fn alloc_unmod_list_itr(
     snapshot: ObjectRef,
     cursor: i32,
 ) -> ObjectRef {
+    // GC-SAFETY: same contract as `make_iterator_from_array` — the shell
+    // allocation can relocate the snapshot. Covered by
+    // `gc_native_pins::unmodifiable_list_iterator_roots_snapshot_graph_across_allocation`.
+    let snapshot_pin = ctx.pin_native_root(snapshot);
     let it = alloc_synthetic(ctx, UNMOD_LIST_ITR_CLASS, 2);
+    let it_pin = ctx.pin_native_root(it);
+    let it = ctx.read_native_pin(it_pin, it);
+    let snapshot = ctx.read_native_pin(snapshot_pin, snapshot);
     ctx.set_field(it, UNMOD_LIST_ITR_SNAPSHOT, Value::Object(Some(snapshot)));
+    let it = ctx.read_native_pin(it_pin, it);
     ctx.set_field(it, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor));
+    let it = ctx.read_native_pin(it_pin, it);
+    ctx.unpin_native_roots(snapshot_pin);
     it
 }
 

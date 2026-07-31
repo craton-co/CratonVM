@@ -530,6 +530,7 @@ export inherited from a parent shell.
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
 | `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
+| `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
 | `overhead-limit` | `CRATONVM_GC_OVERHEAD_LIMIT` |
 | `par-min-bytes` | `CRATONVM_GC_PAR_MIN_BYTES` |
 | `par-threads` | `CRATONVM_GC_PAR_THREADS` |
