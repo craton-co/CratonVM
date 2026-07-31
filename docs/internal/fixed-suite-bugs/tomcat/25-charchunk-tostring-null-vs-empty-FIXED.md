@@ -75,7 +75,7 @@ recycled path skips `buff`/`start` entirely. The helper is therefore named
 `end > 0` themselves.
 
 That this is worth caring about is corroborated independently by
-[32-doc04-residual-perf-assertions](../../../known-issues/tomcat/32-doc04-residual-perf-assertions.md):
+[32-doc04-residual-perf-assertions](32-doc04-residual-perf-assertions-CLOSED.md):
 snapshotting the `CharChunk` range once per `Mapper` search, instead of
 re-reading three `get_field_by_name` per binary-search probe, moved that
 benchmark from 3.34 s to 2.82 s. Name-keyed field reads in this family are

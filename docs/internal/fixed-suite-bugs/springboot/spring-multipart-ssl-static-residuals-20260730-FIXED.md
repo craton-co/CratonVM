@@ -23,7 +23,7 @@
   With that gap closed at the promotion site, the blanket default-off is no
   longer what holds the hazard shut — and it cost ~8.4x on ordinary
   instance-method bytecode. See
-  [tomcat/32](../../../known-issues/tomcat/32-doc04-residual-perf-assertions.md).
+  [tomcat/32](../tomcat/32-doc04-residual-perf-assertions-CLOSED.md).
 
   **Caveat for whoever revisits this:** the verification table below can no
   longer be reproduced. `module/spring-boot-servlet`'s jars date from 07-11 and
