@@ -572,6 +572,7 @@ mod tests {
         // would ever register. Opt in explicitly, the same choice
         // `CRATONVM_SYNTHETIC_AQS=1` makes at runtime.
         cratonvm_native_builtins::util_concurrent_ext::register_synthetic_aqs_natives(&mut r);
+        cratonvm_native_builtins::util_concurrent_ext::register_synthetic_rwlock_natives(&mut r);
         // Same story for `java.net.Socket` / `ServerSocket`, but guarded twice:
         // `register_phase53_socket_stubs` skips them under real NIO sockets,
         // AND `NativeMethodRegistry::register` drops any registration on those
@@ -583,6 +584,14 @@ mod tests {
         r.allow_synthetic_net_sockets(true);
         cratonvm_native_builtins::phases_early::register_synthetic_socket_stubs(&mut r);
         r.allow_synthetic_net_sockets(false);
+        // Grant FFM native access, the equivalent of launching with
+        // `--enable-native-access=ALL-UNNAMED`. The gate is deliberately
+        // fail-closed, so without this every `MemorySegment` get/set/fill in
+        // this module throws `IllegalCallerException` — the `panama_*` tests
+        // exercise the FFM API itself and cannot do so from behind a denial.
+        // Safe to make process-wide here: no test in this module asserts that
+        // access is refused.
+        cratonvm_native_builtins::panama::set_native_access_enabled(true);
         r
     });
 
@@ -2453,8 +2462,10 @@ mod tests {
 
         let fmt = create_java_string(&shared, "Hello, %s! You are %d.");
         let name = create_java_string(&shared, "World");
-        // For the integer argument, we'll put a boxed int (alloc object with int field)
-        let int_obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        // A real `java.lang.Integer`, not a `ClassId::new(0)` object with an int
+        // in slot 0: `%d` has to recognise the argument as a boxed integer, and
+        // that recognition is by class.
+        let int_obj = alloc_receiver(&shared, &mut thread, "java/lang/Integer", 1);
         shared.mem.heap.set_field(int_obj, 0, Value::Int(42));
 
         let arr = shared
@@ -2515,9 +2526,14 @@ mod tests {
             Some(Value::Object(Some(o))) => o,
             _ => panic!("expected string obj"),
         };
+        // `%n` is `System.lineSeparator()`, not a literal newline, so the
+        // expected text is platform-dependent: "\r\n" on Windows, "\n"
+        // elsewhere. Hardcoding "\n" made this pass on the Linux CI runner and
+        // fail on every Windows dev box.
+        let nl = if cfg!(windows) { "\r\n" } else { "\n" };
         assert_eq!(
             read_java_string(&shared.mem.heap, obj),
-            Some("100% done\n".to_string())
+            Some(format!("100% done{nl}"))
         );
     }
 

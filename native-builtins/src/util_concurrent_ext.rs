@@ -5389,7 +5389,18 @@ pub(crate) fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
         register_stamped_lock_natives(registry);
         return;
     }
+    register_synthetic_rwlock_natives(registry);
+}
 
+/// The legacy synthetic `ReentrantReadWriteLock` surface, split out of
+/// [`register_rwlock_natives`] for the same reason as
+/// [`register_synthetic_aqs_natives`]: under the default real-AQS build it is
+/// never registered, and `cratonvm-vm`'s inline tests cannot drive the real
+/// path either, so its tests had nothing to call.
+///
+/// Production behaviour is unchanged — the caller above still returns early
+/// under real AQS without reaching this.
+pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
     let rwl = "java/util/concurrent/locks/ReentrantReadWriteLock";
     let rl = "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock";
     let wl = "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock";
