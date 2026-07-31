@@ -992,6 +992,16 @@ pub fn render_gate(report: &GateReport) -> String {
         "nondeterministic (skipped)",
         &report.nondeterministic,
     );
+    if !report.path_splits.is_empty() {
+        let _ = writeln!(
+            s,
+            "  CratonVM execution paths disagreed with each other (reported, not gated): {}",
+            report.path_splits.len()
+        );
+        for split in &report.path_splits {
+            let _ = writeln!(s, "      {split}");
+        }
+    }
     if !report.strict_violations.is_empty() {
         let _ = writeln!(
             s,
@@ -1605,6 +1615,84 @@ mod tests {
     }
 
     // -- census-free modes are untouched -------------------------------------
+
+    // -- cross-path (reference-free) findings --------------------------------
+
+    #[test]
+    fn two_execution_paths_disagreeing_is_reported_but_does_not_gate() {
+        // `nojit` printed "42" and `ir-jit` printed nothing: one of the VM's own
+        // executors is wrong, and no reference JDK is needed to know it. It is
+        // surfaced on the gate report and deliberately left out of the exit
+        // code — a `JitOnly` row already on the ledger is a path split by
+        // construction, so gating here would fail the frozen baseline.
+        let r = program_with(
+            "X",
+            vec![
+                diverging_outcome(Mode::NoJit),
+                agreeing_outcome(Mode::IrJit),
+            ],
+        );
+        let splits = r.path_disagreements();
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].label(), "nojit≠ir-jit[stdout]");
+
+        // The ledger says this program is a known divergence, so the gate is
+        // clean — and the split is still reported.
+        let report = gate(
+            &summary_of(vec![r]),
+            &ledger_with("X", LedgerStatus::Known, "42"),
+        );
+        assert_eq!(report.path_splits, vec!["X: nojit≠ir-jit[stdout]".to_string()]);
+        assert_eq!(report.exit_code(), 0, "a path split must not move the gate");
+        assert!(report.is_clean());
+        assert!(render_gate(&report).contains("reported, not gated"));
+    }
+
+    #[test]
+    fn paths_that_agree_produce_no_split_even_when_all_diverge_from_hotspot() {
+        // The `Universal` shape: every executor is wrong in the same way. There
+        // is no path split, because the paths agree with each other — which is
+        // itself the useful signal (the bug is shared, not JIT-specific).
+        let r = diverging_program("X");
+        assert!(r.path_disagreements().is_empty());
+        let report = gate(
+            &summary_of(vec![r]),
+            &Ledger::new("h".into(), "t".into(), "25".into()),
+        );
+        assert!(report.path_splits.is_empty());
+        assert!(!render_gate(&report).contains("reported, not gated"));
+    }
+
+    #[test]
+    fn a_cross_policy_pair_is_never_reported_as_a_path_split() {
+        // `--jdk-only` refusing something the compatible run allowed is a policy
+        // finding with its own ledger row, not two executors disagreeing.
+        let r = program_with(
+            "X",
+            vec![
+                diverging_outcome(Mode::JitOn),
+                agreeing_outcome(Mode::JdkOnlyJit),
+            ],
+        );
+        assert!(
+            r.path_disagreements().is_empty(),
+            "the policy axis must not masquerade as an execution-path split"
+        );
+    }
+
+    #[test]
+    fn the_summary_names_the_dimension_that_moved() {
+        // The whole point of splitting the exception channel: a report says
+        // `exception-message`, not `exception`.
+        let mut outcome = agreeing_outcome(Mode::JitOn);
+        outcome.verdict = Verdict::Diverge(vec![ChannelDiff {
+            channel: Channel::ExceptionMessage,
+            cratonvm: "no detail".into(),
+            hotspot: "Index 9 out of bounds for length 3".into(),
+        }]);
+        let rendered = render_summary(&summary_of(vec![program_with("X", vec![outcome])]));
+        assert!(rendered.contains("jit-on:exception-message"), "{rendered}");
+    }
 
     #[test]
     fn legacy_modes_carry_no_census_and_no_violation() {

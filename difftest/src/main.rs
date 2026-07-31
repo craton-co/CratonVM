@@ -13,6 +13,8 @@
 //! * `min` — ddmin-shrink a confirmed divergence to a minimal repro (Step 6).
 //! * `gate` — diff a fresh run against the committed ledger; exit per the §3.5
 //!   contract (0 ok / 1 new-or-drift / 2 fixed-reopened / 3 bootstrap).
+//! * `matrix` — generate the opcode / execution-path coverage matrix from the
+//!   corpus's own class files (C2 review P0).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -23,8 +25,10 @@ use clap::{Args, Parser, Subcommand};
 use cratonvm_difftest::generate::{self, Rng, TargetFamily};
 use cratonvm_difftest::harness::{self, RunOne};
 use cratonvm_difftest::ledger::{self, Ledger};
+use cratonvm_difftest::matrix::{self, CoverageMatrix};
 use cratonvm_difftest::minimize;
 use cratonvm_difftest::mutate;
+use cratonvm_difftest::oracle::Normalizer;
 use cratonvm_difftest::runner::{self, Mode, RunError, RunnerConfig, DEFAULT_TIMEOUT};
 
 /// Gate / run exit-code contract (design §3.5). These describe the *divergence
@@ -68,6 +72,8 @@ enum Cmd {
     Min(MinArgs),
     /// CI gate: exit non-zero on a new or regressed divergence (Step 3).
     Gate(RunArgs),
+    /// Generate the opcode / execution-path coverage matrix (C2 review P0).
+    Matrix(MatrixArgs),
 }
 
 /// Flags shared by `run` and `gate` (the A/B-executing subcommands).
