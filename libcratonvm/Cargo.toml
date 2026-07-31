@@ -28,8 +28,13 @@ build = "build.rs"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 # Keep libcratonvm publishable: cratonvm-vm's default feature set includes
-# `awt`, which pulls the unpublished cratonvm-native-awt crate. Mirror the
-# remaining default VM support features explicitly and leave AWT opt-out here.
+# `awt`, which pulls the unpublished cratonvm-native-awt crate, so we take
+# `default-features = false` and re-add what we want by hand. This list is
+# deliberately NOT "the VM defaults" — the VM's default set is `awt` +
+# `management`, and the three experiments below are additions on top of it that
+# the shipped .so/.dll has always carried. Left as-is on purpose: what a
+# distributed binary artifact contains is a release decision, not a naming
+# cleanup. Revisit alongside the 0.4 removal of the deprecated feature aliases.
 [dependencies.cratonvm-vm]
 path = "../vm"
 version = "0.3.0"
