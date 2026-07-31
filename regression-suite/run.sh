@@ -30,7 +30,7 @@ TIMEOUT="${TIMEOUT:-120}"
 # CratonVM gap (cross-thread JIT-frame root scanning at a STW GC pause — see
 # README "Known gaps"), so it flakes. Run it explicitly once that gap is closed:
 #   ONLY="RConcurrent" bash regression-suite/run.sh
-CLASSES="${ONLY:-RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RExecutorShutdown RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RPriorityQueueGc}"
+CLASSES="${ONLY:-RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RExecutorShutdown RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RPriorityQueueGc RTreeRangeGc}"
 
 # Per-class extra CratonVM arguments. Most classes run on plain defaults; a few
 # only exercise their target defect under a specific VM configuration, and
@@ -44,6 +44,11 @@ cv_extra_args() {
     # ObjectRefs this class hunts for still resolve and the defect hides. The
     # small heap forces collections to happen inside the native it targets.
     RPriorityQueueGc) echo "--nojit --Xmx 64m" ;;
+    # Only needs the small heap: on the default heap no collection happens
+    # during the walk it targets, so the class passes on a broken VM. Unlike
+    # RPriorityQueueGc it does NOT need --nojit -- it reproduces with the JIT
+    # on, so leave the default (compiling) configuration under test.
+    RTreeRangeGc) echo "--Xmx 64m" ;;
     *) echo "" ;;
   esac
 }
