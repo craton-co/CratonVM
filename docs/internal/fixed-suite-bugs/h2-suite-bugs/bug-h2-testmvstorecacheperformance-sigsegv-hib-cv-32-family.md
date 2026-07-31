@@ -1,131 +1,255 @@
-# `TestMVStoreCachePerformance` crashes with `SIGSEGV` after a burst of heap-integrity defensive-guard warnings — HIB-CV-32-family, guards don't fully prevent the crash here
+# `TestMVStoreCachePerformance` `SIGSEGV` after a burst of heap-integrity guard warnings — HIB-CV-32 family
 
-## Status
-**OPEN** — a hard `SIGSEGV` preceded by a burst of
-`gen_heap::set_field: out-of-bounds field write dropped ... class_id=ClassId(0)
-class_name=java/lang/Object num_slots=0` guard warnings. Found while re-running
-the H2 suite's HANG classes with a longer (1500s) per-class timeout.
+> **✅ FIXED (2026-07-31, branch `fix/h2-mvstore-cache-segv-20260731`).**
+> Two commits, one root cause in two places:
+> * `c0d09e2451` — post-GC reference processing wrote through stale
+>   old-generation addresses.
+> * `b86945eafe` — the same old-gen blind spot in `is_stale_young`, the guard
+>   the cleared / enqueue / finalize / cleaner loops use.
+>
+> `org.h2.test.store.TestMVStoreCachePerformance` now runs to completion —
+> all six `testCache` rounds, up to 100 concurrent reader threads — exit 0,
+> with zero `gen_heap::set_field`/`get_field` out-of-bounds guard hits and
+> zero `read_slot: corrupt Value cell` reports, under **both** `--nojit` and
+> the JIT.
+>
+> The sibling finding this doc cross-referenced (`TestGetGeneratedKeys`)
+> turned out to be an unrelated defect and **not heap corruption at all** —
+> a wrapper `equals` native reading field 0 of a `String[]`. It was
+> root-caused and fixed independently, on another branch, while this one was
+> out: `7656ad39`, retired as
+> [bug-h2-testgetgeneratedkeys-wrapper-equals-missing-type-check-FIXED.md](bug-h2-testgetgeneratedkeys-wrapper-equals-missing-type-check-FIXED.md).
+> This branch adds `967abc2546` on top of it, closing two residuals its
+> class-id gate left open (`Foo` vs `Foo[]` compare equal by class id; an
+> undecodable slot compared EQUAL).
 
-> **Correction (2026-07-31).** The original text of this section cited
-> `TestGetGeneratedKeys` as a milder sibling occurrence of the same
-> `HIB-CV-32` heap-corruption family. **That corroboration is withdrawn** —
-> `TestGetGeneratedKeys` was root-caused and fixed and had *nothing* to do
-> with heap corruption: its `gen_heap::read_slot: corrupt Value cell`
-> diagnostics came from `Integer/Boolean/...equals(Object)` natives reading
-> field 0 of an *array* argument, because they never performed the JDK's
-> `instanceof` test. See
-> `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testgetgeneratedkeys-wrapper-equals-missing-type-check-FIXED.md`.
-> The `HIB-CV-32` attribution for *this* crash is therefore un-corroborated
-> and still unverified — treat it as a hypothesis, and confirm the holder's
-> `kind=`/backtrace with `CRATONVM_DBG_CELLCORRUPT=1` before assuming a
-> GC/reference-integrity cause.
+## Original symptom
 
-**Faster reproducer available (2026-07-31):** this crash's exact signature
-(the `class_id=ClassId(0) java/lang/Object num_slots=0` write-guard burst,
-then `SIGSEGV`) also occurs in `org.h2.test.synth.TestDiskFull`, which takes
-**~2 s** per attempt instead of `TestMVStoreCachePerformance`'s ~972 s. See
-`bug-h2-testdiskfull-classid0-corruption-segv-cce.md`.
-
-## Severity
-**HIGH** — a hard `SIGSEGV`, not a catchable exception or a clean test
-failure.
-
-## Affected test class
-`org.h2.test.store.TestMVStoreCachePerformance`
-
-## Symptom
-Immediately before the crash, a burst of two distinct defensive-guard
-warnings fires repeatedly:
 ```
 [WARN] gen_heap::set_field: out-of-bounds field write dropped (caller used
-  slot index past receiver's layout — class layout is correct; the bug is
-  in the caller's slot computation) obj=0x200274cf3a8 index=0 num_slots=0
-  class_id=ClassId(0) class_name=java/lang/Object real_field_count=Some(0)
-  value=Object(Some(ObjectRef { ptr: 0x20026751978 }))
-  ... (repeats for at least 10 distinct objects, all class_id=ClassId(0)/
-      java.lang.Object, all num_slots=0, all index=0)
+  slot index past receiver's layout ...) obj=0x200274cf3a8 index=0
+  num_slots=0 class_id=ClassId(0) class_name=java/lang/Object
+  real_field_count=Some(0) value=Object(Some(ObjectRef { ptr: ... }))
+  ... (repeats)
 
 [ERROR] gen_heap::read_slot: corrupt Value cell (out-of-range discriminant)
-  — returning null instead of a UB-on-match Value. Heap reference-integrity
-  defect (see HIB-CV-32). slot=0x20010419010 raw0="0x0000003436363834" raw1="0x0102080100000000"
-  ... (fires 3x, two distinct slots)
+  ... slot=0x20010419010 raw0="0x0000003436363834" raw1="0x0102080100000000"
 
-#
-# A fatal error has been detected by the CratonVM Runtime Environment:
-#  SIGSEGV at pc=0x626dfd6bf929, addr=0x0, pid=1820707, ...
+# SIGSEGV at pc=..., addr=0x0
 ```
 
-## Analysis
-The `set_field` warnings are a **different** guard than the `read_slot`
-one already tied to `HIB-CV-32`, but describe the same underlying shape of
-defect: a live object reference (`ObjectRef { ptr: ... }`) is about to be
-written into slot 0 of a receiver whose header claims `class_id=0`
-(`java/lang/Object`) with **zero fields** — i.e. the receiver's own header
-looks like a bare `Object`, not whatever real, field-bearing class it
-should be. This is architecturally the same signature as `HIB-CV-31`'s
-already-documented finding (`recv_cid=0 recv_class=java/lang/Object` on a
-reference that should have pointed at a concrete object) and this session's
-own `TestGetGeneratedKeys` finding (`gen_heap::read_slot` catching a
-corrupt cell) — all three read back a **plausible-looking but wrong**
-`java/lang/Object`/`ClassId(0)` shape where a real, concrete object should
-be.
+## Root cause
 
-The crucial difference here: **10+ occurrences of the write-side guard and
-3 occurrences of the read-side guard all fired and were safely absorbed**
-(dropped/nulled, no crash from any of them individually) — but the process
-still `SIGSEGV`'d moments later. This means either:
-1. The corruption is wide enough under this specific workload's allocation
-   pattern that *some* corrupted access isn't covered by either existing
-   guard (a getfield/putfield path, an array access, or a JIT-compiled
-   fast path that bypasses `gen_heap::{read_slot,set_field}` entirely —
-   `--nojit` was NOT confirmed for this specific run, worth checking
-   first), or
-2. One of the "successfully" dropped/nulled writes or reads itself leaves
-   the object graph in a state that a *later*, ordinary (non-corrupt-looking)
-   access then dereferences incorrectly (e.g. a `null` substituted for what
-   should have been a real reference, then unconditionally dereferenced
-   without a null-check a few instructions later, in either interpreted or
-   JIT-compiled code).
+`VmHeap::is_addr_live` answers `true` for **any** address inside the
+old-generation arena:
 
-Not root-caused further this session — this is a "found a crash, connected
-it to the closest known defect family, and stopped" flag, not a
-root-caused fix write-up.
+```rust
+VmHeap::Generational(h) => h.is_old_gen_addr(addr) || h.is_live_young_survivor(addr)
+```
 
-## Suggested next steps
-1. Re-run with `--nojit` explicitly (confirm whether this is JIT-only,
-   interpreter-only, or both) — none of the three related HIB-CV docs
-   (`HIB-CV-31`/`-32`/this session's `TestGetGeneratedKeys` finding) have
-   directly confirmed this specific test's JIT-vs-interpreter sensitivity.
-2. Capture the actual `hs_err_pid*.log` this run produced (referenced in
-   the crash banner but not retrieved this session) for the faulting
-   frame's Java-level context — the raw crash banner alone doesn't show
-   which bytecode/JIT frame dereferenced the null pointer at `addr=0x0`.
-3. Cross-reference against
-   `docs/internal/fixed-suite-bugs/hibernate/run-20260622/HIB-CV-32-sigsegv-blob-bytearray-bind.md`'s
-   own root-cause mechanism (`gen_heap.rs`'s `promotion_oom_risk` diverting
-   `--nojit` young collections into a corrupting non-moving sweep) to see
-   whether this workload's own allocation/GC pattern (cache eviction under
-   sustained throughput — `TestMVStoreCachePerformance` is explicitly a
-   cache-churn benchmark) hits the same trigger condition, or a distinct
-   one that the June 23 fix doesn't cover.
+`OldGen::contains` is a pure bounds check over the arena's whole backing
+store. That is correct for a *minor* cycle — old gen is not touched, so
+nothing moved — and `gc_quiescence.rs` documents it as such. It stops being
+true the moment the **same cycle** reclaims old-gen storage:
 
-## Repro
+* the mark-compact `major_gc` (Phase 5, fires at 75% old-gen occupancy or on
+  an explicit `System.gc()`) slides live objects down over the dead ones and
+  **zeroes the freed tail**;
+* the in-place `sweep_old_gen_non_moving` (the JIT-active path) returns dead
+  blocks to the free list.
+
+Post-GC reference processing used `is_addr_live` as its survival proof, in
+three places (`is_marked` → `process_references`, the weak/phantom
+referent-restore pass, and `remove_collected`). So a dead old-gen
+`Reference` — or referent — was judged "survived":
+
+1. `remove_collected` never pruned the entry, so it accumulated **forever**;
+2. every subsequent collection's restore pass wrote a referent pointer
+   *through the stale address*.
+
+When the recycled memory was the zeroed compaction tail the write hit the
+`gen_heap::set_field` out-of-bounds guard (`class_id=ClassId(0)`,
+`num_slots=0` — exactly the reported shape) and was dropped. When it was a
+live object slid onto that address, the write landed **silently** on a real
+reference field. That is the `SIGSEGV` and the `corrupt Value cell` reports:
+a live object's slot holding a pointer that belongs to something else.
+
+`is_stale_young` — `VmHeap::pre_gc_addr_did_not_survive`, the guard the
+cleared / enqueue / finalize / cleaner loops use — had the identical blind
+spot: for the Generational heap it only rejects **young** addresses absent
+from the pointer map, and answers "survived" for every old-gen address. The
+finalize and cleaner loops hand that address to `run_finalizers` /
+`run_cleaner_actions`, which **invoke Java methods on it**.
+
+### Measured
+
+Instrumenting the restore site (`CRATONVM_DBG_WEAKREF_STALE`, temporary)
+printed, for every one of the first 40 stale restores:
+
+```
+[weakref-stale #0] ref_old=0x20010143658 ref_new=0x20010143658
+  ref_in_map=false ref_oldgen=true ref_youngsurv=false ref_nf=0 |
+  referent_old=0x20010143548 referent_new=0x20010143548
+  referent_in_map=false referent_oldgen=true referent_youngsurv=false
+  referent_nf=0 | map_len=234865 active_len=86266
+```
+
+Every one: an **old-gen** address, **absent from the pointer map**, admitted
+solely by `is_old_gen_addr`, resolving to a receiver with **0 fields**.
+`active_len=86266` — 86 k "active" weak/phantom entries, essentially all
+stale, because none had ever been prunable. Per-run guard-caught corrupt
+writes: **98,559** (`--nojit`) and **64,960** (JIT on).
+
+## The fix
+
+The collector now publishes a survival proof for exactly the addresses
+reference processing writes through, and reference processing requires it.
+
+| Change | File |
+| --- | --- |
+| `ReferenceProcessor::all_tracked_addrs` — publish **every** tracked address (soft/weak/phantom/cleaner/finalizer reference object, referent, queue) as watched before each collection, not just the weak/phantom pairs' | `gc/src/reference.rs` |
+| `sweep_old_gen_non_moving` returns identity `pointer_map` entries for watched survivors (it returned an empty map), mirroring what `OldGen::compact` already did for watched *stationary* survivors | `gc/src/gen_heap.rs` |
+| `gc_quiescence::OLD_GEN_RECLAIMED` — did the cycle in flight reclaim old-gen storage? | `gc/src/gc_quiescence.rs` |
+| `VmHeap::watched_pre_gc_addr_survived` — exact verdict: map membership, or an old-gen address in a cycle that did **not** reclaim old gen | `gc/src/vm_heap.rs` |
+| `is_marked`, both halves of the restore lookup, and `is_stale_young` use it; the restore write gains the `num_fields < 2` guard every other write site already had | `vm/src/runtime/interpreter.rs` |
+
+`is_stale_young` **ORs** the two verdicts rather than replacing one with the
+other, so the young rule stays exactly as strict as the `bc math-ec 0x4` fix
+made it and the change can only skip more writes, never fewer.
+
+`CRATONVM_NO_EXACT_REFPROC_SURVIVAL=1` restores the permissive predicate
+(bisection escape hatch).
+
+### Why the "watched" set makes it exact
+
+`OldGen::compact` already emitted an identity `pointer_map` entry for a
+*watched* object that happened not to move (the RandomizedContext
+`WeakHashMap<Thread,…>` fix). Publishing every tracked address as watched,
+and adding the same emission to the in-place sweep, makes "absent from the
+pointer map" a **complete** death proof for precisely the address set
+reference processing dereferences — and for nothing else, so no other
+consumer's behaviour changes.
+
+## Verification
+
+`org.h2.test.store.TestMVStoreCachePerformance`, `--Xmx 1g`, JDK 25, Azure
+box. "Anomalies" = `gen_heap::set_field`/`get_field` out-of-bounds guard
+hits + `read_slot: corrupt Value cell` reports + fatal-error banners.
+
+**Before** — 6 for 6 failures, across three separate builds and both arms:
+
+| build | arm | outcome | corrupt writes |
+| --- | --- | --- | --- |
+| `origin/dev` fat-LTO | `--nojit` | `MVStoreException: chunk is null`, exit 1 @786 s | 98,559 |
+| `origin/dev` fat-LTO | JIT | `ClassCastException: Integer→String`, exit 1 @1397 s | 0 (silent variant) |
+| + diagnostics | `--nojit` | **SIGSEGV**, exit 139 @1038 s | 79,023 |
+| + diagnostics | JIT | `ClassCastException`, exit 1 @1302 s | 64,960 |
+| + `CRATONVM_DBG_OOBFIELD` | `--nojit` | exit 1 @951 s | 98,559 |
+| + `CRATONVM_DBG_OOBFIELD` | JIT | exit 1 @1130 s | 0 (silent variant) |
+
+Every run died in round 3 or 4 (`testCache(10, …)`); none ever reached the
+100-thread rounds.
+
+**After** — complete runs, all six rounds through `testCache(100, "cache:")`:
+
+| build | arm | outcome | anomalies |
+| --- | --- | --- | --- |
+| both fixes | `--nojit` | **exit 0**, 2667 s | 0 |
+| both fixes | JIT | **exit 0**, 2679 s | 0 |
+| both fixes (repeat) | `--nojit` | **exit 0**, 3038 s | 0 |
+| + merged `origin/dev` | `--nojit` | **exit 0**, 2871 s | 0 |
+| + merged `origin/dev` | JIT | **exit 0**, 3160 s | 0 |
+
+Intermediate stage, recorded honestly: with only the FIRST commit in, the
+corrupt-write burst was already gone (98,559 → 0 and 64,960 → 0) but the
+process still `SIGSEGV`'d — the second commit (`is_stale_young`) is what
+made the workload complete. Both are needed.
+
+**One residual failure, not reproduced since.** A repeat of the JIT arm on
+the pre-merge build (i.e. without the 96 `origin/dev` commits this branch
+later merged) failed at 2269 s with `ClassCastException: java.lang.Object
+cannot be cast to org.h2.mvstore.Page` out of
+`FileStore.readPageFromCache`, and **zero** guard hits. That is a
+different signature from anything above — no stale-write burst, no corrupt
+cell — and it has not recurred on the merged build (2 for 2 clean, plus a
+third `--nojit` repeat clean). It is recorded here rather than swept up:
+if `TestMVStoreCachePerformance` regresses again, this is the shape to
+look for, and it is NOT the defect this doc describes. A fourth repeat
+(JIT, merged build) was killed by the host's OOM killer at load average
+379 with 0 GB free — an environment casualty, log clean to the last line,
+not a VM result.
+
+Unit tests: 877 `cratonvm-gc`, 3153 `cratonvm-native-builtins`, 2326
+`cratonvm-vm`, 453 `cratonvm-types` — all pass. New regressions:
+
+* `gen_heap::tests::in_place_old_sweep_proves_watched_survivors_and_dead_ones`
+* `gen_heap::tests::explicit_full_gc_marks_dead_old_gen_watched_addr_as_not_surviving`
+* `reference::tests::all_tracked_addrs_covers_every_reference_kind`
+
+## The three "suggested next steps" the original doc left open
+
+1. **Is it JIT-only?** No. It reproduces under **both** `--nojit` and the
+   JIT, with the same guard signature and comparable volumes (98,559 vs
+   64,960 corrupt writes). The `--nojit` arm is where the hard `SIGSEGV`
+   showed up most reliably; the JIT arm more often degraded to a
+   `ClassCastException`. Which face you get is just which slot the stale
+   write happened to clobber.
+2. **The `hs_err_pid*.log`.** Captured, and it is *not* where the answer
+   was. CratonVM's signal handler writes a deliberately minimal report
+   (`# (truncated: full report requires allocator, unsafe in signal
+   handler)`), and the faulting frame moved every run — `alloc_object`,
+   `SynchronizedMethodGuard::drop`, `young_mark::drain_parallel` — which is
+   the signature of heap corruption rather than a single bad call site. The
+   diagnostic that actually located it was the existing `RESID-DIAG WRITE`
+   backtrace on the `num_slots == 0` write guard, which named
+   `process_references_after_gc` on the very first occurrence.
+3. **Is it HIB-CV-32's `promotion_oom_risk` mechanism?** No. That fix
+   (`dev@c9258e17`) is about which *collector* runs. This is a
+   **consumer-side** defect: post-GC reference processing trusting an
+   address-range test as a liveness proof. Same symptom family, same
+   defensive guards firing, different root cause. Both of HIB-CV-32's halves
+   remain correct and untouched.
+
+## Observations noted during this work — NOT part of this defect
+
+* The `--nojit` arm printed `STW cross-thread JIT takeover is still waiting
+  for cooperative mutators rounds=64` under 10–100 mutator threads before one
+  of the intermediate crashes. It did not recur once both halves of the fix
+  were in.
+* The JIT arm logs a steady stream of `[moving-young] fallback` warnings
+  (`unregistered-jit-frame-on-stack`, `xt-helper-window-conservative-scan`,
+  `missing-exact-rbp`, `active-safepoint-map-incomplete`,
+  `cross-thread-jit-peer`) — i.e. the young generation is repeatedly NOT a
+  copying collector under this workload. That is the documented, safe
+  diversion, and it is orthogonal to this defect (the `--nojit` arm, which
+  takes none of those fallbacks, reproduced the bug just as hard). Worth its
+  own investigation for throughput reasons, not correctness ones.
+
+## Repro (historical)
+
 ```bash
 cd apps/h2database/h2
 <cratonvm-bin> --java-home /home/victor/jdk25 --Xmx 1g \
   -c "target/classes:target/test-classes:$(cat craton-testcp.txt)" \
   org.h2.test.store.TestMVStoreCachePerformance
 ```
-Reproduced once this session (~972s to crash, JIT enabled per the suite
-runner's default for this pass — `--nojit` not yet tried); not yet
-confirmed deterministic across repeated runs.
+
+Reproduced 6/6 before the fix across both arms and three different builds;
+5 clean completions after (see Verification for the one unexplained repeat
+failure on the pre-merge build).
 
 ## Related
-- `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testgetgeneratedkeys-wrapper-equals-missing-type-check-FIXED.md`
-  — FIXED, and **not** this family (see the Status correction above).
-- `bug-h2-testdiskfull-classid0-corruption-segv-cce.md` — same guard-burst +
-  `SIGSEGV` signature, ~2 s per attempt.
-- `docs/internal/fixed-suite-bugs/hibernate/run-20260622/HIB-CV-31-abstractmethoderror-onflush-root-cause.md`
-  and
-  `docs/internal/fixed-suite-bugs/hibernate/run-20260622/HIB-CV-32-sigsegv-blob-bytearray-bind.md`
-  — the original investigation and partial fix for this defect family.
+
+- [`bug-h2-testgetgeneratedkeys-wrapper-equals-missing-type-check-FIXED.md`](bug-h2-testgetgeneratedkeys-wrapper-equals-missing-type-check-FIXED.md)
+  — the same *guard* firing for an unrelated *cause*. Read together, the two
+  are the argument for never filing a `corrupt Value cell` report under a
+  heap-corruption family before dumping the cell's HOLDER
+  (`CRATONVM_DBG_CELLCORRUPT=1`): here the heap really was corrupt, there it
+  never was, and the diagnostic text is identical.
+- `../../../known-issues/h2/bug-h2-testdiskfull-classid0-corruption-segv-cce.md`
+  — the `TestDiskFull` `AbstractMethodError` the original write-up flagged as
+  "possibly related, not confirmed" now has its own doc. It is **not** closed
+  by this fix and was not investigated here.
+- `../hibernate/run-20260622/HIB-CV-31-abstractmethoderror-onflush-root-cause.md`
+  and `../hibernate/run-20260622/HIB-CV-32-sigsegv-blob-bytearray-bind.md`
+  — the original family; their own root causes are unrelated to this one.

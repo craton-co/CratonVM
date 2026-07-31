@@ -200,6 +200,32 @@ caution applies to the sibling report
 this one as corroborating evidence for its `HIB-CV-32` attribution — that
 corroboration has been withdrawn in place.
 
+## Follow-up: two residuals of the class-id gate (`967abc2546`, 2026-07-31)
+
+Found while retiring the sibling
+`bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`, whose
+investigation hit this same native on a build that predated `7656ad39`.
+
+1. **`Foo` and `Foo[]` compare EQUAL under `wrapper_same_class`.** An array's
+   header stores its COMPONENT class id, not an id of its own (the convention
+   `interpreter/invoke.rs`'s `VirtualNative` cache gate already guards
+   receivers against). `wrapper_int_equals_rejects_an_array_argument` passes
+   only because a PRIMITIVE array reports `ClassId(0)`; a REFERENCE array
+   whose component class is the receiver's own class — `Integer[]` against an
+   `Integer` — still reached the field reads, and decoded two adjacent 8-byte
+   element references as one 16-byte tagged `Value`, i.e. reproduced the exact
+   corrupt-cell report this doc is about. Fixed by declining when either
+   operand is an array. New regression:
+   `wrapper_int_equals_rejects_a_reference_array_with_the_receivers_class_id`
+   — it asserts both operands report the SAME class id, so only the array-kind
+   test can decline it, and it fails with the guard removed.
+2. **An undecodable slot compared EQUAL.** `native_wrapper_int_equals`
+   compared the two reads as raw `Value`s, so "neither read decoded as an int"
+   — including the benign `Object(None)` the `gen_heap` guards substitute for
+   an undecodable slot — answered `true`. The `Long` arm beside it already
+   destructured `Value::Long`; the int arm now does the same with
+   `Value::Int`.
+
 ## Repro (pre-fix)
 ```bash
 cd apps/h2database/h2
