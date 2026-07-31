@@ -7671,8 +7671,19 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
     // This re-gates the edge; it does not fix it. Whoever reopens it needs to
     // make an unguarded callee frame describable to the root scan first, and
     // should re-run this class 14x as the acceptance gate.
-    if x64::moving_young_enabled() {
+    // EXPERIMENT (temporary, 2026-07-31): `CRATONVM_JIT_DIRECT_CALLEE_CALLS=force`
+    // opens the gate under moving-young in the SAME binary, so the crashing and
+    // the clean arm differ only by an environment variable rather than by a
+    // build. Removed once the edge is fixed and the gate reopens for real.
+    let forced = matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS").as_deref(),
+        Ok("force")
+    );
+    if x64::moving_young_enabled() && !forced {
         return false;
+    }
+    if forced {
+        return true;
     }
 
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
