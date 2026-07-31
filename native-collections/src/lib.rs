@@ -7647,8 +7647,92 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
     }
 
+    // `CRATONVM_DBG_MAP_MISS_AUDIT` — a miss is normal, but a miss on a key the
+    // map still holds by reference identity is not. Only the identity case is
+    // reported, so this stays quiet on the millions of legitimate misses.
+    //
+    // Written for the Spring `@Bean` attribute flake: `ClassUtils`'
+    // `IdentityHashMap<Class,Class>` returned null for a key it demonstrably
+    // still contained, once in ~70 runs, with the map intact before and after.
+    // That shape — a single bad lookup against a healthy map — is invisible from
+    // Java, because by the time anything notices, the evidence is gone.
+    if dbg_map_miss_audit() {
+        let key_now = match read_pinned_elem(ctx, key_pin, key_val) {
+            Value::Object(Some(k)) => Some(k),
+            _ => key_ref,
+        };
+        if let Some(k) = key_now {
+            report_identity_present_miss(ctx, this, buckets, cap, k, hash, idx);
+        }
+    }
+
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(None)))
+}
+
+/// `true` iff `CRATONVM_DBG_MAP_MISS_AUDIT` is set. Cached: this is consulted on
+/// every map miss, which is a hot path.
+fn dbg_map_miss_audit() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MAP_MISS_AUDIT").is_some()
+    })
+}
+
+/// Re-walk every bucket after a miss. If a node's key is the SAME OBJECT as the
+/// one we searched for, the lookup was wrong and we print everything needed to
+/// say why: which bucket the key actually lives in versus the one we probed, and
+/// the stored node hash versus the hash we just computed.
+///
+/// Capped at `AUDIT_MAX_CAP` buckets so enabling this on a large map cannot turn
+/// a miss into an O(n) walk.
+fn report_identity_present_miss(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    buckets: ObjectRef,
+    cap: i32,
+    key: ObjectRef,
+    searched_hash: i32,
+    searched_idx: usize,
+) {
+    const AUDIT_MAX_CAP: i32 = 4096;
+    if cap <= 0 || cap > AUDIT_MAX_CAP {
+        return;
+    }
+    for b in 0..(cap as usize) {
+        let mut node_val = ctx.get_array_element(buckets, b);
+        let mut guard = 0usize;
+        while let Value::Object(Some(node)) = node_val {
+            guard += 1;
+            if guard > 4096 {
+                break;
+            }
+            if let Value::Object(Some(node_key)) = get_node_key(ctx, node) {
+                if node_key == key {
+                    let node_hash = get_node_hash(ctx, node);
+                    let key_class = ctx.class_name_of_id(ctx.class_id_of_object(key));
+                    eprintln!(
+                        "[MAP-MISS-AUDIT] map={:?} MISSED a key it still holds by identity: \
+                         key={:?} key_class={:?} searched_hash={} searched_bucket={} \
+                         found_in_bucket={} node_hash={} cap={} \
+                         (hash_mismatch={}, bucket_mismatch={})",
+                        this,
+                        key,
+                        key_class,
+                        searched_hash,
+                        searched_idx,
+                        b,
+                        node_hash,
+                        cap,
+                        node_hash != searched_hash,
+                        b != searched_idx,
+                    );
+                    return;
+                }
+            }
+            node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+        }
+    }
 }
 
 fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

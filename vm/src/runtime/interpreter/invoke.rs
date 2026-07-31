@@ -9515,6 +9515,33 @@ pub(crate) fn is_string_builder_layout_native_override(
     method_name == "substring" && method_descriptor == "(II)Ljava/lang/String;"
 }
 
+/// The layout-incompatible natives, for the invoke-cache dispatch sites.
+///
+/// These sites must not use `redefine_immune_forced_native`. Broadening them to
+/// the full set — which additionally covers reflection metadata, JFR, BC crypto,
+/// StampedLock and FileHandler — was measured on 2026-07-31 and **regressed**
+/// ByteBuddy type creation: Spring AOT chunk 3 started failing roughly one run
+/// in eight with `NoSuchMethodError: java.lang.Integer.isArray()Z` /
+/// `Integer.represents(Type)Z` out of
+/// `TypeDescription$Generic$Visitor$Substitutor`, a signature that appears in no
+/// pre-change log across three full sweeps. 9/9 clean on the unmodified binary
+/// under the same harness, 8/9 with the broadening. Those extra arms exist for
+/// the *slow* path and are not safe to assert here.
+///
+/// What every member of this set has in common is narrower and checkable: the
+/// receiver's real JDK body indexes a field layout CratonVM's object does not
+/// have, so running it can only produce nonsense — whatever else is true about
+/// the class.
+pub(super) fn redefine_immune_layout_native(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
+        || redefine_immune_path_native(class_name, method_name, method_descriptor)
+        || redefine_immune_synthetic_collection_native(class_name)
+}
+
 pub(super) fn redefine_immune_string_builder_native(
     class_name: &str,
     method_name: &str,
@@ -9647,6 +9674,15 @@ pub(crate) fn is_datagram_channel_open_native_override(
                 && method_name == "openDatagramChannel"))
 }
 
+/// The full immunity set, for the slow dispatch path.
+///
+/// The invoke-cache sites deliberately use the narrower
+/// `redefine_immune_layout_native` instead — see the note there for the
+/// measurement that says why. What both must share is the layout arm: when the
+/// 2026-07-31 collections entry was added here only, the collection probe went
+/// from 32 broken operations to 18 rather than to 0, because the cache sites
+/// re-assembled their own chain and never saw it.
+/// `layout_immunity_is_not_open_coded` keeps the two in step.
 pub(super) fn redefine_immune_forced_native(
     class_name: &str,
     method_name: &str,
@@ -9675,6 +9711,59 @@ pub(super) fn redefine_immune_forced_native(
                 method_name,
                 "<init>" | "publish" | "flush" | "close"
             ))
+        || redefine_immune_synthetic_collection_native(class_name)
+}
+
+/// CratonVM implements these collections as small synthetic objects — a bucket
+/// array plus a size, not the JDK's `table`/`root`/`head` field graph — and
+/// every operation on them is a registered native. Their real JDK bodies can
+/// therefore NEVER run correctly against an instance CratonVM built, whatever
+/// the circumstances.
+///
+/// That makes them unconditionally immune: a redefinition drops native shadows
+/// so an agent's woven bytecode can run, which is right for an ordinary class
+/// and catastrophic here. `RedefineCollectionLayoutProbe` measured the damage
+/// before this gate existed — **32 of 89 operations** changed behaviour after
+/// redefining these classes with their OWN bytes, and the worst of them are
+/// silent:
+///
+/// ```text
+/// TreeMap.get               v7  -> null
+/// TreeMap.containsKey       true -> false
+/// ConcurrentHashMap.get     v7  -> null
+/// ConcurrentHashMap.size    12  -> 0
+/// ConcurrentHashMap.isEmpty false -> true
+/// HashMap.keySet            [k0..k11] -> []
+/// ```
+///
+/// The rest throw — `LinkedHashMap$Node.getKey` NoSuchMethodError,
+/// `AnonymousObject$4 cannot be cast to Map$Entry`, `TreeSet` NPEs on a null
+/// `this.m`. One `Mockito.mock()` anywhere in the process was enough to arm it,
+/// which is how it reached Spring's AOT run: `AnnotationAttributes` extends
+/// `LinkedHashMap`, and its `keySet()` NPE'd.
+///
+/// Unlike the StringBuilder list above, this is class-wide rather than
+/// method-wise. There is no analogue of `length()`/`substring(int)` here — no
+/// suite stubs a method on a mocked JDK collection, and the cost of being wrong
+/// in that direction (one un-stubbed mock) is far below the cost of being wrong
+/// in the other (silent data loss on every real collection in the process). If
+/// a test ever does need to stub one, narrow this the way the builder list is
+/// narrowed, and say which test.
+fn redefine_immune_synthetic_collection_native(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/util/ArrayDeque"
+            | "java/util/ArrayList"
+            | "java/util/HashMap"
+            | "java/util/HashSet"
+            | "java/util/IdentityHashMap"
+            | "java/util/LinkedHashMap"
+            | "java/util/LinkedHashSet"
+            | "java/util/LinkedList"
+            | "java/util/TreeMap"
+            | "java/util/TreeSet"
+            | "java/util/concurrent/ConcurrentHashMap"
+    )
 }
 
 pub(crate) fn should_force_registered_native_over_bytecode(
@@ -13745,6 +13834,116 @@ mod string_builder_layout_override_tests {
             "trimToSize",
             "()V"
         ));
+    }
+}
+
+#[cfg(test)]
+mod redefine_immunity_tests {
+    use super::redefine_immune_forced_native;
+
+    /// CratonVM's synthetic collections must keep their native shadow across a
+    /// redefinition. Their real JDK bodies index a `table`/`root`/`head` field
+    /// graph the synthetic objects do not have, so running them returns silent
+    /// nonsense — `TreeMap.get` null, `ConcurrentHashMap.size` 0,
+    /// `HashMap.keySet` empty. `RedefineCollectionLayoutProbe` is the witness.
+    #[test]
+    fn synthetic_collections_keep_their_natives_across_a_redefinition() {
+        for class in [
+            "java/util/ArrayDeque",
+            "java/util/ArrayList",
+            "java/util/HashMap",
+            "java/util/HashSet",
+            "java/util/IdentityHashMap",
+            "java/util/LinkedHashMap",
+            "java/util/LinkedHashSet",
+            "java/util/LinkedList",
+            "java/util/TreeMap",
+            "java/util/TreeSet",
+            "java/util/concurrent/ConcurrentHashMap",
+        ] {
+            for (name, desc) in [
+                ("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+                ("size", "()I"),
+                ("containsKey", "(Ljava/lang/Object;)Z"),
+                ("keySet", "()Ljava/util/Set;"),
+                ("entrySet", "()Ljava/util/Set;"),
+                ("iterator", "()Ljava/util/Iterator;"),
+                ("toString", "()Ljava/lang/String;"),
+            ] {
+                assert!(
+                    redefine_immune_forced_native(class, name, desc),
+                    "{class}.{name}{desc} must survive a redefinition"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_classes_stay_evictable() {
+        assert!(!redefine_immune_forced_native(
+            "com/example/Service",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;"
+        ));
+        // The two operations the Mockito suite genuinely stubs on a mocked
+        // StringBuilder — see `is_string_builder_layout_native_override`.
+        assert!(!redefine_immune_forced_native(
+            "java/lang/StringBuilder",
+            "length",
+            "()I"
+        ));
+        assert!(!redefine_immune_forced_native(
+            "java/lang/StringBuilder",
+            "substring",
+            "(I)Ljava/lang/String;"
+        ));
+    }
+
+    /// No dispatch site may name a layout arm directly: they must go through
+    /// `redefine_immune_layout_native` (cache paths) or
+    /// `redefine_immune_forced_native` (slow path). Six sites used to open-code
+    /// `string_builder || path`, so the collections entry silently did not apply
+    /// there and the collection probe stalled at 18 of 32 rather than 0.
+    ///
+    /// The reflection arm is NOT policed: two cache sites legitimately omit it,
+    /// and forcing them to include it regressed ByteBuddy type creation.
+    #[test]
+    fn layout_immunity_is_not_open_coded() {
+        let src = include_str!("invoke.rs");
+        let mut offenders = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            let code = line.trim_start();
+            // Comments, and this test's own list of names (string literals).
+            if code.starts_with("//") || code.starts_with("///") || code.starts_with('"') {
+                continue;
+            }
+            // A definition is not a call site.
+            if code.starts_with("fn ") || code.starts_with("pub(super) fn ")
+                || code.starts_with("pub(crate) fn ")
+            {
+                continue;
+            }
+            // The predicates compose each other inside this band.
+            if (5000..9800).contains(&n) {
+                continue;
+            }
+            for part in [
+                "redefine_immune_string_builder_native(",
+                "redefine_immune_path_native(",
+                "redefine_immune_jfr_native(",
+                "redefine_immune_synthetic_collection_native(",
+            ] {
+                if code.contains(part) {
+                    offenders.push(format!("line {}: {}", n + 1, code));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "call redefine_immune_layout_native (cache paths) or \
+             redefine_immune_forced_native (slow path) instead of naming an arm:\n{}",
+            offenders.join("\n")
+        );
     }
 }
 
@@ -20563,12 +20762,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
             // it with the Rust intrinsic, or the advice never runs.
             if crate::classloading::any_class_redefined()
                 && cm.class_redefine_generation(declaring_id) > 0
-                && !redefine_immune_string_builder_native(
-                    &declaring_class.name,
-                    &method_name,
-                    &method_descriptor,
-                )
-                && !redefine_immune_path_native(
+                && !redefine_immune_layout_native(
                     &declaring_class.name,
                     &method_name,
                     &method_descriptor,
@@ -20634,12 +20828,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
             let receiver_redefined = crate::classloading::any_class_redefined()
                 && cm.class_redefine_generation(receiver_class_id) > 0
                 && !redefine_immune_reflection_native(rcv_name, &method_name)
-                && !redefine_immune_string_builder_native(
-                    rcv_name,
-                    &method_name,
-                    &method_descriptor,
-                )
-                && !redefine_immune_path_native(rcv_name, &method_name, &method_descriptor);
+                && !redefine_immune_layout_native(rcv_name, &method_name, &method_descriptor);
             // WP2.7 — annotation proxies have no real bytecode for
             // equals/hashCode/toString. Force fall-through to the slow path
             // so `execute_invoke`'s annotation_proxy interception layer
@@ -21705,8 +21894,7 @@ pub(super) fn execute_invokevirtual_cached(
                 // and crashes with ArrayIndexOutOfBoundsException).
                 if native_shadow_suppressed_by_redefine(shared, &mcn)
                     && !redefine_immune_reflection_native(&mcn, &mn)
-                    && !redefine_immune_string_builder_native(&mcn, &mn, &desc)
-                    && !redefine_immune_path_native(&mcn, &mn, &desc)
+                    && !redefine_immune_layout_native(&mcn, &mn, &desc)
                 {
                     thread
                         .invoke_cache
@@ -23133,12 +23321,7 @@ pub(super) fn populate_virtual_invoke_cache(
             // silently no-ops instead of throwing "wanted but not invoked".
             let declaring_redefined_not_immune = crate::classloading::any_class_redefined()
                 && cm.class_redefine_generation(declaring_id) > 0
-                && !redefine_immune_string_builder_native(
-                    declaring_name,
-                    &method_name,
-                    &descriptor,
-                )
-                && !redefine_immune_path_native(declaring_name, &method_name, &descriptor);
+                && !redefine_immune_layout_native(declaring_name, &method_name, &descriptor);
             let intrinsic_kind = if declaring_redefined_not_immune {
                 None
             } else {
@@ -23272,8 +23455,7 @@ pub(super) fn populate_virtual_invoke_cache(
         let receiver_redefined = crate::classloading::any_class_redefined()
             && cm.class_redefine_generation(receiver_class_id) > 0
             && !redefine_immune_reflection_native(&lookup_name, &method_name)
-            && !redefine_immune_string_builder_native(&lookup_name, &method_name, &descriptor)
-            && !redefine_immune_path_native(&lookup_name, &method_name, &descriptor);
+            && !redefine_immune_layout_native(&lookup_name, &method_name, &descriptor);
         let direct_native_callback =
             if native_signature_may_exist && !is_real_tpe_execute && !receiver_redefined {
                 shared
@@ -23384,12 +23566,7 @@ pub(super) fn populate_virtual_invoke_cache(
                     let parent_redefined = crate::classloading::any_class_redefined()
                         && cm.class_redefine_generation(parent_id) > 0
                         && !redefine_immune_reflection_native(&parent_name, &method_name)
-                        && !redefine_immune_string_builder_native(
-                            &parent_name,
-                            &method_name,
-                            &descriptor,
-                        )
-                        && !redefine_immune_path_native(&parent_name, &method_name, &descriptor);
+                        && !redefine_immune_layout_native(&parent_name, &method_name, &descriptor);
                     if parent_redefined {
                         break;
                     }
