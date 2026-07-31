@@ -54,24 +54,27 @@ Run to completion the class **PASSES**, in **30 149 s (8.4 hours)**. Nothing
 here was ever a functional defect; it is purely throughput. Before the bug-24
 fix this was masked — the run died with a spurious OOM at ~150-600 s.
 
-**Re-measured 2026-07-31, and the class-level number has NOT moved:**
+**Re-measured 2026-07-31**, same class, same fixture:
 
-```
-.MessageBytes conversion took :4075206863800ns     (100M iterations, 40.75 us/iter)
-```
+| loop | original | 2026-07-31 | |
+|---|---|---|---|
+| 1st 100M | 3 820 342 393 100 ns (38.2 µs/iter) | 4 075 206 863 800 ns (40.75 µs/iter) | measured while the 646-class A/B below saturated the box — an upper bound |
+| 2nd 100M | 3 092 470 156 300 ns (30.9 µs/iter) | **2 751 918 093 000 ns (27.5 µs/iter)** | quiet host |
 
-against the original 3820342393100 ns (38.2 µs/iter). That is the expected
-result, not a disappointment — it is exactly what the per-iteration
-decomposition below predicts. The admission bans governed *loop control*, which
-is now at HotSpot parity; the ~38 µs an iteration costs is spent in the JDK
-charset chain the loop body calls into, and no admission gate was ever standing
-in front of that. **Anyone re-opening this document because "the number didn't
-change" should read
+The like-for-like comparison is the second loop — both post-warmup, and the
+2026-07-31 one on a quiet host: **30.9 → 27.5 µs/iter, ~11% better.** That
+agrees with the ~12% measured independently on `OsrMessageBytesProbe` for the
+ban-1b lift, and it is the whole of what the admission bans were ever worth
+here.
+
+**The class-level gap is therefore still ~400x, and that is the expected
+result, not a disappointment.** The admission bans governed *loop control*,
+which now runs at HotSpot parity; the remaining ~27 µs an iteration is spent in
+the JDK charset chain the loop body calls into, and no admission gate was ever
+standing in front of that. **Anyone re-opening this document because "the
+number barely moved" should read
 [§ Where the time actually goes](#where-the-time-actually-goes-re-derived-2026-07-31)
 first.**
-
-(That loop ran while the 646-class A/B below was saturating the box, so treat
-40.75 µs as an upper bound; the quiet-host per-iteration figure is ~38 µs.)
 
 ## The three bans, and how each ended
 
