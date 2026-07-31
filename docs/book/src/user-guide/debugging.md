@@ -78,8 +78,45 @@ synthetic-stub):
 cratonvm --dump-native-registry natives.json --classpath . MyApp
 ```
 
+That file is `"schema_version": 2`. Each row carries, beyond the kind, the
+`register()` call site (`registered_by`), the kind this registration replaced
+in place (`overwrote` — registrations overwrite by triple, last write wins),
+and this run's dispatch count (`invocations`, so `0` means the entry cost this
+workload nothing). `real_declaring_method` is present but currently always
+`null`. The field-by-field description is in [Native
+Methods](../internals/native-methods.md#the-native-registry-census-schema-2).
+
 These audits are the fastest way to understand why a particular library doesn't
 work yet and to file an actionable bug report.
+
+## Auditing compatibility substitutions
+
+The three flags above say what the VM *provides*. A separate family says what
+the VM had to *substitute* — classes it fabricated with no real bytes, and
+synthetic-stub natives it registered or dispatched:
+
+```bash
+# What did this run have to fabricate, and what would strict mode reject?
+cratonvm --dump-class-origins origins.json \
+         --jdk-only-report jdk-only.json \
+         --classpath . MyApp
+
+# Same run, with each violation reported to stderr and explained in full.
+cratonvm --trace-jdk-only --explain-jdk-only --classpath . MyApp
+```
+
+None of these require `--jdk-only`. Under the default compatibility policy the
+violations recorded are the ones a strict run *would* have hit, so the files
+measure the distance to strict mode before anything is enforced.
+
+`--trace-jdk-only` polls rather than hooks: the launcher drains the violation
+logs after VM construction and again at shutdown, so a class-origin violation
+recorded mid-run is reported at shutdown. `--explain-jdk-only` additionally
+turns off path redaction in all three report files — leave it off when the
+output is going into a bug report or a committed baseline.
+
+See [JDK-Only Mode](jdk-only-mode.md) for the origin vocabulary and for what
+`--jdk-only` itself changes.
 
 ## Java Flight Recorder (JFR)
 
@@ -104,3 +141,6 @@ Include:
 3. Expected vs. actual output.
 4. Whether it reproduces under `--nojit` and/or `--synthetic-jdk`.
 5. `cratonvm --version`, your OS, and Rust version.
+6. For a missing, wrong or apparently fabricated standard-library class, the
+   `--dump-class-origins` and `--jdk-only-report` files (without
+   `--explain-jdk-only`, so paths stay redacted).

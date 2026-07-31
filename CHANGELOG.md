@@ -7,6 +7,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-07-31 JDK-only mode (`--jdk-only`) — provenance instrumentation, wave 1
+
+A new **runtime** compatibility policy: `--jdk-only` declares that real JDK class
+bytes are authoritative, so no non-array class is fabricated without real bytes
+and no `NativeKind::SyntheticStub` native is registered or invoked. It is
+orthogonal to `--real-jdk` / `--synthetic-jdk`, which select *which class
+library* boots; this selects *which substitutions are permitted*. One binary
+runs both policies, so a failure can be A/B'd in the same shell.
+
+**This is an internal diagnostic, not a supported runtime mode.** Wave 1 is
+instrumentation and measurement: only class fabrication and synthetic-native
+*registration* actually enforce, while the remaining dispatch paths are counted
+rather than blocked. A program that runs fine under `--real-jdk` may fail under
+`--jdk-only` — that is the signal the mode exists to produce. The default
+(`compatible`) behaviour is unchanged, on both the launcher and embedded entry
+points, and is reached by doing nothing. Normative contract:
+`docs/feature-designs/jdk-only-mode.md`; operator guide:
+`docs/jdk-only-migration.md`.
+
+#### Added
+- `--jdk-only` launcher flag. Implies `JdkMode::Real` and requires a real JDK
+  runtime image — there is no silent fallback, and the failure names the flag,
+  the searched paths and the accepted JDK layout. Conflicts with
+  `--synthetic-jdk` (that library *is* the set of substitutions the flag
+  forbids), and the conflict is diagnosed as a policy error rather than a
+  library error.
+- Four diagnostic flags, all usable in either mode — under the default
+  `compatible` mode they census what strict mode *would* reject:
+  `--jdk-only-report <FILE>` (JSON violations plus class-origin and
+  per-`NativeKind` invocation counters, `schema_version` 1),
+  `--dump-class-origins <FILE>` (see below), `--trace-jdk-only` (log each
+  recorded violation to stderr), and `--explain-jdk-only` (long-form
+  operator-facing explanation per violation, and leaves absolute paths
+  unredacted in every report file; they are redacted by default).
+- `--dump-class-origins <FILE>` — a new class-origin census, one row per class
+  the class manager holds: `{name, origin, reason, requested_by,
+  real_bytes_found, loader_id}`, sorted by `(name, loader_id, origin)` for
+  byte-stable output, with a `counts` block keyed by origin tag.
+- A `ClassOrigin` provenance model on `Class` (`classloading/src/class_origin.rs`),
+  replacing "is this a stub, yes or no?" with where the bytes actually came
+  from: `BootImage`, `ApplicationClassPath`, `UserDefined`, `VmArray`,
+  `HiddenClass`, `GeneratedLambda`, `GeneratedProxy`, `ReflectionAccessor`,
+  `VmInternal`, `CompatibilityStub`. Only `CompatibilityStub` is rejected under
+  the strict policy; arrays, hidden classes, lambdas, proxies and reflection
+  accessors are products of a conforming JVM and are allowed, with their own
+  distinct origins. The pre-existing `Class::is_synthetic_stub` bool is
+  retained as a **derived mirror** of `origin.is_compatibility_stub()` (~160
+  read sites across 17 files depend on it); both are written together through
+  `Class::set_origin`.
+- Shared policy token `cratonvm_types::compat` (`CompatibilityMode`,
+  `ExecutionPolicy`) with `NativeKind::allowed_in` and `ClassOrigin::allowed_in`
+  as predicates next to their own types, a structured `JdkOnlyViolation` error
+  family in `types/src/error.rs`, and a single policy-aware
+  `resolve_dispatch` / `DispatchDecision` native-vs-bytecode decision point in
+  `vm/src/vm/vm_exec.rs` that the main interpreter path now routes through.
+- Per-VM policy state: `VmConfig::compatibility_mode` (plus `is_jdk_only`,
+  `execution_policy`, `validate_compatibility`), propagated into the native
+  registry and the `ClassManager` at VM init. No process globals were added for
+  this feature.
+- C ABI (`libcratonvm`): `cratonvm_create_with_compatibility(args, mode)`,
+  `cratonvm_compatibility_mode(vm)` (read back what the live VM actually got),
+  and `cratonvm_compatibility_mode_supported(mode)` (a capability probe that
+  needs no VM, so a host can avoid a failed create). The mode constants are
+  `CRATONVM_COMPATIBILITY_COMPATIBLE = 0` and
+  `CRATONVM_COMPATIBILITY_JDK_ONLY = 1`. **These numeric values are a published,
+  append-only part of the ABI** — a value may be added, never renumbered — and
+  they are `cratonvm_jint` rather than a boolean so a third posture can be added
+  later without breaking a compiled host. An unrecognised value is *rejected*
+  (`NULL` + `cratonvm_last_error()`), never clamped to `COMPATIBLE`;
+  `cratonvm_compatibility_mode` returns `-1`, never a mode value, on a bad
+  handle. The option string `"--jdk-only"` is the second route to strict mode
+  and the only one available to `JNI_CreateJavaVM`; passing
+  `CRATONVM_COMPATIBILITY_COMPATIBLE` alongside `--jdk-only` is a contradiction
+  error, not a precedence rule.
+- A 21-vector strict regression corpus (`regression-suite`, `SUITE=jdk-only`)
+  indexed against the blocker rows in `docs/jdk-only-runtime-services.md`, and
+  an advisory `jdk-only` CI job that runs the censuses. Some strict-mode vectors
+  are **expected to fail** while fabrication enforcement is incomplete: that is
+  the enforcement test working, not a regression.
+
+#### Changed
+- **`--dump-native-registry` output format changed (consumer-visible).** The
+  native census now emits `"schema_version": 2`; the previous output carried no
+  `schema_version` key at all, so any consumer that parsed the old shape needs
+  updating. Each `natives[]` entry gains `registered_by` (the registration site,
+  captured via `#[track_caller]`), `overwrote` (the `NativeKind` of the entry
+  this registration replaced, if any — registration is last-write-wins), and
+  `invocations` (times the slot was dispatched this run). A `real_declaring_method`
+  field is present and is `null` on every row today; filling it in needs a
+  *non-initiating* probe of the runtime image, because resolving it at shutdown
+  through ordinary class loading would load classes the run never touched and
+  change the very census the file reports. A top-level `"invocations"` block
+  gives the per-`NativeKind` dispatch totals. Rows are sorted by
+  `(class, name, descriptor, registered_by)` — `registered_by` is part of the
+  key because a superseded row and the row that overwrote it share the triple.
+  Absolute paths in `registered_by` are redacted unless `--explain-jdk-only` is
+  passed.
+- `NativeMethodRegistry` gained VM-scoped policy (`set_compatibility_mode`,
+  `compatibility_mode`), a refusal log (`refused_registrations`), a
+  `schema_version` 2 census (`census`), and hot-path-safe invocation counting
+  (`record_invocation`, `invocations_of_kind`) that does not require `&mut self`.
+  Under `JdkOnly`, `register()` refuses to insert a `SyntheticStub` and records
+  a `SyntheticNativeRegistered` violation instead.
+
+#### Deprecated
+- **`CRATONVM_REAL=-stubs` in favour of `--jdk-only`.** The env token keeps
+  working unchanged as a native-registry filter, but it now prints a one-time
+  note recommending `--jdk-only`: the token can only drop stub *registrations*,
+  and cannot express the class-loading or dispatch half of the policy. Strict
+  mode is deliberately never inferred from `CRATONVM_REAL` / `CRATONVM_NO_STUBS`,
+  from a Cargo feature, or from what the host machine has installed — a run must
+  not end up enforcing rules nobody asked for.
+
+#### Known follow-ups
+- The residual synthetic-stub set is unchanged: `native-builtins/tests/stub_ratchet.rs`
+  still freezes `BASELINE_SYNTHETIC_STUBS = 157` exactly with `SLACK = 0`, and
+  the end-state `strict_mode_refuses_nothing` test is deliberately `#[ignore]`d
+  until that baseline reaches zero. Wave 1 refuses those registrations under
+  `--jdk-only`; it does not retire them. The path is reclassification first,
+  deletion second — a previous global drop was reverted the same day it landed.
+- The wave-2 backlog is ranked by danger in `docs/known-issues/jdk-only/README.md`;
+  its first tier causes **silent wrong behaviour** rather than clean failure.
+  Summarised with staging gates in [ROADMAP.md](ROADMAP.md#jdk-only-mode---jdk-only).
+
+---
+
 ### 2026-07-11 GPU offload — first real-hardware validation and feature completion
 
 First systematic validation of the GPU offload stack on real hardware (RTX

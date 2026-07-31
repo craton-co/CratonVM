@@ -2258,41 +2258,14 @@ fn ois_read_value(ctx: &mut dyn NativeContext, addr: usize) -> Value {
     }
 }
 
-/// Mirror of real HotSpot's `JVM_LatestUserDefinedLoader` / `jdk.internal
-/// .misc.VM.latestUserDefinedLoader()`: walk the Java call stack innermost
-/// frame first and return the `ClassId` of the first frame whose class was
-/// NOT loaded by the bootstrap or platform/extension loader (i.e. loader id
-/// `>= 2`; see `NativeContext::loader_id_of_class`). Returns `None` if every
-/// frame on the stack is bootstrap/platform (e.g. `main` itself, or a stack
-/// walk with no user code visible).
-///
-/// Uses `NativeContext::frame_class_ids` (each frame's own already-resolved
-/// `ClassId`), NOT a name-based re-resolution of `capture_stack_trace`'s
-/// display `StackTraceEntry`s — re-resolving by name collapses to whichever
-/// definition the global class table associates with that name (typically
-/// the first one ever registered in the process), which silently picks the
-/// WRONG class whenever the same name has been loaded more than once by
-/// different loaders (exactly what happens running more than one
-/// `@BytecodeEnhanced` Hibernate test class in a single process: each test
-/// class execution gets its own fresh `EnhancingClassLoader`; once a second
-/// test has run, `class_id_by_name("...TheFirstTestClass")` would still
-/// resolve, but for a DIFFERENT class than the one actually executing on
-/// that frame right now).
-///
-/// Shared by the real `VM.latestUserDefinedLoader0()` native (`lib.rs`) and
-/// this module's synthetic deserialization read-path (`ois_read_object`
-/// below), which never goes through `ObjectInputStream.resolveClass()` and
-/// so has no other way to learn which classloader a deserializing caller
-/// actually expects — without this, `ois_read_object` resolved every stream
-/// class name via the loader-oblivious `ensure_class_initialized`, silently
-/// materializing the WRONG (e.g. non-bytecode-enhanced) class whenever a
-/// custom classloader (like Hibernate's `EnhancingClassLoader`) defined the
-/// class actually referenced by the code doing the deserializing.
-pub(crate) fn latest_user_defined_loader_class(ctx: &mut dyn NativeContext) -> Option<ClassId> {
-    ctx.frame_class_ids()
-        .into_iter()
-        .find(|&class_id| ctx.loader_id_of_class(class_id) >= 2)
-}
+// `latest_user_defined_loader_class` used to live here. It moved to
+// `crate::classloader` because this module is `#[cfg(any(feature =
+// "experimental-serialization", feature = "synthetic-jdk"))]` and the real
+// `jdk/internal/misc/VM.latestUserDefinedLoader0()` native — which every
+// real-JDK `ObjectInputStream.readObject()` reaches via `resolveClass()` —
+// must be registered in the DEFAULT build, where neither feature is on.
+// See docs/internal/fixed-suite-bugs/h2/ for the H2 regression this caused.
+pub(crate) use crate::classloader::latest_user_defined_loader_class;
 
 /// Materialize a `TC_OBJECT` whose opening tag has already been consumed.
 /// Reserves the wire handle **before** reading field values so that a

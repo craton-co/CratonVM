@@ -47,6 +47,8 @@ You can also enable individual forwarded features such as `awt`,
 
 - `Vm`, `SharedVm`, `StackTraceFrame`
 - `VmConfig`
+- `CompatibilityMode`, `ExecutionPolicy`, `JdkMode` — the configuration-policy
+  tokens (see [Compatibility mode](#compatibility-mode) below)
 - `Value`, `ObjectRef`, `ClassId`
 - `JvmThread`, `ThreadId`
 - `VmError`, `MethodCallFailed`, `MethodCallResult`
@@ -79,6 +81,55 @@ Vm::new(VmConfig)        // construct + bootstrap
 across OS threads (one `JvmThread` per Java thread). Native methods are immutable
 after construction — register them on the `VmConfig` / `SharedVm` before first use.
 One VM per process is the only tested configuration.
+
+## Compatibility mode
+
+*Compatibility mode* selects **which substitutions the VM may make**;
+`JdkMode` selects **which class library it boots**. They are independent, and
+both are set on the `VmConfig` before `Vm::new`.
+
+| Mode | Meaning |
+|---|---|
+| `CompatibilityMode::Compatible` | Today's behaviour: bridges, intrinsics **and** compatibility shims. The default on every entry point. |
+| `CompatibilityMode::JdkOnly` | Real JDK class bytes are authoritative: no class fabricated without real bytes, no synthetic-stub native registered or invoked. Requires a real JDK runtime image. |
+
+```rust
+use cratonvm_embed::{CompatibilityMode, ExecutionPolicy, VmConfig};
+
+// with_host_jdk_default() is the launcher's base config: real JDK, deterministic.
+let config = VmConfig::with_host_jdk_default()
+    .with_compatibility_mode(CompatibilityMode::JdkOnly);
+assert!(config.is_jdk_only());
+
+// Call once, before Vm::new. JdkOnly + the synthetic class library is a
+// VmError::InvalidConfiguration naming both conflicting flags.
+config.validate_compatibility().expect("real JDK + JDK-only is coherent");
+
+// The resolved token the native registry and class manager read at VM init.
+let policy: ExecutionPolicy = config.execution_policy();
+assert!(policy.is_jdk_only() && policy.real_jdk);
+```
+
+Two rules are easy to get wrong:
+
+- **The default is `Compatible`, and you reach it by doing nothing.** Strict mode
+  is never inferred from a Cargo feature, from `CRATONVM_REAL` /
+  `CRATONVM_NO_STUBS`, or from what the host machine has installed — those select
+  a native-registry filter only and cannot express the class-loading or dispatch
+  half of the contract.
+- **`JdkMode` is asymmetric between entry points; compatibility mode is not, and
+  that is deliberate.** `VmConfig::default()` (the embedding / in-tree-test path)
+  is `JdkMode::Synthetic` while `VmConfig::with_host_jdk_default()` (the
+  launcher's base config, which `libcratonvm`'s C entry points also build on) is
+  `JdkMode::Real`, because the two entry points genuinely want different class
+  libraries. They **agree** on `Compatible` because neither may silently *want*
+  strictness. Do not "align" the second split with the first.
+
+JDK-only is an internal diagnostic, not a production posture: it is at stage 1 of
+4 of its rollout, so a host that enables it should expect failures on programs
+that run fine under `Compatible`. See
+[`docs/EMBEDDING.md`](../docs/EMBEDDING.md#choosing-a-compatibility-mode) and
+[`docs/feature-designs/jdk-only-mode.md`](../docs/feature-designs/jdk-only-mode.md).
 
 ## GPU offload for embedders
 

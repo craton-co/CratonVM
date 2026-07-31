@@ -159,7 +159,7 @@ lowering) is inert by default.
 
 ### Measured cost on a real test (2026-07-30)
 
-[tomcat/32.1](tomcat/32-doc04-residual-perf-assertions.md) is the first item to
+[tomcat/32.1](../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md) is the first item to
 quantify this end to end. Its workload is a nested chain of ordinary instance
 methods — `MappingData.recycle()` → 4× `MessageBytes.recycle()` → 2×
 `AbstractChunk.recycle()` per iteration — exactly the shape both penalties bite
@@ -330,3 +330,76 @@ describable to the root scan first (`chain_entry_rbp_is_foreign` in
 `vm/src/jit/conservative_roots.rs` detects the situation and gives up coverage;
 that is a fallback, not a fix). Acceptance gate for any future attempt: this
 class, 14 consecutive runs, on default flags.
+
+### What the re-gating costs — adopted 2026-07-31 from the retired tomcat/32
+
+`catalina.mapper.TestMapperPerformance` is this gate's clearest price tag, and
+it now lives here rather than in
+[tomcat/32](../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md),
+because once that document's cause 1 was fixed **this gate became the entire
+remainder**. The test asserts each of **nine** hostnames completes 10^6
+`recycle() + map()` calls in under 5 000 ms. `MapperPerfProbe`, hostname
+`xxxxxxxxxxx`, 300k iterations:
+
+| loop body | dev `b695d468f` (pre-regression, PASSED) | 2026-07-31 dev | 07-30 with both penalties removed |
+|---|---|---|---|
+| `MappingData.recycle()` | 0.73 µs | **3.46 µs** | 0.80 µs |
+| `recycle()` + `map()` | 2.03 µs | **6.2–8.5 µs** | — |
+
+The class fails on the first and easiest hostname at 6 057 ms, reruns at
+9 222 ms, and never reaches the other eight. Its workload is
+`MappingData.recycle` → 4× `MessageBytes.recycle` → 2× `AbstractChunk.recycle`
+per iteration — exactly the shape this gate penalises — and the trace says so
+directly:
+
+```
+[cratonvm-jitc] ir-direct-call MISSED java/util/Calendar.setTime(...)V
+                @pc=5 ir_direct=false static=false special=false
+```
+
+tomcat/32 predicted "32.1 should close when that branch merges". The branch
+merged, half of it was reverted here four days later for the soundness reason
+above, and nothing re-tested the prediction — so it stayed recorded as
+closing-soon while still failing. It closes when this edge does.
+
+**Correction to this document's own 07-30 entry.** The "Measured cost on a real
+test" table above was produced with `CRATONVM_NO_MOVING_YOUNG=1`. That lever
+now **crashes**: access violation, 3 runs of 3 on a ten-second probe
+(`DateSymbolsProbe`), with `CRATONVM_JIT_DIRECT_CALLEE_CALLS` on *or* off,
+while the default lane is clean 3/3 on the same binary. So that table cannot be
+reproduced today and should be read as history, not as evidence. It is not this
+edge — disabling the edge does not change the crash — and is filed separately.
+
+Whoever reopens the edge should re-run `TestMapperPerformance` — the whole
+class, not two of its nine hostnames — as a second acceptance signal alongside
+the Spring class above. The edge now has its own document,
+[jit-raw-jit-to-jit-shadow-stack-overflow-20260731](jit-raw-jit-to-jit-shadow-stack-overflow-20260731.md),
+which supersedes the reclaimed-root framing above; this table is what reopening
+it is worth on a real Tomcat class.
+
+## Correction 2026-07-31 — "the optimizing tier does run on default flags" is not what it sounds like
+
+The scoping above is right and it did open the gate. What it did not do — and
+what the header of this document implies — is make the optimizing tier
+*produce bodies*. Measured with `CRATONVM_DBG_IR_COMPILES=1`, a default run
+produces approximately none, for two reasons that have nothing to do with
+moving-young:
+
+1. **`optimize=false` on nearly every compile.** The tier is selected outside
+   `cratonvm-jit`; the eager first-call single-pass compile caches a non-IR
+   body and preempts every later path. The gate this document scoped sits
+   *downstream* of a decision that rarely asks for C2 at all.
+2. **`compact_ref_fields_enabled()` (default TRUE) made `IrBuilder::build`
+   refuse every `getfield`/`putfield`** — most object-oriented Java — at stage
+   one, silently. Fixed 2026-07-31; the constraint now lives where the
+   layout-naive displacement is emitted.
+
+Both are documented in `docs/internal/jit-ir-relocation-map-contract.md`, along
+with the per-stage refusal reporting that makes this checkable instead of
+inferable. The practical consequence for THIS document: its verification table
+shows unit-test counts, which the scoping genuinely fixed, but nothing in it
+establishes runtime C2 coverage — and the ASTParser 376→138 s and Oracle
+322→93 s improvements credited to the scoping cannot have come from the
+optimizing tier, since it emitted nothing. `direct_jit_callee_calls_enabled`,
+scoped in the same commit and since re-gated, is the candidate and still needs
+re-measuring.

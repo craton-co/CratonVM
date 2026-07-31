@@ -17,8 +17,139 @@ cratonvm [OPTIONS] --jar <FILE.jar> [ARGS...]
 | `--jar <FILE>` | Execute a JAR. Main class is read from `META-INF/MANIFEST.MF`. `-cp` is ignored when this is set. | — |
 | `--Xbootclasspath <PATH>` | Override bootstrap classpath. | Auto-detected from `--java-home` |
 | `--java-home <PATH>` | JDK installation for boot/ext classpath discovery and JMOD loading. Does **not** select a mode — it only points the (already selected) real-JDK mode at a specific installation. | `CRATONVM_JAVA_HOME`, then `JAVA_HOME`, then `java` on `PATH` |
-| `--real-jdk` | Load the real JDK class files from `jmods/` or `lib/modules` (~300 native methods in Rust). Already the default; pass it to be explicit. Fails loudly if no usable JDK is found. | **on** (`LAUNCHER_DEFAULT_JDK_MODE`) |
+| `--real-jdk` | Load the real JDK class files from `jmods/` or `lib/modules`, with roughly **2,700** native registrations in Rust (`REAL_JDK_NATIVE_REGISTRATIONS` in [`vm/src/config.rs`](../vm/src/config.rs)). Already the default; pass it to be explicit. Fails loudly if no usable JDK is found. | **on** (`LAUNCHER_DEFAULT_JDK_MODE`) |
 | `--synthetic-jdk` | Use the synthetic Rust standard library (~5,200 native stubs, no JDK needed) instead. Mutually exclusive with `--real-jdk`. Requires a build with the `synthetic-jdk` Cargo feature — otherwise the launch fails rather than starting a VM with no class library at all. | off |
+| `--jdk-only` | Real JDK **and** real class bytes are authoritative: no class is fabricated without real bytes, and no synthetic-stub native is registered or invoked. Implies `--real-jdk`; conflicts with `--synthetic-jdk`. An internal diagnostic — see [JDK-only mode](#jdk-only-mode) below. | off (`LAUNCHER_DEFAULT_COMPATIBILITY_MODE` = `compatible`) |
+
+> **The `--real-jdk` figure used to read "~300 native methods".** That was wrong
+> by roughly 9x and is now pinned to a single constant with its derivation
+> attached. Read it carefully: `REAL_JDK_NATIVE_REGISTRATIONS` counts
+> registration *call sites* reached from the default build's registrars, not
+> distinct registry keys — a method registered twice counts twice, so the true
+> distinct-method count is somewhat lower, and six registrars defined outside
+> `native-builtins/src` were not walked, so the number is a floor. For an exact
+> per-run census run `--dump-native-registry`; that dump, not this table, is the
+> authority.
+
+## JDK-only mode
+
+`--jdk-only` is an **internal diagnostic**, not a supported runtime mode.
+`--real-jdk` remains the default and is unchanged by anything in this section.
+Wave 1 is measurement-first: violations that cannot yet be enforced safely are
+recorded and counted rather than made fatal. Normative semantics live in
+[`feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md); the
+operator-facing walkthrough is [`jdk-only-migration.md`](jdk-only-migration.md).
+
+### Two orthogonal axes
+
+The VM has *two* independent settings that people routinely conflate:
+
+| Axis | Type | Question it answers | Values |
+|---|---|---|---|
+| `JdkMode` | `vm::config::JdkMode` | **which class library** loads | `real-jdk` · `synthetic-jdk` |
+| `CompatibilityMode` | `types::compat::CompatibilityMode` | **which substitutions** are permitted | `compatible` · `jdk-only` |
+
+Neither implies the other, and neither is inferred from a Cargo feature, an
+environment variable, or what happens to be installed on the host. The
+resulting pair is read as one `ExecutionPolicy` value
+(`VmConfig::execution_policy()`) by class loading, the native registry and
+dispatch.
+
+| Flags | `JdkMode` | `CompatibilityMode` |
+|---|---|---|
+| *(none)* | `real-jdk` | `compatible` |
+| `--real-jdk` | `real-jdk` | `compatible` |
+| `--synthetic-jdk` | `synthetic-jdk` | `compatible` |
+| `--jdk-only` | `real-jdk` | `jdk-only` |
+| `--jdk-only --synthetic-jdk` | **rejected at startup** | |
+
+The last row is a configuration error, not a preference. `jdk-only` forbids
+registering or invoking a `SyntheticStub` native, and the synthetic library
+*is* ~5,200 such stubs, so the pair selects a VM with no usable class library.
+`VmConfig::validate_compatibility()` rejects it before boot and names both
+fixes; the VM never silently picks one, because the two corrections run
+different class libraries with different semantics and different bug sets.
+
+### Where the defaults come from
+
+| Entry point | `JdkMode` default | `CompatibilityMode` default |
+|---|---|---|
+| `cratonvm` launcher (`VmConfig::for_launcher`) | `real-jdk` (`LAUNCHER_DEFAULT_JDK_MODE`) | `compatible` (`LAUNCHER_DEFAULT_COMPATIBILITY_MODE`) |
+| embedding / in-tree tests (`VmConfig::default`) | `synthetic-jdk` (`EMBEDDED_DEFAULT_JDK_MODE`) | `compatible` (`EMBEDDED_DEFAULT_COMPATIBILITY_MODE`) |
+
+The asymmetry is deliberate and is the point of declaring four constants rather
+than two. The `JdkMode` pair *differs* by entry point because "which class
+library loads" is a hermeticity question and the two entry points genuinely
+want different answers. The `CompatibilityMode` pair is **deliberately
+identical**: `jdk-only` rejects work that `compatible` accepts, so a caller
+that did not ask for strictness must never be handed it. Strictness has exactly
+one source — an explicit `--jdk-only`, or an explicit
+`VmConfig::with_compatibility_mode(CompatibilityMode::JdkOnly)`.
+
+`with_compatibility_mode` also **does not** rewrite `use_synthetic_jdk`, even
+though `--jdk-only` implies a real JDK. Forcing `JdkMode::Real` there would
+silently repair `--jdk-only --synthetic-jdk` into a real-JDK run and erase the
+conflict the launcher is supposed to report. The setter records only what it
+was asked for; `validate_compatibility()` is the backstop for any caller that
+sets the two independently.
+
+### Diagnostic flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--jdk-only-report <FILE>` | Write the violation/counter report as JSON (`schema_version` 1): `{ mode, jdk_feature, violations[], counts{} }`, with the class-origin buckets and the per-`NativeKind` invocation totals. Violations are sorted so the file is diff-stable. Works in **either** mode — under the default `compatible` mode it is a census of what strict mode *would* reject. | — |
+| `--dump-class-origins <FILE>` | Write the class-origin census: one row per class the class manager holds (`name`, `origin`, `reason`, `requested_by`, `real_bytes_found`, `loader_id`), sorted. `origin` uses the stable `ClassOrigin::as_str()` tags — `boot-image`, `vm-array`, `generated-lambda`, `compatibility-stub`, … | — |
+| `--trace-jdk-only` | Log each violation to stderr as it is picked up. Drained once after VM init (which is when registration refusals happen) and again at shutdown. | Off |
+| `--explain-jdk-only` | Print the long-form operator-facing explanation for each violation instead of the one-line summary — **and leave absolute paths unredacted** in the report and census files. Paths are redacted without it, so treat a run with this flag as one whose artifacts carry local filesystem layout. | Off (paths redacted) |
+
+`--dump-native-registry <FILE>` is not JDK-only-specific, but is the companion
+census: `schema_version` 2 adds `registered_by`, `overwrote`, `invocations` and
+`real_declaring_method` per entry, which is what turns "this stub exists" into
+"this stub was actually dispatched".
+
+The compatibility mode is also reported in the version banner
+(`compatibility=jdk-only`), so a bug report can be read without guessing which
+policy produced it.
+
+### Embedding equivalents
+
+There is no environment variable and no build feature for strict mode; every
+entry point takes it explicitly.
+
+| Surface | How to request `jdk-only` |
+|---|---|
+| launcher | `--jdk-only` |
+| Rust (`cratonvm-embed` / `cratonvm-vm`) | `VmConfig::with_compatibility_mode(CompatibilityMode::JdkOnly)`, then `validate_compatibility()` before boot |
+| C ABI (`libcratonvm`) | `cratonvm_create_with_compatibility(..., CRATONVM_COMPATIBILITY_JDK_ONLY)`, or the `--jdk-only` option string in `JavaVMInitArgs` |
+
+The C-ABI values (`CRATONVM_COMPATIBILITY_COMPATIBLE` = 0,
+`CRATONVM_COMPATIBILITY_JDK_ONLY` = 1) are a published, append-only part of the
+ABI and are typed `cratonvm_jint` rather than a boolean so a third enforcement
+posture can be added later without breaking a compiled host. Rust embedders
+read the resolved pair back as `VmConfig::execution_policy()`. See
+[EMBEDDING.md](EMBEDDING.md).
+
+### `CRATONVM_REAL=-stubs` is not a substitute
+
+`CRATONVM_REAL=-stubs` (equivalently `CRATONVM_NO_STUBS`) keeps working as a
+**native-registry filter** and is not being removed. But it covers only one
+third of the contract, and the launcher now prints a one-time note saying so
+when it sees the variable without `--jdk-only`.
+
+| Contract half | `CRATONVM_REAL=-stubs` | `--jdk-only` |
+|---|---|---|
+| Drop `SyntheticStub` native **registrations** | yes — silently | yes, with an attributed refusal record |
+| Refuse a **fabricated compatibility class** (no real bytes) | **no** — cannot express it | yes (enforced in wave 1) |
+| Refuse a registered native that **shadows real bytecode** at dispatch | **no** — cannot express it | counted in wave 1; the resolver routes every path |
+| Structured, attributed violation report | no | `--jdk-only-report` / `--dump-class-origins` |
+| Require a real JDK image, no silent fallback | no | yes |
+
+The two are deliberately separate code paths in
+`NativeMethodRegistry::register`, not one merged branch: the env var is an
+operator's blunt "make the bucket vanish" switch and is silent by design, while
+`jdk-only` is a policy that must produce evidence. Merging them would either
+make the env var start allocating a violation per drop, or cost `jdk-only` its
+provenance.
 
 ## Heap and GC
 
@@ -137,6 +268,7 @@ and can be overridden by editing the `Default for VmConfig` impl:
 | `use_compressed_oops` | false | `-XX:+UseCompressedOops` |
 | `use_compact_headers` | false | `-XX:+UseCompactObjectHeaders` |
 | `use_synthetic_jdk` | true (library) / **false — real-JDK, always** (launcher) | **Never host-detected.** Library/embedding default (`VmConfig::default()`, `EMBEDDED_DEFAULT_JDK_MODE`) stays `true` so the in-tree suite is hermetic. The `cratonvm` launcher and the C embedding API use `VmConfig::for_launcher()` (`LAUNCHER_DEFAULT_JDK_MODE`), which is **real-JDK unconditionally**. Select the other mode with `--real-jdk` / `--synthetic-jdk` (mutually exclusive). If the selected mode is unavailable — no usable JDK for `--real-jdk`, or a build without the `synthetic-jdk` Cargo feature for `--synthetic-jdk` — the launch is a **hard error** naming everything searched; there is no silent fallback to the other class library. |
+| `compatibility_mode` | `Compatible` — **both** launcher and embedded | Which substitutions are permitted, orthogonal to `use_synthetic_jdk`. Unlike the JDK-mode pair above, `LAUNCHER_DEFAULT_COMPATIBILITY_MODE` and `EMBEDDED_DEFAULT_COMPATIBILITY_MODE` are deliberately **equal**: strict mode rejects work that `Compatible` accepts, so it is never inherited, never inferred from a Cargo feature, and never read from the environment. Set it with `--jdk-only` or `VmConfig::with_compatibility_mode`; see [JDK-only mode](#jdk-only-mode). |
 | `use_container_support` | true | Cgroup limits honoured by default |
 | `xverify_mode` | `Remote` | See `XverifyMode` enum |
 | `cds_mode` | `Off` | |
@@ -218,7 +350,7 @@ is where the grouped-variable syntax came from.
 
 | Token | Description | Default |
 |-------|-------------|---------|
-| `-stubs` | Drop **every** `SyntheticStub` native at registration so calls fall through to real JDK bytecode (or a clear `NoSuchMethodError`) instead of a fake. Surfaces real gaps as errors. `Intrinsic`/`Bridge` natives are unaffected. | stubs present |
+| `-stubs` | Drop **every** `SyntheticStub` native at registration so calls fall through to real JDK bytecode (or a clear `NoSuchMethodError`) instead of a fake. Surfaces real gaps as errors. `Intrinsic`/`Bridge` natives are unaffected. Still supported, but it is a registry filter only — it cannot reject a fabricated compatibility class or stop a native shadowing real bytecode. Prefer `--jdk-only`; see [JDK-only mode](#jdk-only-mode) for the coverage table. | stubs present |
 | `net-sockets` / `-net-sockets` | Use the real `java.net` socket bytecode (the central registry drops the synthetic `java/net/Socket`/`ServerSocket` natives) instead of the synthetic socket layer. | real |
 | `aqs` / `-aqs` | Route `AbstractQueuedSynchronizer` / `ReentrantLock` etc. through real `java.util.concurrent` bytecode instead of the synthetic lock natives. | real |
 | `annotations` / `-annotations` | Annotation reflection uses real proxy-backed annotation objects. | real |

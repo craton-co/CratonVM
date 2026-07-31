@@ -7,6 +7,12 @@
 //! split into non-catchable internal VM errors and catchable Java exceptions —
 //! along with the [`VmError`] hierarchy ([`ClassFileError`], [`LinkageError`],
 //! [`RuntimeError`]) and the [`MethodCallResult`] alias used throughout the VM.
+//!
+//! Also home to [`JdkOnlyViolation`], the structured `--jdk-only` refusal
+//! defined by `docs/feature-designs/jdk-only-mode.md` §3. It lives here rather
+//! than beside [`crate::compat::CompatibilityMode`] because it is an *error*
+//! that `VmError` carries, and because every crate that can raise one already
+//! depends on this module.
 
 use std::fmt;
 
@@ -109,12 +115,604 @@ pub enum VmError {
     #[error("internal error: {message}")]
     Internal { message: String },
 
+    /// The requested configuration is self-contradictory and the VM refused to
+    /// start. `--jdk-only` together with `--synthetic-jdk` is the case this was
+    /// added for (`VmConfig::validate_compatibility`), but the variant is
+    /// deliberately general: it is the "you asked for two things that cannot
+    /// both be true" error, distinct from `Internal`, which means *we* have a
+    /// bug.
+    #[error("invalid configuration: {0}")]
+    InvalidConfiguration(String),
+
+    /// A `--jdk-only` policy violation ([`JdkOnlyViolation`]).
+    ///
+    /// Deliberately **not** `#[from]`. thiserror's `#[from]` also makes the
+    /// field the error's `source()`, which requires
+    /// `JdkOnlyViolation: std::error::Error`; the contract gives the violation
+    /// `Display` only (it is a report, not a chained cause), so the conversion
+    /// is hand-written below instead.
+    #[error("jdk-only violation: {0}")]
+    JdkOnly(JdkOnlyViolation),
+
     /// Non-failure scheduler control transfer used to unmount an unpinned
     /// virtual thread. It is wrapped in `MethodCallFailed::InternalError`
     /// solely to travel through native/interpreter return types and is
     /// intercepted before any Java exception boundary.
     #[error("virtual-thread continuation yielded for {wake_after_nanos}ns")]
     ContinuationYield { wake_after_nanos: u64 },
+}
+
+impl From<JdkOnlyViolation> for VmError {
+    /// Hand-written rather than `#[from]`.
+    ///
+    /// `#[from]` would additionally register the field as the error's
+    /// `source()`, which makes thiserror require
+    /// `JdkOnlyViolation: std::error::Error`. The contract
+    /// (`docs/feature-designs/jdk-only-mode.md` §3) gives the violation
+    /// `Display` only — it is a structured *report* the launcher renders, not a
+    /// cause in an error chain — so the bound cannot be satisfied without
+    /// widening the contract. This impl gives callers the same `?`/`.into()`
+    /// ergonomics with none of that.
+    fn from(violation: JdkOnlyViolation) -> Self {
+        VmError::JdkOnly(violation)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JdkOnlyViolation -- the `--jdk-only` structured refusal
+// ---------------------------------------------------------------------------
+
+/// The stand-in for any value the VM could not determine.
+const UNKNOWN: &str = "<unknown>";
+
+/// What an absolute path is replaced with when `verbose` is false.
+const REDACTED: &str = "<redacted>";
+
+/// The penultimate line of every [`JdkOnlyViolation::render`]. Pinned: §1.7
+/// requires every strict-mode failure to name the fallback, and an operator
+/// scrolled to the bottom of a wall of diagnostics must find it in the same
+/// place every time.
+const REMEDIATION_FALLBACK: &str =
+    "re-run with --real-jdk to restore the current compatibility behaviour";
+
+/// The final line of every [`JdkOnlyViolation::render`]. Pinned for the same
+/// reason, and because a violation an operator cannot capture is a violation
+/// that arrives in a bug report as a screenshot.
+const REMEDIATION_CAPTURE: &str =
+    "capture the full machine-readable report with --jdk-only-report <FILE>";
+
+/// A JDK-only policy violation. All fields are owned/plain so `types` needs no
+/// dependency on `native-api` or `classloading` — `NativeKind` and
+/// `ClassOrigin` are carried as their own `as_str()` spellings, never as the
+/// enums, which is what keeps the crate layering in §2 acyclic.
+///
+/// `PartialEq` is load-bearing: `jit/src/lib.rs` de-duplicates recorded
+/// violations with `Vec::contains` before pushing, so that a hot refused call
+/// site cannot fill the bounded buffer with one repeated entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JdkOnlyViolation {
+    /// A class with no real bytes anywhere was about to be fabricated (§1.2).
+    CompatibilityClassRequested {
+        class: String,
+        initiating_loader: Option<String>,
+        /// `"owner/Class.method(Desc)"` — the site that asked for the class.
+        requester: Option<String>,
+        reason: String,
+    },
+    /// A `NativeKind::SyntheticStub` was offered to the registry (§1.3).
+    SyntheticNativeRegistered {
+        class: String,
+        method: String,
+        descriptor: String,
+        /// Registration site, captured by `#[track_caller]` in the registry.
+        registered_by: Option<String>,
+    },
+    /// A `NativeKind::SyntheticStub` was about to be dispatched (§1.3).
+    SyntheticNativeInvocation {
+        class: String,
+        method: String,
+        descriptor: String,
+        call_site: Option<String>,
+    },
+    /// An `ACC_NATIVE` method has no bridge and no reviewed intrinsic (§1.5).
+    /// Never answered with a stub.
+    MissingNative {
+        class: String,
+        method: String,
+        descriptor: String,
+        module: Option<String>,
+    },
+    /// A registered native stood in front of concrete Java bytecode for the
+    /// same method, and is not a reviewed intrinsic (§1.4).
+    NativeShadowsBytecode {
+        class: String,
+        method: String,
+        descriptor: String,
+        /// `NativeKind::as_str()`, or the VM mechanism when the reporting crate
+        /// cannot see that enum (the JIT's thin direct helpers).
+        native_kind: &'static str,
+    },
+    /// A boot class was not present in the real runtime image (§1.1).
+    MissingBootClass {
+        class: String,
+        searched_image: String,
+    },
+    /// A method has neither a `Code` attribute nor an admissible native, so
+    /// there is nothing to run (§7 step 4).
+    MissingImplementation {
+        class: String,
+        method: String,
+        descriptor: String,
+    },
+}
+
+impl JdkOnlyViolation {
+    /// Stable kind tag for counters and JSON.
+    ///
+    /// **Wire format.** It is the `"kind"` field of every `--jdk-only-report`
+    /// violation row (`difftest/src/census.rs` tallies by exactly this string)
+    /// and the label the dispatch tests assert on. Do not re-spell these.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            JdkOnlyViolation::CompatibilityClassRequested { .. } => "compatibility-class-requested",
+            JdkOnlyViolation::SyntheticNativeRegistered { .. } => "synthetic-native-registered",
+            JdkOnlyViolation::SyntheticNativeInvocation { .. } => "synthetic-native-invocation",
+            JdkOnlyViolation::MissingNative { .. } => "missing-native",
+            JdkOnlyViolation::NativeShadowsBytecode { .. } => "native-shadows-bytecode",
+            JdkOnlyViolation::MissingBootClass { .. } => "missing-boot-class",
+            JdkOnlyViolation::MissingImplementation { .. } => "missing-implementation",
+        }
+    }
+
+    /// The class every variant names.
+    pub fn class(&self) -> &str {
+        match self {
+            JdkOnlyViolation::CompatibilityClassRequested { class, .. }
+            | JdkOnlyViolation::SyntheticNativeRegistered { class, .. }
+            | JdkOnlyViolation::SyntheticNativeInvocation { class, .. }
+            | JdkOnlyViolation::MissingNative { class, .. }
+            | JdkOnlyViolation::NativeShadowsBytecode { class, .. }
+            | JdkOnlyViolation::MissingBootClass { class, .. }
+            | JdkOnlyViolation::MissingImplementation { class, .. } => class.as_str(),
+        }
+    }
+
+    /// `(method, descriptor)` for the six variants that name a member.
+    ///
+    /// The descriptor is not decoration: it is the only thing that
+    /// distinguishes an overload, and a refusal that cannot be turned back into
+    /// a single method is not actionable (§1.7).
+    pub fn member(&self) -> Option<(&str, &str)> {
+        match self {
+            JdkOnlyViolation::SyntheticNativeRegistered {
+                method, descriptor, ..
+            }
+            | JdkOnlyViolation::SyntheticNativeInvocation {
+                method, descriptor, ..
+            }
+            | JdkOnlyViolation::MissingNative {
+                method, descriptor, ..
+            }
+            | JdkOnlyViolation::NativeShadowsBytecode {
+                method, descriptor, ..
+            }
+            | JdkOnlyViolation::MissingImplementation {
+                method, descriptor, ..
+            } => Some((method.as_str(), descriptor.as_str())),
+            JdkOnlyViolation::CompatibilityClassRequested { .. }
+            | JdkOnlyViolation::MissingBootClass { .. } => None,
+        }
+    }
+
+    /// Whoever asked: the requesting method, the registrar's source line, or
+    /// the call site, depending on the variant.
+    fn requested_from(&self) -> Option<&str> {
+        match self {
+            JdkOnlyViolation::CompatibilityClassRequested { requester, .. } => requester.as_deref(),
+            JdkOnlyViolation::SyntheticNativeRegistered { registered_by, .. } => {
+                registered_by.as_deref()
+            }
+            JdkOnlyViolation::SyntheticNativeInvocation { call_site, .. } => call_site.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The module the member belongs to, when the reporter knew it.
+    fn module(&self) -> Option<&str> {
+        match self {
+            JdkOnlyViolation::MissingNative { module, .. } => module.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Why the policy refused. Only `CompatibilityClassRequested` carries a
+    /// caller-supplied reason; the rest are a property of the kind itself.
+    fn reason(&self) -> String {
+        match self {
+            JdkOnlyViolation::CompatibilityClassRequested { reason, .. } => reason.clone(),
+            JdkOnlyViolation::SyntheticNativeRegistered { .. } => {
+                "a synthetic-stub native may not be registered under --jdk-only".to_string()
+            }
+            JdkOnlyViolation::SyntheticNativeInvocation { .. } => {
+                "a synthetic-stub native may not be invoked under --jdk-only".to_string()
+            }
+            JdkOnlyViolation::MissingNative { .. } => {
+                "the method is ACC_NATIVE and no bridge or reviewed intrinsic is bound".to_string()
+            }
+            JdkOnlyViolation::NativeShadowsBytecode { native_kind, .. } => format!(
+                "a registered {native_kind} native stands in front of the real class \
+                 bytes; concrete bytecode wins under --jdk-only"
+            ),
+            JdkOnlyViolation::MissingBootClass { searched_image, .. } => {
+                format!("no real class bytes for this boot class in {searched_image}")
+            }
+            JdkOnlyViolation::MissingImplementation { .. } => {
+                "the method has no Code attribute and no admissible native".to_string()
+            }
+        }
+    }
+
+    /// The variant-specific remediation lines, in order. The two fixed lines
+    /// are appended by [`Self::render`] and are not repeated here.
+    fn remediation(&self) -> &'static [&'static str] {
+        match self {
+            JdkOnlyViolation::CompatibilityClassRequested { .. } => &[
+                "put the real class on the class path, or drop the dependency that needs it",
+                "list every fabrication this run wanted with --dump-class-origins <FILE>",
+            ],
+            JdkOnlyViolation::SyntheticNativeRegistered { .. } => &[
+                "reclassify the registration as a Bridge or a reviewed Intrinsic, or delete it",
+            ],
+            JdkOnlyViolation::SyntheticNativeInvocation { .. } => &[
+                "the real JDK implements this method; check why its bytes were not loaded",
+            ],
+            JdkOnlyViolation::MissingNative { .. } => {
+                &["implement the method as a NativeKind::Bridge and register it at VM init"]
+            }
+            JdkOnlyViolation::NativeShadowsBytecode { .. } => &[
+                "unregister the native, or have it reviewed and reclassified as an Intrinsic",
+            ],
+            JdkOnlyViolation::MissingBootClass { .. } => &[
+                "point --jdk-home at a complete JDK runtime image (one with lib/modules)",
+            ],
+            JdkOnlyViolation::MissingImplementation { .. } => &[
+                "the resolved method is abstract or bodiless; check the dispatch that reached it",
+            ],
+        }
+    }
+
+    /// One-line form for logs and for the message of the Java-visible error the
+    /// JNI layer raises.
+    ///
+    /// Deliberately **not** redacted: it is a log line, and the caller that
+    /// wants redaction wants [`Self::render`].
+    pub fn summary(&self) -> String {
+        match self {
+            JdkOnlyViolation::CompatibilityClassRequested {
+                class, requester, ..
+            } => match requester {
+                Some(from) => format!("compatibility class requested: {class} (from {from})"),
+                None => format!("compatibility class requested: {class}"),
+            },
+            JdkOnlyViolation::SyntheticNativeRegistered {
+                class,
+                method,
+                descriptor,
+                ..
+            } => format!("synthetic-stub native registered: {class}.{method}{descriptor}"),
+            JdkOnlyViolation::SyntheticNativeInvocation {
+                class,
+                method,
+                descriptor,
+                ..
+            } => format!("synthetic-stub native invoked: {class}.{method}{descriptor}"),
+            JdkOnlyViolation::MissingNative {
+                class,
+                method,
+                descriptor,
+                ..
+            } => format!("no native bound for {class}.{method}{descriptor}"),
+            JdkOnlyViolation::NativeShadowsBytecode {
+                class,
+                method,
+                descriptor,
+                native_kind,
+            } => format!(
+                "{native_kind} native shadows bytecode of {class}.{method}{descriptor}"
+            ),
+            JdkOnlyViolation::MissingBootClass {
+                class,
+                searched_image,
+            } => format!("boot class not found: {class} (searched {searched_image})"),
+            JdkOnlyViolation::MissingImplementation {
+                class,
+                method,
+                descriptor,
+            } => format!("no implementation for {class}.{method}{descriptor}"),
+        }
+    }
+
+    /// Multi-line operator-facing report.
+    ///
+    /// Layout: the requested class (and member), who asked, why it was refused,
+    /// a JDK block, then a `Remediation:` block whose **last two lines are
+    /// fixed** — the `--real-jdk` fallback, then the `--jdk-only-report`
+    /// capture hint.
+    ///
+    /// Absolute paths are replaced with `<redacted>` unless `verbose` (which
+    /// `--explain-jdk-only` sets). Relative paths — the shape of every
+    /// `#[track_caller]` provenance string, e.g.
+    /// `native-builtins/src/lib.rs:1234` — pass through untouched, because
+    /// those are the ones a reader actually needs and they leak nothing about
+    /// the machine the run happened on.
+    pub fn render(&self, jdk_feature: Option<u32>, verbose: bool) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("JDK-only policy violation [{}]\n", self.kind()));
+        out.push_str(&format!(
+            "  requested class:   {}\n",
+            redact_paths(self.class(), verbose)
+        ));
+        if let Some((method, descriptor)) = self.member() {
+            out.push_str(&format!("  requested member:  {method}{descriptor}\n"));
+        }
+        out.push_str(&format!(
+            "  requested from:    {}\n",
+            match self.requested_from() {
+                Some(from) => redact_paths(from, verbose),
+                None => UNKNOWN.to_string(),
+            }
+        ));
+        out.push_str(&format!(
+            "  reason:            {}\n",
+            redact_paths(&self.reason(), verbose)
+        ));
+        out.push_str("  JDK:\n");
+        out.push_str(&format!(
+            "    feature version: {}\n",
+            match jdk_feature {
+                Some(v) => v.to_string(),
+                None => UNKNOWN.to_string(),
+            }
+        ));
+        out.push_str(&format!(
+            "    java.home:       {}\n",
+            match java_home() {
+                Some(home) => redact_paths(&home, verbose),
+                None => UNKNOWN.to_string(),
+            }
+        ));
+        out.push_str(&format!(
+            "    module:          {}\n",
+            self.module().unwrap_or(UNKNOWN)
+        ));
+        out.push_str("  Remediation:\n");
+        for line in self.remediation() {
+            out.push_str(&format!("    {line}\n"));
+        }
+        out.push_str(&format!("    {REMEDIATION_FALLBACK}\n"));
+        out.push_str(&format!("    {REMEDIATION_CAPTURE}\n"));
+        out
+    }
+
+    /// One `violations[]` element of the `--jdk-only-report` JSON.
+    ///
+    /// Hand-rolled to match the existing dump style (`types` has no serde). The
+    /// object is internally tagged: `kind` first, then `summary`, then the
+    /// variant's own fields in declaration order. Absent optionals are emitted
+    /// as `null` rather than omitted, so every row of a given kind has the same
+    /// shape and a consumer can index columns without probing.
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        let mut first = true;
+        let summary = self.summary();
+        out.push('{');
+        json_field(&mut out, &mut first, "kind", Some(self.kind()));
+        json_field(&mut out, &mut first, "summary", Some(summary.as_str()));
+        match self {
+            JdkOnlyViolation::CompatibilityClassRequested {
+                class,
+                initiating_loader,
+                requester,
+                reason,
+            } => {
+                json_field(&mut out, &mut first, "class", Some(class.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "initiating_loader",
+                    initiating_loader.as_deref(),
+                );
+                json_field(&mut out, &mut first, "requester", requester.as_deref());
+                json_field(&mut out, &mut first, "reason", Some(reason.as_str()));
+            }
+            JdkOnlyViolation::SyntheticNativeRegistered {
+                class,
+                method,
+                descriptor,
+                registered_by,
+            } => {
+                json_field(&mut out, &mut first, "class", Some(class.as_str()));
+                json_field(&mut out, &mut first, "method", Some(method.as_str()));
+                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "registered_by",
+                    registered_by.as_deref(),
+                );
+            }
+            JdkOnlyViolation::SyntheticNativeInvocation {
+                class,
+                method,
+                descriptor,
+                call_site,
+            } => {
+                json_field(&mut out, &mut first, "class", Some(class.as_str()));
+                json_field(&mut out, &mut first, "method", Some(method.as_str()));
+                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(&mut out, &mut first, "call_site", call_site.as_deref());
+            }
+            JdkOnlyViolation::MissingNative {
+                class,
+                method,
+                descriptor,
+                module,
+            } => {
+                json_field(&mut out, &mut first, "class", Some(class.as_str()));
+                json_field(&mut out, &mut first, "method", Some(method.as_str()));
+                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(&mut out, &mut first, "module", module.as_deref());
+            }
+            JdkOnlyViolation::NativeShadowsBytecode {
+                class,
+                method,
+                descriptor,
+                native_kind,
+            } => {
+                json_field(&mut out, &mut first, "class", Some(class.as_str()));
+                json_field(&mut out, &mut first, "method", Some(method.as_str()));
+                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(&mut out, &mut first, "native_kind", Some(*native_kind));
+            }
+            JdkOnlyViolation::MissingBootClass {
+                class,
+                searched_image,
+            } => {
+                json_field(&mut out, &mut first, "class", Some(class.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "searched_image",
+                    Some(searched_image.as_str()),
+                );
+            }
+            JdkOnlyViolation::MissingImplementation {
+                class,
+                method,
+                descriptor,
+            } => {
+                json_field(&mut out, &mut first, "class", Some(class.as_str()));
+                json_field(&mut out, &mut first, "method", Some(method.as_str()));
+                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+            }
+        }
+        out.push('}');
+        out
+    }
+}
+
+impl fmt::Display for JdkOnlyViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.summary())
+    }
+}
+
+/// The JDK image location to name in the report's JDK block.
+///
+/// Read straight from the environment rather than from
+/// [`crate::flags::flags`]: this is a diagnostic printed on a failure path, and
+/// the flags snapshot latches on first read — binding a *report* to that latch
+/// would make the rendered text depend on whether some other subsystem had
+/// already touched a flag. `CRATONVM_JAVA_HOME` is the VM's own override and
+/// wins over the ambient `JAVA_HOME`, matching the launcher's precedence.
+fn java_home() -> Option<String> {
+    for key in ["CRATONVM_JAVA_HOME", "JAVA_HOME"] {
+        if let Some(value) = std::env::var_os(key) {
+            if let Ok(text) = value.into_string() {
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether `token` names an absolute location on any platform this VM builds
+/// for.
+///
+/// Three shapes, all of which leak the layout of the machine the run happened
+/// on: POSIX (`/opt/jdk`), Windows drive-qualified (`C:\Program Files\jdk`,
+/// `C:/jdk`) and UNC (`\\build\share\jdk`; the POSIX-spelled `//host/share`
+/// falls out of the first rule). A drive-relative Windows root (`\Windows\x`)
+/// counts too — it is still an absolute-from-the-root path.
+///
+/// Nothing else in a violation can collide with these: an internal class name
+/// (`java/lang/Object`) and a descriptor (`(Ljava/lang/String;)V`) never begin
+/// with a separator, and a `#[track_caller]` provenance string is relative to
+/// the workspace root.
+fn is_absolute_path(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    match bytes {
+        [b'/', ..] | [b'\\', ..] => true,
+        [drive, b':', sep, ..] if drive.is_ascii_alphabetic() && (*sep == b'/' || *sep == b'\\') => {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Replace every whitespace-delimited absolute path in `value` with
+/// `<redacted>`, unless `verbose`.
+///
+/// Returns `value` unchanged — not merely equal, but with its original spacing
+/// intact — when nothing needs redacting, which is the common case and the one
+/// where the exact text is what a reader is diffing against.
+fn redact_paths(value: &str, verbose: bool) -> String {
+    if verbose || !value.split_whitespace().any(is_absolute_path) {
+        return value.to_string();
+    }
+    value
+        .split_whitespace()
+        .map(|token| {
+            if is_absolute_path(token) {
+                REDACTED
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Append `"key":<value>` to a JSON object body, inserting the separating comma
+/// only when something precedes it — which is what keeps the object free of the
+/// trailing comma that makes a hand-rolled dump unparseable.
+fn json_field(out: &mut String, first: &mut bool, key: &str, value: Option<&str>) {
+    if !*first {
+        out.push(',');
+    }
+    *first = false;
+    json_string(out, key);
+    out.push(':');
+    match value {
+        Some(text) => json_string(out, text),
+        None => out.push_str("null"),
+    }
+}
+
+/// Append a JSON string literal, escaping per RFC 8259.
+///
+/// Class names and descriptors cannot contain a quote or a backslash, but a
+/// `reason` is free text supplied by the class loader and a Windows path is
+/// full of backslashes — either would otherwise produce a report no JSON
+/// parser accepts.
+fn json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// Errors related to class file loading and parsing.
@@ -882,6 +1480,387 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, MethodCallFailed::InternalError(_)));
+    }
+
+    // -- JdkOnlyViolation --
+
+    /// One of each variant, fully populated, so a test can sweep all seven.
+    fn all_variants() -> Vec<JdkOnlyViolation> {
+        vec![
+            JdkOnlyViolation::CompatibilityClassRequested {
+                class: "org/jboss/Absent".into(),
+                initiating_loader: Some("app".into()),
+                requester: Some("com/example/Boot.start()V".into()),
+                reason: "enterprise-prefix fallback".into(),
+            },
+            JdkOnlyViolation::SyntheticNativeRegistered {
+                class: "com/example/Strict".into(),
+                method: "fake".into(),
+                descriptor: "(I)Ljava/lang/String;".into(),
+                registered_by: Some("native-builtins/src/lib.rs:1234".into()),
+            },
+            JdkOnlyViolation::SyntheticNativeInvocation {
+                class: "com/example/Strict".into(),
+                method: "fake".into(),
+                descriptor: "(Ljava/lang/Object;)Z".into(),
+                call_site: None,
+            },
+            JdkOnlyViolation::MissingNative {
+                class: "java/net/Socket".into(),
+                method: "socket0".into(),
+                descriptor: "(ZZZZ)I".into(),
+                module: Some("java.base".into()),
+            },
+            JdkOnlyViolation::NativeShadowsBytecode {
+                class: "java/util/HashMap".into(),
+                method: "put".into(),
+                descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;".into(),
+                native_kind: "jit-thin-direct-helper",
+            },
+            JdkOnlyViolation::MissingBootClass {
+                class: "java/lang/Object".into(),
+                searched_image: "jdk-25".into(),
+            },
+            JdkOnlyViolation::MissingImplementation {
+                class: "com/example/Owner".into(),
+                method: "compute".into(),
+                descriptor: "()J".into(),
+            },
+        ]
+    }
+
+    /// The kind tags are a wire format: `difftest/src/census.rs` tallies
+    /// `--jdk-only-report` rows by exactly these strings, and
+    /// `vm/tests/jdk_only_dispatch.rs` asserts three of them literally. Pinning
+    /// them here means a re-spelling fails in this crate rather than silently
+    /// producing a report whose every row tallies as an unknown kind.
+    #[test]
+    fn kind_tags_are_pinned() {
+        let expected = [
+            "compatibility-class-requested",
+            "synthetic-native-registered",
+            "synthetic-native-invocation",
+            "missing-native",
+            "native-shadows-bytecode",
+            "missing-boot-class",
+            "missing-implementation",
+        ];
+        let actual: Vec<&str> = all_variants().iter().map(|v| v.kind()).collect();
+        assert_eq!(actual, expected);
+    }
+
+    /// Two kinds sharing a tag would make the report unable to say which policy
+    /// rule fired, and would silently merge two counters into one.
+    #[test]
+    fn kind_tags_are_distinct() {
+        let mut tags: Vec<&str> = all_variants().iter().map(|v| v.kind()).collect();
+        let before = tags.len();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(before, tags.len(), "two variants share a kind tag");
+        assert_eq!(before, 7, "the contract defines exactly seven variants");
+    }
+
+    /// Every method-bearing variant must be identifiable down to the overload.
+    /// A refusal naming `HashMap.put` without the descriptor cannot be turned
+    /// into a work item (§1.7), and both the dispatch and registry suites
+    /// assert the descriptor is present in `summary()`.
+    #[test]
+    fn summary_names_the_class_and_the_overload() {
+        for v in all_variants() {
+            let summary = v.summary();
+            assert!(
+                summary.contains(v.class()),
+                "{}: summary omits the class: {summary}",
+                v.kind()
+            );
+            if let Some((method, descriptor)) = v.member() {
+                assert!(
+                    summary.contains(method) && summary.contains(descriptor),
+                    "{}: summary omits the overload: {summary}",
+                    v.kind()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn display_is_exactly_summary() {
+        for v in all_variants() {
+            assert_eq!(format!("{v}"), v.summary());
+        }
+    }
+
+    /// `render` ends with the two fixed lines, in that order. An operator who
+    /// scrolls to the bottom of a wall of diagnostics has to find the fallback
+    /// and the capture hint in the same place every time; the ordering is also
+    /// the one thing about the layout other agents were told to rely on.
+    #[test]
+    fn remediation_ends_with_the_two_fixed_lines() {
+        for v in all_variants() {
+            let rendered = v.render(Some(25), true);
+            let lines: Vec<&str> = rendered.lines().collect();
+            let last = lines[lines.len() - 1].trim();
+            let penultimate = lines[lines.len() - 2].trim();
+            assert_eq!(
+                penultimate, REMEDIATION_FALLBACK,
+                "{}: fallback is not the penultimate line\n{rendered}",
+                v.kind()
+            );
+            assert_eq!(
+                last, REMEDIATION_CAPTURE,
+                "{}: capture hint is not the last line\n{rendered}",
+                v.kind()
+            );
+            assert!(
+                rendered.contains("--real-jdk"),
+                "§1.7 requires the fallback to be named"
+            );
+            assert!(rendered.contains("--jdk-only-report <FILE>"));
+
+            // The blocks the contract requires, in order.
+            let remediation_at = rendered.find("  Remediation:").expect("remediation block");
+            let jdk_at = rendered.find("  JDK:").expect("JDK block");
+            let reason_at = rendered.find("  reason:").expect("reason line");
+            let from_at = rendered
+                .find("  requested from:")
+                .expect("requested-from line");
+            let class_at = rendered
+                .find("  requested class:")
+                .expect("requested-class line");
+            assert!(
+                class_at < from_at && from_at < reason_at && reason_at < jdk_at,
+                "{}: block order is wrong\n{rendered}",
+                v.kind()
+            );
+            assert!(jdk_at < remediation_at, "remediation must come last");
+            assert!(rendered.contains("feature version: 25"));
+        }
+    }
+
+    #[test]
+    fn render_reports_an_unknown_feature_version_rather_than_guessing() {
+        let v = JdkOnlyViolation::MissingNative {
+            class: "java/net/Socket".into(),
+            method: "socket0".into(),
+            descriptor: "(ZZZZ)I".into(),
+            module: Some("java.base".into()),
+        };
+        let rendered = v.render(None, true);
+        assert!(rendered.contains("feature version: <unknown>"), "{rendered}");
+        // The module the reporter *did* know is still named.
+        assert!(rendered.contains("module:          java.base"), "{rendered}");
+    }
+
+    /// The three absolute forms leak the layout of the machine the run happened
+    /// on and are redacted; a relative path is the useful, harmless one and
+    /// passes through byte-for-byte.
+    #[test]
+    fn absolute_paths_are_redacted_unless_verbose() {
+        let absolute = [
+            "/opt/jdk-25/lib/modules",
+            "C:\\Program\\jdk-25",
+            "c:/jdk-25/lib",
+            "\\\\build01\\share\\jdk-25",
+            "//build01/share/jdk-25",
+            "\\Windows\\jdk",
+        ];
+        for path in absolute {
+            assert!(is_absolute_path(path), "{path} should count as absolute");
+            assert_eq!(redact_paths(path, false), REDACTED, "{path} not redacted");
+            assert_eq!(redact_paths(path, true), path, "verbose must not redact");
+        }
+
+        let relative = [
+            "native-builtins/src/lib.rs:1234",
+            "java/lang/Object",
+            "(Ljava/lang/String;)V",
+            "com/example/Boot.start()V",
+            "jdk-25",
+        ];
+        for path in relative {
+            assert!(!is_absolute_path(path), "{path} is not absolute");
+            assert_eq!(
+                redact_paths(path, false),
+                path,
+                "a relative path must pass through untouched"
+            );
+        }
+
+        // Mixed text: only the absolute token goes.
+        assert_eq!(
+            redact_paths("searched /opt/jdk-25 and lib/modules", false),
+            "searched <redacted> and lib/modules"
+        );
+    }
+
+    #[test]
+    fn render_redacts_the_searched_image_but_keeps_the_registrar_line() {
+        let boot = JdkOnlyViolation::MissingBootClass {
+            class: "java/lang/Object".into(),
+            searched_image: "/opt/jdk-25/lib/modules".into(),
+        };
+        let quiet = boot.render(Some(25), false);
+        assert!(!quiet.contains("/opt/jdk-25"), "{quiet}");
+        assert!(quiet.contains(REDACTED), "{quiet}");
+        assert!(boot.render(Some(25), true).contains("/opt/jdk-25/lib/modules"));
+
+        // `#[track_caller]` provenance is workspace-relative: redacting it
+        // would delete the only actionable fact in the report.
+        let registered = JdkOnlyViolation::SyntheticNativeRegistered {
+            class: "com/example/Strict".into(),
+            method: "fake".into(),
+            descriptor: "(I)Ljava/lang/String;".into(),
+            registered_by: Some("native-builtins/src/lib.rs:1234".into()),
+        };
+        assert!(registered
+            .render(Some(25), false)
+            .contains("native-builtins/src/lib.rs:1234"));
+    }
+
+    /// The JSON is hand-rolled, so the three ways a hand-rolled dump goes wrong
+    /// — unbalanced braces, a trailing comma, an unescaped quote — are pinned
+    /// here rather than discovered by a consumer that cannot parse the report.
+    #[test]
+    fn to_json_is_well_formed() {
+        for v in all_variants() {
+            let json = v.to_json();
+            assert!(json.starts_with('{') && json.ends_with('}'), "{json}");
+            assert!(!json.contains(",}"), "trailing comma in {json}");
+            assert!(!json.contains("{,"), "leading comma in {json}");
+
+            // Braces balance, counting only those outside string literals.
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut escaped = false;
+            for ch in json.chars() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_string = true,
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                assert!(depth >= 0, "unbalanced braces in {json}");
+            }
+            assert_eq!(depth, 0, "unbalanced braces in {json}");
+            assert!(!in_string, "unterminated string in {json}");
+
+            assert!(
+                json.contains(&format!("\"kind\":\"{}\"", v.kind())),
+                "every row must be internally tagged: {json}"
+            );
+            assert!(json.contains("\"summary\":\""), "{json}");
+            assert!(json.contains("\"class\":\""), "{json}");
+        }
+    }
+
+    /// Absent optionals are `null`, not omitted: every row of a kind then has
+    /// the same shape, so a consumer can index columns without probing.
+    #[test]
+    fn to_json_emits_null_for_absent_optionals() {
+        let invocation = JdkOnlyViolation::SyntheticNativeInvocation {
+            class: "C".into(),
+            method: "m".into(),
+            descriptor: "()V".into(),
+            call_site: None,
+        };
+        assert!(
+            invocation.to_json().contains("\"call_site\":null"),
+            "{}",
+            invocation.to_json()
+        );
+
+        let present = JdkOnlyViolation::SyntheticNativeInvocation {
+            class: "C".into(),
+            method: "m".into(),
+            descriptor: "()V".into(),
+            call_site: Some("D.n()V".into()),
+        };
+        assert!(present.to_json().contains("\"call_site\":\"D.n()V\""));
+
+        let missing = JdkOnlyViolation::MissingNative {
+            class: "C".into(),
+            method: "m".into(),
+            descriptor: "()V".into(),
+            module: None,
+        };
+        assert!(missing.to_json().contains("\"module\":null"));
+    }
+
+    #[test]
+    fn to_json_escapes_strings() {
+        let v = JdkOnlyViolation::CompatibilityClassRequested {
+            class: "org/x/Q".into(),
+            initiating_loader: None,
+            requester: None,
+            reason: "said \"no\" at C:\\build\\x\tand\nstopped".into(),
+        };
+        let json = v.to_json();
+        assert!(json.contains("\\\"no\\\""), "{json}");
+        assert!(json.contains("C:\\\\build\\\\x"), "{json}");
+        assert!(json.contains("\\t"), "{json}");
+        assert!(json.contains("\\n"), "{json}");
+        // The raw control characters must not survive into the output.
+        assert!(!json.contains('\t'));
+        assert!(!json.contains('\n'));
+        assert!(json.contains("\"initiating_loader\":null"));
+
+        let mut escaped = String::new();
+        json_string(&mut escaped, "\u{1}");
+        assert_eq!(escaped, "\"\\u0001\"");
+    }
+
+    // -- the two new VmError variants --
+
+    #[test]
+    fn vm_error_invalid_configuration_display() {
+        let err = VmError::InvalidConfiguration(
+            "--jdk-only conflicts with --synthetic-jdk".to_string(),
+        );
+        assert_eq!(
+            format!("{err}"),
+            "invalid configuration: --jdk-only conflicts with --synthetic-jdk"
+        );
+        assert!(matches!(err, VmError::InvalidConfiguration(_)));
+    }
+
+    /// `From` is hand-written because `#[from]` would also make the violation
+    /// the error's `source()`, which needs `JdkOnlyViolation: std::error::Error`
+    /// — a bound the contract's `Display`-only type does not have. This pins
+    /// both that the conversion exists and that the Display text is the
+    /// violation's own summary behind one category prefix.
+    #[test]
+    fn vm_error_jdk_only_variant_and_conversion() {
+        let violation = JdkOnlyViolation::MissingNative {
+            class: "java/net/Socket".into(),
+            method: "socket0".into(),
+            descriptor: "(ZZZZ)I".into(),
+            module: Some("java.base".into()),
+        };
+        let err: VmError = violation.clone().into();
+        assert!(matches!(err, VmError::JdkOnly(_)));
+        assert_eq!(format!("{err}"), format!("jdk-only violation: {violation}"));
+        assert!(format!("{err}").contains("(ZZZZ)I"));
+
+        // And it travels through the two-layer exception model unchanged: the
+        // JNI and interpreter surfacing paths match on exactly this shape.
+        let failed: MethodCallFailed = VmError::JdkOnly(violation.clone()).into();
+        match failed {
+            MethodCallFailed::InternalError(VmError::JdkOnly(inner)) => {
+                assert_eq!(inner, violation);
+            }
+            other => panic!("expected InternalError(JdkOnly), got {other:?}"),
+        }
     }
 
     // -- format_optional_message --

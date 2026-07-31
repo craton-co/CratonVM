@@ -1947,20 +1947,11 @@ fn p59_jar_lookup_versioned_entry(
     path: &str,
     entry_name: &str,
 ) -> MethodCallResult {
-    let runtime_feature = match ctx.invoke(
-        "java/lang/Runtime",
-        "version",
-        "()Ljava/lang/Runtime$Version;",
-        &[],
-    )? {
-        Some(Value::Object(Some(version))) => {
-            match ctx.invoke_virtual(version, "feature", "()I", &[])? {
-                Some(Value::Int(feature)) => feature.max(8),
-                _ => 8,
-            }
-        }
-        _ => 8,
-    };
+    // Read the feature version straight from the system properties instead of
+    // materialising a `Runtime$Version` per entry lookup: `Runtime.version()`
+    // now populates the object's four real fields (a `List<Integer>`, three
+    // `Optional`s), which is several VM re-entries of work to then throw away.
+    let runtime_feature = crate::lang_system::runtime_feature_version(ctx).max(8);
     let physical_name = if !entry_name.starts_with("META-INF/")
         && runtime_feature > 8
         && p59_jar_is_multi_release(path)

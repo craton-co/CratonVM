@@ -564,6 +564,73 @@ pointer.
    `VmConfig` / `runtime::env_cache` over introducing a new bare
    `std::env::var` call.
 
+8. **Compatibility policy is a runtime token in `types`, not a build feature.**
+   `--jdk-only` (`CompatibilityMode::JdkOnly`) says *real class bytes are
+   authoritative*; the default `CompatibilityMode::Compatible` is today's
+   behaviour, byte for byte. It is **orthogonal** to `JdkMode` — that picks
+   *which class library* boots, this picks *which substitutions are permitted* —
+   and `JdkMode` was deliberately not overloaded with strictness. The default is
+   `Compatible` on **both** entry points (`LAUNCHER_DEFAULT_COMPATIBILITY_MODE`
+   and `EMBEDDED_DEFAULT_COMPATIBILITY_MODE`, `vm/src/config.rs`), and you reach
+   it by doing nothing. Contract:
+   [`docs/feature-designs/jdk-only-mode.md`](docs/feature-designs/jdk-only-mode.md).
+
+   Four structural shapes were **forced** here, and each is worth understanding
+   before touching this code, because each has an obvious alternative that does
+   not work:
+
+   * **The policy token lives in `types`, alone.** The policy has to be legible
+     to both the native registry (`native-api`) and the class loader
+     (`classloading`), and those two are *peers* in the dependency flow above —
+     neither can see the other. The only crate below both is `types`, so
+     `types/src/compat.rs` holds `CompatibilityMode` / `ExecutionPolicy` and
+     nothing else about the feature. `ExecutionPolicy` carries a bare
+     `real_jdk: bool` rather than a `JdkMode` for the same reason: `JdkMode`
+     lives in `vm`, which `types` cannot see.
+   * **The predicates live next to their own types, not in one place.**
+     `NativeKind::allowed_in(mode)` stays in `native-api` and
+     `ClassOrigin::allowed_in(mode)` stays in `classloading`. A single
+     `fn allowed(kind, origin, mode)` would need both enums in one scope, which
+     means either a new edge between two crates that must not depend on each
+     other, or dragging both enums (and their whole surfaces) down into `types`.
+     The shared thing is only the mode; the judgements stay local to the type
+     that can answer them.
+   * **One policy-aware dispatch resolver, which every path routes through.**
+     `resolve_dispatch` / `DispatchDecision` (`vm/src/vm/vm_exec.rs`) is the
+     single native-vs-bytecode decision point for the interpreter, JIT,
+     reflection, JNI and method handles. This is not tidiness: the repository
+     already had two independent override gates that **disagreed** about
+     `java/lang/String` and carried comments asking that they be kept in sync by
+     hand. A policy evaluated at N call sites is N policies, and the divergence
+     is invisible until something silently takes the wrong branch. Wave 1 landed
+     the resolver and routed the main interpreter path through it; paths that
+     still bypass it are marked `// JDK-ONLY-WAVE2:` so they can be found
+     mechanically rather than by memory.
+   * **Policy state is per-VM, never a process global.** It lives on `VmConfig`
+     and is pushed into the native registry and the `ClassManager` at VM init,
+     before any registration pass. A process global would break
+     multi-VM-in-one-process runs, and this repository has a documented history
+     of exactly that failure with process-global native caches leaking across
+     VMs. Two pre-existing globals reachable from this feature's paths are
+     logged as violations to remove, not as precedent.
+
+   Two consequences that surprise people. First, `Class` now carries a
+   `ClassOrigin` (boot image, application classpath, user-defined, array, hidden,
+   lambda, proxy, reflection accessor, VM-internal, compatibility stub), and the
+   older `is_synthetic_stub` bool is a **derived mirror** of it — write both
+   through `Class::set_origin`, never one alone. The bool survives because ~160
+   read sites across 17 files still use it; collapsing it is a later wave.
+   Second, this capability deliberately violates the "ship opt-out" convention
+   below, and is the one shape that legitimately can: an opt-out flag makes a
+   capability run by default, and a policy whose whole job is to *refuse* work
+   cannot be default-on without changing what every existing program does. So it
+   is recorded here as what it is — an internal diagnostic, **off by default**
+   (`CompatibilityMode::Compatible`, `vm/src/config.rs`), enforcing at class
+   fabrication and synthetic-native registration only, with the remaining
+   dispatch paths counted rather than blocked. See
+   [ROADMAP.md](ROADMAP.md#jdk-only-mode---jdk-only) for the staged rollout that
+   is meant to end that exception.
+
 ## How to tell whether a feature actually runs
 
 This repository has a chronic and well-evidenced failure mode: a capability

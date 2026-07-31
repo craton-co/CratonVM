@@ -3,6 +3,7 @@
 | | |
 |---|---|
 | **Status** | **FIXED 2026-07-31.** Root-caused, fixed and measured: 46x -> 1x on a Mockito-free reproducer. Two independent 2026-07-30 re-measurements (Windows after the gate work, and Azure) had already ruled out the 2026-07-26 profile's leading hypothesis; see "Resolution" for what it actually was. |
+| **Correction** | This document also claimed, from 2026-07-26 to 2026-07-31, that this cost was what made Spring's AOT chunk 4 look like a hang. **It was not.** With this fixed and confirmed on the same host, chunk 4 still did not finish. The real cause was a correctness bug two layers down — a redefinition handed six `StringBuilder` operations back to real JDK bodies that index a layout CratonVM's synthetic builder does not have, so javac's tokenizer lexed garbage and its parser looped in error recovery. See ["Why this was believed to present as a hang"](#why-this-was-believed-to-present-as-a-hang) below and [`fixed-suite-bugs/spring/spring-aot-cluster.md`](fixed-suite-bugs/spring/spring-aot-cluster.md). |
 | **Category** | VM-PERFORMANCE (JVMTI redefine / interpreter caching) |
 | **Found** | 2026-07-26, Azure host `20.83.144.174`, dev `7cb040a97`, real JDK 25. |
 | **CratonVM** | ~40,950 ns per `StringBuilder.length()` call after `Mockito.mock(StringBuilder.class)` |
@@ -122,6 +123,11 @@ redefining with a body whose arithmetic differs and asserting the new body is
 observed both interpreted and after re-tiering. That second assertion was
 vacuous while the gates blocked compilation, and is load-bearing now.
 
+Its sibling, [`../known-issues/repros/redefine-builder-layout/`](../known-issues/repros/redefine-builder-layout/),
+covers the *correctness* half of the same story — what a redefinition used to do
+to every real `StringBuilder` in the process. That is the one chunk 4 was
+actually waiting on.
+
 ### Not claimed
 
 This does not order a compilation already in flight against a concurrent
@@ -147,7 +153,23 @@ AFTER   2000000 length() calls: 72588 ms  (36294 ns/call)   MULTIPLIER 451x
 
 CratonVM is ~2000x slower than HotSpot in the post-mock state.
 
-## Why this presents as a hang
+## Why this was believed to present as a hang
+
+**Read the correction in the header first: this section's conclusion is wrong.**
+It is kept because the mechanism it describes is real and the reasoning error is
+worth seeing. Everything up to "The problem is what each of those calls now
+costs" holds; the attribution to chunk 4 does not.
+
+What was missed: the watchdog stack below is a *sample*, and it was read as
+"javac's tokenizer, therefore the per-call cost". A fuller dump taken on
+2026-07-31 (56,324 samples of the same thread) has 30% of its frames in
+`JavacParser.parseCompilationUnit -> VirtualParser.<init>` and a further slice in
+`updateUnexpectedTopLevelDefinitionStartError` — javac's **error** path. javac
+was not slow, it was failing to parse, because `setLength` had corrupted the
+tokenizer's one long-lived `StringBuilder`. Two cheap checks would have caught
+it: diff the generated artefacts across the two VMs (they were byte-identical,
+so the input was fine and the consumer was broken), and ask whether the loop is
+making progress at all before asking how fast it is.
 
 Mockito's inline mock maker redefines `StringBuilder` **and** its
 package-private superclass `AbstractStringBuilder` in place, weaving
@@ -266,11 +288,17 @@ checked on Azure the same day, and there is no such allocation left to find.
 
 `SbCostProbe` on `fix/spring-aot-cluster-20260730` (dev `c8da3d9188` + this
 session's loader fixes): **32 876 ns/call** after the mock, 350 ns before. So
-the defect is undiminished, and it is still what makes Spring's
-`AotIntegrationTests` chunk 4 look like a hang — a fresh watchdog dump
+the defect is undiminished, and a fresh watchdog dump
 (`CRATONVM_DEFAULT_WATCHDOG_SEC=420`) pins the main thread at
 `TestCompiler.compile` → javac `JavaTokenizer` → … →
 `WeakConcurrentMap$LatentKey.hashCode`, exactly as described above.
+
+*(2026-07-31: the sentence that used to sit here — "and it is still what makes
+chunk 4 look like a hang" — was wrong, for the reason given in the header. Both
+halves of that stack were true; only the causal claim was not. After this
+defect was fixed, `SbCostProbe` reports **444 ns/call** after the mock against
+488 before on the same host, and chunk 4 still hung until the StringBuilder
+layout bug was fixed separately.)*
 
 **Do not re-chase "a fresh `Arc<[u8]>` per call".** The uncached invoke path
 already interns its padded bytecode per method identity
