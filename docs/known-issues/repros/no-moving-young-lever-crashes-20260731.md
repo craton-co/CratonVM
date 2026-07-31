@@ -1,5 +1,18 @@
 # `CRATONVM_NO_MOVING_YOUNG=1` crashes — the diagnostic lever half the JIT docs measure with
 
+> **SUPERSEDED 2026-07-31** by
+> [`../jit-no-moving-young-opt-out-unpublishes-roots.md`](../jit-no-moving-young-opt-out-unpublishes-roots.md),
+> which root-causes this lane from a Linux Hibernate repro found the same day.
+> Two independent faults, not one: (1) the flag also withdrew shadow-stack root
+> publication — both sides read `flags().jit.shadow_stack ||
+> moving_young_enabled()` — now **FIXED**, the collector term is gone from
+> both; (2) with publication restored the lane takes a one-byte-off control
+> transfer into the safepoint register-spill run (SIGILL) — still **OPEN**, and
+> neutralised by `CRATONVM_NO_PRECISE_REG_SPILL=1`.
+>
+> The isolation below stands and adds to it: the raw JIT-to-JIT direct-call
+> gate was ruled out here independently.
+
 **Status:** 🔴 **OPEN**, found 2026-07-31 while re-deriving
 [tomcat/32](../../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md).
 

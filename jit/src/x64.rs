@@ -37008,23 +37008,34 @@ mod flag_and_header_contracts {
 
     /// `CRATONVM_SHADOW_STACK` is likewise read by `jit`, `gc` and `vm`; the
     /// emission side and the root-scan side must agree or the collector walks
-    /// a shadow stack the codegen never pushed to. Moving-young implies it.
+    /// a shadow stack the codegen never pushed to.
     ///
-    /// Deliberately still the BARE flag, not the relocation-scoped predicate:
-    /// scoping it was tried, measured as no-change, and reverted rather than
-    /// move one side of an exact agreement for nothing. See
-    /// `shadow_stack_maps_enabled`.
+    /// The moving-young implication is GONE (2026-07-31): publication is how a
+    /// JIT frame's live references reach the collector at all, so keying it on
+    /// the collector choice made `CRATONVM_NO_MOVING_YOUNG=1` withdraw root
+    /// visibility — that lane crashed on a reclaimed root within seconds. The
+    /// assertion below is what stops it coming back, and it also pins the two
+    /// sides to one expression.
     #[test]
-    fn shadow_stack_maps_enabled_is_central_flag_or_moving_young() {
+    fn shadow_stack_maps_enabled_does_not_depend_on_the_young_collector() {
         assert_eq!(
             shadow_stack_maps_enabled(),
             cratonvm_types::flags().jit.shadow_stack
-                || (moving_young_enabled() && shadow_emission_moving_implication_enabled()),
-            "shadow-stack codegen must be gated on the shared flag plus the moving-young \
-             implication (itself bisectable via CRATONVM_JIT_MY_SHADOW_EMISSION), not on a \
-             crate-private getenv. `vm::jit::conservative_roots::shadow_stack_enabled` must \
-             spell the SAME expression — they are two halves of one agreement"
+                || shadow_emission_moving_implication_enabled(),
+            "shadow-stack codegen must be gated on the shared flag plus its own opt-out \
+             (CRATONVM_JIT_MY_SHADOW_EMISSION), NOT on the young collector: root \
+             publication is not a property of which collector runs. \
+             `vm::jit::conservative_roots::shadow_stack_enabled` must spell the SAME \
+             expression — they are two halves of one agreement"
         );
+        // The property that actually matters, stated directly: turning the
+        // moving young generation off must not turn publication off with it.
+        crate::x64::set_moving_young_override(Some(false));
+        assert!(
+            shadow_stack_maps_enabled(),
+            "publication must survive CRATONVM_NO_MOVING_YOUNG=1"
+        );
+        crate::x64::set_moving_young_override(None);
     }
 
     /// Source-scan regression guard. Needles are assembled at runtime so this
