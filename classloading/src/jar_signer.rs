@@ -613,7 +613,8 @@ fn parse_signed_data(
                 // evidence of trust: refuse, with a message that does not
                 // claim a verdict we did not reach.
                 return Err(
-                    "SignerInfo signature could not be verified (unsupported or unusable algorithm/key) — refusing",
+                    "SignerInfo signature could not be verified \
+                     (unsupported or unusable algorithm/key) — refusing",
                 );
             }
         }
@@ -1411,10 +1412,10 @@ enum PublicKey {
 /// absence of one.  See `docs/security/signed-jar-trust.md` §2 and
 /// `docs/security/crypto-failure-contract.md` §1.
 ///
-/// | Variant | Meaning | Was a verification performed? |
+/// | Variant | Meaning | Verified? |
 /// |---|---|---|
-/// | [`SigVerify::Ok`] | The signature is cryptographically valid under this key. | Yes — positive. |
-/// | [`SigVerify::Bad`] | The signature bytes do not match. **This is a real security decision** (what a forgery looks like). | Yes — negative. |
+/// | [`SigVerify::Ok`] | Valid signature under this key. | Yes — positive. |
+/// | [`SigVerify::Bad`] | The bytes do not match. **A real decision.** | Yes — negative. |
 /// | [`SigVerify::Unsupported`] | Nothing was verified. | **No.** |
 ///
 /// All three are handled explicitly at every call site; `Bad` and
@@ -3484,7 +3485,7 @@ pub fn parse_manifest_entry_digests(manifest_bytes: &[u8]) -> Vec<ManifestEntryD
 ///
 /// Fail-closed in both directions: an `expected` of the wrong length —
 /// including the empty slice, the classic success-shaped default — can
-/// never match, because [`ct_eq`] compares lengths first.
+/// never match, because `ct_eq` compares lengths first.
 pub fn digest_matches(alg: DigestAlg, data: &[u8], expected: &[u8]) -> bool {
     let actual = raw_digest(alg, data);
     !actual.is_empty() && ct_eq(expected, &actual)
@@ -5219,8 +5220,9 @@ mod tests {
         let msg = b"the real message";
         let sig = rsa_sign(msg, DigestAlg::Sha256, RSA1024_N, RSA1024_D);
 
+        let other = b"a different message";
         assert_eq!(
-            verify_signature_with_spki(&spki, "1.2.840.113549.1.1.11", b"a different message", &sig),
+            verify_signature_with_spki(&spki, "1.2.840.113549.1.1.11", other, &sig),
             SigVerify::Bad,
             "a completed verification that fails is a genuine negative"
         );

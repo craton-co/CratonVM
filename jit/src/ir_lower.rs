@@ -4508,8 +4508,7 @@ const SLOT_PLAN_MAX_ITERATIONS: usize = 256;
 /// [`plan_slots`] attributes a phi's value inputs to exactly the predecessor
 /// block `emit_phi_copies` will copy them from. Every index is checked: the
 /// planner runs before `verify_data_locations`, on a graph nothing has vetted.
-fn ctrl_block_of(graph: &Graph, schedule: &Schedule, ctrl: NodeId) -> Option<usize> {
-    let mut ctrl = ctrl;
+fn ctrl_block_of(graph: &Graph, schedule: &Schedule, mut ctrl: NodeId) -> Option<usize> {
     for _ in 0..graph.nodes.len() {
         if ctrl == NO_NODE {
             return None;
@@ -4570,7 +4569,11 @@ fn bits_for_each(bits: &[u64], mut f: impl FnMut(usize)) {
 /// this existed. The result is *checked* by [`verify_slot_colouring`], not
 /// trusted — the property it establishes (two values live at one point never
 /// share a word) is the one whose violation is silent wrong code.
-fn plan_slots(graph: &Graph, schedule: &Schedule, sr_map: Option<&ScalarReplacementMap>) -> SlotPlan {
+fn plan_slots(
+    graph: &Graph,
+    schedule: &Schedule,
+    sr_map: Option<&ScalarReplacementMap>,
+) -> SlotPlan {
     let n = graph.nodes.len();
     let nb = schedule.blocks.len();
 
@@ -4964,11 +4967,11 @@ fn verify_slot_colouring(
     schedule: &Schedule,
     plan: &SlotPlan,
 ) -> CompileResult<()> {
-    let coloured = |id: usize| plan.node_color.get(id).copied().flatten();
+    let color_of = |id: usize| plan.node_color.get(id).copied().flatten();
 
     // (1) Coverage — the same two sources `plan_slots` enumerates.
     for (id, node) in graph.nodes.iter().enumerate() {
-        if matches!(node.op, Op::Phi) && coloured(id).is_none() {
+        if matches!(node.op, Op::Phi) && color_of(id).is_none() {
             return Err(Bailout::with_context(
                 BailoutReason::UnallocatedValue { node: id as NodeId },
                 format!("phi n{id} has no planned frame slot"),
@@ -4985,13 +4988,10 @@ fn verify_slot_colouring(
                     )))
                 }
             };
-            if op_defines_result_slot(&node.op) && coloured(nid as usize).is_none() {
+            if op_defines_result_slot(&node.op) && color_of(nid as usize).is_none() {
                 return Err(Bailout::with_context(
                     BailoutReason::UnallocatedValue { node: nid },
-                    format!(
-                        "scheduled n{nid} ({:?}) has no planned frame slot",
-                        node.op
-                    ),
+                    format!("scheduled n{nid} ({:?}) has no planned frame slot", node.op),
                 ));
             }
         }
@@ -7027,9 +7027,12 @@ mod tests {
             "staged outgoing arguments must count",
         );
 
-        // One 8-byte spill slot per node (no liveness reuse yet), so a graph at
-        // the node budget implies ~160 KiB — five times the 32 KiB oop-map
-        // bound. That combination must be refused, not built.
+        // A method whose PEAK LIVE set is as wide as the node budget still has
+        // to be refused: 20_000 simultaneously live values is ~160 KiB, five
+        // times the 32 KiB oop-map bound. What changed with liveness reuse is
+        // that reaching this now takes 20_000 values live *at once*, not merely
+        // 20_000 values in the arena — see
+        // `a_previously_declined_large_method_now_compiles`.
         let huge = estimate_frame_bytes(0, DEFAULT_MAX_NODES, &plain);
         assert!(huge > DEFAULT_MAX_FRAME_BYTES, "{huge}");
         let err =
@@ -7059,5 +7062,464 @@ mod tests {
         );
         // The same graph with a sane local count still compiles.
         assert!(lower(&graph, &schedule, 1, 1, &no_helpers()).is_some());
+    }
+
+    // ── Liveness-based frame-slot reuse ──────────────────────────────────
+
+    /// An empty graph shell, so each test below only writes the shape it cares
+    /// about.
+    fn empty_graph() -> Graph {
+        Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        }
+    }
+
+    /// `int f(int a) { a += 1; a += 1; … }` with `len` increments: a chain in
+    /// which every temporary is dead the instant the next one consumes it. The
+    /// shape the old one-slot-per-node reservation was worst on.
+    fn straight_line_chain(len: usize) -> (Graph, Schedule) {
+        let mut graph = empty_graph();
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let one = graph.add(Op::Const(1), IrType::Int, vec![], None);
+        let mut cur = a;
+        for _ in 0..len {
+            cur = graph.add(Op::Add, IrType::Int, vec![cur, one], None);
+        }
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, cur], None);
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
+    /// Re-derive the linear emission positions [`plan_slots`] numbers, so a
+    /// test can assert *where* a value is live. Deliberately a separate
+    /// implementation of the numbering the module comment documents: if the two
+    /// ever disagree, the loop test below is the one that notices.
+    #[allow(clippy::type_complexity)]
+    fn emission_positions(
+        graph: &Graph,
+        schedule: &Schedule,
+    ) -> (Vec<Option<usize>>, Vec<(usize, usize)>) {
+        let mut pos = vec![None; graph.nodes.len()];
+        let mut span = Vec::with_capacity(schedule.blocks.len());
+        let mut seq = 0usize;
+        for block in &schedule.blocks {
+            let start = seq;
+            for &nid in &block.nodes {
+                pos[nid as usize] = Some(seq);
+                seq += 1;
+            }
+            if let Some(term) = block.terminator {
+                pos[term as usize] = Some(seq);
+                seq += 1;
+            }
+            span.push((start, seq));
+            seq += 1;
+        }
+        (pos, span)
+    }
+
+    /// How many values the plan gives a slot to at all — the number the old
+    /// reservation would have needed (one word each, forever).
+    fn slotted_value_count(plan: &SlotPlan) -> usize {
+        plan.node_color.iter().flatten().count()
+    }
+
+    /// The colouring's whole point: values that are never live at the same time
+    /// land on the same frame word.
+    #[test]
+    fn non_overlapping_values_share_a_frame_slot() {
+        let (graph, schedule) = straight_line_chain(64);
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+
+        let slotted = slotted_value_count(&plan);
+        assert_eq!(slotted, 66, "param + const + 64 adds each want a slot");
+        // Successive links of the chain overlap at one position (the consumer's
+        // own position), so the chain alternates between two words; the
+        // constant and the parameter account for the rest.
+        assert!(
+            plan.slots <= 8,
+            "64 chained temporaries should collapse to a handful of slots, got {}",
+            plan.slots,
+        );
+        assert!(
+            plan.slots < slotted,
+            "no reuse happened at all: {} slots for {slotted} values",
+            plan.slots,
+        );
+        assert!(
+            plan.peak_live <= plan.slots,
+            "peak live ({}) is the floor the colouring cannot beat, slots = {}",
+            plan.peak_live,
+            plan.slots,
+        );
+    }
+
+    /// …and values that ARE live at the same time never do. The endpoint-
+    /// inclusive overlap rule means a value whose last use is at position `p`
+    /// also keeps its word against a value defined at `p`.
+    #[test]
+    fn overlapping_values_never_share_a_frame_slot() {
+        // int f(int a, int b) { int s = a + b; return a + s; }  — `a` is live
+        // across `s`, so the two cannot share; `b` dies at `s`, so it can be
+        // recycled by the value defined last.
+        let mut graph = empty_graph();
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let b = graph.add(Op::Param(1), IrType::Int, vec![start], None);
+        let s = graph.add(Op::Add, IrType::Int, vec![a, b], None);
+        let t = graph.add(Op::Add, IrType::Int, vec![a, s], None);
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, t], None);
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+        let color = |id: NodeId| plan.node_color[id as usize].expect("a coloured value");
+
+        assert_ne!(color(a), color(b), "both live into the first add");
+        assert_ne!(color(a), color(s), "a outlives s's definition");
+        assert_ne!(color(a), color(t), "a is live where t is defined");
+        assert_ne!(color(s), color(t), "s is live where t is defined");
+        // Four values, one legitimate sharing pair (b dies before t is defined).
+        assert_eq!(slotted_value_count(&plan), 4);
+        assert!(
+            plan.slots < 4,
+            "a dead-before-t value must be recycled, got {} slots",
+            plan.slots,
+        );
+
+        // End to end, the code still computes a + (a + b).
+        let cm = lower(&graph, &schedule, 2, 2, &no_helpers()).expect("lowers");
+        assert_eq!(unsafe { cm.try_call(&[3, 4]) }, Ok(10));
+        assert_eq!(unsafe { cm.try_call(&[-1, 5]) }, Ok(3));
+    }
+
+    /// A value used anywhere in a loop is live across the WHOLE loop, not just
+    /// up to its textually last use — otherwise the second iteration reads a
+    /// word some later definition has overwritten.
+    ///
+    /// The liveness fixed point produces this without knowing what a loop is:
+    /// the back edge makes the header's uses reach every block on the path back
+    /// to it. This test pins that it actually happens.
+    #[test]
+    fn a_loop_carried_value_stays_live_across_the_whole_loop() {
+        // int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; } —
+        // `n` is compared every iteration, so it must survive the back edge.
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        // Drop the deopt snapshots: every node they name is deliberately pinned
+        // to a dedicated slot, which would make this test pass for the wrong
+        // reason. The pinning itself is covered by
+        // `a_deopt_visible_value_keeps_a_dedicated_slot`.
+        graph.safepoints.clear();
+        let schedule = ir_schedule::schedule(&graph);
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+
+        let (_pos, span) = emission_positions(&graph, &schedule);
+        // The loop: the outermost back edge (a successor at or before its own
+        // block index) and the header it returns to.
+        let (header, latch) = schedule
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(b, block)| block.successors.iter().map(move |&s| (s, b)))
+            .filter(|&(s, b)| s <= b)
+            .max_by_key(|&(_, b)| b)
+            .expect("the counted loop has a back edge");
+
+        let n_node = graph
+            .nodes
+            .iter()
+            .position(|node| matches!(node.op, Op::Param(0)))
+            .expect("the loop bound is a parameter") as NodeId;
+        let n_range = plan.range[n_node as usize].expect("the loop bound has a live range");
+        assert!(
+            n_range.lo <= span[header].0 && n_range.hi >= span[latch].1,
+            "the loop bound is live [{}, {}] but the loop spans [{}, {}]",
+            n_range.lo,
+            n_range.hi,
+            span[header].0,
+            span[latch].1,
+        );
+
+        // …and therefore nothing defined inside the loop took its word.
+        let n_color = plan.node_color[n_node as usize].expect("a coloured value");
+        for (id, color) in plan.node_color.iter().enumerate() {
+            if id as NodeId == n_node || *color != Some(n_color) {
+                continue;
+            }
+            let block = schedule.node_to_block[id];
+            assert!(
+                block == usize::MAX || block < header || block > latch,
+                "n{id} is inside the loop (block {block}) and reused the loop \
+                 bound's frame slot",
+            );
+        }
+
+        // The behavioural proof is `test_lower_counted_loop_sum`, which runs
+        // this exact method; keep the compile working here too.
+        assert!(lower(&graph, &schedule, 1, 3, &no_helpers()).is_some());
+    }
+
+    /// A reference and a primitive never share a frame word.
+    ///
+    /// `emit_safepoint_map` publishes a slot as a GC root because *some* `Ref`
+    /// value was defined into it, and `defined_nodes` never un-sets. If a
+    /// primitive could inherit that word, the collector would follow an `int`
+    /// as an object pointer. The two free lists are disjoint, so this is a
+    /// property of the representation, not of the schedule.
+    #[test]
+    fn a_reference_is_never_aliased_with_a_non_reference() {
+        // Object f(Object r, int a) { int t = a + 1; int u = t + 1; return r; }
+        // `r` is live to the return; `a`, `t`, `u` die in sequence, so the
+        // primitive pool recycles while the reference pool does not.
+        let mut graph = empty_graph();
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let r = graph.add(Op::Param(0), IrType::Ref, vec![start], None);
+        let a = graph.add(Op::Param(1), IrType::Int, vec![start], None);
+        let one = graph.add(Op::Const(1), IrType::Int, vec![], None);
+        let t = graph.add(Op::Add, IrType::Int, vec![a, one], None);
+        let u = graph.add(Op::Add, IrType::Int, vec![t, one], None);
+        let v = graph.add(Op::Add, IrType::Int, vec![u, one], None);
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, r], None);
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+
+        // Reuse did happen among the primitives…
+        assert!(
+            plan.slots < slotted_value_count(&plan),
+            "the primitive chain should have recycled a word",
+        );
+        // …and no word holds both classes.
+        let mut class_of_color: HashMap<u32, SlotClass> = HashMap::new();
+        for (id, color) in plan.node_color.iter().enumerate() {
+            let (color, class) = match (color, plan.class[id]) {
+                (Some(color), Some(class)) => (*color, class),
+                _ => continue,
+            };
+            match class_of_color.get(&color) {
+                Some(seen) => assert_eq!(
+                    *seen, class,
+                    "slot {color} mixes {seen:?} and {class:?} (n{id})",
+                ),
+                None => {
+                    class_of_color.insert(color, class);
+                }
+            }
+        }
+        // The reference genuinely got a word of its own, not merely a word no
+        // primitive happened to want.
+        let r_color = plan.node_color[r as usize].expect("a coloured reference");
+        assert_eq!(class_of_color.get(&r_color), Some(&SlotClass::Ref));
+        for id in [a, t, u, v] {
+            assert_ne!(
+                plan.node_color[id as usize],
+                Some(r_color),
+                "n{id} is a primitive on the reference's word",
+            );
+        }
+    }
+
+    /// Every value a deopt frame names keeps a dedicated slot: the deopt
+    /// producer reads it at a native offset chosen at run time, so "dead by
+    /// then" is not a question this file can answer.
+    #[test]
+    fn a_deopt_visible_value_keeps_a_dedicated_slot() {
+        let (mut graph, _) = straight_line_chain(8);
+        // Name the first two adds in a snapshot, exactly as `IrBuilder` would
+        // for a bytecode boundary whose locals hold them.
+        let adds: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.op, Op::Add))
+            .map(|(id, _)| id as NodeId)
+            .take(2)
+            .collect();
+        graph.safepoints.push(SafepointSnapshot {
+            bci: 0,
+            locals: vec![adds[0]],
+            stack: vec![adds[1]],
+        });
+        let schedule = ir_schedule::schedule(&graph);
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+
+        for &pinned in &adds {
+            assert_eq!(
+                plan.class[pinned as usize],
+                Some(SlotClass::Pinned),
+                "n{pinned} is named by a deopt frame and must not share",
+            );
+            let color = plan.node_color[pinned as usize].expect("a coloured value");
+            let sharers = plan
+                .node_color
+                .iter()
+                .filter(|c| **c == Some(color))
+                .count();
+            assert_eq!(sharers, 1, "n{pinned}'s word is shared by {sharers} values");
+        }
+    }
+
+    /// The colouring verifier is a real check, not a comment: each way a
+    /// colouring could go wrong is refused.
+    #[test]
+    fn the_colouring_verifier_rejects_an_aliased_plan() {
+        let (graph, schedule) = straight_line_chain(8);
+        let good = plan_slots(&graph, &schedule, None);
+        assert!(verify_slot_colouring(&graph, &schedule, &good).is_ok());
+
+        let adds: Vec<usize> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.op, Op::Add))
+            .map(|(id, _)| id)
+            .collect();
+
+        // (a) Two values that ARE live together forced onto one word — the
+        //     silent-wrong-code case.
+        let mut aliased = plan_slots(&graph, &schedule, None);
+        let (first, second) = (adds[0], adds[1]);
+        assert!(
+            aliased.range[first]
+                .expect("range")
+                .overlaps(aliased.range[second].expect("range")),
+            "precondition: consecutive chain links overlap",
+        );
+        aliased.node_color[second] = aliased.node_color[first];
+        aliased.class[second] = aliased.class[first];
+        let err = verify_slot_colouring(&graph, &schedule, &aliased)
+            .expect_err("an aliased pair must be refused");
+        assert_eq!(err.category(), "internal");
+        assert!(
+            err.to_string().contains("simultaneously live"),
+            "unexpected reason: {err}",
+        );
+
+        // (b) A reference on a primitive's word.
+        let mut mixed = plan_slots(&graph, &schedule, None);
+        mixed.node_color[adds[2]] = mixed.node_color[adds[0]];
+        mixed.class[adds[2]] = Some(SlotClass::Ref);
+        mixed.class[adds[0]] = Some(SlotClass::Prim);
+        let err = verify_slot_colouring(&graph, &schedule, &mixed)
+            .expect_err("a mixed-class word must be refused");
+        assert!(
+            err.to_string().contains("reference and primitive"),
+            "unexpected reason: {err}",
+        );
+
+        // (c) A value the lowerer will allocate for, left uncoloured — the
+        //     scheduler-omission class `verify_data_locations` guards, restated
+        //     for the plan.
+        let mut missing = plan_slots(&graph, &schedule, None);
+        missing.node_color[adds[0]] = None;
+        let err = verify_slot_colouring(&graph, &schedule, &missing)
+            .expect_err("an uncoloured scheduled value must be refused");
+        assert_eq!(err.category(), "unallocated_value");
+
+        // (d) A colour outside the reservation the frame was sized from.
+        let mut oversized = plan_slots(&graph, &schedule, None);
+        oversized.node_color[adds[0]] = Some(oversized.slots as u32 + 1);
+        assert!(verify_slot_colouring(&graph, &schedule, &oversized).is_err());
+    }
+
+    /// The measurement the report asks for: frame bytes against node count on a
+    /// long straight-line method.
+    #[test]
+    fn frame_bytes_track_peak_liveness_not_node_count() {
+        let plain = FrameNeeds {
+            needs_context: false,
+            max_call_args: 0,
+        };
+        let (graph, schedule) = straight_line_chain(512);
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+
+        let before = estimate_frame_bytes(0, graph.nodes.len(), &plain);
+        let after = estimate_frame_bytes(0, plan.slots, &plain);
+        assert!(
+            after * 8 < before,
+            "frame bytes only fell from {before} to {after} on a 512-link chain",
+        );
+        // The residual is the fixed part of the frame — bookkeeping slots, the
+        // stack-arg reserve and the ABI shadow space — not spill.
+        assert!(after <= 160, "{after} bytes for a 4-slot working set");
+    }
+
+    /// The node ceiling the frame bound implies, before and after.
+    ///
+    /// One 8-byte slot per node put the ceiling at ~4 000 nodes: past that the
+    /// frame estimate crossed `DEFAULT_MAX_FRAME_BYTES` and the optimizing tier
+    /// declined the method outright. Sized by peak liveness instead, a long
+    /// method is bounded by `DEFAULT_MAX_NODES` again.
+    #[test]
+    fn a_previously_declined_large_method_now_compiles() {
+        let plain = FrameNeeds {
+            needs_context: false,
+            max_call_args: 0,
+        };
+
+        // Where the old accounting stopped: the largest node count whose
+        // one-slot-per-node frame still fit.
+        let old_ceiling = (1..=DEFAULT_MAX_NODES)
+            .take_while(|&n| estimate_frame_bytes(0, n, &plain) <= DEFAULT_MAX_FRAME_BYTES)
+            .last()
+            .expect("some node count fits");
+        assert!(
+            (4000..4200).contains(&old_ceiling),
+            "the old ceiling was ~4 000 nodes, computed {old_ceiling}",
+        );
+
+        let (graph, schedule) = straight_line_chain(5_000);
+        assert!(
+            graph.nodes.len() > old_ceiling,
+            "precondition: this method was over the old ceiling",
+        );
+        assert!(
+            check_frame_size(
+                estimate_frame_bytes(0, graph.nodes.len(), &plain),
+                DEFAULT_MAX_FRAME_BYTES,
+            )
+            .is_err(),
+            "precondition: one slot per node would still be refused",
+        );
+
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+        assert!(
+            check_frame_size(
+                estimate_frame_bytes(1, plan.slots, &plain),
+                DEFAULT_MAX_FRAME_BYTES,
+            )
+            .is_ok(),
+            "{} slots should fit comfortably",
+            plan.slots,
+        );
+
+        // And it really compiles and really runs.
+        let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a 5 000-node method lowers");
+        assert_eq!(unsafe { cm.try_call(&[0]) }, Ok(5_000));
+        assert_eq!(unsafe { cm.try_call(&[42]) }, Ok(5_042));
     }
 }

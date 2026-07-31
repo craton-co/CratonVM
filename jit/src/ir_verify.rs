@@ -82,13 +82,22 @@
 //!   `check_schedule` lane rather than left riding along with the memory-chain
 //!   check it has nothing in common with.
 //!
-//! What is still *not* on by default at `"pre-lower"` is the pair of lanes
-//! above that `ir_optimize` fixed, because a second mutating pass runs after
-//! it: `apply_ea_to_ir` (in `lib.rs`) marks the scalar-replaced allocation, its
-//! stores and its loads `Op::Dead` while rewiring only `graph.nodes` — it never
-//! touches `graph.safepoints`, and it does not splice the memory chain. Until
-//! it does, both lanes have real false positives after escape analysis. The
-//! single switch is [`APPLY_EA_ROUTES_SAFEPOINTS_AND_MEMORY`].
+//! Those two lanes are on at `"post-optimize"` and **not** at
+//! `"post-escape-analysis"` / `"pre-lower"`, because a second mutating pass
+//! runs in between: `apply_ea_to_ir` (in `lib.rs`). It used to mark the
+//! scalar-replaced allocation, its stores and its loads `Op::Dead` while
+//! rewiring only `graph.nodes`, breaking both. Its two remaining stories are
+//! *not* the same, which is why they are two constants and not one:
+//!
+//! * [`APPLY_EA_SPLICES_MEMORY_CHAIN`] — a plain "not verified yet" switch.
+//!   `apply_ea_to_ir` now gates every victim on a feasible splice and rewires
+//!   its token consumers, so the lane should be clean after EA; the constant is
+//!   the one-line flip once that lands and passes.
+//! * [`APPLY_EA_ROUTES_ALL_SAFEPOINTS`] — not a bug, a modelling gap. An
+//!   eliminated `Op::New`'s snapshot slot deliberately keeps naming the dead
+//!   node, because that slot *is* the virtual-object descriptor. A `&Graph`
+//!   carries no `ScalarReplacementMap`, so this module cannot tell that
+//!   intentional state from the silent-null it exists to catch.
 //!
 //! ## The φ fallback
 //!
@@ -123,24 +132,46 @@ use crate::ir::{join_data_type, Graph, IrType, Node, NodeId, Op, NO_NODE};
 
 // ── Options ──────────────────────────────────────────────────────────
 
-/// Whether `apply_ea_to_ir` (`jit/src/lib.rs`) keeps `graph.safepoints` and the
-/// memory-token chain consistent when it deletes a scalar-replaced allocation.
+/// Whether `apply_ea_to_ir` (`jit/src/lib.rs`) splices every node it retires out
+/// of the memory-token chain, the way
+/// `ir_optimize::kill_store_splicing_memory_chain` does.
 ///
-/// **This constant is the entire "turn the remaining lanes on at `pre-lower`"
-/// change.** Flip it to `true` once `apply_ea_to_ir`, in addition to rewiring
-/// `graph.nodes`, (a) retargets or clears every `graph.safepoints` slot naming
-/// a node it marks `Op::Dead`, and (b) splices each killed store/allocation out
-/// of the memory-token chain the way `ir_optimize::kill_store_splicing_memory_chain`
-/// does. Nothing else needs to change: [`VerifyOptions::for_phase`] reads it.
+/// **Flipping this one constant to `true` is the entire "run the memory-chain
+/// lane at `"post-escape-analysis"` and `"pre-lower"` too" change** —
+/// [`VerifyOptions::for_phase`] is the only reader.
 ///
-/// It is `false` today because `apply_ea_to_ir` does neither — it marks the
-/// allocation, its eliminated stores and its replaced loads `Op::Dead` and
-/// clears their inputs, and its "replace all references" loop iterates
-/// `ir_graph.nodes` only. So after escape analysis a snapshot slot can name a
-/// removed node (frame-state lane) and a surviving memory op can take its token
-/// from one (memory-chain lane), and both lanes would reject correct-enough
-/// graphs at `"post-escape-analysis"` and `"pre-lower"`.
-pub const APPLY_EA_ROUTES_SAFEPOINTS_AND_MEMORY: bool = false;
+/// It was `false` because `apply_ea_to_ir` marked the allocation, its
+/// eliminated stores and its replaced loads `Op::Dead` while rewiring only
+/// `ir_graph.nodes`, leaving a surviving memory operation's token pointing into
+/// the hole. That is no longer the code: `plan_scalar_replacement` now gates
+/// every victim on `ea_splice_feasible`, and the kill loop follows each
+/// victim's incoming token transitively before rewiring its token consumers to
+/// it. The constant is still `false` only because that fix is landing
+/// concurrently and this module does not get to declare another module's change
+/// verified; flip it once the pipeline builds and its tests pass.
+pub const APPLY_EA_SPLICES_MEMORY_CHAIN: bool = false;
+
+/// Whether *every* `graph.safepoints` slot names a live node after
+/// `apply_ea_to_ir`.
+///
+/// Unlike [`APPLY_EA_SPLICES_MEMORY_CHAIN`] this is **not** simply waiting on a
+/// fix, and it is why the two were split apart rather than left as one switch.
+/// `apply_ea_to_ir` retargets a snapshot slot that names a forwarded load, but
+/// a slot naming an *eliminated* `Op::New` is deliberately left pointing at the
+/// dead node: that slot **is** the "materialise this virtual object" descriptor
+/// that `ir_lower::resolve_frame_state` resolves through
+/// `ir_lower::ScalarReplacementMap` into a `FrameValue::VirtualObject`.
+/// `plan_scalar_replacement` refuses the elision unless such a descriptor will
+/// exist, so the state is intentional and correct — but it is indistinguishable
+/// *from this module* from the silent-null case the lane exists to catch,
+/// because a `&Graph` carries no `ScalarReplacementMap`.
+///
+/// So enabling the frame-state lane after escape analysis needs a model change,
+/// not a bug fix: either the verifier is handed the scalar-replacement map, or
+/// `SafepointSnapshot` grows a way to spell "eliminated, described elsewhere"
+/// rather than reusing a stale `NodeId`. Until then the lane runs where it is
+/// unambiguous — at [`PHASE_POST_OPTIMIZE`], before EA — and is opt-in after.
+pub const APPLY_EA_ROUTES_ALL_SAFEPOINTS: bool = false;
 
 /// The phase name `lib.rs` passes for the verification that runs immediately
 /// after `ir_optimize::optimize` and *before* `apply_ea_to_ir`. This is the one
@@ -238,18 +269,24 @@ impl VerifyOptions {
     ///   `eliminate_dead_nodes` roots and normalises snapshot slots, and
     ///   `kill_store_splicing_memory_chain` keeps the token chain closed.
     /// * every other phase (`"post-escape-analysis"`, `"pre-lower"`) runs after
-    ///   `apply_ea_to_ir`, which does neither, so those two lanes stay opt-in
-    ///   until [`APPLY_EA_ROUTES_SAFEPOINTS_AND_MEMORY`] says otherwise.
+    ///   `apply_ea_to_ir`, so those two lanes stay opt-in until
+    ///   [`APPLY_EA_SPLICES_MEMORY_CHAIN`] and [`APPLY_EA_ROUTES_ALL_SAFEPOINTS`]
+    ///   respectively say otherwise.
     /// * the arena-order lane is never enabled here at any phase — it is a
     ///   heuristic that GVN violates by construction (module docs).
     pub fn for_phase(phase: &str) -> Self {
         let env = VerifyOptions::from_env();
-        // Before EA, or after an EA that has learnt to route both.
-        let ea_clean = phase == PHASE_POST_OPTIMIZE || APPLY_EA_ROUTES_SAFEPOINTS_AND_MEMORY;
+        // `PHASE_POST_OPTIMIZE` is the only hook that runs before
+        // `apply_ea_to_ir`; every other phase name is after it.
+        let before_ea = phase == PHASE_POST_OPTIMIZE;
         VerifyOptions {
             check_types: env.check_types,
-            check_frame_states: env.check_frame_states || ea_clean,
-            check_memory_chain: env.check_memory_chain || ea_clean,
+            check_frame_states: env.check_frame_states
+                || before_ea
+                || APPLY_EA_ROUTES_ALL_SAFEPOINTS,
+            check_memory_chain: env.check_memory_chain
+                || before_ea
+                || APPLY_EA_SPLICES_MEMORY_CHAIN,
             check_arena_order: env.check_arena_order,
         }
     }
@@ -1050,9 +1087,10 @@ fn check_types(graph: &Graph, v: &mut Violations) {
 /// `ir_optimize::eliminate_dead_nodes` now roots every value a snapshot names
 /// and normalises an already-stranded slot to `NO_NODE`, so this lane is clean
 /// after `ir_optimize::optimize` and [`VerifyOptions::for_phase`] enables it at
-/// [`PHASE_POST_OPTIMIZE`]. It is *not* yet clean after `apply_ea_to_ir`, which
-/// marks nodes `Op::Dead` without touching `graph.safepoints` — see
-/// [`APPLY_EA_ROUTES_SAFEPOINTS_AND_MEMORY`].
+/// [`PHASE_POST_OPTIMIZE`]. It is *not* clean after `apply_ea_to_ir`, which
+/// deliberately leaves an eliminated `Op::New`'s snapshot slot naming the dead
+/// node as the virtual-object descriptor — see [`APPLY_EA_ROUTES_ALL_SAFEPOINTS`]
+/// for why that needs a model change rather than a fix.
 fn check_frame_states(graph: &Graph, v: &mut Violations) {
     for (si, sp) in graph.safepoints.iter().enumerate() {
         if sp.locals.len() > MAX_JVM_FRAME_SLOTS {
@@ -1393,8 +1431,9 @@ mod tests {
         assert!(verify_graph(&g, "test", VerifyOptions::default()).is_err());
     }
 
-    /// The φ fallback, degenerate half: a φ no input types is a slot that is
-    /// dead at the merge, which verified bytecode may have. Tolerated — the
+    /// The φ fallback, degenerate half: a φ no input of which carries a type is
+    /// a slot that is dead at the merge, which verified bytecode may have — the
+    /// always-on lane already accepts `NO_NODE` there. Tolerated: the
     /// fallback's `Int` keeps it out of the oop map, the right answer for a slot
     /// nothing reads.
     #[test]
@@ -1450,7 +1489,9 @@ mod tests {
         let ret = g.exit as usize;
         g.nodes[ret].inputs[1] = sh;
         // Not `all()`: the appended nodes outrank the Return in arena order,
-        // which is exactly what the (opt-in, heuristic) schedule lane reports.
+        // which is exactly what the (opt-in, heuristic) arena-order lane
+        // reports. `Shl` is checked only on operand 0, so the `Int` shift
+        // amount against a `Long` result is not an Int/Long non-join finding.
         let r = verify_graph(&g, "test", VerifyOptions::default());
         assert!(r.is_ok(), "{}", r.unwrap_err());
     }
@@ -1707,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_lane_flags_a_use_before_its_definition() {
+    fn arena_order_lane_flags_a_use_before_its_definition() {
         let mut g = linear_graph();
         // Append a constant *after* the Return, then make the Return consume
         // it: valid as a graph, impossible as an arena-ordered schedule.
@@ -1723,20 +1764,210 @@ mod tests {
         );
     }
 
+    /// The split is the point: an arena-order finding must not drag the
+    /// memory-chain lane in with it, and vice versa. They used to be one
+    /// `check_schedule` flag, which meant the soundness half could not be
+    /// enabled without the heuristic half's guaranteed false positives.
+    #[test]
+    fn the_two_ordering_lanes_are_independent() {
+        let mut g = linear_graph();
+        let later = g.add(Op::Const(5), IrType::Int, vec![], None);
+        g.nodes[g.exit as usize].inputs[1] = later;
+
+        let arena_only = VerifyOptions {
+            check_arena_order: true,
+            check_memory_chain: false,
+            ..VerifyOptions::structural()
+        };
+        let chain_only = VerifyOptions {
+            check_arena_order: false,
+            check_memory_chain: true,
+            ..VerifyOptions::structural()
+        };
+        // An arena-order violation is invisible to the chain lane…
+        let r = verify_graph(&g, "test", chain_only);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+        assert!(message(&verify_graph(&g, "test", arena_only).unwrap_err())
+            .contains("defined after its use"));
+
+        // …and a broken memory token is invisible to the arena-order lane.
+        let ctrl = g.nodes[g.exit as usize].inputs[0];
+        let mem = g
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::Proj(1)))
+            .expect("memory projection") as NodeId;
+        let st1 = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, later, later, later],
+            None,
+        );
+        let _st2 = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, st1, later, later, later],
+            None,
+        );
+        g.kill(st1);
+        assert!(message(&verify_graph(&g, "test", chain_only).unwrap_err())
+            .contains("memory token"));
+        let arena_msg = message(&verify_graph(&g, "test", arena_only).unwrap_err());
+        assert!(arena_msg.contains("defined after its use"), "{arena_msg}");
+        assert!(!arena_msg.contains("memory token"), "{arena_msg}");
+    }
+
     #[test]
     fn options_from_env_defaults_to_structural_only() {
         // The env vars are not set in the test harness, so `from_env` must be
-        // the structural-only configuration.
+        // the structural-only configuration. `from_env` is deliberately *pure*
+        // environment: the phase-aware defaults live in `for_phase`.
+        let unset = |n: &str| cratonvm_types::flags::runtime_var_os(n).is_none();
         let o = VerifyOptions::from_env();
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_VERIFY_TYPES").is_none() {
+        if unset("CRATONVM_JIT_VERIFY_TYPES") {
             assert!(!o.check_types);
         }
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_VERIFY_FRAME_STATES").is_none() {
+        if unset("CRATONVM_JIT_VERIFY_FRAME_STATES") {
             assert!(!o.check_frame_states);
         }
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_VERIFY_SCHEDULE").is_none() {
-            assert!(!o.check_schedule);
+        if unset("CRATONVM_JIT_VERIFY_MEMORY_CHAIN") && unset("CRATONVM_JIT_VERIFY_SCHEDULE") {
+            assert!(!o.check_memory_chain);
         }
+        if unset("CRATONVM_JIT_VERIFY_ARENA_ORDER") && unset("CRATONVM_JIT_VERIFY_SCHEDULE") {
+            assert!(!o.check_arena_order);
+        }
+    }
+
+    /// The lanes `ir_optimize`'s fixes made safe are on at `"post-optimize"`,
+    /// and only there until `apply_ea_to_ir` catches up. The heuristic
+    /// arena-order lane is on at no phase.
+    #[test]
+    fn for_phase_enables_the_ea_blocked_lanes_only_before_escape_analysis() {
+        let post_opt = VerifyOptions::for_phase(PHASE_POST_OPTIMIZE);
+        assert!(post_opt.check_frame_states);
+        assert!(post_opt.check_memory_chain);
+        assert!(!post_opt.check_arena_order);
+
+        let env = VerifyOptions::from_env();
+        for phase in ["post-escape-analysis", "pre-lower"] {
+            let o = VerifyOptions::for_phase(phase);
+            assert!(!o.check_arena_order, "{phase}");
+            // Flipping either constant is the whole change; these state the
+            // invariant either way rather than pinning today's value, so a flip
+            // needs no test edit.
+            assert_eq!(
+                o.check_frame_states,
+                APPLY_EA_ROUTES_ALL_SAFEPOINTS || env.check_frame_states,
+                "{phase}"
+            );
+            assert_eq!(
+                o.check_memory_chain,
+                APPLY_EA_SPLICES_MEMORY_CHAIN || env.check_memory_chain,
+                "{phase}"
+            );
+        }
+    }
+
+    /// The two EA constants gate *different* lanes. They were one switch until
+    /// it became clear they are waiting on different things — a fix versus a
+    /// model change — and a test that could not tell them apart would let them
+    /// silently fuse back together.
+    #[test]
+    fn the_two_ea_constants_gate_different_lanes() {
+        let env = VerifyOptions::from_env();
+        let pre_lower = VerifyOptions::for_phase("pre-lower");
+        assert_eq!(
+            pre_lower.check_memory_chain,
+            APPLY_EA_SPLICES_MEMORY_CHAIN || env.check_memory_chain
+        );
+        assert_eq!(
+            pre_lower.check_frame_states,
+            APPLY_EA_ROUTES_ALL_SAFEPOINTS || env.check_frame_states
+        );
+        // Neither constant has any effect at the pre-EA hook: both lanes are
+        // unconditionally on there.
+        let post_opt = VerifyOptions::for_phase(PHASE_POST_OPTIMIZE);
+        assert!(post_opt.check_memory_chain && post_opt.check_frame_states);
+    }
+
+    /// The environment may only *add* lanes to a phase's defaults, never
+    /// subtract: an operator turning the gate down uses `CRATONVM_JIT_VERIFY_IR=0`,
+    /// which disables it outright rather than silently narrowing it.
+    #[test]
+    fn for_phase_never_drops_a_phase_default() {
+        let env = VerifyOptions::from_env();
+        for phase in [PHASE_POST_OPTIMIZE, "post-escape-analysis", "pre-lower"] {
+            let o = VerifyOptions::for_phase(phase);
+            assert!(!env.check_types || o.check_types, "{phase}");
+            assert!(!env.check_frame_states || o.check_frame_states, "{phase}");
+            assert!(!env.check_memory_chain || o.check_memory_chain, "{phase}");
+            assert!(!env.check_arena_order || o.check_arena_order, "{phase}");
+        }
+    }
+
+    #[test]
+    fn verify_graph_at_phase_matches_verify_graph_with_for_phase() {
+        let g = diamond_graph();
+        for phase in [PHASE_POST_OPTIMIZE, "pre-lower"] {
+            let a = verify_graph_at_phase(&g, phase);
+            let b = verify_graph(&g, phase, VerifyOptions::for_phase(phase));
+            assert_eq!(a.is_ok(), b.is_ok(), "{phase}");
+        }
+    }
+
+    /// The module doc makes claims about the code it verifies. The ones that are
+    /// checkable from here are checked here, so the doc cannot rot back into the
+    /// state this consolidation found it in.
+    #[test]
+    fn module_doc_claims_match_observable_behaviour() {
+        // "the lattice is `ir::join_data_type`, and it rejects an Int/Long
+        // merge" — the claim that retired the private `Cat` lattice.
+        assert!(crate::ir::join_data_type(IrType::Int, IrType::Long).is_none());
+        assert!(crate::ir::join_data_type(IrType::Float, IrType::Double).is_none());
+        assert_eq!(
+            crate::ir::join_data_type(IrType::Ref, IrType::Ref),
+            Some(IrType::Ref)
+        );
+        assert!(crate::ir::join_data_type(IrType::Void, IrType::Void).is_none());
+
+        // "`ir::PHI_TYPE_FALLBACK` is `Int`, and it is not a GC root type."
+        assert_eq!(crate::ir::PHI_TYPE_FALLBACK, IrType::Int);
+        assert_ne!(crate::ir::PHI_TYPE_FALLBACK, IrType::Ref);
+
+        // "the frame-state and memory-chain lanes are on at post-optimize, the
+        // arena-order lane at no phase."
+        let post_opt = VerifyOptions::for_phase(PHASE_POST_OPTIMIZE);
+        assert!(post_opt.check_frame_states && post_opt.check_memory_chain);
+        assert!(!post_opt.check_arena_order);
+        assert!(!VerifyOptions::for_phase("pre-lower").check_arena_order);
+
+        // "the two EA constants are the switches for the post-EA phases."
+        let env = VerifyOptions::from_env();
+        let pre_lower = VerifyOptions::for_phase("pre-lower");
+        assert_eq!(
+            pre_lower.check_frame_states,
+            APPLY_EA_ROUTES_ALL_SAFEPOINTS || env.check_frame_states
+        );
+        assert_eq!(
+            pre_lower.check_memory_chain,
+            APPLY_EA_SPLICES_MEMORY_CHAIN || env.check_memory_chain
+        );
+
+        // "`VerifyOptions::all` turns everything on."
+        let all = VerifyOptions::all();
+        assert!(
+            all.check_types
+                && all.check_frame_states
+                && all.check_memory_chain
+                && all.check_arena_order
+        );
+        let none = VerifyOptions::structural();
+        assert!(
+            !none.check_types
+                && !none.check_frame_states
+                && !none.check_memory_chain
+                && !none.check_arena_order
+        );
     }
 
     #[test]

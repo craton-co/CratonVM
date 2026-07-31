@@ -7430,6 +7430,10 @@ fn apply_ea_to_ir(
 /// leaves its slot `Undefined` (safe whole-method re-run) rather than emit a
 /// partial/garbage object. Only called when `scalar_deopt_enabled() &&
 /// deopt_real_enabled()`.
+///
+/// Also omitted: any candidate `apply_ea_to_ir` will *refuse* to elide. Those
+/// keep a real allocation, and a `VirtualObject` recipe for a live object would
+/// have a deopt materialize a second one — see the loop body.
 fn build_scalar_replacement_map(
     ir_graph: &ir::Graph,
     id_map: &[escape_analysis::NodeId],
@@ -7441,8 +7445,25 @@ fn build_scalar_replacement_map(
             reverse_map.insert(ea_id, ir_id as ir::NodeId);
         }
     }
+    // The predicate `apply_ea_to_ir` will compute for itself. Recomputed rather
+    // than passed in so the two cannot drift apart at the call site.
+    let deopt_descriptor_available = scalar_deopt_enabled() && deopt_real_enabled();
     let mut objects: HashMap<ir::NodeId, ir_lower::VirtualObjectInfo> = HashMap::new();
     for info in &ea_result.scalar_replaceable {
+        // Only objects `apply_ea_to_ir` will actually ELIDE may be described. A
+        // candidate it refuses (its allocation survives — see
+        // `plan_scalar_replacement`) must NOT get a `VirtualObject` recipe: the
+        // JIT frame holds the real reference, and materializing the recipe at a
+        // deopt would create a SECOND object with the same field values, so the
+        // resumed interpreter frame would hold a different identity than the
+        // compiled frame did. `plan_scalar_replacement` is pure and runs on this
+        // same pre-apply graph, so the two answers are the same answer.
+        let elided =
+            plan_scalar_replacement(ir_graph, &reverse_map, info, deopt_descriptor_available)
+                .is_some_and(|p| p.elide_alloc);
+        if !elided {
+            continue;
+        }
         if let Some((ir_new, vo)) = virtual_object_info_for(ir_graph, &reverse_map, info) {
             objects.insert(ir_new, vo);
         }
@@ -7545,7 +7566,15 @@ fn ir_verify_reject(
     // signature". It is a no-op (and reads no clock) unless
     // `CRATONVM_JIT_METRICS=1`.
     let _metrics_phase = metrics::current_phase(metrics::Phase::Verify);
-    match ir_verify::verify_graph(graph, phase, ir_verify::VerifyOptions::from_env()) {
+    // `for_phase`, not `from_env`: the environment can only ADD lanes, and each
+    // pipeline point runs every lane that is known clean there. At
+    // `PHASE_POST_OPTIMIZE` that is the frame-state and memory-chain lanes
+    // (`ir_optimize` roots snapshots in DCE and splices the chain in DSE); after
+    // `apply_ea_to_ir` it is whatever `ir_verify::APPLY_EA_SPLICES_MEMORY_CHAIN`
+    // and `ir_verify::APPLY_EA_ROUTES_ALL_SAFEPOINTS` say. Flipping those two
+    // constants is what turns the lanes on at `"post-escape-analysis"` and
+    // `"pre-lower"` — see this function's callers.
+    match ir_verify::verify_graph(graph, phase, ir_verify::VerifyOptions::for_phase(phase)) {
         Ok(()) => false,
         Err(b) => {
             bailout::record_bailout(&b);
@@ -9947,7 +9976,11 @@ fn try_compile_inner(
                 if ir_verify::verify_enabled() {
                     ir_verify_bail |= ir_verify_reject(
                         &graph,
-                        "post-optimize",
+                        // The one hook that runs BEFORE `apply_ea_to_ir`, which
+                        // is what makes its extra lanes safe; the name is the
+                        // constant `VerifyOptions::for_phase` matches on, so the
+                        // two cannot drift.
+                        ir_verify::PHASE_POST_OPTIMIZE,
                         &cached.class_name,
                         &cached.method_name,
                         &cached.method_descriptor,
