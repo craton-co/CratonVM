@@ -223,7 +223,16 @@ struct Lowerer<'a> {
     /// Address of the checked `jit_getfield` helper. When present, `Op::Load`
     /// instance-field reads route through it so receivers are validated against
     /// the live heap before any object-header dereference.
+    ///
+    /// It is also the only compact-layout-correct `Op::Load` lowering: the
+    /// inline fallback derives `HEADER_SIZE + field_index*SLOT_SIZE`, which a
+    /// compact object does not obey. See [`compact_field_lowering_available`].
     getfield: usize,
+    /// Address of the `jit_putfield_int` helper — the compact-layout-correct
+    /// `Op::Store` lowering, for the same reason as `getfield` above. The
+    /// inline store is kept for the legacy (uniform-slot) layout, where it
+    /// avoids a call per field write.
+    putfield_int: usize,
     /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
     /// nodes use the same shared runtime-lowering stub as the baseline tier.
     new_object: usize,
@@ -237,6 +246,50 @@ struct Lowerer<'a> {
     needs_context: bool,
     /// Frame offset of the saved VM context pointer (valid iff `needs_context`).
     context_slot_off: i32,
+    /// Frame offset of the reserved safepoint-id slot (see the layout comment
+    /// in `new`). Non-zero for every IR frame; the relocation contract needs it
+    /// so the collector can tell which `OopMapEntry` describes this frame right
+    /// now, rather than unioning every map in the method (unsound to relocate).
+    sp_id_slot_off: i32,
+    shadow_thread_slot_off: i32,
+    /// Frame offsets (`[rbp - off]`) of every reference PARAMETER's prologue
+    /// home. These are not node results, so the node scan cannot find them —
+    /// see [`Lowerer::emit_safepoint_map`].
+    ref_param_homes: Vec<i16>,
+    shadow_savebase_slot_off: i32,
+    /// `get_current_thread` helper; `0` when unwired (the JIT unit tests' stub
+    /// table). Every shadow site is gated on it — dereferencing a thread
+    /// pointer that was never fetched would read stack garbage.
+    get_current_thread: usize,
+    /// Byte offset of the `ShadowStack` within `JvmThread`.
+    shadow_off_in_thread: i32,
+    /// Offsets pushed by the safepoint most recently emitted, consumed by the
+    /// matching reload. Cleared on consumption so an unbalanced push cannot
+    /// hand stale homes to a later reload.
+    pending_shadow: Vec<i16>,
+    /// Byte span of the prologue's `get_current_thread` fetch, so it can be
+    /// NOP-ed out when the method turns out never to publish.
+    thread_fetch_span: Option<(usize, usize)>,
+    /// Did any safepoint actually emit a shadow push?
+    shadow_pushed_any: bool,
+    /// Byte size of the Java-locals region, for the published `FrameLayout`.
+    locals_size: i32,
+    /// First operand-spill offset, i.e. the exclusive top of the reserved
+    /// locals region (locals + context + sp-id).
+    first_spill: i32,
+    /// Per-safepoint oop maps published for the moving-young relocation
+    /// contract. An empty vector means "no precise coverage", which
+    /// `conservative_roots` reads as a refusal — the fail-closed direction.
+    oop_maps: Vec<super::OopMapEntry>,
+    /// Nodes whose frame slot has been WRITTEN by already-emitted code. A
+    /// `Ref` node's slot is uninitialised stack garbage until its defining node
+    /// is emitted, so publishing it before then would hand the collector a
+    /// bogus root out of the previous frame's leftovers.
+    defined_nodes: Vec<bool>,
+    /// Monotonic safepoint id. Starts at 1: `sp_id_slot_off == 0` is the
+    /// "no slot" sentinel on the reader side, and a zero id in the slot means
+    /// "this frame has not reached a safepoint yet".
+    next_sp_id: u32,
     /// Frame offset of `arg[0]` in the Java-argument staging region a call
     /// marshals its args into; `arg[i]` lives at `args_stage_top_off - i*8`
     /// (increasing address), and `args_ptr = rbp - args_stage_top_off`.
@@ -323,6 +376,23 @@ impl<'a> Lowerer<'a> {
         direct_calls: &'a HashMap<usize, (usize, bool)>,
         ic_slots: &'a HashMap<usize, (usize, usize)>,
     ) -> Self {
+        // Frame homes of the reference PARAMETERS, in `[rbp - off]` form. Every
+        // safepoint map republishes these; see `emit_safepoint_map`.
+        let ref_param_homes: Vec<i16> = graph
+            .nodes
+            .iter()
+            .filter_map(|n| match n.op {
+                Op::Param(idx) if n.ty == IrType::Ref => {
+                    let off = ((idx as i32) + 1) * 8;
+                    if off > 0 && off <= i16::MAX as i32 {
+                        Some(off as i16)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
         // Gap B: scan for `Op::Call` to size the call-related frame regions.
         // `needs_context` ⇒ the method takes the VM ptr as a hidden first arg
         // and reserves a context slot. `max_call_args` sizes the Java-argument
@@ -354,12 +424,20 @@ impl<'a> Lowerer<'a> {
         // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
         let locals_size = (num_locals as i32) * 8;
         let context_size = if needs_context { 8 } else { 0 };
+        // Three extra reserved slots: the safepoint id, the cached
+        // `*mut JvmThread`, and the shadow stack's base `top` for this push.
+        let sp_id_size = 8i32 * 3;
         let spill_size = (max_nodes as i32) * 8;
         let args_stage_size = (max_call_args as i32) * 8;
         let shadow = 32i32;
         let stack_arg_reserve = 16i32;
-        let total =
-            locals_size + context_size + spill_size + args_stage_size + shadow + stack_arg_reserve;
+        let total = locals_size
+            + context_size
+            + sp_id_size
+            + spill_size
+            + args_stage_size
+            + shadow
+            + stack_arg_reserve;
         let frame_size = (total + 15) & !15;
 
         // The context slot is the first slot after the locals; spills start
@@ -391,7 +469,21 @@ impl<'a> Lowerer<'a> {
         } else {
             0
         };
-        let first_spill = (num_locals as i32 + 1 + if needs_context { 1 } else { 0 }) * 8;
+        // Relocation contract: one reserved slot holding the id of the
+        // safepoint this frame is currently stopped at. `conservative_roots`
+        // reads `[rbp - cm.sp_id_slot_off]` and matches it against `oop_maps`
+        // to find the map for the ACTIVE safepoint — a union-of-all-maps is
+        // unsound for relocation. Zero would mean "no slot", so ids start at 1.
+        let base = num_locals as i32 + 1 + if needs_context { 1 } else { 0 };
+        let sp_id_slot_off = base * 8;
+        // Cached thread pointer, fetched once in the prologue. The shadow push
+        // and reload both need it and neither may call out to get it.
+        let shadow_thread_slot_off = (base + 1) * 8;
+        // The `top` this push started from. The reload restores from exactly
+        // here, so an intervening unbalanced push cannot drift it (the
+        // single-pass backend's spring-bug-10 fix; same hazard applies here).
+        let shadow_savebase_slot_off = (base + 2) * 8;
+        let first_spill = (base + 3) * 8;
         let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
         let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
 
@@ -417,11 +509,26 @@ impl<'a> Lowerer<'a> {
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
             getfield: helpers.getfield,
+            putfield_int: helpers.putfield_int,
             new_object: helpers.new_object,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
             context_slot_off,
+            sp_id_slot_off,
+            shadow_thread_slot_off,
+            ref_param_homes,
+            shadow_savebase_slot_off,
+            get_current_thread: helpers.get_current_thread,
+            shadow_off_in_thread: helpers.shadow_stack_offset_in_thread as i32,
+            pending_shadow: Vec::new(),
+            thread_fetch_span: None,
+            shadow_pushed_any: false,
+            locals_size,
+            first_spill,
+            oop_maps: Vec::new(),
+            defined_nodes: vec![false; graph.nodes.len()],
+            next_sp_id: 1,
             args_stage_top_off,
             spill_cap_off,
             call_exc_patches: Vec::new(),
@@ -463,6 +570,14 @@ impl<'a> Lowerer<'a> {
         );
         self.next_spill += 8;
         self.node_slot[id as usize] = offset;
+        // Relocation contract: a slot becomes publishable the moment the
+        // emitting code writes it. `alloc_slot` is called at the point of
+        // emission for every node EXCEPT phis, whose slots are reserved up
+        // front by `prealloc_phi_slots` and written later by edge copies —
+        // those are marked separately, after the prologue zeroes them.
+        if !matches!(self.graph.nodes[id as usize].op, Op::Phi) {
+            self.defined_nodes[id as usize] = true;
+        }
         offset
     }
 
@@ -484,6 +599,143 @@ impl<'a> Lowerer<'a> {
         }
         s
     }
+
+    /// `CRATONVM_JIT_IR_RELOC_EMIT=0` — disable the relocation contract's EMISSION
+/// side entirely (safepoint-id stores, shadow push/reload, the prologue thread
+/// fetch), leaving the frame layout alone.
+///
+/// Exists so the cost of that emission can be A/B'd on ONE binary against a
+/// deterministic probe. Three attempts inferred it from a single run of a suite
+/// class that later turned out to be bimodal; a lever plus repeats is what that
+/// should have been. Default on, so this changes nothing unless asked.
+fn reloc_emit_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RELOC_EMIT") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+// ── Moving-young relocation contract ─────────────────────────────────
+    //
+    // What `conservative_roots` demands of a compiled frame before a young
+    // collection may RELOCATE while that frame is live:
+    //
+    //   1. a non-zero `sp_id_slot_off`, and the id of the active safepoint
+    //      stored there, so the exact map can be found (never a union);
+    //   2. an `OopMapEntry` whose `bytecode_pc` equals that id and whose
+    //      `moving_young_coverage_complete` is set. **No matching entry is a
+    //      refusal**, not an absence of objections;
+    //   3. `frame_slot_offsets` naming every frame slot that holds a live
+    //      reference, so each can be rewritten in place;
+    //   4. a `frame_layout` + `live_frame_hi` precise enough that the band scan
+    //      can tell storage this frame resumes from apart from dead spill and
+    //      outgoing-argument scratch.
+    //
+    // The IR lowerer is unusually well placed to satisfy this: it "keeps all
+    // live values in frame slots" (see `emit_safepoint_poll`), so unlike the
+    // single-pass backend there are no register-resident oops to chase — the
+    // complete root set at a safepoint is a set of frame offsets.
+
+    /// Emit the safepoint-id store and record the map for a GC-capable point.
+    ///
+    /// Call immediately BEFORE the call or allocation that can reach a
+    /// collection, and before allocating the result slot of that node — the
+    /// result slot is not written until the call returns, so publishing it as a
+    /// live reference beforehand would hand the collector uninitialised memory.
+    ///
+    /// This ALWAYS stores an id and ALWAYS records a map, even when coverage
+    /// cannot be established. Skipping either would leave the slot holding the
+    /// id of an *earlier* safepoint, and the collector would then match a map
+    /// describing a different program point and relocate against it. A map with
+    /// `moving_young_coverage_complete: false` is the fail-closed answer: the
+    /// verifier finds the entry, sees the flag, and diverts to the non-moving
+    /// sweep for that cycle.
+    fn emit_safepoint_map(&mut self, live_hi: i32) {
+        if self.sp_id_slot_off <= 0 || !Self::reloc_emit_enabled() {
+            return;
+        }
+        // `live_ref_slots` returns an empty vector for two different reasons —
+        // a genuinely oop-free safepoint, and a slot it could not describe.
+        // Distinguish them, because the first is complete coverage and the
+        // second is a refusal.
+        let mut coverable = true;
+        // Reference PARAMETER homes come first, because they are the one class
+        // of live oop that is not a node result and so cannot be found by the
+        // scan below. The prologue stores each incoming argument to
+        // `[rbp - (idx+1)*8]` and that word keeps holding the reference for the
+        // whole frame; `Op::Param`'s own spill slot is a COPY of it.
+        //
+        // Omitting them is not a partial claim, it is a false one: the band
+        // scan is conservative, so a single unpublished young word anywhere in
+        // the live band refuses the whole cycle. Measured on `IrEscapeProbe`
+        // (`CRATONVM_MOVING_YOUNG_BAND_DBG`), the two rejected words were
+        // `off=8 region=java-local` and `off=56 region=operand-spill` holding
+        // the SAME reference — the parameter home and its node copy.
+        let mut slots: Vec<i16> = self.ref_param_homes.clone();
+        for id in 0..self.defined_nodes.len() {
+            if !self.defined_nodes[id] || self.graph.nodes[id].ty != IrType::Ref {
+                continue;
+            }
+            let off = self.node_slot[id];
+            if off <= 0 || off > i16::MAX as i32 {
+                coverable = false;
+                break;
+            }
+            let off = off as i16;
+            if !slots.contains(&off) {
+                slots.push(off);
+            }
+        }
+        if !coverable {
+            slots.clear();
+        }
+
+        let id = self.next_sp_id;
+        self.next_sp_id = self.next_sp_id.wrapping_add(1);
+        // MOV qword [rbp - sp_id_slot_off], imm32 (sign-extended; ids are small)
+        self.buf.emit(&[0x48, 0xC7, 0x85]);
+        self.buf.emit(&(-self.sp_id_slot_off).to_le_bytes());
+        self.buf.emit(&id.to_le_bytes());
+
+        // Publish, and only then claim coverage. `emit_shadow_push` returns
+        // false when the thread helper is unwired or there is nothing to
+        // publish; an oop-free safepoint is still complete coverage, so the
+        // claim below requires `coverable` AND (published OR nothing to
+        // publish).
+        let published = self.emit_shadow_push(&slots);
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_RELOC").is_some() {
+            eprintln!(
+                "[ir-reloc] safepoint id={id} slots={slots:?} coverable={coverable} \
+                 published={published} thread_helper={:#x} thread_slot={} savebase={} \
+                 ss_off={}",
+                self.get_current_thread,
+                self.shadow_thread_slot_off,
+                self.shadow_savebase_slot_off,
+                self.shadow_off_in_thread,
+            );
+        }
+        self.shadow_pushed_any |= published;
+        self.pending_shadow = if published { slots.clone() } else { Vec::new() };
+        let complete = coverable && (published || slots.is_empty());
+
+        self.oop_maps.push(super::OopMapEntry {
+            // The relocation path matches on the id in the frame slot, not on
+            // this; `close_safepoint_map` fills it once the call is emitted.
+            native_pc_offset: 0,
+            bytecode_pc: id,
+            frame_slot_offsets: slots,
+            // The claim the collector acts on: the shadow stack HAS been
+            // published with every live oop of this frame, so each can be
+            // rewritten in place. Requires both halves — `coverable` (every
+            // live `Ref` slot could be named) and `published` (the push was
+            // actually emitted). Naming the slots alone is not enough:
+            // `scan_oop_slots` yields `ObjectRef` values, which mark but cannot
+            // be written back through.
+            moving_young_coverage_complete: complete,
+            live_frame_hi: live_hi,
+        });
+    }
+
 
     // ── Phi resolution (BUG FIX [jit-irlower #2]) ────────────────────────
     //
@@ -626,6 +878,281 @@ impl<'a> Lowerer<'a> {
                 break;
             }
             self.store_abi_reg(abi_regs[abi_idx], ((i as i32) + 1) * 8); // local_offset(i)
+        }
+        self.emit_frame_record();
+        self.fetch_current_thread();
+        self.zero_ref_phi_slots();
+    }
+
+    /// Publish this frame's exact RBP into the precise-maps innermost-RBP
+    /// mirror, exactly as the single-pass prologue does.
+    ///
+    /// Without it the collector cannot locate the frame at all:
+    /// `moving_young_frame_coverage_complete` needs an address to resolve
+    /// `sp_id_slot_off` and the map's slot offsets against, and
+    /// `PreciseFrameInfo::exact_rbp` is only ever a snapshot of this mirror. An
+    /// IR frame that never wrote it left the mirror holding `0`, and the
+    /// verifier refused the whole cycle with `missing-exact-rbp` — before it
+    /// ever looked at an oop map.
+    ///
+    /// That is why the relocation contract, though implemented and sound,
+    /// changed nothing observable: with `CRATONVM_JIT_FORCE_C2=1` on the
+    /// `IrEscapeProbe` the collector reported `cycles=0 coverage_fallbacks=14,
+    /// missing-exact-rbp=14` — every young collection diverted for want of a
+    /// nine-byte store, with the maps and the shadow publication both present
+    /// and correct. Emitted after the ABI parameter stores for the same reason
+    /// the single-pass backend does it there.
+    fn emit_frame_record(&mut self) {
+        if !crate::x64::precise_jit_maps_enabled() || self.frame_record == 0 {
+            return;
+        }
+        let disp = crate::x64::inline_rbp_tls_disp();
+        if disp != 0 {
+            self.emit_mov_tls_disp32_rbp(disp as u32);
+        } else {
+            // No usable TLS displacement on this target: fall back to the
+            // helper. Params are already in frame slots, so its caller-saved
+            // clobbers cost nothing here.
+            self.emit_mov_arg0_rbp();
+            self.emit_mov_reg_imm64(RAX, self.frame_record as u64);
+            self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        }
+    }
+
+    /// Restore this frame's RBP into the mirror after a call returned.
+    ///
+    /// A compiled callee publishes its OWN rbp on entry, so after it returns
+    /// the mirror names the wrong (now-dead) frame. The single-pass backend
+    /// republishes at every call site (`emit_post_call_rbp_republish`); the
+    /// shared allocation stub does the same
+    /// (`runtime_lowering::emit_post_call_frame_republish`). This is the IR
+    /// tier's equivalent, and it must not disturb RAX — the callee's return
+    /// value is still in it — which the inline TLS store satisfies for free.
+    fn emit_post_call_frame_record(&mut self) {
+        if !crate::x64::precise_jit_maps_enabled() || self.frame_record == 0 {
+            return;
+        }
+        let disp = crate::x64::inline_rbp_tls_disp();
+        if disp != 0 {
+            self.emit_mov_tls_disp32_rbp(disp as u32);
+            return;
+        }
+        self.buf.emit_byte(0x50); // PUSH RAX (preserve the Java return value)
+        #[cfg(target_os = "windows")]
+        const RESERVE: u8 = 40; // shadow space + alignment after the PUSH
+        #[cfg(not(target_os = "windows"))]
+        const RESERVE: u8 = 8; // restore 16-byte call-site alignment
+        self.buf.emit(&[0x48, 0x83, 0xEC, RESERVE]); // SUB RSP, reserve
+        self.emit_mov_arg0_rbp();
+        self.emit_mov_reg_imm64(RAX, self.frame_record as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        self.buf.emit(&[0x48, 0x83, 0xC4, RESERVE]); // ADD RSP, reserve
+        self.buf.emit_byte(0x58); // POP RAX
+    }
+
+    /// `MOV <arg0>, RBP` — for the helper form of the frame record, which is
+    /// reached only when no inline TLS displacement could be probed.
+    fn emit_mov_arg0_rbp(&mut self) {
+        const RBP_REG: u8 = 5;
+        let dest = CALL_ARG_REGS[0];
+        // REX.W (+ REX.B when the destination is R8..R15), MOV r/m64, r64.
+        self.buf
+            .emit_byte(0x48 | if dest >= 8 { 0x01 } else { 0x00 });
+        self.buf.emit_byte(0x89);
+        self.buf.emit_byte(0xC0 | (RBP_REG << 3) | (dest & 7));
+    }
+
+    /// `MOV <seg>:[disp32], RBP` — the 9-byte inline frame-record store.
+    ///
+    /// Byte-identical to the single-pass backend's `emit_mov_tls_disp32_rbp`;
+    /// both must write the SAME slot, since `inline_rbp_tls_disp()` is the one
+    /// source of truth the VM-side mirror accessor reads back.
+    fn emit_mov_tls_disp32_rbp(&mut self, disp32: u32) {
+        self.buf.emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+        self.buf.emit_byte(0x48); // REX.W
+        self.buf.emit_byte(0x89); // MOV r/m64, r64
+        self.buf.emit_byte(0x2C); // ModRM: reg=RBP, r/m=SIB
+        self.buf.emit_byte(0x25); // SIB: [disp32] absolute
+        self.buf.emit(&disp32.to_le_bytes());
+    }
+
+    /// Cache `*mut JvmThread` in its reserved slot.
+    ///
+    /// Emitted AFTER the ABI parameter stores: the helper clobbers the
+    /// caller-saved registers the parameters arrive in, and by this point they
+    /// are already in frame slots. A zero helper address (the JIT unit tests'
+    /// stub table) leaves the slot untouched, and every shadow site is gated on
+    /// the same condition, so such a method is consistently untracked rather
+    /// than dereferencing a pointer that was never fetched.
+    fn fetch_current_thread(&mut self) {
+        if self.get_current_thread == 0
+            || self.shadow_thread_slot_off <= 0
+            || !Self::reloc_emit_enabled()
+        {
+            return;
+        }
+        let start = self.buf.pos();
+        self.emit_mov_reg_imm64(RAX, self.get_current_thread as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        self.store_rax(self.shadow_thread_slot_off);
+        self.thread_fetch_span = Some((start, self.buf.pos()));
+    }
+
+    /// Lazy prologue: erase the thread fetch when nothing published.
+    ///
+    /// The fetch is a `CALL` on the ENTRY path of every IR method, and most
+    /// methods publish nothing — they hold no live reference across a call, or
+    /// make no call at all. Paying a helper call per invocation for a slot that
+    /// is then never read is what made the first publication attempt regress
+    /// `ZonedDateTimeTest` 302 s -> >1200 s while leaving shallow-stack
+    /// `ASTParserLoadingTest` untouched: the cost scales with how often methods
+    /// are ENTERED, not with stack depth.
+    ///
+    /// The single-pass backend solves this the same way (`shadow_pushed_any`).
+    /// Overwriting with `0x90` rather than shifting the body keeps every
+    /// already-recorded offset — branch patches, deopt points, oop-map native
+    /// pcs — valid, which is why this is an erase and not a removal.
+    fn finish_lazy_thread_fetch(&mut self) {
+        if self.shadow_pushed_any {
+            return;
+        }
+        if let Some((start, end)) = self.thread_fetch_span.take() {
+            for off in start..end {
+                let _ = self.buf.try_patch_byte(off, 0x90);
+            }
+        }
+    }
+
+    /// Publish every live oop of this safepoint onto the thread's shadow stack,
+    /// so a relocating collector can rewrite each one in place.
+    ///
+    /// This is the half that `moving_young_coverage_complete` actually asserts.
+    /// The oop map names the slots; only this makes them *rewritable*, because
+    /// `scan_oop_slots` yields `ObjectRef` values (marking roots) while
+    /// `published_shadow_values` yields the homes the collector writes back to.
+    ///
+    /// Registers: R10 (thread), R11 (running top), RCX (value temp). All
+    /// caller-saved and free here — this runs at the top of the `Op::Call` arm,
+    /// before any argument staging or ABI register loading.
+    ///
+    /// Returns whether the push was actually emitted.
+    fn emit_shadow_push(&mut self, offsets: &[i16]) -> bool {
+        if self.get_current_thread == 0
+            || self.shadow_thread_slot_off <= 0
+            || self.shadow_savebase_slot_off <= 0
+            || offsets.is_empty()
+        {
+            return false;
+        }
+        let ss_top = self.shadow_off_in_thread;
+        // MOV R10, [rbp - thread_slot]
+        self.buf.emit(&[0x4C, 0x8B, 0x95]);
+        self.buf.emit(&(-self.shadow_thread_slot_off).to_le_bytes());
+        // TEST R10, R10 ; JE skip  — a null thread means "untracked", exactly
+        // as in the single-pass backend; the reload's guard is symmetric.
+        self.buf.emit(&[0x4D, 0x85, 0xD2]);
+        self.buf.emit(&[0x0F, 0x84]);
+        let skip = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // MOV R11, [R10 + ss_top]      (current top)
+        self.buf.emit(&[0x4D, 0x8B, 0x9A]);
+        self.buf.emit(&ss_top.to_le_bytes());
+        // MOV [rbp - savebase], R11    (base of THIS push)
+        self.buf.emit(&[0x4C, 0x89, 0x9D]);
+        self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        for &off in offsets {
+            // MOV RCX, [rbp - off] ; MOV [R11], RCX ; LEA R11, [R11 + 8]
+            self.buf.emit(&[0x48, 0x8B, 0x8D]);
+            self.buf.emit(&(-(off as i32)).to_le_bytes());
+            self.buf.emit(&[0x49, 0x89, 0x0B]);
+            self.buf.emit(&[0x4D, 0x8D, 0x5B, 0x08]);
+        }
+        // MOV [R10 + ss_top], R11      (publish the new top)
+        self.buf.emit(&[0x4D, 0x89, 0x9A]);
+        self.buf.emit(&ss_top.to_le_bytes());
+        self.patch_rel32_to_here(skip);
+        true
+    }
+
+    /// Copy the (possibly rewritten) published values back into their frame
+    /// slots and retract `top`. Pairs with [`Self::emit_shadow_push`].
+    ///
+    /// Emitted immediately after the call returns — deliberately BEFORE the
+    /// result is stored. The single-pass backend uses RAX as its value temp,
+    /// which would collide with the return value and force this after the
+    /// store; RCX held an outgoing argument and is dead the instant the call
+    /// returns, so using it keeps RAX untouched and lets this sit at the one
+    /// choke point (`emit_call_return_check`) all dispatch routes share.
+    fn emit_shadow_reload(&mut self) {
+        let offsets = std::mem::take(&mut self.pending_shadow);
+        if self.get_current_thread == 0
+            || self.shadow_thread_slot_off <= 0
+            || self.shadow_savebase_slot_off <= 0
+            || offsets.is_empty()
+        {
+            return;
+        }
+        let ss_top = self.shadow_off_in_thread;
+        // MOV R10, [rbp - thread_slot] ; TEST ; JE skip  (mirrors the push)
+        self.buf.emit(&[0x4C, 0x8B, 0x95]);
+        self.buf.emit(&(-self.shadow_thread_slot_off).to_le_bytes());
+        self.buf.emit(&[0x4D, 0x85, 0xD2]);
+        self.buf.emit(&[0x0F, 0x84]);
+        let skip = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // MOV R11, [rbp - savebase]    (restore from THIS push's base, not the
+        // live `top`, so an unbalanced intervening push cannot drift it)
+        self.buf.emit(&[0x4C, 0x8B, 0x9D]);
+        self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        for &off in &offsets {
+            // MOV RCX, [R11] ; MOV [rbp - off], RCX ; LEA R11, [R11 + 8]
+            self.buf.emit(&[0x49, 0x8B, 0x0B]);
+            self.buf.emit(&[0x48, 0x89, 0x8D]);
+            self.buf.emit(&(-(off as i32)).to_le_bytes());
+            self.buf.emit(&[0x4D, 0x8D, 0x5B, 0x08]);
+        }
+        // MOV R11, [rbp - savebase] ; MOV [R10 + ss_top], R11  (retract top)
+        self.buf.emit(&[0x4C, 0x8B, 0x9D]);
+        self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        self.buf.emit(&[0x4D, 0x89, 0x9A]);
+        self.buf.emit(&ss_top.to_le_bytes());
+        self.patch_rel32_to_here(skip);
+    }
+
+
+
+    /// Zero the frame slot of every `Ref`-typed phi, and mark those slots
+    /// publishable.
+    ///
+    /// Phi slots are reserved by `prealloc_phi_slots` before any code runs and
+    /// are written later, by the edge copy of whichever predecessor is taken.
+    /// A safepoint reached on a path that has not yet written one would
+    /// otherwise see the previous frame's leftovers through a slot the oop map
+    /// claims is a live reference — the collector would then follow, and
+    /// rewrite, a garbage word.
+    ///
+    /// Zeroing makes the unwritten state a null reference, which every root
+    /// consumer already handles, so the whole phi set becomes safe to publish
+    /// unconditionally. The alternative — proving per-safepoint which phis are
+    /// written on every path reaching it — is a dataflow problem for a handful
+    /// of stores. Only `Ref` phis are zeroed; a primitive phi read before its
+    /// write would be a lowering bug, not a GC one, and zeroing it would hide
+    /// that.
+    fn zero_ref_phi_slots(&mut self) {
+        let refs: Vec<(usize, i32)> = (0..self.graph.nodes.len())
+            .filter(|&id| {
+                matches!(self.graph.nodes[id].op, Op::Phi)
+                    && self.graph.nodes[id].ty == IrType::Ref
+            })
+            .map(|id| (id, self.node_slot[id]))
+            .filter(|&(_, off)| off > 0)
+            .collect();
+        for (id, off) in refs {
+            // MOV qword [rbp - off], 0
+            self.buf.emit(&[0x48, 0xC7, 0x85]);
+            self.buf.emit(&(-off).to_le_bytes());
+            self.buf.emit(&0u32.to_le_bytes());
+            self.defined_nodes[id] = true;
         }
     }
 
@@ -1047,6 +1574,11 @@ impl<'a> Lowerer<'a> {
         let patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
         self.self_call_patches.push(patch);
+        // The recursive callee published ITS frame's RBP into the mirror on
+        // entry. This route bypasses `emit_call_return_check`, so it has to
+        // republish here or the mirror keeps naming the returned frame — which
+        // for a deeply recursive method is every frame but the right one.
+        self.emit_post_call_frame_record();
         // Exception/deopt sentinel — identical to the dispatch path's return
         // check. Integer/reference results cannot equal the full-width sentinel;
         // wide returns can legitimately carry those bits (for example
@@ -1514,6 +2046,20 @@ impl<'a> Lowerer<'a> {
     /// spilled to `slot` (harmless for a void call: the slot is allocated but
     /// never read).
     fn emit_call_return_check(&mut self, slot: i32, ty: IrType) {
+        // The call has just returned. Copy back any relocated shadow values
+        // BEFORE anything else touches the frame — and before the sentinel
+        // compare below, which clobbers R10. Uses RCX, never RAX, so the return
+        // value in RAX is untouched (see `emit_shadow_reload`). This is the one
+        // site all three dispatch routes share; the self-recursive route does
+        // not reach here and does not publish.
+        //
+        // The RBP republish comes first because the reload's own correctness
+        // does not depend on it, but the frame's identity to the collector
+        // does: the callee overwrote the mirror with its own RBP on entry, and
+        // any safepoint reached between here and the next call would otherwise
+        // resolve this frame's maps against a dead frame's base.
+        self.emit_post_call_frame_record();
+        self.emit_shadow_reload();
         self.emit_mov_reg_imm64(R10, i64::MIN as u64);
         self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
         if matches!(ty, IrType::Long | IrType::Double | IrType::Float) {
@@ -2107,6 +2653,32 @@ impl<'a> Lowerer<'a> {
                 let pay_off = tag_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
                 let high_off = tag_off + 8; // the 8-byte payload region (Long/ref)
                 let bci = node.bytecode_pc.unwrap_or(0);
+                // Compact layout packs field offsets, so the uniform
+                // `field_index * SLOT_SIZE` displacement below is wrong for a
+                // compact object. Route the write through `jit_putfield_int`,
+                // which resolves the packed offset from the receiver's
+                // registered layout — the same helper the baseline tier uses.
+                //
+                // The null check stays INLINE and still deopts. The helper
+                // returns silently on an implausible receiver, so calling it
+                // unguarded would convert a NullPointerException into a
+                // dropped store — the exact silent-data-loss defect the inline
+                // path was fixed for in cd451faccc.
+                if cratonvm_types::compact_ref_fields_enabled() {
+                    self.load_to_rax(self.slot_of(base));
+                    self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                    self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+                    // jit_putfield_int(obj_ptr, field_index, val) — no context.
+                    // Receiver first: `load_reg_from_frame` into arg0 would be
+                    // clobbered by nothing here, but keep the order arg0..arg2
+                    // so a future stack-arg spill sees a conventional sequence.
+                    self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(base));
+                    self.emit_mov_reg_imm64(CALL_ARG_REGS[1], field_index as i64 as u64);
+                    self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(value));
+                    self.emit_mov_reg_imm64(RAX, self.putfield_int as u64);
+                    self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                    return;
+                }
                 // Receiver → RAX, value → RCX.
                 self.load_to_rax(self.slot_of(base));
                 self.load_to_rcx(self.slot_of(value));
@@ -2201,6 +2773,16 @@ impl<'a> Lowerer<'a> {
                 self.store_rax(slot);
             }
             Op::Call { info_ptr } => {
+                // Relocation contract: publish the map for this GC-capable
+                // point BEFORE `alloc_slot`. Every route out of this arm can
+                // reach a collection, and `alloc_slot` marks the call's own
+                // result slot defined — but that slot is not written until the
+                // call RETURNS, so covering it here would publish whatever the
+                // previous frame left at that offset as a live reference.
+                // `live_frame_hi` is the spill cursor as it stands now, i.e.
+                // before this node's result slot is carved.
+                let sp_live_hi = self.next_spill;
+                self.emit_safepoint_map(sp_live_hi);
                 let slot = self.alloc_slot(id);
                 let num_args = node.inputs.len().saturating_sub(2);
                 // fib44-fix follow-up: invoke_kind 4 marks a self-recursive call
@@ -2211,6 +2793,16 @@ impl<'a> Lowerer<'a> {
                 // the whole compile. `lower_data_node` has no post-`match` code,
                 // so an early `return` here fully handles the node.
                 if unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind } == 4 {
+                    // This route bypasses `emit_call_return_check`, so nothing
+                    // would reload the published values afterwards and the
+                    // frame would keep pre-relocation addresses. Withdraw the
+                    // claim for this safepoint and drop the pending homes; the
+                    // collector then diverts to the non-moving sweep whenever
+                    // such a frame is live, which is correct if unambitious.
+                    if let Some(last) = self.oop_maps.last_mut() {
+                        last.moving_young_coverage_complete = false;
+                    }
+                    self.pending_shadow.clear();
                     self.emit_self_recursive_call(&node.inputs, slot, num_args);
                     return;
                 }
@@ -3266,6 +3858,28 @@ pub(crate) fn lower_inner(
     {
         return None;
     }
+    // Compact field layout (default ON) packs field offsets, so `Op::Load` and
+    // `Op::Store`'s inline `HEADER_SIZE + field_index*SLOT_SIZE` displacements
+    // are wrong for a compact object. Both have a compact-correct alternative —
+    // the `jit_getfield` / `jit_putfield_int` helpers — so the only unlowerable
+    // combination is "compact layout on AND the helper address absent", which
+    // in practice means a synthetic unit-test helper table.
+    //
+    // This check used to live in `IrBuilder::build` as an unconditional bail on
+    // the getfield/putfield opcodes themselves, which refused every
+    // field-accessing method — most of real Java — from the optimizing tier
+    // regardless of which lowering would have been chosen. Keeping it here
+    // states the actual constraint: it is a property of one lowering, not of
+    // the opcode.
+    if cratonvm_types::compact_ref_fields_enabled() {
+        let needs_getfield_helper = helpers.getfield == 0
+            && graph.nodes.iter().any(|n| matches!(n.op, Op::Load(_)));
+        let needs_putfield_helper = helpers.putfield_int == 0
+            && graph.nodes.iter().any(|n| matches!(n.op, Op::Store(_)));
+        if needs_getfield_helper || needs_putfield_helper {
+            return None;
+        }
+    }
     // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
     // lowering: an arithmetic node emits well under 32 bytes, but a single
     // MIC + 4-way-PIC dual-ABI inline-cache site emits ~360 and a direct call
@@ -3346,6 +3960,7 @@ pub(crate) fn lower_inner(
     // dispatch site's sentinel `JE` reaches it.
     lowerer.emit_call_exc_stub();
 
+    lowerer.finish_lazy_thread_fetch();
     lowerer.patch_branches();
     // fib44-fix follow-up: patch direct self-recursive calls to the method entry.
     lowerer.patch_self_calls();
@@ -3358,6 +3973,16 @@ pub(crate) fn lower_inner(
     // Gap B: a method containing an `Op::Call` takes the VM context pointer as a
     // hidden first arg, so it must be invoked via `try_call_with_context`.
     let needs_context = lowerer.needs_context;
+
+    // Relocation-contract values, read off the lowerer before `buf` moves out.
+    let sp_id_slot_off = lowerer.sp_id_slot_off;
+    let shadow_thread_slot_off = lowerer.shadow_thread_slot_off;
+    let shadow_savebase_slot_off = lowerer.shadow_savebase_slot_off;
+    let oop_maps = std::mem::take(&mut lowerer.oop_maps);
+    let locals_size = lowerer.locals_size;
+    let first_spill = lowerer.first_spill;
+    let spill_cap_off = lowerer.spill_cap_off;
+    let frame_size = lowerer.frame_size;
 
     let buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
@@ -3377,6 +4002,64 @@ pub(crate) fn lower_inner(
     let mut cm = CompiledMethod::new(buf);
     cm.deopt_points = deopt_points;
     cm._deopt_point_boxes = deopt_boxes;
+
+    // ── Moving-young relocation contract ────────────────────────────────
+    //
+    // Publish what `conservative_roots` needs to decide, per frame, whether a
+    // relocating young collection may proceed while this frame is live. Before
+    // this the IR backend published NOTHING — no maps, no frame layout, no
+    // safepoint-id slot — and an empty `oop_maps` reads as "no precise
+    // coverage", so every live IR frame forced the non-moving sweep. That is
+    // also why the optimizing tier was gated off under moving-young.
+    //
+    // The frame the lowerer builds, from `rbp` downward:
+    //
+    //     locals | [context] | sp-id | spills … | arg staging | argrsv | shadow
+    //     ^0       ^locals    ^       ^first_spill            ^spill_cap_off
+    //
+    // `callee_saved_lo` names the start of the region the verifier must NOT
+    // inspect. The IR prologue saves no callee-saved registers (it uses only
+    // caller-saved scratch), so that region here is not a register save area
+    // but the outgoing-argument staging, the stack-arg reserve and the ABI
+    // shadow space — scratch this frame never resumes from, and full of dead
+    // argument words. That is exactly the role the field plays on the reader
+    // side (`band_slot_is_verifiable` skips everything at or above it).
+    cm.sp_id_slot_off = sp_id_slot_off;
+    cm.oop_maps = oop_maps;
+    cm.osr_frame_size = frame_size;
+    // Where the reader finds what the emission side published. Without these
+    // three, `shadow_window_from_frame` cannot even locate the shadow stack —
+    // it returns `None`, `published_shadow_values` yields the empty set, and
+    // EVERY published word then reads back as unpublished. That is not a
+    // partial failure that shows up as a smaller win: it makes a fully correct
+    // publication indistinguishable from no publication at all, and it is what
+    // `compiled-frame-oop-not-published` meant on `IrEscapeProbe` after the
+    // maps, the frame record and the parameter homes were all in place.
+    cm.shadow_thread_slot_off = shadow_thread_slot_off;
+    cm.shadow_savebase_slot_off = shadow_savebase_slot_off;
+    cm.shadow_off_in_thread = helpers.shadow_stack_offset_in_thread as i32;
+    cm.frame_layout = super::FrameLayout {
+        java_locals_hi: locals_size,
+        // No LICM hoists, no scalar-replacement slots and no per-safepoint
+        // blind GPR spill in this backend: empty ranges (`hi == lo`), which
+        // `is_register_image` and `region_name` both read as "absent".
+        ref_hoist_lo: 0,
+        ref_hoist_hi: 0,
+        arith_lo: 0,
+        arith_hi: 0,
+        scalar_lo: 0,
+        scalar_hi: 0,
+        locals_hi: first_spill,
+        spill_lo: first_spill,
+        spill_hi: spill_cap_off,
+        callee_saved_lo: spill_cap_off,
+        callee_saved_hi: frame_size,
+        xmm_saved_lo: 0,
+        xmm_saved_hi: 0,
+        reg_spill_lo: 0,
+        reg_spill_hi: 0,
+        frame_size,
+    };
     if needs_context {
         cm.needs_context = true;
     }
