@@ -3,7 +3,9 @@
 ## Status
 **FIXED 2026-07-31**, branch `fix/vm-latestuserdefinedloader0-20260731`
 (merged to `dev`). All three reported H2 test classes now produce output
-**byte-identical to HotSpot JDK 25**. Retired from `docs/known-issues/h2/`.
+**byte-identical to HotSpot JDK 25**, and **63 of the Spring Framework suite's
+90 FAIL classes flipped to OK** in a controlled A/B on the same host. Retired
+from `docs/known-issues/h2/`.
 
 ## The bug, confirmed
 The doc's root cause was correct. `registry.register("jdk/internal/misc/VM",
@@ -99,6 +101,39 @@ CI therefore built and tested a binary that **had** the native, every suite
 session built one that did not, and no test in either configuration could see
 the difference. Note what this does to a test named "…in a default build":
 under `cargo test --workspace` it is not running in a default build at all.
+
+## Blast radius: this was never an H2 bug
+`dev` `0c54a91849` (2026-07-31, landed while this fix was in flight) appended
+independent confirmation from the Spring Framework suite to the original
+report: a full 2847-class 4-shard run on a plain
+`cargo build --release -p cratonvm-cli` hit this identical
+`UnsatisfiedLinkError` on **61 of 90 FAIL classes — 68% of that run's entire
+FAIL count**, across `spring-aop`, `spring-context`, `spring-tx`,
+`spring-orm`, `spring-context-support`, `spring-messaging`, `spring-core`,
+`spring-web` and `spring-webmvc`. Every one is a test whose method involves
+Java serialization (`serializable()`, `canSerializeProxies()`, …). That
+addendum is preserved verbatim below.
+
+The three H2 classes in the title of this report were, as it guessed, "the
+first three of many".
+
+**Post-fix, interleaved A/B on the same host, same runner, same day.** The 63
+classes were extracted from that run's `full-failcauses.log` (the addendum says
+61; the log's exact count is 63) and re-run through
+`apps/spring-suite-runner/runlist.sh`, 6 shards, `--jdk real --jit on`,
+one VM per class:
+
+| binary | tally | `latestUserDefinedLoader0` failcauses |
+| --- | --- | --- |
+| fix-free control (`7656ad3968`, built same day) | **63 FAIL** | 63 classes |
+| this branch | **63 OK** | 0 |
+
+Zero failcauses and zero crashes in the fixed run. The control is a *repeat*
+of the baseline rather than the original 03:17 run's numbers, so the delta is
+not confounded by the other commits that landed between them.
+
+63 of the suite's 90 FAIL classes — 70% of its entire FAIL count — were this
+one `#[cfg]`.
 
 ## Guards added
 - `native-builtins/src/lib.rs`:
@@ -255,6 +290,46 @@ the symbol in a build with the feature(s) enabled; a default `--release`
 build should not register it as a runtime `NativeMethodRegistry` entry
 (check the `[NativeBridge] N unregistered native methods` startup
 diagnostic, or grep the registered-natives dump if one exists).
+
+### Confirmed independently via the Spring Framework suite (2026-07-31) — much larger blast radius than H2 alone
+
+Same day, different suite, same root cause: a full 2847-class Spring
+Framework suite run (dev `2f138f04e3`, 4-shard, `apps/spring-suite-runner`,
+plain `cargo build --release -p cratonvm-cli` — no extra `--features`, same
+default build this doc already describes) hit the identical
+`UnsatisfiedLinkError: jdk/internal/misc/VM.latestUserDefinedLoader0()Ljava/lang/ClassLoader;`
+on **61 of 90 FAIL classes (68% of that run's entire FAIL count)** — every
+one a test whose method name involves Java serialization (`serializable()`,
+`canSerializeProxies()`, `cacheExceptionRewriteCallStack()`, etc.), spread
+across modules with no other relationship: `spring-aop` (proxy
+serialization — `AspectProxyFactoryTests`, `CglibProxyTests`,
+`JdkDynamicProxyTests`, `MethodMatchersTests`, `AopUtilsTests`, and 9 more),
+`spring-context` (`StaticApplicationContextTests`,
+`ComponentScanAnnotationIntegrationTests`, and others), `spring-tx`
+(`TransactionInterceptorTests`, `AnnotationDrivenTests`,
+`TransactionAttributeSourceAdvisorTests`), `spring-orm` (every
+`HibernateEntityManagerFactory*IntegrationTests` and
+`EclipseLinkEntityManagerFactory*IntegrationTests` variant's
+`canSerializeProxies()`), `spring-context-support` (all of
+`JCacheAspectJ*Tests`/`JCacheJavaConfigTests`/`JCacheNamespaceDrivenTests`/`JCacheStandaloneConfigTests`),
+`spring-messaging`, `spring-core`, `spring-web`, `spring-webmvc`.
+
+This confirms the doc's own severity assessment ("MEDIUM-HIGH... any code
+that round-trips a `Serializable` object") was if anything an
+**underestimate** — this is not an H2-specific or even a database-adjacent
+gap, it is the single highest-yield native-registration fix currently
+available across the whole Spring suite. Fixing the Cargo feature gate
+described above would very likely flip most or all of these 61 classes to
+OK in one build, since the actual native implementation
+(`latest_user_defined_loader_class`) is already correct and unmodified —
+this needs zero new Rust logic, only moving the `registry.register(...)`
+call out from under `#[cfg(any(feature = "experimental-serialization",
+feature = "synthetic-jdk"))]`.
+
+Full affected-class list from this run available in the Spring suite
+session's own investigation; not reproduced here in full to avoid
+duplicating this doc's existing H2-side detail — the point of this addendum
+is blast-radius evidence, not a new investigation.
 
 ### Related
 `docs/internal/fixed-suite-bugs/hibernate/hib-linux-fail-bucket-triage-20260703.md`
