@@ -35,6 +35,10 @@ CRATONVM_JAVA_HOME=<real jdk> cratonvm -cp classes HashSetInitProbe 20000 28
 
 Both are byte-clean on HotSpot; a `PROBE-FAILED` line is a CratonVM defect.
 
+`-Dcvm.probe.selftest=1` on `WflyAttrSetProbe` skips the
+`hornetq-store-enable-async-io` remove — the exact state a real failure leaves —
+and must turn every round into a `FAIL`. Run it before trusting a clean pass.
+
 ## Real WildFly boots
 
 Needs a WildFly 32 distribution (the campaigns used
@@ -65,8 +69,27 @@ sequence `-Dcvm.dupattr.reps=N` times **inside the real
 * `registry` — the `HashMap<String, AttributeAccess>` `containsKey`/`put`
   sequence from `ConcreteResourceRegistration.storeAttribute`.
 
+`-Dcvm.dupattr.threads=N` runs the canary on N threads. Prefer 8 × 2000 over
+1 × 16000: a single-threaded loop reproduces the rate but not the concurrency,
+and its later reps run after every other extension has finished, in a quiet VM.
+
 It also leaves an always-on check on the ONE real sequence
 (`CVM-DUPATTR-REAL FAIL`), so an unamplified occurrence is still caught.
+
+### Prove the detectors can fire
+
+`CANARY_SELFTEST=1 ./wfboot.sh …` (or `-Dcvm.dupattr.selftest=1`) skips the
+`hornetq-store-enable-async-io` remove and re-adds it to the real set. That one
+change must produce, in a single boot:
+
+* `CVM-DUPATTR-CANARY FAIL` in all three modes,
+* `CVM-DUPATTR-REAL FAIL` from the real sequence,
+* WildFly's own `WFLYCTL0079` / `WFLYCTL0043` for that attribute — byte-identical
+  to the historical capture, which is what pins the root cause to this one
+  `Set.remove`,
+* `wfboot.sh` exit 3 (`HIT`).
+
+Always run it once before reporting a clean campaign.
 
 ```bash
 cp <wildfly-src>/transactions/src/main/java/org/jboss/as/txn/subsystem/\

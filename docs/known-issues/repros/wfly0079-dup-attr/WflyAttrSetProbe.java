@@ -105,6 +105,8 @@ public class WflyAttrSetProbe {
         }
     }
 
+    static final boolean SELFTEST = System.getProperty("cvm.probe.selftest") != null;
+
     static final AtomicLong iterations = new AtomicLong();
     static final AtomicLong failures = new AtomicLong();
     static volatile Object sink;
@@ -144,6 +146,13 @@ public class WflyAttrSetProbe {
         }
         Set<Attr> attributes = new HashSet<>(Arrays.asList(attrs));
         for (int idx : REMOVE_IDX) {
+            // NEGATIVE CONTROL: with -Dcvm.probe.selftest=1 the
+            // hornetq-store-enable-async-io remove is skipped, which is exactly
+            // the state a real failure would leave behind. The probe MUST then
+            // report it — otherwise a clean run proves nothing.
+            if (SELFTEST && idx == 26) {
+                continue;
+            }
             attributes.remove(attrs[idx]);
         }
 

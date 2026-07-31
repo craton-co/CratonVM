@@ -29,6 +29,8 @@ setsid "$WF/bin/standalone.sh" \
   -Djboss.bind.address=127.0.0.1 \
   -Djboss.bind.address.management=127.0.0.1 \
   -Dcvm.dupattr.reps="$REPS" \
+  -Dcvm.dupattr.threads="${CANARY_THREADS:-1}" \
+  ${CANARY_SELFTEST:+-Dcvm.dupattr.selftest=1} \
   > "$CONSOLE" 2>&1 &
 P=$!
 

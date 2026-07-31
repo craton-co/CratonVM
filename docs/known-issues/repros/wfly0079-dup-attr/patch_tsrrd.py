@@ -58,9 +58,21 @@ REPLACEMENT = """    // --- CratonVM WFLYCTL0079 canary (additive; inert without
         return sb == null ? null : sb.toString();
     }
 
+    /**
+     * NEGATIVE CONTROL. With -Dcvm.dupattr.selftest=1 the
+     * hornetq-store-enable-async-io remove is skipped, leaving exactly the
+     * state a real failure produces. Every canary mode MUST then report a
+     * failure — otherwise a clean campaign proves nothing about the canary.
+     */
+    private static final boolean CVM_SELFTEST =
+            System.getProperty("cvm.dupattr.selftest") != null;
+
     private static Set<AttributeDefinition> cvmBuildWithoutMutuals() {
         Set<AttributeDefinition> s = new HashSet<>(Arrays.asList(add_attributes));
         for (AttributeDefinition mutual : CVM_MUTUALS) {
+            if (CVM_SELFTEST && mutual == HORNETQ_STORE_ENABLE_ASYNC_IO) {
+                continue;
+            }
             s.remove(mutual);
         }
         return s;
@@ -144,11 +156,47 @@ REPLACEMENT = """    // --- CratonVM WFLYCTL0079 canary (additive; inert without
         return null;
     }
 
+    private static final java.util.concurrent.atomic.AtomicInteger CVM_BAD =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * The real failure happens once, on ONE of ~40 threads that are all
+     * initializing extensions at the same time. A single-threaded rep loop
+     * reproduces the rate but not the concurrency -- and its later reps run
+     * after every other extension has finished, in a quiet VM. Running the
+     * canary on several threads restores the concurrent-allocation profile
+     * and multiplies the rate at the same time.
+     */
     private static void cvmDupAttrCanary() {
         int reps = Integer.getInteger("cvm.dupattr.reps", 0);
         if (reps <= 0) {
             return;
         }
+        int nthreads = Integer.getInteger("cvm.dupattr.threads", 1);
+        if (nthreads <= 1) {
+            cvmCanaryLoop(reps);
+        } else {
+            Thread[] ts = new Thread[nthreads];
+            for (int t = 0; t < nthreads; t++) {
+                ts[t] = new Thread(() -> cvmCanaryLoop(reps), "cvm-dupattr-" + t);
+                ts[t].start();
+            }
+            for (Thread t : ts) {
+                try {
+                    t.join();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+        System.out.println("CVM-DUPATTR-CANARY done reps=" + reps
+                + " threads=" + Math.max(nthreads, 1)
+                + " bad=" + CVM_BAD.get()
+                + " thread=" + Thread.currentThread().getName());
+        System.out.flush();
+    }
+
+    private static void cvmCanaryLoop(int reps) {
         int expected = add_attributes.length - CVM_MUTUALS.length;
         int bad = 0;
         for (int i = 0; i < reps; i++) {
@@ -180,6 +228,9 @@ REPLACEMENT = """    // --- CratonVM WFLYCTL0079 canary (additive; inert without
                 AttributeDefinition[] fresh = cvmFreshAttrs();
                 Set<AttributeDefinition> s = new HashSet<>(Arrays.asList(fresh));
                 for (AttributeDefinition mutual : CVM_MUTUALS) {
+                    if (CVM_SELFTEST && mutual == HORNETQ_STORE_ENABLE_ASYNC_IO) {
+                        continue;
+                    }
                     s.remove(fresh[cvmIndexOf(fresh, mutual)]);
                 }
                 String survivors = cvmSurvivorsFresh(s, fresh);
@@ -193,9 +244,7 @@ REPLACEMENT = """    // --- CratonVM WFLYCTL0079 canary (additive; inert without
                 }
             }
         }
-        System.out.println("CVM-DUPATTR-CANARY done reps=" + reps + " bad=" + bad
-                + " thread=" + Thread.currentThread().getName());
-        System.out.flush();
+        CVM_BAD.addAndGet(bad);
     }
 
     @Override
@@ -209,7 +258,15 @@ text = text.replace(ANCHOR, REPLACEMENT)
 ANCHOR2 = """        OperationStepHandler writeHandler = new ReloadRequiredWriteAttributeHandler(attributesWithoutMutuals);
         for(final AttributeDefinition def : attributesWithoutMutuals) {"""
 assert text.count(ANCHOR2) == 1, "writeHandler anchor not unique"
-REPLACEMENT2 = """        String cvmSurvivors = cvmSurvivors(attributesWithoutMutuals);
+REPLACEMENT2 = """        if (CVM_SELFTEST) {
+            // End-to-end negative control: put the attribute back, which is
+            // precisely the state a failed remove() leaves. The boot must then
+            // report CVM-DUPATTR-REAL FAIL *and* die with the real
+            // WFLYCTL0043, proving both the canary and wfboot.sh's HIT
+            // classification can actually fire.
+            attributesWithoutMutuals.add(HORNETQ_STORE_ENABLE_ASYNC_IO);
+        }
+        String cvmSurvivors = cvmSurvivors(attributesWithoutMutuals);
         if (cvmSurvivors != null) {
             System.out.println("CVM-DUPATTR-REAL FAIL size=" + attributesWithoutMutuals.size()
                     + " survivors=" + cvmSurvivors
