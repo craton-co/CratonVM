@@ -41413,21 +41413,35 @@ mod tests {
         let arr_val = shared.mem.heap.get_field(b_ref, 0);
         let new_arr = arr_val.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(new_arr), 2);
-        // Boxed values stored directly (simplified)
+        // `IntStream.boxed()` produces real `java.lang.Integer` objects, which
+        // is the whole point of the method. `get_array_element_unboxing` only
+        // unwraps the VM's `AUTOBOX_CLASS_ID` sentinel, not a genuine wrapper,
+        // so it hands back the reference — this used to assert the raw ints
+        // that an earlier, non-boxing `boxed()` left in the array.
+        let unbox = |v: Value| -> Value {
+            match v {
+                Value::Object(Some(o)) => shared.mem.heap.get_field(o, 0),
+                other => other,
+            }
+        };
         assert_eq!(
-            shared
-                .mem
-                .heap
-                .get_array_element_unboxing(new_arr, 0)
-                .unwrap(),
+            unbox(
+                shared
+                    .mem
+                    .heap
+                    .get_array_element_unboxing(new_arr, 0)
+                    .unwrap()
+            ),
             Value::Int(5)
         );
         assert_eq!(
-            shared
-                .mem
-                .heap
-                .get_array_element_unboxing(new_arr, 1)
-                .unwrap(),
+            unbox(
+                shared
+                    .mem
+                    .heap
+                    .get_array_element_unboxing(new_arr, 1)
+                    .unwrap()
+            ),
             Value::Int(10)
         );
     }
