@@ -8785,6 +8785,15 @@ fn native_sw_append_cs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 const DIS_FIELD_IN: usize = 0;
 const DOS_FIELD_OUT: usize = 0;
+/// Slot fallback for the `written` counter.
+///
+/// `written` is normally addressed by NAME, which works against a real-JDK
+/// `DataOutputStream`. A synthetically-allocated one has no field names at all
+/// (`ensure_synthetic_class` mints unnamed slots), so both the read and the
+/// write silently no-op and `size()` reported 0 no matter how many bytes went
+/// out. Keep the by-name path — it is the one that matches the real layout —
+/// and fall back to this slot when the name does not resolve.
+const DOS_WRITTEN_SLOT: usize = 1;
 // NOTE: `written` is NOT at a fixed low slot. The real JDK layout is
 // FilterOutputStream{out, closed, closeLock} then DataOutputStream{written, …},
 // so `written` lives at slot 3 — NOT slot 1 (which is `closed`). These natives
@@ -9640,7 +9649,7 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(None),
     };
     ctx.set_field(this, DOS_FIELD_OUT, args[1]);
-    ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(0));
+    dos_set_written(ctx, this, 0);
     // Real JDK 25's `DataOutputStream(OutputStream)` constructor also
     // allocates `private final byte[] writeBuffer = new byte[8]` -- an
     // internal scratch buffer real bytecode for `writeChars`/`writeUTF`
@@ -9671,6 +9680,29 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// (the pre-fix `writeUTF` loop handed a stale `this` to every iteration
 /// after a GC, tripping CRATONVM_DBG_STALE_OBJREF in the WildFly Host
 /// Controller).
+/// Read the `written` counter, by name where the receiver has real field
+/// names and from [`DOS_WRITTEN_SLOT`] otherwise.
+fn dos_written(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    if let Value::Int(w) = ctx.get_field_by_name(this, DOS_WRITTEN_FIELD) {
+        return w;
+    }
+    if ctx.object_num_fields(this) > DOS_WRITTEN_SLOT {
+        if let Value::Int(w) = ctx.get_field(this, DOS_WRITTEN_SLOT) {
+            return w;
+        }
+    }
+    0
+}
+
+/// Companion writer for [`dos_written`]. Writes BOTH spellings so a receiver
+/// that later resolves by name agrees with one that only has slots.
+fn dos_set_written(ctx: &mut dyn NativeContext, this: ObjectRef, v: i32) {
+    ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(v));
+    if ctx.object_num_fields(this) > DOS_WRITTEN_SLOT {
+        ctx.set_field(this, DOS_WRITTEN_SLOT, Value::Int(v));
+    }
+}
+
 fn dos_write_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -9685,11 +9717,8 @@ fn dos_write_one(
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     r?;
-    let written = match ctx.get_field_by_name(this, DOS_WRITTEN_FIELD) {
-        Value::Int(w) => w,
-        _ => 0,
-    };
-    ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(written + 1));
+    let written = dos_written(ctx, this);
+    dos_set_written(ctx, this, written + 1);
     Ok(this)
 }
 
@@ -9904,11 +9933,7 @@ fn native_dos_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let written = match ctx.get_field_by_name(this, DOS_WRITTEN_FIELD) {
-        Value::Int(w) => w,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(written)))
+    Ok(Some(Value::Int(dos_written(ctx, this))))
 }
 
 // ===========================================================================
