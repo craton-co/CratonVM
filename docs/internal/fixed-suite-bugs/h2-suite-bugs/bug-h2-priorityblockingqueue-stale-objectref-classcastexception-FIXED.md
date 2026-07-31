@@ -153,25 +153,38 @@ clean A/B for the reported symptom:
 `TestCompatibility` therefore goes from *fails with the reported corruption* to
 *passes outright*.
 
-### Remaining `TestMultiThread` failures are a different, already-tracked bug
+**After merging `origin/dev` @ `b2f7c83cc2`** (which independently fixed the
+array-receiver clone-dispatch bug below), re-measured on the merged binary:
 
-`TestMultiThread` no longer hangs and never shows a `RemovedPageInfo` cast or
-"The database has been closed" — the symptom the original report flagged as a
-possible downstream effect is gone. It still exits non-zero, on two causes
-neither of which is this bug:
+| class | merged `dev` + this fix |
+| --- | --- |
+| `TestCompatibility`, JIT on | **`rc=0`, PASSES**, 762 s |
+| `TestCompatibility`, `--nojit` | **`rc=0`, PASSES**, 1038 s |
+| `TestMultiThread`, JIT on | `rc=1` after 554 s — `TimeoutException` only (see below) |
 
-* `ExecutionException` wrapping `CloneNotSupportedException`, raised from
-  `org.h2.mvstore.tx.VersionedBitSet.<init>` (`VersionedBitSet extends BitSet`
-  and clones itself) via a nonsensical `java.lang.Thread.clone` frame. This is
-  the byte-for-byte same mechanism already tracked as
-  `docs/known-issues/h2/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame.md`;
-  `TestCompatibility` (JIT on) and `TestMultiThread` are two further carriers,
-  and `VersionedBitSet` is a much smaller reproduction than `TestTempTables`'
-  `testLotsOfTables`. Noted on that doc.
-* On one run, H2's own `job.get(5, TimeUnit.MINUTES)` expired
-  (`TimeoutException`). HotSpot runs the whole class in **4.5 s** on the same
-  host, so there is a real throughput gap here — but it is a throughput gap, not
-  a correctness one, and it is not this bug.
+### The intermediate `CloneNotSupportedException` — fixed elsewhere, same day
+
+Before merging `dev`, the fixed binary's `TestCompatibility` (JIT on) and
+`TestMultiThread` both got *past* this bug and then failed with an
+`ExecutionException` wrapping `CloneNotSupportedException`, raised from
+`org.h2.mvstore.tx.VersionedBitSet.<init>` via a `java.lang.Thread.clone` frame
+— reached through three different H2 paths (`TransactionStore.begin`,
+`registerTransaction`, `flipCommittingTransactionsBit`). That is the bug a
+concurrent session root-caused and fixed the same day (array receivers
+dispatched through their *component* class; see
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`),
+which is why it is gone from the merged numbers above and why
+`TestCompatibility` now passes with the JIT on as well.
+
+### The remaining `TestMultiThread` failure is not this bug
+
+`TestMultiThread` no longer hangs and never shows a `RemovedPageInfo` cast, an
+MVStore panic, or "The database has been closed" — the symptom the original
+report flagged as a possible downstream effect is gone. What is left is H2's own
+`job.get(5, TimeUnit.MINUTES)` expiring: a pure throughput gap (a
+single-threaded `INSERT`+`commit` loop measures ~250x slower than HotSpot, and
+scales worse on top of that). Split out and quantified in
+`docs/known-issues/h2/bug-h2-testmultithread-concurrent-insert-throughput-timeout.md`.
 
 ## Audit of the rest of the family
 
@@ -199,6 +212,7 @@ refreshed across the `tree_compare`/`native_tm_put` calls in the loop body.
 * `cargo test -p cratonvm-native-collections` — 156 tests, 0 failures.
 * `cargo fmt -p cratonvm-native-collections -- --check` clean; `cargo clippy -p
   cratonvm-native-collections` clean.
-* Full `regression-suite/run.sh` on the fixed binary: 18 passed, 1 failed
-  (`RSerial`) — `RSerial` fails identically on the unmodified `origin/dev`
-  binary, i.e. pre-existing and unrelated.
+* Full `regression-suite/run.sh` on the merged binary (`dev` @ `4a48f12cb6`):
+  **19 passed, 0 failed.** (On the pre-merge binary it was 18/1: `RSerial`
+  failed there, identically on the unmodified `origin/dev` @ `a31a8a93fe`
+  binary — pre-existing, and since fixed on `dev`.)
