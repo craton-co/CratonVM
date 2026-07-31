@@ -70,6 +70,33 @@ so correctness is already at parity and only throughput is at issue.
 `ZonedDateTimeTest` behaves the same: TIMEOUT >900 s by default; completes with
 `found=608 started=608 ok=404 failed=0 aborted=204` once moving-young is off.
 
+> **CORRECTION 2026-07-31 — read the table above with three caveats.**
+>
+> 1. **The C2-tier half of the 2026-07-30 correction is wrong.** The gate was
+>    real, but opening it changed nothing at runtime: the optimizing tier
+>    produced approximately zero bodies, refused inside `IrBuilder::build`
+>    (reference field reads, `areturn`, `getstatic`, …), not by the gate. Counts
+>    and method in
+>    `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`.
+> 2. **Both named emission-cost candidates were measured and neither moves
+>    anything.** `CRATONVM_JIT_MY_SCRATCH_FLUSH=0` and
+>    `CRATONVM_JIT_MY_SELFCALL_PROOF=0` on `BinTreesClassic 18` @512m, five
+>    interleaved reps each: medians 4117 ms and 4343 ms against a 4281 ms
+>    default, ranges fully overlapping in both directions.
+> 3. **`CRATONVM_NO_MOVING_YOUNG=1` is not a throughput restoration in
+>    general.** On the same probe, six interleaved reps as the host quieted, it
+>    is a **1.37x LOSS** (4060–4904 ms default vs 5741–6850 ms, non-overlapping).
+>    It selects a different collector; which one wins is a property of the
+>    workload, so "the class passes with the flag" does not identify a
+>    moving-young cost by itself.
+>
+> `ZonedDateTimeTest` is additionally **bimodal** with no VM change at all
+> (~300 s or >900 s — the eight-run table in
+> `docs/internal/jit-ir-relocation-map-contract.md`), so a one-sample-per-lane
+> comparison of it cannot support an attribution. What this document needs to
+> stay open on is a quiet-host, repeated-run characterisation of these two
+> classes; the single-variable claim above is not yet that.
+
 ## Why the flag costs anything when both paths sweep
 
 Both configurations end in the *same* `run_non_moving_young_cycle`

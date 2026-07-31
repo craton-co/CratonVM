@@ -214,6 +214,25 @@ fix, two interleaved passes:
 included** — so 32.1 is fully accounted for by exactly these two, with no
 unattributed residual.
 
+**Correction 2026-07-31 — the split between the two penalties is not what this
+section says.** `CRATONVM_NO_MOVING_YOUNG=1` moves three things at once (both
+gates AND the collector), and the first of the two bullets above cannot have
+contributed: at the commit measured here the optimizing tier produced
+approximately zero bodies at runtime, refused inside `IrBuilder::build` rather
+than by the gate — see
+[the retired moving-young gate doc](../../internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md)
+for the per-stage refusal counts. The `tier=C1`/`tier=C2` byte-identical
+observation in that bullet is the tell that this was already the case, read the
+other way round.
+
+That leaves `direct_jit_callee_calls_enabled` as the candidate for the
+3.1–3.7x, which fits this workload's shape exactly — and that gate has since
+been re-closed (`ea5b2df6e`), because opening it SIGSEGVs
+`BasicErrorControllerIntegrationTests` 8/8. Re-measure 32.1 against the fix for
+that edge, not against `CRATONVM_NO_MOVING_YOUNG=1`, which on a deterministic
+allocation-heavy probe (`BinTreesClassic 18`, `-Xmx512m`) is a **1.37x
+throughput LOSS**, 6/6 interleaved reps.
+
 > **Correction.** An earlier revision of this document called cause 2 "diffuse,
 > not one commit" and explicitly ruled out `moving_young`, citing
 > `CRATONVM_MOVING_YOUNG=0` producing no change. **That was wrong, and the
