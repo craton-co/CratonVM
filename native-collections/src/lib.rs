@@ -19059,6 +19059,23 @@ fn collector_tag_of(ctx: &mut dyn NativeContext, v: Value) -> Option<i32> {
     None
 }
 
+/// The source `Collector` a synthetic collector-function object carries in
+/// field 0, or `Object(None)` when the receiver is not one.
+///
+/// `make_collector_fn` allocates these with exactly one field, but the SAM
+/// natives that read that field are registered on the PUBLIC functional
+/// interfaces, so a receiver with no fields at all can reach them — a
+/// non-capturing user lambda proxy, for instance. Reading slot 0 of a
+/// zero-slot object is an out-of-bounds field read: the heap drops it, but not
+/// before `CRATONVM_DBG`-grade machinery captures a full Rust backtrace per
+/// call. Ask the layout first.
+fn collector_fn_source(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    if ctx.object_num_fields(this) == 0 {
+        return Value::Object(None);
+    }
+    ctx.get_field(this, 0)
+}
+
 /// `Collector.supplier()/accumulator()/finisher()/combiner()` — return a synthetic
 /// functional object (class == the SAM interface) carrying the source Collector in
 /// field 0 so its SAM (registered above) can read the tag.
@@ -19088,7 +19105,7 @@ fn native_collfn_supplier_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return make_list_of(ctx, &[]),
     };
-    let coll = ctx.get_field(this, 0);
+    let coll = collector_fn_source(ctx, this);
     match collector_tag_of(ctx, coll) {
         Some(COLLECTOR_TAG_TO_SET) => make_set_of(ctx, &[]),
         Some(COLLECTOR_TAG_TO_MAP) | Some(COLLECTOR_TAG_TO_MAP_MERGE) => make_map_of(ctx, &[]),
@@ -19131,7 +19148,7 @@ fn native_collfn_accumulator_accept(
     };
     let container = args.get(1).copied().unwrap_or(Value::Object(None));
     let item = args.get(2).copied().unwrap_or(Value::Object(None));
-    let coll = ctx.get_field(this, 0);
+    let coll = collector_fn_source(ctx, this);
     match collector_tag_of(ctx, coll) {
         Some(COLLECTOR_TAG_TO_MAP)
         | Some(COLLECTOR_TAG_TO_MAP_MERGE)
@@ -19218,7 +19235,7 @@ fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(container)),
     };
-    let coll = ctx.get_field(this, 0);
+    let coll = collector_fn_source(ctx, this);
     let read_str = |ctx: &dyn NativeContext, field: usize| -> String {
         match coll {
             Value::Object(Some(c)) => match ctx.get_field(c, field) {
