@@ -37213,17 +37213,48 @@ fn native_synthetic_instant_is_after(
     )))
 }
 
+/// `Instant.toString()` — ISO-8601, per `DateTimeFormatter.ISO_INSTANT`.
+///
+/// This used to emit Rust's debug shape, `Instant(0.042000000)`, which is not
+/// a format any Java caller can parse and which leaked straight through
+/// `FileTime.toString()` (it delegates here). The JDK prints
+/// `1970-01-01T00:00:00.042Z`: the UTC date-time, with the fraction rendered
+/// in whole groups of three digits — milliseconds, microseconds or
+/// nanoseconds — and omitted entirely when zero.
+fn iso_instant_string(sec: i64, nano: i32) -> String {
+    // Floor division so pre-epoch instants borrow correctly into the previous
+    // day rather than truncating toward zero.
+    let days = sec.div_euclid(86_400);
+    let secs_of_day = sec.rem_euclid(86_400);
+    let (y, m, d) = crate::util_time::epoch_day_to_ymd(days);
+    let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    // Years outside 0..=9999 take an explicit sign, as ISO-8601 requires.
+    let mut s = if (0..=9999).contains(&y) {
+        format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
+    } else {
+        format!("{y:+05}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
+    };
+    if nano != 0 {
+        let nano = nano.unsigned_abs();
+        if nano % 1_000_000 == 0 {
+            s.push_str(&format!(".{:03}", nano / 1_000_000));
+        } else if nano % 1_000 == 0 {
+            s.push_str(&format!(".{:06}", nano / 1_000));
+        } else {
+            s.push_str(&format!(".{nano:09}"));
+        }
+    }
+    s.push('Z');
+    s
+}
+
 fn native_synthetic_instant_to_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let (sec, nano) = synthetic_instant_parts(ctx, this);
-    let s = if nano == 0 {
-        format!("Instant({sec})")
-    } else {
-        format!("Instant({sec}.{nano:09})")
-    };
+    let s = iso_instant_string(sec, nano);
     Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
 }
 

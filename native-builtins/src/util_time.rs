@@ -4783,7 +4783,7 @@ fn ymd_to_epoch_day(y: i32, m: i32, d: i32) -> i64 {
     era * 146097 + doe - 719468
 }
 
-fn epoch_day_to_ymd(epoch_day: i64) -> (i32, i32, i32) {
+pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> (i32, i32, i32) {
     let z = epoch_day + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;

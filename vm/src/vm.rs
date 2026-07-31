@@ -82,8 +82,24 @@ mod tests {
         let vm = test_vm();
         // Session 85 (C25): `SharedVm::new` pre-registers `Enumeration$Impl`
         // as a synthetic stub so iterator-backed Enumeration dispatch routes
-        // through the native registry. Baseline is 1.
-        assert_eq!(vm.shared.classes.class_manager.read().loaded_count(), 1);
+        // through the native registry.
+        //
+        // This asserted an EXACT `loaded_count()` of 1. That is a count of
+        // whatever bootstrap happens to pre-register, which grows whenever a
+        // new stub is added at startup — it reached 29 — and breaking a test
+        // for that is noise, not signal. Assert the thing the comment is
+        // actually about: the class is there.
+        {
+            let cm = vm.shared.classes.class_manager.read();
+            assert!(
+                cm.loaded_count() >= 1,
+                "SharedVm::new must pre-register its bootstrap stubs",
+            );
+            assert!(
+                cm.get_loaded_class_id("java/util/Enumeration$Impl").is_some(),
+                "Enumeration$Impl must be pre-registered so iterator-backed                  Enumeration dispatch reaches the native registry",
+            );
+        }
         assert!(vm.main_thread.printed.is_empty());
         assert!(!vm.shared.natives.native_methods.is_empty());
     }
@@ -50797,7 +50813,9 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(sref)) = s {
             let text = read_java_string(&shared.mem.heap, sref).unwrap();
-            assert_eq!(text, "42ms");
+            // `FileTime.toString()` delegates to `Instant.toString()`, which is
+            // ISO-8601. The old "42ms" expectation predates that delegation.
+            assert_eq!(text, "1970-01-01T00:00:00.042Z");
         } else {
             panic!("Expected string");
         }
