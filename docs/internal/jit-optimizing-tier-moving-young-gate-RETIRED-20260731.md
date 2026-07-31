@@ -217,7 +217,8 @@ Meanwhile both classes **complete on default flags**, every run, correct:
 |---|---|---:|---|
 | `ZonedDateTimeTest` | default | 447 s | `found=608 ok=404 failed=0 aborted=204` |
 | `ZonedDateTimeTest` | default | 435 s | same |
-| `ZonedDateTimeTest` | `NO_MOVING_YOUNG=1` | 3 s / 2 s | **SIGSEGV**, both runs |
+| `ZonedDateTimeTest` | default | 391 s | same |
+| `ZonedDateTimeTest` | `NO_MOVING_YOUNG=1` | 3 s / 2 s / 2 s | **SIGSEGV**, all three runs |
 | `OffsetDateTimeTest` | default | 367 s | `found=488 ok=324 failed=0 aborted=164` |
 | `OffsetDateTimeTest` | default | 308 s | same |
 | `OffsetDateTimeTest` | `NO_MOVING_YOUNG=1` | 3 s / 1 s | **SIGSEGV**, both runs |
