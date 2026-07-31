@@ -16765,6 +16765,17 @@ pub fn register_essential_natives_with_shims(
                 args.get(2).copied().unwrap_or(Value::Object(None)),
             );
             ctx.set_field_by_name(this, "needToInferCaller", Value::Int(0));
+            // A SYNTHETIC LogRecord has no field names, so both writes above
+            // silently no-opped and the record came out empty. Mirror them
+            // into the synthetic layout (level = 0, message = 1) when the name
+            // does not resolve; `native_jul_log_record_get_message` reads the
+            // same slots as its last fallback.
+            if !matches!(ctx.get_field_by_name(this, "message"), Value::Object(Some(_)))
+                && ctx.object_num_fields(this) > 1
+            {
+                ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+                ctx.set_field(this, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
+            }
             // Real JDK stamps the constructing thread's id into
             // threadID/longThreadID. Without it, records report
             // getLongThreadID() == 0 and Tomcat JULI's OneLineFormatter feeds

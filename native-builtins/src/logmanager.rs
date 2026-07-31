@@ -3298,7 +3298,26 @@ fn native_jul_log_record_get_message(
         .get(&record_id)
         .cloned()
         .map(|text| ctx.create_string_uninterned_gc_safe(&text));
-    Ok(Some(Value::Object(message)))
+    if message.is_some() {
+        return Ok(Some(Value::Object(message)));
+    }
+    // Side-table miss. Two other shapes reach here:
+    //   * a real-layout LogRecord, whose `<init>` stored the message under the
+    //     field NAME rather than in the table; and
+    //   * a SYNTHETIC one, which has no field names at all, so that same
+    //     `<init>` no-opped and the message landed in the slot fallback added
+    //     alongside it (level = 0, message = 1).
+    // Reading only the table made `new LogRecord(level, msg).getMessage()`
+    // return null for both.
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(*record, "message") {
+        return Ok(Some(Value::Object(Some(s))));
+    }
+    if ctx.object_num_fields(*record) > 1 {
+        if let Value::Object(Some(s)) = ctx.get_field(*record, 1) {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    }
+    Ok(Some(Value::Object(None)))
 }
 
 /// Store an explicit handler without relying on the private JDK Logger layout.
