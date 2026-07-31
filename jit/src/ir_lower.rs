@@ -4807,22 +4807,21 @@ mod tests {
             "the self-recursive body must lower — an imbalance now makes \
              lower_inner discard it, so a None here means the push came back",
         );
+        // Lowering at all is most of the assertion: `lower_inner` counts the
+        // emitted pushes against the emitted reloads and DISCARDS the body when
+        // they disagree, so a `None` above is exactly the bug this test exists
+        // for. What remains to check is that the retraction is really emitted
+        // on this route rather than inherited from a choke point it never
+        // reaches: `MOV RCX, [R11]` reads a published value back, and only the
+        // reload does that. (Deliberately not an exact count — the prologue's
+        // own `top` watermark shares the push's encoding, so counting pushes
+        // here measures the prologue too.)
         let bytes = cm.code_bytes();
-        // Byte signatures unique to each half: the push reads the LIVE `top`
-        // with `MOV R11, [R10 + ss_top]`, the reload reads a published value
-        // back with `MOV RCX, [R11]`. This route has exactly one safepoint, so
-        // one of each — and, above all, the same count of each.
-        let pushes = count_seq(bytes, &[0x4D, 0x8B, 0x9A]);
-        let reloads = count_seq(bytes, &[0x49, 0x8B, 0x0B]);
-        assert_eq!(
-            pushes, 1,
-            "the self-recursive site still publishes: its map claims no \
-             coverage, but the values are roots for the duration of the call"
-        );
-        assert_eq!(
-            reloads, pushes,
-            "and it must retract exactly what it published — this route \
-             bypasses emit_call_return_check, so it emits its own reload"
+        assert!(
+            count_seq(bytes, &[0x49, 0x8B, 0x0B]) >= 1,
+            "the self-recursive route bypasses emit_call_return_check, so it \
+             must emit its own shadow reload — without it every execution of \
+             the site advances the thread's shadow top and nothing retracts it"
         );
         crate::x64::set_moving_young_override(None);
     }

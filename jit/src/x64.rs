@@ -1576,9 +1576,28 @@ impl Compiler {
         // the MIC/PIC cascade, allocation helpers, checkcast/instanceof) sit
         // in caller-saved/argument registers, which the callee-saved-only
         // spill never covers.
-        let precise_implies_reg_spill = precise_maps && !precise_reg_spill_disabled();
-        let safepoint_reg_spill = safepoint_reg_spill_enabled() || precise_implies_reg_spill;
-        let safepoint_reg_spill_all = safepoint_reg_spill_all() || precise_implies_reg_spill;
+        //
+        // 2026-07-31: this used to read `precise_maps && !…`, and `precise_maps`
+        // is `precise_jit_maps_enabled() || moving_young_enabled()`. So a
+        // ROOT-VISIBILITY mechanism was on only because moving-young defaults
+        // on, and `CRATONVM_NO_MOVING_YOUNG=1` silently withdrew it — together
+        // with the scratch flush in `emit_pre_safepoint_spill_impl` and shadow
+        // publication, all three keyed on the same flag. Each exists so the
+        // conservative scan can SEE a register-resident oop across a
+        // GC-capable call; none of them is moving-specific, and each was added
+        // to fix a real reclaimed-root crash. With all three gone at once the
+        // opt-out lane faulted on a zeroed heap slot within seconds of real
+        // work — Hibernate `ZonedDateTimeTest` / `OffsetDateTimeTest` (1–3 s,
+        // reproduced on a pristine dev build) and the Windows
+        // `DateSymbolsProbe` repro. See
+        // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+        //
+        // Keyed on its own opt-out alone, the DEFAULT path is byte-identical
+        // (`precise_reg_spill_disabled()` is opt-in and unset), and the
+        // non-moving lane gets the visibility the default lane already had.
+        let reg_spill_for_root_visibility = !precise_reg_spill_disabled();
+        let safepoint_reg_spill = safepoint_reg_spill_enabled() || reg_spill_for_root_visibility;
+        let safepoint_reg_spill_all = safepoint_reg_spill_all() || reg_spill_for_root_visibility;
         let safepoint_reg_spill_nostore = safepoint_reg_spill_nostore();
         // Register-only operand-stack-oop soundness (DEFAULT ON): flush
         // `CalleeSaved` operand-stack reference entries in `flush_scratch_
@@ -2995,11 +3014,24 @@ impl Compiler {
         // no-change; see `shadow_stack_maps_enabled`), which leaves this and
         // the self-call spill-elision proof.
         //
-        // The non-moving path has never called this and is the historically
-        // correct configuration, so `0` returns to known-good codegen rather
-        // than inventing a new one. Kept default-ON until measured on a quiet
-        // host — the box had eight other sessions' VMs running when this landed.
-        if moving_young_enabled() && scratch_flush_at_safepoint_enabled() {
+        // 2026-07-31 — the `moving_young_enabled()` term is REMOVED, and the
+        // paragraph above is answered: measured on `BinTreesClassic 18`
+        // @512m, five interleaved reps, `CRATONVM_JIT_MY_SCRATCH_FLUSH=0`
+        // moves nothing (median 4117 ms against a 4281 ms default, ranges
+        // overlapping in both directions), so this is not the `type.temporal`
+        // residual it was added to bisect.
+        //
+        // What it IS, is root visibility. This spills operand-stack values
+        // that live in a caller-saved SCRATCH register — which the
+        // callee-saved blind spill never covers — to frame slots the
+        // conservative scan reads. The claim that "the non-moving path has
+        // never called this and is the historically correct configuration" was
+        // true when written and is not now: the non-moving path is reached
+        // today only via `CRATONVM_NO_MOVING_YOUNG=1`, which withdrew this,
+        // the full-GPR safepoint spill and shadow publication in one move, and
+        // that lane faults on a reclaimed root within seconds. Root visibility
+        // is not a property of which young collector runs.
+        if scratch_flush_at_safepoint_enabled() {
             self.flush_scratch_registers();
         }
         // Capture the live-frame bound for the map this safepoint will record.

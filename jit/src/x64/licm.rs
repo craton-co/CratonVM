@@ -852,14 +852,23 @@ pub fn moving_young_enabled() -> bool {
     cratonvm_types::flags().gc.moving_young
 }
 
-/// `CRATONVM_JIT_MY_SCRATCH_FLUSH` — bisect lever for the scratch-register
-/// flush `emit_pre_safepoint_spill_impl` performs at every GC-capable safepoint
-/// under moving-young. Default ON (current behaviour); `0` drops it.
+/// `CRATONVM_JIT_MY_SCRATCH_FLUSH` — opt-out for the scratch-register flush
+/// `emit_pre_safepoint_spill_impl` performs at every GC-capable safepoint.
+/// Default ON. **`0` is known-unsafe**, kept only as an A/B control.
 ///
-/// Exists to attribute the residual moving-young throughput cost that the
-/// relocation-scoped admission gates do NOT remove — see the call site. Do not
-/// flip the default without a quiet-host measurement on the `type.temporal`
-/// Hibernate classes, which are the workload that shows the residual.
+/// It arrived as a bisect lever for a residual moving-young throughput cost,
+/// and as a lever it has answered: `BinTreesClassic 18` @512m, five
+/// interleaved reps, `0` moves nothing (median 4117 ms against a 4281 ms
+/// default, ranges overlapping in both directions). There is no cost here
+/// worth carrying a risk for.
+///
+/// What it does carry is ROOT VISIBILITY — it spills operand-stack values
+/// living in caller-saved scratch registers, which the callee-saved blind
+/// spill never covers, into the frame slots the conservative scan reads. The
+/// call site used to gate it additionally on `moving_young_enabled()`, so
+/// `CRATONVM_NO_MOVING_YOUNG=1` withdrew it; that is one third of why that
+/// lane crashed. See
+/// `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
 pub fn scratch_flush_at_safepoint_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SCRATCH_FLUSH") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
