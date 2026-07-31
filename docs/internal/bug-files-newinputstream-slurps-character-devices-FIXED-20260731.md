@@ -127,11 +127,16 @@ Worth reading if you are tempted to trust its numbers:
   still worth doing — but it is bounded by GC, it is not what killed anything,
   and it is not tracked as a bug.
 
-## Remaining blocker (a different bug, filed separately)
-The two H2 classes now fail on
-`docs/known-issues/h2/bug-lucene-bytebuffersdatainput-eof-lz4-presetdict.md`:
-`EOFException: Unexpected EOF` out of CratonVM's own `ByteBuffersDataInput`
-natives during Lucene's LZ4 preset-dictionary compression. Proven independent
-of this fix — with `-Dtests.seed=deadbeef` (which makes Lucene skip the
-`/dev/urandom` read) the **unmodified `dev` binary** reaches the identical
-exception at the identical point with identical RSS.
+## The blocker behind this one — also fixed (2026-07-31)
+With this landed, the two H2 classes hit `EOFException: Unexpected EOF` out of
+CratonVM's own `ByteBuffersDataInput` natives during Lucene's LZ4
+preset-dictionary compression — proven independent of this fix at the time,
+since with `-Dtests.seed=deadbeef` (which makes Lucene skip the `/dev/urandom`
+read) the unmodified `dev` binary reached the identical exception at the
+identical point with identical RSS.
+
+That defect, and a second one behind it (`Lookup.findVirtual` never throwing
+`NoSuchMethodException`, so H2's Lucene-version probe could not take its
+fallback), are fixed in
+`docs/internal/bug-lucene-bbdatainput-size-field-FIXED-20260731.md`.
+**`org.h2.test.db.TestFullText` and `org.h2.test.unit.TestRecovery` now pass.**
