@@ -1749,7 +1749,9 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// the bytes it freed: `before - after` live bytes, where `before` is the live
 /// set at `maybe_gc_forced` entry (post-TLAB-retire) and `after` is the live set
 /// once the collection finishes. A forced GC that freed < 2% of total heap
-/// capacity counts toward the GC-overhead streak; one that freed more resets it.
+/// capacity counts toward the GC-overhead streak — provided the old generation
+/// is also too full to absorb 2% of capacity, see the HIB-GCOVERHEAD-HALFFULL.1
+/// note below; one that freed more resets the streak either way.
 ///
 /// The *freed-amount* signal (not post-GC fullness) is the right one for a
 /// generational heap: in a retained-allocation death-spiral the young semi-space
