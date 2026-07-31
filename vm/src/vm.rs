@@ -38853,6 +38853,23 @@ mod tests {
             read_java_string(&shared.mem.heap, tp_ref),
             Some("PKCS12".to_string())
         );
+        // A KeyStore must be loaded before it can be queried: the JDK throws
+        // `KeyStoreException: Uninitialized keystore` from size()/containsAlias()
+        // otherwise, and so does CratonVM. `load(null, null)` is the documented
+        // way to initialise an empty one.
+        call_native(
+            &shared,
+            &mut thread,
+            "java/security/KeyStore",
+            "load",
+            "(Ljava/io/InputStream;[C)V",
+            &[
+                Value::Object(Some(ks_ref)),
+                Value::Object(None),
+                Value::Object(None),
+            ],
+        )
+        .unwrap();
         let sz = call_native(
             &shared,
             &mut thread,
