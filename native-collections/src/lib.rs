@@ -34099,21 +34099,30 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     tm_materialize_deser_array(ctx, this);
     let pairs = tm_collect_pairs(ctx, this);
     let size = pairs.len() as i32;
+    // Family-1 stale-ObjectRef fix (2026-07-31): the two allocations below can
+    // collect, moving both `this` and every key still held only in `pairs`.
+    let this_pin = ctx.pin_native_root(this);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     // Reserve one extra trailing slot and stash the source TreeMap there so the
     // keySet view writes through (`keySet().remove` / `iterator().remove`).
     // The slot lives beyond the logical size, so sorted iteration / binary
     // search (which use `size`) never see it, yet it is GC-scanned.
     let cap = std::cmp::max(pairs.len(), TS_DEFAULT_CAPACITY) + 1;
+    let ts_pin = ctx.pin_native_root(ts);
     let buf = alloc_ref_array(ctx, cap);
-    for (i, (k, _)) in pairs.iter().enumerate() {
-        ctx.set_array_element(buf, i, *k);
+    for i in 0..pinned_pairs.len() {
+        let (k, _) = pinned_pairs.get(&*ctx, i);
+        ctx.set_array_element(buf, i, k);
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    let ts = ctx.read_native_pin(ts_pin, ts);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(this)));
     ts_set_slot(ctx, ts, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, ts, TS_FIELD_SIZE, Value::Int(size));
     let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
     ts_set_slot(ctx, ts, TS_FIELD_COMPARATOR, comparator);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(ts))))
 }
 
@@ -34125,9 +34134,33 @@ fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value,
         let raw: Vec<(TreeKey, Value)> = tm_fast_with(ctx, this, |bt| {
             bt.iter().map(|(k, v)| (k.clone(), *v)).collect()
         });
-        raw.into_iter()
-            .map(|(k, v)| (tree_key_to_value(ctx, &k), v))
-            .collect()
+        // Family-1 stale-ObjectRef fix (2026-07-31): `tree_key_to_value`
+        // ALLOCATES (`create_string` / `Wrapper.valueOf`), so boxing key `i`
+        // can trigger a young collection that relocates (a) every value after
+        // it, which lives only as a raw `ObjectRef` in `raw`, and (b) every key
+        // already boxed on a previous iteration. Neither Vec is rewritten by
+        // the collector. Pin both sides across the whole conversion and read
+        // them back through their pins at the end.
+        let anchor = ctx.pin_native_root(this);
+        let vals: Vec<Value> = raw.iter().map(|(_, v)| *v).collect();
+        let (_, val_pins) = pin_value_slice(ctx, &vals);
+        let mut keys: Vec<Value> = Vec::with_capacity(raw.len());
+        let mut key_pins: Vec<usize> = Vec::with_capacity(raw.len());
+        for (k, _) in raw.iter() {
+            let boxed = tree_key_to_value(ctx, k);
+            key_pins.push(pin_value(ctx, boxed));
+            keys.push(boxed);
+        }
+        let out: Vec<(Value, Value)> = (0..raw.len())
+            .map(|i| {
+                (
+                    read_pinned_elem(ctx, key_pins[i], keys[i]),
+                    read_pinned_elem(ctx, val_pins[i], vals[i]),
+                )
+            })
+            .collect();
+        ctx.unpin_native_roots(anchor);
+        out
     } else {
         let (data_opt, size, _) = tm_state(ctx, this);
         let data = match data_opt {
@@ -34141,6 +34174,78 @@ fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value,
             out.push((k, v));
         }
         out
+    }
+}
+
+/// GC-safe cursor over a [`tm_collect_pairs`] snapshot.
+///
+/// Family-1 stale-ObjectRef fix (2026-07-31): `tm_collect_pairs` hands back a
+/// bare Rust `Vec` of raw `ObjectRef`s, and every consumer then runs code that
+/// allocates while walking it — `tree_compare` dispatching a custom
+/// `Comparable`/`Comparator`, `native_tm_put`, `alloc_ref_array`,
+/// `alloc_live_entry`, a `toString()`, a user lambda. A young collection during
+/// any of those relocates every entry the walk has not consumed yet, and
+/// nothing rewrites the `Vec`, so the rest of the walk dereferences moved
+/// addresses. Reproduced on `headMap` as
+/// `ClassCastException: class java.lang.Object cannot be cast to class
+/// java.lang.Comparable` (the stale key decoded as whatever now occupies the
+/// address); see the sibling
+/// `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md`
+/// for the same defect in `PriorityBlockingQueue`.
+///
+/// Pin the whole snapshot once, then read each element back through its pin
+/// immediately before every use — the collector remaps `native_pin_roots`, so
+/// that is the only view of the snapshot that stays correct. Same shape
+/// `native_tm_for_each` already used inline.
+///
+/// The pins are pushed on the caller's pin stack. Release them with
+/// `ctx.unpin_native_roots(pinned.base())`, or — when the caller took an
+/// earlier pin of its own and unpins from that handle — construct this
+/// afterwards and let the caller's existing `unpin_native_roots` cover it.
+///
+/// Cost is one pin per entry, on a walk that already performs one interpreted
+/// call (or one allocation) per entry.
+struct PinnedPairs {
+    orig: Vec<Value>,
+    handles: Vec<usize>,
+    base: usize,
+}
+
+impl PinnedPairs {
+    fn new(ctx: &mut dyn NativeContext, pairs: &[(Value, Value)]) -> Self {
+        let orig: Vec<Value> = pairs.iter().flat_map(|(k, v)| [*k, *v]).collect();
+        let (base, handles) = pin_value_slice(ctx, &orig);
+        Self {
+            orig,
+            handles,
+            base,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.orig.len() / 2
+    }
+
+    /// Handle to pass to `unpin_native_roots`; `usize::MAX` when nothing was
+    /// pinned (an all-primitive snapshot), which `unpin_native_roots` ignores.
+    fn base(&self) -> usize {
+        self.base
+    }
+
+    /// The current (post-GC) key/value at `i`.
+    fn get(&self, ctx: &dyn NativeContext, i: usize) -> (Value, Value) {
+        (
+            read_pinned_elem(ctx, self.handles[i * 2], self.orig[i * 2]),
+            read_pinned_elem(ctx, self.handles[i * 2 + 1], self.orig[i * 2 + 1]),
+        )
+    }
+
+    /// Refresh `k`/`v` in place. Used immediately before every dereference so
+    /// the caller keeps ordinary `Value` locals instead of re-binding.
+    fn refresh(&self, ctx: &dyn NativeContext, i: usize, k: &mut Value, v: &mut Value) {
+        let (nk, nv) = self.get(ctx, i);
+        *k = nk;
+        *v = nv;
     }
 }
 
@@ -34167,22 +34272,37 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let pairs = tm_collect_pairs(ctx, this);
     // Live view: build Map.Entry objects and stash the source TreeMap so
     // removing an entry through the list (or its iterator) deletes the key.
-    let entries: Vec<Value> = pairs
-        .into_iter()
-        .map(|(k, v)| {
-            Value::Object(Some(alloc_live_entry(
-                ctx,
-                // Real Map.Entry impl so reflection sees getKey/getValue (SpEL
-                // `map.?[key...]` selection over a TreeMap). The fabricated
-                // "HashMap$Entry" does not implement Map.Entry → EL1008E.
-                "java/util/AbstractMap$SimpleEntry",
-                k,
-                v,
-                this,
-            )))
-        })
+    //
+    // Family-1 stale-ObjectRef fix (2026-07-31): `alloc_live_entry` allocates
+    // once per pair, so entry `i`'s allocation can relocate every pair after it
+    // AND every entry already produced. `alloc_live_entry` pins its own three
+    // arguments, but nothing was keeping these two Vecs current.
+    let this_pin = ctx.pin_native_root(this);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
+    let mut entries: Vec<Value> = Vec::with_capacity(pinned_pairs.len());
+    let mut entry_pins: Vec<usize> = Vec::with_capacity(pinned_pairs.len());
+    for i in 0..pinned_pairs.len() {
+        let (k, v) = pinned_pairs.get(&*ctx, i);
+        let this = ctx.read_native_pin(this_pin, this);
+        let entry = Value::Object(Some(alloc_live_entry(
+            ctx,
+            // Real Map.Entry impl so reflection sees getKey/getValue (SpEL
+            // `map.?[key...]` selection over a TreeMap). The fabricated
+            // "HashMap$Entry" does not implement Map.Entry → EL1008E.
+            "java/util/AbstractMap$SimpleEntry",
+            k,
+            v,
+            this,
+        )));
+        entry_pins.push(pin_value(ctx, entry));
+        entries.push(entry);
+    }
+    let entries: Vec<Value> = (0..entries.len())
+        .map(|i| read_pinned_elem(ctx, entry_pins[i], entries[i]))
         .collect();
+    let this = ctx.read_native_pin(this_pin, this);
     let list = make_view_list_of(ctx, this, &entries);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -34425,15 +34545,22 @@ fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     tm_materialize_deser_array(ctx, this);
     let pairs = tm_collect_pairs(ctx, this);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `obj_to_display_string`
+    // dispatches each element's real `toString()`, which allocates — every
+    // not-yet-rendered entry can move under it.
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut buf = String::from("{");
-    for (i, (k, v)) in pairs.iter().enumerate() {
+    for i in 0..pinned_pairs.len() {
         if i > 0 {
             buf.push_str(", ");
         }
-        buf.push_str(&obj_to_display_string(ctx, k));
+        let (k, _) = pinned_pairs.get(&*ctx, i);
+        buf.push_str(&obj_to_display_string(ctx, &k));
         buf.push('=');
-        buf.push_str(&obj_to_display_string(ctx, v));
+        let (_, v) = pinned_pairs.get(&*ctx, i);
+        buf.push_str(&obj_to_display_string(ctx, &v));
     }
+    ctx.unpin_native_roots(pinned_pairs.base());
     buf.push('}');
     let s = ctx.create_string(&buf);
     Ok(Some(Value::Object(Some(s))))
@@ -34478,13 +34605,21 @@ fn native_tm_head_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // into the result (each such put replacing the prior null entry, since
     // they all compare equal), producing a corrupt one-entry-with-null-key
     // result instead of the real matching entries.
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut to_key = to_key;
     let to_key_pin = pin_value(ctx, to_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp = tree_compare(ctx, &comparator, k, to_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34492,6 +34627,7 @@ fn native_tm_head_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         if cmp >= 0 {
             break;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34516,18 +34652,27 @@ fn native_tm_tail_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
     // BUGFIX: see `native_tm_head_map` above -- read via the fast/array-mode-
     // aware `tm_collect_pairs`, not `tm_state()` directly.
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut from_key = from_key;
     let from_key_pin = pin_value(ctx, from_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp = tree_compare(ctx, &comparator, k, from_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
         from_key = read_pinned_elem(ctx, from_key_pin, from_key);
         if cmp >= 0 {
+            pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
             native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
             result = ctx.read_native_pin(result_pin, result);
             comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34554,15 +34699,23 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
     // BUGFIX: see `native_tm_head_map` above -- read via the fast/array-mode-
     // aware `tm_collect_pairs`, not `tm_state()` directly.
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut from_key = from_key;
     let from_key_pin = pin_value(ctx, from_key);
     let mut to_key = to_key;
     let to_key_pin = pin_value(ctx, to_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34571,6 +34724,7 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         if cmp_lo < 0 {
             continue;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34579,6 +34733,7 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         if cmp_hi >= 0 {
             break;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34616,13 +34771,21 @@ fn native_tm_head_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut to_key = to_key;
     let to_key_pin = pin_value(ctx, to_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp = tree_compare(ctx, &comparator, k, to_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34632,6 +34795,7 @@ fn native_tm_head_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         if stop {
             break;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34654,19 +34818,28 @@ fn native_tm_tail_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut from_key = from_key;
     let from_key_pin = pin_value(ctx, from_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp = tree_compare(ctx, &comparator, k, from_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
         from_key = read_pinned_elem(ctx, from_key_pin, from_key);
         let keep = if inclusive { cmp >= 0 } else { cmp > 0 };
         if keep {
+            pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
             native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
             result = ctx.read_native_pin(result_pin, result);
             comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34692,15 +34865,23 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut from_key = from_key;
     let from_key_pin = pin_value(ctx, from_key);
     let mut to_key = to_key;
     let to_key_pin = pin_value(ctx, to_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34714,6 +34895,7 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         if below {
             continue;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34727,6 +34909,7 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         if above {
             break;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -34877,11 +35060,17 @@ fn native_tm_key_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // Both fast and array modes go through the shared snapshot helper so
     // the iterator sees sorted-order keys regardless of backing store.
     let pairs = tm_collect_pairs(ctx, this);
+    // Family-1 stale-ObjectRef fix (2026-07-31): both allocations below can
+    // collect and move the snapshotted keys (and the snapshot array itself).
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let snap = alloc_ref_array(ctx, pairs.len().max(1));
-    for (i, (k, _)) in pairs.iter().enumerate() {
-        ctx.set_array_element(snap, i, *k);
+    let snap_pin = ctx.pin_native_root(snap);
+    for i in 0..pinned_pairs.len() {
+        let (k, _) = pinned_pairs.get(&*ctx, i);
+        ctx.set_array_element(snap, i, k);
     }
     let itr = alloc_synthetic(ctx, "java/util/TreeMap$KeyItr", 2);
+    let snap = ctx.read_native_pin(snap_pin, snap);
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(itr))))
@@ -35105,15 +35294,28 @@ fn native_ts_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     )?;
     // Elements in sorted order (the data array is kept sorted by native_ts_add).
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix (2026-07-31): each `writeObject` runs
+        // interpreted serialization bytecode, which allocates freely — the
+        // backing array and the stream both move under this loop.
+        let data_pin = ctx.pin_native_root(data);
+        let oos_pin = ctx.pin_native_root(oos);
+        let mut data = data;
+        let mut oos = oos;
         for i in 0..size as usize {
             let e = ctx.get_array_element(data, i);
-            ctx.invoke(
+            if let Err(err) = ctx.invoke(
                 oos_cls,
                 "writeObject",
                 "(Ljava/lang/Object;)V",
                 &[Value::Object(Some(oos)), e],
-            )?;
+            ) {
+                ctx.unpin_native_roots(data_pin);
+                return Err(err);
+            }
+            data = ctx.read_native_pin(data_pin, data);
+            oos = ctx.read_native_pin(oos_pin, oos);
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(None)
 }
@@ -35581,6 +35783,11 @@ fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             if cmp >= 0 {
                 break;
             }
+            // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+            // `data` BEFORE the comparison above, which dispatches
+            // interpreted bytecode and can move it. `data` is kept
+            // current through its pin, so re-read the element.
+            let e = ctx.get_array_element(data, i);
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
             data = ctx.read_native_pin(data_pin, data);
             result = ctx.read_native_pin(result_pin, result);
@@ -35621,6 +35828,11 @@ fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             comparator = read_pinned_elem(ctx, comparator_pin, comparator);
             from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
             if cmp >= 0 {
+                // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+                // `data` BEFORE the comparison above, which dispatches
+                // interpreted bytecode and can move it. `data` is kept
+                // current through its pin, so re-read the element.
+                let e = ctx.get_array_element(data, i);
                 native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
                 data = ctx.read_native_pin(data_pin, data);
                 result = ctx.read_native_pin(result_pin, result);
@@ -35677,6 +35889,11 @@ fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             if cmp_hi >= 0 {
                 break;
             }
+            // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+            // `data` BEFORE the comparison above, which dispatches
+            // interpreted bytecode and can move it. `data` is kept
+            // current through its pin, so re-read the element.
+            let e = ctx.get_array_element(data, i);
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
             data = ctx.read_native_pin(data_pin, data);
             result = ctx.read_native_pin(result_pin, result);
@@ -35733,6 +35950,11 @@ fn native_ts_tail_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
             let keep = if inclusive { cmp >= 0 } else { cmp > 0 };
             if keep {
+                // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+                // `data` BEFORE the comparison above, which dispatches
+                // interpreted bytecode and can move it. `data` is kept
+                // current through its pin, so re-read the element.
+                let e = ctx.get_array_element(data, i);
                 native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
                 data = ctx.read_native_pin(data_pin, data);
                 result = ctx.read_native_pin(result_pin, result);
@@ -35779,6 +36001,11 @@ fn native_ts_head_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             if stop {
                 break;
             }
+            // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+            // `data` BEFORE the comparison above, which dispatches
+            // interpreted bytecode and can move it. `data` is kept
+            // current through its pin, so re-read the element.
+            let e = ctx.get_array_element(data, i);
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
             data = ctx.read_native_pin(data_pin, data);
             result = ctx.read_native_pin(result_pin, result);
@@ -35846,6 +36073,11 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             if above {
                 break;
             }
+            // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+            // `data` BEFORE the comparison above, which dispatches
+            // interpreted bytecode and can move it. `data` is kept
+            // current through its pin, so re-read the element.
+            let e = ctx.get_array_element(data, i);
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
             data = ctx.read_native_pin(data_pin, data);
             result = ctx.read_native_pin(result_pin, result);
@@ -35963,10 +36195,21 @@ fn native_ts_descending_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, rev);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix (2026-07-31): `native_ts_add` allocates
+        // (it grows the destination array and can dispatch a Comparator), so
+        // both the source array and the result move under this loop.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut result = result;
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
         }
+        ctx.unpin_native_roots(data_pin);
+        return Ok(Some(Value::Object(Some(result))));
     }
     Ok(Some(Value::Object(Some(result))))
 }
