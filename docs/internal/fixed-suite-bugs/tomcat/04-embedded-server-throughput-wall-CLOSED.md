@@ -7,7 +7,7 @@ tracked owner:
 
 * **`docs/internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`** —
   the synchronized-method JIT admission defect, fixed on 2026-07-28.
-* **`docs/known-issues/tomcat/32-doc04-residual-perf-assertions.md`** — the
+* **`docs/internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md`** — the
   four per-test residuals that are not deploy throughput.
 
 The rest of this file is the closing evidence, then the group's own history.

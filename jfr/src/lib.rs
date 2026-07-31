@@ -77,16 +77,39 @@
 //!    trigger, not after.
 //!  * `RecordingSettings::max_age` / `max_size` are **not enforced anywhere**;
 //!    see their declarations in [`recording`].
+//!
+//! ## JDK-only mode telemetry
+//!
+//! [`jdk_only`] holds the aggregate counter set of
+//! `docs/feature-designs/jdk-only-mode.md` — seven `_total` counters folded, at
+//! report time, out of censuses the VM already keeps. It lives in this crate
+//! because this is where the repository puts "measurements of a run that an
+//! operator may ask to have written out", not because it emits JFR events: it
+//! shares none of the machinery above, takes no ring, registers no event type,
+//! and does not consult [`is_enabled`]. It has its own gate (off by default,
+//! opened only by the JDK-only artefact flags), because a flight recording and
+//! a policy census are different questions and an operator asking for one must
+//! not silently get the other.
 
 pub mod builtin;
 pub mod dump;
 pub mod event;
+pub mod jdk_only;
 pub mod recording;
 pub mod repository;
 pub mod stream;
 
 pub use dump::{dump_to_file, read_events, read_jfr_header, JfrDumpError, JfrFileHeader};
 pub use event::*;
+// JDK-only counters. Named re-exports rather than a glob: the module's public
+// surface is mostly `const` label vocabularies whose names (`NATIVE_KINDS`,
+// `GENERATORS`) are generic enough to collide with a future JFR export, and a
+// vocabulary should be reached through `jdk_only::` so the reader knows which
+// contract's spelling they are looking at.
+pub use jdk_only::{
+    ContractCounts, JdkOnlyCounters, JdkOnlyTelemetry, NativeCensusSample,
+    JDK_ONLY_TELEMETRY_SCHEMA_VERSION,
+};
 pub use recording::*;
 pub use repository::*;
 pub use stream::EventStream;

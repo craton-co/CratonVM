@@ -1,0 +1,8 @@
+# CratonVM regression suite: class-path ServiceLoader providers for RJdkServices.
+# Copied into the build directory by run.sh. LF line endings, UTF-8.
+# On the CLASS PATH every entry must be a subtype of the service with a public
+# no-arg constructor; the static provider() factory form is module-path only
+# and is covered by RJdkModule instead.
+RJdkServices$En
+RJdkServices$Fr
+RJdkServices$De

@@ -99,17 +99,60 @@ pub fn java_available(jdk_home: Option<&Path>) -> bool {
 /// header. Returns `None` if `java` can't be run. HotSpot prints the version
 /// banner to stderr.
 pub fn jdk_version(jdk_home: Option<&Path>) -> Option<String> {
+    jdk_version_banner(jdk_home).and_then(|banner| {
+        banner
+            .lines()
+            .next()
+            .map(|l| l.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// The raw `java -version` banner (stderr), or `None` if `java` can't be run.
+fn jdk_version_banner(jdk_home: Option<&Path>) -> Option<String> {
     let out = Command::new(java_executable(jdk_home))
         .arg("-version")
         .stdin(Stdio::null())
         .output()
         .ok()?;
-    let banner = String::from_utf8_lossy(&out.stderr);
-    banner
-        .lines()
-        .next()
-        .map(|l| l.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
+    Some(String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// The JDK **feature version** (`25`, `21`, `8`, …) of the configured runtime.
+///
+/// Recorded on every schema-2 ledger row (`docs/feature-designs/jdk-only-mode.md`
+/// §9's `jdk_feature`), because a strict-mode violation is only meaningful
+/// against the JDK it was measured on: a `MissingNative` on 25 and the same one
+/// on 21 are different findings. Probed **once per corpus** (into
+/// [`RunnerConfig::jdk_feature`]), never per run.
+pub fn jdk_feature_version(jdk_home: Option<&Path>) -> Option<u32> {
+    jdk_version_banner(jdk_home).and_then(|b| parse_jdk_feature(&b))
+}
+
+/// Extract the feature version from a `java -version` banner.
+///
+/// Handles both the modern and the legacy spellings:
+///
+/// ```text
+/// openjdk version "25.0.3" 2026-04-21 LTS   ⇒ 25
+/// java version "1.8.0_412"                  ⇒  8   (1.x is the pre-9 scheme)
+/// openjdk version "17"                      ⇒ 17
+/// ```
+///
+/// Returns `None` rather than guessing when no quoted version is present — an
+/// unknown feature version must read as "not measured", not as `0`.
+pub fn parse_jdk_feature(banner: &str) -> Option<u32> {
+    // The version is the first double-quoted token on the banner's first
+    // non-empty line (`openjdk version "25.0.3" ...`).
+    let line = banner.lines().map(str::trim).find(|l| l.contains('"'))?;
+    let quoted = line.split('"').nth(1)?;
+    let mut parts = quoted.split(['.', '-', '+', '_']);
+    let first: u32 = parts.next()?.parse().ok()?;
+    if first == 1 {
+        // `1.8.0_412` — the feature version is the *second* component.
+        return parts.next()?.parse().ok();
+    }
+    Some(first)
 }
 
 /// Resolve a JDK tool by name under `<jdk_home>/bin`, falling back to the bare
@@ -138,6 +181,20 @@ fn resolve_jdk_tool(jdk_home: Option<&Path>, tool: &str) -> PathBuf {
 /// matrix), distinguished by the `CRATONVM_*` env it sets — which is why a JIT
 /// divergence shows up as `jit-on ≠ java` while `nojit = java` and auto-
 /// classifies as a JIT bug (design §3.3).
+///
+/// ## Two families
+///
+/// The **historical five** (`jit-on` … `low-jit-threshold`) pass *no* CLI flags
+/// at all and run under the launcher's default compatibility policy. Their
+/// argv, env and ledger rows are frozen: the committed `difftest/seeds` gate
+/// baseline is measured with them, so anything this feature adds must be
+/// invisible to them.
+///
+/// The **four profile modes** additionally select a compatibility policy on the
+/// command line (`docs/feature-designs/jdk-only-mode.md` §9) and collect the
+/// three census dumps. They are a second axis, not a replacement: a program can
+/// be run under both, and lands on **two ledger rows** keyed by
+/// `(class, jdk_profile)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Default execution (JIT enabled).
@@ -150,9 +207,37 @@ pub enum Mode {
     MovingGc,
     /// `CRATONVM_JIT_THRESHOLD=1` — force early compile to surface OSR/deopt.
     LowJitThreshold,
+
+    /// `--jdk-only`, JIT enabled: real class bytes are authoritative.
+    JdkOnlyJit,
+    /// `--jdk-only`, interpreter only — isolates a strict-mode divergence from
+    /// a JIT one exactly the way `nojit` does for the compatible policy.
+    JdkOnlyNoJit,
+    /// `--real-jdk`, JIT enabled: today's compatibility behaviour, but with the
+    /// census dumps on, so the strict rows have a same-JDK control to diff
+    /// against. **Not** the same as `jit-on`: it names the policy explicitly and
+    /// records what a strict run *would* have rejected (contract §10).
+    RealCompatibleJit,
+    /// `--real-jdk`, interpreter only.
+    RealCompatibleNoJit,
 }
 
 impl Mode {
+    /// Every mode, historical five first, in `--modes` order.
+    pub fn all() -> &'static [Mode] {
+        &[
+            Mode::JitOn,
+            Mode::NoJit,
+            Mode::NoIntrinsics,
+            Mode::MovingGc,
+            Mode::LowJitThreshold,
+            Mode::JdkOnlyJit,
+            Mode::JdkOnlyNoJit,
+            Mode::RealCompatibleJit,
+            Mode::RealCompatibleNoJit,
+        ]
+    }
+
     /// The stable kebab-case label used on the CLI (`--modes`) and in ledger
     /// rows.
     pub fn label(self) -> &'static str {
@@ -162,6 +247,10 @@ impl Mode {
             Mode::NoIntrinsics => "no-intrinsics",
             Mode::MovingGc => "moving-gc",
             Mode::LowJitThreshold => "low-jit-threshold",
+            Mode::JdkOnlyJit => "jdk-only-jit",
+            Mode::JdkOnlyNoJit => "jdk-only-nojit",
+            Mode::RealCompatibleJit => "real-compatible-jit",
+            Mode::RealCompatibleNoJit => "real-compatible-nojit",
         }
     }
 
@@ -169,6 +258,10 @@ impl Mode {
     /// `JitOn` is the default and sets nothing. The runner additionally
     /// *clears* the opposing knobs (see [`apply_mode_env`]) so a child's
     /// environment is deterministic regardless of what the harness inherited.
+    ///
+    /// The policy modes reuse the same JIT knob: strictness is a *launcher
+    /// flag* (see [`cli_args`](Mode::cli_args)), never an env var, so a stale
+    /// inherited `CRATONVM_*` can't turn a compatible run strict or back.
     pub fn env_overrides(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Mode::JitOn => &[],
@@ -178,7 +271,57 @@ impl Mode {
             // promotion (see MEMORY.md's GC knobs).
             Mode::MovingGc => &[("CRATONVM_NO_SELECTIVE_PROMOTE", "1")],
             Mode::LowJitThreshold => &[("CRATONVM_JIT_THRESHOLD", "1")],
+            Mode::JdkOnlyJit | Mode::RealCompatibleJit => &[],
+            Mode::JdkOnlyNoJit | Mode::RealCompatibleNoJit => &[("CRATONVM_DISABLE_JIT", "1")],
         }
+    }
+
+    /// Launcher flags this mode passes, ahead of `-cp` (contract §9).
+    ///
+    /// The historical five return `&[]` — they must keep producing the exact
+    /// argv the committed gate baseline was captured with. `--jdk-only` and
+    /// `--real-jdk` are mutually exclusive by construction: no mode emits both.
+    pub fn cli_args(self) -> &'static [&'static str] {
+        match self {
+            Mode::JdkOnlyJit | Mode::JdkOnlyNoJit => &["--jdk-only"],
+            Mode::RealCompatibleJit | Mode::RealCompatibleNoJit => &["--real-jdk"],
+            _ => &[],
+        }
+    }
+
+    /// The `CompatibilityMode::as_str()` spelling of the policy this mode runs
+    /// under — the second half of a ledger row's key.
+    ///
+    /// `real-compatible-*` reports `"compatible"`, the same as the historical
+    /// five: it differs in *observability*, not in policy, so it must share
+    /// their ledger rows rather than forking a parallel set.
+    pub fn jdk_profile(self) -> &'static str {
+        if self.is_jdk_only() {
+            crate::ledger::PROFILE_JDK_ONLY
+        } else {
+            crate::ledger::PROFILE_COMPATIBLE
+        }
+    }
+
+    /// Whether this mode asks the launcher for the strict policy.
+    pub fn is_jdk_only(self) -> bool {
+        matches!(self, Mode::JdkOnlyJit | Mode::JdkOnlyNoJit)
+    }
+
+    /// Whether this mode passes the three census dump flags.
+    ///
+    /// True for all four profile modes — including the compatible pair, since
+    /// wave 1 is measurement (contract §10) and the compatible census is the
+    /// baseline the strict one is read against. **False for the historical
+    /// five**, whose argv is frozen.
+    pub fn collects_census(self) -> bool {
+        matches!(
+            self,
+            Mode::JdkOnlyJit
+                | Mode::JdkOnlyNoJit
+                | Mode::RealCompatibleJit
+                | Mode::RealCompatibleNoJit
+        )
     }
 
     /// Parse a single mode label. Returns `None` for an unknown label.
@@ -189,6 +332,10 @@ impl Mode {
             "no-intrinsics" => Some(Mode::NoIntrinsics),
             "moving-gc" => Some(Mode::MovingGc),
             "low-jit-threshold" => Some(Mode::LowJitThreshold),
+            "jdk-only-jit" => Some(Mode::JdkOnlyJit),
+            "jdk-only-nojit" | "jdk-only-no-jit" => Some(Mode::JdkOnlyNoJit),
+            "real-compatible-jit" => Some(Mode::RealCompatibleJit),
+            "real-compatible-nojit" | "real-compatible-no-jit" => Some(Mode::RealCompatibleNoJit),
             _ => None,
         }
     }
@@ -248,10 +395,18 @@ pub struct RunnerConfig {
     /// oracle's soundness guard (design §3.3). The single most important
     /// correctness property of the gate.
     pub determinism_check: bool,
-    /// Re-confirm a divergence by re-running the diverging CratonVM mode; a
-    /// divergence that doesn't reproduce was a transient (e.g. a concurrent
-    /// rebuild overwriting the binary mid-run) and is dropped.
+    /// Re-confirm a divergence by re-running the diverging CratonVM mode.
+    ///
+    /// A divergence that doesn't reproduce was a transient (e.g. a concurrent
+    /// rebuild overwriting the binary mid-run) and is dropped. The re-run uses
+    /// the **same mode** — there is deliberately no fallback to a laxer policy,
+    /// because a strict divergence that "goes away" under `--real-jdk` is the
+    /// finding, not a flake.
     pub reconfirm: bool,
+    /// JDK feature version of the configured runtime (`25`, `21`, `8`, …),
+    /// probed once per corpus by [`crate::harness::run_corpus`] and stamped on
+    /// every ledger row. `None` until probed / when `java` is unavailable.
+    pub jdk_feature: Option<u32>,
 }
 
 impl RunnerConfig {
@@ -268,6 +423,7 @@ impl RunnerConfig {
             update_ledger: false,
             determinism_check: false,
             reconfirm: false,
+            jdk_feature: None,
         }
     }
 }
@@ -373,7 +529,82 @@ pub fn run_subprocess(mut cmd: Command, timeout: Duration) -> Result<Observation
     })
 }
 
+// ---------------------------------------------------------------------------
+// JDK-only census dumps (contract §9)
+// ---------------------------------------------------------------------------
+
+/// Where one census-collecting child writes its three JSON artefacts.
+///
+/// The launcher writes these on shutdown; [`crate::census::collect`] reads them
+/// back. All three work **with or without** `--jdk-only` (contract §9), which
+/// is what makes `real-compatible-*` a usable control: it measures what a
+/// strict run *would* have rejected while behaving exactly as today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DumpPaths {
+    /// `--jdk-only-report <FILE>` — mode, jdk_feature, violations, counts.
+    pub jdk_only_report: PathBuf,
+    /// `--dump-class-origins <FILE>` — one row per loaded class.
+    pub class_origins: PathBuf,
+    /// `--dump-native-registry <FILE>` — schema-2 native census.
+    pub native_registry: PathBuf,
+}
+
+impl DumpPaths {
+    /// The three dumps under `dir`, with plain names.
+    pub fn in_dir(dir: impl AsRef<Path>) -> Self {
+        Self::tagged(dir, "")
+    }
+
+    /// The three dumps under `dir`, prefixed with `tag` so concurrent runs of
+    /// different `(program, mode)` pairs in one scratch directory can't
+    /// overwrite each other's census.
+    pub fn tagged(dir: impl AsRef<Path>, tag: &str) -> Self {
+        let dir = dir.as_ref();
+        let name = |what: &str| {
+            if tag.is_empty() {
+                format!("{what}.json")
+            } else {
+                format!("{tag}-{what}.json")
+            }
+        };
+        Self {
+            jdk_only_report: dir.join(name("jdk-only-report")),
+            class_origins: dir.join(name("class-origins")),
+            native_registry: dir.join(name("native-registry")),
+        }
+    }
+
+    /// The launcher flags that request these dumps, in contract §9 order.
+    pub fn cli_args(&self) -> Vec<std::ffi::OsString> {
+        let mut args: Vec<std::ffi::OsString> = Vec::with_capacity(6);
+        for (flag, path) in [
+            ("--jdk-only-report", &self.jdk_only_report),
+            ("--dump-class-origins", &self.class_origins),
+            ("--dump-native-registry", &self.native_registry),
+        ] {
+            args.push(flag.into());
+            args.push(path.clone().into_os_string());
+        }
+        args
+    }
+
+    /// Remove any files a previous run left behind, so a launcher that fails to
+    /// write one cannot have a stale file read as this run's measurement.
+    pub fn cleanup(&self) {
+        for p in [
+            &self.jdk_only_report,
+            &self.class_origins,
+            &self.native_registry,
+        ] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// Run `<main_class>` on CratonVM in `mode` with `classpath`.
+///
+/// Signature unchanged from Step 1; delegates to
+/// [`run_cratonvm_with_dumps`] with no census.
 pub fn run_cratonvm(
     bin: &Path,
     classpath: &Path,
@@ -381,7 +612,30 @@ pub fn run_cratonvm(
     mode: Mode,
     timeout: Duration,
 ) -> Result<Observation, RunError> {
+    run_cratonvm_with_dumps(bin, classpath, main_class, mode, timeout, None)
+}
+
+/// Run `<main_class>` on CratonVM in `mode`, optionally requesting the three
+/// JDK-only census dumps.
+///
+/// Argv order is `<policy flag> <dump flags> -cp <classpath> <main class>`:
+/// the launcher's own options must precede `-cp`, and everything after the main
+/// class would be program arguments. A mode with no policy flag and no dumps
+/// produces byte-identical argv to Step 1's.
+pub fn run_cratonvm_with_dumps(
+    bin: &Path,
+    classpath: &Path,
+    main_class: &str,
+    mode: Mode,
+    timeout: Duration,
+    dumps: Option<&DumpPaths>,
+) -> Result<Observation, RunError> {
     let mut cmd = Command::new(bin);
+    cmd.args(mode.cli_args());
+    if let Some(dumps) = dumps {
+        dumps.cleanup();
+        cmd.args(dumps.cli_args());
+    }
     cmd.arg("-cp").arg(classpath).arg(main_class);
     apply_mode_env(&mut cmd, mode);
     run_subprocess(cmd, timeout)
@@ -490,13 +744,7 @@ mod tests {
     fn all_mode_knobs_cover_every_override() {
         // The clear-list must be a superset of every mode's set-keys, or an
         // inherited knob could leak into a mode that doesn't set it.
-        for mode in [
-            Mode::JitOn,
-            Mode::NoJit,
-            Mode::NoIntrinsics,
-            Mode::MovingGc,
-            Mode::LowJitThreshold,
-        ] {
+        for mode in Mode::all() {
             for (k, _) in mode.env_overrides() {
                 assert!(
                     ALL_MODE_KNOBS.contains(k),
@@ -504,6 +752,221 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- the historical five are frozen -------------------------------------
+
+    /// The five modes the committed `difftest/seeds` gate baseline was captured
+    /// with. Their labels, argv and env are a compatibility surface.
+    const LEGACY_MODES: [Mode; 5] = [
+        Mode::JitOn,
+        Mode::NoJit,
+        Mode::NoIntrinsics,
+        Mode::MovingGc,
+        Mode::LowJitThreshold,
+    ];
+
+    #[test]
+    fn legacy_modes_contribute_no_cli_flags_and_no_census() {
+        // The whole point of the new modes being *new*: adding a policy axis
+        // must not change one byte of what the historical five run. A flag or a
+        // dump leaking in here silently re-measures the CI baseline.
+        for mode in LEGACY_MODES {
+            assert!(
+                mode.cli_args().is_empty(),
+                "{} must pass no launcher flags, got {:?}",
+                mode.label(),
+                mode.cli_args()
+            );
+            assert!(
+                !mode.collects_census(),
+                "{} must not request census dumps",
+                mode.label()
+            );
+            assert!(!mode.is_jdk_only(), "{} is not strict", mode.label());
+            assert_eq!(mode.jdk_profile(), "compatible", "{}", mode.label());
+        }
+    }
+
+    #[test]
+    fn legacy_labels_and_env_are_unchanged() {
+        let labels: Vec<&str> = LEGACY_MODES.iter().map(|m| m.label()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "jit-on",
+                "nojit",
+                "no-intrinsics",
+                "moving-gc",
+                "low-jit-threshold"
+            ]
+        );
+        assert!(Mode::JitOn.env_overrides().is_empty());
+        assert_eq!(
+            Mode::NoJit.env_overrides(),
+            &[("CRATONVM_DISABLE_JIT", "1")]
+        );
+        assert_eq!(
+            Mode::NoIntrinsics.env_overrides(),
+            &[("CRATONVM_DISABLE_INTRINSICS", "1")]
+        );
+        assert_eq!(
+            Mode::MovingGc.env_overrides(),
+            &[("CRATONVM_NO_SELECTIVE_PROMOTE", "1")]
+        );
+        assert_eq!(
+            Mode::LowJitThreshold.env_overrides(),
+            &[("CRATONVM_JIT_THRESHOLD", "1")]
+        );
+        // The default `--modes` list is still the historical pair.
+        assert_eq!(
+            RunnerConfig::for_corpus(PathBuf::from("x")).modes,
+            vec![Mode::JitOn, Mode::NoJit]
+        );
+    }
+
+    // -- the profile modes ---------------------------------------------------
+
+    #[test]
+    fn profile_modes_round_trip_and_carry_one_policy_flag() {
+        let modes =
+            parse_modes("jdk-only-jit,jdk-only-nojit,real-compatible-jit,real-compatible-nojit")
+                .unwrap();
+        assert_eq!(
+            modes,
+            vec![
+                Mode::JdkOnlyJit,
+                Mode::JdkOnlyNoJit,
+                Mode::RealCompatibleJit,
+                Mode::RealCompatibleNoJit
+            ]
+        );
+        for m in &modes {
+            assert!(m.collects_census(), "{} collects a census", m.label());
+            assert_eq!(m.cli_args().len(), 1, "{}", m.label());
+            assert_eq!(Mode::from_label(m.label()), Some(*m), "label round-trips");
+        }
+        assert_eq!(Mode::JdkOnlyJit.cli_args(), &["--jdk-only"]);
+        assert_eq!(Mode::RealCompatibleNoJit.cli_args(), &["--real-jdk"]);
+        // The nojit half of each pair disables the JIT the same way `nojit` does.
+        assert_eq!(
+            Mode::JdkOnlyNoJit.env_overrides(),
+            &[("CRATONVM_DISABLE_JIT", "1")]
+        );
+        assert!(Mode::JdkOnlyJit.env_overrides().is_empty());
+    }
+
+    #[test]
+    fn no_mode_mixes_the_two_policy_flags() {
+        // `--jdk-only` and `--real-jdk` request opposite policies; a mode that
+        // passed both would leave the verdict to the launcher's argument order.
+        for &m in Mode::all() {
+            let args = m.cli_args();
+            if m.is_jdk_only() {
+                assert!(args.contains(&"--jdk-only"), "{}", m.label());
+                assert!(
+                    !args.contains(&"--real-jdk"),
+                    "{} is strict and must not ask for the compatible policy",
+                    m.label()
+                );
+            } else {
+                assert!(
+                    !args.contains(&"--jdk-only"),
+                    "{} is compatible and must not ask for the strict policy",
+                    m.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn profile_maps_to_the_compatibility_mode_spelling() {
+        assert_eq!(Mode::JdkOnlyJit.jdk_profile(), "jdk-only");
+        assert_eq!(Mode::JdkOnlyNoJit.jdk_profile(), "jdk-only");
+        // `real-compatible-*` shares the historical five's profile: it differs
+        // in observability, not policy, so it keys onto the same ledger rows.
+        assert_eq!(Mode::RealCompatibleJit.jdk_profile(), "compatible");
+        assert_eq!(Mode::RealCompatibleNoJit.jdk_profile(), "compatible");
+        assert!(!Mode::RealCompatibleJit.is_jdk_only());
+    }
+
+    #[test]
+    fn all_lists_every_mode_exactly_once() {
+        let labels: Vec<&str> = Mode::all().iter().map(|m| m.label()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "duplicate label in Mode::all()");
+        assert_eq!(labels.len(), 9);
+        for label in &labels {
+            assert!(Mode::from_label(label).is_some(), "{label} must parse");
+        }
+    }
+
+    // -- census dumps --------------------------------------------------------
+
+    #[test]
+    fn dump_paths_emit_the_three_contract_flags() {
+        let dumps = DumpPaths::tagged(Path::new("scratch"), "Foo-jdk-only-jit");
+        let args = dumps.cli_args();
+        assert_eq!(args.len(), 6);
+        assert_eq!(args[0], "--jdk-only-report");
+        assert_eq!(args[2], "--dump-class-origins");
+        assert_eq!(args[4], "--dump-native-registry");
+        assert!(dumps
+            .jdk_only_report
+            .ends_with("Foo-jdk-only-jit-jdk-only-report.json"));
+        // Distinct tags never collide in one scratch dir.
+        let other = DumpPaths::tagged(Path::new("scratch"), "Foo-real-compatible-jit");
+        assert_ne!(dumps.jdk_only_report, other.jdk_only_report);
+    }
+
+    #[test]
+    fn dump_cleanup_removes_stale_files() {
+        let dir = std::env::temp_dir().join(format!("difftest_dumps_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dumps = DumpPaths::in_dir(&dir);
+        std::fs::write(&dumps.jdk_only_report, "{}").expect("write");
+        assert!(dumps.jdk_only_report.exists());
+        // A stale report from a previous run must not be readable as this
+        // run's measurement.
+        dumps.cleanup();
+        assert!(!dumps.jdk_only_report.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- JDK feature probe ---------------------------------------------------
+
+    #[test]
+    fn parses_the_modern_version_banner() {
+        assert_eq!(
+            parse_jdk_feature("openjdk version \"25.0.3\" 2026-04-21 LTS\nOpenJDK Runtime ...\n"),
+            Some(25)
+        );
+        assert_eq!(parse_jdk_feature("openjdk version \"17\"\n"), Some(17));
+        assert_eq!(
+            parse_jdk_feature("openjdk version \"21.0.2\" 2024-01-16"),
+            Some(21)
+        );
+        assert_eq!(
+            parse_jdk_feature("openjdk version \"24-ea\" 2025-03-18"),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn parses_the_legacy_1_8_banner() {
+        // Pre-9 JDKs spell 8 as `1.8.0_x`; reading the leading component would
+        // record every JDK 8 run as feature 1.
+        assert_eq!(parse_jdk_feature("java version \"1.8.0_412\"\n"), Some(8));
+        assert_eq!(parse_jdk_feature("java version \"1.7.0_80\"\n"), Some(7));
+    }
+
+    #[test]
+    fn an_unreadable_banner_is_none_not_zero() {
+        assert_eq!(parse_jdk_feature(""), None);
+        assert_eq!(parse_jdk_feature("no version here\n"), None);
+        assert_eq!(parse_jdk_feature("openjdk version \"weird\"\n"), None);
     }
 
     #[test]

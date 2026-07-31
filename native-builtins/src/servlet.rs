@@ -2687,9 +2687,17 @@ const S2DC_SOCK_ID: usize = 4;
 
 // ---- ByteBuffer helpers ----------------------------------------------------
 
-fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
+fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Option<ObjectRef> {
     use cratonvm_types::ArrayElementType;
-    let arr = ctx.new_array(ArrayElementType::Byte, cap);
+    // `ByteBuffer.allocate(n)` is caller-sized: `n` comes straight from Java,
+    // and on a full heap the backing `new byte[n]` must raise a *catchable*
+    // OutOfMemoryError (what HotSpot does) rather than abort the VM. This is
+    // the same fallible-allocator idiom as the ArrayList(int)/StringBuilder(int)
+    // capacity-constructor family — see
+    // `docs/internal/gaps/crash-01-arraylist-capacity-oom-abend.md`. Found via
+    // H2's `org.h2.test.db.TestOutOfMemory`, whose MVStore-on-memFS workload
+    // allocates ~76 MB buffers until the heap is gone.
+    let arr = ctx.try_new_array(ArrayElementType::Byte, cap)?;
     // GC-safety: `alloc_concurrent_synthetic` below allocates and can
     // trigger a collection that relocates `arr` (read again by
     // `bb_write_hb` immediately after); pin it and re-read.
@@ -2698,7 +2706,7 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
     bb_write_hb(ctx, buf, arr, cap as i32);
-    buf
+    Some(buf)
 }
 
 /// NEW-17 — synthetic-mode `ByteBuffer.allocateDirect(cap)`.
@@ -3209,6 +3217,42 @@ fn s2_bb_set_pos(ctx: &mut dyn NativeContext, buf: ObjectRef, v: i32) {
     } else {
         ctx.set_field_by_name(buf, "position", Value::Int(v));
     }
+}
+
+/// Bulk `byte[]` → `byte[]` copy for the ByteBuffer natives, through the VM's
+/// `memcpy` intrinsics instead of a per-element accessor loop.
+///
+/// Every heap↔heap arm of `get([B)`, `get([BII)`, `put([B)`, `put([BII)` and
+/// `put(Ljava/nio/ByteBuffer;)` used to move one byte per `get_array_element` /
+/// `set_array_element` call, i.e. two dynamic accessor calls per byte. That is
+/// what `native-api`'s own doc comment on `write_byte_array_from` calls out as
+/// the migration these callers were waiting for, and it is the whole of
+/// `TestAsyncMessagesPerformance`'s inter-chunk gap: the WebSocket client moves
+/// ~32 KiB through these five methods for every 8 KiB partial message it
+/// delivers (socket → `response` → `inputBuffer` → `messageBufferBinary` →
+/// the defensive `copy` handed to `onMessage`).
+/// See `docs/known-issues/tomcat/32-doc04-residual-perf-assertions.md` §32.3.
+///
+/// Returns `false` — having written nothing — when either intrinsic declines
+/// (non-byte array kind, or bounds it refuses); the caller must then fall back
+/// to the element loop. Copying via an owned buffer also makes an overlapping
+/// same-array copy well defined, which the element loop was not.
+fn s2_bb_bulk_array_copy(
+    ctx: &mut dyn NativeContext,
+    src: ObjectRef,
+    src_off: usize,
+    dst: ObjectRef,
+    dst_off: usize,
+    len: usize,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mut buf = vec![0u8; len];
+    if ctx.read_byte_array_into(src, src_off, &mut buf) != len {
+        return false;
+    }
+    ctx.write_byte_array_from(dst, dst_off, &buf)
 }
 
 fn s2_bb_get_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i8 {
@@ -4305,7 +4349,13 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
 
     r.register(bb, "allocate", "(I)Ljava/nio/ByteBuffer;", |ctx, args| {
         let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-        Ok(Some(Value::Object(Some(s2_bb_alloc(ctx, cap)))))
+        match s2_bb_alloc(ctx, cap) {
+            Some(buf) => Ok(Some(Value::Object(Some(buf)))),
+            None => Err(RuntimeError::OutOfMemoryError {
+                message: "Java heap space".to_string(),
+            }
+            .into()),
+        }
     });
     r.register(
         bb,
@@ -4428,9 +4478,12 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         // came back as zero (ES-FAIL-FAMILY-20260709).
         if let Some(arr) = s2_bb_arr(ctx, this) {
             let base = s2_bb_heap_base(ctx, this);
-            for i in 0..len as usize {
-                let b = ctx.get_array_element(arr, base + pos as usize + i);
-                ctx.set_array_element(dst, off + i, b);
+            let src_off = base + pos as usize;
+            if !s2_bb_bulk_array_copy(ctx, arr, src_off, dst, off, len as usize) {
+                for i in 0..len as usize {
+                    let b = ctx.get_array_element(arr, src_off + i);
+                    ctx.set_array_element(dst, off + i, b);
+                }
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
             let mut bytes = vec![0u8; len as usize];
@@ -4440,8 +4493,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            for (i, byte) in bytes.iter().enumerate() {
-                ctx.set_array_element(dst, off + i, Value::Int(*byte as i8 as i32));
+            if !ctx.write_byte_array_from(dst, off, &bytes) {
+                for (i, byte) in bytes.iter().enumerate() {
+                    ctx.set_array_element(dst, off + i, Value::Int(*byte as i8 as i32));
+                }
             }
         } else {
             // Genuinely storage-less synthetic buffer — keep the historic
@@ -4462,9 +4517,12 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         if let Some(arr) = s2_bb_arr(ctx, this) {
             let base = s2_bb_heap_base(ctx, this);
-            for i in 0..len as usize {
-                let b = ctx.get_array_element(arr, base + pos as usize + i);
-                ctx.set_array_element(dst, i, b);
+            let src_off = base + pos as usize;
+            if !s2_bb_bulk_array_copy(ctx, arr, src_off, dst, 0, len as usize) {
+                for i in 0..len as usize {
+                    let b = ctx.get_array_element(arr, src_off + i);
+                    ctx.set_array_element(dst, i, b);
+                }
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
             let mut bytes = vec![0u8; len as usize];
@@ -4474,8 +4532,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            for (i, byte) in bytes.iter().enumerate() {
-                ctx.set_array_element(dst, i, Value::Int(*byte as i8 as i32));
+            if !ctx.write_byte_array_from(dst, 0, &bytes) {
+                for (i, byte) in bytes.iter().enumerate() {
+                    ctx.set_array_element(dst, i, Value::Int(*byte as i8 as i32));
+                }
             }
         } else {
             return Ok(Some(Value::Object(Some(this))));
@@ -4546,14 +4606,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         // get([BII)'s comment above for the matching read-side rationale.
         if let Some(arr) = s2_bb_arr(ctx, this) {
             let base = s2_bb_heap_base(ctx, this);
-            for i in 0..len as usize {
-                let b = ctx.get_array_element(src, off + i);
-                ctx.set_array_element(arr, base + pos as usize + i, b);
+            let dst_off = base + pos as usize;
+            if !s2_bb_bulk_array_copy(ctx, src, off, arr, dst_off, len as usize) {
+                for i in 0..len as usize {
+                    let b = ctx.get_array_element(src, off + i);
+                    ctx.set_array_element(arr, dst_off + i, b);
+                }
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
             let mut bytes = vec![0u8; len as usize];
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = ctx.get_array_element(src, off + i).as_int().unwrap_or(0) as u8;
+            if ctx.read_byte_array_into(src, off, &mut bytes) != len as usize {
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte = ctx.get_array_element(src, off + i).as_int().unwrap_or(0) as u8;
+                }
             }
             if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
                 return Err(RuntimeError::IllegalStateException {
@@ -4580,14 +4645,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         if let Some(arr) = s2_bb_arr(ctx, this) {
             let base = s2_bb_heap_base(ctx, this);
-            for i in 0..len as usize {
-                let b = ctx.get_array_element(src, i);
-                ctx.set_array_element(arr, base + pos as usize + i, b);
+            let dst_off = base + pos as usize;
+            if !s2_bb_bulk_array_copy(ctx, src, 0, arr, dst_off, len as usize) {
+                for i in 0..len as usize {
+                    let b = ctx.get_array_element(src, i);
+                    ctx.set_array_element(arr, dst_off + i, b);
+                }
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
             let mut bytes = vec![0u8; len as usize];
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = ctx.get_array_element(src, i).as_int().unwrap_or(0) as u8;
+            if ctx.read_byte_array_into(src, 0, &mut bytes) != len as usize {
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte = ctx.get_array_element(src, i).as_int().unwrap_or(0) as u8;
+                }
             }
             if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
                 return Err(RuntimeError::IllegalStateException {
@@ -4632,11 +4702,14 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let mut bytes = vec![0u8; n];
             if let Some(src_arr) = s2_bb_arr(ctx, src) {
                 let src_base = s2_bb_heap_base(ctx, src);
-                for (i, b) in bytes.iter_mut().enumerate() {
-                    *b = ctx
-                        .get_array_element(src_arr, src_base + src_pos as usize + i)
-                        .as_int()
-                        .unwrap_or(0) as u8;
+                let src_start = src_base + src_pos as usize;
+                if ctx.read_byte_array_into(src_arr, src_start, &mut bytes) != n {
+                    for (i, b) in bytes.iter_mut().enumerate() {
+                        *b = ctx
+                            .get_array_element(src_arr, src_start + i)
+                            .as_int()
+                            .unwrap_or(0) as u8;
+                    }
                 }
             } else if let Some(addr) = s2_bb_direct_addr(ctx, src) {
                 if !ctx.copy_from_native_memory(addr.saturating_add(src_pos as i64), &mut bytes) {
@@ -4652,12 +4725,15 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             }
             if let Some(dst_arr) = s2_bb_arr(ctx, this) {
                 let dst_base = s2_bb_heap_base(ctx, this);
-                for (i, b) in bytes.iter().enumerate() {
-                    ctx.set_array_element(
-                        dst_arr,
-                        dst_base + pos as usize + i,
-                        Value::Int(*b as i8 as i32),
-                    );
+                let dst_start = dst_base + pos as usize;
+                if !ctx.write_byte_array_from(dst_arr, dst_start, &bytes) {
+                    for (i, b) in bytes.iter().enumerate() {
+                        ctx.set_array_element(
+                            dst_arr,
+                            dst_start + i,
+                            Value::Int(*b as i8 as i32),
+                        );
+                    }
                 }
             } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
                 if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {

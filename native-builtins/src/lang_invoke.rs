@@ -3547,15 +3547,46 @@ fn lookup_find_virtual(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let desc = descriptor_from_method_type(ctx, mt_obj);
-    // Ensure class is loaded
-    let _ = ctx.ensure_class_initialized(&class);
-    // Validate method exists
-    if !ctx.method_exists(&class, &name, &desc) {
-        // Don't throw — method may be in a synthetic stub or native-only class.
-        // Create the MH anyway; dispatch will handle missing methods gracefully.
-    }
+    let loaded = ctx.ensure_class_initialized(&class).is_ok();
+    lookup_require_method(ctx, loaded, &class, &name, &desc)?;
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_VIRTUAL);
     Ok(Some(Value::Object(Some(mh))))
+}
+
+/// `Lookup.findVirtual`/`findStatic`/`findSpecial` must raise
+/// `NoSuchMethodException` when the member is absent — a *checked* exception.
+///
+/// Handing back a `MethodHandle` regardless and letting the call site raise
+/// `NoSuchMethodError` at invoke time is not a smaller version of the same
+/// behaviour: `NoSuchMethodError` extends `Error`, so it sails straight through
+/// the `catch (Exception)` that every version-probing library writes. H2's
+/// `FullTextLucene.<clinit>` is the canonical shape —
+///
+/// ```java
+/// try   { mh = lookup.findVirtual(TotalHits.class, "value", methodType(long.class)); }
+/// catch (Exception e) { mh = lookup.findGetter(TotalHits.class, "value", long.class); }
+/// ```
+///
+/// — Lucene 10 exposes `value()`, Lucene 9 only the `value` field, and with an
+/// `Error` escaping the probe H2 died with `NoSuchMethodError: TotalHits.value()J`
+/// instead of taking its own fallback.
+///
+/// The escape hatch that motivated the old "create it anyway" comment is kept
+/// where it belongs: `method_exists` already answers true for synthetic-stub
+/// classes and for anything in the native registry, so a false answer means the
+/// member genuinely is not there. Only when the class itself could not be
+/// initialised do we stay quiet and let dispatch decide.
+fn lookup_require_method(
+    ctx: &dyn NativeContext,
+    class_loaded: bool,
+    class: &str,
+    name: &str,
+    desc: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if class_loaded && !ctx.method_exists(class, name, desc) {
+        return Err(no_such_method_error(class, name, desc));
+    }
+    Ok(())
 }
 
 fn lookup_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3578,12 +3609,8 @@ fn lookup_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let desc = descriptor_from_method_type(ctx, mt_obj);
-    let _ = ctx.ensure_class_initialized(&class);
-    if !ctx.method_exists(&class, &name, &desc) {
-        // Some internal targets live in stubs/synthetics that don't surface
-        // through method_exists. Create the MH anyway; the dispatch site
-        // raises NoSuchMethodError at invoke time if it cannot resolve.
-    }
+    let loaded = ctx.ensure_class_initialized(&class).is_ok();
+    lookup_require_method(ctx, loaded, &class, &name, &desc)?;
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_STATIC);
     Ok(Some(Value::Object(Some(mh))))
 }
@@ -3681,8 +3708,9 @@ fn lookup_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let class = resolve_class_name_robust(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let desc = descriptor_from_method_type(ctx, mt_obj);
-    let _ = ctx.ensure_class_initialized(&class);
+    let loaded = ctx.ensure_class_initialized(&class).is_ok();
     ctx.unpin_native_roots(class_obj_pin);
+    lookup_require_method(ctx, loaded, &class, &name, &desc)?;
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SPECIAL);
     Ok(Some(Value::Object(Some(mh))))
 }
@@ -3693,19 +3721,28 @@ fn no_such_method_error(
     method: &str,
     desc: &str,
 ) -> cratonvm_types::error::MethodCallFailed {
+    // A REAL `java.lang.NoSuchMethodException`, not a `VmError::Internal` whose
+    // message merely spells one. `Lookup.find*` is the standard way libraries
+    // version-probe an API, and they guard it with `catch (Exception)` — see
+    // the note on `lookup_find_virtual`.
     cratonvm_types::error::MethodCallFailed::InternalError(
-        cratonvm_types::error::VmError::Internal {
-            message: format!("NoSuchMethodException: {class}.{method}{desc}"),
-        },
+        cratonvm_types::error::VmError::Runtime(
+            cratonvm_types::error::RuntimeError::NoSuchMethodException {
+                message: format!("{class}.{method}{desc}"),
+            },
+        ),
     )
 }
 
 /// Create a NoSuchFieldException error.
 fn no_such_field_error(class: &str, field: &str) -> cratonvm_types::error::MethodCallFailed {
+    // A REAL `java.lang.NoSuchFieldException` — see `no_such_method_error`.
     cratonvm_types::error::MethodCallFailed::InternalError(
-        cratonvm_types::error::VmError::Internal {
-            message: format!("NoSuchFieldException: {class}.{field}"),
-        },
+        cratonvm_types::error::VmError::Runtime(
+            cratonvm_types::error::RuntimeError::NoSuchFieldException {
+                field_name: format!("{class}.{field}"),
+            },
+        ),
     )
 }
 
@@ -3732,10 +3769,15 @@ fn lookup_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
     let _ = ctx.ensure_class_initialized(&class);
-    // Validate field exists
-    if ctx.resolve_field_index(&class, &name).is_none() {
-        // Field might be in a synthetic stub — don't throw hard error
-    }
+    // Deliberately permissive, unlike `lookup_find_virtual`: HotSpot raises
+    // `NoSuchFieldException` here, but `resolve_field_index` walks only the
+    // real class hierarchy — it has no synthetic-stub / native-registry
+    // fallback the way `method_exists` does — so a `None` does not reliably
+    // mean "absent" and throwing on it would break getters on stub classes.
+    // Nothing observed so far needs the throw (H2's version probe needs
+    // `findGetter` to SUCCEED as its fallback); revisit if a field-exists
+    // predicate that understands stubs shows up.
+    let _ = ctx.resolve_field_index(&class, &name);
     let desc = format!("(L{class};){field_desc}");
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER);
     Ok(Some(Value::Object(Some(mh))))
@@ -3764,9 +3806,8 @@ fn lookup_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
     let _ = ctx.ensure_class_initialized(&class);
-    if ctx.resolve_field_index(&class, &name).is_none() {
-        // Field might be in a synthetic stub
-    }
+    // Permissive for the same reason as `lookup_find_getter` above.
+    let _ = ctx.resolve_field_index(&class, &name);
     let desc = format!("(L{class};{field_desc})V");
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER);
     Ok(Some(Value::Object(Some(mh))))

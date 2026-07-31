@@ -1,22 +1,48 @@
 # Three conservative JIT-admission bans leave `TestMethodPerformance`'s whole hot path interpreted
 
-**Status:** 🔴 **OPEN.** Residual of
-[24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md) (whose `OutOfMemoryError` is FIXED).
-This is a *throughput* residual, in the family of
-[31](../../internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md) (and of the retired
-[04](../../internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-CLOSED.md) /
-[29](../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md)) — but unlike those it
-is root-caused here to three **specific, named** admission gates, all of which
-were added deliberately to close real silent-corruption bugs.
+**Status:** 🟡 **The admission-ban thesis is CLOSED (2026-07-31). The document
+stays OPEN for two throughput residuals adopted from
+[32](../../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md)
+the same day**, which are not admission problems and never were — see
+[§ Adopted](#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32).
 
-## Symptom
+Every admission ban this document names is settled and the "next lever" its
+last update identified is implemented — see
+[§ The three bans](#the-three-bans-and-how-each-ended). Two things this
+document asserted turned out to be wrong, and both are recorded there rather
+than quietly dropped: the per-pc local→location map it said ban 1b needed, and
+its claim that ban 2 had been lifted.
+
+Residual of [24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md)
+(whose `OutOfMemoryError` is FIXED). Family of
+[31](../../internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md),
+and of the retired
+[04](../../internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-CLOSED.md) /
+[29](../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md).
+
+> **Read this before chasing the number.** The headline "730x on the class" was
+> real, but its stated cause was wrong. With all three bans settled, loop
+> control in this shape runs at **HotSpot parity** — 1 ns/op against HotSpot's
+> 2 — and so does arithmetic. What remains is per-frame and native-call cost in
+> the JDK charset chain that `MessageBytes.toStringType` sits on top of. That
+> is a VM-wide baseline issue; it is measured and re-homed in
+> [§ Where the time actually goes](#where-the-time-actually-goes-re-derived-2026-07-31).
+>
+> The two adopted residuals below reached the same verdict independently, from
+> different tests: **their hot methods compile, and the compiled output is the
+> problem.** Three separate lines of evidence now say this family is codegen
+> and native-call quality, not admission gating. Do not send work at admission
+> gates on the strength of this document's title.
+---
+
+## Symptom (as originally recorded)
 
 `org.apache.tomcat.util.http.TestMethodPerformance` runs 6 × 100 000 000
 iterations of `mb.setBytes(...); mb.toStringType();` and then 6 × 100 000 000
 of `Method.bytesToString(...)`. HotSpot finishes the class in **41.2 s**.
 
-Measured end-to-end on the post-[24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md) binary,
-from the class's own printout:
+Measured on the post-[24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md) binary, from
+the class's own printout:
 
 ```
 .MessageBytes conversion took :3820342393100ns      (CratonVM, 1st 100M loop)
@@ -24,111 +50,444 @@ MessageBytes conversion took :3092470156300ns       (CratonVM, 2nd 100M loop)
 MessageBytes conversion took :6573830400ns          (HotSpot, same loop)
 ```
 
-**3100-3800 s vs 6.6 s for the same 100M iterations — ~470-580x**, stable
-across loops rather than a warm-up artefact. Phase 2 (`Method.bytesToString`,
-no allocation) is worse still: 1793-2277 s per 100M loop against HotSpot's
-0.40 s, ~4800x.
+Run to completion the class **PASSES**, in **30 149 s (8.4 hours)**. Nothing
+here was ever a functional defect; it is purely throughput. Before the bug-24
+fix this was masked — the run died with a spurious OOM at ~150-600 s.
 
-Run to completion, the class **PASSES** — in **30 149 s (8.4 hours)** against
-HotSpot's 41.2 s:
+**Re-measured 2026-07-31**, same class, same fixture:
+
+| loop | original | 2026-07-31 | |
+|---|---|---|---|
+| 1st 100M | 3 820 342 393 100 ns (38.2 µs/iter) | 4 075 206 863 800 ns (40.75 µs/iter) | measured while the 646-class A/B below saturated the box — an upper bound |
+| 2nd 100M | 3 092 470 156 300 ns (30.9 µs/iter) | **2 751 918 093 000 ns (27.5 µs/iter)** | quiet host |
+
+The like-for-like comparison is the second loop — both post-warmup, and the
+2026-07-31 one on a quiet host: **30.9 → 27.5 µs/iter, ~11% better.** That
+agrees with the ~12% measured independently on `OsrMessageBytesProbe` for the
+ban-1b lift, and it is the whole of what the admission bans were ever worth
+here.
+
+**The class-level gap is therefore still ~400x, and that is the expected
+result, not a disappointment.** The admission bans governed *loop control*,
+which now runs at HotSpot parity; the remaining ~27 µs an iteration is spent in
+the JDK charset chain the loop body calls into, and no admission gate was ever
+standing in front of that. **Anyone re-opening this document because "the
+number barely moved" should read
+[§ Where the time actually goes](#where-the-time-actually-goes-re-derived-2026-07-31)
+first.**
+
+## The three bans, and how each ended
+
+| # | Ban | Disposition |
+|---|-----|-------------|
+| 1 | **RBC.7** — `compile_osr_artifact` refuses any method containing `invokedynamic` | ✅ premise removed 2026-07-30 (concat sites are bridged, not trapped) |
+| 1b | **`osr_dead_mask`** — a second, independent gate hidden behind ban 1 | ✅ **FIXED here** — see below |
+| 2 | **RBC.6** — `local_handler_reads_unsafe_local` refuses `StringCache.toString` | ⚠️ **still refuses it, deliberately** — this doc's earlier "lifted" claim is stale, see below |
+| 3 | **Constructor** — `classify_init_complexity` refuses any `<init>` containing `putfield` | ✅ lifted by default 2026-07-28, regression-settled here |
+
+### Ban 1 — cleared, and it was hiding a second gate
+
+`compile_osr_artifact`'s blanket `if !scan.indy_ops.is_empty() { return None; }`
+refused `testGetMethodPerformance` because the
+`System.out.println("..." + duration + "ns")` after each loop lowers to
+`invokedynamic StringConcatFactory`. Since the test method is a once-invoked
+harness method with the hot loop inline, OSR is the only route into compiled
+code, so all 600 000 000 iterations of loop control interpreted.
+
+That ban's premise was removed on 2026-07-30 by lowering a resolved
+`StringConcatFactory` site to a direct call instead of an uncommon trap
+(`make_jit_string_concat_site_from_parts` / `execute_jit_string_concat_raw`,
+the `0xba` arm in `jit/src/x64.rs`). RBC.7 now only covers *unbridged*
+bootstraps.
+
+**And the loop still did not OSR**, because a completely independent gate
+refused the same entry and had been invisible for as long as RBC.7 bailed
+first:
 
 ```
-Time: 30,149.543
-
-OK (1 test)
+[cratonvm-jitc] indy-concat bridge pc=25 args=1          <- RBC.7 passed
+[cratonvm-jitc] OSR-reject OsrConcatProbe.main([Ljava/lang/String;)V
+                entry_pc=4 (dead_mask non-zero; memoed)
 ```
 
-So nothing here is a functional defect any more; it is purely a throughput
-gap, and that gap is ~730x on the class as a whole. Before the bug-24 fix this
-was all masked: the run died with a spurious OOM at ~150-600 s and never
-reached a timeout. That same run is the end-to-end confirmation for bug 24.
+`CompiledMethod::can_osr_enter` refused any entry pc whose `osr_dead_mask` is
+non-zero. At `entry_pc=4` the mask is `0x1` — local 0 (`args`), dead at the
+loop head but register-resident and sharing a home GPR with a live local.
 
-## Root cause — three independent admission bans on the same hot path
+### Ban 1b — the `osr_dead_mask` refusal, FIXED
 
-The first two are visible in one `CRATONVM_DBG_JITC=1` run of the class; the
-third is in the probe table below.
+The previous revision of this document concluded:
 
-### 1. The driving loop is permanently OSR-denied (RBC.7 `invokedynamic` ban)
+> The root problem is that `osr_local_assignments` is a **whole-method** table:
+> it cannot express "at this pc this register belongs to local *j*, not local
+> *i*". … Making this entry safe means giving OSR a per-pc local→location map,
+> not relaxing the check.
+
+**That conclusion was wrong.** No per-pc map is needed, because the locations
+are already per-method and the allocator's own invariant closes the gap:
+
+1. **A local has exactly one home for the whole method.** `local_assignments`
+   is indexed by local, `x64::Compiler::reg_for_local` is its single reader,
+   and there is no live-range splitting — so there is no "at this pc register R
+   belongs to someone else" state to express in the first place. The OSR copy
+   only *nulls* entries (category-2 high halves); it never re-points them.
+2. **Two locals sharing a register are never both live-in at the same block
+   start.** `regalloc::build_interference` unions every block's `live_in`
+   against itself, so any pair simultaneously live-in at a block boundary is
+   marked interfering — and `regalloc_invariants_hold` throws the entire
+   allocation away (falling back to no register homes) if an interfering pair
+   received the same colour. `RegAllocResult::block_live_in`, which the mask is
+   computed from, is that *same* `blocks[i].live_in`.
+3. Therefore at an OSR entry pc — always a block start — **at most one of the
+   locals homed to register R is live**, and the trampoline, which skips
+   exactly the masked ones, loads that one. R ends up holding the correct
+   value.
+4. A masked local needs no value: dead means every path from the entry
+   redefines it before reading it. Its frame slot goes unwritten, but the
+   trampoline already elides the frame-slot store for *every* register-homed
+   local, dead or live, so that is not a new hole.
+
+The refusal (`3415d052b`, 2026-07-03) also turns out to have landed alongside
+the change that actually closed the Hibernate regression it cites: the same
+commit threaded `compute_param_jvm_slots` / `param_slot_span` into the OSR
+compile so category-2 parameters — the `long limitRows` in that very
+`org.h2.command.query.Select.queryFlat` frame — land in the slots the body
+reads. That mismatch, not the dead-local skip, produced the NPE.
+
+Lifted by default; **`CRATONVM_JIT_OSR_DEAD_LOCALS=0` restores the blanket
+refusal with no rebuild**. `can_osr_enter_with` is the pure variant so one
+process can pin both sides.
+
+**Result.** `OsrConcatProbe.main` now logs `OSR-compile entry_pc=4` followed by
+`OSR-reuse` where it logged `OSR-reject`, with `first`/`second` unchanged and
+matching HotSpot. Same on the real shape (`OsrMessageBytesProbe`,
+`entry_pc=24`). Interleaved A/B, one binary one knob apart, 500k iterations:
+
+| round | admitted (ns) | refused (ns) |
+|---|---|---|
+| 1 | 12 942 854 700 | 14 134 067 700 |
+| 2 | 11 927 264 500 | 13 676 509 100 |
+| 3 | 12 139 174 800 | 14 197 219 100 |
+| **mean** | **12 336 431 333** | **14 002 598 633** |
+
+**~12% faster** (wall 13.49 s vs 14.84 s). Modest, and that is the point: see
+the re-derivation below for why.
+
+#### It found a real miscompile on the way
+
+The differential written for this change (`probes/OsrDeadLocalProbe.java`,
+eight coalescing shapes, FNV-checksummed) failed on its first run — and the
+failure reproduced with `CRATONVM_JIT_OSR_DEAD_LOCALS=0`, i.e. **on plain
+`dev`**, independent of this change. Narrowed to `probes/SlotReuseCategoryProbe.java`:
 
 ```
-[cratonvm-jitc] bg-compile org/apache/tomcat/util/http/TestMethodPerformance.testGetMethodPerformance()V tier=C2 optimized=true osr_bci=15
-[cratonvm-jitc] OSR-compile FAILED org/apache/tomcat/util/http/TestMethodPerformance.testGetMethodPerformance()V osr_bci=15 — method marked OSR-denied for the rest of this process
+                       HotSpot / --nojit   CratonVM JIT
+reused                        5599982.5    1.7716133435E9   <-- wrong
+noReuse                       5599982.5    5599982.5
+intAfter                      5599982.5    5599982.5
+noAfter                       5599982.5    5599982.5
+dblThenIntCounter             5599982.5    5599982.5
 ```
 
-`compile_osr_artifact` (vm/src/runtime/interpreter.rs) refuses any method
-containing `invokedynamic`:
+javac reuses a JVM local slot the moment the previous variable's scope ends and
+does not care whether the next occupant shares its type category:
 
-```rust
-if !scan.indy_ops.is_empty() { return None; }
+```java
+for (int i = 0; i < N; i++) { sum += (i % 17) * 0.5 + acc0; }
+double tail = sum / 3.0;      // javac gives `tail` the slot `i` had
 ```
 
-`testGetMethodPerformance` contains two, from the
-`System.out.println("MessageBytes conversion took :" + duration + "ns")`
-string concatenations *after* each loop (Java 9+ lowers `+` on strings to
-`invokedynamic StringConcatFactory`). The ban exists for a real reason — see
-`docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`:
-the 0xba arm lowers every indy site to an unconditional deopt trap, and for an
-OSR frame that bail resumes at the *stale* pre-OSR back-edge, silently
-re-executing a loop whose side effects were already committed. The RBC.7
-comment even names this exact shape ("a `System.out.println("..." + n + ...)`
-immediately following the loop") as the motivating case.
+`find_float_locals` marks that slot float on the strength of the `dstore`, so
+it gets an XMM home for the whole method, while its `iload`/`istore`/`iinc` go
+through the canonical frame slot (`reg_for_local` returns `None` for a
+float-masked local). Each category is internally consistent, so ordinary entry
+compiles correct code — but the OSR trampoline seeds locals by index and elides
+the frame-slot store for any local with a register home. The interpreter's
+`int i` lands in an XMM nothing reads, and the frame slot the loop actually
+reads is left **uninitialised**: the counter starts at garbage.
 
-The cost is that the test method is a once-invoked harness method with the hot
-loop inline, so OSR is the *only* way it can ever run compiled. Denied, all
-600 000 000 iterations of loop control run in the interpreter.
+Fixed in `86e5122b5`: `find_non_float_locals` scans the GPR-category accesses,
+and a slot in both scans gets neither a GPR nor an XMM home, so both categories
+use the frame slot and the trampoline seeds it. This costs nothing on the int
+side — such slots already had no GPR home. The sibling shape (a category-2's
+dead high half reused for a real local, `probes/HighHalfReuseProbe.java`) does
+**not** reproduce, so `wide_local_high_halves` was left alone.
 
-### 2. `StringCache.toString(ByteChunk, …)` never compiles (RBC.6 handler-safety gate)
+> **On the regression gate for this one.** The deterministic gate is the
+> allocator unit test `regalloc::tests::dual_category_slot_gets_no_register_home`,
+> which pins the decision directly (`assignments[2]` and `xmm_assignments[2]`
+> both `None` for a slot used as both `int` and `double`) and fails on a
+> reverted fix every time.
+>
+> An **end-to-end** Java fixture was written first and then withdrawn, and the
+> reason is worth recording. The defect only bites on a round that actually
+> OSR-*enters*, and from Java there is no way to force that: on the un-fixed
+> tree the fixture caught it in **1 run out of 3** under `cargo test`'s default
+> parallelism, and its very first single-round version passed under default
+> parallelism while failing under `--test-threads=1`. A test that silently
+> passes two times in three on broken code is worse than no test, because it
+> reads as coverage. `probes/SlotReuseCategoryProbe.java` remains the
+> end-to-end reproduction, run by hand against a real binary.
+
+This is the third time a "just throughput" Tomcat doc has turned out to contain
+a real correctness defect (cf. 29, 32). Re-derive them item by item.
+
+### Ban 2 — RBC.6 still refuses `StringCache.toString`, on purpose
+
+**This document's "Update 2026-07-27 — ban 2 (RBC.6) is lifted" is stale and is
+retained below only as history.** The widening of
+`precise_exception_frame_sites_supported` to `0xb6` / `0xb9` was reverted on
+`dev`:
+
+* `a523715a8` (2026-07-29) removed them, because they let Spring's
+  `SimpleApplicationEventMulticaster.invokeListener` read its own pre-try local
+  back as **null** inside the handler; and
+* `cd50a2208` (2026-07-30) reverted a re-widening attempt, recording the
+  measurement that settles it: *"A/B'd on one binary one line apart: the
+  widening is worth nothing to this test now that try/catch methods reach the
+  optimizing tier by other means."*
+
+Verified live on this tree — `StringCache.toString` is still refused:
 
 ```
-[rbc6-dbg] try_compile_inner: local_handler_reads_unsafe_local=true for org/apache/tomcat/util/buf/StringCache.toString(Lorg/apache/tomcat/util/buf/ByteChunk;Ljava/nio/charset/CodingErrorAction;Ljava/nio/charset/CodingErrorAction;)Ljava/lang/String;
-[cratonvm-jitc] compile-bail org/apache/tomcat/util/buf/StringCache.toString(...)Ljava/lang/String; backend_attempted=false
+[cratonvm-jitc] resolver-bail site=rbc6-handler-reads-unsafe-local
+    org/apache/tomcat/util/buf/StringCache.toString(...)Ljava/lang/String;
+[cratonvm-jitc] compile-bail ... backend_attempted=false
 ```
 
-`local_handler_reads_unsafe_local` (jit/src/lib.rs) conservatively refuses a
-method whose exception handler reads a local it has not itself written. The
-`synchronized (bcStats) { … }` block in `StringCache.toString` compiles to a
-javac-generated monitor handler that does exactly that (it reloads the monitor
-local to `monitorexit` it), so the method is refused.
+**Do not re-widen `0xb6`/`0xb9` to chase this doc.** It has been tried twice,
+it costs a silent wrong-locals defect in Spring, and it is measurably worth
+nothing here. `StringCache.toString` is the *only* method in the per-iteration
+chain that does not compile — every one of its neighbours does:
 
-> **This gate is analysed canonically in
-> [23](23-charsetcache-pathological-slowdown.md)**,
-> which reached it independently the same day via
-> `CharsetCache.getCharset` and went further: RBC.6 fires on *ordinary*
-> try/catch too, because only **parameter** slots count as reconstructible, and
-> the `precise_exception_frames` escape hatch whitelists only
-> `invokestatic`/`monitorenter`/`monitorexit` — so one `invokevirtual` inside
-> the try region is enough. Read 23 before touching this gate; the two docs
-> describe one bug with two victims.
+| method | status |
+|---|---|
+| `MessageBytes.toStringType()` | ✅ C1, then C2 |
+| `ByteChunk.toString()` | ✅ full-compile |
+| `ByteChunk.toString(a, b)` | ✅ C1 full-compile |
+| **`StringCache.toString(bc, a, b)`** | ❌ RBC.6 resolver-bail |
+| `ByteChunk.toStringInternal(a, b)` | ✅ C1 full-compile |
 
-This one sits in the *middle* of the per-iteration call chain — `toStringType`
-→ `ByteChunk.toString` → **`StringCache.toString`** → `ByteChunk.toStringInternal`
-— and both of its neighbours DO compile, so every iteration pays a
-compiled→interpreted→compiled transition. Note the hot path never even enters
-the synchronized block: `tomcat.util.buf.StringCache.byte.enabled` is false by
-default, so `bcCache` is null and the method falls straight through to
-`toStringInternal`. The ban is purely static.
+Its measured share is ~4 µs of a ~38 µs iteration (~10%). The canonical
+analysis of this gate is [23](23-charsetcache-pathological-slowdown.md),
+which remains OPEN on its own residual (a thread-scaling wall in the dispatch
+helper, not an admission question).
 
-The bail used to be **silent**: it reported only `backend_attempted=false`
-under `CRATONVM_DBG_JITC`, which reads like a transient resolver miss. Fixed
-here — the refusal now names itself on the default trace as
-`resolver-bail site=rbc6-handler-reads-unsafe-local`. The fastest first check
-for this whole shape is `CRATONVM_DBG_JIT_METHOD_STATS=1`, which prints
-`hot_but_stuck_in_interpreter=N` with the offending method and its
-`tier_fail_count`.
+### Ban 3 — the constructor `putfield` ban
 
-## Supporting measurements (isolated probes, this host, JDK 25 HotSpot control)
+`classify_init_complexity` (`vm/src/jit/skip_list.rs`) marked any `<init>`
+containing `putfield`, `putstatic`, `monitorenter/exit` or `invokedynamic` as
+`InitComplexity::Complex`, and `should_skip_jit_with_init` refused it with
+`SkipReason::Constructor` — so a constructor that assigns a field, which is
+what constructors are *for*, was never compiled and, unlike the RBC.6 case,
+never even **enqueued**. That was a VM-wide ceiling on allocation.
 
-> **Caveat on absolute rates.** This Windows box was multitenant throughout
-> (17 concurrent `cratonvm` processes from other sessions at one point), so
-> treat every absolute figure below as a *lower bound* — see
-> `feedback_shared_host_multitenant_confound`. The HotSpot control ran under
-> the same conditions, and the structural findings above (OSR-denied,
-> RBC.6-refused, constructor-refused) are compile-time facts read out of a trace, so
-> neither depends on host load.
+**Lifted by default 2026-07-28**, for `putfield`-only constructors;
+`putstatic` / `monitorenter-exit` / `invokedynamic` constructors remain banned.
+Kill switch `CRATONVM_JIT_PUTFIELD_INIT=0`. Measured prize: `allocBody` (a
+constructor assigning one field) **1846 ns → 226 ns, 8.2×**, with the
+empty-constructor controls flat.
 
-Per-operation cost in a JIT-compiled loop, nanoseconds. HotSpot's figures are
-escape-analysed for the allocating rows, so treat those as a floor rather than
-a like-for-like ratio; the CratonVM *column* is the interesting part.
+The outstanding item was the regression run. The Tomcat arm of it is **done**
+— see [§ Regression evidence](#regression-evidence-2026-07-31) — and is clean.
+
+**The knob is kept, deliberately, and the previous revision's instruction to
+delete it is not followed.** That instruction ("if it comes back clean, delete
+the `putfield` arm from `classify_init_complexity` outright and retire the
+knob") was written before the knob had been used for anything. Two things
+changed since:
+
+* **It is the mechanism by which this document's own regression evidence was
+  produced.** Every A/B above is one binary with `CRATONVM_JIT_PUTFIELD_INIT=0`
+  on one side. Deleting the knob deletes the ability to run that comparison
+  again on a shipped binary, which is exactly what someone chasing a future
+  miscompile will want first.
+* **The stated bar is only partly met.** The bar was "Tomcat + Spring Boot +
+  Hibernate on a quiet host". Tomcat is done here. Spring Boot and Hibernate
+  are not, and this ban still carries no incident write-up — it predates the
+  open-source import (`a6dc911ed`) and rests on a one-line "field stores
+  trigger the JIT's load-forwarding interaction" note. Removing the escape
+  hatch while two thirds of the evidence is outstanding trades a real option
+  for a cosmetic cleanup.
+
+Retire the knob when the Spring Boot and Hibernate arms are also clean. Until
+then the ban is **settled as default-lifted**, which is what this document
+needed; the knob's continued existence is not an open issue.
+
+## Where the time actually goes (re-derived 2026-07-31)
+
+`probes/MbChainCostProbe.java` decomposes the per-iteration chain into the
+frames it is actually made of. Every stage is a plain static method with the
+loop **inline** — an earlier revision drove the stages through a `Runnable` and
+measured ~3.4 µs per call on CratonVM, which buried everything it was meant to
+compare. Six blocks of 100 000; steady-state block, ns/op:
+
+| stage | HotSpot | CratonVM | ratio |
+|---|---|---|---|
+| `emptyLoop` | 2 | **1** | **parity** |
+| `setBytesOnly` | 3 | 759 | 253× |
+| `byteBufferWrap` | 1 | 1 304 | — (HotSpot escape-analyses it away) |
+| `newStringFromChars` | 7 | 2 000 | 285× |
+| `charsetDecode` | 28 | 4 600 | 164× |
+| `inlineEquivalent` (decode + `new String`, inline) | 54 | 16 503 | 305× |
+| `toStringInternalDirect` | 50 | 21 824 | 436× |
+| `stringCacheDirect` | 53 | 25 870 | 488× |
+| `byteChunkToString` | 29 | 33 883 | 1168× |
+| `mbFullChain` | 28 | ~38 000 | ~1350× |
+
+And `probes/AllocScalingProbe.java`, ten blocks of 200 000:
+
+| shape | HotSpot | CratonVM | ratio |
+|---|---|---|---|
+| `arithOnly` | 2 | **1** | **parity** |
+| `newIntArray8` | 4 | 109 | 27× |
+| `newCharArray3` | 5 | 101 | 20× |
+| `newSmallObject` | 4 | 260 | 65× |
+| `newStringFromChars` | 11 | 680 | 62× |
+
+Read those two tables together and the doc's original thesis collapses:
+
+* **Loop control and arithmetic are at parity.** `emptyLoop` 1 ns, `arithOnly`
+  1 ns. Whatever the 730× is, it is not interpreted loop control — which is
+  precisely what all three admission bans were about.
+
+  That row is also the cleanest positive evidence that the ban-1b lift works.
+  `emptyLoop` is invoked **6 times** (once per block), far below the
+  500-invocation whole-method threshold, so it cannot have been compiled by
+  tier-up. Running it at 1 ns/op means its internal loop was **OSR-entered** —
+  the exact entry `can_osr_enter` used to refuse.
+* **Allocation is 20-65×, and flat.** It does not degrade with heap occupancy,
+  and `-Xlog:gc*=info` reports `minor=7 major=0` across the whole probe, so
+  this is not a GC story either.
+* **The cost is per-frame, in this specific chain.** Each additional Java frame
+  between `setBytes` and the decode adds 4-8 µs, and the decode itself is
+  ~4.6 µs against HotSpot's 28 ns.
+
+### The residual, named as precisely as this document can name it
+
+`probes/CharsetDecodeShapeProbe.java` splits `Charset.decode`'s cost into its
+fixed per-call and marginal per-byte parts, by decoding payloads of 3, 30, 300
+and 3000 bytes in one process. (Run while the full-suite A/B was occupying the
+box, so the absolute figures are roughly 2× inflated against the quiet-host
+numbers above — the *shape* is the point, and every row shares the same load.)
+
+| payload | CratonVM ns/call | HotSpot ns/call | CratonVM `ByteBuffer.wrap` alone |
+|---|---|---|---|
+| 3 B | 12 017 | 99 | 3 005 |
+| 30 B | 8 751 | 260 | 2 984 |
+| 300 B | 24 436 | 256 | 1 889 |
+| 3000 B | 104 811 | 1 400 | 2 077 |
+
+Two separate terms fall out:
+
+* **A fixed per-call cost of roughly 8-12 µs** against HotSpot's ~250 ns — and
+  ~2-3 µs of that is `ByteBuffer.wrap` on its own, before any charset work
+  happens. For this document's workload (**3 bytes**) the fixed term is
+  essentially the entire cost.
+* **A marginal transcoding cost of ~30 ns/byte** (from the 300 → 3000 step)
+  against HotSpot's ~0.42 — a separate ~70×, which only matters for large
+  payloads. `TestMethodPerformance` does not have them.
+
+One concrete but **unverified** lead for the fixed term, recorded for whoever
+picks it up: `native_charset_decode_bytebuf` → `decode_with_charset`
+(`native-builtins/src/charset.rs`) reads the `Charset` object's `name` String
+out of the heap, converts it to a Rust `String`, runs it through
+`normalize_charset_name` (a second allocation), and then dispatches into the
+transcoding engine **by name string** — on every call, independent of payload.
+`encode_with_charset` does the same. Memoising the resolved charset on the
+`Charset` object's identity is the obvious move and is deliberately **not**
+attempted here: this tree has been bitten twice by exactly that shape
+(`reference_get_field_by_name_memo_is_a_slowdown` — a memo that cost 37% — and
+`reference_per_thread_memo_bypasses_slowpath_filter` — a memo in front of a
+fast path that skipped its post-lookup filters). It needs its own quiet-host
+A/B, which is a perf project rather than a known-issue closeout.
+
+So the residual belongs to the VM-wide native-call / dispatch baseline —
+`reference_native_call_direct_helper_vs_generic_dispatch_35x`,
+`reference_junit5_execution_machinery_dispatch_overhead`, and the half-gap perf
+projects — not to this document. **Re-homed there.**
+
+> **Two measurement traps this re-derivation walked into**, recorded so the
+> next person does not:
+>
+> 1. Running each stage through a `Runnable`/`IntConsumer` made every row read
+>    ~3.4 µs, because that *is* what a lambda interface call costs here. Inline
+>    the loop into a named static method.
+> 2. A first pass showed `charsetDecode` growing 5090 → 10249 ns across blocks,
+>    and separate processes showed 15.5 µs/iter at 100k against 35.3 µs at
+>    800k. **Neither reproduced.** A repeat gave 4444 → 4629, flat. There is no
+>    superlinear trend; it was host noise. Repeat the baseline.
+
+## Regression evidence (2026-07-31)
+
+All on one binary, both relaxations toggled together against their historical
+behaviour — arm A = defaults (`osr_dead_mask` entry admitted, `putfield`-ctor
+ban lifted), arm B = `CRATONVM_JIT_OSR_DEAD_LOCALS=0` +
+`CRATONVM_JIT_PUTFIELD_INIT=0`. One binary, two knobs, nothing else differs.
+
+* **`cargo test -p cratonvm-jit`** — green: **1064** lib tests + **193** across
+  the 11 integration binaries, 0 failures. (This suite was reported
+  uncompilable on `dev` in the previous revision — `E0063: missing fields
+  service_callee_deopt and set_throw_bci`. That was fixed on `dev` in the
+  interim; verified here.)
+* **`probes/OsrDeadLocalProbe.java`** — HotSpot, CratonVM JIT, CratonVM with
+  the kill switch, `--nojit`, and `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET=1` all
+  return `acc=5697627218349681645` at 400k iterations and
+  `acc=-3383397992731040631` at 3M.
+* **`probes/SlotReuseCategoryProbe.java`**, **`probes/HighHalfReuseProbe.java`**,
+  **`probes/OsrDoubleShapeProbe.java`** — all arms identical to HotSpot.
+* **Tomcat `util.{buf,collections,http}` / `catalina.util`** (the same 63-class
+  set `cd50a2208` used): **55 classes completed, 0 status differences**. The
+  non-PASS classes are identical on both sides — `TestByteChunkLargeHeap` and
+  `TestCharChunkLargeHeap` FAIL on both (known LargeHeap fixture gap),
+  `TestCharsetCachePerformance` HANGs on both (doc 23's known-slow class).
+* **Full Tomcat suite, 646 classes, both arms run concurrently** so they saw
+  the same host load:
+
+  | | PASS | FAIL | HANG | NOSUMMARY | wall |
+  |---|---|---|---|---|---|
+  | **A** (defaults) | 560 | 47 | 38 | 1 | 143.8 min |
+  | **B** (both knobs restored) | 558 | 46 | 40 | 2 | 145.9 min |
+
+  **638 of 646 classes (98.8%) have identical status.** The 8 that differ are
+  bidirectional — arm A is worse on 3 and arm B on 5 — which is the signature
+  of flake, not of a change that breaks things. Each was then re-run
+  individually on a quiet box at a 900 s timeout (`repeat-diffs.ps1`), and
+  **every one passes in BOTH arms**:
+
+  | class | in-suite A / B | repeat A | repeat B |
+  |---|---|---|---|
+  | `TestHttpServletDoHeadInvalidWrite0ValidWrite1` | FAIL / PASS | PASS ×3 | PASS ×3 |
+  | `TestHttpServletDoHeadInvalidWrite1ValidWrite1` | FAIL / PASS | PASS | PASS |
+  | `TestHttpServletDoHeadInvalidWrite1023ValidWrite512` | PASS / FAIL | PASS | PASS |
+  | `tribes…TestTcpFailureDetector` | FAIL / PASS | PASS | PASS |
+  | `tribes…TestNonBlockingCoordinator` | PASS / HANG | PASS | PASS |
+  | `coyote.http11.TestHttp11InputBuffer` | PASS / NOSUMMARY | PASS | PASS |
+  | `coyote.http2.TestAsyncFlush` | PASS / FAIL | PASS | PASS |
+  | `jasper.compiler.TestCompiler` | PASS / HANG | PASS (148 s) | PASS (142 s) |
+
+  So **nothing in the 646-class suite is attributable to either knob.** The
+  `TestHttpServletDoHead*` family in particular ran 67-99 s standalone against
+  a 300 s in-suite timeout — the documented straddle — and all 8 sit in
+  families `00-INDEX.md` already records as environmental (that timing
+  straddle, Tribes multicast, HTTP/2).
+
+> **Warning to anyone measuring this.** `TestDefaultServlet` has a
+> **pre-existing flaky stack overflow** on `dev` under load — an unmodified
+> baseline binary crashed once in four runs with "thread 'main-vm' has
+> overflowed its stack" while this host ran three concurrent heavy jobs. It ate
+> an entire investigation cycle: a single crash-vs-pass pair was read as
+> attribution three separate times, and every one was refuted by simply
+> repeating the baseline. **Repeat the control before believing any difference
+> against this class.**
+
+## Appendix — history retained
+
+### Original supporting measurements (isolated probes, multitenant host)
+
+> Absolute rates are a lower bound — this Windows box was multitenant
+> throughout. The structural findings are compile-time facts read out of a
+> trace, so they do not depend on host load.
 
 | probe | what it does | HotSpot | CratonVM |
 |---|---|---|---|
@@ -144,321 +503,133 @@ a like-for-like ratio; the CratonVM *column* is the interesting part.
 | `allocEsc` | same allocation **inline in the C2/OSR loop** | 3 | 2331 |
 | `allocBody` | `new Body()` whose ctor writes one field | – | 2338 |
 
-Two leads fell out of this table. Both are now root-caused:
+Both leads out of that table were root-caused: `allocBody`'s 20× became ban 3,
+and the endless OSR recompile loop was fixed (`allocPutOld` logged **200
+`OSR-compile` events for 200 000 iterations**; the `OSR-recompile reason=`
+trace attributed 199 to `cached-cannot-enter-at-pc`. The back-edge path treated
+"published artifact that cannot be entered at this pc" as *still compiling* and
+re-requested forever, instead of consuming the bounded per-pc rejection budget.
+Now 200 → **1**).
 
-* **an allocation whose constructor has a body costs ~20× one whose
-  constructor is empty (2338 vs 162 ns)** — root-caused to a THIRD admission
-  ban, and the biggest of the three. See the section below; and
-* ~~a C2/OSR loop that mixes an allocation with another helper-call op can
-  enter an **endless OSR recompile loop**~~ — **FIXED** (`fix(jit): stop the
-  OSR recompile loop on a permanently un-enterable entry pc`). The
-  `allocPutOld` probe logged **200 `OSR-compile` events for 200 000
-  iterations**; the new `OSR-recompile reason=` trace attributed 199 of them to
-  `cached-cannot-enter-at-pc`. The back-edge path treated "published artifact
-  that cannot be entered at this pc" as *still compiling* and re-requested a
-  compile forever, instead of consuming the bounded per-pc rejection budget
-  that already exists for it. Enterability is a pure function of the bytecode
-  and the entry pc — the codegen writes `-1` for a pc strictly inside a
-  LICM-hoisted loop body, whose pre-header an OSR entry would skip — so the
-  retries were guaranteed to reproduce it. Now 200 -> **1** compile, with
-  legitimate OSR (compile-then-reuse) unaffected. The loop still runs
-  interpreted; this removed the wasted compiles, not the interpretation.
+### Update 2026-07-27 — ban 2 lifted (SUPERSEDED, see § Ban 2)
 
-## 3. Constructors that store a field are never compiled — the biggest lever
+`precise_exception_frame_sites_supported` admitted `invokevirtual` /
+`invokespecial` / `invokeinterface` alongside `invokestatic` and the monitor
+ops. **Reverted on `dev` in `a523715a8` / `cd50a2208`** — this update no longer
+describes the tree.
 
-The "ctor with a body costs 20×" lead above is not an allocation cost at all.
-`classify_init_complexity` (`vm/src/jit/skip_list.rs`) marks any `<init>`
-containing `putfield`, `putstatic`, `monitorenter/exit` or `invokedynamic` as
-`InitComplexity::Complex`, and `should_skip_jit_with_init` then refuses it with
-`SkipReason::Constructor`. A constructor that assigns a field — which is what
-constructors are *for* — is therefore never compiled and, unlike the RBC.6
-case, never even **enqueued**:
+### Update 2026-07-30 — ban 1's premise removed, second gate found
 
-```
-allocNEsc (static callee):  tiered-enqueue CallRate.make(I)… invoc_count=500  -> compiled
-allocBody (ctor callee):    (nothing — no tiered-enqueue, no bg-compile, ever)
-```
+See § Ban 1 and § Ban 1b above. Correctness evidence for the concat bridge:
+`ConcatBridgeProbe` drives 14 distinct `makeConcatWithConstants` shapes from a
+hot loop and FNV-checksums every string; HotSpot JDK 25, CratonVM JIT and
+CratonVM `--nojit` all give `510489415044571348`. `OsrConcatProbe` returns
+`first=12499997500000 second=24999995000000`, matching HotSpot — no duplicate
+loop execution. Five Tomcat classes A/B'd against pure `origin/dev` were
+identical.
 
-So every `new` whose constructor stores a field runs that constructor in the
-interpreter, forever: `new String(…)`, `new HashMap.Node(…)`, essentially the
-whole JDK. This is a VM-wide ceiling on allocation, not a Tomcat issue.
+### Deliberately NOT ported from the handover branch
 
-**Status: the ban is now LIFTED BY DEFAULT** (2026-07-28, explicit maintainer
-decision, with a full regression run to follow). It applies to `putfield`-only
-constructors; `putstatic` / `monitorenter-exit` / `invokedynamic` constructors
-remain banned. **Kill switch — no rebuild needed:**
+The originating worktree (`codex/fix-tomcat-hotloop-jit-admission-20260728`,
+based 187 commits behind) also carried three changes that were dropped:
 
-```bash
-CRATONVM_JIT_PUTFIELD_INIT=0
-```
+1. **The RBC.6 admission-gate rewrite.** It deleted the `return false` in
+   `precise_exception_frame_sites_supported`, leaving an empty `if` whose
+   comment still claims it checks something — i.e. the gate admits everything.
+   Subsequent history (§ Ban 2) vindicates the decision to drop it.
+2. **The generic protected-range exact-resume trap** in `x64.rs`, which existed
+   only to justify (1).
+3. **`RETIRED_COMPILED_METHODS`** — process-lifetime retention of every
+   superseded compiled body. `dev` already solves that with `defer_jit_owner`.
 
-restores the historical blanket ban. If a regression run turns up a
-miscompile, wrong result or crash, set that and re-run *before* anything else:
-it is the fastest attribution test for this change and separates it cleanly
-from everything else in the same binary.
-
-**Measured prize:**
-
-| probe | ban on (default) | ban lifted |
-|---|---|---|
-| `allocBody` (ctor assigns one field) | 1846 ns | **226 ns** (8.2×) |
-| `allocArg` (ctor, empty body) | 200 ns | 186 ns |
-| `allocBare` | 100 ns | 103 ns |
-| `allocNoCtor` | 86 ns | 106 ns |
-
-Controls flat, so the knob does only what it claims.
-
-**Correctness evidence so far.** `CtorCheck` (a probe that READS BACK every
-field — plain stores, a superclass ctor storing before a subclass ctor, a store
-whose value comes from an instance method call on the half-built object, and a
-conditional store) gives byte-identical checksums across HotSpot, CratonVM
-`--nojit`, ban-on and ban-lifted, at both 200k and 2M iterations. Six JIT test
-binaries pass with the ban lifted (`jit_interp_differential`,
-`jit_collection_ctor_identity`, `jit_local_exception_handler_tests`,
-`jit_null_receiver_npe`, `jit_arity_5plus`, `jit_category2_params` — 26 tests).
-A six-class Tomcat sweep produced **no attributable regression**: 3 PASS, and
-all 3 non-PASS reproduce identically with the knob OFF.
-
-**What is NOT yet established.** The ban predates the open-source import
-(`a6dc911ed`) and is one of the four *structural* bans; unlike the ~46 named
-correctness bans it carries no incident write-up, only the one-line "field
-stores trigger the JIT's load-forwarding interaction". Nothing here proves that
-rationale stale — it proves only that six Tomcat classes and 26 JIT tests do
-not catch it. The full-suite regression run (Tomcat + Spring Boot + Hibernate)
-**on a quiet host** is the real verdict and is still outstanding; the kill
-switch above exists precisely because of that. If it comes back clean, delete
-the `putfield` arm from `classify_init_complexity` outright and retire the
-knob; if it does not, the failing case is the incident write-up this ban never
-had — record it here.
-
-> **Warning to anyone measuring this.** `TestDefaultServlet` has a
-> **pre-existing flaky stack overflow** on `dev` under load — an unmodified
-> baseline binary crashed once in four runs with
-> "thread 'main-vm' has overflowed its stack" while this host was running three
-> concurrent heavy jobs. It ate an entire investigation cycle here: a single
-> crash-vs-pass pair was read as attribution three separate times (to the
-> constructor ban, then to an OSR change, then to a debug `eprintln!`), and
-> every one of those was refuted by simply repeating the baseline. **Repeat the
-> control before believing any difference against this class.**
-
-## What a fix would involve
-
-Neither ban should simply be relaxed — each closed a confirmed
-silent-corruption bug, and the corruption they prevent is invisible (wrong
-results, not crashes). Plausible directions, roughly in order of
-value/risk:
-
-1. ~~**Make the OSR recompile loop stop**~~ — **done**, see the struck lead
-   above. It was pure waste elimination and needed no safety property relaxed.
-2. **Link `invokedynamic` in compiled code** instead of lowering it to an
-   unconditional trap. That removes RBC.7's premise rather than its check.
-3. **Narrow RBC.6** — but see
-   [23](23-charsetcache-pathological-slowdown.md)
-   first, which spells out why the obvious narrowing (widening
-   `precise_exception_frame_sites_supported` to `invokevirtual`) is *unsafe*:
-   several invoke lowerings in `jit/src/x64.rs` deliberately bypass
-   `emit_post_invoke_exception_check`, and inlined callees never reach the
-   caller's check, so widening reintroduces silent-wrong-locals. Doing it right
-   means auditing every invoke lowering to publish the reason-9 frame first.
-4. ~~Make the silent bails self-reporting~~ — **done**, see the trace line
-   above.
+`DIRECT_CALLEE_EXCEPTION_ROUTE_TAG` was also left out — an independent
+optimisation, not part of ban 1.
 
 ## Reproduction
 
 ```bash
 CP=$(cat apps/tomcat/.suite/cp.txt)
-CRATONVM_DBG_JITC=1 CRATONVM_DBG_RBC6=1 <cratonvm.exe> -Xmx2g -cp "$CP" \
+CRATONVM_DBG=jitc <cratonvm.exe> -Xmx2g -cp "$CP" \
   org.junit.runner.JUnitCore org.apache.tomcat.util.http.TestMethodPerformance \
-  2>&1 | grep -iE 'TestMethodPerformance|StringCache'
+  2>&1 | grep -iE 'TestMethodPerformance|StringCache|OSR-'
 ```
 
-Both diagnostic lines appear within the first ~30 s, long before the class
-would finish.
+For the decomposition rather than the class:
 
-## Update 2026-07-27 — ban 2 (RBC.6) is lifted; ban 1 (RBC.7) remains
-
-`precise_exception_frame_sites_supported` now admits `invokevirtual` /
-`invokespecial` / `invokeinterface` alongside `invokestatic` and the monitor
-ops, so the RBC.6 refusal of `StringCache.toString` is gone. The widening was
-gated on auditing every lowering the `0xb6 | 0xb7 | 0xb9` codegen arm can
-select — two of its four exits emit no call at all, the inline path is already
-unreachable under `precise_exception_frames` (`inline_sites.clear()`), and the
-remaining two both end in `emit_post_invoke_exception_check`. The sibling
-tail-call, which tears the frame down before the callee runs and so escapes the
-handler, is now suppressed inside protected ranges
-(`x64::Compiler::pc_is_protected`); that was a pre-existing hole for
-`invokestatic`, which this whitelist always admitted.
-
-This addresses direction 3 of "What a fix would involve" above — though by
-proving the *lowerings* safe rather than by pattern-matching the javac
-`synchronized` shape, which is strictly more general.
-
-**This does not on its own close this document.** Ban 1 (RBC.7 — a method
-containing `invokedynamic` is permanently OSR-denied) is untouched, and
-`testGetMethodPerformance` is a once-invoked harness method whose hot loop is
-inline, so OSR remains the only way it can run compiled. Expect the
-compiled→interpreted→compiled transition through `StringCache.toString` to be
-gone and the per-iteration cost to drop, but the loop control itself still
-interprets until RBC.7's premise is removed (direction 2: link
-`invokedynamic` in compiled code instead of lowering it to a trap).
-
-Sibling doc `23-charsetcache-pathological-slowdown.md` shares this gate and was
-half-closed by the same change (its `timeFull < timeNone` assertion now passes).
-
-## Update 2026-07-30 — ban 1's premise is removed, and a SECOND gate is found behind it
-
-Direction 2 ("link `invokedynamic` in compiled code instead of lowering it to a
-trap") is now implemented, narrowly, for `StringConcatFactory` sites. **RBC.7 no
-longer refuses `testGetMethodPerformance`.** It still does not OSR — because a
-second, completely independent gate refuses the same entry, and that gate was
-invisible for as long as RBC.7 bailed first.
-
-### What was built
-
-A resolved concat call site is lowered to a direct call instead of an uncommon
-trap:
-
-* `vm/src/runtime/invokedynamic.rs` — `make_jit_string_concat_site_from_parts`
-  resolves a bootstrap to a process-lived `JitStringConcatSite` (recipe +
-  constants + target descriptor), or `None` for every other bootstrap kind.
-  `execute_jit_string_concat_raw` decodes the JIT's raw i64 arg buffer **through
-  the call site's descriptor** before any Java code runs, so a category-2 value
-  is never reclassified from its bit pattern.
-* `jit/src/x64.rs` — the `0xba` arm calls that bridge when a site resolved;
-  every other bootstrap still falls through to the existing trap.
-* `vm/src/runtime/interpreter.rs` — RBC.7's blanket
-  `if !scan.indy_ops.is_empty() { return None; }` becomes a *bridged-only*
-  admission, evaluated after `indy_info` resolves. A method with any unbridged
-  indy is still refused, and logs
-  `[cratonvm-jitc] osr-DENY (unbridged invokedynamic)`.
-
-`has_indy_trap` is now computed from *unbridged* sites only, so a fully bridged
-method no longer forces its callers onto the dispatch helper.
-
-### The result — ban 1 is cleared, and it was not the only blocker
-
-```
-[cratonvm-jitc] bg-compile OsrConcatProbe.main([Ljava/lang/String;)V tier=C2 optimized=true osr_bci=4
-[cratonvm-jitc] indy-concat bridge pc=25 args=1
-[cratonvm-jitc] indy-concat bridge pc=56 args=1
-[cratonvm-jitc] OSR-reject OsrConcatProbe.main([Ljava/lang/String;)V entry_pc=4 (dead_mask non-zero; memoed)
+```bash
+<cratonvm.exe> -Xmx2g -cp "probes/out;$CP" MbChainCostProbe 6 100000
 ```
 
-The bridge fires, no `osr-DENY` is logged — RBC.7 passed. The OSR body then
-*compiles successfully* and is refused at the door by
-`CompiledMethod::can_osr_enter`, which rejects any entry pc whose
-`osr_dead_mask` is non-zero. Identical on the real shape
-(`OsrMessageBytesProbe`, `entry_pc=24`, bridge at `pc=62`).
+## Adopted 2026-07-31 — two residuals from the retired tomcat/32
 
-**So the doc's original root-cause list was incomplete.** Removing RBC.7 does
-not make `testGetMethodPerformance` OSR; it only moves the refusal one gate
-later. Anyone measuring direction 2 in isolation and seeing no speedup should
-look here before concluding the bridge is broken.
+[32](../../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md)
+closed; two of its items are this document's family and move here with their
+numbers. **Both come with a correction to this document's own framing**: in
+neither case do the hot methods fail to compile. They compile, and the compiled
+output is ~100x off HotSpot. "Hot methods never compile" is the right story for
+`TestMethodPerformance`'s OSR-denied driving loop; it is the wrong story for
+these two, and reading them through it sends the work at admission gates that
+are not the problem.
 
-### The second gate, precisely
+### 30.A — `juli.TestOneLineFormatterPerformance.testDateFormat` (was 32.4)
 
-`CRATONVM_DBG_OSR_META=1` prints the published mask:
+Asserts `DateFormatCache` beats `String.format`, 10^6 iterations each. The test
+feeds `System.nanoTime()` to a formatter cached on `time / 1000`, so it misses
+essentially every call and the miss path — a bare `SimpleDateFormat.format` —
+is what is measured. End to end 2026-07-31, loaded host:
 
 ```
-[osr-meta] gpr_resident=0xb xmm_resident=0x0
-           blanket_entries=[(0,a),(4,1),(a,1),(15,9),(23,1),(29,1),(34,9)]
-           published_entries=[(0,8),(4,1),(a,1),(23,1),(29,1)] unblocked=2
+StringFormatImpl        4 730 855 700 ns
+DateFormatCacheImpl   606 794 187 200 ns      -- 128x short
 ```
 
-At `entry_pc=4` the mask is `0x1` — local 0 (`args`). It is **dead** at the loop
-head but register-resident, and it shares a home GPR with a live local
-(graph-colouring coalescing reused the register once `args`'s range ended).
-Entering there would load the interpreter's stale `args` over the live local's
-register.
+`CRATONVM_DBG_JITC` shows both hot methods compiling —
+`SimpleDateFormat.format` at `len=1708`, `subFormat` at `len=64359` — so this
+is codegen quality, not admission:
 
-The obvious fix — *don't load dead locals at entry* — *is already implemented*
-in the OSR trampoline (`jit/src/lib.rs`, the `dead_mask >> i & 1` `continue`,
-added 2026-06-03 in `62e65640f`), and it is **not sufficient**. The guard that
-currently short-circuits it was added **after**, on 2026-07-03 in `3415d052b`
-("fix(jit): reject unsafe OSR dead-local entries"), whose own write-up says
-skipping the load "still left the OSR-entered compiled frame relying on a
-coalesced state transition that was not proven safe". The root problem is that
-`osr_local_assignments` is a **whole-method** table: it cannot express "at this
-pc this register belongs to local *j*, not local *i*". Two tests pin the
-refusal (`test_can_osr_enter_rejects_dead_masked_entry`,
-`test_osr_enter_rejects_dead_mask_before_trampoline`).
-
-**Do not simply delete that guard.** Making this entry safe means giving OSR a
-per-pc local→location map, not relaxing the check.
-
-### Correctness evidence for the bridge
-
-`ConcatBridgeProbe` drives 14 distinct `makeConcatWithConstants` shapes from a
-hot loop — `int`, `long` (full 64-bit, `(i<<33)^i`), `double`, `float`, `char`,
-`boolean`, `byte`, `short`, a null `String`, a null `Object`, mixed arity with
-interleaved category-2 values, and the no-constant / bracketed forms — and FNV
-checksums every string produced:
-
-| | acc | sample |
+| operation | HotSpot | CratonVM |
 |---|---|---|
-| HotSpot JDK 25 | 510489415044571348 | `m=199999:1717978328665407:99999.5:s7` |
-| CratonVM, JIT | 510489415044571348 | identical |
-| CratonVM, `--nojit` | 510489415044571348 | identical |
+| `SimpleDateFormat.format` (same Date) | 2.3–2.5 µs | 250–300 µs |
+| `DateFormatSymbols.getInstance(Locale.US)` | 1.1–1.2 µs | 50–62 µs |
+| `new DateFormatSymbols(Locale.US)` | 0.5–1.1 µs | 28–34 µs |
 
-19 `indy-concat bridge` lowerings were logged in the JIT run, so the bridge is
-genuinely on the measured path rather than being bypassed.
+Closing it needs `SimpleDateFormat.format` at ≲ 4.7 µs, which is where
+`String.format` lands **because on CratonVM that side is a Rust intrinsic**. The
+assertion therefore reduces to "compiled Java must match a Rust intrinsic", and
+**optimising `String.format` makes this test harder to pass** — worth knowing
+before anyone treats the fast side as an improvement target.
 
-`OsrConcatProbe` (the exact loop-then-`println("..."+total)` shape RBC.7 was
-written to protect) returns `first=12499997500000 second=24999995000000`,
-matching HotSpot — no duplicate loop execution.
+Separately actionable but *not* a lever for this test:
+`java/text/DateFormatSymbols.getProviderInstance` fails codegen
+(`compile-bail … backend_attempted=true`, `tier_fail_count=3`), which
+`CRATONVM_DBG_JIT_METHOD_STATS` classifies as "not policy — these are bugs". It
+is reached ~2x per `String.format` call, i.e. it is on the fast side.
 
-Five Tomcat classes A/B against a pure-`origin/dev` binary built on the same
-host: `TestMessageBytes` (8), `TestByteChunk` (8), `TestCharChunk` (3),
-`TestStringCache` (1), `TestCookieParsing` (8) — all `OK`, identical both sides.
+Repro: `cratonvm.exe -Xmx2g -cp <probes-out> DateFmtProbe` and
+`… DateSymbolsProbe 1000`.
 
-Throughput is neutral, as expected while the second gate still blocks OSR —
-interleaved A/B, `OsrMessageBytesProbe` 500k, quiet host (load 0.8):
+### 30.B — `TestAsyncMessagesPerformance`'s SEQ2 residual (was 32.3)
 
-| round | base (ns) | new (ns) |
-|---|---|---|
-| 1 | 8 697 986 374 | 8 530 225 215 |
-| 2 | 8 474 439 293 | 8 748 237 515 |
-| 3 | 8 573 803 178 | 8 585 377 862 |
+32.3's binding SEQ1 assertion was a real defect and is **fixed** (`9f7095ed9`,
+the bulk `ByteBuffer` natives copying one byte per accessor call): SEQ0 4→1 and
+SEQ1 500→86–143 across interleaved reps. What remains is SEQ2 — the gap between
+the 16 KiB message and the 4 KiB message, tolerance 100, actual 495–500 — and
+it is here because it is measured to be general Java throughput.
 
-~0.5% apart on the means, inside the baseline's own 2.6% run-to-run spread.
+`CRATONVM_DBG_AIO_INLINE` (`9bef50216`) splits the ~1.3 ms gap, n=1000
+not-ready reads:
 
-### Deliberately NOT ported from the handover branch
+```
+wait buckets: <1ms=493  1-10ms=6  >10ms=501  (sub-10ms mean=444us)
+queue_mean=35us   deliver_mean=46us
+```
 
-The originating worktree (`codex/fix-tomcat-hotloop-jit-admission-20260728`,
-based 187 commits behind) also carried three changes that were **dropped** here:
+* **81 µs** is our AIO plumbing (35 queue + 46 deliver) — about 6 %,
+* **444 µs** the worker genuinely blocked waiting for the peer,
+* **~775 µs** client-side Java between the two `onMessage` callbacks.
 
-1. **The RBC.6 admission-gate rewrite.** It deleted the `return false` in
-   `precise_exception_frame_sites_supported`, leaving an empty `if` whose
-   comment still claims it checks something — i.e. the gate admits everything.
-   That is a much larger safety change than this doc needs, it re-opens what
-   `a523715a8` ("Fix Spring Boot residual exception-handler cluster") closed on
-   2026-07-29 by re-admitting `0xb6`/`0xb9`, and it collides head-on with the
-   still-unmerged `codex/fix-tomcat-charsetcache-complete-20260729-019fb049`,
-   which re-widens the same line *with* a regression test. RBC.7 is a separate
-   gate; none of this was required.
-2. **The generic protected-range exact-resume trap** in `x64.rs`, which existed
-   only to justify (1).
-3. **`RETIRED_COMPILED_METHODS`** — process-lifetime retention of every
-   superseded compiled body. `dev` already solves that problem properly with
-   `defer_jit_owner` (drop immediately when no JIT execution is in flight,
-   otherwise hold until `ACTIVE_JIT_EXECUTIONS` hits zero).
-
-`DIRECT_CALLEE_EXCEPTION_ROUTE_TAG` (admitting exception-table callees as
-tagged direct calls instead of refusing them) was also left out — it is an
-independent optimisation, not part of ban 1.
-
-### Unrelated breakage found on `dev`
-
-`cargo test -p cratonvm-jit` **does not compile on `origin/dev`**: 11 integration
-tests fail with `E0063: missing fields service_callee_deopt and set_throw_bci in
-initializer of JitRuntimeHelpers`. Identical count on a pure-`origin/dev`
-checkout and on this branch, so it predates this work — but it means that suite
-is currently unavailable as a regression gate for anyone touching the JIT.
-
-### Status
-
-Ban 1 (RBC.7) — **premise removed** for string-concat sites; the ban now only
-covers unbridged bootstraps. Ban 2 (RBC.6) — see doc 23, unchanged here. Ban 3
-(constructor) — unchanged. **This document stays OPEN**: the 730x class-level
-gap is untouched, and the next lever is no longer an admission ban at all but
-the per-pc local→location map that `can_osr_enter` needs.
+Thread wake-up is ruled out too: a Semaphore round-trip is 20.5 µs against
+HotSpot's 10.5 µs and `park`/`unpark` is *faster* than HotSpot at 8.1 vs 10.3 µs
+(`probes/ParkPingPongProbe`). The test runs the embedded server and the client
+in one process, so the 444 µs peer turnaround is also our VM executing Tomcat's
+send path. **No further AIO or buffer work will close SEQ2.**

@@ -50,6 +50,9 @@ and large reference tables without duplicating the manual.
 - [GC Tuning](gc-tuning.md)
 - [Moving-young throughput status](moving-young-throughput.md)
 - [Framework throughput program](framework-throughput.md)
+- [JDK-only mode benchmarks](benchmarks/jdk-only.md) — proposed non-regression
+  budgets for `--jdk-only`; no baseline captured yet, so every number there is
+  an engineering gate rather than a measurement.
 
 ## Architecture and internals
 
@@ -111,6 +114,39 @@ compatibility work.
 CratonVM is not JCK-certified. See [legal.md](legal.md) for licensing and
 compliance terminology.
 
+## JDK-only mode (`--jdk-only`)
+
+An **internal diagnostic stage**, not a supported runtime mode. `--jdk-only`
+asks the VM to treat real JDK class bytes as authoritative — no fabricated
+compatibility class, no synthetic-stub native registered or invoked — so that
+every compatibility substitution CratonVM performs becomes a counted,
+attributed event. It is expected to fail on programs that run fine under
+`--real-jdk`; that failure is the measurement. **`--real-jdk` remains the
+default and is unaffected.**
+
+- [JDK-only mode — design contract](feature-designs/jdk-only-mode.md) — the
+  normative interface contract. A proposal document: read it for semantics, not
+  as evidence that a wave has landed.
+- [Migration and operator guide](jdk-only-migration.md) — what the flag means,
+  how to read a violation, and the staged path from diagnostic to default.
+- [Reproducible audit](jdk-only-audit.md) — how to *measure* substitutions:
+  the census dumps, their schemas, and why a source grep is not the oracle.
+- [Blocker inventory by service area](jdk-only-runtime-services.md) — the
+  confirmed, open work list; a floor, not a ceiling.
+- [Native promotion review](jdk-only-native-review.md) — the checklist a
+  `SyntheticStub` must pass to become a reviewed `Bridge` or `Intrinsic`.
+- [Object-layout audit](jdk-only-object-layout-audit.md) — every site that
+  reaches a field by assumed synthetic slot index, a prerequisite for
+  dropping the corresponding stub.
+- [Threat model](security/jdk-only-threat-model.md) — what the flag does and
+  does not change about the VM's trust posture. It is a correctness and
+  provenance control, **not** an isolation boundary.
+- [Benchmarks and non-regression budgets](benchmarks/jdk-only.md) — proposed
+  gates; no baseline has been captured yet.
+- [Open wave-2 issues](known-issues/jdk-only/README.md) — gaps deliberately
+  deferred rather than papered over, with the evidence that makes them
+  actionable.
+
 ## Embedding and native integration
 
 - [Embedding Overview](book/src/embedding/overview.md)
@@ -126,6 +162,9 @@ compliance terminology.
 - [Cryptography](book/src/security/cryptography.md)
 - [Security Hardening Reference](SECURITY_HARDENING.md)
 - [Cryptographic Algorithm Status](CRYPTO_STATUS.md)
+- [JDK-only mode threat model](security/jdk-only-threat-model.md) — advisory;
+  `--jdk-only` narrows *which class implementations may execute* and creates no
+  isolation boundary.
 - [`../SECURITY.md`](../SECURITY.md) — vulnerability reporting policy.
 
 ## GPU offload

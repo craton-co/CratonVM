@@ -25,8 +25,12 @@ difftest/
     harness.rs   compile + run the matrix + diff + gate (§3.5)
     generate.rs  corpus generator (§3.1)
     minimize.rs  reproducer shrinker (§3.4)
+    census.rs    reads the launcher's JDK-only dumps (jdk-only-mode.md §9)
     main.rs      the `cratonvm-difftest` CLI
   seeds/         curated self-printing .java programs (the first corpus)
+  seeds-jdk-only/ JDK-only boundary vectors — a SIBLING of seeds/, not a child,
+                 because `discover_programs` is non-recursive and these are
+                 expected to diverge until §5 enforcement lands
   ledger.json    committed known-divergence ledger (the gate's baseline)
   corpus/        live corpus (generated / promoted inputs)   [grows at runtime]
   regression/    minimized, committed repros of confirmed divergences
@@ -56,7 +60,38 @@ cratonvm-difftest min difftest/corpus/Found_0042.java
 
 # CI gate: exit non-zero only on a *new* or *regressed* divergence (Step 3).
 cratonvm-difftest gate --corpus difftest/seeds
+
+# JDK-only mode: measure the strict policy against the compatible one.
+cratonvm-difftest gate --corpus difftest/seeds-jdk-only \
+    --modes jdk-only-jit,jdk-only-nojit,real-compatible-jit
 ```
+
+### JDK-only modes
+
+`docs/feature-designs/jdk-only-mode.md` adds a second axis to the mode matrix:
+the **compatibility policy** the launcher runs under.
+
+| Mode | Launcher flag | `jdk_profile` | Census dumps |
+|------|---------------|---------------|--------------|
+| `jit-on`, `nojit`, `no-intrinsics`, `moving-gc`, `low-jit-threshold` | *(none)* | `compatible` | no |
+| `jdk-only-jit`, `jdk-only-nojit` | `--jdk-only` | `jdk-only` | yes |
+| `real-compatible-jit`, `real-compatible-nojit` | `--real-jdk` | `compatible` | yes |
+
+The five historical modes are **frozen** — same labels, same argv, same env, no
+dump flags — so `gate --corpus difftest/seeds` keeps measuring exactly what it
+measured before, and `--modes` still defaults to `jit-on,nojit`.
+
+A ledger row is keyed by **`(class, jdk_profile)`**. The same program diverging
+under both policies produces two rows (`Foo` and `Foo@jdk-only` in gate output),
+judged independently: a `known` compatible divergence can never excuse a strict
+one. There is deliberately **no fallback** — a divergence is re-confirmed by
+re-running the *same* mode, and a `--jdk-only` child that reports the compatible
+profile is recorded as a `profile-mismatch` violation, which is how a silent
+VM-side downgrade is caught.
+
+Wave 1 is **measurement, not enforcement** (contract §10). Recorded violations
+are listed in the gate report but do **not** move its exit code; a violation
+that actually changed behaviour is already a divergence and gates as one.
 
 ### Gate exit codes (design §3.5)
 

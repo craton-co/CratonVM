@@ -927,6 +927,30 @@ impl ReferenceProcessor {
         }
     }
 
+    /// Drop weak/phantom entries whose `Reference` object no longer *looks
+    /// like* a `Reference` — i.e. its memory has been reclaimed and recycled.
+    ///
+    /// HIB-WEAKREF-RECYCLE.1 (2026-07-31). [`Self::remove_collected`]'s
+    /// survivor predicate ultimately bottoms out in `is_addr_live`, which for
+    /// an old-generation address is a pure range check: freed old-gen memory
+    /// still answers "live". A weak/phantom entry whose `Reference` object was
+    /// reclaimed by an old-gen sweep therefore survives every prune, and both
+    /// the pre-GC null pass and the post-GC restore pass keep writing slot 0 of
+    /// whatever now occupies that address, forever. Declining the write at each
+    /// of those sites stops the corruption but leaves the dangling entry (and
+    /// its per-cycle cost) in place; this prunes it.
+    ///
+    /// Deliberately scoped to `weak_refs`/`phantom_refs`: their `reference_obj`
+    /// is always a `java.lang.ref.Reference` subclass, so "has >= 2 instance
+    /// fields" is a sound shape test. `finalizer_refs`/`cleaner_refs` are NOT
+    /// safe to test this way — a finalizable object is an arbitrary class and
+    /// may legitimately declare fewer than two fields.
+    pub fn retain_shaped_weak_phantom(&mut self, still_a_reference: &dyn Fn(usize) -> bool) {
+        self.weak_refs.retain(|e| still_a_reference(e.reference_obj));
+        self.phantom_refs
+            .retain(|e| still_a_reference(e.reference_obj));
+    }
+
     /// Remove entries whose `Reference` object has itself been collected.
     ///
     /// `soft_refs` is indexed by position into [`Self::soft_ref_lru_index`]
@@ -1162,6 +1186,48 @@ impl ReferenceProcessor {
         for e in self.weak_refs.iter().chain(self.phantom_refs.iter()) {
             if !e.cleared && !e.enqueued {
                 v.push((e.reference_obj, e.referent));
+            }
+        }
+        v
+    }
+
+    /// Every heap address this processor holds a raw pointer to, across ALL
+    /// reference kinds (soft / weak / phantom / cleaner / finalizer): the
+    /// `Reference` object itself, its referent, and its `ReferenceQueue`.
+    ///
+    /// Published to `gc_quiescence::set_watched_referents` before each
+    /// collection. Both young collectors and the old-gen collector emit an
+    /// identity `pointer_map` entry for every watched address that SURVIVES
+    /// but does not move, which is what makes "absent from the pointer map"
+    /// an exact death proof for precisely the addresses post-GC reference
+    /// processing writes through — see
+    /// `VmHeap::watched_pre_gc_addr_survived`.
+    ///
+    /// Superset of [`Self::weak_phantom_active_pairs`] +
+    /// [`Self::weak_phantom_active_queue_addrs`], which covered only the
+    /// weak/phantom halves and only their non-cleared entries: the survival
+    /// predicate is consulted for soft/cleaner/finalizer entries too (via
+    /// `process_references` and `remove_collected`), so every one of them
+    /// needs the same proof.
+    pub fn all_tracked_addrs(&self) -> Vec<usize> {
+        let n = self.soft_refs.len()
+            + self.weak_refs.len()
+            + self.phantom_refs.len()
+            + self.cleaner_refs.len()
+            + self.finalizer_refs.len();
+        let mut v = Vec::with_capacity(n * 3);
+        for e in self
+            .soft_refs
+            .iter()
+            .chain(self.weak_refs.iter())
+            .chain(self.phantom_refs.iter())
+            .chain(self.cleaner_refs.iter())
+            .chain(self.finalizer_refs.iter())
+        {
+            v.push(e.reference_obj);
+            v.push(e.referent);
+            if let Some(q) = e.queue_addr {
+                v.push(q);
             }
         }
         v
@@ -1612,6 +1678,24 @@ mod tests {
 
     // 19. remove_collected cleans up dead Reference objects -----------------
     #[test]
+    fn all_tracked_addrs_covers_every_reference_kind() {
+        let mut proc = ReferenceProcessor::new();
+        proc.discover_reference(ReferenceType::Soft, 100, 200, None);
+        proc.discover_reference(ReferenceType::Weak, 101, 201, Some(301));
+        proc.discover_reference(ReferenceType::Phantom, 102, 202, None);
+        proc.discover_reference(ReferenceType::Cleaner, 103, 203, None);
+        proc.discover_reference(ReferenceType::Finalizer, 104, 204, None);
+
+        let addrs = proc.all_tracked_addrs();
+        // Soft / cleaner / finalizer entries were NOT published before the
+        // old-gen-reclamation fix, so the collector emitted no survival proof
+        // for them and the exact post-GC predicate could not be used.
+        for a in [100, 200, 101, 201, 301, 102, 202, 103, 203, 104, 204] {
+            assert!(addrs.contains(&a), "address {a} must be published as watched");
+        }
+    }
+
+    #[test]
     fn remove_collected_cleans_up() {
         let mut proc = ReferenceProcessor::new();
         proc.discover_reference(ReferenceType::Weak, 100, 200, None);
@@ -1620,6 +1704,34 @@ mod tests {
         proc.remove_collected(&live_set(&live));
         assert_eq!(proc.weak_refs.len(), 1);
         assert_eq!(proc.weak_refs[0].reference_obj, 101);
+    }
+
+    // 19b. HIB-WEAKREF-RECYCLE.1 — the shape prune drops weak/phantom entries
+    //      whose Reference object has been recycled, and leaves the
+    //      finalizer/cleaner lists (whose reference_obj is an arbitrary object)
+    //      completely alone.
+    #[test]
+    fn retain_shaped_weak_phantom_prunes_recycled_and_spares_finalizers() {
+        let mut proc = ReferenceProcessor::new();
+        proc.discover_reference(ReferenceType::Weak, 100, 200, None);
+        proc.discover_reference(ReferenceType::Weak, 101, 201, None);
+        proc.discover_reference(ReferenceType::Phantom, 102, 202, Some(302));
+        // A finalizable object with a shape the weak/phantom test would reject.
+        proc.discover_reference(ReferenceType::Finalizer, 103, 203, None);
+        proc.discover_reference(ReferenceType::Cleaner, 104, 204, None);
+
+        // 100 and 102 have been reclaimed and their memory recycled: whatever
+        // occupies those addresses no longer has >= 2 instance fields.
+        let still_a_reference = [101usize];
+        proc.retain_shaped_weak_phantom(&live_set(&still_a_reference));
+
+        assert_eq!(proc.weak_refs.len(), 1);
+        assert_eq!(proc.weak_refs[0].reference_obj, 101);
+        assert!(proc.phantom_refs.is_empty());
+        // Untouched — pruning these on a field-count test would drop live
+        // finalizable objects that legitimately declare fewer than two fields.
+        assert_eq!(proc.finalizer_refs.len(), 1);
+        assert_eq!(proc.cleaner_refs.len(), 1);
     }
 
     // 20. Stats tracking ---------------------------------------------------

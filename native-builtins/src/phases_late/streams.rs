@@ -1934,83 +1934,22 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// Collectors expansion: maxBy, minBy, mapping, filtering, flatMapping,
-// summarizingInt/Long/Double, toUnmodifiableList/Set/Map, collectingAndThen
-// Collector tags. There is exactly ONE decoder for the tag we write here:
-// native-collections' `native_stream_collect`, the only registered
-// `Stream.collect(Collector)` in the VM. So these constants MUST live in
-// native-collections' `COLLECTOR_TAG_*` numbering — they are aliases of it, not
-// a parallel namespace.
+// Collectors expansion: maxBy, minBy, mapping, filtering,
+// summarizingInt/Long/Double, averaging*/summing*, toUnmodifiableList/Set,
+// collectingAndThen.
 //
-// They used to be a private 9..15 numbering, and for the factories
-// native-collections does NOT itself register (maxBy, minBy, filtering,
-// summarizing{Int,Long,Double}) nothing overwrote them, so the tag we wrote was
-// decoded in the wrong namespace: 9 → GROUPING_BY_DOWNSTREAM, 10 →
-// GROUPING_BY_SUPPLIER, 12 → TO_MAP_MERGE, 13 → COLLECTING_AND_THEN, 14 →
-// TO_COLLECTION, 15 → MAPPING. `stream.collect(Collectors.minBy(cmp))` handed
-// the program a Map instead of an Optional — a silent wrong answer.
-//
-// `mapping` and `collectingAndThen` are also registered by native-collections,
-// whose registration wins (registry is last-wins and
-// `register_collections_natives` runs after `register_builtins`), so their old
-// 11/18 values never reached the decoder. They are aliased here anyway so a
-// future ordering change cannot resurrect the same bug.
-//
-// averaging* (19..21) and summing* (22..24) were the second half of the same
-// bug, reached by a different route: those numbers were in NO decoder table at
-// all, so `is_known_collector_tag` rejected them, `collect` treated the
-// collector as an untagged JDK one, and `collect(averagingInt(f))` handed back
-// the raw accumulation ArrayList where a `Double` is required. They are now
-// tags 31..36 in native-collections and aliased below; 17..24 are unallocated.
+// Every factory here mints its Collector through native-collections'
+// `make_*_collector` helpers, because native-collections owns the ONLY
+// registered `Stream.collect(Collector)` (`native_stream_collect`) and with it
+// the only collector tag namespace anything decodes. This file used to stamp
+// its own `P56_COLLECTOR_*` tags (maxBy=9, minBy=10, filtering=12,
+// summarizing*=13/14/15, …) into 3-field objects that nothing ever read: those
+// numbers aliased live tags on the other side, so `collect(minBy(cmp))` was
+// decoded as `groupingBy(classifier, supplier, downstream)` and answered a Map
+// instead of an Optional. Registration is last-wins and native-collections
+// registers after this crate, so both crates must produce identical objects —
+// route new factories through the shared helpers, never through a local tag.
 // ---------------------------------------------------------------------------
-pub(crate) const P56_COLLECTOR_MAX_BY: i32 = cratonvm_native_collections::COLLECTOR_TAG_MAX_BY;
-
-pub(crate) const P56_COLLECTOR_MIN_BY: i32 = cratonvm_native_collections::COLLECTOR_TAG_MIN_BY;
-
-pub(crate) const P56_COLLECTOR_MAPPING: i32 = cratonvm_native_collections::COLLECTOR_TAG_MAPPING;
-
-pub(crate) const P56_COLLECTOR_FILTERING: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_FILTERING;
-
-pub(crate) const P56_COLLECTOR_SUMMARIZING_INT: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_SUMMARIZING_INT;
-
-pub(crate) const P56_COLLECTOR_SUMMARIZING_LONG: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_SUMMARIZING_LONG;
-
-pub(crate) const P56_COLLECTOR_SUMMARIZING_DOUBLE: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_SUMMARIZING_DOUBLE;
-
-pub(crate) const P56_COLLECTOR_TO_UNMODIFIABLE_LIST: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_TO_LIST;
-
-pub(crate) const P56_COLLECTOR_TO_UNMODIFIABLE_SET: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_TO_SET;
-
-pub(crate) const P56_COLLECTOR_COLLECTING_AND_THEN: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_COLLECTING_AND_THEN;
-
-pub(crate) const P56_COLLECTOR_AVERAGING_INT: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_AVERAGING_INT;
-
-pub(crate) const P56_COLLECTOR_AVERAGING_LONG: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_AVERAGING_LONG;
-
-pub(crate) const P56_COLLECTOR_AVERAGING_DOUBLE: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_AVERAGING_DOUBLE;
-
-pub(crate) const P56_COLLECTOR_SUMMING_INT: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_SUMMING_INT;
-
-pub(crate) const P56_COLLECTOR_SUMMING_LONG: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_SUMMING_LONG;
-
-pub(crate) const P56_COLLECTOR_SUMMING_DOUBLE: i32 =
-    cratonvm_native_collections::COLLECTOR_TAG_SUMMING_DOUBLE;
-
-/// `Collectors.teeing` — registered in Phase 64 below, same shared numbering.
-pub(crate) const P64_COLLECTOR_TEEING: i32 = cratonvm_native_collections::COLLECTOR_TAG_TEEING;
-
 pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -2022,17 +1961,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "maxBy",
         "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let comparator = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let comparator_pin = pinned_object_value(ctx, comparator);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            let comparator = read_pinned_object_value(ctx, comparator_pin, comparator);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_MAX_BY));
-            ctx.set_field(c, 1, comparator);
-            if let Some((h, _)) = comparator_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let comparator = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_max_by_collector(ctx, comparator);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2043,17 +1973,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "minBy",
         "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let comparator = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let comparator_pin = pinned_object_value(ctx, comparator);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            let comparator = read_pinned_object_value(ctx, comparator_pin, comparator);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_MIN_BY));
-            ctx.set_field(c, 1, comparator);
-            if let Some((h, _)) = comparator_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let comparator = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_min_by_collector(ctx, comparator);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2064,23 +1985,9 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "mapping",
         "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let func = args[0];
-            let downstream = args[1];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let func_pin = pinned_object_value(ctx, func);
-            let downstream_pin = pinned_object_value(ctx, downstream);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_MAPPING));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func)); // Function
-            ctx.set_field(
-                c,
-                2,
-                read_pinned_object_value(ctx, downstream_pin, downstream),
-            ); // downstream Collector
-            if let Some((h, _)) = func_pin.or(downstream_pin) {
-                ctx.unpin_native_roots(h);
-            }
+            let func = args.first().copied().unwrap_or(Value::Object(None));
+            let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_mapping_collector(ctx, func, downstream);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2091,23 +1998,9 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "filtering",
         "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let pred = args[0];
-            let downstream = args[1];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let pred_pin = pinned_object_value(ctx, pred);
-            let downstream_pin = pinned_object_value(ctx, downstream);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_FILTERING));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, pred_pin, pred)); // Predicate
-            ctx.set_field(
-                c,
-                2,
-                read_pinned_object_value(ctx, downstream_pin, downstream),
-            ); // downstream Collector
-            if let Some((h, _)) = pred_pin.or(downstream_pin) {
-                ctx.unpin_native_roots(h);
-            }
+            let pred = args.first().copied().unwrap_or(Value::Object(None));
+            let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_filtering_collector(ctx, pred, downstream);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2118,16 +2011,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summarizingInt",
         "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let func = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let func_pin = pinned_object_value(ctx, func);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_SUMMARIZING_INT));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
-            if let Some((h, _)) = func_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let func = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_summarizing_int_collector(ctx, func);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2138,16 +2023,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summarizingLong",
         "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let func = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let func_pin = pinned_object_value(ctx, func);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_SUMMARIZING_LONG));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
-            if let Some((h, _)) = func_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let func = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_summarizing_long_collector(ctx, func);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2158,16 +2035,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summarizingDouble",
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let func = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let func_pin = pinned_object_value(ctx, func);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_SUMMARIZING_DOUBLE));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
-            if let Some((h, _)) = func_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let func = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_summarizing_double_collector(ctx, func);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2200,43 +2069,23 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "collectingAndThen",
         "(Ljava/util/stream/Collector;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let downstream = args[0];
-            let finisher = args[1];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let downstream_pin = pinned_object_value(ctx, downstream);
-            let finisher_pin = pinned_object_value(ctx, finisher);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_COLLECTING_AND_THEN));
-            ctx.set_field(
-                c,
-                1,
-                read_pinned_object_value(ctx, downstream_pin, downstream),
-            ); // downstream Collector
-            ctx.set_field(c, 2, read_pinned_object_value(ctx, finisher_pin, finisher)); // finisher Function
-            if let Some((h, _)) = downstream_pin.or(finisher_pin) {
-                ctx.unpin_native_roots(h);
-            }
+            let downstream = args.first().copied().unwrap_or(Value::Object(None));
+            let finisher = args.get(1).copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_collecting_and_then_collector(
+                ctx, downstream, finisher,
+            );
             Ok(Some(Value::Object(Some(c))))
         },
     );
 
-    // --- averagingInt(ToIntFunction) → Collector (returns a boxed Double) ---
+    // --- averagingInt/Long/Double(To*Function) → Collector (Double average) ---
     r.register(
         col,
         "averagingInt",
         "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let func = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let func_pin = pinned_object_value(ctx, func);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_AVERAGING_INT));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
-            if let Some((h, _)) = func_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let func = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_averaging_int_collector(ctx, func);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2245,16 +2094,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "averagingLong",
         "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let func = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let func_pin = pinned_object_value(ctx, func);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_AVERAGING_LONG));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
-            if let Some((h, _)) = func_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let func = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_averaging_long_collector(ctx, func);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2263,16 +2104,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "averagingDouble",
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let func = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let func_pin = pinned_object_value(ctx, func);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_AVERAGING_DOUBLE));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
-            if let Some((h, _)) = func_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let func = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_averaging_double_collector(ctx, func);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2283,16 +2116,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summingInt",
         "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let func = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let func_pin = pinned_object_value(ctx, func);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_SUMMING_INT));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
-            if let Some((h, _)) = func_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let func = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_summing_int_collector(ctx, func);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2301,16 +2126,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summingLong",
         "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let func = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let func_pin = pinned_object_value(ctx, func);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_SUMMING_LONG));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
-            if let Some((h, _)) = func_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let func = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_summing_long_collector(ctx, func);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2319,16 +2136,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summingDouble",
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let func = args[0];
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let func_pin = pinned_object_value(ctx, func);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_SUMMING_DOUBLE));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
-            if let Some((h, _)) = func_pin {
-                ctx.unpin_native_roots(h);
-            }
+            let func = args.first().copied().unwrap_or(Value::Object(None));
+            let c = cratonvm_native_collections::make_summing_double_collector(ctx, func);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3964,35 +3773,24 @@ pub(crate) fn native_p64_stream_to_list(
 pub(crate) fn register_p64_collectors_teeing(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // Collectors.teeing(Collector, Collector, BiFunction) -> Collector
-    // ARG1 = downstream1, ARG2 = downstream2, ARG3 = the merge BiFunction.
-    //
-    // This used to write tag 1 (toList) with null args — the comment claimed
-    // "Tag 9 … ARG1/ARG2 downstreams" but the body kept none of the three
-    // arguments, so `collect(teeing(a, b, merge))` silently returned a List of
-    // the stream elements instead of `merge.apply(a-result, b-result)`.
-    // Five fields, not three: the merger lives in ARG3 and reading field 3 off a
-    // 3-field object is out of bounds.
+    // Collectors.teeing(Collector, Collector, BiFunction) -> Collector.
+    // Minted through native-collections like every other Collectors factory —
+    // see the phase-56 block comment on why a locally-stamped tag is a bug.
+    // This used to discard all three arguments and hand back a bare toList
+    // collector, so `collect(teeing(a, b, merger))` answered a List of the
+    // elements instead of `merger.apply(collect(a), collect(b))`.
     r.register("java/util/stream/Collectors", "teeing",
         "(Ljava/util/stream/Collector;Ljava/util/stream/Collector;Ljava/util/function/BiFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
-            let down1 = args.first().copied().unwrap_or(Value::Object(None));
-            let down2 = args.get(1).copied().unwrap_or(Value::Object(None));
+            let downstream1 = args.first().copied().unwrap_or(Value::Object(None));
+            let downstream2 = args.get(1).copied().unwrap_or(Value::Object(None));
             let merger = args.get(2).copied().unwrap_or(Value::Object(None));
-            // Pin across the Collector alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let d1_pin = pinned_object_value(ctx, down1);
-            let d2_pin = pinned_object_value(ctx, down2);
-            let merger_pin = pinned_object_value(ctx, merger);
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 5);
-            ctx.set_field(c, 0, Value::Int(P64_COLLECTOR_TEEING));
-            ctx.set_field(c, 1, read_pinned_object_value(ctx, d1_pin, down1));
-            ctx.set_field(c, 2, read_pinned_object_value(ctx, d2_pin, down2));
-            ctx.set_field(c, 3, read_pinned_object_value(ctx, merger_pin, merger));
-            ctx.set_field(c, 4, Value::Object(None));
-            if let Some((h, _)) = d1_pin.or(d2_pin).or(merger_pin) {
-                ctx.unpin_native_roots(h);
-            }
+            let c = cratonvm_native_collections::make_teeing_collector(
+                ctx,
+                downstream1,
+                downstream2,
+                merger,
+            );
             Ok(Some(Value::Object(Some(c))))
         });
 

@@ -38,7 +38,21 @@
 //! | [`generate`]    | corpus generator (§3.1)     | wired (3 families) |
 //! | [`mutate`]      | bytecode mutator (§3.1 t3)  | wired          |
 //! | [`minimize`]    | ddmin shrink (§3.4)         | wired          |
+//! | [`census`]      | JDK-only dump reader (§9)   | wired          |
+//!
+//! ## JDK-only mode (`docs/feature-designs/jdk-only-mode.md`)
+//!
+//! Four additional [`runner::Mode`]s select a *compatibility policy* on the
+//! launcher command line (`--jdk-only` / `--real-jdk`) and collect the three
+//! census dumps [`census`] reads back. Because the policy is part of what was
+//! measured, a ledger row is keyed by **`(class, jdk_profile)`**: the same
+//! program diverging under the strict policy and under the compatible one is
+//! two findings, and a `known` compatible row can never excuse a strict
+//! divergence. The five historical modes are untouched — same labels, same
+//! argv, same env, same rows — so the committed `difftest/seeds` gate baseline
+//! keeps measuring exactly what it always did.
 
+pub mod census;
 pub mod generate;
 pub mod harness;
 pub mod ledger;

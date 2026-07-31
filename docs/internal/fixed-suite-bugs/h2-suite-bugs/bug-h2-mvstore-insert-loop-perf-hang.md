@@ -42,6 +42,18 @@ CratonVM's MVMap/ConcurrentHashMap path is the hot spot.
 frames and looked like a lock livelock; the wider sample shows those are just
 the per-row lock acquire/release on the normal path, not a stuck wait.)
 
+## Another confirmed instance (2026-07-31)
+
+`org.h2.test.db.TestOutOfMemory` — once its `SIGABRT` was fixed (see
+`bug-h2-testoutofmemory-sigabrt-young-old-gen-both-exhausted-FIXED.md`) the
+class stopped crashing and started *timing out* instead. A
+`--stack-dump-on-timeout 420` run on the **unmodified baseline** puts the main
+thread in exactly this shape: `CreateTable.insertAsData -> Insert.insertRows ->
+Select$LazyResultQueryFlat.fetchNextRow -> StringFunction1.getValue`, i.e. the
+`create table ... as select x, space(1000000+x) from system_range(1, 10000)`
+insert loop, progressing (frames differ between samples). HotSpot runs the whole
+class in 5s.
+
 ## Why it matters
 H2's TestAll exercises many large loops (bulk insert, fuzz, random ops). The
 per-operation overhead in MVMap/transaction commit turns these from seconds into

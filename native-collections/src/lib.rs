@@ -1526,6 +1526,24 @@ fn native_unsorted_set_comparator(
 }
 
 /// Register all collection native methods.
+// JDK-ONLY-CLASSIFY: stub — crate-wide verdict, applied by one line. The
+// `set_category(Bridge)` below is not a per-registration judgement: it is a
+// dynamic ambient assignment that every callee in this file inherits, and it
+// covers 1,195 of the crate's 1,219 registrations. Cross-checked against JDK 25
+// with `javap -p -s`, **not one** of those 1,195 targets an ACC_NATIVE method
+// (622 target methods with concrete bytecode, 214 are abstract interface
+// methods, the remainder are absent from the image or use a class name this
+// audit could not resolve statically). `java.util` is pure Java: there is no
+// VM/OS boundary in this crate to bridge to. The correct disposition for
+// almost everything here is jdk-only-native-review.md's rule 4 — "concrete
+// bytecode + incomplete replacement → delete from the strict path" — with a
+// small number of genuine `Intrinsic` promotions.
+//
+// DO NOT flip this line to `SyntheticStub` as a bulk edit. That is the exact
+// shape of the 2026-07-14 regression, at ~8x the blast radius, and the 214
+// abstract-interface registrations additionally decide dispatch for every USER
+// subclass, not just for `java.util` classes. Retag per subsystem, one PR each,
+// with schema-v2 `invocations` and `overwrote` evidence.
 pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_gc_root_provider();
     let __prev_cat = registry.current_category();
@@ -1783,6 +1801,27 @@ fn pin_value(ctx: &mut dyn NativeContext, v: Value) -> usize {
     match v {
         Value::Object(Some(o)) => ctx.pin_native_root(o),
         _ => usize::MAX,
+    }
+}
+
+/// Pin an `Option<ObjectRef>` cursor, returning `usize::MAX` for `None`.
+/// Companion to [`opt_read`]; both exist for `map_resize_inner`'s chain-split
+/// walk, which carries four such cursors across a GC-capable reference store.
+#[inline]
+fn opt_pin(ctx: &mut dyn NativeContext, o: Option<ObjectRef>) -> usize {
+    match o {
+        Some(r) => ctx.pin_native_root(r),
+        None => usize::MAX,
+    }
+}
+
+/// Read back an `Option<ObjectRef>` cursor pinned with [`opt_pin`]. `None`
+/// cursors and unpinned handles are returned verbatim.
+#[inline]
+fn opt_read(ctx: &dyn NativeContext, handle: usize, o: Option<ObjectRef>) -> Option<ObjectRef> {
+    match o {
+        Some(r) if handle != usize::MAX => Some(ctx.read_native_pin(handle, r)),
+        _ => o,
     }
 }
 
@@ -5820,7 +5859,25 @@ fn map_resize_inner(
     // `bulk_array_copy` is still attempted as an optional fast path so
     // that if a future VM override does support reference arrays, we
     // skip the per-bucket head reads.
+    // HIB-MAPRESIZE-STALE.1 (2026-07-31) — the rehash below is NOT
+    // allocation-free, contrary to the `this_pin` comment above ("the split
+    // loop below reuses existing nodes (no further allocation), so one re-read
+    // suffices"). Its `set_field(node, NODE_FIELD_NEXT, ..)` and
+    // `set_array_element(new_buckets, ..)` calls are REFERENCE-typed stores, so
+    // each can allocate a remembered-set entry through the write barrier and
+    // therefore complete a moving young GC — the exact hazard
+    // `native_map_put_evict_pinned` documents and pins against. `old_b` and
+    // `new_buckets` are bare Rust locals invisible to `collect_roots`, so after
+    // such a GC they name pre-move addresses; the loops then write through
+    // freed nodes and, far worse, publish stale `lo_head`/`hi_head` into
+    // `new_buckets`, leaving the map with dangling chain heads permanently.
+    // Pin both arrays for the whole rehash and re-read them after every store
+    // that can collect.
+    let new_buckets_h = ctx.pin_native_root(new_buckets);
+    let mut new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
     if let Some(old_b) = old_buckets {
+        let old_b_h = ctx.pin_native_root(old_b);
+        let mut old_b = ctx.read_native_pin(old_b_h, old_b);
         let doubled = (new_cap as i64) == (old_cap as i64) * 2;
         if doubled {
             // Optional fast path: if the VM's bulk_array_copy supports
@@ -5863,18 +5920,60 @@ fn map_resize_inner(
                         _ => 0,
                     };
                     let next = ctx.get_field(node, NODE_FIELD_NEXT);
-                    if (key_hash & split_mask) == 0 {
+                    let is_lo = (key_hash & split_mask) == 0;
+                    // HIB-MAPRESIZE-STALE.1: the link store below is this
+                    // step's only GC point, and it only happens once a
+                    // partition already has a head — so the common
+                    // single-node bucket pays no pin at all. When it does
+                    // fire, pin every reference that has to outlive it and
+                    // re-read each one afterwards. The frame sits ABOVE the
+                    // two array pins, so unwinding it leaves those intact.
+                    let will_store = if is_lo {
+                        lo_head.is_some() && lo_tail.is_some()
+                    } else {
+                        hi_head.is_some() && hi_tail.is_some()
+                    };
+                    let mut node = node;
+                    let mut next = next;
+                    if will_store {
+                        let step_base = ctx.pin_native_root(node);
+                        let node_h = step_base;
+                        let next_h = pin_value(ctx, next);
+                        let lo_head_h = opt_pin(ctx, lo_head);
+                        let lo_tail_h = opt_pin(ctx, lo_tail);
+                        let hi_head_h = opt_pin(ctx, hi_head);
+                        let hi_tail_h = opt_pin(ctx, hi_tail);
+
+                        let tail = if is_lo { lo_tail } else { hi_tail };
+                        let tail_h = if is_lo { lo_tail_h } else { hi_tail_h };
+                        if let Some(t) = tail {
+                            let t = ctx.read_native_pin(tail_h, t);
+                            let linked = ctx.read_native_pin(node_h, node);
+                            ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(linked)));
+                        }
+
+                        // Everything below this line is post-GC.
+                        node = ctx.read_native_pin(node_h, node);
+                        next = read_pinned_elem(ctx, next_h, next);
+                        lo_head = opt_read(ctx, lo_head_h, lo_head);
+                        lo_tail = opt_read(ctx, lo_tail_h, lo_tail);
+                        hi_head = opt_read(ctx, hi_head_h, hi_head);
+                        hi_tail = opt_read(ctx, hi_tail_h, hi_tail);
+                        new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                        old_b = ctx.read_native_pin(old_b_h, old_b);
+                        ctx.unpin_native_roots(step_base);
+                    }
+                    // Assign this step's cursors from the (refreshed) node.
+                    // Emptiness is preserved by the refresh, so testing
+                    // `is_none()` here matches the `will_store` decision above.
+                    if is_lo {
                         if lo_head.is_none() {
                             lo_head = Some(node);
-                        } else if let Some(t) = lo_tail {
-                            ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(node)));
                         }
                         lo_tail = Some(node);
                     } else {
                         if hi_head.is_none() {
                             hi_head = Some(node);
-                        } else if let Some(t) = hi_tail {
-                            ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(node)));
                         }
                         hi_tail = Some(node);
                     }
@@ -5904,23 +6003,67 @@ fn map_resize_inner(
                         };
                         let next = ctx.get_field(node, NODE_FIELD_NEXT);
                         let new_idx = map_bucket_index(key_hash, new_cap);
+                        // HIB-MAPRESIZE-STALE.1: same hazard as the split walk
+                        // — both stores below are reference-typed and can
+                        // collect, and `node`/`next`/`new_buckets` are bare
+                        // locals across them.
+                        let step_base = ctx.pin_native_root(node);
+                        let node_h = step_base;
+                        let next_h = pin_value(ctx, next);
                         let existing = ctx.get_array_element(new_buckets, new_idx);
-                        ctx.set_field(node, NODE_FIELD_NEXT, existing);
-                        ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
-                        nv = next;
+                        let existing_h = pin_value(ctx, existing);
+                        let node_now = ctx.read_native_pin(node_h, node);
+                        ctx.set_field(
+                            node_now,
+                            NODE_FIELD_NEXT,
+                            read_pinned_elem(ctx, existing_h, existing),
+                        );
+                        new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                        let node_now = ctx.read_native_pin(node_h, node);
+                        ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node_now)));
+                        new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                        old_b = ctx.read_native_pin(old_b_h, old_b);
+                        nv = read_pinned_elem(ctx, next_h, next);
+                        ctx.unpin_native_roots(step_base);
                     }
                     continue;
                 }
-                // Terminate both partitioned chains.
-                if let Some(t) = lo_tail {
+                // HIB-MAPRESIZE-STALE.1: these four stores are the ones that
+                // actually PUBLISH the partitioned chains, so a stale
+                // `lo_head`/`hi_head` here is what corrupts the map for good.
+                // Two of them are reference-typed and can collect, so pin the
+                // cursors and refresh between stores.
+                // The frame is anchored on `new_buckets` rather than on one of
+                // the cursors: any cursor may legitimately be `None`, and a
+                // `usize::MAX` base would silently leak the rest of the frame.
+                let tail_base = ctx.pin_native_root(new_buckets);
+                let lo_head_h = opt_pin(ctx, lo_head);
+                let lo_tail_h = opt_pin(ctx, lo_tail);
+                let hi_head_h = opt_pin(ctx, hi_head);
+                let hi_tail_h = opt_pin(ctx, hi_tail);
+                // Terminate both partitioned chains. A null store does not fire
+                // the write barrier, but refresh anyway rather than depend on
+                // that staying true.
+                if let Some(t) = opt_read(ctx, lo_tail_h, lo_tail) {
                     ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(None));
                 }
-                if let Some(t) = hi_tail {
+                if let Some(t) = opt_read(ctx, hi_tail_h, hi_tail) {
                     ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(None));
                 }
                 // Overwrite the two slots (low keeps `i`, high goes to i+old_cap).
-                ctx.set_array_element(new_buckets, i, Value::Object(lo_head));
-                ctx.set_array_element(new_buckets, i + old_cap as usize, Value::Object(hi_head));
+                new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                let lo_head_now = opt_read(ctx, lo_head_h, lo_head);
+                ctx.set_array_element(new_buckets, i, Value::Object(lo_head_now));
+                new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                let hi_head_now = opt_read(ctx, hi_head_h, hi_head);
+                ctx.set_array_element(
+                    new_buckets,
+                    i + old_cap as usize,
+                    Value::Object(hi_head_now),
+                );
+                new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                old_b = ctx.read_native_pin(old_b_h, old_b);
+                ctx.unpin_native_roots(tail_base);
             }
         } else {
             // Legacy rebuild path: per-bucket re-insert (head-prepend).
@@ -5949,25 +6092,64 @@ fn map_resize_inner(
                                 i, steps
                             );
                             // Truncate: splice node alone, do not continue
+                            // (HIB-MAPRESIZE-STALE.1 pinning, as below).
                             let new_idx = map_bucket_index(key_hash, new_cap);
+                            let step_base = ctx.pin_native_root(node);
+                            let node_h = step_base;
                             let existing = ctx.get_array_element(new_buckets, new_idx);
-                            ctx.set_field(node, NODE_FIELD_NEXT, existing);
-                            ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
+                            let existing_h = pin_value(ctx, existing);
+                            let node_now = ctx.read_native_pin(node_h, node);
+                            ctx.set_field(
+                                node_now,
+                                NODE_FIELD_NEXT,
+                                read_pinned_elem(ctx, existing_h, existing),
+                            );
+                            new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                            let node_now = ctx.read_native_pin(node_h, node);
+                            ctx.set_array_element(
+                                new_buckets,
+                                new_idx,
+                                Value::Object(Some(node_now)),
+                            );
+                            new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                            old_b = ctx.read_native_pin(old_b_h, old_b);
+                            ctx.unpin_native_roots(step_base);
                             break;
                         }
                     }
 
-                    // Insert into new bucket
+                    // Insert into new bucket (HIB-MAPRESIZE-STALE.1 pinning:
+                    // both stores are reference-typed and can collect).
                     let new_idx = map_bucket_index(key_hash, new_cap);
+                    let step_base = ctx.pin_native_root(node);
+                    let node_h = step_base;
+                    let next_h = pin_value(ctx, next);
                     let existing = ctx.get_array_element(new_buckets, new_idx);
-                    ctx.set_field(node, NODE_FIELD_NEXT, existing);
-                    ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
-
-                    node_val = next;
+                    let existing_h = pin_value(ctx, existing);
+                    let node_now = ctx.read_native_pin(node_h, node);
+                    ctx.set_field(
+                        node_now,
+                        NODE_FIELD_NEXT,
+                        read_pinned_elem(ctx, existing_h, existing),
+                    );
+                    new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                    let node_now = ctx.read_native_pin(node_h, node);
+                    ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node_now)));
+                    new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                    old_b = ctx.read_native_pin(old_b_h, old_b);
+                    node_val = read_pinned_elem(ctx, next_h, next);
+                    ctx.unpin_native_roots(step_base);
                 }
             }
         }
+        ctx.unpin_native_roots(old_b_h);
     }
+    // HIB-MAPRESIZE-STALE.1: `this` was pinned before `alloc_ref_array` and
+    // re-read once, but the rehash above can now collect too, so the local was
+    // a pre-move address by the time the publication writes below used it.
+    // Re-read both roots one last time.
+    let this = ctx.read_native_pin(this_pin, this);
+    let new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
 
     // Round-5 CRIT fix (publication race): publish the new buckets
     // array with a volatile/Release-style write so that concurrent
@@ -6208,6 +6390,15 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
     entries
 }
 
+// JDK-ONLY-CLASSIFY: stub — both registrations target `org.hibernate.*`, which
+// is not in any JDK boot image, so jdk-only-native-review.md rule 1 fires: no
+// real declaring class ⇒ CompatibilityShim, forbidden under `JdkOnly`. Note
+// these are third-party classes, not JDK classes: they are on the APPLICATION
+// class path when Hibernate is present and absent otherwise, so `--jdk-only`
+// must refuse the registration rather than the class. This is one of only two
+// lexically uncategorised registration sites in the whole crate; both inherit
+// `Bridge` dynamically from `register_collections_natives`, which is how a
+// third-party shim ends up wearing the tag reserved for VM/OS boundaries.
 fn register_hibernate_persistent_map_natives(r: &mut NativeMethodRegistry) {
     r.register(
         "org/hibernate/collection/spi/PersistentMap",
@@ -6450,8 +6641,17 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     if uses_native_hashtable_layout(ctx, this) {
+        // GC-safety: `alloc_ref_array` is a collection point and `this` is a
+        // bare local, so every store below must use a re-read reference.
+        let this_pin = ctx.pin_native_root(this);
         let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+        let buckets_pin = ctx.pin_native_root(buckets);
+        let this = ctx.read_native_pin(this_pin, this);
+        let buckets = ctx.read_native_pin(buckets_pin, buckets);
         ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        // The store above is a GC point (write barrier); refresh before reusing.
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
         set_map_size(ctx, this, 0);
         let cname = ctx
             .class_name_of_id(ctx.class_id_of_object(this))
@@ -6471,8 +6671,19 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         HM_INT_FAST_LAST_KEY.with(|cache| cache.set(None));
     }
     // Legacy synthetic layout — what every other native HashMap op expects.
+    // GC-safety: same hazard as the Hashtable branch above — `alloc_ref_array`
+    // can collect, and every field store from here on uses `this`.
+    // A reference-typed store is itself a GC point: its write barrier can
+    // allocate a remembered-set entry and complete a young collection (see
+    // the `map_resize` chain-cursor fix). Keep both pins live and re-read
+    // across every such store, not just across the allocation.
+    let this_pin = ctx.pin_native_root(this);
     let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+    let buckets_pin = ctx.pin_native_root(buckets);
+    let this = ctx.read_native_pin(this_pin, this);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    let this = ctx.read_native_pin(this_pin, this);
     set_map_size(ctx, this, 0);
     // S111r29: Resolve the JDK `table` slot (descriptor `[Ljava/util/HashMap$Node;`)
     // and store the bucket array there. Writing `Int(MAP_DEFAULT_CAPACITY)` to
@@ -6488,9 +6699,13 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
     if let Some(slot) = table_slot {
         if slot < ctx.object_num_fields(this) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let buckets = ctx.read_native_pin(buckets_pin, buckets);
             ctx.set_field(this, slot, Value::Object(Some(buckets)));
         }
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     if table_slot != Some(MAP_FIELD_CAPACITY) {
         ctx.set_field(
             this,
@@ -6546,8 +6761,23 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // sizes the table lazily, so `new HashMap(Integer.MAX_VALUE)` must not
     // abort); `cap` is rebound to the actually-allocated size so the JDK
     // `threshold`/`__capacity` fields below stay consistent with the table.
+    // GC-safety: `lhm_init_with_cap` pins `this` across the identical
+    // `alloc_bucket_table` call (confirmed live under CRATONVM_DBG_STALE_OBJREF
+    // during WildFly parallel-extension-add); the plain-HashMap constructor —
+    // which is what `new HashSet<>(...)`'s backing map goes through — never
+    // got the same treatment, so the bucket-array store below could land on a
+    // stale receiver and leave the fresh map with no table at all.
+    // A reference-typed store is itself a GC point: its write barrier can
+    // allocate a remembered-set entry and complete a young collection (see
+    // the `map_resize` chain-cursor fix). Keep both pins live and re-read
+    // across every such store, not just across the allocation.
+    let this_pin = ctx.pin_native_root(this);
     let (buckets, cap) = alloc_bucket_table(ctx, cap);
+    let buckets_pin = ctx.pin_native_root(buckets);
+    let this = ctx.read_native_pin(this_pin, this);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    let this = ctx.read_native_pin(this_pin, this);
     set_map_size(ctx, this, 0);
     // S111r29: see `native_map_init` for rationale. Mirror the bucket array
     // into the JDK `table` slot so `HashMap.resize()` bytecode sees an array
@@ -6556,9 +6786,13 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
     if let Some(slot) = table_slot {
         if slot < ctx.object_num_fields(this) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let buckets = ctx.read_native_pin(buckets_pin, buckets);
             ctx.set_field(this, slot, Value::Object(Some(buckets)));
         }
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     if table_slot != Some(MAP_FIELD_CAPACITY) {
         ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     }
@@ -7572,8 +7806,92 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
     }
 
+    // `CRATONVM_DBG_MAP_MISS_AUDIT` — a miss is normal, but a miss on a key the
+    // map still holds by reference identity is not. Only the identity case is
+    // reported, so this stays quiet on the millions of legitimate misses.
+    //
+    // Written for the Spring `@Bean` attribute flake: `ClassUtils`'
+    // `IdentityHashMap<Class,Class>` returned null for a key it demonstrably
+    // still contained, once in ~70 runs, with the map intact before and after.
+    // That shape — a single bad lookup against a healthy map — is invisible from
+    // Java, because by the time anything notices, the evidence is gone.
+    if dbg_map_miss_audit() {
+        let key_now = match read_pinned_elem(ctx, key_pin, key_val) {
+            Value::Object(Some(k)) => Some(k),
+            _ => key_ref,
+        };
+        if let Some(k) = key_now {
+            report_identity_present_miss(ctx, this, buckets, cap, k, hash, idx);
+        }
+    }
+
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(None)))
+}
+
+/// `true` iff `CRATONVM_DBG_MAP_MISS_AUDIT` is set. Cached: this is consulted on
+/// every map miss, which is a hot path.
+fn dbg_map_miss_audit() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MAP_MISS_AUDIT").is_some()
+    })
+}
+
+/// Re-walk every bucket after a miss. If a node's key is the SAME OBJECT as the
+/// one we searched for, the lookup was wrong and we print everything needed to
+/// say why: which bucket the key actually lives in versus the one we probed, and
+/// the stored node hash versus the hash we just computed.
+///
+/// Capped at `AUDIT_MAX_CAP` buckets so enabling this on a large map cannot turn
+/// a miss into an O(n) walk.
+fn report_identity_present_miss(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    buckets: ObjectRef,
+    cap: i32,
+    key: ObjectRef,
+    searched_hash: i32,
+    searched_idx: usize,
+) {
+    const AUDIT_MAX_CAP: i32 = 4096;
+    if cap <= 0 || cap > AUDIT_MAX_CAP {
+        return;
+    }
+    for b in 0..(cap as usize) {
+        let mut node_val = ctx.get_array_element(buckets, b);
+        let mut guard = 0usize;
+        while let Value::Object(Some(node)) = node_val {
+            guard += 1;
+            if guard > 4096 {
+                break;
+            }
+            if let Value::Object(Some(node_key)) = get_node_key(ctx, node) {
+                if node_key == key {
+                    let node_hash = get_node_hash(ctx, node);
+                    let key_class = ctx.class_name_of_id(ctx.class_id_of_object(key));
+                    eprintln!(
+                        "[MAP-MISS-AUDIT] map={:?} MISSED a key it still holds by identity: \
+                         key={:?} key_class={:?} searched_hash={} searched_bucket={} \
+                         found_in_bucket={} node_hash={} cap={} \
+                         (hash_mismatch={}, bucket_mismatch={})",
+                        this,
+                        key,
+                        key_class,
+                        searched_hash,
+                        searched_idx,
+                        b,
+                        node_hash,
+                        cap,
+                        node_hash != searched_hash,
+                        b != searched_idx,
+                    );
+                    return;
+                }
+            }
+            node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+        }
+    }
 }
 
 fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10137,11 +10455,22 @@ fn alloc_hs_backing(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) ->
         let total = ctx.class_num_total_fields(cid);
         let n = std::cmp::max(total, MAP_NUM_FIELDS);
         let m = ctx.alloc_object(cid, n);
+        // The freshly allocated backing map is referenced ONLY by this local
+        // until the caller stores it into the set's `map` field. Pin it across
+        // the initializer (which allocates the bucket table): a moving cycle
+        // would relocate it, and a non-moving sweep cannot even see it as live,
+        // so the returned reference could name reclaimed-and-reused memory.
+        let m_pin = ctx.pin_native_root(m);
         lhm_init_with_cap(ctx, m, cap.max(MAP_DEFAULT_CAPACITY));
+        let m = ctx.read_native_pin(m_pin, m);
+        ctx.unpin_native_roots(m_pin);
         m
     } else {
         let m = alloc_backing_map(ctx);
+        let m_pin = ctx.pin_native_root(m);
         let _ = native_map_init_capacity(ctx, &[Value::Object(Some(m)), Value::Int(cap as i32)]);
+        let m = ctx.read_native_pin(m_pin, m);
+        ctx.unpin_native_roots(m_pin);
         m
     }
 }
@@ -10151,8 +10480,13 @@ fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // `alloc_hs_backing` allocates and can therefore move `this`; the field
+    // store below would otherwise land on a from-space address.
+    let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -10165,8 +10499,12 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(c)) if *c > 0 => *c as usize,
         _ => MAP_DEFAULT_CAPACITY,
     };
+    // Same allocation-moves-`this` hazard as `native_hs_init`.
+    let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, cap);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -15797,6 +16135,14 @@ fn prim_stream_values(
     }
 }
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Same abstract-interface hazard as
+// `register_interface_natives`: 30 of 37 registrations here target abstract
+// methods of `java.util.stream.Stream` and friends. `java.util.stream` has no
+// ACC_NATIVE method anywhere, so nothing in this group is a bridge; the open
+// question is whether each entry should become an `Intrinsic` (the pipeline
+// fusion these natives perform is a real speedup) or be deleted so the JDK's
+// own `ReferencePipeline` runs. That question is answered by measurement, not
+// by `javap`. Do not retag without a benchmark and a differential run.
 fn register_stream_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -18299,99 +18645,63 @@ pub const COLLECTOR_TAG_MAPPING: i32 = 15;
 /// `Collectors.toMap(keyFn, valFn, mergeFn, supplier)`.
 /// ARG1=keyFn, ARG2=valFn, ARG3=mergeFn, ARG4=supplier.
 const COLLECTOR_TAG_TO_MAP_SUPPLIER: i32 = 16;
-
 // ---------------------------------------------------------------------------
-// Tags 25.. — collectors that only `native-builtins` REGISTERS.
-//
-// `native_stream_collect` below is the only registered
-// `Stream.collect(Collector)` anywhere, so whatever tag the factory writes into
-// field 0 is decoded against THIS table — there is no second decoder. For
-// `minBy`/`maxBy`/`filtering`/`summarizing{Int,Long,Double}` the factory lives
-// in `native-builtins` `phases_late::streams` (native-collections registers no
-// such factory, so registration last-wins never hides it), and that crate used
-// to number them in a private 9..15 space that collided head-on with the
-// groupingBy/toMap/collectingAndThen/toCollection/mapping tags above:
-// `collect(minBy(cmp))` decoded as GROUPING_BY_SUPPLIER and handed the program
-// back a Map where the `java.util.stream.Collectors` contract requires an
-// `Optional` — a silent wrong answer, not a crash.
-//
-// The band starts at 25, not 17, because when it was opened `native-builtins`
-// still spent 18 on its (shadowed) collectingAndThen and 19..24 on
-// averaging*/summing*. Those six have since moved into this table as well
-// (tags 31..36 below), so 17..24 are now entirely unallocated — do not recycle
-// them without re-checking every `set_field(c, 0, Value::Int(..))` in
-// `native-builtins` `phases_late::streams`. The `P56_COLLECTOR_*` names over
-// there are now `const` ALIASES of the constants below, so the two crates can no
-// longer drift apart again.
-/// `Collectors.minBy(Comparator)` — ARG1 = Comparator. Result is an
-/// `Optional`, empty for an empty stream.
-pub const COLLECTOR_TAG_MIN_BY: i32 = 25;
-/// `Collectors.maxBy(Comparator)` — ARG1 = Comparator. Result is an
-/// `Optional`, empty for an empty stream.
-pub const COLLECTOR_TAG_MAX_BY: i32 = 26;
-/// `Collectors.filtering(Predicate, Collector)` — ARG1 = Predicate,
-/// ARG2 = downstream Collector. Elements failing the predicate are dropped;
-/// the survivors are collected through the downstream collector via the same
-/// recursive sub-stream protocol `mapping`/`groupingBy(downstream)` use, so the
-/// downstream may be another tagged collector OR a real JDK one.
-pub const COLLECTOR_TAG_FILTERING: i32 = 27;
-/// `Collectors.summarizingInt(ToIntFunction)` — ARG1 = the extractor. Result is
-/// a `java.util.IntSummaryStatistics` in the 4-field layout
-/// (count=0 Long, sum=1 Long, min=2 Int, max=3 Int) that `native-builtins`
-/// `register_phase56_summary_stats` getters read.
-pub const COLLECTOR_TAG_SUMMARIZING_INT: i32 = 28;
-/// `Collectors.summarizingLong(ToLongFunction)` — ARG1 = the extractor.
-/// Result is a `java.util.LongSummaryStatistics` (min/max are `Long`).
-pub const COLLECTOR_TAG_SUMMARIZING_LONG: i32 = 29;
-/// `Collectors.summarizingDouble(ToDoubleFunction)` — ARG1 = the extractor.
-/// Result is a `java.util.DoubleSummaryStatistics` (sum/min/max are `Double`).
-pub const COLLECTOR_TAG_SUMMARIZING_DOUBLE: i32 = 30;
+// Tags 17+ arrived when a SECOND collector tag namespace was folded into this
+// one. `native-builtins`' `phases_late::streams` used to mint its own
+// `P56_COLLECTOR_*` numbers (maxBy=9, minBy=10, filtering=12,
+// summarizingInt/Long/Double=13/14/15, …) that nothing ever decoded — this
+// file owns the only registered `Stream.collect(Collector)` — while aliasing
+// live tags above. `Collectors.minBy(cmp)` was stamped 10, so
+// `stream.collect(minBy(cmp))` came back through GROUPING_BY_SUPPLIER and
+// answered a Map instead of an Optional; maxBy/filtering/summarizing* were
+// wrong the same way. Every producer, in either crate, now mints through the
+// `make_*_collector` helpers below, so there is one namespace to keep
+// consistent: a new tag must be added here, to `is_known_collector_tag`, and
+// to the `native_stream_collect` match.
+/// `Collectors.minBy(Comparator)` — ARG1=comparator. Reduces to an `Optional`
+/// (empty when the stream is empty), like `Stream.min(Comparator)`.
+const COLLECTOR_TAG_MIN_BY: i32 = 17;
+/// `Collectors.maxBy(Comparator)` — ARG1=comparator. See [`COLLECTOR_TAG_MIN_BY`].
+const COLLECTOR_TAG_MAX_BY: i32 = 18;
+/// `Collectors.filtering(Predicate, Collector)` — ARG1=predicate, ARG2=downstream
+/// Collector fed only the elements the predicate accepts.
+const COLLECTOR_TAG_FILTERING: i32 = 19;
+/// `Collectors.summarizingInt(ToIntFunction)` — ARG1=extractor. Yields a
+/// `java.util.IntSummaryStatistics` in the layout `native-builtins`'
+/// `phases_late::streams` accessors read (see [`STATS_FIELD_COUNT`]).
+const COLLECTOR_TAG_SUMMARIZING_INT: i32 = 20;
+/// `Collectors.summarizingLong(ToLongFunction)` — ARG1=extractor.
+const COLLECTOR_TAG_SUMMARIZING_LONG: i32 = 21;
+/// `Collectors.summarizingDouble(ToDoubleFunction)` — ARG1=extractor.
+const COLLECTOR_TAG_SUMMARIZING_DOUBLE: i32 = 22;
+/// `Collectors.averagingInt(ToIntFunction)` — ARG1=extractor. Yields a boxed
+/// `Double` (0.0 for an empty stream), matching the JDK.
+const COLLECTOR_TAG_AVERAGING_INT: i32 = 23;
+/// `Collectors.averagingLong(ToLongFunction)` — ARG1=extractor.
+const COLLECTOR_TAG_AVERAGING_LONG: i32 = 24;
+/// `Collectors.averagingDouble(ToDoubleFunction)` — ARG1=extractor.
+const COLLECTOR_TAG_AVERAGING_DOUBLE: i32 = 25;
+/// `Collectors.summingInt(ToIntFunction)` — ARG1=extractor. Yields a boxed
+/// `Integer`; the sum wraps at 32 bits exactly as the JDK's `int` accumulator does.
+const COLLECTOR_TAG_SUMMING_INT: i32 = 26;
+/// `Collectors.summingLong(ToLongFunction)` — ARG1=extractor. Yields a boxed `Long`.
+const COLLECTOR_TAG_SUMMING_LONG: i32 = 27;
+/// `Collectors.summingDouble(ToDoubleFunction)` — ARG1=extractor. Yields a boxed `Double`.
+const COLLECTOR_TAG_SUMMING_DOUBLE: i32 = 28;
+/// `Collectors.teeing(Collector, Collector, BiFunction)` — ARG1/ARG2 are the two
+/// downstream Collectors, both fed the SAME elements, ARG3 the BiFunction that
+/// merges their two results. Registered synthetic for the reason `mapping` is
+/// (see [`COLLECTOR_TAG_MAPPING`]): the real `Collectors.teeing` bytecode calls
+/// `downstream.accumulator()` eagerly, which AbstractMethodErrors on our tagged
+/// synthetic downstreams. Until this tag existed, `teeing` handed back a bare
+/// `toList` collector and dropped both downstreams and the merger on the floor.
+const COLLECTOR_TAG_TEEING: i32 = 29;
 
-// ---------------------------------------------------------------------------
-// Tags 31.. — `averaging*` / `summing*` / `teeing`, the rest of the same
-// `native-builtins`-only family.
-//
-// averaging*/summing* used to sit in a private 19..24 that this table did not
-// decode AT ALL: the tag fell through `is_known_collector_tag`, so
-// `collect(averagingInt(f))` was treated as an untagged JDK collector and the
-// caller got the raw accumulation `ArrayList` where the
-// `java.util.stream.Collectors` contract requires a `Double` (and `Integer` for
-// `summingInt`). Same silent-wrong-answer class as the 9..15 collisions above,
-// reached by a different route.
-// ---------------------------------------------------------------------------
-/// `Collectors.averagingInt(ToIntFunction)` — ARG1 = the extractor. Result is a
-/// boxed `Double`; an empty stream averages to 0.0, matching the JDK finisher
-/// (`count == 0 ? 0.0d : sum / count`), not NaN.
-pub const COLLECTOR_TAG_AVERAGING_INT: i32 = 31;
-/// `Collectors.averagingLong(ToLongFunction)` — ARG1 = the extractor, result
-/// is a boxed `Double`.
-pub const COLLECTOR_TAG_AVERAGING_LONG: i32 = 32;
-/// `Collectors.averagingDouble(ToDoubleFunction)` — ARG1 = the extractor,
-/// result is a boxed `Double`.
-pub const COLLECTOR_TAG_AVERAGING_DOUBLE: i32 = 33;
-/// `Collectors.summingInt(ToIntFunction)` — ARG1 = the extractor. Result is a
-/// boxed `Integer`, NOT a Long: the factory is declared
-/// `Collector<T,?,Integer>` and callers cast to `Integer`. Identity 0.
-pub const COLLECTOR_TAG_SUMMING_INT: i32 = 34;
-/// `Collectors.summingLong(ToLongFunction)` — ARG1 = the extractor, result is a
-/// boxed `Long`. Identity 0.
-pub const COLLECTOR_TAG_SUMMING_LONG: i32 = 35;
-/// `Collectors.summingDouble(ToDoubleFunction)` — ARG1 = the extractor, result
-/// is a boxed `Double`. Identity 0.0.
-pub const COLLECTOR_TAG_SUMMING_DOUBLE: i32 = 36;
-/// `Collectors.teeing(Collector, Collector, BiFunction)` — ARG1/ARG2 = the two
-/// downstream Collectors (each sees the whole stream), ARG3 = the merge
-/// BiFunction applied to the two downstream results. The `native-builtins`
-/// factory used to write tag 1 (`toList`) with both downstreams and the merger
-/// discarded — its comment claimed "Tag 9 … ARG1/ARG2 downstreams" while the
-/// body wrote 1 — so `collect(teeing(a, b, merge))` returned a List instead of
-/// whatever `merge` produces.
-pub const COLLECTOR_TAG_TEEING: i32 = 37;
-
-// `{Int,Long,Double}SummaryStatistics` 4-field synthetic layout. Must stay in
-// step with `native-builtins` `phases_late::streams::STATS_FIELD_*`, which
-// backs the `getCount/getSum/getMin/getMax/getAverage/toString` natives that
-// read the objects the summarizing arms below build.
+// Field layout of the synthetic `java.util.{Int,Long,Double}SummaryStatistics`
+// the summarizing collectors build. Mirrors — and must stay in step with — the
+// `STATS_FIELD_*` layout that `native-builtins`' `phases_late::streams`
+// allocates and whose registered getters (`getCount`/`getSum`/`getMin`/
+// `getMax`/`accept`) read, and the real JDK's field declaration order.
 const STATS_FIELD_COUNT: usize = 0;
 const STATS_FIELD_SUM: usize = 1;
 const STATS_FIELD_MIN: usize = 2;
@@ -18538,6 +18848,91 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "mapping",
         "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
         native_collectors_mapping,
+    );
+    // minBy/maxBy/filtering/summarizing*/averaging*/summing*. `native-builtins`
+    // (phase 56) registers the same factories and mints through the shared
+    // `make_*_collector` helpers, so whichever registration wins produces the
+    // same object. Before tags 17+ these were produced ONLY there, in a second
+    // tag namespace nothing decodes — `collect(minBy(cmp))` answered a Map.
+    r.register(
+        c,
+        "minBy",
+        "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
+        native_collectors_min_by,
+    );
+    r.register(
+        c,
+        "maxBy",
+        "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
+        native_collectors_max_by,
+    );
+    r.register(
+        c,
+        "filtering",
+        "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
+        native_collectors_filtering,
+    );
+    r.register(
+        c,
+        "summarizingInt",
+        "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summarizing_int,
+    );
+    r.register(
+        c,
+        "summarizingLong",
+        "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summarizing_long,
+    );
+    r.register(
+        c,
+        "summarizingDouble",
+        "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summarizing_double,
+    );
+    r.register(
+        c,
+        "averagingInt",
+        "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
+        native_collectors_averaging_int,
+    );
+    r.register(
+        c,
+        "averagingLong",
+        "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
+        native_collectors_averaging_long,
+    );
+    r.register(
+        c,
+        "averagingDouble",
+        "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
+        native_collectors_averaging_double,
+    );
+    r.register(
+        c,
+        "summingInt",
+        "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summing_int,
+    );
+    r.register(
+        c,
+        "summingLong",
+        "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summing_long,
+    );
+    r.register(
+        c,
+        "summingDouble",
+        "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summing_double,
+    );
+    // teeing — also registered by native-builtins (phase 64), which delegates to
+    // the same mint helper.
+    r.register(
+        c,
+        "teeing",
+        "(Ljava/util/stream/Collector;Ljava/util/stream/Collector;Ljava/util/function/BiFunction;)Ljava/util/stream/Collector;",
+        native_collectors_teeing,
     );
     // Our synthetic Collector objects need a `characteristics()` method that
     // returns a non-null Set — JDK stream internals (e.g.
@@ -18834,538 +19229,6 @@ fn native_collfn_accumulator_accept(
         }
     }
     Ok(None)
-}
-
-/// `finisher.apply(container)` — identity for the IDENTITY_FINISH container
-/// collectors (toList/toSet/toMap/toCollection), but non-identity collectors
-/// must materialise their real result here: external drivers of the raw
-/// Collector protocol — Reactor's `MonoStreamCollector`
-/// (`Flux.collect(Collectors.joining(...))`) or any hand-rolled
-/// supplier/accumulator/finisher loop — call this Function directly rather
-/// than going through CratonVM's eager `Stream.collect` native. Returning the
-/// raw accumulation LIST for a joining collector made
-/// `WebClientIntegrationTests.retrieveJsonArrayAsBodilessEntityShouldRelease
-/// Connection` die with "java.util.ArrayList cannot be cast to
-/// java.lang.String" at the `.block()` cast.
-fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let container = args.get(1).copied().unwrap_or(Value::Object(None));
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(container)),
-    };
-    let coll = ctx.get_field(this, 0);
-    let read_str = |ctx: &dyn NativeContext, field: usize| -> String {
-        match coll {
-            Value::Object(Some(c)) => match ctx.get_field(c, field) {
-                Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
-                _ => String::new(),
-            },
-            _ => String::new(),
-        }
-    };
-    let container_values = |ctx: &dyn NativeContext| -> Vec<Value> {
-        match container {
-            Value::Object(Some(l)) => {
-                let (data, size) = al_state(ctx, l);
-                match data {
-                    Some(data) => (0..(size.max(0) as usize))
-                        .map(|i| ctx.get_array_element(data, i))
-                        .collect(),
-                    None => Vec::new(),
-                }
-            }
-            _ => Vec::new(),
-        }
-    };
-    match collector_tag_of(ctx, coll) {
-        Some(tag @ (COLLECTOR_TAG_JOINING | COLLECTOR_TAG_JOINING_DELIM)) => {
-            let elements = container_values(ctx);
-            let mut parts = Vec::with_capacity(elements.len());
-            for elem in &elements {
-                parts.push(obj_to_display_string(ctx, elem));
-            }
-            let (delim, prefix, suffix) = if tag == COLLECTOR_TAG_JOINING_DELIM {
-                (
-                    read_str(ctx, COLLECTOR_FIELD_ARG1),
-                    read_str(ctx, COLLECTOR_FIELD_ARG2),
-                    read_str(ctx, COLLECTOR_FIELD_ARG3),
-                )
-            } else {
-                (String::new(), String::new(), String::new())
-            };
-            let joined = format!("{}{}{}", prefix, parts.join(&delim), suffix);
-            let s = ctx.create_string(&joined);
-            Ok(Some(Value::Object(Some(s))))
-        }
-        Some(COLLECTOR_TAG_COUNTING) => {
-            // Box as java/lang/Long — Function.apply returns Object, and a
-            // bare primitive Value here reads back as null to the caller
-            // (reactor: NullPointerException "Collector returned null").
-            let n = container_values(ctx).len() as i64;
-            let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
-            ctx.set_field(long_obj, 0, Value::Long(n));
-            Ok(Some(Value::Object(Some(long_obj))))
-        }
-        // minBy / maxBy / filtering / summarizing* / averaging* / summing* /
-        // teeing are non-identity finishes too: the accumulation container is a
-        // plain list of the elements, and the real result (Optional / downstream
-        // result / SummaryStatistics / boxed Double|Integer|Long / merged pair)
-        // is computed here. Without this arm a raw-protocol driver got the bare
-        // ArrayList — the same shape bug the eager `collect` path had.
-        Some(
-            tag @ (COLLECTOR_TAG_MIN_BY
-            | COLLECTOR_TAG_MAX_BY
-            | COLLECTOR_TAG_FILTERING
-            | COLLECTOR_TAG_SUMMARIZING_INT
-            | COLLECTOR_TAG_SUMMARIZING_LONG
-            | COLLECTOR_TAG_SUMMARIZING_DOUBLE
-            | COLLECTOR_TAG_AVERAGING_INT
-            | COLLECTOR_TAG_AVERAGING_LONG
-            | COLLECTOR_TAG_AVERAGING_DOUBLE
-            | COLLECTOR_TAG_SUMMING_INT
-            | COLLECTOR_TAG_SUMMING_LONG
-            | COLLECTOR_TAG_SUMMING_DOUBLE
-            | COLLECTOR_TAG_TEEING),
-        ) => {
-            let c = match coll {
-                Value::Object(Some(c)) => c,
-                _ => return Ok(Some(container)),
-            };
-            let elements = container_values(ctx);
-            collect_builtins_collector_tag(ctx, c, tag, &elements)
-        }
-        _ => Ok(Some(container)),
-    }
-}
-
-/// `combiner.apply(a, b)` — a.addAll(b); a.
-fn native_collfn_combiner_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let a = args.get(1).copied().unwrap_or(Value::Object(None));
-    let b = args.get(2).copied().unwrap_or(Value::Object(None));
-    if let (Value::Object(Some(ca)), Value::Object(Some(_))) = (a, b) {
-        ctx.invoke_virtual(ca, "addAll", "(Ljava/util/Collection;)Z", &[b])?;
-    }
-    Ok(Some(a))
-}
-
-fn native_collector_characteristics(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    make_set_of(ctx, &[])
-}
-
-fn native_collectors_to_collection(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_TO_COLLECTION);
-    let supplier = args.first().copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, supplier);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn make_collector(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
-    let collector = alloc_synthetic(ctx, "java/util/stream/Collector", COLLECTOR_NUM_FIELDS);
-    ctx.set_field(collector, COLLECTOR_FIELD_TAG, Value::Int(tag));
-    collector
-}
-
-pub fn make_to_list_collector(ctx: &mut dyn NativeContext) -> ObjectRef {
-    make_collector(ctx, COLLECTOR_TAG_TO_LIST)
-}
-
-pub fn make_to_set_collector(ctx: &mut dyn NativeContext) -> ObjectRef {
-    make_collector(ctx, COLLECTOR_TAG_TO_SET)
-}
-
-fn native_collectors_to_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_TO_LIST);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_to_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_TO_SET);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_to_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_TO_MAP);
-    let key_fn = args.first().copied().unwrap_or(Value::Object(None));
-    let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_to_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_TO_MAP_MERGE);
-    let key_fn = args.first().copied().unwrap_or(Value::Object(None));
-    let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
-    let merge_fn = args.get(2).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG3, merge_fn);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_to_map_supplier(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_TO_MAP_SUPPLIER);
-    let key_fn = args.first().copied().unwrap_or(Value::Object(None));
-    let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
-    let merge_fn = args.get(2).copied().unwrap_or(Value::Object(None));
-    let supplier = args.get(3).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG3, merge_fn);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG4, supplier);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_collecting_and_then(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_COLLECTING_AND_THEN);
-    let downstream = args.first().copied().unwrap_or(Value::Object(None));
-    let finisher = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, downstream);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG2, finisher);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_joining(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_JOINING);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_joining_delim(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_JOINING_DELIM);
-    let delim = args.first().copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, delim);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-/// `Collectors.joining(delimiter, prefix, suffix)` — captures all three so the
-/// JOINING_DELIM application can wrap the joined elements. Without this the
-/// 3-arg overload fell through to real JDK bytecode that produced an opaque
-/// `Collector` the native `collect()` terminal didn't recognise → "".
-fn native_collectors_joining_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_JOINING_DELIM);
-    ctx.set_field(
-        c,
-        COLLECTOR_FIELD_ARG1,
-        args.first().copied().unwrap_or(Value::Object(None)),
-    );
-    ctx.set_field(
-        c,
-        COLLECTOR_FIELD_ARG2,
-        args.get(1).copied().unwrap_or(Value::Object(None)),
-    );
-    ctx.set_field(
-        c,
-        COLLECTOR_FIELD_ARG3,
-        args.get(2).copied().unwrap_or(Value::Object(None)),
-    );
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_counting(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_COUNTING);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_grouping_by(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_GROUPING_BY);
-    let classifier = args.first().copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_grouping_by_downstream(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_GROUPING_BY_DOWNSTREAM);
-    let classifier = args.first().copied().unwrap_or(Value::Object(None));
-    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-/// `Collectors.mapping(mapper, downstream)` — ARG1=mapper, ARG2=downstream.
-fn native_collectors_mapping(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_MAPPING);
-    let mapper = args.first().copied().unwrap_or(Value::Object(None));
-    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, mapper);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-fn native_collectors_partitioning_by(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_PARTITIONING_BY);
-    let predicate = args.first().copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, predicate);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-/// T2.3.18 — `Collectors.groupingBy(Function, Supplier, Collector)`.
-/// Stores classifier in ARG1, supplier in ARG2, and the downstream
-/// Collector in ARG3 for `native_stream_collect` to apply per-group.
-fn native_collectors_grouping_by_supplier(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_GROUPING_BY_SUPPLIER);
-    let classifier = args.first().copied().unwrap_or(Value::Object(None));
-    let supplier = args.get(1).copied().unwrap_or(Value::Object(None));
-    let downstream = args.get(2).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG2, supplier);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG3, downstream);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-/// T2.3.19 — `Collectors.partitioningBy(Predicate, Collector)`.
-/// Stores predicate in ARG1 and downstream Collector in ARG2.
-fn native_collectors_partitioning_by_downstream(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM);
-    let predicate = args.first().copied().unwrap_or(Value::Object(None));
-    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, predicate);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
-    Ok(Some(Value::Object(Some(c))))
-}
-
-/// Run a *real* `java.util.stream.Collector` (one not produced by our
-/// `make_collector` fast-path — e.g. the collector from
-/// `ImmutableList.toImmutableList()` or any `Collector.of(...)`) via the
-/// standard JLS collector contract:
-///   `c = supplier().get(); accumulator().accept(c, e)*; finisher().apply(c)`.
-///
-/// Without this, `native_stream_collect` returned `null` for every
-/// non-tagged collector, which surfaced downstream as a bogus NPE — e.g.
-/// cassandra's airline `MetadataLoader.mergeOptionSet` does
-/// `... .collect(ImmutableList.toImmutableList())` and then iterates the
-/// result: a `null` there throws `Cannot invoke iterator on null`.
-fn collect_via_collector_protocol(
-    ctx: &mut dyn NativeContext,
-    collector: ObjectRef,
-    elements: &[Value],
-) -> MethodCallResult {
-    // SPR-AOT-JUNIT-COLLECT.1 (2026-07-08) — in long JUnit discovery
-    // pipelines a non-tagged collector can occasionally arrive as the raw
-    // java.lang.Object placeholder. Calling Collector.supplier() on that
-    // receiver raises NoSuchMethodError and poisons discovery; the only safe
-    // sequential fallback is the standard list accumulation shape used by
-    // Collectors.toCollection(ArrayList::new) in ReflectionUtils.
-    if ctx
-        .class_name_of_id(ctx.class_id_of_object(collector))
-        .as_deref()
-        == Some("java/lang/Object")
-        && collector_tag_of(ctx, Value::Object(Some(collector))).is_none()
-    {
-        // A real JDK `Collectors$CollectorImpl` can survive a loader/GC
-        // boundary with its object header collapsed to Object while retaining
-        // its five instance fields. The old list fallback avoided a
-        // NoSuchMethodError, but changed the result type: Spring's
-        // `MergedAnnotationCollectors.toMultiValueMap` then reached
-        // `AnnotatedTypeMetadata.getAllAnnotationAttributes` as ArrayList and
-        // failed its required MultiValueMap checkcast. CollectorImpl's stable
-        // JDK layout is supplier, accumulator, combiner, finisher,
-        // characteristics. Drive those preserved function objects directly.
-        if ctx.object_num_fields(collector) >= 5 {
-            let supplier = ctx.get_field(collector, 0);
-            let accumulator = ctx.get_field(collector, 1);
-            let finisher = ctx.get_field(collector, 3);
-            if let (
-                Value::Object(Some(supplier)),
-                Value::Object(Some(accumulator)),
-                Value::Object(Some(finisher)),
-            ) = (supplier, accumulator, finisher)
-            {
-                let supplier_pin = ctx.pin_native_root(supplier);
-                let accumulator_pin = ctx.pin_native_root(accumulator);
-                let finisher_pin = ctx.pin_native_root(finisher);
-                let container = match ctx.invoke_virtual(
-                    ctx.read_native_pin(supplier_pin, supplier),
-                    "get",
-                    "()Ljava/lang/Object;",
-                    &[],
-                ) {
-                    Ok(Some(value)) => value,
-                    Ok(None) => Value::Object(None),
-                    Err(error) => {
-                        ctx.unpin_native_roots(supplier_pin);
-                        return Err(error);
-                    }
-                };
-                let container_pin = pin_value(ctx, container);
-                for element in elements {
-                    let container = read_pinned_elem(ctx, container_pin, container);
-                    let element_pin = pin_value(ctx, *element);
-                    let element = read_pinned_elem(ctx, element_pin, *element);
-                    let result = ctx.invoke_virtual(
-                        ctx.read_native_pin(accumulator_pin, accumulator),
-                        "accept",
-                        "(Ljava/lang/Object;Ljava/lang/Object;)V",
-                        &[container, element],
-                    );
-                    ctx.unpin_native_roots(element_pin);
-                    if let Err(error) = result {
-                        ctx.unpin_native_roots(supplier_pin);
-                        return Err(error);
-                    }
-                }
-                let container = read_pinned_elem(ctx, container_pin, container);
-                let result = ctx.invoke_virtual(
-                    ctx.read_native_pin(finisher_pin, finisher),
-                    "apply",
-                    "(Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[container],
-                );
-                ctx.unpin_native_roots(supplier_pin);
-                return result;
-            }
-        }
-        return make_list_of(ctx, elements);
-    }
-    let supplier = match ctx.invoke_virtual_declared(
-        "java/util/stream/Collector",
-        collector,
-        "supplier",
-        "()Ljava/util/function/Supplier;",
-        &[],
-    )? {
-        Some(Value::Object(Some(s))) => s,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let container = ctx
-        .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
-        .unwrap_or(Value::Object(None));
-    let accumulator = match ctx.invoke_virtual_declared(
-        "java/util/stream/Collector",
-        collector,
-        "accumulator",
-        "()Ljava/util/function/BiConsumer;",
-        &[],
-    )? {
-        Some(Value::Object(Some(a))) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    for elem in elements {
-        ctx.invoke_virtual(
-            accumulator,
-            "accept",
-            "(Ljava/lang/Object;Ljava/lang/Object;)V",
-            &[container, *elem],
-        )?;
-    }
-    let finisher = match ctx.invoke_virtual_declared(
-        "java/util/stream/Collector",
-        collector,
-        "finisher",
-        "()Ljava/util/function/Function;",
-        &[],
-    )? {
-        Some(Value::Object(Some(f))) => f,
-        // An IDENTITY_FINISH collector with no finisher: the accumulated
-        // container is itself the result.
-        _ => return Ok(Some(container)),
-    };
-    let result = ctx
-        .invoke_virtual(
-            finisher,
-            "apply",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[container],
-        )?
-        .unwrap_or(Value::Object(None));
-    Ok(Some(result))
-}
-
-/// `Stream.collect(Supplier<R>, BiConsumer<R,? super T>, BiConsumer<R,R>)`
-/// — the 3-arg mutable-reduction terminal operation.
-///
-/// In real JDK this is abstract on `Stream` (body lives in `ReferencePipeline`),
-/// so when our synthetic Stream — or any receiver whose runtime class is the
-/// `Stream` interface itself — is the receiver, the abstract declaration has
-/// no Code attribute and the VM throws AbstractMethodError. H2's
-/// `FilePathDisk.newDirectoryStream` is the canonical tripwire.
-///
-/// Sequential semantics (no parallel split):
-///   `R c = supplier.get();`
-///   `for each t in stream: accumulator.accept(c, t);`
-///   `return c;`
-/// The combiner is parallel-only and intentionally ignored.
-fn native_stream_collect_3arg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let supplier = match args.get(1) {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let accumulator = match args.get(2) {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    // args.get(3) is the combiner — ignored in sequential mode.
-    // cceres3: pin across GC-capable call (stream stale-at-store wave)
-    let sup_pin = ctx.pin_native_root(supplier);
-    let acc_pin = ctx.pin_native_root(accumulator);
-    let elements = match stream_elements_mut(ctx, this) {
-        Ok(v) => v,
-        Err(e) => {
-            ctx.unpin_native_roots(sup_pin);
-            return Err(e);
-        }
-    };
-    let (_, elem_handles) = pin_value_slice(ctx, &elements);
-    let supplier = ctx.read_native_pin(sup_pin, supplier);
-    let container = match ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[]) {
-        Ok(Some(Value::Object(Some(c)))) => Value::Object(Some(c)),
-        // Null supplier result is unusual but permitted; pass through to
-        // the accumulator just like JDK would.
-        Ok(other) => other.unwrap_or(Value::Object(None)),
-        Err(e) => {
-            ctx.unpin_native_roots(sup_pin);
-            return Err(e);
-        }
-    };
-    let cont_handle = pin_value(ctx, container);
-    for i in 0..elements.len() {
-        let accumulator = ctx.read_native_pin(acc_pin, accumulator);
-        let container = read_pinned_elem(ctx, cont_handle, container);
-        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-        if let Err(e) = ctx.invoke_virtual(
-            accumulator,
-            "accept",
-            "(Ljava/lang/Object;Ljava/lang/Object;)V",
-            &[container, elem],
-        ) {
-            ctx.unpin_native_roots(sup_pin);
-            return Err(e);
-        }
-    }
-    let container = read_pinned_elem(ctx, cont_handle, container);
-    ctx.unpin_native_roots(sup_pin);
-    Ok(Some(container))
 }
 
 /// Result computation for the `Collectors` factories that only `native-builtins`
@@ -19716,6 +19579,911 @@ fn collect_builtins_collector_tag(
     })();
     ctx.unpin_native_roots(collector_pin);
     result
+}
+
+/// `finisher.apply(container)` — identity for the IDENTITY_FINISH container
+/// collectors (toList/toSet/toMap/toCollection), but non-identity collectors
+/// must materialise their real result here: external drivers of the raw
+/// Collector protocol — Reactor's `MonoStreamCollector`
+/// (`Flux.collect(Collectors.joining(...))`) or any hand-rolled
+/// supplier/accumulator/finisher loop — call this Function directly rather
+/// than going through CratonVM's eager `Stream.collect` native. Returning the
+/// raw accumulation LIST for a joining collector made
+/// `WebClientIntegrationTests.retrieveJsonArrayAsBodilessEntityShouldRelease
+/// Connection` die with "java.util.ArrayList cannot be cast to
+/// java.lang.String" at the `.block()` cast.
+fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let container = args.get(1).copied().unwrap_or(Value::Object(None));
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(container)),
+    };
+    let coll = ctx.get_field(this, 0);
+    let read_str = |ctx: &dyn NativeContext, field: usize| -> String {
+        match coll {
+            Value::Object(Some(c)) => match ctx.get_field(c, field) {
+                Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    };
+    let container_values = |ctx: &dyn NativeContext| -> Vec<Value> {
+        match container {
+            Value::Object(Some(l)) => {
+                let (data, size) = al_state(ctx, l);
+                match data {
+                    Some(data) => (0..(size.max(0) as usize))
+                        .map(|i| ctx.get_array_element(data, i))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        }
+    };
+    match collector_tag_of(ctx, coll) {
+        Some(tag @ (COLLECTOR_TAG_JOINING | COLLECTOR_TAG_JOINING_DELIM)) => {
+            let elements = container_values(ctx);
+            let mut parts = Vec::with_capacity(elements.len());
+            for elem in &elements {
+                parts.push(obj_to_display_string(ctx, elem));
+            }
+            let (delim, prefix, suffix) = if tag == COLLECTOR_TAG_JOINING_DELIM {
+                (
+                    read_str(ctx, COLLECTOR_FIELD_ARG1),
+                    read_str(ctx, COLLECTOR_FIELD_ARG2),
+                    read_str(ctx, COLLECTOR_FIELD_ARG3),
+                )
+            } else {
+                (String::new(), String::new(), String::new())
+            };
+            let joined = format!("{}{}{}", prefix, parts.join(&delim), suffix);
+            let s = ctx.create_string(&joined);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        Some(COLLECTOR_TAG_COUNTING) => {
+            // Box as java/lang/Long — Function.apply returns Object, and a
+            // bare primitive Value here reads back as null to the caller
+            // (reactor: NullPointerException "Collector returned null").
+            let n = container_values(ctx).len() as i64;
+            let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
+            ctx.set_field(long_obj, 0, Value::Long(n));
+            Ok(Some(Value::Object(Some(long_obj))))
+        }
+        // minBy / maxBy / filtering / summarizing* / averaging* / summing* /
+        // teeing are non-identity finishes too: the accumulation container is a
+        // plain list of the elements, and the real result (Optional / downstream
+        // result / SummaryStatistics / boxed Double|Integer|Long / merged pair)
+        // is computed here. Without this arm a raw-protocol driver got the bare
+        // ArrayList — the same shape bug the eager `collect` path had.
+        Some(
+            tag @ (COLLECTOR_TAG_MIN_BY
+            | COLLECTOR_TAG_MAX_BY
+            | COLLECTOR_TAG_FILTERING
+            | COLLECTOR_TAG_SUMMARIZING_INT
+            | COLLECTOR_TAG_SUMMARIZING_LONG
+            | COLLECTOR_TAG_SUMMARIZING_DOUBLE
+            | COLLECTOR_TAG_AVERAGING_INT
+            | COLLECTOR_TAG_AVERAGING_LONG
+            | COLLECTOR_TAG_AVERAGING_DOUBLE
+            | COLLECTOR_TAG_SUMMING_INT
+            | COLLECTOR_TAG_SUMMING_LONG
+            | COLLECTOR_TAG_SUMMING_DOUBLE
+            | COLLECTOR_TAG_TEEING),
+        ) => {
+            let c = match coll {
+                Value::Object(Some(c)) => c,
+                _ => return Ok(Some(container)),
+            };
+            let elements = container_values(ctx);
+            collect_builtins_collector_tag(ctx, c, tag, &elements)
+        }
+        _ => Ok(Some(container)),
+    }
+}
+
+/// `combiner.apply(a, b)` — a.addAll(b); a.
+fn native_collfn_combiner_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let a = args.get(1).copied().unwrap_or(Value::Object(None));
+    let b = args.get(2).copied().unwrap_or(Value::Object(None));
+    if let (Value::Object(Some(ca)), Value::Object(Some(_))) = (a, b) {
+        ctx.invoke_virtual(ca, "addAll", "(Ljava/util/Collection;)Z", &[b])?;
+    }
+    Ok(Some(a))
+}
+
+fn native_collector_characteristics(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    make_set_of(ctx, &[])
+}
+
+fn native_collectors_to_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_COLLECTION);
+    let supplier = args.first().copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, supplier);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn make_collector(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
+    let collector = alloc_synthetic(ctx, "java/util/stream/Collector", COLLECTOR_NUM_FIELDS);
+    ctx.set_field(collector, COLLECTOR_FIELD_TAG, Value::Int(tag));
+    collector
+}
+
+pub fn make_to_list_collector(ctx: &mut dyn NativeContext) -> ObjectRef {
+    make_collector(ctx, COLLECTOR_TAG_TO_LIST)
+}
+
+pub fn make_to_set_collector(ctx: &mut dyn NativeContext) -> ObjectRef {
+    make_collector(ctx, COLLECTOR_TAG_TO_SET)
+}
+
+/// Allocate a tagged Collector carrying one captured argument in ARG1.
+///
+/// The argument is rooted across the allocation: `make_collector` allocates,
+/// and a moving young GC there relocates the argument while this frame still
+/// holds its pre-GC address (native stale-local family).
+fn make_collector_arg1(ctx: &mut dyn NativeContext, tag: i32, arg: Value) -> ObjectRef {
+    let arg_pin = pin_value(ctx, arg);
+    let c = make_collector(ctx, tag);
+    let arg = read_pinned_elem(ctx, arg_pin, arg);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, arg);
+    if arg_pin != usize::MAX {
+        ctx.unpin_native_roots(arg_pin);
+    }
+    c
+}
+
+/// Two-argument form of [`make_collector_arg1`] (ARG1, ARG2).
+fn make_collector_arg2(
+    ctx: &mut dyn NativeContext,
+    tag: i32,
+    arg1: Value,
+    arg2: Value,
+) -> ObjectRef {
+    let pin1 = pin_value(ctx, arg1);
+    let pin2 = pin_value(ctx, arg2);
+    let c = make_collector(ctx, tag);
+    let arg1 = read_pinned_elem(ctx, pin1, arg1);
+    let arg2 = read_pinned_elem(ctx, pin2, arg2);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, arg1);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, arg2);
+    let base = if pin1 != usize::MAX { pin1 } else { pin2 };
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
+    c
+}
+
+/// Three-argument form of [`make_collector_arg1`] (ARG1, ARG2, ARG3).
+fn make_collector_arg3(
+    ctx: &mut dyn NativeContext,
+    tag: i32,
+    arg1: Value,
+    arg2: Value,
+    arg3: Value,
+) -> ObjectRef {
+    let pin1 = pin_value(ctx, arg1);
+    let pin2 = pin_value(ctx, arg2);
+    let pin3 = pin_value(ctx, arg3);
+    let c = make_collector(ctx, tag);
+    let arg1 = read_pinned_elem(ctx, pin1, arg1);
+    let arg2 = read_pinned_elem(ctx, pin2, arg2);
+    let arg3 = read_pinned_elem(ctx, pin3, arg3);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, arg1);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, arg2);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, arg3);
+    // Pins are a stack: releasing the first one pushed releases all three.
+    let base = [pin1, pin2, pin3]
+        .into_iter()
+        .find(|p| *p != usize::MAX)
+        .unwrap_or(usize::MAX);
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
+    c
+}
+
+// The `make_*_collector` mint points below are `pub` because `native-builtins`
+// registers the same `java/util/stream/Collectors` factories (phase 56) and
+// must produce byte-identical objects — registration is last-wins, and the
+// crates disagreeing on the tag is exactly the bug tags 17+ fixed.
+
+/// `Collectors.minBy(Comparator)`.
+pub fn make_min_by_collector(ctx: &mut dyn NativeContext, comparator: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_MIN_BY, comparator)
+}
+
+/// `Collectors.maxBy(Comparator)`.
+pub fn make_max_by_collector(ctx: &mut dyn NativeContext, comparator: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_MAX_BY, comparator)
+}
+
+/// `Collectors.filtering(Predicate, Collector)`.
+pub fn make_filtering_collector(
+    ctx: &mut dyn NativeContext,
+    predicate: Value,
+    downstream: Value,
+) -> ObjectRef {
+    make_collector_arg2(ctx, COLLECTOR_TAG_FILTERING, predicate, downstream)
+}
+
+/// `Collectors.mapping(Function, Collector)`.
+pub fn make_mapping_collector(
+    ctx: &mut dyn NativeContext,
+    mapper: Value,
+    downstream: Value,
+) -> ObjectRef {
+    make_collector_arg2(ctx, COLLECTOR_TAG_MAPPING, mapper, downstream)
+}
+
+/// `Collectors.collectingAndThen(Collector, Function)`.
+pub fn make_collecting_and_then_collector(
+    ctx: &mut dyn NativeContext,
+    downstream: Value,
+    finisher: Value,
+) -> ObjectRef {
+    make_collector_arg2(ctx, COLLECTOR_TAG_COLLECTING_AND_THEN, downstream, finisher)
+}
+
+/// `Collectors.summarizingInt(ToIntFunction)`.
+pub fn make_summarizing_int_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMARIZING_INT, extractor)
+}
+
+/// `Collectors.summarizingLong(ToLongFunction)`.
+pub fn make_summarizing_long_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMARIZING_LONG, extractor)
+}
+
+/// `Collectors.summarizingDouble(ToDoubleFunction)`.
+pub fn make_summarizing_double_collector(
+    ctx: &mut dyn NativeContext,
+    extractor: Value,
+) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMARIZING_DOUBLE, extractor)
+}
+
+/// `Collectors.averagingInt(ToIntFunction)`.
+pub fn make_averaging_int_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_AVERAGING_INT, extractor)
+}
+
+/// `Collectors.averagingLong(ToLongFunction)`.
+pub fn make_averaging_long_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_AVERAGING_LONG, extractor)
+}
+
+/// `Collectors.averagingDouble(ToDoubleFunction)`.
+pub fn make_averaging_double_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_AVERAGING_DOUBLE, extractor)
+}
+
+/// `Collectors.summingInt(ToIntFunction)`.
+pub fn make_summing_int_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMING_INT, extractor)
+}
+
+/// `Collectors.summingLong(ToLongFunction)`.
+pub fn make_summing_long_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMING_LONG, extractor)
+}
+
+/// `Collectors.summingDouble(ToDoubleFunction)`.
+pub fn make_summing_double_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMING_DOUBLE, extractor)
+}
+
+/// `Collectors.teeing(Collector, Collector, BiFunction)`.
+pub fn make_teeing_collector(
+    ctx: &mut dyn NativeContext,
+    downstream1: Value,
+    downstream2: Value,
+    merger: Value,
+) -> ObjectRef {
+    make_collector_arg3(ctx, COLLECTOR_TAG_TEEING, downstream1, downstream2, merger)
+}
+
+fn native_collectors_min_by(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let cmp = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_min_by_collector(ctx, cmp);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_max_by(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let cmp = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_max_by_collector(ctx, cmp);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_filtering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let predicate = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+    let c = make_filtering_collector(ctx, predicate, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summarizing_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summarizing_int_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summarizing_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summarizing_long_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summarizing_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summarizing_double_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_averaging_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_averaging_int_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_averaging_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_averaging_long_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_averaging_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_averaging_double_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summing_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summing_int_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summing_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summing_long_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summing_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summing_double_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_teeing(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let downstream1 = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream2 = args.get(1).copied().unwrap_or(Value::Object(None));
+    let merger = args.get(2).copied().unwrap_or(Value::Object(None));
+    let c = make_teeing_collector(ctx, downstream1, downstream2, merger);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_to_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_LIST);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_to_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_SET);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_to_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_MAP);
+    let key_fn = args.first().copied().unwrap_or(Value::Object(None));
+    let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_to_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_MAP_MERGE);
+    let key_fn = args.first().copied().unwrap_or(Value::Object(None));
+    let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
+    let merge_fn = args.get(2).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, merge_fn);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_to_map_supplier(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_TO_MAP_SUPPLIER);
+    let key_fn = args.first().copied().unwrap_or(Value::Object(None));
+    let val_fn = args.get(1).copied().unwrap_or(Value::Object(None));
+    let merge_fn = args.get(2).copied().unwrap_or(Value::Object(None));
+    let supplier = args.get(3).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, key_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, val_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, merge_fn);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG4, supplier);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_collecting_and_then(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let downstream = args.first().copied().unwrap_or(Value::Object(None));
+    let finisher = args.get(1).copied().unwrap_or(Value::Object(None));
+    let c = make_collecting_and_then_collector(ctx, downstream, finisher);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_joining(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_JOINING);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_joining_delim(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_JOINING_DELIM);
+    let delim = args.first().copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, delim);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// `Collectors.joining(delimiter, prefix, suffix)` — captures all three so the
+/// JOINING_DELIM application can wrap the joined elements. Without this the
+/// 3-arg overload fell through to real JDK bytecode that produced an opaque
+/// `Collector` the native `collect()` terminal didn't recognise → "".
+fn native_collectors_joining_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_JOINING_DELIM);
+    ctx.set_field(
+        c,
+        COLLECTOR_FIELD_ARG1,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
+    ctx.set_field(
+        c,
+        COLLECTOR_FIELD_ARG2,
+        args.get(1).copied().unwrap_or(Value::Object(None)),
+    );
+    ctx.set_field(
+        c,
+        COLLECTOR_FIELD_ARG3,
+        args.get(2).copied().unwrap_or(Value::Object(None)),
+    );
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_counting(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_COUNTING);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_grouping_by(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_GROUPING_BY);
+    let classifier = args.first().copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_grouping_by_downstream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_GROUPING_BY_DOWNSTREAM);
+    let classifier = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// `Collectors.mapping(mapper, downstream)` — ARG1=mapper, ARG2=downstream.
+fn native_collectors_mapping(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mapper = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+    let c = make_mapping_collector(ctx, mapper, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_partitioning_by(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_PARTITIONING_BY);
+    let predicate = args.first().copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, predicate);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// T2.3.18 — `Collectors.groupingBy(Function, Supplier, Collector)`.
+/// Stores classifier in ARG1, supplier in ARG2, and the downstream
+/// Collector in ARG3 for `native_stream_collect` to apply per-group.
+fn native_collectors_grouping_by_supplier(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_GROUPING_BY_SUPPLIER);
+    let classifier = args.first().copied().unwrap_or(Value::Object(None));
+    let supplier = args.get(1).copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(2).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, supplier);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// T2.3.19 — `Collectors.partitioningBy(Predicate, Collector)`.
+/// Stores predicate in ARG1 and downstream Collector in ARG2.
+fn native_collectors_partitioning_by_downstream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM);
+    let predicate = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, predicate);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// Run a *real* `java.util.stream.Collector` (one not produced by our
+/// `make_collector` fast-path — e.g. the collector from
+/// `ImmutableList.toImmutableList()` or any `Collector.of(...)`) via the
+/// standard JLS collector contract:
+///   `c = supplier().get(); accumulator().accept(c, e)*; finisher().apply(c)`.
+///
+/// Without this, `native_stream_collect` returned `null` for every
+/// non-tagged collector, which surfaced downstream as a bogus NPE — e.g.
+/// cassandra's airline `MetadataLoader.mergeOptionSet` does
+/// `... .collect(ImmutableList.toImmutableList())` and then iterates the
+/// result: a `null` there throws `Cannot invoke iterator on null`.
+fn collect_via_collector_protocol(
+    ctx: &mut dyn NativeContext,
+    collector: ObjectRef,
+    elements: &[Value],
+) -> MethodCallResult {
+    // SPR-AOT-JUNIT-COLLECT.1 (2026-07-08) — in long JUnit discovery
+    // pipelines a non-tagged collector can occasionally arrive as the raw
+    // java.lang.Object placeholder. Calling Collector.supplier() on that
+    // receiver raises NoSuchMethodError and poisons discovery; the only safe
+    // sequential fallback is the standard list accumulation shape used by
+    // Collectors.toCollection(ArrayList::new) in ReflectionUtils.
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(collector))
+        .as_deref()
+        == Some("java/lang/Object")
+        && collector_tag_of(ctx, Value::Object(Some(collector))).is_none()
+    {
+        // A real JDK `Collectors$CollectorImpl` can survive a loader/GC
+        // boundary with its object header collapsed to Object while retaining
+        // its five instance fields. The old list fallback avoided a
+        // NoSuchMethodError, but changed the result type: Spring's
+        // `MergedAnnotationCollectors.toMultiValueMap` then reached
+        // `AnnotatedTypeMetadata.getAllAnnotationAttributes` as ArrayList and
+        // failed its required MultiValueMap checkcast. CollectorImpl's stable
+        // JDK layout is supplier, accumulator, combiner, finisher,
+        // characteristics. Drive those preserved function objects directly.
+        if ctx.object_num_fields(collector) >= 5 {
+            let supplier = ctx.get_field(collector, 0);
+            let accumulator = ctx.get_field(collector, 1);
+            let finisher = ctx.get_field(collector, 3);
+            if let (
+                Value::Object(Some(supplier)),
+                Value::Object(Some(accumulator)),
+                Value::Object(Some(finisher)),
+            ) = (supplier, accumulator, finisher)
+            {
+                let supplier_pin = ctx.pin_native_root(supplier);
+                let accumulator_pin = ctx.pin_native_root(accumulator);
+                let finisher_pin = ctx.pin_native_root(finisher);
+                let container = match ctx.invoke_virtual(
+                    ctx.read_native_pin(supplier_pin, supplier),
+                    "get",
+                    "()Ljava/lang/Object;",
+                    &[],
+                ) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => Value::Object(None),
+                    Err(error) => {
+                        ctx.unpin_native_roots(supplier_pin);
+                        return Err(error);
+                    }
+                };
+                let container_pin = pin_value(ctx, container);
+                for element in elements {
+                    let container = read_pinned_elem(ctx, container_pin, container);
+                    let element_pin = pin_value(ctx, *element);
+                    let element = read_pinned_elem(ctx, element_pin, *element);
+                    let result = ctx.invoke_virtual(
+                        ctx.read_native_pin(accumulator_pin, accumulator),
+                        "accept",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                        &[container, element],
+                    );
+                    ctx.unpin_native_roots(element_pin);
+                    if let Err(error) = result {
+                        ctx.unpin_native_roots(supplier_pin);
+                        return Err(error);
+                    }
+                }
+                let container = read_pinned_elem(ctx, container_pin, container);
+                let result = ctx.invoke_virtual(
+                    ctx.read_native_pin(finisher_pin, finisher),
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[container],
+                );
+                ctx.unpin_native_roots(supplier_pin);
+                return result;
+            }
+        }
+        return make_list_of(ctx, elements);
+    }
+    let supplier = match ctx.invoke_virtual_declared(
+        "java/util/stream/Collector",
+        collector,
+        "supplier",
+        "()Ljava/util/function/Supplier;",
+        &[],
+    )? {
+        Some(Value::Object(Some(s))) => s,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let container = ctx
+        .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
+        .unwrap_or(Value::Object(None));
+    let accumulator = match ctx.invoke_virtual_declared(
+        "java/util/stream/Collector",
+        collector,
+        "accumulator",
+        "()Ljava/util/function/BiConsumer;",
+        &[],
+    )? {
+        Some(Value::Object(Some(a))) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    for elem in elements {
+        ctx.invoke_virtual(
+            accumulator,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[container, *elem],
+        )?;
+    }
+    let finisher = match ctx.invoke_virtual_declared(
+        "java/util/stream/Collector",
+        collector,
+        "finisher",
+        "()Ljava/util/function/Function;",
+        &[],
+    )? {
+        Some(Value::Object(Some(f))) => f,
+        // An IDENTITY_FINISH collector with no finisher: the accumulated
+        // container is itself the result.
+        _ => return Ok(Some(container)),
+    };
+    let result = ctx
+        .invoke_virtual(
+            finisher,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[container],
+        )?
+        .unwrap_or(Value::Object(None));
+    Ok(Some(result))
+}
+
+/// `Stream.collect(Supplier<R>, BiConsumer<R,? super T>, BiConsumer<R,R>)`
+/// — the 3-arg mutable-reduction terminal operation.
+///
+/// In real JDK this is abstract on `Stream` (body lives in `ReferencePipeline`),
+/// so when our synthetic Stream — or any receiver whose runtime class is the
+/// `Stream` interface itself — is the receiver, the abstract declaration has
+/// no Code attribute and the VM throws AbstractMethodError. H2's
+/// `FilePathDisk.newDirectoryStream` is the canonical tripwire.
+///
+/// Sequential semantics (no parallel split):
+///   `R c = supplier.get();`
+///   `for each t in stream: accumulator.accept(c, t);`
+///   `return c;`
+/// The combiner is parallel-only and intentionally ignored.
+fn native_stream_collect_3arg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let supplier = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let accumulator = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // args.get(3) is the combiner — ignored in sequential mode.
+    // cceres3: pin across GC-capable call (stream stale-at-store wave)
+    let sup_pin = ctx.pin_native_root(supplier);
+    let acc_pin = ctx.pin_native_root(accumulator);
+    let elements = match stream_elements_mut(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(sup_pin);
+            return Err(e);
+        }
+    };
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    let supplier = ctx.read_native_pin(sup_pin, supplier);
+    let container = match ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(c)))) => Value::Object(Some(c)),
+        // Null supplier result is unusual but permitted; pass through to
+        // the accumulator just like JDK would.
+        Ok(other) => other.unwrap_or(Value::Object(None)),
+        Err(e) => {
+            ctx.unpin_native_roots(sup_pin);
+            return Err(e);
+        }
+    };
+    let cont_handle = pin_value(ctx, container);
+    for i in 0..elements.len() {
+        let accumulator = ctx.read_native_pin(acc_pin, accumulator);
+        let container = read_pinned_elem(ctx, cont_handle, container);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        if let Err(e) = ctx.invoke_virtual(
+            accumulator,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[container, elem],
+        ) {
+            ctx.unpin_native_roots(sup_pin);
+            return Err(e);
+        }
+    }
+    let container = read_pinned_elem(ctx, cont_handle, container);
+    ctx.unpin_native_roots(sup_pin);
+    Ok(Some(container))
+}
+
+/// Invoke a summarizing/averaging/summing collector's primitive extractor SAM
+/// (`applyAsInt`/`applyAsLong`/`applyAsDouble`) on every element and return the
+/// raw primitive results.
+///
+/// cceres3: the SAM re-enters Java and can trigger a moving young collection, so
+/// the extractor and each element are re-read through their pins per iteration.
+/// The pin pushed here is released by the single `unpin_native_roots` that
+/// [`native_stream_collect`] runs after its tag dispatch.
+fn collector_extract_primitives(
+    ctx: &mut dyn NativeContext,
+    extractor: Value,
+    elements: &[Value],
+    elem_handles: &[usize],
+    method: &str,
+    descriptor: &str,
+) -> Result<Vec<Value>, MethodCallFailed> {
+    let extractor = match extractor {
+        Value::Object(Some(f)) => f,
+        // A null extractor NPEs in the JDK. Answer "no values" so the caller
+        // still hands back a well-formed (empty) result object.
+        _ => return Ok(Vec::new()),
+    };
+    let fn_pin = ctx.pin_native_root(extractor);
+    let mut out = Vec::with_capacity(elements.len());
+    for i in 0..elements.len() {
+        let extractor = ctx.read_native_pin(fn_pin, extractor);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let v = ctx.invoke_virtual(extractor, method, descriptor, &[elem])?;
+        out.push(v.unwrap_or(Value::Int(0)));
+    }
+    Ok(out)
+}
+
+/// Widen a primitive extractor result to `i64`. The SAM's declared return type
+/// already fixes the shape; this only tolerates a dispatch path that hands back
+/// a wider/narrower primitive than the descriptor promised.
+fn value_as_i64(v: Value) -> i64 {
+    match v {
+        Value::Int(i) => i as i64,
+        Value::Long(l) => l,
+        Value::Double(d) => d as i64,
+        Value::Float(f) => f as i64,
+        _ => 0,
+    }
+}
+
+/// `f64` counterpart of [`value_as_i64`].
+fn value_as_f64(v: Value) -> f64 {
+    match v {
+        Value::Int(i) => i as f64,
+        Value::Long(l) => l as f64,
+        Value::Double(d) => d,
+        Value::Float(f) => f as f64,
+        _ => 0.0,
+    }
+}
+
+/// Box a primitive collector result as its `java.lang.*` wrapper.
+///
+/// `Stream.collect` is declared `(Ljava/util/stream/Collector;)Ljava/lang/Object;`,
+/// so a bare primitive `Value` here is coerced away and the caller reads back
+/// null — the trap documented at length on the COUNTING arm.
+fn box_primitive_result(ctx: &mut dyn NativeContext, v: Value) -> Value {
+    let (class_name, descriptor) = match v {
+        Value::Int(_) => ("java/lang/Integer", "(I)Ljava/lang/Integer;"),
+        Value::Long(_) => ("java/lang/Long", "(J)Ljava/lang/Long;"),
+        Value::Double(_) => ("java/lang/Double", "(D)Ljava/lang/Double;"),
+        other => return other,
+    };
+    if let Ok(Some(boxed @ Value::Object(Some(_)))) =
+        ctx.invoke(class_name, "valueOf", descriptor, &[v])
+    {
+        return boxed;
+    }
+    // No real `valueOf` to run: fall back to the wrapper's single value slot,
+    // the same shape the COUNTING arm's boxed Long uses.
+    let o = alloc_synthetic(ctx, class_name, 1);
+    ctx.set_field(o, 0, v);
+    Value::Object(Some(o))
+}
+
+/// Build the synthetic `java.util.*SummaryStatistics` a summarizing collector
+/// returns, in the [`STATS_FIELD_COUNT`] layout.
+fn make_summary_statistics(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    count: i64,
+    sum: Value,
+    min: Value,
+    max: Value,
+) -> Value {
+    // In real-JDK mode the loaded class declares more instance fields than the
+    // four slots CratonVM's accessors use (`DoubleSummaryStatistics` also
+    // carries `sumCompensation`/`simpleSum`). Allocate the larger of the two so
+    // real bytecode reading a later slot cannot run off the end of the object —
+    // the same sizing `alloc_concurrent_synthetic` applies on the
+    // native-builtins side, which owns the getters for these four slots.
+    let num_fields = match ctx.ensure_class_initialized(class_name) {
+        Ok(cid) => STATS_NUM_FIELDS.max(ctx.class_num_total_fields(cid)),
+        Err(_) => STATS_NUM_FIELDS,
+    };
+    let stats = alloc_synthetic(ctx, class_name, num_fields);
+    ctx.set_field(stats, STATS_FIELD_COUNT, Value::Long(count));
+    ctx.set_field(stats, STATS_FIELD_SUM, sum);
+    ctx.set_field(stats, STATS_FIELD_MIN, min);
+    ctx.set_field(stats, STATS_FIELD_MAX, max);
+    Value::Object(Some(stats))
 }
 
 fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20663,27 +21431,274 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 ];
                 make_map_of(ctx, &pairs)
             }
-            // minBy / maxBy / filtering / summarizing{Int,Long,Double} /
-            // averaging{Int,Long,Double} / summing{Int,Long,Double} / teeing —
-            // the factories `native-builtins` owns. Shared with the raw-protocol
-            // finisher so both drivers agree.
-            COLLECTOR_TAG_MIN_BY
-            | COLLECTOR_TAG_MAX_BY
-            | COLLECTOR_TAG_FILTERING
-            | COLLECTOR_TAG_SUMMARIZING_INT
-            | COLLECTOR_TAG_SUMMARIZING_LONG
-            | COLLECTOR_TAG_SUMMARIZING_DOUBLE
-            | COLLECTOR_TAG_AVERAGING_INT
+            COLLECTOR_TAG_MIN_BY | COLLECTOR_TAG_MAX_BY => {
+                // `Collectors.minBy/maxBy(cmp)` reduce to an `Optional` (empty for
+                // an empty stream) — the same walk as `Stream.min`/`Stream.max`.
+                let comparator = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+                let comparator = match comparator {
+                    Value::Object(Some(r)) if !elements.is_empty() => r,
+                    _ => return Ok(Some(Value::Object(Some(opt)))),
+                };
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                let opt_pin = ctx.pin_native_root(opt);
+                let cmp_pin = ctx.pin_native_root(comparator);
+                let mut best = elements[0];
+                let mut best_handle = elem_handles[0];
+                for i in 1..elements.len() {
+                    let comparator = ctx.read_native_pin(cmp_pin, comparator);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let best_arg = read_pinned_elem(ctx, best_handle, best);
+                    let cmp = comparator_compare(ctx, comparator, elem, best_arg)?;
+                    let better = match cmp {
+                        Some(Value::Int(v)) if tag == COLLECTOR_TAG_MIN_BY => v < 0,
+                        Some(Value::Int(v)) => v > 0,
+                        _ => false,
+                    };
+                    if better {
+                        best = elem;
+                        best_handle = elem_handles[i];
+                    }
+                }
+                let opt = ctx.read_native_pin(opt_pin, opt);
+                let best = read_pinned_elem(ctx, best_handle, best);
+                ctx.set_field(opt, OPT_FIELD_VALUE, best);
+                Ok(Some(Value::Object(Some(opt))))
+            }
+            COLLECTOR_TAG_FILTERING => {
+                // filtering(predicate, downstream): keep the elements the
+                // predicate accepts, then feed them to the downstream collector
+                // through the same recursive sub-stream protocol MAPPING uses.
+                let predicate = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                let pred_pin = ctx.pin_native_root(predicate);
+                let ds_handle = pin_value(ctx, downstream);
+                let mut kept = Vec::new();
+                let mut kept_handles: Vec<usize> = Vec::new();
+                for i in 0..elements.len() {
+                    let predicate = ctx.read_native_pin(pred_pin, predicate);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let keep = ctx
+                        .invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])?
+                        .unwrap_or(Value::Int(0));
+                    if matches!(keep, Value::Int(v) if v != 0) {
+                        kept.push(elements[i]);
+                        kept_handles.push(elem_handles[i]);
+                    }
+                }
+                let kept = read_value_slice(ctx, &kept_handles, &kept);
+                let inner_stream = make_stream(ctx, &kept)?.unwrap_or(Value::Object(None));
+                let downstream = read_pinned_elem(ctx, ds_handle, downstream);
+                native_stream_collect(ctx, &[inner_stream, downstream])
+            }
+            COLLECTOR_TAG_SUMMARIZING_INT => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsInt",
+                    "(Ljava/lang/Object;)I",
+                )?;
+                let mut sum = 0i64;
+                // Identity seeds, as the JDK's IntSummaryStatistics ctor uses:
+                // an empty statistics reports MAX_VALUE/MIN_VALUE, not 0/0.
+                let mut min = i32::MAX;
+                let mut max = i32::MIN;
+                for v in &vals {
+                    let i = value_as_i64(*v) as i32;
+                    sum += i as i64;
+                    min = min.min(i);
+                    max = max.max(i);
+                }
+                Ok(Some(make_summary_statistics(
+                    ctx,
+                    "java/util/IntSummaryStatistics",
+                    vals.len() as i64,
+                    Value::Long(sum),
+                    Value::Int(min),
+                    Value::Int(max),
+                )))
+            }
+            COLLECTOR_TAG_SUMMARIZING_LONG => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsLong",
+                    "(Ljava/lang/Object;)J",
+                )?;
+                let mut sum = 0i64;
+                let mut min = i64::MAX;
+                let mut max = i64::MIN;
+                for v in &vals {
+                    let l = value_as_i64(*v);
+                    sum = sum.wrapping_add(l);
+                    min = min.min(l);
+                    max = max.max(l);
+                }
+                Ok(Some(make_summary_statistics(
+                    ctx,
+                    "java/util/LongSummaryStatistics",
+                    vals.len() as i64,
+                    Value::Long(sum),
+                    Value::Long(min),
+                    Value::Long(max),
+                )))
+            }
+            COLLECTOR_TAG_SUMMARIZING_DOUBLE => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsDouble",
+                    "(Ljava/lang/Object;)D",
+                )?;
+                let mut sum = 0.0f64;
+                // DoubleSummaryStatistics seeds min/max with ±infinity.
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                for v in &vals {
+                    let d = value_as_f64(*v);
+                    sum += d;
+                    if d < min {
+                        min = d;
+                    }
+                    if d > max {
+                        max = d;
+                    }
+                }
+                Ok(Some(make_summary_statistics(
+                    ctx,
+                    "java/util/DoubleSummaryStatistics",
+                    vals.len() as i64,
+                    Value::Double(sum),
+                    Value::Double(min),
+                    Value::Double(max),
+                )))
+            }
+            COLLECTOR_TAG_AVERAGING_INT
             | COLLECTOR_TAG_AVERAGING_LONG
-            | COLLECTOR_TAG_AVERAGING_DOUBLE
-            | COLLECTOR_TAG_SUMMING_INT
-            | COLLECTOR_TAG_SUMMING_LONG
-            | COLLECTOR_TAG_SUMMING_DOUBLE
-            | COLLECTOR_TAG_TEEING => {
-                // Refresh through the pins first: `stream_elements_mut` above
-                // can have moved every element out from under `elements`.
+            | COLLECTOR_TAG_AVERAGING_DOUBLE => {
+                let (method, descriptor) = match tag {
+                    COLLECTOR_TAG_AVERAGING_INT => ("applyAsInt", "(Ljava/lang/Object;)I"),
+                    COLLECTOR_TAG_AVERAGING_LONG => ("applyAsLong", "(Ljava/lang/Object;)J"),
+                    _ => ("applyAsDouble", "(Ljava/lang/Object;)D"),
+                };
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    method,
+                    descriptor,
+                )?;
+                let sum: f64 = vals.iter().map(|v| value_as_f64(*v)).sum();
+                // The JDK's averaging* collectors answer 0.0 for an empty stream.
+                let avg = if vals.is_empty() {
+                    0.0
+                } else {
+                    sum / vals.len() as f64
+                };
+                Ok(Some(box_primitive_result(ctx, Value::Double(avg))))
+            }
+            COLLECTOR_TAG_SUMMING_INT => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsInt",
+                    "(Ljava/lang/Object;)I",
+                )?;
+                // `int` accumulator: wraps at 32 bits exactly like the JDK's.
+                let sum = vals
+                    .iter()
+                    .fold(0i32, |acc, v| acc.wrapping_add(value_as_i64(*v) as i32));
+                Ok(Some(box_primitive_result(ctx, Value::Int(sum))))
+            }
+            COLLECTOR_TAG_SUMMING_LONG => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsLong",
+                    "(Ljava/lang/Object;)J",
+                )?;
+                let sum = vals
+                    .iter()
+                    .fold(0i64, |acc, v| acc.wrapping_add(value_as_i64(*v)));
+                Ok(Some(box_primitive_result(ctx, Value::Long(sum))))
+            }
+            COLLECTOR_TAG_SUMMING_DOUBLE => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsDouble",
+                    "(Ljava/lang/Object;)D",
+                )?;
+                let sum: f64 = vals.iter().map(|v| value_as_f64(*v)).sum();
+                Ok(Some(box_primitive_result(ctx, Value::Double(sum))))
+            }
+            COLLECTOR_TAG_TEEING => {
+                // teeing(d1, d2, merger): run the SAME elements through both
+                // downstream collectors via the recursive sub-stream protocol
+                // COLLECTING_AND_THEN uses, then merge the two results.
+                let downstream1 = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let downstream2 = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+                let merger = match ctx.get_field(collector, COLLECTOR_FIELD_ARG3) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                // cceres3: pin across GC-capable call (stream stale-at-store
+                // wave) — each sub-collect allocates and re-enters Java, so the
+                // merger, both downstreams, and the FIRST result (which has to
+                // survive the second collect) are all rooted.
+                let merger_pin = ctx.pin_native_root(merger);
+                let ds1_handle = pin_value(ctx, downstream1);
+                let ds2_handle = pin_value(ctx, downstream2);
+
                 let elems = read_value_slice(ctx, &elem_handles, &elements);
-                collect_builtins_collector_tag(ctx, collector, tag, &elems)
+                let stream1 = make_stream(ctx, &elems)?.unwrap_or(Value::Object(None));
+                let downstream1 = read_pinned_elem(ctx, ds1_handle, downstream1);
+                let result1 = native_stream_collect(ctx, &[stream1, downstream1])?
+                    .unwrap_or(Value::Object(None));
+                let result1_handle = pin_value(ctx, result1);
+
+                // Re-read the elements: the first collect may have moved them.
+                let elems = read_value_slice(ctx, &elem_handles, &elements);
+                let stream2 = make_stream(ctx, &elems)?.unwrap_or(Value::Object(None));
+                let downstream2 = read_pinned_elem(ctx, ds2_handle, downstream2);
+                let result2 = native_stream_collect(ctx, &[stream2, downstream2])?
+                    .unwrap_or(Value::Object(None));
+
+                let merger = ctx.read_native_pin(merger_pin, merger);
+                let result1 = read_pinned_elem(ctx, result1_handle, result1);
+                let merged = ctx
+                    .invoke_virtual(
+                        merger,
+                        "apply",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[result1, result2],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                Ok(Some(merged))
             }
             _ => Ok(Some(Value::Object(None))),
         }
@@ -23532,6 +24547,15 @@ fn native_double_stream_map_to_int(
 // we register native methods for common interfaces that delegate to the concrete
 // implementations (ArrayList / HashSet).
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. 23 of these 34 registrations land
+// on ABSTRACT methods of `java.util` interfaces. An abstract method has no
+// bytecode, so jdk-only-native-review.md rule 3 says the strict disposition is
+// `MissingImplementation` rather than a stub — but that is only true if no
+// implementor is reached first. In practice a native on an abstract interface
+// method intercepts every implementing class, including user-defined ones, so
+// the tag here silently decides dispatch far outside `java.util`. Neither
+// `bridge` nor `stub` is defensible from source. Evidence needed: which of
+// these 23 are ever dispatched, and against which receiver classes.
 fn register_interface_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -23922,6 +24946,20 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
     // backing alloc moves `this`, and every native_map_put below re-enters Java
     // (hashCode/equals, possible resize) moving `backing` + pending elems.
+    //
+    // `source` must be rooted BEFORE `alloc_hs_backing` too. That allocation is
+    // GC-capable, and `source` is a raw `args` value that is next dereferenced
+    // AFTER it, by `collect_collection_elements_or_real` below — a moving young
+    // GC in between leaves it pointing into from-space, so `new HashSet<>(coll)`
+    // reads its elements out of a dead (possibly already reused) object. This is
+    // the same hazard `native_map_init_from_map` guards with its `source_pin`
+    // (added after the live `NoSuchMethodError java/lang/Object.entrySet()`
+    // capture from `new HashMap<>(children)` during WildFly
+    // `parallel-extension-add`) and `native_al_init_from_collection` guards with
+    // its `src_pin`; the HashSet constructor was the one member of the family
+    // that never got it, and `new HashSet<>(Arrays.asList(...))` is on exactly
+    // that WildFly boot path.
+    let source_pin = ctx.pin_native_root(source);
     let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     let backing_pin = ctx.pin_native_root(backing);
@@ -23938,6 +24976,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // `Collections.unmodifiableList(arrayList)`) silently produced an
     // empty set — wiping every auto-configuration before filtering and
     // surfacing as `MissingWebServerFactoryBeanException` at boot.
+    let source = ctx.read_native_pin(source_pin, source);
     let elems = collect_collection_elements_or_real(ctx, source);
     let (_, elem_handles) = pin_value_slice(ctx, &elems);
     let sentinel = Value::Int(1);
@@ -23945,12 +24984,12 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
         let backing = ctx.read_native_pin(backing_pin, backing);
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
         if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel]) {
-            ctx.unpin_native_roots(this_pin);
+            ctx.unpin_native_roots(source_pin);
             return Err(e);
         }
     }
 
-    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(source_pin);
     Ok(None)
 }
 
@@ -25125,6 +26164,16 @@ const SJ_FIELD_SUFFIX: usize = 2;
 const SJ_FIELD_ELEMENTS: usize = 3;
 const SJ_FIELD_EMPTY_VALUE: usize = 4;
 
+// JDK-ONLY-CLASSIFY: stub — `java.util.StringJoiner` declares zero ACC_NATIVE
+// methods in JDK 25; all 7 registrations here shadow concrete bytecode using a
+// fabricated 5-slot layout (`SJ_FIELD_*` above) that does not match the real
+// class. This is the repo's clearest worked example of why the category must be
+// a per-registration decision rather than ambient state: the SAME seven
+// registrations are emitted under `Bridge` by `register_string_joiner_natives`
+// and under `SyntheticStub` by `register_string_joiner_stub_natives`, and the
+// only thing that distinguishes them is the `kind` argument this helper was
+// handed. Both are the same code registering the same triples; only the tag
+// differs, and the tag decides whether they survive `--jdk-only`.
 fn register_string_joiner_natives_with_category(
     registry: &mut NativeMethodRegistry,
     kind: cratonvm_native_api::NativeKind,
@@ -34733,21 +35782,30 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     tm_materialize_deser_array(ctx, this);
     let pairs = tm_collect_pairs(ctx, this);
     let size = pairs.len() as i32;
+    // Family-1 stale-ObjectRef fix (2026-07-31): the two allocations below can
+    // collect, moving both `this` and every key still held only in `pairs`.
+    let this_pin = ctx.pin_native_root(this);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     // Reserve one extra trailing slot and stash the source TreeMap there so the
     // keySet view writes through (`keySet().remove` / `iterator().remove`).
     // The slot lives beyond the logical size, so sorted iteration / binary
     // search (which use `size`) never see it, yet it is GC-scanned.
     let cap = std::cmp::max(pairs.len(), TS_DEFAULT_CAPACITY) + 1;
+    let ts_pin = ctx.pin_native_root(ts);
     let buf = alloc_ref_array(ctx, cap);
-    for (i, (k, _)) in pairs.iter().enumerate() {
-        ctx.set_array_element(buf, i, *k);
+    for i in 0..pinned_pairs.len() {
+        let (k, _) = pinned_pairs.get(&*ctx, i);
+        ctx.set_array_element(buf, i, k);
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    let ts = ctx.read_native_pin(ts_pin, ts);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(this)));
     ts_set_slot(ctx, ts, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, ts, TS_FIELD_SIZE, Value::Int(size));
     let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
     ts_set_slot(ctx, ts, TS_FIELD_COMPARATOR, comparator);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(ts))))
 }
 
@@ -34759,9 +35817,33 @@ fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value,
         let raw: Vec<(TreeKey, Value)> = tm_fast_with(ctx, this, |bt| {
             bt.iter().map(|(k, v)| (k.clone(), *v)).collect()
         });
-        raw.into_iter()
-            .map(|(k, v)| (tree_key_to_value(ctx, &k), v))
-            .collect()
+        // Family-1 stale-ObjectRef fix (2026-07-31): `tree_key_to_value`
+        // ALLOCATES (`create_string` / `Wrapper.valueOf`), so boxing key `i`
+        // can trigger a young collection that relocates (a) every value after
+        // it, which lives only as a raw `ObjectRef` in `raw`, and (b) every key
+        // already boxed on a previous iteration. Neither Vec is rewritten by
+        // the collector. Pin both sides across the whole conversion and read
+        // them back through their pins at the end.
+        let anchor = ctx.pin_native_root(this);
+        let vals: Vec<Value> = raw.iter().map(|(_, v)| *v).collect();
+        let (_, val_pins) = pin_value_slice(ctx, &vals);
+        let mut keys: Vec<Value> = Vec::with_capacity(raw.len());
+        let mut key_pins: Vec<usize> = Vec::with_capacity(raw.len());
+        for (k, _) in raw.iter() {
+            let boxed = tree_key_to_value(ctx, k);
+            key_pins.push(pin_value(ctx, boxed));
+            keys.push(boxed);
+        }
+        let out: Vec<(Value, Value)> = (0..raw.len())
+            .map(|i| {
+                (
+                    read_pinned_elem(ctx, key_pins[i], keys[i]),
+                    read_pinned_elem(ctx, val_pins[i], vals[i]),
+                )
+            })
+            .collect();
+        ctx.unpin_native_roots(anchor);
+        out
     } else {
         let (data_opt, size, _) = tm_state(ctx, this);
         let data = match data_opt {
@@ -34775,6 +35857,78 @@ fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value,
             out.push((k, v));
         }
         out
+    }
+}
+
+/// GC-safe cursor over a [`tm_collect_pairs`] snapshot.
+///
+/// Family-1 stale-ObjectRef fix (2026-07-31): `tm_collect_pairs` hands back a
+/// bare Rust `Vec` of raw `ObjectRef`s, and every consumer then runs code that
+/// allocates while walking it — `tree_compare` dispatching a custom
+/// `Comparable`/`Comparator`, `native_tm_put`, `alloc_ref_array`,
+/// `alloc_live_entry`, a `toString()`, a user lambda. A young collection during
+/// any of those relocates every entry the walk has not consumed yet, and
+/// nothing rewrites the `Vec`, so the rest of the walk dereferences moved
+/// addresses. Reproduced on `headMap` as
+/// `ClassCastException: class java.lang.Object cannot be cast to class
+/// java.lang.Comparable` (the stale key decoded as whatever now occupies the
+/// address); see the sibling
+/// `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md`
+/// for the same defect in `PriorityBlockingQueue`.
+///
+/// Pin the whole snapshot once, then read each element back through its pin
+/// immediately before every use — the collector remaps `native_pin_roots`, so
+/// that is the only view of the snapshot that stays correct. Same shape
+/// `native_tm_for_each` already used inline.
+///
+/// The pins are pushed on the caller's pin stack. Release them with
+/// `ctx.unpin_native_roots(pinned.base())`, or — when the caller took an
+/// earlier pin of its own and unpins from that handle — construct this
+/// afterwards and let the caller's existing `unpin_native_roots` cover it.
+///
+/// Cost is one pin per entry, on a walk that already performs one interpreted
+/// call (or one allocation) per entry.
+struct PinnedPairs {
+    orig: Vec<Value>,
+    handles: Vec<usize>,
+    base: usize,
+}
+
+impl PinnedPairs {
+    fn new(ctx: &mut dyn NativeContext, pairs: &[(Value, Value)]) -> Self {
+        let orig: Vec<Value> = pairs.iter().flat_map(|(k, v)| [*k, *v]).collect();
+        let (base, handles) = pin_value_slice(ctx, &orig);
+        Self {
+            orig,
+            handles,
+            base,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.orig.len() / 2
+    }
+
+    /// Handle to pass to `unpin_native_roots`; `usize::MAX` when nothing was
+    /// pinned (an all-primitive snapshot), which `unpin_native_roots` ignores.
+    fn base(&self) -> usize {
+        self.base
+    }
+
+    /// The current (post-GC) key/value at `i`.
+    fn get(&self, ctx: &dyn NativeContext, i: usize) -> (Value, Value) {
+        (
+            read_pinned_elem(ctx, self.handles[i * 2], self.orig[i * 2]),
+            read_pinned_elem(ctx, self.handles[i * 2 + 1], self.orig[i * 2 + 1]),
+        )
+    }
+
+    /// Refresh `k`/`v` in place. Used immediately before every dereference so
+    /// the caller keeps ordinary `Value` locals instead of re-binding.
+    fn refresh(&self, ctx: &dyn NativeContext, i: usize, k: &mut Value, v: &mut Value) {
+        let (nk, nv) = self.get(ctx, i);
+        *k = nk;
+        *v = nv;
     }
 }
 
@@ -34801,22 +35955,37 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let pairs = tm_collect_pairs(ctx, this);
     // Live view: build Map.Entry objects and stash the source TreeMap so
     // removing an entry through the list (or its iterator) deletes the key.
-    let entries: Vec<Value> = pairs
-        .into_iter()
-        .map(|(k, v)| {
-            Value::Object(Some(alloc_live_entry(
-                ctx,
-                // Real Map.Entry impl so reflection sees getKey/getValue (SpEL
-                // `map.?[key...]` selection over a TreeMap). The fabricated
-                // "HashMap$Entry" does not implement Map.Entry → EL1008E.
-                "java/util/AbstractMap$SimpleEntry",
-                k,
-                v,
-                this,
-            )))
-        })
+    //
+    // Family-1 stale-ObjectRef fix (2026-07-31): `alloc_live_entry` allocates
+    // once per pair, so entry `i`'s allocation can relocate every pair after it
+    // AND every entry already produced. `alloc_live_entry` pins its own three
+    // arguments, but nothing was keeping these two Vecs current.
+    let this_pin = ctx.pin_native_root(this);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
+    let mut entries: Vec<Value> = Vec::with_capacity(pinned_pairs.len());
+    let mut entry_pins: Vec<usize> = Vec::with_capacity(pinned_pairs.len());
+    for i in 0..pinned_pairs.len() {
+        let (k, v) = pinned_pairs.get(&*ctx, i);
+        let this = ctx.read_native_pin(this_pin, this);
+        let entry = Value::Object(Some(alloc_live_entry(
+            ctx,
+            // Real Map.Entry impl so reflection sees getKey/getValue (SpEL
+            // `map.?[key...]` selection over a TreeMap). The fabricated
+            // "HashMap$Entry" does not implement Map.Entry → EL1008E.
+            "java/util/AbstractMap$SimpleEntry",
+            k,
+            v,
+            this,
+        )));
+        entry_pins.push(pin_value(ctx, entry));
+        entries.push(entry);
+    }
+    let entries: Vec<Value> = (0..entries.len())
+        .map(|i| read_pinned_elem(ctx, entry_pins[i], entries[i]))
         .collect();
+    let this = ctx.read_native_pin(this_pin, this);
     let list = make_view_list_of(ctx, this, &entries);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -35059,15 +36228,22 @@ fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     tm_materialize_deser_array(ctx, this);
     let pairs = tm_collect_pairs(ctx, this);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `obj_to_display_string`
+    // dispatches each element's real `toString()`, which allocates — every
+    // not-yet-rendered entry can move under it.
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut buf = String::from("{");
-    for (i, (k, v)) in pairs.iter().enumerate() {
+    for i in 0..pinned_pairs.len() {
         if i > 0 {
             buf.push_str(", ");
         }
-        buf.push_str(&obj_to_display_string(ctx, k));
+        let (k, _) = pinned_pairs.get(&*ctx, i);
+        buf.push_str(&obj_to_display_string(ctx, &k));
         buf.push('=');
-        buf.push_str(&obj_to_display_string(ctx, v));
+        let (_, v) = pinned_pairs.get(&*ctx, i);
+        buf.push_str(&obj_to_display_string(ctx, &v));
     }
+    ctx.unpin_native_roots(pinned_pairs.base());
     buf.push('}');
     let s = ctx.create_string(&buf);
     Ok(Some(Value::Object(Some(s))))
@@ -35112,13 +36288,21 @@ fn native_tm_head_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // into the result (each such put replacing the prior null entry, since
     // they all compare equal), producing a corrupt one-entry-with-null-key
     // result instead of the real matching entries.
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut to_key = to_key;
     let to_key_pin = pin_value(ctx, to_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp = tree_compare(ctx, &comparator, k, to_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35126,6 +36310,7 @@ fn native_tm_head_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         if cmp >= 0 {
             break;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35150,18 +36335,27 @@ fn native_tm_tail_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
     // BUGFIX: see `native_tm_head_map` above -- read via the fast/array-mode-
     // aware `tm_collect_pairs`, not `tm_state()` directly.
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut from_key = from_key;
     let from_key_pin = pin_value(ctx, from_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp = tree_compare(ctx, &comparator, k, from_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
         from_key = read_pinned_elem(ctx, from_key_pin, from_key);
         if cmp >= 0 {
+            pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
             native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
             result = ctx.read_native_pin(result_pin, result);
             comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35188,15 +36382,23 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
     // BUGFIX: see `native_tm_head_map` above -- read via the fast/array-mode-
     // aware `tm_collect_pairs`, not `tm_state()` directly.
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut from_key = from_key;
     let from_key_pin = pin_value(ctx, from_key);
     let mut to_key = to_key;
     let to_key_pin = pin_value(ctx, to_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35205,6 +36407,7 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         if cmp_lo < 0 {
             continue;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35213,6 +36416,7 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         if cmp_hi >= 0 {
             break;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35250,13 +36454,21 @@ fn native_tm_head_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut to_key = to_key;
     let to_key_pin = pin_value(ctx, to_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp = tree_compare(ctx, &comparator, k, to_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35266,6 +36478,7 @@ fn native_tm_head_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         if stop {
             break;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35288,19 +36501,28 @@ fn native_tm_tail_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut from_key = from_key;
     let from_key_pin = pin_value(ctx, from_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp = tree_compare(ctx, &comparator, k, from_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
         from_key = read_pinned_elem(ctx, from_key_pin, from_key);
         let keep = if inclusive { cmp >= 0 } else { cmp > 0 };
         if keep {
+            pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
             native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
             result = ctx.read_native_pin(result_pin, result);
             comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35326,15 +36548,23 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
+    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
+    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
+    // either can run a young collection that relocates every entry this walk
+    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
     let pairs = tm_collect_pairs(ctx, this);
     let result_pin = ctx.pin_native_root(result);
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let mut comparator = comparator;
     let comparator_pin = pin_value(ctx, comparator);
     let mut from_key = from_key;
     let from_key_pin = pin_value(ctx, from_key);
     let mut to_key = to_key;
     let to_key_pin = pin_value(ctx, to_key);
-    for (k, v) in pairs {
+    for __i in 0..pinned_pairs.len() {
+        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35348,6 +36578,7 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         if below {
             continue;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35361,6 +36592,7 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         if above {
             break;
         }
+        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
         native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
         result = ctx.read_native_pin(result_pin, result);
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
@@ -35511,11 +36743,17 @@ fn native_tm_key_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // Both fast and array modes go through the shared snapshot helper so
     // the iterator sees sorted-order keys regardless of backing store.
     let pairs = tm_collect_pairs(ctx, this);
+    // Family-1 stale-ObjectRef fix (2026-07-31): both allocations below can
+    // collect and move the snapshotted keys (and the snapshot array itself).
+    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
     let snap = alloc_ref_array(ctx, pairs.len().max(1));
-    for (i, (k, _)) in pairs.iter().enumerate() {
-        ctx.set_array_element(snap, i, *k);
+    let snap_pin = ctx.pin_native_root(snap);
+    for i in 0..pinned_pairs.len() {
+        let (k, _) = pinned_pairs.get(&*ctx, i);
+        ctx.set_array_element(snap, i, k);
     }
     let itr = alloc_synthetic(ctx, "java/util/TreeMap$KeyItr", 2);
+    let snap = ctx.read_native_pin(snap_pin, snap);
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(itr))))
@@ -35739,15 +36977,28 @@ fn native_ts_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     )?;
     // Elements in sorted order (the data array is kept sorted by native_ts_add).
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix (2026-07-31): each `writeObject` runs
+        // interpreted serialization bytecode, which allocates freely — the
+        // backing array and the stream both move under this loop.
+        let data_pin = ctx.pin_native_root(data);
+        let oos_pin = ctx.pin_native_root(oos);
+        let mut data = data;
+        let mut oos = oos;
         for i in 0..size as usize {
             let e = ctx.get_array_element(data, i);
-            ctx.invoke(
+            if let Err(err) = ctx.invoke(
                 oos_cls,
                 "writeObject",
                 "(Ljava/lang/Object;)V",
                 &[Value::Object(Some(oos)), e],
-            )?;
+            ) {
+                ctx.unpin_native_roots(data_pin);
+                return Err(err);
+            }
+            data = ctx.read_native_pin(data_pin, data);
+            oos = ctx.read_native_pin(oos_pin, oos);
         }
+        ctx.unpin_native_roots(data_pin);
     }
     Ok(None)
 }
@@ -36215,6 +37466,11 @@ fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             if cmp >= 0 {
                 break;
             }
+            // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+            // `data` BEFORE the comparison above, which dispatches
+            // interpreted bytecode and can move it. `data` is kept
+            // current through its pin, so re-read the element.
+            let e = ctx.get_array_element(data, i);
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
             data = ctx.read_native_pin(data_pin, data);
             result = ctx.read_native_pin(result_pin, result);
@@ -36255,6 +37511,11 @@ fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             comparator = read_pinned_elem(ctx, comparator_pin, comparator);
             from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
             if cmp >= 0 {
+                // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+                // `data` BEFORE the comparison above, which dispatches
+                // interpreted bytecode and can move it. `data` is kept
+                // current through its pin, so re-read the element.
+                let e = ctx.get_array_element(data, i);
                 native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
                 data = ctx.read_native_pin(data_pin, data);
                 result = ctx.read_native_pin(result_pin, result);
@@ -36311,6 +37572,11 @@ fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             if cmp_hi >= 0 {
                 break;
             }
+            // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+            // `data` BEFORE the comparison above, which dispatches
+            // interpreted bytecode and can move it. `data` is kept
+            // current through its pin, so re-read the element.
+            let e = ctx.get_array_element(data, i);
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
             data = ctx.read_native_pin(data_pin, data);
             result = ctx.read_native_pin(result_pin, result);
@@ -36367,6 +37633,11 @@ fn native_ts_tail_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             from_elem = read_pinned_elem(ctx, from_elem_pin, from_elem);
             let keep = if inclusive { cmp >= 0 } else { cmp > 0 };
             if keep {
+                // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+                // `data` BEFORE the comparison above, which dispatches
+                // interpreted bytecode and can move it. `data` is kept
+                // current through its pin, so re-read the element.
+                let e = ctx.get_array_element(data, i);
                 native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
                 data = ctx.read_native_pin(data_pin, data);
                 result = ctx.read_native_pin(result_pin, result);
@@ -36413,6 +37684,11 @@ fn native_ts_head_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             if stop {
                 break;
             }
+            // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+            // `data` BEFORE the comparison above, which dispatches
+            // interpreted bytecode and can move it. `data` is kept
+            // current through its pin, so re-read the element.
+            let e = ctx.get_array_element(data, i);
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
             data = ctx.read_native_pin(data_pin, data);
             result = ctx.read_native_pin(result_pin, result);
@@ -36480,6 +37756,11 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             if above {
                 break;
             }
+            // Family-1 stale-ObjectRef fix (2026-07-31): `e` was read from
+            // `data` BEFORE the comparison above, which dispatches
+            // interpreted bytecode and can move it. `data` is kept
+            // current through its pin, so re-read the element.
+            let e = ctx.get_array_element(data, i);
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
             data = ctx.read_native_pin(data_pin, data);
             result = ctx.read_native_pin(result_pin, result);
@@ -36597,10 +37878,21 @@ fn native_ts_descending_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, rev);
     if let Some(data) = data_opt {
+        // Family-1 stale-ObjectRef fix (2026-07-31): `native_ts_add` allocates
+        // (it grows the destination array and can dispatch a Comparator), so
+        // both the source array and the result move under this loop.
+        let data_pin = ctx.pin_native_root(data);
+        let result_pin = ctx.pin_native_root(result);
+        let mut data = data;
+        let mut result = result;
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
             native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+            data = ctx.read_native_pin(data_pin, data);
+            result = ctx.read_native_pin(result_pin, result);
         }
+        ctx.unpin_native_roots(data_pin);
+        return Ok(Some(Value::Object(Some(result))));
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -39974,6 +41266,19 @@ fn register_set_from_map_natives(r: &mut NativeMethodRegistry) {
 
 const PROPS_FIELD_DEFAULTS: usize = 3;
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. HIGHEST-RISK GROUP IN THIS CRATE.
+// All 43 registrations target `java.util.Properties` methods that have concrete
+// bytecode in JDK 25 and none that is ACC_NATIVE, which reads as "stub" on the
+// static evidence alone. Do not act on that reading. `Properties` is on the
+// real-JDK bootstrap path (`java.home` and friends are read out of it before
+// most of the class library is usable), and this repo has already shipped a
+// bootstrap failure — `InternalError: null property: java.home` — caused by a
+// whole function's worth of `Properties` registrations picking up the wrong
+// ambient category at a single call site. Anything that changes what survives
+// here must be proven with a full `--jdk-only` boot, not with `javap`.
+// Evidence needed before any retag: schema-v2 `invocations` for every triple in
+// this group across a real-JDK boot, plus `overwrote` to see which of these are
+// already being replaced by `native-builtins`' `register_properties_sidetable`.
 fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -43354,6 +44659,15 @@ fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
 // the bytecode side. NOT lock-free in the throughput sense; treat as a
 // correctness-only stopgap until a real Michael-Scott port lands.
 
+// JDK-ONLY-CLASSIFY: stub — correctly tagged already, and worth recording as
+// the crate's counter-example. `java.util.concurrent.LinkedBlockingDeque`
+// declares zero ACC_NATIVE methods in JDK 25; all 15 registrations shadow
+// concrete bytecode with a monitor-wrapped ArrayList, which the comment above
+// already calls "a correctness-only stopgap". This is the one place in
+// `native-collections` where a `set_category` states a per-subsystem judgement
+// instead of inheriting the crate-wide `Bridge`, and it reaches the right
+// answer. Under `--jdk-only` the registration is refused and the real
+// lock-free bytecode runs, which is the intended outcome.
 #[cfg(not(feature = "synthetic-jdk"))]
 fn register_linked_blocking_deque_stub_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -45949,7 +47263,12 @@ fn native_pbq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // Family-1 stale-ObjectRef fix (2026-07-31): `alloc_ref_array` can trigger
+    // a young collection that relocates/promotes `this`, so pin it across the
+    // allocation and write the fields through the forwarded reference.
+    let h_this = ctx.pin_native_root(this);
     let arr = alloc_ref_array(ctx, PBQ_DEFAULT_CAPACITY);
+    let this = ctx.read_native_pin(h_this, this);
     ctx.set_field(this, PBQ_FIELD_DATA, Value::Object(Some(arr)));
     ctx.set_field(this, PBQ_FIELD_SIZE, Value::Int(0));
     // Our synthetic offer/poll/peek/etc. manage queue(slot 0)/size(slot 1)
@@ -45964,6 +47283,7 @@ fn native_pbq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if !ctx.is_class_synthetic_stub("java/util/concurrent/PriorityBlockingQueue") {
         pbq_seed_real_lock(ctx, this);
     }
+    ctx.unpin_native_roots(h_this);
     Ok(None)
 }
 
@@ -46003,21 +47323,44 @@ fn pbq_seed_real_lock(ctx: &mut dyn NativeContext, this: ObjectRef) {
     ctx.unpin_native_roots(h_this);
 }
 
-fn pbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) {
+/// Grow the backing array so it can hold `needed` elements.
+///
+/// Family-1 stale-ObjectRef fix (2026-07-31): `alloc_ref_array` below is a real
+/// heap allocation that can trigger a young collection, which relocates (or
+/// promotes) both `this` and the *existing* backing array. Both are therefore
+/// pinned across the allocation and re-read through their pins before the copy
+/// loop and the field write - copying out of a stale `arr` would splice
+/// whatever now occupies that address into the queue. Returns the current
+/// (possibly forwarded) `this` so the caller never reuses its pre-call copy.
+#[must_use]
+fn pbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) -> ObjectRef {
+    let h_this = ctx.pin_native_root(this);
     let arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
         Value::Object(Some(a)) => a,
-        _ => return,
+        _ => {
+            ctx.unpin_native_roots(h_this);
+            return this;
+        }
     };
     let old_len = ctx.array_length(arr);
     if needed <= old_len {
-        return;
+        ctx.unpin_native_roots(h_this);
+        return this;
     }
+    let h_arr = ctx.pin_native_root(arr);
     let new_len = (old_len * 2).max(needed).max(PBQ_DEFAULT_CAPACITY);
     let new_arr = alloc_ref_array(ctx, new_len);
+    // Re-read both through their pins: the allocation above may have moved
+    // them. (`new_arr` itself needs no pin - nothing below it allocates.)
+    let this = ctx.read_native_pin(h_this, this);
+    let arr = ctx.read_native_pin(h_arr, arr);
     for i in 0..old_len {
-        ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+        let v = ctx.get_array_element(arr, i);
+        ctx.set_array_element(new_arr, i, v);
     }
     ctx.set_field(this, PBQ_FIELD_DATA, Value::Object(Some(new_arr)));
+    ctx.unpin_native_roots(h_this);
+    this
 }
 
 fn pbq_reject_null_element(elem: Value) -> Result<(), MethodCallFailed> {
@@ -46030,16 +47373,46 @@ fn pbq_reject_null_element(elem: Value) -> Result<(), MethodCallFailed> {
     Ok(())
 }
 
+/// Insert `elem` into the sorted backing array (caller holds the monitor).
+///
+/// Family-1 stale-ObjectRef fix (2026-07-31): the binary search below calls
+/// `tree_compare`, which for anything that is not a `String` or a homogeneous
+/// primitive wrapper dispatches the element's **real, interpreted**
+/// `Comparable.compareTo()` - a full re-entry into the VM that can allocate and
+/// trigger a young collection. Every raw `ObjectRef` this function still uses
+/// *after* such a call must be pinned and re-read through its pin, exactly like
+/// the sibling `tm_binary_search` (see its doc comment). That is all three of:
+///
+/// * `arr` - dereferenced by `get_array_element` on the *next* loop iteration
+///   and by the post-loop shift/insert. A stale `arr` decodes to whatever now
+///   occupies that address; observed as a `gen_heap` "left: Object, right:
+///   Array" assertion failure in the isolated repro.
+/// * `elem` - re-passed to `tree_compare` on every iteration and finally stored
+///   by `set_array_element(arr, low, elem)`. A stale `elem` writes a dangling
+///   reference into the queue that a later `offer()`/`poll()` reads back as an
+///   unrelated object - H2 MVStore's "java.lang.Object cannot be cast to
+///   org.h2.mvstore.FileStore$RemovedPageInfo".
+/// * `this` - written by the trailing `set_field(PBQ_FIELD_SIZE)`.
+///
+/// `pbq_ensure_capacity` also allocates, hence it returns the forwarded `this`.
 fn pbq_offer_locked(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) -> MethodCallResult {
     let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
-    pbq_ensure_capacity(ctx, this, (size + 1) as usize);
-    let arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
+    let h_this = ctx.pin_native_root(this);
+    let h_elem = pin_value(ctx, elem);
+    let mut elem = elem;
+    let mut this = pbq_ensure_capacity(ctx, this, (size + 1) as usize);
+    elem = read_pinned_elem(ctx, h_elem, elem);
+    let mut arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Int(1))),
+        _ => {
+            ctx.unpin_native_roots(h_this);
+            return Ok(Some(Value::Int(1)));
+        }
     };
+    let h_arr = ctx.pin_native_root(arr);
     // Binary search for insertion position using natural ordering.
     let comparator = Value::Object(None);
     let mut low: usize = 0;
@@ -46047,7 +47420,17 @@ fn pbq_offer_locked(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) -
     while low < high {
         let mid = low + (high - low) / 2;
         let mid_elem = ctx.get_array_element(arr, mid);
-        let cmp = tree_compare(ctx, &comparator, mid_elem, elem)?;
+        let cmp = match tree_compare(ctx, &comparator, mid_elem, elem) {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.unpin_native_roots(h_this);
+                return Err(e);
+            }
+        };
+        // The comparison ran real bytecode - refresh everything reused below.
+        this = ctx.read_native_pin(h_this, this);
+        arr = ctx.read_native_pin(h_arr, arr);
+        elem = read_pinned_elem(ctx, h_elem, elem);
         if cmp < 0 {
             low = mid + 1;
         } else {
@@ -46061,6 +47444,7 @@ fn pbq_offer_locked(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) -
     }
     ctx.set_array_element(arr, low, elem);
     ctx.set_field(this, PBQ_FIELD_SIZE, Value::Int(size + 1));
+    ctx.unpin_native_roots(h_this);
     Ok(Some(Value::Int(1)))
 }
 
@@ -46094,12 +47478,32 @@ fn native_pbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     pbq_reject_null_element(elem)?;
-    ctx.monitor_enter(this);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `monitor_enter` can park this
+    // thread and `pbq_offer_locked` re-enters the interpreter through the
+    // element's `compareTo`, so a collection can run between any two lines
+    // here. Pin `this`/`elem` for the whole critical section and re-read them
+    // through their pins before every subsequent use.
+    let h_this = ctx.pin_native_root(this);
+    let h_elem = pin_value(ctx, elem);
+    // STW-safepoint fix (2026-07-31): `monitor_enter_gc_safe`, not the plain
+    // `monitor_enter`. A plain enter blocks as a *counted* mutator, so a writer
+    // waiting on this queue's monitor never arrives at a concurrent
+    // stop-the-world barrier and the whole VM wedges ("STW cross-thread JIT
+    // takeover is still waiting for cooperative mutators rounds=64 pending=3
+    // taken=0"). The escape hatch is only sound for callers that pin and
+    // re-read every raw ref across the wait, which is exactly what the pins
+    // above now provide - same contract as `ChmMonitorGuard::acquire_gc_safe`.
+    let this = ctx.monitor_enter_gc_safe(this);
+    let this = ctx.read_native_pin(h_this, this);
+    let elem = read_pinned_elem(ctx, h_elem, elem);
     let result = pbq_offer_locked(ctx, this, elem);
+    let this = ctx.read_native_pin(h_this, this);
     if result.is_ok() {
         let _ = ctx.monitor_notify_all(this);
     }
+    let this = ctx.read_native_pin(h_this, this);
     ctx.monitor_exit(this);
+    ctx.unpin_native_roots(h_this);
     result
 }
 
@@ -46108,9 +47512,18 @@ fn native_pbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.monitor_enter(this);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `monitor_enter` can park this
+    // thread, so `this` may be relocated before the dequeue runs; the dequeued
+    // head likewise has to survive `monitor_exit`.
+    let h_this = ctx.pin_native_root(this);
+    // STW-safepoint fix (2026-07-31) - see `native_pbq_offer`.
+    let this = ctx.monitor_enter_gc_safe(this);
+    let this = ctx.read_native_pin(h_this, this);
     let head = pbq_poll_locked(ctx, this);
+    let h_head = pin_value(ctx, head);
     ctx.monitor_exit(this);
+    let head = read_pinned_elem(ctx, h_head, head);
+    ctx.unpin_native_roots(h_this);
     Ok(Some(head))
 }
 
@@ -46143,7 +47556,14 @@ fn native_pbq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.monitor_enter(this);
+    // Family-1 stale-ObjectRef fix (2026-07-31): this method blocks - both
+    // `monitor_enter` and every `monitor_wait` iteration are points at which
+    // another thread can run a collection that relocates `this`. Pin it and
+    // re-read it through the pin after each blocking call.
+    let h_this = ctx.pin_native_root(this);
+    // STW-safepoint fix (2026-07-31) - see `native_pbq_offer`.
+    let this = ctx.monitor_enter_gc_safe(this);
+    let mut this = ctx.read_native_pin(h_this, this);
     loop {
         let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
             Value::Int(v) => v,
@@ -46153,9 +47573,13 @@ fn native_pbq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             break;
         }
         let _ = ctx.monitor_wait(this, Some(50));
+        this = ctx.read_native_pin(h_this, this);
     }
     let head = pbq_poll_locked(ctx, this);
+    let h_head = pin_value(ctx, head);
     ctx.monitor_exit(this);
+    let head = read_pinned_elem(ctx, h_head, head);
+    ctx.unpin_native_roots(h_this);
     Ok(Some(head))
 }
 
@@ -51366,5 +52790,195 @@ mod tests {
         assert!(range_long_elements(0, STREAM_RANGE_MAX_ELEMENTS + 1).is_err());
         assert!(range_long_elements(0, STREAM_RANGE_MAX_ELEMENTS).is_ok());
         assert!(range_long_elements(10, -5).unwrap().is_empty());
+    }
+
+    /// Every `Collectors.*` factory must mint a DISTINCT tag that
+    /// `is_known_collector_tag` accepts, because `native_stream_collect`'s tag
+    /// dispatch is the only thing that ever reads a collector.
+    ///
+    /// This is the invariant that broke: `native-builtins`' phase-56 factories
+    /// minted a private second namespace (maxBy=9, minBy=10, filtering=12,
+    /// summarizing*=13/14/15) that aliased the tags below, so
+    /// `stream.collect(Collectors.minBy(cmp))` was decoded as
+    /// `groupingBy(classifier, supplier, downstream)` and answered a Map.
+    /// The "tags are exactly 1..=N" check makes a colliding or unregistered
+    /// new tag fail here rather than silently in a stream pipeline.
+    #[test]
+    fn collector_factories_mint_unique_decodable_tags() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        let null = Value::Object(None);
+        let obj = |r: MethodCallResult| -> ObjectRef {
+            match r {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                other => panic!("collector factory returned {other:?}"),
+            }
+        };
+        // One representative factory per tag. Aliases (toUnmodifiableList →
+        // toList, joining(d,p,s) → JOINING_DELIM) are deliberately omitted.
+        let mints: Vec<(&str, ObjectRef)> = vec![
+            ("toList", obj(native_collectors_to_list(&mut ctx, &[]))),
+            ("toSet", obj(native_collectors_to_set(&mut ctx, &[]))),
+            ("joining", obj(native_collectors_joining(&mut ctx, &[]))),
+            (
+                "joining(delim)",
+                obj(native_collectors_joining_delim(&mut ctx, &[null])),
+            ),
+            ("toMap", obj(native_collectors_to_map(&mut ctx, &[]))),
+            ("counting", obj(native_collectors_counting(&mut ctx, &[]))),
+            (
+                "groupingBy",
+                obj(native_collectors_grouping_by(&mut ctx, &[null])),
+            ),
+            (
+                "partitioningBy",
+                obj(native_collectors_partitioning_by(&mut ctx, &[null])),
+            ),
+            (
+                "groupingBy(downstream)",
+                obj(native_collectors_grouping_by_downstream(&mut ctx, &[null])),
+            ),
+            (
+                "groupingBy(supplier)",
+                obj(native_collectors_grouping_by_supplier(&mut ctx, &[null])),
+            ),
+            (
+                "partitioningBy(downstream)",
+                obj(native_collectors_partitioning_by_downstream(
+                    &mut ctx,
+                    &[null],
+                )),
+            ),
+            (
+                "toMap(merge)",
+                obj(native_collectors_to_map_merge(&mut ctx, &[null])),
+            ),
+            (
+                "collectingAndThen",
+                obj(native_collectors_collecting_and_then(&mut ctx, &[null])),
+            ),
+            (
+                "toCollection",
+                obj(native_collectors_to_collection(&mut ctx, &[null])),
+            ),
+            ("mapping", obj(native_collectors_mapping(&mut ctx, &[null]))),
+            (
+                "toMap(supplier)",
+                obj(native_collectors_to_map_supplier(&mut ctx, &[null])),
+            ),
+            ("minBy", obj(native_collectors_min_by(&mut ctx, &[null]))),
+            ("maxBy", obj(native_collectors_max_by(&mut ctx, &[null]))),
+            (
+                "filtering",
+                obj(native_collectors_filtering(&mut ctx, &[null])),
+            ),
+            (
+                "summarizingInt",
+                obj(native_collectors_summarizing_int(&mut ctx, &[null])),
+            ),
+            (
+                "summarizingLong",
+                obj(native_collectors_summarizing_long(&mut ctx, &[null])),
+            ),
+            (
+                "summarizingDouble",
+                obj(native_collectors_summarizing_double(&mut ctx, &[null])),
+            ),
+            (
+                "averagingInt",
+                obj(native_collectors_averaging_int(&mut ctx, &[null])),
+            ),
+            (
+                "averagingLong",
+                obj(native_collectors_averaging_long(&mut ctx, &[null])),
+            ),
+            (
+                "averagingDouble",
+                obj(native_collectors_averaging_double(&mut ctx, &[null])),
+            ),
+            (
+                "summingInt",
+                obj(native_collectors_summing_int(&mut ctx, &[null])),
+            ),
+            (
+                "summingLong",
+                obj(native_collectors_summing_long(&mut ctx, &[null])),
+            ),
+            (
+                "summingDouble",
+                obj(native_collectors_summing_double(&mut ctx, &[null])),
+            ),
+            ("teeing", obj(native_collectors_teeing(&mut ctx, &[null]))),
+        ];
+
+        let mut seen: Vec<(&str, i32)> = Vec::new();
+        for (name, c) in mints {
+            assert!(
+                ctx.object_num_fields(c) >= COLLECTOR_NUM_FIELDS,
+                "{name}: collector layout is undersized ({} fields)",
+                ctx.object_num_fields(c)
+            );
+            let tag = match ctx.get_field(c, COLLECTOR_FIELD_TAG) {
+                Value::Int(t) => t,
+                other => panic!("{name}: non-int tag {other:?}"),
+            };
+            assert!(
+                is_known_collector_tag(tag),
+                "{name}: tag {tag} is not decodable by native_stream_collect"
+            );
+            if let Some((prev, _)) = seen.iter().find(|(_, t)| *t == tag) {
+                panic!("{name} and {prev} both mint tag {tag}");
+            }
+            seen.push((name, tag));
+        }
+
+        let mut tags: Vec<i32> = seen.iter().map(|(_, t)| *t).collect();
+        tags.sort_unstable();
+        let expected: Vec<i32> = (1..=seen.len() as i32).collect();
+        assert_eq!(
+            tags, expected,
+            "collector tags must be a dense 1..=N range with one factory each"
+        );
+    }
+
+    /// `collect(minBy/maxBy(cmp))` must answer an `Optional`, which is what
+    /// regressed: those collectors were tagged 10 and 9 — GROUPING_BY_SUPPLIER
+    /// and GROUPING_BY_DOWNSTREAM here — so `collect` returned a Map.
+    #[test]
+    fn collect_min_by_max_by_yield_optional() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        // Every mock object reports ClassId(0); naming it makes `stream_elements`
+        // take the synthetic-stream path. The Collector/Optional allocations are
+        // recognised by layout (field count), not by name.
+        ctx.define_class(ClassId::new(0), "java/util/stream/Stream");
+
+        let elements = [Value::Int(3), Value::Int(1), Value::Int(2)];
+        let arr = ctx.new_ref_array(ClassId::new(0), elements.len());
+        for (i, v) in elements.iter().enumerate() {
+            ctx.set_array_element(arr, i, *v);
+        }
+        let stream = ctx.alloc_object(ClassId::new(0), STREAM_NUM_FIELDS);
+        ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+
+        let natural = make_comparator(&mut ctx, CMP_TAG_NATURAL_ORDER);
+        for (tag_maker, expected) in [
+            (
+                make_min_by_collector as fn(&mut dyn NativeContext, Value) -> ObjectRef,
+                Value::Int(1),
+            ),
+            (make_max_by_collector, Value::Int(3)),
+        ] {
+            let collector = tag_maker(&mut ctx, Value::Object(Some(natural)));
+            let result = native_stream_collect(
+                &mut ctx,
+                &[Value::Object(Some(stream)), Value::Object(Some(collector))],
+            );
+            let opt = match result {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                other => panic!("collect returned {other:?}"),
+            };
+            assert_eq!(ctx.get_field(opt, OPT_FIELD_VALUE), expected);
+        }
     }
 }

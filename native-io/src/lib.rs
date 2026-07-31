@@ -4654,6 +4654,23 @@ fn real_filewriter_enabled() -> bool {
     !io_flags().synthetic_filewriter_forced
 }
 
+// JDK-ONLY-CLASSIFY: unknown — needs census, at the granularity of this whole
+// crate. The `set_category(Bridge)` below is the crate's root ambient
+// assignment: 1,105 of `native-io`'s 1,129 registrations end up `Bridge`
+// because of it, either directly or through a callee that never sets a category
+// of its own. Unlike `native-collections`, that tag is often RIGHT here — this
+// crate does own genuine OS boundaries — but it is right by luck of placement,
+// not by per-site judgement. Measured against JDK 25 with `javap -p -s`, 86 of
+// the resolvable `Bridge` triples target an ACC_NATIVE method (`sun.nio.ch.Net`,
+// `FileInputStream`/`FileOutputStream`'s `*0` family, `RandomAccessFile`,
+// `ProcessHandleImpl`) while 307 shadow methods that have concrete bytecode.
+//
+// Note the ambient value is also caller-visible: this function saves and
+// restores `__prev_cat`, and `vm/src/vm/vm_init.rs` calls it while the registry
+// is at its DEFAULT category, which is `SyntheticStub`. If the
+// `set_category(Bridge)` line below were ever moved after a registration, that
+// registration would become a synthetic stub with no syntactic marker at all.
+// Per-entry-point verdicts are annotated on the `register_*` functions.
 pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -4939,6 +4956,17 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // synthetic fallback classes without stealing a real FileInputStream
     // constructor. `vm_exec` protects SyntheticStub-tagged FileInputStream
     // methods by preferring real bytecode when it exists.
+    //
+    // JDK-ONLY-CLASSIFY: stub — correctly tagged, and the tag is LOAD-BEARING.
+    // JDK 25's `FileInputStream` declares exactly nine ACC_NATIVE methods
+    // (`open0`, `read0`, `readBytes`, `length0`, `position0`, `skip0`,
+    // `available0`, `isRegularFile0`, `initIDs`); every one of them is
+    // registered `Bridge` further down this function. The seven triples in the
+    // block below are the PUBLIC surface (`<init>(String)`, `read()`,
+    // `read([B)`, `read([BII)`, `available()`, `skip(J)`, `close()`), all of
+    // which have concrete bytecode — so `SyntheticStub` is the correct
+    // classification and is what makes `vm_exec` prefer that bytecode. Do not
+    // "fix" this to `Bridge`: the tag is the mechanism, not a mislabel.
     {
         let __prev_cat = registry.current_category();
         registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
@@ -5008,6 +5036,18 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // The real JDK public bulk-read wrapper delegates to readBytes. Annotation
     // scanning reaches this signature directly, so route it to the same native
     // implementation when selected by the interpreter bridge policy.
+    //
+    // JDK-ONLY-CLASSIFY: unknown — needs census. CONCRETE OVERWRITE HAZARD, and
+    // the cleanest example in the repo of why `overwrote` belongs in the census.
+    // `FileInputStream.read([BII)I` is registered TWICE in this one function:
+    // once inside the `SyntheticStub` block above and again here under the
+    // ambient `Bridge`. Registration is last-write-wins, so this line silently
+    // upgrades that entry to `Bridge` and the earlier stub tag never appears in
+    // the final registry — invisible to `dump_registrations` and to any grep.
+    // `read([BII)I` is NOT ACC_NATIVE in JDK 25 (only the private `readBytes`
+    // is), so `Bridge` is the wrong tag on the merits; but silently demoting it
+    // would also change which of the two callbacks wins, so this must be
+    // resolved with `overwrote` + `invocations`, not by deleting a line.
     registry.register(
         "java/io/FileInputStream",
         "read",
@@ -5974,6 +6014,12 @@ fn native_is_transfer_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Long(transferred)))
 }
 
+// JDK-ONLY-CLASSIFY: stub — `java.util.Scanner` declares zero ACC_NATIVE
+// methods in JDK 25. All 37 registrations here shadow concrete bytecode (35
+// on `Scanner` itself, 2 on abstract `Readable`/`Iterator` methods), so there
+// is no VM/OS boundary being crossed: the OS boundary is one layer down, in the
+// `InputStream` these natives read through, and that layer is already bridged.
+// Tagged `Bridge` purely by inheritance from `register_io_natives`.
 fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -8079,6 +8125,14 @@ fn sw_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: usize) {
     ctx.set_field(this, SW_FIELD_COUNT, Value::Object(Some(holder)));
 }
 
+// JDK-ONLY-CLASSIFY: stub — `java.io.StringReader` and `java.io.StringWriter`
+// are pure Java: neither declares a single ACC_NATIVE method in JDK 25, and 22
+// of these 25 registrations shadow concrete bytecode. The `Bridge` set on the
+// next line is therefore wrong on the merits for the StringWriter half; the
+// StringReader half below already opts back down to `SyntheticStub` explicitly.
+// Both halves are string-buffer manipulation with no OS boundary anywhere. The
+// two categories inside one function make this a good split candidate: the
+// stub-tagged inner block should stay, the surrounding `Bridge` should not.
 fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -8807,6 +8861,12 @@ const DOS_WRITTEN_SLOT: usize = 1;
 // Access `written` by NAME so the native and real bytecode agree on the slot.
 const DOS_WRITTEN_FIELD: &str = "written";
 
+// JDK-ONLY-CLASSIFY: stub — `DataInputStream`/`DataOutputStream`/`DataInput`/
+// `DataOutput` declare no ACC_NATIVE method in JDK 25; 25 of these 37
+// registrations shadow concrete bytecode and 4 land on abstract interface
+// methods. These are byte-order/encoding conversions expressible in bytecode,
+// which is the definition of "not a bridge". Inherited `Bridge` from
+// `register_io_natives`.
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);

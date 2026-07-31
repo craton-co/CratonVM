@@ -55,9 +55,14 @@ include = [
     "CRATON_TAG_DOUBLE",
     "CRATON_TAG_OBJECT",
     "CRATON_TAG_ERROR",
+    # Compatibility-mode ABI values: published, stable, append-only. Keep in
+    # lockstep with the anonymous enum in include/cratonvm.h.
+    "CRATONVM_COMPATIBILITY_COMPATIBLE",
+    "CRATONVM_COMPATIBILITY_JDK_ONLY",
     "cratonvm_thread_enter_native",
     "cratonvm_thread_leave_native",
     "cratonvm_create",
+    "cratonvm_create_with_compatibility",
     "cratonvm_destroy",
     "cratonvm_release_ref",
     "cratonvm_load_class",
@@ -75,6 +80,8 @@ include = [
     "cratonvm_get_field_by_name",
     "cratonvm_set_field",
     "cratonvm_set_field_by_name",
+    "cratonvm_compatibility_mode",
+    "cratonvm_compatibility_mode_supported",
     "cratonvm_last_error",
     "cratonvm_clear_error",
 ]

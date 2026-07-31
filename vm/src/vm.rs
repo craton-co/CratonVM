@@ -30,6 +30,24 @@ pub use vm_util::*;
 // so it — and its supporting `use` block — are gated behind
 // `#[cfg(all(test, feature = "synthetic-jdk"))]`. The external test
 // files in `vm/tests/` remain available in both feature modes.
+//
+// JDK-ONLY-LAYOUT: safe (whole file) — this module contains ~500 raw
+// `heap.get_field(obj, <literal>)` / `set_field(obj, <literal>, …)` calls, and
+// every one of them is inside the `#[cfg(all(test, feature = "synthetic-jdk"))]`
+// block below. They hand-build synthetic objects and then assert on the slots
+// they themselves wrote, so they are self-consistent by construction and never
+// observe a real JDK layout: `synthetic-jdk` is a build-time feature that
+// excludes the real class library, whereas `--jdk-only` is a *runtime* policy
+// on a real image (contract §1: "Strictness is a runtime policy, not a build
+// feature"). Nothing here is reachable from a `--jdk-only` run.
+//
+// This is a verdict about reachability, not about quality: several of these
+// fixtures encode layouts (`Throwable` message at slot 0, `StringBuilder`
+// count at slot 1) that are WRONG for real JDK bytes. They are safe only
+// because they never meet them. Do not copy a slot number out of this module
+// into production code, and do not treat a green run of these tests as
+// evidence that a native's slot arithmetic survives stub removal.
+// See `docs/jdk-only-object-layout-audit.md`.
 #[cfg(all(test, feature = "synthetic-jdk"))]
 use crate::classloading::resolution::MethodHandleKind;
 #[cfg(all(test, feature = "synthetic-jdk"))]
@@ -2935,6 +2953,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: cratonvm_classloading::ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
@@ -2989,6 +3008,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: cratonvm_classloading::ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
@@ -54935,6 +54955,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
@@ -55018,6 +55039,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
@@ -55064,6 +55086,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
@@ -55165,6 +55188,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
@@ -55203,6 +55227,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
@@ -55241,6 +55266,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
@@ -57906,6 +57932,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: cratonvm_classloading::ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
@@ -63593,6 +63620,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
@@ -64567,6 +64595,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
@@ -64651,6 +64680,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
@@ -64787,6 +64817,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
