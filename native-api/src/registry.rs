@@ -4230,6 +4230,17 @@ pub struct NativeMethodRegistry {
     /// errors. `Intrinsic` and `Bridge` registrations are never affected.
     /// See docs/synthetic-vs-real-explained.md.
     drop_synthetic_stubs: bool,
+    /// Opt out of the `java/net/Socket` / `ServerSocket` drop below.
+    ///
+    /// That filter exists because ONE registered native shadows a class's real
+    /// bytecode at every dispatch site, so under `CRATONVM_REAL_NET_SOCKETS`
+    /// the synthetic socket surface has to be absent from the registry, not
+    /// merely un-called. That is right for a running VM and wrong for a
+    /// registry built purely to unit-test the synthetic natives themselves:
+    /// there is no real socket bytecode in that process to shadow, so the
+    /// filter just leaves the tests with nothing to call. Default `false`; only
+    /// `cratonvm-vm`'s inline test registry sets it.
+    allow_synthetic_net_sockets: bool,
     /// Real-JDK mode: drop synthetic natives whose hardcoded field-slot layout
     /// corrupts the *real* JDK object. Currently `java/util/StringJoiner`,
     /// `java/io/StringReader`, `java/util/EnumSet`, `LinkedBlockingDeque`, and
@@ -4319,6 +4330,7 @@ impl NativeMethodRegistry {
             // Read once at construction. `CRATONVM_NO_STUBS` (any non-empty
             // value) enables strict mode: synthetic-stub registrations are
             // dropped so calls hit real bytecode or a clear error.
+            allow_synthetic_net_sockets: false,
             drop_synthetic_stubs: cratonvm_types::flags::runtime_var_os("CRATONVM_NO_STUBS")
                 .is_some_and(|v| !v.is_empty()),
             drop_real_layout_synthetic: false,
@@ -4400,6 +4412,13 @@ impl NativeMethodRegistry {
     }
 
     /// Register a native method implementation.
+    /// Permit the synthetic `java.net.Socket` / `ServerSocket` natives to be
+    /// registered even under `CRATONVM_REAL_NET_SOCKETS`. See
+    /// [`Self::allow_synthetic_net_sockets`]. Test-registry use only.
+    pub fn allow_synthetic_net_sockets(&mut self, allow: bool) {
+        self.allow_synthetic_net_sockets = allow;
+    }
+
     pub fn register(
         &mut self,
         class_name: &str,
@@ -4436,6 +4455,7 @@ impl NativeMethodRegistry {
         // phases_late p72, net_phase_e re1/re2, socket_channel, …) — filtering
         // here catches them all in one place. See `reference_server_socket_gap`.
         if real_net_sockets_enabled()
+            && !self.allow_synthetic_net_sockets
             && (class_name == "java/net/Socket"
                 || class_name == "java/net/ServerSocket"
                 // DoHead third root cause (2026-07-13): the WildFly bootstrap

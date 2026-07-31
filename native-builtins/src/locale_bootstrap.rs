@@ -154,6 +154,14 @@ fn locale_language(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         if let Some(lang) = syn {
             return Ok(Some(Value::Object(Some(ctx.create_string(lang)))));
         }
+        // `locale_populate` (lib.rs) records into a SECOND side table, and that
+        // is the one `Locale.<init>`, `forLanguageTag` and the constants fill.
+        // Consult it before the `baseLocale` fallback, which a synthetically
+        // allocated Locale need not have.
+        let (l, _, _) = crate::locale_data_get(*this);
+        if !l.is_empty() {
+            return Ok(Some(Value::Object(Some(ctx.create_string(&l)))));
+        }
         // Real JDK Locale (e.g. Locale.FRENCH): read its BaseLocale.language.
         if let Some(s) = base_locale_field(ctx, *this, "language") {
             return Ok(Some(Value::Object(Some(s))));
@@ -164,6 +172,10 @@ fn locale_language(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn locale_country(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
+        let (_, c_side, _) = crate::locale_data_get(*this);
+        if !c_side.is_empty() {
+            return Ok(Some(Value::Object(Some(ctx.create_string(&c_side)))));
+        }
         let syn = synthetic_locale_data().lock().get(this).map(|&(_, c, _)| c);
         if let Some(country) = syn {
             return Ok(Some(Value::Object(Some(ctx.create_string(country)))));
@@ -180,6 +192,26 @@ fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // Synthetic locales (our getDefault) carry a recorded BCP-47 tag.
         if let Some(&(_, _, tag)) = synthetic_locale_data().lock().get(this) {
             return Ok(Some(Value::Object(Some(ctx.create_string(tag)))));
+        }
+        // See `locale_language`: the `locale_populate` side table is what the
+        // constructors and constants fill, and a synthetic Locale has no
+        // `baseLocale` for the fallback below to read.
+        let (l, c, v) = crate::locale_data_get(*this);
+        if !l.is_empty() || !c.is_empty() {
+            let mut tag = if l.is_empty() {
+                "und".to_string()
+            } else {
+                l.to_ascii_lowercase()
+            };
+            if !c.is_empty() {
+                tag.push('-');
+                tag.push_str(&c.to_ascii_uppercase());
+            }
+            if !v.is_empty() {
+                tag.push('-');
+                tag.push_str(&v);
+            }
+            return Ok(Some(Value::Object(Some(ctx.create_string(&tag)))));
         }
         // Real JDK Locale: build a BCP-47 tag from its baseLocale subtags.
         // The previous unconditional "und" fallback dropped language/script/
@@ -783,5 +815,149 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             ctx.invoke_virtual(this, "getCountry", "()Ljava/lang/String;", &[])
         },
     );
+
+    // ---------------------------------------------------------------------
+    // Construction, `toString`, `forLanguageTag`, and the remaining public
+    // constants.
+    //
+    // The surface above could read a Locale but not make one: there was no
+    // `<init>`, no `toString`, no `forLanguageTag`, and only ROOT / ENGLISH /
+    // US / CANADA of the sixteen public constants. `new Locale("en", "US")`
+    // therefore produced an object with nothing in the side table, which every
+    // accessor above reports as the root locale.
+    // ---------------------------------------------------------------------
+
+    /// Read `args[i]` as a Rust string, treating null/absent as empty — the
+    /// shape `Locale`'s constructors give a missing country or variant.
+    fn str_arg(ctx: &mut dyn NativeContext, args: &[Value], i: usize) -> String {
+        match args.get(i) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    fn locale_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        // `Locale` normalises language to lower case and country to upper.
+        let lang = str_arg(ctx, args, 1).to_ascii_lowercase();
+        let country = str_arg(ctx, args, 2).to_ascii_uppercase();
+        let variant = str_arg(ctx, args, 3);
+        crate::locale_populate(ctx, this, &lang, &country, &variant);
+        Ok(None)
+    }
+
+    for desc in [
+        "(Ljava/lang/String;)V",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+    ] {
+        registry.register("java/util/Locale", "<init>", desc, locale_init);
+    }
+
+    // `language`, `language_COUNTRY`, `language_COUNTRY_variant`, and the
+    // `_COUNTRY` form when the language is empty — `Locale.toString`'s
+    // documented layout, which is NOT the same as `toLanguageTag`.
+    registry.register(
+        "java/util/Locale",
+        "toString",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let (lang, country, variant) = crate::locale_data_get(this);
+            let mut s = lang.clone();
+            if !country.is_empty() || (!variant.is_empty() && !lang.is_empty()) {
+                s.push('_');
+                s.push_str(&country);
+            }
+            if !variant.is_empty() {
+                s.push('_');
+                s.push_str(&variant);
+            }
+            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        },
+    );
+
+    // BCP-47 `language-Script-REGION-variant`. Only the language and region
+    // subtags feed the side table, which is all the accessors above read; a
+    // script subtag is recognised so it is not mistaken for the region.
+    registry.register(
+        "java/util/Locale",
+        "forLanguageTag",
+        "(Ljava/lang/String;)Ljava/util/Locale;",
+        |ctx, args| {
+            let tag = match args.first() {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let mut parts = tag.split(['-', '_']).filter(|p| !p.is_empty());
+            let lang = parts.next().unwrap_or("").to_ascii_lowercase();
+            let mut country = String::new();
+            let mut variant = String::new();
+            for p in parts {
+                // A 4-letter subtag is a script (e.g. `Hant`); skip it.
+                if p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()) {
+                    continue;
+                }
+                if country.is_empty()
+                    && (p.len() == 2 || (p.len() == 3 && p.chars().all(|c| c.is_ascii_digit())))
+                {
+                    country = p.to_ascii_uppercase();
+                } else if variant.is_empty() {
+                    variant = p.to_string();
+                }
+            }
+            let loc = crate::locale_alloc(ctx, &lang, &country);
+            if !variant.is_empty() {
+                crate::locale_populate(ctx, loc, &lang, &country, &variant);
+            }
+            Ok(Some(Value::Object(Some(loc))))
+        },
+    );
+
+    // The public constants `java.util.Locale` declares, minus ROOT / ENGLISH /
+    // US / CANADA which are registered in `lib.rs`. Registered with the FIELD
+    // descriptor, matching those four — these are static-field natives, not
+    // methods. A macro rather than a loop because `register` takes a plain
+    // `fn`, so the language/country must be literals baked into each shim
+    // rather than values a closure captures.
+    macro_rules! locale_const {
+        ($name:literal, $lang:literal, $country:literal) => {
+            registry.register(
+                "java/util/Locale",
+                $name,
+                "Ljava/util/Locale;",
+                |ctx, _args| {
+                    Ok(Some(Value::Object(Some(crate::locale_alloc(
+                        ctx, $lang, $country,
+                    )))))
+                },
+            );
+        };
+    }
+    locale_const!("UK", "en", "GB");
+    locale_const!("FRANCE", "fr", "FR");
+    locale_const!("GERMANY", "de", "DE");
+    locale_const!("ITALY", "it", "IT");
+    locale_const!("JAPAN", "ja", "JP");
+    locale_const!("KOREA", "ko", "KR");
+    locale_const!("CHINA", "zh", "CN");
+    locale_const!("PRC", "zh", "CN");
+    locale_const!("TAIWAN", "zh", "TW");
+    locale_const!("CANADA_FRENCH", "fr", "CA");
+    locale_const!("SIMPLIFIED_CHINESE", "zh", "CN");
+    locale_const!("TRADITIONAL_CHINESE", "zh", "TW");
+    locale_const!("FRENCH", "fr", "");
+    locale_const!("GERMAN", "de", "");
+    locale_const!("ITALIAN", "it", "");
+    locale_const!("JAPANESE", "ja", "");
+    locale_const!("KOREAN", "ko", "");
+    locale_const!("CHINESE", "zh", "");
+
     registry.set_category(__prev_cat);
 }

@@ -572,6 +572,17 @@ mod tests {
         // would ever register. Opt in explicitly, the same choice
         // `CRATONVM_SYNTHETIC_AQS=1` makes at runtime.
         cratonvm_native_builtins::util_concurrent_ext::register_synthetic_aqs_natives(&mut r);
+        // Same story for `java.net.Socket` / `ServerSocket`, but guarded twice:
+        // `register_phase53_socket_stubs` skips them under real NIO sockets,
+        // AND `NativeMethodRegistry::register` drops any registration on those
+        // two classes outright, because in a running VM one registered native
+        // shadows the class's real bytecode everywhere. Neither concern
+        // applies to a registry that exists only to unit-test the synthetic
+        // natives — there is no real socket bytecode here to shadow — so opt
+        // out of both and register them.
+        r.allow_synthetic_net_sockets(true);
+        cratonvm_native_builtins::phases_early::register_synthetic_socket_stubs(&mut r);
+        r.allow_synthetic_net_sockets(false);
         r
     });
 
@@ -31925,7 +31936,7 @@ mod tests {
             &mut thread,
             "java/util/Locale",
             "US",
-            "()Ljava/util/Locale;",
+            "Ljava/util/Locale;",
             &[],
         )
         .unwrap()
@@ -31936,7 +31947,7 @@ mod tests {
             &mut thread,
             "java/util/Locale",
             "UK",
-            "()Ljava/util/Locale;",
+            "Ljava/util/Locale;",
             &[],
         )
         .unwrap()

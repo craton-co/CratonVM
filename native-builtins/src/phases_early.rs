@@ -16225,10 +16225,6 @@ fn ss_accept_with_timeout(lid: i32) -> SsAccept {
 const SIO_STREAM_ID: usize = 0;
 
 pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
-    use crate::servlet::{s2_alloc_listener, s2_alloc_stream, s2_registry};
-    use std::io::{Read as StdRead, Write as StdWrite};
-    use std::net::TcpListener;
-    use std::net::TcpStream;
     // NIO-SERVER-SOCKET (route 1): skip this synthetic TCP surface so real
     // java.net.Socket/ServerSocket bytecode drives sun/nio/ch/Net (native-io::net).
     // A registered native shadows the class's real bytecode at every interpreter
@@ -16237,6 +16233,24 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
     if crate::vmflags().io.real_net_sockets {
         return;
     }
+    register_synthetic_socket_stubs(r);
+}
+
+/// The synthetic `java.net.Socket` / `ServerSocket` surface, split out of
+/// [`register_phase53_socket_stubs`] so it can be named.
+///
+/// Production behaviour is unchanged — the caller above still skips this
+/// entirely under the default `real_net_sockets`. It is public for the same
+/// reason [`crate::util_concurrent_ext::register_synthetic_aqs_natives`] is:
+/// `cratonvm-vm`'s inline tests drive hand-built receivers with no real
+/// `java.net` bytecode behind them, so they cannot exercise the real path, and
+/// with the synthetic path unregistered they were asserting against natives
+/// nothing would ever provide.
+pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
+    use crate::servlet::{s2_alloc_listener, s2_alloc_stream, s2_registry};
+    use std::io::{Read as StdRead, Write as StdWrite};
+    use std::net::TcpListener;
+    use std::net::TcpStream;
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
 
