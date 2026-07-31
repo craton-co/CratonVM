@@ -1,14 +1,25 @@
-# `BasicErrorControllerIntegrationTests` fails 23/26 under the JIT — and it is NOT the direct-call gate
+# `BasicErrorControllerIntegrationTests` is NOT a usable acceptance gate right now
 
-**Status:** OPEN, measured 2026-07-31 against dev `399079cb7`.
+**Status:** OPEN, measured 2026-07-31 against dev `f14b64379`.
 
-This matters beyond the class itself: `direct_jit_callee_calls_enabled()` names
-this class as its acceptance gate — *"14 consecutive clean runs, plus a
-same-binary gate-closed control"*. **Neither arm is clean right now**, so anyone
-re-running that gate will conclude the reopened direct-call edge is unsafe. It
-is not. The failure is gate-independent.
+This is a narrow companion to the two existing reports on this class —
+[`../spring/springboot-basicerrorcontroller-checkcast-abort-20260731.md`](../spring/springboot-basicerrorcontroller-checkcast-abort-20260731.md)
+and
+[`../spring/basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](../spring/basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md).
+It does not re-file those. It records one fact they do not cover, which will
+otherwise cause a wrong conclusion about a different subsystem.
 
-## The matrix
+## Why this needs saying
+
+`jit/src/lib.rs::direct_jit_callee_calls_enabled()` names this class as the
+acceptance gate for the reopened raw JIT-to-JIT edge:
+
+> Acceptance: `BasicErrorControllerIntegrationTests`, default flags, 14
+> consecutive clean runs, plus a same-binary gate-closed control.
+
+**Neither arm is clean today**, so anyone running that gate will read the
+result as the reopened direct-call edge being unsafe. It is not. The failure is
+independent of the gate:
 
 | arm | result |
 |---|---|
@@ -17,13 +28,24 @@ is not. The failure is gate-independent.
 | CratonVM, JIT on, gate open (default) | FAIL — 26 tests, 23 failed |
 | CratonVM, JIT on, `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` | FAIL — 26 tests, 23 failed |
 
-JIT-only, and unmoved by the gate. Nondeterministic: the same binary and
-classpath produced `failed=23`, then `failed=15`, so **a single green run proves
-nothing here**.
+JIT-only, and unmoved by the gate. Also **nondeterministic** — the same binary
+and classpath gave `failed=23`, then `failed=15` — so a single clean run of
+this class proves nothing, for this gate or any other.
 
-## Signatures
+Until this class is green again, validate that edge with
+`probes/CallFloorProbe.java` plus a suite that currently passes, and treat the
+comment's acceptance line as unrunnable rather than as failing.
 
-Before `7f1b1f263` (binary at `351218f44`) the class died on a receiver mix-up:
+## Signature observed here
+
+Distinct from the `checkcast: not an object reference` hard abort in the
+companion docs — this arm does not abort, it fails assertions:
+
+* `NullPointerException: Cannot invoke "java.util.Iterator.hasNext()" because "<local5>" is null` (×46)
+* `BindException: Failed to bind properties under 'spring.main.allow-bean-definition-overriding' to boolean` (×44)
+
+On a binary at `351218f44` (before `7f1b1f263`) the same class instead died on
+a receiver mix-up, which is worth recording since it may be a separate defect:
 
 ```
 NoSuchMethodError method="java/lang/Class.getLog(Ljava/util/function/Supplier;)Lorg/apache/commons/logging/Log;"
@@ -33,26 +55,25 @@ NoSuchMethodError method="java/lang/Class.getLog(Ljava/util/function/Supplier;)L
 `DeferredLogFactory.getLog(Class)` calls `this.getLog(Supplier)` — an overload
 on itself — and the VM took the **argument** as the receiver.
 
-After `7f1b1f263` that signature is gone and a different one is present, so this
-may be a second defect rather than the same one:
+## Separate finding: the code buffer now overflows
 
-* `NullPointerException: Cannot invoke "java.util.Iterator.hasNext()" because "<local5>" is null` (×46)
-* `BindException: Failed to bind properties under 'spring.main.allow-bean-definition-overriding' to boolean` (×44)
-* a flood of `JIT try_patch_i32: offset out of bounds; marking buffer overflowed offset=4094 len=4094`
+The failing runs emit a flood of:
 
-## The buffer overflow is worth chasing separately
+```
+JIT try_patch_i32: offset out of bounds; marking buffer overflowed offset=4094 len=4094
+```
 
-`x64.rs` sizes the code buffer as `ExecutableBuffer::new(estimated_size.max(4096))`
-(~line 22954). Widening the PIC inter-slot branch from `rel8` to `rel32` (part of
-`7f1b1f263`) grew slot bodies, and the estimate no longer covers them.
+`x64.rs` sizes the buffer as `ExecutableBuffer::new(estimated_size.max(4096))`
+(~line 22954). Widening the PIC inter-slot branch from `rel8` to `rel32` (part
+of `7f1b1f263`) grew slot bodies past that estimate.
 
-The overflow path itself is **safe** — it sets `overflowed` and the compile
-driver bails to the interpreter — so this is a silent **de-optimization**, not
-corruption. But it means affected methods quietly stop being compiled at all,
-which will read as an unexplained throughput loss elsewhere. It does not by
-itself explain a null local, so treat it as a separate finding.
+The overflow path is **safe** — it sets `overflowed` and the compile driver
+bails to the interpreter — so this is a silent **de-optimization**, not
+corruption. But affected methods quietly stop being compiled, which will later
+read as an unexplained throughput loss. It does not by itself explain a null
+local, so treat it as its own item.
 
-## What is ruled out
+## Ruled out
 
 * **The Spring Boot checkout.** HotSpot passes the same classpath, and the
   failure reproduces identically against both `C:\craton\CratonVM\apps\spring-boot`
@@ -60,15 +81,6 @@ itself explain a null local, so treat it as a separate finding.
 * **The doc-23 merge.** Still fails with all four opt-outs set at once:
   `CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES=1 CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE=1
   CRATONVM_STRIPED_COUNTERS_OFF=1 CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX=1`.
-* **The direct-call gate**, per the matrix above.
-
-## Window and bisect candidates
-
-`CratonVM-spring-boot-residual-20260728`'s own suite results have this class
-**PASS 26/26 (547 s) on 07-30** and **CRASH on 07-31**. Candidates in that
-window: `86e5122b5` (a slot javac reuses across type categories must get no
-register home), `bb26f2b65` (array receivers dispatch through Object),
-`e2355534d` (a merge dropped three statements from `Op::Call`).
 
 ## Reproduction
 
