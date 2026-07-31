@@ -476,7 +476,9 @@ mod tests {
                 TlsFactoryKind::Socket => (
                     "createSocket",
                     BRIDGED_SSL_SOCKET_FACTORY_OVERLOADS,
-                    &[] as &[&str],
+                    // No `SocketFactory.createSocket` overload is knowingly
+                    // unsupported: all five plaintext ones are bridged.
+                    &[] as &'static [&'static str],
                 ),
                 TlsFactoryKind::ServerSocket => (
                     "createServerSocket",

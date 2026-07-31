@@ -98,9 +98,9 @@ None do yet — the variant is added with no producer, which is why the silent
 1. `jit/src/ir_lower.rs:3850,3858,3878,3889,3909,3916` — every `return
    FrameValue::Undefined` in `frame_value_for_object` must become
    `FrameValue::MaterializationRequired(EliminatedValue::allocation(new_id,
-   info.class_id, cause))` with the cause the bail already knows
-   (`DominanceUnproven` → `ScalarReplacedObject`, the nested-virtual bail →
-   `NestedVirtualObject`, the field bail → `ScalarReplacedObject`).
+   info.class_id, cause))`, picking the cause each bail already knows: the
+   dominance and unresolvable-field bails are `ScalarReplacedObject`, the
+   nested-virtual bail at `:3909` is `NestedVirtualObject`.
 2. `jit/src/ir_lower.rs:3417` — the "no machine location" fallback in
    `frame_value_for`. This one needs care: it fires both for genuinely dead
    values and for values a pass removed, and only the caller knows which. The
@@ -179,6 +179,26 @@ rather than to a plausible-looking wrong value.
 
 Every error names the deopt point (native PC), the scope (depth + method key),
 the bci and the slot — see `SlotRef`.
+
+### Relationship to the VM-side resume verifier
+
+The VM already has a *resume-time* checker behind `CRATONVM_DEOPT_VERIFY`
+(`cratonvm_jit::deopt_verify_enabled`, consumed around
+`vm/src/runtime/interpreter.rs:13885`): it re-checks slot counts against the
+live frame's `max_locals`/`max_stack`, validates virtual-object descriptors, and
+runs an oop-plausibility scan before writing anything into the frame.
+
+The two are complementary and should not be merged:
+
+* the VM one runs **per deopt**, on the reconstructed frame, and can only
+  refuse (fall back to re-run) — by then the artifact is installed and running;
+* this one runs **once per compile**, on the emitted metadata, and can refuse
+  to install at all. It can also check things the VM cannot see: agreement with
+  the oop map, agreement with the set of nodes the optimizer removed, and the
+  sortedness `find_deopt_point` depends on.
+
+They should share an invariant list so a rule added to one is added to the
+other. Today they overlap only on the slot-count check.
 
 ### What it does **not** prove
 

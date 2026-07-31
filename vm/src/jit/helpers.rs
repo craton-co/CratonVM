@@ -23,6 +23,7 @@ use crate::runtime::redefine_state::{
     named_class_was_redefined,
 };
 use crate::threading::jvm_thread::JvmThread;
+use crate::threading::thread_state::{self, ThreadExecState};
 use crate::vm::SharedVm;
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
 
@@ -849,6 +850,21 @@ pub(crate) fn stash_jit_pending_npe_action(code: u8) {
 #[inline]
 pub(crate) fn set_jit_deopt_pending() {
     JIT_SIGNALS.with(|s| s.deopt.set(true));
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // the deopt trap is the `CompiledUninterruptible -> Deoptimizing` edge —
+    // the only tabled way into that state. From here until the interpreter has
+    // materialised the frames, the thread holds `FrameValue` buffers that are
+    // in neither the compiled frame's oop map nor a not-yet-built interpreter
+    // frame, which is exactly what makes the window its own state.
+    //
+    // The window is closed by whichever comes first: the JIT entry pop
+    // (`conservative_roots::leaving_compiled_state`, which resolves
+    // `Deoptimizing` to `JavaRunning` rather than manufacturing an untabled
+    // edge) or the interpreter's own resume sites.
+    thread_state::record_transition(
+        ThreadExecState::Deoptimizing,
+        "jit::helpers::set_jit_deopt_pending",
+    );
 }
 
 /// Read+clear the out-of-band deopt/exception signal. The interpreter's

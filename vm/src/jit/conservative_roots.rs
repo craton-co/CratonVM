@@ -72,6 +72,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use cratonvm_types::ObjectRef;
 
 use crate::memory::vm_heap::VmHeap;
+use crate::threading::thread_state::{self, ThreadExecState};
 
 // ---------------------------------------------------------------------------
 // Thread-local active JIT entry chain
@@ -623,6 +624,15 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         n
     });
     GLOBAL_JIT_DEPTH.fetch_add(1, Ordering::Release);
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // this is the ONLY point at which a thread becomes
+    // `CompiledUninterruptible`. A nested entry re-records the same state,
+    // which the recorder treats as the counting event it is (self-edges are
+    // legal) rather than a transition.
+    thread_state::record_transition(
+        ThreadExecState::CompiledUninterruptible,
+        "jit::conservative_roots::push_entry_full",
+    );
     cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
     // compaction whenever any thread is inside a JIT call. NEW-12's
@@ -647,6 +657,33 @@ pub fn push_jit_entry() -> usize {
     push_jit_entry_at(sp)
 }
 
+/// P1 shadow record — the state a thread leaving one JIT entry lands in, given
+/// the chain length that REMAINS after the pop.
+///
+/// An empty chain means the thread is back in the interpreter
+/// (`CompiledUninterruptible -> JavaRunning`, the tabled edge for
+/// `pop_jit_entry` / `prune_returned_jit_entries`). A non-empty one means an
+/// outer compiled frame is still live, so the thread stays
+/// `CompiledUninterruptible` (a legal self-edge).
+///
+/// The `Deoptimizing` case is the exception, and it is why this is a function
+/// rather than a bare `if`: a deopt trap raised the signal from *inside*
+/// compiled code, and `Deoptimizing`'s only tabled successors are
+/// `JavaRunning` / `VmRunning` — re-recording `CompiledUninterruptible` for a
+/// nested pop would manufacture a violation the code is not actually
+/// committing. The window is closed at the pop instead, which is the last
+/// point this module can observe; the interpreter's own resume sites
+/// (`resume_from_ir_deopt`, `real_frame_deopt_resume_and_despeculate`) then
+/// re-record `JavaRunning` as a no-op self-edge.
+#[inline]
+fn leaving_compiled_state(remaining: usize) -> ThreadExecState {
+    if remaining == 0 || thread_state::current_state() == ThreadExecState::Deoptimizing {
+        ThreadExecState::JavaRunning
+    } else {
+        ThreadExecState::CompiledUninterruptible
+    }
+}
+
 /// Pop the topmost entry off the JIT entry chain.
 ///
 /// Should be called immediately after a JIT call returns, regardless of
@@ -655,15 +692,19 @@ pub fn push_jit_entry() -> usize {
 pub fn pop_jit_entry() -> Option<usize> {
     // Chain mutation = JIT boundary: invalidate the per-thread scan cache.
     note_jit_boundary();
-    let popped = JIT_ENTRY_CHAIN.with(|c| {
+    let (popped, remaining) = JIT_ENTRY_CHAIN.with(|c| {
         let mut v = c.borrow_mut();
         let p = v.pop();
         // Mirror now tracks the entry that became top again.
         reload_top_rbp_cache(&v);
-        p
+        (p, v.len())
     });
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
+        thread_state::record_transition(
+            leaving_compiled_state(remaining),
+            "jit::conservative_roots::pop_jit_entry",
+        );
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
         Some(entry.entry_sp)
@@ -700,6 +741,7 @@ pub fn pop_jit_entry() -> Option<usize> {
 /// still correctly keeps quiescence active and the non-moving sweep
 /// engaged. Returns the number of stale entries reclaimed.
 pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
+    let mut remaining = 0usize;
     let pruned = JIT_ENTRY_CHAIN.with(|c| {
         let mut v = c.borrow_mut();
         let before = v.len();
@@ -729,11 +771,19 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         if pruned > 0 {
             reload_top_rbp_cache(&v);
         }
+        remaining = v.len();
         pruned
     });
     if pruned > 0 {
         // Chain mutation = JIT boundary: invalidate the per-thread scan cache.
         note_jit_boundary();
+        // P1 shadow record: the self-heal is a real (if belated) observation
+        // that those frames have returned — same edge `pop_jit_entry` records,
+        // once for the whole batch.
+        thread_state::record_transition(
+            leaving_compiled_state(remaining),
+            "jit::conservative_roots::prune_returned_jit_entries",
+        );
     }
     for _ in 0..pruned {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);

@@ -7310,6 +7310,97 @@ mod tests {
         assert_eq!(shared.mem.gc_barrier.blocked_count(), 0);
     }
 
+    /// CENSUS-RECONCILE — the IDENTITY-census twin of the test above, and the
+    /// one that fails without the fix.
+    ///
+    /// `host_native_excludes_idle_thread_from_stw` drives `request_stw`, the
+    /// LEGACY path, whose `expected` subtracts the barrier's anonymous
+    /// `threads_blocked` counter — the one thing `host_thread_enter_native`
+    /// always bumped. Production does not use that path: it computes `expected`
+    /// from `alive_count_blocked_and_os_tids` (the `in_blocked_region` identity
+    /// census) via `request_stw_counted_with_live_blocked`
+    /// (`runtime/interpreter.rs`). Before the fix this test observes
+    /// `blocked == 0`, `expected == 1` and a `pending_count()` of 1 — an
+    /// `expected` slot for a thread parked in host code that will never arrive,
+    /// i.e. the hang the primitive exists to prevent, reached through the only
+    /// census production actually consults.
+    ///
+    /// Windows/Linux only: the identity link from a host thread back to its
+    /// registry entry is the published `os_tid`, and `set_os_tid_current` has a
+    /// backend only on those two platforms (see
+    /// `ThreadRegistry::thread_id_for_current_os_tid`).
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn host_native_excludes_idle_thread_from_the_identity_census() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        use std::collections::HashMap;
+        let _guard = PROCESS_VM_TEST_LOCK.lock();
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        set_process_vm(&shared);
+
+        let init = shared.threads.thread_registry.next_thread_id();
+        shared.threads.thread_registry.register(init, "init", None);
+        let coord = shared.threads.thread_registry.next_thread_id();
+        shared
+            .threads
+            .thread_registry
+            .register(coord, "coordinator", None);
+        // THIS OS thread is the coordinator's carrier. Publishing its OS id is
+        // what lets `host_thread_enter_native` name itself to the identity
+        // census; the real creating thread gets the same publication from
+        // `Vm::new` (`vm/src/vm/vm_init.rs`, `set_os_tid_current(ThreadId(0))`).
+        shared.threads.thread_registry.set_os_tid_current(coord);
+        assert!(!is_foreign_attached());
+        assert_eq!(shared.threads.thread_registry.alive_count(), 2);
+
+        assert!(host_thread_enter_native());
+        assert_eq!(shared.mem.gc_barrier.blocked_count(), 1);
+
+        // The production census — NOT the legacy anonymous counter.
+        let (alive, blocked, _tids, blocked_tids) = shared
+            .threads
+            .thread_registry
+            .alive_count_blocked_and_os_tids();
+        assert_eq!(alive, 2);
+        assert_eq!(
+            blocked, 1,
+            "a host-native thread must be visible to the IDENTITY census that \
+             computes `expected`, not only to the anonymous counter",
+        );
+        assert!(
+            blocked_tids.contains(&coord.0),
+            "the excluded identity must be the coordinator's: {blocked_tids:?}",
+        );
+
+        // Same call shape as `runtime/interpreter.rs`'s GC initiator.
+        assert!(shared.mem.gc_barrier.request_stw_counted_with_live_blocked(
+            init,
+            || (alive as u32, blocked as u32, blocked_tids),
+        ));
+        assert_eq!(
+            shared.mem.gc_barrier.pending_count(),
+            0,
+            "the host-native thread must not occupy an `expected` slot it can \
+             never arrive to fill",
+        );
+        shared.mem.gc_barrier.wait_for_all(); // returns immediately — no hang
+        shared.mem.gc_barrier.complete_gc(HashMap::new());
+
+        assert!(host_thread_leave_native());
+        assert_eq!(shared.mem.gc_barrier.blocked_count(), 0);
+        assert!(
+            !shared.threads.thread_registry.is_blocked(coord),
+            "leaving must clear the identity flag too — a thread that resumes \
+             with it raised is excluded from every LATER pause while running",
+        );
+        let (_, blocked_after, _, _) = shared
+            .threads
+            .thread_registry
+            .alive_count_blocked_and_os_tids();
+        assert_eq!(blocked_after, 0, "the census must see the thread running again");
+    }
+
     #[test]
     fn jni_version_constant() {
         assert_eq!(JNI_VERSION_1_8, 0x00010008);

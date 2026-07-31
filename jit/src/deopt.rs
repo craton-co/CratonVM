@@ -1663,7 +1663,27 @@ pub fn restash_last_deopt(frame: ReconstructedFrame) {
 /// `CompiledMethod`), and `rbp` must be the live frame base of the trapping
 /// method. Both are guaranteed by the trampoline that calls this.
 pub extern "C" fn ir_deopt_entry(point: *const DeoptimizationPoint, rbp: u64) -> i64 {
-    // SAFETY: contract documented above.
+    // Checked, not assumed. The contract above says `point` is non-null, but a
+    // deopt trampoline is the worst place in the VM to find out that a
+    // contract was broken: dereferencing null here is UB inside a stub with a
+    // half-torn-down frame. A null pointer instead stashes the identity-less
+    // `bci == u32::MAX` re-run sentinel — the VM resume path rejects that bci
+    // and re-runs the method in the interpreter — so the `i64::MIN` return can
+    // never be mistaken for a legitimate `Long.MIN_VALUE` result.
+    if point.is_null() {
+        LAST_DEOPT.with(|c| {
+            *c.borrow_mut() = Some(ReconstructedFrame {
+                method_key: String::new(),
+                bci: u32::MAX,
+                locals: Vec::new(),
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller_frames: Vec::new(),
+            })
+        });
+        return i64::MIN;
+    }
+    // SAFETY: contract documented above; non-null checked immediately above.
     let point = unsafe { &*point };
     // The IR lowerer keeps every live value in a frame slot, so no register
     // file is needed; a register-allocating backend would spill GPRs/XMMs in
@@ -3414,6 +3434,19 @@ mod deopt_metadata_tests {
             EliminatedValue::unknown(EliminationCause::Unclassified).to_string(),
             "unclassified elimination"
         );
+    }
+
+    /// A null `DeoptimizationPoint` must not be dereferenced inside the
+    /// trampoline: the entry stashes the `u32::MAX` re-run sentinel so the VM
+    /// takes the safe whole-method path and never reads the `i64::MIN` return
+    /// as a legitimate `Long.MIN_VALUE`.
+    #[test]
+    fn ir_deopt_entry_survives_a_null_point() {
+        let _ = take_last_deopt();
+        assert_eq!(ir_deopt_entry(std::ptr::null(), 0), i64::MIN);
+        let frame = take_last_deopt().expect("null point stashes the re-run sentinel");
+        assert_eq!(frame.bci, u32::MAX);
+        assert!(frame.method_key.is_empty());
     }
 
     /// The runtime resolver must not panic on a malformed register descriptor:

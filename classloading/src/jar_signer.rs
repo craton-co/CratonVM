@@ -1303,18 +1303,55 @@ enum PublicKey {
 }
 
 /// Outcome of a public-key signature verification attempt.
+///
+/// # The three-valued contract
+///
+/// This enum exists to keep **"we checked and the answer is no"** distinct
+/// from **"we never checked"**.  Collapsing the two into a `bool` is the
+/// defect this type prevents: at the call site a `false` that means *the
+/// key was unusable* reads identically to a `false` that means *this is a
+/// forgery*, and the second is a security decision while the first is the
+/// absence of one.  See `docs/security/signed-jar-trust.md` §2 and
+/// `docs/security/crypto-failure-contract.md` §1.
+///
+/// | Variant | Meaning | Was a verification performed? |
+/// |---|---|---|
+/// | [`SigVerify::Ok`] | The signature is cryptographically valid under this key. | Yes — positive. |
+/// | [`SigVerify::Bad`] | The signature bytes do not match. **This is a real security decision** (what a forgery looks like). | Yes — negative. |
+/// | [`SigVerify::Unsupported`] | Nothing was verified. | **No.** |
+///
+/// All three are handled explicitly at every call site; `Bad` and
+/// `Unsupported` both refuse, and there is deliberately no `_ =>` arm that
+/// could let a fourth state default into acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SigVerify {
     /// Signature is cryptographically valid.
     Ok,
-    /// Signature did not verify against the key.
+    /// Signature did not verify against the key.  **A genuine negative:**
+    /// the full verification ran and the padded digest did not match.
+    /// Never used for "the input was unusable" — that is
+    /// [`SigVerify::Unsupported`].
     Bad,
-    /// The signature algorithm / key type is recognised in the abstract
-    /// but not verifiable in this build — an EC curve we do not carry
-    /// (P-521 / Brainpool / explicit ECParameters), DSA with an unusual
-    /// digest, or a key/algorithm mismatch.  (RSA, ECDSA P-256/P-384, and
-    /// DSA SHA-1/256 are all verified — see module docs.)  Treated as
-    /// failure by all callers (fail-closed).
+    /// **No verification was performed.**  Covers every reason the check
+    /// could not run:
+    ///
+    ///   * the signature-algorithm OID is not recognised at all;
+    ///   * the algorithm is recognised but the key type / curve is not
+    ///     carried by this build (P-521, Brainpool, explicit
+    ///     `ECParameters`, DSA with a digest other than SHA-1/256, or a
+    ///     key/algorithm family mismatch);
+    ///   * the `SubjectPublicKeyInfo` would not parse;
+    ///   * the crypto backend **rejected the key** — notably an RSA
+    ///     modulus above `RsaPublicKey::MAX_SIZE` (4096 bits), so a
+    ///     *legitimate* 8192-bit signer key lands here rather than being
+    ///     mis-reported as a bad signature;
+    ///   * the signature *encoding* is malformed (wrong length for the
+    ///     modulus, un-decodable DER `SEQUENCE { r, s }`).
+    ///
+    /// (RSA PKCS#1 v1.5 SHA-1/256/384/512, ECDSA P-256/P-384, and DSA
+    /// SHA-1/256 are all really verified — see module docs.)  Treated as
+    /// **not trusted** by every caller, and never conflated with
+    /// [`SigVerify::Bad`].
     Unsupported,
 }
 
