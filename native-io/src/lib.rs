@@ -7693,10 +7693,30 @@ fn native_bb_duplicate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let cap = view.cap;
     let mark = buf_read_mark(ctx, this);
     let dup = alloc_byte_buffer(ctx, cap as usize);
-    let dup_view = bb_storage_view(ctx, dup)?;
-    for i in 0..cap as usize {
-        let b = bb_read_byte(ctx, view, i)?;
-        bb_write_byte(ctx, dup_view, i, b)?;
+    // `duplicate()` SHARES content with the original — "changes to this
+    // buffer's content will be visible in the new buffer, and vice versa"
+    // (java.nio.ByteBuffer). This used to allocate a fresh array and COPY the
+    // bytes into it, so a write through either buffer was invisible to the
+    // other; only the independent position/limit/mark half of the contract
+    // held. Point the duplicate at the original's backing array instead.
+    //
+    // Both spellings are set for the same reason `alloc_byte_buffer` sets
+    // both: real heap-buffer subclasses read `hb`, the synthetic layout reads
+    // slot 0, and `bb_state` prefers `hb` when it resolves.
+    if let Value::Object(Some(shared_array)) = ctx.get_field(this, BB_FIELD_ARRAY) {
+        ctx.set_field(dup, BB_FIELD_ARRAY, Value::Object(Some(shared_array)));
+        ctx.set_field_by_name(dup, "hb", Value::Object(Some(shared_array)));
+    } else if let Value::Object(Some(shared_array)) = ctx.get_field_by_name(this, "hb") {
+        ctx.set_field(dup, BB_FIELD_ARRAY, Value::Object(Some(shared_array)));
+        ctx.set_field_by_name(dup, "hb", Value::Object(Some(shared_array)));
+    } else {
+        // No resolvable backing array (a direct buffer, say): fall back to the
+        // copy so the duplicate is at least readable.
+        let dup_view = bb_storage_view(ctx, dup)?;
+        for i in 0..cap as usize {
+            let b = bb_read_byte(ctx, view, i)?;
+            bb_write_byte(ctx, dup_view, i, b)?;
+        }
     }
     buf_write_metadata(ctx, dup, pos, lim, cap, mark);
     Ok(Some(Value::Object(Some(dup))))
