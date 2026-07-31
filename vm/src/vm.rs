@@ -38640,7 +38640,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(os, Value::Int(32));
+        // PKCS#5 padding ALWAYS adds a block, including when the input is
+        // already a whole number of blocks — 32 bytes of plaintext encrypt to
+        // 48. Expecting 32 assumed padding was skipped on an exact multiple,
+        // which is the one case the scheme is specifically designed to handle
+        // (otherwise the unpadder could not tell padding from data).
+        assert_eq!(os, Value::Int(48));
         let os2 = call_native(
             &shared,
             &mut thread,
@@ -39477,6 +39482,52 @@ mod tests {
         .unwrap()
         .unwrap();
         let cipher_ref = cipher.as_object().unwrap();
+        // A Cipher must be initialised before doFinal: the JDK throws
+        // IllegalStateException("Cipher not initialized") otherwise and so does
+        // CratonVM. This used to call doFinal straight after getInstance and
+        // accept whatever came back — the comment below ("crypto_impl stub
+        // returns Object(None)") records the passthrough stub that made that
+        // work.
+        // A REAL key: `doFinal` needs key material, and a bare
+        // `ClassId::new(0)` object has none ("No key provided"). Generate one
+        // the way a caller would.
+        let kg_algo = create_java_string(&shared, "AES");
+        let kg = call_native(
+            &shared,
+            &mut thread,
+            "javax/crypto/KeyGenerator",
+            "getInstance",
+            "(Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
+            &[Value::Object(Some(kg_algo))],
+        )
+        .unwrap()
+        .unwrap();
+        let kg_ref = kg.as_object().unwrap();
+        let key = call_native(
+            &shared,
+            &mut thread,
+            "javax/crypto/KeyGenerator",
+            "generateKey",
+            "()Ljavax/crypto/SecretKey;",
+            &[Value::Object(Some(kg_ref))],
+        )
+        .unwrap()
+        .unwrap()
+        .as_object()
+        .expect("generateKey must return a SecretKey");
+        call_native(
+            &shared,
+            &mut thread,
+            "javax/crypto/Cipher",
+            "init",
+            "(ILjava/security/Key;)V",
+            &[
+                Value::Object(Some(cipher_ref)),
+                Value::Int(1),
+                Value::Object(Some(key)),
+            ],
+        )
+        .unwrap();
         let input = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
@@ -39496,8 +39547,16 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        // crypto_impl stub returns Object(None) for doFinal
-        assert!(matches!(result, Value::Object(_)));
+        // An initialised AES cipher encrypts the 4-byte input into a padded
+        // block, so doFinal must hand back an actual array.
+        let out = result
+            .as_object()
+            .expect("doFinal on an initialised cipher must return a byte[]");
+        assert_eq!(
+            shared.mem.heap.array_length(out),
+            16,
+            "4 bytes of plaintext pad up to one AES block"
+        );
     }
 
     #[test]
