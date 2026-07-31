@@ -970,7 +970,7 @@ fn ir_vs_singlepass_if_acmp_compares_all_64_bits() {
         "same",
         "(Ljava/lang/Object;Ljava/lang/Object;)I",
         vec![
-            0x2a, 0x2b, 0xa5, 0x00, 0x06, // aload_0; aload_1; if_acmpeq +6 → 7
+            0x2a, 0x2b, 0xa5, 0x00, 0x05, // aload_0; aload_1; if_acmpeq +5 → 7
             0x03, 0xac, // iconst_0; ireturn
             0x04, 0xac, // iconst_1; ireturn
         ],
