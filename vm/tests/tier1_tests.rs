@@ -386,8 +386,25 @@ fn t1_init_complexity_classifier_is_wired_through_jit() {
         ),
         None,
     );
-    // Complex constructor with putfield keeps the ban.
-    let complex = [0x2a, 0x2a, 0x04, 0xb5, 0x00, 0x02, 0xb1];
+    // A Complex constructor keeps the ban. The disqualifier here is
+    // `putstatic`, NOT `putfield`, deliberately: `putfield` is governed by
+    // `CRATONVM_JIT_PUTFIELD_INIT` (default-ON since 2026-07-28, so a
+    // field-storing ctor now classifies Trivial), and this test is about the
+    // classifier being WIRED THROUGH the skip list — it should not also be a
+    // second, stale copy of the gate's semantics. `putstatic` /
+    // `monitorenter` / `monitorexit` / `invokedynamic` are Complex on both
+    // sides of that gate, so this assertion holds whichever way the default
+    // goes.
+    //
+    // Both sides of the `putfield` gate are pinned by
+    // `putfield_only_ctor_follows_the_putfield_gate` and
+    // `the_other_disqualifiers_ignore_the_putfield_gate` in
+    // `vm/src/jit/skip_list.rs`, which can reach the private
+    // `classify_init_complexity_with` and so can test the kill switch without
+    // depending on what this process latched in `allow_putfield_init`'s
+    // `OnceLock`. Do not re-add a gate-dependent assertion here.
+    // iconst_2; putstatic #3; return
+    let complex = [0x05u8, 0xb3, 0x00, 0x03, 0xb1];
     assert_eq!(classify_init_complexity(&complex), InitComplexity::Complex);
     assert!(should_skip_jit_with_init(
         "Foo",
@@ -399,6 +416,31 @@ fn t1_init_complexity_classifier_is_wired_through_jit() {
         InitComplexity::Complex,
     )
     .is_some(),);
+
+    // The `putfield` ctor the previous revision used still classifies — as
+    // Trivial under the current default — and still reaches the skip list.
+    // Keeping it here (rather than deleting it) preserves the end-to-end shape
+    // the test is named for: whatever the classifier says, the skip list acts
+    // on it.
+    // aload_0; aload_0; iconst_1; putfield #2; return
+    let putfield_ctor = [0x2au8, 0x2a, 0x04, 0xb5, 0x00, 0x02, 0xb1];
+    let classified = classify_init_complexity(&putfield_ctor);
+    let banned = should_skip_jit_with_init(
+        "Foo",
+        "<init>",
+        false,
+        true,
+        SkipPolicy::Aggressive,
+        &[],
+        classified,
+    )
+    .is_some();
+    assert_eq!(
+        banned,
+        classified == InitComplexity::Complex,
+        "the skip list must act on whatever the classifier returned \
+         (got {classified:?} for a putfield-only ctor)",
+    );
 }
 
 #[test]
