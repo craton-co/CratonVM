@@ -15303,6 +15303,20 @@ pub fn register_essential_natives_with_shims(
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
+        // Same encapsulation gate the typed `setAccessible` natives apply --
+        // this shorthand variant must not become a way around it.
+        if flag != 0 {
+            if let Err(msg) =
+                lang_class::check_class_loader_define_class_is_encapsulated(ctx, this)
+            {
+                return Err(
+                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
+                        message: msg,
+                    }
+                    .into(),
+                );
+            }
+        }
         ctx.set_field_by_name(this, "override", Value::Int(flag));
         Ok(None)
     }

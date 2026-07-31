@@ -4366,6 +4366,12 @@ fn set_accessible_impl(
 
     // Only the `true` case needs the deep-reflection check.
     if flag != 0 {
+        if let Err(msg) = check_class_loader_define_class_is_encapsulated(ctx, this) {
+            return Err(
+                cratonvm_types::error::RuntimeError::InaccessibleObjectException { message: msg }
+                    .into(),
+            );
+        }
         // Field 0 on Field/Method/Constructor is the declaring-class mirror.
         let declaring_mirror = match ctx.get_field(this, 0) {
             Value::Object(Some(m)) => Some(m),
@@ -4393,6 +4399,96 @@ fn set_accessible_impl(
 
     ctx.set_field(this, flag_field_index, Value::Int(flag));
     Ok(None)
+}
+
+/// `java.base` does not `opens java.lang`, so classpath (unnamed-module) code
+/// cannot `setAccessible(true)` the protected `ClassLoader.defineClass`
+/// overloads. HotSpot enforces this; CratonVM's general module gate cannot,
+/// because classes loaded from the runtime image carry no `module_name` and so
+/// look like the unnamed module to
+/// [`check_deep_reflection_access`] — every `java.lang` target is then an
+/// unnamed→unnamed edge and is allowed.
+///
+/// Populating `module_name` for the whole boot image is the real repair, and it
+/// is a much larger change: it would start denying every `setAccessible` into
+/// `java.lang` that this VM currently permits. This encodes the ONE edge that
+/// has been measured against HotSpot and that demonstrably changes behaviour.
+///
+/// Why it matters. Spring CGLIB's `ReflectUtils` tries, in order: `Lookup
+/// .defineClass` when the requested loader equals the neighbour class's loader;
+/// then the reflective `ClassLoader.defineClass`; then `Lookup.defineClass` on
+/// the neighbour class *even though the loaders differ*. On HotSpot the middle
+/// option is unavailable, so an AOP proxy for a class in another loader lands
+/// in **its superclass's** loader — the same runtime package — and its
+/// package-private overrides really override. CratonVM allowed the middle
+/// option, so the proxy landed in the requested loader instead; a
+/// package-private method then cannot be overridden across the runtime-package
+/// boundary (JVMS 5.4.5), and `invokevirtual` on the proxy silently ran the
+/// superclass body. That is what made `@MockitoSpyBean` stubs vanish behind a
+/// Spring AOP proxy in AOT replay
+/// (`MockitoSpyBeanAndSpringAopProxyIntegrationTests`, 4/4 fail): no
+/// interceptor frame, no Mockito advice, just the real method.
+///
+/// Returns `Err(message)` when the access must be denied. JDK-internal callers
+/// keep their access — this is the same trust rule
+/// `check_reflection_module_access_with_target_id` applies.
+/// `CRATONVM_DBG_SETACC=1` — report who asked to make
+/// `ClassLoader.defineClass` accessible, and whether it was denied.
+fn dbg_set_accessible() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CRATONVM_DBG_SETACC").is_ok())
+}
+
+pub(crate) fn check_class_loader_define_class_is_encapsulated(
+    ctx: &mut dyn NativeContext,
+    accessible_object: ObjectRef,
+) -> Result<(), String> {
+    // Read the declaring class BY NAME: the real-JDK `Method` layout starts
+    // with `AccessibleObject.override`, not with `clazz`, so slot 0 is only the
+    // declaring-class mirror in the synthetic layout.
+    //
+    // Every `setAccessible(true)` in the process reaches this, so the
+    // declaring-class test comes first and nothing else is read until it hits.
+    let declaring = match ctx.get_field_by_name(accessible_object, "clazz") {
+        Value::Object(Some(m)) => Some(m),
+        _ => match ctx.get_field(accessible_object, 0) {
+            Value::Object(Some(m)) => Some(m),
+            _ => None,
+        },
+    };
+    match declaring.and_then(|m| mirror_class_name(ctx, m)).as_deref() {
+        Some("java/lang/ClassLoader") => {}
+        _ => return Ok(()),
+    }
+    let member = match ctx.get_field_by_name(accessible_object, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if member != "defineClass" {
+        return Ok(());
+    }
+    let trace = dbg_set_accessible();
+    // Trust the JDK's own frames, and VM-internal calls with no Java caller.
+    let Some(accessor_cid) = resolve_caller_class_id(ctx) else {
+        return Ok(());
+    };
+    let accessor_name = ctx.class_name_of_id(accessor_cid);
+    let accessor_loader_id = ctx.loader_id_of_class(accessor_cid);
+    if trace {
+        eprintln!(
+            "[setacc] ClassLoader.defineClass requested by {accessor_name:?}              loader={accessor_loader_id}"
+        );
+    }
+    if caller_is_jdk_internal(accessor_name.as_deref(), accessor_loader_id) {
+        return Ok(());
+    }
+    Err(
+        "Unable to make protected final java.lang.Class java.lang.ClassLoader.defineClass(\
+         java.lang.String,byte[],int,int,java.security.ProtectionDomain) throws \
+         java.lang.ClassFormatError accessible: module java.base does not \"opens java.lang\" \
+         to unnamed module"
+            .to_string(),
+    )
 }
 
 /// Field.setAccessible(boolean) вЂ” writes the accessible flag.
