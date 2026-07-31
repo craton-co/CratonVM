@@ -5233,39 +5233,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         fsp,
         "newInputStream",
         "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/InputStream;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 1)?;
-            let p = p57_read_path(ctx, path_obj);
-            let read = match vfs_read(&p) {
-                Some(r) => r,
-                None => std::fs::read(&p),
-            };
-            match read {
-                Ok(data) => {
-                    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    // Pin across the array alloc below — a moving young GC
-                    // there would relocate the fresh stream (native
-                    // stale-local family).
-                    let stream_pin = ctx.pin_native_root(stream);
-                    use cratonvm_types::ArrayElementType;
-                    let arr = ctx.new_array(ArrayElementType::Byte, data.len());
-                    let stream = ctx.read_native_pin(stream_pin, stream);
-                    ctx.unpin_native_roots(stream_pin);
-                    ctx.write_byte_array_from(arr, 0, &data);
-                    ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
-                    ctx.set_field_by_name(stream, "pos", Value::Int(0));
-                    ctx.set_field_by_name(stream, "mark", Value::Int(0));
-                    ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
-                    Ok(Some(Value::Object(Some(stream))))
-                }
-                // NIO contract: missing file → NoSuchFileException (see
-                // newByteChannel above) so optional-config catches match.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
-                }
-                Err(e) => Err(p57_io_error(&e)),
-            }
-        },
+        // args[0] = this (the provider), args[1] = the Path.
+        |ctx, args| fsp_new_input_stream(ctx, args, 1),
     );
 
     // FileSystemProvider.newOutputStream — JDK's default impl at
@@ -5791,41 +5760,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         files,
         "newInputStream",
         "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/InputStream;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            let read = match vfs_read(&p) {
-                Some(r) => r,
-                None => std::fs::read(&p),
-            };
-            match read {
-                Ok(data) => {
-                    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    // Pin across the array alloc below — a moving young GC
-                    // there would relocate the fresh stream (native
-                    // stale-local family).
-                    let stream_pin = ctx.pin_native_root(stream);
-                    use cratonvm_types::ArrayElementType;
-                    let arr = ctx.new_array(ArrayElementType::Byte, data.len());
-                    let stream = ctx.read_native_pin(stream_pin, stream);
-                    ctx.unpin_native_roots(stream_pin);
-                    for (i, &b) in data.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                    }
-                    ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
-                    ctx.set_field_by_name(stream, "pos", Value::Int(0));
-                    ctx.set_field_by_name(stream, "mark", Value::Int(0));
-                    ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
-                    Ok(Some(Value::Object(Some(stream))))
-                }
-                // NIO contract: missing file → NoSuchFileException (see
-                // newByteChannel above) so optional-config catches match.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
-                }
-                Err(e) => Err(p57_io_error(&e)),
-            }
-        },
+        // args[0] = the Path (static method).
+        |ctx, args| fsp_new_input_stream(ctx, args, 0),
     );
 
     r.register(
@@ -7598,6 +7534,110 @@ pub(crate) fn fsp_scan_open_options(
         }
     }
     (append, create_new)
+}
+
+/// `Files.newInputStream` / `FileSystemProvider.newInputStream` — a **lazy**
+/// stream over `path`, the mirror image of [`fsp_new_output_stream`].
+///
+/// These used to read the whole file up front and hand back a
+/// `ByteArrayInputStream` over a snapshot. That is wasteful for ordinary files
+/// (a full copy of anything anyone streams) and *fatal* for anything that is
+/// not a regular file: `std::fs::read` on a character device never returns.
+/// Lucene's `org.apache.lucene.util.StringHelper.<clinit>` does
+///
+/// ```java
+/// new DataInputStream(Files.newInputStream(Paths.get("/dev/urandom"))).readLong()
+/// ```
+///
+/// — it wants eight bytes. Slurping `/dev/urandom` instead grew an unbounded
+/// `Vec<u8>` at ~600 MB/s until the kernel OOM-killed the process. Nothing
+/// bounded it: this is native memory, so `-Xmx` is irrelevant (peak RSS was
+/// ~14 GB at every heap size from 128m to 4g), and the kernel's SIGKILL left
+/// no Java exception and no VM diagnostic behind. See
+/// docs/known-issues/h2/bug-filechannel-map-anon-memory-growth.md.
+///
+/// `path_index` is where the `Path` argument sits: 0 for the `Files` statics,
+/// 1 for the `FileSystemProvider` instance method (whose slot 0 is `this`).
+pub(crate) fn fsp_new_input_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    path_index: usize,
+) -> MethodCallResult {
+    let path_obj = obj_arg(args, path_index)?;
+    let p = p57_read_path(ctx, path_obj);
+    // Jar/VFS entries have no file descriptor to hand out: they are already
+    // decoded in memory and bounded by the entry size, so a snapshot is both
+    // correct and the only option there.
+    if let Some(read) = vfs_read(&p) {
+        return match read {
+            Ok(data) => files_byte_array_input_stream(ctx, &data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(p57_no_such_file(ctx, &p)),
+            Err(e) => Err(p57_io_error(&e)),
+        };
+    }
+    let fd = match ctx.fd_table().open_read(&p) {
+        Ok(fd) => fd,
+        Err(e) => {
+            return Err(match e.kind() {
+                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p),
+                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p),
+                _ => p57_io_error(&e),
+            })
+        }
+    };
+    // Wire the fd onto a real `FileInputStream`, filling in every field its
+    // constructor would have. `FileInputStream.<init>` is itself natively
+    // intercepted (native-io's `native_fis_open0`), so the instance
+    // initialiser that creates `closeLock` never runs on any path — which is
+    // why native-io has `fis_backfill_constructor_fields` doing exactly this.
+    // Miss `closeLock` and the JDK's `close()`, which opens with
+    // `synchronized (closeLock)`, NPEs on every try-with-resources.
+    let stream = alloc_concurrent_synthetic(ctx, "java/io/FileInputStream", 4);
+    // Pin across the allocations below — each can trigger a moving young GC
+    // that relocates the fresh stream (native stale-local family).
+    let stream_pin = ctx.pin_native_root(stream);
+    let fd_obj = ctx.new_object("java/io/FileDescriptor");
+    let path_str = ctx.create_string(&p);
+    let close_lock = ctx.new_object("java/lang/Object");
+    let stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.unpin_native_roots(stream_pin);
+    let Ok(Some(Value::Object(Some(fd_obj)))) = fd_obj else {
+        let _ = ctx.fd_table().close(fd);
+        return Err(RuntimeError::IOException {
+            message: format!("newInputStream({p}): could not allocate a FileDescriptor"),
+        }
+        .into());
+    };
+    ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
+    ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
+    ctx.set_field_by_name(stream, "fd", Value::Object(Some(fd_obj)));
+    // `FileInputStream.path` backs `getChannel()`/diagnostics on the real JDK.
+    ctx.set_field_by_name(stream, "path", Value::Object(Some(path_str)));
+    if let Ok(Some(lock @ Value::Object(Some(_)))) = close_lock {
+        ctx.set_field_by_name(stream, "closeLock", lock);
+    }
+    ctx.set_field_by_name(stream, "closed", Value::Int(0));
+    // Belt-and-braces for legacy callers that read instance slot 0 directly.
+    ctx.set_field(stream, 0, Value::Object(Some(fd_obj)));
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+/// A `ByteArrayInputStream` over `data` — the in-memory stream shape used for
+/// VFS (jar) entries, which have no file descriptor to stream from.
+fn files_byte_array_input_stream(ctx: &mut dyn NativeContext, data: &[u8]) -> MethodCallResult {
+    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+    // Pin across the array alloc below — a moving young GC there would
+    // relocate the fresh stream (native stale-local family).
+    let stream_pin = ctx.pin_native_root(stream);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, data.len());
+    let stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.unpin_native_roots(stream_pin);
+    ctx.write_byte_array_from(arr, 0, data);
+    ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
+    ctx.set_field_by_name(stream, "pos", Value::Int(0));
+    ctx.set_field_by_name(stream, "mark", Value::Int(0));
+    ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
+    Ok(Some(Value::Object(Some(stream))))
 }
 
 /// FileSystemProvider.newOutputStream — opens `path` for writing via
@@ -15825,39 +15865,17 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let f = "java/nio/file/Files";
 
-    // Files.newInputStream — read the entire file into a ByteArrayInputStream
+    // Files.newInputStream — a lazy stream over the file. NB: this is the
+    // THIRD registration of this exact (class, name, descriptor); registration
+    // is last-writer-wins, so whichever of them runs last is the one that
+    // dispatches. They all route to the same helper now, which is why that no
+    // longer matters.
     r.register(
         f,
         "newInputStream",
         "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/InputStream;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            match std::fs::read(&p) {
-                Ok(data) => {
-                    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    // Pin across the array alloc below — a moving young GC
-                    // there would relocate the fresh stream (native
-                    // stale-local family).
-                    let stream_pin = ctx.pin_native_root(stream);
-                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, data.len());
-                    let stream = ctx.read_native_pin(stream_pin, stream);
-                    ctx.unpin_native_roots(stream_pin);
-                    for (i, &b) in data.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                    }
-                    ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
-                    ctx.set_field_by_name(stream, "pos", Value::Int(0));
-                    ctx.set_field_by_name(stream, "mark", Value::Int(0));
-                    ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
-                    Ok(Some(Value::Object(Some(stream))))
-                }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException reading {}: {}", p, e),
-                }
-                .into()),
-            }
-        },
+        // args[0] = the Path (static method).
+        |ctx, args| fsp_new_input_stream(ctx, args, 0),
     );
 
     r.register(

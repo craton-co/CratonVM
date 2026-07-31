@@ -982,6 +982,20 @@ fn safe_native_call_impl(
     };
 
     let result = {
+        // Heap-exhaustion unwind permission. The callback below runs directly
+        // under this `catch_unwind` with no JIT-compiled frame in between, so
+        // the native array/object allocators may unwind from here to surface
+        // the catchable `java.lang.OutOfMemoryError` HotSpot throws instead of
+        // `std::process::abort()`-ing the process. The guard restores the
+        // previous depth on every exit path, unwind included. See
+        // `crate::runtime::native_oom`.
+        struct UnwindOkGuard(u32);
+        impl Drop for UnwindOkGuard {
+            fn drop(&mut self) {
+                crate::runtime::native_oom::restore(self.0);
+            }
+        }
+        let _unwind_ok = UnwindOkGuard(crate::runtime::native_oom::enter_native_call());
         let mut ctx = NativeContextImpl { shared, thread };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             callback(&mut ctx, native_args)
@@ -1137,6 +1151,29 @@ fn safe_native_call_impl(
             thread.native_pin_roots.truncate(pin_base);
             thread.native_pending_return = None;
             let _ = crate::native::jni::take_jni_pending_exception();
+            // Set when the unwind was the allocators' heap-exhaustion signal;
+            // consumed by this arm's tail expression below.
+            let mut return_oom: Option<RuntimeError> = None;
+            // Heap exhaustion raised by the native allocators (see
+            // `crate::runtime::native_oom`): this is a HANDLED condition, not a
+            // native bug. Surface the same catchable `java.lang.OutOfMemoryError`
+            // the interpreter's `gc_alloc_*` slow path raises — the interpreter
+            // materialises `RuntimeError::OutOfMemoryError` as a real
+            // `java/lang/OutOfMemoryError` throwable (falling back to the
+            // pre-allocated `singleton_oom` when the heap is too full to build
+            // one), so application `catch (OutOfMemoryError)` observes it.
+            if let Some(oom) = payload.downcast_ref::<crate::runtime::native_oom::NativeAllocOom>()
+            {
+                // Produced as this arm's value (not an early `return`) so the
+                // funnel's shared return path — pin-watermark truncation, the
+                // `native_pending_return` clear, the unpin ring — still runs.
+                return_oom = Some(RuntimeError::OutOfMemoryError {
+                    message: format!(
+                        "Java heap space (native {} of length {})",
+                        oom.what, oom.length
+                    ),
+                });
+            }
             let msg = if let Some(s) = payload.downcast_ref::<String>() {
                 s.clone()
             } else if let Some(s) = payload.downcast_ref::<&str>() {
@@ -1180,9 +1217,12 @@ fn safe_native_call_impl(
                     top
                 );
             }
-            Err(MethodCallFailed::InternalError(VmError::Internal {
-                message: format!("native method panic: {msg}"),
-            }))
+            match return_oom {
+                Some(oom) => Err(MethodCallFailed::InternalError(VmError::Runtime(oom))),
+                None => Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("native method panic: {msg}"),
+                })),
+            }
         }
     };
 
@@ -2360,6 +2400,33 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
 pub struct NativeContextImpl<'a> {
     pub shared: &'a SharedVm,
     pub thread: &'a mut JvmThread,
+}
+
+impl NativeContextImpl<'_> {
+    /// Terminal object allocation for [`NativeContext::alloc_object`], with the
+    /// heap-exhaustion unwind applied (see `crate::runtime::native_oom`).
+    ///
+    /// `try_alloc_object_full` walks the identical no-GC young -> old-gen spill
+    /// path as the panicking `alloc_object`, so every allocation that fits is
+    /// unchanged; the only divergence is that true double-exhaustion becomes a
+    /// catchable `java.lang.OutOfMemoryError` rather than `abort()`. Outside a
+    /// native callback (JIT helpers construct this context too, and a panic
+    /// cannot cross a compiled frame) the historical abort is retained.
+    #[inline]
+    fn heap_alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+        if crate::runtime::native_oom::unwind_ok() {
+            match self
+                .shared
+                .mem
+                .heap
+                .try_alloc_object_full(class_id, num_fields)
+            {
+                Some(o) => return o,
+                None => crate::runtime::native_oom::raise(num_fields, "object"),
+            }
+        }
+        self.shared.mem.heap.alloc_object(class_id, num_fields)
+    }
 }
 
 /// W1-C (real-JDK, 2026-07-27): run the `UncaughtExceptionHandler` for a
@@ -7788,11 +7855,29 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
-        let array = self
-            .shared
-            .mem
-            .heap
-            .alloc_array(ClassId::new(0), element_type, length);
+        // Caller-sized allocation: when this native is running under
+        // `safe_native_call`'s `catch_unwind` (no JIT frame in between), a
+        // request that neither generation can satisfy raises a catchable
+        // `OutOfMemoryError` instead of aborting the process. The fallible
+        // twin walks the identical young -> old-gen spill path, so a request
+        // that fits behaves byte-for-byte as before. See
+        // `crate::runtime::native_oom`.
+        let array = if crate::runtime::native_oom::unwind_ok() {
+            match self
+                .shared
+                .mem
+                .heap
+                .try_alloc_array_full(ClassId::new(0), element_type, length)
+            {
+                Some(a) => a,
+                None => crate::runtime::native_oom::raise(length, "primitive array"),
+            }
+        } else {
+            self.shared
+                .mem
+                .heap
+                .alloc_array(ClassId::new(0), element_type, length)
+        };
         if crate::runtime::env_cache::disable_jit() && self.shared.mem.heap.needs_gc() {
             self.shared
                 .mem
@@ -7815,11 +7900,22 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 length, frame
             );
         }
-        let array = self
-            .shared
-            .mem
-            .heap
-            .alloc_array(class_id, ArrayElementType::Reference, length);
+        // Same caller-sized-allocation contract as `new_array` above.
+        let array = if crate::runtime::native_oom::unwind_ok() {
+            match self.shared.mem.heap.try_alloc_array_full(
+                class_id,
+                ArrayElementType::Reference,
+                length,
+            ) {
+                Some(a) => a,
+                None => crate::runtime::native_oom::raise(length, "reference array"),
+            }
+        } else {
+            self.shared
+                .mem
+                .heap
+                .alloc_array(class_id, ArrayElementType::Reference, length)
+        };
         if crate::runtime::env_cache::disable_jit() && self.shared.mem.heap.needs_gc() {
             self.shared
                 .mem
@@ -8455,11 +8551,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 let cached = self.shared.classes.anon_class_cache[num_fields]
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if cached != 0 {
-                    return self
-                        .shared
-                        .mem
-                        .heap
-                        .alloc_object(ClassId::new(cached), num_fields);
+                    return self.heap_alloc_object(ClassId::new(cached), num_fields);
                 }
             }
             let name = format!("cratonvm/synthetic/AnonymousObject${num_fields}");
@@ -8644,7 +8736,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 return obj;
             }
         }
-        self.shared.mem.heap.alloc_object(class_id, slots)
+        self.heap_alloc_object(class_id, slots)
     }
 
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
