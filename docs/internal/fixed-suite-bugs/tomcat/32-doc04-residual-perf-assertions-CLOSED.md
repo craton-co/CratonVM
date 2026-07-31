@@ -13,10 +13,10 @@ prediction nobody re-tested.
 
 | item | disposition |
 |---|---|
-| 32.1 | Moved to [jit-raw-jit-to-jit-shadow-stack-overflow](../../../known-issues/jit-raw-jit-to-jit-shadow-stack-overflow-20260731.md) (and its context in [the retired moving-young gate doc](../../jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md)). Cause 1 fixed 07-30; the entire residual is the raw JIT-to-JIT direct-call edge, whose gate stays closed. No Tomcat work. |
+| 32.1 | Moved to [jit-raw-jit-to-jit-shadow-stack-overflow](../../jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md) (and its context in [the retired moving-young gate doc](../../jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md)). Cause 1 fixed 07-30; the entire residual is the raw JIT-to-JIT direct-call edge, whose gate stays closed. No Tomcat work. |
 | 32.2 | ✅ **Not a defect, and now confirmed on a LOADED host** — the harder condition, not the easier one. |
-| 32.3 | ✅ **Real defect found and FIXED** (`9f7095ed9`): the bulk `ByteBuffer` natives copied one byte per accessor call. SEQ0 and SEQ1 close. The SEQ2 residual is general Java throughput, measured, and moves to [30](../../../known-issues/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md). |
-| 32.4 | Moved to [30](../../../known-issues/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md), which the 07-30 revision already argued for and then did not act on. |
+| 32.3 | ✅ **Real defect found and FIXED** (`9f7095ed9`): the bulk `ByteBuffer` natives copied one byte per accessor call. SEQ0 and SEQ1 close. The SEQ2 residual is general Java throughput, measured, and moves to [30](30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md). |
+| 32.4 | Moved to [30](30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md), which the 07-30 revision already argued for and then did not act on. |
 
 HotSpot reference for all four, same host, same fixture: all PASS.
 
@@ -99,7 +99,7 @@ prediction.
 
 Reopening that edge is not a Tomcat decision, and as of dev `cac4cbac0` it has
 its own document:
-[jit-raw-jit-to-jit-shadow-stack-overflow-20260731](../../../known-issues/jit-raw-jit-to-jit-shadow-stack-overflow-20260731.md).
+[jit-raw-jit-to-jit-shadow-stack-overflow-20260731](../../jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md).
 Note that document **supersedes the reclaimed-root hypothesis** this item was
 originally reasoned about — measured, the root scan behaves correctly and
 diverts to the non-moving sweep; what actually fails is a shadow-stack push

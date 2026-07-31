@@ -8,11 +8,15 @@ The thread-scaling wall the previous status described is fixed: the class goes
 from not finishing inside a 300s per-class timeout to a completed 154s run, and
 at its own parameters the three arms are 3.7x / 2.6x / 5.9x faster. What is
 left is not a charset-cache problem, not a dispatch problem and not a scaling
-problem — it is the ~630 ns marginal cost of **any call the JIT does not
-inline**, where HotSpot inlines the same calls and pays ~0. The test compares
-one arm that makes one such call against two arms that make two, so it cannot
-pass until that floor comes down. The arithmetic is in *What the test actually
-needs now*.
+problem — it is the flat cost of a Java call in compiled code, and **that has
+since been traced to a single gate**: `direct_jit_callee_calls_enabled()`
+returns false whenever moving-young is on, which is the default, so every call
+site in every compiled body falls through to the generic dispatch helper.
+Opening it in the same binary takes `invokestatic` from 94.9 to 5.6 ns/op. The
+test compares one arm that makes one call against two arms that make two, so it
+cannot pass until that gate can be reopened safely. See
+`../jit-direct-call-gate-closed-by-moving-young-is-the-call-floor.md`; the
+arithmetic is in *What the test actually needs now*.
 
 Everything between here and that section is kept as the record of how the
 earlier layers were peeled off. Several of its conclusions were corrected
@@ -993,12 +997,25 @@ should be closed by that work, not by more work on this test.
 
 Ranked next steps, with the evidence for each:
 
-1. **The per-call floor** (~630 ns/op marginal at one thread). `String.length()`
-   in `NativeCallCostProbe` is the cheapest possible target — three bytecodes,
-   no native, no charset fixture — and HotSpot spends ~0 on it because it
-   inlines it. Worth roughly 2x on both cached arms and only 1x on the control,
-   which is exactly the direction this test needs; it is what closes this
-   document.
+1. **The per-call floor — now traced to one gate.**
+   `direct_jit_callee_calls_enabled()` is false under moving-young (the
+   default), so the JIT plans no direct calls at all and every call site takes
+   the `jit_invoke_dispatch` helper. `probes/CallFloorProbe.java` on the same
+   binary: `invokestatic` 94.9 ns/op with the gate closed, **5.6** with
+   `CRATONVM_JIT_DIRECT_CALLEE_CALLS=force`; virtual and interface 149 → 37;
+   the call-free control unmoved at 1.6. Worth roughly 2x on both cached arms
+   and only 1x on the control, which is exactly the direction this test needs.
+   Reopening it requires making an unguarded callee frame describable to the
+   root scan — written up, with the design and the acceptance gate, in
+   `../jit-direct-call-gate-closed-by-moving-young-is-the-call-floor.md`.
+
+   **The ~630 ns figure this document previously quoted was inflated by its own
+   harness** — `NativeCallCostProbe`'s timing loop sits inside a lambda invoked
+   on a freshly started thread, which raises every rung roughly uniformly (its
+   call-free baseline reads 122 ns/op where a plain compiled loop reads 1.6).
+   Use `CallFloorProbe`, which runs each body both as one long OSR loop and as
+   many short invocation-compiled ones; the two columns agreeing is what rules
+   out OSR code quality before anything else.
 2. **`ConcurrentHashMap.get` versus `HashMap.get`.**
    `probes/ChmVsHashMapProbe.java` reaches one warm map through four declared
    types, because the thin direct helper is selected by the call site's

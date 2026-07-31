@@ -6613,12 +6613,19 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     if uses_native_hashtable_layout(ctx, this) {
-        // GC-safety: `alloc_ref_array` can complete a moving young GC and
-        // `this` is a bare local (`safe_native_call`'s pin keeps the receiver
-        // alive but does not rewrite this copy). See `rooted_across`.
-        let (this, buckets) =
-            rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY));
+        // GC-safety: `alloc_ref_array` is a collection point and `this` is a
+        // bare local, so every store below must use a re-read reference.
+        let this_pin = ctx.pin_native_root(this);
+        let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+        let buckets_pin = ctx.pin_native_root(buckets);
+        let this = ctx.read_native_pin(this_pin, this);
+        let buckets = ctx.read_native_pin(buckets_pin, buckets);
         ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        // Refresh before reusing. (The store above is NOT itself a GC point —
+        // see the `map_resize_inner` note; the refresh is kept as cheap
+        // store-boundary discipline, not because the barrier can collect.)
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
         set_map_size(ctx, this, 0);
         let cname = ctx
             .class_name_of_id(ctx.class_id_of_object(this))
@@ -6638,10 +6645,23 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         HM_INT_FAST_LAST_KEY.with(|cache| cache.set(None));
     }
     // Legacy synthetic layout — what every other native HashMap op expects.
-    // GC-safety: see the Hashtable arm above; `this` must survive the alloc.
-    let (this, buckets) =
-        rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY));
+    // GC-safety: same hazard as the Hashtable branch above — `alloc_ref_array`
+    // can collect, and every field store from here on uses `this`.
+    // NOTE (HIB-MAPRESIZE-STALE.1): the pins below stay live across the whole
+    // store sequence, but NOT for the reason originally given here. A
+    // reference-typed store is not a GC point: `gen_heap::write_barrier`
+    // bails out on a non-cross-generational store and otherwise pushes an
+    // offset into a per-mutator Rust buffer — it never allocates from the
+    // Java heap. The real hazard is the ALLOCATION above; holding the pins
+    // through the stores is harmless and keeps every store using a re-read
+    // reference.
+    let this_pin = ctx.pin_native_root(this);
+    let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+    let buckets_pin = ctx.pin_native_root(buckets);
+    let this = ctx.read_native_pin(this_pin, this);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    let this = ctx.read_native_pin(this_pin, this);
     set_map_size(ctx, this, 0);
     // S111r29: Resolve the JDK `table` slot (descriptor `[Ljava/util/HashMap$Node;`)
     // and store the bucket array there. Writing `Int(MAP_DEFAULT_CAPACITY)` to
@@ -6657,9 +6677,13 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
     if let Some(slot) = table_slot {
         if slot < ctx.object_num_fields(this) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let buckets = ctx.read_native_pin(buckets_pin, buckets);
             ctx.set_field(this, slot, Value::Object(Some(buckets)));
         }
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     if table_slot != Some(MAP_FIELD_CAPACITY) {
         ctx.set_field(
             this,
@@ -6715,10 +6739,27 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // sizes the table lazily, so `new HashMap(Integer.MAX_VALUE)` must not
     // abort); `cap` is rebound to the actually-allocated size so the JDK
     // `threshold`/`__capacity` fields below stay consistent with the table.
-    // GC-safety: `alloc_bucket_table` allocates, so `this` (a bare local, see
-    // `rooted_across`) must be re-read afterwards — every write below targets it.
-    let (this, (buckets, cap)) = rooted_across1(ctx, this, |ctx| alloc_bucket_table(ctx, cap));
+    // GC-safety: `lhm_init_with_cap` pins `this` across the identical
+    // `alloc_bucket_table` call (confirmed live under CRATONVM_DBG_STALE_OBJREF
+    // during WildFly parallel-extension-add); the plain-HashMap constructor —
+    // which is what `new HashSet<>(...)`'s backing map goes through — never
+    // got the same treatment, so the bucket-array store below could land on a
+    // stale receiver and leave the fresh map with no table at all.
+    // NOTE (HIB-MAPRESIZE-STALE.1): the pins below stay live across the whole
+    // store sequence, but NOT for the reason originally given here. A
+    // reference-typed store is not a GC point: `gen_heap::write_barrier`
+    // bails out on a non-cross-generational store and otherwise pushes an
+    // offset into a per-mutator Rust buffer — it never allocates from the
+    // Java heap. The real hazard is the ALLOCATION above; holding the pins
+    // through the stores is harmless and keeps every store using a re-read
+    // reference.
+    let this_pin = ctx.pin_native_root(this);
+    let (buckets, cap) = alloc_bucket_table(ctx, cap);
+    let buckets_pin = ctx.pin_native_root(buckets);
+    let this = ctx.read_native_pin(this_pin, this);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    let this = ctx.read_native_pin(this_pin, this);
     set_map_size(ctx, this, 0);
     // S111r29: see `native_map_init` for rationale. Mirror the bucket array
     // into the JDK `table` slot so `HashMap.resize()` bytecode sees an array
@@ -6727,9 +6768,13 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
     if let Some(slot) = table_slot {
         if slot < ctx.object_num_fields(this) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let buckets = ctx.read_native_pin(buckets_pin, buckets);
             ctx.set_field(this, slot, Value::Object(Some(buckets)));
         }
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     if table_slot != Some(MAP_FIELD_CAPACITY) {
         ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     }
@@ -10422,19 +10467,22 @@ fn alloc_hs_backing(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) ->
         let total = ctx.class_num_total_fields(cid);
         let n = std::cmp::max(total, MAP_NUM_FIELDS);
         let m = ctx.alloc_object(cid, n);
-        // GC-safety: the initialiser allocates the bucket table, so `m` must be
-        // re-read through a pin before it is handed back — the caller stores it
-        // into a field and would otherwise publish a pre-move address.
-        let (m, ()) = rooted_across1(ctx, m, |ctx| {
-            lhm_init_with_cap(ctx, m, cap.max(MAP_DEFAULT_CAPACITY))
-        });
+        // The freshly allocated backing map is referenced ONLY by this local
+        // until the caller stores it into the set's `map` field. Pin it across
+        // the initializer (which allocates the bucket table): a moving cycle
+        // would relocate it, and a non-moving sweep cannot even see it as live,
+        // so the returned reference could name reclaimed-and-reused memory.
+        let m_pin = ctx.pin_native_root(m);
+        lhm_init_with_cap(ctx, m, cap.max(MAP_DEFAULT_CAPACITY));
+        let m = ctx.read_native_pin(m_pin, m);
+        ctx.unpin_native_roots(m_pin);
         m
     } else {
         let m = alloc_backing_map(ctx);
-        let (m, ()) = rooted_across1(ctx, m, |ctx| {
-            let _ =
-                native_map_init_capacity(ctx, &[Value::Object(Some(m)), Value::Int(cap as i32)]);
-        });
+        let m_pin = ctx.pin_native_root(m);
+        let _ = native_map_init_capacity(ctx, &[Value::Object(Some(m)), Value::Int(cap as i32)]);
+        let m = ctx.read_native_pin(m_pin, m);
+        ctx.unpin_native_roots(m_pin);
         m
     }
 }
@@ -10444,12 +10492,13 @@ fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    // GC-safety: `alloc_hs_backing` allocates (twice), so `this` must be
-    // re-read before the field write — see `rooted_across`.
-    let (this, backing) = rooted_across1(ctx, this, |ctx| {
-        alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY)
-    });
+    // `alloc_hs_backing` allocates and can therefore move `this`; the field
+    // store below would otherwise land on a from-space address.
+    let this_pin = ctx.pin_native_root(this);
+    let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -10462,9 +10511,12 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(c)) if *c > 0 => *c as usize,
         _ => MAP_DEFAULT_CAPACITY,
     };
-    // GC-safety: see `native_hs_init`.
-    let (this, backing) = rooted_across1(ctx, this, |ctx| alloc_hs_backing(ctx, this, cap));
+    // Same allocation-moves-`this` hazard as `native_hs_init`.
+    let this_pin = ctx.pin_native_root(this);
+    let backing = alloc_hs_backing(ctx, this, cap);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -24618,6 +24670,20 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
     // backing alloc moves `this`, and every native_map_put below re-enters Java
     // (hashCode/equals, possible resize) moving `backing` + pending elems.
+    //
+    // `source` must be rooted BEFORE `alloc_hs_backing` too. That allocation is
+    // GC-capable, and `source` is a raw `args` value that is next dereferenced
+    // AFTER it, by `collect_collection_elements_or_real` below — a moving young
+    // GC in between leaves it pointing into from-space, so `new HashSet<>(coll)`
+    // reads its elements out of a dead (possibly already reused) object. This is
+    // the same hazard `native_map_init_from_map` guards with its `source_pin`
+    // (added after the live `NoSuchMethodError java/lang/Object.entrySet()`
+    // capture from `new HashMap<>(children)` during WildFly
+    // `parallel-extension-add`) and `native_al_init_from_collection` guards with
+    // its `src_pin`; the HashSet constructor was the one member of the family
+    // that never got it, and `new HashSet<>(Arrays.asList(...))` is on exactly
+    // that WildFly boot path.
+    let source_pin = ctx.pin_native_root(source);
     let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     let backing_pin = ctx.pin_native_root(backing);
@@ -24634,6 +24700,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // `Collections.unmodifiableList(arrayList)`) silently produced an
     // empty set — wiping every auto-configuration before filtering and
     // surfacing as `MissingWebServerFactoryBeanException` at boot.
+    let source = ctx.read_native_pin(source_pin, source);
     let elems = collect_collection_elements_or_real(ctx, source);
     let (_, elem_handles) = pin_value_slice(ctx, &elems);
     let sentinel = Value::Int(1);
@@ -24641,12 +24708,12 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
         let backing = ctx.read_native_pin(backing_pin, backing);
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
         if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel]) {
-            ctx.unpin_native_roots(this_pin);
+            ctx.unpin_native_roots(source_pin);
             return Err(e);
         }
     }
 
-    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(source_pin);
     Ok(None)
 }
 
