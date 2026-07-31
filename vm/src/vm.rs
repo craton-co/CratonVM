@@ -4696,9 +4696,21 @@ mod tests {
             &Value::Object(None),
             &Value::Object(None)
         ));
-        // Different types should not be equal
-        assert!(!super::values_equal_for_cas(
+        // Cross-tag primitives compare by bit pattern (T19_H6): the
+        // field-descriptor cache can report `I` for what is really a `J`
+        // slot, so a zero-extended Int must match the equivalent Long or
+        // CAS loops on such a field livelock. See the doc comment on
+        // `value_as_u64_bits`.
+        assert!(super::values_equal_for_cas(
             &Value::Int(42),
+            &Value::Long(42)
+        ));
+        // A reference is never equal to a primitive, though — the bit-pattern
+        // arm must not reach Object.
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        assert!(!super::values_equal_for_cas(
+            &Value::Object(Some(obj)),
             &Value::Long(42)
         ));
     }
