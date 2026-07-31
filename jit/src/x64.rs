@@ -1580,9 +1580,28 @@ impl Compiler {
         // the MIC/PIC cascade, allocation helpers, checkcast/instanceof) sit
         // in caller-saved/argument registers, which the callee-saved-only
         // spill never covers.
-        let precise_implies_reg_spill = precise_maps && !precise_reg_spill_disabled();
-        let safepoint_reg_spill = safepoint_reg_spill_enabled() || precise_implies_reg_spill;
-        let safepoint_reg_spill_all = safepoint_reg_spill_all() || precise_implies_reg_spill;
+        //
+        // 2026-07-31: this used to read `precise_maps && !…`, and `precise_maps`
+        // is `precise_jit_maps_enabled() || moving_young_enabled()`. So a
+        // ROOT-VISIBILITY mechanism was on only because moving-young defaults
+        // on, and `CRATONVM_NO_MOVING_YOUNG=1` silently withdrew it — together
+        // with the scratch flush in `emit_pre_safepoint_spill_impl` and shadow
+        // publication, all three keyed on the same flag. Each exists so the
+        // conservative scan can SEE a register-resident oop across a
+        // GC-capable call; none of them is moving-specific, and each was added
+        // to fix a real reclaimed-root crash. With all three gone at once the
+        // opt-out lane faulted on a zeroed heap slot within seconds of real
+        // work — Hibernate `ZonedDateTimeTest` / `OffsetDateTimeTest` (1–3 s,
+        // reproduced on a pristine dev build) and the Windows
+        // `DateSymbolsProbe` repro. See
+        // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+        //
+        // Keyed on its own opt-out alone, the DEFAULT path is byte-identical
+        // (`precise_reg_spill_disabled()` is opt-in and unset), and the
+        // non-moving lane gets the visibility the default lane already had.
+        let reg_spill_for_root_visibility = !precise_reg_spill_disabled();
+        let safepoint_reg_spill = safepoint_reg_spill_enabled() || reg_spill_for_root_visibility;
+        let safepoint_reg_spill_all = safepoint_reg_spill_all() || reg_spill_for_root_visibility;
         let safepoint_reg_spill_nostore = safepoint_reg_spill_nostore();
         // Register-only operand-stack-oop soundness (DEFAULT ON): flush
         // `CalleeSaved` operand-stack reference entries in `flush_scratch_
@@ -3000,10 +3019,24 @@ impl Compiler {
         // no-change; see `shadow_stack_maps_enabled`), which leaves this and
         // the self-call spill-elision proof.
         //
-        // The non-moving path has never called this and is the historically
-        // correct configuration, so `0` returns to known-good codegen rather
-        // than inventing a new one. Kept default-ON until measured on a quiet
-        // host — the box had eight other sessions' VMs running when this landed.
+        // The lever question is answered: measured on `BinTreesClassic 18`
+        // @512m, five interleaved reps, `CRATONVM_JIT_MY_SCRATCH_FLUSH=0`
+        // moves nothing (median 4117 ms against a 4281 ms default, ranges
+        // overlapping in both directions), so this is NOT the `type.temporal`
+        // residual it was added to bisect.
+        //
+        // TRIED AND REVERTED 2026-07-31: dropping the `moving_young_enabled()`
+        // term, so the flush also runs in the non-moving lane where nothing
+        // else spills a caller-saved scratch oop. It is a plausible root-
+        // visibility fix and it made things WORSE — the
+        // `CRATONVM_NO_MOVING_YOUNG=1 CRATONVM_SHADOW_STACK=1` lane turned a
+        // clean run into a deterministic SIGILL (2/2), where the same lane on
+        // the same tree without this change runs clean (2/2). Calling it here
+        // reserves spill slots and rewrites `self.stack` at a point the
+        // non-precise frame layout did not budget for. Whoever revisits the
+        // non-moving lane's root visibility should start from the shadow
+        // publication instead — see
+        // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
         if moving_young_enabled() && scratch_flush_at_safepoint_enabled() {
             self.flush_scratch_registers();
         }
@@ -37207,7 +37240,7 @@ mod flag_and_header_contracts {
     /// moving-young for the whole process as soon as any compiled code exists.
     /// The optimizing tier must therefore NOT be disabled by the moving-young
     /// default — that trade bought nothing. Pins the regression that
-    /// `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+    /// `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`
     /// describes.
     #[test]
     fn optimizing_tier_is_not_disabled_while_relocation_is_vetoed() {
@@ -37225,23 +37258,34 @@ mod flag_and_header_contracts {
 
     /// `CRATONVM_SHADOW_STACK` is likewise read by `jit`, `gc` and `vm`; the
     /// emission side and the root-scan side must agree or the collector walks
-    /// a shadow stack the codegen never pushed to. Moving-young implies it.
+    /// a shadow stack the codegen never pushed to.
     ///
-    /// Deliberately still the BARE flag, not the relocation-scoped predicate:
-    /// scoping it was tried, measured as no-change, and reverted rather than
-    /// move one side of an exact agreement for nothing. See
-    /// `shadow_stack_maps_enabled`.
+    /// The moving-young implication is GONE (2026-07-31): publication is how a
+    /// JIT frame's live references reach the collector at all, so keying it on
+    /// the collector choice made `CRATONVM_NO_MOVING_YOUNG=1` withdraw root
+    /// visibility — that lane crashed on a reclaimed root within seconds. The
+    /// assertion below is what stops it coming back, and it also pins the two
+    /// sides to one expression.
     #[test]
-    fn shadow_stack_maps_enabled_is_central_flag_or_moving_young() {
+    fn shadow_stack_maps_enabled_does_not_depend_on_the_young_collector() {
         assert_eq!(
             shadow_stack_maps_enabled(),
             cratonvm_types::flags().jit.shadow_stack
-                || (moving_young_enabled() && shadow_emission_moving_implication_enabled()),
-            "shadow-stack codegen must be gated on the shared flag plus the moving-young \
-             implication (itself bisectable via CRATONVM_JIT_MY_SHADOW_EMISSION), not on a \
-             crate-private getenv. `vm::jit::conservative_roots::shadow_stack_enabled` must \
-             spell the SAME expression — they are two halves of one agreement"
+                || shadow_emission_moving_implication_enabled(),
+            "shadow-stack codegen must be gated on the shared flag plus its own opt-out \
+             (CRATONVM_JIT_MY_SHADOW_EMISSION), NOT on the young collector: root \
+             publication is not a property of which collector runs. \
+             `vm::jit::conservative_roots::shadow_stack_enabled` must spell the SAME \
+             expression — they are two halves of one agreement"
         );
+        // The property that actually matters, stated directly: turning the
+        // moving young generation off must not turn publication off with it.
+        crate::x64::set_moving_young_override(Some(false));
+        assert!(
+            shadow_stack_maps_enabled(),
+            "publication must survive CRATONVM_NO_MOVING_YOUNG=1"
+        );
+        crate::x64::set_moving_young_override(None);
     }
 
     /// Source-scan regression guard. Needles are assembled at runtime so this

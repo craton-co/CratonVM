@@ -391,6 +391,16 @@ impl_curve_scalar_mul!(scalar_mul_p256, p256, 32);
 impl_curve_scalar_mul!(scalar_mul_p384, p384, 48);
 impl_curve_scalar_mul!(scalar_mul_p521, p521, 66);
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Same structural hazard as
+// `sunec_intpoly`: the single registration below carries no category and
+// inherits `Intrinsic` from its ONE caller in `native-builtins/src/lib.rs`.
+// Unlike `sunec_intpoly` the equivalence claim here is weaker — the comment at
+// the call site describes this as a *coarse* scalar-multiply that bypasses the
+// JDK's generator-table precompute, i.e. a different algorithm reaching the
+// same point. Under jdk-only-native-review.md §4 that is an intrinsic only if
+// exception ordering and side effects match on every path; nothing in-repo
+// proves that. Additionally `gate_enabled()` means the registration may not
+// happen at all, so a source census cannot see it — only `invocations` can.
 /// Register the coarse native EC scalar-multiply (P-256/384/521). Active when
 /// EC is routed real (`gate_enabled`: `route_ec_to_real` default, or the
 /// `CRATONVM_NATIVE_EC_MULTIPLY` env force-on).

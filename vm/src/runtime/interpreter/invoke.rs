@@ -6943,6 +6943,23 @@ pub(crate) fn is_undertow_native_override(
     )
 }
 
+/// JDK-ONLY-WAVE2: the warm-path force-native gate — roughly 55 hard-coded
+/// class/method/descriptor branches, every one of them a statement that
+/// CratonVM's native beats the real JDK's concrete bytecode. Under contract
+/// §1.4 that is exactly the thing `--jdk-only` exists to abolish: a `Bridge` or
+/// `SyntheticStub` may not shadow real bytes, and a genuine `Intrinsic` needs
+/// no name list because `resolve_dispatch` step 2 already takes it.
+///
+/// What must replace this function: **nothing**. Under `--jdk-only` every
+/// branch is dead, because `resolve_dispatch` step 3 returns `Bytecode` for a
+/// method that has `Code`. Under `Compatible` the branches are load-bearing for
+/// real boots today, so they come out family by family with their own
+/// verification, not in one sweep.
+///
+/// Two branches below carry their own markers because they cannot be removed on
+/// their own: the `java/lang/String` exclusion (paired with the positive form in
+/// `vm/src/vm/vm_exec.rs`'s `check_override`) and the `ThreadPoolExecutor`
+/// family.
 pub(super) fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -7277,6 +7294,22 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // JDK-ONLY-WAVE2: the forced-native `java/lang/String` policy, INVERTED-
+    // EXCLUSION form. Read it as: for `java/lang/String`, ONLY these seven
+    // shapes may go on to force a native; every other String method returns
+    // `false` right here and runs real bytecode.
+    //
+    // Its twin is the POSITIVE, 21-method `java/lang/String` arm of
+    // `check_override` in `vm/src/vm/vm_exec.rs::invoke_on_class_shared_inner`.
+    // This one governs the WARM path (memoized force-native gate); that one
+    // governs the COLD path (first call at a site). THE TWO MUST BE DELETED
+    // TOGETHER: drop either alone and cold and warm dispatch disagree about
+    // which implementation of `String.equals`/`hashCode`/`substring` runs, so
+    // a String method's observable behaviour starts depending on how many times
+    // its call site has executed — the precise class of JIT-state-dependent bug
+    // §7 centralisation exists to prevent. What must replace both: nothing;
+    // `String`'s natives are registered as `Intrinsic` and
+    // `resolve_dispatch` step 2 takes them on kind alone, with no name list.
     if class_name == "java/lang/String"
         && !matches!(
             (method_name, method_descriptor),
@@ -9482,6 +9515,33 @@ pub(crate) fn is_string_builder_layout_native_override(
     method_name == "substring" && method_descriptor == "(II)Ljava/lang/String;"
 }
 
+/// The layout-incompatible natives, for the invoke-cache dispatch sites.
+///
+/// These sites must not use `redefine_immune_forced_native`. Broadening them to
+/// the full set — which additionally covers reflection metadata, JFR, BC crypto,
+/// StampedLock and FileHandler — was measured on 2026-07-31 and **regressed**
+/// ByteBuddy type creation: Spring AOT chunk 3 started failing roughly one run
+/// in eight with `NoSuchMethodError: java.lang.Integer.isArray()Z` /
+/// `Integer.represents(Type)Z` out of
+/// `TypeDescription$Generic$Visitor$Substitutor`, a signature that appears in no
+/// pre-change log across three full sweeps. 9/9 clean on the unmodified binary
+/// under the same harness, 8/9 with the broadening. Those extra arms exist for
+/// the *slow* path and are not safe to assert here.
+///
+/// What every member of this set has in common is narrower and checkable: the
+/// receiver's real JDK body indexes a field layout CratonVM's object does not
+/// have, so running it can only produce nonsense — whatever else is true about
+/// the class.
+pub(super) fn redefine_immune_layout_native(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
+        || redefine_immune_path_native(class_name, method_name, method_descriptor)
+        || redefine_immune_synthetic_collection_native(class_name)
+}
+
 pub(super) fn redefine_immune_string_builder_native(
     class_name: &str,
     method_name: &str,
@@ -9614,6 +9674,15 @@ pub(crate) fn is_datagram_channel_open_native_override(
                 && method_name == "openDatagramChannel"))
 }
 
+/// The full immunity set, for the slow dispatch path.
+///
+/// The invoke-cache sites deliberately use the narrower
+/// `redefine_immune_layout_native` instead — see the note there for the
+/// measurement that says why. What both must share is the layout arm: when the
+/// 2026-07-31 collections entry was added here only, the collection probe went
+/// from 32 broken operations to 18 rather than to 0, because the cache sites
+/// re-assembled their own chain and never saw it.
+/// `layout_immunity_is_not_open_coded` keeps the two in step.
 pub(super) fn redefine_immune_forced_native(
     class_name: &str,
     method_name: &str,
@@ -9642,6 +9711,59 @@ pub(super) fn redefine_immune_forced_native(
                 method_name,
                 "<init>" | "publish" | "flush" | "close"
             ))
+        || redefine_immune_synthetic_collection_native(class_name)
+}
+
+/// CratonVM implements these collections as small synthetic objects — a bucket
+/// array plus a size, not the JDK's `table`/`root`/`head` field graph — and
+/// every operation on them is a registered native. Their real JDK bodies can
+/// therefore NEVER run correctly against an instance CratonVM built, whatever
+/// the circumstances.
+///
+/// That makes them unconditionally immune: a redefinition drops native shadows
+/// so an agent's woven bytecode can run, which is right for an ordinary class
+/// and catastrophic here. `RedefineCollectionLayoutProbe` measured the damage
+/// before this gate existed — **32 of 89 operations** changed behaviour after
+/// redefining these classes with their OWN bytes, and the worst of them are
+/// silent:
+///
+/// ```text
+/// TreeMap.get               v7  -> null
+/// TreeMap.containsKey       true -> false
+/// ConcurrentHashMap.get     v7  -> null
+/// ConcurrentHashMap.size    12  -> 0
+/// ConcurrentHashMap.isEmpty false -> true
+/// HashMap.keySet            [k0..k11] -> []
+/// ```
+///
+/// The rest throw — `LinkedHashMap$Node.getKey` NoSuchMethodError,
+/// `AnonymousObject$4 cannot be cast to Map$Entry`, `TreeSet` NPEs on a null
+/// `this.m`. One `Mockito.mock()` anywhere in the process was enough to arm it,
+/// which is how it reached Spring's AOT run: `AnnotationAttributes` extends
+/// `LinkedHashMap`, and its `keySet()` NPE'd.
+///
+/// Unlike the StringBuilder list above, this is class-wide rather than
+/// method-wise. There is no analogue of `length()`/`substring(int)` here — no
+/// suite stubs a method on a mocked JDK collection, and the cost of being wrong
+/// in that direction (one un-stubbed mock) is far below the cost of being wrong
+/// in the other (silent data loss on every real collection in the process). If
+/// a test ever does need to stub one, narrow this the way the builder list is
+/// narrowed, and say which test.
+fn redefine_immune_synthetic_collection_native(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/util/ArrayDeque"
+            | "java/util/ArrayList"
+            | "java/util/HashMap"
+            | "java/util/HashSet"
+            | "java/util/IdentityHashMap"
+            | "java/util/LinkedHashMap"
+            | "java/util/LinkedHashSet"
+            | "java/util/LinkedList"
+            | "java/util/TreeMap"
+            | "java/util/TreeSet"
+            | "java/util/concurrent/ConcurrentHashMap"
+    )
 }
 
 pub(crate) fn should_force_registered_native_over_bytecode(
@@ -10601,6 +10723,15 @@ pub(super) fn synthetic_stub_kind_should_yield_to_real_bytecode(
 /// cannot call the full helper while holding the class-manager read lock):
 /// classes whose SyntheticStub natives exist only for stub-phase bootstraps
 /// and must yield to loaded real bytecode.
+///
+/// JDK-ONLY-WAVE2: real-protected-stub class allow-list, COPY 2 OF 2. The other
+/// copy is inline in `vm/src/vm/vm_exec.rs::invoke_or_native`, and **the two
+/// are not identical**: that one lists `java/util/StringJoiner`, this one
+/// deliberately does not (see the comment inside). Wave 2 must RECONCILE them
+/// — decide what StringJoiner should do on both paths — not assume they are
+/// duplicates and delete one. What must replace them: `NativeKind` alone; under
+/// `--jdk-only` no `SyntheticStub` dispatches, so no class needs protecting
+/// from one and the entire list becomes dead.
 pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
     crate::runtime::env_cache::real_bytecode_selector().prefers_real(class_name)
         || matches!(
@@ -10643,6 +10774,93 @@ pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
                 | "java/lang/ref/Cleaner$Cleanable"
                 | "java/lang/management/ManagementFactory"
         )
+}
+
+/// [`try_stackless_invoke`] step 1's primary native lookup, routed through the
+/// §7 policy (`docs/feature-designs/jdk-only-mode.md`).
+///
+/// Replaces the bare `native_methods.find(class_name, method_name, descriptor)`
+/// that sat at the head of step 1's `.or_else` chain. A lookup that throws the
+/// `NativeKind` away cannot tell a reviewed `Intrinsic` from a `SyntheticStub`,
+/// so it cannot enforce §1.3 or §1.4 — it was a policy bypass sitting beside
+/// `resolve_dispatch` instead of routing through it.
+///
+/// Cost is unchanged. `resolve_id` is the *same* single 128-bit triple hash
+/// `find` already paid — `resolve_id(..).and_then(callback_of)` is documented
+/// to equal `find(..)`, descriptor-quirk fallback included — and the slot
+/// handle it returns makes the §4 census increment one relaxed add instead of a
+/// second full hash. Nothing is allocated or formatted; violation objects are
+/// built only on the reject path, in `vm_exec`'s `#[cold]` constructors.
+///
+/// `id_out` carries the resolved handle back to the caller so the census is
+/// recorded at the point of actual **dispatch**, not here at resolution: three
+/// later guards (JVMTI redefine, synthetic-stub yield, the `ThreadPoolExecutor`
+/// receiver check) can still discard this callback, and counting a discarded
+/// resolution as an invocation would make the zero-stub acceptance criterion
+/// unfalsifiable in the wrong direction.
+///
+/// `refusal` is an out-parameter rather than a `Result` because this runs
+/// inside an `Option`-returning `.or_else` chain; the caller checks it once,
+/// after the chain, and turns it into `VmError::JdkOnly`.
+///
+/// **`Compatible` mode is bit-for-bit today's behaviour**: `compat_native_wins`
+/// is `true`, which is exactly the unconditional "a registered native wins
+/// here" the `find` call encoded, and in `Compatible` mode
+/// `resolve_native_dispatch_wave1` is a pure function of that boolean.
+#[inline]
+fn resolve_step1_native(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    id_out: &mut Option<cratonvm_native_api::NativeMethodId>,
+    refusal: &mut Option<cratonvm_types::error::JdkOnlyViolation>,
+) -> Option<cratonvm_native_api::NativeCallback> {
+    let registry = &shared.natives.native_methods;
+    let id = registry.resolve_id(class_name, method_name, descriptor)?;
+    let callback = registry.callback_of(id)?;
+    // `kind_of_id` reports the slot's true kind. `find_with_kind` would report
+    // `Bridge` on its descriptor-quirk cold path; the difference is invisible
+    // in `Compatible` mode (every kind yields the same callback) and strictly
+    // more accurate under `JdkOnly`.
+    let kind = registry
+        .kind_of_id(id)
+        .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
+    match crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::dispatch_policy(shared),
+        class_name,
+        method_name,
+        descriptor,
+        Some((callback, kind)),
+        // JDK-ONLY-WAVE2: hard-coded `true` reproduces the pre-§7 "a registered
+        // native unconditionally wins here" of the `find` call this replaces.
+        // The three per-site compatibility verdicts that can still veto it run
+        // AFTER this chain (see the `native_cb` rebindings below); wave 2 folds
+        // them in as the real `compat_native_wins`.
+        true,
+        // Step 1 runs before any method resolution — deliberately, so the
+        // common "no native registered" case never touches the class manager.
+        // §7 step 3's input is therefore unknown here; `false` reproduces
+        // today's behaviour, and step 6 (which has resolved bytecode) passes
+        // the real value.
+        false,
+    ) {
+        Some(crate::vm::DispatchDecision::Reject(violation)) => {
+            *refusal = Some(violation);
+            None
+        }
+        Some(decision) => match decision.native_callback() {
+            Some(callback) => {
+                *id_out = Some(id);
+                Some(callback)
+            }
+            // `Bytecode` is unreachable from the name-only adapter, but treat
+            // it as "no native" rather than assuming.
+            None => None,
+        },
+        // JdkOnly, §7 step 3: concrete bytecode beats this bridge.
+        None => None,
+    }
 }
 
 /// Stackless invoke: resolve a method and either call native (Handled) or push
@@ -10837,6 +11055,16 @@ pub(super) fn try_stackless_invoke(
     //      priority (e.g. URI.toString() must NOT be short-circuited by
     //      Object.toString() native). If it doesn't (e.g. RunnerClassLoader.getParent()),
     //      walking finds the parent's native (ClassLoader.getParent native).
+    //
+    // JDK-only §7: the PRIMARY lookup in the chain below (the one keyed on
+    // `class_name` itself) goes through `resolve_step1_native`. The receiver-
+    // gated probes, the SSL impl->API aliases, the `DowncallHandle` adapters
+    // and the superclass walk still call bare `find`: each of those resolves a
+    // DIFFERENT triple from `(class_name, method_name, descriptor)`, so a
+    // kind/id looked up on `class_name` would describe the wrong slot. Wave 2
+    // routes them by giving each its own resolved triple.
+    let mut step1_native_id: Option<cratonvm_native_api::NativeMethodId> = None;
+    let mut step1_refusal: Option<cratonvm_types::error::JdkOnlyViolation> = None;
     let native_cb = match args.first() {
         Some(Value::Object(Some(obj)))
             if method_name == "type" && descriptor == "()Ljava/lang/invoke/MethodType;" =>
@@ -10888,10 +11116,14 @@ pub(super) fn try_stackless_invoke(
         _ => None,
     }
     .or_else(|| {
-        shared
-            .natives
-            .native_methods
-            .find(class_name, method_name, descriptor)
+        resolve_step1_native(
+            shared,
+            class_name,
+            method_name,
+            descriptor,
+            &mut step1_native_id,
+            &mut step1_refusal,
+        )
             .or_else(|| {
                 class_name
                     .starts_with("sun/security/ssl/SSLContextImpl")
@@ -11046,6 +11278,10 @@ pub(super) fn try_stackless_invoke(
     // receiver check for the FORCE-native case; mirror it here so a real
     // receiver's native shadow is dropped too. See docs/known-issues/
     // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+    //
+    // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 2
+    // OF 4. See COPY 1 in `vm/src/vm/vm_exec.rs::invoke_or_native` for the full
+    // note and what must replace all four.
     let native_cb = if class_name == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && descriptor == "(Ljava/lang/Runnable;)V"
@@ -11055,6 +11291,22 @@ pub(super) fn try_stackless_invoke(
     } else {
         native_cb
     };
+    // A `JdkOnly` refusal recorded by `resolve_step1_native` is authoritative:
+    // §1.3 forbids silently substituting some other implementation for a
+    // refused stub, so this must surface as an error rather than fall through
+    // to the bytecode path. Never set under `Compatible`.
+    if let Some(violation) = step1_refusal {
+        return Err(MethodCallFailed::InternalError(VmError::JdkOnly(violation)));
+    }
+    // The three guards above (redefine suppression, synthetic-stub yield,
+    // ThreadPoolExecutor receiver shape) can veto step 1's callback, and the
+    // `.or_else` arms below can supply a DIFFERENT one for a different triple.
+    // Either way the step-1 slot handle no longer describes what is about to
+    // run, so drop it: an invocation counted against the wrong slot is worse
+    // than an uncounted one.
+    if native_cb.is_none() {
+        step1_native_id = None;
+    }
     // Real-JDK Linker can adapt a void downcall through a generic
     // MethodHandle. Its field 0 retains the actual DowncallHandle. Preserve
     // the call-site arguments but substitute that target for native dispatch.
@@ -11206,6 +11458,13 @@ pub(super) fn try_stackless_invoke(
         }
     }
     if let Some(callback) = native_cb {
+        // §4 census, at the point of actual dispatch: one relaxed increment on
+        // a handle already in hand — no hashing, no allocation. `None` here
+        // means the callback came from one of the exotic arms, which resolve
+        // other triples and are the wave-2 census gap noted at step 1.
+        if let Some(id) = step1_native_id {
+            shared.natives.native_methods.record_invocation(id);
+        }
         let call_args = downcall_adapter_args.as_deref().unwrap_or(args);
         let result = safe_native_call(shared, thread, callback, call_args)?;
         if let Some(value) = result {
@@ -11321,18 +11580,76 @@ pub(super) fn try_stackless_invoke(
     let is_static = method.is_static();
 
     if is_native {
-        // Native method — look up in registry by declaring class
-        let declaring_name = cm
-            .get_class(declaring_id)
-            .map(|c| c.name.to_string())
-            .unwrap_or_default();
+        // Native method — look up in registry by declaring class.
+        //
+        // THE canonical §7 site. Of every native-dispatch point in the
+        // interpreter this is the only one holding both a resolved `&Class`
+        // and the resolved `&Method` at the same time, so it is the one that
+        // calls `resolve_dispatch` itself rather than the name-only wave-1
+        // adapter. The class-manager read guard is deliberately still held: it
+        // is what makes the `&Class` borrow available, and dropping it first is
+        // exactly why the old code had to allocate `declaring_name`.
+        let class = match cm.get_class(declaring_id) {
+            Some(class) => class,
+            None => {
+                drop(cm);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        };
+        let registry = &shared.natives.native_methods;
+        // `resolve_id` is the same single triple hash `find` paid, and its slot
+        // handle turns the §4 census increment into one relaxed add. The
+        // documented identity `resolve_id(..).and_then(callback_of) == find(..)`
+        // (descriptor-quirk fallback included) is what keeps this byte-for-byte.
+        let native_id = registry.resolve_id(&class.name, method_name, descriptor);
+        let native = native_id.and_then(|id| {
+            registry.callback_of(id).map(|cb| {
+                (
+                    cb,
+                    registry
+                        .kind_of_id(id)
+                        .unwrap_or(cratonvm_native_api::NativeKind::Bridge),
+                )
+            })
+        });
+        let decision = crate::vm::resolve_dispatch(
+            crate::vm::dispatch_policy(shared),
+            class,
+            method,
+            native,
+        );
+        // A `SyntheticStub` refusal is a real policy stop (§1.3) and must not
+        // fall through to some other implementation.
+        //
+        // DEVIATION, forced by preserving behaviour: `Reject(MissingNative)` is
+        // NOT surfaced as an error in either mode. An `ACC_NATIVE` method with
+        // no entry in the Rust registry is the ordinary case for a JNI-bound
+        // native — `RegisterNatives` pointers and dlsym-resolved symbols are
+        // resolved further down the recursive `invoke_shared` path, which this
+        // `CacheMiss` is the door to. Erroring here would refuse every
+        // legitimate JNI bridge, which §1.5 explicitly permits. The structured
+        // `MissingNative` belongs at the END of that chain (wave 2), not at the
+        // first of its three lookups.
+        let mut refusal: Option<cratonvm_types::error::JdkOnlyViolation> = None;
+        let callback = match decision {
+            crate::vm::DispatchDecision::Reject(
+                violation @ cratonvm_types::error::JdkOnlyViolation::SyntheticNativeInvocation { .. },
+            ) => {
+                refusal = Some(violation);
+                None
+            }
+            crate::vm::DispatchDecision::Reject(_) => None,
+            other => other.native_callback(),
+        };
         drop(cm);
-        if let Some(callback) =
-            shared
-                .natives
-                .native_methods
-                .find(&declaring_name, method_name, descriptor)
-        {
+        if let Some(violation) = refusal {
+            return Err(MethodCallFailed::InternalError(VmError::JdkOnly(violation)));
+        }
+        if let Some(callback) = callback {
+            // §4 census: relaxed increment on the handle already resolved above.
+            if let Some(id) = native_id {
+                shared.natives.native_methods.record_invocation(id);
+            }
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
                 // T18.K4 — tag-exact push for J/D native-bytecode method return values.
@@ -11405,11 +11722,14 @@ pub(super) fn try_stackless_invoke(
         && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
             || redefine_immune_forced_native(&class_name_arc, method_name, descriptor))
     {
-        if let Some(callback) =
-            shared
-                .natives
-                .native_methods
-                .find(&class_name_arc, method_name, descriptor)
+        // `find` -> `resolve_id` + `callback_of`: one hash either way
+        // (`resolve_id(..).and_then(callback_of)` is documented to equal
+        // `find(..)`), but the slot handle also yields the `NativeKind` §7
+        // needs and makes the §4 census increment a relaxed add.
+        let registry = &shared.natives.native_methods;
+        let native_id = registry.resolve_id(&class_name_arc, method_name, descriptor);
+        if let Some((id, callback)) =
+            native_id.and_then(|id| registry.callback_of(id).map(|cb| (id, cb)))
         {
             // Same ThreadPoolExecutor.execute(Runnable) receiver-aware
             // exemption as step 1 above -- this is a SEPARATE, independent
@@ -11420,29 +11740,71 @@ pub(super) fn try_stackless_invoke(
             // here, even though the real `execute()` bytecode was correctly
             // found and would otherwise run. See docs/known-issues/
             // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+            //
+            // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape
+            // check, COPY 3 OF 4. See COPY 1 in
+            // `vm/src/vm/vm_exec.rs::invoke_or_native` for the full note and
+            // what must replace all four.
             let is_real_tpe_execute_step6 = class_name_arc.as_ref()
                 == "java/util/concurrent/ThreadPoolExecutor"
                 && method_name == "execute"
                 && descriptor == "(Ljava/lang/Runnable;)V"
                 && matches!(args.first(), Some(recv) if threadpool_executor_has_real_workers(shared, recv));
-            if !is_real_tpe_execute_step6
+            // These two guards ARE this site's compatibility verdict, so they
+            // are handed to §7 as `compat_native_wins` verbatim — same
+            // predicates, same order, same short-circuit — and `Compatible`
+            // mode is therefore bit-for-bit what it was.
+            //
+            // `synthetic_stub_should_yield_to_real_bytecode` deliberately keeps
+            // its own `kind_of` lookup rather than reusing `kind_of_id` above:
+            // the two disagree on the descriptor-quirk cold path (`kind_of`
+            // misses and reports "not a stub"), and reusing the slot's true
+            // kind would silently change which natives yield.
+            let compat_native_wins = !is_real_tpe_execute_step6
                 && !synthetic_stub_should_yield_to_real_bytecode(
                     shared,
                     &class_name_arc,
                     method_name,
                     descriptor,
-                )
-            {
-                let result = safe_native_call(shared, thread, callback, args)?;
-                if let Some(value) = result.filter(|_| ret_type != b'V') {
-                    // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
-                    push_invoke_return_value(
-                        &mut thread.frames[frame_idx].stack,
-                        coerce_value_for_return(value, ret_type),
-                    )?;
-                    native_return_pushed_to_stack(shared, thread);
+                );
+            let kind = registry
+                .kind_of_id(id)
+                .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
+            match crate::vm::resolve_native_dispatch_wave1(
+                crate::vm::dispatch_policy(shared),
+                &class_name_arc,
+                method_name,
+                descriptor,
+                Some((callback, kind)),
+                compat_native_wins,
+                // Step 5 already produced this method's `Code` attribute, so
+                // §7 step 3 has a definite answer here: there IS bytecode, and
+                // under `JdkOnly` a plain `Bridge` must not shadow it.
+                true,
+            ) {
+                Some(crate::vm::DispatchDecision::Reject(violation)) => {
+                    return Err(MethodCallFailed::InternalError(VmError::JdkOnly(violation)));
                 }
-                return Ok(CachedCallResult::Handled);
+                Some(decision) => {
+                    if let Some(callback) = decision.native_callback() {
+                        // §4 census: relaxed add on the handle already in hand.
+                        registry.record_invocation(id);
+                        let result = safe_native_call(shared, thread, callback, args)?;
+                        if let Some(value) = result.filter(|_| ret_type != b'V') {
+                            // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
+                            push_invoke_return_value(
+                                &mut thread.frames[frame_idx].stack,
+                                coerce_value_for_return(value, ret_type),
+                            )?;
+                            native_return_pushed_to_stack(shared, thread);
+                        }
+                        return Ok(CachedCallResult::Handled);
+                    }
+                }
+                // Compatible: one of the two guards vetoed the native, exactly
+                // as before. JdkOnly: that, or §7 step 3 preferring the real
+                // bytecode this method already has.
+                None => {}
             }
         }
     }
@@ -12401,23 +12763,53 @@ pub(super) fn populate_invoke_cache(
         && class_name == symbolic_class_name)
         .then(|| resolved.native_target.zip(resolved.native_kind))
         .flatten();
-    if let Some((callback, kind)) = cached_exact_native
+    let native_for_cache = cached_exact_native
         .or_else(|| {
             shared
                 .natives
                 .native_methods
                 .find_with_kind(&class_name, &method_name, &descriptor)
         })
-        .filter(|(_, kind)| {
-            !synthetic_stub_kind_should_yield_to_real_bytecode(
+        .and_then(|(callback, kind)| {
+            // The stub-yield predicate IS this site's compatibility verdict —
+            // the old `.filter` — so it is handed to §7 as `compat_native_wins`
+            // verbatim and `Compatible` mode caches exactly what it cached
+            // before.
+            let compat_native_wins = !synthetic_stub_kind_should_yield_to_real_bytecode(
                 shared,
                 &class_name,
                 &method_name,
                 &descriptor,
-                Some(*kind),
-            )
-        })
-    {
+                Some(kind),
+            );
+            match crate::vm::resolve_native_dispatch_wave1(
+                crate::vm::dispatch_policy(shared),
+                &class_name,
+                &method_name,
+                &descriptor,
+                Some((callback, kind)),
+                compat_native_wins,
+                // The bytecode method is resolved BELOW, only once this native
+                // route has declined. §7 step 3's input is therefore unknown
+                // here, and `false` keeps `JdkOnly` from changing what gets
+                // cached on a fact it has not established.
+                false,
+            ) {
+                // Deliberately NOT an error path: populating a call-site cache
+                // is not a dispatch. Under `JdkOnly` a refused stub simply does
+                // not get cached, and the refusal is raised — once, with a real
+                // call site behind it — when something actually tries to run
+                // it. Reporting it from here would fire on mere resolution and
+                // for call sites that never execute.
+                Some(crate::vm::DispatchDecision::Reject(_)) => None,
+                Some(decision) => decision.native_callback(),
+                None => None,
+            }
+        });
+    // No §4 census increment anywhere in this function: caching a native is not
+    // invoking one, and counting it here would inflate every counter by one per
+    // call site regardless of whether the site ever ran.
+    if let Some(callback) = native_for_cache {
         let cm = shared.classes.class_manager.read();
         let gate = match cm.get_loaded_class_id(&class_name) {
             Some(cid) => RedefineGate::snapshot(cm.class_redefine_generation_handle(cid)),
@@ -12463,6 +12855,16 @@ pub(super) fn populate_invoke_cache(
                 return;
             }
         }
+        // JDK-ONLY-WAVE2: `CachedInvokeTarget::Native` stores the callback and
+        // throws the `NativeKind` away. A cache HIT therefore cannot re-ask the
+        // §7 question — it has no idea whether it is about to run a reviewed
+        // intrinsic or a `SyntheticStub` — which is why
+        // `execute_invokestatic_cached` has to re-derive the triple from the
+        // constant pool just to run the stub-yield gate. What must replace it:
+        // a `kind: NativeKind` field on the variant (and on
+        // `CachedInvokeTarget::VirtualNative`), populated here where the kind is
+        // already in hand. That variant lives in
+        // `classloading/src/resolution.rs`, outside this wave's file ownership.
         let target = CachedInvokeTarget::Native {
             callback,
             num_params: num_params as u16, // Widening: parameter count conversion
@@ -12735,8 +13137,25 @@ pub(super) fn execute_invokestatic_cached(
                 thread.invoke_cache.evict(caller_class_id, cp_index, false);
                 return Ok(CachedCallResult::CacheMiss);
             }
+            // §4 census ONLY — the dispatch decision was taken when this entry
+            // was cached and is not revisited here (see the
+            // `CachedInvokeTarget::Native` marker in `populate_invoke_cache`).
+            // The triple is already resolved by the gate above, so the census
+            // costs one triple hash on a path that just paid a constant-pool
+            // resolution; without it, every warmed static native call site
+            // would be invisible to the zero-stub acceptance criterion. This
+            // does not change what runs.
+            crate::vm::record_native_dispatch(shared, &class_name, &method_name, &descriptor);
         }
     }
+    // JDK-ONLY-WAVE2: the cached *virtual* native path
+    // (`CachedInvokeTarget::VirtualNative` in `execute_invokevirtual_cached`)
+    // is deliberately left UNCOUNTED. It has no equivalent already-paid
+    // constant-pool resolution to piggyback on, so a census increment there
+    // would add a full triple hash to the hottest warmed dispatch in the
+    // interpreter for a measurement-only feature. What must replace it: the
+    // `kind`+id carried on the cached target (same marker as above), which
+    // makes the increment a relaxed add and the hash unnecessary.
     if crate::runtime::env_cache::modstatic_dbg() {
         if let Ok((mcn, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
             if mn.as_ref() == "initBootModuleLoader" {
@@ -13415,6 +13834,116 @@ mod string_builder_layout_override_tests {
             "trimToSize",
             "()V"
         ));
+    }
+}
+
+#[cfg(test)]
+mod redefine_immunity_tests {
+    use super::redefine_immune_forced_native;
+
+    /// CratonVM's synthetic collections must keep their native shadow across a
+    /// redefinition. Their real JDK bodies index a `table`/`root`/`head` field
+    /// graph the synthetic objects do not have, so running them returns silent
+    /// nonsense — `TreeMap.get` null, `ConcurrentHashMap.size` 0,
+    /// `HashMap.keySet` empty. `RedefineCollectionLayoutProbe` is the witness.
+    #[test]
+    fn synthetic_collections_keep_their_natives_across_a_redefinition() {
+        for class in [
+            "java/util/ArrayDeque",
+            "java/util/ArrayList",
+            "java/util/HashMap",
+            "java/util/HashSet",
+            "java/util/IdentityHashMap",
+            "java/util/LinkedHashMap",
+            "java/util/LinkedHashSet",
+            "java/util/LinkedList",
+            "java/util/TreeMap",
+            "java/util/TreeSet",
+            "java/util/concurrent/ConcurrentHashMap",
+        ] {
+            for (name, desc) in [
+                ("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+                ("size", "()I"),
+                ("containsKey", "(Ljava/lang/Object;)Z"),
+                ("keySet", "()Ljava/util/Set;"),
+                ("entrySet", "()Ljava/util/Set;"),
+                ("iterator", "()Ljava/util/Iterator;"),
+                ("toString", "()Ljava/lang/String;"),
+            ] {
+                assert!(
+                    redefine_immune_forced_native(class, name, desc),
+                    "{class}.{name}{desc} must survive a redefinition"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_classes_stay_evictable() {
+        assert!(!redefine_immune_forced_native(
+            "com/example/Service",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;"
+        ));
+        // The two operations the Mockito suite genuinely stubs on a mocked
+        // StringBuilder — see `is_string_builder_layout_native_override`.
+        assert!(!redefine_immune_forced_native(
+            "java/lang/StringBuilder",
+            "length",
+            "()I"
+        ));
+        assert!(!redefine_immune_forced_native(
+            "java/lang/StringBuilder",
+            "substring",
+            "(I)Ljava/lang/String;"
+        ));
+    }
+
+    /// No dispatch site may name a layout arm directly: they must go through
+    /// `redefine_immune_layout_native` (cache paths) or
+    /// `redefine_immune_forced_native` (slow path). Six sites used to open-code
+    /// `string_builder || path`, so the collections entry silently did not apply
+    /// there and the collection probe stalled at 18 of 32 rather than 0.
+    ///
+    /// The reflection arm is NOT policed: two cache sites legitimately omit it,
+    /// and forcing them to include it regressed ByteBuddy type creation.
+    #[test]
+    fn layout_immunity_is_not_open_coded() {
+        let src = include_str!("invoke.rs");
+        let mut offenders = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            let code = line.trim_start();
+            // Comments, and this test's own list of names (string literals).
+            if code.starts_with("//") || code.starts_with("///") || code.starts_with('"') {
+                continue;
+            }
+            // A definition is not a call site.
+            if code.starts_with("fn ") || code.starts_with("pub(super) fn ")
+                || code.starts_with("pub(crate) fn ")
+            {
+                continue;
+            }
+            // The predicates compose each other inside this band.
+            if (5000..9800).contains(&n) {
+                continue;
+            }
+            for part in [
+                "redefine_immune_string_builder_native(",
+                "redefine_immune_path_native(",
+                "redefine_immune_jfr_native(",
+                "redefine_immune_synthetic_collection_native(",
+            ] {
+                if code.contains(part) {
+                    offenders.push(format!("line {}: {}", n + 1, code));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "call redefine_immune_layout_native (cache paths) or \
+             redefine_immune_forced_native (slow path) instead of naming an arm:\n{}",
+            offenders.join("\n")
+        );
     }
 }
 
@@ -14674,9 +15203,12 @@ pub(super) fn compile_osr_artifact(
     };
 
     // The compile succeeded but the body may still refuse to enter at the PC it
-    // was compiled for (non-zero `osr_dead_mask[entry_pc]`). Memo that so the
-    // next trip over this back-edge does not re-run the whole pipeline to the
-    // same conclusion; the artifact stays cached and other PCs are unaffected.
+    // was compiled for: no published native offset (the codegen writes -1 for a
+    // pc strictly inside a LICM-hoisted loop body, whose preheader an OSR entry
+    // would skip), or — only under `CRATONVM_JIT_OSR_DEAD_LOCALS=0` — a
+    // non-zero `osr_dead_mask[entry_pc]`. Memo that so the next trip over this
+    // back-edge does not re-run the whole pipeline to the same conclusion; the
+    // artifact stays cached and other PCs are unaffected.
     if !osr_reused && !compiled.can_osr_enter(entry_pc) {
         crate::jit::mark_osr_entry_rejected(
             &class_name,
@@ -14686,7 +15218,8 @@ pub(super) fn compile_osr_artifact(
         );
         if crate::runtime::env_cache::dbg_jitc() {
             eprintln!(
-                "[cratonvm-jitc] OSR-reject {}.{}{} entry_pc={} (dead_mask non-zero; memoed)",
+                "[cratonvm-jitc] OSR-reject {}.{}{} entry_pc={} (no enterable native offset\
+                 , or dead_mask non-zero with CRATONVM_JIT_OSR_DEAD_LOCALS=0; memoed)",
                 &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
             );
         }
@@ -20229,12 +20762,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
             // it with the Rust intrinsic, or the advice never runs.
             if crate::classloading::any_class_redefined()
                 && cm.class_redefine_generation(declaring_id) > 0
-                && !redefine_immune_string_builder_native(
-                    &declaring_class.name,
-                    &method_name,
-                    &method_descriptor,
-                )
-                && !redefine_immune_path_native(
+                && !redefine_immune_layout_native(
                     &declaring_class.name,
                     &method_name,
                     &method_descriptor,
@@ -20300,12 +20828,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
             let receiver_redefined = crate::classloading::any_class_redefined()
                 && cm.class_redefine_generation(receiver_class_id) > 0
                 && !redefine_immune_reflection_native(rcv_name, &method_name)
-                && !redefine_immune_string_builder_native(
-                    rcv_name,
-                    &method_name,
-                    &method_descriptor,
-                )
-                && !redefine_immune_path_native(rcv_name, &method_name, &method_descriptor);
+                && !redefine_immune_layout_native(rcv_name, &method_name, &method_descriptor);
             // WP2.7 — annotation proxies have no real bytecode for
             // equals/hashCode/toString. Force fall-through to the slow path
             // so `execute_invoke`'s annotation_proxy interception layer
@@ -21371,8 +21894,7 @@ pub(super) fn execute_invokevirtual_cached(
                 // and crashes with ArrayIndexOutOfBoundsException).
                 if native_shadow_suppressed_by_redefine(shared, &mcn)
                     && !redefine_immune_reflection_native(&mcn, &mn)
-                    && !redefine_immune_string_builder_native(&mcn, &mn, &desc)
-                    && !redefine_immune_path_native(&mcn, &mn, &desc)
+                    && !redefine_immune_layout_native(&mcn, &mn, &desc)
                 {
                     thread
                         .invoke_cache
@@ -22799,12 +23321,7 @@ pub(super) fn populate_virtual_invoke_cache(
             // silently no-ops instead of throwing "wanted but not invoked".
             let declaring_redefined_not_immune = crate::classloading::any_class_redefined()
                 && cm.class_redefine_generation(declaring_id) > 0
-                && !redefine_immune_string_builder_native(
-                    declaring_name,
-                    &method_name,
-                    &descriptor,
-                )
-                && !redefine_immune_path_native(declaring_name, &method_name, &descriptor);
+                && !redefine_immune_layout_native(declaring_name, &method_name, &descriptor);
             let intrinsic_kind = if declaring_redefined_not_immune {
                 None
             } else {
@@ -22938,8 +23455,7 @@ pub(super) fn populate_virtual_invoke_cache(
         let receiver_redefined = crate::classloading::any_class_redefined()
             && cm.class_redefine_generation(receiver_class_id) > 0
             && !redefine_immune_reflection_native(&lookup_name, &method_name)
-            && !redefine_immune_string_builder_native(&lookup_name, &method_name, &descriptor)
-            && !redefine_immune_path_native(&lookup_name, &method_name, &descriptor);
+            && !redefine_immune_layout_native(&lookup_name, &method_name, &descriptor);
         let direct_native_callback =
             if native_signature_may_exist && !is_real_tpe_execute && !receiver_redefined {
                 shared
@@ -23050,12 +23566,7 @@ pub(super) fn populate_virtual_invoke_cache(
                     let parent_redefined = crate::classloading::any_class_redefined()
                         && cm.class_redefine_generation(parent_id) > 0
                         && !redefine_immune_reflection_native(&parent_name, &method_name)
-                        && !redefine_immune_string_builder_native(
-                            &parent_name,
-                            &method_name,
-                            &descriptor,
-                        )
-                        && !redefine_immune_path_native(&parent_name, &method_name, &descriptor);
+                        && !redefine_immune_layout_native(&parent_name, &method_name, &descriptor);
                     if parent_redefined {
                         break;
                     }

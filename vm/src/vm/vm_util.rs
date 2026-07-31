@@ -247,6 +247,16 @@ pub fn ensure_system_stdin_object(
             .set_field(in_obj, idx, Value::Object(Some(fd_obj)));
     } else {
         // Fall back to the legacy slot-1 encoding if reflection fails.
+        //
+        // JDK-ONLY-LAYOUT: breaks-under-strict (dead arm on real bytes).
+        // Slot 1 of a REAL `java/io/FileInputStream` is `path:String`, not an
+        // int marker — writing `Int(1)` there is a silent wrong-field write
+        // that would make `getPath`/`toString` observe a non-reference. The arm
+        // is only reached when `fd` fails to resolve by name, which cannot
+        // happen once real `FileInputStream` bytes are authoritative. Under
+        // `CompatibilityMode::JdkOnly` this must become a structured
+        // `MissingImplementation`-style failure rather than a fabricated write;
+        // it is left as-is for wave 1 (measurement, not deletion).
         shared.mem.heap.set_field(in_obj, 1, Value::Int(1));
     }
 
@@ -1806,33 +1816,45 @@ fn initialize_class_shared(
                                 // deeper NPE/IAE. Print up to 4 levels.
                                 {
                                     let cm = shared.classes.class_manager.read();
-                                    // Resolve Throwable.cause field index by name
-                                    let cause_idx_of =
-                                        |obj: crate::types::ObjectRef| -> Option<usize> {
-                                            let mut walk = Some(shared.mem.heap.class_id_of(obj));
-                                            while let Some(k) = walk {
-                                                if let Some(cls) = cm.get_class(k) {
-                                                    let mut inst = 0usize;
-                                                    for f in &cls.fields {
-                                                        if !f.is_static() {
-                                                            if &*f.name == "cause" {
-                                                                return Some(
-                                                                    cls.first_field_index + inst,
-                                                                );
-                                                            }
-                                                            inst += 1;
+                                    // Resolve a `java/lang/Throwable` field index
+                                    // by NAME, walking the superclass chain.
+                                    //
+                                    // JDK-ONLY-LAYOUT: converted from raw slot
+                                    // indices. A synthetic `java/lang/Throwable`
+                                    // stub is `instance_fields(2)` — `_f0` = message,
+                                    // `_f1` = cause — but the REAL JDK declares
+                                    // `backtrace`, `detailMessage`, `cause`,
+                                    // `stackTrace`, `depth`, `suppressedExceptions`,
+                                    // so real slot 0 is `backtrace` and the message
+                                    // lives at slot 1. Reading slot 0 as the message
+                                    // against real bytes is a silent wrong-field read.
+                                    let field_idx_of = |obj: crate::types::ObjectRef,
+                                                        want: &'static str|
+                                     -> Option<usize> {
+                                        let mut walk = Some(shared.mem.heap.class_id_of(obj));
+                                        while let Some(k) = walk {
+                                            if let Some(cls) = cm.get_class(k) {
+                                                let mut inst = 0usize;
+                                                for f in &cls.fields {
+                                                    if !f.is_static() {
+                                                        if &*f.name == want {
+                                                            return Some(
+                                                                cls.first_field_index + inst,
+                                                            );
                                                         }
+                                                        inst += 1;
                                                     }
-                                                    walk = cls.superclass;
-                                                } else {
-                                                    break;
                                                 }
+                                                walk = cls.superclass;
+                                            } else {
+                                                break;
                                             }
-                                            None
-                                        };
+                                        }
+                                        None
+                                    };
                                     let mut cur = *exc_ref;
                                     for depth in 0..4 {
-                                        let Some(ci) = cause_idx_of(cur) else {
+                                        let Some(ci) = field_idx_of(cur, "cause") else {
                                             break;
                                         };
                                         let cause_val = shared.mem.heap.get_field(cur, ci);
@@ -1845,8 +1867,14 @@ fn initialize_class_shared(
                                             .get_class(cause_cid)
                                             .map(|c| c.name.to_string())
                                             .unwrap_or_default();
+                                        // `detailMessage` by name on real bytes;
+                                        // slot 0 only as the synthetic-stub
+                                        // fallback (where the stub's `_f0` IS the
+                                        // message and no name resolves).
+                                        let msg_idx =
+                                            field_idx_of(cause_obj, "detailMessage").unwrap_or(0);
                                         let cause_msg =
-                                            match shared.mem.heap.get_field(cause_obj, 0) {
+                                            match shared.mem.heap.get_field(cause_obj, msg_idx) {
                                                 Value::Object(Some(s)) => {
                                                     crate::vm::vm_object::read_java_string(
                                                         &shared.mem.heap,
@@ -2038,6 +2066,27 @@ fn make_prepared_value_layout(
         .map(|c| c.num_total_fields.max(2))
         .unwrap_or(2);
     let obj = shared.mem.heap.alloc_object(layout_class_id, num_fields);
+    // JDK-ONLY-LAYOUT: breaks-under-strict — assumed slot 0 = `byteSize`,
+    // slot 1 = `byteAlignment`.
+    //
+    // Every `class_name` reached here (`java/lang/foreign/ValueLayout$Of*`,
+    // `java/lang/foreign/AddressLayout`) is an INTERFACE in the real JDK: it
+    // has zero instance fields, and the concrete carrier is
+    // `jdk/internal/foreign/layout/ValueLayouts$Of*Impl` (whose size/alignment
+    // live on `AbstractLayout`, under different names and in an unspecified
+    // order). The `.max(2)` above therefore invents two slots on an object of
+    // an interface type and writes into them positionally — a fabricated
+    // layout, not merely a mis-numbered one. This pairs with the
+    // `has_clinit && != "java/lang/foreign/ValueLayout"` suppression above,
+    // which stops the real `<clinit>` from ever running.
+    //
+    // Wave-2 requirement: under `CompatibilityMode::JdkOnly` this preseed must
+    // be dropped entirely and the real `ValueLayout.<clinit>` allowed to run,
+    // which in turn requires `jdk/internal/misc/UnsafeConstants` to be
+    // backfilled with real platform values (see the FFM/Unsafe note above)
+    // before class preparation. Do NOT convert this to named-field lookup:
+    // there are no real fields to name. It is a `CompatibilityClassRequested`
+    // violation, not a slot-numbering bug.
     shared.mem.heap.set_field(obj, 0, Value::Long(byte_size));
     shared
         .mem
@@ -2704,6 +2753,15 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 // NoopNormalizer2 has no instance fields.
                 if let Some(noop_obj) = shared.mem.heap.try_alloc_object(nid, 0) {
                     // ModeImpl has 1 instance field: normalizer2:Normalizer2.
+                    // JDK-ONLY-LAYOUT: safe — verified against JDK 25,
+                    // `NormalizerBase$ModeImpl` is `final` and declares exactly
+                    // one instance field (`private final Normalizer2
+                    // normalizer2`) with `java/lang/Object` as its superclass,
+                    // so slot 0 is unambiguous whatever the declaration order.
+                    // Note this fixup itself is a compatibility substitution
+                    // (it stands in for a failed resource load) and is in scope
+                    // for the wave-2 `CompatibilityClassRequested` sweep even
+                    // though its slot arithmetic is correct.
                     if let Some(mode_impl) = shared.mem.heap.try_alloc_object(mid, 1) {
                         shared
                             .mem
@@ -3511,6 +3569,15 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                         if let Some(ai_obj) = shared.mem.heap.try_alloc_object(aid, 1) {
                             // Initial value 1, matching SCI<clinit> bytecode
                             // (`new AtomicInteger / dup / iconst_1 / <init>(I)V`).
+                            // JDK-ONLY-LAYOUT: safe — verified against JDK 25,
+                            // `AtomicInteger` declares one instance field
+                            // (`private volatile int value`) and its superclass
+                            // `java/lang/Number` declares none, so slot 0 is
+                            // unambiguous. The hard-coded field COUNT of 1 is
+                            // likewise correct; prefer `num_total_fields` if
+                            // this is ever generalised to other atomics
+                            // (`AtomicReference` = 1, but `AtomicMarkableReference`
+                            // and `AtomicStampedReference` are not).
                             shared.mem.heap.set_field(ai_obj, 0, Value::Int(1));
                             if set_static_by_name(fname, Value::Object(Some(ai_obj))) {
                                 tracing::warn!(
@@ -4144,6 +4211,7 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
+                origin: cratonvm_classloading::ClassOrigin::default(),
                 is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
@@ -4234,6 +4302,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: cratonvm_classloading::ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,

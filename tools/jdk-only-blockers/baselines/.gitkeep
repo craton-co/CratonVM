@@ -1,0 +1,12 @@
+# Committed JDK-only blocker baselines live here, one pair per JDK image:
+#
+#   jdk-<feature>-missing-natives.json
+#   jdk-<feature>-synthetic-dependencies.json
+#
+# Generate them with:
+#
+#   python tools/jdk-only-blockers/blockers.py ... --update-baseline
+#
+# and commit the result. `--check` fails when the open blocker set grows
+# against these files. There is intentionally no baseline in the tree yet:
+# one must be produced from a real run of a real JDK image, never by hand.

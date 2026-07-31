@@ -230,6 +230,15 @@ const HUMONGOUS_YOUNG_FRACTION_PERCENT: usize = 50;
 const HUMONGOUS_ABSOLUTE_CAP_BYTES: usize = 256 * 1024 * 1024;
 
 /// Maximum allowed heap expansion factor (4x the initial size).
+///
+/// This is only ONE of the two ceilings on young growth, and on the
+/// production path it is not the binding one: heaps built from `-Xmx` via
+/// [`GenerationalHeap::with_capacity`] are additionally clamped so that
+/// `2 * young_semi + old_gen <= Xmx` (see `max_heap_bytes`), which under that
+/// constructor's 50/50 split lands exactly on the initial semi. This factor
+/// still governs the explicit-size constructors ([`GenerationalHeap::new`],
+/// [`GenerationalHeap::with_sizes`]), which take absolute arena sizes and
+/// therefore have no budget to divide.
 const MAX_HEAP_EXPANSION_FACTOR: usize = 4;
 
 /// If GC reclaims less than this fraction of young gen, expand the heap.
@@ -743,6 +752,29 @@ pub struct GenerationalHeap {
     concurrent_gc_state: Option<Arc<ConcurrentGcState>>,
     /// Maximum young semi-space size (limits growth).
     max_young_semi_size: usize,
+    /// The `-Xmx` budget for the WHOLE committed heap:
+    /// `young_from.capacity() + young_to.capacity() + old_gen.capacity()`
+    /// must never exceed it.
+    ///
+    /// Before this field existed, `-Xmx` bounded only the *initial* split.
+    /// [`with_sizes`] derived the young growth ceiling from the young semi
+    /// alone (`young_semi * MAX_HEAP_EXPANSION_FACTOR`), with no reference to
+    /// the total or to the old generation, so adaptive expansion could commit
+    /// far more than the user asked for: measured at `--Xmx 1g`, a live run
+    /// held `young_from` 512 MiB + `young_to` **1024 MiB** + old 512 MiB — 2 GiB
+    /// of Java heap, 4.0 GiB RSS — and was killed by the Linux OOM killer
+    /// instead of throwing a catchable `OutOfMemoryError`. With the default
+    /// 1/4-of-RAM ergonomic `-Xmx` that ceiling scales with the host: on a
+    /// 31 GiB box the ~7.75 GiB default admitted a ~19 GiB committed heap.
+    ///
+    /// `usize::MAX` means "no budget" and reproduces the historical
+    /// behaviour exactly. That is what the explicit-size constructors
+    /// ([`new`], [`with_sizes`]) pass: they take absolute arena sizes rather
+    /// than a heap budget to divide, and the GC's own tests drive them with
+    /// deliberately tiny arenas that rely on expansion. Only
+    /// [`with_capacity`] — the sole production path, fed straight from
+    /// `-Xmx` via `VmHeap::new_with_overrides` — sets a real budget.
+    max_heap_bytes: usize,
     /// Primary NUMA node hint for the young-gen slow path.
     ///
     /// Records the topology's preferred home node for this heap (defaults
@@ -852,17 +884,23 @@ impl GenerationalHeap {
     }
 
     /// Create a generational heap with custom young semi-space and old gen sizes.
+    ///
+    /// Takes absolute arena sizes, not a heap budget to divide, so it imposes
+    /// no whole-heap ceiling (`max_heap_bytes = usize::MAX`) and keeps the
+    /// historical `young_semi * MAX_HEAP_EXPANSION_FACTOR` growth ceiling.
+    /// The production path is [`with_capacity`], which does budget itself.
     pub fn with_sizes(young_semi_size: usize, old_gen_size: usize) -> Self {
         let max_young = young_semi_size
             .max(1024)
             .saturating_mul(MAX_HEAP_EXPANSION_FACTOR);
-        Self::with_sizes_and_max_young(young_semi_size, old_gen_size, max_young)
+        Self::with_sizes_and_max_young(young_semi_size, old_gen_size, max_young, usize::MAX)
     }
 
     fn with_sizes_and_max_young(
         young_semi_size: usize,
         old_gen_size: usize,
         max_young_semi_size: usize,
+        max_heap_bytes: usize,
     ) -> Self {
         let young_semi_size = young_semi_size.max(1024);
         let old_gen_size = old_gen_size.max(1024);
@@ -910,6 +948,7 @@ impl GenerationalHeap {
             satb_queue: None,
             concurrent_gc_state: None,
             max_young_semi_size: max_young,
+            max_heap_bytes,
             numa_node_hint,
             numa_num_nodes,
             stats: HeapStats::default(),
@@ -1056,7 +1095,45 @@ impl GenerationalHeap {
         // underflow when the clamped young is larger than half of it.
         let young_pair = young_semi.saturating_mul(2);
         let old_size = total.saturating_sub(young_pair).max(512);
-        Self::with_sizes(young_semi, old_size)
+        // `-Xmx N` means "this process may commit N bytes of Java heap", not
+        // "start at N and grow from there". The young growth ceiling is
+        // therefore whatever is left of the budget after the (fixed,
+        // non-expandable) old generation, split across the two semi-spaces:
+        // both semis must fit, because a copying collection needs a to-space
+        // as large as the from-space it is evacuating, and the pair swaps
+        // roles every cycle.
+        //
+        // Under this constructor's own 50/50 split that ceiling equals the
+        // initial semi, i.e. expansion has nothing left to give — which is
+        // the correct outcome, not a loss: the young semi already *starts* at
+        // the largest size the budget permits, so a heap that would previously
+        // have grown into it is strictly better off starting there. What the
+        // clamp removes is only the ability to exceed `-Xmx`. A workload that
+        // genuinely needs more room now surfaces a catchable
+        // `OutOfMemoryError` (the honest answer, and what HotSpot does) rather
+        // than silently committing 2.5x its stated maximum and risking a
+        // kernel OOM-kill, which is unrecoverable.
+        //
+        // `max(young_semi)` keeps the ceiling coherent for the tiny-heap
+        // corner where `YOUNG_SEMI_MIN` clamping pushed the pair past `total`.
+        let max_young_semi = total.saturating_sub(old_size) / 2;
+        let max_young_semi = max_young_semi.max(young_semi);
+        Self::with_sizes_and_max_young(young_semi, old_size, max_young_semi, total)
+    }
+
+    /// The `-Xmx` budget for the whole committed heap, or `usize::MAX` when
+    /// this heap was built from explicit arena sizes (see [`max_heap_bytes`]).
+    pub fn heap_budget_bytes(&self) -> usize {
+        self.max_heap_bytes
+    }
+
+    /// Bytes currently committed across both young semi-spaces and the old
+    /// generation — the quantity [`heap_budget_bytes`] bounds.
+    pub fn committed_heap_bytes(&self) -> usize {
+        let from = self.young_from.lock().capacity();
+        let to = self.young_to.lock().capacity();
+        let old = self.old_gen.lock().capacity();
+        from + to + old
     }
 
     // ----- Allocation --------------------------------------------------------
@@ -3753,6 +3830,10 @@ impl GenerationalHeap {
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
+        // Fresh cycle: no old-gen reclamation has happened yet (see
+        // `gc_quiescence::OLD_GEN_RECLAIMED`). The moving path resets this in
+        // `collect_garbage_inner`; this path can be entered directly.
+        crate::gc_quiescence::set_old_gen_reclaimed(false);
         let mut result = self.sweep_young_non_moving(roots, finalizer_addrs);
         // Selective promotion commits young -> old relocations inside
         // `sweep_young_non_moving`. Registered external-root providers can own
@@ -3816,7 +3897,13 @@ impl GenerationalHeap {
             && old_capacity > 0
             && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
         {
-            let old_freed = self.sweep_old_gen_non_moving(roots);
+            let (old_freed, old_survivors) = self.sweep_old_gen_non_moving(roots);
+            // This cycle DID reclaim old-gen storage: a freed block is back on
+            // the free list, so an old-gen address is no longer self-evidently
+            // live. `old_survivors` carries the identity entries that make
+            // "absent from the map" an exact death proof for watched addresses.
+            crate::gc_quiescence::set_old_gen_reclaimed(true);
+            result.0.pointer_map.extend(old_survivors);
             result.0.stats.bytes_freed += old_freed;
             self.stats
                 .bytes_freed_old
@@ -3883,6 +3970,11 @@ impl GenerationalHeap {
             let on = *G.get_or_init(|| gc_flags().dbg_gcpause);
             PauseTimer(on.then(std::time::Instant::now))
         };
+        // Fresh cycle: no old-gen reclamation has happened yet. Phase 5 below
+        // sets this when the mark-compact major GC runs, and
+        // `run_non_moving_young_cycle` does the same for the in-place old
+        // sweep. See `gc_quiescence::OLD_GEN_RECLAIMED`.
+        crate::gc_quiescence::set_old_gen_reclaimed(false);
         // Phase 6 #1: spin-yield until every live `SafepointToken` has
         // dropped. While a kernel is reading a JVM array on the GPU, we
         // must not move that array — a single token held anywhere on
@@ -5308,6 +5400,12 @@ impl GenerationalHeap {
                 old_gen.used() * 100 / old_gen.capacity(),
             );
             let old_used_before = old_gen.used();
+            // Sliding compaction moves live old-gen objects and zeroes the
+            // freed tail, so an old-gen address stops being a survival proof
+            // from here on. `OldGen::compact` emits an identity entry for every
+            // watched object that stayed put, so `compact_map` membership is
+            // the exact replacement proof.
+            crate::gc_quiescence::set_old_gen_reclaimed(true);
             let compact_map = Self::major_gc(roots, &young_from, &mut old_gen);
             // CRITICAL FIX (heavy binary-trees GC corruption):
             //
@@ -5453,7 +5551,21 @@ impl GenerationalHeap {
         // (`System.gc` at well under 50% full) does not.
         if freed_percent < GC_EXPANSION_THRESHOLD_PERCENT && bytes_before >= from_cap_before / 2 {
             let current_cap = young_to.capacity();
-            let new_cap = (current_cap * 2).min(self.max_young_semi_size);
+            // Whole-heap budget (see `max_heap_bytes`). The steady state after
+            // this growth has BOTH semi-spaces at `new_cap` — they swap roles
+            // every cycle and a copying collection needs a to-space as large
+            // as the from-space — so the admissible ceiling is
+            // `(Xmx - old_capacity) / 2`, not `Xmx - old - other_semi`.
+            // `usize::MAX` (the explicit-size constructors) leaves this
+            // saturating to "no bound", reproducing the historical behaviour.
+            let budget_ceiling = if self.max_heap_bytes == usize::MAX {
+                usize::MAX
+            } else {
+                self.max_heap_bytes.saturating_sub(old_gen.capacity()) / 2
+            };
+            let new_cap = (current_cap * 2)
+                .min(self.max_young_semi_size)
+                .min(budget_ceiling.max(current_cap));
             if new_cap > current_cap {
                 tracing::debug!(
                     "GC: low reclamation ({}% freed) — expanding young to-space {} → {} bytes",
@@ -7519,8 +7631,8 @@ impl GenerationalHeap {
                     eprintln!(
                         "[quiesce] FIRST corruption: quiescence depth={} enter_count={} leave_count={}",
                         crate::gc_quiescence::depth(),
-                        crate::gc_quiescence::ENTER_COUNT.load(Ordering::Relaxed),
-                        crate::gc_quiescence::LEAVE_COUNT.load(Ordering::Relaxed),
+                        crate::gc_quiescence::ENTER_COUNT.get(),
+                        crate::gc_quiescence::LEAVE_COUNT.get(),
                     );
                 }
                 tracing::warn!(
@@ -8293,13 +8405,20 @@ impl GenerationalHeap {
     /// Run a non-moving mark-sweep of old space while conservative JIT roots are
     /// active.  The supplied roots are copied only because the shared marker's
     /// compacting mode can rewrite its mutable root slice; this mode never does.
-    fn sweep_old_gen_non_moving(&self, roots: &[ObjectRef]) -> usize {
+    /// Returns `(bytes_reclaimed, watched_survivor_identity_map)`. The second
+    /// element is the survival proof post-GC reference processing needs: this
+    /// sweep frees dead old-gen blocks in place, so after it runs "the address
+    /// is inside old gen" no longer implies "the object is still there".
+    fn sweep_old_gen_non_moving(
+        &self,
+        roots: &[ObjectRef],
+    ) -> (usize, HashMap<usize, usize>) {
         let young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
         let mut root_shadow = roots.to_vec();
-        let _ = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
-        before.saturating_sub(old_gen.used())
+        let survivors = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
+        (before.saturating_sub(old_gen.used()), survivors)
     }
 
     /// Run a major garbage collection on the old generation using mark-compact.
@@ -8517,6 +8636,15 @@ impl GenerationalHeap {
         }
 
         if !compact {
+            // Watched addresses (every address the reference processor holds —
+            // see `ReferenceProcessor::all_tracked_addrs`) need an explicit
+            // survival proof from this sweep: it frees dead blocks in place,
+            // so post-GC reference processing can no longer infer survival
+            // from "the address is inside old gen". Emit an identity entry for
+            // each watched survivor, mirroring what `OldGen::compact` already
+            // does for watched objects that happen not to move.
+            let watched = crate::gc_quiescence::watched_referents_snapshot();
+            let mut watched_survivors: HashMap<usize, usize> = HashMap::new();
             let objects = old_gen.walk_objects();
             for (obj_ptr, total_size) in objects {
                 // SAFETY: `walk_objects` returns valid old-gen object starts.
@@ -8526,6 +8654,12 @@ impl GenerationalHeap {
                 let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
                 if header.gc_flags & GC_FLAG_MARKED != 0 {
                     header.gc_flags &= !GC_FLAG_MARKED;
+                    if watched
+                        .as_ref()
+                        .is_some_and(|w| w.contains(&(obj_ptr as usize)))
+                    {
+                        watched_survivors.insert(obj_ptr as usize, obj_ptr as usize);
+                    }
                 } else {
                     // A2 forensic breadcrumb (CRATONVM_DBG_A2): preserve the
                     // victim's pre-free identity so a later zero-header /
@@ -8545,7 +8679,7 @@ impl GenerationalHeap {
                     unsafe { old_gen.free(obj_ptr, total_size) };
                 }
             }
-            return HashMap::new();
+            return watched_survivors;
         }
 
         // ---- Compact phase ---- sliding compaction of old gen ----
@@ -9112,10 +9246,20 @@ impl GenerationalHeap {
             )
         };
         let s = self.stats.snapshot();
+        let committed = yf_cap + yt_cap + og_cap;
+        let budget = if self.max_heap_bytes == usize::MAX {
+            "unbounded (explicit arena sizes)".to_string()
+        } else {
+            format!("{}", self.max_heap_bytes)
+        };
         eprintln!(
             "FATAL: OutOfMemoryError: young gen exhausted — tried to allocate {} bytes, \
              from-space has {}/{} used",
             size, yf_used, yf_cap,
+        );
+        eprintln!(
+            "FATAL-OOM budget: committed heap {committed} bytes \
+             (young_from + young_to + old_gen) against an -Xmx budget of {budget}",
         );
         eprintln!(
             "FATAL-OOM detail: young_to {}/{} used; old_gen {}/{} used \
@@ -11976,6 +12120,81 @@ mod tests {
         );
     }
 
+    /// Regression: `-Xmx` bounds the WHOLE committed heap, not just its
+    /// initial split.
+    ///
+    /// Before the budget existed, `with_sizes` derived the young growth
+    /// ceiling from the young semi alone (`young_semi * 4`), so adaptive
+    /// expansion could commit up to 2.5x `-Xmx`: measured live at
+    /// `--Xmx 1g`, `young_from` 512 MiB + `young_to` 1024 MiB + old 512 MiB,
+    /// 4.0 GiB RSS, killed by the Linux OOM killer rather than throwing a
+    /// catchable OutOfMemoryError. With the 1/4-of-RAM ergonomic default the
+    /// same factor applied to a multi-GiB heap.
+    ///
+    /// The invariant this pins is the one the expansion path enforces:
+    /// both semi-spaces plus the old generation fit inside `-Xmx`, at the
+    /// growth ceiling and not merely at construction. Both semis are counted
+    /// because they swap roles every cycle and a copying collection needs a
+    /// to-space as large as the from-space it evacuates.
+    #[test]
+    fn with_capacity_growth_ceiling_stays_inside_the_xmx_budget() {
+        for &total in &[
+            64 * 1024,
+            256 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024_usize,
+            16 * 1024 * 1024 * 1024_usize,
+        ] {
+            let h = GenerationalHeap::with_capacity(total);
+            let old = h.old_gen_capacity();
+            let max_semi = h.max_young_semi_size;
+
+            assert_eq!(
+                h.heap_budget_bytes(),
+                total,
+                "with_capacity must record -Xmx as the heap budget",
+            );
+            assert!(
+                h.committed_heap_bytes() <= total,
+                "initial commit {} exceeds -Xmx {}",
+                h.committed_heap_bytes(),
+                total,
+            );
+            assert!(
+                2 * max_semi + old <= total,
+                "growth ceiling exceeds -Xmx {}: 2 * {} (semi) + {} (old) = {}",
+                total,
+                max_semi,
+                old,
+                2 * max_semi + old,
+            );
+            // The clamp must not shrink the *initial* semi — the whole point
+            // is that young already starts at the largest size the budget
+            // allows, so nothing is given up by capping growth.
+            assert_eq!(
+                max_semi,
+                h.young_semi_capacity(),
+                "the growth ceiling should equal the initial semi under the \
+                 50/50 split, not shrink it",
+            );
+        }
+    }
+
+    /// The explicit-size constructors take absolute arena sizes rather than a
+    /// budget to divide, so they must keep the historical unbounded growth
+    /// ceiling — the GC's own tests drive them with deliberately tiny arenas
+    /// that rely on expansion.
+    #[test]
+    fn with_sizes_keeps_the_historical_unbounded_growth_ceiling() {
+        let h = GenerationalHeap::with_sizes(64 * 1024, 128 * 1024);
+        assert_eq!(h.heap_budget_bytes(), usize::MAX);
+        assert_eq!(
+            h.max_young_semi_size,
+            64 * 1024 * MAX_HEAP_EXPANSION_FACTOR,
+            "with_sizes must keep young_semi * MAX_HEAP_EXPANSION_FACTOR",
+        );
+    }
+
     /// Regression: `with_capacity` splits the heap 50/50 (young_semi = 25%
     /// of total), not the older 25/75 (young_semi = 12.5% of total) split.
     ///
@@ -11989,7 +12208,15 @@ mod tests {
     /// `docs/internal/performance/binarytrees-bt18-half-gap-20260730.md` —
     /// because this workload's young GC already always falls back to a
     /// non-moving sweep, and a smaller semispace just means more of those
-    /// expensive fallbacks. Reverted; `with_capacity` stays uncapped.
+    /// expensive fallbacks. Reverted; `with_capacity`'s *initial* semi stays
+    /// uncapped and exactly `total / 4` — which is what this test pins.
+    ///
+    /// What DID change (2026-07-31) is the growth *ceiling*: it is now the
+    /// `-Xmx` budget left over after the old generation, so the committed heap
+    /// can no longer exceed `-Xmx` (see
+    /// `with_capacity_growth_ceiling_stays_inside_the_xmx_budget`). The two
+    /// are independent — nothing below is affected, because under the 50/50
+    /// split the ceiling lands exactly on the initial semi this test asserts.
     ///
     /// We test the same -Xmx values the orchestrator uses to validate
     /// QuickBenchLong's binary-trees-d18 kernel:
@@ -12712,7 +12939,7 @@ mod tests {
         assert!(heap.is_in_old(roots[1].as_ptr()));
 
         let old_used_before = heap.old_gen_used();
-        let reclaimed = heap.sweep_old_gen_non_moving(&[live_old]);
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old]);
 
         assert!(
             reclaimed > 0,
@@ -12723,6 +12950,115 @@ mod tests {
             heap.get_field(live_old, 0).as_int(),
             Some(4242),
             "the rooted old object must stay at its original address"
+        );
+    }
+
+    /// HIB-CV-32-family regression (`TestMVStoreCachePerformance` SIGSEGV):
+    /// after an old-gen reclamation, a WATCHED old-gen address that did NOT
+    /// survive must be reported dead by the exact predicate post-GC reference
+    /// processing uses — even though the permissive `is_addr_live` still
+    /// reports every old-gen address live.
+    ///
+    /// Before the fix, reference processing judged such an entry "survived",
+    /// never pruned it, and every subsequent collection wrote a referent
+    /// pointer through the stale address into whatever now occupied that
+    /// memory (the zeroed compaction tail, or a live object slid onto it).
+    #[test]
+    fn in_place_old_sweep_proves_watched_survivors_and_dead_ones() {
+        let heap = GenerationalHeap::with_sizes(4 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        let dead = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(live, 0, Value::Int(4242));
+        heap.set_field(dead, 0, Value::Int(-1));
+
+        let mut roots = vec![live, dead];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let live_old = roots[0].as_ptr() as usize;
+        let dead_old = roots[1].as_ptr() as usize;
+        assert!(heap.is_in_old(live_old as *mut u8));
+        assert!(heap.is_in_old(dead_old as *mut u8));
+
+        // Both addresses are watched — exactly what the VM publishes for every
+        // address the reference processor holds.
+        crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
+        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]]);
+        crate::gc_quiescence::set_watched_referents(&[]);
+
+        assert!(reclaimed > 0, "the unreachable promotion must be reclaimed");
+        assert_eq!(
+            survivors.get(&live_old),
+            Some(&live_old),
+            "a watched old-gen survivor kept in place must get an IDENTITY \
+             pointer_map entry — that entry is the only survival proof post-GC \
+             reference processing has once old gen has been reclaimed"
+        );
+        assert!(
+            !survivors.contains_key(&dead_old),
+            "a reclaimed old-gen object must NOT be reported as a survivor"
+        );
+    }
+
+    /// Companion to the above for the mark-COMPACT major GC, and the direct
+    /// statement of the defect: `is_addr_live` answers `true` for a dead
+    /// old-gen address (by design — it cannot see the pointer map), so the
+    /// exact predicate must be the one reference processing consults.
+    #[test]
+    fn explicit_full_gc_marks_dead_old_gen_watched_addr_as_not_surviving() {
+        let heap = GenerationalHeap::with_sizes(4 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        let dead = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(live, 0, Value::Int(4242));
+        heap.set_field(dead, 0, Value::Int(-1));
+
+        let mut roots = vec![live, dead];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let live_old = roots[0].as_ptr() as usize;
+        let dead_old = roots[1].as_ptr() as usize;
+        assert!(heap.is_in_old(live_old as *mut u8));
+        assert!(heap.is_in_old(dead_old as *mut u8));
+
+        crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
+        // Drop the reference to `dead` and force the old-gen mark-compact.
+        let mut live_roots = vec![roots[0]];
+        crate::gc_quiescence::request_major_gc();
+        let result = heap.collect_garbage(&stw(), &mut live_roots, &monitors);
+        crate::gc_quiescence::set_watched_referents(&[]);
+
+        assert!(
+            crate::gc_quiescence::old_gen_reclaimed_last_cycle(),
+            "the explicit major-GC request must have run an old-gen reclamation"
+        );
+        // The permissive predicate cannot tell the two apart — this is the
+        // behaviour the fix stops reference processing from relying on.
+        assert!(
+            heap.is_old_gen_addr(dead_old),
+            "precondition: the stale address is still inside the old-gen arena"
+        );
+        // The exact predicate can: the survivor has an entry (identity or
+        // relocated), the dead one has none.
+        let survived = |a: usize| {
+            result.pointer_map.contains_key(&a)
+                || (heap.is_old_gen_addr(a)
+                    && !crate::gc_quiescence::old_gen_reclaimed_last_cycle())
+        };
+        assert!(
+            survived(live_roots[0].as_ptr() as usize),
+            "the surviving watched Reference must be provable as alive"
+        );
+        assert!(
+            !survived(dead_old),
+            "a reclaimed watched old-gen address must be provable as DEAD — \
+             otherwise post-GC reference processing writes a referent pointer \
+             through it into whatever now occupies that memory (HIB-CV-32 \
+             family: TestMVStoreCachePerformance SIGSEGV)"
         );
     }
 

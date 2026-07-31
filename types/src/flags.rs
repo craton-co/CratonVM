@@ -536,7 +536,7 @@ pub const DEFAULT_MOVING_YOUNG: bool = true;
 /// is unreachable. The cost is not theoretical: with the IR gate closed, every
 /// compile falls through to the single-pass backend and the optimizing tier
 /// contributes nothing (see
-/// `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`).
+/// `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`).
 ///
 /// So the gates read this constant *in addition to* `moving_young`, and the
 /// runtime veto reads it too. One flip re-arms all of them together, which is
@@ -717,6 +717,13 @@ pub struct GcFlags {
     pub dbg_zero_ranges: bool,
     /// `CRATONVM_DIAG_HIB32`
     pub diag_hib32: bool,
+    /// `CRATONVM_NO_EXACT_REFPROC_SURVIVAL` — bisection escape hatch:
+    /// restore the pre-fix permissive survival predicate in post-GC reference
+    /// processing (every old-gen address counts as a survivor, even in a cycle
+    /// that reclaimed old gen). See `VmHeap::watched_pre_gc_addr_survived`;
+    /// setting this reinstates the stale-address writes that fix repaired, so
+    /// it is for A/B isolation only.
+    pub no_exact_refproc_survival: bool,
     /// `CRATONVM_G1_DBG_HEADERS`
     pub g1_dbg_headers: bool,
     /// `CRATONVM_DBG_G1DIAG` — print region-type counts (free/eden/survivor/
@@ -819,6 +826,7 @@ impl GcFlags {
             dbg_youngstate: present(src, "CRATONVM_DBG_YOUNGSTATE"),
             dbg_zero_ranges: present(src, "CRATONVM_DBG_ZERO_RANGES"),
             diag_hib32: present(src, "CRATONVM_DIAG_HIB32"),
+            no_exact_refproc_survival: present(src, "CRATONVM_NO_EXACT_REFPROC_SURVIVAL"),
             g1_dbg_headers: present(src, "CRATONVM_G1_DBG_HEADERS"),
             g1_dbg_diag: present(src, "CRATONVM_DBG_G1DIAG"),
             g1_dbg_pins: present(src, "CRATONVM_G1_DBG_PINS"),

@@ -17,6 +17,7 @@ readme = "README.md"
 # growing corpus blob in the published crate.
 exclude = [
     "seeds/**",
+    "seeds-jdk-only/**",
     "corpus/**",
     "regression/**",
     "**/*.class",

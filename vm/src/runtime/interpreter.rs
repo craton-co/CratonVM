@@ -208,19 +208,20 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     // kept-in-place survivor the sweep retains (side-marked or header-marked),
     // which is exactly the survival proof the restore pass needs — the
     // referent half of this fix simply never covered the reference objects.
-    let watch_addrs: Vec<usize> = pairs
-        .iter()
-        .flat_map(|&(ref_obj, referent)| [ref_obj, referent])
-        .collect();
-    let queue_watch_addrs = {
+    // Old-gen reclamation fix (HIB-CV-32 family, TestMVStoreCachePerformance):
+    // publish EVERY address the processor holds, not just the weak/phantom
+    // pairs' and their queues'. `process_references` and `remove_collected`
+    // consult the survival predicate for soft/cleaner/finalizer entries too,
+    // and after an old-gen reclamation that predicate is only exact for
+    // addresses the collector was asked to prove — see
+    // `VmHeap::watched_pre_gc_addr_survived`. The set is bounded by the number
+    // of live `Reference` objects, and a non-surviving address simply never
+    // gets an entry, so widening it costs one hash insert per tracked
+    // reference and cannot over-retain.
+    let watch_addrs: Vec<usize> = {
         let rp = shared.mem.ref_processor.lock();
-        rp.weak_phantom_active_queue_addrs()
+        rp.all_tracked_addrs()
     };
-    let mut watched_reference_liveness = watch_addrs;
-    watched_reference_liveness.extend(queue_watch_addrs);
-    // Queue addresses need the same non-moving survival proof as their
-    // Reference objects; post-GC enqueue writes both endpoints.
-    let watch_addrs = watched_reference_liveness;
 
     if crate::runtime::env_cache::dbg_watchref() {
         eprintln!(
@@ -2310,8 +2311,24 @@ fn process_references_after_gc(
     // 1. It appears in the pointer map (evacuated/copied during collection), OR
     // 2. It resides in a live (non-collected) heap region (G1: Old/Humongous regions
     //    that weren't in the collection set are still live).
+    // Every address reaching this predicate belongs to the reference
+    // processor and was therefore published as watched by
+    // `weakref_null_referents_pre_gc` — so the exact predicate applies. It
+    // only differs from the permissive `is_addr_live` when this cycle
+    // reclaimed old-gen storage, in which case an old-gen address absent from
+    // the pointer map genuinely did not survive (see
+    // `VmHeap::watched_pre_gc_addr_survived`). Fall back to the permissive
+    // form when the pre-GC publication pass is switched off, since then no
+    // watch set was published and no identity entries were emitted.
     let is_marked = |addr: usize| -> bool {
-        pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
+        if weakref_clear_enabled() {
+            shared
+                .mem
+                .heap
+                .watched_pre_gc_addr_survived(addr, pointer_map)
+        } else {
+            pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
+        }
     };
 
     // The `0` third argument is deliberate, not a second hardcode: when the
@@ -2338,11 +2355,42 @@ fn process_references_after_gc(
     // was hardwired inert for G1/ZGC — dead finalize/cleaner/enqueue
     // addresses flowed through unguarded and `run_finalizers` later
     // dereferenced freed CSet memory (finalize-on-recycled-object UAF).
+    // OLD-GEN RECLAMATION FIX (HIB-CV-32 family,
+    // `TestMVStoreCachePerformance`): `pre_gc_addr_did_not_survive` has the
+    // same old-generation blind spot `is_addr_live` had — for the Generational
+    // heap it only rejects YOUNG addresses absent from the pointer map, and
+    // answers "survived" for every old-gen address on the grounds that a minor
+    // GC does not move old gen. That stops being true the moment the SAME
+    // cycle reclaims old-gen storage (mark-compact `major_gc`, or the in-place
+    // `sweep_old_gen_non_moving`): the pre-GC address of a reclaimed old-gen
+    // Reference / queue / cleaner action now names the zeroed compaction tail,
+    // a live object slid onto it, or a free block. The cleared/enqueue writes
+    // below then landed on an innocent occupant, and — worse — the finalize
+    // and cleaner loops handed that address to `run_finalizers` /
+    // `run_cleaner_actions`, which INVOKE Java methods on it.
+    //
+    // Every address that reaches this predicate belongs to the reference
+    // processor and was published as watched by
+    // `weakref_null_referents_pre_gc`, so `watched_pre_gc_addr_survived` is
+    // exact for it (both old-gen paths emit an identity `pointer_map` entry
+    // for watched survivors). OR the two verdicts: a "did not survive" from
+    // either predicate declines the write, which is always the safe
+    // direction, and keeps the young rule exactly as strict as before (the
+    // `bc math-ec 0x4` fix). Falls back to the young-only rule when the
+    // pre-GC publication pass is off, since then nothing was watched.
     let is_stale_young = |addr: usize| -> bool {
-        shared
+        let young_stale = shared
             .mem
             .heap
-            .pre_gc_addr_did_not_survive(addr, pointer_map)
+            .pre_gc_addr_did_not_survive(addr, pointer_map);
+        if !weakref_clear_enabled() {
+            return young_stale;
+        }
+        young_stale
+            || !shared
+                .mem
+                .heap
+                .watched_pre_gc_addr_survived(addr, pointer_map)
     };
 
     // Null referent field (field 0) on cleared weak/soft references.
@@ -2550,7 +2598,13 @@ fn process_references_after_gc(
             // not itself survive — never write through freed/reused memory.
             let ref_obj_new = match pointer_map.get(&ref_obj_old) {
                 Some(&a) => a,
-                None if shared.mem.heap.is_addr_live(ref_obj_old) => ref_obj_old,
+                None if shared
+                    .mem
+                    .heap
+                    .watched_pre_gc_addr_survived(ref_obj_old, pointer_map) =>
+                {
+                    ref_obj_old
+                }
                 None => continue,
             };
             // The referent survived (this entry was not cleared/enqueued): find
@@ -2558,7 +2612,13 @@ fn process_references_after_gc(
             // in place → live).
             let referent_new = match pointer_map.get(&referent_old) {
                 Some(&a) => a,
-                None if shared.mem.heap.is_addr_live(referent_old) => referent_old,
+                None if shared
+                    .mem
+                    .heap
+                    .watched_pre_gc_addr_survived(referent_old, pointer_map) =>
+                {
+                    referent_old
+                }
                 // Defensive: should not happen for an active entry, but never
                 // write a stale referent — leave the slot null.
                 None => continue,
@@ -5589,6 +5649,130 @@ fn c2_first_call_enabled() -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// JDK-only mode: kind-aware native resolution for this file's dispatch sites
+// ---------------------------------------------------------------------------
+
+/// The one native lookup used by every native-dispatch site in this file
+/// (`docs/feature-designs/jdk-only-mode.md` §7).
+///
+/// Replaces the bare `NativeMethodRegistry::find` calls that handed back a
+/// `NativeCallback` with the `NativeKind` thrown away. A lookup that discards
+/// the kind cannot tell a reviewed `Intrinsic` from a `SyntheticStub`, so it
+/// cannot enforce §1.3 or §1.4 — it was a policy bypass sitting *beside*
+/// `resolve_dispatch` rather than routing through it. Every `find` in
+/// `fn execute`'s no-`Code` rescue chain now comes through here.
+///
+/// Why the wave-1 name-only adapter and not [`crate::vm::resolve_dispatch`]
+/// itself: these sites hold a class *name* (and in the receiver-walk case a
+/// `ClassId` whose `&Class` borrow is already pinned by an in-scope
+/// `class_manager` read guard), but never the resolved `&Method` — the whole
+/// point of this chain is that the resolved method has **no** `Code`, so the
+/// `&Method` §7 wants is the abstract declaration we are trying to get away
+/// from. Re-resolving one just to satisfy the signature would add a
+/// class-manager read lock plus a hierarchy walk per rescue. The adapter takes
+/// the identical policy decision from the names, and `bytecode_available` is
+/// the one §7 step-3 input the names cannot supply.
+///
+/// Cost is unchanged: `resolve_id` is the *same* single triple hash `find`
+/// already paid (`resolve_id(..).and_then(callback_of)` is documented to equal
+/// `find(..)`, descriptor-quirk fallback included), and the slot handle it
+/// returns makes the §4 census increment one relaxed add instead of a second
+/// hash. No allocation, no formatting; violation objects are built only on the
+/// reject path, inside the adapter's `#[cold]` constructors.
+///
+/// Returns:
+/// * `Ok(Some(cb))` — dispatch `cb`. The invocation is already counted.
+/// * `Ok(None)` — no native registered, or (under `JdkOnly`) bytecode wins.
+///   The caller continues down its existing fallback chain, exactly as it did
+///   when `find` returned `None`.
+/// * `Err(violation)` — `JdkOnly` refusal (§1.3). Surface it as
+///   `VmError::JdkOnly`; never silently fall back to another implementation.
+///
+/// **`Compatible` mode is bit-for-bit today's behaviour.** `compat_native_wins`
+/// is passed `true`, which is exactly the unconditional "a registered native
+/// wins here" that the `find` call sites encoded, and in `Compatible` mode
+/// `resolve_native_dispatch_wave1` is a pure function of that boolean.
+///
+/// ORCHESTRATOR — this function is the **single** point of coupling between
+/// this file and agent E's `vm/src/vm/vm_exec.rs`. All five native-dispatch
+/// sites in `fn execute` funnel through it, so if E's wave-1 surface lands with
+/// a different shape, this body is the only thing to reconcile. It depends on
+/// exactly three items, all re-exported through `crate::vm` by
+/// `pub use vm_exec::*`:
+///
+/// * `dispatch_policy(&SharedVm) -> cratonvm_types::compat::ExecutionPolicy`
+/// * `resolve_native_dispatch_wave1(policy, class_name, method_name,
+///   descriptor, Option<(NativeCallback, NativeKind)>, compat_native_wins:
+///   bool, bytecode_available: bool) -> Option<DispatchDecision<'static>>`
+/// * `DispatchDecision::{Reject, native_callback}`
+///
+/// The contract's §7 `resolve_dispatch(policy, &Class, &Method, native)` is
+/// deliberately not called here — see the paragraph above on why these sites
+/// have no `&Method`. If E's name-only adapter is dropped, the replacement is
+/// to re-acquire the `class_manager` read lock at each of the five sites and
+/// call `resolve_dispatch` proper; that is a correctness-neutral but
+/// measurably more expensive shape, which is why it was not done first.
+#[inline]
+fn resolve_native_for_dispatch(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    bytecode_available: bool,
+) -> Result<
+    Option<cratonvm_native_api::NativeCallback>,
+    cratonvm_types::error::JdkOnlyViolation,
+> {
+    let registry = &shared.natives.native_methods;
+    let id = match registry.resolve_id(class_name, method_name, method_descriptor) {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    let callback = match registry.callback_of(id) {
+        Some(callback) => callback,
+        None => return Ok(None),
+    };
+    // `kind_of_id` reports the slot's true kind. `find_with_kind` would report
+    // `Bridge` on its descriptor-quirk cold path; the difference is invisible in
+    // `Compatible` mode (every kind yields the same callback) and strictly more
+    // accurate under `JdkOnly`.
+    let kind = registry
+        .kind_of_id(id)
+        .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
+    match crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::dispatch_policy(shared),
+        class_name,
+        method_name,
+        method_descriptor,
+        Some((callback, kind)),
+        // JDK-ONLY-WAVE2: hard-coded `true` reproduces the pre-§7 "a registered
+        // native unconditionally wins here" of the `find` calls this replaces.
+        // Wave 2 replaces it with the real per-site compatibility verdict once
+        // `force_native_over_real_jdk_bytecode` and the forced-native `String`
+        // list (both in `vm/src/runtime/interpreter/invoke.rs` /
+        // `vm/src/vm/vm_exec.rs`) are unified.
+        true,
+        bytecode_available,
+    ) {
+        Some(crate::vm::DispatchDecision::Reject(violation)) => Err(violation),
+        Some(decision) => match decision.native_callback() {
+            Some(callback) => {
+                // §4 census: one relaxed increment, no hashing, no allocation.
+                // The acceptance criterion is *zero* synthetic-stub invocations
+                // through **any** path, and an uncounted path is unverifiable.
+                registry.record_invocation(id);
+                Ok(Some(callback))
+            }
+            // `Bytecode` is unreachable from the name-only adapter, but treat it
+            // as "no native" rather than assuming.
+            None => Ok(None),
+        },
+        // JdkOnly, §7 step 3: concrete bytecode beats this bridge.
+        None => Ok(None),
+    }
+}
+
 /// Execute a method on the given class.
 ///
 /// This is called by `invoke_on_class_shared` for non-native methods.
@@ -5797,6 +5981,17 @@ pub fn execute(
             // place by an agent, its woven bytecode is authoritative — skip the
             // per-class native shadow so the interpreter runs the (instrumented)
             // body and the advice fires. Fast-pathed on `any_class_redefined`.
+            //
+            // JDK-ONLY-WAVE2: the three `redefine_immune_*` predicates are
+            // hard-coded class/method-name exception lists (defined in
+            // `vm/src/runtime/interpreter/invoke.rs`, not owned here). They
+            // encode "this native keeps winning even over instrumented
+            // bytecode", which is a §1.4 shadow decision taken outside
+            // `resolve_dispatch`. What should replace them: `NativeKind` —
+            // exactly `Intrinsic` should be redefine-immune, and everything
+            // else should yield to redefined bytecode, with no name list at
+            // all. NOT deleted this wave; the lists gate real Mockito/ByteBuddy
+            // behaviour. Call site marked so wave 2 finds it mechanically.
             let class_redefined = crate::classloading::any_class_redefined()
                 && shared
                     .classes
@@ -5812,12 +6007,25 @@ pub fn execute(
                 )
                 && !redefine_immune_path_native(&class_name_owned, method_name, method_descriptor);
             if method_name != "<init>" && method_name != "<clinit>" && !class_redefined {
-                if let Some(cb) = shared.natives.native_methods.find(
+                // JDK-only §7, resolved-class native. `bytecode_available =
+                // false`: this whole arm only runs when the resolved method has
+                // NO `Code` attribute, so the registered native is the only
+                // implementation the method has (§7 step 3b) — there is no
+                // bytecode for it to shadow, and §1.4 is not in play.
+                match resolve_native_for_dispatch(
+                    shared,
                     &class_name_owned,
                     method_name,
                     method_descriptor,
+                    false,
                 ) {
-                    return crate::vm::safe_native_call(shared, thread, cb, args);
+                    Ok(Some(cb)) => {
+                        return crate::vm::safe_native_call(shared, thread, cb, args);
+                    }
+                    Ok(None) => {}
+                    Err(violation) => {
+                        return Err(MethodCallFailed::InternalError(VmError::JdkOnly(violation)));
+                    }
                 }
             }
             // S111r10 — interface-dispatch receiver-walk fallback. The
@@ -5961,7 +6169,7 @@ pub fn execute(
                     // missed it). Without this, every `@Timeout` test throws
                     // `AbstractMethodError: Future.cancel(Z)Z has no Code`.
                     if recv_cid != ClassId::new(0) {
-                        let (recv_native_cb, has_bytecode) = {
+                        let (recv_native_cb, has_bytecode, jdk_only_violation) = {
                             let cm2 = shared.classes.class_manager.read();
                             let bytecode = crate::classloading::find_method_recursive(
                                 recv_cid,
@@ -5972,24 +6180,62 @@ pub fn execute(
                             .map(|(m, _)| m.code().is_some())
                             .unwrap_or(false);
                             let mut cb = None;
-                            let mut walk = Some(recv_cid);
-                            while let Some(cid) = walk {
-                                if let Some(cls) = cm2.class_store.get(cid) {
-                                    if let Some(found) = shared.natives.native_methods.find(
-                                        &cls.name,
-                                        method_name,
-                                        method_descriptor,
-                                    ) {
-                                        cb = Some(found);
+                            let mut violation = None;
+                            // JDK-only §7, receiver-hierarchy native rescue.
+                            //
+                            // The walk used to run unconditionally and its result
+                            // was then discarded whenever `has_bytecode` held.
+                            // Hoisting that test keeps the §4 census honest — a
+                            // resolution that can never dispatch must not be
+                            // counted as an invocation — and is otherwise
+                            // behaviour-identical: `recv_native_cb` has no other
+                            // reader, so the walk was pure work in that case.
+                            if !bytecode {
+                                let mut walk = Some(recv_cid);
+                                while let Some(cid) = walk {
+                                    if let Some(cls) = cm2.class_store.get(cid) {
+                                        match resolve_native_for_dispatch(
+                                            shared,
+                                            &cls.name,
+                                            method_name,
+                                            method_descriptor,
+                                            // §7 step 3b: nothing in the
+                                            // receiver's chain has `Code` for
+                                            // this signature (that is what
+                                            // `!bytecode` means), so a
+                                            // registered native is the only
+                                            // implementation and shadows
+                                            // nothing.
+                                            false,
+                                        ) {
+                                            Ok(Some(found)) => {
+                                                cb = Some(found);
+                                                break;
+                                            }
+                                            // Under `JdkOnly` a `SyntheticStub`
+                                            // here is a refusal, NOT a reason to
+                                            // keep walking: continuing to the
+                                            // superclass would be precisely the
+                                            // silent fallback §1.3 forbids.
+                                            Err(v) => {
+                                                violation = Some(v);
+                                                break;
+                                            }
+                                            Ok(None) => {}
+                                        }
+                                        walk = cls.superclass;
+                                    } else {
                                         break;
                                     }
-                                    walk = cls.superclass;
-                                } else {
-                                    break;
                                 }
                             }
-                            (cb, bytecode)
+                            (cb, bytecode, violation)
                         };
+                        if let Some(violation) = jdk_only_violation {
+                            return Err(MethodCallFailed::InternalError(VmError::JdkOnly(
+                                violation,
+                            )));
+                        }
                         if !has_bytecode {
                             if let Some(cb) = recv_native_cb {
                                 let r = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -6027,6 +6273,22 @@ pub fn execute(
                             };
                             (concrete, better, decl)
                         };
+                        // JDK-only §7: this is a *routing* probe, not a dispatch.
+                        // It only decides whether Path A retargets to
+                        // `invoke_on_class_shared_no_retarget`, which is itself
+                        // routed through `resolve_dispatch` — so the policy
+                        // decision is taken there, with the resolved `&Class` /
+                        // `&Method` in hand, and no invocation is counted here
+                        // (nothing is invoked here).
+                        //
+                        // The kind is deliberately NOT filtered: refusing to
+                        // retarget on a `SyntheticStub` under `JdkOnly` would
+                        // convert what should be a structured
+                        // `SyntheticNativeInvocation` refusal into a silent
+                        // `AbstractMethodError` from the fall-through below.
+                        // `find_with_kind` is used anyway so the probe is on a
+                        // kind-aware API (identical cost — same `slot_for_exact`
+                        // fast path, same descriptor-quirk fallback).
                         let recv_native = if recv_concrete {
                             let cm2 = shared.classes.class_manager.read();
                             let mut walk = Some(recv_cid);
@@ -6036,7 +6298,7 @@ pub fn execute(
                                     if shared
                                         .natives
                                         .native_methods
-                                        .find(&cls.name, method_name, method_descriptor)
+                                        .find_with_kind(&cls.name, method_name, method_descriptor)
                                         .is_some()
                                     {
                                         found = true;
@@ -6091,6 +6353,21 @@ pub fn execute(
                     {
                         // Map well-known interfaces -> canonical concrete
                         // class whose natives we register.
+                        //
+                        // JDK-ONLY-WAVE2: hard-coded class-name exception list.
+                        // This substitutes a *different class's* native for an
+                        // unresolvable interface call — a compatibility
+                        // substitution in the §1 sense, and one that is silent:
+                        // the receiver is not an instance of `canonical`. What
+                        // should replace it: a real interface-method resolution
+                        // (JVMS §5.4.3.4 `selectMethod` over the receiver's
+                        // runtime class), with the `ClassOrigin` of the receiver
+                        // deciding whether a shim receiver is even legal. Under
+                        // `JdkOnly` real class bytes make every one of these
+                        // interfaces resolvable, so the map should become
+                        // unreachable rather than conditional. NOT deleted this
+                        // wave — removing shim mappings has regressed real-JDK
+                        // boot before.
                         let canonical: &'static str = match &*class_name_owned {
                             "java/util/Set" | "java/util/Collection" => "java/util/HashSet",
                             // Iterable has no collection shape of its own. Keep
@@ -6104,23 +6381,52 @@ pub fn execute(
                             _ => "",
                         };
                         if !canonical.is_empty() {
-                            if let Some(cb) = shared.natives.native_methods.find(
+                            // JDK-only §7. `bytecode_available = false`
+                            // throughout: we are in the no-`Code` arm and the
+                            // receiver matched no concrete class, so a
+                            // registered native is the only implementation
+                            // (§7 step 3b).
+                            match resolve_native_for_dispatch(
+                                shared,
                                 canonical,
                                 method_name,
                                 method_descriptor,
+                                false,
                             ) {
-                                let r = crate::vm::safe_native_call(shared, thread, cb, args)?;
-                                return Ok(r);
+                                Ok(Some(cb)) => {
+                                    let r = crate::vm::safe_native_call(shared, thread, cb, args)?;
+                                    return Ok(r);
+                                }
+                                Ok(None) => {}
+                                // §1.3: a refused stub must NOT fall through to
+                                // the interface-name probe below. Falling
+                                // through would be a silent second attempt at
+                                // exactly the substitution strict mode refused.
+                                Err(violation) => {
+                                    return Err(MethodCallFailed::InternalError(VmError::JdkOnly(
+                                        violation,
+                                    )));
+                                }
                             }
                             // Also try the cp class itself — natives may be
                             // registered directly on the interface name.
-                            if let Some(cb) = shared.natives.native_methods.find(
+                            match resolve_native_for_dispatch(
+                                shared,
                                 &class_name_owned,
                                 method_name,
                                 method_descriptor,
+                                false,
                             ) {
-                                let r = crate::vm::safe_native_call(shared, thread, cb, args)?;
-                                return Ok(r);
+                                Ok(Some(cb)) => {
+                                    let r = crate::vm::safe_native_call(shared, thread, cb, args)?;
+                                    return Ok(r);
+                                }
+                                Ok(None) => {}
+                                Err(violation) => {
+                                    return Err(MethodCallFailed::InternalError(VmError::JdkOnly(
+                                        violation,
+                                    )));
+                                }
                             }
                         }
                         // No native implements this interface method on the
@@ -6273,10 +6579,20 @@ pub fn execute(
             // native and can compile. Keep the ByteBuddy safety case by rejecting
             // methods whose own bytecode contains an invoke that resolves to a
             // native-shadowed target such as `Object.equals`.
+            //
+            // JDK-only §7: a compile-eligibility probe, not a resolution — no
+            // dispatch happens here and no invocation is counted. Every kind
+            // must keep suppressing the compile: an `Intrinsic` legitimately
+            // supersedes bytecode (§1.4) so compiling the bytecode would be
+            // wrong, a `Bridge`/`SyntheticStub` shadow is adjudicated by
+            // `resolve_dispatch` on the interpreter path, and under `JdkOnly` a
+            // `SyntheticStub` must reach that adjudication to be *refused*
+            // rather than be quietly compiled around. So the kind is read
+            // (`find_with_kind`, identical cost) but deliberately not filtered.
             let native_skip = if shared
                 .natives
                 .native_methods
-                .find(&class_name_str, method_name, method_descriptor)
+                .find_with_kind(&class_name_str, method_name, method_descriptor)
                 .is_some()
             {
                 true

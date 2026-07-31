@@ -1,0 +1,270 @@
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.function.Function;
+
+/**
+ * JDK-only corpus: the MODE-DIVERGENT probes.
+ *
+ * Every other RJdk* vector asserts behaviour that is correct in BOTH
+ * {@code --real-jdk} (compatible) and {@code --jdk-only} (strict) mode, so it
+ * can be diffed against HotSpot in either. This one cannot: it probes exactly
+ * the places where CratonVM's compatible mode deliberately FABRICATES a class,
+ * and where strict mode must instead raise the specification-appropriate
+ * error. HotSpot always behaves the strict way, so:
+ *
+ *   expected under --jdk-only : identical to HotSpot (this vector PASSES)
+ *   expected under --real-jdk : DIVERGENT from HotSpot by design
+ *
+ * The runner therefore only schedules this class when CRATONVM_ARGS names
+ * --jdk-only. Encoding "both expectations" for it means exactly that: the
+ * strict expectation is HotSpot parity, and the compatible expectation is
+ * "not asserted, because compatible mode is allowed to fabricate here".
+ * See regression-suite/jdk-only-coverage.txt.
+ *
+ * Sources for each probe are the P0 rows of docs/jdk-only-runtime-services.md.
+ */
+public class RJdkStrict {
+    static int checks;
+
+    static void check(boolean c, String m) {
+        checks++;
+        if (!c) {
+            throw new AssertionError(m);
+        }
+    }
+
+    /**
+     * P0 "Synthetic class fallback policy": ClassManager::load_class falls back
+     * to fabricating an empty class for these prefixes. Under --jdk-only every
+     * one of them must be a ClassNotFoundException.
+     */
+    static final String[] ENTERPRISE_STUB_PROBES = {
+        "org.jboss.logging.Logger",
+        "org.jboss.modules.Module",
+        "io.quarkus.runtime.Application",
+        "io.smallrye.config.SmallRyeConfig",
+        "org.jboss.as.server.Main",
+        "io.quarkus.arc.Arc",
+    };
+
+    static void noFabricatedEnterpriseClasses() {
+        ClassLoader loader = RJdkStrict.class.getClassLoader();
+        List<String> fabricated = new ArrayList<>();
+        for (String name : ENTERPRISE_STUB_PROBES) {
+            boolean threw = false;
+            try {
+                Class<?> k = Class.forName(name, false, loader);
+                fabricated.add(name + "->" + k.getName());
+            } catch (ClassNotFoundException expected) {
+                threw = true;
+            } catch (NoClassDefFoundError expected) {
+                // Also specification-appropriate for a resolution failure.
+                threw = true;
+            }
+            check(threw, "strict mode fabricated a compatibility class for " + name);
+        }
+        check(fabricated.isEmpty(), "fabricated classes: " + fabricated);
+
+        // The same through ClassLoader.loadClass, which is the path frameworks
+        // actually use for capability probes.
+        for (String name : ENTERPRISE_STUB_PROBES) {
+            boolean threw = false;
+            try {
+                loader.loadClass(name);
+            } catch (ClassNotFoundException expected) {
+                threw = true;
+            }
+            check(threw, "loadClass fabricated a compatibility class for " + name);
+        }
+        System.out.println("CK RJdkStrict enterpriseStubs=0 probed="
+                + ENTERPRISE_STUB_PROBES.length);
+    }
+
+    /**
+     * P0 "Function.identity()": CratonVM carries a dedicated
+     * java/util/function/Function$Identity stand-in with a hand-written field
+     * table. Under --jdk-only the value must be a real generated lambda.
+     */
+    static void functionIdentityIsNotAStandIn() {
+        Function<String, String> id = Function.identity();
+        String name = id.getClass().getName();
+        check(!name.equals("java.util.function.Function$Identity"),
+                "Function.identity() returned the fabricated stand-in: " + name);
+        // NB: a real generated lambda IS named after its defining class, so the
+        // name legitimately begins "java.util.function.Function$$Lambda...".
+        // What must not appear is the fabricated "$Identity" stand-in.
+        check(!name.endsWith("$Identity"),
+                "Function.identity() must not be an $Identity stand-in: " + name);
+        check(name.contains("$$Lambda"),
+                "Function.identity() must be a generated lambda class, got: " + name);
+        check(id.getClass().isSynthetic(), "the identity lambda class must be synthetic");
+        String s = "ref";
+        check(id.apply(s) == s, "identity must return the same reference");
+
+        // The stand-in class must not be loadable by name either.
+        boolean threw = false;
+        try {
+            Class.forName("java.util.function.Function$Identity", false,
+                    Function.class.getClassLoader());
+        } catch (ClassNotFoundException expected) {
+            threw = true;
+        }
+        check(threw, "java.util.function.Function$Identity must not exist");
+        System.out.println("CK RJdkStrict identityIsLambda=true");
+    }
+
+    /**
+     * P1 "ProcessHandle": is_native_backed_jdk_stub explicitly allows
+     * java/lang/ProcessHandle and java/lang/ProcessHandle$Info to be fabricated
+     * with a hand-written method table. Real boot bytes have a specific,
+     * checkable shape that a hand-written table does not reproduce.
+     */
+    static void processHandleHasRealBytes() {
+        check(ProcessHandle.class.isInterface(), "ProcessHandle must be an interface");
+        check(ProcessHandle.Info.class.isInterface(), "ProcessHandle.Info must be an interface");
+        check(Comparable.class.isAssignableFrom(ProcessHandle.class),
+                "ProcessHandle extends Comparable");
+        check(ProcessHandle.class.getModule().getName().equals("java.base"),
+                "ProcessHandle must belong to java.base");
+        check(ProcessHandle.class.getClassLoader() == null,
+                "ProcessHandle must be defined to the boot loader");
+
+        List<String> methods = new ArrayList<>();
+        for (Method m : ProcessHandle.class.getDeclaredMethods()) {
+            if (Modifier.isPublic(m.getModifiers()) && !m.isSynthetic()) {
+                methods.add(m.getName());
+            }
+        }
+        Collections.sort(methods);
+        for (String required : new String[] { "allProcesses", "children", "compareTo",
+            "current", "descendants", "destroy", "destroyForcibly", "info", "isAlive",
+            "of", "onExit", "parent", "pid", "supportsNormalTermination" }) {
+            check(methods.contains(required), "ProcessHandle is missing " + required
+                    + "; declared: " + methods);
+        }
+
+        List<String> infoMethods = new ArrayList<>();
+        for (Method m : ProcessHandle.Info.class.getDeclaredMethods()) {
+            infoMethods.add(m.getName());
+        }
+        Collections.sort(infoMethods);
+        check(infoMethods.equals(Arrays.asList("arguments", "command", "commandLine",
+                "startInstant", "totalCpuDuration", "user")),
+                "ProcessHandle.Info surface: " + infoMethods);
+        System.out.println("CK RJdkStrict processHandleInfo=" + infoMethods);
+    }
+
+    /**
+     * P0 "Native-first dispatch": concrete bytecode must win over a registered
+     * compatibility native. A user subclass overriding a java.util method is
+     * the cheapest way to see it: if a native shim answers instead of the
+     * override, the wrong value comes back.
+     */
+    static void concreteBytecodeWins() {
+        List<String> l = new CountingList();
+        l.add("a");
+        l.add("b");
+        check(((CountingList) l).addCalls == 2,
+                "the user override of add() must run, not a native shim");
+        check(l.size() == 2, "the superclass state must still be correct");
+        check(((CountingList) l).sizeCalls >= 1, "the user override of size() must run");
+
+        java.util.Map<String, String> m = new CountingMap();
+        m.put("k", "v");
+        check(((CountingMap) m).putCalls == 1, "the user override of put() must run");
+        check("v".equals(m.get("k")), "the map still works through the override");
+        System.out.println("CK RJdkStrict overrideAdd=" + ((CountingList) l).addCalls
+                + " overridePut=" + ((CountingMap) m).putCalls);
+    }
+
+    static final class CountingList extends java.util.ArrayList<String> {
+        private static final long serialVersionUID = 1L;
+        int addCalls;
+        int sizeCalls;
+
+        @Override
+        public boolean add(String s) {
+            addCalls++;
+            return super.add(s);
+        }
+
+        @Override
+        public int size() {
+            sizeCalls++;
+            return super.size();
+        }
+    }
+
+    static final class CountingMap extends java.util.HashMap<String, String> {
+        private static final long serialVersionUID = 1L;
+        int putCalls;
+
+        @Override
+        public String put(String k, String v) {
+            putCalls++;
+            return super.put(k, v);
+        }
+    }
+
+    /** Legitimately generated classes must still be allowed in strict mode. */
+    static void generatedClassesStillAllowed() throws Throwable {
+        // Arrays.
+        check(int[].class.isArray() && int[].class.getComponentType() == int.class, "array class");
+        check(java.lang.reflect.Array.newInstance(String.class, 2, 3).getClass()
+                .getName().equals("[[Ljava.lang.String;"), "multi-dim array class");
+
+        // Lambda.
+        Runnable r = () -> { };
+        check(r.getClass().getName().contains("$$Lambda"), "lambda class");
+
+        // Proxy.
+        Object p = java.lang.reflect.Proxy.newProxyInstance(
+                RJdkStrict.class.getClassLoader(), new Class<?>[] { Runnable.class },
+                (proxy, method, args) -> null);
+        check(java.lang.reflect.Proxy.isProxyClass(p.getClass()), "proxy class");
+
+        // Hidden class.
+        byte[] bytes;
+        try (java.io.InputStream in = RJdkStrict.class
+                .getResourceAsStream("RJdkStrict$CountingMap.class")) {
+            check(in != null, "own class bytes readable");
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            bytes = out.toByteArray();
+        }
+        Class<?> hidden = java.lang.invoke.MethodHandles.lookup()
+                .defineHiddenClass(bytes, true,
+                        java.lang.invoke.MethodHandles.Lookup.ClassOption.NESTMATE)
+                .lookupClass();
+        check(hidden.isHidden(), "hidden class still definable under --jdk-only");
+
+        // Reflection accessor generation (past the inflation threshold).
+        Method size = java.util.ArrayList.class.getDeclaredMethod("size");
+        java.util.ArrayList<String> list = new java.util.ArrayList<>();
+        list.add("x");
+        int acc = 0;
+        for (int i = 0; i < 100; i++) {
+            acc += (Integer) size.invoke(list);
+        }
+        check(acc == 100, "reflection accessors must keep working: " + acc);
+        System.out.println("CK RJdkStrict generated=array,lambda,proxy,hidden,accessor");
+    }
+
+    public static void main(String[] args) throws Throwable {
+        noFabricatedEnterpriseClasses();
+        functionIdentityIsNotAStandIn();
+        processHandleHasRealBytes();
+        concreteBytecodeWins();
+        generatedClassesStillAllowed();
+        System.out.println("CK RJdkStrict checks=" + checks);
+        System.out.println("PASS RJdkStrict (" + checks + " checks)");
+    }
+}

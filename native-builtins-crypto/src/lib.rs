@@ -7,6 +7,13 @@
 //! `native-builtins` facade. This crate is a separately compiled code-size and
 //! incremental-build island with no VM-context dependency.
 
+// JDK-ONLY-CLASSIFY: not applicable — this crate contains ZERO calls to
+// `NativeMethodRegistry::register` and ZERO `set_category`/`with_category`
+// calls. It exports pure kernels that `native-builtins` marshals and registers
+// on its behalf, so the ambient-category footgun cannot bite here. The
+// classification of anything backed by these kernels is decided at the
+// `native-builtins` call site, not here.
+// See docs/jdk-only-ambient-category-audit.md.
 pub mod bc_aes;
 pub mod bc_chacha;
 pub mod bc_newhope;

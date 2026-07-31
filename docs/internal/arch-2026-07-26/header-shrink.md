@@ -340,6 +340,9 @@ audit the shrink was planned from:
 - `ir_lower.rs:1971`, `:1992` — `HEADER_SIZE as u8` inside literal instruction byte arrays (disp8)
 - `ir_lower.rs:1887`, `:1923` — `HEADER_SIZE as i32` (disp32)
 - `ir_lower.rs:2604` — `ARRAY_LENGTH_OFFSET as u8` (disp8, `MOV R10D,[RAX+12]`)
+- `ir_lower.rs:1186` (added 2026-07-31) — `(HEADER_SIZE + packed_body_offset) as i32`,
+  the guarded inline compact `getfield` cell address (disp32, so no disp8 hazard;
+  it is here because it bakes the header size into emitted machine code)
 
 Plus `jit/src/lib.rs:3210`, `:3236` (was `:3186`, `:3226` — the two closures were
 rewritten by BUG-STRING-CODER-COMPACT-20260726) —
