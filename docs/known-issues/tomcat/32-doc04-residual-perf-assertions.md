@@ -9,7 +9,7 @@ assertion is about speed, with its own separate reason.
 
 | item | disposition after the 2026-07-30 re-derivation |
 |---|---|
-| 32.1 | OPEN. A dev regression, not a mapper problem, and now **fully accounted for**. **Cause 1 FIXED 2026-07-30** (instance tier-up default restored, ~8.4x). **Cause 2 = moving-young becoming active** ([its own doc](../jit-optimizing-tier-disabled-by-moving-young-default.md)); a fix is written and pushed on `codex/fix-hibernate-five-takeover-20260730`, not yet on dev. With both removed the test PASSES on both hostnames. No Tomcat work left. |
+| 32.1 | OPEN. A dev regression, not a mapper problem, and now **fully accounted for**. **Cause 1 FIXED 2026-07-30** (instance tier-up default restored, ~8.4x). **Cause 2 = moving-young becoming active** ([its own doc](../../internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md)); a fix is written and pushed on `codex/fix-hibernate-five-takeover-20260730`, not yet on dev. With both removed the test PASSES on both hostnames. No Tomcat work left. |
 | 32.2 | ✅ **Not a defect** — passes on a quiet host. Genuinely load-sensitive; expect intermittency on a busy one. |
 | 32.3 | OPEN, improved ~12–16 %. Root cause identified as per-completion processing, not I/O; no further AIO work will close it. |
 | 32.4 | OPEN, and **harder than recorded** — belongs to doc [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md)'s family, not here. |
@@ -184,7 +184,7 @@ test's own loop still runs 5.72 s (`xxxxxxxxxxx`) and 8.16 s
 `b695d468f` ran the easy one in 2.19 s.
 
 The rest is
-[jit-optimizing-tier-disabled-by-moving-young-default](../jit-optimizing-tier-disabled-by-moving-young-default.md).
+[the retired moving-young gate doc](../../internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md).
 `moving_young` did not change its *flag* in this window — it started actually
 **engaging** (it had been `true`-but-inert). Two independent penalties follow
 from `x64::moving_young_enabled()`, both in `jit/src/lib.rs`:

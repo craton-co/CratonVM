@@ -9,7 +9,7 @@
 > `!x64::moving_young_enabled()`, so with `DEFAULT_MOVING_YOUNG = true` every
 > compile falls through to the single-pass C1 backend and C2 never runs. That
 > was found independently and is tracked on dev as
-> `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`,
+> `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`,
 > which is the authority for this interaction. The emission cost described below
 > is real but secondary, and the "Options" section here is superseded by that
 > document — in particular it **rejects** flipping `DEFAULT_MOVING_YOUNG` back.

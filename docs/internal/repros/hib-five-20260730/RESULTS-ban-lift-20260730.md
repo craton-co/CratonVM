@@ -60,7 +60,7 @@ temporal classes.
 **Correction to the earlier write-up on this branch.** I first attributed that
 gap to the rewritable-root-map emission `moving_young` forces on. That is real
 but secondary. The larger mechanism was found independently and landed on dev as
-`docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`:
+`docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`:
 `try_compile_inner` admits the optimizing IR pipeline only when
 `!x64::moving_young_enabled()`, so with `DEFAULT_MOVING_YOUNG = true`
 **every compile falls through to the single-pass C1 backend and the C2/IR tier
@@ -87,7 +87,7 @@ On the best available configuration (ban lifted, `CRATONVM_NO_MOVING_YOUNG=1`):
 
 Remaining gap to HotSpot on that configuration: 15.1x (Offset), 12.3x (Zoned),
 7.8x (Oracle), 18.1x (ASTParser). Closing it is the JIT-tiering work tracked in
-`jit-optimizing-tier-disabled-by-moving-young-default.md`, tomcat doc 30, and
+`docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`, tomcat doc 30, and
 `project_hib_actionqueue_graph_default_jit_tiering_blocker` — not a
 Hibernate-specific defect.
 

@@ -215,7 +215,7 @@ Also in this change:
   platform's HotSpot line for line. (Under GC stress the Linux run also emits
   eight `[moving-young] fallback … jit-relocation-contract-unproven` warnings;
   those are the pre-existing default-moving-young issue tracked in
-  `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`,
+  `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`,
   not probe output, and the 33 reported values are unchanged.)
 - `cargo test -p cratonvm-jit` (all targets): 1,057 lib + 193 integration
   tests, **0 failed**. This includes

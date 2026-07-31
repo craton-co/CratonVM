@@ -7286,7 +7286,7 @@ pub fn moving_young_disables_optimizing_tier() -> bool {
              compiles, but through the single-pass C1 backend only — the IR optimizer, its \
              inline caches and its direct-call lowering contribute nothing. \
              `CRATONVM_NO_MOVING_YOUNG=1` restores the optimizing tier and gives up compaction. \
-             See docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md",
+             See docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md",
         );
     }
     true
@@ -8465,7 +8465,7 @@ fn try_compile_inner(
         // in exchange for a frame that cannot occur: the runtime vetoes
         // moving-young whenever an un-rewritable compiled frame is live, so a
         // relocating cycle never sees one. See
-        // `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+        // `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`
         // and `moving_young_relocates_compiled_frames` for the invariant.
         //
         // This scopes the gate; it does not remove it. When the JIT publishes a

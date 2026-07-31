@@ -36938,7 +36938,7 @@ mod flag_and_header_contracts {
     /// moving-young for the whole process as soon as any compiled code exists.
     /// The optimizing tier must therefore NOT be disabled by the moving-young
     /// default — that trade bought nothing. Pins the regression that
-    /// `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+    /// `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`
     /// describes.
     #[test]
     fn optimizing_tier_is_not_disabled_while_relocation_is_vetoed() {
