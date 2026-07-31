@@ -9,6 +9,7 @@ pub(crate) const MAX_LAMBDA_PROXIES: usize = 100_000;
 static NEXT_VM_IDENTITY: AtomicUsize = AtomicUsize::new(1);
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -35,6 +36,7 @@ use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::threading::monitor::MonitorTable;
 use crate::threading::thread_registry::ThreadRegistry;
 use crate::types::{ObjectRef, Value};
+use cratonvm_types::compat::CompatibilityMode;
 
 // ---------------------------------------------------------------------------
 // Missing-native audit log entry (NEW-10)
@@ -373,6 +375,68 @@ fn reject_startup_jvmti_agents_when_disabled(config: &VmConfig) {
     }
 }
 
+/// Boot precondition for `--jdk-only`
+/// (`docs/feature-designs/jdk-only-mode.md` §1.1, §8): strict mode means real
+/// class bytes are authoritative, so a real JDK runtime image is **required**
+/// and there is no silent fallback.
+///
+/// Returns the resolved `JAVA_HOME` under
+/// [`CompatibilityMode::JdkOnly`](cratonvm_types::compat::CompatibilityMode::JdkOnly)
+/// and `Ok(None)` under `Compatible`.
+///
+/// Three properties this shape is protecting, each of which has burned us
+/// before:
+///
+///  1. **The `Compatible` arm probes nothing.** `VmConfig::default()` is
+///     hermetic — hundreds of unit tests and every embedder build one without
+///     a JDK on the box — and a host probe on the default path would make the
+///     *default* boot depend on the machine. That is the exact defect
+///     `require_real_jdk` was written to remove, so it must not be
+///     reintroduced one level up. `Compatible` returns before touching disk.
+///  2. **`validate_compatibility` runs first, unconditionally.** The launcher
+///     rejects `--jdk-only --synthetic-jdk` at argv-parse time, but embedders
+///     (`libcratonvm`, `cratonvm-embed`) and in-process harnesses construct a
+///     `VmConfig` by hand and never see argv. `SharedVm::new` is the one choke
+///     point every boot passes through, so the config-consistency check lives
+///     here too rather than only in the CLI.
+///  3. **One boot check, not two.** The JDK search is
+///     [`crate::config::require_real_jdk`]'s job; its message already carries
+///     [`crate::config::describe_jdk_search`]'s per-probe account and the
+///     accepted image layouts (`jmods/java.base.jmod` or `lib/modules`). A
+///     second, `--jdk-only`-flavoured copy of that search would drift out of
+///     sync with the first the moment either is edited. We delegate and wrap.
+///
+/// The wrapper preamble exists because `require_real_jdk`'s stock text offers
+/// `--synthetic-jdk` as one of its four fixes, and under `--jdk-only` that
+/// escape is unavailable by construction (§9: the two flags conflict) — a
+/// strict-mode operator handed that suggestion would follow it into a second,
+/// more confusing error.
+fn require_jdk_image_for_jdk_only(config: &VmConfig) -> Result<Option<PathBuf>, VmError> {
+    // Covers embedders and in-process harnesses that never parse argv.
+    config.validate_compatibility()?;
+
+    if !config.is_jdk_only() {
+        // Default path: no host probing. See property 1 above.
+        return Ok(None);
+    }
+
+    match crate::config::require_real_jdk(config.java_home.as_deref()) {
+        Ok(home) => Ok(Some(home)),
+        Err(detail) => Err(VmError::InvalidConfiguration(format!(
+            "--jdk-only requires a real JDK runtime image, and none was found.\n\
+             \n\
+             In JDK-only mode real class bytes are authoritative: no class may be \
+             fabricated and no synthetic-stub native may be registered, so there is \
+             no class library left to boot without a runtime image. The \
+             --synthetic-jdk escape hatch does NOT apply here — it conflicts with \
+             --jdk-only by construction. If you want today's compatibility \
+             behaviour instead, re-run with --real-jdk (the default).\n\
+             \n\
+             {detail}"
+        ))),
+    }
+}
+
 /// State for the `main_thread_group` lazy singleton's claim/wait
 /// coordination (see `SharedVm::main_thread_group_init`'s doc). Mirrors the
 /// `Class::initializing_thread` + `class_init_waiters` shape used for JVMS
@@ -699,6 +763,26 @@ impl SharedVm {
     pub fn new(mut config: VmConfig) -> Self {
         apply_container_default_heap(&mut config);
 
+        // ── Strict-mode boot precondition (jdk-only-mode.md §1.1, §8) ──────
+        //
+        // Deliberately the *second* statement in the constructor: before any
+        // heap allocation, before the crash-handler cells are published, and
+        // before `ClassManager::new` has read a byte of any classpath. A
+        // `--jdk-only` run with no real JDK image cannot produce a meaningful
+        // VM, so it must not produce a half-built one either — failing here
+        // keeps the error a configuration error rather than a class-loading
+        // mystery 3,000 classes later.
+        //
+        // `SharedVm::new` is infallible by signature and has several hundred
+        // call sites, so this surfaces as a panic — the same mechanism
+        // `reject_startup_jvmti_agents_when_disabled` (just above) already
+        // uses for the same class of "the config asks for something this
+        // build/host cannot do" failure. Changing the signature to
+        // `Result` is a separate, much larger refactor.
+        if let Err(e) = require_jdk_image_for_jdk_only(&config) {
+            panic!("{e}");
+        }
+
         // ── Publish the crash-report facts that only the config knows ──────
         //
         // The launcher prints the JDK mode on its own paths (`-version`, panic
@@ -837,6 +921,23 @@ impl SharedVm {
         // otherwise invisible until someone notices the VM "feels slow".
         let __boot_t0 = std::time::Instant::now();
         let mut class_manager = ClassManager::new(&boot_cp, &ext_cp, &config.classpath);
+        // ── Class-origin policy, installed before the first question ───────
+        //
+        // This is the *very next statement* after construction on purpose, and
+        // the position is load-bearing rather than stylistic: everything below
+        // that can mint a class — `application_contains_resource`'s probe,
+        // `bootstrap_core_classes`, `ensure_synthetic_class`, and every
+        // `load_class` — must find the policy already installed. A manager that
+        // answers even one class request before `set_compatibility_mode` would
+        // fabricate that class under `Compatible` rules and then be told the
+        // rules were strict, i.e. exactly the un-auditable state
+        // `--jdk-only` exists to make impossible (jdk-only-mode.md §5, §8).
+        //
+        // Read straight off the config: there is NO process global for this
+        // (§2). Two VMs in one process may run under different policies, and
+        // this repo has already paid for process-global native state leaking
+        // across VM instances more than once.
+        class_manager.set_compatibility_mode(config.compatibility_mode);
         let native_shim_selection =
             cratonvm_native_builtins::app_shims::ShimSelection::from_resource_probe(|resource| {
                 class_manager.application_contains_resource(resource)
@@ -1245,6 +1346,25 @@ impl SharedVm {
             .expect("bootstrap ClassesReady invariants");
 
         let mut native_methods = NativeMethodRegistry::new();
+        // ── Native policy, installed before ANY `register_*` pass ──────────
+        //
+        // One line after construction and one line *above* the
+        // `#[cfg(feature = "synthetic-jdk")]` fork, so it is structurally
+        // impossible to add a registration pass to either arm that runs
+        // unpoliced: there is no reachable point between `new()` and the first
+        // `register_*` where the mode is not yet set. (Placing it inside the
+        // arms would have meant two call sites and a standing invitation for
+        // the next `register_*` to be inserted above one of them.)
+        //
+        // Under `JdkOnly` the registry refuses `NativeKind::SyntheticStub`
+        // registrations outright and records a `SyntheticNativeRegistered`
+        // violation with the registration site, which is what turns the
+        // ~157-stub inventory from an assertion into evidence
+        // (jdk-only-mode.md §4, §8, §10).
+        //
+        // Config-sourced, not a process global — see the `ClassManager` note
+        // above for why (§2).
+        native_methods.set_compatibility_mode(config.compatibility_mode);
         #[cfg(feature = "synthetic-jdk")]
         {
             if config.use_synthetic_jdk {
@@ -1335,6 +1455,24 @@ impl SharedVm {
                 // docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md's
                 // 2026-07-14 addendum for the WildFly-boot regression this
                 // caused and how it was found (git bisect).
+                //
+                // 2026-07-31, `--jdk-only` (docs/feature-designs/jdk-only-mode.md):
+                // strict mode does NOT re-litigate the 2026-07-14 revert above,
+                // and nothing here changes. The two are different questions.
+                // What the 2026-07-14 bisect actually proved is that a subset
+                // of the `SyntheticStub`-tagged clusters is **mis-tagged**:
+                // JMX and `Function$Identity` are permanent bridges with no
+                // real-bytecode fallback, which by the contract's own taxonomy
+                // (§1's terminology table) makes them `NativeKind::Bridge`, not
+                // stubs. The fix is to retag them at the source, one subsystem
+                // per PR, in the reclassification wave (§8 explicitly keeps
+                // `native-builtins/src/lib.rs` out of scope this wave) — not to
+                // flip a global drop switch again and rediscover the same
+                // WildFly boot failure. Until that wave lands, `--jdk-only`'s
+                // enforcement is measurement-only for this population (§10):
+                // the registry records the refusal and the census names the
+                // registration site, so the retagging work starts from evidence
+                // instead of from another bisect.
                 cratonvm_native_builtins::register_essential_natives_with_shims(
                     &mut native_methods,
                     native_shim_selection,
@@ -1538,6 +1676,31 @@ impl SharedVm {
                 cratonvm_native_builtins::phases_late::register_p60_process_handle(
                     &mut native_methods,
                 );
+                // ╔══ LAST-WRITE-WINS BOUNDARY — do not reorder ═════════════╗
+                //
+                // Everything from here to the end of this arm is ordered
+                // *semantically*, not stylistically. `NativeMethodRegistry`
+                // registration is last-write-wins, and this arm deliberately
+                // re-registers implementations that `register_collections_natives`
+                // is known to clobber (Properties side-table below; `Random`/
+                // `SecureRandom` and StringJoiner in the sibling arm). Each
+                // re-registration below already carries the incident that
+                // produced it. Moving, sorting or deduplicating these calls
+                // silently reinstates the clobbered version — every one of
+                // these comments is a bug that was found in production, not a
+                // preference.
+                //
+                // Untangling this into an explicit precedence table is
+                // deliberately deferred (jdk-only-mode.md §8): this wave is
+                // measurement, not deletion. The schema-2 native census
+                // (`dump_native_census_json`) now records `overwrote` and
+                // `registered_by` per slot, so the wave that does the
+                // untangling has evidence — which registration actually won,
+                // and which one it displaced — instead of having to re-derive
+                // the order by bisecting this file again.
+                //
+                // ╚══════════════════════════════════════════════════════════╝
+                //
                 // Mixed real-JDK mode still routes many collection call sites
                 // through synthetic wrappers; register collection natives so
                 // ArrayList/Iterator/Map operations don't fail linkage.
@@ -1777,6 +1940,16 @@ impl SharedVm {
             // regression + revert, 2026-07-14): several SyntheticStub-tagged
             // register_* clusters (JMX, Function$Identity) are permanent
             // bridges needed in real mode too, not fake-JDK-only shadows.
+            //
+            // 2026-07-31, `--jdk-only` (docs/feature-designs/jdk-only-mode.md):
+            // unchanged here too, and for the same reason as the sibling arm —
+            // `drop_synthetic_stubs` stays opt-in (`CRATONVM_NO_STUBS`) in
+            // BOTH arms. `--jdk-only` is a stricter, *recorded* superset of
+            // that switch, not a second way to turn it on globally: the
+            // mis-tagged permanent bridges (JMX, `Function$Identity`) get
+            // reclassified to `NativeKind::Bridge` at their registration sites
+            // in their own wave (§8), and the schema-2 census exists to tell
+            // that wave which ones they are.
             cratonvm_native_builtins::register_essential_natives_with_shims(
                 &mut native_methods,
                 native_shim_selection,
@@ -1983,6 +2156,26 @@ impl SharedVm {
             // registration otherwise lives, via `register_p67_misc`), same
             // "keep in sync" reasoning as `register_p60_process_handle` above.
             cratonvm_native_builtins::phases_late::register_classvalue_natives(&mut native_methods);
+            // ╔══ LAST-WRITE-WINS BOUNDARY — do not reorder ═════════════════╗
+            //
+            // Same contract as the sibling arm above. Registration is
+            // last-write-wins, and the calls below exist *because*
+            // `register_collections_natives` overwrites earlier, correct
+            // implementations: `securerandom` (collections re-registers every
+            // `java/util/Random` method against a synthetic 2-field layout, so
+            // a seeded `Random` returned all zeroes) and
+            // `properties_sidetable` (collections re-registers `Properties`
+            // against the legacy HashMap layout, breaking Surefire's
+            // load → stringPropertyNames → getProperty round-trip). Both
+            // incidents are written up inline below. Reordering, sorting or
+            // "cleaning up" this sequence reinstates the broken versions.
+            //
+            // Untangling is deferred by jdk-only-mode.md §8. The schema-2
+            // native census now carries `overwrote` + `registered_by` per
+            // slot, which is the evidence a later wave needs to replace this
+            // ordering with an explicit precedence rule.
+            //
+            // ╚══════════════════════════════════════════════════════════════╝
             register_collections_natives(&mut native_methods);
             // Re-register the side-table-backed `java.util.Random` /
             // `SecureRandom` natives AFTER `register_collections_natives`:
@@ -2432,7 +2625,24 @@ impl SharedVm {
         sys_props.insert("java.vm.version".to_string(), "25.0.1+8".to_string());
         sys_props.insert("java.vm.name".to_string(), "cratonvm".to_string());
         sys_props.insert("java.vm.vendor".to_string(), "cratonvm".to_string());
-        sys_props.insert("java.vm.info".to_string(), "mixed mode".to_string());
+        // HotSpot puts its execution-mode summary here ("mixed mode, sharing",
+        // "interpreted mode", …) and tools print it verbatim after the VM
+        // name. `--jdk-only` appends its own token so a captured run, a
+        // support bundle or a `-version` paste says which substitution policy
+        // produced it, without anyone having to find the flags line.
+        //
+        // Under `Compatible` the value stays *exactly* `"mixed mode"` — this
+        // string is compared literally by tests and by the differential
+        // harness, and the default path must be byte-for-byte unchanged
+        // (jdk-only-mode.md §10).
+        sys_props.insert(
+            "java.vm.info".to_string(),
+            if config.compatibility_mode.is_jdk_only() {
+                "mixed mode, jdk-only".to_string()
+            } else {
+                "mixed mode".to_string()
+            },
+        );
         sys_props.insert(
             "java.vm.specification.name".to_string(),
             "Java Virtual Machine Specification".to_string(),
@@ -3497,48 +3707,332 @@ impl SharedVm {
         Ok(())
     }
 
+    /// The substitution policy this VM booted under
+    /// (`docs/feature-designs/jdk-only-mode.md` §6).
+    ///
+    /// Read straight off the config, which is immutable after construction:
+    /// the mode is decided once, at launch, and every consumer — the census
+    /// dumps below, `vm_flags`, `java.vm.info` — reads it from here rather
+    /// than from a process global (§2).
+    pub fn compatibility_mode(&self) -> CompatibilityMode {
+        self.config.compatibility_mode
+    }
+
+    /// JDK feature version this VM reports, parsed back out of the
+    /// `java.specification.version` system property so the census cannot
+    /// disagree with what Java code sees. `"25"` → `Some(25)`; a
+    /// legacy-shaped `"1.8"` → `Some(1)`, which is the same reading the
+    /// property itself offers.
+    fn jdk_feature_version(&self) -> Option<u32> {
+        let props = self.system_properties.read();
+        let raw = props.get("java.specification.version")?;
+        raw.split('.').next().unwrap_or(raw).trim().parse().ok()
+    }
+
     /// Synthetic-stub census: dump every registered native with its
     /// [`NativeKind`](cratonvm_native_api::NativeKind) tag
     /// (intrinsic / bridge / synthetic-stub) to a diff-stable JSON file.
     ///
-    /// Schema: `{ "counts": {intrinsic, bridge, "synthetic-stub", total},
-    /// "natives": [{class, name, descriptor, kind}...] }`, sorted by
-    /// `(class, name, descriptor)` so the file is suitable as a committed
-    /// baseline. Returns the per-kind counts so the caller can report them.
-    /// Hand-serialized (no serde_json), mirroring `dump_missing_natives_json`.
+    /// Thin wrapper over [`SharedVm::dump_native_census_json`] with
+    /// `verbose = false` (registration sites redacted). The name, parameter
+    /// list and `(intrinsic, bridge, synthetic-stub)` return are **unchanged**
+    /// on purpose: `--dump-native-registry`, the stub ratchet and several
+    /// tests call this exact signature, and the schema-2 upgrade is a change
+    /// to the file's *contents*, not to its Rust surface.
     pub fn dump_native_registry_json(
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> std::io::Result<(usize, usize, usize)> {
+        self.dump_native_census_json(path, false)
+    }
+
+    /// Native census, **schema 2** (`jdk-only-mode.md` §4, §9).
+    ///
+    /// Schema 1 answered "what is registered". That was enough for a ratchet
+    /// and useless for the untangling work: it could not say which
+    /// registration *won* a contested slot, who installed it, or whether the
+    /// slot was ever actually dispatched. Schema 2 adds those three columns:
+    ///
+    /// ```json
+    /// {
+    ///   "schema_version": 2,
+    ///   "mode": "compatible",
+    ///   "counts": { "intrinsic": 2, "bridge": 1, "synthetic-stub": 1, "total": 4 },
+    ///   "natives": [
+    ///     { "class": "java/lang/System", "name": "arraycopy",
+    ///       "descriptor": "([Ljava/lang/Object;I[Ljava/lang/Object;II)V",
+    ///       "kind": "intrinsic",
+    ///       "registered_by": "native-builtins/src/lib.rs:1234",
+    ///       "overwrote": "synthetic-stub",
+    ///       "invocations": 10,
+    ///       "real_declaring_method": { "loaded": true, "declared": true,
+    ///                                  "acc_native": true, "has_code": false } }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// Notes on the fields that are easy to misread:
+    ///
+    /// * `counts` still counts **registrations**, not invocations — it is the
+    ///   schema-1 block, unchanged, so the existing ratchet keeps working.
+    ///   Per-slot `invocations` is the new, different measurement; summing it
+    ///   per kind is `difftest`'s job.
+    /// * `overwrote` is the `NativeKind` of the entry this registration
+    ///   displaced, or `null`. Registration is last-write-wins throughout
+    ///   `SharedVm::new` (see the two LAST-WRITE-WINS BOUNDARY blocks), and
+    ///   this column plus `registered_by` is the evidence the later
+    ///   untangling wave needs — §8 explicitly defers the untangling itself.
+    /// * `registered_by` is redacted unless `verbose` (i.e. unless
+    ///   `--explain-jdk-only` was passed): absolute build paths leak the
+    ///   builder's home directory into committed baselines and make the file
+    ///   differ per machine. See [`redact_registration_site`].
+    /// * `real_declaring_method` reports what the *real* class says about the
+    ///   slot, which is how a reviewer tells a legitimate `ACC_NATIVE` bridge
+    ///   from a native shadowing concrete bytecode (§1 item 4, §7 step 3).
+    ///   `has_code` is derived from the access flags (JVMS §4.6: `Code` is
+    ///   present iff the method is neither `native` nor `abstract`) rather
+    ///   than from `ClassFileMethod::code()`, which returns `None` for a
+    ///   not-yet-force-decoded lazy attribute — a decode-state artefact, not
+    ///   a fact about the class.
+    ///
+    /// Rows are sorted by `(class, name, descriptor)` with a **stable** sort,
+    /// so the duplicate rows a contested triple produces stay in registration
+    /// order — which is the overwrite chronology the untangling wave needs, and
+    /// is deterministic run to run. Hand-serialized (no serde_json), mirroring
+    /// `dump_missing_natives_json`. Returns the per-kind registration counts.
+    ///
+    /// ## Relationship to `vm-cli`'s `write_native_census_json`
+    ///
+    /// `--dump-native-registry` is served by the **launcher's** writer, not
+    /// this one; this is the embedded / in-process path, which has no launcher
+    /// and no `--explain-jdk-only` flag. The two agree on `schema_version`, on
+    /// the `NativeKind::as_str()` / `ClassOrigin::as_str()` tag vocabulary, on
+    /// the `counts` and `invocations` blocks and on every per-row field name,
+    /// so `difftest::census` parses either. They differ in exactly three ways,
+    /// all deliberate:
+    ///
+    /// * this writer adds a top-level `"mode"`; the launcher prints the mode on
+    ///   its own status line instead;
+    /// * the launcher's tie-break for duplicate triples is `registered_by`,
+    ///   this one's is registration order (see above);
+    /// * the launcher emits `"real_declaring_method": null` — it runs at
+    ///   shutdown and (reasonably) refuses to resolve names through the
+    ///   ordinary loading path, which would load hundreds of classes the run
+    ///   never touched and change the census it is reporting. This writer fills
+    ///   the object in **without that risk**, because it only consults classes
+    ///   the run already loaded: `get_loaded_class_id` is a lookup, not an
+    ///   initiating load, so `"loaded": false` is a real answer ("this run
+    ///   never loaded the class") rather than a probe declined.
+    pub fn dump_native_census_json(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        verbose: bool,
+    ) -> std::io::Result<(usize, usize, usize)> {
         use cratonvm_native_api::NativeKind;
-        let mut rows = self.natives.native_methods.dump_registrations();
-        rows.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        let mut rows = self.natives.native_methods.census();
+        rows.sort_by(|a, b| {
+            (&a.class, &a.name, &a.descriptor).cmp(&(&b.class, &b.name, &b.descriptor))
+        });
         let mut n_intrinsic = 0usize;
         let mut n_bridge = 0usize;
         let mut n_stub = 0usize;
-        for (_, _, _, kind) in &rows {
-            match kind {
+        for row in &rows {
+            match row.kind {
                 NativeKind::Intrinsic => n_intrinsic += 1,
                 NativeKind::Bridge => n_bridge += 1,
                 NativeKind::SyntheticStub => n_stub += 1,
             }
         }
-        let mut out = String::with_capacity(256 + 96 * rows.len());
-        out.push_str("{\n  \"counts\": {\n");
+
+        let mut out = String::with_capacity(256 + 192 * rows.len());
+        out.push_str("{\n  \"schema_version\": 2,\n");
+        out.push_str(&format!(
+            "  \"mode\": {},\n",
+            json_escape(self.compatibility_mode().as_str())
+        ));
+        out.push_str("  \"counts\": {\n");
         out.push_str(&format!("    \"intrinsic\": {n_intrinsic},\n"));
         out.push_str(&format!("    \"bridge\": {n_bridge},\n"));
         out.push_str(&format!("    \"synthetic-stub\": {n_stub},\n"));
         out.push_str(&format!("    \"total\": {}\n", rows.len()));
+        // Per-kind dispatch totals, the same three keys in the same order as
+        // `vm-cli`'s writer. Separate from `counts` on purpose: `counts` is
+        // registrations, this is invocations, and the two have been confused
+        // before.
+        out.push_str("  },\n  \"invocations\": {\n");
+        out.push_str(&format!(
+            "    \"intrinsic\": {},\n",
+            self.natives
+                .native_methods
+                .invocations_of_kind(NativeKind::Intrinsic)
+        ));
+        out.push_str(&format!(
+            "    \"bridge\": {},\n",
+            self.natives
+                .native_methods
+                .invocations_of_kind(NativeKind::Bridge)
+        ));
+        out.push_str(&format!(
+            "    \"synthetic-stub\": {}\n",
+            self.natives
+                .native_methods
+                .invocations_of_kind(NativeKind::SyntheticStub)
+        ));
         out.push_str("  },\n  \"natives\": [");
-        for (i, (class, name, desc, kind)) in rows.iter().enumerate() {
+
+        // One read lock for the whole loop: `real_declaring_method` asks the
+        // class manager a question per row, and re-acquiring L10 tens of
+        // thousands of times would turn a diagnostic dump into a contention
+        // event.
+        let cm = self.classes.class_manager.read();
+        for (i, row) in rows.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push_str("\n    {\n");
-            out.push_str(&format!("      \"class\": {},\n", json_escape(class)));
-            out.push_str(&format!("      \"name\": {},\n", json_escape(name)));
-            out.push_str(&format!("      \"descriptor\": {},\n", json_escape(desc)));
-            out.push_str(&format!("      \"kind\": {}\n", json_escape(kind.as_str())));
+            out.push_str(&format!("      \"class\": {},\n", json_escape(&row.class)));
+            out.push_str(&format!("      \"name\": {},\n", json_escape(&row.name)));
+            out.push_str(&format!(
+                "      \"descriptor\": {},\n",
+                json_escape(&row.descriptor)
+            ));
+            out.push_str(&format!(
+                "      \"kind\": {},\n",
+                json_escape(row.kind.as_str())
+            ));
+            match &row.registered_by {
+                Some(site) => out.push_str(&format!(
+                    "      \"registered_by\": {},\n",
+                    json_escape(&if verbose {
+                        site.clone()
+                    } else {
+                        redact_registration_site(site)
+                    })
+                )),
+                None => out.push_str("      \"registered_by\": null,\n"),
+            }
+            match row.overwrote {
+                Some(kind) => out.push_str(&format!(
+                    "      \"overwrote\": {},\n",
+                    json_escape(kind.as_str())
+                )),
+                None => out.push_str("      \"overwrote\": null,\n"),
+            }
+            out.push_str(&format!("      \"invocations\": {},\n", row.invocations));
+
+            let declaring = cm
+                .get_loaded_class_id(&row.class)
+                .and_then(|id| cm.get_class(id));
+            let method = declaring.and_then(|c| c.find_method(&row.name, &row.descriptor));
+            out.push_str("      \"real_declaring_method\": {");
+            out.push_str(&format!(
+                "\"loaded\": {}, \"declared\": {}, \"acc_native\": {}, \"has_code\": {}",
+                declaring.is_some(),
+                method.is_some(),
+                method.is_some_and(|m| m.is_native()),
+                method.is_some_and(|m| !m.is_native() && !m.is_abstract()),
+            ));
+            out.push_str("}\n");
+            out.push_str("    }");
+        }
+        drop(cm);
+
+        if !rows.is_empty() {
+            out.push_str("\n  ");
+        }
+        out.push_str("]\n}\n");
+
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(out.as_bytes())?;
+        file.sync_all()?;
+        Ok((n_intrinsic, n_bridge, n_stub))
+    }
+
+    /// Class-origin census (`--dump-class-origins`, `jdk-only-mode.md` §5, §9).
+    ///
+    /// Schema 1:
+    ///
+    /// ```json
+    /// {
+    ///   "schema_version": 1,
+    ///   "counts": { "boot-image": 312, "...": 0, "total": 343 },
+    ///   "classes": [
+    ///     { "name": "java/lang/String", "origin": "boot-image", "reason": null,
+    ///       "requested_by": null, "real_bytes_found": true, "loader_id": 0 }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// `counts` is seeded to zero from the full
+    /// [`ClassOrigin::as_str`](cratonvm_classloading::class_origin::ClassOrigin::as_str)
+    /// vocabulary, so `"compatibility-stub": 0` is *stated* rather than implied
+    /// by an absent key — the one assertion a strict-mode reader most wants and
+    /// the one an omission would silently fake. Rows sort by
+    /// `(name, loader_id, origin)`: a class name legitimately appears once per
+    /// defining loader, and twice with different origins during an in-place
+    /// stub-upgrade window, so all three are needed for a total order.
+    /// Returns the row count.
+    ///
+    /// Deliberately the **same schema, sort key, seeded counts and field
+    /// order** as `vm-cli`'s `write_class_origins_json`. Two writers exist
+    /// because the launcher owns the `--dump-class-origins` flag while the
+    /// embedded / in-process path has no launcher at all; a run's census must
+    /// not depend on which of the two produced it, so change one and change
+    /// the other. The single intentional difference: the launcher redacts
+    /// embedded absolute paths in `name` / `reason` / `requested_by` unless
+    /// `--explain-jdk-only` is passed, which this entry point cannot do
+    /// because it has no verbose parameter to key off — an embedder that
+    /// needs redaction should ask the launcher, or pass the rows through
+    /// [`redact_registration_site`] itself.
+    ///
+    /// Emitted in **both** modes: under `Compatible` the origins are recorded
+    /// but nothing is refused (§5), which is what makes the census meaningful
+    /// as a baseline *before* enforcement lands (§10).
+    pub fn dump_class_origins_json(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<usize> {
+        let mut rows = self.classes.class_manager.read().dump_class_origins();
+        rows.sort_by(|a, b| {
+            (&a.name, a.loader_id, &a.origin).cmp(&(&b.name, b.loader_id, &b.origin))
+        });
+
+        let mut counts: std::collections::BTreeMap<String, u64> = CLASS_ORIGIN_TAGS
+            .iter()
+            .map(|tag| ((*tag).to_string(), 0u64))
+            .collect();
+        for row in &rows {
+            *counts.entry(row.origin.clone()).or_insert(0) += 1;
+        }
+
+        let mut out = String::with_capacity(256 + 160 * rows.len());
+        out.push_str("{\n  \"schema_version\": 1,\n  \"counts\": {\n");
+        for (tag, n) in &counts {
+            out.push_str(&format!("    {}: {n},\n", json_escape(tag)));
+        }
+        out.push_str(&format!("    \"total\": {}\n", rows.len()));
+        out.push_str("  },\n  \"classes\": [");
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("\n    {\n");
+            out.push_str(&format!("      \"name\": {},\n", json_escape(&row.name)));
+            out.push_str(&format!("      \"origin\": {},\n", json_escape(&row.origin)));
+            match &row.reason {
+                Some(r) => out.push_str(&format!("      \"reason\": {},\n", json_escape(r))),
+                None => out.push_str("      \"reason\": null,\n"),
+            }
+            match &row.requested_by {
+                Some(r) => out.push_str(&format!("      \"requested_by\": {},\n", json_escape(r))),
+                None => out.push_str("      \"requested_by\": null,\n"),
+            }
+            out.push_str(&format!(
+                "      \"real_bytes_found\": {},\n",
+                row.real_bytes_found
+            ));
+            out.push_str(&format!("      \"loader_id\": {}\n", row.loader_id));
             out.push_str("    }");
         }
         if !rows.is_empty() {
@@ -3550,7 +4044,142 @@ impl SharedVm {
         let mut file = std::fs::File::create(path)?;
         file.write_all(out.as_bytes())?;
         file.sync_all()?;
-        Ok((n_intrinsic, n_bridge, n_stub))
+        Ok(rows.len())
+    }
+
+    /// JDK-only violation/counter report (`--jdk-only-report`, §9). Schema 1,
+    /// spelled exactly as the contract prints it:
+    ///
+    /// ```json
+    /// {
+    ///   "schema_version": 1,
+    ///   "mode": "jdk-only",
+    ///   "jdk_feature": 25,
+    ///   "violations": [],
+    ///   "counts": {
+    ///     "boot_image_classes": 312, "application_classes": 18,
+    ///     "generated_classes": 4,   "compatibility_classes": 0,
+    ///     "bridge_invocations": 1082, "intrinsic_invocations": 4301,
+    ///     "synthetic_stub_invocations": 0
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// `violations` concatenates the registry's refused registrations (§4)
+    /// with the class manager's origin violations (§5), registry first, each
+    /// rendered by `JdkOnlyViolation::to_json()` so the wire shape is owned by
+    /// the type rather than re-derived here.
+    ///
+    /// The four class counters are a **partition** of the ten
+    /// `ClassOrigin::as_str()` tags — every row lands in exactly one bucket, so
+    /// their sum is the row count and no class can go missing between this
+    /// summary and `--dump-class-origins`. `user-defined` counts as an
+    /// application class (application bytes, whoever defined them);
+    /// `generated_classes` is `vm-array` + `hidden-class` + `generated-lambda`
+    /// + `generated-proxy` + `reflection-accessor` + `vm-internal`, i.e. every
+    /// origin a conforming JVM produces without a class file (§1 item 6).
+    /// `compatibility-stub` keeps its own counter and is never folded in with
+    /// the legitimate generated origins — conflating those two is exactly the
+    /// confusion this feature exists to end.
+    ///
+    /// This fold is deliberately identical to `vm-cli`'s `fold_origin_buckets`
+    /// (agent B). Two writers exist because the launcher owns the flag and the
+    /// embedded/in-process path has no launcher; they must not disagree about
+    /// arithmetic.
+    ///
+    /// Returns the number of violations written, so the caller can decide
+    /// whether to exit non-zero without re-reading the file.
+    pub fn dump_jdk_only_report_json(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<usize> {
+        use cratonvm_native_api::NativeKind;
+
+        let registry = &self.natives.native_methods;
+        let mut violations: Vec<String> = registry
+            .refused_registrations()
+            .iter()
+            .map(|v| v.to_json())
+            .collect();
+        // One L10 acquisition for both questions the class manager answers
+        // here — the census and the violation list must describe the same
+        // instant, and re-locking between them would let a still-running
+        // thread load a class in the gap.
+        let (origins, origin_violations) = {
+            let cm = self.classes.class_manager.read();
+            let origins = cm.dump_class_origins();
+            let violations: Vec<String> =
+                cm.origin_violations().iter().map(|v| v.to_json()).collect();
+            (origins, violations)
+        };
+        violations.extend(origin_violations);
+
+        let mut by_origin: std::collections::BTreeMap<&str, u64> =
+            std::collections::BTreeMap::new();
+        for row in &origins {
+            *by_origin.entry(row.origin.as_str()).or_insert(0) += 1;
+        }
+        let count_of = |tag: &str| by_origin.get(tag).copied().unwrap_or(0);
+        let boot_image = count_of("boot-image");
+        // `user-defined` is application bytes, whoever called defineClass.
+        let application = count_of("application-class-path") + count_of("user-defined");
+        let generated = count_of("vm-array")
+            + count_of("hidden-class")
+            + count_of("generated-lambda")
+            + count_of("generated-proxy")
+            + count_of("reflection-accessor")
+            + count_of("vm-internal");
+        let compatibility = count_of("compatibility-stub");
+
+        let mut out = String::with_capacity(512 + 128 * violations.len());
+        out.push_str("{\n  \"schema_version\": 1,\n");
+        out.push_str(&format!(
+            "  \"mode\": {},\n",
+            json_escape(self.compatibility_mode().as_str())
+        ));
+        match self.jdk_feature_version() {
+            Some(f) => out.push_str(&format!("  \"jdk_feature\": {f},\n")),
+            None => out.push_str("  \"jdk_feature\": null,\n"),
+        }
+        out.push_str("  \"violations\": [");
+        for (i, v) in violations.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("\n    ");
+            // Re-indent the violation body so nested objects stay readable —
+            // and so this file is byte-identical to `vm-cli`'s writer.
+            out.push_str(&v.replace('\n', "\n    "));
+        }
+        if !violations.is_empty() {
+            out.push_str("\n  ");
+        }
+        out.push_str("],\n  \"counts\": {\n");
+        out.push_str(&format!("    \"boot_image_classes\": {boot_image},\n"));
+        out.push_str(&format!("    \"application_classes\": {application},\n"));
+        out.push_str(&format!("    \"generated_classes\": {generated},\n"));
+        out.push_str(&format!(
+            "    \"compatibility_classes\": {compatibility},\n"
+        ));
+        out.push_str(&format!(
+            "    \"bridge_invocations\": {},\n",
+            registry.invocations_of_kind(NativeKind::Bridge)
+        ));
+        out.push_str(&format!(
+            "    \"intrinsic_invocations\": {},\n",
+            registry.invocations_of_kind(NativeKind::Intrinsic)
+        ));
+        out.push_str(&format!(
+            "    \"synthetic_stub_invocations\": {}\n",
+            registry.invocations_of_kind(NativeKind::SyntheticStub)
+        ));
+        out.push_str("  }\n}\n");
+
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(out.as_bytes())?;
+        file.sync_all()?;
+        Ok(violations.len())
     }
 
     /// NEW-10: append a missing-native entry to the audit log,
@@ -3829,6 +4458,66 @@ fn json_escape(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Every `ClassOrigin::as_str()` tag, in the enum's own declaration order.
+///
+/// The class-origin census seeds its `counts` block from this list so a tag
+/// that never occurred reports `0` rather than being absent. `"compatibility-
+/// stub": 0` is the single most load-bearing line in the whole artefact, and a
+/// missing key would let "we did not observe any" and "we did not look" render
+/// identically (jdk-only-mode.md §9, §11).
+///
+/// Kept in sync by hand with
+/// [`ClassOrigin::as_str`](cratonvm_classloading::class_origin::ClassOrigin::as_str)
+/// and with `vm-cli`'s `CLASS_ORIGIN_TAGS`; a tag added there and forgotten
+/// here shows up as an unseeded (but still counted) key, never as a lost row.
+const CLASS_ORIGIN_TAGS: [&str; 10] = [
+    "boot-image",
+    "application-class-path",
+    "user-defined",
+    "vm-array",
+    "hidden-class",
+    "generated-lambda",
+    "generated-proxy",
+    "reflection-accessor",
+    "vm-internal",
+    "compatibility-stub",
+];
+
+/// Redact a native registration site for the schema-2 census
+/// (`jdk-only-mode.md` §9: "absolute paths are redacted unless
+/// `--explain-jdk-only` is passed").
+///
+/// Provenance is captured with `#[track_caller]`, so
+/// [`core::panic::Location::file`] normally yields a **workspace-relative**
+/// path — `native-builtins/src/lib.rs:1234` — which is exactly what a reviewer
+/// needs and contains nothing private. Those are kept verbatim (modulo `\` →
+/// `/`, so a census taken on Windows diffs against one taken on Linux).
+///
+/// An **absolute** path is a different animal: it appears for code compiled
+/// out of a registry checkout or with `--remap-path-prefix` absent, and it
+/// carries the builder's home directory into a file that gets committed as a
+/// baseline and pasted into issues. Those collapse to `<redacted>/<file:line>`
+/// — the basename plus line is still enough to find the registration, and the
+/// output no longer varies per machine, which also keeps the baseline
+/// diff-stable.
+///
+/// Windows drive letters are handled before any `:`-splitting: the path
+/// separator is located first, so `C:/…/lib.rs:12` is not mistaken for a
+/// `host:port`-shaped string.
+pub(crate) fn redact_registration_site(site: &str) -> String {
+    let normalised = site.replace('\\', "/");
+    let bytes = normalised.as_bytes();
+    let is_absolute = normalised.starts_with('/')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
+    if !is_absolute {
+        return normalised;
+    }
+    match normalised.rsplit_once('/') {
+        Some((_, tail)) if !tail.is_empty() => format!("<redacted>/{tail}"),
+        _ => "<redacted>".to_string(),
+    }
 }
 
 impl SharedVm {
@@ -6082,6 +6771,17 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
             flags.push("-noverify".to_string());
         }
         flags.push(format!("-XX:+TieredCompilation"));
+        // Emitted **unconditionally**, including under `Compatible`. A flag
+        // that only appears in the strict mode answers "is this a jdk-only
+        // run?" but leaves "was this VM even aware of the policy?"
+        // indistinguishable from an old binary — and `jcmd VM.flags` output is
+        // routinely the only artefact attached to a bug report. Always
+        // printing the value makes the census, the report's `mode` field and
+        // this line agree by construction (jdk-only-mode.md §6).
+        flags.push(format!(
+            "-XX:CompatibilityMode={}",
+            self.config.compatibility_mode.as_str()
+        ));
         flags
     }
 
@@ -6207,6 +6907,103 @@ mod tests {
         apply_container_default_heap(&mut config);
 
         assert_eq!(config.max_heap_size, DEFAULT_MAX_HEAP_SIZE);
+    }
+
+    // -----------------------------------------------------------------------
+    // JDK-only mode (docs/feature-designs/jdk-only-mode.md §8)
+    // -----------------------------------------------------------------------
+
+    /// The `Compatible` boot precondition must probe **nothing**.
+    ///
+    /// `VmConfig::default()` is hermetic — it is built by hundreds of unit
+    /// tests, by every embedder and on CI machines with no JDK installed — and
+    /// the whole point of returning early in `require_jdk_image_for_jdk_only`
+    /// is that adding the strict-mode check must not make the *default* boot
+    /// depend on what happens to be on the host. `Ok(None)` is therefore the
+    /// assertion: not merely "it succeeded", but "it did not resolve a
+    /// `JAVA_HOME`", which is only possible if the probe never ran.
+    #[test]
+    fn compatible_boot_precondition_does_no_host_probing() {
+        let config = VmConfig::default();
+        assert_eq!(
+            config.compatibility_mode,
+            CompatibilityMode::Compatible,
+            "the default config must never infer strict mode from a build \
+             feature or an unrelated env var (contract §6)"
+        );
+
+        let resolved = require_jdk_image_for_jdk_only(&config)
+            .expect("the default configuration must always be bootable");
+        assert!(
+            resolved.is_none(),
+            "Compatible mode returned a resolved JDK home ({resolved:?}) — the \
+             default path probed the host, which breaks VmConfig::default()'s \
+             hermetic contract"
+        );
+    }
+
+    /// `--jdk-only` + the synthetic class library is a configuration error, and
+    /// it must be caught here rather than only in the launcher: embedders and
+    /// in-process harnesses build a `VmConfig` by hand and never parse argv.
+    #[test]
+    fn jdk_only_with_synthetic_library_is_a_configuration_error() {
+        // `with_jdk_mode` rather than poking a field, so this test keeps
+        // asking the same question regardless of whether `JdkMode` is stored
+        // or derived in `config.rs`.
+        let mut config = VmConfig::default().with_jdk_mode(crate::config::JdkMode::Synthetic);
+        config.compatibility_mode = CompatibilityMode::JdkOnly;
+
+        let err = require_jdk_image_for_jdk_only(&config)
+            .expect_err("jdk-only + synthetic-jdk must be rejected");
+        // `validate_compatibility` owns the wording (contract §6); assert on
+        // the fact rather than on its exact prose so agent A can improve the
+        // message without breaking this test.
+        assert!(
+            matches!(err, VmError::InvalidConfiguration(_)),
+            "expected a configuration error, got {err:?}"
+        );
+        // Crucially: rejected by the *conflict*, not by the JDK search. A
+        // strict run must fail this way even on a host with a perfectly good
+        // JDK installed, which is why `validate_compatibility` runs first.
+        let text = err.to_string();
+        assert!(
+            !text.contains("Searched, in order"),
+            "the conflict must be reported before the JDK probe runs, but the \
+             message carried the probe's search report: {text}"
+        );
+    }
+
+    /// Registration-site redaction keeps the workspace-relative form (which is
+    /// what `#[track_caller]` normally produces and what a reviewer needs) and
+    /// collapses absolute paths, which otherwise leak the builder's home
+    /// directory into a committed baseline and make the census differ per
+    /// machine.
+    #[test]
+    fn registration_site_redaction_keeps_relative_and_collapses_absolute() {
+        // Workspace-relative: kept verbatim, line number and all.
+        assert_eq!(
+            redact_registration_site("native-builtins/src/lib.rs:1234"),
+            "native-builtins/src/lib.rs:1234"
+        );
+        // Windows separators normalise so a census taken on Windows diffs
+        // against one taken on Linux.
+        assert_eq!(
+            redact_registration_site("native-builtins\\src\\jmx.rs:88"),
+            "native-builtins/src/jmx.rs:88"
+        );
+        // POSIX absolute: collapsed to basename + line.
+        assert_eq!(
+            redact_registration_site("/home/someone/craton/native-builtins/src/lib.rs:1234"),
+            "<redacted>/lib.rs:1234"
+        );
+        // Windows absolute: the drive-letter colon must not be mistaken for
+        // the line-number separator.
+        assert_eq!(
+            redact_registration_site("C:\\craton\\wt-jdk-only\\native-builtins\\src\\lib.rs:12"),
+            "<redacted>/lib.rs:12"
+        );
+        // Nothing recognisable left to keep.
+        assert_eq!(redact_registration_site("/"), "<redacted>");
     }
 
     #[cfg(feature = "experimental-debug")]

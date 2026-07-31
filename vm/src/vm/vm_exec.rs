@@ -31,6 +31,326 @@ use super::SharedVm;
 use crate::classloading::ClassStore;
 use crate::native::registry::NativeCallback;
 
+// ---------------------------------------------------------------------------
+// JDK-only mode — THE native-vs-bytecode decision point
+// (`docs/feature-designs/jdk-only-mode.md` §7)
+// ---------------------------------------------------------------------------
+//
+// Everything in this section is re-exported through `crate::vm` by
+// `pub use vm_exec::*` in `vm/src/vm.rs`, which is the path the interpreter,
+// JNI and the `vm/tests/jdk_only_dispatch.rs` integration test use.
+//
+// Why one function: this repository's history is a catalogue of the same
+// native-vs-bytecode question being answered independently at each dispatch
+// site and the answers disagreeing (a native shadowing real bytecode on the
+// cold path but not the warm one, so behaviour changed with JIT state). §7
+// makes that decision a single pure function so the answer cannot depend on
+// which door the call came through.
+
+/// The contract (§7) names the method type `Method`; this repository's method
+/// type is `cratonvm_reader::method::ClassFileMethod`. Aliased rather than
+/// renamed so the signature reads as the contract specifies it without
+/// touching ~400 existing `ClassFileMethod` mentions.
+pub type Method = cratonvm_reader::method::ClassFileMethod;
+
+/// What to run for one `(class, method)` pair under one `ExecutionPolicy`.
+///
+/// `Bytecode` borrows the method it was handed — never a re-resolved
+/// same-named one. Re-resolving here would reintroduce the super-call
+/// recursion bug this VM has hit before (a virtual dispatch that re-enters the
+/// subclass override).
+pub enum DispatchDecision<'a> {
+    /// Run this method's own `Code`.
+    Bytecode(&'a Method),
+    /// Call the registered `NativeKind::Bridge` (or, under `Compatible`, any
+    /// admissible native).
+    NativeBridge(NativeCallback),
+    /// Call the registered, reviewed `NativeKind::Intrinsic`. The one kind
+    /// permitted to shadow concrete bytecode (§1.4).
+    Intrinsic(NativeCallback),
+    /// `JdkOnly` policy refusal. Surface as [`VmError::JdkOnly`]; never fall
+    /// back to another implementation behind the operator's back.
+    Reject(cratonvm_types::error::JdkOnlyViolation),
+}
+
+impl DispatchDecision<'_> {
+    /// The callback for the two native-shaped decisions, `None` otherwise.
+    ///
+    /// Call sites that only need "is there a native to call here" use this and
+    /// stay agnostic about bridge-vs-intrinsic, which is a census distinction,
+    /// not a calling-convention one.
+    #[inline]
+    pub fn native_callback(&self) -> Option<NativeCallback> {
+        match self {
+            DispatchDecision::NativeBridge(cb) | DispatchDecision::Intrinsic(cb) => Some(*cb),
+            DispatchDecision::Bytecode(_) | DispatchDecision::Reject(_) => None,
+        }
+    }
+}
+
+// Violation objects own their strings, so building one allocates three times
+// and formats nothing. That is fine on a refusal (which terminates a call) and
+// unacceptable on the dispatch fast path, so every constructor below is
+// `#[cold] #[inline(never)]`: the allocation and the `String` machinery live
+// off in their own functions and the hot path keeps only a not-taken branch.
+
+#[cold]
+#[inline(never)]
+fn reject_synthetic_invocation(
+    class: &str,
+    method: &str,
+    descriptor: &str,
+) -> cratonvm_types::error::JdkOnlyViolation {
+    cratonvm_types::error::JdkOnlyViolation::SyntheticNativeInvocation {
+        class: class.to_string(),
+        method: method.to_string(),
+        descriptor: descriptor.to_string(),
+        call_site: None,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn reject_missing_native(
+    class: &str,
+    method: &str,
+    descriptor: &str,
+) -> cratonvm_types::error::JdkOnlyViolation {
+    cratonvm_types::error::JdkOnlyViolation::MissingNative {
+        class: class.to_string(),
+        method: method.to_string(),
+        descriptor: descriptor.to_string(),
+        module: None,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn reject_missing_implementation(
+    class: &str,
+    method: &str,
+    descriptor: &str,
+) -> cratonvm_types::error::JdkOnlyViolation {
+    cratonvm_types::error::JdkOnlyViolation::MissingImplementation {
+        class: class.to_string(),
+        method: method.to_string(),
+        descriptor: descriptor.to_string(),
+    }
+}
+
+/// THE single native-vs-bytecode decision point (§7). Interpreter, JIT,
+/// reflection, JNI and method handles route through this (or, where the site
+/// has no resolved `&Method`, through [`resolve_native_dispatch_wave1`], which
+/// takes the identical decision from the names).
+///
+/// Normative order (§7), plus one deliberate deviation documented below:
+///
+/// 1. `method.is_native()` → the registered bridge or intrinsic. Under
+///    `JdkOnly` a `SyntheticStub` is `Reject(SyntheticNativeInvocation)`;
+///    nothing registered is `Reject(MissingNative)`. Under `Compatible` every
+///    kind is accepted, exactly as today.
+/// 2. a registered `Intrinsic` wins next — reviewed and semantics-preserving,
+///    so it may shadow bytecode (§1.4's single exception).
+/// 3. `method.code().is_some()` → `Bytecode`. **Concrete bytecode beats a
+///    registered `Bridge` or `SyntheticStub`.** This is the whole point of the
+///    mode: a fake must not stand in front of correct real bytes.
+/// 4. otherwise → `Reject(MissingImplementation)`.
+///
+/// # Deliberate deviation from the literal §7 order
+///
+/// Between steps 3 and 4 this function inserts: *a method with no `Code` but a
+/// registered native dispatches to that native.* The literal order sends every
+/// `Code`-less method straight to `Reject(MissingImplementation)`, which would
+/// reject every interface-level bridge the VM boots on — `Path.getFileSystem`,
+/// `Iterator.hasNext` on a synthetic wrapper, `Enumeration.hasMoreElements`,
+/// the whole `FileSystemProvider` surface. Nothing would start in *either*
+/// mode, so the deviation is not a strictness concession, it is the difference
+/// between a resolver that can be turned on and one that cannot.
+///
+/// It does not weaken §1.4. §1.4 forbids a native **shadowing** bytecode, and
+/// this branch is only reachable when `method.code()` is `None` — there is no
+/// bytecode to shadow. `SyntheticStub` is still refused here under `JdkOnly`,
+/// so §1.3 is enforced on this branch too.
+///
+/// Wave-2 note: the right long-term shape is for the abstract declaration to
+/// resolve to the *implementing* class's method before reaching here, at which
+/// point step 3 covers it and this branch can go.
+pub fn resolve_dispatch<'a>(
+    policy: cratonvm_types::compat::ExecutionPolicy,
+    class: &crate::classloading::Class,
+    method: &'a Method,
+    native: Option<(NativeCallback, cratonvm_native_api::NativeKind)>,
+) -> DispatchDecision<'a> {
+    use cratonvm_native_api::NativeKind;
+
+    let strict = policy.is_jdk_only();
+
+    // Step 1 — ACC_NATIVE. There is no bytecode by definition, so the only
+    // question is which registration answers, and whether policy admits it.
+    if method.is_native() {
+        return match native {
+            Some((cb, NativeKind::Intrinsic)) => DispatchDecision::Intrinsic(cb),
+            Some((_, NativeKind::SyntheticStub)) if strict => DispatchDecision::Reject(
+                reject_synthetic_invocation(&class.name, &method.name, &method.descriptor),
+            ),
+            Some((cb, _)) => DispatchDecision::NativeBridge(cb),
+            None => DispatchDecision::Reject(reject_missing_native(
+                &class.name,
+                &method.name,
+                &method.descriptor,
+            )),
+        };
+    }
+
+    // Step 2 — a reviewed intrinsic may shadow concrete bytecode.
+    if let Some((cb, NativeKind::Intrinsic)) = native {
+        return DispatchDecision::Intrinsic(cb);
+    }
+
+    // Step 3 — real class bytes are authoritative.
+    if method.code().is_some() {
+        return DispatchDecision::Bytecode(method);
+    }
+
+    // Documented deviation (see the banner above): no `Code`, but something is
+    // registered. Nothing is being shadowed, so run it — minus stubs under
+    // `JdkOnly`, which stay refused.
+    if let Some((cb, kind)) = native {
+        if strict && kind == NativeKind::SyntheticStub {
+            return DispatchDecision::Reject(reject_synthetic_invocation(
+                &class.name,
+                &method.name,
+                &method.descriptor,
+            ));
+        }
+        return DispatchDecision::NativeBridge(cb);
+    }
+
+    // Step 4 — nothing to run.
+    DispatchDecision::Reject(reject_missing_implementation(
+        &class.name,
+        &method.name,
+        &method.descriptor,
+    ))
+}
+
+/// Name-only wave-1 adapter for the dispatch sites that deliberately decide
+/// **before** paying for method resolution.
+///
+/// [`resolve_dispatch`] needs a resolved `&Class` and `&Method`.
+/// `invoke_or_native`'s native-first probe and
+/// `invoke_on_class_shared_inner`'s override check run *before* the class
+/// manager has been asked anything: that ordering is the reason those paths
+/// are cheap. Forcing a resolution there to satisfy the §7 signature would add
+/// a class-manager read lock plus a `find_method_recursive` hierarchy walk to
+/// the hottest path in the VM, on every native call, in both modes. This
+/// adapter takes the identical policy decision from the triple, with the two
+/// inputs the names cannot supply passed in explicitly.
+///
+/// * `compat_native_wins` — what the call site's **existing** compatibility
+///   logic already decided: `true` means "today, a registered native wins
+///   here". This is the *only* input consulted in `Compatible` mode, which is
+///   what makes wave 1 bit-for-bit (see below).
+/// * `bytecode_available` — whether concrete bytecode exists for this method,
+///   the §7 step-3 input a name triple cannot answer.
+///
+/// Returns `None` for "no opinion — carry on down your existing path", which
+/// is exactly what a `find` returning `None` used to mean at these sites.
+///
+/// # Compatible mode is a pure function of `compat_native_wins`
+///
+/// `Compatible` never inspects the kind, never inspects `bytecode_available`
+/// and never produces a `Reject`. `compat_native_wins == true` yields the
+/// native (the identical callback `find` returned); `false` yields `None`.
+/// Every routed site therefore behaves exactly as it did before, and a
+/// default `--real-jdk` run cannot observe that the resolver exists.
+///
+/// # JdkOnly
+///
+/// `!compat_native_wins` still yields `None`: the site has an independent
+/// reason to prefer bytecode, and §1.4 agrees with it, so strict mode is never
+/// *less* strict than compatible mode. When the native would have won:
+/// `SyntheticStub` is refused (§1.3), a reviewed `Intrinsic` is taken (§1.4),
+/// and a `Bridge` yields to concrete bytecode when there is any (§7 step 3).
+///
+/// `'static` in the return type is not a lifetime claim about anything — this
+/// adapter never has a `&Method`, so it can never return `Bytecode`.
+#[inline]
+pub fn resolve_native_dispatch_wave1(
+    policy: cratonvm_types::compat::ExecutionPolicy,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    native: Option<(NativeCallback, cratonvm_native_api::NativeKind)>,
+    compat_native_wins: bool,
+    bytecode_available: bool,
+) -> Option<DispatchDecision<'static>> {
+    use cratonvm_native_api::NativeKind;
+
+    // No registration: nothing to decide. Deliberately NOT `MissingNative` —
+    // these sites have not established that the method is `ACC_NATIVE`, so an
+    // absent registration here just means "no override", the same thing it
+    // meant before §7 existed.
+    let (callback, kind) = native?;
+
+    if !compat_native_wins {
+        return None;
+    }
+
+    if !policy.is_jdk_only() {
+        // Compatible: the kind is irrelevant, exactly as it was when these
+        // sites called bare `find` and threw the kind away.
+        return Some(match kind {
+            NativeKind::Intrinsic => DispatchDecision::Intrinsic(callback),
+            _ => DispatchDecision::NativeBridge(callback),
+        });
+    }
+
+    match kind {
+        // §1.3 — a fake may not be invoked under `--jdk-only`.
+        NativeKind::SyntheticStub => Some(DispatchDecision::Reject(reject_synthetic_invocation(
+            class_name,
+            method_name,
+            descriptor,
+        ))),
+        // §1.4 — the reviewed exception; may shadow bytecode.
+        NativeKind::Intrinsic => Some(DispatchDecision::Intrinsic(callback)),
+        // §7 step 3 — concrete bytecode beats a bridge.
+        NativeKind::Bridge if bytecode_available => None,
+        NativeKind::Bridge => Some(DispatchDecision::NativeBridge(callback)),
+    }
+}
+
+/// The policy this VM is running under. One `Copy` field read; no lock, no
+/// allocation, safe to call per dispatch.
+#[inline]
+pub fn dispatch_policy(shared: &SharedVm) -> cratonvm_types::compat::ExecutionPolicy {
+    shared.config.execution_policy()
+}
+
+/// §4 census hook: count one native dispatch for the `(class, method,
+/// descriptor)` triple.
+///
+/// For dispatch sites that reach a native through a **cached** target and so
+/// never hold a `NativeMethodId`. Sites that resolve an id anyway must call
+/// `NativeMethodRegistry::record_invocation(id)` directly instead — this
+/// wrapper pays one triple hash that they do not need to.
+///
+/// The acceptance criterion for the mode is *zero* `SyntheticStub` invocations
+/// through **any** path, and an uncounted path is an unverifiable one.
+#[inline]
+pub fn record_native_dispatch(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) {
+    let registry = &shared.natives.native_methods;
+    if let Some(id) = registry.resolve_id(class_name, method_name, descriptor) {
+        registry.record_invocation(id);
+    }
+}
+
 #[cfg(target_os = "windows")]
 extern "system" {
     fn GetModuleHandleA(lpModuleName: *const i8) -> *mut std::ffi::c_void;
@@ -13179,6 +13499,20 @@ pub fn invoke_or_native(
     // on it from native code (via `ctx.invoke_virtual`) recurses back into
     // this same native forever (a real stack overflow, confirmed via gdb).
     // See docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    //
+    // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 1
+    // OF 4. The other three are in `vm/src/runtime/interpreter/invoke.rs`
+    // (`try_stackless_invoke` step 1, `try_stackless_invoke` step 6, and the
+    // `!is_native` forced-native block of `invoke_on_class_shared_inner` below
+    // — which inlines the `workers`-field probe a fourth time rather than
+    // calling `threadpool_executor_has_real_workers`). Each dispatch path
+    // carries its own copy because each reaches the native by a different
+    // route; all four must be removed together or the paths disagree about the
+    // same receiver. What must replace them: `native_es_execute` is only
+    // correct for CratonVM's synthetic 2-field `Executors.new*ThreadPool()`
+    // stand-in, so under `--jdk-only` (where that stand-in cannot exist) the
+    // registration itself is a `SyntheticStub` that never dispatches, and the
+    // receiver probe becomes unreachable.
     if effective_class == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && descriptor == "(Ljava/lang/Runnable;)V"
@@ -13232,6 +13566,18 @@ pub fn invoke_or_native(
         // single native dispatch VM-wide. `find_with_kind` above folds both
         // lookups into one hash computation. See its doc comment.
         let synthetic_stub_native = native_kind == cratonvm_native_api::NativeKind::SyntheticStub;
+        // JDK-ONLY-WAVE2: real-protected-stub class allow-list, COPY 1 OF 2.
+        // The other copy is `real_protected_stub_class` in
+        // `vm/src/runtime/interpreter/invoke.rs`, and the two are NOT identical:
+        // this one includes `java/util/StringJoiner`, that one deliberately
+        // omits it (see the long comment there — yielding StringJoiner's stub
+        // to real bytecode on the interpreter path trips a heap-reference
+        // integrity defect). Wave 2 must RECONCILE them, not assume they are
+        // the same list and delete one; deleting either without the other
+        // desynchronises the two dispatch paths for this exact class.
+        // What must replace it: `NativeKind` alone. Under `--jdk-only` a
+        // `SyntheticStub` never dispatches, so no class needs "protecting"
+        // from one and the whole allow-list becomes dead.
         let real_protected_stub = synthetic_stub_native
             && (crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class)
                 || matches!(
@@ -13268,9 +13614,48 @@ pub fn invoke_or_native(
                 })
                 .unwrap_or(false)
         };
-        if !has_real {
-            return safe_native_call(shared, thread, callback, args)
-                .map(|v| coerce_native_return(v, descriptor));
+        // §7 routing. `!has_real` IS this site's compatibility verdict — the
+        // pre-existing "a registered native wins here" — so it is passed
+        // through as `compat_native_wins` unchanged and `Compatible` mode is
+        // bit-for-bit what it was: `resolve_native_dispatch_wave1` consults
+        // nothing else in that mode, and `find_with_kind` hands back the same
+        // callback the old `find` did.
+        //
+        // `bytecode_available` is `has_real`, the only bytecode fact this site
+        // has computed. It is only ever read when `compat_native_wins` is true,
+        // i.e. when `has_real` is false — so this costs nothing and cannot
+        // change the answer; it is passed rather than hard-coded `false` so a
+        // wave-2 reader is not misled about what is known here.
+        //
+        // JDK-ONLY-WAVE2: this dispatch is NOT counted for the §4 census.
+        // `find_with_kind` yields no `NativeMethodId`, and adding
+        // `record_native_dispatch` here would pay a second full triple hash on
+        // the VM's hottest native path for a measurement-only feature. What
+        // must replace it: a `find_with_kind`-shaped lookup that also returns
+        // the slot id (`resolve_id` + `callback_of` + `kind_of_id`), so the
+        // census increment is one relaxed add on the id already in hand.
+        match resolve_native_dispatch_wave1(
+            dispatch_policy(shared),
+            effective_class,
+            method_name,
+            descriptor,
+            Some((callback, native_kind)),
+            !has_real,
+            has_real,
+        ) {
+            Some(DispatchDecision::Reject(violation)) => {
+                return Err(MethodCallFailed::InternalError(VmError::JdkOnly(violation)));
+            }
+            Some(decision) => {
+                if let Some(callback) = decision.native_callback() {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|v| coerce_native_return(v, descriptor));
+                }
+            }
+            // "No opinion": under `Compatible` this is exactly the old
+            // `has_real` fall-through; under `JdkOnly` it can additionally mean
+            // §7 step 3 (concrete bytecode beats this bridge).
+            None => {}
         }
     }
     if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
@@ -17193,6 +17578,20 @@ fn invoke_on_class_shared_inner(
                     // For concrete methods, only check native overrides for classes
                     // where we create synthetic objects without running <init>
                     // (e.g. ByteArrayInputStream created by getResourceAsStream).
+                    //
+                    // JDK-ONLY-WAVE2: the `check_override` chain header. Of the
+                    // ~250 disjuncts below, exactly ONE survives contract §7:
+                    // `method.is_abstract()`, which is §7 step 3b (no `Code`,
+                    // so a registered native is the only thing there is to run
+                    // — the documented deviation in `resolve_dispatch`'s
+                    // banner). Every other disjunct is a class-name exception
+                    // saying "prefer our native over the real JDK's concrete
+                    // bytecode", which is precisely what §1.4 forbids. What
+                    // must replace the whole chain: nothing — under
+                    // `--jdk-only` `resolve_dispatch` step 3 returns
+                    // `Bytecode` for all of them. Removing them under
+                    // `Compatible` is a separate, per-family exercise; each
+                    // entry is load-bearing for a real boot today.
                     let check_override = method.is_abstract()
                         || class_name == "java/io/ByteArrayInputStream"
                         // Jandex constructs a real-JDK BufferedInputStream around
@@ -18464,6 +18863,26 @@ fn invoke_on_class_shared_inner(
                         // register_essential_natives) so the boot can advance
                         // past String dispatch. Drop when RKC16N.6 lands a
                         // permanent fix.
+                        //
+                        // JDK-ONLY-WAVE2: the forced-native `java/lang/String`
+                        // policy, POSITIVE FORM (21 methods). Its twin is the
+                        // INVERTED-EXCLUSION form in
+                        // `vm/src/runtime/interpreter/invoke.rs::force_native_over_real_jdk_bytecode`
+                        // (`class == "java/lang/String" && !matches!(..7 shapes..)
+                        // => return false`). This arm is the COLD path
+                        // (`invoke_on_class_shared_inner`, first call at a
+                        // site); that one is the WARM path (memoized
+                        // force-native gate). THEY MUST BE DELETED TOGETHER:
+                        // removing one alone makes cold and warm dispatch
+                        // disagree about which implementation of `String.equals`
+                        // / `hashCode` / `substring` runs, and the observable
+                        // behaviour of a String method then depends on how many
+                        // times its call site has executed. What must replace
+                        // both: nothing — these natives are registered as
+                        // `Intrinsic`, so `resolve_dispatch` step 2 takes them
+                        // on their own merit with no class-name list at all;
+                        // any that are NOT intrinsic-grade are `SyntheticStub`s
+                        // shadowing real `String` bytecode and must go.
                         || (class_name == "java/lang/String"
                             && matches!(
                                 method_name,
@@ -20929,6 +21348,12 @@ fn invoke_on_class_shared_inner(
         // `should_force_registered_native_over_bytecode`, so it needs its own
         // copy of the receiver check. See docs/known-issues/
         // threadpoolexecutor-execute-npe-on-ctl-regression.md.
+        //
+        // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check,
+        // COPY 4 OF 4 — and the one that does NOT call
+        // `threadpool_executor_has_real_workers`, it re-inlines the
+        // `workers`-field probe. See COPY 1 in `invoke_or_native` above for the
+        // full note and what must replace all four.
         let force_native_receiver_exempt = class_name_for_force
             == "java/util/concurrent/ThreadPoolExecutor"
             && method_name == "execute"
@@ -20939,21 +21364,50 @@ fn invoke_on_class_shared_inner(
                     .map(|idx| matches!(shared.mem.heap.get_field(*recv, idx), Value::Object(Some(_))))
                     .unwrap_or(false)
             });
-        if !force_native_receiver_exempt
+        // §7 routing. This site's whole purpose is "force the registered native
+        // in front of real JDK bytecode", so the pre-existing condition IS
+        // `compat_native_wins` and `bytecode_available` is `true`. Evaluated
+        // before the registry lookup, exactly as before, so a call that does
+        // not force a native still pays no hash.
+        let compat_native_wins = !force_native_receiver_exempt
             && crate::runtime::interpreter::should_force_registered_native_over_bytecode(
                 shared,
                 &class_name_for_force,
                 method_name,
                 descriptor,
-            )
-        {
-            if let Some(callback) =
-                shared
-                    .natives
-                    .native_methods
-                    .find(&class_name_for_force, method_name, descriptor)
-            {
-                return safe_native_call(shared, thread, callback, args);
+            );
+        if compat_native_wins {
+            // `find` -> `find_with_kind`: same 128-bit triple hash, same
+            // callback, and the kind that `find` used to discard is what makes
+            // §1.3/§1.4 decidable here at all.
+            if let Some((callback, native_kind)) = shared.natives.native_methods.find_with_kind(
+                &class_name_for_force,
+                method_name,
+                descriptor,
+            ) {
+                match resolve_native_dispatch_wave1(
+                    dispatch_policy(shared),
+                    &class_name_for_force,
+                    method_name,
+                    descriptor,
+                    Some((callback, native_kind)),
+                    compat_native_wins,
+                    true,
+                ) {
+                    Some(DispatchDecision::Reject(violation)) => {
+                        return Err(MethodCallFailed::InternalError(VmError::JdkOnly(violation)));
+                    }
+                    Some(decision) => {
+                        if let Some(callback) = decision.native_callback() {
+                            return safe_native_call(shared, thread, callback, args);
+                        }
+                    }
+                    // JdkOnly, §7 step 3: real bytecode beats this bridge, so
+                    // fall through to the bytecode path below. Unreachable
+                    // under `Compatible`, where `compat_native_wins` is true
+                    // here by construction.
+                    None => {}
+                }
             }
         }
     }
@@ -21014,14 +21468,65 @@ fn invoke_on_class_shared_inner(
     let args = synchronized_args.as_deref().unwrap_or(args);
 
     let result = if is_native {
-        // Look up native implementation
-        let class_name = shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(declaring_class_id)
-            .map(|c| c.name.to_string())
-            .unwrap_or_default();
+        // Look up native implementation.
+        //
+        // §7 routing. `is_native` here is NOT the same thing as
+        // `method.is_native()`: the `check_override` chain above also sets it
+        // for concrete methods whose real bytecode we deliberately shadow. So
+        // this site can be about to run a native in front of real bytes —
+        // exactly the §1.4 question — and it is the only place that can answer
+        // it, because it is the only place holding `declaring_class_id`.
+        //
+        // The answer is recovered from the SAME class-manager read that was
+        // already being taken for `class_name`: no extra lock, no extra
+        // hierarchy walk. It is computed only under `JdkOnly`, so a default
+        // `--real-jdk` run pays one `is_jdk_only()` bool test and nothing else.
+        let policy = dispatch_policy(shared);
+        let strict = policy.is_jdk_only();
+        let (class_name, native_shadows_bytecode) = {
+            let cm = shared.classes.class_manager.read();
+            let declaring = cm.get_class(declaring_class_id);
+            let class_name = declaring
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
+            let shadows = strict
+                && declaring
+                    .and_then(|c| c.find_method(method_name, descriptor))
+                    .map(|m| !m.is_native() && m.code().is_some())
+                    .unwrap_or(false);
+            (class_name, shadows)
+        };
+
+        // `find` -> `find_with_kind`: identical hash, identical callback, plus
+        // the `NativeKind` that decides §1.3 / §1.4. `compat_native_wins` is
+        // `true` — the unconditional "the registered native runs here" this
+        // site has always encoded — so `Compatible` is bit-for-bit unchanged.
+        let registry_native = match shared.natives.native_methods.find_with_kind(
+            &class_name,
+            method_name,
+            descriptor,
+        ) {
+            Some((callback, native_kind)) => match resolve_native_dispatch_wave1(
+                policy,
+                &class_name,
+                method_name,
+                descriptor,
+                Some((callback, native_kind)),
+                true,
+                native_shadows_bytecode,
+            ) {
+                Some(DispatchDecision::Reject(violation)) => {
+                    return Err(MethodCallFailed::InternalError(VmError::JdkOnly(violation)));
+                }
+                Some(decision) => decision.native_callback(),
+                // JdkOnly, §7 step 3: this "native" is a bridge standing in
+                // front of concrete bytecode. Fall through to the JNI chain,
+                // and past it to the bytecode path, exactly as an unregistered
+                // native would have.
+                None => None,
+            },
+            None => None,
+        };
 
         // `tcnative-*.dll` / `netty_tcnative*.dll` may RegisterNatives for Tomcat
         // `org/apache/tomcat/jni/*` or Netty `io/netty/internal/tcnative/*`. Those
@@ -21032,12 +21537,7 @@ fn invoke_on_class_shared_inner(
         let skip_jni_incompatible_host_lib = class_name.starts_with("org/apache/tomcat/jni/")
             || class_name.starts_with("io/netty/internal/tcnative/");
 
-        if let Some(callback) =
-            shared
-                .natives
-                .native_methods
-                .find(&class_name, method_name, descriptor)
-        {
+        if let Some(callback) = registry_native {
             // Fast path: Rust NativeCallback registered in the built-in registry.
             safe_native_call(shared, thread, callback, args)
         } else if let Some(fn_ptr) = if skip_jni_incompatible_host_lib {
