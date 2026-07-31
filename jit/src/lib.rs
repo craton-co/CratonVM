@@ -7343,12 +7343,16 @@ fn apply_ea_to_ir(
         let mut token = ir_graph
             .node_opt(victim)
             .and_then(|n| ea_memory_token_slot(n).and_then(|s| n.input_opt(s)));
-        for _ in 0..=node_count {
-            match token {
-                Some(t) if !ir_graph.node_opt(t).is_some_and(|n| n.op != ir::Op::Dead) => {
-                    token = spliced.get(&t).copied();
-                }
-                _ => break,
+        let mut hops = 0usize;
+        while let Some(t) = token {
+            if ir_graph.node_opt(t).is_some_and(|n| n.op != ir::Op::Dead) {
+                break;
+            }
+            token = spliced.get(&t).copied();
+            hops += 1;
+            if hops > node_count {
+                token = None;
+                break;
             }
         }
         // Likewise for the replacement value: a load can resolve to a value that
@@ -7356,10 +7360,12 @@ fn apply_ea_to_ir(
         let kind = match kind {
             EaVictimKind::Forwarded(v) => {
                 let mut r = v;
-                for _ in 0..=node_count {
-                    match forwarded.get(&r) {
-                        Some(&next) => r = next,
-                        None => break,
+                let mut steps = 0usize;
+                while let Some(&next) = forwarded.get(&r) {
+                    r = next;
+                    steps += 1;
+                    if steps > node_count {
+                        break;
                     }
                 }
                 EaVictimKind::Forwarded(r)

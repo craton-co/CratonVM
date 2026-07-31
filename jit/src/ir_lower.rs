@@ -4660,101 +4660,107 @@ fn plan_slots(graph: &Graph, schedule: &Schedule, sr_map: Option<&ScalarReplacem
     // ── 4. Uses, definitions and the liveness fixed point ────────────
     let mut lo = vec![usize::MAX; n];
     let mut hi = vec![0usize; n];
-    let words = n.div_ceil(64).max(1);
+    // Past the work budget nothing below runs — including the `nodes × blocks`
+    // bit-set allocation, which is the expensive part — and every value keeps a
+    // dedicated slot.
     let mut coloured = n.saturating_mul(nb) <= SLOT_PLAN_WORK_BUDGET;
+    if coloured {
+        let words = n.div_ceil(64).max(1);
+        let mut def_bits = vec![0u64; words * nb];
+        let mut use_bits = vec![0u64; words * nb];
+        let mut phi_out_bits = vec![0u64; words * nb];
 
-    let mut def_bits = vec![0u64; words * nb];
-    let mut use_bits = vec![0u64; words * nb];
-    let mut phi_out_bits = vec![0u64; words * nb];
-
-    // Direct (non-phi) uses and definitions, in block order so that "used
-    // before defined in this block" — the upward-exposed set the dataflow
-    // needs — falls out of a single pass.
-    let mut local_def = vec![0u64; words];
-    for b in 0..nb {
-        let base = b * words;
-        local_def.iter_mut().for_each(|w| *w = 0);
-        let block = &schedule.blocks[b];
-        for u in block.nodes.iter().copied().chain(block.terminator) {
-            let ui = u as usize;
-            let node = match graph.nodes.get(ui) {
-                Some(node) => node,
-                None => continue,
-            };
-            let upos = pos_of.get(ui).copied().flatten().unwrap_or(span[b].0);
-            // A phi's value inputs are NOT read here — the predecessor's edge
-            // copy reads them, handled below. `inputs[0]` is the merge control.
-            if !matches!(node.op, Op::Phi) {
-                for &inp in &node.inputs {
-                    let ii = inp as usize;
-                    if inp == NO_NODE || ii >= n || !wants_slot[ii] {
-                        continue;
-                    }
-                    lo[ii] = lo[ii].min(upos);
-                    hi[ii] = hi[ii].max(upos);
-                    if !bits_contains(&local_def, ii) {
-                        bits_insert(&mut use_bits[base..base + words], ii);
+        // Direct (non-phi) uses and definitions, in block order so that "used
+        // before defined in this block" — the upward-exposed set the dataflow
+        // needs — falls out of a single pass.
+        let mut local_def = vec![0u64; words];
+        for b in 0..nb {
+            let base = b * words;
+            local_def.iter_mut().for_each(|w| *w = 0);
+            let block = &schedule.blocks[b];
+            for u in block.nodes.iter().copied().chain(block.terminator) {
+                let ui = u as usize;
+                let node = match graph.nodes.get(ui) {
+                    Some(node) => node,
+                    None => continue,
+                };
+                let upos = pos_of.get(ui).copied().flatten().unwrap_or(span[b].0);
+                // A phi's value inputs are NOT read here — the predecessor's
+                // edge copy reads them, handled below; `inputs[0]` is control.
+                if !matches!(node.op, Op::Phi) {
+                    for &inp in &node.inputs {
+                        let ii = inp as usize;
+                        if inp == NO_NODE || ii >= n || !wants_slot[ii] {
+                            continue;
+                        }
+                        lo[ii] = lo[ii].min(upos);
+                        hi[ii] = hi[ii].max(upos);
+                        if !bits_contains(&local_def, ii) {
+                            bits_insert(&mut use_bits[base..base + words], ii);
+                        }
                     }
                 }
-            }
-            if wants_slot[ui] {
-                bits_insert(&mut local_def, ui);
-                bits_insert(&mut def_bits[base..base + words], ui);
-                lo[ui] = lo[ui].min(upos);
-                hi[ui] = hi[ui].max(upos);
+                if wants_slot[ui] {
+                    bits_insert(&mut local_def, ui);
+                    bits_insert(&mut def_bits[base..base + words], ui);
+                    lo[ui] = lo[ui].min(upos);
+                    hi[ui] = hi[ui].max(upos);
+                }
             }
         }
-    }
 
-    // Phi edge copies. Grouping the phis by their merge control once turns
-    // `emit_phi_copies`' per-edge whole-graph scan into a single pass.
-    let mut phis_of: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-    for (id, node) in graph.nodes.iter().enumerate() {
-        if !matches!(node.op, Op::Phi) {
-            continue;
-        }
-        if let Some(&merge) = node.inputs.first() {
-            if merge != NO_NODE {
-                phis_of.entry(merge).or_default().push(id as NodeId);
+        // Phi edge copies. Grouping the phis by their merge control once turns
+        // `emit_phi_copies`' per-edge whole-graph scan into a single pass.
+        let mut phis_of: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if !matches!(node.op, Op::Phi) {
+                continue;
+            }
+            if let Some(&merge) = node.inputs.first() {
+                if merge != NO_NODE {
+                    phis_of.entry(merge).or_default().push(id as NodeId);
+                }
             }
         }
-    }
-    for succ in 0..nb {
-        let merge_ctrl = schedule.blocks[succ].ctrl;
-        let merge_node = match graph.nodes.get(merge_ctrl as usize) {
-            Some(m) if matches!(m.op, Op::Merge | Op::Region) => m,
-            _ => continue,
-        };
-        let phis = match phis_of.get(&merge_ctrl) {
-            Some(phis) => phis,
-            None => continue,
-        };
-        // merge.inputs[k] is the control token for phi value k (= input k+1).
-        for (k, &ctrl_in) in merge_node.inputs.iter().enumerate() {
-            let pred = match ctrl_block_of(graph, schedule, ctrl_in) {
-                Some(pred) if pred < nb => pred,
+        for succ in 0..nb {
+            let merge_ctrl = schedule.blocks[succ].ctrl;
+            let merge_node = match graph.nodes.get(merge_ctrl as usize) {
+                Some(m) if matches!(m.op, Op::Merge | Op::Region) => m,
                 _ => continue,
             };
-            let at = span[pred].1;
-            for &pid in phis {
-                let v = match graph.nodes.get(pid as usize).and_then(|p| p.inputs.get(k + 1)) {
-                    Some(&v) if v != NO_NODE => v,
+            let phis = match phis_of.get(&merge_ctrl) {
+                Some(phis) => phis,
+                None => continue,
+            };
+            // merge.inputs[k] is the control token for phi value k (= input k+1).
+            for (k, &ctrl_in) in merge_node.inputs.iter().enumerate() {
+                let pred = match ctrl_block_of(graph, schedule, ctrl_in) {
+                    Some(pred) if pred < nb => pred,
                     _ => continue,
                 };
-                let vi = v as usize;
-                if vi >= n || !wants_slot[vi] {
-                    continue;
+                let at = span[pred].1;
+                for &pid in phis {
+                    let v = match graph
+                        .nodes
+                        .get(pid as usize)
+                        .and_then(|p| p.inputs.get(k + 1))
+                    {
+                        Some(&v) if v != NO_NODE => v,
+                        _ => continue,
+                    };
+                    let vi = v as usize;
+                    if vi >= n || !wants_slot[vi] {
+                        continue;
+                    }
+                    lo[vi] = lo[vi].min(at);
+                    hi[vi] = hi[vi].max(at);
+                    bits_insert(&mut phi_out_bits[pred * words..(pred + 1) * words], vi);
                 }
-                lo[vi] = lo[vi].min(at);
-                hi[vi] = hi[vi].max(at);
-                bits_insert(&mut phi_out_bits[pred * words..(pred + 1) * words], vi);
             }
         }
-    }
 
-    let mut live_in = vec![0u64; words * nb];
-    let mut live_out = vec![0u64; words * nb];
-    if coloured {
+        let mut live_in = vec![0u64; words * nb];
+        let mut live_out = vec![0u64; words * nb];
         let mut scratch = vec![0u64; words];
         let mut converged = false;
         for _ in 0..SLOT_PLAN_MAX_ITERATIONS {
@@ -4773,13 +4779,12 @@ fn plan_slots(graph: &Graph, schedule: &Schedule, sr_map: Option<&ScalarReplacem
                     }
                 }
                 for w in 0..words {
-                    let merged = live_out[base + w] | scratch[w];
-                    if merged != live_out[base + w] {
-                        live_out[base + w] = merged;
+                    let merged_out = live_out[base + w] | scratch[w];
+                    if merged_out != live_out[base + w] {
+                        live_out[base + w] = merged_out;
                         changed = true;
                     }
-                    let entering =
-                        use_bits[base + w] | (live_out[base + w] & !def_bits[base + w]);
+                    let entering = use_bits[base + w] | (merged_out & !def_bits[base + w]);
                     let merged_in = live_in[base + w] | entering;
                     if merged_in != live_in[base + w] {
                         live_in[base + w] = merged_in;
@@ -4793,26 +4798,31 @@ fn plan_slots(graph: &Graph, schedule: &Schedule, sr_map: Option<&ScalarReplacem
             }
         }
         coloured = converged;
-    }
 
-    // ── 5. Ranges ────────────────────────────────────────────────────
-    if coloured {
-        for b in 0..nb {
-            let base = b * words;
-            let (start, end) = span[b];
-            bits_for_each(&live_in[base..base + words], |v| {
-                if v < n && wants_slot[v] {
-                    lo[v] = lo[v].min(start);
-                }
-            });
-            bits_for_each(&live_out[base..base + words], |v| {
-                if v < n && wants_slot[v] {
-                    hi[v] = hi[v].max(end);
-                }
-            });
+        // ── 5a. Widen each range to cover every block it is live in ──
+        //
+        // This is where loops are handled: a value used inside a loop is
+        // live-out of every block on the back edge's path, so its range covers
+        // the whole loop without the colouring ever knowing what a loop is.
+        if coloured {
+            for b in 0..nb {
+                let base = b * words;
+                let (start, end) = span[b];
+                bits_for_each(&live_in[base..base + words], |v| {
+                    if v < n && wants_slot[v] {
+                        lo[v] = lo[v].min(start);
+                    }
+                });
+                bits_for_each(&live_out[base..base + words], |v| {
+                    if v < n && wants_slot[v] {
+                        hi[v] = hi[v].max(end);
+                    }
+                });
+            }
         }
     }
 
+    // ── 5b. Finalise the ranges ──────────────────────────────────────
     let whole_method = LiveRange {
         lo: 0,
         hi: total_positions.saturating_sub(1),
@@ -5248,9 +5258,27 @@ pub(crate) fn lower_inner(
         return refuse(bailout);
     }
     let frame_needs = scan_frame_needs(graph, helpers);
-    let frame_estimate = estimate_frame_bytes(num_locals, graph.nodes.len(), &frame_needs);
+    // Liveness-based frame-slot reuse: values whose live ranges do not overlap
+    // share one 8-byte word, so the spill reservation is sized by the peak
+    // number of simultaneously live values instead of by the node count. The
+    // colouring is *checked* before it is used — an aliased pair of live values
+    // is silent wrong code, so it is not taken on trust.
+    let slot_plan = plan_slots(graph, schedule, sr_map);
+    if let Err(bailout) = verify_slot_colouring(graph, schedule, &slot_plan) {
+        return refuse(bailout);
+    }
+    let frame_estimate = estimate_frame_bytes(num_locals, slot_plan.slots, &frame_needs);
     if let Err(bailout) = check_frame_size(frame_estimate, DEFAULT_MAX_FRAME_BYTES) {
         return refuse(bailout);
+    }
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SLOTS").is_some() {
+        eprintln!(
+            "[ir-slots] nodes={} blocks={} slots={} peak_live={} frame_bytes={frame_estimate}",
+            graph.nodes.len(),
+            schedule.blocks.len(),
+            slot_plan.slots,
+            slot_plan.peak_live,
+        );
     }
 
     // ── Every emitted value has a location, decided before emission ──
@@ -5291,7 +5319,7 @@ pub(crate) fn lower_inner(
         buf,
         num_params,
         num_locals,
-        graph.nodes.len(),
+        &slot_plan,
         helpers,
         branch_hints,
         sr_map,
@@ -6908,13 +6936,14 @@ mod tests {
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
         let buf = ExecutableBuffer::new(4096).expect("executable buffer");
         let helpers = no_helpers();
+        let plan = plan_slots(&graph, &schedule, None);
         let mut lowerer = Lowerer::new(
             &graph,
             &schedule,
             buf,
             1,
             1,
-            graph.nodes.len(),
+            &plan,
             &helpers,
             &empty,
             None,

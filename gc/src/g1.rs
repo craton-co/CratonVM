@@ -2621,6 +2621,14 @@ impl G1Collector {
             bytes_freed,
         };
         self.record_collection(G1CollectionType::YoungOnly, pause_us, &stats);
+        crate::gc_metrics::record_g1_cycle(
+            crate::gc_metrics::g1_cycle_kind::YOUNG,
+            cset.len() as u32,
+            0,
+            (jni_pinned_out + jit_pinned_out) as u32,
+            rset_sources_scanned as u32,
+            g1_pause_degraded_flags(&pointer_map, jni_pinned_out, jit_pinned_out, false),
+        );
 
         GcResult { stats, pointer_map }
     }
@@ -2767,6 +2775,9 @@ impl G1Collector {
             })
             .map(|(i, _)| i)
             .collect();
+        let cset_young = cset.len();
+        let (jni_pinned_out, jit_pinned_out) =
+            count_young_regions_pinned_out(&regions, &jit_pinned_regions);
 
         // Select old regions sorted by gc_efficiency (lowest = most
         // garbage first).  See [`Self::select_old_regions_for_mixed_gc`]
@@ -2821,6 +2832,16 @@ impl G1Collector {
         }
 
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
+        // Same invariant as the young path: a pinned region must never enter a
+        // collection set, because Phase 5 resets every CSet region that holds
+        // no self-forwarded object. A mixed CSet is the harder case — it also
+        // takes Old regions, where a long-lived JIT-rooted or JNI-pinned object
+        // is most likely to have ended up.
+        debug_assert!(
+            cset.iter()
+                .all(|&i| !regions[i].pinned && !jit_pinned_regions.contains(&i)),
+            "G1 mixed CSet contains a pinned region"
+        );
         let mut work_list: Vec<*mut u8> = Vec::new();
 
         // Evacuate roots
@@ -2894,6 +2915,7 @@ impl G1Collector {
             set.extend(jit_pinned_regions.iter().copied());
             set
         };
+        let rset_sources_scanned = mixed_rset_sources.len();
 
         for src_idx in mixed_rset_sources {
             self.scan_source_region_for_cset_refs(
@@ -8106,6 +8128,38 @@ fn consume_satb_pre_barrier_epoch() -> bool {
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
+
+/// Assemble the [`crate::gc_metrics::g1_degraded`] mask for one evacuation
+/// pause from the facts the pause already computed.
+///
+/// An identity entry (`key == value`) in the forwarding map IS the definition
+/// of an evacuation failure: `evacuate_object` installs one when no to-space
+/// could be allocated, and `free_or_keep_cset` reads exactly the same predicate
+/// to decide which regions it must keep. Deriving the flag from the map rather
+/// than from a separate counter is what stops the report and the reclamation
+/// decision from ever disagreeing.
+fn g1_pause_degraded_flags(
+    pointer_map: &HashMap<usize, usize>,
+    jni_pinned_out: usize,
+    jit_pinned_out: usize,
+    parallel: bool,
+) -> u32 {
+    use crate::gc_metrics::g1_degraded as flag;
+    let mut degraded = flag::NONE;
+    if pointer_map.iter().any(|(k, v)| k == v) {
+        degraded |= flag::EVACUATION_FAILURE;
+    }
+    if jni_pinned_out > 0 {
+        degraded |= flag::JNI_PINNED_REGIONS_EXCLUDED;
+    }
+    if jit_pinned_out > 0 {
+        degraded |= flag::JIT_PINNED_REGIONS_EXCLUDED;
+    }
+    if parallel {
+        degraded |= flag::PARALLEL_EVACUATOR;
+    }
+    degraded
+}
 
 /// How many *young* (Eden/Survivor) regions each pin vocabulary kept out of a
 /// collection set, as `(jni_no_relocation_pins, jit_conservative_root_pins)`.

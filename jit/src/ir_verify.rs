@@ -1577,8 +1577,10 @@ mod tests {
             vec![ctrl, mem, arr, arr, arr],
             None,
         );
-        let len = g.add(Op::ArrayLength, IrType::Int, vec![ctrl, st, arr], None);
-        g.nodes[g.exit as usize].inputs[1] = len;
+        // Deliberately not rewired into the Return: `Graph::add` appends, so a
+        // Return consuming it would trip the (heuristic) arena-order lane and
+        // muddy what this test is about.
+        let _len = g.add(Op::ArrayLength, IrType::Int, vec![ctrl, st, arr], None);
         assert!(verify_graph(&g, "test", VerifyOptions::all()).is_ok());
 
         g.kill(st);
@@ -1597,20 +1599,21 @@ mod tests {
     /// keeps the two forms apart.
     #[test]
     fn compact_array_length_has_no_memory_token() {
-        let arr = Node {
+        let compact = Node {
             op: Op::ArrayLength,
             ty: IrType::Int,
             inputs: vec![7],
-            aux: None,
+            bytecode_pc: None,
         };
-        assert!(!is_memory_token_input(&arr, 1));
+        assert!(!is_memory_token_input(&compact, 1));
         let full = Node {
             op: Op::ArrayLength,
             ty: IrType::Int,
             inputs: vec![1, 2, 3],
-            aux: None,
+            bytecode_pc: None,
         };
         assert!(is_memory_token_input(&full, 1));
+        assert!(!is_memory_token_input(&full, 0));
         assert!(!is_memory_token_input(&full, 2));
     }
 
