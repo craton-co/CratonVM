@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
 // The live-thread helpers live in `crate::phases_late::management` rather than
-// here: this module is gated on the `experimental-jmx` feature, that one is
+// here: this module is gated on the `management` feature, that one is
 // not, and both register the same `ThreadMXBean` triples. One copy is what
 // stops the two registrations from drifting apart again.
 use crate::phases_late::management::{
@@ -5410,7 +5410,7 @@ fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // 10. MBeanServer — in-process synthetic MBean registry
 //
-// `experimental-jmx` ships a working (if minimal) in-process JMX agent. The
+// `management` ships a working (if minimal) in-process JMX agent. The
 // synthetic `javax/management/MBeanServer` instance carries its registry on
 // the heap so the moving GC traces it like any other object — no Rust-side
 // static handle table (which a moving GC would silently relocate out from
@@ -6509,7 +6509,7 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
 /// instead — which throws `AbstractMethodError: ... has no Code attribute`
 /// on every un-overridden `MBeanServer` method (e.g.
 /// `addNotificationListener`), exactly the failure the KAFKA-MBEAN fix was
-/// meant to avoid. Under `experimental-jmx` synthetic-JDK mode there is no
+/// meant to avoid. Under `management` synthetic-JDK mode there is no
 /// real `java.management` module, so the factory call needs a server —
 /// returning our synthetic `alloc_mbean_server` gives the full
 /// register/get/set/invoke/query flow a concrete receiver there.

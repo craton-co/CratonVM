@@ -23,10 +23,21 @@ synthetic-jdk = []
 app-stubs = []
 legacy-synthetic-crypto = []
 synthetic-quarkus-arc = []
-# NEW-13: `experimental-tls` is now a no-op alias. The native-tls backed
-# javax.net.ssl implementation is always compiled and registered.
-experimental-tls = []
-experimental-jmx = []
+# NEW-13: a no-op. The native-tls backed javax.net.ssl implementation is
+# always compiled and registered, so this gates nothing. Declared only so
+# downstream feature requests and `check-cfg` keep resolving. Slated for
+# removal in 0.4. `experimental-tls` is the pre-2026-07-30 name, kept as a
+# back-compat alias — it wrongly implied TLS was feature-gated.
+deprecated-noop-tls = []
+experimental-tls = ["deprecated-noop-tls"]
+# `sun.management` (java.lang.management backing) + `javax.management` (JMX)
+# natives — the `jmx` / `jmx_openmbean` modules. Named `experimental-jmx`
+# until 2026-07-30, which was wrong twice: the surface is not an experiment
+# (cratonvm-vm enables it by default because `ManagementFactory` needs it),
+# and it is not confined to JMX. The old name stays as a back-compat alias
+# and is slated for removal in 0.4.
+management = []
+experimental-jmx = ["management"]
 experimental-serialization = []
 experimental-aot = []
 # Phase 3 — Java-side GPU surface (craton.gpu.internal.Native shims).
