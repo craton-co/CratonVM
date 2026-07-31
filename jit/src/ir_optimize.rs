@@ -1679,7 +1679,7 @@ fn is_memory_barrier(op: &Op) -> bool {
 /// recognised here even though the verifier does not classify it — being the
 /// stricter of the two can only make this side *refuse* a splice, never
 /// perform a wrong one.
-fn memory_token_slot(node: &Node) -> Option<usize> {
+pub(crate) fn memory_token_slot(node: &Node) -> Option<usize> {
     let min_full_arity = match node.op {
         Op::Load(_) => 3,          // [ctrl, mem, base]
         Op::Store(_) => 4,         // [ctrl, mem, base, value]
@@ -1705,7 +1705,7 @@ fn memory_token_slot(node: &Node) -> Option<usize> {
 /// A memory-typed φ is the one op whose token edges are not a single slot:
 /// *every* value input (slots 1.., past the control anchor) is a token from
 /// one predecessor.
-fn is_memory_token_slot(node: &Node, idx: usize) -> bool {
+pub(crate) fn is_memory_token_slot(node: &Node, idx: usize) -> bool {
     if matches!(node.op, Op::Phi) {
         return node.ty == IrType::Memory && idx >= 1;
     }

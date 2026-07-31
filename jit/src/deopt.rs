@@ -2812,8 +2812,8 @@ fn deopt_metadata_bailout(errors: &[DeoptMetadataError]) -> Bailout {
         msg.push_str(&format!(" … and {} more", errors.len() - shown));
     }
     Bailout::with_context(
-        BailoutReason::IrVerification(msg),
-        "phase=deopt-metadata".to_string(),
+        BailoutReason::DeoptMetadata(msg),
+        "phase=install".to_string(),
     )
 }
 
@@ -3285,8 +3285,8 @@ mod deopt_metadata_tests {
         p.frame_state.bci = 99;
         p.frame_state.locals = vec![FrameValue::Int(0); 4];
         let err = verifier().verify(&[p]).unwrap_err();
-        assert_eq!(err.category(), "ir_verification");
-        assert_eq!(err.context.as_deref(), Some("phase=deopt-metadata"));
+        assert_eq!(err.category(), "deopt_metadata");
+        assert_eq!(err.context.as_deref(), Some("phase=install"));
         let s = err.to_string();
         assert!(s.contains("2 deopt-metadata violation(s)"), "{s}");
         assert!(s.contains("resume bci 99"), "{s}");
