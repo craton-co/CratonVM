@@ -79,6 +79,14 @@
 # why, and docs/benchmarking/methodology.md for the protocol it enforces.
 set -u
 
+# Every numeric comparison in this script goes through awk. Under a locale
+# whose decimal separator is a comma, "9.9" can parse as 9 and a load,
+# frequency-drift or CV ceiling silently stops rejecting anything while still
+# printing PASS. Pin the numeric locale rather than hope the bench host's is
+# the one it was written on. (The PowerShell twin does the same thing with
+# InvariantCulture, for the same reason.)
+export LC_ALL=C
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA_VERSION=1
 
@@ -259,6 +267,7 @@ baseline_phase_rows() {  # -> "phase<TAB>ms<TAB>checksum<TAB>status<TAB>placehol
             ;;
         *)
             awk -F'\t' '
+                { sub(/\r$/, "") }   # this repo checks out CRLF on Windows
                 /^#/ || NF == 0 { next }
                 $1 == "" { next }
                 {
@@ -418,6 +427,17 @@ samples_field_index() {  # samples_field_index <column-name>
 check_samples_present() {
     SAMPLES="$RESULTS/samples.tsv"
     SUMMARY="$RESULTS/summary.tsv"
+    # A UTF-8 BOM (which is what Windows PowerShell's `Set-Content -Encoding
+    # utf8` writes) hides the leading '#' of the header row from every
+    # `/^#/` test below: the header then reads as a data row and the column
+    # names are never found, so checks silently report "no checksum column"
+    # instead of checking checksums. Normalise once, loudly.
+    if [ -f "$SAMPLES" ] && [ "$(head -c 3 "$SAMPLES" 2>/dev/null)" = "$(printf '\357\273\277')" ]; then
+        local stripped="${TMPDIR:-/tmp}/cratonbench-samples-$$.tsv"
+        tail -c +4 "$SAMPLES" > "$stripped"
+        warn_check SUMMARY-INTEGRITY "samples.tsv starts with a UTF-8 BOM; reading a BOM-stripped copy"
+        SAMPLES="$stripped"
+    fi
     if [ ! -f "$SAMPLES" ]; then
         fail_check 14 MANIFEST-MISSING \
             "no raw sample file at $SAMPLES — a results directory that kept only the summary cannot be re-analysed, and 'we only kept the median' is how the retracted HashMap number survived"

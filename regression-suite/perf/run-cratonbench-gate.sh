@@ -72,6 +72,12 @@
 #             instability / missing manifest — see reliability-gate.sh).
 set -u
 
+# Fixed numeric locale for the whole run: the distribution maths is awk, and
+# a comma-decimal locale turns "2564.5" into 2564 (or into a parse failure)
+# without any error. It is also one more thing that is now identical between
+# any two runs being compared, and it is recorded in the manifest.
+export LC_ALL=C
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RELIABILITY_GATE="$SCRIPT_DIR/reliability-gate.sh"
@@ -274,6 +280,7 @@ MANIFEST="$RESULTS/manifest.tsv"
     printf 'bench_source_sha256\t%s\n' "$(dash "$BENCH_SHA")"
     printf 'gate_script_sha256\t%s\n' "$(dash "$GATE_SHA")"
     printf 'vm_flags\t%s\n' "$VM_FLAGS"
+    printf 'locale\t%s\n' "$LC_ALL"
     printf 'vm_stats_enabled\t%s\n' "$VM_STATS"
     printf 'command_line\t%s\n' "$CHILD_CMDLINE"
     printf 'gate_command_line\t%s %s\n' "${BASH_SOURCE[0]}" "$GATE_ARGV"
@@ -370,7 +377,11 @@ run_one() {
         # /proc/<pid>/stat field 39 is the CPU the task last ran on. comm can
         # contain spaces and parentheses, so everything up to the last ") "
         # is dropped first and the remainder is indexed from field 3.
-        if IFS= read -r line < "/proc/$pid/stat" 2>/dev/null; then
+        # 2>/dev/null BEFORE the input redirection, not after: redirections are
+        # applied left to right, so the other order lets the "No such file"
+        # from a process that exited between `kill -0` and here reach the
+        # console.
+        if IFS= read -r line 2>/dev/null < "/proc/$pid/stat"; then
             line=${line#*') '}
             arr=($line)
             c=${arr[36]:-}

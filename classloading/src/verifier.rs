@@ -4099,4 +4099,273 @@ mod tests {
             crate::type_maps::VerificationStatus::Verified
         );
     }
+
+    // =====================================================================
+    // JVMS §4.9.1 structural bytecode verification
+    // =====================================================================
+
+    /// A method with a `Code` attribute, a custom descriptor and a custom
+    /// exception table — the shapes the structural scan is about.
+    fn structural_method(
+        name: &str,
+        descriptor: &str,
+        max_stack: u16,
+        max_locals: u16,
+        code: Vec<u8>,
+        exception_table: Vec<cratonvm_reader::attribute::ExceptionTableEntry>,
+    ) -> ClassFileMethod {
+        ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+            name: Arc::from(name),
+            descriptor: Arc::from(descriptor),
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+                max_stack,
+                max_locals,
+                code: cratonvm_reader::ByteView::from_vec(code),
+                exception_table,
+                attributes: vec![],
+            }))],
+        }
+    }
+
+    fn handler(
+        start_pc: u16,
+        end_pc: u16,
+        handler_pc: u16,
+    ) -> cratonvm_reader::attribute::ExceptionTableEntry {
+        cratonvm_reader::attribute::ExceptionTableEntry {
+            start_pc,
+            end_pc,
+            handler_pc,
+            catch_type: 0, // catch-all (finally)
+        }
+    }
+
+    /// `iconst_0; istore_0; return` with a valid catch-all handler — the valid
+    /// counterpart every rejection test below is measured against.
+    fn well_formed_body() -> Vec<u8> {
+        vec![0x03, 0x3b, 0xb1]
+    }
+
+    #[test]
+    fn structural_accepts_a_well_formed_method() {
+        let class = make_pre_java7_class_with_id(
+            92_001,
+            vec![structural_method(
+                "m",
+                "()V",
+                1,
+                1,
+                well_formed_body(),
+                vec![handler(0, 2, 2)],
+            )],
+        );
+        verify_class_structural_bytecode(&class).expect("a well-formed method must pass");
+    }
+
+    #[test]
+    fn structural_rejects_handler_pc_past_the_code_array() {
+        let class = make_pre_java7_class_with_id(
+            92_002,
+            vec![structural_method(
+                "m",
+                "()V",
+                1,
+                1,
+                well_formed_body(),
+                vec![handler(0, 2, 99)],
+            )],
+        );
+        let err = verify_class_structural_bytecode(&class)
+            .expect_err("a handler_pc past the end of the code array must be rejected");
+        assert!(err.to_string().contains("handler_pc"), "{err}");
+    }
+
+    #[test]
+    fn structural_rejects_handler_pc_inside_an_instruction() {
+        // `sipush` is 3 bytes (0x11 hi lo); handler_pc = 1 lands on its operand.
+        let class = make_pre_java7_class_with_id(
+            92_003,
+            vec![structural_method(
+                "m",
+                "()V",
+                1,
+                1,
+                vec![0x11, 0x00, 0x01, 0x57, 0xb1], // sipush 1; pop; return
+                vec![handler(0, 3, 1)],
+            )],
+        );
+        let err = verify_class_structural_bytecode(&class)
+            .expect_err("a handler entry inside an instruction must be rejected");
+        assert!(err.to_string().contains("instruction boundary"), "{err}");
+    }
+
+    #[test]
+    fn structural_rejects_inverted_handler_range() {
+        let class = make_pre_java7_class_with_id(
+            92_004,
+            vec![structural_method(
+                "m",
+                "()V",
+                1,
+                1,
+                well_formed_body(),
+                vec![handler(2, 0, 2)],
+            )],
+        );
+        assert!(verify_class_structural_bytecode(&class).is_err());
+    }
+
+    #[test]
+    fn structural_rejects_empty_handler_range() {
+        let class = make_pre_java7_class_with_id(
+            92_005,
+            vec![structural_method(
+                "m",
+                "()V",
+                1,
+                1,
+                well_formed_body(),
+                vec![handler(1, 1, 2)],
+            )],
+        );
+        assert!(verify_class_structural_bytecode(&class).is_err());
+    }
+
+    #[test]
+    fn structural_rejects_local_index_past_max_locals() {
+        // `istore_3` with max_locals = 1.
+        let class = make_pre_java7_class_with_id(
+            92_006,
+            vec![structural_method(
+                "m",
+                "()V",
+                1,
+                1,
+                vec![0x03, 0x3e, 0xb1], // iconst_0; istore_3; return
+                vec![],
+            )],
+        );
+        let err = verify_class_structural_bytecode(&class)
+            .expect_err("a local operand past max_locals must be rejected");
+        assert!(err.to_string().contains("max_locals"), "{err}");
+    }
+
+    #[test]
+    fn structural_rejects_cat2_local_straddling_max_locals() {
+        // `lstore_1` needs slots 1 and 2, but max_locals = 2 stops at slot 1.
+        let class = make_pre_java7_class_with_id(
+            92_007,
+            vec![structural_method(
+                "m",
+                "()V",
+                2,
+                2,
+                vec![0x09, 0x40, 0xb1], // lconst_0; lstore_1; return
+                vec![],
+            )],
+        );
+        assert!(verify_class_structural_bytecode(&class).is_err());
+        // The same body with one more local slot is fine.
+        let ok = make_pre_java7_class_with_id(
+            92_008,
+            vec![structural_method(
+                "m",
+                "()V",
+                2,
+                3,
+                vec![0x09, 0x40, 0xb1],
+                vec![],
+            )],
+        );
+        verify_class_structural_bytecode(&ok).expect("lstore_1 fits when max_locals is 3");
+    }
+
+    #[test]
+    fn structural_rejects_max_locals_smaller_than_the_argument_slots() {
+        // `static m(J)V` needs 2 local slots for its single `long` argument.
+        let class = make_pre_java7_class_with_id(
+            92_009,
+            vec![structural_method("m", "(J)V", 1, 1, vec![0xb1], vec![])],
+        );
+        let err = verify_class_structural_bytecode(&class)
+            .expect_err("max_locals must cover the method's own arguments");
+        assert!(err.to_string().contains("max_locals"), "{err}");
+
+        let ok = make_pre_java7_class_with_id(
+            92_010,
+            vec![structural_method("m", "(J)V", 1, 2, vec![0xb1], vec![])],
+        );
+        verify_class_structural_bytecode(&ok).expect("max_locals = 2 covers a long argument");
+    }
+
+    #[test]
+    fn structural_rejects_out_of_range_branch_target() {
+        // `goto +100` in a 4-byte method.
+        let class = make_pre_java7_class_with_id(
+            92_011,
+            vec![structural_method(
+                "m",
+                "()V",
+                1,
+                1,
+                vec![0xa7, 0x00, 0x64, 0xb1],
+                vec![],
+            )],
+        );
+        assert!(verify_class_structural_bytecode(&class).is_err());
+    }
+
+    #[test]
+    fn structural_rejects_branch_into_the_middle_of_an_instruction() {
+        // `goto +2` lands on the second byte of the following `sipush`.
+        let class = make_pre_java7_class_with_id(
+            92_012,
+            vec![structural_method(
+                "m",
+                "()V",
+                1,
+                1,
+                vec![
+                    0xa7, 0x00, 0x02, // 0: goto 2   (mid-`goto` operand)
+                    0x11, 0x00, 0x01, // 3: sipush 1
+                    0x57, // 6: pop
+                    0xb1, // 7: return
+                ],
+                vec![],
+            )],
+        );
+        assert!(verify_class_structural_bytecode(&class).is_err());
+    }
+
+    #[test]
+    fn structural_rejects_empty_code_array() {
+        let class = make_pre_java7_class_with_id(
+            92_013,
+            vec![structural_method("m", "()V", 1, 1, vec![], vec![])],
+        );
+        assert!(verify_class_structural_bytecode(&class).is_err());
+    }
+
+    #[test]
+    fn structural_skips_abstract_and_native_methods() {
+        // They have no `Code`, so there is nothing to scan and nothing to
+        // reject — the presence rules live in Pass 2.
+        let mut class = make_pre_java7_class_with_id(92_014, vec![]);
+        class.methods = vec![
+            ClassFileMethod {
+                access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT,
+                name: Arc::from("a"),
+                descriptor: Arc::from("()V"),
+                attributes: vec![],
+            },
+            ClassFileMethod {
+                access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+                name: Arc::from("n"),
+                descriptor: Arc::from("(J)V"),
+                attributes: vec![],
+            },
+        ];
+        verify_class_structural_bytecode(&class).expect("no Code, nothing to verify");
+    }
 }

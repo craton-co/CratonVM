@@ -7,6 +7,19 @@
 #         provisional = best-of measurement 2026-07-24 pending re-anchor after
 #                       the open bt18 dev regression is root-caused; may be
 #                       re-anchored with a normal PR justification.
+#         placeholder = NOT MEASURED on this host. This value is the
+#                       machine-readable marker read by
+#                       regression-suite/perf/reliability-gate.sh: a row with
+#                       this status (or with an empty/zero/non-numeric
+#                       baseline_ms, or an empty checksum) is REFUSED as a
+#                       regression threshold — the gate exits 11 rather than
+#                       print a verdict against a number nobody measured.
+#                       See baselines/README.md for why, and
+#                       docs/benchmarking/methodology.md for how to record a
+#                       real one. As of 2026-07-31 no row below is a
+#                       placeholder: every row has a non-zero baseline and a
+#                       reference checksum. None of them has yet been
+#                       re-measured under the reliability gate.
 #
 # phase	baseline_ms	checksum	status	evidence
 arithmetic	3976	5000000003999999995	provisional	pure-kernel OSR reg-homes default-on + R8/R9 operand cache, median-of-7 3976ms (checksum-verified), 2026-07-30
