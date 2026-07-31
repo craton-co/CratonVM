@@ -568,7 +568,22 @@ impl<'a> Lowerer<'a> {
         s
     }
 
-    // ── Moving-young relocation contract ─────────────────────────────────
+    /// `CRATONVM_JIT_IR_RELOC_EMIT=0` — disable the relocation contract's EMISSION
+/// side entirely (safepoint-id stores, shadow push/reload, the prologue thread
+/// fetch), leaving the frame layout alone.
+///
+/// Exists so the cost of that emission can be A/B'd on ONE binary against a
+/// deterministic probe. Three attempts inferred it from a single run of a suite
+/// class that later turned out to be bimodal; a lever plus repeats is what that
+/// should have been. Default on, so this changes nothing unless asked.
+fn reloc_emit_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RELOC_EMIT") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+// ── Moving-young relocation contract ─────────────────────────────────
     //
     // What `conservative_roots` demands of a compiled frame before a young
     // collection may RELOCATE while that frame is live:
@@ -604,7 +619,7 @@ impl<'a> Lowerer<'a> {
     /// verifier finds the entry, sees the flag, and diverts to the non-moving
     /// sweep for that cycle.
     fn emit_safepoint_map(&mut self, live_hi: i32) {
-        if self.sp_id_slot_off <= 0 {
+        if self.sp_id_slot_off <= 0 || !Self::reloc_emit_enabled() {
             return;
         }
         // `live_ref_slots` returns an empty vector for two different reasons —
@@ -822,7 +837,10 @@ impl<'a> Lowerer<'a> {
     /// the same condition, so such a method is consistently untracked rather
     /// than dereferencing a pointer that was never fetched.
     fn fetch_current_thread(&mut self) {
-        if self.get_current_thread == 0 || self.shadow_thread_slot_off <= 0 {
+        if self.get_current_thread == 0
+            || self.shadow_thread_slot_off <= 0
+            || !Self::reloc_emit_enabled()
+        {
             return;
         }
         let start = self.buf.pos();

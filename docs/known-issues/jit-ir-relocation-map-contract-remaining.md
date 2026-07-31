@@ -177,3 +177,46 @@ unexplained and may be the same underlying instability.
   repeats — rather than inferring it from one 15-minute suite run;
 * keep `ASTParserLoadingTest` as the stable large-workload control: it was 138 s
   in every configuration tried, including both publication attempts.
+
+## The measurement, done properly (attempt 4)
+
+`CRATONVM_JIT_IR_RELOC_EMIT=0` disables the whole emission side (safepoint-id
+stores, shadow push/reload, prologue thread fetch) on one binary, which is what
+attempts 1-3 lacked. Interleaved, five reps per lane, `BinTreesClassic 18`
+at `-Xmx512m` — call-heavy and entry-heavy, i.e. the shape the cost hypothesis
+predicted would hurt:
+
+| lane | ms | median |
+|---|---|---|
+| emission OFF | 2566, 2604, 2579, 2604, 2563 | 2579 |
+| emission ON  | 2616, 2595, 2614, 2621, 2538 | 2614 |
+
+**~1.4%, ranges fully overlapping** (2563-2604 vs 2538-2621), checksum
+`68332206` in both lanes. The emission side is not expensive.
+
+That closes the question attempts 1-3 kept getting wrong: those
+`ZonedDateTimeTest` timeouts were the class's own bimodality, not this change.
+One lever and ten 2.5-second runs settled what three 15-minute suite runs could
+not — the fix was never a better hypothesis, it was a probe that can express the
+signal and a control on the same binary.
+
+## Status
+
+Implemented and measured:
+
+* frame side — sp-id slot and store, per-safepoint `OopMapEntry`, `FrameLayout`,
+  zeroed `Ref` phi slots;
+* emission side — shadow push/reload (RCX temp, `emit_call_return_check` choke
+  point, self-recursive route excluded), lazy prologue;
+* relocation verified: `cycles=25 coverage_fallbacks=0` on bt18 @512m, checksums
+  `68332206` (2g and 512m) and `14985902` (`--nojit` bt16);
+* emission cost measured at ~1.4% (above);
+* `cargo test -p cratonvm-jit` 1060 lib + every integration target 0 failed.
+
+Still open, and the only thing between this and default-on: the READER-side cost
+of asserting coverage. A `true` makes `conservative_roots` run its band scan
+instead of taking the early-out, and that cost was never isolated either — the
+runs that tried are the same bimodal ones. Measure it the same way this was
+measured (`CRATONVM_JIT_IR_RELOC_MAPS=1` vs default, interleaved reps on a
+deterministic probe, plus a deep-stack probe since band-scan cost should scale
+with live frame count) before flipping the default.
