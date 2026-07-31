@@ -93,6 +93,31 @@ const SF_LINENUMBER: usize = 3;
 const SF_BCI: usize = 4;
 const SF_DECL_INTERNAL: usize = 5;
 
+/// Slot 6 of the 8-slot `java/lang/StackWalker$StackFrame` carrier built by
+/// [`crate::phases_late::reflect_invoke::populate_stack_frame`]: the declaring
+/// class's `Class` mirror, resolved eagerly from the frame's own `ClassId`.
+/// Only meaningful on that carrier — always read it behind an
+/// [`as_class_mirror`] check, since the 6-slot `StackFrameInfo` synthetic has
+/// no such slot and the real JDK class holds `ste` there.
+const SF_DECL_MIRROR: usize = 6;
+
+/// Return `value` iff it is a `java.lang.Class` mirror.
+///
+/// The frame carriers in this VM disagree about which slot (if any) holds the
+/// declaring class, and two of them hold something else entirely in the slots
+/// the others use for it. Type-checking the value rather than trusting the
+/// slot is what lets one accessor serve all of them.
+fn as_class_mirror(ctx: &mut dyn NativeContext, value: Value) -> Option<Value> {
+    let Value::Object(Some(obj)) = value else {
+        return None;
+    };
+    let class_id = ctx.class_id_of_object(obj);
+    match ctx.class_name_of_id(class_id).as_deref() {
+        Some("java/lang/Class") => Some(Value::Object(Some(obj))),
+        _ => None,
+    }
+}
+
 /// `java.lang.ClassFrameInfo.RETAIN_CLASS_REF` — the bit of the frame's
 /// `flags` field that records whether the `StackWalker` that produced the frame
 /// was created with `Option.RETAIN_CLASS_REFERENCE`.
@@ -1056,7 +1081,48 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        // Prefer the internal-name slot we always populate.
+        // Prefer the mirror `populate_sfi` wrote into `classOrMemberName`.
+        // That write came from the frame's OWN `ClassId`, so it names the exact
+        // copy of the class the frame is executing. Re-deriving the class from
+        // the internal name instead goes through `find_unique_class_by_name`,
+        // which answers `None` whenever two loaders have their own copy of the
+        // same name -- routine under Spring Boot's `@WithResource` /
+        // `ClassPathOverrides` forked loaders (see
+        // reference_multiple_class_copies_are_normal_under_isolating_loaders),
+        // and the reason log4j2's `StackLocator.getCallerClass` NPE'd on a null
+        // `getDeclaringClass()` for `AbstractEnvironment`.
+        //
+        // Read it through the object's own layout (`get_field_by_name`), not a
+        // name-keyed `ClassFrameInfo` slot lookup: these frames are synthetic
+        // allocations whose slot numbering need not match the real JDK class.
+        // Guard on the value actually being a `Class` -- a real-JDK-built
+        // `ClassFrameInfo` can hold a `ResolvedMethodName` here instead.
+        // (Read the field into a local first: `f(ctx, ctx.get(..))` borrows
+        // `ctx` both mutably and immutably in one expression.)
+        let class_or_member = ctx.get_field_by_name(this, "classOrMemberName");
+        if let Some(mirror) = as_class_mirror(ctx, class_or_member) {
+            return Ok(Some(mirror));
+        }
+        // Next: slot 6 of the 8-slot `StackWalker$StackFrame` carrier that
+        // `phases_late::reflect_invoke::populate_stack_frame` builds -- the
+        // *other* frame carrier in this VM, and the one `StackWalker.walk`
+        // actually produces in real-JDK mode. It stores the declaring-class
+        // mirror there, eagerly resolved from the frame's own `ClassId`. This
+        // registration shadows that module's own slot-6 accessor for
+        // `StackWalker$StackFrame.getDeclaringClass`, so without reading it
+        // here the mirror was simply never consulted.
+        //
+        // The `as_class_mirror` guard is what makes this safe for the other
+        // carriers: a 6-slot `populate_sfi` frame has no slot 6 at all, and a
+        // real-JDK `StackFrameInfo` holds its `ste` (a `StackTraceElement`)
+        // there -- neither is a `Class`, so neither is returned.
+        if ctx.object_num_fields(this) > SF_DECL_MIRROR {
+            let slot6 = ctx.get_field(this, SF_DECL_MIRROR);
+            if let Some(mirror) = as_class_mirror(ctx, slot6) {
+                return Ok(Some(mirror));
+            }
+        }
+        // Next: the internal-name slot we always populate.
         if let Value::Object(Some(s)) = ctx.get_field(this, SF_DECL_INTERNAL) {
             let internal = ctx.read_string(s).unwrap_or_default();
             if !internal.is_empty() {
@@ -1085,8 +1151,29 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::from("<no SF_DECL_INTERNAL>"),
             };
+            let com = match ctx.get_field_by_name(this, "classOrMemberName") {
+                Value::Object(Some(o)) => {
+                    let cid = ctx.class_id_of_object(o);
+                    format!("obj of {:?}", ctx.class_name_of_id(cid))
+                }
+                Value::Object(None) => String::from("null"),
+                other => format!("{other:?}"),
+            };
+            let fields = ctx.object_num_fields(this);
+            let slot6 = if fields > SF_DECL_MIRROR {
+                match ctx.get_field(this, SF_DECL_MIRROR) {
+                    Value::Object(Some(o)) => {
+                        let cid = ctx.class_id_of_object(o);
+                        format!("obj of {:?}", ctx.class_name_of_id(cid))
+                    }
+                    Value::Object(None) => String::from("null"),
+                    other => format!("{other:?}"),
+                }
+            } else {
+                String::from("<absent>")
+            };
             eprintln!(
-                "[SFI-NULL-TRACE] declaringClass() returning NULL for frame internal={internal:?} resolved_cid={:?}",
+                "[SFI-NULL-TRACE] declaringClass() returning NULL for frame internal={internal:?} resolved_cid={:?} classOrMemberName={com} fields={fields} slot6={slot6}",
                 if internal.is_empty() { None } else { ctx.class_id_by_name(&internal) }
             );
         }
