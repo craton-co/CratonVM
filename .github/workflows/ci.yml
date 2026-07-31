@@ -438,8 +438,8 @@ jobs:
   #     `--dump-native-registry` (vm-cli, §9): PRESENT.
   #   * `jdk-only-jit` / `jdk-only-nojit` difftest mode labels: PRESENT.
   #   * `CompatibilityMode` / registry census / `ClassOrigin` (§§3-5): PRESENT.
-  #   * `CRATONVM_ARGS` forwarding in `regression-suite/run.sh`: NOT PRESENT.
-  #     See the note on that step — it is currently a compatible-mode run.
+  #   * `CRATONVM_ARGS` forwarding in `regression-suite/run.sh`: PRESENT as of
+  #     this commit (it was not, one commit ago — see the note on that step).
   jdk-only:
     name: JDK-only mode (advisory) ${{ matrix.os }} / JDK ${{ matrix.java }}
     runs-on: ${{ matrix.os }}
@@ -544,7 +544,7 @@ jobs:
               # upload, so the non-zero exit is deferred to the last step of this
               # job.
               echo "::error::jdk-only-census.sh exited 5: the dumps were written, but the"
-              echo "  design-§6 blocker artifacts were not generated (no python interpreter,"
+              echo "  design section-6 blocker artifacts were not generated (no python interpreter,"
               echo "  an undeterminable JDK feature version, or blockers.py itself failed)."
               echo "  Hosted runners ship python3, so this is a real regression, not an"
               echo "  expected environment gap. The dumps are complete; the gates below run"
@@ -655,15 +655,16 @@ jobs:
             exit 1
           fi
 
-      # PRECONDITION, NOT YET MET: as of this commit `regression-suite/run.sh`
-      # invokes the VM as
-      #   "$CV" --java-home "$JDK" -cp "$BUILD" "$c"
-      # and never reads CRATONVM_ARGS, so this step currently runs the ordinary
-      # compatible-mode suite and the env var below is inert. Another agent in
-      # this wave is adding the forwarding; until it lands, treat a green result
-      # here as "compatible mode still passes", NOT as "the suite passes under
-      # --jdk-only". Re-check line ~48 of run.sh before quoting this step as
-      # strict-mode evidence.
+      # PRECONDITION NOW MET — re-verified against `regression-suite/run.sh` at
+      # this commit, where it was NOT met one commit ago. The suite expands
+      # `${CRATONVM_ARGS:-}` (unquoted, so multi-flag values work) into every
+      # CratonVM invocation and deliberately withholds it from the HotSpot
+      # oracle, and `--jdk-only` in that variable additionally switches on the
+      # RJdk* strict corpus. So a green result here now really is "the suite
+      # passes under --jdk-only" — but re-check that expansion before quoting
+      # this step as strict-mode evidence, because a run.sh that stops reading
+      # the variable turns this back into a compatible-mode run whose green
+      # says nothing about the policy it names, with no other symptom.
       #
       # run.sh defaults CV to target/release/cratonvm[.exe]; this job builds
       # debug, so point CV at it explicitly rather than paying for a release
@@ -757,7 +758,7 @@ jobs:
           rc="${CENSUS_RC:-not-run}"
           echo "jdk-only-census.sh exit status: $rc"
           if [ "$rc" = "5" ]; then
-            echo "::error::The design-§6 blocker artifacts are missing from this run"
+            echo "::error::The design section-6 blocker artifacts are missing from this run"
             echo "(jdk-<feature>-missing-natives.json / -synthetic-dependencies.json)."
             echo "See the census step's log for which of the three causes fired."
             exit 1

@@ -1,43 +1,48 @@
 # `ClassManager::ensure_synthetic_class` can record a JDK-only violation but cannot refuse one
 
-**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31. **DANGEROUS:
-under `--jdk-only` this API records the violation and then fabricates the class
-anyway, so the run reports a violation while continuing in the exact state the
-contract forbids.**
+**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31, re-verified
+against the re-landed tree the same day. **DANGEROUS: under `--jdk-only` this
+API records the violation and then fabricates the class anyway, so the run
+reports a violation while continuing in the exact state the contract forbids.**
 
-> **Evidence provenance.** The `try_ensure_synthetic_class` /
-> `ensure_generated_class` / `synthetic_name_origin` machinery and the
-> `// JDK-ONLY-WAVE2:` marker quoted below were present in the working tree of
-> `C:\craton\cratonvm` (branch `dev`, HEAD `0c54a9184`) on 2026-07-31 and were
-> read directly. Between then and this record being written, the uncommitted
-> wave-1 edits to `classloading/src/class_manager.rs` were reverted out of the
-> working tree — see the *Wave-1 revert* note in
-> [`README.md`](README.md). The **caller counts and the pre-existing
-> `ensure_synthetic_class` signature below are re-verified against the current
-> tree and are independent of that.**
+> **Evidence provenance.** The original filing quoted a
+> `synthetic_name_origin`-based body that **no longer exists**; the re-land
+> replaced it with a four-argument `fabricate_class(name, num_fields, origin,
+> enforce)` and a shared `admit_compatibility_class` policy choke point. The
+> quotations below are from the re-landed code in
+> `C:\craton\wt-jdk-only` (branch `feat/jdk-only-mode`), read 2026-07-31. The
+> *defect* is unchanged; only its shape is.
 
 ## What is wrong
+
+`classloading/src/class_manager.rs` ~2918:
 
 ```rust
 pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId
 ```
 
 The return type is a bare `ClassId`. There is no error channel. A refusal cannot
-be expressed, so under `CompatibilityMode::JdkOnly` the function records a
-`CompatibilityClassRequested` violation and then fabricates the class regardless:
+be expressed, so the function passes `enforce: false` and fabricates regardless
+of mode:
 
 ```rust
-let origin = Self::synthetic_name_origin(name);
-if origin.is_compatibility_stub() {
-    let reason = origin.reason().unwrap_or("compatibility stub").to_string();
-    self.record_compatibility_class_violation(name, Some(ClassLoaderId::Bootstrap), &reason);
+pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+    self.fabricate_class(
+        name,
+        num_fields,
+        ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON),
+        // Record the violation, then fabricate anyway — there is no error
+        // channel on this signature.
+        false,
+    )
+    .expect("non-enforcing fabrication never returns Err")
 }
-self.fabricate_class(name, num_fields, origin)
 ```
 
-The function's own wave-1 doc comment states the constraint plainly: *"This
-entry point is **infallible by contract with its ~70 callers** across 33 files,
-so it cannot report a refusal."*
+`enforce` is documented on `fabricate_class` (~3037) exactly as the defect
+describes it: *"`true` returns the `ClassNotFoundException` the contract asks
+for, `false` records the violation and fabricates anyway. Either way the
+violation is recorded, and either way `Compatible` mode fabricates."*
 
 Contract §5 requires the opposite: *"Under `JdkOnly`, every path that today
 fabricates a class … must instead return the specification-appropriate
@@ -46,73 +51,98 @@ fabricates a class … must instead return the specification-appropriate
 
 **The `load_class` chain does enforce.** This is the important distinction: an
 absent enterprise or JDK class arriving through ordinary class loading is
-correctly refused (`create_synthetic_stub`). It is this *direct* API — used by
-VM bootstrap and by natives that want an allocation shape — that cannot.
+correctly refused (`create_synthetic_stub`, ~7289, which routes through
+`admit_compatibility_class` at ~2455). It is this *direct* API — used by VM
+bootstrap and by natives that want an allocation shape — that cannot.
 
-## Scale (re-verified 2026-07-31 against the current tree)
+The re-land made the policy a single choke point, which is a genuine
+improvement worth keeping: `admit_compatibility_class` is called from exactly
+two places (`create_synthetic_stub` and `fabricate_class`), *"so there is no
+third place a stub can be minted without the policy seeing it."* The problem is
+no longer "the policy can be bypassed"; it is "the policy is seen and then
+overridden by a signature".
 
-`.ensure_synthetic_class(` matches **68 times across 32 files** (ripgrep,
-workspace, gitignored paths excluded). Excluding 2 documentation hits and 2
-integration-test hits leaves **64 live Rust call sites in 28 files**, of which
-12 are `class_manager.rs`'s own unit tests. The heaviest callers:
+## The fallible siblings exist — and have zero callers
+
+Both entry points the original filing asked for were re-landed:
+
+* `try_ensure_synthetic_class(name, n) -> Result<ClassId, VmError>` (~2941) —
+  `ClassNotFoundException` under `JdkOnly`, which constant-pool resolution
+  already translates to `NoClassDefFoundError`. Byte-for-byte
+  `ensure_synthetic_class` under `Compatible`.
+* `ensure_generated_class(name, n, origin)` (~2969) — for arrays, hidden
+  classes, lambdas, proxies, reflection accessors and VM-internal shapes
+  (contract §1 item 6). Never refused, in either mode; `debug_assert`s that the
+  caller did not pass a `CompatibilityStub` origin.
+
+**Neither has a single caller outside `class_manager.rs`** (ripgrep,
+2026-07-31). The migration is the work; the API was never the blocker. Note in
+particular that `try_ensure_synthetic_class`'s doc comment names its intended
+chief caller — *"the `java/util/function/Function$Identity` stand-in minted by
+the stream/function natives"* — and that caller still goes through
+`ensure_synthetic_class` via `alloc_concurrent_synthetic`. See
+[the ambient-`NativeKind` record](native-kind-is-ambient-and-defaults-to-syntheticstub.md)
+for why that particular one is now load-bearing in a new way.
+
+## Scale (re-counted 2026-07-31 against the re-landed tree)
+
+`.ensure_synthetic_class(` matches **66 times across 30 files** (ripgrep,
+workspace, `--include=*.rs`). Excluding 12 hits inside `class_manager.rs`'s own
+`mod tests` (from line 14007) and 2 integration-test hits
+(`vm/tests/jdk_only_dispatch.rs`, `classloading/tests/jdk_only_class_origin.rs`)
+leaves **52 live call sites in 27 files**. The heaviest callers:
 
 | File | Sites |
 |---|---|
-| `classloading/src/proxy_gen.rs` | 5 |
 | `vm/src/vm/vm_init.rs` | 5 |
 | `native-builtins/src/lang_system.rs` | 5 |
+| `classloading/src/proxy_gen.rs` | 5 |
 | `native-io/src/process.rs` | 4 |
 | `vm/src/vm/vm_exec.rs` | 3 |
 | `vm/src/native/jni.rs` | 3 |
 | `vm/src/vm.rs`, `native-collections/src/lib.rs`, `native-builtins/src/{lib,lang_string,keystore,util_concurrent_ext}.rs` | 2 each |
-| 14 further `native-builtins` / `native-io` modules | 1 each |
+| 15 further `native-builtins` / `native-io` modules | 1 each |
 
-The orchestrator's "~70 callers across ~33 files" is accurate to within rounding.
+*(The original filing said 64 live sites in 28 files, derived from a count of 68
+that included two documentation hits. Both numbers describe the same population;
+the current figure is the one to work from.)*
 
 ## The concrete symptom this produces today
 
-`vm/src/vm/vm_init.rs`'s bootstrap block carries a wave-1 note describing the
-end state precisely:
+`vm/src/vm/vm_init.rs`'s bootstrap block mints `java/util/Enumeration$Impl`
+(~1052) and `java/util/Comparator$Native` (~1107) through this API and then
+wires them up with `get_class_mut`. Under `JdkOnly` the fabrication is recorded
+as a violation and happens anyway, so the wiring succeeds and the run continues
+in the state §5 forbids.
 
-> every `ensure_synthetic_class` call in this bootstrap block fabricates a class
-> with no real bytes, which is exactly what `CompatibilityMode::JdkOnly`
-> forbids. The mode is already installed on `class_manager` above, so the
-> refusal happens inside `classloading` and is recorded as a
-> `CompatibilityClassRequested` violation. `ensure_synthetic_class` returns a
-> bare `ClassId` and cannot report the refusal here, so the `get_class_mut(...)`
-> wiring below simply finds nothing and is skipped — benign, but it means the
-> strict boot **silently loses** `Enumeration$Impl` / `Comparator$Native` / the
-> unmodifiable-view carriers rather than failing loudly.
+**UNVERIFIED against the re-landed tree:** the original filing quoted a wave-1
+note in that block predicting the *other* outcome — that the fabrication would
+be refused, `get_class_mut` would find nothing, and *"the strict boot silently
+loses `Enumeration$Impl` / `Comparator$Native` … rather than failing loudly."*
+That note is not in the re-landed `vm_init.rs`, and with `enforce: false` the
+refusal it describes cannot occur on this path. Which of the two behaviours a
+strict boot actually shows needs a run, not a reading. Either way the boot does
+not fail loudly, which is the point of the item.
 
-"Silently loses, rather than failing loudly" is the whole problem: a strict run
-does not crash, it quietly boots with less than it thinks it has.
+## The migration recipe (from the in-code `JDK-ONLY-WAVE2` marker, ~2899)
 
-## The migration recipe (from the in-code `JDK-ONLY-WAVE2` marker)
-
-> Migrate the ~70 `ensure_synthetic_class` callers to
-> `try_ensure_synthetic_class` (or, where the class is legitimately generated,
-> to `ensure_generated_class` with an explicit origin), then delete this
-> wrapper. Until then `--jdk-only` is diagnostic-only on this path. The
-> `load_class` fabrication chain — which is where an absent enterprise or JDK
-> class actually arrives — does enforce; see `create_synthetic_stub`.
-
-Three entry points exist for this (they were added in wave 1 and are part of the
-reverted change set — re-landing them is a prerequisite):
-
-* `try_ensure_synthetic_class(name, n) -> Result<ClassId, VmError>` — same
-  behaviour, but `Err(ClassFileError::ClassNotFound)` under `JdkOnly`, which
-  constant-pool resolution already translates to `NoClassDefFoundError`.
-  Under `Compatible` it is byte-for-byte `ensure_synthetic_class` wrapped in
-  `Ok`.
-* `ensure_generated_class(name, n, origin)` — for arrays, hidden classes,
-  lambdas, proxies, reflection accessors and VM-internal shapes (contract §1
-  item 6). Never refused, in either mode; `debug_assert`s that the caller did
-  not pass a `CompatibilityStub` origin.
-* `ensure_synthetic_class` — the infallible wrapper, to be deleted last.
+> `ensure_synthetic_class` returns a bare `ClassId` — there is no error channel
+> — and it has ~70 callers across ~33 files, almost all of them inside
+> `native-builtins` allocation helpers such as `alloc_concurrent_synthetic`,
+> which likewise return a value rather than a `Result`. … Migration recipe for
+> wave 2, per call site:
+>   1. If the caller is generating a legitimate VM class (a lambda, a proxy, a
+>      reflection accessor, an internal allocation shape), switch it to
+>      `ensure_generated_class` with the matching `ClassOrigin` — it is never
+>      refused, in either mode.
+>   2. If the caller is standing in for a class whose real bytes should have
+>      been found, switch it to `try_ensure_synthetic_class` and propagate the
+>      `ClassNotFoundException` up through the native's own error path.
+>   3. When no caller remains, delete this method.
 
 ## Why it was not fixed in wave 1
 
-Touching 64 call sites across `classloading`, `vm`, `native-builtins`,
+Touching 52 call sites across `classloading`, `vm`, `native-builtins`,
 `native-collections`, `native-io` and `vm/src/native/jni.rs` means editing files
 owned by six other agents in the same wave, and every one of those call sites
 needs a *judgement*: is this class a compatibility substitution (→ `try_…`) or a
@@ -122,17 +152,15 @@ suite. Contract §10 scopes wave 1 to measurement.
 
 ## What specifically must change
 
-1. Re-land `try_ensure_synthetic_class` / `ensure_generated_class` (they were
-   reverted with the rest of wave 1's `class_manager.rs` edits).
-2. Migrate call sites **subsystem by subsystem**, deciding per site between the
-   two fallible/legitimate entry points. `proxy_gen.rs` (5 sites) and the
+1. Migrate call sites **subsystem by subsystem**, deciding per site between the
+   two entry points, which already exist. `proxy_gen.rs` (5 sites) and the
    `cratonvm/synthetic/AnonymousObject$N` allocation shape in `vm_exec.rs` are
    the clearest `ensure_generated_class` candidates — see
    [VM-internal classes are mislabelled `CompatibilityStub`](vm-internal-classes-mislabelled-compatibility-stub.md).
-3. Make `vm_init.rs`'s bootstrap block fail loudly under `JdkOnly` instead of
-   skipping its `get_class_mut` wiring — that is the specific behaviour the note
-   above flags as benign-but-wrong.
-4. Delete `ensure_synthetic_class`.
+2. Make `vm_init.rs`'s bootstrap block fail loudly under `JdkOnly` instead of
+   fabricating `Enumeration$Impl` / `Comparator$Native` behind a recorded
+   violation.
+3. Delete `ensure_synthetic_class`.
 
 ## How to verify a fix
 
@@ -157,3 +185,7 @@ suite. Contract §10 scopes wave 1 to measurement.
   Contract §11's acceptance criterion becomes unfalsifiable.
 * Because `ensure_generated_class` only `debug_assert!`s on a `CompatibilityStub`
   origin, a release build will not catch the second mistake at all.
+* Note that `admit_compatibility_class` dedupes by class name
+  (`origin_violations_seen`), so a migrated caller that stops fabricating a
+  name some *other* caller also requests will not change the violation count.
+  Count call sites, not violations, when checking migration progress.

@@ -4033,6 +4033,109 @@ impl SharedVm {
         Ok(rows.len())
     }
 
+    /// Snapshot of the three **process-global** JDK-only violation sinks, in a
+    /// stable order: `[jit-compile, jit-helpers, interpreter-dispatch]`.
+    ///
+    /// The two sinks the report already folded — `refused_registrations()` and
+    /// `origin_violations()` — are VM-scoped: they hang off this `SharedVm`'s
+    /// registry and class manager. The three here are `static`s, because the
+    /// sites that record them (a JIT compile-time bytecode scan, a JIT runtime
+    /// fast path reached from emitted code, and the interpreter's name-triple
+    /// dispatch resolver) have no `&SharedVm` at hand cheaply enough to carry
+    /// one. That difference is why they are gated below and why the ordering
+    /// contract of the array matters — see [`JDK_ONLY_PROCESS_SINKS`].
+    ///
+    /// # Why `Compatible` returns three empty vectors without touching them
+    ///
+    /// Two independent reasons, and both are needed:
+    ///
+    /// 1. **Cost.** Each accessor takes a `parking_lot::Mutex` and clones a
+    ///    `Vec<JdkOnlyViolation>`. A `Compatible` VM that asked for
+    ///    `--jdk-only-report` would pay three uncontended locks for three
+    ///    guaranteed-empty answers. The early return is free.
+    /// 2. **Honesty.** `cratonvm_jit`'s policy is a process global that
+    ///    latches monotonically toward strict (see
+    ///    `cratonvm_jit::set_jit_execution_policy`). Two VMs in one process can
+    ///    therefore make a `Compatible` VM compile under strict policy — never
+    ///    the reverse — and that VM's JIT would start filling these sinks with
+    ///    refusals it never asked for. Folding them into a report whose `mode`
+    ///    field says `"compatible"` would attribute another VM's policy
+    ///    decisions to this one. A `Compatible` VM has no JDK-only policy, so
+    ///    it reports no JDK-only violations, full stop.
+    ///
+    /// The residual imprecision runs the other way and cannot be fixed here:
+    /// in a multi-VM process where at least one VM is `JdkOnly`, these three
+    /// lists are **process-wide**, not this VM's. A `JdkOnly` VM's report may
+    /// therefore include rows produced while a sibling `Compatible` VM was
+    /// running. Making them per-VM is the wave-2 change named in
+    /// `cratonvm_jit`'s `JDK-ONLY-WAVE2` note (move the policy and the helper
+    /// addresses into a per-VM struct); until then this is over-reporting in
+    /// the strict direction, which is the safe direction for a diagnostic.
+    ///
+    /// Each sink is append-only and bounded at 256 entries with an internal
+    /// dedup, so a positional watermark into these vectors is stable across
+    /// calls — that is what `--trace-jdk-only` uses to drain incrementally.
+    pub fn jdk_only_process_violations(
+        &self,
+    ) -> [Vec<cratonvm_types::error::JdkOnlyViolation>; JDK_ONLY_PROCESS_SINKS] {
+        if !self.compatibility_mode().is_jdk_only() {
+            return [Vec::new(), Vec::new(), Vec::new()];
+        }
+        [
+            // Compile-time thin-direct-native binds refused by `try_compile`'s
+            // bytecode scan. `NativeShadowsBytecode` with
+            // `native_kind: "jit-thin-direct-helper"`.
+            cratonvm_jit::jdk_only_jit_violations(),
+            // Runtime by-name fast-path admissions refused at cache-fill time.
+            // Carries whatever `resolve_native_dispatch_wave1` produced, which
+            // for this site is a `SyntheticNativeInvocation` `Reject`.
+            crate::jit::helpers::jdk_only_jit_helper_violations(),
+            // Interpreter dispatch: concrete bytecode preferred over a
+            // registered non-intrinsic native. `NativeShadowsBytecode` with the
+            // *registered* `NativeKind::as_str()`, so these never collide with
+            // the JIT's `"jit-thin-direct-helper"` rows even for the same
+            // triple — the two are different facts about the same method and
+            // both belong in the report.
+            crate::vm::jdk_only_native_shadow_observations(),
+        ]
+    }
+
+    /// Exact refusal **event** counts from the same three process-global
+    /// sources, for the report's `refusals` block and the `--trace-jdk-only`
+    /// summary line.
+    ///
+    /// These are not a second spelling of `violations[]`. Every sink above is
+    /// deduplicated by triple and capped at 256 entries; these counters are
+    /// uncapped `AtomicU64`s incremented once per refusal event. A run that
+    /// refuses `HashMap.put` ten million times contributes **one** row to
+    /// `violations[]` and ten million to `jit_direct_native_binds`. Reporting
+    /// only the rows would understate the blast radius; reporting only the
+    /// counters would lose the identities. Both, in separate blocks, is the
+    /// only shape that double-counts neither.
+    ///
+    /// `jit_inline_cache_natives` is the one source with **no** structured
+    /// violation behind it: `record_jdk_only_ic_native_refusal` increments and
+    /// returns, because the inline-cache publication site has an entry address
+    /// and not a name triple, so there is nothing to name. Per the task's rule,
+    /// it is surfaced as a count rather than as a fabricated row.
+    ///
+    /// Zero in `Compatible` mode, for the same two reasons as
+    /// [`SharedVm::jdk_only_process_violations`]. Reading them is four relaxed
+    /// atomic loads, no lock and no allocation, but the mode test is still
+    /// checked first so a `Compatible` report cannot inherit a sibling VM's
+    /// latched-strict counters.
+    pub fn jdk_only_refusal_counts(&self) -> JdkOnlyRefusalCounts {
+        if !self.compatibility_mode().is_jdk_only() {
+            return JdkOnlyRefusalCounts::default();
+        }
+        JdkOnlyRefusalCounts {
+            jit_direct_native_binds: cratonvm_jit::jdk_only_direct_native_refusals(),
+            jit_inline_cache_natives: cratonvm_jit::jdk_only_ic_native_refusals(),
+            jit_fastpath_admissions: crate::jit::helpers::jdk_only_jit_fastpath_refusals(),
+            interpreter_bytecode_preferred: crate::vm::jdk_only_native_shadow_attempts(),
+        }
+    }
+
     /// JDK-only violation/counter report (`--jdk-only-report`, §9). Schema 1,
     /// spelled exactly as the contract prints it:
     ///
@@ -4047,6 +4150,10 @@ impl SharedVm {
     ///     "generated_classes": 4,   "compatibility_classes": 0,
     ///     "bridge_invocations": 1082, "intrinsic_invocations": 4301,
     ///     "synthetic_stub_invocations": 0
+    ///   },
+    ///   "refusals": {
+    ///     "jit_direct_native_binds": 0, "jit_inline_cache_natives": 0,
+    ///     "jit_fastpath_admissions": 0, "interpreter_bytecode_preferred": 0
     ///   }
     /// }
     /// ```
@@ -4057,10 +4164,47 @@ impl SharedVm {
     /// (unlike `render()`) has no `verbose` parameter and threading one through
     /// `types` is not this file's call.
     ///
-    /// `violations` unions the registry's refused registrations (§4) with the
-    /// class manager's origin violations (§5), each rendered by
+    /// # `violations` unions all five sources
+    ///
+    /// | § | source | accessor | scope |
+    /// |---|--------|----------|-------|
+    /// | §4 | native registrations refused | `NativeMethodRegistry::refused_registrations` | this VM |
+    /// | §5 | compatibility classes requested | `ClassManager::origin_violations` | this VM |
+    /// | §7 | JIT compile-time direct binds refused | `cratonvm_jit::jdk_only_jit_violations` | process |
+    /// | §7 | JIT fast-path admissions refused | `crate::jit::helpers::jdk_only_jit_helper_violations` | process |
+    /// | §7 | interpreter preferred bytecode | `crate::vm::jdk_only_native_shadow_observations` | process |
+    ///
+    /// The last three arrive through
+    /// [`SharedVm::jdk_only_process_violations`], which documents why they are
+    /// process-scoped and why `Compatible` gets three empty vectors instead of
+    /// three lock acquisitions. Every row is rendered by
     /// `JdkOnlyViolation::to_json()` so the wire shape is owned by the type
-    /// rather than re-derived here, and **sorted by `(kind, summary)`**.
+    /// rather than re-derived here, and the union is **sorted by
+    /// `(kind, summary)`**.
+    ///
+    /// A report that folded only the first two would print `"violations": []`
+    /// for a run whose JIT refused ten thousand native binds, and an empty
+    /// array reads as *clean*, not as *not measured*. That is strictly worse
+    /// than printing nothing, which is why the fold is all-or-nothing.
+    ///
+    /// # No source is counted twice
+    ///
+    /// The five lists are disjoint by construction, and the union is **not**
+    /// deduplicated — deduplicating would be wrong here, because two sources
+    /// reporting the same method are reporting two different events. The three
+    /// process sinks each dedup internally by triple, and where two of them can
+    /// name the same triple they disagree on `native_kind`
+    /// (`"jit-thin-direct-helper"` for the JIT's own baked helper versus the
+    /// registered `NativeKind::as_str()` for the interpreter's observation), so
+    /// the rows differ in both `summary()` and `to_json()` and sort apart.
+    ///
+    /// The refusal **counters** are the other half of the same rule, and they
+    /// deliberately do not live in this array: a counter increment that also
+    /// produced a row would be double-counting if it were rendered as a second
+    /// row, and a counter with no row behind it (`jit_inline_cache_natives`)
+    /// would be a fabricated row. Both go to the `refusals` sibling object
+    /// instead — see [`JdkOnlyRefusalCounts`] for why it is a sibling and not
+    /// four more keys in the closed §9 `counts` set.
     ///
     /// Sorting rather than preserving recording order is the opposite of the
     /// choice [`SharedVm::dump_native_census_json`] makes, and for a reason
@@ -4080,6 +4224,14 @@ impl SharedVm {
     /// `total_classes`, no `vm_internal_classes`. A reader that needs either
     /// can add the partition up or read the class-origin census, and every
     /// extra key here is one more thing the two artefacts can disagree about.
+    /// `refusals` is a **sibling** object for exactly that reason — widening
+    /// `counts` would break both the closed set §9 documents and the partition
+    /// the `debug_assert_eq!` below proves.
+    ///
+    /// `refusals` is emitted in both modes with all four keys, and is all-zero
+    /// in `Compatible` by construction. A key set that varied with `mode` would
+    /// force every consumer to branch on the mode before reading a number;
+    /// zeros say "measured, none" where an absent key says "unknown".
     ///
     /// Returns `(violations, compatibility_classes)` — the violation count so
     /// the caller can decide whether to exit non-zero without re-reading the
@@ -4115,7 +4267,41 @@ impl SharedVm {
             (origins, violations)
         };
         violations.extend(origin_violations);
-        violations.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        // §7: the three process-global sinks — JIT compile-time refusals, JIT
+        // runtime fast-path refusals, and the interpreter's bytecode-wins
+        // observations. Empty (and untouched, so no lock and no allocation) in
+        // `Compatible`; see `jdk_only_process_violations` for why the mode gate
+        // lives there rather than here.
+        //
+        // Folded into the same `(kind, summary, body)` tuple as the two
+        // VM-scoped sources so all five sort together under one comparator. The
+        // sort is what makes the report reproducible, and it only works if
+        // every source enters the same vector before it runs.
+        for sink in self.jdk_only_process_violations() {
+            violations.extend(
+                sink.iter()
+                    .map(|v| (v.kind().to_string(), v.summary(), v.to_json())),
+            );
+        }
+        // Deterministic order, primary key unchanged: `(kind, summary)`.
+        // Class-origin rows are recorded from arbitrary application threads and
+        // the JIT sinks are filled from compiler and mutator threads alike, so
+        // recording order is nondeterministic for every source except native
+        // registration — sorting is the only way two runs of the same program
+        // produce identical bytes.
+        //
+        // `body` is a **tiebreaker**, not a third sort dimension: two rows can
+        // tie on `(kind, summary)` and still differ, because `summary()` drops
+        // the provenance fields `to_json()` keeps (`registered_by` on
+        // `SyntheticNativeRegistered`, `call_site` on
+        // `SyntheticNativeInvocation`). Before, such a tie fell back to
+        // insertion order, which for the class-manager source is exactly the
+        // nondeterministic order this sort exists to erase. Including the body
+        // makes the comparator total, so the output no longer depends on which
+        // thread got there first. Rows that tie on all three are genuinely
+        // indistinguishable on the wire and their relative order cannot be
+        // observed.
+        violations.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
         let violations: Vec<String> = violations
             .into_iter()
             .map(|(_, _, body)| {
@@ -4178,6 +4364,26 @@ impl SharedVm {
         out.push_str(&format!(
             "    \"synthetic_stub_invocations\": {}\n",
             registry.invocations_of_kind(NativeKind::SyntheticStub)
+        ));
+        // §9's `counts` ends here — seven keys, closed set, class buckets
+        // partitioned. Everything below is a sibling object.
+        out.push_str("  },\n  \"refusals\": {\n");
+        let refusals = self.jdk_only_refusal_counts();
+        out.push_str(&format!(
+            "    \"jit_direct_native_binds\": {},\n",
+            refusals.jit_direct_native_binds
+        ));
+        out.push_str(&format!(
+            "    \"jit_inline_cache_natives\": {},\n",
+            refusals.jit_inline_cache_natives
+        ));
+        out.push_str(&format!(
+            "    \"jit_fastpath_admissions\": {},\n",
+            refusals.jit_fastpath_admissions
+        ));
+        out.push_str(&format!(
+            "    \"interpreter_bytecode_preferred\": {}\n",
+            refusals.interpreter_bytecode_preferred
         ));
         out.push_str("  }\n}\n");
 
@@ -4712,6 +4918,80 @@ fn json_opt_string(value: Option<&str>, verbose: bool) -> String {
     match value {
         Some(v) => json_string(v, verbose),
         None => "null".to_string(),
+    }
+}
+
+/// How many process-global JDK-only violation sinks
+/// [`SharedVm::jdk_only_process_violations`] returns, and the meaning of each
+/// index. The order is a contract: `--trace-jdk-only` keeps one watermark per
+/// slot across the run, so inserting a sink in the middle would silently
+/// re-report one source and skip another.
+///
+/// | index | sink | recorded by |
+/// |-------|------|-------------|
+/// | 0 | `cratonvm_jit::jdk_only_jit_violations` | JIT compile-time direct-bind scan |
+/// | 1 | `crate::jit::helpers::jdk_only_jit_helper_violations` | JIT by-name fast-path admission |
+/// | 2 | `crate::vm::jdk_only_native_shadow_observations` | interpreter dispatch resolver |
+///
+/// New sinks append; they never insert.
+pub const JDK_ONLY_PROCESS_SINKS: usize = 3;
+
+/// Exact refusal-event counts for the JDK-only report's `refusals` block.
+///
+/// # Why this is a sibling of `counts` and not four more keys in it
+///
+/// Contract §9 spells `counts` as a **closed seven-key set**, and its four
+/// class keys are a partition proved by a `debug_assert_eq!` against the
+/// class-origin row count. Adding a refusal key there would break both
+/// properties at once: the set would no longer be the one §9 documents, and a
+/// reader summing the block to recover the class total would get a number that
+/// is not the class total. The two blocks also answer different questions —
+/// `counts` is a census of what the run *contains*, `refusals` is a tally of
+/// what strict policy *stopped* — and they are not commensurable: a class
+/// appears in `counts` once, whereas a refused method appears in `refusals`
+/// once per call.
+///
+/// Every field is a count of events, not of distinct methods. The distinct
+/// methods are the rows in `violations[]`, which are deduplicated and capped at
+/// 256 per sink; these counters are exact and uncapped. A field being larger
+/// than the matching row count is the normal case, not a discrepancy.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct JdkOnlyRefusalCounts {
+    /// Compile-time thin-native direct binds the JIT refused. Each distinct
+    /// triple also appears once in sink 0 of
+    /// [`SharedVm::jdk_only_process_violations`].
+    pub jit_direct_native_binds: u64,
+    /// Inline-cache publications of an unowned (native/builtin) entry the JIT
+    /// refused. **Counter-only**: the publication site holds an entry address,
+    /// not a name triple, so there is no honest row to emit and none is
+    /// fabricated. This number is the sole evidence of this refusal class.
+    pub jit_inline_cache_natives: u64,
+    /// JIT by-name native fast-path admissions refused at cache-fill time.
+    /// Includes both outright `Reject`s (which contribute a row to sink 1) and
+    /// §7-step-3 yields to bytecode (which do not — the resolver returns "no
+    /// opinion", and there is no violation object to record). So this is a
+    /// strict superset of sink 1's length, by design.
+    pub jit_fastpath_admissions: u64,
+    /// Times the interpreter's dispatch resolver preferred concrete bytecode
+    /// over a registered non-intrinsic native. Distinct triples appear in
+    /// sink 2; this count is exact and uncapped.
+    pub interpreter_bytecode_preferred: u64,
+}
+
+impl JdkOnlyRefusalCounts {
+    /// Total refusal events across all four sources. Not a violation count —
+    /// see the type docs.
+    pub fn total(self) -> u64 {
+        self.jit_direct_native_binds
+            + self.jit_inline_cache_natives
+            + self.jit_fastpath_admissions
+            + self.interpreter_bytecode_preferred
+    }
+
+    /// Whether strict policy refused nothing at all. Always true in
+    /// `Compatible` mode.
+    pub fn is_zero(self) -> bool {
+        self.total() == 0
     }
 }
 

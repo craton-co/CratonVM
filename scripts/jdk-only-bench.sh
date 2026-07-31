@@ -1275,8 +1275,10 @@ finalise() {
         echo "INTERNAL ERROR: a non-ok row in $RESULTS carries a value" >&2
         exit 4
     fi
-    # Self-check 3: every ok row carries one.
-    if awk -F'\t' '$1 !~ /^#/ && $4 == "ok" && ($5 == "-" || $5 == "") { bad = 1 } END { exit !bad }' "$RESULTS"; then
+    # Self-check 3: every ok row carries one. `unit=state` rows are exempt:
+    # the per-group status rows record that a group ran, and have no number by
+    # construction.
+    if awk -F'\t' '$1 !~ /^#/ && $3 != "state" && $4 == "ok" && ($5 == "-" || $5 == "") { bad = 1 } END { exit !bad }' "$RESULTS"; then
         echo "INTERNAL ERROR: an ok row in $RESULTS carries no value" >&2
         exit 4
     fi
@@ -1306,7 +1308,10 @@ gate_ratio() {
     strict="$(lookup "$RESULTS" "$metric" jdk-only)"
     compat="$(lookup "$RESULTS" "$metric" real-jdk)"
     if [ -z "$strict" ] || [ -z "$compat" ]; then
-        gate_line NOT-EVAL "$label [$tag]" "need '$metric' measured in both modes; jdk-only=$(lookup_status "$RESULTS" "$metric" jdk-only), real-jdk=$(lookup_status "$RESULTS" "$metric" real-jdk)"
+        local ss cs
+        ss="$(lookup_status "$RESULTS" "$metric" jdk-only)"
+        cs="$(lookup_status "$RESULTS" "$metric" real-jdk)"
+        gate_line NOT-EVAL "$label [$tag]" "need '$metric' measured in both modes; jdk-only=${ss:-absent}, real-jdk=${cs:-absent}"
         GATE_NOT_EVAL=$((GATE_NOT_EVAL + 1))
         return
     fi
@@ -1335,9 +1340,18 @@ gate_row() { # id kind metric limit class
             case "$metric" in
                 *'*')
                     m="${metric%\*}"
+                    st=0
                     for v in $(awk -F'\t' -v p="$m" 'index($1, p) == 1 { print $1 }' "$RESULTS" | sort -u); do
                         gate_ratio "$v" "$tag" "$v" "$limit" "ms"
+                        st=$((st + 1))
                     done
+                    # A family that matched nothing must still produce a row.
+                    # Silently emitting no line at all is how a budget stops
+                    # being checked without anyone noticing.
+                    if [ "$st" -eq 0 ]; then
+                        gate_line NOT-EVAL "$id [$tag]" "no metric matches '$metric'; the throughput group was not run, or every phase failed its checksum"
+                        GATE_NOT_EVAL=$((GATE_NOT_EVAL + 1))
+                    fi
                     ;;
                 *) gate_ratio "$id" "$tag" "$metric" "$limit" "ms" ;;
             esac
@@ -1438,6 +1452,14 @@ run_drift() {
                 key = $1 "\t" $2
                 seen[key] = 1
                 if (!(key in bs))  { printf "  NEW        %s [%s] (%s)\n", $1, $2, $4; next }
+                # unit=state rows carry no number; a change of STATUS is the
+                # whole signal, and running them through the ratio arithmetic
+                # would print a spurious "baseline is 0".
+                if ($3 == "state") {
+                    if ($4 != bs[key]) printf "  STATE      %s [%s] %s -> %s\n", $1, $2, bs[key], $4
+                    else               printf "  ok         %s [%s] %s\n", $1, $2, $4
+                    next
+                }
                 if ($4 != "ok" || !(key in b)) { printf "  NOT-EVAL   %s [%s] now %s, baseline %s\n", $1, $2, $4, bs[key]; next }
                 if (b[key] + 0 == 0) { printf "  NOT-EVAL   %s [%s] baseline is 0; a ratio is undefined\n", $1, $2; next }
                 d = ($5 - b[key]) * 100.0 / b[key]

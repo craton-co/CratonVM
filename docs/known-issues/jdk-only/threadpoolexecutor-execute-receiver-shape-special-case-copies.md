@@ -1,9 +1,11 @@
 # The `ThreadPoolExecutor.execute` receiver-shape special case is copied **eight** times, not four
 
-**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31. All copies
-become removable once one native is reclassified — but the wave-1 marker set
-names only four of them, so a mechanical "delete every `JDK-ONLY-WAVE2`
-ThreadPoolExecutor site" sweep leaves half the duplication behind.
+**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31, re-verified
+against the re-landed tree the same day. All copies become removable once one
+native is reclassified — but the marker set still names only four of them, so a
+mechanical "delete every `JDK-ONLY-WAVE2` ThreadPoolExecutor site" sweep leaves
+half the duplication behind. **The re-land did not change the undercount**;
+that is why this item moved up the ranking rather than down.
 
 ## What is wrong
 
@@ -21,50 +23,57 @@ stand-ins and the native must run.
 
 That probe is duplicated at **eight** dispatch sites in the `vm` crate.
 
-## The eight sites (verified 2026-07-31 against the current tree)
+## The eight sites (re-verified 2026-07-31 against the re-landed tree)
 
 `vm/src/vm/vm_exec.rs` — probe written out inline via
 `resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)`:
 
-| ~Line | Context |
-|---|---|
-| 13182 | `invoke_or_native` |
-| 20932 | `force_native_receiver_exempt`, guarding `should_force_registered_native_over_bytecode` |
+| Line | Context | Marked? |
+|---|---|---|
+| 13524 | `invoke_or_native` | **yes** — marker at 13503, "COPY 1 OF 4" |
+| 21363 | `force_native_receiver_exempt`, guarding `should_force_registered_native_over_bytecode` in `invoke_on_class_shared_inner` | **yes** — marker at 21352, "COPY 4 OF 4 — and the one that does NOT call `threadpool_executor_has_real_workers`" |
 
 `vm/src/runtime/interpreter/invoke.rs` — probe factored into
-`threadpool_executor_has_real_workers` (defined at ~9691, itself documented as
-*"Mirrors `native-builtins::executor_has_real_workers` (same check, same …)"*):
+`threadpool_executor_has_real_workers` (defined at 9724, reading the `workers`
+field index at 9738):
 
-| ~Line | Enclosing function |
-|---|---|
-| 9968 | `intercept_force_registered_native` |
-| 10119 | `intercept_force_registered_native_cached` |
-| 11006 | `try_stackless_invoke`, step 1 (direct native lookup) |
-| 11381 | `try_stackless_invoke`, step 6 (post-resolution "double-check for a native override") |
-| 22733 | `populate_virtual_invoke_cache` — keeps the native shadow out of the inline cache |
-| 23032 | `populate_virtual_invoke_cache`, the `force_native_over_real_jdk_bytecode` arm |
+| Line | Enclosing function | Marked? |
+|---|---|---|
+| 10001 | `intercept_force_registered_native` (fn at 9749) | no |
+| 10152 | `intercept_force_registered_native_cached` (fn at 10043) | no |
+| 11153 | `try_stackless_invoke` step 1, direct native lookup (fn at 10735) | **yes** — marker at 11147, "COPY 2 OF 4" |
+| 11617 | `try_stackless_invoke` step 6, post-resolution double-check | **yes** — marker at 11609, "COPY 3 OF 4" |
+| 23063 | `populate_virtual_invoke_cache` (fn at 22763) — keeps the native shadow out of the inline cache | no |
+| 23362 | `populate_virtual_invoke_cache`, the `force_native_over_real_jdk_bytecode` arm | no |
 
-**Wave 1's markers name only four**: `vm_exec.rs`'s two and
-`try_stackless_invoke`'s steps 1 and 6. The marker text is explicit —
-*"the first is in `invoke_or_native`, a third is `try_stackless_invoke` step 1
-and a fourth is its step 6 … All four disappear together"* — and it is an
-undercount. `intercept_force_registered_native`,
+**The markers name only four of eight.** COPY 1's text enumerates the other
+three and gets one of them wrong on top of the undercount: it says all three
+live in `invoke.rs`, when COPY 4 is in `vm_exec.rs`'s own
+`invoke_on_class_shared_inner`. `intercept_force_registered_native`,
 `intercept_force_registered_native_cached` and both
-`populate_virtual_invoke_cache` sites carry no `JDK-ONLY-WAVE2` marker.
+`populate_virtual_invoke_cache` sites carry no `JDK-ONLY-WAVE2` marker at all.
 
-There is also a ninth, *different* site: `invoke.rs` ~7582, inside
+There is also a ninth, *different* site: `invoke.rs` 7615, inside
 `force_native_over_real_jdk_bytecode`, which returns `true` for the
 `(ThreadPoolExecutor, execute, (Ljava/lang/Runnable;)V)` triple with **no
 receiver awareness at all**. That is the unconditional decision the other eight
 exist to override. It must be deleted in the same change or the overrides cannot
-be.
+be. The enclosing function's own doc marker (6946) does flag *"the
+`ThreadPoolExecutor` family"* as one of two branches that cannot be removed on
+their own, so the site is discoverable — but only from the function header, not
+from the branch.
 
-Beyond the `vm` crate, the same probe appears as `executor_has_real_workers` in
-`native-builtins` (`lib.rs`, `lucene_es.rs`, `util_concurrent_ext.rs`,
-`phases_late/concurrent.rs`) and `native-collections/src/lib.rs`, where the
-natives themselves re-check and redirect a genuinely-real receiver. Those are
-defence in depth *inside* the callee and are a separate cleanup; they are listed
-here only so a wave-2 grep does not mistake them for dispatch sites.
+Beyond the `vm` crate, the same probe appears as `executor_has_real_workers`
+(defined in `native-builtins/src/lib.rs` ~32950) with **eight call sites**
+across `native-builtins` (`lib.rs`, `lucene_es.rs` ×3, `util_concurrent_ext.rs`
+×2, `phases_late/concurrent.rs` ×2) plus a deliberately-separate twin in
+`native-collections/src/lib.rs` (~47363, *"kept separate to avoid a"*
+cross-crate dependency). There the natives themselves re-check and redirect a
+genuinely-real receiver. Those are defence in depth *inside* the callee and are
+a separate cleanup; they are listed here only so a wave-2 grep does not mistake
+them for dispatch sites — and so nobody deletes them at the same time as the
+dispatch-side probes, which would remove both the check and its backstop in one
+change.
 
 ## Why each copy exists (the history is worth keeping)
 

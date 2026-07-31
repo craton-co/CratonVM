@@ -109,18 +109,42 @@ fn reject_synthetic_invocation(
     }
 }
 
+/// The JPMS module that owns `class`, when the class came out of the boot
+/// runtime image.
+///
+/// §1.7 requires a strict-mode failure to name the class's origin, and the
+/// `cratonvm_missing_native_total{module}` counter's label is this string. The
+/// answer is already in the class: `ClassOrigin::BootImage` is the only origin
+/// that carries a module attribution, and it is the origin every JDK class the
+/// `MissingNative` report is about actually has. Application-classpath,
+/// user-defined and VM-created classes have no module to name and correctly
+/// yield `None` (they render as `unknown`), rather than being guessed at from
+/// the package name — `java/…` is not a module and `jdk.internal.*` spans
+/// several.
+///
+/// One `match` on a borrowed field: no lock, no allocation, no class-manager
+/// read. Safe on the reject path and cheap enough to be safe anywhere.
+#[inline]
+fn declaring_module(class: &crate::classloading::Class) -> Option<&str> {
+    match &class.origin {
+        cratonvm_classloading::ClassOrigin::BootImage { module, .. } => module.as_deref(),
+        _ => None,
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn reject_missing_native(
     class: &str,
     method: &str,
     descriptor: &str,
+    module: Option<&str>,
 ) -> cratonvm_types::error::JdkOnlyViolation {
     cratonvm_types::error::JdkOnlyViolation::MissingNative {
         class: class.to_string(),
         method: method.to_string(),
         descriptor: descriptor.to_string(),
-        module: None,
+        module: module.map(str::to_string),
     }
 }
 
@@ -136,6 +160,179 @@ fn reject_missing_implementation(
         method: method.to_string(),
         descriptor: descriptor.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// §1.4 observation sink: concrete bytecode beat a registered non-intrinsic
+// native
+// ---------------------------------------------------------------------------
+//
+// The interpreter's answer to §1.4 is an ACCEPT, not a reject: bytecode simply
+// wins and execution continues. Nothing was refused, so nothing was recorded,
+// and `cratonvm_real_bytecode_shadow_attempt_total` measured the JIT alone —
+// the one producer of `NativeShadowsBytecode` in the tree
+// (`jit/src/lib.rs`'s thin-direct-helper refusal). Yet "a native was registered
+// for a triple that has real bytecode" is exactly the over-tagged-registration
+// evidence wave 2 needs, and the interpreter sees far more of it than the JIT
+// does.
+//
+// # Cost discipline
+//
+// This is the common case for a correctly-behaving VM, so the recording must
+// not be on the `Compatible` path at all. Every call site below tests
+// `policy.is_jdk_only()` — one `Copy` field read, already loaded for the
+// policy decision itself — before anything else happens. In `Compatible` mode
+// the whole mechanism is a single not-taken branch on a register: no atomic,
+// no hash, no allocation, and the sink below stays empty and untouched for the
+// life of the process. That is the "gate it on `is_jdk_only()` and say so"
+// concession, taken deliberately: it means these counters are only populated
+// under `--jdk-only`, which is the mode whose report consumes them.
+//
+// Under `JdkOnly` the steady-state cost is one relaxed `fetch_add` plus one
+// relaxed load from the dedup filter. The `JdkOnlyViolation` — three `String`
+// allocations — is built only the first time a given triple is seen, in a
+// `#[cold]` function, and never after the bounded buffer saturates.
+//
+// # Shape
+//
+// Deliberately the same shape as `vm/src/jit/helpers.rs`'s
+// `jdk_only_jit_helper_violations()` / `jdk_only_jit_fastpath_refusals()` pair:
+// an exact `u64` counter plus a bounded, deduplicated `Vec<JdkOnlyViolation>`.
+// The report writer folds all three sources through one pattern.
+
+/// Times concrete bytecode was preferred over a registered non-intrinsic
+/// native under `JdkOnly`. Exact; never saturates.
+static JDK_ONLY_NATIVE_SHADOW_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Maximum number of distinct structured observations retained.
+pub const JDK_ONLY_NATIVE_SHADOW_CAP: usize = 256;
+
+/// Slots in the lock-free "already recorded" filter. A power of two so the
+/// index is a mask, and larger than the cap so a saturated buffer still
+/// answers most repeats from the filter.
+const JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS: usize = 512;
+
+/// Non-zero 64-bit digests of triples already offered to the buffer.
+///
+/// A pure optimisation: a hit skips the mutex, a miss (including a hash
+/// collision evicting another triple) costs one redundant lock, and the `Vec`
+/// dedups regardless. Correctness never depends on it.
+static JDK_ONLY_NATIVE_SHADOW_FILTER: [std::sync::atomic::AtomicU64;
+    JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS];
+
+/// Set once the buffer is full, so later filter misses stop taking the lock.
+static JDK_ONLY_NATIVE_SHADOW_FULL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+static JDK_ONLY_NATIVE_SHADOWS: std::sync::OnceLock<
+    parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>>,
+> = std::sync::OnceLock::new();
+
+fn jdk_only_native_shadows(
+) -> &'static parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>> {
+    JDK_ONLY_NATIVE_SHADOWS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+/// Snapshot of the structured `NativeShadowsBytecode` observations the
+/// interpreter's dispatch resolver recorded this run. Read when building
+/// `--jdk-only-report`; never hot.
+///
+/// Disjoint from `cratonvm_jit::jdk_only_jit_violations()` (compile-time
+/// refusals) and from `crate::jit::jdk_only_jit_helper_violations()` (runtime
+/// fast-path refusals). All three belong in the report.
+pub fn jdk_only_native_shadow_observations() -> Vec<cratonvm_types::error::JdkOnlyViolation> {
+    let recorded = jdk_only_native_shadows().lock();
+    recorded.as_slice().to_vec()
+}
+
+/// Exact number of times bytecode won over a registered non-intrinsic native
+/// on a dispatch path resolved here. Feeds
+/// `cratonvm_real_bytecode_shadow_attempt_total` alongside the JIT's count.
+///
+/// Always `>=` the length of [`jdk_only_native_shadow_observations`], which is
+/// deduplicated and capped.
+pub fn jdk_only_native_shadow_attempts() -> u64 {
+    JDK_ONLY_NATIVE_SHADOW_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// FNV-1a over the triple plus the kind tag. Only ever computed under
+/// `JdkOnly`, inside the `#[cold]` recorder.
+fn jdk_only_shadow_digest(
+    class: &str,
+    method: &str,
+    descriptor: &str,
+    kind: cratonvm_native_api::NativeKind,
+) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in [class.as_bytes(), method.as_bytes(), descriptor.as_bytes()] {
+        for &b in part {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // Separator, so ("ab","c") and ("a","bc") do not collide.
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^= kind as u64;
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    // 0 is the filter's "empty" marker.
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+/// Record one "concrete bytecode won over a registered non-intrinsic native"
+/// observation.
+///
+/// `#[cold] #[inline(never)]`, mirroring the reject helpers above: the counter
+/// increment and the filter probe are cheap, but they live off the dispatch
+/// path with the `String` machinery rather than inline in it.
+///
+/// **Only call this under `JdkOnly`.** The caller owns that test so
+/// `Compatible` never even reaches the call instruction.
+#[cold]
+#[inline(never)]
+fn record_native_shadows_bytecode(
+    class: &str,
+    method: &str,
+    descriptor: &str,
+    kind: cratonvm_native_api::NativeKind,
+) {
+    use std::sync::atomic::Ordering;
+
+    JDK_ONLY_NATIVE_SHADOW_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+
+    if JDK_ONLY_NATIVE_SHADOW_FULL.load(Ordering::Relaxed) {
+        return;
+    }
+    let digest = jdk_only_shadow_digest(class, method, descriptor, kind);
+    let slot =
+        &JDK_ONLY_NATIVE_SHADOW_FILTER[(digest as usize) & (JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS - 1)];
+    if slot.load(Ordering::Relaxed) == digest {
+        return;
+    }
+
+    let violation = cratonvm_types::error::JdkOnlyViolation::NativeShadowsBytecode {
+        class: class.to_string(),
+        method: method.to_string(),
+        descriptor: descriptor.to_string(),
+        native_kind: kind.as_str(),
+    };
+    let mut recorded = jdk_only_native_shadows().lock();
+    if recorded.len() >= JDK_ONLY_NATIVE_SHADOW_CAP {
+        JDK_ONLY_NATIVE_SHADOW_FULL.store(true, Ordering::Relaxed);
+        return;
+    }
+    if !recorded.contains(&violation) {
+        recorded.push(violation);
+    }
+    // Published last: a reader that sees the digest is guaranteed the triple
+    // has already been offered to the buffer.
+    slot.store(digest, Ordering::Relaxed);
 }
 
 /// THE single native-vs-bytecode decision point (§7). Interpreter, JIT,
@@ -198,6 +395,9 @@ pub fn resolve_dispatch<'a>(
                 &class.name,
                 &method.name,
                 &method.descriptor,
+                // §1.7 / `cratonvm_missing_native_total{module}`: the owning
+                // JDK module, straight off the declaring class's origin.
+                declaring_module(class),
             )),
         };
     }
@@ -209,6 +409,28 @@ pub fn resolve_dispatch<'a>(
 
     // Step 3 — real class bytes are authoritative.
     if method.code().is_some() {
+        // …and if something was nevertheless registered for this triple, that
+        // registration is a native standing where real code exists: §1.4's
+        // `NativeShadowsBytecode`. It loses, so this is an ACCEPT, not a
+        // reject — but it is the over-tagged-registration evidence wave 2
+        // needs, and until now only the JIT ever recorded it.
+        //
+        // Step 2 above has already consumed every `Intrinsic`, so anything
+        // still here is a `Bridge` or a `SyntheticStub` — precisely the two
+        // kinds §1.4 forbids shadowing bytecode.
+        //
+        // `strict` is the field read taken at the top of this function; in
+        // `Compatible` mode this is one not-taken branch and nothing else.
+        if strict {
+            if let Some((_, kind)) = native {
+                record_native_shadows_bytecode(
+                    &class.name,
+                    &method.name,
+                    &method.descriptor,
+                    kind,
+                );
+            }
+        }
         return DispatchDecision::Bytecode(method);
     }
 
@@ -291,9 +513,33 @@ pub fn resolve_native_dispatch_wave1(
     // these sites have not established that the method is `ACC_NATIVE`, so an
     // absent registration here just means "no override", the same thing it
     // meant before §7 existed.
+    //
+    // This is also why the `module` half of §1.7 is absent from this adapter
+    // and only `resolve_dispatch` fills it in: the owning JPMS module lives on
+    // the declaring class's `ClassOrigin::BootImage`, and this function has a
+    // name triple, not a `&Class`. Looking one up would mean a class-manager
+    // read lock and a hierarchy walk — the exact cost this adapter exists to
+    // avoid — on a path that does not emit a `MissingNative` anyway. If a
+    // future `MissingNative` is ever raised from here, its `module` must stay
+    // `None` unless the CALLER (which usually does hold a class) passes it in.
     let (callback, kind) = native?;
 
     if !compat_native_wins {
+        // The site preferred bytecode on its own. A registration exists for a
+        // triple the site has told us has real bytecode, so this is §1.4's
+        // `NativeShadowsBytecode` — recorded, not refused, because the right
+        // implementation already won. `bytecode_available` is what makes the
+        // claim true rather than assumed: a site that has not established the
+        // bytecode fact passes `false` and records nothing.
+        //
+        // `is_jdk_only()` is tested FIRST so `Compatible` short-circuits on a
+        // `Copy` field read and the documented "a default `--real-jdk` run
+        // cannot observe that the resolver exists" property still holds: the
+        // added cost on this branch is one register comparison, no atomic, no
+        // hash, no allocation, and the observation sink stays untouched.
+        if policy.is_jdk_only() && bytecode_available && kind != NativeKind::Intrinsic {
+            record_native_shadows_bytecode(class_name, method_name, descriptor, kind);
+        }
         return None;
     }
 
@@ -307,7 +553,9 @@ pub fn resolve_native_dispatch_wave1(
     }
 
     match kind {
-        // §1.3 — a fake may not be invoked under `--jdk-only`.
+        // §1.3 — a fake may not be invoked under `--jdk-only`. This one IS a
+        // refusal, and the caller turns it into `VmError::JdkOnly`, so it is
+        // counted as a `SyntheticNativeInvocation` there rather than here.
         NativeKind::SyntheticStub => Some(DispatchDecision::Reject(reject_synthetic_invocation(
             class_name,
             method_name,
@@ -315,8 +563,14 @@ pub fn resolve_native_dispatch_wave1(
         ))),
         // §1.4 — the reviewed exception; may shadow bytecode.
         NativeKind::Intrinsic => Some(DispatchDecision::Intrinsic(callback)),
-        // §7 step 3 — concrete bytecode beats a bridge.
-        NativeKind::Bridge if bytecode_available => None,
+        // §7 step 3 — concrete bytecode beats a bridge. The bridge lost, so
+        // this is the other half of the §1.4 observation: the site would have
+        // run a registered native in front of real bytes and strict mode sent
+        // it to the bytecode instead.
+        NativeKind::Bridge if bytecode_available => {
+            record_native_shadows_bytecode(class_name, method_name, descriptor, kind);
+            None
+        }
         NativeKind::Bridge => Some(DispatchDecision::NativeBridge(callback)),
     }
 }

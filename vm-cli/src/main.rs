@@ -215,13 +215,25 @@ struct Args {
     /// Write the JDK-only violation/counter report to the given JSON file.
     ///
     /// Schema (`schema_version` 1): `{ mode, jdk_feature, violations[],
-    /// counts{} }`, where `counts` carries the four class-origin buckets and
-    /// the three per-`NativeKind` invocation totals. Violations are sorted so
-    /// the file is diff-stable, and absolute paths are redacted unless
+    /// counts{}, refusals{} }`, where `counts` carries the four class-origin
+    /// buckets and the three per-`NativeKind` invocation totals, and
+    /// `refusals` carries the four exact refusal-event tallies that have no
+    /// place in the closed `counts` set. Violations are sorted so the file is
+    /// diff-stable, and absolute paths are redacted unless
     /// `--explain-jdk-only` is also passed.
     ///
-    /// Works in either compatibility mode: in the default `compatible` mode
-    /// the report is a census of what strict mode *would* reject.
+    /// `violations[]` unions all five recording sites: refused native
+    /// registrations, compatibility-class requests, JIT compile-time direct
+    /// binds, JIT fast-path admissions and interpreter bytecode-wins
+    /// observations. A source that is silently omitted would make an empty
+    /// array read as "clean" when it means "not measured", so the fold is
+    /// all-or-nothing.
+    ///
+    /// Works in either compatibility mode. In the default `compatible` mode
+    /// the report is a census of what strict mode *would* reject, built from
+    /// the class-origin side alone: the four other sites only record when
+    /// strict policy actually refuses something, so they and every `refusals`
+    /// tally are zero there.
     #[arg(long = "jdk-only-report", value_name = "FILE")]
     jdk_only_report: Option<String>,
 
@@ -238,8 +250,15 @@ struct Args {
 
     /// Log each JDK-only violation to stderr as it is picked up.
     ///
-    /// The violation logs are drained once immediately after VM init (which
-    /// is when registration refusals happen) and again at shutdown.
+    /// All five violation logs are drained once immediately after VM init
+    /// (which is when registration refusals happen) and again at shutdown, on
+    /// the same schedule, so the trace and `--jdk-only-report` name the same
+    /// set. Each drain also prints one refusal-counter delta line when any
+    /// counter moved — that is the only way `jit_inline_cache_natives`, which
+    /// has no violation object behind it, becomes visible in a traced run.
+    ///
+    /// Compile-time and dispatch-time refusals cannot have happened yet at the
+    /// post-init drain, so in practice they all surface at shutdown.
     #[arg(long = "trace-jdk-only")]
     trace_jdk_only: bool,
 
@@ -2106,19 +2125,40 @@ fn detect_jdk_feature(java_home: Option<&str>) -> Option<u32> {
 
 /// How far each append-only violation log has already been reported.
 ///
-/// JDK-ONLY-NOTE: `--trace-jdk-only` is a **poll**, not a live trace. The two
+/// JDK-ONLY-NOTE: `--trace-jdk-only` is a **poll**, not a live trace. All five
 /// recording sites (`ClassManager::origin_violations`,
-/// `NativeMethodRegistry::refused_registrations`) are append-only vectors, so
+/// `NativeMethodRegistry::refused_registrations`, and the three process sinks
+/// behind `SharedVm::jdk_only_process_violations`) are append-only vectors, so
 /// the launcher can only drain them at the points it holds the VM: right after
 /// `Vm::new` (which is when registration refusals actually happen — draining
 /// only at shutdown would report them minutes late, after the failure they
 /// caused) and again at shutdown. A genuinely live trace needs a VM-scoped sink
 /// installed at the recording sites themselves; that is a wave-2 change to
 /// `classloading` and `native-api`, not something the launcher can fake.
+///
+/// The three JIT/dispatch sinks are drained on **the same schedule** as the
+/// other two, so a traced run and `--jdk-only-report` name the same set of
+/// violations. In practice their `vm-init` drain is almost always empty and
+/// everything lands at `shutdown`: nothing has been compiled or dispatched yet
+/// when `Vm::new` returns. That is a property of *when refusals happen*, not a
+/// limitation of the drain — no sink here is shutdown-only, and a caller that
+/// added a mid-run drain point would get the entries recorded so far.
+///
+/// Each sink is bounded (256 entries) and internally deduplicated, and none of
+/// them ever shrinks, so a positional watermark stays valid across drains: once
+/// a sink saturates, `len()` stops growing and the drain correctly reports
+/// nothing new.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ViolationWatermark {
     origins: usize,
     registrations: usize,
+    /// One watermark per slot of [`cratonvm_vm::vm::JDK_ONLY_PROCESS_SINKS`],
+    /// in that constant's documented order. Indexed positionally on purpose:
+    /// the array's order is a contract precisely so this stays a plain index.
+    process_sinks: [usize; cratonvm_vm::vm::JDK_ONLY_PROCESS_SINKS],
+    /// Refusal-event totals as of the last drain, so the summary line reports a
+    /// delta rather than a running total that looks like a per-phase count.
+    refusals: cratonvm_vm::vm::JdkOnlyRefusalCounts,
 }
 
 /// One trace line for a violation.
@@ -2165,9 +2205,55 @@ fn trace_jdk_only_violations(
         }
         watermark.registrations = refused.len();
     }
+    // The three process-global sinks the report also folds — JIT compile-time
+    // refusals, JIT fast-path refusals, interpreter bytecode-wins observations.
+    // Drained here on the same schedule as the two above so a traced run and
+    // `--jdk-only-report` cannot disagree about which violations occurred.
+    //
+    // `jdk_only_process_violations()` returns three empty vectors in
+    // `Compatible` mode without touching the sinks, so this loop costs a mode
+    // test and three empty iterations on a default `--real-jdk` run.
+    let process_sinks = shared.jdk_only_process_violations();
+    for (slot, sink) in process_sinks.iter().enumerate() {
+        for violation in sink.iter().skip(watermark.process_sinks[slot]) {
+            lines.push(render_violation(violation, jdk_feature, explain));
+        }
+        watermark.process_sinks[slot] = sink.len();
+    }
     for line in lines {
         eprintln!("[cratonvm][jdk-only:{phase}] {line}");
     }
+    // Refusal counters, as a delta since the last drain. These are *events*,
+    // not violations: they are uncapped and undeduplicated, whereas the lines
+    // above are one-per-distinct-triple and capped at 256 per sink. Printing
+    // them per-event would bury the identities under repetition, and printing
+    // nothing would make a traced run silently disagree with the `refusals`
+    // block of the report. One summary line per drain is the compromise.
+    //
+    // `jit_inline_cache_natives` has no violation object behind it at all — the
+    // inline-cache publication site has an entry address, not a name triple —
+    // so this line is the only place a traced run can see that refusal class.
+    let refusals = shared.jdk_only_refusal_counts();
+    if refusals != watermark.refusals {
+        eprintln!(
+            "[cratonvm][jdk-only:{phase}] refusals since last drain: \
+             jit-direct-native-binds={} jit-inline-cache-natives={} \
+             jit-fastpath-admissions={} interpreter-bytecode-preferred={}",
+            refusals
+                .jit_direct_native_binds
+                .saturating_sub(watermark.refusals.jit_direct_native_binds),
+            refusals
+                .jit_inline_cache_natives
+                .saturating_sub(watermark.refusals.jit_inline_cache_natives),
+            refusals
+                .jit_fastpath_admissions
+                .saturating_sub(watermark.refusals.jit_fastpath_admissions),
+            refusals
+                .interpreter_bytecode_preferred
+                .saturating_sub(watermark.refusals.interpreter_bytecode_preferred),
+        );
+    }
+    watermark.refusals = refusals;
 }
 
 /// Write whichever of the three census artefacts were requested.
@@ -2225,10 +2311,17 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
 
     if let Some(path) = &args.jdk_only_report {
         match shared.dump_jdk_only_report_json(path, verbose) {
+            // `violations` is now the union of all five recording sites, so
+            // this number moved: it used to count refused registrations plus
+            // compatibility-class requests only. The refusal-event total is
+            // reported alongside it rather than folded in — they are different
+            // units (distinct methods versus events) and adding them would
+            // produce a number that means nothing.
             Ok((violations, compatibility_classes)) => eprintln!(
                 "[cratonvm] wrote {} JDK-only report to {path} ({violations} violation(s), \
-                 {compatibility_classes} compatibility class(es))",
+                 {compatibility_classes} compatibility class(es), {} refusal event(s))",
                 mode.as_str(),
+                shared.jdk_only_refusal_counts().total(),
             ),
             Err(e) => {
                 eprintln!("[cratonvm] warning: could not write JDK-only report to {path}: {e}")
