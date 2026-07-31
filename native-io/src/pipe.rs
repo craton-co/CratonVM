@@ -764,6 +764,15 @@ fn channel_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // Public registration
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. A pipe is an OS object, so the
+// intent is bridge-shaped, but the registrations do not land where the JDK puts
+// the boundary: none of the 19 resolvable triples is ACC_NATIVE in JDK 25, 12
+// name methods absent from the real class, 3 shadow concrete bytecode and 2 are
+// abstract. `java.nio.channels.Pipe` is an abstract factory whose real work
+// happens in `sun.nio.ch.PipeImpl` over `Net`/`IOUtil` natives that this crate
+// already bridges elsewhere. Likely disposition is "move down a layer or
+// delete", but that needs `invocations` to confirm nothing depends on the
+// current placement.
 /// Register the WP3.7 Pipe natives.  Idempotent.
 pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();

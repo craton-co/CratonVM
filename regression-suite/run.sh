@@ -30,7 +30,23 @@ TIMEOUT="${TIMEOUT:-120}"
 # CratonVM gap (cross-thread JIT-frame root scanning at a STW GC pause — see
 # README "Known gaps"), so it flakes. Run it explicitly once that gap is closed:
 #   ONLY="RConcurrent" bash regression-suite/run.sh
-CLASSES="${ONLY:-RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RExecutorShutdown RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem}"
+CLASSES="${ONLY:-RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RExecutorShutdown RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RPriorityQueueGc}"
+
+# Per-class extra CratonVM arguments. Most classes run on plain defaults; a few
+# only exercise their target defect under a specific VM configuration, and
+# running them any other way turns the gate into a no-op. HotSpot always runs on
+# its own defaults, so whatever is listed here must not change the *expected*
+# output, only the VM configuration that produces it.
+cv_extra_args() {
+  case "$1" in
+    # Needs the young generation to be an actual copying collector: a live JIT
+    # frame downgrades it to a non-moving sweep, under which the stale
+    # ObjectRefs this class hunts for still resolve and the defect hides. The
+    # small heap forces collections to happen inside the native it targets.
+    RPriorityQueueGc) echo "--nojit --Xmx 64m" ;;
+    *) echo "" ;;
+  esac
+}
 
 [ -x "$CV" ] || { echo "ERROR: CratonVM binary not found: $CV (build with build-cpu.bat)"; exit 3; }
 [ -x "$JAVAC" ] || { echo "ERROR: javac not found: $JAVAC (set JDK=...)"; exit 3; }
@@ -45,7 +61,8 @@ extract() { sed 's/\x1b\[[0-9;]*m//g' | grep -aE '^(PASS|CK) ' ; }
 
 pass=0; fail=0; failed=""
 for c in $CLASSES; do
-  cvout=$(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$CV" --java-home "$JDK" -cp "$BUILD" "$c" 2>&1)
+  # shellcheck disable=SC2046  # deliberate word-splitting of the extra args
+  cvout=$(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$CV" --java-home "$JDK" $(cv_extra_args "$c") -cp "$BUILD" "$c" 2>&1)
   cvrc=$?
   cvkey=$(printf '%s\n' "$cvout" | extract)
   # A failed assertion throws AssertionError → non-zero exit (handled by the rc
