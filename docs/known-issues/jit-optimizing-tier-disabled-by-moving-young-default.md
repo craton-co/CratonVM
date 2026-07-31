@@ -90,6 +90,38 @@ still compiles them. It means the optimizing tier contributes nothing, so every
 C2-only optimization (the IR optimizer, its inline caches, its direct-call
 lowering) is inert by default.
 
+### Measured cost on a real test (2026-07-30)
+
+[tomcat/32.1](tomcat/32-doc04-residual-perf-assertions.md) is the first item to
+quantify this end to end. Its workload is a nested chain of ordinary instance
+methods — `MappingData.recycle()` → 4× `MessageBytes.recycle()` → 2×
+`AbstractChunk.recycle()` per iteration — exactly the shape both penalties bite
+on. On a dev build carrying the `jit_virtual_tierup` fix, two interleaved passes:
+
+| | default | `CRATONVM_NO_MOVING_YOUNG=1` |
+|---|---|---|
+| `MapperPerfProbe -mode recycle` | 2.48 / 2.51 µs | **0.80 / 0.79 µs** |
+| `CalleeTierUpProbe` | 2 422 / 2 375 ns | **617 / 677 ns** |
+| `TestMapperPerformance` loop, easy host | 5 724 ms | **2 262 ms** |
+| `TestMapperPerformance` loop, hard host | 8 164 ms | **4 052 ms** |
+
+**~3.1–3.7×** — and it is the difference between that test failing its absolute
+5 000 ms budget on both hostnames and passing on both. The second penalty
+matters as much as the tier here: `direct_jit_callee_calls_enabled()` also
+returns `false` under moving-young, so every compiled call in that chain takes
+the dispatch bridge instead of a direct JIT-to-JIT edge.
+
+**Diagnosing it from a trace:** `CRATONVM_DBG_JITC=1` shows
+`MappingData.recycle` emitting `len=3569` at *both* `tier=C1 optimized=false`
+and `tier=C2 optimized=true`. Byte-identical output across the two tiers is the
+tell that the C2 compile is a relabelled C1.
+
+**Trap:** the disabling lever is `CRATONVM_NO_MOVING_YOUNG=1`, named in
+`moving_young_disables_optimizing_tier`'s own warning text.
+`CRATONVM_MOVING_YOUNG=0` is *not* it — it silently changes nothing and reads
+exactly like a successful elimination, which is how tomcat/32 first ruled this
+cause out in error.
+
 ## What a fix would involve
 
 1. **Give IR the map contract the gate demands** — exact-RBP + a complete
