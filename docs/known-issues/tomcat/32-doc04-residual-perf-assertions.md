@@ -12,7 +12,7 @@ assertion is about speed, with its own separate reason.
 | 32.1 | OPEN. A dev regression, not a mapper problem, and now **fully accounted for**. **Cause 1 FIXED 2026-07-30** (instance tier-up default restored, ~8.4x). **Cause 2 = moving-young becoming active** ([its own doc](../jit-optimizing-tier-disabled-by-moving-young-default.md)); a fix is written and pushed on `codex/fix-hibernate-five-takeover-20260730`, not yet on dev. With both removed the test PASSES on both hostnames. No Tomcat work left. |
 | 32.2 | ✅ **Not a defect** — passes on a quiet host. Genuinely load-sensitive; expect intermittency on a busy one. |
 | 32.3 | OPEN, improved ~12–16 %. Root cause identified as per-completion processing, not I/O; no further AIO work will close it. |
-| 32.4 | OPEN, and **harder than recorded** — belongs to doc [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md)'s family, not here. |
+| 32.4 | OPEN, and **harder than recorded** — belongs to doc [30](../../internal/fixed-suite-bugs/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md)'s family, not here. |
 
 Nothing here is a Tomcat defect any more. Three items are consumers of VM-wide
 throughput problems and one is a test-shape artefact. 32.1 is the only one
@@ -409,7 +409,7 @@ JDK caches `DateFormatSymbols` per locale). Note that fixing it speeds up the
 *fast* side of this assertion.
 
 **This item is a throughput residual in the family of
-[30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md), not a Tomcat
+[30](../../internal/fixed-suite-bugs/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md), not a Tomcat
 defect.** Closing it needs `SimpleDateFormat.format` under ~4 µs — a 54×
 improvement in real `java.text` code — which is the standing JIT/interpreter
 gap, not something this document can carry.
