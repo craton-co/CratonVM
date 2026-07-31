@@ -73251,117 +73251,107 @@ public class SkippedTest {
 
     #[test]
     fn s41_jfr_gc_events_emitted_on_gc_cycle() {
-        // Verify the GC event emission helpers produce valid events
-        let mut fr = cratonvm_jfr::create_flight_recorder();
-        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("gc-test"));
-        fr.start_recording(rid);
-
-        cratonvm_jfr::builtin::emit_gc_event(
-            &mut fr,
-            1,
-            "YoungGC",
-            "Allocation Failure",
-            1000,
-            500,
-        );
-        cratonvm_jfr::builtin::emit_young_gc_event(&mut fr, 1, 15, 1000, 500);
-        cratonvm_jfr::builtin::emit_gc_heap_summary_event(
-            &mut fr, 1, "After GC", "Eden", 1024, 2048, 4096, 1500,
-        );
-
-        let rec = fr.get_recording(rid).unwrap();
-        assert_eq!(rec.event_count(), 3);
+        let events = s41_jfr_emitted("gc-test", |fr| {
+            cratonvm_jfr::builtin::emit_gc_event(fr, 1, "YoungGC", "Allocation Failure", 1000, 500);
+            cratonvm_jfr::builtin::emit_young_gc_event(fr, 1, 15, 1000, 500);
+            cratonvm_jfr::builtin::emit_gc_heap_summary_event(
+                fr, 1, "After GC", "Eden", 1024, 2048, 4096, 1500,
+            );
+        });
+        assert_eq!(events.len(), 3);
     }
 
     #[test]
     fn s41_jfr_thread_events_cover_lifecycle() {
+        let events = s41_jfr_emitted("thread-test", |fr| {
+            cratonvm_jfr::builtin::emit_thread_start_event(fr, "worker-1", "main", 1, 1000);
+            cratonvm_jfr::builtin::emit_thread_sleep_event(fr, 100_000_000, 1, 2000, 100_000_000);
+            cratonvm_jfr::builtin::emit_thread_park_event(fr, "AQS", 0, 0, 1, 3000, 500);
+            cratonvm_jfr::builtin::emit_monitor_enter_event(
+                fr, "Object", "main", 0xCAFE, 1, 4000, 100,
+            );
+            cratonvm_jfr::builtin::emit_monitor_wait_event(
+                fr, "Object", "worker-1", 0, false, 0xBEEF, 1, 5000, 200,
+            );
+            cratonvm_jfr::builtin::emit_thread_end_event(fr, "worker-1", 1, 6000);
+        });
+        assert_eq!(events.len(), 6);
+    }
+
+    /// Emit through `emit` against a fresh recorder and return the events that
+    /// reached the JFR ring. Local-recorder sibling of [`p90_jfr_emitted`] —
+    /// see that helper for why `Recording::event_count()` reads empty here.
+    fn s41_jfr_emitted(
+        name: &str,
+        emit: impl FnOnce(&mut cratonvm_jfr::FlightRecorder),
+    ) -> Vec<cratonvm_jfr::EventInstance> {
+        let _guard = P90_JFR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut fr = cratonvm_jfr::create_flight_recorder();
-        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("thread-test"));
+        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new(name));
         fr.start_recording(rid);
-
-        cratonvm_jfr::builtin::emit_thread_start_event(&mut fr, "worker-1", "main", 1, 1000);
-        cratonvm_jfr::builtin::emit_thread_sleep_event(&mut fr, 100_000_000, 1, 2000, 100_000_000);
-        cratonvm_jfr::builtin::emit_thread_park_event(&mut fr, "AQS", 0, 0, 1, 3000, 500);
-        cratonvm_jfr::builtin::emit_monitor_enter_event(
-            &mut fr, "Object", "main", 0xCAFE, 1, 4000, 100,
-        );
-        cratonvm_jfr::builtin::emit_monitor_wait_event(
-            &mut fr, "Object", "worker-1", 0, false, 0xBEEF, 1, 5000, 200,
-        );
-        cratonvm_jfr::builtin::emit_thread_end_event(&mut fr, "worker-1", 1, 6000);
-
-        let rec = fr.get_recording(rid).unwrap();
-        assert_eq!(rec.event_count(), 6);
+        let _ = cratonvm_jfr::repository::global_ring_registry().drain_all();
+        emit(&mut fr);
+        let drained = cratonvm_jfr::repository::global_ring_registry().drain_all();
+        fr.stop_recording(rid);
+        drained
     }
 
     #[test]
     fn s41_jfr_io_events_cover_read_write() {
-        let mut fr = cratonvm_jfr::create_flight_recorder();
-        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("io-test"));
-        fr.start_recording(rid);
-
-        cratonvm_jfr::builtin::emit_file_read_event(&mut fr, "fd:3", 4096, false, 1, 1000, 500);
-        cratonvm_jfr::builtin::emit_file_write_event(&mut fr, "fd:1", 2048, 1, 2000, 300);
-        cratonvm_jfr::builtin::emit_socket_read_event(
-            &mut fr, "10.0.0.1", 80, 512, false, 1, 3000, 1000,
-        );
-        cratonvm_jfr::builtin::emit_socket_write_event(&mut fr, "10.0.0.1", 80, 256, 1, 4000, 800);
-
-        let rec = fr.get_recording(rid).unwrap();
-        assert_eq!(rec.event_count(), 4);
+        let events = s41_jfr_emitted("io-test", |fr| {
+            cratonvm_jfr::builtin::emit_file_read_event(fr, "fd:3", 4096, false, 1, 1000, 500);
+            cratonvm_jfr::builtin::emit_file_write_event(fr, "fd:1", 2048, 1, 2000, 300);
+            cratonvm_jfr::builtin::emit_socket_read_event(
+                fr, "10.0.0.1", 80, 512, false, 1, 3000, 1000,
+            );
+            cratonvm_jfr::builtin::emit_socket_write_event(fr, "10.0.0.1", 80, 256, 1, 4000, 800);
+        });
+        assert_eq!(events.len(), 4);
     }
 
     #[test]
     fn s41_jfr_class_loading_events() {
-        let mut fr = cratonvm_jfr::create_flight_recorder();
-        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("class-test"));
-        fr.start_recording(rid);
-
-        cratonvm_jfr::builtin::emit_class_load_event(
-            &mut fr,
-            "com/example/Foo",
-            "app",
-            "app",
-            1000,
-            50,
-        );
-        cratonvm_jfr::builtin::emit_class_unload_event(&mut fr, "com/example/Foo", "app", 5000);
-
-        let rec = fr.get_recording(rid).unwrap();
-        assert_eq!(rec.event_count(), 2);
+        let events = s41_jfr_emitted("class-test", |fr| {
+            cratonvm_jfr::builtin::emit_class_load_event(
+                fr,
+                "com/example/Foo",
+                "app",
+                "app",
+                1000,
+                50,
+            );
+            cratonvm_jfr::builtin::emit_class_unload_event(fr, "com/example/Foo", "app", 5000);
+        });
+        assert_eq!(events.len(), 2);
     }
 
     #[test]
     fn s41_jfr_compilation_and_deopt_events() {
-        let mut fr = cratonvm_jfr::create_flight_recorder();
-        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("jit-test"));
-        fr.start_recording(rid);
-
-        cratonvm_jfr::builtin::emit_compilation_event(
-            &mut fr,
-            "Foo.bar:()V",
-            1,
-            4,
-            true,
-            false,
-            256,
-            64,
-            1000,
-            5000,
-        );
-        cratonvm_jfr::builtin::emit_deoptimization_event(
-            &mut fr,
-            "Foo.bar:()V",
-            1,
-            "ReceiverTypeChanged",
-            "RecompileAndReinterpret",
-            10,
-            1,
-            6000,
-        );
-
-        let rec = fr.get_recording(rid).unwrap();
-        assert_eq!(rec.event_count(), 2);
+        let events = s41_jfr_emitted("jit-test", |fr| {
+            cratonvm_jfr::builtin::emit_compilation_event(
+                fr,
+                "Foo.bar:()V",
+                1,
+                4,
+                true,
+                false,
+                256,
+                64,
+                1000,
+                5000,
+            );
+            cratonvm_jfr::builtin::emit_deoptimization_event(
+                fr,
+                "Foo.bar:()V",
+                1,
+                "ReceiverTypeChanged",
+                "RecompileAndReinterpret",
+                10,
+                1,
+                6000,
+            );
+        });
+        assert_eq!(events.len(), 2);
     }
 
     // -----------------------------------------------------------------------

@@ -3086,11 +3086,55 @@ fn try_delegate_real_collection(
     Some(r)
 }
 
+/// If `this` is one of the `cratonvm/internal/Unmodifiable*` wrappers that
+/// `List.of` / `Set.of` / `Map.of` and `Collections.unmodifiable*` hand back,
+/// the collection it wraps.
+///
+/// The wrapper's own class carries delegating natives, so a call that arrives
+/// through it is fine. A call that arrives through the CONCRETE class instead —
+/// `HashSet.size()` on a `Set.of(a, b)` result, which is what real code does
+/// after `Set.of` is assigned to a `HashSet`-typed local, and what these tests
+/// do — found no backing map and answered 0. Unwrapping first makes the
+/// concrete-class entry points agree with the wrapper's.
+fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
+    if !name.starts_with("cratonvm/internal/Unmodifiable") {
+        return None;
+    }
+    unmod_backing(ctx, this)
+}
+
+/// Size of a JDK singleton/empty collection wrapper.
+///
+/// `Collections.singletonList` / `singleton` / `singletonMap` return real
+/// `Collections$Singleton*` objects, and `emptyList` and friends return
+/// `Collections$Empty*`. None of them has an `elementData`/`table` field, so
+/// `al_state` and `map_state` read nothing and the accessors below fall back to
+/// delegating into the class's own bytecode. That is right when the bytecode is
+/// loaded and answers nothing when it is not — which left `singletonList(x).size()`
+/// reporting **0**. The sizes are constants of the wrapper type, so answer them
+/// directly and keep the delegation as the path for everything else.
+fn singleton_wrapper_size(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
+    match name.as_str() {
+        "java/util/Collections$SingletonList"
+        | "java/util/Collections$SingletonSet"
+        | "java/util/Collections$SingletonMap" => Some(1),
+        "java/util/Collections$EmptyList"
+        | "java/util/Collections$EmptySet"
+        | "java/util/Collections$EmptyMap" => Some(0),
+        _ => None,
+    }
+}
+
 pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if let Some(b) = unmod_receiver_backing(ctx, this) {
+        return native_al_size(ctx, &[Value::Object(Some(b))]);
+    }
     let this = resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     if data.is_none() {
@@ -3098,6 +3142,9 @@ pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             try_delegate_real_collection(ctx, this, "java/util/Collection", "size", "()I")
         {
             return r;
+        }
+        if let Some(n) = singleton_wrapper_size(ctx, this) {
+            return Ok(Some(Value::Int(n)));
         }
     }
     Ok(Some(Value::Int(size)))
@@ -3115,6 +3162,9 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             try_delegate_real_collection(ctx, this, "java/util/Collection", "isEmpty", "()Z")
         {
             return r;
+        }
+        if let Some(n) = singleton_wrapper_size(ctx, this) {
+            return Ok(Some(Value::Int(i32::from(n == 0))));
         }
     }
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
@@ -3165,6 +3215,21 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(i)) => *i,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Some(b) = unmod_receiver_backing(ctx, this) {
+        return native_al_get(ctx, &[Value::Object(Some(b)), Value::Int(index)]);
+    }
+    // `Collections$SingletonList` keeps its one element in a field, not in an
+    // `elementData` array, so `al_state` reports size 0 and every index looked
+    // out of range. Same reason `size()` needed `singleton_wrapper_size`.
+    if singleton_wrapper_size(ctx, this) == Some(1) {
+        if index != 0 {
+            return Err(
+                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }
+                    .into(),
+            );
+        }
+        return Ok(Some(ctx.get_field_by_name(this, "element")));
+    }
     let this = resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
@@ -6616,6 +6681,9 @@ fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if let Some(b) = unmod_receiver_backing(ctx, this) {
+        return native_map_size(ctx, &[Value::Object(Some(b))]);
+    }
     if is_tree_map_receiver(ctx, this) {
         return native_tm_size(ctx, args);
     }
@@ -6629,6 +6697,9 @@ fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if buckets.is_none() {
         if let Some(r) = try_delegate_real_collection(ctx, this, "java/util/Map", "size", "()I") {
             return r;
+        }
+        if let Some(n) = singleton_wrapper_size(ctx, this) {
+            return Ok(Some(Value::Int(n)));
         }
     }
     Ok(Some(Value::Int(size)))
@@ -9967,6 +10038,9 @@ fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if let Some(b) = unmod_receiver_backing(ctx, this) {
+        return native_hs_size(ctx, &[Value::Object(Some(b))]);
+    }
     resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
