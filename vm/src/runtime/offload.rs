@@ -3446,13 +3446,25 @@ pub(crate) mod h2d_trace {
 //     kernel stale device data. The fix is a one-line call to
 //     `input_cache::invalidate(obj)` in the interpreter store and
 //     `jit_iastore`/`jit_fastore`/etc. helpers.
-//   - GC compaction is currently OK because the GPU-critical guard
-//     held during dispatch keeps the GC paused — but the cache
-//     entry survives ACROSS submits, and a GC between submits that
-//     moves an array's payload would invalidate the device buffer's
-//     mirror without us noticing. Mitigated today by clearing the
-//     whole cache via `clear_all` from `releaseExecutor`. A
-//     production fix would clear on every major-GC compaction event.
+//
+// GC interaction (closed):
+//   - Within a dispatch the GPU-critical guard keeps the GC paused, so
+//     the marshalled `ObjectRef`s cannot move mid-submission.
+//   - Across submits there is no guard, and the cache key is a bare
+//     heap address. [`input_cache::remap_and_sweep`] is called once per
+//     collection from `memory::gc::update_all_roots` to re-key moved
+//     survivors and drop entries whose array died. Dropping is the half
+//     that matters: a reclaimed address is reused by the allocator, and
+//     the `element_type`/`len` guard in the getters does not separate a
+//     recycled address from a genuine hit when the new array has the
+//     same shape — which, for a kernel argument list, is the common
+//     case rather than the exception.
+//   - The cache is deliberately NOT a GC root. An array reachable only
+//     from a cache entry can never be named by a future submit, so
+//     rooting it would leak every array the GPU ever saw instead of
+//     keeping anything useful alive. See `memory::addr_keyed`.
+//   - `clear_all` from `releaseExecutor` remains as the coarse teardown
+//     path; it is no longer load-bearing for GC correctness.
 #[cfg(feature = "gpu-offload")]
 pub(crate) mod input_cache {
     use cratonvm_types::{ArrayElementType, ObjectRef};
@@ -3580,10 +3592,53 @@ pub(crate) mod input_cache {
         map().lock().remove(&obj);
     }
 
-    /// Drop every cached entry. Called from `releaseExecutor` and
-    /// any future major-GC-compaction hook.
+    /// Drop every cached entry. Called from `releaseExecutor` as a
+    /// teardown path. GC correctness does not depend on it — see
+    /// [`remap_and_sweep`].
     pub fn clear_all() {
         map().lock().clear();
+    }
+
+    /// Post-collection fixup: re-key surviving entries through the
+    /// collector's old→new map and drop entries whose Java array did
+    /// not survive.
+    ///
+    /// Called once per collection from
+    /// [`crate::memory::gc::update_all_roots`], **before** its
+    /// empty-`pointer_map` early return, because the sweep half is
+    /// needed on a non-moving collection too: objects still die there,
+    /// and a stale key over a reclaimed address is what turns a later
+    /// cache lookup into a false hit.
+    ///
+    /// The device buffer itself needs no fixup. It lives in device
+    /// memory and never holds a JVM heap address — the marshal path
+    /// copies the payload out of the heap at upload time — so
+    /// relocating the source array leaves the mirror valid. Only the
+    /// key is address-derived.
+    ///
+    /// # Locking
+    ///
+    /// Runs with the world stopped and takes the cache mutex, which is
+    /// safe because every other holder of that mutex (the getters,
+    /// `put_*`, `invalidate`) does a bounded map operation with no
+    /// safepoint poll in between, so a stopped mutator can never be
+    /// parked while holding it.
+    pub fn remap_and_sweep(
+        pointer_map: &std::collections::HashMap<usize, usize>,
+        heap: &crate::memory::vm_heap::VmHeap,
+    ) {
+        let mut guard = map().lock();
+        let stats = crate::memory::addr_keyed::remap_and_sweep(&mut guard, pointer_map, &|addr| {
+            heap.is_object_address(addr).is_some()
+        });
+        if stats.moved != 0 || stats.dropped != 0 {
+            tracing::debug!(
+                "gpu input_cache post-GC: {} re-keyed, {} retained, {} dropped",
+                stats.moved,
+                stats.retained,
+                stats.dropped
+            );
+        }
     }
 
     /// Diagnostic: current entry count.

@@ -10,6 +10,9 @@
 //! - [`native_roots`] — uniform registry letting native side-tables register
 //!   their held `ObjectRef`s as GC roots (scan + post-move remap) without
 //!   editing `roots`/`gc` directly
+//! - [`addr_keyed`] — post-collection re-key + sweep for address-keyed
+//!   side-tables that must NOT root their keys (caches, as opposed to the
+//!   root sources in `native_roots`)
 
 // Re-export submodules from the gc crate so that existing
 // `use crate::memory::{arena, heap, ...}` paths continue to work.
@@ -22,6 +25,7 @@ pub use cratonvm_gc::old_gen;
 pub use cratonvm_gc::vm_heap;
 
 // VM-local modules that depend on VM-internal types.
+pub mod addr_keyed;
 pub mod gc;
 pub mod native_roots;
 pub mod roots;
