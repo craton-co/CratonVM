@@ -2853,8 +2853,15 @@ mod tests {
         let cp = init_cp();
         let mut frame = make_frame(1, 4);
         frame.locals[0] = VType::UninitializedThis;
-        let err = run(&Instruction::Return, &mut frame, &cp, "Example", "<init>", "()V")
-            .expect_err("a constructor may not return with `this` uninitialized");
+        let err = run(
+            &Instruction::Return,
+            &mut frame,
+            &cp,
+            "Example",
+            "<init>",
+            "()V",
+        )
+        .expect_err("a constructor may not return with `this` uninitialized");
         assert!(err.to_string().contains("uninitialized"), "{err}");
     }
 
