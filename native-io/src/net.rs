@@ -2674,6 +2674,15 @@ fn ext_opt_peer_cred(_args: &[Value]) -> i64 {
 // T19.5 registration
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: bridge — the strongest bridge evidence in the repo. 36 of
+// this function's registrations resolve to methods that are ACC_NATIVE in JDK
+// 25 (`sun.nio.ch.Net.socket0`, `bind0`, `connect0`, `listen`, `localPort`,
+// `setIntOption0`, `poll*`, …); they are socket syscalls with no bytecode
+// fallback anywhere in the image, so `NativeKind::Bridge` is correct on the
+// merits and must survive `--jdk-only`. Caveat for the next wave: 17 further
+// registrations here name classes absent from the boot image (platform-specific
+// `sun.nio.ch.*Impl` variants), and those are dead registrations on this JDK
+// rather than bridges — split them out before claiming the whole function.
 /// Register the `sun/nio/ch/Net` TCP-native surface. Safe to call more than
 /// once — later registrations override earlier ones at the same signature.
 pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {

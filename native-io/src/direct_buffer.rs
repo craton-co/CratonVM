@@ -1417,6 +1417,16 @@ fn dbb_commit_position(ctx: &mut dyn NativeContext, this: ObjectRef, new_positio
     }
 }
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Direct buffers ARE a memory
+// boundary, which is bridge territory under jdk-only-native-review.md §5, but
+// not one of the 25 statically resolvable triples here is ACC_NATIVE in JDK 25:
+// 9 shadow concrete bytecode, 7 name methods absent from the image, 2 name
+// absent classes and 2 have a descriptor that does not match the real one. In
+// JDK 25 the actual native boundary for direct memory is `jdk.internal.misc.
+// Unsafe`, not `java.nio.Bits` / `DirectByteBuffer`, so several of these look
+// like they are bridging one layer too high. Evidence needed: `invocations`
+// plus `real_declaring_method` per triple before promoting or demoting any of
+// them — and note the descriptor mismatches are dead registrations either way.
 /// Register the WP3.5 DirectByteBuffer + Cleaner natives.  Idempotent:
 /// safe to call multiple times.  See module docs for FQN list and
 /// caveats around partial WP1.10 Cleaner integration.
