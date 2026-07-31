@@ -3983,6 +3983,11 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *mut i32;
     *elem_ptr = val as i32;
+    // Phase 10 #2: the host just wrote this array, so a GPU input-cache
+    // entry mirroring it is stale. Costs one relaxed load when nothing is
+    // cached, which is every run that never submits a kernel.
+    #[cfg(feature = "gpu-offload")]
+    crate::runtime::offload::input_cache::invalidate(cratonvm_types::ObjectRef::from_raw(ptr));
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap

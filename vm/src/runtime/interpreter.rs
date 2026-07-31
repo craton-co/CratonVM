@@ -15780,6 +15780,10 @@ fn execute_instruction(
                     }
                     RuntimeError::ArrayIndexOutOfBoundsException { index: i }
                 })?;
+            // Phase 10 #2: the host just wrote this array, so any device
+            // buffer mirroring it is stale.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
         // WP4.3 fix: long[] / double[] store must use typed pop so that the
         // CompactValue type-erasure (raw long bits decoding as Value::Double via
@@ -15835,6 +15839,9 @@ fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Long(v))
                 .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
+            // Phase 10 #2 — see the `Iastore` arm.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
         Instruction::Dastore => {
             let d = thread.frames[frame_idx].stack.pop_double()?;
@@ -15874,6 +15881,9 @@ fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Double(d))
                 .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
+            // Phase 10 #2 — see the `Iastore` arm.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
 
         // -- Stack manipulation (T10.9.D direct CompactValue path) --

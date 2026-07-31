@@ -11869,7 +11869,7 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     fn gpu_clear_input_cache(&mut self) {
         #[cfg(feature = "gpu-offload")]
         {
-            crate::runtime::offload::input_cache::clear_all();
+            crate::runtime::offload::input_cache::clear_all(self.shared.vm_identity);
         }
     }
 
