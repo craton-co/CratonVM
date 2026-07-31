@@ -1299,6 +1299,79 @@ fn find_float_locals(code: &[u8], code_len: usize, num_locals: usize) -> u64 {
     float_mask
 }
 
+/// Detect which locals are accessed as `int` / `long` / reference — the GPR
+/// category, i.e. the complement of [`find_float_locals`].
+///
+/// Exists only to find slots that appear in BOTH scans. javac reuses a JVM
+/// local slot the moment the previous variable's scope ends, and it does not
+/// care whether the next occupant has the same type category:
+///
+/// ```java
+/// for (int i = 0; i < N; i++) { sum += (i % 17) * 0.5 + acc0; }
+/// double tail = sum / 3.0;      // <- javac gives `tail` the slot `i` had
+/// ```
+///
+/// compiles to `istore 11` / `iload 11` / `iinc 11` inside the loop and
+/// `dstore 11` / `dload 11` after it. [`find_float_locals`] marks slot 11
+/// float because *something* stored a double there, so the slot gets an XMM
+/// home for the whole method — while its integer accesses go through the
+/// canonical frame slot, since `reg_for_local` returns `None` for a
+/// float-masked local.
+///
+/// Each category is internally consistent, so an ordinary entry compiles
+/// correct code. The OSR trampoline, however, seeds locals by index and
+/// elides the frame-slot store for any local that has a register home. For a
+/// dual-category slot that deposits the interpreter's `int i` into an XMM
+/// register nothing reads and leaves the frame slot the loop actually reads
+/// **uninitialised** — an OSR-entered loop starts its counter at garbage.
+/// Measured on `probes/SlotReuseCategoryProbe.java`: `reused` returns
+/// 1.7716133435E9 against the correct 5599982.5, while the three controls
+/// that avoid the cross-category reuse are all exact (2026-07-31).
+///
+/// `allocate_registers_with` gives such slots no register home at all, so
+/// both categories use the frame slot and the trampoline seeds it.
+fn find_non_float_locals(code: &[u8], code_len: usize) -> u64 {
+    fn set(idx: usize, mask: &mut u64) {
+        if idx < 64 {
+            *mask |= 1u64 << idx;
+        }
+    }
+    let mut mask = 0u64;
+    let mut pc = 0;
+    while pc < code_len {
+        match code[pc] {
+            // iload_0..3 / lload_0..3 / aload_0..3
+            0x1a..=0x1d => set((code[pc] - 0x1a) as usize, &mut mask),
+            0x1e..=0x21 => set((code[pc] - 0x1e) as usize, &mut mask),
+            0x2a..=0x2d => set((code[pc] - 0x2a) as usize, &mut mask),
+            // istore_0..3 / lstore_0..3 / astore_0..3
+            0x3b..=0x3e => set((code[pc] - 0x3b) as usize, &mut mask),
+            0x3f..=0x42 => set((code[pc] - 0x3f) as usize, &mut mask),
+            0x4b..=0x4e => set((code[pc] - 0x4b) as usize, &mut mask),
+            // iload / lload / aload / istore / lstore / astore / iinc / ret
+            0x15 | 0x16 | 0x19 | 0x36 | 0x37 | 0x3a | 0x84 | 0xa9 => {
+                if let Some(&raw) = code.get(pc + 1) {
+                    set(raw as usize, &mut mask);
+                }
+            }
+            // wide forms of the same
+            0xc4 => {
+                if matches!(
+                    code.get(pc + 1),
+                    Some(&0x15 | &0x16 | &0x19 | &0x36 | &0x37 | &0x3a | &0x84 | &0xa9)
+                ) {
+                    if let (Some(&hi), Some(&lo)) = (code.get(pc + 2), code.get(pc + 3)) {
+                        set(u16::from_be_bytes([hi, lo]) as usize, &mut mask);
+                    }
+                }
+            }
+            _ => {}
+        }
+        pc += bc_len(code, pc);
+    }
+    mask
+}
+
 /// Bitmask of locals that are ever accessed as a REFERENCE (`aload`/`astore`
 /// in any encoding, including the `wide` forms). Mirrors
 /// [`find_float_locals`]' structure.
@@ -1804,6 +1877,13 @@ fn allocate_registers_with(
     // Detect float/double locals — these use XMM registers, not GPRs
     let float_mask = find_float_locals(code, code_len, num_locals);
 
+    // Slots javac reused across type categories — an `int` loop counter and,
+    // once its scope ends, a `double`. Such a slot must get NO register home:
+    // the two categories read different places (`iload` the frame slot,
+    // `dload` the XMM), and the OSR trampoline only seeds one of them. See
+    // [`find_non_float_locals`] for the measured failure.
+    let dual_category_mask = float_mask & find_non_float_locals(code, code_len);
+
     // Build CFG and solve liveness. `handlers` is empty for every compile that
     // does not reconstruct a handler frame from register homes, in which case
     // this is exactly `build_cfg`.
@@ -1867,10 +1947,14 @@ fn allocate_registers_with(
         }
     }
     let xmm_raw = color_graph(&xmm_interference, num_locals, xmm_available, &use_counts);
-    // Only propagate XMM assignments for float/double locals
+    // Only propagate XMM assignments for float/double locals — and never for a
+    // slot javac also uses as an int/long/reference. The GPR pass above already
+    // refused it (it is float-masked), so leaving the XMM home off too puts the
+    // slot wholly in its canonical frame slot, which both categories read and
+    // which the OSR trampoline seeds. See `dual_category_mask`.
     let mut xmm_assignments = vec![None; num_locals];
     for i in 0..n {
-        if float_mask & (1u64 << i) != 0 {
+        if float_mask & (1u64 << i) != 0 && dual_category_mask & (1u64 << i) == 0 {
             xmm_assignments[i] = xmm_raw[i];
         }
     }
@@ -2182,6 +2266,76 @@ mod tests {
             mask & (1u64 << 6),
             0,
             "wide dstore local should be float-classified"
+        );
+    }
+
+    #[test]
+    fn find_non_float_locals_covers_every_gpr_category_encoding() {
+        #[rustfmt::skip]
+        let code = [
+            0x1a,                   // iload_0
+            0x1f,                   // lload_1
+            0x2c,                   // aload_2
+            0x3e,                   // istore_3
+            0x15, 0x04,             // iload 4
+            0x37, 0x05,             // lstore 5
+            0x3a, 0x06,             // astore 6
+            0x84, 0x07, 0x01,       // iinc 7, 1
+            0xc4, 0x15, 0x00, 0x08, // wide iload 8
+            0xc4, 0x84, 0x00, 0x09, 0x00, 0x01, // wide iinc 9, 1
+            0xb1,                   // return
+        ];
+        let mask = find_non_float_locals(&code, code.len());
+        for slot in 0..=9u32 {
+            assert_ne!(
+                mask & (1u64 << slot),
+                0,
+                "slot {slot} is accessed in the GPR category and must be flagged"
+            );
+        }
+        assert_eq!(mask & (1u64 << 10), 0, "untouched slot must stay clear");
+    }
+
+    /// A slot javac reuses across type categories (an `int` loop counter, then
+    /// a `double` once the counter's scope ends) must get NEITHER a GPR nor an
+    /// XMM home: `iload` would read the frame slot while `dload` read the XMM,
+    /// and the OSR trampoline seeds only the register. See
+    /// `find_non_float_locals` for the measured miscompile.
+    #[test]
+    fn dual_category_slot_gets_no_register_home() {
+        #[rustfmt::skip]
+        let code = [
+            0x0e,                   // dconst_0
+            0x39, 0x00,             // dstore 0        (double sum -> slot 0)
+            0x03,                   // iconst_0
+            0x36, 0x02,             // istore 2        (int i    -> slot 2)
+            // loop head @6
+            0x15, 0x02,             // iload 2
+            0x10, 0x64,             // bipush 100
+            0xa2, 0x00, 0x0a,       // if_icmpge +10 -> 20
+            0x84, 0x02, 0x01,       // iinc 2, 1
+            0xa7, 0xff, 0xf9,       // goto -7 -> 6
+            // @20: slot 2 is reused for a double
+            0x18, 0x00,             // dload 0
+            0x39, 0x02,             // dstore 2        (double tail -> slot 2)
+            0x18, 0x02,             // dload 2
+            0xaf,                   // dreturn
+        ];
+        let r = allocate_registers(&code, code.len(), 4, 0, &[]);
+        assert_eq!(
+            r.assignments[2], None,
+            "a dual-category slot must not get a GPR home"
+        );
+        assert_eq!(
+            r.xmm_assignments[2], None,
+            "a dual-category slot must not get an XMM home either -- the OSR \
+             trampoline would seed the XMM and leave the frame slot the int \
+             accesses read uninitialised"
+        );
+        // The control: slot 0 is only ever a double, so it keeps its XMM home.
+        assert!(
+            r.xmm_assignments[0].is_some(),
+            "a single-category double local must still be XMM-homed"
         );
     }
 

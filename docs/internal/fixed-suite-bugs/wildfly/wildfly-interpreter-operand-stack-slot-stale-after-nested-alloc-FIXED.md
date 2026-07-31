@@ -38,9 +38,13 @@ acceptance record at the end of this document for the post-merge matrix.
 `WFLYCTL0079` duplicate attribute registration was historically co-located
 here only because it occurred in the same large boot campaigns. It has no
 stale-reference/GC evidence and survived two negative double-dispatch probes.
-It remains separately tracked in
-`docs/known-issues/wildfly/wflyctl0079-duplicate-attribute-registration.md`;
-it is not being mislabeled as fixed by retiring this stale-reference report.
+It was tracked separately and was itself closed as not reproducible on
+2026-07-31 — see
+`docs/internal/fixed-suite-bugs/wildfly/wflyctl0079-duplicate-attribute-registration.md`,
+which identifies the exact failing statement (a `Set.remove` in
+`TransactionSubsystemRootResourceDefinition.registerAttributes`) and ships a
+reproduction harness at `docs/known-issues/repros/wfly0079-dup-attr/`. It was
+never mislabeled as fixed by retiring this stale-reference report.
 
 The remainder of this file is the preserved investigation history. Statements
 that an item is “open” below describe the state at the dated checkpoint and

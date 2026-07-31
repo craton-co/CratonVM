@@ -107,7 +107,7 @@ and ~2.8 MB reclaimed per cycle. It is also why the run *slows down* as it goes
 This is the same mechanism already tracked in
 [`moving-young-inert-under-jit-throughput-tax-20260730.md`](moving-young-inert-under-jit-throughput-tax-20260730.md)
 and its authority
-[`../jit-optimizing-tier-disabled-by-moving-young-default.md`](../jit-optimizing-tier-disabled-by-moving-young-default.md).
+[`../../internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`](../../internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md).
 Those document it as a **throughput** tax; this doc records that on a
 long-running allocation-heavy class it is also a **correctness** failure — the
 process dies with an `OutOfMemoryError` on a half-empty heap.

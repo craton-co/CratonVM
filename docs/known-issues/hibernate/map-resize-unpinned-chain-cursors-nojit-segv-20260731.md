@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔴 OPEN — real VM defect, root cause located, fix not landed. |
+| **Status** | 🔴 **STILL OPEN.** The `map_resize_inner` pin refactor this doc called for is now landed and closes a genuine GC-safety hole — but it does **NOT** stop the SIGSEGV. See "Follow-up 2026-07-31" at the bottom: a second corruptor, in the *put* path, is the dominant one. |
 | **ID** | `HIB-MAPRESIZE-STALE.1` |
 | **Found** | 2026-07-31, while validating the `DefaultCatalogAndSchemaTest` runner accommodation (see [`../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md)). |
 | **Repro** | `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` under `--nojit`, `--Xmx 1500m`, real JDK. SIGSEGV (rc=139) at ~17–20 min, three for three. |
@@ -129,6 +129,115 @@ resize), the change is ~50 lines of pin plumbing, and each validation cycle is a
 10-minute build plus a ~50-minute run. It deserves its own change with its own
 `CRATONVM_DBG_GC_STRESS` reproducer rather than being folded into an unrelated
 harness fix.
+
+## Follow-up 2026-07-31 — the refactor landed; the crash did not go away
+
+`codex/fix-map-resize-stale-cursors-20260731` implements the pinning described
+above, across the split walk, the cycle fallback and the legacy rebuild path,
+and additionally re-reads `this`/`new_buckets` before the publication writes
+(they were pinned once before `alloc_ref_array` and never refreshed, so the
+final `set_field_volatile(this, MAP_FIELD_BUCKETS, ..)` could itself target a
+pre-move address). It is non-regressive: `regression-suite/run.sh` reports
+19 passed / 0 failed, all HotSpot-diffed, including a new `RMapResizeGc`.
+
+**The mechanism above needs one correction.** The receivers read
+`num_slots=0 class_id=ClassId(0)` — *zeroed* memory, not merely relocated
+memory. `native_pin_roots` is both enumerated as a GC root
+(`vm/src/memory/roots.rs:229`) and remapped after a collection
+(`vm/src/memory/gc.rs:602`), so an unpinned cursor is not just stale, it is
+**not a root at all**: once the walk rewrites a predecessor's `NEXT`, the
+detached "high" partition is reachable *only* from the native locals, and a
+collection there **reclaims it outright**. That is what produces the zeroed
+receiver, and it is why pinning (which roots *and* remaps) is the right fix.
+
+**But the SIGSEGV survives the fix.** A/B on the reproducer, both arms from the
+same tree, run concurrently on the same host:
+
+| arm | outcome | drops | backtraces | tests reached |
+|---|---|---|---|---|
+| baseline | SIGSEGV rc=139 @ ~36 min | 0 | 0 | 94/132 |
+| + pin refactor | SIGSEGV rc=139 @ ~29 min | 91 | 6 | 74/132 |
+
+Read this table carefully rather than optimistically:
+
+- The baseline logged **zero** drops this run, so it yields **no** drop-site
+  distribution to compare against. The earlier claim that the refactor removes
+  `map_resize_inner` from the corrupt-write sites is **not supported** by this
+  A/B — it is merely absent from the fixed arm's 6 sampled backtraces.
+- Run-to-run variance is enormous: drop counts across five runs of this
+  reproducer have been 0, 91, 174, 375 and 606, and tests-reached 74–104.
+  Single runs cannot settle anything subtle here; the 74-vs-94 difference is
+  inside that band and should not be read as the fix hurting.
+- The one sampled site in the fixed arm is
+  `native_map_put_evict_pinned` (`native-collections/src/lib.rs`), reached from
+  `native_chm_put`, which matches the earlier baseline's 3-of-5 majority.
+
+**Prime remaining suspect** — `native_map_put_evict_pinned`'s chain walk. It
+assigns `tail_node = Some(node)` at the top of each iteration and refreshes it
+after each `map_keys_equal` (arbitrary Java `equals()`, a GC point) — but the
+walk also calls `map_resize` *before* it, and `buckets`/`idx` are computed
+around that call. Pinning `tail_node` at the end (as the code does) cannot help
+if the value pinned was already stale, or if the bucket array it was reached
+through was replaced by the resize. That is the next thing to instrument, with
+`CRATONVM_DBG_BLOCKGC` (its pin-time canary fires exactly on "pinned an
+already-forwarded address", naming the upstream culprit).
+
+**Do not close this doc on the strength of the landed refactor.**
+
+## Follow-up 2 — 2026-07-31: relocation is RULED OUT as the mechanism
+
+Went after `native_map_put_evict_pinned` as this doc directed. The most useful
+result is a **negative** one, and it invalidates the framing used above.
+
+**The corrupt receiver is `tail_node`.** Every drop from this site reports
+`index=3`, and `NODE_FIELD_NEXT == 3`, so the failing store is the tail-append
+`set_field(t, NODE_FIELD_NEXT, Some(new_node))` — `t` is the `tail_node` the
+chain walk produced.
+
+**But `tail_node` is not stale.** A full failing run (`CRATONVM_DBG_BLOCKGC=1`,
+SIGSEGV rc=139, 93/132 tests) recorded **zero** `[blockgc] PIN-STALE` hits.
+That canary fires whenever *any* `pin_native_root` receives an already-forwarded
+address — precisely the "pinned a stale value, so the pin preserved the
+staleness" failure hypothesised above. Not one fired, anywhere in the process,
+across the whole run.
+
+That rules out the entire stale-`ObjectRef` family for this crash:
+
+- `tail_node` is pinned before `alloc_object` and re-read from that pin
+  immediately before the store, and `native_pin_roots` is a genuine GC root, so
+  it cannot be collected *after* the pin either.
+- With no forwarding recorded anywhere, it was not silently pre-stale when
+  pinned.
+
+**So `tail_node` was already a dead, zeroed node when the walk read it out of
+the chain.** `native_map_put_evict_pinned` is a *victim* site, not the source:
+something reclaims a node that is still linked into a live bucket chain, and
+this store is merely where the damage first becomes visible. Chasing this
+function further is chasing a symptom.
+
+**Where to look next.** The source is a *rooting/liveness* defect, not a
+staleness one, so the tooling has to change:
+
+- `CRATONVM_DBG_BLOCKGC`'s pin-time canary only sees relocation — wrong
+  detector.
+- A `CRATONVM_DBG_GC_STRESS` probe is also wrong unless moving-young actually
+  engages: one built for this reported `moving_young: cycles=0
+  coverage_fallbacks=0`, i.e. the mechanism never ran, so its passing on an
+  *unfixed* binary proved nothing (kept as `regression-suite/src/RMapResizeGc.java`
+  for its HotSpot-diffed coverage, but it is NOT a reproducer).
+- What is wanted is a liveness/ownership assertion: mark nodes at link time and
+  check at sweep time that nothing reachable from a live bucket array is being
+  reclaimed.
+
+**Also landed (hardening, NOT the fix): `HIB-MAPPUT-PINORDER.1`.**
+`native_map_put_evict` and `native_hashmap_put_exact` copy `key_val`/`value` out
+of `args` into bare locals, then call `materialize_hm_int_fast` — which re-puts
+every side-stored entry through `native_map_put_evict_pinned`, allocating a node
+each, so it can collect — and only pin them *afterwards*. Pinning after a
+collection roots an already-stale address. Given the canary result this is
+**latent, not live** on the collector that actually runs today, but it becomes
+live the moment moving-young engages (its own open doc). Fixed by pinning across
+the materialisation and re-reading after it.
 
 ## Related
 
