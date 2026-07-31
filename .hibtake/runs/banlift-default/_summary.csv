@@ -1,6 +1,0 @@
-"Class","Status","WallSec","Exit","Result"
-"LockTest","FAIL","34,5",,"@@RESULT org.hibernate.orm.test.jpa.lock.LockTest found=23 started=15 ok=14 failed=1 aborted=0 skipped=8 ms=33271"
-"OffsetDateTimeTest","TIMEOUT","901","-1",""
-"ZonedDateTimeTest","NORESULT","663,3",,
-"ASTParserLoadingTest","PASS","375,9",,"@@RESULT org.hibernate.orm.test.hql.ASTParserLoadingTest found=106 started=106 ok=106 failed=0 aborted=0 skipped=0 ms=375081"
-"OracleInlineMutationStrategyIdTest","PASS","322,2",,"@@RESULT org.hibernate.orm.test.bulkid.OracleInlineMutationStrategyIdTest found=6 started=6 ok=6 failed=0 aborted=0 skipped=0 ms=321518"

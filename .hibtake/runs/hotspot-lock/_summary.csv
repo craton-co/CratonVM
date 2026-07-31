@@ -1,2 +1,0 @@
-"Class","Status","WallSec","Exit","Result"
-"LockTest","FAIL","10,8",,"@@RESULT org.hibernate.orm.test.jpa.lock.LockTest found=23 started=15 ok=14 failed=1 aborted=0 skipped=8 ms=10269"

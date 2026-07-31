@@ -1,2 +1,0 @@
-"Class","Status","WallSec","Exit","Result"
-"OffsetDateTimeTest","FAIL","717",,"@@RESULT org.hibernate.orm.test.type.temporal.OffsetDateTimeTest found=488 started=488 ok=323 failed=1 aborted=164 skipped=0 ms=715892"

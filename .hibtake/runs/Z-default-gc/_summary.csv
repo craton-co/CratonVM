@@ -1,2 +1,0 @@
-"Class","Status","WallSec","Exit","Result"
-"ZonedDateTimeTest","PASS","306,2",,"@@RESULT org.hibernate.orm.test.type.temporal.ZonedDateTimeTest found=608 started=608 ok=404 failed=0 aborted=204 skipped=0 ms=305683"

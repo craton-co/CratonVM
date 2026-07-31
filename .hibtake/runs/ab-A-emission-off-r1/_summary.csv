@@ -1,2 +1,0 @@
-"Class","Status","WallSec","Exit","Result"
-"ASTParserLoadingTest","PASS","189",,"@@RESULT org.hibernate.orm.test.hql.ASTParserLoadingTest found=106 started=106 ok=106 failed=0 aborted=0 skipped=0 ms=188536"
