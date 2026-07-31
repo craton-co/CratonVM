@@ -72,6 +72,41 @@ The missing-native outputs answer "what did this workload actually request?"
 The complete registry answers "what could this binary provide?" Preserve both
 when reporting a compatibility gap.
 
+`--dump-native-registry` writes `"schema_version": 2`. Alongside the
+intrinsic/bridge/synthetic-stub kind, every row carries the `register()` call
+site (`registered_by`), the kind that registration replaced in place
+(`overwrote`) and this run's dispatch count (`invocations` — dispatches, not
+registrations, and a lower bound because some warm and compiled dispatch paths
+carry no slot handle to count from). `real_declaring_method` is present but is
+currently always `null`. Rows are sorted for byte-stable output, so the file
+diffs cleanly against a committed baseline. See [Native
+Methods](../internals/native-methods.md#the-native-registry-census-schema-2).
+
+### Compatibility-substitution census
+
+The native audit says what the VM can provide. A second family says what it had
+to *substitute* — classes fabricated without real bytes, and synthetic-stub
+natives registered or dispatched:
+
+```bash
+cratonvm --dump-class-origins origins.json ...
+cratonvm --jdk-only-report jdk-only.json ...
+cratonvm --trace-jdk-only --explain-jdk-only ...
+```
+
+None of these require `--jdk-only`; under the default policy they record what a
+strict run *would* have rejected, which makes them a measurement rather than a
+post-mortem. Both files are written even when the run fails, and both are
+sorted so they can be committed as a baseline and diffed release over release.
+`--trace-jdk-only` polls the violation logs after VM construction and at
+shutdown rather than hooking each recording site, so mid-run class-origin
+violations appear at shutdown.
+
+Keep `--explain-jdk-only` **off** for any artifact leaving the host: it
+disables the path redaction that otherwise rewrites absolute filesystem paths
+in all three report files. See [JDK-Only
+Mode](../user-guide/jdk-only-mode.md).
+
 ### JIT isolation
 
 Run the same deterministic reproduction with and without compilation:
@@ -100,6 +135,8 @@ incident/
   jit.out              deterministic JIT run
   nojit.out            matching --nojit run
   missing-natives.json optional native audit
+  origins.json         optional class-origin census
+  jdk-only.json        optional compatibility-substitution report
   recording.jfr        optional, access-controlled
   reproducer/          minimal source/classes and invocation
 ```
