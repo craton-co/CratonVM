@@ -116,8 +116,8 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   each found "a few more" and none had a completion signal; the fourth changed the
   representation: all 344 `pin_native_root` / `read_native_pin` / `unpin_native_roots` calls are
   gone, replaced by `NativeHandleScope` / `NativeHandle`; config sets are walked by index out of
-  the rooted set; a guard test keeps the raw API out. Twelve further live unrooted sites were
-  fixed on the way through. Full write-up:
+  the rooted set; a guard test keeps the raw API out. Eleven further groups of live unrooted sites
+  (~29 functions) were fixed on the way through. Full write-up:
   `docs/internal/fixed-suite-bugs/hibernate/antlr-native-roots-moving-young-hql-misparse-20260730-FIXED.md`.
 
 ## Open

@@ -101,8 +101,9 @@ recommended:
 
 ### Defects found while converting
 
-Each of these is a reference read *after* a call that can collect. All were
-live on `dev` at 2026-07-31 (`a31a8a93f`), i.e. they survived both 07-30 passes.
+Each row is a reference read *after* a call that can collect; several cover a
+family of functions with the same shape (~29 functions in total). All were live
+on `dev` at 2026-07-31 (`a31a8a93f`), i.e. they survived both 07-30 passes.
 
 | Site | Defect |
 |---|---|
@@ -168,12 +169,13 @@ where it passes.
    `cycles=0` under `--nojit` is expected and says nothing either way. Anyone
    extending this work should first establish a configuration in which the
    verifier actually reports, and treat the GC-stress lever as unproven until
-   then — see [[reference_inert_lever_is_not_an_elimination]].
+   then: a lever that provably moves nothing is not an elimination.
 
 The value of this change therefore rests on the other half, which does not
-depend on provoking the race: the defect class can no longer be written, and the
-twelve concrete unrooted sites in the table above — every one of them a live
-"read after a collection point" on `dev` at `a31a8a93f` — are fixed. A clean
+depend on provoking the race: the defect class can no longer be written, and
+every site in the table above — eleven defect groups spanning ~29 functions,
+all of them live "read after a collection point" bugs on `dev` at `a31a8a93f` —
+is fixed. A clean
 corpus was never going to be proof that none were left; making the pattern
 unrepresentable is.
 
