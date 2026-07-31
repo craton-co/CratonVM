@@ -242,6 +242,23 @@ struct Lowerer<'a> {
     /// so the collector can tell which `OopMapEntry` describes this frame right
     /// now, rather than unioning every map in the method (unsound to relocate).
     sp_id_slot_off: i32,
+    shadow_thread_slot_off: i32,
+    shadow_savebase_slot_off: i32,
+    /// `get_current_thread` helper; `0` when unwired (the JIT unit tests' stub
+    /// table). Every shadow site is gated on it — dereferencing a thread
+    /// pointer that was never fetched would read stack garbage.
+    get_current_thread: usize,
+    /// Byte offset of the `ShadowStack` within `JvmThread`.
+    shadow_off_in_thread: i32,
+    /// Offsets pushed by the safepoint most recently emitted, consumed by the
+    /// matching reload. Cleared on consumption so an unbalanced push cannot
+    /// hand stale homes to a later reload.
+    pending_shadow: Vec<i16>,
+    /// Byte span of the prologue's `get_current_thread` fetch, so it can be
+    /// NOP-ed out when the method turns out never to publish.
+    thread_fetch_span: Option<(usize, usize)>,
+    /// Did any safepoint actually emit a shadow push?
+    shadow_pushed_any: bool,
     /// Byte size of the Java-locals region, for the published `FrameLayout`.
     locals_size: i32,
     /// First operand-spill offset, i.e. the exclusive top of the reserved
@@ -377,8 +394,9 @@ impl<'a> Lowerer<'a> {
         // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
         let locals_size = (num_locals as i32) * 8;
         let context_size = if needs_context { 8 } else { 0 };
-        // One extra reserved slot for the safepoint id (see below).
-        let sp_id_size = 8i32;
+        // Three extra reserved slots: the safepoint id, the cached
+        // `*mut JvmThread`, and the shadow stack's base `top` for this push.
+        let sp_id_size = 8i32 * 3;
         let spill_size = (max_nodes as i32) * 8;
         let args_stage_size = (max_call_args as i32) * 8;
         let shadow = 32i32;
@@ -426,9 +444,16 @@ impl<'a> Lowerer<'a> {
         // reads `[rbp - cm.sp_id_slot_off]` and matches it against `oop_maps`
         // to find the map for the ACTIVE safepoint — a union-of-all-maps is
         // unsound for relocation. Zero would mean "no slot", so ids start at 1.
-        let sp_id_slot_off = (num_locals as i32 + 1 + if needs_context { 1 } else { 0 }) * 8;
-        let first_spill =
-            (num_locals as i32 + 2 + if needs_context { 1 } else { 0 }) * 8;
+        let base = num_locals as i32 + 1 + if needs_context { 1 } else { 0 };
+        let sp_id_slot_off = base * 8;
+        // Cached thread pointer, fetched once in the prologue. The shadow push
+        // and reload both need it and neither may call out to get it.
+        let shadow_thread_slot_off = (base + 1) * 8;
+        // The `top` this push started from. The reload restores from exactly
+        // here, so an intervening unbalanced push cannot drift it (the
+        // single-pass backend's spring-bug-10 fix; same hazard applies here).
+        let shadow_savebase_slot_off = (base + 2) * 8;
+        let first_spill = (base + 3) * 8;
         let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
         let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
 
@@ -460,6 +485,13 @@ impl<'a> Lowerer<'a> {
             needs_context,
             context_slot_off,
             sp_id_slot_off,
+            shadow_thread_slot_off,
+            shadow_savebase_slot_off,
+            get_current_thread: helpers.get_current_thread,
+            shadow_off_in_thread: helpers.shadow_stack_offset_in_thread as i32,
+            pending_shadow: Vec::new(),
+            thread_fetch_span: None,
+            shadow_pushed_any: false,
             locals_size,
             first_spill,
             oop_maps: Vec::new(),
@@ -580,8 +612,6 @@ impl<'a> Lowerer<'a> {
         // Distinguish them, because the first is complete coverage and the
         // second is a refusal.
         let mut coverable = true;
-        // Read only by the pending publication step; see the map below.
-        let _ = &coverable;
         let mut slots: Vec<i16> = Vec::new();
         for id in 0..self.defined_nodes.len() {
             if !self.defined_nodes[id] || self.graph.nodes[id].ty != IrType::Ref {
@@ -608,41 +638,30 @@ impl<'a> Lowerer<'a> {
         self.buf.emit(&(-self.sp_id_slot_off).to_le_bytes());
         self.buf.emit(&id.to_le_bytes());
 
+        // Publish, and only then claim coverage. `emit_shadow_push` returns
+        // false when the thread helper is unwired or there is nothing to
+        // publish; an oop-free safepoint is still complete coverage, so the
+        // claim below requires `coverable` AND (published OR nothing to
+        // publish).
+        let published = self.emit_shadow_push(&slots);
+        self.shadow_pushed_any |= published;
+        self.pending_shadow = if published { slots.clone() } else { Vec::new() };
+        let complete = coverable && (published || slots.is_empty());
+
         self.oop_maps.push(super::OopMapEntry {
             // The relocation path matches on the id in the frame slot, not on
             // this; `close_safepoint_map` fills it once the call is emitted.
             native_pc_offset: 0,
             bytecode_pc: id,
             frame_slot_offsets: slots,
-            // DELIBERATELY `false` — the map above is necessary but not
-            // sufficient, and claiming otherwise would be a lie the collector
-            // acts on.
-            //
-            // `moving_young_coverage_complete` asserts that the shadow stack
-            // has been PUBLISHED with every live oop of this frame, not merely
-            // that we can name their slots. `conservative_roots` checks the
-            // claim by scanning the frame band for any relocatable word absent
-            // from `published_shadow_values` — and the IR backend pushes
-            // nothing to the shadow stack, so every such word is absent.
-            //
-            // Setting `true` here was measured and reverted: it makes the
-            // verifier skip its cheap early-out and run the full band scan on
-            // every live frame at every collection, only to reject
-            // (`compiled-frame-oop-not-published`). On `ZonedDateTimeTest` that
-            // took a 302 s pass to a >1200 s timeout while still never
-            // relocating. Worse, it was only ever *safe* because the band scan
-            // happened to catch the false claim — soundness resting on a
-            // verifier catching a lie the producer told, rather than on the
-            // producer telling the truth.
-            //
-            // What remains, and it is the whole of it: emit the shadow push
-            // before each safepoint and the reload after, over exactly the
-            // offsets in `frame_slot_offsets` (mirroring
-            // `x64::emit_shadow_push` / `emit_shadow_reload`), then set this to
-            // `coverable`. Everything else the contract needs — the sp-id slot
-            // and its store, the per-safepoint map, the frame layout, the
-            // zeroed `Ref` phi slots — is in place and exercised below.
-            moving_young_coverage_complete: false,
+            // The claim the collector acts on: the shadow stack HAS been
+            // published with every live oop of this frame, so each can be
+            // rewritten in place. Requires both halves — `coverable` (every
+            // live `Ref` slot could be named) and `published` (the push was
+            // actually emitted). Naming the slots alone is not enough:
+            // `scan_oop_slots` yields `ObjectRef` values, which mark but cannot
+            // be written back through.
+            moving_young_coverage_complete: complete,
             live_frame_hi: live_hi,
         });
     }
@@ -790,8 +809,151 @@ impl<'a> Lowerer<'a> {
             }
             self.store_abi_reg(abi_regs[abi_idx], ((i as i32) + 1) * 8); // local_offset(i)
         }
+        self.fetch_current_thread();
         self.zero_ref_phi_slots();
     }
+
+    /// Cache `*mut JvmThread` in its reserved slot.
+    ///
+    /// Emitted AFTER the ABI parameter stores: the helper clobbers the
+    /// caller-saved registers the parameters arrive in, and by this point they
+    /// are already in frame slots. A zero helper address (the JIT unit tests'
+    /// stub table) leaves the slot untouched, and every shadow site is gated on
+    /// the same condition, so such a method is consistently untracked rather
+    /// than dereferencing a pointer that was never fetched.
+    fn fetch_current_thread(&mut self) {
+        if self.get_current_thread == 0 || self.shadow_thread_slot_off <= 0 {
+            return;
+        }
+        let start = self.buf.pos();
+        self.emit_mov_reg_imm64(RAX, self.get_current_thread as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        self.store_rax(self.shadow_thread_slot_off);
+        self.thread_fetch_span = Some((start, self.buf.pos()));
+    }
+
+    /// Lazy prologue: erase the thread fetch when nothing published.
+    ///
+    /// The fetch is a `CALL` on the ENTRY path of every IR method, and most
+    /// methods publish nothing — they hold no live reference across a call, or
+    /// make no call at all. Paying a helper call per invocation for a slot that
+    /// is then never read is what made the first publication attempt regress
+    /// `ZonedDateTimeTest` 302 s -> >1200 s while leaving shallow-stack
+    /// `ASTParserLoadingTest` untouched: the cost scales with how often methods
+    /// are ENTERED, not with stack depth.
+    ///
+    /// The single-pass backend solves this the same way (`shadow_pushed_any`).
+    /// Overwriting with `0x90` rather than shifting the body keeps every
+    /// already-recorded offset — branch patches, deopt points, oop-map native
+    /// pcs — valid, which is why this is an erase and not a removal.
+    fn finish_lazy_thread_fetch(&mut self) {
+        if self.shadow_pushed_any {
+            return;
+        }
+        if let Some((start, end)) = self.thread_fetch_span.take() {
+            for off in start..end {
+                let _ = self.buf.try_patch_byte(off, 0x90);
+            }
+        }
+    }
+
+    /// Publish every live oop of this safepoint onto the thread's shadow stack,
+    /// so a relocating collector can rewrite each one in place.
+    ///
+    /// This is the half that `moving_young_coverage_complete` actually asserts.
+    /// The oop map names the slots; only this makes them *rewritable*, because
+    /// `scan_oop_slots` yields `ObjectRef` values (marking roots) while
+    /// `published_shadow_values` yields the homes the collector writes back to.
+    ///
+    /// Registers: R10 (thread), R11 (running top), RCX (value temp). All
+    /// caller-saved and free here — this runs at the top of the `Op::Call` arm,
+    /// before any argument staging or ABI register loading.
+    ///
+    /// Returns whether the push was actually emitted.
+    fn emit_shadow_push(&mut self, offsets: &[i16]) -> bool {
+        if self.get_current_thread == 0
+            || self.shadow_thread_slot_off <= 0
+            || self.shadow_savebase_slot_off <= 0
+            || offsets.is_empty()
+        {
+            return false;
+        }
+        let ss_top = self.shadow_off_in_thread;
+        // MOV R10, [rbp - thread_slot]
+        self.buf.emit(&[0x4C, 0x8B, 0x95]);
+        self.buf.emit(&(-self.shadow_thread_slot_off).to_le_bytes());
+        // TEST R10, R10 ; JE skip  — a null thread means "untracked", exactly
+        // as in the single-pass backend; the reload's guard is symmetric.
+        self.buf.emit(&[0x4D, 0x85, 0xD2]);
+        self.buf.emit(&[0x0F, 0x84]);
+        let skip = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // MOV R11, [R10 + ss_top]      (current top)
+        self.buf.emit(&[0x4D, 0x8B, 0x9A]);
+        self.buf.emit(&ss_top.to_le_bytes());
+        // MOV [rbp - savebase], R11    (base of THIS push)
+        self.buf.emit(&[0x4C, 0x89, 0x9D]);
+        self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        for &off in offsets {
+            // MOV RCX, [rbp - off] ; MOV [R11], RCX ; LEA R11, [R11 + 8]
+            self.buf.emit(&[0x48, 0x8B, 0x8D]);
+            self.buf.emit(&(-(off as i32)).to_le_bytes());
+            self.buf.emit(&[0x49, 0x89, 0x0B]);
+            self.buf.emit(&[0x4D, 0x8D, 0x5B, 0x08]);
+        }
+        // MOV [R10 + ss_top], R11      (publish the new top)
+        self.buf.emit(&[0x4D, 0x89, 0x9A]);
+        self.buf.emit(&ss_top.to_le_bytes());
+        self.patch_rel32_to_here(skip);
+        true
+    }
+
+    /// Copy the (possibly rewritten) published values back into their frame
+    /// slots and retract `top`. Pairs with [`Self::emit_shadow_push`].
+    ///
+    /// Emitted immediately after the call returns — deliberately BEFORE the
+    /// result is stored. The single-pass backend uses RAX as its value temp,
+    /// which would collide with the return value and force this after the
+    /// store; RCX held an outgoing argument and is dead the instant the call
+    /// returns, so using it keeps RAX untouched and lets this sit at the one
+    /// choke point (`emit_call_return_check`) all dispatch routes share.
+    fn emit_shadow_reload(&mut self) {
+        let offsets = std::mem::take(&mut self.pending_shadow);
+        if self.get_current_thread == 0
+            || self.shadow_thread_slot_off <= 0
+            || self.shadow_savebase_slot_off <= 0
+            || offsets.is_empty()
+        {
+            return;
+        }
+        let ss_top = self.shadow_off_in_thread;
+        // MOV R10, [rbp - thread_slot] ; TEST ; JE skip  (mirrors the push)
+        self.buf.emit(&[0x4C, 0x8B, 0x95]);
+        self.buf.emit(&(-self.shadow_thread_slot_off).to_le_bytes());
+        self.buf.emit(&[0x4D, 0x85, 0xD2]);
+        self.buf.emit(&[0x0F, 0x84]);
+        let skip = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // MOV R11, [rbp - savebase]    (restore from THIS push's base, not the
+        // live `top`, so an unbalanced intervening push cannot drift it)
+        self.buf.emit(&[0x4C, 0x8B, 0x9D]);
+        self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        for &off in &offsets {
+            // MOV RCX, [R11] ; MOV [rbp - off], RCX ; LEA R11, [R11 + 8]
+            self.buf.emit(&[0x49, 0x8B, 0x0B]);
+            self.buf.emit(&[0x48, 0x89, 0x8D]);
+            self.buf.emit(&(-(off as i32)).to_le_bytes());
+            self.buf.emit(&[0x4D, 0x8D, 0x5B, 0x08]);
+        }
+        // MOV R11, [rbp - savebase] ; MOV [R10 + ss_top], R11  (retract top)
+        self.buf.emit(&[0x4C, 0x8B, 0x9D]);
+        self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        self.buf.emit(&[0x4D, 0x89, 0x9A]);
+        self.buf.emit(&ss_top.to_le_bytes());
+        self.patch_rel32_to_here(skip);
+    }
+
+
 
     /// Zero the frame slot of every `Ref`-typed phi, and mark those slots
     /// publishable.
@@ -1713,6 +1875,13 @@ impl<'a> Lowerer<'a> {
     /// spilled to `slot` (harmless for a void call: the slot is allocated but
     /// never read).
     fn emit_call_return_check(&mut self, slot: i32, ty: IrType) {
+        // The call has just returned. Copy back any relocated shadow values
+        // BEFORE anything else touches the frame — and before the sentinel
+        // compare below, which clobbers R10. Uses RCX, never RAX, so the return
+        // value in RAX is untouched (see `emit_shadow_reload`). This is the one
+        // site all three dispatch routes share; the self-recursive route does
+        // not reach here and does not publish.
+        self.emit_shadow_reload();
         self.emit_mov_reg_imm64(R10, i64::MIN as u64);
         self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
         if matches!(ty, IrType::Long | IrType::Double | IrType::Float) {
@@ -2420,6 +2589,16 @@ impl<'a> Lowerer<'a> {
                 // the whole compile. `lower_data_node` has no post-`match` code,
                 // so an early `return` here fully handles the node.
                 if unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind } == 4 {
+                    // This route bypasses `emit_call_return_check`, so nothing
+                    // would reload the published values afterwards and the
+                    // frame would keep pre-relocation addresses. Withdraw the
+                    // claim for this safepoint and drop the pending homes; the
+                    // collector then diverts to the non-moving sweep whenever
+                    // such a frame is live, which is correct if unambitious.
+                    if let Some(last) = self.oop_maps.last_mut() {
+                        last.moving_young_coverage_complete = false;
+                    }
+                    self.pending_shadow.clear();
                     self.emit_self_recursive_call(&node.inputs, slot, num_args);
                     return;
                 }
@@ -3555,6 +3734,7 @@ pub(crate) fn lower_inner(
     // dispatch site's sentinel `JE` reaches it.
     lowerer.emit_call_exc_stub();
 
+    lowerer.finish_lazy_thread_fetch();
     lowerer.patch_branches();
     // fib44-fix follow-up: patch direct self-recursive calls to the method entry.
     lowerer.patch_self_calls();
