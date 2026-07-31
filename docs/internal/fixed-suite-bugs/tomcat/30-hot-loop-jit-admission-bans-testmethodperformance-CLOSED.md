@@ -9,12 +9,11 @@ every `invokevirtual` from compiled code takes the generic dispatch helper. See
 [§ Adopted](#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32-and-where-they-went)
 for the measurement and the re-homing.
 
-Every admission ban this document names is settled and the "next lever" its
-last update identified is implemented — see
-[§ The three bans](#the-three-bans-and-how-each-ended). Two things this
-document asserted turned out to be wrong, and both are recorded there rather
-than quietly dropped: the per-pc local→location map it said ban 1b needed, and
-its claim that ban 2 had been lifted.
+Two things this document asserted turned out to be wrong, and both are recorded
+in [§ The three bans](#the-three-bans-and-how-each-ended) rather than quietly
+dropped: the per-pc local→location map it said ban 1b needed, and its claim
+that ban 2 had been lifted. A third — that 30.A/30.B are "codegen quality" —
+is corrected in § Adopted.
 
 Residual of [24](24-stringcache-oom-under-load-FIXED.md)
 (whose `OutOfMemoryError` is FIXED). Family of
@@ -605,20 +604,41 @@ full resolution *per call*:
 `internalGet` is declared **`final`**. It cannot be overridden, so it is
 trivially devirtualizable, and it still takes the generic path 99 373 times.
 
-Two things have to change before it stops:
+### The one prerequisite: `final` / CHA devirtualization
 
-1. **Direct JIT-to-JIT calls are globally OFF.**
-   `jit::direct_jit_callee_calls_enabled()` returns `false` whenever the moving
-   young generation is on, which is the default — tracked in
-   [`jit-raw-jit-to-jit-shadow-stack-overflow-20260731.md`](../../../known-issues/jit-raw-jit-to-jit-shadow-stack-overflow-20260731.md)
-   (OPEN: a shadow-stack push runs off the end of the 2 MiB buffer). Forcing it
-   with `CRATONVM_JIT_DIRECT_CALLEE_CALLS=force` is worth **1.8×** on the
-   Calendar path (`setThenGet` 58.7 → 32.4 µs) — real, and nowhere near enough.
-2. **Even with that gate open, `invokevirtual` cannot use it.** The direct path
-   admits only `invokestatic` and non-`<init>` `invokespecial` (`jit/src/lib.rs`,
-   the `ir_direct && (is_static || is_special)` guard). There is no `final` /
-   CHA devirtualization, so `Calendar.get` → `complete()` / `internalGet()` stays
-   generic either way. That is why forcing the gate bought 1.8× and not 100×.
+**`invokevirtual` cannot take the direct-call path at all.** That path admits
+only `invokestatic` and non-`<init>` `invokespecial` (`jit/src/lib.rs`, the
+`ir_direct && (is_static || is_special)` guard) — statically bound calls, where
+the resolved callee is the only possible target. A `final` method is *also* the
+only possible target, by JVMS guarantee, and is not admitted. So `Calendar.get`
+→ `complete()` / `internalGet()` takes the helper regardless.
+
+This was checked against the direct-call gate rather than assumed, and the first
+attempt was wrong — recorded because the mistake is the instructive part.
+
+The raw JIT-to-JIT gate (`direct_jit_callee_calls_enabled`) was closed under
+moving-young for most of this investigation, and forcing it open *appeared* to
+buy ~1.8× on the Calendar path. **That measurement did not survive.** It
+compared two different binaries. `dev` then fixed the underlying defect
+([`jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md`](../../jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md)
+— a `rel8` `JNE` in the PIC cascade silently truncated by `rel as u8`, landing
+inside the pre-call shadow-stack push) and reopened the gate by default. Re-run
+properly as a one-knob A/B on ONE binary, `CRATONVM_JIT_DIRECT_CALLEE_CALLS`
+default vs `=0`:
+
+| stage | gate on | gate off |
+|---|---|---|
+| `userVirtualGet` | 1 115 | 1 148 |
+| `userPolyVirtualGet` | 6 590 | 6 271 |
+| `calendarGet` | 16 611 | 19 485 |
+
+**No difference** — exactly what the guard above predicts, since none of these
+sites is static or special. (That run was on a host at 79-100% from other
+tenants, so read the columns against each other and not the absolutes.)
+
+So there is **one** prerequisite, not two: admit provably-monomorphic
+`invokevirtual` — `final` methods and `final` classes first, CHA after — to the
+direct-call path. Until then, the gate being open buys this family nothing.
 
 ### 30.A — `juli.TestOneLineFormatterPerformance.testDateFormat` (was 32.4)
 
@@ -659,7 +679,7 @@ Closing 30.A means `SimpleDateFormat.format` at ≲ 4.7 µs against today's 193 
 — **41×** — on a path whose per-call cost is 200-1000× HotSpot. That is the
 dispatch work above, not a fix to this test.
 
-**Re-homed to** [`jit-raw-jit-to-jit-shadow-stack-overflow-20260731.md`](../../../known-issues/jit-raw-jit-to-jit-shadow-stack-overflow-20260731.md)
+**Re-homed to** [`jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md`](../../jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md)
 (prerequisite 1) with the devirtualization gap (prerequisite 2) recorded there.
 
 ### 30.B — `TestAsyncMessagesPerformance`'s SEQ2 residual (was 32.3)

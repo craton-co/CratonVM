@@ -81,7 +81,7 @@ close to that probe's own 40 000 explicit invocations.)
 
 The cost is the generic-dispatch round trips the format performs. See
 [30 § Adopted](../../internal/fixed-suite-bugs/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32-and-where-they-went)
-and [raw JIT-to-JIT](../jit-raw-jit-to-jit-shadow-stack-overflow-20260731.md),
+and [raw JIT-to-JIT](../../internal/jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md),
 which now carries that work.
 
 So: fix this because a hot JDK method failing codegen is a real defect. Stop
