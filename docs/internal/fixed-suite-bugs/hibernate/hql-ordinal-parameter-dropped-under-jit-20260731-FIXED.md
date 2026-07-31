@@ -10,6 +10,24 @@ JIT mode, 1 failure in 14 runs (2026-07-31, `cratonvm-antlrfix-20260731.exe`).
 
 **Fixed on:** `fix/hib-hql-ordinal-param-20260731`.
 
+## Acceptance
+
+| | runs | `ASTParserLoadingTest` | `ordinal parameters []` |
+| --- | --- | --- | --- |
+| baseline (dev tip) | 24 (22 valid) | **103/106 on every one** | 0 |
+| after the fix | 24 | **106/106 on 18**; 105/106 on the other 6 | 0 |
+
+HotSpot runs the class 106/106 in 18.8s, so 106 is the right target.
+
+The six 105/106 runs were one round, all failing the *same* test
+(`testJpaTypeOperator`) with the *same* cause — JUnit's 120s per-test timeout —
+while a full `cargo build` saturated all 32 cores alongside six concurrent VMs.
+Those runs took 761s against ~600s for every other round, and the rounds before
+and after them were 6/6 clean on the same binary. That is host load, not a
+regression; the same round is the only place a rare
+`NoSuchMethodError: java/lang/Integer.getTypeName()` warning appeared (recovered,
+no test failed), and it too is absent from every unloaded round.
+
 ## Symptom as reported
 
 ```
