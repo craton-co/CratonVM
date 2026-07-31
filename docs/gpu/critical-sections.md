@@ -122,14 +122,37 @@ which are pre-existing:
    that lets a collection run while a submission is in flight — including
    a naive "time out and collect anyway" — makes those references stale.
    *This is why timeout must not mean "proceed".*
-2. **`input_cache` is an `ObjectRef`-keyed table with no remap**
-   (`offload.rs:3477`). The code admits it: *"a GC between submits that
-   moves an array's payload would invalidate the device buffer's mirror
-   without us noticing"* (`offload.rs:3449-3455`). This is exactly the
-   `HashMap<ObjectRef, _>` hazard of the `ObjectRef` contract §7 item 3,
-   and it is **not** covered by the critical section, because it survives
-   *across* submissions when no token is held. Out of scope here;
-   reported separately.
+2. ~~**`input_cache` is an `ObjectRef`-keyed table with no remap**~~ —
+   **CLOSED** on `dev`. This was the `HashMap<ObjectRef, _>` hazard of
+   the `ObjectRef` contract §7 item 3, and it was **not** covered by the
+   critical section, because the entries survive *across* submissions
+   when no token is held.
+
+   `input_cache::remap_and_sweep` now runs once per collection from
+   `memory::gc::update_all_roots`, re-keying relocated survivors and
+   dropping entries whose array died. Three details worth carrying
+   forward, because the obvious fix gets each of them wrong:
+
+   - It is **not** an `external_roots`/`native_roots` provider. Both
+     registries are driven from *after* `update_all_roots`' empty-
+     `pointer_map` early return, so a provider's `remap` never fires on
+     a non-moving collection — and objects still die on that path. The
+     call sits before the early return, next to
+     `smuggled_longs::remap_and_sweep`.
+   - The **dead** entry, not the moved one, was the real hazard. A moved
+     key only costs a miss and a re-upload; a dead key sits over an
+     address the allocator immediately reuses, so a later array collides
+     with it and the kernel reads another array's device buffer. The
+     `element_type`/`len` guard does not separate that from a genuine
+     hit when the shapes match, which for a kernel argument list is the
+     common case.
+   - The cache is deliberately **not** a GC root. An array reachable
+     only from a cache entry can never be named by a future submit, so
+     rooting it would make the cache an immortality set rather than keep
+     anything useful alive. This is consistent with §2.3's own argument:
+     the device holds no heap address, so only the *key* needs fixing.
+
+   The generic mechanism is `vm/src/memory/addr_keyed.rs`.
 3. If any future path adopts unified memory, zero-copy mapping, or pinned
    host staging aliased to the heap, the device *will* hold a heap
    address, and keep-alive stops being sufficient. The new API forces that
@@ -235,9 +258,10 @@ stale `ObjectRef`.
 | 4 | **VM shutdown mid-submission** — `finalize_enqueued_handle` does `let Some(shared) = weak_vm.upgrade() else { return; }` (`offload.rs:2102-2105`). Nothing else ever drains `SUBMISSIONS` (`offload.rs:1916`); `release_submission` (`:1950`) is only called from Java-driven paths; `REAPER_SHUTDOWN` (`:2018`) is **never stored `true`** anywhere. | **OPEN — and the worst one.** The `FinalizeState`, and with it the `GcCriticalGuard`, is never dropped. `GPU_CRITICAL_COUNT` stays ≥ 1 **for the rest of the process**, so *every subsequent VM in that process can never collect*. The `REAPER_QUEUE` comment (`offload.rs:1993-2010`) documents that multi-`SharedVm` processes are real and that real-hardware validation already caught a related bug on this exact path. | **Closed** by `Registry::shutdown_vm(vm_id)`, which revokes and releases exactly that VM's tokens and leaves a concurrently-live VM's alone. Requires the one-line call from VM teardown listed in §7. |
 | 5 | **A submission that never completes** — a wedged kernel, or a submission whose host callback never fires and which no Java thread ever polls. `finalize_submission`'s `event.synchronize()` (`offload.rs:2925`) blocks indefinitely by CUDA contract. | **OPEN.** Guard held forever; collector spins forever. | **Closed** by the lease: `reap_expired` revokes it after 30 s, names the holder at `error` level, and lets the wait drain. |
 
-A sixth, adjacent finding that is **not** a token leak and is **not**
-closed here: `input_cache` is an `ObjectRef`-keyed table with no post-GC
-remap (§2.3 caveat 2).
+A sixth, adjacent finding that is **not** a token leak: `input_cache` was
+an `ObjectRef`-keyed table with no post-GC remap. Not closed by this
+work — it is orthogonal to token ownership — but closed separately on
+`dev`; see §2.3 caveat 2.
 
 ---
 
