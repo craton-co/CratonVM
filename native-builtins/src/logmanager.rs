@@ -1082,36 +1082,45 @@ fn native_jul_logger_get_resource_bundle(
 
 /// Test-only helper: wipe the singleton + logger registry so tests
 /// don't see state bleed between parallel threads.
+/// VM identity the crate's own tests run under.
+///
+/// The side tables below are per-VM (see `per_vm_table`), keyed by
+/// `NativeContext::vm_identity`. These tests drive mock contexts, which take
+/// the trait's default identity of 0, so that is the scope their assertions
+/// and `reset_state_for_tests` must look at.
+#[cfg(test)]
+const TEST_VM: usize = 0;
+
 #[cfg(test)]
 pub(crate) fn reset_state_for_tests() {
-    if let Ok(mut g) = singleton_cell(vm).lock() {
+    if let Ok(mut g) = singleton_cell(TEST_VM).lock() {
         *g = None;
     }
-    if let Ok(mut r) = logger_registry(vm).lock() {
+    if let Ok(mut r) = logger_registry(TEST_VM).lock() {
         r.clear();
     }
-    if let Ok(mut r) = tomcat_juli_logger_registry(vm).lock() {
+    if let Ok(mut r) = tomcat_juli_logger_registry(TEST_VM).lock() {
         r.clear();
     }
-    if let Ok(mut r) = tomcat_juli_root_handler_registry(vm).lock() {
+    if let Ok(mut r) = tomcat_juli_root_handler_registry(TEST_VM).lock() {
         r.clear();
     }
-    if let Ok(mut h) = logger_handlers(vm).lock() {
+    if let Ok(mut h) = logger_handlers(TEST_VM).lock() {
         h.clear();
     }
-    if let Ok(mut l) = config_listeners(vm).lock() {
+    if let Ok(mut l) = config_listeners(TEST_VM).lock() {
         l.clear();
     }
     if let Ok(mut m) = log_record_messages().lock() {
         m.clear();
     }
-    if let Ok(mut g) = jboss_log_context_singleton(vm).lock() {
+    if let Ok(mut g) = jboss_log_context_singleton(TEST_VM).lock() {
         *g = None;
     }
-    if let Ok(mut r) = jboss_logger_registry(vm).lock() {
+    if let Ok(mut r) = jboss_logger_registry(TEST_VM).lock() {
         r.clear();
     }
-    if let Ok(mut m) = attachments(vm).lock() {
+    if let Ok(mut m) = attachments(TEST_VM).lock() {
         m.clear();
     }
 }
@@ -6310,7 +6319,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            logger_handlers(vm)
+            logger_handlers(TEST_VM)
                 .lock()
                 .unwrap()
                 .get("org.example.capture")
@@ -6337,7 +6346,7 @@ mod tests {
             &[Value::Object(Some(logger)), Value::Object(Some(handler))],
         )
         .unwrap();
-        assert!(logger_handlers(vm)
+        assert!(logger_handlers(TEST_VM)
             .lock()
             .unwrap()
             .get("org.example.capture")
@@ -6668,7 +6677,7 @@ mod tests {
         // "d" and "d.e" as well, so the registry held 7 entries and
         // `getParent()` returned a logger HotSpot never creates.)
         {
-            let reg = logger_registry(vm)
+            let reg = logger_registry(TEST_VM)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let mut names: Vec<&str> = reg.keys().map(|k| k.as_str()).collect();
@@ -6677,7 +6686,7 @@ mod tests {
         }
         native_reset(&mut ctx, &[Value::Object(Some(mgr))]).unwrap();
         assert!(
-            logger_registry(vm)
+            logger_registry(TEST_VM)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty(),
@@ -6796,7 +6805,7 @@ mod tests {
             "bad names must not be cached (each call allocates a throw-away Logger)"
         );
         // Registry untouched.
-        assert!(logger_registry(vm)
+        assert!(logger_registry(TEST_VM)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty());
@@ -6947,30 +6956,30 @@ mod tests {
     /// `LogContext` singleton, and every attachment receiver/key/value).
     fn cached_addrs_snapshot() -> Vec<u64> {
         let mut v = Vec::new();
-        if let Some(a) = *singleton_cell(vm).lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(a) = *singleton_cell(TEST_VM).lock().unwrap_or_else(|e| e.into_inner()) {
             v.push(a);
         }
-        if let Some(a) = *jboss_log_context_singleton(vm)
+        if let Some(a) = *jboss_log_context_singleton(TEST_VM)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
         {
             v.push(a);
         }
         v.extend(
-            logger_registry(vm)
+            logger_registry(TEST_VM)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .values()
                 .copied(),
         );
         v.extend(
-            jboss_logger_registry(vm)
+            jboss_logger_registry(TEST_VM)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .values()
                 .copied(),
         );
-        for (&(this, key), &value) in attachments(vm)
+        for (&(this, key), &value) in attachments(TEST_VM)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
@@ -7023,7 +7032,7 @@ mod tests {
         assert!(!expected.is_empty(), "side-tables must be populated");
 
         let mut roots = Vec::new();
-        gc_scan_logmanager_roots(&mut roots);
+        gc_scan_logmanager_roots(TEST_VM, &mut roots);
         let root_addrs: std::collections::HashSet<u64> =
             roots.iter().map(|o| o.as_ptr() as u64).collect();
         for a in expected {
@@ -7084,7 +7093,7 @@ mod tests {
             pointer_map.insert(a as usize, base + (i + 1) * 0x1000);
         }
 
-        gc_update_logmanager_refs(&pointer_map);
+        gc_update_logmanager_refs(TEST_VM, &pointer_map);
 
         // Every stored address must now be the relocated target — no old
         // address may survive (that would be the use-after-free B4 flags).
@@ -7122,7 +7131,7 @@ mod tests {
         )
         .unwrap();
         let before = cached_addrs_snapshot();
-        gc_update_logmanager_refs(&std::collections::HashMap::new());
+        gc_update_logmanager_refs(TEST_VM, &std::collections::HashMap::new());
         let after = cached_addrs_snapshot();
         assert_eq!(
             before, after,
@@ -7151,7 +7160,7 @@ mod tests {
         // A pointer map that mentions only some unrelated address.
         let mut pm: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
         pm.insert(0xdead_beef, 0xfeed_face);
-        gc_update_logmanager_refs(&pm);
+        gc_update_logmanager_refs(TEST_VM, &pm);
         let after = cached_addrs_snapshot();
         assert_eq!(
             before, after,

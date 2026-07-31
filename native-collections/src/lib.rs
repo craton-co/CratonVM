@@ -47615,11 +47615,13 @@ mod tests {
                 last_ptr: 0x10,
                 generation: 0,
                 class_id: 7,
+                vm: 0,
             },
             ObjKeyEntry {
                 last_ptr: 0x20,
                 generation: 1,
                 class_id: 7,
+                vm: 0,
             },
         ];
         assert_eq!(next_generation(&two), 2);
@@ -47630,6 +47632,7 @@ mod tests {
             last_ptr: 0x20,
             generation: 1,
             class_id: 7,
+            vm: 0,
         }];
         assert_eq!(after_prune.len(), 1);
         assert_eq!(
