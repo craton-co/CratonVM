@@ -190,7 +190,7 @@ test-triage work — confirming they were never this branch's.
 
 ## 6. The `--nojit` HQL mis-parse, and where it ended up
 
-`docs/known-issues/hibernate/antlr-native-roots-moving-young-hql-misparse-20260730.md`
+`docs/internal/fixed-suite-bugs/hibernate/antlr-native-roots-moving-young-hql-misparse-20260730-FIXED.md`
 carries the full account. In short: the native ANTLR intrinsics held raw
 `ObjectRef` locals — and whole `Vec<ObjectRef>` config snapshots — across
 allocating calls, so a moving young collection linked dead addresses into the
