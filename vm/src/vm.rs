@@ -9071,8 +9071,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        // identityHashCode returns an Int value, and invoke_virtual wraps it as Value::Int
-        assert!(matches!(elem0, Value::Int(_)));
+        // `UnaryOperator.apply` returns `Ljava/lang/Object;`, so the int from
+        // `identityHashCode` comes back BOXED and the list stores a reference.
+        // The old comment ("invoke_virtual wraps it as Value::Int") described
+        // the dispatcher before it honoured the SAM's return descriptor.
+        assert!(
+            matches!(elem0, Value::Object(Some(_))),
+            "expected the operator's boxed result, got {elem0:?}"
+        );
     }
 
     #[test]
@@ -13616,7 +13622,12 @@ mod tests {
         )
         .unwrap();
         for v in [3, 1, 2] {
-            let w = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+            // Real `java.lang.Integer`s. `ClassId::new(0)` is no longer
+            // `java/lang/Object` — `SharedVm::new` pre-registers a bootstrap
+            // stub there — so these elements came out typed as
+            // `Enumeration$Impl` and the natural-order comparator's
+            // `Comparable` cast failed on them.
+            let w = alloc_receiver(&shared, &mut thread, "java/lang/Integer", 1);
             shared.mem.heap.set_field(w, 0, Value::Int(v));
             call_native(
                 &shared,
