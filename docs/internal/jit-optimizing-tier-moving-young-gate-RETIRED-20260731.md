@@ -211,11 +211,21 @@ because `shadow_stack_maps_enabled()` is
 `CRATONVM_SHADOW_STACK=1` back removes the crash. Filed as
 `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
 
-Meanwhile the same class on **default flags completes**, twice, 447 s and
-435 s, `found=608 started=608 ok=404 failed=0 aborted=204` — over the suite's
-300 s cap on a host carrying 30–50 load average from other tenants, but neither
-a timeout nor a failure. The residual as written ("TIMEOUT by default, passes
-under the flag") is now inverted in both halves.
+Meanwhile both classes **complete on default flags**, every run, correct:
+
+| class | lane | wall | result |
+|---|---|---:|---|
+| `ZonedDateTimeTest` | default | 447 s | `found=608 ok=404 failed=0 aborted=204` |
+| `ZonedDateTimeTest` | default | 435 s | same |
+| `ZonedDateTimeTest` | `NO_MOVING_YOUNG=1` | 3 s / 2 s | **SIGSEGV**, both runs |
+| `OffsetDateTimeTest` | default | 367 s | `found=488 ok=324 failed=0 aborted=164` |
+| `OffsetDateTimeTest` | default | 308 s | same |
+| `OffsetDateTimeTest` | `NO_MOVING_YOUNG=1` | 3 s / 1 s | **SIGSEGV**, both runs |
+
+Over the suite's 300 s cap on a host carrying 30–50 load average from other
+tenants, but neither a timeout nor a failure. **The residual as written —
+"TIMEOUT >900 s by default, passes under `CRATONVM_NO_MOVING_YOUNG=1`" — is now
+inverted in both halves.**
 
 Two further reasons this residual was never evidence:
 

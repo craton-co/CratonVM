@@ -90,6 +90,14 @@ so correctness is already at parity and only throughput is at issue.
 >    workload, so "the class passes with the flag" does not identify a
 >    moving-young cost by itself.
 >
+> Re-run 2026-07-31 on the same harness, two reps per class, default flags:
+> `ZonedDateTimeTest` **447 s and 435 s, `failed=0`**; `OffsetDateTimeTest`
+> **367 s and 308 s, `failed=0`**. Neither timed out. The
+> `CRATONVM_NO_MOVING_YOUNG=1` lane **SIGSEGV'd in 1–3 s on all four runs** —
+> on a pristine `origin/dev` build too, see
+> `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`. So the
+> table above is inverted in both halves as of today's dev.
+>
 > `ZonedDateTimeTest` is additionally **bimodal** with no VM change at all
 > (~300 s or >900 s — the eight-run table in
 > `docs/internal/jit-ir-relocation-map-contract.md`), so a one-sample-per-lane
