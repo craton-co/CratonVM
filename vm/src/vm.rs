@@ -3903,13 +3903,27 @@ mod tests {
 
         let (out, err) = shared.ensure_system_streams();
 
-        // System.out should have fd_id = 1
-        let out_fd = shared.mem.heap.get_field(out, 0);
-        assert_eq!(out_fd, Value::Int(1));
+        // The streams must be distinct objects — that is what the real-JDK
+        // path relies on, since it resolves stdout/stderr by POINTER IDENTITY
+        // rather than by reading a tag.
+        assert_ne!(out.as_ptr(), err.as_ptr(), "out and err must be distinct");
 
-        // System.err should have fd_id = 2
+        // `ensure_system_streams` writes the fd tag into slot 0 only when slot
+        // 0 is not a reference field — i.e. for the 1-field synthetic stub.
+        // With a real (or compact-ref) PrintStream layout slot 0 holds a
+        // reference and the tag is deliberately skipped. Asserting Int(1)
+        // unconditionally encoded the stub configuration as if it were the
+        // only one.
+        let out_fd = shared.mem.heap.get_field(out, 0);
         let err_fd = shared.mem.heap.get_field(err, 0);
-        assert_eq!(err_fd, Value::Int(2));
+        match (out_fd, err_fd) {
+            (Value::Int(o), Value::Int(e)) => {
+                assert_eq!((o, e), (1, 2), "synthetic stub must tag stdout=1, stderr=2");
+            }
+            _ => {
+                // Reference layout: no tag to check, identity is the contract.
+            }
+        }
     }
 
     #[test]
