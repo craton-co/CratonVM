@@ -369,8 +369,17 @@ pub fn shadow_stack_enabled() -> bool {
     // `JIT_PUBLISHES_RELOCATION_CONTRACT` and both were reverted together: the
     // scoping measured as no-change (see that function's comment), and moving
     // one side of this agreement is not worth doing for an unmeasurable win.
+    // `CRATONVM_JIT_MY_SHADOW_EMISSION=0` drops the moving-young implication on
+    // BOTH sides at once; see `jit::x64::shadow_emission_moving_implication_enabled`.
+    // This expression must stay character-for-character equivalent to the
+    // emission side's.
     *ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some()
+            || (moving_young_enabled()
+                && match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SHADOW_EMISSION") {
+                    Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                    Err(_) => true,
+                })
     })
 }
 
@@ -1647,20 +1656,54 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
     // frame bases, and live oops outside the published map.  Detecting one of
     // those after a cycle has started is necessarily too late to make a copied
     // from-space safe.  Keep JIT execution fully enabled, but require the
-    // non-moving young sweep whenever compiled artifacts exist until every JIT
-    // frame home is mechanically enumerable and rewritable.
+    // non-moving young sweep whenever an un-rewritable compiled frame is LIVE,
+    // until every JIT frame home is mechanically enumerable and rewritable.
     //
     // Interpreter-only executions retain copying young collections.  This is a
     // VM-wide GC/JIT safety boundary, deliberately not an ANTLR/Hibernate
     // exception or a JIT eligibility ban.
+    //
     // The same constant the JIT's relocation-safety admission gates read, so the
     // veto and those gates cannot drift apart: while it is `false` this veto is
     // in force and `x64::moving_young_relocates_compiled_frames()` is `false`,
     // which is exactly what makes those gates safe to scope. Flipping it lifts
     // the veto and re-arms them in the same change. See
     // `cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT`.
+    //
+    // LIVENESS, not existence.
+    //
+    // This used to fire on `jit_code_range_count() != 0` alone — i.e. from the
+    // first compile onwards, forever, including on cycles where no compiled
+    // frame was on any stack. But the hazard is an un-rewritable compiled frame
+    // that is *live*, which is exactly `is_active() ||
+    // unregistered_jit_frame_on_stack()` — the pair `gen_heap` computes as
+    // `has_conservative_roots`, and whose own comment says that with no JIT
+    // frame on any stack "the moving collector is then fully precise and
+    // correct".
+    //
+    // Vetoing the JIT-quiescent cycles too meant the young generation NEVER
+    // compacted in a JIT-enabled run: every cycle took the in-place sweep, which
+    // reclaims into a free list without retreating the bump cursor, so the space
+    // fragments and the next collection comes sooner. Measured on
+    // `OffsetDateTimeTest` (quiet host, -Xmx2g): 12 minor collections and a
+    // 222 s pass under `CRATONVM_NO_MOVING_YOUNG=1`, against 2048+ collections
+    // and no completion in 1500 s by default. A 170x collection-count
+    // explosion, and the whole of the residual — four codegen suspects
+    // (scratch flush, self-call proof, shadow emission, and both together) were
+    // each eliminated by bisection first.
+    //
+    // Not visible on `BinTreesClassic` (a tight allocation loop *inside*
+    // compiled code, so every cycle has a live JIT frame either way: 31 vs 26
+    // collections) nor on `LockTest` (zero young collections). Those are the two
+    // workloads this was first, wrongly, measured on.
+    //
+    // Safety is unchanged where it matters: when a compiled frame IS live this
+    // still vetoes, and `gen_heap`'s independent `has_conservative_roots &&
+    // !moving_young` term would force the sweep even without this one.
     if !cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT
         && cratonvm_jit::jit_code_range_count() != 0
+        && (cratonvm_gc::gc_quiescence::is_active()
+            || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack())
     {
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
             cratonvm_gc::gc_quiescence::incomplete_reason::JIT_RELOCATION_UNSUPPORTED,

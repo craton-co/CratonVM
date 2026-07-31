@@ -36891,9 +36891,12 @@ mod flag_and_header_contracts {
     fn shadow_stack_maps_enabled_is_central_flag_or_moving_young() {
         assert_eq!(
             shadow_stack_maps_enabled(),
-            cratonvm_types::flags().jit.shadow_stack || moving_young_enabled(),
-            "shadow-stack codegen must be gated on the shared flag (plus the moving-young \
-             implication), not on a crate-private getenv"
+            cratonvm_types::flags().jit.shadow_stack
+                || (moving_young_enabled() && shadow_emission_moving_implication_enabled()),
+            "shadow-stack codegen must be gated on the shared flag plus the moving-young \
+             implication (itself bisectable via CRATONVM_JIT_MY_SHADOW_EMISSION), not on a \
+             crate-private getenv. `vm::jit::conservative_roots::shadow_stack_enabled` must \
+             spell the SAME expression — they are two halves of one agreement"
         );
     }
 

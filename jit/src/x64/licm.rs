@@ -784,9 +784,13 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // every other test in the binary. Recompute instead; the override is never
     // set in production, so the cached fast path is unchanged there.
     if MOVING_YOUNG_OVERRIDE.with(|c| c.get()).is_some() {
-        return cratonvm_types::flags().jit.shadow_stack || moving_young_enabled();
+        return cratonvm_types::flags().jit.shadow_stack
+            || (moving_young_enabled() && shadow_emission_moving_implication_enabled());
     }
-    *G.get_or_init(|| cratonvm_types::flags().jit.shadow_stack || moving_young_enabled())
+    *G.get_or_init(|| {
+        cratonvm_types::flags().jit.shadow_stack
+            || (moving_young_enabled() && shadow_emission_moving_implication_enabled())
+    })
 }
 
 /// Whether the **default moving / compacting young generation**
@@ -857,6 +861,33 @@ pub fn moving_young_enabled() -> bool {
 /// Hibernate classes, which are the workload that shows the residual.
 pub fn scratch_flush_at_safepoint_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SCRATCH_FLUSH") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// `CRATONVM_JIT_MY_SHADOW_EMISSION` — bisect lever for the moving-young
+/// implication in [`shadow_stack_maps_enabled`] / the matching
+/// `vm::jit::conservative_roots::shadow_stack_enabled`. Default ON (current
+/// behaviour); `0` drops the implication so the shadow stack is driven by
+/// `CRATONVM_SHADOW_STACK` alone.
+///
+/// **Both sides must read this identically** — the emission side and the
+/// root-scan side are halves of one agreement, and the collector otherwise
+/// walks a shadow stack the codegen never pushed to. The vm side spells the
+/// same expression against the same variable, and each side has a test pinning
+/// the formula.
+///
+/// Why a third lever: a 5-lane bisect on `OffsetDateTimeTest` (quiet host,
+/// 1500 s cap) eliminated the other two candidates — default, no-scratch-flush,
+/// no-selfcall-proof and *both* all TIMEOUT, while `CRATONVM_NO_MOVING_YOUNG=1`
+/// PASSes at 777 s. Shadow emission is what is left. An earlier measurement
+/// called this scoping neutral, but it was taken on `ASTParserLoadingTest` and
+/// `BinTreesClassic`, neither of which is oop-dense at its safepoints; the
+/// temporal classes hold many live references per call, so
+/// `collect_live_oop_homes` publishes a long home list at every one.
+pub fn shadow_emission_moving_implication_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SHADOW_EMISSION") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
     }
