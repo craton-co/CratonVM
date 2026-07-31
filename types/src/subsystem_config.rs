@@ -80,20 +80,36 @@ pub struct JitVerifyConfig {
     /// `CRATONVM_JIT_VERIFY_FRAME_STATES` — the safepoint-snapshot lane.
     /// Default **off**. [`parse::tristate_word`].
     pub check_frame_states: bool,
-    /// `CRATONVM_JIT_VERIFY_SCHEDULE` — the ordering / memory-token lane.
-    /// Default **off**. [`parse::tristate_word`].
+    /// `CRATONVM_JIT_VERIFY_SCHEDULE` — the **compatibility alias** for the two
+    /// lanes below, which used to be one `check_schedule` flag. Default
+    /// **off**. [`parse::tristate_word`].
+    ///
+    /// Kept as its own field rather than folded away because it is what seeds
+    /// the other two when neither is set explicitly, and an operator's existing
+    /// incantation has to keep meaning what it meant.
     pub check_schedule: bool,
+    /// `CRATONVM_JIT_VERIFY_MEMORY_CHAIN` — memory-token chain integrity.
+    /// Defaults to [`Self::check_schedule`]. [`parse::tristate_word`].
+    pub check_memory_chain: bool,
+    /// `CRATONVM_JIT_VERIFY_ARENA_ORDER` — the heuristic arena-order
+    /// definition-before-use lane. Defaults to [`Self::check_schedule`].
+    /// [`parse::tristate_word`].
+    pub check_arena_order: bool,
 }
 
 impl JitVerifyConfig {
     fn from_source(src: &dyn FlagSource) -> Self {
+        let schedule = parse::tristate_word(src, "CRATONVM_JIT_VERIFY_SCHEDULE").unwrap_or(false);
         Self {
             verify_ir: parse::tristate_word(src, "CRATONVM_JIT_VERIFY_IR"),
             check_types: parse::tristate_word(src, "CRATONVM_JIT_VERIFY_TYPES").unwrap_or(false),
             check_frame_states: parse::tristate_word(src, "CRATONVM_JIT_VERIFY_FRAME_STATES")
                 .unwrap_or(false),
-            check_schedule: parse::tristate_word(src, "CRATONVM_JIT_VERIFY_SCHEDULE")
-                .unwrap_or(false),
+            check_schedule: schedule,
+            check_memory_chain: parse::tristate_word(src, "CRATONVM_JIT_VERIFY_MEMORY_CHAIN")
+                .unwrap_or(schedule),
+            check_arena_order: parse::tristate_word(src, "CRATONVM_JIT_VERIFY_ARENA_ORDER")
+                .unwrap_or(schedule),
         }
     }
 
@@ -117,10 +133,12 @@ impl JitVerifyConfig {
     }
 
     /// Whether any optional lane is on — the cheap "is `from_env` worth
-    /// building" test.
+    /// building" test. `check_schedule` is deliberately absent: it is an alias
+    /// that has already been folded into the two lanes it seeds.
     #[inline]
     pub fn any_optional_lane(&self) -> bool {
-        self.check_types || self.check_frame_states || self.check_schedule
+        self.check_types || self.check_frame_states || self.check_memory_chain
+            || self.check_arena_order
     }
 }
 
