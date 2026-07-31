@@ -19,6 +19,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `experimental-jmx` / `experimental-tls` are back-compat ALIASES
+      # (renamed 2026-07-30 to `management` / `deprecated-noop-tls`). They are
+      # fine on a `--features` command line, but a `#[cfg(feature = "...")]`
+      # written against an alias is a silent bug: the default set enables
+      # `management`, not the alias, so the block compiles to nothing in an
+      # ordinary build. For the JMX natives that means `ManagementFactory`
+      # loses its `sun.management` surface and dies with an
+      # `UnsatisfiedLinkError` at runtime, with no compile error anywhere.
+      # Cheap grep, no toolchain needed, so it fails in seconds.
+      - name: No cfg gates on deprecated feature aliases
+        shell: bash
+        run: |
+          if git grep -n -I -E 'cfg\([^)]*"(experimental-jmx|experimental-tls)"' -- '*.rs'; then
+            echo "::error::Found #[cfg] gate(s) on a deprecated feature alias (listed above)."
+            echo "Use 'management' instead of 'experimental-jmx'; note that"
+            echo "'experimental-tls' / 'deprecated-noop-tls' gate nothing at all."
+            exit 1
+          fi
+          echo "OK: no cfg gates on deprecated aliases."
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
