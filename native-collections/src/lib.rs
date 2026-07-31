@@ -27272,7 +27272,9 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
 
 fn ll_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
     let size = ll_size(ctx, this) as usize;
-    let arr = alloc_ref_array(ctx, size);
+    // GC-safety: the allocation can complete a moving young GC and the node
+    // walk below reads `head` out of `this`. See `rooted_across`.
+    let (this, arr) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, size));
     let mut cur = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
@@ -27298,8 +27300,16 @@ fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let arr = ll_snapshot_array(ctx, this);
-    let it = alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3);
+    // GC-safety: the snapshot and the iterator shell each allocate; `this`
+    // and the snapshot are both stored afterwards. See `rooted_across`.
+    let mut this = this;
+    let this_at_call = this;
+    let mut arr = rooted_across(ctx, &mut [&mut this], |ctx| {
+        ll_snapshot_array(ctx, this_at_call)
+    });
+    let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
+        alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3)
+    });
     ctx.set_field(it, 0, Value::Object(Some(arr)));
     ctx.set_field(it, 1, Value::Int(0));
     ctx.set_field(it, 2, Value::Object(Some(this)));
@@ -27315,8 +27325,16 @@ fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let arr = ll_snapshot_array(ctx, this);
-    let it = alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3);
+    // GC-safety: the snapshot and the iterator shell each allocate; `this`
+    // and the snapshot are both stored afterwards. See `rooted_across`.
+    let mut this = this;
+    let this_at_call = this;
+    let mut arr = rooted_across(ctx, &mut [&mut this], |ctx| {
+        ll_snapshot_array(ctx, this_at_call)
+    });
+    let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
+        alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3)
+    });
     ctx.set_field(it, 0, Value::Object(Some(arr)));
     ctx.set_field(it, 1, Value::Int(idx.max(0)));
     ctx.set_field(it, 2, Value::Object(Some(this)));
@@ -27593,11 +27611,20 @@ fn native_ll_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     };
     let elements = ll_overlay_elements(ctx, this);
-    let arr = alloc_ref_array(ctx, elements.len());
+    // GC-safety: the collected elements live in a bare `Vec`, which is not a
+    // GC root, and both allocations below can collect. Pin the slice and
+    // re-read each element at its store; root the array across the shell.
+    let (elem_base, elem_pins) = pin_value_slice(ctx, &elements);
+    let mut arr = alloc_ref_array(ctx, elements.len());
     for (i, v) in elements.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
+        ctx.set_array_element(arr, i, read_pinned_elem(ctx, elem_pins[i], *v));
     }
-    let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+    if elem_base != usize::MAX {
+        ctx.unpin_native_roots(elem_base);
+    }
+    let spl = rooted_across(ctx, &mut [&mut arr], |ctx| {
+        alloc_synthetic(ctx, "java/util/Spliterator", 3)
+    });
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
     ctx.set_field(spl, 2, Value::Int(elements.len() as i32));
@@ -28231,7 +28258,8 @@ fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     };
     let size = ll_size(ctx, this) as usize;
-    let arr = alloc_ref_array(ctx, size);
+    // GC-safety: see `ll_snapshot_array`.
+    let (this, arr) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, size));
     let mut cur_opt = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
@@ -28268,9 +28296,20 @@ fn native_ll_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
     let size = ll_size(ctx, this) as usize;
     // Reuse the supplied array when it is large enough; otherwise allocate.
-    let target = match template {
-        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
-        _ => alloc_ref_array(ctx, size),
+    // GC-safety: the fallback allocation can move `this` (walked below) and
+    // the caller-supplied template. See `rooted_across`.
+    let mut this = this;
+    let mut template_ref = match template {
+        Value::Object(Some(a)) => a,
+        _ => this,
+    };
+    let reuse = matches!(template, Value::Object(Some(a)) if ctx.array_length(a) >= size);
+    let target = if reuse {
+        template_ref
+    } else {
+        rooted_across(ctx, &mut [&mut this, &mut template_ref], |ctx| {
+            alloc_ref_array(ctx, size)
+        })
     };
     let mut cur_opt = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
@@ -28332,7 +28371,16 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let head = ll_get(ctx, this, "head");
-    let itr = alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3);
+    // GC-safety: `alloc_synthetic` can collect; `this` and the head node are
+    // both stored into the iterator afterwards. See `rooted_across`.
+    let head_pin = pin_value(ctx, head);
+    let (this, itr) = rooted_across1(ctx, this, |ctx| {
+        alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3)
+    });
+    let head = read_pinned_elem(ctx, head_pin, head);
+    if head_pin != usize::MAX {
+        ctx.unpin_native_roots(head_pin);
+    }
     ctx.set_field(itr, 0, head); // current node
     ctx.set_field(itr, 1, Value::Object(Some(this))); // list ref
     ctx.set_field(itr, 2, Value::Object(None)); // last returned node
@@ -30607,7 +30655,12 @@ fn native_ad_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, head, _, size) = ad_state(ctx, this);
-    let arr = alloc_ref_array(ctx, size as usize);
+    // GC-safety: the allocation can move the ring buffer we copy out of.
+    let mut buf_ref = data.unwrap_or(this);
+    let arr = rooted_across(ctx, &mut [&mut buf_ref], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
+    let data = data.map(|_| buf_ref);
     if let Some(buf) = data {
         let cap = ctx.array_length(buf);
         for i in 0..(size as usize) {
@@ -31195,7 +31248,12 @@ fn native_pq_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, size) = pq_state(ctx, this);
-    let arr = alloc_ref_array(ctx, size as usize);
+    // GC-safety: the allocation can move the heap buffer we copy out of.
+    let mut buf_ref = data.unwrap_or(this);
+    let arr = rooted_across(ctx, &mut [&mut buf_ref], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
+    let data = data.map(|_| buf_ref);
     if let Some(buf) = data {
         for i in 0..(size as usize) {
             let elem = ctx.get_array_element(buf, i);
@@ -31211,7 +31269,12 @@ fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, size) = pq_state(ctx, this);
-    let arr = alloc_ref_array(ctx, size as usize);
+    // GC-safety: the allocation can move the heap buffer we copy out of.
+    let mut buf_ref = data.unwrap_or(this);
+    let arr = rooted_across(ctx, &mut [&mut buf_ref], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
+    let data = data.map(|_| buf_ref);
     if let Some(buf) = data {
         for i in 0..(size as usize) {
             let elem = ctx.get_array_element(buf, i);
@@ -45285,7 +45348,13 @@ fn native_lbq_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     let head = lbq_head(ctx, this);
-    let result = alloc_ref_array(ctx, size as usize);
+    // GC-safety: the allocation can move `this` (the monitor we still have to
+    // exit) and the backing buffer we copy out of. See `rooted_across`.
+    let mut this = this;
+    let mut arr = arr;
+    let result = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
     for i in 0..size as usize {
         ctx.set_array_element(result, i, ctx.get_array_element(arr, head + i));
     }
@@ -45311,12 +45380,20 @@ fn native_lbq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     let head = lbq_head(ctx, this);
-    let snap = alloc_ref_array(ctx, size as usize);
+    // GC-safety: see `native_lbq_to_array`; the iterator shell allocates too,
+    // and the snapshot is stored into it afterwards.
+    let mut this = this;
+    let mut arr = arr;
+    let mut snap = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
     for i in 0..size as usize {
         ctx.set_array_element(snap, i, ctx.get_array_element(arr, head + i));
     }
     ctx.monitor_exit(this);
-    let itr = alloc_synthetic(ctx, "java/util/concurrent/LinkedBlockingQueue$Itr", 2);
+    let itr = rooted_across(ctx, &mut [&mut snap], |ctx| {
+        alloc_synthetic(ctx, "java/util/concurrent/LinkedBlockingQueue$Itr", 2)
+    });
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(itr))))
