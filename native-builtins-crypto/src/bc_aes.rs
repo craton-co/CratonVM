@@ -167,12 +167,17 @@ fn sibox(i: u32) -> u32 {
     AES_SI[(i & 255) as usize] as u32
 }
 
+/// The three legal expanded-schedule lengths: `ROUNDS + 1` for AES-128/192/256
+/// (10/12/14 rounds). [`generate_working_key`] produces exactly one of these.
+const VALID_SCHEDULE_LENS: [usize; 3] = [11, 13, 15];
+
 /// Preconditions shared by [`encrypt_block`] and [`decrypt_block`].
 ///
-/// `kw.len() < 2` means the engine was never keyed (or the `int[][] KW` read
-/// back malformed): `rounds = kw.len() - 1` would then underflow and the
-/// subsequent `kw[r]` index would panic. A block shorter than 16 bytes would
-/// panic in `le_to_u32`/`u32_to_le`.
+/// The schedule length is checked **exactly**, not merely for a lower bound.
+/// `rounds = kw.len() - 1` underflows for an empty schedule, and the round
+/// structure additionally reads `kw[rounds]` after the main loop, so lengths
+/// like 2 or 4 index out of bounds even though they are "non-empty". A block
+/// shorter than 16 bytes would panic in `le_to_u32`/`u32_to_le`.
 ///
 /// The critical property is what this function does **not** offer: there is no
 /// "carry on with a degraded schedule" branch. A block cipher that quietly
@@ -180,9 +185,9 @@ fn sibox(i: u32) -> u32 {
 /// caller ciphertext-shaped bytes that are not ciphertext — the single worst
 /// outcome available here.
 fn check_block_args(kw: &[[u32; 4]], inb: &[u8], outb: &[u8]) -> CryptoResult<()> {
-    if kw.len() < 2 {
+    if !VALID_SCHEDULE_LENS.contains(&kw.len()) {
         return Err(CryptoFailure::not_initialised(format!(
-            "AES engine not initialised: key schedule has {} round key(s), need at least 2",
+            "AES engine not initialised: key schedule has {} round key(s), expected 11, 13 or 15",
             kw.len()
         )));
     }
@@ -201,8 +206,10 @@ fn check_block_args(kw: &[[u32; 4]], inb: &[u8], outb: &[u8]) -> CryptoResult<()
 ///
 /// Every in-tree caller of the infallible form already pre-checks
 /// `kw.len() >= 2` (`native-builtins/src/phases_late/bouncycastle.rs:6081`,
-/// `:6199`, `:6565`), so this is the same guard expressed as a value the
-/// facade can turn into a catchable `IllegalStateException`.
+/// `:6199`, `:6565`); this is the same guard expressed as a value the facade
+/// can turn into a catchable `IllegalStateException`, and made **exact** —
+/// their lower bound still admits `kw.len() == 2`, which indexes out of bounds
+/// on the final round.
 pub fn try_encrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) -> CryptoResult<()> {
     check_block_args(kw, inb, outb)?;
     encrypt_block(kw, inb, outb);
@@ -221,12 +228,13 @@ pub fn try_decrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) -> Crypto
 ///
 /// # Panics
 ///
-/// On a malformed key schedule (`kw.len() < 2`) or a short block. This is a
+/// On a key schedule whose length is not 11/13/15, or a short block. This is a
 /// *loud* failure — it can never be mistaken for ciphertext — but it is not a
 /// catchable Java exception. Prefer [`try_encrypt_block`], which reports the
-/// same conditions as an `InvalidKeyException`-family failure the facade can
-/// throw. The signature is kept as-is for the existing `native-builtins`
-/// registrations, all of which validate the schedule first.
+/// same conditions as a failure the facade can throw. The signature is kept
+/// as-is for the existing `native-builtins` registrations, all of which
+/// validate the schedule first (though only with a `>= 2` lower bound — see
+/// [`check_block_args`]).
 pub fn encrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
     let rounds = kw.len() - 1;
     let c0 = le_to_u32(inb, 0);
@@ -655,23 +663,49 @@ mod tests {
         }
     }
 
-    /// An unkeyed engine must raise, not encrypt. Before the guard this
-    /// underflowed `kw.len() - 1` and panicked on the first `kw[r]` index.
+    /// An unkeyed or malformed engine must raise, not encrypt. Before the guard
+    /// an empty schedule underflowed `kw.len() - 1`, and a *non-empty* but
+    /// wrong-length one (2 or 4 entries) still ran off the end of `kw` on the
+    /// final round — so a lower bound alone would not have been enough.
     #[test]
-    fn uninitialised_key_schedule_raises_illegal_state() {
+    fn malformed_key_schedule_raises_illegal_state() {
         let inb = [0u8; 16];
         let mut outb = [0u8; 16];
-        for kw in [Vec::new(), vec![[0u32; 4]]] {
+        for len in [0usize, 1, 2, 3, 4, 10, 12, 14, 16] {
+            let kw = vec![[0u32; 4]; len];
             let err = try_encrypt_block(&kw, &inb, &mut outb)
-                .expect_err("empty/one-entry schedule must be rejected");
-            assert_eq!(err.java_class(), "java/lang/IllegalStateException");
+                .expect_err("malformed schedule must be rejected");
+            assert_eq!(
+                err.java_class(),
+                "java/lang/IllegalStateException",
+                "{len}-entry schedule: wrong exception type"
+            );
             let err = try_decrypt_block(&kw, &inb, &mut outb)
-                .expect_err("empty/one-entry schedule must be rejected");
+                .expect_err("malformed schedule must be rejected");
             assert_eq!(err.java_class(), "java/lang/IllegalStateException");
         }
         // ...and the output buffer was left untouched — no zero "ciphertext"
         // was produced that a caller could mistake for a real transform.
         assert_eq!(outb, [0u8; 16]);
+    }
+
+    /// The three real AES schedule lengths are accepted, so the strict check
+    /// cannot reject a legitimately keyed engine.
+    #[test]
+    fn every_real_key_size_produces_an_accepted_schedule() {
+        let inb = [0u8; 16];
+        let mut outb = [0u8; 16];
+        for key_len in [16usize, 24, 32] {
+            let kw = generate_working_key(&vec![0u8; key_len], true).unwrap();
+            assert!(
+                VALID_SCHEDULE_LENS.contains(&kw.len()),
+                "{key_len}-byte key produced a {}-entry schedule",
+                kw.len()
+            );
+            try_encrypt_block(&kw, &inb, &mut outb).expect("real schedule must be accepted");
+            let kw = generate_working_key(&vec![0u8; key_len], false).unwrap();
+            try_decrypt_block(&kw, &inb, &mut outb).expect("real schedule must be accepted");
+        }
     }
 
     /// A short input or output block raises rather than panicking on the

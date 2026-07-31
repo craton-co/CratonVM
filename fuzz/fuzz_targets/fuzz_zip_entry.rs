@@ -218,23 +218,29 @@ fuzz_target!(|data: &[u8]| {
         // Fails closed: an unparseable archive simply pushes no entry.
         cp.add_path(&path_str);
 
-        // A single file can expand into more than one entry (fat JARs add
-        // their nested archives), but never into more entries than the
-        // archive has bytes to describe them with.
+        // A single file can expand into more than one classpath entry
+        // (fat JARs add their nested archives), but every one of them
+        // needs a central-directory record to exist at all.
+        //
+        // The bound is the *inflated* archive size, not `archive_len`: a
+        // fat JAR's nested archives are themselves compressed entries, so
+        // their central directories live in inflated bytes. Bounding
+        // against the raw file size would be a false positive on any
+        // well-compressed fat JAR, not a finding. What this still catches
+        // is the failure that matters — an entry count taken from the
+        // end-of-central-directory record and believed rather than parsed,
+        // which is a `u16`/`u64` unrelated to how many bytes exist.
+        let bound = inflate_bound(archive_len);
         assert!(
-            cp.entry_count() <= archive_len,
+            cp.entry_count() <= bound,
             "one {archive_len}-byte archive produced {} classpath entries",
             cp.entry_count()
         );
 
         // ---- Central-directory enumeration ----
         let names = cp.list_class_names();
-        // Every entry needs a central-directory record, which is at least
-        // 46 bytes; `<= archive_len` is a deliberately generous form of
-        // the same bound and still catches an entry count that was
-        // believed rather than parsed.
         assert!(
-            names.len() <= archive_len,
+            names.len() <= bound,
             "{} class names enumerated from a {archive_len}-byte archive",
             names.len()
         );

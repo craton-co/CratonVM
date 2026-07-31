@@ -2604,4 +2604,330 @@ mod tests {
             .to_string()
             .contains("uninitializedThis receiver requires the constructor owner"));
     }
+
+    // =====================================================================
+    // Constant-pool cross-checks (JVMS §4.9.1)
+    // =====================================================================
+
+    fn run(
+        insn: &Instruction,
+        frame: &mut VerificationFrame,
+        cp: &ConstantPool,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+    ) -> Result<InsnVerifyResult, LinkageError> {
+        verify_instruction(insn, 0, frame, cp, class, method, descriptor, &MockHierarchy)
+    }
+
+    #[test]
+    fn new_with_a_valid_class_entry_is_accepted() {
+        let cp = init_cp(); // index 2 is a ClassReference → java/lang/Object
+        let mut frame = make_frame(1, 4);
+        run(&Instruction::New(2), &mut frame, &cp, "Test", "m", "()V")
+            .expect("`new java/lang/Object` is well-formed");
+        assert_eq!(frame.stack, vec![VType::Uninitialized(0)]);
+    }
+
+    #[test]
+    fn new_with_a_non_class_cp_entry_rejected() {
+        // Index 4 is a Utf8, not a CONSTANT_Class. The operand used to be
+        // ignored entirely, so `new #4` verified clean.
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        let err = run(&Instruction::New(4), &mut frame, &cp, "Test", "m", "()V")
+            .expect_err("`new` must reject a non-Class operand");
+        assert!(err.to_string().contains("CONSTANT_Class"), "{err}");
+    }
+
+    #[test]
+    fn new_with_an_out_of_range_cp_index_rejected() {
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        assert!(run(
+            &Instruction::New(9999),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn new_of_an_array_type_rejected() {
+        // JVMS §6.5 new: array types are created by anewarray / multianewarray.
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("[Ljava/lang/Object;".into()), // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 },   // 2
+        ]);
+        let mut frame = make_frame(1, 4);
+        let err = run(&Instruction::New(2), &mut frame, &cp, "Test", "m", "()V")
+            .expect_err("`new` of an array type must be rejected");
+        assert!(err.to_string().contains("array type"), "{err}");
+    }
+
+    #[test]
+    fn instanceof_with_a_non_class_cp_entry_rejected() {
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        frame.push(VType::Null).unwrap();
+        assert!(run(
+            &Instruction::Instanceof(4),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn instanceof_with_a_valid_class_entry_accepted() {
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        frame.push(VType::Null).unwrap();
+        run(
+            &Instruction::Instanceof(2),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V",
+        )
+        .expect("`instanceof java/lang/Object` is well-formed");
+        assert_eq!(frame.stack, vec![VType::Int]);
+    }
+
+    #[test]
+    fn getstatic_with_a_malformed_field_descriptor_rejected() {
+        // A descriptor `VType::from_field_descriptor` cannot parse becomes
+        // `Top`, and everything is assignable to `Top` — so a malformed
+        // descriptor used to disable the type check on this operand entirely.
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("Test".into()),              // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 }, // 2
+            ConstantPoolEntry::Utf8("f".into()),                 // 3
+            ConstantPoolEntry::Utf8("Ljava/lang/String".into()), // 4 — no ';'
+            ConstantPoolEntry::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            ConstantPoolEntry::FieldReference {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6
+        ]);
+        let mut frame = make_frame(1, 4);
+        let err = run(
+            &Instruction::Getstatic(6),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V",
+        )
+        .expect_err("a malformed field descriptor must be a VerifyError");
+        assert!(err.to_string().contains("field descriptor"), "{err}");
+    }
+
+    #[test]
+    fn getstatic_with_a_well_formed_field_descriptor_accepted() {
+        let cp = simple_cp(); // index 12 is Test.value : I
+        let mut frame = make_frame(1, 4);
+        run(
+            &Instruction::Getstatic(12),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V",
+        )
+        .expect("a well-formed field ref must verify");
+        assert_eq!(frame.stack, vec![VType::Int]);
+    }
+
+    #[test]
+    fn invokestatic_with_a_malformed_method_descriptor_rejected() {
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("Test".into()),              // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 }, // 2
+            ConstantPoolEntry::Utf8("m".into()),                 // 3
+            ConstantPoolEntry::Utf8("(Ljava/lang/String)V".into()), // 4 — no ';'
+            ConstantPoolEntry::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            ConstantPoolEntry::MethodReference {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6
+        ]);
+        let mut frame = make_frame(1, 4);
+        let err = run(
+            &Instruction::Invokestatic(6),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V",
+        )
+        .expect_err("a malformed method descriptor must be a VerifyError");
+        assert!(err.to_string().contains("method descriptor"), "{err}");
+    }
+
+    // =====================================================================
+    // Category-2 local slot pairing (JVMS §4.10.1.6)
+    // =====================================================================
+
+    #[test]
+    fn lstore_then_lload_round_trips() {
+        let cp = simple_cp();
+        let mut frame = make_frame(4, 4);
+        frame.push(VType::Long).unwrap();
+        frame.push(VType::Top).unwrap();
+        run(&Instruction::Lstore(1), &mut frame, &cp, "Test", "m", "()V").unwrap();
+        run(&Instruction::Lload(1), &mut frame, &cp, "Test", "m", "()V")
+            .expect("an intact long pair must load back");
+        assert_eq!(frame.stack, vec![VType::Long, VType::Top]);
+    }
+
+    #[test]
+    fn splitting_a_long_pair_then_loading_it_rejected() {
+        // `lstore_1; istore_2; lload_1` — the `istore_2` overwrote the long's
+        // upper half, so `lload_1` must not verify.
+        let cp = simple_cp();
+        let mut frame = make_frame(4, 4);
+        frame.push(VType::Long).unwrap();
+        frame.push(VType::Top).unwrap();
+        run(&Instruction::Lstore(1), &mut frame, &cp, "Test", "m", "()V").unwrap();
+        frame.push(VType::Int).unwrap();
+        run(&Instruction::Istore(2), &mut frame, &cp, "Test", "m", "()V").unwrap();
+        let err = run(&Instruction::Lload(1), &mut frame, &cp, "Test", "m", "()V")
+            .expect_err("a split category-2 pair must not load back as a long");
+        assert!(err.to_string().contains("lload"), "{err}");
+    }
+
+    #[test]
+    fn lstore_past_max_locals_rejected() {
+        // `max_locals = 2` leaves slots 0 and 1; a long at slot 1 needs slot 2.
+        let cp = simple_cp();
+        let mut frame = make_frame(2, 4);
+        frame.push(VType::Long).unwrap();
+        frame.push(VType::Top).unwrap();
+        let err = run(&Instruction::Lstore(1), &mut frame, &cp, "Test", "m", "()V")
+            .expect_err("a long store must fit entirely inside max_locals");
+        assert!(err.to_string().contains("lstore"), "{err}");
+    }
+
+    #[test]
+    fn wide_lstore_at_u16_max_does_not_panic() {
+        // REGRESSION: `local_store(*index + 1, ..)` overflowed for a
+        // `wide lstore 65535` — a debug panic on attacker-supplied bytecode.
+        let cp = simple_cp();
+        let mut frame = make_frame(4, 4);
+        frame.push(VType::Long).unwrap();
+        frame.push(VType::Top).unwrap();
+        assert!(run(
+            &Instruction::Lstore(u16::MAX),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V"
+        )
+        .is_err());
+    }
+
+    // =====================================================================
+    // `<init>` must run before a constructor returns (JVMS §4.10.1.9)
+    // =====================================================================
+
+    #[test]
+    fn constructor_return_before_super_init_rejected() {
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        frame.locals[0] = VType::UninitializedThis;
+        let err = run(&Instruction::Return, &mut frame, &cp, "Example", "<init>", "()V")
+            .expect_err("a constructor may not return with `this` uninitialized");
+        assert!(err.to_string().contains("uninitialized"), "{err}");
+    }
+
+    #[test]
+    fn constructor_return_after_super_init_accepted() {
+        struct DirectSuper;
+        impl ClassHierarchy for DirectSuper {
+            fn is_subclass(&self, child: &str, parent: &str) -> bool {
+                child == parent || parent == "java/lang/Object"
+            }
+            fn is_direct_superclass(&self, child: &str, parent: &str) -> bool {
+                child == "Example" && parent == "java/lang/Object"
+            }
+            fn common_superclass(&self, _a: &str, _b: &str) -> String {
+                "java/lang/Object".to_string()
+            }
+            fn is_interface(&self, _name: &str) -> bool {
+                false
+            }
+        }
+
+        let cp = init_cp();
+        let h = DirectSuper;
+        let mut frame = make_frame(1, 4);
+        frame.locals[0] = VType::UninitializedThis;
+        frame.push(VType::UninitializedThis).unwrap();
+        verify_instruction(
+            &Instruction::Invokespecial(6),
+            0,
+            &mut frame,
+            &cp,
+            "Example",
+            "<init>",
+            "()V",
+            &h,
+        )
+        .expect("super() call");
+        verify_instruction(
+            &Instruction::Return,
+            4,
+            &mut frame,
+            &cp,
+            "Example",
+            "<init>",
+            "()V",
+            &h,
+        )
+        .expect("returning after super() is legal");
+    }
+
+    #[test]
+    fn object_constructor_may_return_uninitialized() {
+        // `java/lang/Object.<init>` has no superclass to chain to, so its
+        // `uninitializedThis` is never replaced.
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        frame.locals[0] = VType::UninitializedThis;
+        run(
+            &Instruction::Return,
+            &mut frame,
+            &cp,
+            "java/lang/Object",
+            "<init>",
+            "()V",
+        )
+        .expect("Object.<init> must be allowed to return");
+    }
+
+    #[test]
+    fn ordinary_method_return_unaffected() {
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        run(&Instruction::Return, &mut frame, &cp, "Example", "m", "()V")
+            .expect("an ordinary void return is unaffected");
+    }
 }

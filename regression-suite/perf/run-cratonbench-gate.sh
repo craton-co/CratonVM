@@ -194,8 +194,9 @@ read_sysfs() {
     local v
     if [ -r "$1" ] && IFS= read -r v < "$1" 2>/dev/null; then printf '%s' "$v"; else printf '%s' '-'; fi
 }
-read_throttle() { read_sysfs "/sys/devices/system/cpu/cpu$CPU/thermal_throttle/core_throttle_count"; }
-read_freq_khz() { read_sysfs "/sys/devices/system/cpu/cpu$CPU/cpufreq/scaling_cur_freq"; }
+FREQ_FILE="/sys/devices/system/cpu/cpu$CPU/cpufreq/scaling_cur_freq"
+THROTTLE_FILE="/sys/devices/system/cpu/cpu$CPU/thermal_throttle/core_throttle_count"
+read_throttle() { read_sysfs "$THROTTLE_FILE"; }
 
 # Any of this run's TSVs -> the JSON twin, keys taken from the '#'-prefixed
 # header row. Checksums stay strings: they exceed 2^53 and would silently
@@ -344,7 +345,7 @@ printf '#phase\tn\tmin_ms\tp50_ms\tp90_ms\tp99_ms\tmax_ms\tmean_ms\tstddev_ms\tc
 run_one() {
     local phase="$1"
     local out="$WORK/out" err="$WORK/err"
-    local thr0 thr1 pid line c khz deadline
+    local thr0 thr1 pid line c khz started
     local -a arr
     RUN_MS=""; RUN_SUM=""; RUN_EXIT=0
     RUN_CPUS=""; RUN_KMIN=""; RUN_KMAX=""; RUN_RSS=""; RUN_TIMEOUT_HIT=0
@@ -360,7 +361,10 @@ run_one() {
             >"$out" 2>"$err" </dev/null &
     fi
     pid=$!
-    deadline=$(( $(date +%s) + RUN_TIMEOUT ))
+    # SECONDS and the `read` builtin, not `date` and `cat`: the poll loop runs
+    # while the measurement is running, and every fork it makes is a process
+    # the scheduler can place on the very core we are trying to keep clean.
+    started=$SECONDS
 
     while kill -0 "$pid" 2>/dev/null; do
         # /proc/<pid>/stat field 39 is the CPU the task last ran on. comm can
@@ -377,8 +381,7 @@ run_one() {
                 esac
             fi
         fi
-        khz=$(read_freq_khz)
-        if [ "$khz" != "-" ]; then
+        if [ -r "$FREQ_FILE" ] && IFS= read -r khz < "$FREQ_FILE" && [ -n "$khz" ]; then
             [ -n "$RUN_KMIN" ] || RUN_KMIN=$khz
             [ -n "$RUN_KMAX" ] || RUN_KMAX=$khz
             [ "$khz" -lt "$RUN_KMIN" ] && RUN_KMIN=$khz
@@ -398,7 +401,7 @@ run_one() {
                 esac
             done < "/proc/$pid/status"
         fi
-        if [ "$(date +%s)" -ge "$deadline" ]; then
+        if [ $((SECONDS - started)) -ge "$RUN_TIMEOUT" ]; then
             kill -9 "$pid" 2>/dev/null
             RUN_TIMEOUT_HIT=1
             break

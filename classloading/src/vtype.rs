@@ -1475,4 +1475,100 @@ mod tests {
             Some(VType::ArrayRef(Arc::from("[I")))
         );
     }
+
+    // --- descriptor well-formedness (JVMS §4.3.2 / §4.3.3) ---
+
+    #[test]
+    fn valid_field_descriptors_accepted() {
+        for d in [
+            "I", "J", "D", "F", "B", "C", "S", "Z", "[I", "[[J", "Ljava/lang/String;",
+            "[Ljava/lang/Object;", "[[Ljava/util/Map$Entry;",
+        ] {
+            assert!(is_valid_field_descriptor(d), "{d} should be valid");
+        }
+    }
+
+    #[test]
+    fn malformed_field_descriptors_rejected() {
+        for d in [
+            "",                     // empty
+            "V",                    // void is not a field type
+            "Q",                    // unknown tag
+            "L",                    // bare L
+            "Ljava/lang/String",    // unterminated
+            "L;",                   // empty class name
+            "Lja.va/Foo;",          // '.' is illegal in an internal name
+            "[",                    // dangling array marker
+            "II",                   // trailing garbage
+            "Ljava/lang/String;X",  // trailing garbage
+        ] {
+            assert!(!is_valid_field_descriptor(d), "{d} should be rejected");
+        }
+    }
+
+    #[test]
+    fn valid_method_descriptors_accepted() {
+        for d in [
+            "()V",
+            "()I",
+            "(I)V",
+            "(IJ)Ljava/lang/String;",
+            "([[Ljava/lang/Object;D)[I",
+            "(Ljava/lang/String;Ljava/lang/String;)Z",
+        ] {
+            assert!(is_valid_method_descriptor(d), "{d} should be valid");
+        }
+    }
+
+    #[test]
+    fn malformed_method_descriptors_rejected() {
+        for d in [
+            "",
+            "V",
+            "()",                    // no return type
+            "(I",                    // no ')'
+            "I)V",                   // no '('
+            "()VV",                  // trailing garbage
+            "(Ljava/lang/String)V",  // unterminated parameter
+            "(Q)V",                  // unknown parameter tag
+            "()Q",                   // unknown return tag
+        ] {
+            assert!(!is_valid_method_descriptor(d), "{d} should be rejected");
+        }
+    }
+
+    #[test]
+    fn unterminated_object_parameter_does_not_panic() {
+        // REGRESSION: the old walk computed the parameter's end as
+        // `i + find(';').unwrap_or(len - i) + 1`, i.e. `len + 1` when the `;`
+        // is missing — an out-of-range slice, reachable from any attacker
+        // supplied `NameAndType` descriptor. Must return cleanly instead.
+        assert!(param_types_from_descriptor("(Ljava/lang/String)V").is_empty());
+        assert!(param_types_from_descriptor("([Ljava/lang/String)V").is_empty());
+        assert!(param_types_from_descriptor("(L)V").is_empty());
+        assert!(param_types_from_descriptor("([").is_empty());
+    }
+
+    #[test]
+    fn well_formed_parameters_still_parse() {
+        assert_eq!(
+            param_types_from_descriptor("(IJLjava/lang/String;[D)V"),
+            vec![
+                VType::Int,
+                VType::Long,
+                VType::ObjectRef(Arc::from("java/lang/String")),
+                VType::ArrayRef(Arc::from("[D")),
+            ]
+        );
+    }
+
+    #[test]
+    fn deeply_nested_array_descriptor_is_bounded() {
+        // JVMS §4.4.1 caps array descriptors at 255 dimensions; a longer one is
+        // malformed rather than an unbounded recursion / allocation source.
+        let ok = format!("{}I", "[".repeat(255));
+        let too_deep = format!("{}I", "[".repeat(256));
+        assert!(is_valid_field_descriptor(&ok));
+        assert!(!is_valid_field_descriptor(&too_deep));
+    }
 }

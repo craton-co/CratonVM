@@ -355,6 +355,21 @@ fn verify_class_bytecode_inner(
                     ),
                 });
             }
+            // OBSERVABILITY: this is a deliberate reduction in verification
+            // strength, so it is stated out loud rather than inferred from the
+            // absence of an error. `allow_jsr` names the escape hatch
+            // (`CRATONVM_ALLOW_JSR_RET`) when that is what admitted the method,
+            // as opposed to the version-gated default.
+            tracing::warn!(
+                class = %class.name,
+                method = %method.name,
+                descriptor = %method.descriptor,
+                class_file_major = class.version.major,
+                via_escape_hatch = allow_jsr && !legal_pre_java7_subroutines,
+                "accepting a jsr/ret method on the structural-only path: its operand-stack \
+                 and local type-state inside the subroutine is NOT verified (JVMS §4.10.2.5 \
+                 subroutine inlining is not implemented)",
+            );
             // TYPE MAPS: an explicit "proven nothing, and here is why" entry
             // rather than silence. Zero rows, so every `oop_map_at` answers
             // `None` (scan conservatively); `fast_path_veto()` reports
@@ -708,15 +723,23 @@ fn verify_method_typestate(
     let mut handler_targets: std::collections::HashMap<u16, VType> =
         std::collections::HashMap::with_capacity(code_attr.exception_table.len());
     for entry in &code_attr.exception_table {
-        let catch = if entry.catch_type == 0 {
-            VType::ObjectRef(std::sync::Arc::from("java/lang/Throwable"))
-        } else {
-            match cp.get_class_name_arc(entry.catch_type) {
-                Some(name) => VType::ObjectRef(name),
-                None => VType::ObjectRef(std::sync::Arc::from("java/lang/Throwable")),
-            }
-        };
+        let catch = super::bytecode_verifier::catch_type_of(entry, cp, class_name, &method.name)?;
         handler_targets.insert(entry.handler_pc, catch);
+    }
+
+    // Pre-Java-7 failover (JVMS §4.10.2) — mirrors
+    // `bytecode_verifier::verify_method`. A major ≤ 50 class file may ship a
+    // partial `StackMapTable`; where it does not cover a merge point the
+    // linear walk cannot check that edge, so the worklist inference (which
+    // merges at every branch target and handler entry) is the authority.
+    let pre_java7_partial_frames = !requires_stack_map
+        && parsed_table.is_some()
+        && code_attr
+            .exception_table
+            .iter()
+            .any(|e| !declared_frames.contains_key(&e.handler_pc));
+    if pre_java7_partial_frames {
+        return verify_pre_java7_inference(class, method, hierarchy).map(Some);
     }
 
     // SPEC-COMPLIANCE FIX (MED): map each `new` bytecode offset to the class
@@ -932,6 +955,18 @@ fn verify_method_typestate(
             }
         }
 
+        // Pre-Java-7 failover: a branch target with no declared frame means the
+        // linear walk cannot check this edge. Hand the method to the §4.10.2
+        // worklist, whose verdict is merge-checked. See the derivation of
+        // `pre_java7_partial_frames` above.
+        if !requires_stack_map {
+            for &target in &result.branch_targets {
+                if !declared_frames.contains_key(&target) {
+                    return verify_pre_java7_inference(class, method, hierarchy).map(Some);
+                }
+            }
+        }
+
         verified = result.falls_through;
         if !result.falls_through && next_pc < bytecode.len() {
             verified = false;
@@ -1124,14 +1159,8 @@ fn verify_pre_java7_inference(
 
         for entry in &code_attr.exception_table {
             if pc >= entry.start_pc as usize && pc < entry.end_pc as usize {
-                let catch = if entry.catch_type == 0 {
-                    VType::ObjectRef(std::sync::Arc::from("java/lang/Throwable"))
-                } else {
-                    match cp.get_class_name_arc(entry.catch_type) {
-                        Some(name) => VType::ObjectRef(name),
-                        None => VType::ObjectRef(std::sync::Arc::from("java/lang/Throwable")),
-                    }
-                };
+                let catch =
+                    super::bytecode_verifier::catch_type_of(entry, cp, class_name, &method.name)?;
                 let mut handler_frame = current.clone();
                 handler_frame.clear_stack();
                 handler_frame
@@ -1328,6 +1357,43 @@ fn verify_method_structural_only(
     class: &Class,
     method: &ClassFileMethod,
 ) -> Result<(), LinkageError> {
+    verify_method_structural(&class.name, method)
+}
+
+/// Run the JVMS §4.9.1 structural scan over every method of `class`.
+///
+/// This is the **hierarchy-independent** half of bytecode verification:
+/// instruction decoding, branch/handler bounds and instruction-boundary
+/// landing, local-index and `max_locals` conformance, `jsr`/`ret` shape. None
+/// of it consults [`ClassHierarchy`], so it can be run on the paths that
+/// deliberately defer the *type-state* verdict because their hierarchy adapter
+/// cannot tell two loaders' same-named classes apart (see
+/// [`collect_class_type_maps`] and `class_manager`'s
+/// `defer_loader_sensitive_pass3`). Those paths previously made **no** load
+/// decision at all, so malformed bytecode from a user-defined loader — an
+/// out-of-range branch, a handler entry in the middle of an instruction —
+/// reached the interpreter unchallenged.
+///
+/// Fails closed: the first malformed method aborts the class with a
+/// `VerifyError` naming the class, the method and the rule.
+pub fn verify_class_structural_bytecode(class: &Class) -> Result<(), LinkageError> {
+    for method in class.methods.iter() {
+        if method.is_abstract() || method.is_native() {
+            continue;
+        }
+        verify_method_structural(&class.name, method)?;
+    }
+    Ok(())
+}
+
+/// Per-method form of [`verify_class_structural_bytecode`]. Takes the class
+/// name rather than the `Class` so `bytecode_verifier::verify_method` — which
+/// only ever holds `(&str, &ClassFileMethod, &ConstantPool, &ClassFileVersion)`
+/// — can run the same scan.
+pub(crate) fn verify_method_structural(
+    class_name: &str,
+    method: &ClassFileMethod,
+) -> Result<(), LinkageError> {
     let code_attr = match method.code() {
         Some(c) => c,
         None => return Ok(()),
@@ -1339,9 +1405,36 @@ fn verify_method_structural_only(
     // (JVMS §4.9.1: "code_length ≥ 1").
     if code_len == 0 {
         return Err(LinkageError::VerifyError {
-            class_name: class.name.to_string(),
+            class_name: class_name.to_string(),
             method_name: method.name.to_string(),
             message: "Code attribute has empty bytecode array".to_string(),
+        });
+    }
+
+    // JVMS §4.9.1 / §4.10.1.6: `max_locals` must be large enough to hold the
+    // method's own arguments — `this` (instance methods) plus every parameter,
+    // with `long`/`double` counted as two slots.
+    //
+    // SECURITY: the interpreter allocates exactly `max_locals` slots. An
+    // under-declared `max_locals` used to be invisible, because
+    // `VerificationFrame::initial_frame` sizes its `locals` vector from the
+    // descriptor and only *pads* up to `max_locals` — so the verifier modelled
+    // MORE slots than the runtime frame has and every access in the overhang
+    // verified clean while indexing past the end of the real frame.
+    let argument_slots: usize = param_types_from_descriptor(&method.descriptor)
+        .iter()
+        .map(|t| if t.is_category2() { 2 } else { 1 })
+        .sum::<usize>()
+        + usize::from(!method.is_static());
+    if argument_slots > code_attr.max_locals as usize {
+        return Err(LinkageError::VerifyError {
+            class_name: class_name.to_string(),
+            method_name: method.name.to_string(),
+            message: format!(
+                "max_locals is {} but the method's arguments occupy {argument_slots} local \
+                 slots (descriptor {}); JVMS §4.9.1 requires max_locals to cover them",
+                code_attr.max_locals, method.descriptor
+            ),
         });
     }
 
@@ -1349,7 +1442,7 @@ fn verify_method_structural_only(
     // pre-IR consumed by the JIT. This primes the bounded process cache, so a
     // later compilation reuses this exact instruction/CFG analysis.
     let verified = verified_code(bytecode).map_err(|e| LinkageError::VerifyError {
-        class_name: class.name.to_string(),
+        class_name: class_name.to_string(),
         method_name: method.name.to_string(),
         message: format!("failed to build verified code: {e}"),
     })?;
@@ -1381,14 +1474,14 @@ fn verify_method_structural_only(
 
         for target in instruction_branch_targets(&decoded_insn.insn, pc).map_err(|message| {
             LinkageError::VerifyError {
-                class_name: class.name.to_string(),
+                class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!("branch target at offset {pc} overflowed: {message}"),
             }
         })? {
             if target < 0 || target >= code_len as i64 {
                 return Err(LinkageError::VerifyError {
-                    class_name: class.name.to_string(),
+                    class_name: class_name.to_string(),
                     method_name: method.name.to_string(),
                     message: format!(
                         "branch target {target} at offset {pc} is out of range \
@@ -1399,7 +1492,7 @@ fn verify_method_structural_only(
             let target = target as usize;
             if !instruction_starts.contains(&target) {
                 return Err(LinkageError::VerifyError {
-                    class_name: class.name.to_string(),
+                    class_name: class_name.to_string(),
                     method_name: method.name.to_string(),
                     message: format!(
                         "branch target {target} at offset {pc} does not land on an \
@@ -1410,18 +1503,39 @@ fn verify_method_structural_only(
             branch_targets.push(target);
         }
 
+        // JVMS §4.9.1 static constraint: every local-variable operand must be
+        // a slot the frame actually has. This is checked structurally — i.e.
+        // for EVERY instruction in the method, reachable or not — because the
+        // type-state walk only sees the instructions it reaches, and the
+        // interpreter's unchecked local accessors index `Frame::locals` with
+        // the raw operand.
+        if let Some((index, width)) = local_operand(&decoded_insn.insn) {
+            let needed = u32::from(index) + u32::from(width);
+            if needed > u32::from(code_attr.max_locals) {
+                return Err(LinkageError::VerifyError {
+                    class_name: class_name.to_string(),
+                    method_name: method.name.to_string(),
+                    message: format!(
+                        "local variable index {index} at offset {pc} addresses {width} slot(s) \
+                         but max_locals is {} (JVMS §4.9.1)",
+                        code_attr.max_locals
+                    ),
+                });
+            }
+        }
+
         match &decoded_insn.insn {
             Instruction::Jsr(_) | Instruction::JsrW(_) => {
                 let Some(&target) = branch_targets.first() else {
                     return Err(LinkageError::VerifyError {
-                        class_name: class.name.to_string(),
+                        class_name: class_name.to_string(),
                         method_name: method.name.to_string(),
                         message: format!("jsr at offset {pc} has no valid subroutine target"),
                     });
                 };
                 if next_pc >= code_len || !instruction_starts.contains(&next_pc) {
                     return Err(LinkageError::VerifyError {
-                        class_name: class.name.to_string(),
+                        class_name: class_name.to_string(),
                         method_name: method.name.to_string(),
                         message: format!(
                             "jsr return address {next_pc} at offset {pc} does not land on an \
@@ -1434,7 +1548,7 @@ fn verify_method_structural_only(
             Instruction::Ret(index) => {
                 if *index >= code_attr.max_locals {
                     return Err(LinkageError::VerifyError {
-                        class_name: class.name.to_string(),
+                        class_name: class_name.to_string(),
                         method_name: method.name.to_string(),
                         message: format!(
                             "ret at offset {pc} references local {index}, but max_locals is {}",
@@ -1443,6 +1557,19 @@ fn verify_method_structural_only(
                     });
                 }
                 ret_sites.push((pc, *index));
+            }
+            // JVMS §4.9.1: `wide` is a prefix; the decoder folds it into the
+            // widened instruction, so a standalone `Wide` here means the byte
+            // stream carried a `wide` with no valid successor opcode.
+            Instruction::Wide => {
+                return Err(LinkageError::VerifyError {
+                    class_name: class_name.to_string(),
+                    method_name: method.name.to_string(),
+                    message: format!(
+                        "stray `wide` prefix at offset {pc}: not followed by a widenable \
+                         instruction (JVMS §4.9.1)"
+                    ),
+                });
             }
             _ => {}
         }
@@ -1461,7 +1588,7 @@ fn verify_method_structural_only(
         for (ret_pc, index) in ret_sites {
             if !covered_rets.contains(&(ret_pc, index)) {
                 return Err(LinkageError::VerifyError {
-                    class_name: class.name.to_string(),
+                    class_name: class_name.to_string(),
                     method_name: method.name.to_string(),
                     message: format!(
                         "ret at offset {ret_pc} using local {index} is not covered by a \
@@ -1478,21 +1605,21 @@ fn verify_method_structural_only(
         let handler = entry.handler_pc as usize;
         if start >= end {
             return Err(LinkageError::VerifyError {
-                class_name: class.name.to_string(),
+                class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!("exception handler range invalid: start_pc={start}, end_pc={end}"),
             });
         }
         if end > code_len {
             return Err(LinkageError::VerifyError {
-                class_name: class.name.to_string(),
+                class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!("exception handler end_pc={end} is past code length {code_len}"),
             });
         }
         if handler >= code_len {
             return Err(LinkageError::VerifyError {
-                class_name: class.name.to_string(),
+                class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!(
                     "exception handler handler_pc={handler} is past code length {code_len}"
@@ -1501,7 +1628,7 @@ fn verify_method_structural_only(
         }
         if !instruction_starts.contains(&start) {
             return Err(LinkageError::VerifyError {
-                class_name: class.name.to_string(),
+                class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!(
                     "exception handler start_pc={start} does not land on an instruction boundary"
@@ -1510,7 +1637,7 @@ fn verify_method_structural_only(
         }
         if end != code_len && !instruction_starts.contains(&end) {
             return Err(LinkageError::VerifyError {
-                class_name: class.name.to_string(),
+                class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!(
                     "exception handler end_pc={end} does not land on an instruction boundary"
@@ -1519,7 +1646,7 @@ fn verify_method_structural_only(
         }
         if !instruction_starts.contains(&handler) {
             return Err(LinkageError::VerifyError {
-                class_name: class.name.to_string(),
+                class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!(
                     "exception handler handler_pc={handler} does not land on an instruction boundary"
@@ -1529,6 +1656,29 @@ fn verify_method_structural_only(
     }
 
     Ok(())
+}
+
+/// The local-variable slot an instruction addresses, and how many slots it
+/// occupies (2 for the `long`/`double` forms, 1 otherwise).
+///
+/// Returns `None` for instructions that do not name a local slot. `ret` is
+/// handled separately (it has its own `max_locals` check plus the subroutine
+/// coverage analysis), and `Wide` is rejected outright as a stray prefix.
+fn local_operand(insn: &Instruction) -> Option<(u16, u16)> {
+    match insn {
+        Instruction::Iload(i)
+        | Instruction::Fload(i)
+        | Instruction::Aload(i)
+        | Instruction::Istore(i)
+        | Instruction::Fstore(i)
+        | Instruction::Astore(i) => Some((*i, 1)),
+        Instruction::Iinc { index, .. } => Some((*index, 1)),
+        Instruction::Lload(i)
+        | Instruction::Dload(i)
+        | Instruction::Lstore(i)
+        | Instruction::Dstore(i) => Some((*i, 2)),
+        _ => None,
+    }
 }
 
 fn covered_ret_sites(
