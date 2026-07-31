@@ -161,10 +161,10 @@ jobs:
       #
       #   before   reported 2584 of 3927 (2523 pass, 61 fail), then exit 1 with
       #            NO `test result` line — 1,343 tests never executed
-      #   now      test result: FAILED. 3734 passed; 89 failed; 115 ignored
-      #            (3734+89+115 = 3938, every test accounted for, exit 101)
+      #   now      test result: FAILED. 3743 passed; 80 failed; 115 ignored
+      #            (3743+80+115 = 3938, every test accounted for, exit 101)
       #
-      # So 61 was a floor twice over: the real total was 173, now down to 89.
+      # So 61 was a floor twice over: the real total was 173, now down to 80.
       # Measured AFTER merging origin/dev (140 commits; the merge added 12
       # tests, hence 3938 rather than 3926).
       #
@@ -189,7 +189,7 @@ jobs:
       #
       # TWO things still block promotion. Both are measured:
       #
-      #  1. 89 failing tests. The systemic causes are exhausted. The tail is
+      #  1. 80 failing tests. The systemic causes are exhausted. The tail is
       #     individual, and a chunk of it is NOT missing work — it is work that
       #     was deliberately UNDONE, so "implementing" it would be a regression:
       #       * `java/util/Timer` — the synthetic natives were deleted because
@@ -208,6 +208,23 @@ jobs:
       #     `GZIPOutputStream`, `java/net/URL`'s constructors. (`StringReader`
       #     and `StringWriter` turned out to exist in `cratonvm-native-io` all
       #     along; the test just built a registry that could not see them.)
+      #
+      #     Two VM defects worth their own fix, both diagnosed but not fixed:
+      #       * Synthetic classes have NO named fields (`ensure_synthetic_class`
+      #         mints unnamed slots), and `write_throwable_field_cached`
+      #         resolves `cause` BY NAME — so on a synthetic Throwable the slot
+      #         write is skipped and the by-name write silently drops. No field
+      #         count fixes it; it needs named synthetic fields or a slot
+      #         fallback that does not disturb the real-JDK path.
+      #         (`throwable_init_cause_sets_cause` and the `p93_*` pair.)
+      #       * Lambda SAM-to-impl ARITY MISMATCH looks unsupported: a
+      #         `BiFunction.apply(k, v)` SAM bound to a 1-arg impl
+      #         (`System.identityHashCode`) never reaches the lambda body,
+      #         while `invoke_virtual_lambda_dispatch_static` proves the same
+      #         machinery works at matching arity. (The four `hashmap_compute`
+      #         / `merge` / `replaceAll` tests.) NOTE `CRATONVM_DBG_LAMBDA`
+      #         produced no output even on the PASSING control test, so that
+      #         hook is itself broken — do not trust its silence.
       #     The rest
       #     is ~38 individual `assertion left == right` divergences plus
       #     singles; a few are genuine VM bugs worth their own fix, notably
