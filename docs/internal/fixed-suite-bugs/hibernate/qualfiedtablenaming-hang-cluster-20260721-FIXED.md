@@ -28,8 +28,30 @@
 > **This is a harness/tooling regression, not a VM regression.** The underlying correctness
 > fix this doc is actually about — the `MutableBigInteger` AIOOBE quarantine (`41cdfdf94`) —
 > is unrelated, still intact, and not in question. Full write-up, current evidence, and the
-> re-implementation recommendation:
-> [`docs/known-issues/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731.md`](../../../known-issues/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731.md).
+> re-implementation recommendation: `qualfiedtablenaming-runner-timeout-floor-lost-20260731`
+> (now retired to
+> [`qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`](qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md)).
+>
+> **FOLLOW-UP 2026-07-31 (same day, later) — the accommodation is re-implemented, and two
+> claims in this doc are now known to be WRONG.** The runner override is back and durable
+> (tracked `apps/hib-suite-runner/class-overrides.tsv` + `run-hib.sh`, force-added past the
+> `apps/` ignore). Running the class to completion for the first time since then showed:
+>
+> 1. **"Clean but slow" is false on current `dev`.** The class does not pass in *either*
+>    mode with *any* timeout. `--nojit` **SIGSEGVs** at ~20 min (two distinct corrupt-write
+>    bugs — one fixed as `HIB-WEAKREF-RECYCLE.1`, one filed as `HIB-MAPRESIZE-STALE.1`);
+>    JIT-on **OOMs** at ~41 min on a 49 %-full heap (`HIB-GCOVERHEAD-HALFFULL.1`). The
+>    2026-07-21 CPU-time sampling that established "genuinely computing, not parked" was
+>    correct as far as it went — it just never ran long enough to watch the class fail.
+> 2. **"Force `--nojit` for this class" is INVERTED.** The "Resolved 2026-07-22" section
+>    below prescribes `--nojit` as the safe mode. On current `dev` `--nojit` is the
+>    *worse* mode: it segfaults, in roughly half the time the JIT lane takes to OOM. The
+>    re-implemented override is therefore **timeout-only** — deliberately no `--nojit`.
+>    Do not reinstate it from the section below without re-measuring.
+>
+> HotSpot control, identical class/classpath/`-Xmx1500m`/runner: `found=132 started=132
+> ok=132 failed=0` in **119,721 ms**, clean — so the historical `started=123` was a
+> CratonVM artifact, not 9 genuinely-skipped tests.
 
 Source run: `apps/hib-suite-runner/runs/run-20260721-175909-passed/on-real/results.tsv`
 (shard-3 / shard-4 `raw.log`), binary from worktree `CratonVM-hib-local-0712`
