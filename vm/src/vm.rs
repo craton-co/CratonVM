@@ -70919,8 +70919,9 @@ mod tests {
     #[test]
     fn p86_interrupt_unblocks_monitor_wait() {
         // `Thread.interrupt()` on a thread parked in `Object.wait(timeout)` must
-        // (a) end the wait well before the timeout, and (b) surface as an
-        // `InterruptedException` whose throw CONSUMES the interrupt status.
+        // (a) end the wait because of the INTERRUPT (not the timeout), and
+        // (b) surface as an `InterruptedException` whose throw CONSUMES the
+        // interrupt status.
         //
         // JLS §17.2.1 / `Object.wait`: "the interrupted status of the current
         // thread is cleared" when InterruptedException is thrown. So asserting
@@ -70928,7 +70929,44 @@ mod tests {
         // Java contract — `monitor_wait`'s own `swap(false)` before returning
         // `Err(InterruptedException)` is the correct behaviour, and the exception
         // (not a leftover flag) is how the wakeup reason reaches the caller.
-        use std::sync::atomic::Ordering;
+        //
+        // LOAD SENSITIVITY — why there are no fixed wall-clock offsets here.
+        // This test used to sleep a fixed 20ms before interrupting and then
+        // assert `waited < 400ms` against a 500ms wait timeout. On a loaded box
+        // the interrupter's 20ms sleep is routinely stretched past the whole
+        // 500ms window: the wait then ends on its own TIMEOUT and the assertion
+        // fires (reproduced under load: "waited 530.271307ms", "waited
+        // 517.347139ms", "waited 504.819127ms"). The same skew can also push the
+        // interrupt *ahead* of `monitor_wait`, in which case the run only
+        // exercises the entry-time interrupt check and never the in-wait wakeup
+        // this test exists to cover. Both fixed offsets are therefore gone:
+        //
+        //   * the interrupter waits until the waiter is OBSERVABLY parked — the
+        //     registry publishes a JMX waiting-monitor for exactly the duration
+        //     of the park — instead of guessing with a sleep, so the interrupt
+        //     always lands mid-wait;
+        //   * the wait's own timeout is a generous hang backstop, so a slow box
+        //     observes the wakeup LATER rather than failing;
+        //   * "the wait really parked and the interrupt is what reached it" is
+        //     proved by timing-INDEPENDENT readouts (`parked_observed`,
+        //     `delivered`) plus the `Err(InterruptedException)` itself. Only
+        //     the final backstop is a clock, and it is two minutes below the
+        //     wait's own timeout.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Hang backstops only — never timing assertions, and sized from
+        // measurement rather than taste. Reproducing the old flake on a
+        // 16-core box at load ~300 produced a `monitor_wait` that took
+        // 21.043604037s wall for a 500ms timeout: ~20.5s of that was pure
+        // scheduling stall OUTSIDE the wait loop (re-acquire / GC-block
+        // bookkeeping / JFR). Every bound below therefore clears 20.5s by at
+        // least 5x, while the work they cover normally finishes in single-digit
+        // milliseconds. `WAIT_BACKSTOP` is deliberately far BELOW
+        // `WAIT_TIMEOUT_MS` so a timeout-driven wakeup can never satisfy it,
+        // and the gap between them (>= 2 minutes) absorbs that post-wait stall.
+        const WAIT_TIMEOUT_MS: u64 = 240_000;
+        const WAIT_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(120);
+        const PARK_POLL_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid = ThreadId(1);
@@ -70943,31 +70981,73 @@ mod tests {
 
         let flag = thread.interrupted.clone();
         let shared1 = shared.clone();
+        // Raised once the interrupter has SEEN the waiter parked on the monitor;
+        // stays false if it gave up waiting for that to happen.
+        let parked_observed = Arc::new(AtomicBool::new(false));
+        // Raised immediately BEFORE `set_interrupted`, so observing it false at
+        // the instant `monitor_wait` returns means the wait ended without the
+        // interrupt — i.e. it never actually blocked.
+        let delivered = Arc::new(AtomicBool::new(false));
+        let parked_observed1 = parked_observed.clone();
+        let delivered1 = delivered.clone();
 
-        // Interrupt after a short delay
+        // Interrupt once — and only once — the waiter is demonstrably parked.
         let interrupter = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // `monitor_wait` publishes the JMX waiting-monitor immediately
+            // before it parks and takes it back the moment the park ends, so
+            // this is the state readout for "is parked inside Object.wait".
+            // Poll at 1ms granularity under a generous ceiling: a slow box just
+            // observes the park later.
+            let deadline = std::time::Instant::now() + PARK_POLL_CEILING;
+            while std::time::Instant::now() < deadline {
+                let parked = shared1
+                    .threads
+                    .thread_registry
+                    .jmx_lock_snapshot(tid)
+                    .is_some_and(|snap| snap.1.is_some());
+                if parked {
+                    parked_observed1.store(true, Ordering::Release);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Deliver the interrupt either way. If the waiter never parked, the
+            // `parked_observed` assertion below reports that — but the main
+            // thread must not be left sitting on the backstop timeout.
+            delivered1.store(true, Ordering::Release);
             shared1.threads.thread_registry.set_interrupted(tid, true);
         });
 
-        // Enter monitor and wait with timeout — should return after interrupt
+        // Enter monitor and wait. The timeout is a hang backstop, not a
+        // deadline the interrupt is racing: only the interrupt should end this.
         let mut ctx = NativeContextImpl {
             shared: &shared,
             thread: &mut thread,
         };
         ctx.monitor_enter(lock);
         let started = std::time::Instant::now();
-        let result = ctx.monitor_wait(lock, Some(500)); // interrupt should wake us long before this
+        let result = ctx.monitor_wait(lock, Some(WAIT_TIMEOUT_MS));
         let waited = started.elapsed();
+        // Sample the delivery flag at the return instant, before anything else
+        // can give the interrupter more time to run.
+        let delivered_at_return = delivered.load(Ordering::Acquire);
         ctx.monitor_exit(lock);
 
         interrupter.join().unwrap();
-        // (a) the interrupt, not the timeout, ended the wait.
+        // (a) the wait really parked, and the interrupt — not a timeout and not
+        //     a spurious wakeup — is what ended it. Both readouts are state, so
+        //     load can only make them arrive later, never make them wrong.
         assert!(
-            waited < std::time::Duration::from_millis(400),
-            "interrupt should end the wait well before the 500ms timeout, waited {waited:?}"
+            parked_observed.load(Ordering::Acquire),
+            "waiter never published a JMX waiting-monitor: Object.wait did not park"
         );
-        // (b) it surfaced as InterruptedException...
+        assert!(
+            delivered_at_return,
+            "monitor_wait returned before the interrupt was delivered — the wait \
+             did not block on the monitor"
+        );
+        // (b) it surfaced as InterruptedException — the wakeup reason reached
+        //     the caller as an exception rather than being swallowed...
         assert!(
             matches!(
                 &result,
@@ -70984,6 +71064,19 @@ mod tests {
             !flag.load(Ordering::Acquire),
             "InterruptedException consumes the interrupt status; the flag must be \
              clear once wait() has thrown"
+        );
+        // Hang backstop ONLY — not a timing assertion, and the last line of
+        // defence for "the INTERRUPT ended the wait, not the timeout": the
+        // interrupter always delivers, so a `monitor_wait` that ignored the
+        // interrupt and slept out its full timeout would still return
+        // `Err(InterruptedException)` from the exit-time `swap`. Only elapsed
+        // time separates those two worlds, so this check has to stay — but it
+        // sits 2 minutes below the wait's own timeout precisely so ordinary
+        // load cannot reach it.
+        assert!(
+            waited < WAIT_BACKSTOP,
+            "interrupt never unblocked the wait — it ran to its {WAIT_TIMEOUT_MS}ms \
+             timeout instead (hang backstop), waited {waited:?}"
         );
     }
 
