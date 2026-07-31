@@ -585,55 +585,68 @@ engine's `ServiceConfigurationError` under the forked TCCL and
 `non-public interface is not defined by the given loader`. They are equal on
 both VMs, which is the point.)
 
-### NEW, found by merging with `origin/dev` at the end of the session
+### Closed after the dev merge: the `@MockitoSpyBean` stub that vanished
 
-`mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests` passes
-**4/4** with this session's fixes on `dev@c8da3d9188`, and **0/4** with the same
-fixes on `dev` as of 2026-07-30 evening. The failure has moved: it is no longer
-`Could not inject field` (that is the CGLIB defect, closed above) but
+Merging `origin/dev` at the end of the session took
+`mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests` from
+**4/4 to 0/4**, with the failure moved on from the CGLIB injection defect
+(closed above) to every stubbed call returning a live `System.nanoTime()`.
+Now **4/4 again**, and chunk 9 is back to **8/8**.
+
+The spy was never wrong. A direct `spy.getDate(false)` returned the stubbed
+`1`; the same call *through the Spring AOP proxy* ran the real method. A stack
+trace printed from inside that real body settled it — there were **no frames in
+between**: no CGLIB interceptor, no cache interceptor, no `MockMethodAdvice`.
+`invokevirtual` on the proxy went straight to the superclass body.
+
+The proxy does declare the override — but it is **package-private**
+(`final Long getDate(boolean)`), and the proxy had been defined into
+`DynamicClassLoader` while its superclass lives in the
+`@CompileWithForkedClassLoader` fork. Same package *name*, different loaders,
+therefore different runtime packages, therefore per JVMS §5.4.5 **not an
+override**. Dispatch was correct; the proxy was in the wrong loader.
+
+Why HotSpot gets it right is upstream of AOP entirely. Spring CGLIB's
+`ReflectUtils.defineClass` tries `Lookup.defineClass` when the requested loader
+equals the neighbour class's, then the reflective `ClassLoader.defineClass`,
+then `Lookup.defineClass` on the neighbour class *even though the loaders
+differ*. Without `--add-opens java.base/java.lang=ALL-UNNAMED` the middle
+option does not exist on HotSpot, so Spring takes the third and the proxy joins
+its superclass's runtime package. CratonVM allowed the middle option:
 
 ```
-AssertionFailedError: expected: 1L but was: 69529817542L
+DefineClassAccessProbe, forked, no --add-opens
+  HotSpot   setAccessible(ClassLoader.defineClass) -> InaccessibleObjectException
+  CratonVM  setAccessible(ClassLoader.defineClass) -> ALLOWED
 ```
 
-— a `@MockitoSpyBean` stub being ignored, so the real method runs and returns a
-live `System.nanoTime()` reading. Same binary, same fixes, only the dev base
-differs, so this is a regression on `dev`, not from this branch. It is invisible
-on plain `dev` because without the CGLIB fix the test dies at injection before
-ever reaching the assertion.
+`setAccessible` already runs a deep-reflection gate, but it cannot see this
+edge: classes loaded from the runtime image carry no `module_name`, so every
+`java.lang` target reads as an unnamed→unnamed access. Populating
+`module_name` for the whole boot image is the real repair and a far larger
+change — it would begin denying every `setAccessible` into `java.lang` this VM
+currently permits. The fix encodes the one edge measured against HotSpot, in
+**all three** competing `setAccessible` natives; guarding only one of them is
+silently bypassed, which is what happened on the first attempt.
+`probes/DefineClassAccessProbe.java` is the standalone witness;
+`CRATONVM_DBG_SETACC=1` names the caller.
 
-Not JIT-related (`--nojit` reproduces). The obvious suspect is the same day's
-`fix/deep-audit-retire-20260730`, which replaced the process-wide
-`any_class_redefined()` quiesce with per-class checks in
-`vm/src/runtime/redefine_state.rs` — the old blanket gate suppressed native
-shadows for everything, so it could not miss a woven class.
-
-**One thing already tried and reverted** (so it is not tried twice): those
-per-class checks resolve names through `get_loaded_class_id`, which probes the
-built-in chain in delegation order and therefore returns the APPLICATION
-loader's copy whenever one exists — generation 0 — even when the fork loader's
-copy right beside it is the woven one. Making the name-keyed checks answer
-"was ANY class under this name redefined" is strictly more correct, was
-implemented, and **did not change the result** (still 0/4), so it was reverted
-rather than shipped as an unverified widening of a gate someone had just
-deliberately narrowed. The loader-blindness is real and worth fixing; it is
-simply not the whole of this failure.
-
-Repro, ~2 minutes:
-
-```bash
-cd /data/data/aot20260726
-CRATONVM_BIN=<binary> TMO=600 XMX=2g ./oneaot.sh cg \
-  org.springframework.test.context.bean.override.mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests
-```
+**A note on how this was found**, because the shortcut is reusable: four
+successively closer standalone probes (plain spy, spy behind an AOP proxy,
+proxy in a child loader, package-private method) **all passed** — the bug needed
+the real AOT context. What cracked it was instrumenting the actual failing test
+through a classpath overlay (`ovbuild` ahead of the suite classpath in
+`AotE2EProbe2`'s `-cp`), which costs two minutes and prints whatever you want
+from inside the real run. Reach for the overlay sooner than the fourth
+synthetic probe.
 
 ## What is left
 
-1. `AotIntegrationTests#endToEndTestsForBeanOverrides` chunk 4, blocked on the
-   Mockito redefine-throughput issue above.
-2. The `@MockitoSpyBean` stub regression just described.
+`AotIntegrationTests#endToEndTestsForBeanOverrides` chunk 4 only, blocked on
+the Mockito redefine-throughput issue above.
 
-Every other chunk matches HotSpot or beats it.
+All **19** other chunks match HotSpot exactly, and chunk 6 beats it (33/33
+against the HotSpot harness's own 31/33).
 
 ## What the fifth session left (1 class)
 
