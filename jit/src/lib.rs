@@ -8020,6 +8020,61 @@ fn exc_table_c2_disabled() -> bool {
 /// `invokestatic`, which this list has always admitted, not something the
 /// opcodes added here introduced.
 #[cfg(target_arch = "x86_64")]
+/// Does `op`, inside a protected range, always exit through a call site that
+/// publishes a precise (reason-9) exceptional frame?
+///
+/// `invokespecial`/`invokestatic` and the monitor ops have always been here.
+/// `invokevirtual` (0xb6) and `invokeinterface` (0xb9) are here again as of
+/// 2026-07-31, and the reason they can be is that the hole that took them out
+/// has since been plugged in the codegen rather than in this list:
+/// `a523715a84` added the `protected_precise_handler_call` suppression to
+/// `x64.rs`, which forces a protected virtual/interface call onto the dispatch
+/// path (ending in `emit_post_invoke_exception_check`) instead of the inline
+/// MIC/PIC cascade — and the inline cascade machine-CALLing a raw entry, with
+/// nothing recording the caller's locals, is exactly what let Spring's
+/// `SimpleApplicationEventMulticaster.invokeListener` read its pre-`try`
+/// `errorHandler` local back as null. The narrowing landed in the same commit
+/// as the fix and was belt to its braces; `probes/HandlerLocalAcrossProtected
+/// InvokeProbe.java` is the acceptance test that the braces hold on their own.
+///
+/// The remaining lowerings a protected 0xb6/0xb9 can select all publish:
+/// the two that emit no call at all cannot throw; the inline-callee path is
+/// unreachable because `try_compile_inner` clears `inline_sites` under
+/// `precise_exception_frames`; the sibling tail-call is suppressed inside a
+/// protected range (`pc_is_protected`, x64.rs); and the direct-call and
+/// MIC/`jit_invoke_dispatch` paths both end in
+/// `emit_post_invoke_exception_check`.
+///
+/// `getfield`/`putfield` (0xb4/0xb5) are NOT here. They were added 2026-07-28
+/// in `5bf306bb0` alongside a precise null check, but that check has a single
+/// call site on the INLINED-CALLEE `putfield` path; the top-level arms keep an
+/// inline fast path that neither null-checks nor publishes a frame. Measured
+/// with `probes/Rbc6FieldProbe.java`: a `getfield` NPE inside a protected range
+/// let the handler read a non-parameter local as 0 instead of 38, and a
+/// `putfield` on a null receiver did not throw at all. Both are silent wrong
+/// answers, which is what RBC.6 exists to prevent. Re-admit them only together
+/// with a precise frame at the top-level field arms — see
+/// `docs/internal/fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md`.
+///
+/// `invokedynamic` (0xba) is deliberately absent too: it lowers to an
+/// unconditional deopt trap, not to a call site that publishes a frame.
+fn precise_frame_publishing_opcode(op: u8) -> bool {
+    if matches!(op, 0xb6 | 0xb9) {
+        return precise_virtual_invokes_enabled();
+    }
+    matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
+}
+
+/// Opt-out for admitting `invokevirtual`/`invokeinterface` above, so one
+/// binary can be A/B'd against itself.
+fn precise_virtual_invokes_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES").is_none()
+    })
+}
+
 fn precise_exception_frame_sites_supported(
     code: &[u8],
     code_len: usize,
@@ -8046,26 +8101,11 @@ fn precise_exception_frame_sites_supported(
     let mut pc = 0;
     while pc < code_len {
         let op = code[pc];
-        // 0xb6 invokevirtual, 0xb7 invokespecial, 0xb8 invokestatic,
-        // 0xb9 invokeinterface, 0xc2/0xc3 monitorenter/monitorexit.
-        // 0xba (invokedynamic) is deliberately NOT here: it lowers to an
-        // unconditional deopt trap, not to a call site that publishes a frame.
+        // Which opcodes are admitted, and why, is documented on
+        // `precise_frame_publishing_opcode`.
         if covered(pc)
             && may_throw_without_precise_frame(op)
-            // 0xb4/0xb5 (getfield/putfield) are NOT here. They were added
-            // 2026-07-28 in 5bf306bb0 alongside a precise null check, but that
-            // check has a single call site on the INLINED-CALLEE putfield path;
-            // the top-level arms keep an inline fast path that neither
-            // null-checks nor publishes a frame. Measured on this tree with
-            // probes/Rbc6FieldProbe.java: a `getfield` NPE inside a protected
-            // range let the handler read a non-parameter local as 0 instead of
-            // 38, and a `putfield` on a null receiver did not throw at all
-            // (returned the normal-path -1 instead of the handler's 66). Both
-            // are silent wrong answers, which is exactly what RBC.6 exists to
-            // prevent. Re-admit them only together with a precise frame at the
-            // top-level field arms -- see
-            // docs/known-issues/tomcat/23-charsetcache-pathological-slowdown.md.
-            && !matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
+            && !precise_frame_publishing_opcode(op)
         {
             return false;
         }
