@@ -485,11 +485,55 @@ engine's `ServiceConfigurationError` under the forked TCCL and
 `non-public interface is not defined by the given loader`. They are equal on
 both VMs, which is the point.)
 
+### NEW, found by merging with `origin/dev` at the end of the session
+
+`mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests` passes
+**4/4** with this session's fixes on `dev@c8da3d9188`, and **0/4** with the same
+fixes on `dev` as of 2026-07-30 evening. The failure has moved: it is no longer
+`Could not inject field` (that is the CGLIB defect, closed above) but
+
+```
+AssertionFailedError: expected: 1L but was: 69529817542L
+```
+
+— a `@MockitoSpyBean` stub being ignored, so the real method runs and returns a
+live `System.nanoTime()` reading. Same binary, same fixes, only the dev base
+differs, so this is a regression on `dev`, not from this branch. It is invisible
+on plain `dev` because without the CGLIB fix the test dies at injection before
+ever reaching the assertion.
+
+Not JIT-related (`--nojit` reproduces). The obvious suspect is the same day's
+`fix/deep-audit-retire-20260730`, which replaced the process-wide
+`any_class_redefined()` quiesce with per-class checks in
+`vm/src/runtime/redefine_state.rs` — the old blanket gate suppressed native
+shadows for everything, so it could not miss a woven class.
+
+**One thing already tried and reverted** (so it is not tried twice): those
+per-class checks resolve names through `get_loaded_class_id`, which probes the
+built-in chain in delegation order and therefore returns the APPLICATION
+loader's copy whenever one exists — generation 0 — even when the fork loader's
+copy right beside it is the woven one. Making the name-keyed checks answer
+"was ANY class under this name redefined" is strictly more correct, was
+implemented, and **did not change the result** (still 0/4), so it was reverted
+rather than shipped as an unverified widening of a gate someone had just
+deliberately narrowed. The loader-blindness is real and worth fixing; it is
+simply not the whole of this failure.
+
+Repro, ~2 minutes:
+
+```bash
+cd /data/data/aot20260726
+CRATONVM_BIN=<binary> TMO=600 XMX=2g ./oneaot.sh cg \
+  org.springframework.test.context.bean.override.mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests
+```
+
 ## What is left
 
-`test.context.aot.AotIntegrationTests#endToEndTestsForBeanOverrides`, chunk 4
-only, blocked on the Mockito redefine-throughput issue above. Every other
-chunk matches HotSpot or beats it.
+1. `AotIntegrationTests#endToEndTestsForBeanOverrides` chunk 4, blocked on the
+   Mockito redefine-throughput issue above.
+2. The `@MockitoSpyBean` stub regression just described.
+
+Every other chunk matches HotSpot or beats it.
 
 ## What the fifth session left (1 class)
 
