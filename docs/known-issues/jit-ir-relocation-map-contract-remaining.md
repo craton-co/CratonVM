@@ -376,3 +376,32 @@ Note the shape of the mistake being avoided here: "the tier is off" was inferred
 twice from an absence (no IR bodies, then no live IR frames) without checking
 which conjunct produced it. The absence is the same in all cases; only the
 reason distinguishes them, and nothing currently reports the reason.
+
+## Retraction: the "ir_compatible never called" result was a harness error
+
+An attempt to add per-conjunct rejection reporting to `ir_compatible` produced
+"zero refusals AND zero IR bodies", which was read as proof that the `&&` chain
+short-circuits before `ir_compatible` — i.e. that `optimize` is false on the
+path that compiles hot methods.
+
+**That reading is void.** The patch never reached the tree that was built. The
+script targeted `C:\craton\CratonVM\jit\src\ir.rs` (backslashes) and the `sed`
+meant to redirect it to the task worktree matched on forward slashes, so it
+silently did nothing. The diagnostic was applied to the dev worktree three times
+over and to the task worktree never; the binary under test contained no
+reporting at all, so "zero refusals" only means "nothing was instrumented".
+
+Both trees have been reverted. Nothing is known about which conjunct fires.
+
+The narrowing in the section above still stands on its own evidence — three call
+sites pass `optimize = true` literally, and the moving-young term is `false` by
+construction — so `ir_compatible` remains the prime suspect. It is just not yet
+demonstrated.
+
+**When redoing this:** apply the patch, then *verify it is in the tree you are
+about to build* (`grep -c ir_reject jit/src/ir.rs`) before building, and confirm
+the built binary emits at least one line on a method you know is refused. Three
+separate conclusions in this investigation have now come from instrumentation
+that was not actually running — zero fallbacks with no live IR frame, zero IR
+bodies, and now zero refusals. Absence of output is not evidence until the
+output path is known to work.
