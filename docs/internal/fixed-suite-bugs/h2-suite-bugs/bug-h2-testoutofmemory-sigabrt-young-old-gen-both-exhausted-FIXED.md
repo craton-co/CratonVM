@@ -199,8 +199,18 @@ build aborts on the first one in both modes.
   calls itself "likely the dominant cause of the CratonVM-specific silent hangs".
   Not introduced here, and not fixable in this record.
 
-* **Committed heap exceeds `-Xmx`** — see section 3 above; filed as
-  `docs/known-issues/gc-young-semispace-expansion-ignores-xmx.md`.
+* **Committed heap exceeds `-Xmx`** — see section 3 above. **FIXED**
+  2026-07-31 in a follow-up (`fix/xmx-heap-budget-20260731`): `-Xmx` now bounds
+  `young_from + young_to + old_gen`, and this test's peak RSS at `--Xmx 1g`
+  drops from 3.63 GB to 2.09 GB with the young semi never expanding. Retired to
+  `docs/internal/fixed-suite-bugs/gc-young-semispace-expansion-ignores-xmx-FIXED.md`.
+
+* **`SIGSEGV addr=0x0` in class-mirror slot resolution** — a *pre-existing*,
+  heap-pressure-dependent crash this class reaches after ~9-13 minutes, in
+  roughly one long run in two to three. Reproduced on **unmodified `dev`** at
+  `--Xmx 512m` with a byte-identical register signature, so it is neither this
+  record's abort nor the heap-budget follow-up. Filed as
+  `docs/known-issues/gc-class-mirror-sigsegv-under-sustained-heap-pressure.md`.
 
 * **`gen_heap::set_field: out-of-bounds field write dropped` on a
   `java/lang/Object` with `num_slots=0`** — appears in the post-OOM region that

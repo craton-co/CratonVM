@@ -536,7 +536,7 @@ pub const DEFAULT_MOVING_YOUNG: bool = true;
 /// is unreachable. The cost is not theoretical: with the IR gate closed, every
 /// compile falls through to the single-pass backend and the optimizing tier
 /// contributes nothing (see
-/// `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`).
+/// `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`).
 ///
 /// So the gates read this constant *in addition to* `moving_young`, and the
 /// runtime veto reads it too. One flip re-arms all of them together, which is
