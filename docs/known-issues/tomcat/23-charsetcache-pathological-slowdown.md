@@ -1,16 +1,21 @@
 # `TestCharsetCachePerformance` — the cached paths lose to the uncached one
 
-**Status:** OPEN, **half fixed** (last measured 2026-07-30). The
-`timeFull < timeNone` assertion now passes in most runs but is flaky (5 of 7);
-`timeLazy < timeNone` still fails, by 4.0x. Read the final section first — it supersedes the running diagnosis
-below, and it reframes the residual as a *thread-scaling* wall in the dispatch
-helper rather than anything specific to charset caching.
+**Status:** OPEN (last measured 2026-07-31). Both assertions still fail, but
+the reason has changed and is now specific. **Read the 2026-07-31 section at
+the end first — it supersedes every diagnosis above it.**
 
-The RBC.6 admission gate described below as "why this was not fixed here" WAS
-subsequently fixed — see *Update* at the end — which is what flipped the first
-assertion. `CharsetCache.getCharset` now compiles, yet the `LazyCsCache` arm is
-still ~835s, so compilation admission was necessary but not sufficient and
-something further remains in that arm.
+The thread-scaling wall the previous status described is fixed: at the real
+test parameters the three arms are 3.7x / 2.6x / 5.9x faster, and the
+`LazyCsCache` arm alone went 459.5s → 76s. What is left is not a charset-cache
+problem, not a dispatch problem and not a scaling problem — it is the flat
+~750 ns CratonVM pays per *native call*, where HotSpot pays ~4 ns. The test
+compares one arm that makes one native call against two arms that make two, so
+it cannot pass until that floor comes down. The arithmetic is in *What the
+test actually needs now*.
+
+Everything between here and that section is kept as the record of how the
+earlier layers were peeled off. Several of its conclusions were corrected
+later; the corrections say so where they are.
 
 Confirmed CratonVM-only — passes on HotSpot in the same fixture.
 
@@ -750,3 +755,268 @@ the colliding class appear. Note it passes **with the epoch flush disabled as
 well** — which is the honest reading of the paragraph above, not a claim that
 the probe proves the epoch necessary. It proves the memo does not break
 multi-loader dispatch, which is what it is for.
+
+## Update 2026-07-31 — the scaling wall is fixed; the residual is the native-call floor
+
+This section supersedes everything above it.
+
+Three defects landed. Each was A/B'd on **one binary against itself** behind a
+flag, which is the only comparison this document trusts (see the 2026-07-28
+methodological note). Measured on the Windows box, 32 logical cores.
+
+### 1. Every Java call serialized on process-wide counters
+
+`probes/ScaleLadder.java` runs a ladder of increasingly VM-dependent
+per-iteration operations at 1 and N threads, so a collapse can be attributed to
+a *kind of operation* rather than to a benchmark arm. On `origin/dev` it showed
+the wall directly: at ten threads a plain **virtual call went from 207 ns/op to
+19,900**, i.e. ten threads doing a *tenth* of one thread's total work, while
+pure arithmetic scaled 6x. Allocation, interface calls and `IdentityHashMap.get`
+collapsed the same way; `getstatic` and primitive-returning natives did not.
+
+Every interpreter/JIT boundary crossing did five contended global atomic RMWs
+plus a global mutex, **twice** (once on enter, once on exit):
+
+* `gc_quiescence::{ENTER_COUNT, LEAVE_COUNT}` — unconditional diagnostics,
+* `gc_quiescence::JIT_ACTIVE_DEPTH` — a `fetch_update` CAS *loop* on the leave
+  side, the worst possible shape under contention,
+* `conservative_roots::GLOBAL_JIT_DEPTH`,
+* `jit::ACTIVE_JIT_EXECUTIONS`,
+* `types::jit_activation`'s single `Mutex<Registry>`, for both of its maps.
+
+All of them are written on every call and read only by the GC, a diagnostic
+dump, or code retirement. The four counters became
+`cratonvm_types::striped_counter::StripedCounter` — one cache-line-aligned
+stripe per thread, summed on the rare read. A thread's stripe never changes, so
+`is_zero()` keeps exactly the contract `load() == 0` had, and per-stripe
+saturation is strictly *safer*: one thread's unbalanced leave can no longer
+cancel another thread's live entry.
+
+`jit_activation` lost both halves rather than getting a cheaper lock. Its
+`entry_ptr -> class_id` map was unnecessary — every activation site already
+holds the `&CompiledMethod`, so the declaring class now travels on
+`CompiledMethod::owner_class_id`, stamped at publication, which also cannot
+return a retired entry's stale answer. Its `class_id -> count` map became a
+per-thread chunked slot table: `enter`/`exit` touch only the calling thread's
+own cache lines, and `active_class_ids` walks every thread's table from the
+outside, which is sound because each published class id is an `AtomicU32`.
+
+| ten-thread ns/op | legacy | striped + per-thread |
+|---|---|---|
+| virtual call | 8835 | **1493** |
+| interface call | 8805 | **1728** |
+| `IdentityHashMap.get` | 28375 | **1708** |
+| allocation (`new TinyImpl`) | 8894 | **2199** |
+
+`CRATONVM_STRIPED_COUNTERS_OFF=1` puts every thread back on stripe zero and
+`CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX=1` restores the old lock.
+
+### 2. `invokevirtual`/`invokeinterface` were wrongly excluded from RBC.6's escape hatch
+
+`precise_exception_frame_sites_supported` did not admit `0xb6`/`0xb9`, so RBC.6
+refused to compile any method whose handler reads a non-parameter local and
+whose protected range calls one — **including `CharsetCache.getCharset`
+itself**, whose `try` contains `invokevirtual addToCache`. Confirmed
+mechanically, not by inference: with `CRATONVM_DBG_JIT_COMPILED=1` the method is
+absent from the publication list under the narrow list and present under the
+wide one.
+
+They were removed in `a523715a84` because admitting them let Spring's
+`SimpleApplicationEventMulticaster.invokeListener` read its own pre-`try`
+`errorHandler` local back as null inside the handler. **That same commit also
+added the fix**: the `protected_precise_handler_call` suppression in `x64.rs`,
+which forces a protected virtual/interface call onto the dispatch path (ending
+in `emit_post_invoke_exception_check`, which records the caller's complete
+state) instead of the inline MIC/PIC cascade that machine-CALLs a raw entry
+with nothing recording the caller's locals. The inline cascade was the actual
+defect; the whitelist narrowing was belt to those braces. Both are in the tree,
+so the opcodes are admitted again.
+
+Acceptance: `probes/HandlerLocalAcrossProtectedInvokeProbe.java` builds the
+Spring shape — a non-parameter local assigned before the `try`, read back in
+the handler — through `invokevirtual`, `invokeinterface` and `invokespecial`
+throw sites, plus a nested `try`, a reassignment after the protected call, and
+(extended here) the null-`errorHandler` path that must skip the protected
+region entirely, run 10,000 times *after* the branch has been profiled the
+other way. It passes. `probes/Rbc6FieldProbe.java` is byte-identical to HotSpot
+and to `--nojit`, whole-run checksum included, so `getfield`/`putfield` stay
+out for the reason now recorded on `precise_frame_publishing_opcode`.
+`cargo test -p cratonvm-jit` is green (1061 lib tests plus 11 integration
+binaries) and `cargo test -p cratonvm-vm --test jit_local_exception_handler_tests`
+is 15/15. The unit test that pinned the narrow contract now pins the wide one
+and names the probe a future change has to re-verify with.
+
+### 3. An exception-table callee cost a full dispatch on *every* call, forever
+
+Compiling it was necessary but not sufficient — and this is the part every
+earlier round of this document missed, because it is caller-side.
+
+`probes/LazyArmVariants.java` decomposes the lazy arm one construct at a time.
+Its V7/V8 pair is the decisive one: two delegates that differ **only** by a
+`try`/`catch` that never fires, at the same call depth as the real arm (V0
+against V2 changes two things at once, which is what hid this for so long).
+
+| ten threads, ns/op | before | after |
+|---|---|---|
+| V7 delegate, no `try` (control) | 8362 | 8684 |
+| V8 delegate, with `try` | 45613 | **10048** |
+| V0 real `CharsetCache` | 46780 | **10055** |
+| V2 no `try`/`catch` (control) | 9749 | 9973 |
+
+A callee that declares an exception table is barred from the machine-code
+MIC/PIC, because the inline cascade CALLs the cached entry directly. Nothing
+ever writes the MIC's class id for such a callee, so every call landed in the
+cache **miss** arm — a compile probe, an exception-table probe, and
+`invoke_or_native` — and the compiled body sat in the JIT cache unused. Under
+`--nojit` the V7/V8 gap disappears entirely, which is what proves the cost is
+the compiled caller's dispatch and not the callee's body.
+
+The virtual-MIC helper now keeps such callees in the per-thread
+`VIRTUAL_DISPATCH_CACHE`, which the inline cascade cannot see, so a hit runs
+the compiled body while still routing any `i64::MIN` sentinel through
+`handle_compiled_callee_deopt_sentinel` — the same trade `jit_invoke_dispatch`'s
+virtual arm already makes for its own callees. Both the entryless-hit and the
+miss arm consult and populate it, and the helper now owes that cache the same
+generation/supersede revalidation, factored out as
+`flush_raw_entry_dispatch_caches`.
+
+**The ban itself is obsolete, and is deliberately still on.**
+`Compiler::emit_inline_callee_deopt_check` is emitted after *every* inline
+direct-entry CALL (both PIC slots and the MIC arm) and hands a sentinel to
+`jit_service_callee_deopt`, a thin wrapper over the same handler — so
+publishing exception-table callees into the MIC/PIC would now be safe. Lifting
+it was A/B'd on an idle host, three rounds, and is **indistinguishable** from
+keeping it (V8: 9705/9779/9855 kept vs 8740/10229/9278 lifted), because the
+Rust-level cache already captures the win. This document's own precedent
+applies: a change carrying a correctness risk for zero measured throughput does
+not land. `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1` opts in.
+
+### What the whole change set is worth on the real class
+
+**The real class, under JUnit, one run each** (`probes/run-doc23-regression.ps1`,
+300s per-class timeout, same host, back to back):
+
+| arm | dev | this branch |
+|---|---|---|
+| `NoCsCache` (control) | 90.5s | 48.8s |
+| `FullCsCache` | 85.6s | 54.5s |
+| `LazyCsCache` | *still running at the 300s kill* | 73.0s |
+| whole class | **TIMEOUT** | 176s, completes |
+
+`dev` cannot finish the class inside 300s; this branch finishes it in 176s.
+That is the headline: doc 23 opened on "the `LazyCsCache` arm alone takes 15
+minutes, which is what pushes the class past even a 1500s per-class timeout",
+and that part is over.
+
+The same three arms under `probes/Doc23Arms.java` at the class's own parameters
+(10,000,000 iterations x 10 threads) on an idle host, where `dev` can be given
+as long as it needs:
+
+| arm | dev | this branch | change |
+|---|---|---|---|
+| `NoCsCache` (control) | 174.0s | 41.6-50.1s | **3.7x faster** |
+| `FullCsCache` | 164.9s | 56.3-68.5s | **2.6x faster** |
+| `LazyCsCache` | 459.5s | 75.5-78.3s | **5.9x faster** |
+| `timeLazy / timeNone` | 2.64 | 1.50-1.81 | still FAILS |
+| `timeFull / timeNone` | 0.95 | 1.12-1.65 | still FAILS |
+
+Read the last row carefully, because it is counter-intuitive and the next
+person will trip on it: **`timeFull` got worse as a ratio while getting 2.6x
+faster in absolute terms.** The control arm is a single contended native
+(`Charset.forName`), so it benefited *more* from the counter/lock work than the
+cached arms did, and the ratio moved against us. Judging this class on ratios
+alone, without the absolute times beside them, manufactures a "regression" that
+is nothing of the sort. (Its own control-arm noise is separately documented in
+the 2026-07-30 section: 8+ runs before any claim about `NoCsCache`.)
+
+### What the test actually needs now
+
+`probes/NativeCallCostProbe.java` measures each native the arms depend on
+against `String.length()`, which establishes the floor for "call a native and
+come back":
+
+| | CratonVM 1t | CratonVM 10t | HotSpot 1t |
+|---|---|---|---|
+| *loop overhead alone, no call* (`ScaleLadder` arith) | *122* | *235* | *1.3* |
+| `String.length()` — the floor | 749 | 6413 | 4.0 |
+| `String.hashCode()` | 764 | 9116 | 4.2 |
+| `toLowerCase(Locale)`, repeated receiver | 1296 | 13391 | 32.2 |
+| `Map.get` on a `HashMap` | 822 | 3478 | 11.0 |
+| `ConcurrentMap.get` on a CHM | 958 | 3406 | 13.8 |
+
+The first row is there so the rest are read correctly: this probe shape (a loop
+inside a method entered once, so the loop reaches compiled code only through
+OSR) costs ~122 ns/iteration before any call at all, which is itself ~90x
+HotSpot and worth its own investigation. The **marginal** cost of adding the
+cheapest possible native call to that loop is therefore ~630 ns, and every
+richer native lands within a small factor of it. **The bodies are not the
+problem; entering and leaving a native is.**
+
+That marginal cost is what the remaining ratio is made of:
+
+* `NoCsCache` = **one** native call (`Charset.forName`).
+* `FullCsCache` = **two** (`toLowerCase`, then `HashMap.get`).
+* `LazyCsCache` = **two**, plus one more Java call level
+  (`CharsetCache.getCharset`), and its map is a `ConcurrentHashMap`.
+
+The arithmetic works out: `toLowerCase` (1296) + `HashMap.get` (822) = 2118
+against `Charset.forName`'s 2290 — which is why `FullCsCache` and `NoCsCache`
+now finish within ~10-60% of each other and the assertion turns on noise. On
+HotSpot the floor is ~4 ns, so the *work* dominates and the caches win by 48x.
+On CratonVM the floor dominates, so an arm making two native calls cannot
+reliably beat one making one, however good the caching is. No further work on
+the charset cache, the dispatch helpers or the scaling counters changes that
+ordering.
+
+So this document's residual is now **exactly** the separate, already-known
+native-call dispatch overhead it has been deferring since 2026-07-30 ("the
+separate, already-known native-call dispatch overhead, and is not addressed
+here either"). It is a VM-wide project, not a Tomcat one. Doc 23 stays OPEN and
+should be closed by that work, not by more work on this test.
+
+Ranked next steps, with the evidence for each:
+
+1. **The per-native-call floor** (~750 ns/op at one thread, ~6400 at ten).
+   `NativeCallCostProbe` isolates it, and `String.length()` is the cheapest
+   possible target — no charset fixture needed. Worth roughly 2x on both cached
+   arms, and it is what closes this document.
+2. **`ConcurrentHashMap.get` versus `HashMap.get`.**
+   `probes/ChmVsHashMapProbe.java` reaches one warm map through four declared
+   types, because the thin direct helper is selected by the call site's
+   *constant-pool class* — comparing a `Map`-typed field against a
+   `ConcurrentMap`-typed one is an accidental apples-to-oranges test, and the
+   earlier `ScaleProbe` `chmOnly`/`hashmapOnly` rows have exactly that flaw.
+   On an idle host: `Map` to HashMap 345/2200 ns/op, `ConcurrentMap` to CHM
+   1480/4400. Closing that gap is worth ~2.2 us/op to the lazy arm, more than
+   the whole remaining `timeLazy` margin.
+3. **The allocator.** `new int[4]` still scales at 0.47x (`ScaleLadder`) —
+   `try_alloc_young_initialized` holds `young_from.lock()` across zeroing, and
+   the JIT array path does not use the TLAB. It does not affect these arms (the
+   run does **zero** collections, confirmed with `CRATONVM_GC_STATS=1`, so
+   nothing here is GC-bound) but it is the next global lock of the same family
+   as the ones fixed above.
+
+### Reproduction
+
+```powershell
+# the three arms at any scale, with the two ratios the test asserts on
+<cratonvm> --java-home <jdk25> -cp "<probes>;<tomcat classes>" Doc23Arms 10000000 10 1
+# where multi-thread scaling collapses, by kind of operation
+<cratonvm> --java-home <jdk25> -cp <probes> ScaleLadder 1000000 10
+# the lazy arm one construct at a time (V7 against V8 is the try/catch pair)
+<cratonvm> --java-home <jdk25> -cp "<probes>;<tomcat classes>" LazyArmVariants 300000 10
+# the native-call floor
+<cratonvm> --java-home <jdk25> -cp <probes> NativeCallCostProbe 500000 10
+# CHM against HashMap without the declared-type confound
+<cratonvm> --java-home <jdk25> -cp <probes> ChmVsHashMapProbe 500000 10
+# did my flag move anything? -- always answer this before measuring
+CRATONVM_DBG_JIT_COMPILED=1 <cratonvm> ... 2>&1 | Select-String getCharset
+```
+
+Regression check for the change set (`probes/run-doc23-regression.ps1`): of the
+63 `org.apache.tomcat.util.{buf,collections,http}` / `org.apache.catalina.util`
+classes, **62 give an identical verdict** on `origin/dev` and on this branch —
+including the same two `*LargeHeap` failures (they want more than the 2g used
+here) and the same `TestMethodPerformance` timeout. The single class that
+differs is `TestCharsetCachePerformance` itself, which goes from TIMEOUT to a
+completed FAIL.

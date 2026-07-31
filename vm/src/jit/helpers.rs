@@ -1605,11 +1605,25 @@ fn flush_raw_entry_dispatch_caches() {
 /// (`probes/LazyArmVariants.java` V7 vs V8: identical delegates differing only
 /// by a never-taken `try`/`catch`, 8362 vs 45613 ns/op at ten threads).
 ///
-/// `CRATONVM_JIT_NO_MIC_EXC_TABLE_PUBLISH=1` restores the ban.
+/// **The ban is nevertheless kept ON by default**, because lifting it buys
+/// nothing measurable once the Rust-level cache above exists. A/B on one
+/// binary, three interleaved rounds on an idle host, ten threads
+/// (`probes/LazyArmVariants.java`, ns/op):
+///
+/// | variant                | ban kept          | ban lifted        |
+/// |------------------------|-------------------|-------------------|
+/// | V0 real `CharsetCache` | 11545/9865/9683   | 9272/10737/9441   |
+/// | V8 delegate with `try` | 9705/9779/9855    | 8740/10229/9278   |
+///
+/// Indistinguishable. Doc 23's own precedent applies: a change that carries a
+/// correctness risk for zero measured throughput does not land. What is
+/// recorded here is that the *reason* for the ban has expired, so the next
+/// person can lift it on evidence rather than re-deriving the argument —
+/// set `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1` to try.
 fn mic_publish_exception_table_callees() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_MIC_EXC_TABLE_PUBLISH").is_none()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH").is_some()
     })
 }
 
