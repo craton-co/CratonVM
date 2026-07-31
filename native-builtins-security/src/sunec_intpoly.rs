@@ -176,6 +176,17 @@ fn native_mont_square(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(None)
 }
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Substantively this is an
+// intrinsic, not a bridge and not a stub: the real
+// `MontgomeryIntegerPolynomialP256.{mult,square}` have concrete bytecode, and
+// HotSpot intrinsifies the same field arithmetic. The classification hazard is
+// structural, not semantic — neither of the two registrations below carries a
+// category. Both inherit `Intrinsic` from the ONE caller,
+// `native-builtins/src/lib.rs`'s `with_category(NativeKind::Intrinsic, …)`
+// wrapper. Delete or move that wrapper and these silently become
+// `SyntheticStub` and vanish under `--jdk-only`. Evidence still owed per
+// jdk-only-native-review.md §6: parity is argued from JDK 25 limb vectors in
+// this file's tests, but the speedup is asserted, not measured in-repo.
 /// Register the byte-identical P-256 Montgomery field multiply/square intrinsics.
 pub fn register_sunec_intpoly_intrinsics(registry: &mut NativeMethodRegistry) {
     registry.register(CLASS, "mult", "([J[J[J)V", native_mont_mult);

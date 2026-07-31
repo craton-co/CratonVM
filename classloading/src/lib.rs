@@ -33,6 +33,13 @@ pub mod builtin_loaders;
 pub mod bytecode_verifier;
 mod class;
 mod class_manager;
+/// Class provenance (`ClassOrigin`) — the `--jdk-only` policy's view of where
+/// each loaded class came from. See `docs/feature-designs/jdk-only-mode.md` §5.
+///
+/// Public as a module (not just re-exported) because `--dump-class-origins`
+/// consumers in `vm-cli` / `difftest` name the type through
+/// `cratonvm_classloading::class_origin::…`.
+pub mod class_origin;
 mod class_path;
 pub(crate) mod fx_hash;
 pub mod jar_signer;
@@ -51,6 +58,11 @@ pub use class::{
     ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource, RecordComponentInfo,
     RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE, RECORD_OBJ_TO_STRING,
 };
+// JDK-only mode (contract §5): every `Class` carries a `ClassOrigin`, and the
+// `--dump-class-origins` census is a `Vec<ClassOriginEntry>`. Both are named at
+// the crate root because the consumers (`vm`, `vm-cli`, `difftest`) already
+// import `Class` from here.
+pub use class_origin::{ClassOrigin, ClassOriginEntry};
 pub use class_manager::is_bootstrap_appended_class;
 pub use class_manager::synthetic_stub_instance_field_count;
 pub use class_manager::{

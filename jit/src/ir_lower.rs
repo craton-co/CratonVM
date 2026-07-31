@@ -257,6 +257,9 @@ struct Lowerer<'a> {
     /// see [`Lowerer::emit_safepoint_map`].
     ref_param_homes: Vec<i16>,
     shadow_savebase_slot_off: i32,
+    /// Shadow `top` captured at method entry; restored by every exit. See the
+    /// layout comment in `Lowerer::new`.
+    shadow_savetop_slot_off: i32,
     /// `get_current_thread` helper; `0` when unwired (the JIT unit tests' stub
     /// table). Every shadow site is gated on it — dereferencing a thread
     /// pointer that was never fetched would read stack garbage.
@@ -424,9 +427,10 @@ impl<'a> Lowerer<'a> {
         // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
         let locals_size = (num_locals as i32) * 8;
         let context_size = if needs_context { 8 } else { 0 };
-        // Three extra reserved slots: the safepoint id, the cached
-        // `*mut JvmThread`, and the shadow stack's base `top` for this push.
-        let sp_id_size = 8i32 * 3;
+        // Four extra reserved slots: the safepoint id, the cached
+        // `*mut JvmThread`, the shadow stack's base `top` for this push, and
+        // the shadow `top` watermark captured at method entry.
+        let sp_id_size = 8i32 * 4;
         let spill_size = (max_nodes as i32) * 8;
         let args_stage_size = (max_call_args as i32) * 8;
         let shadow = 32i32;
@@ -483,7 +487,19 @@ impl<'a> Lowerer<'a> {
         // here, so an intervening unbalanced push cannot drift it (the
         // single-pass backend's spring-bug-10 fix; same hazard applies here).
         let shadow_savebase_slot_off = (base + 2) * 8;
-        let first_spill = (base + 3) * 8;
+        // The shadow `top` at METHOD ENTRY. Every exit restores it, unwinding
+        // any push this activation did not pop. Without it an abnormal exit
+        // (the `i64::MIN` exception/deopt sentinel, which jumps straight to the
+        // shared bail stub and skips the matching reload) leaks its push
+        // FOREVER: nothing else retracts `top` once a raw JIT-to-JIT call has
+        // removed the Rust boundary whose `restore_jit_thread` used to heal it.
+        // The single-pass backend has always done this (`emit_epilogue`'s
+        // savetop-restore); this tier never did, and leaked ~4 slots per
+        // sentinel return until the 256K-slot stack ran off its end and the
+        // unguarded push stored past the mapping. See
+        // `x64.rs::Compiler::emit_epilogue` for the mechanism this mirrors.
+        let shadow_savetop_slot_off = (base + 3) * 8;
+        let first_spill = (base + 4) * 8;
         let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
         let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
 
@@ -519,6 +535,7 @@ impl<'a> Lowerer<'a> {
             shadow_thread_slot_off,
             ref_param_homes,
             shadow_savebase_slot_off,
+            shadow_savetop_slot_off,
             get_current_thread: helpers.get_current_thread,
             shadow_off_in_thread: helpers.shadow_stack_offset_in_thread as i32,
             pending_shadow: Vec::new(),
@@ -879,6 +896,16 @@ fn reloc_emit_enabled() -> bool {
             }
             self.store_abi_reg(abi_regs[abi_idx], ((i as i32) + 1) * 8); // local_offset(i)
         }
+        // Zero the cached-thread and watermark slots BEFORE the fetch. The
+        // fetch is erased (NOP'd) by `finish_lazy_thread_fetch` when the method
+        // publishes nothing, and every consumer below is null-guarded on the
+        // thread slot — so it must read 0, not uninitialised stack. The
+        // single-pass backend zero-initialises for exactly this reason (see the
+        // incident writeup on `x64.rs::Compiler::emit_epilogue`).
+        if self.get_current_thread != 0 && self.shadow_thread_slot_off > 0 {
+            self.emit_zero_frame_slot(self.shadow_thread_slot_off);
+            self.emit_zero_frame_slot(self.shadow_savetop_slot_off);
+        }
         self.emit_frame_record();
         self.fetch_current_thread();
         self.zero_ref_phi_slots();
@@ -995,6 +1022,27 @@ fn reloc_emit_enabled() -> bool {
         self.emit_mov_reg_imm64(RAX, self.get_current_thread as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         self.store_rax(self.shadow_thread_slot_off);
+        // Capture the entry watermark, inside the erasable span: a method that
+        // publishes nothing has no push to unwind, so the capture goes away
+        // with the fetch and the (zeroed) thread slot makes every exit's
+        // restore skip through its null guard.
+        if self.shadow_savetop_slot_off > 0 {
+            let ss_top = self.shadow_off_in_thread;
+            // MOV R10, [rbp - thread_slot]
+            self.buf.emit(&[0x4C, 0x8B, 0x95]);
+            self.buf.emit(&(-self.shadow_thread_slot_off).to_le_bytes());
+            // TEST R10, R10 ; JE skip
+            self.buf.emit(&[0x4D, 0x85, 0xD2]);
+            self.buf.emit(&[0x0F, 0x84]);
+            let skip = self.buf.pos();
+            self.buf.emit(&[0, 0, 0, 0]);
+            // MOV R11, [R10 + ss_top] ; MOV [rbp - savetop], R11
+            self.buf.emit(&[0x4D, 0x8B, 0x9A]);
+            self.buf.emit(&ss_top.to_le_bytes());
+            self.buf.emit(&[0x4C, 0x89, 0x9D]);
+            self.buf.emit(&(-self.shadow_savetop_slot_off).to_le_bytes());
+            self.patch_rel32_to_here(skip);
+        }
         self.thread_fetch_span = Some((start, self.buf.pos()));
     }
 
@@ -1226,7 +1274,42 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&neg.to_le_bytes());
     }
 
+    /// `MOV qword [rbp - off], 0` (mod=10 disp32, /0).
+    fn emit_zero_frame_slot(&mut self, off: i32) {
+        self.buf.emit(&[0x48, 0xC7, 0x85]);
+        self.buf.emit(&(-off).to_le_bytes());
+        self.buf.emit(&0i32.to_le_bytes());
+    }
+
+    /// Restore the shadow `top` captured at method entry, unwinding any push
+    /// this activation did not pop. Mirrors the single-pass backend's epilogue.
+    /// R10/R11 are caller-saved and dead at every exit; RAX (the return value,
+    /// or the `i64::MIN` sentinel on the bail path) is untouched.
+    fn emit_shadow_savetop_restore(&mut self) {
+        if self.get_current_thread == 0
+            || self.shadow_thread_slot_off <= 0
+            || self.shadow_savetop_slot_off <= 0
+        {
+            return;
+        }
+        let ss_top = self.shadow_off_in_thread;
+        // MOV R10, [rbp - thread_slot] ; TEST R10,R10 ; JE skip
+        self.buf.emit(&[0x4C, 0x8B, 0x95]);
+        self.buf.emit(&(-self.shadow_thread_slot_off).to_le_bytes());
+        self.buf.emit(&[0x4D, 0x85, 0xD2]);
+        self.buf.emit(&[0x0F, 0x84]);
+        let skip = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // MOV R11, [rbp - savetop] ; MOV [R10 + ss_top], R11
+        self.buf.emit(&[0x4C, 0x8B, 0x9D]);
+        self.buf.emit(&(-self.shadow_savetop_slot_off).to_le_bytes());
+        self.buf.emit(&[0x4D, 0x89, 0x9A]);
+        self.buf.emit(&ss_top.to_le_bytes());
+        self.patch_rel32_to_here(skip);
+    }
+
     fn emit_epilogue(&mut self) {
+        self.emit_shadow_savetop_restore();
         // add rsp, frame_size
         self.buf.emit(&[0x48, 0x81, 0xC4]);
         self.buf.emit(&self.frame_size.to_le_bytes());
@@ -2793,17 +2876,27 @@ fn reloc_emit_enabled() -> bool {
                 // the whole compile. `lower_data_node` has no post-`match` code,
                 // so an early `return` here fully handles the node.
                 if unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind } == 4 {
-                    // This route bypasses `emit_call_return_check`, so nothing
-                    // would reload the published values afterwards and the
-                    // frame would keep pre-relocation addresses. Withdraw the
-                    // claim for this safepoint and drop the pending homes; the
-                    // collector then diverts to the non-moving sweep whenever
-                    // such a frame is live, which is correct if unambitious.
+                    // This route bypasses `emit_call_return_check`, so the
+                    // shared post-call reload never runs here. Withdraw the
+                    // coverage claim — the reload below restores the homes but
+                    // this route cannot promise a relocating collector anything
+                    // — and then emit the reload explicitly.
+                    //
+                    // Dropping `pending_shadow` instead (the original) withdrew
+                    // the claim but left the PUSH that `emit_safepoint_map`
+                    // above had already emitted, with nothing to pop it. Every
+                    // execution of a self-recursive direct call then leaked its
+                    // published oops permanently, and a recursive method in a
+                    // hot loop walked the thread's 2 MiB shadow stack off its
+                    // end within a second — storing across the heap behind it,
+                    // because no backend emits the `end` guard the shadow-stack
+                    // design documents. That is what made the raw JIT-to-JIT
+                    // gate unsafe to open; this route only exists when it is.
                     if let Some(last) = self.oop_maps.last_mut() {
                         last.moving_young_coverage_complete = false;
                     }
-                    self.pending_shadow.clear();
                     self.emit_self_recursive_call(&node.inputs, slot, num_args);
+                    self.emit_shadow_reload();
                     return;
                 }
                 // IR direct-call lowering: a statically-bound site whose callee
@@ -3469,10 +3562,10 @@ fn reloc_emit_enabled() -> bool {
             return;
         }
         let stub_off = self.buf.pos();
-        self.buf.emit(&[0x48, 0x81, 0xC4]); // add rsp, frame_size
-        self.buf.emit(&self.frame_size.to_le_bytes());
-        self.buf.emit_byte(0x5D); // pop rbp
-        self.buf.emit_byte(0xC3); // ret
+        // Shares the method epilogue so the shadow `top` watermark is restored
+        // here too — this is the path a callee's `i64::MIN` exception/deopt
+        // sentinel takes, skipping the call site's matching shadow reload.
+        self.emit_epilogue();
         let patches = std::mem::take(&mut self.call_exc_patches);
         for p in patches {
             let rel = stub_off as i32 - (p as i32 + 4);

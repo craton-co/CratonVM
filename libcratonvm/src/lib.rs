@@ -61,7 +61,13 @@ use std::os::raw::{c_char, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
-use cratonvm_vm::config::VmConfig;
+// `CompatibilityMode` is reached through `cratonvm_vm::config` on purpose:
+// `cratonvm-types` (where the type is actually defined, as
+// `cratonvm_types::compat::CompatibilityMode`) is only a **dev-dependency** of
+// this crate, so naming it directly would compile the tests and break the
+// cdylib. The re-export in `vm/src/config.rs` is the supported path; promoting
+// the dependency is a separate decision about what the shipped .so links.
+use cratonvm_vm::config::{CompatibilityMode, VmConfig};
 use cratonvm_vm::native::jni::{
     clear_jni_context, get_java_vm, get_jni_env, host_thread_enter_native,
     host_thread_leave_native, set_destroy_vm_hook, set_jni_context_arc,
@@ -368,6 +374,19 @@ enum InitArgsError {
     /// build/environment. Carries the full, actionable message produced by
     /// `require_real_jdk` / `require_synthetic_jdk`.
     JdkModeUnavailable(String),
+    /// The `compatibility_mode` argument of
+    /// [`cratonvm_create_with_compatibility`] is not a
+    /// `CRATONVM_COMPATIBILITY_*` value. Carries the offending integer.
+    ///
+    /// A distinct variant rather than an `InvalidOption`: the fault is in a
+    /// typed C argument, not in a `JavaVMInitArgs` option string, and
+    /// `ignoreUnrecognized` must not soften it.
+    UnknownCompatibilityMode(JInt),
+    /// [`VmConfig::validate_compatibility`] rejected the assembled config.
+    /// Carries that [`cratonvm_vm::error::VmError::InvalidConfiguration`]'s
+    /// `Display` text **verbatim**, so the rule is called, not re-derived
+    /// here — see [`finish_config`].
+    InvalidCompatibility(String),
 }
 
 impl fmt::Display for InitArgsError {
@@ -382,6 +401,16 @@ impl fmt::Display for InitArgsError {
                 write!(f, "unrecognized JavaVM option {opt:?}")
             }
             InitArgsError::JdkModeUnavailable(msg) => f.write_str(msg),
+            InitArgsError::UnknownCompatibilityMode(value) => write!(
+                f,
+                "unknown compatibility mode {value}: expected {} (compatible) or {} (jdk-only)",
+                craton_compatibility::COMPATIBLE,
+                craton_compatibility::JDK_ONLY
+            ),
+            // Verbatim: byte-for-byte the `VmError::InvalidConfiguration` text,
+            // so the C ABI and the launcher report the same conflict in the
+            // same words. A test pins the equality.
+            InitArgsError::InvalidCompatibility(msg) => f.write_str(msg),
         }
     }
 }
@@ -462,6 +491,95 @@ fn validate_jdk_mode(cfg: VmConfig) -> Result<VmConfig, InitArgsError> {
     }
 }
 
+/// Resolve the compatibility mode from the two explicit sources — the typed
+/// `compatibility_mode` argument (`requested`) and the `--jdk-only` option
+/// string — and record it on the config.
+///
+/// # The four rules, each deliberate
+///
+/// * **Neither stated → [`DEFAULT_COMPATIBILITY_MODE`]**
+///   ([`CompatibilityMode::Compatible`]). The default is reached by doing
+///   nothing; see that constant for why it is never inferred from anything else.
+/// * **`--jdk-only` alone → [`CompatibilityMode::JdkOnly`].** It is spelled
+///   exactly as the launcher flag, and it is the *only* route to strict mode
+///   from [`JNI_CreateJavaVM`], which takes nothing but a [`JavaVMInitArgs`].
+/// * **[`CRATONVM_COMPATIBILITY_JDK_ONLY`] plus `--jdk-only` → strict.** They
+///   agree; agreeing twice is not an error.
+/// * **[`CRATONVM_COMPATIBILITY_COMPATIBLE`] plus `--jdk-only` → a
+///   contradiction error, not a precedence rule.** Both are explicit statements
+///   of policy. Picking a winner would mean a host that assembled its options
+///   from two places (a config file and a call site, say) runs under a policy
+///   neither half asked for — silently strict, or silently loose. Either is
+///   worse than being told.
+///
+/// # This does not rewrite the JDK mode
+///
+/// `--jdk-only` implies a real JDK image, and the base config here is already
+/// [`VmConfig::with_host_jdk_default`] (real), so strict-on-its-own lands on
+/// real + strict with nothing to do. Forcing `JdkMode::Real` anyway would
+/// silently repair `--jdk-only --synthetic-jdk` into a real-JDK run and erase
+/// the conflict [`finish_config`] exists to report.
+fn apply_compatibility(
+    cfg: VmConfig,
+    requested: Option<CompatibilityMode>,
+    jdk_only_option: bool,
+) -> Result<VmConfig, InitArgsError> {
+    let mode = match (requested, jdk_only_option) {
+        (None, false) => DEFAULT_COMPATIBILITY_MODE,
+        (None, true) => CompatibilityMode::JdkOnly,
+        (Some(CompatibilityMode::JdkOnly), _) => CompatibilityMode::JdkOnly,
+        (Some(CompatibilityMode::Compatible), false) => CompatibilityMode::Compatible,
+        (Some(CompatibilityMode::Compatible), true) => {
+            return Err(InitArgsError::InvalidOption(format!(
+                "compatibility mode {} (compatible) was requested together with the \
+                 --jdk-only option, which requests {} (jdk-only): both are explicit \
+                 statements of compatibility policy and they contradict. Pass \
+                 CRATONVM_COMPATIBILITY_JDK_ONLY alongside --jdk-only, or drop one of \
+                 the two.",
+                craton_compatibility::COMPATIBLE,
+                craton_compatibility::JDK_ONLY
+            )));
+        }
+    };
+    Ok(cfg.with_compatibility_mode(mode))
+}
+
+/// Final validation of an assembled config: **compatibility coherence first,
+/// then class-library availability.**
+///
+/// The order is normative, not incidental. `--jdk-only` with `--synthetic-jdk`
+/// is wrong on a machine with a perfect JDK installation and equally wrong on
+/// one with none, so the verdict must be a property of the *request* rather
+/// than of what happens to be installed. Running [`validate_jdk_mode`] first
+/// would report "no usable JDK was found" for a request that was incoherent
+/// before the host was ever consulted, and the operator would go install a JDK
+/// to fix a flag conflict.
+///
+/// The [`cratonvm_vm::error::VmError::InvalidConfiguration`] message is carried
+/// through **unchanged** in [`InitArgsError::InvalidCompatibility`]: the rule
+/// lives in [`VmConfig::validate_compatibility`] and is *called* here, never
+/// re-derived, so the C ABI and the `cratonvm` launcher cannot drift apart.
+fn finish_config(cfg: VmConfig) -> Result<VmConfig, InitArgsError> {
+    cfg.validate_compatibility()
+        .map_err(|e| InitArgsError::InvalidCompatibility(e.to_string()))?;
+    validate_jdk_mode(cfg)
+}
+
+/// Parse a `JavaVMInitArgs` into a [`VmConfig`], with the compatibility mode
+/// left implicit — i.e. taken from the `--jdk-only` option string if present,
+/// and [`DEFAULT_COMPATIBILITY_MODE`] otherwise.
+///
+/// This is the shape [`JNI_CreateJavaVM`] and [`cratonvm_create`] need: neither
+/// has anywhere to put a typed policy argument. See
+/// [`config_from_args_with_compatibility`] for the full contract.
+///
+/// # Safety
+/// `args` must be a valid `*const JavaVMInitArgs` with `options` pointing at
+/// `n_options` valid, NUL-terminated [`JavaVMOption`] strings.
+unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, InitArgsError> {
+    config_from_args_with_compatibility(args, None)
+}
+
 /// Parse a `JavaVMInitArgs` into a [`VmConfig`].
 ///
 /// Recognises the common HotSpot option forms an embedder is likely to pass:
@@ -480,13 +598,29 @@ fn validate_jdk_mode(cfg: VmConfig) -> Result<VmConfig, InitArgsError> {
 /// machine. Whichever mode results is then validated by [`validate_jdk_mode`]
 /// — this entry point performed no validation at all before.
 ///
+/// # Compatibility mode
+///
+/// `requested` is the typed policy argument of
+/// [`cratonvm_create_with_compatibility`] (`None` for the entry points that
+/// have no such argument). The `--jdk-only` option string is the second route,
+/// spelled exactly as the launcher flag so a command line pasted into a
+/// `JavaVMInitArgs` behaves identically — and the only route available to
+/// [`JNI_CreateJavaVM`]. [`apply_compatibility`] resolves the two; note that a
+/// `--jdk-only` option is a *recognised* flag, so `ignoreUnrecognized` neither
+/// drops it nor softens its contradiction with an explicit
+/// [`CRATONVM_COMPATIBILITY_COMPATIBLE`], exactly as for
+/// `--real-jdk`/`--synthetic-jdk`.
+///
 /// # Safety
 /// `args` must be a valid `*const JavaVMInitArgs` with `options` pointing at
 /// `n_options` valid, NUL-terminated [`JavaVMOption`] strings.
-unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, InitArgsError> {
+unsafe fn config_from_args_with_compatibility(
+    args: *const JavaVMInitArgs,
+    requested: Option<CompatibilityMode>,
+) -> Result<VmConfig, InitArgsError> {
     let mut cfg = VmConfig::with_host_jdk_default();
     if args.is_null() {
-        return validate_jdk_mode(cfg);
+        return finish_config(apply_compatibility(cfg, requested, false)?);
     }
     let init = &*args;
     if !is_supported_jni_version(init.version) {
@@ -498,7 +632,7 @@ unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, Init
         ));
     }
     if init.n_options == 0 {
-        return validate_jdk_mode(cfg);
+        return finish_config(apply_compatibility(cfg, requested, false)?);
     }
     if init.options.is_null() {
         return Err(InitArgsError::InvalidArgs(
@@ -512,6 +646,8 @@ unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, Init
     // Same flags, same spelling, same mutual exclusion as the launcher.
     let mut synthetic_flag = false;
     let mut real_flag = false;
+    // Compatibility policy, spelled exactly as the launcher's `--jdk-only`.
+    let mut jdk_only_flag = false;
     let mut i = 0usize;
     while i < opts.len() {
         let Some(s) = option_to_str(opts, i, ignore_unrecognized)? else {
@@ -575,6 +711,11 @@ unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, Init
             synthetic_flag = true;
         } else if s == "--real-jdk" {
             real_flag = true;
+        } else if s == "--jdk-only" {
+            // NOT `cfg.with_jdk_mode(Real)`: see `apply_compatibility`. The
+            // base config is already real, and rewriting it here would erase
+            // the `--synthetic-jdk` conflict `finish_config` reports.
+            jdk_only_flag = true;
         } else if matches!(s, "vfprintf" | "exit" | "abort") {
             // Standard Invocation API callbacks are recognized but unused.
         } else {
@@ -608,7 +749,7 @@ unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, Init
         cfg = cfg.with_jdk_mode(cratonvm_vm::config::JdkMode::Real);
     }
 
-    validate_jdk_mode(cfg)
+    finish_config(apply_compatibility(cfg, requested, jdk_only_flag)?)
 }
 
 /// Split a classpath string on the platform separator and append the parts.
@@ -918,6 +1059,84 @@ pub const CRATON_TAG_DOUBLE: JInt = craton_tag::DOUBLE;
 pub const CRATON_TAG_OBJECT: JInt = craton_tag::OBJECT;
 pub const CRATON_TAG_ERROR: JInt = craton_tag::ERROR;
 
+/// ABI encoding of [`CompatibilityMode`] — *which substitutions the VM may
+/// make*, orthogonal to the JDK mode (*which class library it boots*).
+///
+/// These numeric values are a **published, stable, append-only** part of the C
+/// ABI: a compiled host carries them in its `.text`, so a value may be added
+/// but never renumbered or re-typed. They are `cratonvm_jint`, deliberately not
+/// a `cratonvm_jboolean`, so a third enforcement posture can be added later
+/// without breaking a host that was compiled against this header.
+///
+/// See `docs/EMBEDDING.md` ("Choosing a compatibility mode") and
+/// `docs/feature-designs/jdk-only-mode.md` for the semantics.
+pub mod craton_compatibility {
+    use super::JInt;
+    /// Today's behaviour: bridges, intrinsics **and** compatibility shims.
+    /// The default on every entry point.
+    pub const COMPATIBLE: JInt = 0;
+    /// Real JDK class bytes are authoritative: no class fabricated without real
+    /// bytes, no synthetic-stub native registered or invoked. Requires a real
+    /// JDK runtime image.
+    pub const JDK_ONLY: JInt = 1;
+}
+
+pub const CRATONVM_COMPATIBILITY_COMPATIBLE: JInt = craton_compatibility::COMPATIBLE;
+pub const CRATONVM_COMPATIBILITY_JDK_ONLY: JInt = craton_compatibility::JDK_ONLY;
+
+/// The compatibility mode a VM created through this crate runs under when the
+/// host asks for nothing: [`CompatibilityMode::Compatible`].
+///
+/// Aliased to `LAUNCHER_DEFAULT_COMPATIBILITY_MODE` rather than
+/// `EMBEDDED_DEFAULT_COMPATIBILITY_MODE` because this crate's base config is
+/// [`VmConfig::with_host_jdk_default`] — i.e. the launcher's, not
+/// `VmConfig::default`'s. The two constants happen to be equal, and the alias
+/// still names the right one so a future divergence lands here correctly.
+///
+/// # The asymmetry, stated on purpose
+///
+/// `JdkMode` differs between entry points (`VmConfig::default` is synthetic,
+/// `with_host_jdk_default` is real) because *which class library loads* is a
+/// hermeticity question and the two entry points genuinely want different
+/// answers. **Compatibility mode deliberately does not differ.**
+/// [`CompatibilityMode::JdkOnly`] rejects work that
+/// [`CompatibilityMode::Compatible`] accepts, so a host that has not asked for
+/// it must never be handed it.
+///
+/// Strictness therefore has exactly two sources here, both explicit: the
+/// [`CRATONVM_COMPATIBILITY_JDK_ONLY`] argument to
+/// [`cratonvm_create_with_compatibility`], or the `--jdk-only` option string in
+/// the `JavaVMInitArgs`. It is never inferred from a Cargo feature, never read
+/// from `CRATONVM_REAL` / `CRATONVM_NO_STUBS` (those are native-registry
+/// filters and cannot express the class-loading or dispatch half of the
+/// contract), and never derived from what the host machine has installed.
+pub const DEFAULT_COMPATIBILITY_MODE: CompatibilityMode =
+    cratonvm_vm::config::LAUNCHER_DEFAULT_COMPATIBILITY_MODE;
+
+/// Decode a `CRATONVM_COMPATIBILITY_*` ABI integer.
+///
+/// An unrecognised value is **rejected**, never clamped to
+/// [`CompatibilityMode::Compatible`]: a host compiled against a newer header
+/// and run against an older library is told so, rather than silently getting
+/// the loose policy it believed it had opted out of.
+fn compatibility_mode_from_abi(value: JInt) -> Result<CompatibilityMode, InitArgsError> {
+    match value {
+        craton_compatibility::COMPATIBLE => Ok(CompatibilityMode::Compatible),
+        craton_compatibility::JDK_ONLY => Ok(CompatibilityMode::JdkOnly),
+        other => Err(InitArgsError::UnknownCompatibilityMode(other)),
+    }
+}
+
+/// Encode a [`CompatibilityMode`] as its `CRATONVM_COMPATIBILITY_*` ABI
+/// integer. Total by construction: adding a mode here is the same commit that
+/// appends its constant to [`craton_compatibility`].
+fn compatibility_mode_to_abi(mode: CompatibilityMode) -> JInt {
+    match mode {
+        CompatibilityMode::Compatible => craton_compatibility::COMPATIBLE,
+        CompatibilityMode::JdkOnly => craton_compatibility::JDK_ONLY,
+    }
+}
+
 /// A C-ABI tagged value exchanged with the flat API. `tag` is one of the
 /// [`craton_tag`] constants; `payload` is interpreted accordingly:
 /// `INT`→low 32 bits (sign-extended), `LONG`→all 64 bits, `FLOAT`→`f32` bits
@@ -1217,36 +1436,112 @@ fn clear_last_error() {
 ///
 /// The returned pointer must be released with [`cratonvm_destroy`].
 ///
+/// The compatibility mode is whatever the options say: `--jdk-only` selects
+/// [`CompatibilityMode::JdkOnly`], and its absence leaves
+/// [`DEFAULT_COMPATIBILITY_MODE`]. Use
+/// [`cratonvm_create_with_compatibility`] to state the policy as a typed
+/// argument instead.
+///
 /// # Safety
 /// `args`, when non-null, must be a valid `*const JavaVMInitArgs`.
 #[no_mangle]
 pub extern "C" fn cratonvm_create(args: *const JavaVMInitArgs) -> *mut CratonVm {
+    create_vm("cratonvm_create", args, None)
+}
+
+/// `CratonVm *cratonvm_create_with_compatibility(const JavaVMInitArgs *args,
+/// cratonvm_jint compatibility_mode)`
+///
+/// [`cratonvm_create`] with the compatibility mode stated as an explicit
+/// `CRATONVM_COMPATIBILITY_*` value instead of an option string. Everything
+/// else — args parsing, bootstrap, handle ownership, failure reporting — is
+/// identical; only the policy source differs.
+///
+/// This exists because a C host has no command line, and a `JavaVMInitArgs` is
+/// often assembled far from the call site that knows the policy (a config
+/// file, a plugin manifest, an outer application). A typed argument lets the
+/// call site state it directly.
+///
+/// `compatibility_mode` must be [`CRATONVM_COMPATIBILITY_COMPATIBLE`] or
+/// [`CRATONVM_COMPATIBILITY_JDK_ONLY`]. Any other integer is **rejected**
+/// (null + last error), never clamped to the compatible default — a host built
+/// against a newer header is told, rather than silently getting the loose
+/// policy it thought it had opted out of. Probe support without paying for a
+/// failed create with [`cratonvm_compatibility_mode_supported`].
+///
+/// Passing [`CRATONVM_COMPATIBILITY_COMPATIBLE`] while the options also carry
+/// `--jdk-only` is a contradiction error, not a precedence rule; passing
+/// [`CRATONVM_COMPATIBILITY_JDK_ONLY`] alongside `--jdk-only` agrees and is
+/// accepted. See [`apply_compatibility`].
+///
+/// # Safety
+/// `args`, when non-null, must be a valid `*const JavaVMInitArgs`.
+#[no_mangle]
+pub extern "C" fn cratonvm_create_with_compatibility(
+    args: *const JavaVMInitArgs,
+    compatibility_mode: JInt,
+) -> *mut CratonVm {
+    const API: &str = "cratonvm_create_with_compatibility";
+    let decoded = catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        compatibility_mode_from_abi(compatibility_mode)
+    }));
+    let requested = match decoded {
+        Ok(Ok(mode)) => mode,
+        Ok(Err(e)) => {
+            set_last_error(format!("{API}: {e}"));
+            return std::ptr::null_mut();
+        }
+        Err(_) => {
+            set_last_error(format!("{API}: panic while validating compatibility mode"));
+            return std::ptr::null_mut();
+        }
+    };
+    create_vm(API, args, Some(requested))
+}
+
+/// The shared body of [`cratonvm_create`] and
+/// [`cratonvm_create_with_compatibility`].
+///
+/// `api` is the *calling* entry point's name, threaded through so every
+/// last-error message names the function the host actually called rather than
+/// this shared helper — the host reads that prefix, and "cratonvm_create: …"
+/// after a `cratonvm_create_with_compatibility` call would send it looking in
+/// the wrong place.
+///
+/// # Safety
+/// `args`, when non-null, must be a valid `*const JavaVMInitArgs`.
+fn create_vm(
+    api: &str,
+    args: *const JavaVMInitArgs,
+    requested: Option<CompatibilityMode>,
+) -> *mut CratonVm {
     let result = catch_unwind(AssertUnwindSafe(|| {
         clear_last_error();
         let created_guard = match CREATED_VM.lock() {
             Ok(g) => g,
             Err(_) => {
-                set_last_error("cratonvm_create: VM registry is poisoned");
+                set_last_error(format!("{api}: VM registry is poisoned"));
                 return std::ptr::null_mut();
             }
         };
         if created_guard.is_some() {
-            set_last_error("cratonvm_create: a JNI Invocation API VM is already active");
+            set_last_error(format!("{api}: a JNI Invocation API VM is already active"));
             return std::ptr::null_mut();
         }
         let mut flat_guard = match begin_flat_vm_create() {
             Ok(g) => g,
             Err(e) => {
-                set_last_error(format!("cratonvm_create: {e}"));
+                set_last_error(format!("{api}: {e}"));
                 return std::ptr::null_mut();
             }
         };
         // SAFETY: caller contract — `args` is a valid `*const JavaVMInitArgs`
-        // or null (handled inside `config_from_args`).
-        let config = match unsafe { config_from_args(args) } {
+        // or null (handled inside `config_from_args_with_compatibility`).
+        let config = match unsafe { config_from_args_with_compatibility(args, requested) } {
             Ok(config) => config,
             Err(e) => {
-                set_last_error(format!("cratonvm_create: {e}"));
+                set_last_error(format!("{api}: {e}"));
                 return std::ptr::null_mut();
             }
         };
@@ -1259,7 +1554,7 @@ pub extern "C" fn cratonvm_create(args: *const JavaVMInitArgs) -> *mut CratonVm 
         let mut boxed = Box::new(CratonVm { vm });
         let vm_key = (&mut *boxed as *mut CratonVm) as usize;
         if let Err(e) = flat_guard.activate(vm_key) {
-            set_last_error(format!("cratonvm_create: {e}"));
+            set_last_error(format!("{api}: {e}"));
             return std::ptr::null_mut();
         }
         Box::into_raw(boxed)
@@ -1267,7 +1562,7 @@ pub extern "C" fn cratonvm_create(args: *const JavaVMInitArgs) -> *mut CratonVm 
     match result {
         Ok(ptr) => ptr,
         Err(_) => {
-            set_last_error("cratonvm_create: panic during VM bootstrap");
+            set_last_error(format!("{api}: panic during VM bootstrap"));
             std::ptr::null_mut()
         }
     }
@@ -1694,6 +1989,63 @@ pub extern "C" fn cratonvm_free_string(s: *mut c_char) {
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         drop(CString::from_raw(s));
     }));
+}
+
+// --- compatibility mode ----------------------------------------------------
+
+/// `cratonvm_jint cratonvm_compatibility_mode(CratonVm *vm)`
+///
+/// The compatibility mode a **live** VM is actually running under, as a
+/// `CRATONVM_COMPATIBILITY_*` value. Returns `-1` — never a mode value, since
+/// the ABI encoding is append-only from `0` upwards — on a null or otherwise
+/// unusable handle, with the reason in [`cratonvm_last_error`].
+///
+/// This is a read-back, not an echo of the request: a host that assembled its
+/// options in one place and its policy argument in another can confirm what it
+/// actually got instead of trusting what it asked for.
+#[no_mangle]
+pub extern "C" fn cratonvm_compatibility_mode(vm: *mut CratonVm) -> JInt {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, -1, |h| {
+                compatibility_mode_to_abi(h.vm.shared.config.compatibility_mode)
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_compatibility_mode: panic");
+        -1
+    })
+}
+
+/// `cratonvm_jint cratonvm_compatibility_mode_supported(cratonvm_jint mode)`
+///
+/// Capability probe. **Needs no VM**, so it answers "does this build know the
+/// mode?" without the trial-and-error of a failed create — and, combined with
+/// `dlsym`, it also covers libraries that predate the symbol entirely.
+///
+/// Returns:
+///
+/// * `1` — this build understands `mode` and honours it;
+/// * `-1` — `mode` is not a `CRATONVM_COMPATIBILITY_*` value at all;
+/// * `0` — reserved for a mode this build *knows* but cannot honour (nothing
+///   returns it today; it exists so a future build can distinguish "never heard
+///   of it" from "recognised but unavailable here" without renumbering).
+///
+/// Like every other entry point it clears this thread's pending error on entry;
+/// it never sets one.
+#[no_mangle]
+pub extern "C" fn cratonvm_compatibility_mode_supported(mode: JInt) -> JInt {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        match compatibility_mode_from_abi(mode) {
+            Ok(_) => 1,
+            Err(_) => -1,
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 // --- last_error ------------------------------------------------------------
@@ -2744,6 +3096,296 @@ mod tests {
             let cfg = unsafe { config_from_args(&args) }.expect("fake JDK is usable");
             assert_eq!(cfg.jdk_mode(), cratonvm_vm::config::JdkMode::Real);
         });
+    }
+
+    // ── Compatibility mode on the C-ABI entry points ──────────────────────
+    //
+    // `docs/feature-designs/jdk-only-mode.md` §6/§10 and `docs/EMBEDDING.md`
+    // ("Choosing a compatibility mode"). Four resolution rules are deliberate
+    // and each is pinned below, because each one is a plausible-looking
+    // "simplification" away from being wrong in a way no compiler catches:
+    // the default is reached by doing nothing; an unknown ABI integer is
+    // rejected rather than clamped; an explicit COMPATIBLE plus `--jdk-only`
+    // is a contradiction rather than a precedence rule; and `--jdk-only` does
+    // not rewrite the JDK mode.
+
+    fn jvm_option(s: &std::ffi::CString) -> JavaVMOption {
+        JavaVMOption {
+            option_string: s.as_ptr() as *mut c_char,
+            extra_info: std::ptr::null_mut(),
+        }
+    }
+
+    /// The ABI numbers are published and append-only: a compiled host carries
+    /// them in its `.text`, so this test failing means every deployed binary
+    /// that linked an older header is now wrong.
+    #[test]
+    fn compatibility_abi_values_are_published_and_append_only() {
+        assert_eq!(craton_compatibility::COMPATIBLE, 0);
+        assert_eq!(craton_compatibility::JDK_ONLY, 1);
+        assert_eq!(
+            CRATONVM_COMPATIBILITY_COMPATIBLE,
+            craton_compatibility::COMPATIBLE
+        );
+        assert_eq!(
+            CRATONVM_COMPATIBILITY_JDK_ONLY,
+            craton_compatibility::JDK_ONLY
+        );
+
+        for (abi, mode) in [
+            (CRATONVM_COMPATIBILITY_COMPATIBLE, CompatibilityMode::Compatible),
+            (CRATONVM_COMPATIBILITY_JDK_ONLY, CompatibilityMode::JdkOnly),
+        ] {
+            assert_eq!(compatibility_mode_from_abi(abi), Ok(mode));
+            assert_eq!(compatibility_mode_to_abi(mode), abi);
+        }
+
+        // `-1` is `cratonvm_compatibility_mode`'s bad-handle sentinel; it must
+        // never become a mode value, which is why the encoding grows upwards.
+        assert_ne!(CRATONVM_COMPATIBILITY_COMPATIBLE, -1);
+        assert_ne!(CRATONVM_COMPATIBILITY_JDK_ONLY, -1);
+    }
+
+    /// An unknown ABI integer is rejected, **never clamped to COMPATIBLE**: a
+    /// host compiled against a newer header and run against an older library
+    /// must be told, not silently handed the loose policy it opted out of.
+    #[test]
+    fn unknown_compatibility_mode_is_rejected_not_clamped() {
+        for bogus in [2, -1, 7, JInt::MAX, JInt::MIN] {
+            match compatibility_mode_from_abi(bogus) {
+                Err(InitArgsError::UnknownCompatibilityMode(v)) => assert_eq!(v, bogus),
+                other => panic!("expected UnknownCompatibilityMode({bogus}), got {other:?}"),
+            }
+        }
+        // The exact wording is quoted in docs/EMBEDDING.md.
+        assert_eq!(
+            InitArgsError::UnknownCompatibilityMode(2).to_string(),
+            "unknown compatibility mode 2: expected 0 (compatible) or 1 (jdk-only)"
+        );
+    }
+
+    /// The default is the **launcher's**, because this crate's base config is
+    /// `with_host_jdk_default()`. Unlike `JdkMode`, the two entry-point
+    /// defaults agree — and that agreement is the point, not an accident.
+    #[test]
+    fn default_compatibility_mode_is_the_launcher_default_and_is_compatible() {
+        assert_eq!(
+            DEFAULT_COMPATIBILITY_MODE,
+            cratonvm_vm::config::LAUNCHER_DEFAULT_COMPATIBILITY_MODE
+        );
+        assert_eq!(DEFAULT_COMPATIBILITY_MODE, CompatibilityMode::Compatible);
+
+        with_fake_jdk("default-compat", || {
+            let args = JavaVMInitArgs {
+                version: JNI_VERSION,
+                n_options: 0,
+                options: std::ptr::null_mut(),
+                ignore_unrecognized: 1,
+            };
+            let cfg = unsafe { config_from_args(&args) }.expect("fake JDK is usable");
+            assert_eq!(cfg.compatibility_mode, CompatibilityMode::Compatible);
+            assert!(!cfg.is_jdk_only());
+        });
+    }
+
+    /// The whole resolution matrix, without touching the host: doing nothing
+    /// is compatible, either explicit route is strict, the two agreeing is
+    /// fine, and only the explicit contradiction fails.
+    #[test]
+    fn apply_compatibility_resolution_matrix() {
+        let base = VmConfig::with_host_jdk_default();
+
+        let cases = [
+            (None, false, CompatibilityMode::Compatible),
+            (None, true, CompatibilityMode::JdkOnly),
+            (
+                Some(CompatibilityMode::Compatible),
+                false,
+                CompatibilityMode::Compatible,
+            ),
+            (
+                Some(CompatibilityMode::JdkOnly),
+                false,
+                CompatibilityMode::JdkOnly,
+            ),
+            (
+                Some(CompatibilityMode::JdkOnly),
+                true,
+                CompatibilityMode::JdkOnly,
+            ),
+        ];
+        for (requested, jdk_only_option, expected) in cases {
+            let cfg = apply_compatibility(base.clone(), requested, jdk_only_option)
+                .unwrap_or_else(|e| panic!("{requested:?} + {jdk_only_option} rejected: {e}"));
+            assert_eq!(cfg.compatibility_mode, expected);
+            // Never rewritten: the base config's JDK mode survives untouched,
+            // so a later `--synthetic-jdk` conflict is still detectable.
+            assert_eq!(cfg.jdk_mode(), base.jdk_mode());
+        }
+
+        // Explicit COMPATIBLE + `--jdk-only` is a contradiction, not a
+        // precedence rule: both are explicit statements of policy, and picking
+        // a winner would run a host under a policy neither half asked for.
+        match apply_compatibility(base, Some(CompatibilityMode::Compatible), true) {
+            Err(InitArgsError::InvalidOption(msg)) => {
+                assert!(msg.contains("--jdk-only"), "{msg}");
+                assert!(msg.contains("contradict"), "{msg}");
+                assert!(msg.contains("CRATONVM_COMPATIBILITY_JDK_ONLY"), "{msg}");
+            }
+            other => panic!("expected InvalidOption contradiction, got {other:?}"),
+        }
+    }
+
+    /// The option-string route, spelled exactly as the launcher flag — the
+    /// only route available to `JNI_CreateJavaVM`, which takes nothing but a
+    /// `JavaVMInitArgs`.
+    #[test]
+    fn jdk_only_option_string_selects_strict_without_rewriting_the_jdk_mode() {
+        let jdk_only = std::ffi::CString::new("--jdk-only").unwrap();
+        let mut opts = [jvm_option(&jdk_only)];
+        // `ignoreUnrecognized = 0`: the flag must be *recognised*, not tolerated.
+        let args = args_with(&mut opts, 0);
+        with_fake_jdk("jdk-only-option", || {
+            let cfg = unsafe { config_from_args(&args) }.expect("fake JDK is usable");
+            assert_eq!(cfg.compatibility_mode, CompatibilityMode::JdkOnly);
+            assert!(cfg.is_jdk_only());
+            // The base config was already real; nothing forced it, so the
+            // `--synthetic-jdk` conflict below stays detectable.
+            assert_eq!(cfg.jdk_mode(), cratonvm_vm::config::JdkMode::Real);
+            assert!(cfg.execution_policy().is_jdk_only());
+            assert!(cfg.execution_policy().real_jdk);
+        });
+    }
+
+    /// The typed argument and the option string agreeing is not an error.
+    #[test]
+    fn explicit_jdk_only_argument_agrees_with_the_option_string() {
+        let jdk_only = std::ffi::CString::new("--jdk-only").unwrap();
+        let mut opts = [jvm_option(&jdk_only)];
+        let args = args_with(&mut opts, 0);
+        with_fake_jdk("jdk-only-both", || {
+            let cfg = unsafe {
+                config_from_args_with_compatibility(&args, Some(CompatibilityMode::JdkOnly))
+            }
+            .expect("the two explicit statements agree");
+            assert_eq!(cfg.compatibility_mode, CompatibilityMode::JdkOnly);
+        });
+    }
+
+    /// …and disagreeing is rejected at the entry point, with no host access
+    /// needed to reach the verdict.
+    #[test]
+    fn explicit_compatible_plus_jdk_only_option_is_rejected() {
+        let jdk_only = std::ffi::CString::new("--jdk-only").unwrap();
+        let mut opts = [jvm_option(&jdk_only)];
+        // `ignoreUnrecognized` must NOT soften this: `--jdk-only` was
+        // recognised, it just contradicts the typed argument.
+        let args = args_with(&mut opts, 1);
+        let err = unsafe {
+            config_from_args_with_compatibility(&args, Some(CompatibilityMode::Compatible))
+        }
+        .expect_err("explicit compatible + --jdk-only must be rejected");
+        match err {
+            InitArgsError::InvalidOption(msg) => assert!(msg.contains("contradict"), "{msg}"),
+            other => panic!("expected InvalidOption, got {other:?}"),
+        }
+    }
+
+    /// The conflict verdict is `VmConfig::validate_compatibility`'s, carried
+    /// **byte for byte**. The rule is called here, never re-derived — so the C
+    /// ABI and the `cratonvm` launcher can never drift into reporting the same
+    /// conflict in different words.
+    #[test]
+    fn jdk_only_plus_synthetic_reports_validate_compatibility_verbatim() {
+        let expected = VmConfig::with_host_jdk_default()
+            .with_jdk_mode(cratonvm_vm::config::JdkMode::Synthetic)
+            .with_compatibility_mode(CompatibilityMode::JdkOnly)
+            .validate_compatibility()
+            .expect_err("jdk-only + synthetic-jdk is incoherent")
+            .to_string();
+        assert!(
+            expected.starts_with("invalid configuration: "),
+            "the flat API's last error is documented as \
+             \"<entry_point>: invalid configuration: …\": {expected}"
+        );
+
+        let jdk_only = std::ffi::CString::new("--jdk-only").unwrap();
+        let synthetic = std::ffi::CString::new("--synthetic-jdk").unwrap();
+        let mut opts = [jvm_option(&jdk_only), jvm_option(&synthetic)];
+        let args = args_with(&mut opts, 1);
+        let err = unsafe { config_from_args(&args) }
+            .expect_err("jdk-only + synthetic-jdk must be rejected");
+        match &err {
+            InitArgsError::InvalidCompatibility(msg) => assert_eq!(*msg, expected),
+            other => panic!("expected InvalidCompatibility, got {other:?}"),
+        }
+        // The `Display` is the message unchanged, so the last-error text a C
+        // host reads is exactly `"<entry_point>: " + expected`.
+        assert_eq!(err.to_string(), expected);
+    }
+
+    /// Validation order is normative: `--jdk-only --synthetic-jdk` is wrong on
+    /// a machine with a perfect JDK and equally wrong on one with none, so the
+    /// verdict must be a property of the *request*. Running the availability
+    /// check first would send the operator off to install a JDK to fix a flag
+    /// conflict.
+    #[test]
+    fn compatibility_is_validated_before_jdk_availability() {
+        let jdk_only = std::ffi::CString::new("--jdk-only").unwrap();
+        let synthetic = std::ffi::CString::new("--synthetic-jdk").unwrap();
+        let mut opts = [jvm_option(&jdk_only), jvm_option(&synthetic)];
+        let args = args_with(&mut opts, 1);
+        with_no_jdk("compat-before-jdk", || {
+            match unsafe { config_from_args(&args) } {
+                Err(InitArgsError::InvalidCompatibility(msg)) => {
+                    assert!(msg.contains("--jdk-only"), "{msg}");
+                    assert!(msg.contains("--synthetic-jdk"), "{msg}");
+                }
+                other => panic!(
+                    "the incoherent request must be rejected on its own terms, \
+                     not blamed on the host: {other:?}"
+                ),
+            }
+        });
+    }
+
+    /// The capability probe needs no VM — that is its whole reason to exist,
+    /// since the alternative is learning the answer from a failed create.
+    #[test]
+    fn compatibility_mode_supported_probes_without_a_vm() {
+        assert_eq!(
+            cratonvm_compatibility_mode_supported(CRATONVM_COMPATIBILITY_COMPATIBLE),
+            1
+        );
+        assert_eq!(
+            cratonvm_compatibility_mode_supported(CRATONVM_COMPATIBILITY_JDK_ONLY),
+            1
+        );
+        // `-1` = "not a CRATONVM_COMPATIBILITY_* value at all"; `0` stays
+        // reserved for known-but-unhonourable and is never returned today.
+        for bogus in [2, -1, 99] {
+            assert_eq!(cratonvm_compatibility_mode_supported(bogus), -1);
+        }
+    }
+
+    #[test]
+    fn compatibility_mode_null_handle_returns_minus_one() {
+        clear_last_error();
+        assert_eq!(cratonvm_compatibility_mode(std::ptr::null_mut()), -1);
+        assert!(last_error_string().is_some());
+    }
+
+    #[test]
+    fn create_with_compatibility_rejects_an_unknown_mode_before_touching_the_vm() {
+        clear_last_error();
+        let vm = cratonvm_create_with_compatibility(std::ptr::null(), 2);
+        assert!(vm.is_null(), "an unknown mode must not create a VM");
+        let msg = last_error_string().expect("last error is set");
+        assert!(
+            msg.starts_with("cratonvm_create_with_compatibility: "),
+            "the last error must name the entry point the host called: {msg}"
+        );
+        assert!(msg.contains("unknown compatibility mode 2"), "{msg}");
     }
 
     // -- Layer 2 flat C API ------------------------------------------------

@@ -1,12 +1,30 @@
 # `TestMVStoreCachePerformance` crashes with `SIGSEGV` after a burst of heap-integrity defensive-guard warnings — HIB-CV-32-family, guards don't fully prevent the crash here
 
 ## Status
-**OPEN** — new, more severe occurrence of the known (partially-fixed)
-`HIB-CV-32` heap-corruption family: unlike `TestGetGeneratedKeys` (which
-this same session found degrading safely to a wrong-but-non-crashing
-`null`), this workload's corruption isn't fully caught by the existing
-defensive guards and the process hard-crashes. Found while re-running the
-H2 suite's HANG classes with a longer (1500s) per-class timeout.
+**OPEN** — a hard `SIGSEGV` preceded by a burst of
+`gen_heap::set_field: out-of-bounds field write dropped ... class_id=ClassId(0)
+class_name=java/lang/Object num_slots=0` guard warnings. Found while re-running
+the H2 suite's HANG classes with a longer (1500s) per-class timeout.
+
+> **Correction (2026-07-31).** The original text of this section cited
+> `TestGetGeneratedKeys` as a milder sibling occurrence of the same
+> `HIB-CV-32` heap-corruption family. **That corroboration is withdrawn** —
+> `TestGetGeneratedKeys` was root-caused and fixed and had *nothing* to do
+> with heap corruption: its `gen_heap::read_slot: corrupt Value cell`
+> diagnostics came from `Integer/Boolean/...equals(Object)` natives reading
+> field 0 of an *array* argument, because they never performed the JDK's
+> `instanceof` test. See
+> `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testgetgeneratedkeys-wrapper-equals-missing-type-check-FIXED.md`.
+> The `HIB-CV-32` attribution for *this* crash is therefore un-corroborated
+> and still unverified — treat it as a hypothesis, and confirm the holder's
+> `kind=`/backtrace with `CRATONVM_DBG_CELLCORRUPT=1` before assuming a
+> GC/reference-integrity cause.
+
+**Faster reproducer available (2026-07-31):** this crash's exact signature
+(the `class_id=ClassId(0) java/lang/Object num_slots=0` write-guard burst,
+then `SIGSEGV`) also occurs in `org.h2.test.synth.TestDiskFull`, which takes
+**~2 s** per attempt instead of `TestMVStoreCachePerformance`'s ~972 s. See
+`bug-h2-testdiskfull-classid0-corruption-segv-cce.md`.
 
 ## Severity
 **HIGH** — a hard `SIGSEGV`, not a catchable exception or a clean test
@@ -103,8 +121,10 @@ runner's default for this pass — `--nojit` not yet tried); not yet
 confirmed deterministic across repeated runs.
 
 ## Related
-- `bug-h2-testgetgeneratedkeys-corrupt-value-cell-hib-cv-32-family.md`
-  (this session) — the `read_slot` guard firing safely, no crash.
+- `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testgetgeneratedkeys-wrapper-equals-missing-type-check-FIXED.md`
+  — FIXED, and **not** this family (see the Status correction above).
+- `bug-h2-testdiskfull-classid0-corruption-segv-cce.md` — same guard-burst +
+  `SIGSEGV` signature, ~2 s per attempt.
 - `docs/internal/fixed-suite-bugs/hibernate/run-20260622/HIB-CV-31-abstractmethoderror-onflush-root-cause.md`
   and
   `docs/internal/fixed-suite-bugs/hibernate/run-20260622/HIB-CV-32-sigsegv-blob-bytearray-bind.md`

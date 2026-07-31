@@ -847,6 +847,15 @@ fn native_iou_init_ids(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 // Public registration
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: bridge — `sun.nio.ch.FileDispatcherImpl` / `IOUtil` /
+// `NativeThread` are the file-descriptor syscall layer: `read0`, `write0`,
+// `pread0`, `size0`, `truncate0`, `force0`, `close0` are ACC_NATIVE in JDK 25
+// and take raw memory pointers, which is why the call site warns that leaving
+// them unregistered segfaults. Only 5 triples resolved statically here because
+// the class name is a loop/`let` variable at most sites, so the count is a
+// floor, not a total. This function deliberately registers the same natives
+// under all three platform class names, so expect `overwrote` noise in the
+// census; that is intentional robustness, not a duplicate-registration defect.
 /// Register `sun/nio/ch/*` natives for real-JDK boot. Idempotent: the
 /// registry's `register` replaces a previous entry at the same key,
 /// so it's safe to call after other NIO-related registrars.
@@ -1465,6 +1474,16 @@ fn t16_lr_get_sequence_number(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // our entries win.
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Nothing here resolves to an
+// ACC_NATIVE method: 9 of the resolvable triples land on abstract methods of
+// `java.nio.channels.AsynchronousFileChannel` / `AsynchronousChannelGroup`, 8
+// name methods absent from JDK 25, and 6 shadow concrete bytecode. Abstract
+// targets mean the tag chosen here decides dispatch for every channel
+// implementation, including ones the application supplies. The
+// `DatagramChannel` block later in this function already opts down to
+// `SyntheticStub` and is `#[cfg(feature = "synthetic-jdk")]`-gated, so it is
+// absent from the default build entirely and cannot be judged from a default
+// census run — check both feature configurations before retagging.
 /// Register the T16.5 / T16.6 channel overrides. Idempotent: safe to call
 /// alongside `register_nio_natives_real` or phase-92's registrations.
 pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
