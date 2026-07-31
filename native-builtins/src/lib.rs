@@ -4839,26 +4839,59 @@ mod context_class_loader_tests {
         }
     }
 
-    #[cfg(feature = "experimental-serialization")]
+    /// The real-JDK essential path must NOT override the `ReflectionFactory`
+    /// serialization surface. Those 18 methods are ordinary `java.base` /
+    /// `jdk.unsupported` *bytecode*, not natives, and a differential probe over
+    /// everything they cover — `readObject()` on a class with no no-arg
+    /// constructor, on one with private
+    /// `writeObject`/`readObject`/`readResolve`/`writeReplace` hooks, and on an
+    /// `Externalizable`; direct `newConstructorForSerialization` (both arities)
+    /// and `newConstructorForExternalization`; every private-hook accessor and
+    /// `hasStaticInitializerForSerialization` — is byte-identical to HotSpot
+    /// JDK 25 with the overrides absent.
+    ///
+    /// This replaces a test that asserted the opposite under
+    /// `#[cfg(feature = "experimental-serialization")]`. That test could only
+    /// run in a resolve no shipping CLI build uses, so it green-lit a
+    /// registration that was compiled out of every suite binary while being
+    /// compiled in for CI. Note there is NO `#[cfg]` here: the assertion has to
+    /// hold in both resolves, which is the entire point.
     #[test]
-    fn essential_registers_reflection_factory_serialization_hooks() {
+    fn essential_path_does_not_override_reflection_factory_serialization() {
         let mut registry = NativeMethodRegistry::new();
         register_essential_natives(&mut registry);
 
-        assert!(registry
-            .find(
-                "sun/reflect/ReflectionFactory",
-                "readObjectForSerialization",
-                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
-            )
-            .is_some());
-        assert!(registry
-            .find(
+        for (class, method, descriptor) in [
+            (
                 "sun/reflect/ReflectionFactory",
                 "getReflectionFactory",
-                "()Lsun/reflect/ReflectionFactory;"
-            )
-            .is_some());
+                "()Lsun/reflect/ReflectionFactory;",
+            ),
+            (
+                "sun/reflect/ReflectionFactory",
+                "readObjectForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            ),
+            (
+                "jdk/internal/reflect/ReflectionFactory",
+                "newConstructorForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+            ),
+            (
+                "jdk/internal/reflect/ReflectionFactory",
+                "hasStaticInitializerForSerialization",
+                "(Ljava/lang/Class;)Z",
+            ),
+        ] {
+            assert!(
+                registry.find(class, method, descriptor).is_none(),
+                "{class}.{method}{descriptor} is registered on the real-JDK \
+                 essential path; that path must run the JDK's own bytecode for \
+                 the ReflectionFactory serialization surface. If this override \
+                 is genuinely needed, it must be added ungated — see the \
+                 comment in register_essential_natives_with_shims.",
+            );
+        }
     }
 }
 
@@ -6692,26 +6725,33 @@ pub fn register_essential_natives_with_shims(
         native_jsp_servlet_handle_missing_resource,
     );
 
-    // Real-JDK mode does not call the full synthetic/experimental
-    // `register_builtins` surface, but JBoss Marshalling calls
-    // `sun.reflect.ReflectionFactory` directly for serialization hooks.
-    // Register only that narrow bridge here so private hook discovery obeys
-    // the ObjectStreamClass rules before Java-side MethodHandle fallback runs.
+    // DELIBERATELY NOT REGISTERED HERE: the `ReflectionFactory` serialization
+    // bridge (`register_reflection_factory_serialization` — 18 overrides across
+    // `sun/reflect/ReflectionFactory` and
+    // `jdk/internal/reflect/ReflectionFactory`). Real-JDK mode runs the JDK's
+    // own bytecode for all of it, which a differential probe shows is
+    // byte-identical to HotSpot 25 both with and without the overrides.
+    // Asserted by
+    // `essential_path_does_not_override_reflection_factory_serialization`.
     //
-    // READ THE GATE BEFORE TRUSTING THE PARAGRAPH ABOVE. `experimental-
-    // serialization` is default-off for both `cratonvm-vm` and `cratonvm-cli`,
-    // so this line is compiled out of `cargo build -p cratonvm-cli` — the
-    // build every suite runner uses — and present in `cargo build
-    // --workspace`, because `libcratonvm`'s default features turn the feature
-    // on for the whole workspace resolve. The two builds therefore run
-    // DIFFERENT serialization code. Unlike the `latestUserDefinedLoader0`
-    // native below, these are overrides of ordinary JDK *bytecode* methods
-    // (`newConstructorForSerialization` and friends are not native in the real
-    // JDK), so ungating them is a behaviour change with a wide blast radius,
-    // not a link fix — do not flip it without evidence. Tracked in
-    // docs/known-issues/serialization/.
-    #[cfg(feature = "experimental-serialization")]
-    serialization::register_reflection_factory_serialization(registry);
+    // A call to that registrar lived here from 364c469c4d (2026-07-09, WildFly
+    // managed-server startup), commented as a real-JDK-mode bridge for JBoss
+    // Marshalling — while feature-gated on `experimental-serialization` the
+    // whole time. That feature is default-off for `cratonvm-vm` and
+    // `cratonvm-cli` but on for `libcratonvm`, and Cargo unifies features
+    // across a workspace resolve, so the call was compiled OUT of every
+    // `-p cratonvm-cli` build (what every suite runner uses, WildFly included)
+    // and IN for a `--workspace` build (CI). Deleted rather than ungated so the
+    // two builds converge on the JDK's own bytecode; ungating would have
+    // converged them on Rust overrides no test asks for.
+    //
+    // If a JBoss Marshalling case ever does need one of these, add it back
+    // WITHOUT a feature gate and with a test that fails when it is missing — a
+    // gated registration on this path is invisible to every suite run. See
+    // docs/internal/fixed-suite-bugs/serialization/ for the retired report.
+    //
+    // The registrar is still used by the synthetic path
+    // (`register_serialization_natives`), where there is no JDK bytecode to run.
 
     registry.register(
         "com/fasterxml/jackson/core/StreamReadConstraints$Builder",

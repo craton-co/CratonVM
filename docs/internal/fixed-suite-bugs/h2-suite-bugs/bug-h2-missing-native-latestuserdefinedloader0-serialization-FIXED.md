@@ -156,21 +156,47 @@ one `#[cfg]`.
   "Default-feature native registry surface" step, so the feature set suite
   runners actually get is exercised in CI.
 
-## Follow-up filed, deliberately not fixed here
+## Follow-up — filed separately, now also FIXED
 The same audit found `serialization::register_reflection_factory_serialization`
 one screen away in `register_essential_natives_with_shims`, gated on
 `experimental-serialization` while its comment claims a real-JDK-mode role.
-It is **not** the same bug: those 18 `ReflectionFactory` methods are ordinary
-JDK bytecode, not natives, so ungating them replaces working JDK code rather
-than fixing a link failure. No failing test asks for it. Written up as
-`docs/known-issues/serialization/reflectionfactory-serialization-hooks-gated-out-of-suite-builds.md`
-along with the recommendation to stop `libcratonvm`'s defaults from silently
-deciding what a `--workspace` build contains.
+It was **not** the same bug: those 18 `ReflectionFactory` methods are ordinary
+JDK bytecode, not natives, so ungating them would replace working JDK code
+rather than fix a link failure, and no failing test asked for it. It was split
+out rather than fixed blind.
+
+**Closed 2026-07-31** on branch `fix/serloader-residual-20260731`, and the
+answer was the third option — delete it. A differential probe over the entire
+surface those 18 methods cover (including the direct
+`sun.reflect.ReflectionFactory.newConstructorForSerialization` /
+`newConstructorForExternalization` pattern its comment cited JBoss Marshalling
+for) is byte-identical to HotSpot JDK 25 both **with** the overrides (workspace
+resolve) and **without** them (default resolve). So they were behaviour-neutral
+where active and unnecessary where absent; deleting the real-JDK call converges
+both builds on the JDK's own bytecode instead of freezing the divergence.
+`git log -S` also showed the call was `#[cfg]`-gated by the very commit that
+added it for WildFly (`364c469c4d`), so the WildFly fix it was written for never
+shipped with it either. Retired to
+`docs/internal/fixed-suite-bugs/serialization/reflectionfactory-serialization-hooks-gated-out-of-suite-builds-FIXED.md`.
+
+That work also generalised this report's guard. Both bugs were the same shape —
+*a `#[cfg]` on a native registration silently forks CI's binary from every suite
+runner's binary* — so
+`vm/tests/t14_system_conformance.rs::t14_gated_registrations_are_declared` now
+requires **every** gated native registration in `native-builtins/src/lib.rs` to
+sit on an allow-list with a written reason, not just the `VM_NATIVES` entries.
+On its first run it caught a sixth gate a hand audit had missed
+(`#[cfg(feature = "management")]` on JMX — benign, since `management` is
+default-**on** and opt-out, and now declared as such). CI's `-p`-scoped step was
+also widened from one test module to the whole
+`cargo test -p cratonvm-native-builtins --lib` suite: the defect was never that
+a particular test was missing, it was that no test ran in the suite runners'
+resolve at all.
 
 The two other `#[cfg]`s in the real-JDK essential path — `wildfly_naming`
 (synthetic JNDI, must not shadow real provider selection) and
 `System.initPhase1/2/3` (synthetic-only by design) — were checked and are
-correct as written.
+correct as written; both are now declared on that allow-list.
 
 ---
 
