@@ -16879,7 +16879,16 @@ fn invoke_on_class_shared_inner(
     let class_id = if !no_retarget && method_name != "<init>" && method_name != "<clinit>" {
         let recv_cid = args.get(0).and_then(|v| {
             if let Value::Object(Some(o)) = v {
-                Some(shared.mem.heap.class_id_of(*o))
+                // JVMS §4.4.1: an array type inherits its method table from
+                // `java.lang.Object`. An array header stores the COMPONENT
+                // class id, so retargeting dispatch onto it would select the
+                // component class's override (e.g. `Foo[].clone()` landing on
+                // `Foo.clone()`) and run that body with the array as `this`.
+                if shared.mem.heap.kind_of(*o) == cratonvm_types::ObjectKind::Array {
+                    None
+                } else {
+                    Some(shared.mem.heap.class_id_of(*o))
+                }
             } else {
                 None
             }
@@ -20463,7 +20472,14 @@ fn invoke_on_class_shared_inner(
                             .map(|c| c.name.to_string())
                             .unwrap_or_default();
                         drop(cm2);
-                        if !recv_name.is_empty() && recv_name != "java/lang/Object" {
+                        // JVMS §4.4.1: an array's method table comes from
+                        // `Object`, but its header carries the COMPONENT class
+                        // id — walking that chain would run the component
+                        // class's own body with the array as `this`.
+                        let recv_is_array = shared.mem.heap.kind_of(recv)
+                            == cratonvm_types::ObjectKind::Array;
+                        if !recv_is_array && !recv_name.is_empty() && recv_name != "java/lang/Object"
+                        {
                             // Native registered on the receiver's class
                             // (or any superclass on the chain).
                             let cm3 = shared.classes.class_manager.read();
