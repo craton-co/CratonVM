@@ -54,6 +54,180 @@ pub const BUILTIN_LOADER_DELEGATION_CHAIN: &[ClassLoaderId] = &[
 /// flat walk.
 pub const MAX_BUILTIN_LOADER_DEPTH: usize = 3;
 
+// ---------------------------------------------------------------------------
+// User-defined loader parent chains
+// ---------------------------------------------------------------------------
+
+/// Parent namespace for each user-defined loader namespace id.
+///
+/// [`BUILTIN_LOADER_DELEGATION_CHAIN`]'s doc comment above says user loaders'
+/// parent chains "are modelled on the Java side ... the Rust side never
+/// observes a deep parent walk for those". That is true for *finding bytes* —
+/// `ClassLoader.loadClass` is Java and the native code only sees the
+/// bottom-most `defineClass`. It was never true for **resolution against
+/// already-defined classes**, which is entirely a Rust-side operation over the
+/// flat `loaded_classes` map: with no parent link recorded, a class defined by
+/// `UserDefined(7)` could only resolve a supertype or constant-pool name
+/// against its own namespace or the built-in chain (Bootstrap -> Extension ->
+/// Application). A name defined by its *parent* `UserDefined(3)` was invisible,
+/// so resolution fell through to the loader-blind global path — and for a name
+/// that also exists on the application classpath that path DEFINES A SECOND
+/// COPY in the application namespace.
+///
+/// That is the mechanism behind the Spring AOT `argument type mismatch`
+/// family: Spring's `TestCompiler` `DynamicClassLoader` (a child of
+/// `@CompileWithForkedClassLoader`'s fork loader) defines a CGLIB proxy, whose
+/// superclass name resolved to a freshly-minted application-loader copy instead
+/// of the fork's, so `Field.set` correctly rejected the proxy as unrelated to
+/// the field's declared, fork-loaded type.
+///
+/// Written by `native-builtins`' loader-namespace allocator — the only place
+/// that can see the Java `ClassLoader.parent` field — and read by the
+/// resolution paths in `class_manager`. A parent of `0` is stored too, and
+/// means "delegates to the built-in chain"; it is what stops the writer from
+/// re-walking the Java parent field on every call.
+static USER_LOADER_PARENTS: std::sync::OnceLock<
+    std::sync::RwLock<crate::fx_hash::FxHashMap<u32, u32>>,
+> = std::sync::OnceLock::new();
+
+/// Whether [`USER_LOADER_PARENTS`] has any entry at all, so the read path can
+/// skip the `RwLock` in a process with no user-defined loaders.
+static USER_LOADER_PARENTS_NONEMPTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The deepest parent chain [`user_loader_ancestors`] reports. Real chains are
+/// short (Tomcat's is 3, Spring's AOT fork 2); the cap keeps the walk
+/// allocation-free and bounds a cycle introduced by a mis-registration.
+pub const MAX_USER_LOADER_DEPTH: usize = 8;
+
+fn user_loader_parents() -> &'static std::sync::RwLock<crate::fx_hash::FxHashMap<u32, u32>> {
+    USER_LOADER_PARENTS.get_or_init(|| std::sync::RwLock::new(Default::default()))
+}
+
+/// Record `child_ns`'s delegation parent (`0` = the built-in chain).
+///
+/// Idempotent, and deliberately last-writer-wins: a `ClassLoader`'s parent is
+/// fixed at construction, so a second call can only be re-registering the same
+/// link or upgrading a `0` recorded before the parent had a namespace of its
+/// own.
+pub fn register_user_loader_parent(child_ns: u32, parent_ns: u32) {
+    if child_ns < 3 || child_ns == parent_ns {
+        return;
+    }
+    let mut map = match user_loader_parents().write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    map.insert(child_ns, parent_ns);
+    USER_LOADER_PARENTS_NONEMPTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// True once any user-loader parent link has been registered.
+#[inline]
+pub fn has_user_loader_parents() -> bool {
+    USER_LOADER_PARENTS_NONEMPTY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// True when `child_ns`'s parent has already been resolved and recorded (even
+/// as `0`). The writer uses this to avoid re-walking the Java `parent` field on
+/// every namespace-id lookup.
+pub fn user_loader_parent_known(child_ns: u32) -> bool {
+    if !has_user_loader_parents() || child_ns < 3 {
+        return false;
+    }
+    match user_loader_parents().read() {
+        Ok(g) => g.contains_key(&child_ns),
+        Err(e) => e.into_inner().contains_key(&child_ns),
+    }
+}
+
+/// Write `ns`'s delegation ancestors into `out`, nearest parent first,
+/// excluding `ns` itself and the built-in chain, and return how many were
+/// written. Stops at a namespace with no registered (or a built-in) parent, on
+/// a repeat (cycle), or at [`MAX_USER_LOADER_DEPTH`].
+pub fn user_loader_ancestors(ns: u32, out: &mut [u32; MAX_USER_LOADER_DEPTH]) -> usize {
+    if !has_user_loader_parents() || ns < 3 {
+        return 0;
+    }
+    let map = match user_loader_parents().read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let mut cur = ns;
+    let mut n = 0;
+    while n < MAX_USER_LOADER_DEPTH {
+        let Some(&parent) = map.get(&cur) else { break };
+        if parent < 3 || parent == ns || out[..n].contains(&parent) {
+            break;
+        }
+        out[n] = parent;
+        n += 1;
+        cur = parent;
+    }
+    n
+}
+
+/// `CRATONVM_LOADER_PARENT_CHAIN` gate (default ON). Off (`0` or empty)
+/// restores the pre-2026-07-30 behaviour where a user loader's resolution saw
+/// only its own namespace and the built-in chain. Kept as an escape hatch for
+/// bisecting a regression to this change; read once and cached.
+pub fn loader_parent_chain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("CRATONVM_LOADER_PARENT_CHAIN") {
+        Ok(v) => !(v.is_empty() || v == "0"),
+        Err(_) => true,
+    })
+}
+
+/// `CRATONVM_DBG_LOADER_CHAIN=1` — print one line per supertype a user loader
+/// resolved through, or failed to resolve through, its parent chain. The
+/// `argument type mismatch` family is otherwise invisible until it surfaces as
+/// two ClassIds inside a `Field.set` coercion guard.
+pub fn dbg_loader_chain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CRATONVM_DBG_LOADER_CHAIN")
+            .map(|v| !(v.is_empty() || v == "0"))
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+mod user_loader_parent_tests {
+    use super::*;
+
+    // The registry is process-global, so these use ids far above anything a
+    // real run allocates and assert only about their own keys.
+    #[test]
+    fn ancestors_walk_nearest_first_and_stop_at_the_builtin_chain() {
+        register_user_loader_parent(9001, 9002);
+        register_user_loader_parent(9002, 9003);
+        register_user_loader_parent(9003, 0);
+        let mut out = [0u32; MAX_USER_LOADER_DEPTH];
+        let n = user_loader_ancestors(9001, &mut out);
+        assert_eq!(&out[..n], &[9002, 9003]);
+        assert!(user_loader_parent_known(9003));
+        assert!(!user_loader_parent_known(9004));
+    }
+
+    #[test]
+    fn a_cycle_terminates() {
+        register_user_loader_parent(9101, 9102);
+        register_user_loader_parent(9102, 9101);
+        let mut out = [0u32; MAX_USER_LOADER_DEPTH];
+        let n = user_loader_ancestors(9101, &mut out);
+        assert_eq!(&out[..n], &[9102]);
+    }
+
+    #[test]
+    fn builtin_and_self_parents_are_not_walked() {
+        register_user_loader_parent(9201, 9201);
+        let mut out = [0u32; MAX_USER_LOADER_DEPTH];
+        assert_eq!(user_loader_ancestors(9201, &mut out), 0);
+        assert_eq!(user_loader_ancestors(2, &mut out), 0);
+    }
+}
+
 /// Trait for class loaders that can locate class bytecode.
 ///
 /// This trait is deliberately simpler than `java.lang.ClassLoader`: it only
