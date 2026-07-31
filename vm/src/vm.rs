@@ -7879,7 +7879,7 @@ mod tests {
         // it's a static that takes Object. Instead, use a simpler approach:
         // Create a lambda that calls a native to record output.
         // Let's use PrintStream.println(String) with a captured PrintStream.
-        let ps = alloc_receiver(&shared, &mut thread, "java/util/function/Consumer", 0);
+        let ps = alloc_receiver(&shared, &mut thread, "java/io/PrintStream", 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -7934,7 +7934,7 @@ mod tests {
         .unwrap();
 
         // Consumer lambda → PrintStream.println
-        let ps = alloc_receiver(&shared, &mut thread, "java/util/function/Consumer", 0);
+        let ps = alloc_receiver(&shared, &mut thread, "java/io/PrintStream", 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -8021,7 +8021,7 @@ mod tests {
         //
         // Let's just verify forEach runs to completion without errors.
         // The lambda will call a no-op: tempPrint(key).
-        let ps = alloc_receiver(&shared, &mut thread, "java/util/function/BiConsumer", 0);
+        let ps = alloc_receiver(&shared, &mut thread, "java/io/PrintStream", 0);
         // We'll create a lambda: accept(k, v) → println(k)
         // This works by: capture PrintStream, then impl is
         // PrintStream.println(String) with descriptor (Ljava/lang/String;)V
@@ -8093,7 +8093,7 @@ mod tests {
         };
 
         // Consumer: println(value)
-        let ps = alloc_receiver(&shared, &mut thread, "java/util/function/Consumer", 0);
+        let ps = alloc_receiver(&shared, &mut thread, "java/io/PrintStream", 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -9003,7 +9003,7 @@ mod tests {
         )
         .unwrap();
         for val in [Value::Int(10), Value::Int(20)] {
-            let obj = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 1);
+            let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
             shared.mem.heap.set_field(obj, 0, val);
             call_native(
                 &shared,
@@ -10222,7 +10222,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let ps = alloc_receiver(&shared, &mut thread, "java/util/function/Consumer", 0);
+        let ps = alloc_receiver(&shared, &mut thread, "java/io/PrintStream", 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -13563,7 +13563,7 @@ mod tests {
         )
         .unwrap();
         for v in [3, 1, 2] {
-            let w = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 1);
+            let w = shared.mem.heap.alloc_object(ClassId::new(0), 1);
             shared.mem.heap.set_field(w, 0, Value::Int(v));
             call_native(
                 &shared,
@@ -13644,7 +13644,7 @@ mod tests {
         )
         .unwrap();
         for v in [10, 20, 30] {
-            let w = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 1);
+            let w = shared.mem.heap.alloc_object(ClassId::new(0), 1);
             shared.mem.heap.set_field(w, 0, Value::Int(v));
             call_native(
                 &shared,
@@ -40131,7 +40131,7 @@ mod tests {
     fn log_record_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let level = alloc_receiver(&shared, &mut thread, "java/util/logging/LogRecord", 0);
+        let level = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let msg = create_java_string(&shared, "test message");
         // LogRecord native handler requires 7 instance fields
         // (level, message, loggerName, thrown, parameters, millis, sequence).
@@ -42600,7 +42600,7 @@ mod tests {
             &[Value::Object(Some(cf))],
         )
         .unwrap();
-        let throwable = alloc_receiver(&shared, &mut thread, "java/util/concurrent/CompletableFuture", 2);
+        let throwable = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let ok = call_native(
             &shared,
             &mut thread,
@@ -56587,7 +56587,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
 
         // Create a dummy handler object
-        let handler = alloc_receiver(&shared, &mut thread, "java/lang/reflect/Proxy", 0);
+        let handler = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         // Call Proxy.newProxyInstance
         let proxy_val = call_native(
@@ -61134,7 +61134,7 @@ mod tests {
         };
 
         // Create a fake SocketAddress
-        let sa = alloc_receiver(&shared, &mut thread, "java/nio/channels/DatagramChannel", 2);
+        let sa = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         // Connect
         call_native(
@@ -66618,7 +66618,7 @@ mod tests {
         };
 
         // Create a SEVERE level (1000)
-        let severe = alloc_receiver(&shared, &mut thread, "java/util/logging/Logger", 2);
+        let severe = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let severe_name = create_java_string(&shared, "SEVERE");
         shared
             .mem
@@ -66638,7 +66638,7 @@ mod tests {
         .unwrap();
 
         // INFO (800) should NOT be loggable at SEVERE (1000)
-        let info = alloc_receiver(&shared, &mut thread, "java/util/logging/Logger", 2);
+        let info = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let info_name = create_java_string(&shared, "INFO");
         shared
             .mem
@@ -74069,8 +74069,8 @@ public class SkippedTest {
             Value::Object(Some(o)) => o,
             _ => panic!(),
         };
-        let referent = alloc_receiver(&shared, &mut thread, "java/lang/ref/Cleaner", 1);
-        let action = alloc_receiver(&shared, &mut thread, "java/lang/ref/Cleaner", 1);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let action = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let cleanable = call_native(
             &shared,
             &mut thread,
