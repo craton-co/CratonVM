@@ -13,10 +13,11 @@
 //! ring keeps each evacuated from-space intact for N cycles so those late
 //! reads still hit the loud forwarded-header panic.
 //!
-//! Deliberately its own test binary: both flags latch process-wide on first
-//! read (same `OnceLock` convention as every other `CRATONVM_DBG_*` flag),
-//! so this must be the only test in its process. See the sibling
-//! `stale_objref_debug_assertion.rs` module comment for the full rationale.
+//! Still its own test binary — both flags change how every minor GC in the
+//! process recycles its arenas — but no longer for correctness: the flags are
+//! installed through `flags::override_process`, which wins over the
+//! process-wide snapshot whether or not something has already latched it. See
+//! the sibling `stale_objref_debug_assertion.rs` module comment.
 
 use std::collections::HashMap;
 
@@ -37,9 +38,14 @@ fn stw() -> StopTheWorldToken {
 
 #[test]
 fn stale_read_three_cycles_late_is_still_caught() {
-    // Must run before ANY other code in this process reads either flag.
-    std::env::set_var("CRATONVM_DBG_STALE_OBJREF", "1");
-    std::env::set_var("CRATONVM_DBG_STALE_OBJREF_CYCLES", "4");
+    // Held for the whole test: `gc_flags()` reads the snapshot live, so the
+    // 4-cycle quarantine ring is in force exactly while this guard is.
+    let _quarantine_ring = cratonvm_types::flags::override_process(
+        cratonvm_types::flags::VmFlags::from_env_with_edits(&[
+            ("CRATONVM_DBG_STALE_OBJREF", Some("1")),
+            ("CRATONVM_DBG_STALE_OBJREF_CYCLES", Some("4")),
+        ]),
+    );
 
     let heap = GenerationalHeap::with_sizes(4 * 1024, 8 * 1024);
     let monitors = NoMonitors;

@@ -42,5 +42,14 @@ features = [
     "experimental-debug",
 ]
 
+[dev-dependencies]
+# Test-only. The JDK-mode fixtures point `CRATONVM_JAVA_HOME` at a synthesised
+# tree; it is a *declared* CratonVM flag, so it has to be overridden on the
+# `cratonvm-types` snapshot (`flags::override_thread`) rather than in `environ`,
+# which `config_from_args` would not re-read. See
+# docs/internal/libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md.
+# Dev-only, so the cdylib's own dependency graph is unchanged.
+cratonvm-types = { path = "../types", version = "0.3.0" }
+
 [lints]
 workspace = true
