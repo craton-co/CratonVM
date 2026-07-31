@@ -2040,12 +2040,13 @@ fn native_stream_support_stream_from_spliterator(
             return alloc_synthetic_stream(ctx, &[]);
         }
     };
-    let spl_class = ctx.class_name_of_id(ctx.class_id_of_object(spliterator));
     // GC-safety: `ensure_class_initialized`/`alloc_object` below (in both
     // branches) can trigger a moving GC; `spliterator` is reused afterward
     // (either stashed in the lazy slot, or re-read from field 0), unpinned
     // otherwise.
     let spliterator_pin = ctx.pin_native_root(spliterator);
+    let spliterator = ctx.read_native_pin(spliterator_pin, spliterator);
+    let spl_class = ctx.class_name_of_id(ctx.class_id_of_object(spliterator));
     if spl_class.as_deref() != Some("java/util/Spliterator") {
         // Real Spliterator implementation. DEFER draining: stash the spliterator
         // in the synthetic stream's lazy slot (field 2) so the terminal op can
@@ -2064,13 +2065,16 @@ fn native_stream_support_stream_from_spliterator(
         // elements (0) and close-handlers (1).
         let nfields = ctx.class_num_total_fields(cid).max(3);
         let stream = ctx.alloc_object(cid, nfields);
+        let stream_pin = ctx.pin_native_root(stream);
         // cce0079 hardening: keep the spliterator pinned through BOTH field
         // stores (refresh immediately before its own store), and unpin only
         // afterwards — closes any residual in-store GC window.
-        let spliterator = ctx.read_native_pin(spliterator_pin, spliterator);
+        let mut stream = ctx.read_native_pin(stream_pin, stream);
         ctx.set_field(stream, 0, Value::Object(None));
+        stream = ctx.read_native_pin(stream_pin, stream);
         let spliterator = ctx.read_native_pin(spliterator_pin, spliterator);
         ctx.set_field(stream, 2, Value::Object(Some(spliterator)));
+        stream = ctx.read_native_pin(stream_pin, stream);
         ctx.unpin_native_roots(spliterator_pin);
         return Ok(Some(Value::Object(Some(stream))));
     }
@@ -2079,11 +2083,13 @@ fn native_stream_support_stream_from_spliterator(
     // fence)). A missing/non-array field 0 means an empty synthetic
     // spliterator.
     let spliterator = ctx.read_native_pin(spliterator_pin, spliterator);
-    ctx.unpin_native_roots(spliterator_pin);
     let field0 = ctx.get_field(spliterator, 0);
     let arr = match field0 {
         Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
-        _ => return alloc_synthetic_stream(ctx, &[]),
+        _ => {
+            ctx.unpin_native_roots(spliterator_pin);
+            return alloc_synthetic_stream(ctx, &[]);
+        }
     };
     let pos = match ctx.get_field(spliterator, 1) {
         Value::Int(v) => v as usize,
@@ -2100,23 +2106,39 @@ fn native_stream_support_stream_from_spliterator(
     // source backing array) is read from afterward in the copy loop.
     let arr_pin = ctx.pin_native_root(arr);
     let snapshot = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
-    let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.unpin_native_roots(arr_pin);
+    let snapshot_pin = ctx.pin_native_root(snapshot);
     for i in 0..n {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let snapshot = ctx.read_native_pin(snapshot_pin, snapshot);
         let v = ctx.get_array_element(arr, pos + i);
+        let value_pin = match v {
+            Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+            _ => None,
+        };
+        let v = match (v, value_pin) {
+            (Value::Object(Some(object)), Some(pin)) => {
+                Value::Object(Some(ctx.read_native_pin(pin, object)))
+            }
+            (value, _) => value,
+        };
         ctx.set_array_element(snapshot, i, v);
+        if let Some(pin) = value_pin {
+            ctx.unpin_native_roots(pin);
+        }
     }
     // GC-safety: `ensure_class_initialized`/`alloc_object` below can trigger
     // a moving GC; `snapshot` is stored into the new stream afterward.
-    let snapshot_pin = ctx.pin_native_root(snapshot);
     let cid = ctx
         .ensure_class_initialized("java/util/stream/Stream")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let nfields = ctx.class_num_total_fields(cid).max(1);
     let stream = ctx.alloc_object(cid, nfields);
+    let stream_pin = ctx.pin_native_root(stream);
     let snapshot = ctx.read_native_pin(snapshot_pin, snapshot);
-    ctx.unpin_native_roots(snapshot_pin);
+    let mut stream = ctx.read_native_pin(stream_pin, stream);
     ctx.set_field(stream, 0, Value::Object(Some(snapshot)));
+    stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.unpin_native_roots(spliterator_pin);
     Ok(Some(Value::Object(Some(stream))))
 }
 
@@ -2137,7 +2159,9 @@ fn alloc_synthetic_stream(ctx: &mut dyn NativeContext, elems: &[Value]) -> Metho
         })
         .collect();
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, v) in elems.iter().enumerate() {
+        let arr = ctx.read_native_pin(arr_pin, arr);
         let value = match (*v, elem_pins[i]) {
             (Value::Object(Some(original)), Some(pin)) => {
                 Value::Object(Some(ctx.read_native_pin(pin, original)))
@@ -2148,15 +2172,17 @@ fn alloc_synthetic_stream(ctx: &mut dyn NativeContext, elems: &[Value]) -> Metho
     }
     // GC-safety: `ensure_class_initialized`/`alloc_object` below can trigger
     // a moving GC; `arr` is stored into the new stream afterward.
-    let arr_pin = ctx.pin_native_root(arr);
     let cid = ctx
         .ensure_class_initialized("java/util/stream/Stream")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let nfields = ctx.class_num_total_fields(cid).max(1);
     let stream = ctx.alloc_object(cid, nfields);
+    let stream_pin = ctx.pin_native_root(stream);
     let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.unpin_native_roots(elem_pin_base.unwrap_or(arr_pin));
+    let mut stream = ctx.read_native_pin(stream_pin, stream);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.unpin_native_roots(elem_pin_base.unwrap_or(arr_pin));
     Ok(Some(Value::Object(Some(stream))))
 }
 
@@ -2168,11 +2194,20 @@ fn alloc_synthetic_stream(ctx: &mut dyn NativeContext, elems: &[Value]) -> Metho
 const STREAM_COLLECTOR_CLASS: &str = "cratonvm/internal/StreamCollector";
 
 fn native_stream_collector_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let mut this = match args.first() {
+    let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // The callback's Java arguments are rooted by safe_native_call, but the
+    // backing array fetched from the collector is not. Root the complete
+    // collector graph across every allocation and write barrier.
+    let pin_base = ctx.pin_native_root(this);
+    let elem_pin = match elem {
+        Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+        _ => None,
+    };
+    let this = ctx.read_native_pin(pin_base, this);
     let mut len = match ctx.get_field(this, 1) {
         Value::Int(v) => v as usize,
         _ => 0,
@@ -2181,38 +2216,50 @@ fn native_stream_collector_accept(ctx: &mut dyn NativeContext, args: &[Value]) -
         Value::Object(Some(a)) => a,
         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16),
     };
+    let storage_pin = ctx.pin_native_root(storage);
     let cap = ctx.array_length(storage);
-    let storage = if len >= cap {
-        // GC-safety: growing the backing array below (`new_array`) can
-        // trigger a moving GC; `this`, `storage` (the OLD array we're about
-        // to copy FROM), and `elem` (the value being appended, often itself
-        // an ObjectRef) are all reused afterward, unpinned otherwise.
-        let this_pin = ctx.pin_native_root(this);
-        let storage_pin = ctx.pin_native_root(storage);
-        let elem_pin = match elem {
-            Value::Object(Some(e)) => Some(ctx.pin_native_root(e)),
-            _ => None,
-        };
+    let (storage, active_storage_pin) = if len >= cap {
         let new_cap = (cap * 2).max(16);
         let bigger = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
-        this = ctx.read_native_pin(this_pin, this);
-        let storage = ctx.read_native_pin(storage_pin, storage);
-        if let (Some(pin), Value::Object(Some(e))) = (elem_pin, elem) {
-            elem = Value::Object(Some(ctx.read_native_pin(pin, e)));
-        }
-        ctx.unpin_native_roots(this_pin);
+        let bigger_pin = ctx.pin_native_root(bigger);
         for i in 0..len {
+            let storage = ctx.read_native_pin(storage_pin, storage);
+            let bigger = ctx.read_native_pin(bigger_pin, bigger);
             let v = ctx.get_array_element(storage, i);
+            let value_pin = match v {
+                Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+                _ => None,
+            };
+            let v = match (v, value_pin) {
+                (Value::Object(Some(object)), Some(pin)) => {
+                    Value::Object(Some(ctx.read_native_pin(pin, object)))
+                }
+                (value, _) => value,
+            };
             ctx.set_array_element(bigger, i, v);
+            if let Some(pin) = value_pin {
+                ctx.unpin_native_roots(pin);
+            }
         }
+        let this = ctx.read_native_pin(pin_base, this);
+        let bigger = ctx.read_native_pin(bigger_pin, bigger);
         ctx.set_field(this, 0, Value::Object(Some(bigger)));
-        bigger
+        (bigger, bigger_pin)
     } else {
-        storage
+        (storage, storage_pin)
+    };
+    let storage = ctx.read_native_pin(active_storage_pin, storage);
+    let elem = match (elem, elem_pin) {
+        (Value::Object(Some(object)), Some(pin)) => {
+            Value::Object(Some(ctx.read_native_pin(pin, object)))
+        }
+        (value, _) => value,
     };
     ctx.set_array_element(storage, len, elem);
     len += 1;
+    let this = ctx.read_native_pin(pin_base, this);
     ctx.set_field(this, 1, Value::Int(len as i32));
+    ctx.unpin_native_roots(pin_base);
     Ok(None)
 }
 
@@ -2229,16 +2276,19 @@ fn drain_real_spliterator(
     ctx: &mut dyn NativeContext,
     spliterator: cratonvm_types::ObjectRef,
 ) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+    let spl_pin = ctx.pin_native_root(spliterator);
     let collector = crate::alloc_concurrent_synthetic(ctx, STREAM_COLLECTOR_CLASS, 2);
+    let col_pin = ctx.pin_native_root(collector);
     let initial = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+    let initial_pin = ctx.pin_native_root(initial);
+    let mut collector = ctx.read_native_pin(col_pin, collector);
+    let initial = ctx.read_native_pin(initial_pin, initial);
     ctx.set_field(collector, 0, Value::Object(Some(initial)));
+    collector = ctx.read_native_pin(col_pin, collector);
     ctx.set_field(collector, 1, Value::Int(0));
 
     // Pin both objects — every `tryAdvance` re-enters Java and can trigger a
     // moving GC that relocates them (same discipline as `native_sl_stream`).
-    let spl_pin = ctx.pin_native_root(spliterator);
-    let col_pin = ctx.pin_native_root(collector);
-
     const SAFETY_CAP: usize = 1_000_000;
     let mut produced = 0usize;
     let mut try_advance_dispatched = false;
@@ -2291,14 +2341,31 @@ fn drain_real_spliterator(
         _ => 0,
     };
     let out = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+    let out_pin = ctx.pin_native_root(out);
     let col = ctx.read_native_pin(col_pin, collector);
     let result = match ctx.get_field(col, 0) {
         Value::Object(Some(storage)) => {
+            let storage_pin = ctx.pin_native_root(storage);
             for i in 0..len {
+                let storage = ctx.read_native_pin(storage_pin, storage);
+                let out = ctx.read_native_pin(out_pin, out);
                 let v = ctx.get_array_element(storage, i);
+                let value_pin = match v {
+                    Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+                    _ => None,
+                };
+                let v = match (v, value_pin) {
+                    (Value::Object(Some(object)), Some(pin)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, object)))
+                    }
+                    (value, _) => value,
+                };
                 ctx.set_array_element(out, i, v);
+                if let Some(pin) = value_pin {
+                    ctx.unpin_native_roots(pin);
+                }
             }
-            out
+            ctx.read_native_pin(out_pin, out)
         }
         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
     };

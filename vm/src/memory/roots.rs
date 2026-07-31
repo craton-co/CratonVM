@@ -262,9 +262,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     for entry in &thread.jit_hashmap_string_node_cache {
         roots.push(entry.map);
         roots.push(entry.node);
+        if let Some(key_object) = entry.key_object {
+            roots.push(key_object);
+        }
     }
     for entry in &thread.string_case_cache {
         roots.extend([entry.source, entry.first, entry.second]);
+        if let Some(locale) = entry.locale {
+            roots.push(locale);
+        }
     }
 
     // 5. Interned string pool — all interned String objects

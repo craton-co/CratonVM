@@ -1,41 +1,92 @@
 # Default Moving / Compacting Young Generation
 
-Status (2026-07-26): **CORRECT behind `CRATONVM_MOVING_YOUNG`, still
-default-off — now for THROUGHPUT reasons, not correctness.** XL, GC-coupled.
+Status (2026-07-30): **DEFAULT-ON AND ENGAGING.** `DEFAULT_MOVING_YOUNG = true`
+is the shipped contract; `CRATONVM_NO_MOVING_YOUNG=1` remains the compatibility
+opt-out. Every moving cycle still requires complete rewritable-root coverage and
+fails closed to the non-moving sweep when that proof is incomplete.
 
-The heap corruption that blocked this feature is fixed:
-five `jit/src/x64.rs` sites pushed an object reference onto the operand stack
+"And engaging" is the part that had to be earned separately, and it is the
+single most important thing to check before believing any status line in this
+document. The constant was `true` from 2026-07-28 onward while the collector
+still ran the non-moving sweep on **every** cycle of **every** process that
+compiled a method — `cycles=0 coverage_fallbacks=66` on bt18 at `-Xmx512m`.
+Three defects did that (a process-wide blanket that bypassed the per-cycle
+proof; a stale mirror reload that erased the proof's own input; and recursion
+being misread as an unguarded foreign frame) and all three are fixed. The same
+lane now runs 25 real Cheney cycles with zero fallbacks and the HotSpot
+checksum, at parity on wall time with both opt-out configurations. Full account
+and evidence:
+`docs/internal/default-moving-young-enabled-20260730.md`.
+
+The one obligation still open by design is the **cross-thread coverage
+handshake**: a cycle is treated as unproven whenever a peer thread is in
+compiled code, so multi-threaded phases keep taking the non-moving sweep. It is
+counted as `cross-thread-jit-peer` in the fallback histogram.
+
+Ask `CRATONVM_DBG=gc-stats` for `[GC] moving_young: cycles=… coverage_fallbacks=…`
+plus the per-reason histogram before treating this feature as active. A correct
+checksum proves safety; only a non-zero cycle count proves the collector is
+actually copying.
+
+The heap corruption that blocked this feature is fixed. In the 2026-07-26
+validation, five `jit/src/x64.rs` sites pushed an object reference onto the operand stack
 without an oop tag, so it reached neither the precise oop map nor the shadow
 stack while the safepoint still certified complete coverage. bt18 is now
 `68332206` on every run with the JIT on, across 1–25 real moving cycles
 (`gc_quiescence::moving_young_cycle_count()`), with zero coverage fallbacks.
 
-**Throughput, measured properly (2026-07-26).** bt18 at `-Xmx8g`, six
-interleaved rounds, minimum: default **1363 ms**, `CRATONVM_MOVING_YOUNG=1`
-**2905 ms** — **2.1×**. It was 5.0× until the pre-cycle from-space walk stopped
-building an `FxHashSet` of every object start (49% of the whole process) and
-started using an exact bitmap.
+**Historical throughput comparison (2026-07-26).** bt18 at `-Xmx8g`, six
+interleaved rounds, minimum: the then-default non-moving sweep **1363 ms**,
+moving young **2905 ms** — **2.1×**. It was 5.0× until the pre-cycle from-space
+walk stopped building an `FxHashSet` of every object start (49% of the whole
+process) and started using an exact bitmap.
 Of the remaining 1.5 s, roughly 370 ms is codegen moving-young forces, 300 ms
 the shadow push/reload, and 870 ms one Cheney copy.
 
-**The flip still needs its own case, but no longer on throughput grounds
-alone.** bt18 is the worst case for a copying collector — a very large live set
-maximises copying cost against sweeping — and it is also the workload where the
-default build dies with `OutOfMemoryError: young gen exhausted` at `-Xmx512m`
-while the compacting collector completes in 3.0 s. What is missing is a
-workload MIX, with `moving_young_cycle_count()` and the fallback counter
-printed for each.
+bt18 is a worst case for a copying collector — a very large live set maximises
+copying cost against sweeping — but it is also the workload where the
+non-moving path died with `OutOfMemoryError: young gen exhausted` at
+`-Xmx512m` while the compacting collector completed. Coverage fallbacks remain
+an expected safety mechanism, not a reason to disable the default globally.
 
-Also still open before a flip: `refresh_moving_young_coverage_for_collection`
-treats any cycle with a peer thread in JIT as unproven, so moving-young engages
-only when the initiator is alone in compiled code; and the A5
-`native_stack_has_jit_frame` probe over-detects (it should validate that a
-candidate return address is actually preceded by a `call` instruction rather
-than treating any stack word inside a JIT code range as a hit). Neither is a
-correctness risk — both only cost compaction.
+## Default-on closeout (2026-07-30)
 
-The 2026-07-01 "FINISHED" validation table at the end of this document remains
-**suspect**: it declared the feature correct without reporting
+`origin/dev` already contained `DEFAULT_MOVING_YOUNG = true` from
+`67de5400ac60` (it arrived as part of an unrelated Liquibase/GC repair), but
+the repository still documented a default-off experiment and its test asserted
+only equality with that constant. This closeout makes the state deliberate:
+the empty environment is asserted `true`, the opt-out is asserted `false`, and
+the architecture, GC guide, and source comments all describe the shipped
+default-on/fail-closed contract.
+
+Acceptance on the uniquely named release binary:
+
+- `cargo check --workspace` passed; GC library tests were 872/872.
+- The complete VM library accounted for 2,565 tests: 2,448 passed, 111 ignored,
+  and six unrelated existing failures. All moving-young/root-coverage tests
+  passed, including the synthetic shadow-window fixture corrected here to
+  satisfy the real fixed-capacity `ShadowStack` invariant.
+- The 18-class HotSpot-differential regression suite passed in default JIT,
+  default `--nojit`, and explicit `CRATONVM_NO_MOVING_YOUNG=1` JIT modes
+  (54/54 class runs).
+- `BinTreesClassic 18` returned the HotSpot checksum `68332206` in every lane.
+  The final merged JIT build requested moving young on all 64 pressure cycles
+  but safely diverted them because exact compiled-frame identity was
+  unavailable. A `--nojit`, 128m `BinTreesClassic 16` control executed 31
+  non-diverted moving collections and returned the HotSpot checksum `14985902`.
+  At `--Xmx 8g`, explicit opt-out returned `68332206` with the moving diagnostic
+  absent. These lanes prove both the active default and its relocation-safety
+  veto.
+- The real-JDK application gauntlet passed in both JIT and `--nojit`: four
+  Spring Boot classes (17 tests per mode), ten Hibernate classes (41 tests per
+  mode), and Tomcat `TestTomcat` (26 tests per mode), all with their runner
+  accounting markers and zero failures/aborts/container failures.
+
+Detailed evidence and baseline exclusions are recorded in
+`docs/internal/default-moving-young-enabled-20260730.md`.
+
+The 2026-07-01 "FINISHED" validation table later in this document remains
+historical and incomplete: it declared the feature correct without reporting
 `moving_young_cycle_count()`, which the diagnostics added on 2026-07-26 now
 print alongside the fallback count precisely so that cannot recur.
 
@@ -47,7 +98,7 @@ penalty of the non-moving free-list sweep that runs whenever JIT frames are
 live, while preserving the Binary-Trees-18 correctness invariant
 (**checksum = 68332206 = HotSpot**).
 
-## Current state (cited)
+## Historical baseline (pre-implementation)
 
 - **Default = non-moving generational mark-sweep.** `gc/src/gen_heap.rs`
   module doc (`:7`) describes the young gen as a non-moving free-list
@@ -285,9 +336,10 @@ aarch64 branch-overflow failures, unrelated to x64/GC). Perf is neutral-to-sligh
 positive at these heaps (bt14 @512m ~9 % faster; bt18 @8g ~2 % faster) — consistent
 with much of the bt gap being per-node mutator cost, not GC.
 
-### Remaining before a default flip (step 6)
+### Historical remaining work before the default flip (step 6)
 
-Not done here — the flip needs the app gauntlet, which this session could not run
+Not done in the 2026-07-01 session — the flip needed the app gauntlet, which
+that session could not run
 end-to-end. Two narrow coverage gaps remain and are the mandatory `step 5`
 fallback's job to catch (they never bite bt10/14/16/18):
 
@@ -297,5 +349,6 @@ fallback's job to catch (they never bite bt10/14/16/18):
 - **PCs the forward oop dataflow never reached** (e.g. exception-handler-only
   entries) publish no locals. Same fallback applies.
 
-Until those are covered by a coverage-completeness signal + fallback, keep the flag
-default-off. Route B (deopt safepoint maps) remains the eventual unification.
+Until those were covered by a coverage-completeness signal + fallback, the
+2026-07-01 branch kept the flag default-off. Route B (deopt safepoint maps)
+remains the eventual unification.
