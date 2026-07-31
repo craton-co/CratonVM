@@ -220,3 +220,46 @@ runs that tried are the same bimodal ones. Measure it the same way this was
 measured (`CRATONVM_JIT_IR_RELOC_MAPS=1` vs default, interleaved reps on a
 deterministic probe, plus a deep-stack probe since band-scan cost should scale
 with live frame count) before flipping the default.
+
+## Reader-side cost: measured, but the probe does not discriminate
+
+Same method as above, `CRATONVM_JIT_IR_RELOC_MAPS=0` vs `=1`, interleaved, five
+reps, `BinTreesClassic 18` @512m:
+
+| lane | ms | median |
+|---|---|---|
+| claim OFF | 2549, 2523, 2520, 2559, 2571 | 2549 |
+| claim ON  | 2519, 2543, 2541, 2543, 2563 | 2543 |
+
+No cost — the `ON` lane is nominally 6 ms faster, ranges fully overlapping.
+
+**Do not conclude from this that the assertion is free.** Both lanes report
+`cycles=25 coverage_fallbacks=0`, *identically*. If an IR frame were live at any
+of those 25 collections, the OFF lane would have had to fall back (its maps say
+"not covered") and the ON lane would not. Identical counts mean **no IR frame
+was live at collection time in this workload at all** — so the run never
+exercised the thing being measured, and the timings above are measuring nothing.
+
+This is the same class of error as attempts 1-3, caught this time before it
+became a conclusion: a probe that cannot express the signal produces a confident
+null. The tell here was free and worth keeping — the fallback counters
+themselves say whether the code path was reached.
+
+### What a discriminating probe needs
+
+* a method the IR tier actually compiles (`ir::ir_compatible`: no `athrow`, no
+  `invokedynamic`, within the invoke/field caps) —
+* holding a live reference across a call, so the frame has something to publish,
+* live on the stack when a young collection runs, and
+* deep enough to make band-scan cost visible, since that cost scales with live
+  frame count.
+
+Confirm it discriminates BEFORE timing anything: with the claim OFF the run must
+show non-zero `coverage_fallbacks`, and with it ON those must drop. If both
+lanes agree, the probe is wrong, not the change.
+
+Until such a probe exists the default stays opt-in. The implementation is
+complete and sound — publication is real, `cycles=25 coverage_fallbacks=0` and
+checksum `68332206` show relocation working through the contract, and the
+emission side costs ~1.4%. What is missing is not code, it is a measurement that
+can see the reader side.
