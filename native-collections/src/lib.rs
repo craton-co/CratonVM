@@ -10446,8 +10446,9 @@ fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     // GC-safety: `alloc_hs_backing` allocates (twice), so `this` must be
     // re-read before the field write — see `rooted_across`.
-    let (this, backing) =
-        rooted_across1(ctx, this, |ctx| alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY));
+    let (this, backing) = rooted_across1(ctx, this, |ctx| {
+        alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY)
+    });
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
     Ok(None)
 }
@@ -28926,7 +28927,8 @@ fn native_lhm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let cia_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
     let fn_pin = ctx.pin_native_root(function);
-    let out = native_lhm_compute_if_absent_pinned(ctx, this, cia_pin, key, key_pin, function, fn_pin);
+    let out =
+        native_lhm_compute_if_absent_pinned(ctx, this, cia_pin, key, key_pin, function, fn_pin);
     ctx.unpin_native_roots(cia_pin);
     out
 }
@@ -29718,10 +29720,15 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     });
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
     for i in 0..pairs.len() {
-        let mut entry_obj = rooted_across(ctx, &mut [&mut this, &mut set, &mut backing_map], |ctx| {
-            alloc_synthetic(ctx, "java/util/Map$Entry", 3)
-        });
-        ctx.set_field(entry_obj, 0, read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]));
+        let mut entry_obj =
+            rooted_across(ctx, &mut [&mut this, &mut set, &mut backing_map], |ctx| {
+                alloc_synthetic(ctx, "java/util/Map$Entry", 3)
+            });
+        ctx.set_field(
+            entry_obj,
+            0,
+            read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]),
+        );
         ctx.set_field(
             entry_obj,
             1,
@@ -29745,7 +29752,13 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let head_at_call = head;
         let node = rooted_across(
             ctx,
-            &mut [&mut this, &mut set, &mut backing_map, &mut bucket_arr, &mut entry_obj],
+            &mut [
+                &mut this,
+                &mut set,
+                &mut backing_map,
+                &mut bucket_arr,
+                &mut entry_obj,
+            ],
             |ctx| map_alloc_node(ctx, entry_at_call, sentinel, hash, head_at_call),
         );
         ctx.set_array_element(bucket_arr, idx, Value::Object(Some(node)));
@@ -40590,10 +40603,7 @@ fn native_chm_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let this_pin = ctx.pin_native_root(this);
     let other_h = ctx.pin_native_root(other);
     let our_entries = chm_collect_all_entries(ctx, this);
-    let flat: Vec<Value> = our_entries
-        .iter()
-        .flat_map(|(k, v)| [*k, *v])
-        .collect();
+    let flat: Vec<Value> = our_entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_flat_base, flat_pins) = pin_value_slice(ctx, &flat);
     let result = native_chm_equals_pinned(ctx, other, other_h, &flat, &flat_pins);
     ctx.unpin_native_roots(this_pin);
@@ -48017,8 +48027,9 @@ fn cowal_ensure_lock_and_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> 
     let mut this = this;
     if let Some(ls) = ctx.resolve_field_index(COWAL_CLASS, "lock") {
         if matches!(ctx.get_field(this, ls), Value::Object(None)) {
-            let made =
-                rooted_across(ctx, &mut [&mut this], |ctx| ctx.new_object("java/lang/Object"));
+            let made = rooted_across(ctx, &mut [&mut this], |ctx| {
+                ctx.new_object("java/lang/Object")
+            });
             if let Ok(Some(Value::Object(Some(lo)))) = made {
                 let mut lo = lo;
                 // The receiver passed to `<init>` is the address that is
