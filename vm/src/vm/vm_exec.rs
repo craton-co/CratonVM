@@ -3809,6 +3809,11 @@ impl<'a> NativeContextImpl<'a> {
         // JVMTI redefinition can stale caller-side direct calls and inline
         // dispatch caches, not just compiled bodies declared by `name`. Full
         // eviction is rare and keeps agent-woven bytecode authoritative.
+        // Invalidate every inline cache exactly once. Slots compare their
+        // stamp against this counter on their next dispatch and flush then;
+        // nothing pays a per-call cost afterwards. Must be bumped alongside
+        // the cache clear so no slot can validate against a pre-clear epoch.
+        cratonvm_jit::bump_redefine_epoch();
         let evicted = self.shared.jit.jit_cache.write().clear_all();
         if evicted > 0 {
             tracing::debug!(

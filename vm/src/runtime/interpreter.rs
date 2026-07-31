@@ -6118,11 +6118,40 @@ pub fn execute(
         // and use the shared artifacts normally.
         let env_disable_jit = crate::runtime::env_cache::disable_jit()
             || matches!(thread.kind, crate::threading::ThreadKind::Virtual);
-        // Redefinition invalidates only the class whose bytecode changed.
-        // Invoke/JIT cache entries already carry that class's generation
-        // handle, so an unrelated Mockito mock must not disable compilation
-        // for the rest of the process.
-        let redefine_jit_quiesced = class_was_redefined(shared, class_id);
+        // Redefinition does NOT permanently bar a class from compiling.
+        //
+        // This used to be `class_was_redefined(shared, class_id)`. The
+        // generation only ever increases, so that predicate is true forever
+        // once a class has been redefined — and it sat in the skip set below,
+        // which meant a class redefined once was condemned to the interpreter
+        // for the life of the process. That is the whole of the "every call
+        // into a redefined class costs ~33 µs" defect: one
+        // `Mockito.mock(Foo.class)` permanently de-optimized `Foo`. Measured
+        // on `docs/known-issues/repros/redefine-call-cost`: 691 ns/call
+        // compiled before the redefine, 33,773 ns/call interpreted after it,
+        // from redefining with *byte-identical* bytecode.
+        //
+        // It was also protecting nothing. `redefine_class` already evicts
+        // every compiled artifact — `jit_cache.write().clear_all()` plus
+        // `invalidate_jit_for_class` in `vm_exec.rs` — so no code compiled
+        // from the old body can survive the redefinition, and a later
+        // compilation necessarily reads the current (agent-woven) bytecode
+        // out of the class store. Blocking recompilation on top of a full
+        // eviction is belt-and-braces that only costs throughput.
+        //
+        // What is deliberately NOT claimed: this does not order a compile
+        // already in flight against a concurrent redefinition. A body
+        // compiled from generation N could in principle publish after the
+        // `clear_all()` for generation N+1. That race predates this change
+        // (it applies to the first redefinition of any class), and closing it
+        // wants a publish-time generation check rather than a permanent ban.
+        //
+        // `RedefineCorrectnessProbe` in the repro directory is the guard: it
+        // redefines with a body whose arithmetic differs, then drives the
+        // method hot, and fails if the recompiled code reverts to the old
+        // body. That assertion was vacuous while this gate blocked
+        // compilation, and is load-bearing now.
+        let redefine_jit_quiesced = false;
         // GPU-offload JIT admission gate (known-issues followups item 2):
         // while `--gpu` is active, a caller whose bytecode contains an
         // offload-eligible invokestatic must stay interpreted, or its

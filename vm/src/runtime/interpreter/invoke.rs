@@ -14583,9 +14583,12 @@ pub(super) fn try_osr(
     // ThrowJava` for why the safe reject was wrong there.
     throw_out: &mut Option<ObjectRef>,
 ) -> Option<Option<Value>> {
-    if class_was_redefined(shared, class_id) {
-        return None;
-    }
+    // Not gated on `class_was_redefined`. That predicate is true forever once
+    // a class has been redefined, so it barred OSR from a redefined class for
+    // the life of the process rather than for the duration of the change.
+    // `redefine_class` clears the entire JIT cache, and OSR compiles from the
+    // frame's current bytecode, so there is nothing stale left to protect
+    // against here. See the note in `interpreter.rs`'s compile gate.
     let frame = &thread.frames[frame_idx];
     let class_name = frame.class_name().to_string();
     let method_name = frame.method_name().to_string();
@@ -16844,9 +16847,12 @@ pub fn try_jit_compile_callee(
             .read()
             .get_loaded_class_id(class_name)
             .unwrap_or(ClassId::new(0));
-        if class_was_redefined(shared, probe_class_id) {
-            return None;
-        }
+        // No `class_was_redefined` gate: `redefine_class` calls
+        // `jit_cache.clear_all()`, so any entry still present in the cache was
+        // necessarily compiled AFTER the most recent redefinition of any
+        // class. Refusing the lookup because the class was once redefined
+        // permanently withheld compiled code from that class -- it is what
+        // kept a mocked class interpreted forever.
         let jit_cache = shared.jit.jit_cache.read();
         if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id) {
             // Cast: object/code pointer to integer address
@@ -16909,7 +16915,12 @@ pub(super) fn try_jit_compile_wrapped_entry(
     descriptor: &str,
     optimize: bool,
 ) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
-    if crate::runtime::env_cache::disable_jit() || named_class_was_redefined(shared, class_name) {
+    // `named_class_was_redefined` was OR'd in here and, being permanent,
+    // stopped a redefined class from ever supplying a compiled callee again.
+    // Compilation reads the current (agent-woven) bytecode out of the class
+    // store, and the previous artifacts were evicted by the redefinition, so
+    // compiling now yields code for the body that is actually installed.
+    if crate::runtime::env_cache::disable_jit() {
         return None;
     }
     let mut cache_negative = false;
