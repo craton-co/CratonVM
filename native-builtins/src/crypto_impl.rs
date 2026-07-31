@@ -4402,19 +4402,49 @@ pub fn rsa_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
 /// `key_id` slot). This is the bridge that lets us keep BOTH optimizations —
 /// fast Rust keygen AND fast Rust sign/verify — while returning spec-correct key
 /// objects. Same GC-stable-identity precedent as the signature payload table.
-static RSA_REALKEY_MAP: parking_lot::RwLock<Option<HashMap<i32, u64>>> =
+///
+/// VM scope: an `identityHashCode` is unique only *within one heap*, but this
+/// table is `static`. Rust tests (and any embedder) create several independent
+/// `Vm`s in one process, so without a VM component VM B's real RSA key whose
+/// identity hash happens to equal an entry VM A registered would resolve to VM
+/// A's `crypto_impl` handle - and `Signature.sign()`/`verify()`
+/// (`jca::signature::extract_key_id_from_key`) plus `Cipher`'s RSA component
+/// lookup (`jca::cipher::rsa_key_components`) would silently use the WRONG KEY.
+/// That is a *correctness* failure, not a crash: the table holds `u64` handles,
+/// never `ObjectRef`s, so nothing dangles - the signature is simply made with
+/// another VM's key. `NativeContext::vm_identity`'s own doc states the rule
+/// ("Native side caches ... must scope entries to this value",
+/// `native-api/src/registry.rs`); the same omission in native-collections'
+/// `widened_obj_key` aliased two VMs' collections and aborted the process.
+/// Keys are therefore `(vm_identity, identity_hash_code)` - the shape already
+/// used by `jca::signature`'s `SigKey` and `jca::key_factory`'s `KpgObjKey`.
+///
+/// GC: no `ObjectRef` is stored (key = a pair of integers, value = a `u64`
+/// `crypto_impl` handle), and `identity_hash_code` is preserved across moving
+/// collection (`HashCodeTable::update_after_gc`, `gc/src/compact_header.rs`),
+/// so this table needs no collector scan/remap companion.
+static RSA_REALKEY_MAP: parking_lot::RwLock<Option<HashMap<RsaRealKeyKey, u64>>> =
     parking_lot::RwLock::new(None);
 
-pub fn rsa_realkey_map_set(identity_hash: i32, key_id: u64) {
+/// `(NativeContext::vm_identity(), identity_hash_code(key))`.
+type RsaRealKeyKey = (usize, i32);
+
+/// Register `key_id` for the real RSA key whose identity hash is
+/// `identity_hash`, inside VM `vm` (`NativeContext::vm_identity()`).
+pub fn rsa_realkey_map_set(vm: usize, identity_hash: i32, key_id: u64) {
     let mut guard = RSA_REALKEY_MAP.write();
     guard
         .get_or_insert_with(HashMap::new)
-        .insert(identity_hash, key_id);
+        .insert((vm, identity_hash), key_id);
 }
 
-pub fn rsa_realkey_map_get(identity_hash: i32) -> Option<u64> {
+/// Look up the `crypto_impl` key handle registered for `identity_hash` **in VM
+/// `vm`**. Never pass a bare identity hash from one VM to look up another's.
+pub fn rsa_realkey_map_get(vm: usize, identity_hash: i32) -> Option<u64> {
     let guard = RSA_REALKEY_MAP.read();
-    guard.as_ref().and_then(|m| m.get(&identity_hash).copied())
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&(vm, identity_hash)).copied())
 }
 
 /// Global ECDSA key store.
@@ -4570,6 +4600,19 @@ pub fn ed25519_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool>
 // ---------------------------------------------------------------------------
 
 /// GC-stable signature-payload store: keyed on `identity_hash_code(this)`.
+///
+/// **VM-UNSCOPED — DO NOT WIRE UP AGAIN AS-IS.** This store and the six
+/// `sig_data_*` functions below currently have ZERO callers anywhere in the
+/// workspace: `jca::signature` moved the payload into its own
+/// `sig_payload_table`, keyed `(vm_identity, identity_hash_code)`, and the
+/// `crypto.rs` legacy-synthetic shim that used the raw-pointer API no longer
+/// exists. The defect is therefore inert, not fixed: the key here is a bare
+/// identity hash, which is unique only *within one heap*, while the table is a
+/// process-global `static`. Two `Vm`s in one process would append to — and
+/// `take` — each other's buffers. Any new caller MUST first re-key this on
+/// `(NativeContext::vm_identity(), identity_hash_code(this))`, exactly like
+/// `RSA_REALKEY_MAP` above and `jca::signature::SigKey`; prefer deleting the
+/// whole block instead.
 static SIG_DATA_STORE: parking_lot::RwLock<Option<HashMap<i32, Vec<u8>>>> =
     parking_lot::RwLock::new(None);
 

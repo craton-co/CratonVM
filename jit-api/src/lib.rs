@@ -6,8 +6,20 @@
 //! Shared types used by the JIT compiler crate and the VM crate:
 //! - [`CachedBytecodeMethod`] — method data needed for JIT compilation
 //! - [`JitRuntimeHelpers`] — function pointer table for JIT runtime callbacks
+//! - [`helpers_abi`] — the typed ABI description of that table: one
+//!   `HelperFn*` signature alias per callable slot, the machine-readable
+//!   [`HELPER_FIELDS`] descriptor list, null-checked accessors, and
+//!   [`JitRuntimeHelpers::validate_with`]
 //! - [`gpu_lowering::GpuLowering`] (under the `gpu-lowering` feature) —
 //!   trait seam for emitting PTX from a resolved Java method.
+//!
+//! # SAFETY: the `JitRuntimeHelpers` ABI is frozen
+//!
+//! [`JitRuntimeHelpers`] is a `#[repr(C)]` table of bare `usize` words whose
+//! **byte offsets are compiled into RWX machine code**. Never reorder, remove,
+//! retype, or insert a field; append only, and bump
+//! [`JIT_HELPERS_ABI_VERSION`] when you do. The full contract, the per-field
+//! signatures, and the per-field nullability rules live in [`helpers_abi`].
 //!
 //! ## `gpu-lowering` feature status
 //!
@@ -23,6 +35,14 @@
 
 #[cfg(feature = "gpu-lowering")]
 pub mod gpu_lowering;
+
+pub mod helpers_abi;
+
+pub use helpers_abi::{
+    helper_field, helper_field_offset, HelperAbiError, HelperFieldDesc, HelperKind,
+    HELPER_FIELDS, HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_ALIGN, JIT_HELPERS_ABI_SIZE,
+    JIT_HELPERS_ABI_VERSION, MAX_PLAUSIBLE_OFFSET, NUM_HELPER_FIELDS,
+};
 
 use std::sync::Arc;
 
@@ -618,6 +638,33 @@ pub mod npe_action {
 /// trap stub, exactly as `set_throw_bci` / `service_callee_deopt` are.
 /// Production builds always go through `build_helpers`, which populates every
 /// field explicitly.
+///
+/// # SAFETY: frozen binary layout
+///
+/// This struct is an ABI, not a data structure. The rules are absolute:
+///
+/// * **`#[repr(C)]` is mandatory.** The JIT reads slots as
+///   `[helpers_ptr + disp32]` with the displacement computed at compile time.
+///   `repr(Rust)` may reorder fields, which would silently re-point every
+///   baked `CALL` at a different helper.
+/// * **Every field is `usize`** (8 bytes; x86-64 only), so the byte offset of
+///   field *N* is exactly `N * 8`. A non-`usize` field would introduce padding
+///   and break that identity — see the `const _` assertions below.
+/// * **Append only.** Never reorder, never remove, never retype, never insert
+///   in the middle. New helpers go at the end, exactly as `set_throw_bci` and
+///   `service_callee_deopt` did.
+/// * **Bump [`JIT_HELPERS_ABI_VERSION`] on any shape change**, including a
+///   pure append: once a field exists, a producer and a consumer built against
+///   different revisions cannot be distinguished by size alone.
+/// * **Nullability is per field**, recorded in [`HELPER_FIELDS`]. A `required`
+///   slot is `CALL`ed unconditionally and must be non-zero; a non-required
+///   slot reads `0` as the documented "not wired" sentinel and the backend
+///   falls back (or emits nothing).
+///
+/// The raw `usize` type conveys none of that. Use the typed view in
+/// [`helpers_abi`] — [`Self::validate_with`] to check a table, the
+/// `<field>_fn` accessors to obtain a null-checked, correctly-typed function
+/// pointer, and [`HELPER_FIELDS`] to describe the layout to tooling.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct JitRuntimeHelpers {

@@ -108,12 +108,12 @@ pub fn verify_instruction(
         }
 
         Instruction::Lload(index) => {
-            let local = frame.local_load(*index)?;
-            if !local.is_assignable_to(&VType::Long, hierarchy) {
-                return Err(verify_err(&format!(
-                    "lload: local {index} is {local:?}, expected Long"
-                )));
-            }
+            // JVMS §4.10.1.6: the pair (`index`, `index+1`) must still be an
+            // intact category-2 value. Checking only the base would accept a
+            // pair whose upper half an intervening category-1 store replaced.
+            frame
+                .local_load_wide(*index, &VType::Long)
+                .map_err(|e| prefix_verify_err("lload", e))?;
             frame.push(VType::Long)?;
             frame.push(VType::Top)?;
             ok_through()
@@ -131,12 +131,9 @@ pub fn verify_instruction(
         }
 
         Instruction::Dload(index) => {
-            let local = frame.local_load(*index)?;
-            if !local.is_assignable_to(&VType::Double, hierarchy) {
-                return Err(verify_err(&format!(
-                    "dload: local {index} is {local:?}, expected Double"
-                )));
-            }
+            frame
+                .local_load_wide(*index, &VType::Double)
+                .map_err(|e| prefix_verify_err("dload", e))?;
             frame.push(VType::Double)?;
             frame.push(VType::Top)?;
             ok_through()
@@ -220,8 +217,12 @@ pub fn verify_instruction(
         Instruction::Lstore(index) => {
             frame.pop()?; // Top (second slot)
             frame.pop_expect(&VType::Long, hierarchy)?;
-            frame.local_store(*index, VType::Long)?;
-            frame.local_store(*index + 1, VType::Top)?;
+            // `local_store_wide` bounds-checks BOTH slots against `max_locals`
+            // and computes `index + 1` with `checked_add` — the previous
+            // `*index + 1` overflowed for a `wide lstore 65535`.
+            frame
+                .local_store_wide(*index, VType::Long)
+                .map_err(|e| prefix_verify_err("lstore", e))?;
             ok_through()
         }
 
@@ -234,8 +235,9 @@ pub fn verify_instruction(
         Instruction::Dstore(index) => {
             frame.pop()?; // Top
             frame.pop_expect(&VType::Double, hierarchy)?;
-            frame.local_store(*index, VType::Double)?;
-            frame.local_store(*index + 1, VType::Top)?;
+            frame
+                .local_store_wide(*index, VType::Double)
+                .map_err(|e| prefix_verify_err("dstore", e))?;
             ok_through()
         }
 
@@ -856,7 +858,30 @@ pub fn verify_instruction(
             ok_no_fallthrough()
         }
 
-        Instruction::Return => ok_no_fallthrough(),
+        Instruction::Return => {
+            // JVMS §4.10.1.9 (`return`): if the method being verified is
+            // `<init>` and the receiver has not been initialized — i.e. no
+            // `invokespecial` of `this.<init>` / `super.<init>` has replaced
+            // `uninitializedThis` — the constructor may not return. Otherwise
+            // a class could hand its caller a fully-typed reference to an
+            // object whose superclass constructor never ran, defeating every
+            // invariant a superclass constructor establishes (this is the
+            // classic "uninitialized object escape").
+            //
+            // `<init>` of `java/lang/Object` is the one exception: it has no
+            // superclass to chain to, so its `uninitializedThis` is never
+            // replaced.
+            if _method_name == "<init>"
+                && current_class_name != "java/lang/Object"
+                && frame.has_uninitialized_this()
+            {
+                return Err(verify_err(
+                    "return: constructor returns while `this` is still uninitialized — \
+                     no this()/super() constructor call was verified (JVMS §4.10.1.9)",
+                ));
+            }
+            ok_no_fallthrough()
+        }
 
         // =====================================================================
         // Field access — resolve type from constant pool
@@ -1085,7 +1110,28 @@ pub fn verify_instruction(
         // =====================================================================
         // Object creation and type checking
         // =====================================================================
-        Instruction::New(_index) => {
+        Instruction::New(index) => {
+            // JVMS §4.9.1 / §6.5 new: the operand must be a `CONSTANT_Class`
+            // entry naming a *class* type — not an array (`anewarray` /
+            // `multianewarray` create those) and not an unrelated constant. The
+            // previous arm ignored the index entirely, so `new #<any index>`
+            // verified clean and the interpreter reached an entry of whatever
+            // tag the class file happened to place there.
+            let class_name = cp.get_class_name(*index).ok_or_else(|| {
+                verify_err(&format!(
+                    "new: constant pool index {index} is not a CONSTANT_Class entry \
+                     with a resolvable name"
+                ))
+            })?;
+            if class_name.starts_with('[') {
+                return Err(verify_err(&format!(
+                    "new: operand {class_name} is an array type; use anewarray / \
+                     multianewarray (JVMS §6.5 new)"
+                )));
+            }
+            if class_name.is_empty() {
+                return Err(verify_err("new: operand names an empty class name"));
+            }
             // Push Uninitialized(pc) — the object is uninitialized until <init> is called
             frame.push(VType::Uninitialized(pc as u16))?;
             ok_through()
@@ -1194,8 +1240,17 @@ pub fn verify_instruction(
             ok_through()
         }
 
-        Instruction::Instanceof(_index) => {
+        Instruction::Instanceof(index) => {
             pop_reference(frame, hierarchy)?;
+            // JVMS §6.5 instanceof: the operand must be a `CONSTANT_Class`
+            // entry. Checked for the same reason as `new` / `checkcast` — the
+            // index was previously ignored outright.
+            if cp.get_class_name(*index).is_none() {
+                return Err(verify_err(&format!(
+                    "instanceof: constant pool index {index} is not a CONSTANT_Class \
+                     entry with a resolvable name"
+                )));
+            }
             frame.push(VType::Int)?;
             ok_through()
         }
@@ -1304,6 +1359,24 @@ fn verify_err(message: &str) -> LinkageError {
         class_name: String::new(),
         method_name: String::new(),
         message: message.to_string(),
+    }
+}
+
+/// Prefix a `VerifyError` raised by a [`VerificationFrame`] helper with the
+/// opcode that raised it, so the message names the rule *and* the instruction.
+/// Non-`VerifyError` variants pass through untouched.
+fn prefix_verify_err(opcode: &str, err: LinkageError) -> LinkageError {
+    match err {
+        LinkageError::VerifyError {
+            class_name,
+            method_name,
+            message,
+        } => LinkageError::VerifyError {
+            class_name,
+            method_name,
+            message: format!("{opcode}: {message}"),
+        },
+        other => other,
     }
 }
 
@@ -1562,24 +1635,80 @@ fn verify_ldc2w(
 }
 
 /// Resolve the field type descriptor from a FieldReference CP entry.
+///
+/// JVMS §4.4.2 / §4.4.6: a `Fieldref`'s `NameAndType` must carry a **field**
+/// descriptor, and the referenced class must itself be a `CONSTANT_Class`.
+/// Both are checked here.
+///
+/// SECURITY: rejecting a malformed descriptor is not pedantry.
+/// [`VType::from_field_descriptor`] maps anything it does not recognise to
+/// [`VType::Top`], and `Top` is the top of the assignability lattice — every
+/// value is assignable to it. So a field whose descriptor is `"Q"` used to make
+/// `putstatic` pop an arbitrary operand with no type check at all, and
+/// `getstatic` push a `Top` that later merges could not constrain.
 fn resolve_field_type(cp: &ConstantPool, index: u16) -> Result<VType, LinkageError> {
     match cp.get(index) {
         Some(ConstantPoolEntry::FieldReference {
+            class_index,
             name_and_type_index,
-            ..
         }) => {
-            if let Some((_, descriptor)) = cp.get_name_and_type(*name_and_type_index) {
-                Ok(VType::from_field_descriptor(descriptor))
-            } else {
-                Err(verify_err(&format!(
-                    "field ref: invalid NameAndType at index {name_and_type_index}"
-                )))
+            if cp.get_class_name(*class_index).is_none() {
+                return Err(verify_err(&format!(
+                    "field ref at index {index}: class_index {class_index} is not a \
+                     CONSTANT_Class entry with a resolvable name"
+                )));
             }
+            let Some((name, descriptor)) = cp.get_name_and_type(*name_and_type_index) else {
+                return Err(verify_err(&format!(
+                    "field ref: invalid NameAndType at index {name_and_type_index}"
+                )));
+            };
+            if name.is_empty() {
+                return Err(verify_err(&format!(
+                    "field ref at index {index}: empty field name"
+                )));
+            }
+            if !super::vtype::is_valid_field_descriptor(descriptor) {
+                return Err(verify_err(&format!(
+                    "field ref at index {index}: {descriptor:?} is not a well-formed \
+                     field descriptor (JVMS §4.3.2)"
+                )));
+            }
+            Ok(VType::from_field_descriptor(descriptor))
         }
         _ => Err(verify_err(&format!(
             "expected FieldReference at constant pool index {index}"
         ))),
     }
+}
+
+/// Shared `NameAndType` cross-check for the `invoke*` family (JVMS §4.4.6).
+///
+/// The name must be non-empty and the descriptor must be a well-formed
+/// **method** descriptor. A malformed descriptor would otherwise be parsed by
+/// [`super::vtype::param_types_from_descriptor`] into a *short* parameter list,
+/// so the verifier would pop fewer operands than the interpreter does at run
+/// time — an operand-stack desynchronisation between the two.
+fn checked_name_and_type(
+    cp: &ConstantPool,
+    name_and_type_index: u16,
+    what: &str,
+) -> Result<(String, String), LinkageError> {
+    let Some((name, descriptor)) = cp.get_name_and_type(name_and_type_index) else {
+        return Err(verify_err(&format!(
+            "{what}: invalid NameAndType at index {name_and_type_index}"
+        )));
+    };
+    if name.is_empty() {
+        return Err(verify_err(&format!("{what}: empty method name")));
+    }
+    if !super::vtype::is_valid_method_descriptor(descriptor) {
+        return Err(verify_err(&format!(
+            "{what}: {descriptor:?} is not a well-formed method descriptor \
+             (JVMS §4.3.3)"
+        )));
+    }
+    Ok((name.to_string(), descriptor.to_string()))
 }
 
 /// Resolve method name and descriptor from a MethodReference CP entry.
@@ -1591,15 +1720,7 @@ fn resolve_method_name_and_type(
         Some(ConstantPoolEntry::MethodReference {
             name_and_type_index,
             ..
-        }) => {
-            if let Some((name, descriptor)) = cp.get_name_and_type(*name_and_type_index) {
-                Ok((name.to_string(), descriptor.to_string()))
-            } else {
-                Err(verify_err(&format!(
-                    "method ref: invalid NameAndType at index {name_and_type_index}"
-                )))
-            }
-        }
+        }) => checked_name_and_type(cp, *name_and_type_index, "method ref"),
         _ => Err(verify_err(&format!(
             "expected MethodReference at constant pool index {index}"
         ))),
@@ -1646,15 +1767,7 @@ fn resolve_method_or_imethod_name_and_type(
         | Some(ConstantPoolEntry::InterfaceMethodReference {
             name_and_type_index,
             ..
-        }) => {
-            if let Some((name, descriptor)) = cp.get_name_and_type(*name_and_type_index) {
-                Ok((name.to_string(), descriptor.to_string()))
-            } else {
-                Err(verify_err(&format!(
-                    "method ref: invalid NameAndType at index {name_and_type_index}"
-                )))
-            }
-        }
+        }) => checked_name_and_type(cp, *name_and_type_index, "method ref"),
         _ => Err(verify_err(&format!(
             "expected MethodReference or InterfaceMethodReference at constant pool index {index}"
         ))),
@@ -1670,15 +1783,7 @@ fn resolve_imethod_name_and_type(
         Some(ConstantPoolEntry::InterfaceMethodReference {
             name_and_type_index,
             ..
-        }) => {
-            if let Some((name, descriptor)) = cp.get_name_and_type(*name_and_type_index) {
-                Ok((name.to_string(), descriptor.to_string()))
-            } else {
-                Err(verify_err(&format!(
-                    "interface method ref: invalid NameAndType at index {name_and_type_index}"
-                )))
-            }
-        }
+        }) => checked_name_and_type(cp, *name_and_type_index, "interface method ref"),
         _ => Err(verify_err(&format!(
             "expected InterfaceMethodReference at constant pool index {index}"
         ))),
@@ -1691,15 +1796,7 @@ fn resolve_invokedynamic_type(cp: &ConstantPool, index: u16) -> Result<String, L
         Some(ConstantPoolEntry::InvokeDynamic {
             name_and_type_index,
             ..
-        }) => {
-            if let Some((_, descriptor)) = cp.get_name_and_type(*name_and_type_index) {
-                Ok(descriptor.to_string())
-            } else {
-                Err(verify_err(&format!(
-                    "invokedynamic: invalid NameAndType at index {name_and_type_index}"
-                )))
-            }
-        }
+        }) => checked_name_and_type(cp, *name_and_type_index, "invokedynamic").map(|(_, d)| d),
         _ => Err(verify_err(&format!(
             "expected InvokeDynamic at constant pool index {index}"
         ))),
@@ -2506,5 +2603,338 @@ mod tests {
         assert!(error
             .to_string()
             .contains("uninitializedThis receiver requires the constructor owner"));
+    }
+
+    // =====================================================================
+    // Constant-pool cross-checks (JVMS §4.9.1)
+    // =====================================================================
+
+    fn run(
+        insn: &Instruction,
+        frame: &mut VerificationFrame,
+        cp: &ConstantPool,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+    ) -> Result<InsnVerifyResult, LinkageError> {
+        verify_instruction(insn, 0, frame, cp, class, method, descriptor, &MockHierarchy)
+    }
+
+    #[test]
+    fn new_with_a_valid_class_entry_is_accepted() {
+        let cp = init_cp(); // index 2 is a ClassReference → java/lang/Object
+        let mut frame = make_frame(1, 4);
+        run(&Instruction::New(2), &mut frame, &cp, "Test", "m", "()V")
+            .expect("`new java/lang/Object` is well-formed");
+        assert_eq!(frame.stack, vec![VType::Uninitialized(0)]);
+    }
+
+    #[test]
+    fn new_with_a_non_class_cp_entry_rejected() {
+        // Index 4 is a Utf8, not a CONSTANT_Class. The operand used to be
+        // ignored entirely, so `new #4` verified clean.
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        let err = run(&Instruction::New(4), &mut frame, &cp, "Test", "m", "()V")
+            .expect_err("`new` must reject a non-Class operand");
+        assert!(err.to_string().contains("CONSTANT_Class"), "{err}");
+    }
+
+    #[test]
+    fn new_with_an_out_of_range_cp_index_rejected() {
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        assert!(run(
+            &Instruction::New(9999),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn new_of_an_array_type_rejected() {
+        // JVMS §6.5 new: array types are created by anewarray / multianewarray.
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("[Ljava/lang/Object;".into()), // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 },   // 2
+        ]);
+        let mut frame = make_frame(1, 4);
+        let err = run(&Instruction::New(2), &mut frame, &cp, "Test", "m", "()V")
+            .expect_err("`new` of an array type must be rejected");
+        assert!(err.to_string().contains("array type"), "{err}");
+    }
+
+    #[test]
+    fn instanceof_with_a_non_class_cp_entry_rejected() {
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        frame.push(VType::Null).unwrap();
+        assert!(run(
+            &Instruction::Instanceof(4),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn instanceof_with_a_valid_class_entry_accepted() {
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        frame.push(VType::Null).unwrap();
+        run(
+            &Instruction::Instanceof(2),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V",
+        )
+        .expect("`instanceof java/lang/Object` is well-formed");
+        assert_eq!(frame.stack, vec![VType::Int]);
+    }
+
+    #[test]
+    fn getstatic_with_a_malformed_field_descriptor_rejected() {
+        // A descriptor `VType::from_field_descriptor` cannot parse becomes
+        // `Top`, and everything is assignable to `Top` — so a malformed
+        // descriptor used to disable the type check on this operand entirely.
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("Test".into()),              // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 }, // 2
+            ConstantPoolEntry::Utf8("f".into()),                 // 3
+            ConstantPoolEntry::Utf8("Ljava/lang/String".into()), // 4 — no ';'
+            ConstantPoolEntry::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            ConstantPoolEntry::FieldReference {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6
+        ]);
+        let mut frame = make_frame(1, 4);
+        let err = run(
+            &Instruction::Getstatic(6),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V",
+        )
+        .expect_err("a malformed field descriptor must be a VerifyError");
+        assert!(err.to_string().contains("field descriptor"), "{err}");
+    }
+
+    #[test]
+    fn getstatic_with_a_well_formed_field_descriptor_accepted() {
+        let cp = simple_cp(); // index 12 is Test.value : I
+        let mut frame = make_frame(1, 4);
+        run(
+            &Instruction::Getstatic(12),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V",
+        )
+        .expect("a well-formed field ref must verify");
+        assert_eq!(frame.stack, vec![VType::Int]);
+    }
+
+    #[test]
+    fn invokestatic_with_a_malformed_method_descriptor_rejected() {
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("Test".into()),              // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 }, // 2
+            ConstantPoolEntry::Utf8("m".into()),                 // 3
+            ConstantPoolEntry::Utf8("(Ljava/lang/String)V".into()), // 4 — no ';'
+            ConstantPoolEntry::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            ConstantPoolEntry::MethodReference {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6
+        ]);
+        let mut frame = make_frame(1, 4);
+        let err = run(
+            &Instruction::Invokestatic(6),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V",
+        )
+        .expect_err("a malformed method descriptor must be a VerifyError");
+        assert!(err.to_string().contains("method descriptor"), "{err}");
+    }
+
+    // =====================================================================
+    // Category-2 local slot pairing (JVMS §4.10.1.6)
+    // =====================================================================
+
+    #[test]
+    fn lstore_then_lload_round_trips() {
+        let cp = simple_cp();
+        let mut frame = make_frame(4, 4);
+        frame.push(VType::Long).unwrap();
+        frame.push(VType::Top).unwrap();
+        run(&Instruction::Lstore(1), &mut frame, &cp, "Test", "m", "()V").unwrap();
+        run(&Instruction::Lload(1), &mut frame, &cp, "Test", "m", "()V")
+            .expect("an intact long pair must load back");
+        assert_eq!(frame.stack, vec![VType::Long, VType::Top]);
+    }
+
+    #[test]
+    fn splitting_a_long_pair_then_loading_it_rejected() {
+        // `lstore_1; istore_2; lload_1` — the `istore_2` overwrote the long's
+        // upper half, so `lload_1` must not verify.
+        let cp = simple_cp();
+        let mut frame = make_frame(4, 4);
+        frame.push(VType::Long).unwrap();
+        frame.push(VType::Top).unwrap();
+        run(&Instruction::Lstore(1), &mut frame, &cp, "Test", "m", "()V").unwrap();
+        frame.push(VType::Int).unwrap();
+        run(&Instruction::Istore(2), &mut frame, &cp, "Test", "m", "()V").unwrap();
+        let err = run(&Instruction::Lload(1), &mut frame, &cp, "Test", "m", "()V")
+            .expect_err("a split category-2 pair must not load back as a long");
+        assert!(err.to_string().contains("lload"), "{err}");
+    }
+
+    #[test]
+    fn lstore_past_max_locals_rejected() {
+        // `max_locals = 2` leaves slots 0 and 1; a long at slot 1 needs slot 2.
+        let cp = simple_cp();
+        let mut frame = make_frame(2, 4);
+        frame.push(VType::Long).unwrap();
+        frame.push(VType::Top).unwrap();
+        let err = run(&Instruction::Lstore(1), &mut frame, &cp, "Test", "m", "()V")
+            .expect_err("a long store must fit entirely inside max_locals");
+        assert!(err.to_string().contains("lstore"), "{err}");
+    }
+
+    #[test]
+    fn wide_lstore_at_u16_max_does_not_panic() {
+        // REGRESSION: `local_store(*index + 1, ..)` overflowed for a
+        // `wide lstore 65535` — a debug panic on attacker-supplied bytecode.
+        let cp = simple_cp();
+        let mut frame = make_frame(4, 4);
+        frame.push(VType::Long).unwrap();
+        frame.push(VType::Top).unwrap();
+        assert!(run(
+            &Instruction::Lstore(u16::MAX),
+            &mut frame,
+            &cp,
+            "Test",
+            "m",
+            "()V"
+        )
+        .is_err());
+    }
+
+    // =====================================================================
+    // `<init>` must run before a constructor returns (JVMS §4.10.1.9)
+    // =====================================================================
+
+    #[test]
+    fn constructor_return_before_super_init_rejected() {
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        frame.locals[0] = VType::UninitializedThis;
+        let err = run(
+            &Instruction::Return,
+            &mut frame,
+            &cp,
+            "Example",
+            "<init>",
+            "()V",
+        )
+        .expect_err("a constructor may not return with `this` uninitialized");
+        assert!(err.to_string().contains("uninitialized"), "{err}");
+    }
+
+    #[test]
+    fn constructor_return_after_super_init_accepted() {
+        struct DirectSuper;
+        impl ClassHierarchy for DirectSuper {
+            fn is_subclass(&self, child: &str, parent: &str) -> bool {
+                child == parent || parent == "java/lang/Object"
+            }
+            fn is_direct_superclass(&self, child: &str, parent: &str) -> bool {
+                child == "Example" && parent == "java/lang/Object"
+            }
+            fn common_superclass(&self, _a: &str, _b: &str) -> String {
+                "java/lang/Object".to_string()
+            }
+            fn is_interface(&self, _name: &str) -> bool {
+                false
+            }
+        }
+
+        let cp = init_cp();
+        let h = DirectSuper;
+        let mut frame = make_frame(1, 4);
+        frame.locals[0] = VType::UninitializedThis;
+        frame.push(VType::UninitializedThis).unwrap();
+        verify_instruction(
+            &Instruction::Invokespecial(6),
+            0,
+            &mut frame,
+            &cp,
+            "Example",
+            "<init>",
+            "()V",
+            &h,
+        )
+        .expect("super() call");
+        verify_instruction(
+            &Instruction::Return,
+            4,
+            &mut frame,
+            &cp,
+            "Example",
+            "<init>",
+            "()V",
+            &h,
+        )
+        .expect("returning after super() is legal");
+    }
+
+    #[test]
+    fn object_constructor_may_return_uninitialized() {
+        // `java/lang/Object.<init>` has no superclass to chain to, so its
+        // `uninitializedThis` is never replaced.
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        frame.locals[0] = VType::UninitializedThis;
+        run(
+            &Instruction::Return,
+            &mut frame,
+            &cp,
+            "java/lang/Object",
+            "<init>",
+            "()V",
+        )
+        .expect("Object.<init> must be allowed to return");
+    }
+
+    #[test]
+    fn ordinary_method_return_unaffected() {
+        let cp = init_cp();
+        let mut frame = make_frame(1, 4);
+        run(&Instruction::Return, &mut frame, &cp, "Example", "m", "()V")
+            .expect("an ordinary void return is unaffected");
     }
 }

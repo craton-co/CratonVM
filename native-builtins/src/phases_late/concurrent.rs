@@ -984,65 +984,14 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
     });
 
     // --- TimeUnit enum (1-field: ordinal=0) ---
+    // `toMillis`/`toNanos`/`toSeconds`/`convert` used to be re-registered
+    // here. `register` is last-wins, and this file runs after phases_early,
+    // so these shadowed the complete implementation over there with a
+    // three-method subset that read the ordinal from slot 0 only
+    // (`unwrap_or(0)` => every unit decayed to NANOSECONDS) and a `convert`
+    // that returned its input unchanged. Deleted; phases_early owns the
+    // conversion surface. Only the static constants remain below.
     let tu = "java/util/concurrent/TimeUnit";
-    r.register(tu, "toMillis", "(J)J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let ord = ctx.get_field(this, 0).as_int().unwrap_or(0);
-        let dur = args[1].as_long().unwrap_or(0);
-        let millis = match ord {
-            0 => dur / 1_000_000,  // NANOSECONDS
-            1 => dur / 1000,       // MICROSECONDS
-            2 => dur,              // MILLISECONDS
-            3 => dur * 1000,       // SECONDS
-            4 => dur * 60_000,     // MINUTES
-            5 => dur * 3_600_000,  // HOURS
-            6 => dur * 86_400_000, // DAYS
-            _ => dur,
-        };
-        Ok(Some(Value::Long(millis)))
-    });
-    r.register(tu, "toNanos", "(J)J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let ord = ctx.get_field(this, 0).as_int().unwrap_or(0);
-        let dur = args[1].as_long().unwrap_or(0);
-        let nanos = match ord {
-            0 => dur,                      // NANOSECONDS
-            1 => dur * 1000,               // MICROSECONDS
-            2 => dur * 1_000_000,          // MILLISECONDS
-            3 => dur * 1_000_000_000,      // SECONDS
-            4 => dur * 60_000_000_000,     // MINUTES
-            5 => dur * 3_600_000_000_000,  // HOURS
-            6 => dur * 86_400_000_000_000, // DAYS
-            _ => dur,
-        };
-        Ok(Some(Value::Long(nanos)))
-    });
-    r.register(tu, "toSeconds", "(J)J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let ord = ctx.get_field(this, 0).as_int().unwrap_or(0);
-        let dur = args[1].as_long().unwrap_or(0);
-        let secs = match ord {
-            0 => dur / 1_000_000_000,
-            1 => dur / 1_000_000,
-            2 => dur / 1000,
-            3 => dur,
-            4 => dur * 60,
-            5 => dur * 3600,
-            6 => dur * 86400,
-            _ => dur,
-        };
-        Ok(Some(Value::Long(secs)))
-    });
-    r.register(
-        tu,
-        "convert",
-        "(JLjava/util/concurrent/TimeUnit;)J",
-        |_ctx, args| {
-            let _this = obj_arg(args, 0)?;
-            // Simplified: just return the value
-            Ok(Some(args[1]))
-        },
-    );
     // TimeUnit static constants (ordinals)
     r.register(
         tu,
@@ -1050,7 +999,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-            ctx.set_field(obj, 0, Value::Int(0));
+            crate::phases_early::tu_set_ordinal(ctx, obj, 0);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1060,7 +1009,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-            ctx.set_field(obj, 0, Value::Int(1));
+            crate::phases_early::tu_set_ordinal(ctx, obj, 1);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1070,7 +1019,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-            ctx.set_field(obj, 0, Value::Int(2));
+            crate::phases_early::tu_set_ordinal(ctx, obj, 2);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1080,7 +1029,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-            ctx.set_field(obj, 0, Value::Int(3));
+            crate::phases_early::tu_set_ordinal(ctx, obj, 3);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1090,7 +1039,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-            ctx.set_field(obj, 0, Value::Int(4));
+            crate::phases_early::tu_set_ordinal(ctx, obj, 4);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1100,7 +1049,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-            ctx.set_field(obj, 0, Value::Int(5));
+            crate::phases_early::tu_set_ordinal(ctx, obj, 5);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1110,7 +1059,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-            ctx.set_field(obj, 0, Value::Int(6));
+            crate::phases_early::tu_set_ordinal(ctx, obj, 6);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5818,6 +5767,19 @@ pub(crate) fn tg_get_field(
     result
 }
 
+/// Slot fallback for a SYNTHETIC `Thread`'s owning group.
+///
+/// `tg_of_thread` resolves the group by NAME (`holder.group`, or `group`
+/// directly), which is right for a real-JDK `Thread`. A synthetically
+/// allocated one has no field names at all — `ensure_synthetic_class` mints
+/// unnamed slots — so the lookup yields nothing and the thread appears to
+/// belong to no group, making `ThreadGroup.enumerate` report zero.
+///
+/// Consulted ONLY after both name lookups fail, so a real `Thread` never
+/// reaches it and the two paths cannot disagree about the same object. Slot 1
+/// mirrors the synthetic `(name, group)` shape the VM's own thread mirrors use.
+const SYNTHETIC_THREAD_GROUP_SLOT: usize = 1;
+
 pub(crate) fn tg_of_thread(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Option<ObjectRef> {
     let pin = ctx.pin_native_root(thread);
     let thread = ctx.read_native_pin(pin, thread);
@@ -5835,7 +5797,15 @@ pub(crate) fn tg_of_thread(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Op
         _ => {
             let thread = ctx.read_native_pin(pin, thread);
             match ctx.get_field_by_name(thread, "group") {
-                Value::Object(group) => group,
+                Value::Object(Some(group)) => Some(group),
+                // Neither `holder.group` nor `group` resolved: a synthetic
+                // Thread with no field names. See the constant above.
+                _ if ctx.object_num_fields(thread) > SYNTHETIC_THREAD_GROUP_SLOT => {
+                    match ctx.get_field(thread, SYNTHETIC_THREAD_GROUP_SLOT) {
+                        Value::Object(group) => group,
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         }

@@ -7,7 +7,10 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::phases_late::{p56_build_stream, p58_new_cf};
+use crate::phases_late::{
+    p56_build_stream, p58_new_cf, CLEANABLE_ACTION, CLEANABLE_CLEANED, CLEANABLE_FIELDS,
+    CLEANABLE_INDEX, REF_TYPE_CLEANER,
+};
 use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
 
 use std::collections::HashMap;
@@ -2638,9 +2641,19 @@ const BB_NATIVE_ID: usize = 6; // Long  — alloc_id from NativeMemoryTable, 0 i
 const BB_DIRECT_FLAG: usize = 7; // Int   — 1 if direct, 0 otherwise
 
 // jdk/internal/ref/Cleaner$Deallocator synthetic for DirectByteBuffer.
-// field 0 = alloc_id (Long).
+//   field 0 = alloc_id (Long)          — key into the VM's `NativeMemoryTable`
+//   field 1 = global-root handle (Long) — the root that keeps the owning
+//             `Cleaner$Cleanable` reachable until the action has run; see
+//             `s2_bb_alloc_direct`. Zeroed by `run()` once released.
 const DEALLOC_ID: usize = 0;
+const DEALLOC_ROOT: usize = 1;
+const DEALLOC_FIELDS: usize = 2;
 const DEALLOC_CLASS: &str = "jdk/internal/ref/DirectBufferDeallocator";
+
+/// Alignment of the off-heap block behind a synthetic `DirectByteBuffer`.
+/// 8 bytes is sufficient for every primitive `Unsafe.put*` width, matching
+/// `native-io/src/direct_buffer.rs`'s `DBB_ALIGN`.
+const DIRECT_BUFFER_ALIGN: usize = 8;
 
 const S2SC_CONNECTED: usize = 0;
 const S2SC_OPEN: usize = 1;
@@ -2694,6 +2707,86 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Option<ObjectRef> {
     ctx.unpin_native_roots(arr_pin);
     bb_write_hb(ctx, buf, arr, cap as i32);
     Some(buf)
+}
+
+/// NEW-17 — synthetic-mode `ByteBuffer.allocateDirect(cap)`.
+///
+/// The result is a genuinely DIRECT buffer: `cap` bytes of real off-heap
+/// memory from the VM's `NativeMemoryTable`, released when the buffer becomes
+/// unreachable. It reuses the six-slot synthetic ByteBuffer shape every
+/// `s2_bb_*` accessor in this file already understands, with one difference
+/// from the heap flavour built by `s2_bb_alloc`: `BB_ARRAY` stays null and
+/// `BB_MARK` (slot 4) carries the native address — exactly what
+/// `s2_bb_direct_addr` probes for, and the same convention the direct
+/// typed-buffer views produced by `s2_view_buf_fn!` already use. So
+/// `isDirect()` answers true, `hasArray()` false, `array()` throws
+/// `UnsupportedOperationException`, and every get/put routes through
+/// `copy_from_native_memory`/`copy_to_native_memory` against the real block.
+/// (The cost of reusing slot 4 is that such a buffer has no `mark` — see the
+/// guard in `s2_bb_set_mark`, which drops the write rather than overwriting
+/// the backing pointer with a small integer.)
+///
+/// Reclamation is the NEW-17 Cleaner pipeline, not a finaliser:
+/// `discover_reference(Cleaner, cleanable, buf)` registers the Cleanable as a
+/// phantom over the buffer, so when the buffer dies the reference processor
+/// emits the Cleanable into `cleaner_actions`, `CleanerThread` queues it, and
+/// `interpreter::run_cleaner_actions` invokes `run()V` on the deallocator
+/// registered under `DEALLOC_CLASS` below. An explicit
+/// `Cleaner$Cleanable.clean()` reaches the same `run()` through the shared
+/// `cleaned` flag, so the block can never be freed twice.
+fn s2_bb_alloc_direct(ctx: &mut dyn NativeContext, cap: i32) -> MethodCallResult {
+    let allocation = ctx.allocate_native_memory(cap.max(0) as usize, DIRECT_BUFFER_ALIGN);
+    let (alloc_id, ptr) = match allocation {
+        Some(block) => block,
+        None => {
+            return Err(RuntimeError::OutOfMemoryError {
+                message: format!("Direct buffer memory: tried {cap}"),
+            }
+            .into())
+        }
+    };
+    let addr = ptr as usize as i64;
+
+    // GC SAFETY: each allocation below is a collection point. `buf` and
+    // `dealloc` are pinned across the later ones and re-read through the pins;
+    // `cleanable` is minted last so nothing can move it before its raw address
+    // reaches the reference processor.
+    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+    let buf_pin = ctx.pin_native_root(buf);
+    let dealloc = alloc_concurrent_synthetic(ctx, DEALLOC_CLASS, DEALLOC_FIELDS);
+    let dealloc_pin = ctx.pin_native_root(dealloc);
+    let cleanable =
+        alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner$Cleanable", CLEANABLE_FIELDS);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    let dealloc = ctx.read_native_pin(dealloc_pin, dealloc);
+    ctx.unpin_native_roots(buf_pin);
+
+    // No heap array: `s2_bb_arr` must answer None so `s2_bb_direct_addr` is
+    // consulted and the buffer reads as direct.
+    ctx.set_field(buf, BB_ARRAY, Value::Object(None));
+    ctx.set_field(buf, BB_POS, Value::Int(0));
+    ctx.set_field(buf, BB_LIMIT, Value::Int(cap));
+    ctx.set_field(buf, BB_CAP, Value::Int(cap));
+    ctx.set_field(buf, BB_MARK, Value::Long(addr));
+    ctx.set_field(buf, BB_ORDER, Value::Int(0)); // JDK default: BIG_ENDIAN
+
+    ctx.set_field(dealloc, DEALLOC_ID, Value::Long(alloc_id));
+    ctx.set_field(cleanable, CLEANABLE_ACTION, Value::Object(Some(dealloc)));
+    ctx.set_field(cleanable, CLEANABLE_CLEANED, Value::Int(0));
+    ctx.set_field(cleanable, CLEANABLE_INDEX, Value::Int(-1));
+
+    // The ReferenceProcessor keeps only the Cleanable's raw ADDRESS and is not
+    // a GC root, so without a strong reference the Cleanable would be
+    // collected alongside the buffer and the block would leak. There is no
+    // owning `Cleaner` object on this path to park it in (the JDK's
+    // `DirectByteBuffer` uses the static `CleanerFactory` list), so take a
+    // persistent global root instead — remapped by the moving collector — and
+    // record its handle in the deallocator, which drops it in `run()`.
+    let root = ctx.add_global_root(cleanable);
+    ctx.set_field(dealloc, DEALLOC_ROOT, Value::Long(root as i64));
+
+    ctx.discover_reference(REF_TYPE_CLEANER, cleanable, buf, None);
+    Ok(Some(Value::Object(Some(buf))))
 }
 
 /// Initialise a synthetic ByteBuffer so BOTH the indexed-slot layout
@@ -2818,7 +2911,22 @@ fn s2_bb_set_mark(ctx: &mut dyn NativeContext, buf: ObjectRef, value: i32) {
     // field resolution itself fails (see `vm_exec.rs::get_field_by_name`),
     // which distinguishes "no such field" from "real int field valued 0".
     match ctx.get_field_by_name(buf, "mark") {
-        Value::Object(None) => ctx.set_field(buf, BB_MARK, Value::Int(value)),
+        Value::Object(None) => {
+            // A SYNTHETIC direct buffer stores its native address in this very
+            // slot (see `s2_bb_alloc_direct` and the direct branch of
+            // `s2_view_buf_fn!`), so it has no mark slot at all. Writing an Int
+            // here would replace the backing pointer with a small integer and
+            // turn the next get/put into a wild native access. Drop the mark
+            // instead — a later `reset()` then reports "no mark", which is a
+            // recoverable `InvalidMarkException` rather than a SIGSEGV. Only
+            // reachable when `mark` did NOT resolve by name, so a real-JDK
+            // buffer (whose slot 4 is also a positive `address` long) never
+            // takes this branch.
+            if matches!(ctx.get_field(buf, BB_MARK), Value::Long(addr) if addr > 0) {
+                return;
+            }
+            ctx.set_field(buf, BB_MARK, Value::Int(value))
+        }
         _ => ctx.set_field_by_name(buf, "mark", Value::Int(value)),
     }
 }
@@ -4261,7 +4369,32 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            ctx.new_object_initialized("java/nio/DirectByteBuffer", "(I)V", &[Value::Int(cap)])
+            // Real-JDK mode: run the genuine `DirectByteBuffer(int)`
+            // constructor. It installs the JDK's own `Cleaner`/`Deallocator`
+            // and `Bits` accounting, which is strictly better than anything we
+            // can synthesise, so nothing changes on that path.
+            //
+            // Both probes are needed and neither alone is enough:
+            // `would_fabricate_synthetic_stub` is the non-destructive "are the
+            // class bytes reachable" question, but it answers "no stub" once
+            // ANY earlier caller has already minted the stub (it short-circuits
+            // on `resolve_fast_path_class_id`); `is_class_synthetic_stub`
+            // covers exactly that case by asking what the loaded class IS.
+            let real_direct_byte_buffer =
+                !ctx.would_fabricate_synthetic_stub("java/nio/DirectByteBuffer")
+                    && !ctx.is_class_synthetic_stub("java/nio/DirectByteBuffer");
+            if real_direct_byte_buffer {
+                return ctx.new_object_initialized(
+                    "java/nio/DirectByteBuffer",
+                    "(I)V",
+                    &[Value::Int(cap)],
+                );
+            }
+            // Synthetic-JDK mode: there is no `DirectByteBuffer` bytecode to
+            // run and `new_object_initialized` would raise NoClassDefFound —
+            // `allocateDirect` simply threw. Build a genuinely direct buffer
+            // here instead (NEW-17).
+            s2_bb_alloc_direct(ctx, cap)
         },
     );
     r.register(bb, "wrap", "([B)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -6045,6 +6178,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         ctx.free_native_memory(alloc_id);
         ctx.set_field(this, DEALLOC_ID, Value::Long(0));
+        // Release the global root that kept the owning `Cleaner$Cleanable`
+        // (and, through it, this deallocator) reachable until the action ran.
+        // Leaving it installed would pin both for the life of the VM — a slow
+        // leak of exactly the shape the Cleaner exists to prevent.
+        if let Value::Long(root) = ctx.get_field(this, DEALLOC_ROOT) {
+            if root != 0 {
+                ctx.remove_global_root(root as usize);
+                ctx.set_field(this, DEALLOC_ROOT, Value::Long(0));
+            }
+        }
         Ok(None)
     });
 }

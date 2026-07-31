@@ -53,6 +53,12 @@ cratonvm-difftest = { path = "../difftest" }
 # unresolved in the default feature set).
 cratonvm-native-builtins = { path = "../native-builtins", features = ["legacy-synthetic-crypto"] }
 cratonvm-classloading = { path = "../classloading" }
+# `fuzz_jfr_chunk` targets the JFR chunk/event wire format
+# (`cratonvm_jfr::dump`): the compressed-int/long varint codec plus the
+# header-offset-driven `read_jfr_header` / `read_events` walk. The crate is a
+# leaf (types + smallvec + parking_lot + tracing), so this costs the fuzz
+# build almost nothing.
+cratonvm-jfr = { path = "../jfr" }
 
 # -----------------------------------------------------------------------
 # Untrusted-byte parsers under fuzz.
@@ -122,6 +128,58 @@ doc = false
 [[bin]]
 name = "fuzz_tls_record"
 path = "fuzz_targets/fuzz_tls_record.rs"
+test = false
+doc = false
+
+# Constant pool in isolation: the harness pins the class-file header and
+# tail so every mutation lands inside the pool. Asserts the u16 count cap,
+# the "no slot is free" byte accounting, and the JVMS 4.4.5 category-2
+# tombstone rule.
+[[bin]]
+name = "fuzz_constant_pool"
+path = "fuzz_targets/fuzz_constant_pool.rs"
+test = false
+doc = false
+
+# Recursive attribute nesting: Code-in-Code, nested annotation
+# element_values, and TypeAnnotation type_paths. Asserts bounded recursion
+# in both directions (a shallow nest must decode; a deep one must not).
+[[bin]]
+name = "fuzz_attribute_nesting"
+path = "fuzz_targets/fuzz_attribute_nesting.rs"
+test = false
+doc = false
+
+# JNI / JVM descriptors and generic signatures with harness-generated
+# adversarial shapes, plus a Display -> parse round-trip oracle.
+[[bin]]
+name = "fuzz_jni_descriptor"
+path = "fuzz_targets/fuzz_jni_descriptor.rs"
+test = false
+doc = false
+
+# JFR chunk / event wire format: varint codec round trips plus the
+# offset-driven header and record walk.
+[[bin]]
+name = "fuzz_jfr_chunk"
+path = "fuzz_targets/fuzz_jfr_chunk.rs"
+test = false
+doc = false
+
+# JAR/ZIP ingestion: central directory parsing, entry-name traversal
+# filters, and the decompression-bomb clamp.
+[[bin]]
+name = "fuzz_zip_entry"
+path = "fuzz_targets/fuzz_zip_entry.rs"
+test = false
+doc = false
+
+# Signed-JAR trust chain: PKCS#7 signer block, `.SF` binding, per-entry
+# manifest digests. Asserts explicit failure, never a success-shaped
+# default.
+[[bin]]
+name = "fuzz_signed_jar"
+path = "fuzz_targets/fuzz_signed_jar.rs"
 test = false
 doc = false
 

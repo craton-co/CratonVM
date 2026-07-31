@@ -182,10 +182,25 @@ fn verify_method(
         return Ok(None);
     }
 
+    // JVMS §4.9.1 static constraints, ahead of the §4.10 type-state pass.
+    //
+    // SECURITY (structural coverage gap): this scan used to run ONLY on
+    // `verifier.rs`'s per-method path — i.e. only for classes that contain a
+    // `jsr`/`ret` method somewhere. Every ordinary class reached this function
+    // instead, where the exception table was never validated at all: a handler
+    // whose `handler_pc` lands in the middle of an instruction (or past the end
+    // of the code array) was accepted, because the linear walk below only
+    // *consults* `handler_pc` as a map key and simply never matches. The
+    // interpreter, which does dispatch to it, then began decoding at a
+    // mid-instruction offset. The same scan also rejects an under-declared
+    // `max_locals` and out-of-range local operands.
+    crate::verifier::verify_method_structural(class_name, method)?;
+
     // Establish the canonical decode and CFG contract before type-state
     // verification. The JIT consumes the same bounded-cache entry, so verifier
     // and compiler cannot disagree about instruction widths or branch
-    // boundaries.
+    // boundaries. (`verify_method_structural` primed the bounded cache above,
+    // so this is a cache hit.)
     let verified = verified_code(bytecode).map_err(|e| LinkageError::VerifyError {
         class_name: class_name.to_string(),
         method_name: method.name.to_string(),
@@ -292,16 +307,39 @@ fn verify_method(
     let mut handler_targets: FxHashMap<u16, VType> =
         FxHashMap::with_capacity_and_hasher(8, Default::default());
     for entry in &code_attr.exception_table {
-        let catch_type = if entry.catch_type == 0 {
-            // catch_type 0 means catch-all (finally)
-            VType::ObjectRef(Arc::from("java/lang/Throwable"))
-        } else {
-            match cp.get_class_name_arc(entry.catch_type) {
-                Some(name) => VType::ObjectRef(name),
-                None => VType::ObjectRef(Arc::from("java/lang/Throwable")),
-            }
-        };
+        let catch_type = catch_type_of(entry, cp, class_name, &method.name)?;
         handler_targets.insert(entry.handler_pc, catch_type);
+    }
+
+    // JVMS §4.10 verifier selection, and the failover that keeps the
+    // StackMapTable walk honest on pre-Java-7 class files.
+    //
+    // The linear StackMapTable walk is sound only where a declared frame exists
+    // at every merge point — which JVMS §4.10.1 guarantees for major ≥ 51 and
+    // the strict mode above enforces. For major ≤ 50 a `StackMapTable` is
+    // OPTIONAL and may be partial, and the strict checks below are (correctly)
+    // gated on `requires_stack_map`. That combination left a hole: a class file
+    // declaring major 50 and shipping a token `StackMapTable` skipped the
+    // worklist inference (`stack_map_table.is_some()`), and then every branch
+    // to a target WITHOUT a declared frame was accepted with the target typed
+    // by whatever fell through into it. Arriving there along the branch with a
+    // shallower stack is a run-time operand-stack underflow the verifier
+    // signed off on.
+    //
+    // JVMS §4.10 already defines the remedy for exactly this version range:
+    // failover to type inference (§4.10.2). So for a pre-Java-7 method whose
+    // declared frames do not cover every merge point, the worklist — which
+    // merges at every branch target and every handler entry and needs no
+    // declared frames at all — is the authority. Detected up front for handler
+    // entries, and at the branch site inside the walk for branch targets.
+    let pre_java7_partial_frames = !requires_stack_map
+        && parsed_table.is_some()
+        && code_attr
+            .exception_table
+            .iter()
+            .any(|e| !declared_frames.contains_key(&e.handler_pc));
+    if pre_java7_partial_frames {
+        return verify_by_inference(class_name, method, code_attr, cp, hierarchy).map(Some);
     }
 
     // TYPE MAPS: ride the walk below. `record` is called once per instruction
@@ -560,6 +598,17 @@ fn verify_method(
                 });
             }
 
+            // Pre-Java-7 failover (see the derivation of
+            // `pre_java7_partial_frames` above): this branch target has no
+            // declared frame, so the linear walk cannot check the edge. Hand
+            // the whole method to the §4.10.2 worklist, whose verdict IS a
+            // merge-checked one. Returning here discards the partial walk's
+            // rows too, which is correct — they describe a type-state the
+            // worklist may refine.
+            if !requires_stack_map && !declared_frames.contains_key(&target) {
+                return verify_by_inference(class_name, method, code_attr, cp, hierarchy).map(Some);
+            }
+
             // SECURITY FIX (cl-verifier): forward-edge type-state merge at the
             // BRANCH SITE. The linear-walk's fall-through check (above, where a
             // declared-frame PC is reached) only validates assignability when
@@ -617,6 +666,41 @@ fn verify_method(
     }
 
     Ok(Some(type_maps.finish(walk_complete)))
+}
+
+/// The verification type an exception handler pushes on entry.
+///
+/// `catch_type == 0` is the catch-all (`finally`) form and yields
+/// `java/lang/Throwable`. Any other value must be a resolvable
+/// `CONSTANT_Class` entry (JVMS §4.7.3).
+///
+/// SECURITY: the previous inline form fell back to `java/lang/Throwable`
+/// whenever the index did not resolve, which silently accepted a handler whose
+/// `catch_type` points at an arbitrary constant-pool slot — the class file was
+/// malformed and the verifier said nothing, leaving the resolution failure to
+/// surface at run time inside exception dispatch. Reject at verify time
+/// instead, naming the entry.
+pub(crate) fn catch_type_of(
+    entry: &cratonvm_reader::attribute::ExceptionTableEntry,
+    cp: &ConstantPool,
+    class_name: &str,
+    method_name: &str,
+) -> Result<VType, LinkageError> {
+    if entry.catch_type == 0 {
+        return Ok(VType::ObjectRef(Arc::from("java/lang/Throwable")));
+    }
+    match cp.get_class_name_arc(entry.catch_type) {
+        Some(name) => Ok(VType::ObjectRef(name)),
+        None => Err(LinkageError::VerifyError {
+            class_name: class_name.to_string(),
+            method_name: method_name.to_string(),
+            message: format!(
+                "exception handler at handler_pc={} has catch_type {}, which is not a \
+                 CONSTANT_Class entry with a resolvable name (JVMS §4.7.3)",
+                entry.handler_pc, entry.catch_type
+            ),
+        }),
+    }
 }
 
 /// Quick scan of bytecode to detect if it contains any branch instructions.
@@ -882,14 +966,7 @@ fn verify_by_inference(
         // Propagate to exception handler entries whose protected range covers this pc
         for entry in &code_attr.exception_table {
             if pc >= entry.start_pc as usize && pc < entry.end_pc as usize {
-                let catch_type = if entry.catch_type == 0 {
-                    VType::ObjectRef(Arc::from("java/lang/Throwable"))
-                } else {
-                    match cp.get_class_name_arc(entry.catch_type) {
-                        Some(name) => VType::ObjectRef(name),
-                        None => VType::ObjectRef(Arc::from("java/lang/Throwable")),
-                    }
-                };
+                let catch_type = catch_type_of(entry, cp, class_name, &method.name)?;
                 let mut handler_frame = current.clone();
                 handler_frame.clear_stack();
                 handler_frame
