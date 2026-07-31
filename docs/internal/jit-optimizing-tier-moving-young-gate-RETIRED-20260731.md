@@ -137,11 +137,20 @@ and array access still take helpers where single-pass inlines them.
 
 ### 4. Verification
 
-`cargo test -p cratonvm-jit`, default flags: lib **1064 passed / 0 failed**,
-`ir_vs_singlepass` **92 / 0**, every other target 0 failed.
-`cratonvm-gc --lib` and `cratonvm-vm --lib`: see the branch's test logs.
-`BinTreesClassic` 16 and 18 return the HotSpot checksums in the default,
-`CRATONVM_JIT_FORCE_C2=1` and post-fix lanes.
+Default flags throughout — none of these needed `CRATONVM_NO_MOVING_YOUNG=1`,
+which is the thing the original document was filed about.
+
+| target | result |
+|---|---|
+| `cratonvm-jit --lib` | **1065 passed / 0 failed** |
+| `cratonvm-jit tests/ir_vs_singlepass.rs` | **92 / 0** |
+| `cratonvm-jit`, every other target | 0 failed |
+| `cratonvm-gc --lib` | **873 / 0** |
+| `cratonvm-vm --lib` | **2304 / 0** (111 ignored) |
+
+`BinTreesClassic` returns `68332206` (d=18) and `14985902` (d=16) in every lane
+of every measurement in this document — default, `CRATONVM_JIT_FORCE_C2=1`,
+both bisect levers, and `CRATONVM_NO_MOVING_YOUNG=1`.
 
 ## Residuals, and where they now live
 
@@ -154,9 +163,60 @@ the raw JIT-to-JIT edge") — the same class of defect as §2 above, on the
 single-pass side. Its acceptance gate is unchanged: that class, 14 consecutive
 runs, default flags. **Not claimed closed here.**
 
-### Residual 2 — the `type.temporal` Hibernate pair
+### Residual 2 — the `type.temporal` Hibernate pair — CLOSED, and its premise does not hold
 
-See the measurement section appended below.
+The claim was: those classes exceed the suite's 300 s cap on default flags and
+pass under `CRATONVM_NO_MOVING_YOUNG=1`, therefore a moving-young cost survives
+the two relocation-scoped gates. Two named candidates were shipped with a
+bisect lever each — `CRATONVM_JIT_MY_SCRATCH_FLUSH=0` (the scratch-register
+flush at every GC-capable safepoint) and `CRATONVM_JIT_MY_SELFCALL_PROOF=0`
+(the stronger proof before a self-recursive call may elide its spill).
+
+Measured the way the retired relocation-contract document says to measure this
+— a deterministic, call-dense, entry-dense probe with interleaved lanes on one
+binary, not one run of a 300-second suite class — `BinTreesClassic 18` at
+`-Xmx512m`, five reps:
+
+| lane | ms | median |
+|---|---|---|
+| default | 4388, 5244, 4281, 3708, 4194 | 4281 |
+| `CRATONVM_JIT_MY_SCRATCH_FLUSH=0` | 4117, 4605, 4479, 4056, 3999 | 4117 |
+| `CRATONVM_JIT_MY_SELFCALL_PROOF=0` | 4343, 4096, 4797, 4660, 3618 | 4343 |
+
+**Neither lever moves it.** Ranges fully overlap the default in both
+directions, so neither named candidate is the residual.
+
+And the premise itself inverts on this probe. Six interleaved reps, taken as
+the host quieted (load average 32 → 24):
+
+| lane | ms |
+|---|---|
+| default | 4542, 4904, 4305, 4668, 4337, 4060 |
+| `CRATONVM_NO_MOVING_YOUNG=1` | 6440, 6850, 6042, 5912, 6125, 5741 |
+
+**Disabling the moving young generation costs ~1.37x here, 6/6, ranges
+non-overlapping** — checksum `68332206` throughout. So "the class passes under
+`CRATONVM_NO_MOVING_YOUNG=1`" cannot be read as "moving-young costs
+throughput": that flag selects a different collector, and which one wins is a
+property of the workload. On the one deterministic probe available it wins for
+moving-young by a wide margin.
+
+Two further reasons this residual was never evidence:
+
+* `ZonedDateTimeTest` is **bimodal** with no VM change at all — roughly 300 s
+  or past 900 s, documented in
+  `docs/internal/jit-ir-relocation-map-contract.md` with the eight-run table
+  that shows it. A single sample per lane cannot support any attribution, and
+  that is exactly what the claim rested on.
+* The host it would have to be re-measured on carries 30–140 load average from
+  other tenants; a 300 s class routinely doubles under that (see
+  `reference_azure_build_host`). An absolute-threshold question ("does it
+  exceed the 300 s cap?") is not answerable there.
+
+What remains true and worth keeping: if a moving-young throughput cost exists
+outside the two gates, neither of the two candidates named for it is that
+cost, and the levers stay in the tree (default-on, no behaviour change) for
+whoever looks next.
 
 ### Residual 3 — the remaining optimizing-tier inventory
 
