@@ -1037,7 +1037,7 @@ impl IrBuilder {
                     // Not an instruction boundary — the verifier guarantees the
                     // walk only ever lands on one, so this is unreachable; bail
                     // to single-pass rather than guess a length.
-                    None => return None,
+                    None => return ir_build_bail(line!(), pc),
                 };
                 continue;
             }
@@ -1066,7 +1066,7 @@ impl IrBuilder {
             // build the very orphan nodes the skip exists to prevent. Bail to
             // the single-pass backend instead of emitting them.
             if self.ctrl == NO_NODE {
-                return None;
+                return ir_build_bail(line!(), pc);
             }
 
             // Step 1 of real-frame-deopt: record the abstract interpreter
@@ -1832,19 +1832,36 @@ impl IrBuilder {
                 // every `putfield` (no IR `Op::Store` lowering yet — writes
                 // need scheduler memory ordering, a separate slice).
                 0xb4 => {
-                    // Compact reference-field layout packs field offsets (refs to
-                    // 8 bytes), so the `HEADER_SIZE + field_index*SLOT_SIZE`
-                    // displacement this lowerer derives is wrong. Bail to the
-                    // compact-aware single-pass helper path.
-                    if cratonvm_types::compact_ref_fields_enabled() {
-                        return None;
-                    }
+                    // Compact reference-field layout packs field offsets (refs
+                    // to 8 bytes), so the `HEADER_SIZE + field_index*SLOT_SIZE`
+                    // displacement is wrong for a compact object. That is a
+                    // property of ONE of `Op::Load`'s two lowerings, not of the
+                    // opcode, and this used to be a blanket bail here.
+                    //
+                    // The blanket bail was the single largest exclusion in the
+                    // optimizing tier. `compact_ref_fields_enabled()` defaults
+                    // to TRUE, so it refused every method containing a
+                    // `getfield` — which is most object-oriented Java — and it
+                    // did so at stage one of the pipeline, invisibly. That is
+                    // why the relocation-map contract could never be exercised:
+                    // every probe written for it read a field
+                    // (docs/internal/jit-ir-relocation-map-contract.md).
+                    //
+                    // The constraint belongs where the displacement is emitted.
+                    // `ir_lower` lowers `Op::Load` through the checked
+                    // `jit_getfield` helper whenever the helper address is
+                    // present, and that helper IS compact-aware
+                    // (`jit_compact_field_slot`); only the inline
+                    // displacement fallback, taken when the helper is absent
+                    // (the JIT unit tests' stub table), is layout-naive. So
+                    // `ir_lower::lower_inner` refuses the graph in exactly that
+                    // combination and the builder no longer refuses the opcode.
                     let (field_index, type_tag) = match self.field_info.get(&pc) {
                         Some(&fi) => fi,
-                        None => return None,
+                        None => return ir_build_bail(line!(), pc),
                     };
                     if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
-                        return None;
+                        return ir_build_bail(line!(), pc);
                     }
                     let base = self.pop();
                     let offset = self.iconst(field_index as i64);
@@ -1873,17 +1890,17 @@ impl IrBuilder {
                 // input-edge topological sort). Non-int fields and any pc without
                 // resolved layout bail (`None` → single-pass).
                 0xb5 => {
-                    // See the getfield (0xb4) note: compact layout packs offsets,
-                    // so bail to single-pass.
-                    if cratonvm_types::compact_ref_fields_enabled() {
-                        return None;
-                    }
+                    // See the getfield (0xb4) note. `Op::Store` likewise has a
+                    // layout-naive inline lowering and a compact-aware helper
+                    // lowering (`jit_putfield_int`); `ir_lower::lower_inner`
+                    // picks between them and refuses only when compact layout is
+                    // on and no helper address is available.
                     let (field_index, type_tag) = match self.field_info.get(&pc) {
                         Some(&fi) => fi,
-                        None => return None,
+                        None => return ir_build_bail(line!(), pc),
                     };
                     if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
-                        return None;
+                        return ir_build_bail(line!(), pc);
                     }
                     let value = self.pop();
                     let base = self.pop();
@@ -1905,7 +1922,7 @@ impl IrBuilder {
                 0xbb => {
                     let (class_id, num_fields) = match self.new_info.get(&pc) {
                         Some(&ci) => ci,
-                        None => return None,
+                        None => return ir_build_bail(line!(), pc),
                     };
                     let newobj = self.graph.add(
                         Op::New {
@@ -1980,7 +1997,7 @@ impl IrBuilder {
                         // Elidable-`<init>` path (scalar-new): elide a trivial
                         // `<init>()V` on a fresh object.
                         if !self.trivial_init_pcs.contains(&pc) {
-                            return None;
+                            return ir_build_bail(line!(), pc);
                         }
                         // Defence in depth: only elide when the receiver (top of
                         // stack for a no-arg `<init>`) is a fresh `Op::New` we
@@ -1994,7 +2011,7 @@ impl IrBuilder {
                                 Some(Op::New { .. })
                             );
                         if !recv_is_new {
-                            return None;
+                            return ir_build_bail(line!(), pc);
                         }
                         self.pop();
                         pc += 3;
@@ -2039,7 +2056,7 @@ impl IrBuilder {
                     }
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
-                        None => return None,
+                        None => return ir_build_bail(line!(), pc),
                     };
                     // Pop args (deepest-first on the abstract stack) and restore
                     // source order so inputs are [ctrl, mem, arg0, arg1, …].
@@ -2089,7 +2106,7 @@ impl IrBuilder {
                 0xb9 => {
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
-                        None => return None,
+                        None => return ir_build_bail(line!(), pc),
                     };
                     let mut args = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
@@ -2318,7 +2335,7 @@ impl IrBuilder {
                 0x14 => {
                     let (val, is_double) = match self.ldc2w_info.get(&pc) {
                         Some(&v) => v,
-                        None => return None,
+                        None => return ir_build_bail(line!(), pc),
                     };
                     let c = if is_double {
                         self.dconst(f64::from_bits(val as u64))
@@ -2366,7 +2383,7 @@ impl IrBuilder {
                 }
 
                 // Unsupported opcode — bail out
-                _ => return None,
+                _ => return ir_build_bail_opcode(op, pc),
             }
         }
 
@@ -2683,6 +2700,42 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
     headers
 }
 
+/// Report the exact [`IrBuilder::build`] site that refused a method.
+///
+/// The builder answers `Option<Graph>`, so every refusal is indistinguishable
+/// from "the optimizing tier is switched off" — both present as zero IR bodies,
+/// and this investigation drew the second conclusion from the first twice
+/// (`docs/internal/jit-ir-relocation-map-contract.md`). Fifteen distinct
+/// `return None` sites share one observable outcome; only the site tells them
+/// apart, and nothing reported it.
+///
+/// `site` is `line!()` at the refusal rather than a parallel reason enum: it
+/// names the site exactly and cannot drift out of step with the code.
+#[cold]
+#[inline(never)]
+pub fn ir_build_bail<T>(site: u32, pc: usize) -> Option<T> {
+    if ir_bail_reporting() {
+        eprintln!("[ir] IrBuilder::build refused at ir.rs:{site} (bytecode pc {pc})");
+    }
+    None
+}
+
+/// [`ir_build_bail`] for the opcode catch-all, which knows something more
+/// useful than its own line number: *which* bytecode has no IR lowering.
+#[cold]
+#[inline(never)]
+pub fn ir_build_bail_opcode<T>(op: u8, pc: usize) -> Option<T> {
+    if ir_bail_reporting() {
+        eprintln!("[ir] IrBuilder::build has no lowering for opcode {op:#04x} at bytecode pc {pc}");
+    }
+    None
+}
+
+fn ir_bail_reporting() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+        || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some()
+}
+
 /// Check if a method (from its JitScanResult) is suitable for IR compilation.
 ///
 /// STUB-S7 widening: previously this rejected every method with any heap op,
@@ -2706,6 +2759,21 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
 /// rejected either there or at the bytecode-parse level.
 ///
 /// TODO(IR widening): increase caps once differential tests validate.
+/// Report which conjunct of [`ir_compatible`] refused a method.
+///
+/// Same problem as [`ir_build_bail`], one stage earlier: the predicate answers
+/// a bare `bool`, so "this method is not IR-eligible" and "the optimizing tier
+/// never ran" are the same observation. The refused conjunct is the only thing
+/// that distinguishes a deliberate exclusion from a bug.
+#[cold]
+#[inline(never)]
+fn ir_reject(why: &str) -> bool {
+    if ir_bail_reporting() {
+        eprintln!("[ir] ir_compatible refused: {why}");
+    }
+    false
+}
+
 pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // Caps below are deliberately conservative. A method that exceeds a cap is
     // still compilable via the x64 single-pass backend; we just decline to
@@ -2714,7 +2782,7 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // RBC.6 — the IR pipeline has no athrow lowering; only the x64
     // single-pass backend emits the stash-pending-exception sequence.
     if scan.has_athrow {
-        return false;
+        return ir_reject("scan.has_athrow");
     }
 
     // invokedynamic-uncommon-trap fix: the IR builder has no lowering for
@@ -2727,7 +2795,7 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // Methods containing invokedynamic always fall back to the x64
     // single-pass backend, which lowers it directly.
     if !scan.indy_ops.is_empty() {
-        return false;
+        return ir_reject("!scan.indy_ops.is_empty()");
     }
 
     // Cap simple invokes (invokestatic / invokevirtual / invokespecial /
@@ -2764,7 +2832,7 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // is ~16 KiB of dispatch code, the same order the single-pass backend
     // produces for the same method. It is a budget, not a lowering gap.
     if scan.invoke_ops.len() > IR_MAX_INVOKES {
-        return false;
+        return ir_reject("scan.invoke_ops.len() > IR_MAX_INVOKES");
     }
     // getfield/putfield. Raised 5 -> 64. Instance field access lowers to
     // `Op::Load`/`Op::Store` (optionally via the checked `jit_getfield`
@@ -2772,44 +2840,55 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // 5 was never a lowering limit — it was part of the same blanket "keep real
     // methods off the IR path" posture as the invoke cap.
     if scan.field_ops.len() > IR_MAX_FIELD_OPS {
-        return false;
+        return ir_reject("scan.field_ops.len() > IR_MAX_FIELD_OPS");
     }
     // getstatic/putstatic (same shape as instance field ops for IR).
     if scan.static_field_ops.len() > IR_MAX_STATIC_FIELD_OPS {
-        return false;
+        return ir_reject("scan.static_field_ops.len() > IR_MAX_STATIC_FIELD_OPS");
     }
-    // `new` / `anewarray`. Raised only 3 -> 16, deliberately the most
-    // conservative of the budgets.
+    // `new` sites. Raised only 3 -> 16, deliberately the most conservative of
+    // the budgets.
     //
-    // DO NOT treat this like the others. The IR has NO allocation lowering: an
-    // `Op::New` that survives escape analysis bails the whole method to
-    // single-pass (`has_live_new` in `try_compile_inner`), precisely so the
-    // single-pass INLINE TLAB bump-pointer fast path keeps serving every real
-    // allocation. Raising this number only lets more allocations be
-    // *scalar-replaced away*; it must never become a licence to lower a
-    // surviving allocation in the IR. Losing the inline TLAB bump is one of the
-    // two independent causes of the July 2026 Binary Trees 4x regression
-    // documented in BENCHMARK.md.
+    // DO NOT treat this like the others. It governs how many allocations escape
+    // analysis may scalar-replace, and each one that SURVIVES is lowered through
+    // the shared `emit_new_object_stub` — the same runtime-lowering stub the
+    // baseline tier uses, not the inline TLAB bump-pointer sequence. Losing that
+    // inline bump is one of the two independent causes of the July 2026 Binary
+    // Trees 4x regression documented in BENCHMARK.md, so raising this cap
+    // increases the number of sites that can pay the stub, not just the number
+    // that can be optimized away.
     if scan.new_ops.len() > IR_MAX_ALLOCATIONS {
-        return false;
-    }
-    if scan.anewarray_ops.len() > IR_MAX_ALLOCATIONS {
-        return false;
+        return ir_reject("scan.new_ops.len() > IR_MAX_ALLOCATIONS");
     }
 
     // ── Surviving exclusions — real missing lowerings, not budgets ───
-    //  * `multianewarray` — multi-dim allocation needs a resolver-shaped helper
-    //    call sequence that the IR lowerer does not synthesize.
+    //  * ARRAY allocation of every arity. `newarray` (0xbc) and `anewarray`
+    //    (0xbd) have no arm in `IrBuilder::build`'s opcode match and `Op::New
+    //    Array` is constructed nowhere, so a method containing either bails at
+    //    the builder's `_ =>` catch-all; `multianewarray` additionally needs a
+    //    resolver-shaped helper sequence the lowerer cannot synthesize.
+    //
+    //    This used to be a `> IR_MAX_ALLOCATIONS` budget on `anewarray_ops`,
+    //    which ADMITTED up to 16 array allocations into a pipeline that cannot
+    //    lower one. Admission and the builder disagreeing is not merely untidy:
+    //    it is what made the optimizing tier produce zero bodies on every probe
+    //    written for the relocation-map contract while every gate upstream
+    //    reported "open" (docs/internal/jit-ir-relocation-map-contract.md). A
+    //    method the builder will refuse must be refused HERE, cheaply and with
+    //    a reason, not after a full graph build.
     //  * `checkcast` / `instanceof` — the runtime type check needs its own
     //    guard shape (class-id compare plus a subtype-check helper fallback)
     //    which the IR lowerer does not emit. The inline caches added for
     //    virtual/interface DISPATCH do not help: they cache a call target, not
     //    a subtype answer.
+    if !scan.anewarray_ops.is_empty() {
+        return ir_reject("!scan.anewarray_ops.is_empty() (no IR lowering for 0xbd)");
+    }
     if !scan.multianewarray_ops.is_empty() {
-        return false;
+        return ir_reject("!scan.multianewarray_ops.is_empty()");
     }
     if !scan.typecheck_ops.is_empty() {
-        return false;
+        return ir_reject("!scan.typecheck_ops.is_empty()");
     }
 
     true
@@ -2826,10 +2905,11 @@ pub const IR_MAX_FIELD_OPS: usize = 64;
 /// Maximum `getstatic`/`putstatic` sites. Was 5.
 pub const IR_MAX_STATIC_FIELD_OPS: usize = 64;
 
-/// Maximum `new` (and, separately, `anewarray`) sites. Was 3. See the warning
-/// at the allocation check in [`ir_compatible`] — this one governs how many
-/// allocations escape analysis may *attempt to eliminate*, not how many the IR
-/// may lower (it lowers none).
+/// Maximum `new` sites. Was 3. See the warning at the allocation check in
+/// [`ir_compatible`] — this one bounds both what escape analysis may attempt to
+/// eliminate AND how many surviving allocations may be lowered through the
+/// shared `emit_new_object_stub` (which costs the baseline tier's inline TLAB
+/// bump). It never applied to arrays, which are refused outright.
 pub const IR_MAX_ALLOCATIONS: usize = 16;
 
 /// Maximum bytecode length for the IR pipeline.
@@ -3269,16 +3349,18 @@ mod tests {
         assert!(!ir_compatible(&scan));
         scan.static_field_ops.clear();
 
-        // Allocations stay the most conservative budget — the IR lowers none,
-        // so this only bounds what escape analysis may try to eliminate.
+        // Object allocations stay the most conservative budget: a surviving
+        // `Op::New` lowers through the shared stub, so the cap bounds real
+        // codegen and not only what escape analysis may try to eliminate.
         scan.new_ops = (0..IR_MAX_ALLOCATIONS).map(|i| (i, i as u16)).collect();
         assert!(ir_compatible(&scan));
         scan.new_ops = (0..IR_MAX_ALLOCATIONS + 1).map(|i| (i, i as u16)).collect();
         assert!(!ir_compatible(&scan));
         scan.new_ops.clear();
-        scan.anewarray_ops = (0..IR_MAX_ALLOCATIONS + 1)
-            .map(|i| (i, i as u16))
-            .collect();
+        // ARRAY allocation is not a budget at all — `IrBuilder::build` has no
+        // arm for 0xbd, so ONE site must be refused here rather than admitted
+        // into a pipeline that bails on it after a full graph build.
+        scan.anewarray_ops = vec![(0, 1)];
         assert!(!ir_compatible(&scan));
         scan.anewarray_ops.clear();
 
