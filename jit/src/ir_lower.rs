@@ -2420,8 +2420,21 @@ fn reloc_emit_enabled() -> bool {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 self.load_to_rcx(self.slot_of(node.inputs[1]));
-                // CMP EAX, ECX
-                self.buf.emit(&[0x39, 0xC8]);
+                // CMP EAX, ECX — 32-bit for the int comparisons this node was
+                // introduced for. A REFERENCE comparison (`ifnull`,
+                // `if_acmpeq`) must compare all 64 bits: a heap pointer whose
+                // low word happens to be zero would otherwise test equal to
+                // null, and two distinct objects 4 GiB apart would test equal
+                // to each other. Selected from the operand types, so an int
+                // compare keeps the shorter encoding.
+                let ref_cmp = matches!(self.graph.nodes[node.inputs[0] as usize].ty, IrType::Ref)
+                    || matches!(self.graph.nodes[node.inputs[1] as usize].ty, IrType::Ref);
+                if ref_cmp {
+                    // CMP RAX, RCX
+                    self.buf.emit(&[0x48, 0x39, 0xC8]);
+                } else {
+                    self.buf.emit(&[0x39, 0xC8]);
+                }
                 // SETcc AL — three bytes: `0F 9x C0`.
                 //
                 // BUG FIX [jit-irlower #1]: `x64_cc()` returns the *near-Jcc*
@@ -2571,12 +2584,15 @@ fn reloc_emit_enabled() -> bool {
                 // `Self::patch_or_bail` / `patch_rel32_to_here`.
                 Self::patch_or_bail(&mut self.buf, jnz_patch, rel);
             }
-            // getfield read — `Op::Load`. The IR builder emits only
-            // `Op::Load(MemKind::Int)` (int-category instance fields, slice 1
-            // of the field/call frontier), so this lowers the single-pass
-            // inline-getfield ABI exactly: null receiver → 0, else MOVSXD the
-            // 32-bit `Value::Int` payload. inputs = [ctrl, mem, base, offset]
-            // where `offset` is a `Const(field_index)`.
+            // getfield read — `Op::Load`. The builder emits
+            // `Op::Load(MemKind::Int)` for the int-category fields and
+            // `Op::Load(MemKind::Ref)` for reference fields; both read through
+            // the checked `jit_getfield` helper, which returns the int payload
+            // or the raw pointer according to the receiver's registered layout.
+            // The inline fallback below is int-only and layout-naive, and
+            // `lower_inner` refuses any graph that would need it for a
+            // reference load. inputs = [ctrl, mem, base, offset] where `offset`
+            // is a `Const(field_index)`.
             Op::Load(_) => {
                 let slot = self.alloc_slot(id);
                 let base = node.inputs[2];
@@ -3879,6 +3895,20 @@ pub(crate) fn lower_inner(
         if needs_getfield_helper || needs_putfield_helper {
             return None;
         }
+    }
+    // A REFERENCE field read has only one correct lowering: the helper. The
+    // inline displacement fallback decodes a 16-byte int cell at
+    // `HEADER_SIZE + index*SLOT_SIZE`, which for a reference slot yields the
+    // discriminant word rather than the pointer — a fabricated address the
+    // frame would then publish as a root. Refuse the graph outright rather
+    // than emit it, independently of the compact-layout switch above.
+    if helpers.getfield == 0
+        && graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::Load(MemKind::Ref)))
+    {
+        return None;
     }
     // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
     // lowering: an arithmetic node emits well under 32 bytes, but a single
