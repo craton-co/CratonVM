@@ -9103,7 +9103,15 @@ mod tests {
         .unwrap();
 
         // Function was called, value was inserted
-        assert!(matches!(result, Value::Int(_)));
+        // The SAM returns `Ljava/lang/Object;`, so an `int` result from the
+        // implementation is BOXED on the way out — the map stores a reference,
+        // not a raw Int. This asserted the unboxed value, which is what the
+        // dispatcher produced before it started honouring the SAM's return
+        // descriptor.
+        assert!(
+            matches!(result, Value::Object(Some(_))),
+            "expected the mapping function's boxed result, got {result:?}"
+        );
 
         let size = call_native(
             &shared,
@@ -9250,7 +9258,15 @@ mod tests {
         .unwrap();
 
         // New value is identityHashCode of the key
-        assert!(matches!(result, Value::Int(_)));
+        // The SAM returns `Ljava/lang/Object;`, so an `int` result from the
+        // implementation is BOXED on the way out — the map stores a reference,
+        // not a raw Int. This asserted the unboxed value, which is what the
+        // dispatcher produced before it started honouring the SAM's return
+        // descriptor.
+        assert!(
+            matches!(result, Value::Object(Some(_))),
+            "expected the mapping function's boxed result, got {result:?}"
+        );
     }
 
     #[test]
@@ -9308,7 +9324,15 @@ mod tests {
         ).unwrap().unwrap();
 
         // BiFunction was called with (old, new) → identityHashCode(old)
-        assert!(matches!(result, Value::Int(_)));
+        // The SAM returns `Ljava/lang/Object;`, so an `int` result from the
+        // implementation is BOXED on the way out — the map stores a reference,
+        // not a raw Int. This asserted the unboxed value, which is what the
+        // dispatcher produced before it started honouring the SAM's return
+        // descriptor.
+        assert!(
+            matches!(result, Value::Object(Some(_))),
+            "expected the mapping function's boxed result, got {result:?}"
+        );
     }
 
     #[test]
@@ -9378,7 +9402,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(matches!(got, Value::Int(_)));
+        // Boxed, not raw: see the note in `hashmap_compute_if_absent_inserts`.
+        assert!(
+            matches!(got, Value::Object(Some(_))),
+            "expected the mapping function's boxed result, got {got:?}"
+        );
     }
 
     // -- Factory methods --

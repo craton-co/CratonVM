@@ -217,23 +217,15 @@ jobs:
       #         count fixes it; it needs named synthetic fields or a slot
       #         fallback that does not disturb the real-JDK path.
       #         (`throwable_init_cause_sets_cause` and the `p93_*` pair.)
-      #     And the `hashmap_compute` family, which splits in two:
-      #       * `compute_updates`, `merge_existing` and
-      #         `replace_all_updates_values` bind SAM
-      #         `BiFunction.apply(Object,Object)Object` to the 1-arg impl
-      #         `System.identityHashCode(Object)I` — a call site javac cannot
-      #         emit, since real indy always produces a synthetic `lambda$N`
-      #         whose arity matches the SAM. `coerce_lambda_args` stops at
-      #         `impl_idx >= impl_params.len()` and leaves the surplus arg in
-      #         place; teaching the VM to drop it would mask genuine arity
-      #         bugs. They need a fixture whose impl arity matches.
-      #       * `compute_if_absent_inserts` does NOT have that problem — its
-      #         `Function.apply(Object)Object` matches the 1-arg impl exactly —
-      #         and still returns a non-Int. Cause UNDETERMINED; do not assume
-      #         the arity story covers it.
-      #         NOTE `CRATONVM_DBG_LAMBDA` produced no output even on the
-      #         PASSING control test, so that hook is broken — its silence is
-      #         not evidence of anything.
+      #     (The `hashmap_compute` family is FIXED, and worth reading as a
+      #     cautionary tale: I diagnosed it twice as a lambda SAM-to-impl arity
+      #     mismatch and was wrong both times. All four simply returned a BOXED
+      #     result — the SAM returns `Ljava/lang/Object;`, so an `int` from the
+      #     implementation is boxed on the way out — while the tests asserted a
+      #     raw `Value::Int`. Printing the actual value in the assertion
+      #     settled in one run what two rounds of reading the dispatcher had
+      #     got backwards.)
+      #
       #     The rest
       #     is ~38 individual `assertion left == right` divergences plus
       #     singles; a few are genuine VM bugs worth their own fix, notably
