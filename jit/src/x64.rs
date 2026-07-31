@@ -2982,7 +2982,24 @@ impl Compiler {
         if self.failed {
             return;
         }
-        if moving_young_enabled() {
+        // Bisect lever, default = current behaviour. `CRATONVM_JIT_MY_SCRATCH_FLUSH=0`
+        // drops this flush when relocation is vetoed anyway.
+        //
+        // Why it is a candidate: this runs at EVERY GC-capable safepoint under
+        // `moving_young`, and it is one of the few remaining costs that
+        // `CRATONVM_NO_MOVING_YOUNG=1` removes but the relocation-scoped
+        // admission gates do not. The `type.temporal` Hibernate classes still
+        // exceed the 300 s cap on default flags while passing under that
+        // variable, so a residual of this shape is unaccounted for. Shadow
+        // push/reload has already been eliminated as the cause (measured
+        // no-change; see `shadow_stack_maps_enabled`), which leaves this and
+        // the self-call spill-elision proof.
+        //
+        // The non-moving path has never called this and is the historically
+        // correct configuration, so `0` returns to known-good codegen rather
+        // than inventing a new one. Kept default-ON until measured on a quiet
+        // host — the box had eight other sessions' VMs running when this landed.
+        if moving_young_enabled() && scratch_flush_at_safepoint_enabled() {
             self.flush_scratch_registers();
         }
         // Capture the live-frame bound for the map this safepoint will record.
@@ -3075,11 +3092,13 @@ impl Compiler {
         if self.failed {
             return;
         }
-        if self.shadow_enabled || moving_young_enabled() {
+        // Must mirror `can_elide_self_call_register_spill` exactly — see the
+        // note there. Both read `self_call_moving_proof_enabled()`.
+        if self.shadow_enabled || self_call_moving_proof_enabled() {
             let coverage_complete = self.moving_young_safepoint_coverage_complete();
             let live_oop_home_count = self.collect_live_oop_homes().len();
             if !moving_oop_free_self_call_is_publishable(
-                moving_young_enabled(),
+                self_call_moving_proof_enabled(),
                 coverage_complete,
                 live_oop_home_count,
             ) {
@@ -3277,9 +3296,13 @@ impl Compiler {
             return false;
         }
 
-        if self.shadow_enabled || moving_young_enabled() {
+        // `self_call_moving_proof_enabled()` rather than `moving_young_enabled()`:
+        // the paired emitter `emit_safepoint_metadata_only` reads the SAME
+        // predicate and fails the compile closed if the two ever disagree, so
+        // they must move together. Default-identical to the old expression.
+        if self.shadow_enabled || self_call_moving_proof_enabled() {
             return moving_oop_free_self_call_is_publishable(
-                moving_young_enabled(),
+                self_call_moving_proof_enabled(),
                 self.moving_young_safepoint_coverage_complete(),
                 self.collect_live_oop_homes().len(),
             );

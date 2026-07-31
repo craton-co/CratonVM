@@ -847,6 +847,41 @@ pub fn moving_young_enabled() -> bool {
     cratonvm_types::flags().gc.moving_young
 }
 
+/// `CRATONVM_JIT_MY_SCRATCH_FLUSH` — bisect lever for the scratch-register
+/// flush `emit_pre_safepoint_spill_impl` performs at every GC-capable safepoint
+/// under moving-young. Default ON (current behaviour); `0` drops it.
+///
+/// Exists to attribute the residual moving-young throughput cost that the
+/// relocation-scoped admission gates do NOT remove — see the call site. Do not
+/// flip the default without a quiet-host measurement on the `type.temporal`
+/// Hibernate classes, which are the workload that shows the residual.
+pub fn scratch_flush_at_safepoint_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SCRATCH_FLUSH") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// `CRATONVM_JIT_MY_SELFCALL_PROOF` — bisect lever for the *stronger* proof
+/// moving-young demands before a self-recursive call may skip the SB-CRASH-04
+/// full register spill. Default ON (current behaviour); `0` makes the decision
+/// behave as it does on the non-moving path.
+///
+/// **Both** users of this — `can_elide_self_call_register_spill` and its paired
+/// emitter `emit_safepoint_metadata_only` — must read this same function. The
+/// emitter fails the compile closed if the two disagree, so they are wired to
+/// one predicate on purpose. Second candidate for the residual described on
+/// [`scratch_flush_at_safepoint_enabled`]; same measurement caveat.
+pub fn self_call_moving_proof_enabled() -> bool {
+    if !moving_young_enabled() {
+        return false;
+    }
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SELFCALL_PROOF") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 /// Can a **relocating** young collection ever observe a live *compiled* frame?
 ///
 /// This is the question the JIT's relocation-safety admission gates actually
