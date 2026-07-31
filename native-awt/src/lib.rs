@@ -86,6 +86,17 @@ pub mod swing;
 
 use cratonvm_native_api::{NativeKind, NativeMethodRegistry};
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. This is the crate's ONLY category
+// call: `natives::register_all` is passed as a function pointer, so all 122
+// registrations in `natives.rs` inherit `Bridge` from this one line without any
+// per-site judgement. Measured against JDK 25 (`javap -p -s`), only 10 of the
+// 122 target an ACC_NATIVE method (`Toolkit.initIDs`, `Disposer.initIDs`,
+// `PlatformGraphicsInfo.hasDisplays0`, the `JPEGImageReader`/`JPEGImageWriter`
+// family); 74 target methods with concrete bytecode, 4 are abstract, 4 do not
+// exist in the image. Per-function verdicts are annotated in `natives.rs`. Do
+// NOT narrow this call before the runtime census: the `Bridge` tag is what
+// keeps these registered under `CRATONVM_NO_STUBS` today, and t7 desktop
+// conformance depends on them. See docs/jdk-only-ambient-category-audit.md.
 /// Register all AWT/Swing/Java2D native methods with the VM.
 pub fn register_awt_natives(registry: &mut NativeMethodRegistry) {
     registry.with_category(NativeKind::Bridge, natives::register_all);
