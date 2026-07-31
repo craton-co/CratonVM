@@ -151,7 +151,7 @@ proptest! {
 1. **Security-model document.** There is no single file describing the trust posture: default-allow `SecurityManager`, no JEP-290 enforcement, Panama default-enabled, no signed-jar verification, embedded test TLS keys reachable from prod. A `SECURITY.md` or `docs/security-posture.md` is mandatory before publish.
 2. **Native registration discipline.** The README mentions `register_essential_natives` + `register_builtins` but does not describe (a) the precedence rule (essential then synthetic, last-wins), (b) which class/method/descriptor triples will be overwritten by synthetic, (c) the "orchestrator" pattern of unwired `register_*_stubs`.
 3. **Crate-level rustdoc** in `lib.rs:4-7` should mirror the README — currently a single throwaway sentence.
-4. **Feature-flag matrix.** `Cargo.toml:13-29` defines 5+ features (`synthetic-jdk`, `experimental-tls` (no-op), `legacy-synthetic-crypto`, `experimental-jmx`, `experimental-serialization`, `experimental-aot`, `gpu-offload`) — none are documented anywhere user-facing.
+4. **Feature-flag matrix.** `Cargo.toml:13-29` defines 5+ features (`synthetic-jdk`, `deprecated-noop-tls` (no-op; was `experimental-tls`), `legacy-synthetic-crypto`, `management` (was `experimental-jmx`), `experimental-serialization`, `experimental-aot`, `gpu-offload`) — none are documented anywhere user-facing.
 5. **`pub` API stability.** Functions like `cb_write_hb`, `bb_write_hb` (newly added in this PR, marked `pub(crate)`) are de-facto API for the cross-module CharBuffer/ByteBuffer plumbing — the rustdoc on `cb_write_hb` is good; `bb_write_hb` mirrors it but has terser doc.
 6. **No CHANGELOG** in the crate (top-level workspace may have one, not checked).
 

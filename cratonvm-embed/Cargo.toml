@@ -20,18 +20,35 @@ readme = "README.md"
 # Keep the default facade dependency graph headless/packageable. Hosts that
 # need the VM crate's desktop or experimental runtime features opt in below.
 default = []
+# Mirrors `cratonvm-vm`'s own default set exactly. Keep these two lists in
+# sync: this feature's whole contract is "what an ordinary `cargo build` of
+# the VM crate gives you", so it is wrong the moment it drifts. It carried
+# `experimental-serialization` / `-aot` / `-debug` until 2026-07-30, which was
+# true of the VM's default set once but stopped being true when those features
+# left it — see `vm-experimental` below for the opt-in that replaces them.
 vm-defaults = [
     "awt",
-    "experimental-tls",
-    "experimental-jmx",
+    "management",
+]
+# The optional experiments, as a group. Not part of the VM's default build.
+# Hosts that were relying on `vm-defaults` to pull these in should ask for this
+# alongside it: `features = ["vm-defaults", "vm-experimental"]`.
+vm-experimental = [
     "experimental-serialization",
     "experimental-aot",
     "experimental-debug",
 ]
 awt = ["cratonvm-vm/awt"]
 synthetic-jdk = ["cratonvm-vm/synthetic-jdk"]
-experimental-tls = ["cratonvm-vm/experimental-tls"]
-experimental-jmx = ["cratonvm-vm/experimental-jmx"]
+# `sun.management` + `javax.management` natives. Called `experimental-jmx`
+# until 2026-07-30; the old name is retained below as a back-compat alias.
+management = ["cratonvm-vm/management"]
+experimental-jmx = ["management"]
+# DEPRECATED no-op (NEW-13) — `javax.net.ssl` is always compiled and
+# registered. Retained only so existing `--features` invocations keep
+# resolving; removal slated for 0.4.
+deprecated-noop-tls = ["cratonvm-vm/deprecated-noop-tls"]
+experimental-tls = ["deprecated-noop-tls"]
 experimental-serialization = ["cratonvm-vm/experimental-serialization"]
 experimental-aot = ["cratonvm-vm/experimental-aot"]
 experimental-debug = ["cratonvm-vm/experimental-debug"]

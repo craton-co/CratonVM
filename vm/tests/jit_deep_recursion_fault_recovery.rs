@@ -41,11 +41,27 @@ fn test_vm() -> Vm {
     Vm::new(VmConfig::new().with_classpath(classpath_entries()))
 }
 
-fn force_deterministic_jit_warmup() {
-    // env_cache reads these once per process; this integration-test binary has
-    // one test, so setting them before VM creation makes the warm-up deterministic.
-    std::env::set_var("CRATONVM_JIT_THRESHOLD", "2");
-    std::env::set_var("CRATONVM_BG_COMPILE", "0");
+/// Pin the warm-up policy for the whole test.
+///
+/// Both names are *declared* flags, so they are served from the process-wide
+/// [`cratonvm_types::flags`] snapshot, not re-read from `environ` — `set_var`
+/// only reached the VM here because this binary holds a single test that runs
+/// before anything else latches the snapshot. That is exactly the
+/// order-dependence that makes this class of test look like a flake the moment
+/// a second test is added to the file, so pin it explicitly instead.
+///
+/// Process-scoped and returned as a guard: `env_cache` memoises both values in
+/// their own `OnceLock`s on first read, which happens on whichever thread the
+/// VM does its first tier-up check on, so the override has to be visible
+/// everywhere and still live at that point.
+#[must_use]
+fn force_deterministic_jit_warmup() -> cratonvm_types::flags::FlagOverride {
+    cratonvm_types::flags::override_process(cratonvm_types::flags::VmFlags::from_env_with_edits(
+        &[
+            ("CRATONVM_JIT_THRESHOLD", Some("2")),
+            ("CRATONVM_BG_COMPILE", Some("0")),
+        ],
+    ))
 }
 
 #[test]
@@ -58,7 +74,7 @@ fn compiled_non_tail_deep_recursion_throws_catchable_stack_overflow() {
         return;
     }
 
-    force_deterministic_jit_warmup();
+    let _warmup_policy = force_deterministic_jit_warmup();
     let mut vm = test_vm();
 
     let ranges_before = cratonvm_jit::jit_code_range_count();

@@ -95,9 +95,26 @@ fn write_fixture_module(root: &std::path::Path, module_name: &str) {
 /// Per-test setup: build a fresh `modules/` tree containing the named
 /// module(s), point `CRATONVM_JBOSS_MP_ROOT` at it, and return a Vm
 /// whose classpath includes the JBossModulesProbe class.
-fn vm_with_modules_tree(modules: &[&str]) -> (Vm, tempfile::TempDir) {
-    // tempfile::TempDir is dropped when this function returns —
-    // Vm holds no reference to the root, so as long as we return the
+///
+/// `CRATONVM_JBOSS_MP_ROOT` is a *declared* flag, so it is served from the one
+/// process-wide snapshot that latches on the first read of any flag — it is
+/// NOT re-read from `environ`. The `set_var` this used to do therefore took
+/// effect for at most one of the seven tests in this binary (whichever ran
+/// first, and only if it beat every other flag read), and the rest silently
+/// pointed at an already-deleted tempdir. Overriding the snapshot gives each
+/// test its own root for real.
+///
+/// Process scope, not thread scope: `find_mp_argument` is reached from the
+/// booted VM's own execution, not necessarily from the thread that called
+/// this. `MP_ROOT_LOCK` is the serialisation `override_process` requires.
+/// The returned `FlagOverride` is load-bearing, not bookkeeping: dropping it
+/// restores the ambient `CRATONVM_JBOSS_MP_ROOT`, so it has to outlive every
+/// `vm.invoke()` the caller makes.
+fn vm_with_modules_tree(
+    modules: &[&str],
+) -> (Vm, tempfile::TempDir, cratonvm_types::flags::FlagOverride) {
+    // tempfile::TempDir is dropped when the fixture is —
+    // Vm holds no reference to the root, so as long as we keep the
     // TempDir alongside the Vm the dir lives at least as long as
     // `CRATONVM_JBOSS_MP_ROOT` is read (i.e. through every subsequent
     // vm.invoke() call).
@@ -106,14 +123,26 @@ fn vm_with_modules_tree(modules: &[&str]) -> (Vm, tempfile::TempDir) {
         write_fixture_module(tmp.path(), m);
     }
     let mp_root = tmp.path().to_string_lossy().into_owned();
-    std::env::set_var("CRATONVM_JBOSS_MP_ROOT", &mp_root);
+    let mp_root_override = cratonvm_types::flags::override_process(
+        cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+            "CRATONVM_JBOSS_MP_ROOT",
+            Some(mp_root.as_str()),
+        )]),
+    );
 
     // Classpath contains ONLY the probe — NOT the stubs/ directory,
     // so org/jboss/modules/* resolves to the synthetic stub layout
     // from class_manager.rs at runtime.
     let probe_dir = fixture_dir().to_string_lossy().into_owned();
     let config = VmConfig::new().with_classpath(vec![probe_dir]);
-    (Vm::new(config), tmp)
+    (Vm::new(config), tmp, mp_root_override)
+}
+
+/// Serialises the process-scoped `CRATONVM_JBOSS_MP_ROOT` overrides: each test
+/// installs a different root, and they must not interleave.
+fn mp_root_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 fn require_probe() -> bool {
@@ -188,7 +217,8 @@ fn probe0_jboss_module_class_reachable() {
     if !require_probe() {
         return;
     }
-    let (mut vm, _tmp) = vm_with_modules_tree(&[]);
+    let _lock = mp_root_lock();
+    let (mut vm, _tmp, _mp_root) = vm_with_modules_tree(&[]);
     let r = invoke_probe(&mut vm, "probeJBossModuleClassReachable", "()I", &[]);
     // WP8.10.5 (session 101) — `is_jdk_class` extended with the
     // org/jboss/* / org/wildfly/* / etc. prefixes, so the synthetic-stub
@@ -227,7 +257,8 @@ fn probe1_boot_holder_instance_populated() {
     if !require_probe() {
         return;
     }
-    let (mut vm, _tmp) = vm_with_modules_tree(&[]);
+    let _lock = mp_root_lock();
+    let (mut vm, _tmp, _mp_root) = vm_with_modules_tree(&[]);
     if !jboss_synthetic_stubs_reachable(&mut vm) {
         eprintln!(
             "probe1: SKIPPED — upstream gap (probe0) blocks: \
@@ -268,7 +299,8 @@ fn probe2_boot_holder_is_local_module_loader() {
     if !require_probe() {
         return;
     }
-    let (mut vm, _tmp) = vm_with_modules_tree(&[]);
+    let _lock = mp_root_lock();
+    let (mut vm, _tmp, _mp_root) = vm_with_modules_tree(&[]);
     if !jboss_synthetic_stubs_reachable(&mut vm) {
         eprintln!("probe2: SKIPPED — gated on probe0 fix");
         return;
@@ -315,7 +347,8 @@ fn probe3_load_module_succeeds() {
         return;
     }
     const MODULE_NAME: &str = "cratonvm.wp8.fixture";
-    let (mut vm, _tmp) = vm_with_modules_tree(&[MODULE_NAME]);
+    let _lock = mp_root_lock();
+    let (mut vm, _tmp, _mp_root) = vm_with_modules_tree(&[MODULE_NAME]);
     if !jboss_synthetic_stubs_reachable(&mut vm) {
         eprintln!("probe3: SKIPPED — gated on probe0 fix");
         return;
@@ -357,7 +390,8 @@ fn probe4_loaded_module_name_roundtrips() {
         return;
     }
     const MODULE_NAME: &str = "cratonvm.wp8.fixture";
-    let (mut vm, _tmp) = vm_with_modules_tree(&[MODULE_NAME]);
+    let _lock = mp_root_lock();
+    let (mut vm, _tmp, _mp_root) = vm_with_modules_tree(&[MODULE_NAME]);
     if !jboss_synthetic_stubs_reachable(&mut vm) {
         eprintln!("probe4: SKIPPED — gated on probe0 fix");
         return;
@@ -395,7 +429,8 @@ fn probe5_module_classloader_resolves() {
         return;
     }
     const MODULE_NAME: &str = "cratonvm.wp8.fixture";
-    let (mut vm, _tmp) = vm_with_modules_tree(&[MODULE_NAME]);
+    let _lock = mp_root_lock();
+    let (mut vm, _tmp, _mp_root) = vm_with_modules_tree(&[MODULE_NAME]);
     if !jboss_synthetic_stubs_reachable(&mut vm) {
         eprintln!("probe5: SKIPPED — gated on probe0 fix");
         return;
@@ -431,7 +466,8 @@ fn probe6_missing_module_throws_not_found() {
     if !require_probe() {
         return;
     }
-    let (mut vm, _tmp) = vm_with_modules_tree(&[]);
+    let _lock = mp_root_lock();
+    let (mut vm, _tmp, _mp_root) = vm_with_modules_tree(&[]);
     if !jboss_synthetic_stubs_reachable(&mut vm) {
         eprintln!("probe6: SKIPPED — gated on probe0 fix");
         return;

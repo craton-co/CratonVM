@@ -1744,6 +1744,93 @@ fn pool_clear(host: &str, port: u16) {
     }
 }
 
+/// Is the idle-connection reaper thread currently alive? See [`pool_put`].
+static POOL_REAPER_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How often the reaper sweeps. Well under [`POOL_IDLE_WINDOW`], so a
+/// connection is closed within roughly that window of becoming unusable.
+const POOL_REAPER_TICK: Duration = Duration::from_millis(400);
+
+/// Close pooled connections that are past [`POOL_IDLE_WINDOW`], and report
+/// whether anything is still pooled.
+///
+/// Dropping a [`PooledConn`] drops its `TcpStream`, which closes the socket.
+fn pool_sweep_idle() -> bool {
+    let Ok(mut guard) = conn_pool().lock() else {
+        return false;
+    };
+    guard.retain(|_, bucket| {
+        bucket.retain(|entry| entry.returned_at.elapsed() <= POOL_IDLE_WINDOW);
+        !bucket.is_empty()
+    });
+    !guard.is_empty()
+}
+
+/// Start the idle-connection reaper if it is not already running.
+///
+/// **Why this exists.** Without it a pooled socket stays open for the entire
+/// life of the VM: `pool_take` only discards stale entries when someone asks
+/// for that exact `(host, port)` again, so a client that makes ONE request and
+/// then stops leaves the connection established forever. The real JDK does not
+/// behave that way — `sun.net.www.http.KeepAliveCache` runs a "Keep-Alive-Timer"
+/// daemon thread that closes idle connections (measured on HotSpot 25:
+/// closed 5.004s after the response was consumed).
+///
+/// The difference is observable from the *server* side, which is how it
+/// surfaced: `MockWebServer.close()` closes its listening socket and then waits
+/// up to 5s for each per-connection task to finish, and that task is parked in
+/// a read on a connection our client never closed — so teardown failed with
+/// `AssertionError: Gave up waiting for queue to shut down` (6 of 21 in
+/// `Saml2RelyingPartyAutoConfigurationTests`, whose SAML metadata fetch goes
+/// through `UrlResource` → `HttpURLConnection`). Any test or application that
+/// waits for its peer to hang up saw the same leak.
+///
+/// The thread exits once the pool drains, so an idle VM carries no extra
+/// thread, and `pool_put` restarts it on the next pooled connection.
+fn pool_start_reaper() {
+    use std::sync::atomic::Ordering;
+    if POOL_REAPER_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("cratonvm-huc-keepalive-reaper".to_string())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(POOL_REAPER_TICK);
+                if pool_sweep_idle() {
+                    continue;
+                }
+                // The pool looks empty, so this thread wants to exit. Publish
+                // "not running" BEFORE the final check, not after: a `pool_put`
+                // that raced us in between would find the latch still set,
+                // decline to start a reaper, and leave its connection open for
+                // the life of the VM — the exact leak this thread exists to
+                // prevent. Having published, re-check; if something did arrive,
+                // re-acquire the latch and keep going (or exit, if that racing
+                // `pool_put` already started a replacement).
+                POOL_REAPER_RUNNING.store(false, Ordering::Release);
+                if !pool_sweep_idle() {
+                    break;
+                }
+                if POOL_REAPER_RUNNING
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    if spawned.is_err() {
+        // Could not spawn (thread limit): clear the latch so a later
+        // `pool_put` retries rather than leaving the pool unreaped forever.
+        POOL_REAPER_RUNNING.store(false, Ordering::Release);
+    }
+}
+
 fn pool_put(host: &str, port: u16, stream: TcpStream) {
     if let Ok(mut guard) = conn_pool().lock() {
         let bucket = guard.entry((host.to_string(), port)).or_default();
@@ -1755,6 +1842,7 @@ fn pool_put(host: &str, port: u16, stream: TcpStream) {
             returned_at: Instant::now(),
         });
     }
+    pool_start_reaper();
 }
 
 /// Whether a just-parsed response leaves the connection in a cleanly
@@ -3968,6 +4056,40 @@ mod http_url_connection_tests {
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+
+    /// A pooled keep-alive connection must actually be CLOSED once it is past
+    /// `POOL_IDLE_WINDOW`, not merely become ineligible for reuse.
+    ///
+    /// Before the reaper existed, `pool_take` was the only thing that dropped a
+    /// stale entry, so a client that made one request and stopped held its
+    /// socket open for the life of the VM — visible to the peer, and what broke
+    /// `MockWebServer.close()` (see `pool_start_reaper`). This asserts from the
+    /// server side, which is the side that noticed.
+    #[test]
+    fn pooled_connection_is_closed_once_idle() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream as Stream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let client = Stream::connect(("127.0.0.1", port)).expect("connect");
+        let (mut accepted, _) = listener.accept().expect("accept");
+
+        pool_put("127.0.0.1", port, client);
+
+        // The peer must observe EOF within a bounded window: the reaper only
+        // discards entries older than POOL_IDLE_WINDOW, so allow that plus
+        // several sweep ticks of slack.
+        accepted
+            .set_read_timeout(Some(POOL_IDLE_WINDOW + Duration::from_secs(5)))
+            .expect("set_read_timeout");
+        let mut buf = [0u8; 1];
+        let observed = accepted.read(&mut buf);
+        assert!(
+            matches!(observed, Ok(0)),
+            "peer should see EOF after the pooled connection goes idle, got {observed:?}"
+        );
+    }
 
     #[test]
     fn test_register_http_url_connection_init() {

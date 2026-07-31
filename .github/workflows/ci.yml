@@ -19,6 +19,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `experimental-jmx` / `experimental-tls` are back-compat ALIASES
+      # (renamed 2026-07-30 to `management` / `deprecated-noop-tls`). They are
+      # fine on a `--features` command line, but a `#[cfg(feature = "...")]`
+      # written against an alias is a silent bug: the default set enables
+      # `management`, not the alias, so the block compiles to nothing in an
+      # ordinary build. For the JMX natives that means `ManagementFactory`
+      # loses its `sun.management` surface and dies with an
+      # `UnsatisfiedLinkError` at runtime, with no compile error anywhere.
+      # Cheap grep, no toolchain needed, so it fails in seconds.
+      - name: No cfg gates on deprecated feature aliases
+        shell: bash
+        run: |
+          if git grep -n -I -E 'cfg\([^)]*"(experimental-jmx|experimental-tls)"' -- '*.rs'; then
+            echo "::error::Found #[cfg] gate(s) on a deprecated feature alias (listed above)."
+            echo "Use 'management' instead of 'experimental-jmx'; note that"
+            echo "'experimental-tls' / 'deprecated-noop-tls' gate nothing at all."
+            exit 1
+          fi
+          echo "OK: no cfg gates on deprecated aliases."
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -190,11 +210,25 @@ jobs:
       # `experimental-t19-diag`, `app-stubs` and `synthetic-quarkus-arc` were
       # missing here and were compiled by nothing at all — which is how this
       # repository lost 1,522 tests once already.
+      #
+      # `management` and `deprecated-noop-tls` are the post-2026-07-30 names for
+      # `experimental-jmx` / `experimental-tls`. The deprecated aliases get their
+      # own resolve check below, so a broken alias fails CI rather than silently
+      # breaking a downstream build.
       - name: Check every optional feature compiles, test targets included
         run: >
           cargo check --all-targets
           -p cratonvm-vm -p cratonvm-native-builtins
-          --features experimental-tls,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug,experimental-t19-diag,zgc
+          --features deprecated-noop-tls,management,experimental-serialization,experimental-aot,experimental-debug,experimental-t19-diag,zgc
+
+      # The whole point of keeping the old names is that existing invocations
+      # keep working. Resolve them explicitly — a feature that vanishes breaks
+      # downstream builds silently, and nothing else in CI spells them out.
+      - name: Check the deprecated feature aliases still resolve
+        run: >
+          cargo check
+          -p cratonvm-vm -p cratonvm-native-builtins
+          --features experimental-tls,experimental-jmx
       - name: Check the native-builtins-only optional features compile
         run: >
           cargo check --all-targets
@@ -209,7 +243,7 @@ jobs:
         run: >
           cargo test
           -p cratonvm-vm -p cratonvm-native-builtins
-          --features experimental-tls,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug,zgc
+          --features deprecated-noop-tls,management,experimental-serialization,experimental-aot,experimental-debug,zgc
 
   # Build + publish the libcratonvm C-ABI embedding library (cdylib + staticlib)
   # and its public C headers as downloadable CI artifacts, per

@@ -39,23 +39,26 @@ exclude = [
 #
 #  * `experimental-aot` / `-serialization` gate module declarations in
 #    `cratonvm-native-builtins`, so dropping them really stops compiling that
-#    code. `experimental-debug` gates the JDWP surface the same way.
-#  * `experimental-tls` is a no-op alias (NEW-13) kept only so downstream
-#    feature requests and `check-cfg` keep resolving — the `javax.net.ssl`
-#    implementation is always compiled and registered.
-#  * `experimental-jmx` is NOT optional in practice and stays in the default
-#    set. Its name says experiment; what it gates is the `sun.management`
-#    native surface, and `java.lang.management.ManagementFactory` is core JDK
-#    API that the JDK's own bootstrap reaches. Without it,
-#    `ManagementFactory.getMemoryPoolMXBeans()` dies with
+#    code. `experimental-debug` gates the JDWP surface the same way. These are
+#    genuine experiments and are genuinely optional.
+#  * `management` is NOT optional in practice and stays in the default set. It
+#    gates the `sun.management` native surface that backs
+#    `java.lang.management` — core JDK API that the JDK's own bootstrap
+#    reaches — plus the `javax.management` (JMX) beans layered on top. Without
+#    it, `ManagementFactory.getMemoryPoolMXBeans()` dies with
 #    `UnsatisfiedLinkError: sun/management/VMManagementImpl.getVersion0()`
-#    (`vm/tests/wave1_a_jmx_mxbeans.rs` catches exactly this). Renaming the
-#    feature would be the honest fix; removing it from the default build is not.
+#    (`vm/tests/wave1_a_jmx_mxbeans.rs` catches exactly this). It was called
+#    `experimental-jmx` until 2026-07-30; that name was wrong twice over — the
+#    surface is not an experiment, and it is not confined to JMX.
+#  * `deprecated-noop-tls` does nothing at all (NEW-13). The `javax.net.ssl`
+#    implementation is unconditionally compiled and registered; the feature is
+#    retained only so existing `--features` invocations and `check-cfg` keep
+#    resolving. Slated for removal in 0.4.
 #
 # ZGC remains selectable with `--features zgc`. The `experimental-features` CI
 # job builds and runs the whole optional surface, because this repository has
 # already lost 1,522 tests to a configuration that nothing compiled.
-default = ["awt", "experimental-jmx"]
+default = ["awt", "management"]
 # AWT/Swing/Java2D desktop natives. On by default so the standard build
 # registers them exactly as before. `cratonvm-native-awt` sets
 # `publish = false`, so this feature is what makes the dependency optional:
@@ -66,11 +69,25 @@ synthetic-jdk = [
     "cratonvm-native-collections/synthetic-jdk",
     "cratonvm-native-io/synthetic-jdk",
     # The legacy synthetic surface includes JMX bootstrap classes and therefore
-    # intentionally opts into that experimental native module.
-    "experimental-jmx",
+    # intentionally opts into the management native module.
+    "management",
 ]
-experimental-tls = ["cratonvm-native-builtins/experimental-tls"]
-experimental-jmx = ["cratonvm-native-builtins/experimental-jmx"]
+# `sun.management` + `javax.management` native surface. Default-on: this backs
+# `java.lang.management.ManagementFactory`, which the JDK's own bootstrap
+# reaches. See the note above `default =`.
+management = ["cratonvm-native-builtins/management"]
+# DEPRECATED back-compat alias for `management`, renamed 2026-07-30. Kept so
+# existing `--features experimental-jmx` invocations keep building. Slated for
+# removal in 0.4 — prefer `management`.
+experimental-jmx = ["management"]
+# DEPRECATED no-op (NEW-13). Enables nothing: the native-tls-backed
+# `javax.net.ssl` implementation is compiled and registered unconditionally.
+# Retained only so existing `--features` invocations and `check-cfg` keep
+# resolving. Slated for removal in 0.4.
+deprecated-noop-tls = ["cratonvm-native-builtins/deprecated-noop-tls"]
+# DEPRECATED back-compat alias for `deprecated-noop-tls`, renamed 2026-07-30.
+# Equally a no-op; the old name wrongly implied TLS was feature-gated.
+experimental-tls = ["deprecated-noop-tls"]
 experimental-serialization = ["cratonvm-native-builtins/experimental-serialization"]
 experimental-aot = ["cratonvm-native-builtins/experimental-aot"]
 experimental-debug = []
