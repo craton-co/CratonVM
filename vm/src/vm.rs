@@ -13714,7 +13714,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase 12: Interface forEach tests
+    // Phase 12: Collection forEach tests
     // =========================================================================
 
     #[test]
@@ -13747,7 +13747,12 @@ mod tests {
             .unwrap();
         }
 
-        // Create a Consumer lambda that calls println(Object) to record output
+        // Create a Consumer lambda that calls println(Object) to record output.
+        // The captured PrintStream is a real receiver, not `Object(None)`: the
+        // proxy dispatches `accept` straight into `PrintStream.println`, and a
+        // null receiver there is an NPE rather than an exercise of `forEach`.
+        // Same shape as `arraylist_for_each_consumer` above.
+        let ps = alloc_receiver(&shared, &mut thread, "java/io/PrintStream", 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -13758,22 +13763,56 @@ mod tests {
             "(Ljava/lang/Object;)V",
             MethodHandleKind::InvokeVirtual,
             vec!['L'],
-            &[Value::Object(None)],
+            &[Value::Object(Some(ps))],
         );
 
-        // Call via Iterable interface
+        // Dispatch `forEach` on the CONCRETE collection class, not on the
+        // `java/lang/Iterable` interface this test used to name.
+        //
+        // `call_native` resolves an exact (class, method, descriptor) triple,
+        // so naming the interface was really asserting "a native is registered
+        // on `java/lang/Iterable.forEach`" — and that registration must not
+        // exist. In this VM a single registered native shadows a class's real
+        // bytecode at EVERY interpreter dispatch site, so a native on a
+        // supertype as broad as `Iterable` would intercept `forEach` for every
+        // implementing class in the program, including user classes that
+        // override it (the documented "natives on java.util.Abstract* classes
+        // intercept user subclasses" defect family). There is no
+        // "only if the receiver declares no override" admission gate in the
+        // dispatcher to make it safe. `java/util/ArrayList.forEach` is the
+        // registration that legitimately exists (`native_al_for_each`), and
+        // exercising it covers the same behaviour: a `Consumer` SAM invoked
+        // once per element with the list left intact.
         call_native(
             &shared,
             &mut thread,
-            "java/lang/Iterable",
+            "java/util/ArrayList",
             "forEach",
             "(Ljava/util/function/Consumer;)V",
             &[Value::Object(Some(list)), Value::Object(Some(consumer))],
         )
         .unwrap();
 
-        // forEach should have been called 3 times
-        assert_eq!(shared.mem.heap.get_field(list, 1), Value::Int(3)); // size is still 3
+        // forEach must not disturb the list: still 3 elements, still [10,20,30].
+        assert_eq!(shared.mem.heap.get_field(list, 1), Value::Int(3));
+        for (i, expected) in [10, 20, 30].iter().enumerate() {
+            let val = call_native(
+                &shared,
+                &mut thread,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                &[Value::Object(Some(list)), Value::Int(i as i32)],
+            )
+            .unwrap()
+            .unwrap();
+            match val {
+                Value::Object(Some(w)) => {
+                    assert_eq!(shared.mem.heap.get_field(w, 0), Value::Int(*expected));
+                }
+                other => panic!("expected wrapper at index {i}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -32429,15 +32468,17 @@ mod tests {
     fn rwlock_init_and_locks() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
+        // NO `<init>` CALL HERE, deliberately. `register_synthetic_rwlock_natives`
+        // does not intercept the `ReentrantReadWriteLock` constructors, and says
+        // why: "Their three reference fields are { readerLock, writerLock, sync };
+        // the historical synthetic initializer wrote integer state into those
+        // slots, so a method reference such as ReentrantReadWriteLock::readLock
+        // received null. Let genuine bytecode initialize the layout, while keeping
+        // the native lock-operation backend below for the returned lock views."
+        // The receiver is therefore left in its allocated (all-default) state,
+        // which is what an object looks like between `new` and the constructor —
+        // and the surviving natives must not depend on constructor state.
         let rwl = alloc_receiver(&shared, &mut thread, "java/util/concurrent/locks/ReentrantReadWriteLock", 3);
-        let _ = call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/locks/ReentrantReadWriteLock",
-            "<init>",
-            "()V",
-            &[Value::Object(Some(rwl))],
-        );
         // Real-JDK covariant return: ReentrantReadWriteLock.readLock/writeLock
         // return the concrete subclasses, not the Lock interface.
         let rl = call_native(
@@ -32462,6 +32503,21 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(matches!(wl, Value::Object(Some(_))));
+        // Each view must point back at the parent lock in slot 0 — that back
+        // pointer is what `rwl_parent_addr` keys the shared read/write state on,
+        // so a null there would silently turn every lock()/unlock() into a no-op.
+        let rl_ref = rl.as_object().unwrap();
+        let wl_ref = wl.as_object().unwrap();
+        assert_eq!(
+            shared.mem.heap.get_field(rl_ref, 0),
+            Value::Object(Some(rwl)),
+            "ReadLock view must reference its parent ReentrantReadWriteLock"
+        );
+        assert_eq!(
+            shared.mem.heap.get_field(wl_ref, 0),
+            Value::Object(Some(rwl)),
+            "WriteLock view must reference its parent ReentrantReadWriteLock"
+        );
     }
 
     #[test]
@@ -38927,6 +38983,26 @@ mod tests {
         );
     }
 
+    /// API-surface check for `KeyPairGenerator`: `getInstance` → `initialize`
+    /// → `generateKeyPair` → `getPublic`/`getPrivate`/`getAlgorithm`.
+    ///
+    /// Deliberately asks for a **512-bit** key, as the `m22_*` tests do. Since
+    /// the synthetic `KeyPairGenerator` stub in
+    /// `native-builtins::phases_early::register_phase53_security` was retired,
+    /// `generateKeyPair` runs the genuine `crypto_impl::Rsa::generate_keypair`
+    /// — two real Miller-Rabin prime searches. At 2048 bits that is two
+    /// ~1024-bit searches through a hand-rolled u32-limb `BigUint`, which in an
+    /// **unoptimised debug test binary** costs tens of seconds to minutes, with
+    /// the heavy tail of a geometric prime search on top (and a ~39% chance of
+    /// discarding the whole pair when `n` lands one bit short, restarting both
+    /// searches). This binary already runs ~10 minutes against a 20-minute CI
+    /// timeout, and a timeout produces NO result line for ANY test in it.
+    ///
+    /// 512 bits keeps the crypto real — the same code path, a real key, a real
+    /// `sign`/`verify` elsewhere — while a 256-bit prime search costs ~1/64th
+    /// of a 1024-bit one per modular exponentiation. What this test asserts (the
+    /// method surface and the algorithm round-trip) is unchanged; it was never
+    /// a prime-search benchmark.
     #[test]
     fn keypair_generator_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -38949,7 +39025,7 @@ mod tests {
             "java/security/KeyPairGenerator",
             "initialize",
             "(I)V",
-            &[Value::Object(Some(kpg_ref)), Value::Int(2048)],
+            &[Value::Object(Some(kpg_ref)), Value::Int(512)],
         )
         .unwrap();
         let kp = call_native(
@@ -41671,11 +41747,69 @@ mod tests {
         assert_eq!(shared.mem.heap.array_length(new_arr), 3);
     }
 
+    /// Build a `Stream` over the given strings via `Stream.of(Object[])`.
+    fn stream_of_strings(
+        shared: &Arc<SharedVm>,
+        thread: &mut crate::threading::JvmThread,
+        texts: &[&str],
+    ) -> Value {
+        let arr =
+            shared
+                .mem
+                .heap
+                .alloc_array(ClassId::new(0), ArrayElementType::Reference, texts.len());
+        for (i, t) in texts.iter().enumerate() {
+            let s = create_java_string(shared, t);
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(arr, i, Value::Object(Some(s)));
+        }
+        call_native(
+            shared,
+            thread,
+            "java/util/stream/Stream",
+            "of",
+            "([Ljava/lang/Object;)Ljava/util/stream/Stream;",
+            &[Value::Object(Some(arr))],
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// A `Comparator` lambda whose `compare(Object,Object)I` is `String.compareTo`.
+    fn string_order_comparator(shared: &Arc<SharedVm>) -> ObjectRef {
+        make_lambda_proxy(
+            shared,
+            "java/util/Comparator",
+            "compare",
+            "(Ljava/lang/Object;Ljava/lang/Object;)I",
+            "java/lang/String",
+            "compareTo",
+            "(Ljava/lang/String;)I",
+            MethodHandleKind::InvokeVirtual,
+            vec![],
+            &[],
+        )
+    }
+
+    // `Collectors.maxBy` / `minBy` return an `Optional`, NOT a Map.
+    //
+    // These two used to assert `get_field(collector, 0) == Int(9)` / `Int(10)` —
+    // i.e. they pinned down the tag `native-builtins` happened to write and
+    // stopped there. That number was decoded by the ONLY registered
+    // `Stream.collect(Collector)` (native-collections' `native_stream_collect`)
+    // as `COLLECTOR_TAG_GROUPING_BY_DOWNSTREAM` (9) and
+    // `COLLECTOR_TAG_GROUPING_BY_SUPPLIER` (10), so `collect(maxBy(cmp))`
+    // returned a grouping Map and the tests were green over a silent wrong
+    // answer. Assert the `java.util.stream.Collectors` contract end-to-end
+    // instead: the tag is an implementation detail, the Optional is the API.
+
     #[test]
     fn collectors_max_by_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let comparator = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let comparator = string_order_comparator(&shared);
         let collector = call_native(
             &shared,
             &mut thread,
@@ -41686,15 +41820,94 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(9));
+        let stream = stream_of_strings(&shared, &mut thread, &["cherry", "apple", "banana"]);
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
+            "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+            &[stream, collector],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            call_native(
+                &shared,
+                &mut thread,
+                "java/util/Optional",
+                "isPresent",
+                "()Z",
+                &[result],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(1),
+            "maxBy over a non-empty stream must be a present Optional"
+        );
+        let got = call_native(
+            &shared,
+            &mut thread,
+            "java/util/Optional",
+            "get",
+            "()Ljava/lang/Object;",
+            &[result],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            read_java_string(&shared.mem.heap, got.as_object().unwrap()),
+            Some("cherry".to_string())
+        );
+    }
+
+    #[test]
+    fn collectors_max_by_empty_stream_is_empty_optional_p56() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
+        let comparator = string_order_comparator(&shared);
+        let collector = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Collectors",
+            "maxBy",
+            "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
+            &[Value::Object(Some(comparator))],
+        )
+        .unwrap()
+        .unwrap();
+        let stream = stream_of_strings(&shared, &mut thread, &[]);
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
+            "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+            &[stream, collector],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            call_native(
+                &shared,
+                &mut thread,
+                "java/util/Optional",
+                "isPresent",
+                "()Z",
+                &[result],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(0),
+            "maxBy over an empty stream must be Optional.empty()"
+        );
     }
 
     #[test]
     fn collectors_min_by_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let comparator = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let comparator = string_order_comparator(&shared);
         let collector = call_native(
             &shared,
             &mut thread,
@@ -41705,8 +41918,45 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(10));
+        let stream = stream_of_strings(&shared, &mut thread, &["cherry", "apple", "banana"]);
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
+            "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+            &[stream, collector],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            call_native(
+                &shared,
+                &mut thread,
+                "java/util/Optional",
+                "isPresent",
+                "()Z",
+                &[result],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(1),
+            "minBy over a non-empty stream must be a present Optional"
+        );
+        let got = call_native(
+            &shared,
+            &mut thread,
+            "java/util/Optional",
+            "get",
+            "()Ljava/lang/Object;",
+            &[result],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            read_java_string(&shared.mem.heap, got.as_object().unwrap()),
+            Some("apple".to_string())
+        );
     }
 
     #[test]
@@ -41719,27 +41969,139 @@ mod tests {
             "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
             &[Value::Object(Some(func)), Value::Object(Some(downstream))]).unwrap().unwrap();
         let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(11));
+        // Tag 15 == `COLLECTOR_TAG_MAPPING` (native-collections). Two crates
+        // register `Collectors.mapping`: native-builtins `phases_late::streams`
+        // (tag 11, `P56_COLLECTOR_MAPPING`) and native-collections. Registration
+        // is last-wins and `register_collections_natives` runs AFTER
+        // `register_builtins` both here and in `vm_init`, so the collections
+        // implementation is the one that ever runs. It has to be: the *only*
+        // registered `Stream.collect(Collector)` is native-collections'
+        // `native_stream_collect`, which decodes the `COLLECTOR_TAG_*`
+        // namespace. Nothing anywhere reads the `P56_COLLECTOR_*` numbering.
+        // So 15 is the correct answer and 11 is the wrong one — a collector
+        // tagged 11 would be decoded by `native_stream_collect` as
+        // `COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM` and produce a
+        // {false=…, true=…} Map instead of the mapped downstream result.
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(15));
+        // The mapper and the downstream collector must survive into ARG1/ARG2 —
+        // that, not the tag, is what `native_stream_collect` consumes.
+        assert_eq!(
+            shared.mem.heap.get_field(c_ref, 1),
+            Value::Object(Some(func))
+        );
+        assert_eq!(
+            shared.mem.heap.get_field(c_ref, 2),
+            Value::Object(Some(downstream))
+        );
     }
 
+    /// `Collectors.filtering(pred, downstream)` drops the elements the predicate
+    /// rejects and collects the rest THROUGH the downstream collector.
+    ///
+    /// Was: `assert get_field(collector, 0) == Int(12)`. Tag 12 is
+    /// `COLLECTOR_TAG_TO_MAP_MERGE` to the only decoder in the VM, so
+    /// `collect(filtering(..))` used to read ARG1/ARG2 as a key/value function
+    /// pair and hand back a Map — the predicate was never called and the
+    /// downstream collector was never consulted.
     #[test]
     fn collectors_filtering_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let pred = shared.mem.heap.alloc_object(ClassId::new(0), 0);
-        let downstream = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        // test(s) → s.isEmpty()
+        let pred = make_lambda_proxy(
+            &shared,
+            "java/util/function/Predicate",
+            "test",
+            "(Ljava/lang/Object;)Z",
+            "java/lang/String",
+            "isEmpty",
+            "()Z",
+            MethodHandleKind::InvokeVirtual,
+            vec![],
+            &[],
+        );
+        let downstream = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Collectors",
+            "toList",
+            "()Ljava/util/stream/Collector;",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         let collector = call_native(&shared, &mut thread, "java/util/stream/Collectors", "filtering",
             "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
-            &[Value::Object(Some(pred)), Value::Object(Some(downstream))]).unwrap().unwrap();
-        let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(12));
+            &[Value::Object(Some(pred)), downstream]).unwrap().unwrap();
+        let stream = stream_of_strings(&shared, &mut thread, &["", "abc", "", "de"]);
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
+            "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+            &[stream, collector],
+        )
+        .unwrap()
+        .unwrap();
+        let list = result.as_object().unwrap();
+        // Downstream is toList(), so the result is a List of the two empty
+        // strings — not a Map, and not all four elements.
+        assert_eq!(
+            call_native(
+                &shared,
+                &mut thread,
+                "java/util/ArrayList",
+                "size",
+                "()I",
+                &[Value::Object(Some(list))],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(2),
+            "filtering must drop the elements the predicate rejects"
+        );
+        for i in 0..2 {
+            let elem = call_native(
+                &shared,
+                &mut thread,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                &[Value::Object(Some(list)), Value::Int(i)],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                read_java_string(&shared.mem.heap, elem.as_object().unwrap()),
+                Some(String::new())
+            );
+        }
     }
 
+    /// `Collectors.summarizingInt(extractor)` returns an `IntSummaryStatistics`.
+    ///
+    /// Was: `assert get_field(collector, 0) == Int(13)`. Tag 13 is
+    /// `COLLECTOR_TAG_COLLECTING_AND_THEN` to the only decoder in the VM, so
+    /// `collect(summarizingInt(f))` read ARG1 as a downstream collector and
+    /// ARG2 as a finisher, and returned null.
     #[test]
     fn collectors_summarizing_int_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let func = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        // applyAsInt(s) → s.length()
+        let func = make_lambda_proxy(
+            &shared,
+            "java/util/function/ToIntFunction",
+            "applyAsInt",
+            "(Ljava/lang/Object;)I",
+            "java/lang/String",
+            "length",
+            "()I",
+            MethodHandleKind::InvokeVirtual,
+            vec![],
+            &[],
+        );
         let collector = call_native(
             &shared,
             &mut thread,
@@ -41750,8 +42112,36 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(13));
+        let stream = stream_of_strings(&shared, &mut thread, &["a", "bbb", "cc"]);
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
+            "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+            &[stream, collector],
+        )
+        .unwrap()
+        .unwrap();
+        let stats = result.as_object().unwrap();
+        let iss = "java/util/IntSummaryStatistics";
+        let get = |thread: &mut crate::threading::JvmThread, name: &str, desc: &str| {
+            call_native(
+                &shared,
+                thread,
+                iss,
+                name,
+                desc,
+                &[Value::Object(Some(stats))],
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(get(&mut thread, "getCount", "()J"), Value::Long(3));
+        assert_eq!(get(&mut thread, "getSum", "()J"), Value::Long(6));
+        assert_eq!(get(&mut thread, "getMin", "()I"), Value::Int(1));
+        assert_eq!(get(&mut thread, "getMax", "()I"), Value::Int(3));
+        assert_eq!(get(&mut thread, "getAverage", "()D"), Value::Double(2.0));
     }
 
     #[test]
@@ -41919,7 +42309,17 @@ mod tests {
             .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(s2)));
-        let stream = alloc_receiver(&shared, &mut thread, "java/lang/String", 1);
+        // The receiver must be a SYNTHETIC STREAM, i.e. runtime class
+        // `java/util/stream/Stream` with the elements array in slot 0. This
+        // fixture used to say "java/lang/String" (copy-paste of the mapper's
+        // impl class), and that is what threw: the winning `Stream.mapToInt`
+        // is native-collections' `native_stream_map_to_int`, whose
+        // `stream_elements` treats any receiver failing `is_synthetic_stream`
+        // as a REAL JDK pipeline and materialises it via
+        // `invoke_virtual(recv, "toArray", "()[Ljava/lang/Object;")`. A String
+        // has no `toArray`, so the native propagated that Err — the observed
+        // `ExceptionThrown(ObjectRef)`.
+        let stream = alloc_receiver(&shared, &mut thread, "java/util/stream/Stream", 1);
         shared
             .mem
             .heap
@@ -42855,7 +43255,27 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(is_open, Value::Int(1));
-        // Bind
+        // A freshly-opened channel is not bound yet.
+        let bound_before = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/ServerSocketChannel",
+            "isBound",
+            "()Z",
+            &[Value::Object(Some(ssc_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bound_before, Value::Int(0));
+        // `bind(null)` is the specified "bind to an address that is assigned
+        // automatically" form. Note the descriptor: `ServerSocketChannel.bind`
+        // covariantly narrows `NetworkChannel.bind`'s return type, so this is
+        // the triple every `ssc.bind(addr)` call site actually uses — and it
+        // must reach the SAME implementation as `accept()` below (the real
+        // listener registry in native-io/src/socket_channel.rs). It did not:
+        // a stale synthetic in native-builtins owned this one descriptor and
+        // recorded its listener somewhere `accept()` never looks, so the
+        // accept failed with "server channel not bound".
         let bound = call_native(
             &shared,
             &mut thread,
@@ -42867,7 +43287,35 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(matches!(bound, Value::Object(Some(_))));
-        // Accept returns a SocketChannel
+        let bound_after = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/ServerSocketChannel",
+            "isBound",
+            "()Z",
+            &[Value::Object(Some(ssc_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            bound_after,
+            Value::Int(1),
+            "bind(null) must assign an ephemeral local port"
+        );
+        // Accept, in non-blocking mode, with nothing dialling the listener:
+        // the JDK contract is "returns null if no connection is available".
+        // (A blocking accept here would park forever, which is exactly what
+        // the JDK specifies and therefore not something a unit test can
+        // assert against without a second thread.)
+        call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/ServerSocketChannel",
+            "configureBlocking",
+            "(Z)Ljava/nio/channels/SelectableChannel;",
+            &[Value::Object(Some(ssc_ref)), Value::Int(0)],
+        )
+        .unwrap();
         let accepted = call_native(
             &shared,
             &mut thread,
@@ -42878,7 +43326,27 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(matches!(accepted, Value::Object(Some(_))));
+        assert_eq!(accepted, Value::Object(None));
+        call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/ServerSocketChannel",
+            "close",
+            "()V",
+            &[Value::Object(Some(ssc_ref))],
+        )
+        .unwrap();
+        let is_open2 = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/ServerSocketChannel",
+            "isOpen",
+            "()Z",
+            &[Value::Object(Some(ssc_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(is_open2, Value::Int(0));
     }
 
     #[test]
@@ -43485,6 +43953,15 @@ mod tests {
     fn socket_channel_connect_p58() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
+        // `SocketChannel.connect` is backed by a real OS connect
+        // (native-io/src/socket_channel.rs), so the only honest way to observe
+        // `isConnected() == true` is to give it something to connect to.
+        // `connect(null)` is NOT a success — the JDK routes every connect
+        // through `sun.nio.ch.Net.checkAddress`, which starts with
+        // `Objects.requireNonNull(sa)`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let port = listener.local_addr().unwrap().port() as i32;
+
         let sc = call_native(
             &shared,
             &mut thread,
@@ -43508,14 +43985,21 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(conn, Value::Int(0));
-        // Connect
+        // The flat `(host: String, port: int)` InetSocketAddress layout that
+        // `decode_socket_address` and the `java/net/InetSocketAddress`
+        // accessors both understand.
+        let host = create_java_string(&shared, "127.0.0.1");
+        let addr = alloc_receiver(&shared, &mut thread, "java/net/InetSocketAddress", 2);
+        shared.mem.heap.set_field(addr, 0, Value::Object(Some(host)));
+        shared.mem.heap.set_field(addr, 1, Value::Int(port));
+        // Connect (blocking mode: completes before returning, hence `true`).
         let ok = call_native(
             &shared,
             &mut thread,
             "java/nio/channels/SocketChannel",
             "connect",
             "(Ljava/net/SocketAddress;)Z",
-            &[Value::Object(Some(sc_ref)), Value::Object(None)],
+            &[Value::Object(Some(sc_ref)), Value::Object(Some(addr))],
         )
         .unwrap()
         .unwrap();
@@ -43532,6 +44016,16 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(conn2, Value::Int(1));
+        call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/SocketChannel",
+            "close",
+            "()V",
+            &[Value::Object(Some(sc_ref))],
+        )
+        .unwrap();
+        drop(listener);
     }
 
     // =====================================================================
@@ -43882,9 +44376,21 @@ mod tests {
         let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(1));
         let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(2));
         let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(3));
-        let spl = alloc_receiver(&shared, &mut thread, "java/util/stream/StreamSupport", 2);
+        // A SYNTHETIC spliterator is the JDK ArraySpliterator shape — runtime
+        // class `java/util/Spliterator`, slots (array, cursor, fence) — which is
+        // what every VM-side producer allocates (`alloc_synthetic(ctx,
+        // "java/util/Spliterator", 3)` in native-collections and
+        // phases_late/streams). This fixture used to be a 2-slot object of class
+        // `java/util/stream/StreamSupport`; the winning native
+        // (`service_loader::native_stream_support_stream_from_spliterator`, which
+        // registers after both phases_late copies) gates on the exact class name,
+        // so it classified the fixture as a REAL Spliterator and took the lazy
+        // branch: slot 0 := null, slot 2 := the spliterator. That null is the
+        // reported `Object(None)`.
+        let spl = alloc_receiver(&shared, &mut thread, "java/util/Spliterator", 3);
         shared.mem.heap.set_field(spl, 0, Value::Object(Some(arr)));
         shared.mem.heap.set_field(spl, 1, Value::Int(0));
+        shared.mem.heap.set_field(spl, 2, Value::Int(3));
         // Create stream from spliterator
         let stream = call_native(
             &shared,
@@ -43897,10 +44403,31 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(matches!(stream, Value::Object(Some(_))));
-        // The stream should have the same backing array
+        // The stream carries the spliterator's [cursor, fence) elements. It is a
+        // fresh SNAPSHOT array, not the spliterator's own backing array — that is
+        // deliberate and required: the source spliterator's cursor keeps moving
+        // (`tryAdvance`/`trySplit` rewrite slots 1 and 2), and the real
+        // `StreamSupport.stream` contract gives the stream a lifetime independent
+        // of it. Asserting array *identity* here pinned an implementation the
+        // native does not and should not have.
         let s_ref = stream.as_object().unwrap();
-        let stream_arr = shared.mem.heap.get_field(s_ref, 0);
-        assert_eq!(stream_arr, Value::Object(Some(arr)));
+        let stream_arr = shared
+            .mem
+            .heap
+            .get_field(s_ref, 0)
+            .as_object()
+            .expect("StreamSupport.stream must materialise a synthetic spliterator eagerly");
+        assert_eq!(shared.mem.heap.array_length(stream_arr), 3);
+        for i in 0..3 {
+            assert_eq!(
+                shared
+                    .mem
+                    .heap
+                    .get_array_element_unboxing(stream_arr, i)
+                    .unwrap(),
+                Value::Int(i as i32 + 1)
+            );
+        }
     }
 
     #[test]
@@ -44128,9 +44655,18 @@ mod tests {
     fn basic_file_attributes_p59() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        // Read attributes from a stub path
+        // `Files.readAttributes` is contractually required to raise
+        // `NoSuchFileException` for a path that does not exist, so this must
+        // point at a file that really is on disk (the old `/tmp/test.txt`
+        // literal only "worked" back when the native answered every read with
+        // a fake all-zero attribute set).
+        let file = std::env::temp_dir().join(format!(
+            "cratonvm_basic_file_attributes_p59_{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&file, b"cratonvm").expect("temp file");
         let path = shared.mem.heap.alloc_object(ClassId::new(0), 1);
-        let path_str = create_java_string(&shared, "/tmp/test.txt");
+        let path_str = create_java_string(&shared, &file.to_string_lossy());
         shared
             .mem
             .heap
@@ -44166,6 +44702,18 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(is_file, Value::Int(1));
+        let size = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/file/attribute/BasicFileAttributes",
+            "size",
+            "()J",
+            &[Value::Object(Some(a_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(size, Value::Long(8));
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]
@@ -44295,7 +44843,28 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(ver, Value::Int(1)); // HTTP/2 default (HTTP_VERSION_2 = 1)
+        // `version()` is declared `()Ljava/net/http/HttpClient$Version;` — a
+        // REFERENCE return. The old `Value::Int(1)` expectation encoded the
+        // native handing back the raw slot int, which every real caller
+        // dereferences (`client.version() == HttpClient.Version.HTTP_2`,
+        // `.name()`, `.ordinal()`, `switch` on it) and would fail on. The
+        // native now returns a genuine enum object built by `p57_alloc_enum`,
+        // the same helper that mints the `HttpClient.Version.HTTP_2` static, so
+        // the two are shape-identical: slot 0 = name String, slot 1 = ordinal.
+        // `newHttpClient()` defaults to HTTP/2, i.e. ordinal 1.
+        let ver_ref = match ver {
+            Value::Object(Some(o)) => o,
+            other => panic!("version() must return an HttpClient$Version object, got {other:?}"),
+        };
+        let name_ref = match shared.mem.heap.get_field(ver_ref, 0) {
+            Value::Object(Some(n)) => n,
+            other => panic!("Version.name slot must hold a String, got {other:?}"),
+        };
+        assert_eq!(
+            read_java_string(&shared.mem.heap, name_ref).as_deref(),
+            Some("HTTP_2")
+        );
+        assert_eq!(shared.mem.heap.get_field(ver_ref, 1), Value::Int(1));
     }
 
     #[test]
@@ -44571,7 +45140,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(closed, Value::Int(0));
-        // Submit an item
+        // Submit an item. `SubmissionPublisher.submit` returns "an estimate of
+        // the maximum lag (number of items submitted but not yet consumed)
+        // among all current subscribers" — with NO subscribers that estimate is
+        // 0, not 1. The native returns the real delivered-subscriber count now
+        // (nb-core B6); the hardcoded 1 it used to return is the exact defect
+        // that `b6_submit_with_no_subscribers_returns_zero_lag` in
+        // `native-builtins` pins down ("no subscribers => estimated lag 0, not a
+        // fake 1"). This assertion is the same contract from the VM side.
         let item = create_java_string(&shared, "event1");
         let lag = call_native(
             &shared,
@@ -44583,7 +45159,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(lag, Value::Int(1));
+        assert_eq!(lag, Value::Int(0));
         // Close
         call_native(
             &shared,
@@ -44909,7 +45485,37 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(cmd, Value::Object(None)); // empty Optional
+        // `ProcessHandle.Info.command()` returns `Optional<String>` — NEVER
+        // null. It also is not a stub any more: it reports this VM's own
+        // executable, the way `ProcessHandleImpl.Info` does (Spring's
+        // `ClassPathManifestEntries` spawns a child JVM from it, and an absent
+        // value there is an immediate `NoSuchElementException`).
+        let cmd_ref = cmd.as_object().expect("command() must return an Optional");
+        let held = shared.mem.heap.get_field(cmd_ref, 0);
+        let exe = std::env::current_exe().expect("current_exe");
+        match held {
+            Value::Object(Some(s)) => assert_eq!(
+                read_java_string(&shared.mem.heap, s).unwrap(),
+                exe.to_string_lossy()
+            ),
+            other => panic!("command() Optional should hold the executable, got {other:?}"),
+        }
+        // `arguments()` has no backing data, so it is a genuinely EMPTY
+        // Optional — still a real object, with a null payload.
+        let args = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ProcessHandle$Info",
+            "arguments",
+            "()Ljava/util/Optional;",
+            &[Value::Object(Some(info_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        let args_ref = args
+            .as_object()
+            .expect("arguments() must return an Optional");
+        assert_eq!(shared.mem.heap.get_field(args_ref, 0), Value::Object(None));
     }
 
     #[test]
@@ -46941,7 +47547,17 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(matches!(lk, Value::Object(Some(_))));
-        // lookupModes = 0x1F (FULL)
+        // `MethodHandles.lookup()` returns a FULL-PRIVILEGE, ORIGINAL lookup.
+        //
+        // JDK `MethodHandles.Lookup`:
+        //   PUBLIC=0x01 PRIVATE=0x02 PROTECTED=0x04 PACKAGE=0x08 MODULE=0x10
+        //   UNCONDITIONAL=0x20 ORIGINAL=0x40
+        //   FULL_POWER_MODES = PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE = 0x1F
+        //   Lookup(Class<?> c) { this(c, null, FULL_POWER_MODES | ORIGINAL); }
+        // and `lookup()` is exactly `new Lookup(callerClass)`, so since JDK 16
+        // `lookup().lookupModes()` is 0x1F|0x40 = 0x5F (95), NOT the bare 0x1F
+        // this assertion used to carry (the pre-Java-9 FULL_POWER value).
+        // `privateLookupIn` is the one that yields 0x1F — it drops ORIGINAL.
         let modes = call_native(
             &shared,
             &mut thread,
@@ -46952,7 +47568,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(modes, Value::Int(0x1F));
+        assert_eq!(modes, Value::Int(0x5F));
     }
 
     #[test]
@@ -46979,8 +47595,50 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(modes, Value::Int(0x01)); // PUBLIC only
-                                             // toString
+        // `publicLookup()` reports UNCONDITIONAL (0x20) and nothing else.
+        //
+        // Verified against the JDK 25 sources
+        // (`java.base/java/lang/invoke/MethodHandles.java` in `src.zip`):
+        //
+        //   public static Lookup publicLookup() { return Lookup.PUBLIC_LOOKUP; }
+        //   static final Lookup PUBLIC_LOOKUP =
+        //       new Lookup(Object.class, null, UNCONDITIONAL);
+        //   public int lookupModes() { return allowedModes & ALL_MODES; }
+        //   ALL_MODES = PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE|
+        //               UNCONDITIONAL|ORIGINAL
+        //
+        // so the answer is the bare UNCONDITIONAL bit. This assertion used to
+        // carry 0x01 (PUBLIC) — the pre-Java-9 value — and the native had been
+        // written to match it. PUBLIC|UNCONDITIONAL (0x21) is wrong too: the
+        // JDK treats that combination as impossible, since `Lookup.toString()`
+        // switches on the exact mode word with a bare `case UNCONDITIONAL` arm
+        // and a `default:` that asserts false.
+        assert_eq!(modes, Value::Int(0x20));
+        // Per the same source the lookup class is `java.lang.Object`:
+        // `publicLookup()` is not caller-sensitive and never carries a null
+        // lookup class. Non-null is as far as this unit test can check —
+        // `SharedVm::new(VmConfig::default())` has no class path, so
+        // `Class.getName()` on the mirror is not reliably resolvable here (it
+        // falls back to `unknown_<id>` with no class-store entry).
+        let lookup_class = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/invoke/MethodHandles$Lookup",
+            "lookupClass",
+            "()Ljava/lang/Class;",
+            &[lk],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(lookup_class, Value::Object(Some(_))),
+            "publicLookup().lookupClass() must be the java.lang.Object mirror, never null"
+        );
+        // toString. Divergence, deliberately left as-is: the real JDK prints
+        // `java.lang.Object/publicLookup` for an UNCONDITIONAL lookup (see the
+        // `toString()` switch cited above), while our synthetic Lookup prints a
+        // fixed class name. Fixing that is a separate change to the `toString`
+        // native, not to `publicLookup()`.
         let ts = call_native(
             &shared,
             &mut thread,
@@ -49260,9 +49918,33 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let afc = "java/nio/channels/AsynchronousFileChannel";
 
+        // `AsynchronousFileChannel.open` is file-backed for real (it opens the
+        // path through `std::fs`), and the JDK specifies a null path as a
+        // NullPointerException — so the channel needs a real file. A fresh
+        // empty one also makes the `size() == 0` assertion below meaningful
+        // rather than a property of "no file was ever opened".
+        let file_path = std::env::temp_dir().join(format!(
+            "cratonvm_async_file_channel_p67_{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&file_path, b"").expect("create empty temp file");
+        let path_text = create_java_string(&shared, &file_path.to_string_lossy());
+        let path = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/file/Paths",
+            "get",
+            "(Ljava/lang/String;)Ljava/nio/file/Path;",
+            &[Value::Object(Some(path_text))],
+        )
+        .unwrap()
+        .unwrap();
+        let path_ref = path.as_object().unwrap();
+
+        // Null options array => the default READ access mode.
         let ch = call_native(&shared, &mut thread, afc, "open",
             "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/nio/channels/AsynchronousFileChannel;",
-            &[Value::Object(None), Value::Object(None)]).unwrap().unwrap();
+            &[Value::Object(Some(path_ref)), Value::Object(None)]).unwrap().unwrap();
         assert!(matches!(ch, Value::Object(Some(_))));
 
         if let Value::Object(Some(c)) = ch {
@@ -49314,6 +49996,7 @@ mod tests {
             .unwrap();
             assert_eq!(open2, Value::Int(0));
         }
+        let _ = std::fs::remove_file(&file_path);
     }
 
     #[test]
@@ -49594,7 +50277,22 @@ mod tests {
         .unwrap();
         assert!(matches!(walker, Value::Object(Some(_))));
 
-        // getCallerClass returns null (stub)
+        // `getCallerClass` is no longer the null stub this assertion was
+        // written against: `stack_walker::native_get_caller_class` now walks
+        // the captured trace and returns the caller of the @CallerSensitive
+        // frame. This test calls it with an EMPTY interpreter stack (a bare
+        // `call_native` off a fresh JvmThread), which is the documented
+        // "degraded" case — the native deliberately answers with a non-null
+        // `java.lang.Object` mirror rather than null, because the boot-path
+        // feature detectors (JBoss-Modules / Keycloak) that reach it accept
+        // any non-null Class but NPE on null. Assert the contract that
+        // actually holds: a non-null Class mirror.
+        //
+        // (Known deviation from HotSpot, which throws
+        // `UnsupportedOperationException` for a walker created without
+        // `RETAIN_CLASS_REFERENCE` and `IllegalCallerException` when there is
+        // no caller frame. The native does not receive the walker receiver at
+        // all here, so it cannot consult the option set.)
         let caller = call_native(
             &shared,
             &mut thread,
@@ -49605,7 +50303,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(caller, Value::Object(None));
+        assert!(
+            matches!(caller, Value::Object(Some(_))),
+            "getCallerClass must degrade to a non-null Class mirror, got {caller:?}"
+        );
     }
 
     #[test]
@@ -49932,17 +50633,40 @@ mod tests {
             assert_eq!(text, "PKIX");
         }
 
+        // Ask for the algorithm `getDefaultAlgorithm()` just reported. This
+        // used to pass a null algorithm name and expect a factory back, which
+        // no JDK does: `TrustManagerFactory.getInstance` starts with
+        // `Objects.requireNonNull(algorithm, "null algorithm name")`, and our
+        // native correspondingly refuses an algorithm that no registered
+        // Provider claims. The test, not the native, was wrong — a factory
+        // handed out for "no algorithm" is a factory nothing can trust.
+        let algo = create_java_string(&shared, "PKIX");
         let inst = call_native(
             &shared,
             &mut thread,
             tmf,
             "getInstance",
             "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
-            &[Value::Object(None)],
+            &[Value::Object(Some(algo))],
         )
         .unwrap()
         .unwrap();
         assert!(matches!(inst, Value::Object(Some(_))));
+
+        // ...and an algorithm no provider implements must still be rejected.
+        let bogus = create_java_string(&shared, "not-a-real-tmf-algorithm");
+        assert!(
+            call_native(
+                &shared,
+                &mut thread,
+                tmf,
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
+                &[Value::Object(Some(bogus))],
+            )
+            .is_err(),
+            "TrustManagerFactory.getInstance must reject an unknown algorithm"
+        );
     }
 
     #[test]
@@ -51019,7 +51743,44 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
+        // `PosixFilePermissions.toString` renders the ACTUAL membership of the
+        // set it is handed — it is not a fixed-string stub any more, and a
+        // `null` set states no permissions at all. Feed it the real 0755 set
+        // that `fromString` builds so this is a genuine round-trip, which is
+        // also the only formulation that is meaningful on Windows (where the
+        // host filesystem has no POSIX mode of its own to read).
+        let perms = create_java_string(&shared, "rwxr-xr-x");
+        let set = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/file/attribute/PosixFilePermissions",
+            "fromString",
+            "(Ljava/lang/String;)Ljava/util/Set;",
+            &[Value::Object(Some(perms))],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(set, Value::Object(Some(_))), "expected a Set");
+
         let s = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/file/attribute/PosixFilePermissions",
+            "toString",
+            "(Ljava/util/Set;)Ljava/lang/String;",
+            &[set],
+        )
+        .unwrap()
+        .unwrap();
+        if let Value::Object(Some(sref)) = s {
+            let text = read_java_string(&shared.mem.heap, sref).unwrap();
+            assert_eq!(text, "rwxr-xr-x");
+        } else {
+            panic!("Expected string");
+        }
+
+        // A null set is "no permissions", not "all permissions".
+        let empty = call_native(
             &shared,
             &mut thread,
             "java/nio/file/attribute/PosixFilePermissions",
@@ -51029,9 +51790,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        if let Value::Object(Some(sref)) = s {
-            let text = read_java_string(&shared.mem.heap, sref).unwrap();
-            assert_eq!(text, "rwxr-xr-x");
+        if let Value::Object(Some(sref)) = empty {
+            assert_eq!(read_java_string(&shared.mem.heap, sref).unwrap(), "---------");
         } else {
             panic!("Expected string");
         }
@@ -52085,6 +52845,47 @@ mod tests {
         .unwrap();
         assert_eq!(fin, Value::Int(0));
 
+        // Feed real input. `setInput` must make the deflater stop asking for
+        // more, and `deflate` must produce a genuine DEFLATE stream — the
+        // previous stubs answered a constant 0 here, so every caller silently
+        // produced an empty archive.
+        let payload: &[u8] = b"cratonvm deflate round-trip cratonvm deflate round-trip";
+        let input =
+            shared
+                .mem
+                .heap
+                .alloc_array(ClassId::new(0), ArrayElementType::Byte, payload.len());
+        for (i, &b) in payload.iter().enumerate() {
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(input, i, Value::Int(b as i32));
+        }
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/zip/Deflater",
+            "setInput",
+            "([B)V",
+            &[Value::Object(Some(defl)), Value::Object(Some(input))],
+        )
+        .unwrap();
+        let ni2 = call_native(
+            &shared,
+            &mut thread,
+            "java/util/zip/Deflater",
+            "needsInput",
+            "()Z",
+            &[Value::Object(Some(defl))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            ni2,
+            Value::Int(0),
+            "needsInput must be false while input is pending"
+        );
+
         // finish()
         call_native(
             &shared,
@@ -52095,6 +52896,47 @@ mod tests {
             &[Value::Object(Some(defl))],
         )
         .unwrap();
+
+        // HotSpot sets `Deflater.finished` INSIDE `deflate()` (when zlib reports
+        // Z_STREAM_END), never in `finish()` itself — `finish()` only raises the
+        // "flush the final block next time" request. So drain the compressor
+        // before asserting it, exactly as the canonical
+        // `while (!def.finished()) out.write(buf, 0, def.deflate(buf))` loop does.
+        let out_buf = shared
+            .mem
+            .heap
+            .alloc_array(ClassId::new(0), ArrayElementType::Byte, 256);
+        let mut compressed: Vec<u8> = Vec::new();
+        for _ in 0..64 {
+            let n = call_native(
+                &shared,
+                &mut thread,
+                "java/util/zip/Deflater",
+                "deflate",
+                "([BII)I",
+                &[
+                    Value::Object(Some(defl)),
+                    Value::Object(Some(out_buf)),
+                    Value::Int(0),
+                    Value::Int(256),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+            let n = match n {
+                Value::Int(n) => n,
+                other => panic!("deflate returned {other:?}"),
+            };
+            if n <= 0 {
+                break;
+            }
+            for i in 0..n as usize {
+                match shared.mem.heap.get_array_element(out_buf, i) {
+                    Ok(Value::Int(b)) => compressed.push(b as u8),
+                    other => panic!("deflate output slot {i}: {other:?}"),
+                }
+            }
+        }
         let fin2 = call_native(
             &shared,
             &mut thread,
@@ -52106,6 +52948,69 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(fin2, Value::Int(1));
+        assert!(
+            !compressed.is_empty(),
+            "deflate produced no output — the compressor is a stub"
+        );
+        // Default (nowrap=false) Deflater emits the ZLIB wrapper.
+        assert_eq!(compressed[0] & 0x0f, 0x08, "expected a ZLIB CM=8 header");
+
+        // Round-trip through Inflater: proves the bytes are real DEFLATE and not
+        // a fabricated payload.
+        let infl = alloc_receiver(&shared, &mut thread, "java/util/zip/Inflater", 4);
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/zip/Inflater",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(infl))],
+        )
+        .unwrap();
+        let cin =
+            shared
+                .mem
+                .heap
+                .alloc_array(ClassId::new(0), ArrayElementType::Byte, compressed.len());
+        for (i, &b) in compressed.iter().enumerate() {
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(cin, i, Value::Int(b as i32));
+        }
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/zip/Inflater",
+            "setInput",
+            "([B)V",
+            &[Value::Object(Some(infl)), Value::Object(Some(cin))],
+        )
+        .unwrap();
+        let dst = shared.mem.heap.alloc_array(
+            ClassId::new(0),
+            ArrayElementType::Byte,
+            payload.len() + 16,
+        );
+        let produced = call_native(
+            &shared,
+            &mut thread,
+            "java/util/zip/Inflater",
+            "inflate",
+            "([B)I",
+            &[Value::Object(Some(infl)), Value::Object(Some(dst))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(produced, Value::Int(payload.len() as i32));
+        let mut round_tripped: Vec<u8> = Vec::with_capacity(payload.len());
+        for i in 0..payload.len() {
+            match shared.mem.heap.get_array_element(dst, i) {
+                Ok(Value::Int(b)) => round_tripped.push(b as u8),
+                other => panic!("inflate output slot {i}: {other:?}"),
+            }
+        }
+        assert_eq!(round_tripped.as_slice(), payload);
     }
 
     #[test]
@@ -52889,16 +53794,38 @@ mod tests {
         };
         assert_eq!(ps, "/api/test");
 
-        // start/stop
-        call_native(
+        // `HttpServer.create()` returns a server that is deliberately NOT bound
+        // ("Creates a HttpServer instance which is initially not bound to any
+        // local address/port … The server must be bound using bind() before it
+        // can be used"), and `ServerImpl.start()` rejects an unbound server with
+        // IllegalStateException("server in wrong state"). `start()` declares no
+        // checked exception, so this must NOT surface as an IOException.
+        //
+        // This used to `.unwrap()` a success. It could never have been one: the
+        // no-arg factory minted a carrier with no `server_registry` entry at
+        // all, so `start()` failed with `IOException("server not registered")` —
+        // an internal-plumbing error, not the JDK's contract. The factory now
+        // shares Phase E's carrier and registry entry, so the failure that
+        // remains is the real, documented one.
+        let started = call_native(
             &shared,
             &mut thread,
             "com/sun/net/httpserver/HttpServer",
             "start",
             "()V",
             &[Value::Object(Some(srv_ref))],
-        )
-        .unwrap();
+        );
+        let started_err = match started {
+            Err(e) => e.to_string(),
+            Ok(v) => panic!("start() on an unbound server must throw, got Ok({v:?})"),
+        };
+        assert!(
+            started_err.contains("IllegalStateException"),
+            "start() on an unbound server must raise IllegalStateException, got {started_err}"
+        );
+
+        // stop() on a never-started server is a no-op in the JDK, and it also
+        // drops this server's registry entry.
         call_native(
             &shared,
             &mut thread,
@@ -56783,8 +57710,10 @@ mod tests {
     // Dynamic Proxy dispatch tests (java.lang.reflect.Proxy)
     // -------------------------------------------------------------------------
 
-    /// Test that Proxy.newProxyInstance returns a Proxy$Instance object and
-    /// stores the InvocationHandler in field 0.
+    /// Test that Proxy.newProxyInstance returns a proxy object (a generated
+    /// `jdk/proxyM/$ProxyN`, or the legacy `Proxy$Instance` shim) and stores
+    /// the InvocationHandler in field 0, retrievable via
+    /// `Proxy.getInvocationHandler`.
     #[test]
     fn proxy_new_instance_stores_handler() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -56811,7 +57740,19 @@ mod tests {
 
         let proxy_ref = proxy_val.as_object().unwrap();
 
-        // Verify that proxy is a Proxy$Instance (class name check)
+        // Verify the proxy's class shape.
+        //
+        // This used to demand the literal `java/lang/reflect/Proxy$Instance`.
+        // That is the LEGACY synthetic shim; the canonical path now emits a
+        // real generated class file and names it the way HotSpot's
+        // `ProxyBuilder` does — `jdk/proxy<M>/$Proxy<N>`, one `jdk/proxyM`
+        // package per defining loader (`proxy_class_name` in
+        // native-builtins/src/reflect_annotations.rs; the pre-JDK-9 name was
+        // `com/sun/proxy/$ProxyN`). Asserting the shim name would pin the VM
+        // to the degraded fallback, so accept either shape: the generated
+        // `$ProxyN` (canonical, `CRATONVM_REAL_PROXY` default-on) or the shim
+        // (`CRATONVM_REAL_PROXY=0`, or a generation failure in non-strict
+        // mode).
         let proxy_class_id = shared.mem.heap.class_id_of(proxy_ref);
         let proxy_class_name = shared
             .classes
@@ -56820,17 +57761,45 @@ mod tests {
             .get_class(proxy_class_id)
             .map(|c| c.name.clone())
             .unwrap_or_default();
-        assert_eq!(
-            &*proxy_class_name, "java/lang/reflect/Proxy$Instance",
-            "newProxyInstance should return Proxy$Instance object"
+        let generated_name = (proxy_class_name.starts_with("jdk/proxy")
+            || proxy_class_name.starts_with("com/sun/proxy"))
+            && proxy_class_name.contains("$Proxy");
+        assert!(
+            generated_name || &*proxy_class_name == "java/lang/reflect/Proxy$Instance",
+            "newProxyInstance should return a generated jdk/proxyM/$ProxyN \
+             (or the Proxy$Instance shim), got {proxy_class_name}"
         );
 
-        // Verify field 0 is the handler
+        // What this test is really for: the InvocationHandler must be STORED
+        // and RETRIEVABLE. Slot 0 is the handler in both layouts — the real
+        // `java.lang.reflect.Proxy` super declares exactly one field, `h`
+        // (the ONE synthetic class in this VM given a NAMED field), and the
+        // synthetic `Proxy$Instance` super puts the handler at slot 0 too.
         let stored_handler = shared.mem.heap.get_field(proxy_ref, 0);
         assert_eq!(
             stored_handler,
             Value::Object(Some(handler)),
             "InvocationHandler should be stored in field 0"
+        );
+
+        // ...and it must come back out through the public API, which also
+        // proves the proxy's superclass chain is recognised as a proxy
+        // (`Proxy.getInvocationHandler` throws IllegalArgumentException for a
+        // non-proxy receiver).
+        let via_api = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/reflect/Proxy",
+            "getInvocationHandler",
+            "(Ljava/lang/Object;)Ljava/lang/reflect/InvocationHandler;",
+            &[Value::Object(Some(proxy_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            via_api,
+            Value::Object(Some(handler)),
+            "Proxy.getInvocationHandler should return the handler that was stored"
         );
     }
 
@@ -58435,13 +59404,20 @@ mod tests {
     /// End-to-end test that exercises real JDK bytecode with `use_synthetic_jdk = false`.
     ///
     /// This test:
-    /// 1. Boots the VM in real-JDK mode (only essential natives registered)
-    /// 2. Calls `String.valueOf(int)` which is a bytecode method in the real JDK
-    /// 3. Calls `Integer.valueOf(int)` and then `Integer.intValue()` round-trip
-    /// 4. Enables `audit_missing_natives` and prints what's missing for visibility
+    /// 1. Boots the VM in real-JDK mode and checks the real-JDK registry filter
+    ///    is engaged (see the long note in step 1 — this used to be a raw
+    ///    `native_methods.len() < 2700` assertion, which measured a property
+    ///    real-JDK mode does not implement)
+    /// 2. Calls `Integer.valueOf(int)` and then `Integer.intValue()` round-trip
+    /// 3. Calls `String.valueOf(int)`
+    /// 4. Checks `java/lang/Integer` was loaded from a real `.class` file
+    ///    (`!is_synthetic_stub`, >10 methods with a real `Code` attribute)
+    /// 5. Enables `audit_missing_natives` and prints what's missing for visibility
     ///
-    /// This proves that real JDK .class bytecode is being loaded and executed,
-    /// not Rust stubs.
+    /// Item 4 is the load-bearing proof that real JDK `.class` bytecode is
+    /// loaded. Items 2-3 are NOT such a proof: real-JDK mode registers natives
+    /// that shadow `Integer.valueOf`, `Integer.intValue` and `String.valueOf`,
+    /// so those calls run Rust. See the caveat at step 2 in the body.
     #[test]
     fn real_jdk_hello_world_e2e() {
         // Discover JAVA_HOME
@@ -58474,17 +59450,123 @@ mod tests {
         };
         let mut vm = Vm::new(config);
 
-        // ---- Step 1: Verify we are in real-JDK mode (fewer natives) ----
+        // ---- Step 1: Verify the real-JDK-mode registry filter is engaged ----
+        //
+        // 2026-07-31: this step used to assert `native_methods.len() < 2700`
+        // ("Real JDK mode should have < 2700 native stubs"). That assertion was
+        // measuring something the VM has never implemented, and it observed
+        // 10,9xx for a long time before it was investigated. Three separate
+        // reasons, all verified against this tree — do NOT restore it as a raw
+        // count with a bigger constant:
+        //
+        // 1. NOTHING FILTERS BY CATEGORY IN REAL-JDK MODE. The stub-dropping
+        //    mechanism is `NativeMethodRegistry::drop_synthetic_stubs`
+        //    (native-api/src/registry.rs), and both real-JDK arms of
+        //    `vm_init.rs` deliberately do NOT turn it on — see the block
+        //    comments at `vm/src/vm/vm_init.rs` ("NOTE: unconditionally
+        //    dropping ALL SyntheticStub-tagged natives in real-JDK mode was
+        //    tried (dev d8092acb, 2026-07-14) and reverted the same day") and
+        //    the twin "set_drop_synthetic_stubs(true) intentionally NOT called
+        //    here". It is opt-in via `CRATONVM_NO_STUBS` only. So `len()` here
+        //    is the FULL registration surface of every category, not a stub
+        //    count, and no threshold on it can mean what the old message said.
+        //
+        // 2. THE SURFACE GENUINELY GREW, BY DESIGN.
+        //    `register_essential_natives_with_shims`
+        //    (native-builtins/src/lib.rs) — the registrar the real-JDK arm
+        //    calls — is now ~13k lines: ~940 direct `register(...)` calls plus
+        //    ~90 sub-registrars, covering third-party app shims (Spring,
+        //    Jackson, Jasper/JSP, JBoss Modules, Jython, Conscrypt/TLS, JDBC,
+        //    JFR, WildFly naming/security/datasources, HTTP client, sockets,
+        //    zip, Vector API) as well as JDK bridges. The "~150 essential
+        //    natives" in `vm/Cargo.toml` and the "~300 truly-native methods" in
+        //    `vm/src/config.rs` are stale by more than an order of magnitude.
+        //
+        // 3. RE-ANCHORING ON `NativeKind::SyntheticStub == 0` WOULD BE
+        //    VACUOUS TODAY. Categories are ambient (`set_category` /
+        //    `with_category`), and 244 `register_*` functions across
+        //    native-builtins/-collections/-io (~2,900 `register` calls) never
+        //    set one at all, so they inherit whatever their caller left. The
+        //    largest single case is `register_essential_natives_with_shims`
+        //    itself, which pins `NativeKind::Bridge` across its whole body
+        //    under the comment "These are the ACC_NATIVE methods with no
+        //    bytecode" — true for the JDK bridges, false for the app shims
+        //    registered in the same span (e.g. `register_ecj_problem_overrides`,
+        //    `register_jfr_natives`, `register_jdk_security_natives`,
+        //    `register_test_harness_natives` all set no category of their own).
+        //    Fixing that mis-tagging is a real, large VM cleanup; it is a
+        //    prerequisite for any category-based assertion here, not something
+        //    this test can paper over.
+        //
+        // The count invariant that IS meaningful lives in
+        // `vm/src/vm/vm_init.rs::real_jdk_mode_registers_fewer_natives` (real
+        // <= synthetic) and `synthetic_mode_registers_many_natives`. What this
+        // test can honestly guard is that real-JDK mode's registry filter is
+        // actually engaged, which is asserted below.
         let native_count = vm.shared.natives.native_methods.len();
-        eprintln!("[real_jdk_e2e] Native methods registered: {}", native_count);
-        // Session 85: corrective overrides grew the count to ~2568; keep +100 headroom.
-        assert!(
-            native_count < 2700,
-            "Real JDK mode should have < 2700 native stubs, got {}",
-            native_count
+        let registrations = vm.shared.natives.native_methods.dump_registrations();
+        let (mut synthetic_stubs, mut bridges, mut intrinsics) = (0usize, 0usize, 0usize);
+        for (_, _, _, kind) in &registrations {
+            match kind {
+                cratonvm_native_api::NativeKind::SyntheticStub => synthetic_stubs += 1,
+                cratonvm_native_api::NativeKind::Bridge => bridges += 1,
+                cratonvm_native_api::NativeKind::Intrinsic => intrinsics += 1,
+            }
+        }
+        eprintln!(
+            "[real_jdk_e2e] Native methods registered: {} (SyntheticStub={} Bridge={} Intrinsic={})",
+            native_count, synthetic_stubs, bridges, intrinsics
         );
 
-        // ---- Step 2: Integer.valueOf(42) → real bytecode execution ----
+        // Real-JDK mode sets `set_drop_real_layout_synthetic(true)` BEFORE any
+        // `register_*` pass (both arms of `vm_init.rs`), and the registry then
+        // refuses every registration on the classes whose synthetic field
+        // layout corrupts the real JDK object. `java/io/StringReader` is an
+        // unconditional entry in that filter AND is genuinely offered in
+        // real-JDK mode — `native-io`'s `register_string_rw_natives` registers
+        // nine `java/io/StringReader` triples and is reached from
+        // `register_io_natives`, which the real-JDK arm calls. So its absence
+        // from the registry here is a direct, non-numeric observation that the
+        // real-JDK filter took effect. If someone drops
+        // `set_drop_real_layout_synthetic(true)` or reorders it after a
+        // registrar, this fails immediately — which is what the old `< 2700`
+        // proxy was reaching for. (Deliberately NOT asserted on
+        // `java/util/EnumSet`: it is in the same filter, but its registrar
+        // `phases_early::register_enum_set_natives` only runs under
+        // `register_synthetic_overrides`, so in real-JDK mode that assertion
+        // would be vacuously true and would guard nothing.)
+        let real_jdk_dropped_class = "java/io/StringReader";
+        assert!(
+            !registrations
+                .iter()
+                .any(|(c, _, _, _)| *c == real_jdk_dropped_class),
+            "real-JDK mode must drop all {real_jdk_dropped_class} natives \
+             (set_drop_real_layout_synthetic); found one registered"
+        );
+        assert!(
+            native_count > 0,
+            "real-JDK mode still needs its bridge/intrinsic surface registered"
+        );
+
+        // ---- Step 2: Integer.valueOf(42) ----
+        //
+        // CAVEAT (2026-07-31), because the header comment above used to claim
+        // this "proves real JDK .class bytecode is being loaded and executed,
+        // not Rust stubs": it does not. A registered native shadows a class's
+        // bytecode at EVERY dispatch site, and real-JDK mode registers natives
+        // for all three probes used in steps 2-4 —
+        // `lang_math::register_wrapper_natives` (reached from
+        // `register_essential_natives_with_shims`) registers
+        // `Integer.valueOf(I)Ljava/lang/Integer;` and `Integer.intValue()I` as
+        // `NativeKind::Intrinsic`, and `register_essential_natives_with_shims`
+        // itself registers `String.valueOf(I)Ljava/lang/String;` (see the
+        // "String.valueOf and Integer.toString overrides" block in
+        // native-builtins/src/lib.rs). Steps 2-4 therefore exercise
+        // the Rust natives, not JDK bytecode. The load-bearing real-JDK proof
+        // in this test is step 6 (`!is_synthetic_stub` plus >10 real Code
+        // attributes on `java/lang/Integer`); steps 2-5 are smoke tests that
+        // the dispatch path returns sane values. Picking probe methods that are
+        // genuinely un-shadowed would make steps 2-4 mean what they claim.
         let result = invoke_or_native(
             &vm.shared,
             &mut vm.main_thread,
@@ -61320,14 +62402,58 @@ mod tests {
             &[],
         )
         .unwrap();
+        // The winning `DatagramChannel` natives are the fd-table-backed ones in
+        // native-io: they deliberately keep the channel's fd and its connected
+        // flag in identity-hash side tables (`dc_fds` / `dc_connected_channels`)
+        // rather than in object slots, because a real-JDK `DatagramChannel`'s
+        // low slots belong to its own private layout. So query the state
+        // through the natives; the old slot 1/2/3 reads described a synthetic
+        // layout that no longer backs this object.
         match result {
             Some(Value::Object(Some(ch))) => {
-                // field 1 = open (should be 1)
-                assert_eq!(shared.mem.heap.get_field(ch, 1), Value::Int(1));
-                // field 2 = connected (should be 0)
-                assert_eq!(shared.mem.heap.get_field(ch, 2), Value::Int(0));
-                // field 3 = blocking (should be 1)
-                assert_eq!(shared.mem.heap.get_field(ch, 3), Value::Int(1));
+                let open = call_native(
+                    &shared,
+                    &mut thread,
+                    "java/nio/channels/DatagramChannel",
+                    "isOpen",
+                    "()Z",
+                    &[Value::Object(Some(ch))],
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(open, Value::Int(1));
+                let connected = call_native(
+                    &shared,
+                    &mut thread,
+                    "java/nio/channels/DatagramChannel",
+                    "isConnected",
+                    "()Z",
+                    &[Value::Object(Some(ch))],
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(connected, Value::Int(0));
+                // "A newly-created channel is always in blocking mode."
+                let blocking = call_native(
+                    &shared,
+                    &mut thread,
+                    "java/nio/channels/DatagramChannel",
+                    "isBlocking",
+                    "()Z",
+                    &[Value::Object(Some(ch))],
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(blocking, Value::Int(1));
+                call_native(
+                    &shared,
+                    &mut thread,
+                    "java/nio/channels/DatagramChannel",
+                    "close",
+                    "()V",
+                    &[Value::Object(Some(ch))],
+                )
+                .unwrap();
             }
             _ => panic!("expected DatagramChannel object"),
         }
@@ -61352,8 +62478,17 @@ mod tests {
             _ => panic!("expected channel"),
         };
 
-        // Create a fake SocketAddress
-        let sa = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        // A real peer address. `DatagramChannel.connect` issues a genuine UDP
+        // `connect(2)` (it only records the default peer — no listener has to
+        // exist), so the address must actually decode: the old
+        // `alloc_object(ClassId::new(0), 2)` placeholder carried neither host
+        // nor port and was correctly rejected as an unsupported SocketAddress.
+        // This is the flat `(host: String, port: int)` InetSocketAddress
+        // layout `dc_socket_addr` falls back to.
+        let host = create_java_string(&shared, "127.0.0.1");
+        let sa = alloc_receiver(&shared, &mut thread, "java/net/InetSocketAddress", 2);
+        shared.mem.heap.set_field(sa, 0, Value::Object(Some(host)));
+        shared.mem.heap.set_field(sa, 1, Value::Int(9)); // discard port
 
         // Connect
         call_native(
@@ -61365,13 +62500,9 @@ mod tests {
             &[Value::Object(Some(ch)), Value::Object(Some(sa))],
         )
         .unwrap();
-        assert_eq!(
-            shared.mem.heap.get_field(ch, 2),
-            Value::Int(1),
-            "should be connected"
-        );
 
-        // isConnected
+        // isConnected — the connected flag lives in native-io's identity-hash
+        // side table, not in an object slot, so ask the native.
         let connected = call_native(
             &shared,
             &mut thread,
@@ -61381,7 +62512,7 @@ mod tests {
             &[Value::Object(Some(ch))],
         )
         .unwrap();
-        assert_eq!(connected, Some(Value::Int(1)));
+        assert_eq!(connected, Some(Value::Int(1)), "should be connected");
 
         // Disconnect
         call_native(
@@ -61393,11 +62524,25 @@ mod tests {
             &[Value::Object(Some(ch))],
         )
         .unwrap();
-        assert_eq!(
-            shared.mem.heap.get_field(ch, 2),
-            Value::Int(0),
-            "should be disconnected"
-        );
+        let disconnected = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "isConnected",
+            "()Z",
+            &[Value::Object(Some(ch))],
+        )
+        .unwrap();
+        assert_eq!(disconnected, Some(Value::Int(0)), "should be disconnected");
+        call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "close",
+            "()V",
+            &[Value::Object(Some(ch))],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -61462,33 +62607,78 @@ mod tests {
             _ => panic!("expected channel"),
         };
 
-        // Set non-blocking
-        call_native(
-            &shared,
-            &mut thread,
-            "java/nio/channels/DatagramChannel",
-            "configureBlocking",
-            "(Z)Ljava/nio/channels/SelectableChannel;",
-            &[Value::Object(Some(ch)), Value::Int(0)],
-        )
-        .unwrap();
+        // Assert the OBSERVABLE contract — what `isBlocking()` answers — and
+        // never a raw slot index.
+        //
+        // This used to read `heap.get_field(ch, 3)` directly. Slot 3 was the
+        // blocking flag of the retired 5-field synthetic `DatagramChannel`
+        // layout; the winning `open` is native-io's fd-table-backed one, which
+        // allocates `DC_NUM_FIELDS` slots and keeps blocking mode (like the fd
+        // and the connected flag) in an identity-hash side table, because a
+        // real-JDK `DatagramChannel`'s low slots belong to its own private
+        // layout. So that assertion was reading a slot nothing writes: it
+        // reported "non-blocking" from a zeroed/out-of-bounds cell, and would
+        // have said exactly the same thing had `configureBlocking` done
+        // nothing at all — which, until the side table was added, was very
+        // nearly the case (it flipped the OS socket and recorded nothing
+        // Java-visible).
+        //
+        // Round-tripping BACK to blocking is the assertion that has teeth: a
+        // reader wired to the wrong state can accidentally satisfy the
+        // "initially blocking" and "non-blocking after configureBlocking(false)"
+        // steps, but only a reader that actually observes what
+        // `configureBlocking` wrote can satisfy all three.
+        fn is_blocking(shared: &Arc<SharedVm>, thread: &mut JvmThread, ch: ObjectRef) -> Value {
+            call_native(
+                shared,
+                thread,
+                "java/nio/channels/DatagramChannel",
+                "isBlocking",
+                "()Z",
+                &[Value::Object(Some(ch))],
+            )
+            .unwrap()
+            .expect("isBlocking() must return a value")
+        }
+
+        fn configure_blocking(
+            shared: &Arc<SharedVm>,
+            thread: &mut JvmThread,
+            ch: ObjectRef,
+            blocking: bool,
+        ) {
+            call_native(
+                shared,
+                thread,
+                "java/nio/channels/DatagramChannel",
+                "configureBlocking",
+                "(Z)Ljava/nio/channels/SelectableChannel;",
+                &[Value::Object(Some(ch)), Value::Int(i32::from(blocking))],
+            )
+            .unwrap();
+        }
+
+        // "A newly-created channel is always in blocking mode"
+        // (`java.nio.channels.SelectableChannel`).
         assert_eq!(
-            shared.mem.heap.get_field(ch, 3),
-            Value::Int(0),
-            "should be non-blocking"
+            is_blocking(&shared, &mut thread, ch),
+            Value::Int(1),
+            "a freshly opened channel must report blocking mode"
         );
 
-        // isBlocking should return 0
-        let blocking = call_native(
-            &shared,
-            &mut thread,
-            "java/nio/channels/DatagramChannel",
-            "isBlocking",
-            "()Z",
-            &[Value::Object(Some(ch))],
-        )
-        .unwrap();
-        assert_eq!(blocking, Some(Value::Int(0)));
+        configure_blocking(&shared, &mut thread, ch, false);
+        assert_eq!(
+            is_blocking(&shared, &mut thread, ch),
+            Value::Int(0),
+            "configureBlocking(false) must be visible to isBlocking()"
+        );
+
+        configure_blocking(&shared, &mut thread, ch, true);
+        assert_eq!(
+            is_blocking(&shared, &mut thread, ch),
+            Value::Int(1),
+            "configureBlocking(true) must switch the channel back to blocking"
+        );
     }
 
     #[test]
@@ -69515,8 +70705,16 @@ mod tests {
 
     #[test]
     fn p86_interrupt_unblocks_monitor_wait() {
-        // A thread waiting on monitor_wait should observe the interrupt flag
-        // upon wakeup (timeout-based wait).
+        // `Thread.interrupt()` on a thread parked in `Object.wait(timeout)` must
+        // (a) end the wait well before the timeout, and (b) surface as an
+        // `InterruptedException` whose throw CONSUMES the interrupt status.
+        //
+        // JLS §17.2.1 / `Object.wait`: "the interrupted status of the current
+        // thread is cleared" when InterruptedException is thrown. So asserting
+        // the flag is still SET after `wait` returns asserts the opposite of the
+        // Java contract — `monitor_wait`'s own `swap(false)` before returning
+        // `Err(InterruptedException)` is the correct behaviour, and the exception
+        // (not a leftover flag) is how the wakeup reason reaches the caller.
         use std::sync::atomic::Ordering;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -69545,13 +70743,34 @@ mod tests {
             thread: &mut thread,
         };
         ctx.monitor_enter(lock);
-        let _result = ctx.monitor_wait(lock, Some(500)); // 500ms timeout, but interrupt should wake us
+        let started = std::time::Instant::now();
+        let result = ctx.monitor_wait(lock, Some(500)); // interrupt should wake us long before this
+        let waited = started.elapsed();
         ctx.monitor_exit(lock);
 
         interrupter.join().unwrap();
+        // (a) the interrupt, not the timeout, ended the wait.
         assert!(
-            flag.load(Ordering::Acquire),
-            "Interrupt flag should be set after wait returns"
+            waited < std::time::Duration::from_millis(400),
+            "interrupt should end the wait well before the 500ms timeout, waited {waited:?}"
+        );
+        // (b) it surfaced as InterruptedException...
+        assert!(
+            matches!(
+                &result,
+                Err(crate::error::MethodCallFailed::InternalError(
+                    crate::error::VmError::Runtime(
+                        crate::error::RuntimeError::InterruptedException
+                    )
+                ))
+            ),
+            "interrupted wait must throw InterruptedException, got {result:?}"
+        );
+        // ...and (c) throwing it cleared the interrupt status, per JLS §17.2.1.
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "InterruptedException consumes the interrupt status; the flag must be \
+             clear once wait() has thrown"
         );
     }
 
@@ -72262,6 +73481,26 @@ public class SkippedTest {
         assert!(!mic.is_monomorphic());
     }
 
+    /// What a receiver-class change does to a populated MIC.
+    ///
+    /// It does NOT retarget the slot, and that is the point. A raw inline MIC
+    /// has no helper boundary between its class-guard load and its indirect
+    /// `CALL`, so a concurrent retarget could pair one receiver's guard with
+    /// another receiver's entry pointer and transfer control to the wrong
+    /// method. `JitMICSlot::update` has therefore been monomorphic for the
+    /// slot's lifetime since the CAS-based install protocol landed (commit
+    /// `1ee92e3fd`, "The MIC install protocol is now atomic (CAS-based,
+    /// monomorphic-for-lifetime) instead of a read-then-store retarget
+    /// race"); `jit/src/lib.rs`'s `s33_mic_slot_update_first_install_wins_
+    /// no_retarget` pins the same rule from the JIT crate's side.
+    ///
+    /// This test predated that fix and still asserted the old retargeting
+    /// semantics (class id 2 / "Cat" / entry `0x2000`), so it had failed ever
+    /// since. It now asserts what the class change actually must do: leave
+    /// the installed triple COHERENT — guard, name and entry all still
+    /// describing the first receiver, never a mixed pair — while the miss is
+    /// still counted so the adaptive recompiler can promote the site to a PIC,
+    /// which is how a second receiver eventually gets cached.
     #[test]
     fn s33_mic_cache_update_on_class_change() {
         use cratonvm_jit::JitMICSlot;
@@ -72274,13 +73513,30 @@ public class SkippedTest {
         mic.record_hit();
         mic.record_hit();
 
-        // Class changes to Cat — miss triggers update
+        // Class changes to Cat — the miss is recorded, and the update for the
+        // new class is refused rather than tearing the installed entry.
         mic.record_miss();
         mic.update(2, "Cat", 0x2000, true);
 
-        assert_eq!(mic.cached_class_id.load(Ordering::Acquire), 2);
-        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("Cat"));
-        assert_eq!(mic.cached_entry_ptr.load(Ordering::Acquire), 0x2000);
+        assert_eq!(
+            mic.cached_class_id.load(Ordering::Acquire),
+            1,
+            "a different receiver class must not retarget a populated MIC"
+        );
+        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("Dog"));
+        assert_eq!(
+            mic.cached_entry_ptr.load(Ordering::Acquire),
+            0x1000,
+            "the guard and the entry pointer must still describe the SAME \
+             receiver — a mixed pair is the miscompile this protocol prevents"
+        );
+        assert!(
+            !mic.cached_needs_context.load(Ordering::Relaxed),
+            "the refused update must not leak its context flag either"
+        );
+        // The miss is still observable, which is what drives the site to a PIC.
+        assert_eq!(mic.misses.load(Ordering::Relaxed), 1);
+        assert_eq!(mic.total_observations(), 4);
     }
 
     #[test]
@@ -72357,19 +73613,52 @@ public class SkippedTest {
         assert!(!mic.is_megamorphic());
     }
 
+    /// `needs_context` must reach the slot from the update that INSTALLS it —
+    /// and only from that one.
+    ///
+    /// Generated code reads `cached_needs_context` to decide whether to thread
+    /// the VM context pointer through the inline dispatch, so the flag has to
+    /// travel with the entry pointer it describes. The second half is the same
+    /// monomorphic-for-lifetime rule `s33_mic_cache_update_on_class_change`
+    /// documents: a refused update for a different class must not flip the
+    /// flag either, or the slot would call the installed entry with the OTHER
+    /// method's calling convention.
+    ///
+    /// This test used to install into one slot twice and expect the second
+    /// (different-class) update to win, which the CAS install protocol has
+    /// refused since commit `1ee92e3fd`; it therefore always failed. Two
+    /// slots, one per convention, test the propagation it was named for.
     #[test]
     fn s33_mic_needs_context_flag_propagates() {
         use cratonvm_jit::JitMICSlot;
         use std::sync::atomic::Ordering;
 
-        let mic = JitMICSlot::new();
-        // Context-free method
-        mic.update(1, "Adder", 0x1000, false);
-        assert!(!mic.cached_needs_context.load(Ordering::Relaxed));
+        // Context-free method: the flag stays clear.
+        let context_free = JitMICSlot::new();
+        context_free.update(1, "Adder", 0x1000, false);
+        assert_eq!(context_free.cached_class_id.load(Ordering::Acquire), 1);
+        assert!(!context_free.cached_needs_context.load(Ordering::Relaxed));
 
-        // Context-requiring method
-        mic.update(2, "Allocator", 0x2000, true);
-        assert!(mic.cached_needs_context.load(Ordering::Relaxed));
+        // Context-requiring method: the installing update carries it through.
+        let context_needed = JitMICSlot::new();
+        context_needed.update(2, "Allocator", 0x2000, true);
+        assert_eq!(context_needed.cached_class_id.load(Ordering::Acquire), 2);
+        assert!(context_needed.cached_needs_context.load(Ordering::Relaxed));
+
+        // A refused (different-class) update cannot flip the flag under the
+        // entry it does not own.
+        context_free.update(2, "Allocator", 0x2000, true);
+        assert_eq!(context_free.cached_class_id.load(Ordering::Acquire), 1);
+        assert_eq!(context_free.cached_entry_ptr.load(Ordering::Acquire), 0x1000);
+        assert!(!context_free.cached_needs_context.load(Ordering::Relaxed));
+
+        // `clear_compiled_entry` is the sanctioned way to drop a compiled
+        // target, and it must clear the convention flag with it — a stale
+        // "needs context" against a zero entry would be read by the next
+        // publication attempt.
+        context_needed.clear_compiled_entry();
+        assert_eq!(context_needed.cached_entry_ptr.load(Ordering::Acquire), 0);
+        assert!(!context_needed.cached_needs_context.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -73412,8 +74701,26 @@ public class SkippedTest {
     // S41 — JFR Event Completeness
     // -----------------------------------------------------------------------
 
+    /// `DeoptimizationController::deoptimize` must emit a `jdk.Deoptimization`
+    /// event naming the method it deoptimized.
+    ///
+    /// Reads the same place every other JFR emission test in this file reads.
+    /// `emit_*` does NOT write into a `Recording`'s repository — it pushes onto
+    /// the per-thread ring that `RingRegistry::drain_all` collects, and nothing
+    /// moves ring events into a `Recording` until a dump asks for them (see
+    /// `p90_jfr_emitted` and `s41_jfr_emitted`, which were corrected for
+    /// exactly this). This test still read `Recording::get_events()` — a
+    /// repository nothing had filled — so it reported "should have been
+    /// recorded" no matter what the deopt path did.
+    ///
+    /// Takes `P90_JFR_LOCK` because the ring and the JFR-enabled flag are
+    /// process-global: a neighbouring emission test running concurrently would
+    /// otherwise steal these events, and the recording is now stopped at the
+    /// end so this test does not leave `cratonvm_jfr::is_enabled()` latched on
+    /// for the rest of the binary.
     #[test]
     fn s41_deopt_emits_jfr_event() {
+        let _guard = P90_JFR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config = crate::config::VmConfig {
             use_synthetic_jdk: true,
             ..Default::default()
@@ -73421,12 +74728,18 @@ public class SkippedTest {
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
         *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
 
-        // Start a JFR recording
-        {
+        // Start a JFR recording — `emit_deoptimization_event` is a no-op while
+        // `cratonvm_jfr::is_enabled()` is false.
+        let rid = {
             let mut jfr = vm.debug.flight_recorder.lock();
             let rid = jfr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             jfr.start_recording(rid);
-        }
+            rid
+        };
+
+        // Discard anything an earlier test left on this thread's ring so the
+        // assertion below can only be satisfied by the deopt we trigger.
+        let _ = cratonvm_jfr::repository::global_ring_registry().drain_all();
 
         // Trigger a deoptimization
         crate::jit::helpers::DeoptimizationController::deoptimize(
@@ -73438,11 +74751,10 @@ public class SkippedTest {
             10,
         );
 
-        // Verify JFR event was recorded
-        let mut jfr = vm.debug.flight_recorder.lock();
-        let rec = jfr.get_recording_mut(1).unwrap();
-        let events = rec.get_events();
-        let deopt_events: Vec<_> = events
+        let drained = cratonvm_jfr::repository::global_ring_registry().drain_all();
+        vm.debug.flight_recorder.lock().stop_recording(rid);
+
+        let deopt_events: Vec<_> = drained
             .iter()
             .filter(|e| {
                 e.fields.iter().any(
@@ -73454,6 +74766,15 @@ public class SkippedTest {
             !deopt_events.is_empty(),
             "Deoptimization JFR event should have been recorded"
         );
+        // The method key the controller builds, and the reason it was handed.
+        let e = deopt_events[0];
+        assert!(e.fields.iter().any(
+            |f| matches!(f, cratonvm_jfr::EventValue::String(s) if &**s == "TestClass.testMethod:()V")
+        ));
+        assert!(e
+            .fields
+            .iter()
+            .any(|f| matches!(f, cratonvm_jfr::EventValue::Str(s) if *s == "NullCheck")));
     }
 
     #[test]

@@ -34,13 +34,16 @@
 //! |  3   | `pending`   Int | bytes accumulated since init     |
 //! |  4   | `key_id`    Long  | crypto_impl handle from KPG    |
 //!
-//! The actual `update(byte[])` payload lives in a process-wide side
-//! table keyed on `NativeContext::identity_hash_code(this)` — see
-//! `crypto_impl::sig_data_{append,take,clear}_h`.  Identity-hash-code keys
-//! survive GC compaction (`HashCodeTable::update_after_gc` in
+//! The actual `update(byte[])` payload lives in a side table keyed on
+//! `(NativeContext::vm_identity(), identity_hash_code(this))` — see
+//! `sig_payload_table` below.  Identity-hash-code keys survive GC
+//! compaction (`HashCodeTable::update_after_gc` in
 //! `gc/src/compact_header.rs`).  Pre-C18 the table was keyed on
 //! `this.as_ptr() as u64`; a compaction silently orphaned the entry and
-//! `sign()` returned a signature over `b""`.
+//! `sign()` returned a signature over `b""`.  The `vm_identity` component
+//! was added later: the store used to be `crypto_impl::sig_data_*_h`,
+//! which is process-global, so two `Vm`s in one process could consume each
+//! other's buffers whenever their receivers' identity hashes collided.
 
 #![allow(clippy::collapsible_if)]
 
@@ -94,48 +97,89 @@ const SIG_PRIVATE_SLOTS: usize = 6;
 // (`HashCodeTable::update_after_gc`, `gc/src/compact_header.rs`).  All
 // accessors therefore thread `&mut dyn NativeContext`.  Mirrors the pattern
 // from `lang_invoke::VH_META_TABLE` (`native-builtins/src/lang_invoke.rs`).
+//
+// VM-scope fix: the identity hash code is unique only *within one heap*.
+// Rust tests (and any embedder) create several independent `Vm`s in one
+// process, and these tables are `static` — so VM B's `Signature` whose
+// identity hash happens to equal VM A's silently reads VM A's algorithm /
+// state / key id.  `NativeContext::vm_identity`'s own doc states the rule
+// ("Native side caches ... must scope entries to this value",
+// `native-api/src/registry.rs`); the same omission in native-collections'
+// `widened_obj_key` aliased two VMs' collections and aborted the process.
+// Every key here is therefore `(vm_identity, identity_hash_code)` — the
+// established shape, cf. `phases_late::net_channels` and `servlet.rs`.
+//
+// None of these tables hold heap `ObjectRef`s (algorithm index, state,
+// `crypto_impl` key handle and the raw `update()` payload are all plain Rust
+// data), so no GC scan/remap companion is required — only the keys had to
+// become address- and heap-independent.
 // ---------------------------------------------------------------------------
 
-fn sig_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+/// VM-scoped, GC-stable side-table key for a `Signature` receiver.
+type SigKey = (usize, i32);
+
+/// `(owning VM, GC-stable identity hash)` for `this`.
+fn sig_key(ctx: &mut dyn NativeContext, this: ObjectRef) -> SigKey {
+    (ctx.vm_identity(), ctx.identity_hash_code(this))
+}
+
+fn sig_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn sig_state_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+fn sig_state_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn sig_keyid_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, u64>> {
+fn sig_keyid_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, u64>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, u64>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, u64>>> = OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+/// The `Signature.update(...)` payload store.
+///
+/// Was `crypto_impl::sig_data_{append,take,clear}_h`, a `static
+/// HashMap<i32, Vec<u8>>` keyed on the identity hash alone.  That store is
+/// process-global with no VM scope, so two VMs in one process could append
+/// to — and `take` — each other's buffers: VM B's `sign()` would consume the
+/// bytes VM A had accumulated (and leave VM A's `sign()` to fail the
+/// `take_data` `None` check with `IllegalStateException`).  The payload lives
+/// here instead, under the same `(vm_identity, identity_hash)` key as the
+/// sibling tables above.  `Vec<u8>` — no `ObjectRef`s, so no GC hooks.
+fn sig_payload_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, Vec<u8>>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, Vec<u8>>>> =
+        OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 fn set_sig_algo(ctx: &mut dyn NativeContext, this: ObjectRef, idx: i32) {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_algo_table().lock().insert(key, idx);
 }
 fn get_sig_algo(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_algo_table().lock().get(&key).copied()
 }
 fn set_sig_state(ctx: &mut dyn NativeContext, this: ObjectRef, st: i32) {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_state_table().lock().insert(key, st);
 }
 fn get_sig_state(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_state_table().lock().get(&key).copied()
 }
 fn set_sig_keyid(ctx: &mut dyn NativeContext, this: ObjectRef, kid: u64) {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_keyid_table().lock().insert(key, kid);
 }
 fn get_sig_keyid(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<u64> {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_keyid_table().lock().get(&key).copied()
 }
 
@@ -364,8 +408,12 @@ fn append_data(ctx: &mut dyn NativeContext, this: ObjectRef, data: &[u8]) {
         base + SIG_OFF_PENDING,
         Value::Int(cur + data.len() as i32),
     );
-    let key = ctx.identity_hash_code(this);
-    crypto_impl::sig_data_append_h(key, data);
+    let key = sig_key(ctx, this);
+    sig_payload_table()
+        .lock()
+        .entry(key)
+        .or_default()
+        .extend_from_slice(data);
 }
 
 /// Remove the receiver's accumulated payload from the side table.
@@ -385,8 +433,9 @@ fn take_data(
 ) -> Result<Vec<u8>, cratonvm_types::error::MethodCallFailed> {
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
-    let key = ctx.identity_hash_code(this);
-    crypto_impl::sig_data_take_h(key).ok_or_else(|| {
+    let key = sig_key(ctx, this);
+    let taken = sig_payload_table().lock().remove(&key);
+    taken.ok_or_else(|| {
         RuntimeError::IllegalStateException {
             message: "Signature payload missing post-GC or init*() never called".into(),
         }
@@ -395,8 +444,11 @@ fn take_data(
 }
 
 fn clear_data(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    let key = ctx.identity_hash_code(this);
-    crypto_impl::sig_data_clear_h(key);
+    let key = sig_key(ctx, this);
+    // Seed an *empty* buffer rather than removing the entry: `take_data`
+    // distinguishes "init*() ran, no update() bytes" (Some(empty)) from
+    // "never initialised / entry lost" (None → IllegalStateException).
+    sig_payload_table().lock().insert(key, Vec::new());
 }
 
 // ---------------------------------------------------------------------------
@@ -459,16 +511,29 @@ fn verify_dispatch(alg: i32, key_id: u64, data: &[u8], sig: &[u8]) -> Option<boo
 
 /// Real-SunEC `ECDSASignature$*` SPI class for an algo index, or `None` when EC
 /// routing is off or the algo is not ECDSA.
-fn ecdsa_real_spi_class(alg: i32) -> Option<&'static str> {
+///
+/// `ctx` is consulted because `route_ec_to_real()` only says we *prefer* the
+/// real SunEC bytecode — it does not say the bytecode is present. Under the
+/// synthetic JDK the named class would be a fabricated, code-less stub, and
+/// `jca::key_factory::real_ec_keypair_available` makes EC keygen fall back to
+/// `crypto_impl` in exactly that case. The two checks must agree: a synthetic
+/// EC key carries a `crypto_impl` `key_id` that a SunEC SPI cannot read, and a
+/// real `ECPrivateKeyImpl` carries no `key_id` for the synthetic dispatch. Both
+/// keys and both signature operations therefore key off the same question.
+fn ecdsa_real_spi_class(ctx: &dyn NativeContext, alg: i32) -> Option<&'static str> {
     if !crate::route_ec_to_real() {
         return None;
     }
-    match alg {
-        SIG_SHA256_ECDSA => Some("sun/security/ec/ECDSASignature$SHA256"),
-        SIG_SHA384_ECDSA => Some("sun/security/ec/ECDSASignature$SHA384"),
-        SIG_SHA512_ECDSA => Some("sun/security/ec/ECDSASignature$SHA512"),
-        _ => None,
+    let cls = match alg {
+        SIG_SHA256_ECDSA => "sun/security/ec/ECDSASignature$SHA256",
+        SIG_SHA384_ECDSA => "sun/security/ec/ECDSASignature$SHA384",
+        SIG_SHA512_ECDSA => "sun/security/ec/ECDSASignature$SHA512",
+        _ => return None,
+    };
+    if ctx.would_fabricate_synthetic_stub(cls) {
+        return None;
     }
+    Some(cls)
 }
 
 /// Real SunEC EdDSA SPI for the requested curve. The generic `EdDSA` SPI
@@ -918,7 +983,7 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER output).
-    if let Some(spi_class) = ecdsa_real_spi_class(alg) {
+    if let Some(spi_class) = ecdsa_real_spi_class(ctx, alg) {
         return drive_real_signature_spi(ctx, this, spi_class, None);
     }
     if let Some(spi_class) = eddsa_real_spi_class(alg) {
@@ -990,7 +1055,7 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER verify).
-    if let Some(spi_class) = ecdsa_real_spi_class(alg) {
+    if let Some(spi_class) = ecdsa_real_spi_class(ctx, alg) {
         let provided = match args.get(1) {
             Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
             _ => Vec::new(),

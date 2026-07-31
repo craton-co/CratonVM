@@ -18252,8 +18252,12 @@ const COLLECTOR_FIELD_ARG3: usize = 3;
 const COLLECTOR_FIELD_ARG4: usize = 4;
 const COLLECTOR_NUM_FIELDS: usize = 5;
 
-const COLLECTOR_TAG_TO_LIST: i32 = 1;
-const COLLECTOR_TAG_TO_SET: i32 = 2;
+// `pub` where `native-builtins` needs the value: its `phases_late::streams`
+// registers `Collectors` factories this table is the sole decoder for, and its
+// `P56_COLLECTOR_*` constants are aliases of these so the two crates cannot
+// drift into two colliding namespaces again.
+pub const COLLECTOR_TAG_TO_LIST: i32 = 1;
+pub const COLLECTOR_TAG_TO_SET: i32 = 2;
 const COLLECTOR_TAG_JOINING: i32 = 3;
 const COLLECTOR_TAG_JOINING_DELIM: i32 = 4;
 const COLLECTOR_TAG_TO_MAP: i32 = 5;
@@ -18275,7 +18279,7 @@ const COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM: i32 = 11;
 const COLLECTOR_TAG_TO_MAP_MERGE: i32 = 12;
 /// `Collectors.collectingAndThen(downstream, finisher)` — ARG1=downstream
 /// Collector, ARG2=finisher Function applied to the downstream result.
-const COLLECTOR_TAG_COLLECTING_AND_THEN: i32 = 13;
+pub const COLLECTOR_TAG_COLLECTING_AND_THEN: i32 = 13;
 /// `Collectors.toCollection(Supplier)` — ARG1=Supplier producing the target
 /// Collection. Stream elements are added to the supplied Collection via
 /// `Collection.add(Object)`. Required by Spring Boot 4.x
@@ -18291,10 +18295,64 @@ const COLLECTOR_TAG_TO_COLLECTION: i32 = 14;
 /// `AbstractMethodError: Collector.accumulator() has no Code attribute`. Keeping
 /// `mapping` synthetic lets it compose with our tagged downstream collectors via
 /// the same recursive sub-stream protocol used by groupingBy(downstream).
-const COLLECTOR_TAG_MAPPING: i32 = 15;
+pub const COLLECTOR_TAG_MAPPING: i32 = 15;
 /// `Collectors.toMap(keyFn, valFn, mergeFn, supplier)`.
 /// ARG1=keyFn, ARG2=valFn, ARG3=mergeFn, ARG4=supplier.
 const COLLECTOR_TAG_TO_MAP_SUPPLIER: i32 = 16;
+
+// ---------------------------------------------------------------------------
+// Tags 25.. — collectors that only `native-builtins` REGISTERS.
+//
+// `native_stream_collect` below is the only registered
+// `Stream.collect(Collector)` anywhere, so whatever tag the factory writes into
+// field 0 is decoded against THIS table — there is no second decoder. For
+// `minBy`/`maxBy`/`filtering`/`summarizing{Int,Long,Double}` the factory lives
+// in `native-builtins` `phases_late::streams` (native-collections registers no
+// such factory, so registration last-wins never hides it), and that crate used
+// to number them in a private 9..15 space that collided head-on with the
+// groupingBy/toMap/collectingAndThen/toCollection/mapping tags above:
+// `collect(minBy(cmp))` decoded as GROUPING_BY_SUPPLIER and handed the program
+// back a Map where the `java.util.stream.Collectors` contract requires an
+// `Optional` — a silent wrong answer, not a crash.
+//
+// The band starts at 25, not 17, because `native-builtins` still spends 18 on
+// its (shadowed) collectingAndThen and 19..24 on averaging*/summing*, none of
+// which this table decodes. The `P56_COLLECTOR_*` names over there are now
+// `const` ALIASES of the constants below, so the two crates can no longer drift
+// apart again.
+/// `Collectors.minBy(Comparator)` — ARG1 = Comparator. Result is an
+/// `Optional`, empty for an empty stream.
+pub const COLLECTOR_TAG_MIN_BY: i32 = 25;
+/// `Collectors.maxBy(Comparator)` — ARG1 = Comparator. Result is an
+/// `Optional`, empty for an empty stream.
+pub const COLLECTOR_TAG_MAX_BY: i32 = 26;
+/// `Collectors.filtering(Predicate, Collector)` — ARG1 = Predicate,
+/// ARG2 = downstream Collector. Elements failing the predicate are dropped;
+/// the survivors are collected through the downstream collector via the same
+/// recursive sub-stream protocol `mapping`/`groupingBy(downstream)` use, so the
+/// downstream may be another tagged collector OR a real JDK one.
+pub const COLLECTOR_TAG_FILTERING: i32 = 27;
+/// `Collectors.summarizingInt(ToIntFunction)` — ARG1 = the extractor. Result is
+/// a `java.util.IntSummaryStatistics` in the 4-field layout
+/// (count=0 Long, sum=1 Long, min=2 Int, max=3 Int) that `native-builtins`
+/// `register_phase56_summary_stats` getters read.
+pub const COLLECTOR_TAG_SUMMARIZING_INT: i32 = 28;
+/// `Collectors.summarizingLong(ToLongFunction)` — ARG1 = the extractor.
+/// Result is a `java.util.LongSummaryStatistics` (min/max are `Long`).
+pub const COLLECTOR_TAG_SUMMARIZING_LONG: i32 = 29;
+/// `Collectors.summarizingDouble(ToDoubleFunction)` — ARG1 = the extractor.
+/// Result is a `java.util.DoubleSummaryStatistics` (sum/min/max are `Double`).
+pub const COLLECTOR_TAG_SUMMARIZING_DOUBLE: i32 = 30;
+
+// `{Int,Long,Double}SummaryStatistics` 4-field synthetic layout. Must stay in
+// step with `native-builtins` `phases_late::streams::STATS_FIELD_*`, which
+// backs the `getCount/getSum/getMin/getMax/getAverage/toString` natives that
+// read the objects the summarizing arms below build.
+const STATS_FIELD_COUNT: usize = 0;
+const STATS_FIELD_SUM: usize = 1;
+const STATS_FIELD_MIN: usize = 2;
+const STATS_FIELD_MAX: usize = 3;
+const STATS_NUM_FIELDS: usize = 4;
 
 fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -18558,6 +18616,12 @@ fn is_known_collector_tag(tag: i32) -> bool {
             | COLLECTOR_TAG_TO_COLLECTION
             | COLLECTOR_TAG_MAPPING
             | COLLECTOR_TAG_TO_MAP_SUPPLIER
+            | COLLECTOR_TAG_MIN_BY
+            | COLLECTOR_TAG_MAX_BY
+            | COLLECTOR_TAG_FILTERING
+            | COLLECTOR_TAG_SUMMARIZING_INT
+            | COLLECTOR_TAG_SUMMARIZING_LONG
+            | COLLECTOR_TAG_SUMMARIZING_DOUBLE
     )
 }
 
@@ -18790,6 +18854,26 @@ fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
             ctx.set_field(long_obj, 0, Value::Long(n));
             Ok(Some(Value::Object(Some(long_obj))))
+        }
+        // minBy / maxBy / filtering / summarizing* are non-identity finishes
+        // too: the accumulation container is a plain list of the elements, and
+        // the real result (Optional / downstream result / SummaryStatistics) is
+        // computed here. Without this arm a raw-protocol driver got the bare
+        // ArrayList — the same shape bug the eager `collect` path had.
+        Some(
+            tag @ (COLLECTOR_TAG_MIN_BY
+            | COLLECTOR_TAG_MAX_BY
+            | COLLECTOR_TAG_FILTERING
+            | COLLECTOR_TAG_SUMMARIZING_INT
+            | COLLECTOR_TAG_SUMMARIZING_LONG
+            | COLLECTOR_TAG_SUMMARIZING_DOUBLE),
+        ) => {
+            let c = match coll {
+                Value::Object(Some(c)) => c,
+                _ => return Ok(Some(container)),
+            };
+            let elements = container_values(ctx);
+            collect_builtins_collector_tag(ctx, c, tag, &elements)
         }
         _ => Ok(Some(container)),
     }
@@ -19223,6 +19307,215 @@ fn native_stream_collect_3arg(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let container = read_pinned_elem(ctx, cont_handle, container);
     ctx.unpin_native_roots(sup_pin);
     Ok(Some(container))
+}
+
+/// Result computation for the `Collectors` factories that only `native-builtins`
+/// registers — tags 25..30, see the `COLLECTOR_TAG_MIN_BY`..
+/// `COLLECTOR_TAG_SUMMARIZING_DOUBLE` constants. Shared by
+/// `native_stream_collect`'s eager tag dispatch and by `finisher.apply(container)`
+/// on the raw four-method Collector protocol, so an external driver (Reactor's
+/// `MonoStreamCollector`, any hand-rolled supplier/accumulator/finisher loop)
+/// gets the same answer as `stream.collect(...)` instead of the bare
+/// accumulation list.
+///
+/// `elements` must be live on entry (the caller reads them through their pins);
+/// this pins its own frame and releases it before returning.
+fn collect_builtins_collector_tag(
+    ctx: &mut dyn NativeContext,
+    collector: ObjectRef,
+    tag: i32,
+    elements: &[Value],
+) -> MethodCallResult {
+    // cceres3: pin across GC-capable call (stream stale-at-store wave). Every
+    // arm below re-enters Java (comparators, predicates, primitive extractors).
+    let collector_pin = ctx.pin_native_root(collector);
+    let (_, elem_handles) = pin_value_slice(ctx, elements);
+    let result = (|| -> MethodCallResult {
+        match tag {
+            COLLECTOR_TAG_MIN_BY | COLLECTOR_TAG_MAX_BY => {
+                let want_min = tag == COLLECTOR_TAG_MIN_BY;
+                // Read ARG1 before any Java call so `collector` cannot be stale.
+                let comparator = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    // The JDK would NPE inside the collector; an empty Optional
+                    // is the closest answer that does not lie about the shape.
+                    _ => {
+                        let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+                        return Ok(Some(Value::Object(Some(opt))));
+                    }
+                };
+                let cmp_pin = ctx.pin_native_root(comparator);
+                let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+                if elements.is_empty() {
+                    return Ok(Some(Value::Object(Some(opt))));
+                }
+                let opt_pin = ctx.pin_native_root(opt);
+                let mut best = elements[0];
+                let mut best_handle = elem_handles[0];
+                for i in 1..elements.len() {
+                    let comparator = ctx.read_native_pin(cmp_pin, comparator);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let best_arg = read_pinned_elem(ctx, best_handle, best);
+                    let ord = comparator_compare(ctx, comparator, elem, best_arg)?;
+                    // Strict `<` / `>` keeps the JDK's "first of equals wins"
+                    // reduction order for both minBy and maxBy.
+                    let better = match ord {
+                        Some(Value::Int(v)) if want_min => v < 0,
+                        Some(Value::Int(v)) => v > 0,
+                        _ => false,
+                    };
+                    if better {
+                        best = elements[i];
+                        best_handle = elem_handles[i];
+                    }
+                }
+                let opt = ctx.read_native_pin(opt_pin, opt);
+                let best = read_pinned_elem(ctx, best_handle, best);
+                ctx.set_field(opt, OPT_FIELD_VALUE, best);
+                Ok(Some(Value::Object(Some(opt))))
+            }
+            COLLECTOR_TAG_FILTERING => {
+                let predicate = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+                let pred_pin = ctx.pin_native_root(predicate);
+                let ds_handle = pin_value(ctx, downstream);
+                let mut kept: Vec<usize> = Vec::new();
+                for i in 0..elements.len() {
+                    let predicate = ctx.read_native_pin(pred_pin, predicate);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let keep = ctx
+                        .invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])?
+                        .unwrap_or(Value::Int(0));
+                    if matches!(keep, Value::Int(v) if v != 0) {
+                        kept.push(i);
+                    }
+                }
+                let kept_vals: Vec<Value> = kept
+                    .iter()
+                    .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
+                    .collect();
+                // Same recursive sub-stream protocol as `mapping` — the
+                // downstream may be another tagged collector or a real JDK one,
+                // and `native_stream_collect` sorts that out.
+                let inner_stream = make_stream(ctx, &kept_vals)?.unwrap_or(Value::Object(None));
+                let downstream = read_pinned_elem(ctx, ds_handle, downstream);
+                native_stream_collect(ctx, &[inner_stream, downstream])
+            }
+            COLLECTOR_TAG_SUMMARIZING_INT
+            | COLLECTOR_TAG_SUMMARIZING_LONG
+            | COLLECTOR_TAG_SUMMARIZING_DOUBLE => {
+                // The extractor is a primitive SAM (`ToIntFunction` etc.), so it
+                // must be called as `applyAsInt`, never `Function.apply`.
+                let (sam, sam_desc, stats_class) = match tag {
+                    COLLECTOR_TAG_SUMMARIZING_INT => (
+                        "applyAsInt",
+                        "(Ljava/lang/Object;)I",
+                        "java/util/IntSummaryStatistics",
+                    ),
+                    COLLECTOR_TAG_SUMMARIZING_LONG => (
+                        "applyAsLong",
+                        "(Ljava/lang/Object;)J",
+                        "java/util/LongSummaryStatistics",
+                    ),
+                    _ => (
+                        "applyAsDouble",
+                        "(Ljava/lang/Object;)D",
+                        "java/util/DoubleSummaryStatistics",
+                    ),
+                };
+                let func = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let fn_pin = ctx.pin_native_root(func);
+                let mut scored: Vec<Value> = Vec::with_capacity(elements.len());
+                for i in 0..elements.len() {
+                    let func = ctx.read_native_pin(fn_pin, func);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    scored.push(
+                        ctx.invoke_virtual(func, sam, sam_desc, &[elem])?
+                            .unwrap_or(Value::Int(0)),
+                    );
+                }
+                // Allocated after the last Java call, and the folds below run no
+                // bytecode, so `stats` needs no pin.
+                let stats = alloc_synthetic(ctx, stats_class, STATS_NUM_FIELDS);
+                ctx.set_field(stats, STATS_FIELD_COUNT, Value::Long(scored.len() as i64));
+                match tag {
+                    COLLECTOR_TAG_SUMMARIZING_INT => {
+                        // An empty stream keeps the JDK identity seeds
+                        // (min=Integer.MAX_VALUE, max=Integer.MIN_VALUE) — same
+                        // convention as the IntSummaryStatistics no-arg ctor.
+                        let mut sum: i64 = 0;
+                        let mut min = i32::MAX;
+                        let mut max = i32::MIN;
+                        for v in &scored {
+                            let n = match v {
+                                Value::Int(i) => *i,
+                                Value::Long(l) => *l as i32,
+                                _ => 0,
+                            };
+                            sum = sum.wrapping_add(n as i64);
+                            min = min.min(n);
+                            max = max.max(n);
+                        }
+                        ctx.set_field(stats, STATS_FIELD_SUM, Value::Long(sum));
+                        ctx.set_field(stats, STATS_FIELD_MIN, Value::Int(min));
+                        ctx.set_field(stats, STATS_FIELD_MAX, Value::Int(max));
+                    }
+                    COLLECTOR_TAG_SUMMARIZING_LONG => {
+                        let mut sum: i64 = 0;
+                        let mut min = i64::MAX;
+                        let mut max = i64::MIN;
+                        for v in &scored {
+                            let n = match v {
+                                Value::Long(l) => *l,
+                                Value::Int(i) => *i as i64,
+                                _ => 0,
+                            };
+                            sum = sum.wrapping_add(n);
+                            min = min.min(n);
+                            max = max.max(n);
+                        }
+                        ctx.set_field(stats, STATS_FIELD_SUM, Value::Long(sum));
+                        ctx.set_field(stats, STATS_FIELD_MIN, Value::Long(min));
+                        ctx.set_field(stats, STATS_FIELD_MAX, Value::Long(max));
+                    }
+                    _ => {
+                        let mut sum: f64 = 0.0;
+                        let mut min = f64::INFINITY;
+                        let mut max = f64::NEG_INFINITY;
+                        for v in &scored {
+                            let n = match v {
+                                Value::Double(d) => *d,
+                                Value::Float(f) => *f as f64,
+                                Value::Long(l) => *l as f64,
+                                Value::Int(i) => *i as f64,
+                                _ => 0.0,
+                            };
+                            sum += n;
+                            if n < min {
+                                min = n;
+                            }
+                            if n > max {
+                                max = n;
+                            }
+                        }
+                        ctx.set_field(stats, STATS_FIELD_SUM, Value::Double(sum));
+                        ctx.set_field(stats, STATS_FIELD_MIN, Value::Double(min));
+                        ctx.set_field(stats, STATS_FIELD_MAX, Value::Double(max));
+                    }
+                }
+                Ok(Some(Value::Object(Some(stats))))
+            }
+            _ => Ok(Some(Value::Object(None))),
+        }
+    })();
+    ctx.unpin_native_roots(collector_pin);
+    result
 }
 
 fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20169,6 +20462,20 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     (Value::Object(Some(false_key)), false_v),
                 ];
                 make_map_of(ctx, &pairs)
+            }
+            // minBy / maxBy / filtering / summarizing{Int,Long,Double} — the
+            // factories `native-builtins` owns. Shared with the raw-protocol
+            // finisher so both drivers agree.
+            COLLECTOR_TAG_MIN_BY
+            | COLLECTOR_TAG_MAX_BY
+            | COLLECTOR_TAG_FILTERING
+            | COLLECTOR_TAG_SUMMARIZING_INT
+            | COLLECTOR_TAG_SUMMARIZING_LONG
+            | COLLECTOR_TAG_SUMMARIZING_DOUBLE => {
+                // Refresh through the pins first: `stream_elements_mut` above
+                // can have moved every element out from under `elements`.
+                let elems = read_value_slice(ctx, &elem_handles, &elements);
+                collect_builtins_collector_tag(ctx, collector, tag, &elems)
             }
             _ => Ok(Some(Value::Object(None))),
         }
@@ -47263,7 +47570,8 @@ fn native_cf_complete_exceptionally(
         return Ok(Some(Value::Int(0)));
     }
 
-    // Drive the real (un-intercepted) `obtrudeException` bytecode, which stores a
+    // For a REAL-JDK CompletableFuture (the branch below the synthetic check),
+    // drive the real (un-intercepted) `obtrudeException` bytecode, which stores a
     // genuine `CompletableFuture$AltResult(ex)` in `result` — exactly the way real
     // `complete()` (which works on CratonVM) stores values/NIL. This keeps the
     // un-intercepted `get()`/`join()`/`isDone()` bytecode and our
@@ -47281,21 +47589,41 @@ fn native_cf_complete_exceptionally(
     // (`kafkaCompleteExceptionally` -> `super.completeExceptionally` == this native)
     // legitimately needs the base behaviour.
     let synthetic = matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Int(_));
+    if synthetic {
+        // Synthetic (CratonVM-minted) CompletableFuture: its slots are
+        // positional and its class carries no named fields, so the real
+        // `obtrudeException` bytecode — which stores `new AltResult(ex)` into
+        // the field *named* `result` — has nothing to bind to. Worse, driving
+        // it requires `java.util.concurrent.CompletableFuture` bytecode to be
+        // loaded at all; where it is not, the invoke fails and this native
+        // returns an exception instead of completing the future.
+        //
+        // Write the synthetic encoding directly instead: result@0 = the raw
+        // Throwable, done@1 = 2 (exceptionally completed). That is exactly what
+        // `cf_make_synthetic(CfState::Exceptional)` produces and what
+        // `cf_read_state` / `isCompletedExceptionally` read back, and it makes
+        // this native symmetric with its sibling `native_cf_complete`, which
+        // likewise stores into the slots for a synthetic CF and only reaches
+        // for real bytecode (`postComplete`) on the real-JDK layout. Synthetic
+        // CFs have no lock-free `stack` of parked `Signaller`s, so there is
+        // nothing to unpark.
+        ctx.set_field(this, CF_FIELD_RESULT, exc);
+        ctx.set_field(this, CF_FIELD_DONE, Value::Int(2));
+        return Ok(Some(Value::Int(1)));
+    }
     ctx.invoke_special(
         "java/util/concurrent/CompletableFuture",
         "obtrudeException",
         "(Ljava/lang/Throwable;)V",
         &[Value::Object(Some(this)), exc],
     )?;
-    if !synthetic {
-        // Real-JDK CompletableFuture: `obtrudeException` only stores the result;
-        // it does NOT fire the lock-free `stack`@1 of parked `Signaller`s. The
-        // real `completeExceptionally()` runs `postComplete()` to unpark threads
-        // blocked in untimed `get()`/`join()`. Without this they hang forever on a
-        // cross-thread exceptional completion — the same defect fixed in
-        // `native_cf_complete`.
-        ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
-    }
+    // Real-JDK CompletableFuture: `obtrudeException` only stores the result;
+    // it does NOT fire the lock-free `stack`@1 of parked `Signaller`s. The
+    // real `completeExceptionally()` runs `postComplete()` to unpark threads
+    // blocked in untimed `get()`/`join()`. Without this they hang forever on a
+    // cross-thread exceptional completion — the same defect fixed in
+    // `native_cf_complete`.
+    ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
     Ok(Some(Value::Int(1)))
 }
 

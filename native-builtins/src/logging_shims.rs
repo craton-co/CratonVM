@@ -1331,6 +1331,64 @@ pub(crate) fn register_log4j_stacklocator_bridge(registry: &mut NativeMethodRegi
     );
 }
 
+/// Decode a `java.util.logging.Level` argument (or a `Logger`'s stored level
+/// slot) to its `intValue()`, tolerating every shape this VM produces.
+///
+/// There is no single shape to rely on: `java/util/logging/Logger.setLevel` is
+/// registered three times across this file and `lib.rs`, and the winner has
+/// changed with registration order — one stores the `Level` OBJECT in the level
+/// slot, another stores the raw `Value::Int`. A synthetic `Level` additionally
+/// has NO field names (`ensure_synthetic_class` mints unnamed slots), so the
+/// by-name `value` read that the real-JDK layout needs resolves nothing and the
+/// only readable copy is slot 1 (or the level NAME in slot 0).
+///
+/// Returns `None` when the value carries no level at all (a null/unset slot),
+/// so the caller can apply the JDK default rather than a silent 0 — reading an
+/// unset slot as level 0 makes EVERY record loggable, which is the exact bug
+/// this helper exists to prevent.
+fn jul_level_int(ctx: &dyn NativeContext, level: Option<Value>) -> Option<i32> {
+    match level? {
+        Value::Int(v) => Some(v),
+        Value::Long(v) => Some(v as i32),
+        Value::Object(Some(l)) => {
+            if let Value::Int(v) = ctx.get_field_by_name(l, "value") {
+                return Some(v);
+            }
+            if ctx.object_num_fields(l) > 1 {
+                if let Value::Int(v) = ctx.get_field(l, 1) {
+                    return Some(v);
+                }
+            }
+            // Last resort: a Level that only carries its name.
+            let name_slot = if ctx.object_num_fields(l) > 0 {
+                ctx.get_field(l, 0)
+            } else {
+                Value::Object(None)
+            };
+            let name = match ctx.get_field_by_name(l, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => match name_slot {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                },
+            }?;
+            Some(match name.as_str() {
+                "OFF" => i32::MAX,
+                "SEVERE" => 1000,
+                "WARNING" => 900,
+                "INFO" => 800,
+                "CONFIG" => 700,
+                "FINE" => 500,
+                "FINER" => 400,
+                "FINEST" => 300,
+                "ALL" => i32::MIN,
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
     let logger = "java/util/logging/Logger";
     let level = "java/util/logging/Level";
@@ -1416,6 +1474,12 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
             };
             let level = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.set_field(this, LOGGER_FIELD_LEVEL, level);
+            // Also publish to the name-keyed explicit-level table. That table
+            // is what `logmanager::native_jul_logger_is_loggable` — which wins
+            // the `isLoggable` registry slot — consults FIRST, so without this
+            // a `setLevel` served by THIS registration was invisible to the
+            // `isLoggable` served by that one.
+            crate::logmanager::record_jul_logger_level(ctx, this, level);
             Ok(None)
         },
     );
@@ -1434,10 +1498,7 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(1))),
             };
-            let arg_val = match args.get(1) {
-                Some(Value::Object(Some(l))) => ctx.get_field(*l, 1).as_int().unwrap_or(800),
-                _ => 800,
-            };
+            let arg_val = jul_level_int(ctx, args.get(1).copied()).unwrap_or(800);
             // Slot 1 holds EITHER a `Level` object or its raw int value:
             // `java/util/logging/Logger.setLevel` is registered twice in this
             // file, and the later registration (which wins) stores
@@ -1445,11 +1506,8 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
             // object. Reading only the object shape meant every `setLevel`
             // silently left this at the INFO default, so `isLoggable` said yes
             // to everything — `logger.setLevel(SEVERE)` did not suppress INFO.
-            let current = match ctx.get_field(this, LOGGER_FIELD_LEVEL) {
-                Value::Object(Some(l)) => ctx.get_field(l, 1).as_int().unwrap_or(800),
-                Value::Int(v) => v,
-                _ => 800, // default INFO
-            };
+            let stored = ctx.get_field(this, LOGGER_FIELD_LEVEL);
+            let current = jul_level_int(ctx, Some(stored)).unwrap_or(800); // default INFO
             // A message is loggable if its level >= logger's current level
             Ok(Some(Value::Int(if arg_val >= current { 1 } else { 0 })))
         },
@@ -2527,11 +2585,13 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/Level;)Z",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let logger_level = ctx.get_field(this, 1).as_int().unwrap_or(800);
-            let check_level = match args.get(1) {
-                Some(Value::Object(Some(lvl))) => ctx.get_field(*lvl, 1).as_int().unwrap_or(800),
-                _ => 800,
-            };
+            // `as_int()` alone silently answers 800 (INFO) whenever the level slot
+            // holds a `Level` OBJECT rather than a raw int — which is what the
+            // OTHER two `setLevel` registrations store. That default made
+            // `setLevel(SEVERE)` suppress nothing. Decode every shape instead.
+            let stored = ctx.get_field(this, 1);
+            let logger_level = jul_level_int(ctx, Some(stored)).unwrap_or(800);
+            let check_level = jul_level_int(ctx, args.get(1).copied()).unwrap_or(800);
             Ok(Some(Value::Int(if check_level >= logger_level {
                 1
             } else {
@@ -2545,11 +2605,22 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/Level;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let level_val = match args.get(1) {
-                Some(Value::Object(Some(lvl))) => ctx.get_field(*lvl, 1).as_int().unwrap_or(800),
-                _ => 800,
+            let level = args.get(1).copied().unwrap_or(Value::Object(None));
+            // `None` here means `setLevel(null)` — "inherit from the parent",
+            // which must CLEAR the explicit level rather than pin it at INFO.
+            let decoded = jul_level_int(ctx, Some(level));
+            ctx.set_field(this, 1, Value::Int(decoded.unwrap_or(800)));
+            // Publish to the name-keyed explicit-level table too: the
+            // `isLoggable` that actually wins the registry slot
+            // (`logmanager::native_jul_logger_is_loggable`, re-registered last
+            // by `register_logmanager_natives`) reads that table first, and
+            // without this entry it fell back to the INFO default and reported
+            // every level loggable.
+            let recorded = match decoded {
+                Some(v) => Value::Int(v),
+                None => Value::Object(None),
             };
-            ctx.set_field(this, 1, Value::Int(level_val));
+            crate::logmanager::record_jul_logger_level(ctx, this, recorded);
             Ok(None)
         },
     );

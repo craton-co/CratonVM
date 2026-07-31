@@ -6922,8 +6922,25 @@ fn lk_private_lookup_in(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Object(Some(obj))))
 }
 
+/// `publicLookup()`'s modes are **exactly** `UNCONDITIONAL` (0x20).
+///
+/// Verified against JDK 25 `java.base/java/lang/invoke/MethodHandles.java`:
+/// `publicLookup()` returns `Lookup.PUBLIC_LOOKUP`, which is
+/// `new Lookup(Object.class, null, UNCONDITIONAL)`, and `lookupModes()`
+/// returns `allowedModes & ALL_MODES` (ALL_MODES includes UNCONDITIONAL).
+/// This used to answer `PUBLIC|UNCONDITIONAL` (0x21) — a combination the JDK
+/// itself treats as impossible: `Lookup.toString()` switches on the exact
+/// mode word, has a `case UNCONDITIONAL` arm and no `PUBLIC|UNCONDITIONAL`
+/// arm, and its `default:` branch asserts false.
+///
+/// Dropping the PUBLIC bit does not narrow access here: `enforce_lookup_access`
+/// admits every `public` member irrespective of the mode word, and requires
+/// `PRIVATE` for everything else — which this lookup never had.
+///
+/// (This registration sits on `MethodHandles$Lookup`; the live
+/// `MethodHandles.publicLookup()` static is `lang_invoke.rs`'s. Both now agree.)
 fn lk_public_lookup(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = alloc_lookup(ctx, LK_PUBLIC | LK_UNCONDITIONAL);
+    let obj = alloc_lookup(ctx, LK_UNCONDITIONAL);
     Ok(Some(Value::Object(Some(obj))))
 }
 

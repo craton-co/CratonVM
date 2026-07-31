@@ -9195,7 +9195,21 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
     }
 
     fn thread_start(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
-        let shared_arc = self.shared.get_arc();
+        // Spawning a child thread needs an owning `Arc<SharedVm>` to hand to it.
+        // A `SharedVm` built directly (`Arc::new(SharedVm::new(config))`, the
+        // shape unit fixtures use) has no weak self-reference — only `Vm::new()`
+        // installs one — so `get_arc()` would abort the process here. Report the
+        // missing threading substrate as an error instead: natives that spawn
+        // workers (e.g. `StructuredTaskScope.fork`) already document an inline
+        // fallback for "thread_start returned Err (no thread registry
+        // available)", and that fallback cannot run if we panic first.
+        let Some(shared_arc) = self.shared.try_get_arc() else {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: "Thread.start: this VM cannot spawn threads (no `self_arc` \
+                          self-reference installed; not built via Vm::new)"
+                    .to_string(),
+            }));
+        };
         let tid = self.shared.threads.thread_registry.next_thread_id();
         let header = self.shared.mem.heap.get_header(thread_obj);
 

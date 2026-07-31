@@ -36239,10 +36239,23 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // `backtrace`, which `capture_throwable_trace` (called below) sets to the
     // self-reference marker that `getOurStackTrace()` keys on. Writing the
     // String message there would clobber the backtrace marker and re-break
-    // getStackTrace(). The named-field write above is the correct, layout-aware
-    // path; the only objects without a named `detailMessage` are synthetic
-    // stubs, which the no-stubs build does not produce.
-    ctx.set_field_by_name(this, "detailMessage", msg);
+    // getStackTrace(). The named-field write is the correct, layout-aware path.
+    //
+    // FIX (synthetic receiver): the bare `set_field_by_name` this used to be
+    // ALSO silently dropped the message whenever the receiver's class declares
+    // no field names at all — which is every `ensure_synthetic_class` stub, and
+    // therefore every exception in synthetic-JDK mode. `getMessage()` (both
+    // `native_exception_get_message` here and
+    // `lang_misc::native_throwable_get_message`) then falls back to raw slot 0
+    // and finds nothing, so `new IllegalArgumentException("x").getMessage()`
+    // answered null. Route through the shared helper, which writes by name for
+    // a real-JDK layout and falls back to `synthetic_throwable_slot`
+    // (detailMessage = slot 0) only when the by-name write did not take — the
+    // exact slot both readers probe, so writer and reader cannot disagree.
+    // These ctors are registered LATER than
+    // `lang_misc::register_throwable_subclass_natives` and win the slot for
+    // ~50 subclasses, so this path is the live one.
+    crate::lang_misc::write_throwable_detail_message(ctx, this, msg);
     // Surefire bootstrap forensics: capture exact Java callsite for the
     // recurring `NullPointerException("Name is null")` blocker so we can
     // patch the true producer instead of masking symptoms.

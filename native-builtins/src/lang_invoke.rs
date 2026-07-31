@@ -3013,6 +3013,40 @@ fn varhandle_get_and_bitwise_xor(ctx: &mut dyn NativeContext, args: &[Value]) ->
 // CallSite = 1-field synthetic (target=0 MethodHandle)
 // =============================================================================
 
+/// Resolve the heap slot holding a `CallSite`'s `target` `MethodHandle`.
+///
+/// Two layouts reach these natives and they do NOT agree on slot 0:
+///   * real JDK `java.lang.invoke.CallSite` — `{ type, target, context }`, so
+///     `target` is NOT slot 0 (slot 0 is the `MethodType`);
+///   * the synthetic 1-field CallSite model minted by `ensure_synthetic_class`,
+///     whose fields are UNNAMED, so only slot 0 is addressable.
+///
+/// Reading/writing a hard-coded slot 0 in one native and the *named* `target`
+/// field in another (which is exactly what `getTarget` here and the
+/// `register_method_handle_combinator_extras_bridge` copy of
+/// `MutableCallSite.setTarget` used to do) makes the writer and the reader
+/// address different storage: on the synthetic layout `set_field_by_name`
+/// silently no-ops, so `setTarget(mh2); getTarget()` handed back the ctor's
+/// original target. Every CallSite native below funnels through this one
+/// resolver so writer and reader can never disagree again.
+fn cs_target_slot(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    let cid = ctx.class_id_of_object(this);
+    ctx.resolve_field_index_by_class_id(cid, "target")
+        .unwrap_or(0)
+}
+
+/// Read a call site's current `target` (see [`cs_target_slot`]).
+fn cs_read_target(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    let slot = cs_target_slot(ctx, this);
+    ctx.get_field(this, slot)
+}
+
+/// Store a call site's `target` (see [`cs_target_slot`]).
+fn cs_write_target(ctx: &mut dyn NativeContext, this: ObjectRef, target: Value) {
+    let slot = cs_target_slot(ctx, this);
+    ctx.set_field(this, slot, target);
+}
+
 pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -3024,7 +3058,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
+            Ok(Some(cs_read_target(ctx, this)))
         },
     );
     r.register(
@@ -3033,23 +3067,23 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/invoke/MethodHandle;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            cs_write_target(ctx, this, args.get(1).copied().unwrap_or(Value::Object(None)));
             Ok(None)
         },
     );
     // `CallSite.type()` is defined as `target.type()`. It used to be a constant
     // null, which NPE'd every caller that asks a call site for its type
     // (`CallSite.dynamicInvoker`, `MutableCallSite.syncAll`, and any JDK code
-    // that type-checks a call site before invoking it). Slot 0 is the target
-    // MethodHandle; a MethodHandle keeps its MethodType in its named `type`
-    // field, falling back to slot 0 (see the `MethodHandle.type` native).
+    // that type-checks a call site before invoking it). The target slot is
+    // resolved by `cs_target_slot`; a MethodHandle keeps its MethodType in its
+    // named `type` field, falling back to slot 0 (see `MethodHandle.type`).
     r.register(
         cs,
         "type",
         "()Ljava/lang/invoke/MethodType;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let target = match ctx.get_field(this, 0) {
+            let target = match cs_read_target(ctx, this) {
                 Value::Object(Some(t)) => t,
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -3068,7 +3102,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/invoke/MethodHandle;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            cs_write_target(ctx, this, args.get(1).copied().unwrap_or(Value::Object(None)));
             Ok(None)
         },
     );
@@ -3078,7 +3112,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
+            Ok(Some(cs_read_target(ctx, this)))
         },
     );
     r.register(
@@ -3087,7 +3121,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/invoke/MethodHandle;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            cs_write_target(ctx, this, args.get(1).copied().unwrap_or(Value::Object(None)));
             Ok(None)
         },
     );
@@ -3100,7 +3134,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/invoke/MethodHandle;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            cs_write_target(ctx, this, args.get(1).copied().unwrap_or(Value::Object(None)));
             Ok(None)
         },
     );
@@ -3110,7 +3144,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
+            Ok(Some(cs_read_target(ctx, this)))
         },
     );
     r.register(
@@ -3119,7 +3153,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
+            Ok(Some(cs_read_target(ctx, this)))
         },
     );
 
@@ -3131,7 +3165,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/invoke/MethodHandle;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            cs_write_target(ctx, this, args.get(1).copied().unwrap_or(Value::Object(None)));
             Ok(None)
         },
     );
@@ -3141,7 +3175,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
+            Ok(Some(cs_read_target(ctx, this)))
         },
     );
     r.register(
@@ -3150,7 +3184,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/invoke/MethodHandle;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            cs_write_target(ctx, this, args.get(1).copied().unwrap_or(Value::Object(None)));
             Ok(None)
         },
     );
@@ -3260,11 +3294,14 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         "publicLookup",
         "()Ljava/lang/invoke/MethodHandles$Lookup;",
         |ctx, _args| {
-            // publicLookup() is NOT caller-sensitive — it always returns a
-            // Lookup whose lookupClass is java.lang.Object with PUBLIC-only
-            // access. Setting it to Object lets findVarHandle on widely
-            // visible classes still resolve, while preventing access to
-            // package-private members (we don't enforce modes anyway).
+            // publicLookup() is NOT caller-sensitive — it always returns the
+            // same singleton Lookup whose lookupClass is java.lang.Object.
+            // Setting it to Object lets findVarHandle on widely visible
+            // classes still resolve, while preventing access to
+            // package-private members (enforced in
+            // `classloader::enforce_lookup_access`, which admits any public
+            // member regardless of the mode bits and requires PRIVATE for
+            // everything else — so dropping PUBLIC here changes nothing).
             let object_cid = ctx
                 .ensure_class_initialized("java/lang/Object")
                 .unwrap_or(cratonvm_types::ClassId::new(0));
@@ -3272,7 +3309,24 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
             ctx.set_field_by_name(obj, "lookupClass", Value::Object(Some(object_mirror)));
             ctx.set_field(obj, 0, Value::Object(Some(object_mirror)));
-            lk_write_allowed_modes(ctx, obj, 0x01); // PUBLIC only
+            // JDK 9+ contract (verified against JDK 25 src.zip,
+            // java.base/java/lang/invoke/MethodHandles.java):
+            //
+            //   public static Lookup publicLookup() { return Lookup.PUBLIC_LOOKUP; }
+            //   static final Lookup PUBLIC_LOOKUP =
+            //       new Lookup(Object.class, null, UNCONDITIONAL);
+            //   public int lookupModes() { return allowedModes & ALL_MODES; }
+            //   ALL_MODES = PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE|
+            //               UNCONDITIONAL|ORIGINAL
+            //
+            // so `publicLookup().lookupModes()` is exactly UNCONDITIONAL
+            // (0x20) — NOT PUBLIC (0x01), and NOT PUBLIC|UNCONDITIONAL
+            // (0x21). The JDK treats 0x21 as an impossible bit combination:
+            // `Lookup.toString()` switches on the exact mode word, with a
+            // `case UNCONDITIONAL: return cname + "/publicLookup";` arm and
+            // no PUBLIC|UNCONDITIONAL arm, so 0x21 lands in the `default:`
+            // branch that `assert(false)`s.
+            lk_write_allowed_modes(ctx, obj, 0x20); // UNCONDITIONAL only
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4554,6 +4608,14 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
     // MutableCallSite/VolatileCallSite.setTarget(MethodHandle) → store the
     // `target` field directly, skipping the real `checkTargetChange` type
     // comparison (synthetic MethodTypes don't equal JDK forms).
+    //
+    // This registration runs AFTER `register_p60_callsite` (phase 65 vs phase
+    // 60) and the registry is LAST-WINS, so it is the `setTarget` the VM
+    // actually dispatches. It used to write `set_field_by_name(this, "target")`
+    // while `getTarget` read slot 0: on the synthetic CallSite model the fields
+    // are UNNAMED, so the by-name write silently no-op'd and `getTarget()` kept
+    // handing back the constructor's target forever (`callsite_mutable_p60`).
+    // Both halves now go through `cs_target_slot`.
     for cs in [
         "java/lang/invoke/MutableCallSite",
         "java/lang/invoke/VolatileCallSite",
@@ -4565,7 +4627,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
                 let new_target = args.get(1).copied().unwrap_or(Value::Object(None));
-                ctx.set_field_by_name(this, "target", new_target);
+                cs_write_target(ctx, this, new_target);
                 Ok(None)
             },
         );
@@ -4578,12 +4640,9 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
 /// `CallSite.target` field, falling back to the synthetic CallSite model's
 /// slot 0), for stamping a dynamic-invoker handle's descriptor.
 fn callsite_target_desc(ctx: &mut dyn NativeContext, callsite: ObjectRef) -> Option<String> {
-    let target = match ctx.get_field_by_name(callsite, "target") {
+    let target = match cs_read_target(ctx, callsite) {
         Value::Object(Some(t)) => t,
-        _ => match ctx.get_field(callsite, 0) {
-            Value::Object(Some(t)) => t,
-            _ => return None,
-        },
+        _ => return None,
     };
     mh_read_desc(ctx, target)
 }

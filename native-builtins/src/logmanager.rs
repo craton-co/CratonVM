@@ -232,12 +232,22 @@ fn logger_handlers(vm: usize) -> &'static Mutex<HashMap<String, Vec<u64>>> {
     per_vm_table(&INSTANCE, vm)
 }
 
-/// Explicit JUL levels for real Logger objects. Their private configuration
-/// layout is not always materialized by the VM, but callers such as Tomcat's
-/// LogCapture rely on `setLevel(FINE)` taking effect immediately.
-fn logger_explicit_levels() -> &'static Mutex<HashMap<String, i32>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Explicit JUL levels for real Logger objects, keyed by logger name.
+///
+/// Their private configuration layout is not always materialized by the VM,
+/// and the synthetic Logger's own level slot holds one of several shapes
+/// (`Level` object or raw int) depending on which of the several competing
+/// `setLevel` registrations won the registry slot. This name-keyed table is the
+/// one representation every `setLevel` writes and `isLoggable` reads, so the
+/// answer no longer depends on that registration race.
+///
+/// Per VM: logger names are not unique across VMs (every test VM has a
+/// `""` root), so a process-wide table let one VM's `setLevel` silently
+/// re-level another's logger.
+fn logger_explicit_levels(vm: usize) -> &'static Mutex<HashMap<String, i32>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<HashMap<String, i32>>>>> =
+        OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
 }
 
 /// Message payloads for minimally-constructed LogRecord mirrors. The real
@@ -1486,7 +1496,7 @@ fn apply_jul_config_entries(
     // `@AfterEach resetLogger` calling `this.logger.setLevel(Level.OFF)`)
     // would leak into every subsequent test sharing this process and
     // permanently mute that logger.
-    logger_explicit_levels()
+    logger_explicit_levels(ctx.vm_identity())
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
@@ -1571,7 +1581,7 @@ fn apply_jul_config_entries(
         // per-logger explicit level.
         if suffix == "level" {
             if let Some(level) = jul_standard_level_value(v.trim()) {
-                logger_explicit_levels()
+                logger_explicit_levels(ctx.vm_identity())
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(prefix.to_string(), level);
@@ -2494,7 +2504,7 @@ fn jboss_logger_level_filter() -> bool {
 /// [`jboss_logger_level_filter`] (opt-in). INFO and above always emit, so the
 /// WildFly/JBoss boot visibility these natives were written for (`WFLYSRV*`,
 /// `WFLYCTL*`, and the throwable dump) is unaffected either way.
-fn jboss_record_suppressed_by_level(level_name: &str, logger_name: &str) -> bool {
+fn jboss_record_suppressed_by_level(vm: usize, level_name: &str, logger_name: &str) -> bool {
     if !jboss_logger_level_filter() || !matches!(level_name, "DEBUG" | "TRACE") {
         return false;
     }
@@ -2510,7 +2520,7 @@ fn jboss_record_suppressed_by_level(level_name: &str, logger_name: &str) -> bool
     // `java.util.logging.Logger.isLoggable`, whose `config.levelValue` CratonVM
     // never initialises -- it reads 0, so every level compares as enabled and
     // the check answers `true` for TRACE on a default-configured logger.
-    let threshold = jul_ancestor_explicit_level(logger_name).unwrap_or(800);
+    let threshold = jul_ancestor_explicit_level(vm, logger_name).unwrap_or(800);
     record_value < threshold
 }
 
@@ -2634,7 +2644,7 @@ fn native_jboss_logging_logger_do_log(
             _ => None,
         })
         .unwrap_or_default();
-    if jboss_record_suppressed_by_level(&level_name, &logger_name) {
+    if jboss_record_suppressed_by_level(ctx.vm_identity(), &level_name, &logger_name) {
         if let Some(p) = pin_base {
             ctx.unpin_native_roots(p);
         }
@@ -2742,7 +2752,7 @@ fn native_jboss_logging_logger_do_logf(
         .unwrap_or_else(|| "INFO".to_string());
     // Drop below-threshold records BEFORE the (expensive) parameter
     // `toString` + format pass -- see `jboss_record_suppressed_by_level`.
-    if jboss_record_suppressed_by_level(&level_name, &logger_name) {
+    if jboss_record_suppressed_by_level(ctx.vm_identity(), &level_name, &logger_name) {
         if let Some(pin) = pin_base {
             ctx.unpin_native_roots(pin);
         }
@@ -3736,7 +3746,8 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // default-quiet console behaviour this arm was written for is unchanged.
     let level_value =
         jul_standard_level_value(&level_name).unwrap_or(800);
-    let console_threshold = jul_ancestor_explicit_level(&logger_name).unwrap_or(800);
+    let console_threshold =
+        jul_ancestor_explicit_level(ctx.vm_identity(), &logger_name).unwrap_or(800);
     let console_allows_fine = level_value >= console_threshold;
 
     // Map JUL level names to the same compact tags log_simple uses so
@@ -4745,9 +4756,10 @@ pub(crate) fn native_jul_logger_is_loggable(
             })
         })
         .unwrap_or(800);
+    let vm = ctx.vm_identity();
     let threshold = logger
         .map(|logger| read_jul_logger_name(ctx, logger))
-        .map(|name| jul_ancestor_explicit_level(&name).unwrap_or(configured_threshold))
+        .map(|name| jul_ancestor_explicit_level(vm, &name).unwrap_or(configured_threshold))
         .unwrap_or(configured_threshold);
     Ok(Some(Value::Int(if level_value >= threshold {
         1
@@ -4759,7 +4771,7 @@ pub(crate) fn native_jul_logger_is_loggable(
 /// Read a synthetic `Level`'s int value: slot 1 directly, or slot 0's name
 /// mapped through [`jul_standard_level_value`]. Used only after the by-name
 /// lookups fail, i.e. for a receiver with no field names at all.
-fn synthetic_level_value(ctx: &mut dyn NativeContext, level: ObjectRef) -> Option<i32> {
+fn synthetic_level_value(ctx: &dyn NativeContext, level: ObjectRef) -> Option<i32> {
     if ctx.object_num_fields(level) > 1 {
         if let Value::Int(v) = ctx.get_field(level, 1) {
             return Some(v);
@@ -4801,8 +4813,8 @@ fn jul_standard_level_value(name: &str) -> Option<i32> {
 /// still see an ancestor's level, e.g. Spring Boot's
 /// `JavaLoggingSystem.setLogLevel("org.springframework.boot", DEBUG)`
 /// followed by a child logger's `.fine(...)` call).
-fn jul_ancestor_explicit_level(logger_name: &str) -> Option<i32> {
-    let levels = logger_explicit_levels()
+fn jul_ancestor_explicit_level(vm: usize, logger_name: &str) -> Option<i32> {
+    let levels = logger_explicit_levels(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut candidate = logger_name;
@@ -4820,19 +4832,34 @@ fn jul_ancestor_explicit_level(logger_name: &str) -> Option<i32> {
     }
 }
 
+/// Record `logger.setLevel(level)` in the name-keyed explicit-level table.
+///
+/// EVERY `setLevel` registration must funnel through here (there are three
+/// competing ones — `lib.rs`, `logging_shims::register_logging_natives` and
+/// `register_slf4j_natives` — and which one wins the registry slot has changed
+/// more than once). The table is what `isLoggable` consults first, so routing
+/// all of them through it makes the answer independent of which slot shape the
+/// winning `setLevel` happens to store.
 pub(crate) fn record_jul_logger_level(ctx: &dyn NativeContext, logger: ObjectRef, level: Value) {
     let name = read_jul_logger_name(ctx, logger);
     if name.is_empty() {
         return;
     }
     let value = match level {
+        // A `setLevel` that already reduced the Level to its int value.
+        Value::Int(value) => Some(value),
         Value::Object(Some(level)) => match ctx.get_field_by_name(level, "value") {
             Value::Int(value) => Some(value),
-            _ => None,
+            // Synthetic `Level`: `ensure_synthetic_class` mints UNNAMED
+            // fields, so the by-name read above resolves nothing and this used
+            // to record `None` — i.e. `setLevel(SEVERE)` REMOVED the entry and
+            // suppressed nothing. Fall back to the synthetic layout
+            // (name = slot 0, value = slot 1) the rest of this file reads.
+            _ => synthetic_level_value(ctx, level),
         },
         _ => None,
     };
-    let mut levels = logger_explicit_levels()
+    let mut levels = logger_explicit_levels(ctx.vm_identity())
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(value) = value {

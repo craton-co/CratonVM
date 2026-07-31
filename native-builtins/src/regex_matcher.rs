@@ -1280,7 +1280,17 @@ fn native_pattern_split_impl(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// Keyed by `ctx.identity_hash_code(matcher)`, NOT `ObjectRef`.
+/// Keyed by `(vm_identity, ctx.identity_hash_code(matcher))`, NOT `ObjectRef`.
+///
+/// The VM half of the key is NOT optional. `identity_hash_code` is minted from
+/// a PER-HEAP counter (`GenerationalHeap::next_hash`), so two VMs alive at the
+/// same time in one process — every parallel `cargo test` thread builds its own
+/// `SharedVm` — hand out the SAME small integers for their first objects. With
+/// a bare `i32` key, VM A's `Matcher` #k found VM B's entry and, because VM B's
+/// input `String` had also been minted the same `input_identity`, passed the
+/// freshness check and returned VM B's decoded text: `find()` then searched the
+/// wrong string and reported no match. Same defect family as the
+/// `widened_obj_key` collection aliasing.
 ///
 /// `ObjectRef` is a raw heap pointer that CratonVM's moving GC relocates on
 /// every collection — an early version of this cache keyed by `ObjectRef`
@@ -1303,11 +1313,16 @@ fn native_pattern_split_impl(
 /// [`MatcherInputCacheEntry::input_identity`] gives the same treatment to
 /// `MAT_FIELD_INPUT`, so a `reset(CharSequence)` swap is still caught.
 fn matcher_input_cache(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<i32, MatcherInputCacheEntry>> {
+) -> &'static parking_lot::Mutex<std::collections::HashMap<(usize, i32), MatcherInputCacheEntry>> {
     static CACHE: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<i32, MatcherInputCacheEntry>>,
+        parking_lot::Mutex<std::collections::HashMap<(usize, i32), MatcherInputCacheEntry>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The `(vm, identity)` key every [`matcher_input_cache`] access must use.
+fn matcher_cache_key(ctx: &dyn NativeContext, mat: cratonvm_types::ObjectRef) -> (usize, i32) {
+    (ctx.vm_identity(), ctx.identity_hash_code(mat))
 }
 
 /// Store capture-group spans for the match `find()` just produced, so a
@@ -1317,14 +1332,14 @@ fn matcher_input_cache(
 /// [`matcher_read_input_cached`], which inserts one, before this); callers
 /// that miss simply take the slower, always-correct re-search fallback.
 fn matcher_cache_store_captures(
-    mat_identity: i32,
+    mat_key: (usize, i32),
     match_start: usize,
     groups: Vec<Option<(usize, usize)>>,
     named: std::collections::HashMap<String, usize>,
 ) {
     let cache = matcher_input_cache();
     let mut guard = cache.lock();
-    if let Some(entry) = guard.get_mut(&mat_identity) {
+    if let Some(entry) = guard.get_mut(&mat_key) {
         entry.captures = Some(MatcherCaptures {
             match_start,
             groups,
@@ -1336,7 +1351,7 @@ fn matcher_cache_store_captures(
 /// Fetch cached capture-group spans for `match_start` on this `Matcher`, if
 /// [`matcher_cache_store_captures`] populated them for exactly this match.
 fn matcher_cache_lookup_captures(
-    mat_identity: i32,
+    mat_key: (usize, i32),
     match_start: usize,
 ) -> Option<(
     Vec<Option<(usize, usize)>>,
@@ -1344,7 +1359,7 @@ fn matcher_cache_lookup_captures(
 )> {
     let cache = matcher_input_cache();
     let guard = cache.lock();
-    let entry = guard.get(&mat_identity)?;
+    let entry = guard.get(&mat_key)?;
     let caps = entry.captures.as_ref()?;
     if caps.match_start == match_start {
         Some((caps.groups.clone(), caps.named.clone()))
@@ -1375,13 +1390,13 @@ fn matcher_read_input_cached(
         Value::Object(Some(r)) => r,
         _ => return std::sync::Arc::from(""),
     };
-    let mat_identity = ctx.identity_hash_code(mat);
+    let mat_key = matcher_cache_key(ctx, mat);
     let input_identity = ctx.identity_hash_code(input_obj);
 
     let cache = matcher_input_cache();
     {
         let guard = cache.lock();
-        if let Some(entry) = guard.get(&mat_identity) {
+        if let Some(entry) = guard.get(&mat_key) {
             if entry.input_identity == input_identity {
                 return entry.decoded.clone();
             }
@@ -1401,7 +1416,7 @@ fn matcher_read_input_cached(
         guard.clear();
     }
     guard.insert(
-        mat_identity,
+        mat_key,
         MatcherInputCacheEntry {
             input_identity,
             decoded: decoded.clone(),
@@ -1467,7 +1482,7 @@ pub(crate) fn native_matcher_find(ctx: &mut dyn NativeContext, args: &[Value]) -
             .map(|i| caps.get(i).map(|g| (offset + g.start, offset + g.end)))
             .collect();
         matcher_cache_store_captures(
-            ctx.identity_hash_code(this),
+            matcher_cache_key(ctx, this),
             abs_start,
             groups,
             caps.named.clone(),
@@ -1632,7 +1647,7 @@ pub(crate) fn native_matcher_group_idx(
     // (`matcher_cache_store_captures`) — reuse them instead of re-running the
     // regex engine over `input[start..]` a second time.
     if let Some((groups, _named)) =
-        matcher_cache_lookup_captures(ctx.identity_hash_code(this), start)
+        matcher_cache_lookup_captures(matcher_cache_key(ctx, this), start)
     {
         return match groups.get(idx).copied().flatten() {
             Some((g_start, g_end)) => Ok(Some(Value::Object(Some(
@@ -1694,7 +1709,7 @@ fn matcher_group_boundary(
     // instead of re-running the regex engine (see `native_matcher_group_idx`
     // for the full rationale).
     if let Some((groups, _named)) =
-        matcher_cache_lookup_captures(ctx.identity_hash_code(mat), match_start)
+        matcher_cache_lookup_captures(matcher_cache_key(ctx, mat), match_start)
     {
         return match groups.get(idx).copied().flatten() {
             Some((g_start, g_end)) => Ok(Some(Value::Int(

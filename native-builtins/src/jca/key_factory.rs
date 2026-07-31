@@ -161,15 +161,30 @@ fn synthetic_base_offset(ctx: &mut dyn NativeContext, class_name: &str) -> usize
 // object, new address); distinct same-hash objects get distinct
 // generations. Values are plain Rust data (i32/String/bool), so no GC
 // scan/remap companion is needed once the keys are address-independent.
+//
+// VM scope: an identity hash (and a heap address) is unique only *within
+// one heap*, but these tables are `static`. Rust tests create several
+// independent `Vm`s in one process, so without the `vm_identity` component
+// VM B's KeyPairGenerator whose hash collides with VM A's would be *adopted*
+// by the `slots.len() == 1` relocation branch below and read VM A's
+// algorithm / key size / provider flag. That is precisely the aliasing that
+// native-collections' `widened_obj_key` hit (two VMs' collections, process
+// abort); `NativeContext::vm_identity`'s doc states the rule.
 struct KpgObjKeyEntry {
     last_ptr: usize,
     generation: u32,
 }
 
+/// `(vm_identity, identity_hash)` → per-VM generation slots.
+type KpgHashKey = (usize, u32);
+
+/// VM-scoped, GC-stable side-table key: `(vm_identity, packed hash+generation)`.
+type KpgObjKey = (usize, usize);
+
 fn kpg_obj_key_registry(
-) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<KpgObjKeyEntry>>> {
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<KpgHashKey, Vec<KpgObjKeyEntry>>> {
     use std::sync::OnceLock;
-    static R: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<KpgObjKeyEntry>>>> =
+    static R: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<KpgHashKey, Vec<KpgObjKeyEntry>>>> =
         OnceLock::new();
     R.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
@@ -179,35 +194,36 @@ fn pack_kpg_obj_key(hash: u32, generation: u32) -> usize {
     ((hash as usize) << 32) | (generation as usize)
 }
 
-fn kpg_obj_key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
+fn kpg_obj_key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> KpgObjKey {
+    let vm = ctx.vm_identity();
     let hash = ctx.identity_hash_code(obj) as u32;
     let ptr = obj.as_ptr() as usize;
     let mut reg = kpg_obj_key_registry().lock();
-    let slots = reg.entry(hash).or_default();
+    let slots = reg.entry((vm, hash)).or_default();
     if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
-        return pack_kpg_obj_key(hash, slot.generation);
+        return (vm, pack_kpg_obj_key(hash, slot.generation));
     }
     if slots.len() == 1 {
         slots[0].last_ptr = ptr;
-        return pack_kpg_obj_key(hash, slots[0].generation);
+        return (vm, pack_kpg_obj_key(hash, slots[0].generation));
     }
     let generation = slots.len() as u32;
     slots.push(KpgObjKeyEntry {
         last_ptr: ptr,
         generation,
     });
-    pack_kpg_obj_key(hash, generation)
+    (vm, pack_kpg_obj_key(hash, generation))
 }
 
-fn kpg_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>> {
+fn kpg_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<KpgObjKey, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<KpgObjKey, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn kpg_keysize_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>> {
+fn kpg_keysize_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<KpgObjKey, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<KpgObjKey, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -226,9 +242,9 @@ fn get_kpg_algo(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
 // raw-slot write can therefore be dropped or coerced, leaving generatePublic
 // to report the placeholder algorithm "Unknown". Keep its algorithm in the
 // same GC-stable identity-keyed side-table scheme.
-fn kf_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>> {
+fn kf_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<KpgObjKey, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<KpgObjKey, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -244,9 +260,10 @@ fn get_kf_algo(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
 
 /// Preserve the caller's requested spelling for `getAlgorithm()` and diagnostic
 /// errors. An algorithm index alone cannot represent unrecognised names.
-fn kpg_name_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, String>> {
+fn kpg_name_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<KpgObjKey, String>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, String>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<KpgObjKey, String>>> =
+        OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -276,9 +293,10 @@ fn get_kpg_keysize(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
 /// BC-specific code (`BCECDSACryptoProvider.getPublicFromPrivate`, which casts to
 /// `org.bouncycastle.jce.interfaces.ECPrivateKey` and uses BC point math) works —
 /// while BC keys still sign/verify through our `Signature` natives.
-fn kpg_bcprov_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, bool>> {
+fn kpg_bcprov_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<KpgObjKey, bool>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, bool>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<KpgObjKey, bool>>> =
+        OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -348,6 +366,36 @@ fn obj_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
 /// exactly `class_name` (`java/security/PublicKey` or `java/security/PrivateKey`).
 fn is_synthetic_key_obj(ctx: &dyn NativeContext, v: &Value, class_name: &str) -> bool {
     matches!(v, Value::Object(Some(o)) if obj_class_name(ctx, *o) == class_name)
+}
+
+/// True when the named real-JDK SPI class is actually on the boot classpath.
+///
+/// The `route_*_to_real()` switches say we *prefer* real JDK bytecode; they do
+/// not say the bytecode is *there*. In synthetic-JDK mode a name-based load of
+/// e.g. `sun/security/ec/ECKeyPairGenerator` is answered with a fabricated stub
+/// whose methods carry no `Code`, so "driving" the SPI yields a dead object (or
+/// an opaque failure) rather than a key pair — and for EC there is no fallback
+/// after the drive, so the whole `generateKeyPair` fails. Ask the class manager
+/// first; when the answer is "you would get a stub", fall back to the
+/// `crypto_impl` path, which is real RSA / P-256 crypto — ours rather than the
+/// JDK's, but genuine key material with a working sign/verify.
+fn real_spi_available(ctx: &dyn NativeContext, class_name: &str) -> bool {
+    !ctx.would_fabricate_synthetic_stub(class_name)
+}
+
+/// Whether [`drive_real_ec_keypair`] would find real bytecode to drive.
+///
+/// Must stay in lockstep with the EC arm of `jca::signature`'s
+/// `ecdsa_real_spi_class`: if keygen falls back to synthetic keys, signing has
+/// to fall back too, or a synthetic `key_id`-bearing key is handed to a stub
+/// SunEC SPI that cannot read it.
+fn real_ec_keypair_available(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    if get_kpg_bcprov(ctx, this) {
+        // BouncyCastle is an application class; `would_fabricate_synthetic_stub`
+        // only speaks for JDK names, so leave the BC route exactly as it was.
+        return true;
+    }
+    real_spi_available(ctx, "sun/security/ec/ECKeyPairGenerator")
 }
 
 /// Drive the real `sun.security.ec.ECKeyPairGenerator` SPI: `new` →
@@ -1673,6 +1721,17 @@ fn kpg_initialize_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Int(n)) => *n,
         _ => 2048,
     };
+    // The real JDK rejects a nonsensical size with `InvalidParameterException`
+    // (a subclass of `IllegalArgumentException`, which is the closest
+    // `RuntimeError` variant) rather than pretending to configure the
+    // generator. Carried over from the retired `phases_early` KeyPairGenerator
+    // stub, which was the only place this check lived.
+    if bits <= 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Invalid key size: {bits}"),
+        }
+        .into());
+    }
     set_kpg_keysize(ctx, this, bits);
     ctx.set_field(this, base + KPG_OFF_KEYSIZE, Value::Int(bits));
     ctx.set_field(this, base + KPG_OFF_STATE, Value::Int(1));
@@ -1785,7 +1844,9 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // work — while sign/verify stay on the fast crypto_impl path via the
         // identity bridge. CRATONVM_SYNTHETIC_RSA=1 restores the bare-interface
         // synthetic keys (faster alloc, but the cast/cert paths fail).
-        if crate::route_rsa_to_real() {
+        if crate::route_rsa_to_real()
+            && real_spi_available(ctx, "sun/security/rsa/RSAKeyFactory$Legacy")
+        {
             let crt_ref: Option<[&[u8]; 5]> = crt_bytes.as_ref().map(|a| {
                 [
                     a[0].as_slice(),
@@ -1811,7 +1872,11 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // Route EC to the real SunEC SPI → concrete ECPublicKey/ECPrivateKey in a
         // real KeyPair (fixes the bare-interface CCE). RSA/AES keep the synthetic
         // path below; CRATONVM_SYNTHETIC_EC=1 restores the legacy synthetic EC.
-        if crate::route_ec_to_real() {
+        // ...but only when the SunEC bytecode is genuinely present. Under the
+        // synthetic JDK the drive would target a fabricated, code-less stub and
+        // there is no fallback after it, so check first (see
+        // `real_ec_keypair_available`).
+        if crate::route_ec_to_real() && real_ec_keypair_available(ctx, this) {
             return drive_real_ec_keypair(ctx, this);
         }
         let (pk, sk) = crypto_impl::Ecdsa::generate_keypair();

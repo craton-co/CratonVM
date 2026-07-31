@@ -3341,25 +3341,42 @@ impl SharedVm {
         ClassId::new(self.classes.next_lambda_id.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Get an `Arc<SharedVm>` from the stored weak self-reference, or `None`
+    /// when this `SharedVm` has no self-reference installed.
+    ///
+    /// `self_arc` is installed at the end of `Vm::new()`, but `SharedVm::new()`
+    /// is public and cannot install it (the `Arc` does not exist yet — the
+    /// caller creates it). A bare `Arc::new(SharedVm::new(config))` — the shape
+    /// most unit fixtures use — therefore has `self_arc == None`, which is a
+    /// legitimate state, not an impossible one. Callers that can degrade
+    /// gracefully (e.g. refusing to spawn a thread rather than aborting the
+    /// process) must use this instead of [`Self::get_arc`].
+    pub fn try_get_arc(&self) -> Option<Arc<SharedVm>> {
+        // `upgrade()` succeeds whenever `self_arc` is set, because we are
+        // called via `&self` on a `SharedVm` that lives inside an
+        // `Arc<SharedVm>` — at least one strong reference is alive for the
+        // duration of this borrow.
+        self.self_arc.read().as_ref().and_then(|w| w.upgrade())
+    }
+
     /// Get an `Arc<SharedVm>` from the stored weak self-reference.
     ///
-    /// Panics if `self_arc` was never set (i.e. `Vm::new()` was not called)
-    /// or if all `Arc`s have been dropped.
+    /// Panics if `self_arc` was never set. This used to be spelled
+    /// `unreachable!("self_arc is set during Vm::new and never cleared")`, but
+    /// the invariant that message asserts is false: it holds only for VMs built
+    /// through `Vm::new()`, and `SharedVm::new()` is public. A reached
+    /// `unreachable!` is always a bug, so the case is now named honestly and
+    /// the message tells the caller how to fix the fixture.
     pub fn get_arc(&self) -> Arc<SharedVm> {
-        // SAFETY: `self_arc` is set to `Some(Arc::downgrade(&shared))` at the
-        // end of `Vm::new()`, and never cleared.  Every code-path that reaches
-        // `get_arc` goes through a fully-constructed `Vm`, so `as_ref()` always
-        // returns `Some`.
-        //
-        // `upgrade()` succeeds because we are called via `&self` on a
-        // `SharedVm` that lives inside an `Arc<SharedVm>` — at least one
-        // strong reference is alive for the duration of this borrow.
-        self.self_arc
-            .read()
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("self_arc is set during Vm::new and never cleared"))
-            .upgrade()
-            .unwrap_or_else(|| unreachable!("called on &SharedVm so at least one Arc is alive"))
+        self.try_get_arc().unwrap_or_else(|| {
+            panic!(
+                "SharedVm::get_arc() on a VM with no `self_arc` weak self-reference. \
+                 `Vm::new()` installs it; a hand-built `Arc::new(SharedVm::new(..))` \
+                 fixture must install it itself with \
+                 `*shared.self_arc.write() = Some(Arc::downgrade(&shared));`. \
+                 Call sites that can degrade should use `try_get_arc()` instead."
+            )
+        })
     }
 }
 

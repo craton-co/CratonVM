@@ -1936,37 +1936,56 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // Collectors expansion: maxBy, minBy, mapping, filtering, flatMapping,
 // summarizingInt/Long/Double, toUnmodifiableList/Set/Map, collectingAndThen
-// Collector tags. Values 1/2 intentionally match native-collections' core
-// collector engine, which owns Stream.collect(Collector) and Collector.supplier().
-//   9 = MAX_BY (comparator in ARG1)
-//  10 = MIN_BY (comparator in ARG1)
-//  11 = MAPPING (Function in ARG1, downstream Collector in ARG2)
-//  12 = FILTERING (Predicate in ARG1, downstream Collector in ARG2)
-//  13 = SUMMARIZING_INT (ToIntFunction in ARG1)
-//  14 = SUMMARIZING_LONG (ToLongFunction in ARG1)
-//  15 = SUMMARIZING_DOUBLE (ToDoubleFunction in ARG1)
-//   1 = TO_UNMODIFIABLE_LIST, 2 = TO_UNMODIFIABLE_SET
-//  18 = COLLECTING_AND_THEN (downstream Collector in ARG1, Function finisher in ARG2)
+// Collector tags. There is exactly ONE decoder for the tag we write here:
+// native-collections' `native_stream_collect`, the only registered
+// `Stream.collect(Collector)` in the VM. So these constants MUST live in
+// native-collections' `COLLECTOR_TAG_*` numbering — they are aliases of it, not
+// a parallel namespace.
+//
+// They used to be a private 9..15 numbering, and for the factories
+// native-collections does NOT itself register (maxBy, minBy, filtering,
+// summarizing{Int,Long,Double}) nothing overwrote them, so the tag we wrote was
+// decoded in the wrong namespace: 9 → GROUPING_BY_DOWNSTREAM, 10 →
+// GROUPING_BY_SUPPLIER, 12 → TO_MAP_MERGE, 13 → COLLECTING_AND_THEN, 14 →
+// TO_COLLECTION, 15 → MAPPING. `stream.collect(Collectors.minBy(cmp))` handed
+// the program a Map instead of an Optional — a silent wrong answer.
+//
+// `mapping` and `collectingAndThen` are also registered by native-collections,
+// whose registration wins (registry is last-wins and
+// `register_collections_natives` runs after `register_builtins`), so their old
+// 11/18 values never reached the decoder. They are aliased here anyway so a
+// future ordering change cannot resurrect the same bug.
+//
+// Still private to this file, still unshared, still NOT decoded by
+// `native_stream_collect`: 19..21 averaging* and 22..24 summing* below. Do not
+// reuse those numbers for anything the decoder is taught to understand.
 // ---------------------------------------------------------------------------
-pub(crate) const P56_COLLECTOR_MAX_BY: i32 = 9;
+pub(crate) const P56_COLLECTOR_MAX_BY: i32 = cratonvm_native_collections::COLLECTOR_TAG_MAX_BY;
 
-pub(crate) const P56_COLLECTOR_MIN_BY: i32 = 10;
+pub(crate) const P56_COLLECTOR_MIN_BY: i32 = cratonvm_native_collections::COLLECTOR_TAG_MIN_BY;
 
-pub(crate) const P56_COLLECTOR_MAPPING: i32 = 11;
+pub(crate) const P56_COLLECTOR_MAPPING: i32 = cratonvm_native_collections::COLLECTOR_TAG_MAPPING;
 
-pub(crate) const P56_COLLECTOR_FILTERING: i32 = 12;
+pub(crate) const P56_COLLECTOR_FILTERING: i32 =
+    cratonvm_native_collections::COLLECTOR_TAG_FILTERING;
 
-pub(crate) const P56_COLLECTOR_SUMMARIZING_INT: i32 = 13;
+pub(crate) const P56_COLLECTOR_SUMMARIZING_INT: i32 =
+    cratonvm_native_collections::COLLECTOR_TAG_SUMMARIZING_INT;
 
-pub(crate) const P56_COLLECTOR_SUMMARIZING_LONG: i32 = 14;
+pub(crate) const P56_COLLECTOR_SUMMARIZING_LONG: i32 =
+    cratonvm_native_collections::COLLECTOR_TAG_SUMMARIZING_LONG;
 
-pub(crate) const P56_COLLECTOR_SUMMARIZING_DOUBLE: i32 = 15;
+pub(crate) const P56_COLLECTOR_SUMMARIZING_DOUBLE: i32 =
+    cratonvm_native_collections::COLLECTOR_TAG_SUMMARIZING_DOUBLE;
 
-pub(crate) const P56_COLLECTOR_TO_UNMODIFIABLE_LIST: i32 = 1;
+pub(crate) const P56_COLLECTOR_TO_UNMODIFIABLE_LIST: i32 =
+    cratonvm_native_collections::COLLECTOR_TAG_TO_LIST;
 
-pub(crate) const P56_COLLECTOR_TO_UNMODIFIABLE_SET: i32 = 2;
+pub(crate) const P56_COLLECTOR_TO_UNMODIFIABLE_SET: i32 =
+    cratonvm_native_collections::COLLECTOR_TAG_TO_SET;
 
-pub(crate) const P56_COLLECTOR_COLLECTING_AND_THEN: i32 = 18;
+pub(crate) const P56_COLLECTOR_COLLECTING_AND_THEN: i32 =
+    cratonvm_native_collections::COLLECTOR_TAG_COLLECTING_AND_THEN;
 
 pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();

@@ -5325,17 +5325,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             #[cfg(windows)]
             {
-                let requested_type = obj_arg(args, 2)
-                    .ok()
-                    .and_then(|class| crate::lang_class::mirror_class_name(ctx, class))
-                    .unwrap_or_default();
-                if !windows_supports_file_attributes_type(&requested_type) {
-                    return Err(RuntimeError::UnsupportedOperationException {
-                        message: format!(
-                            "File attribute type {requested_type} is not supported on Windows"
-                        ),
+                // See the `Files.readAttributes` registration: only a PRESENT,
+                // NAMEABLE `Class` argument states a requested type. Absent or
+                // unresolvable means "no request" and falls back to the
+                // declared return type, `BasicFileAttributes`.
+                if let Some(Value::Object(Some(class))) = args.get(2) {
+                    let requested_type =
+                        crate::lang_class::mirror_class_name(ctx, *class).unwrap_or_default();
+                    if !requested_type.is_empty()
+                        && !windows_supports_file_attributes_type(&requested_type)
+                    {
+                        return Err(RuntimeError::UnsupportedOperationException {
+                            message: format!(
+                                "File attribute type {requested_type} is not supported on Windows"
+                            ),
+                        }
+                        .into());
                     }
-                    .into());
                 }
             }
             let path_obj = obj_arg(args, 1)?;
@@ -12850,17 +12856,26 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             #[cfg(windows)]
             {
-                let requested_type = obj_arg(args, 1)
-                    .ok()
-                    .and_then(|class| crate::lang_class::mirror_class_name(ctx, class))
-                    .unwrap_or_default();
-                if !windows_supports_file_attributes_type(&requested_type) {
-                    return Err(RuntimeError::UnsupportedOperationException {
-                        message: format!(
-                            "File attribute type {requested_type} is not supported on Windows"
-                        ),
+                // Only a PRESENT `Class` argument states a requested type. A
+                // null/absent one carries no request at all, and rejecting it
+                // produced the nonsense `File attribute type  is not supported
+                // on Windows` (note the empty name) for a caller that never
+                // asked for anything unsupported. Fall back to the method's
+                // declared return type, `BasicFileAttributes`, which Windows
+                // does support.
+                if let Some(Value::Object(Some(class))) = args.get(1) {
+                    let requested_type =
+                        crate::lang_class::mirror_class_name(ctx, *class).unwrap_or_default();
+                    if !requested_type.is_empty()
+                        && !windows_supports_file_attributes_type(&requested_type)
+                    {
+                        return Err(RuntimeError::UnsupportedOperationException {
+                            message: format!(
+                                "File attribute type {requested_type} is not supported on Windows"
+                            ),
+                        }
+                        .into());
                     }
-                    .into());
                 }
             }
             let path = args.first().copied().unwrap_or(Value::Object(None));
@@ -13073,11 +13088,67 @@ pub(crate) fn basic_file_attributes_is_windows(ctx: &dyn NativeContext, attrs: O
         == Some("sun/nio/fs/WindowsFileAttributes")
 }
 
+/// True when `attrs` is the synthetic-JDK stub minted by
+/// `basic_file_attributes_alloc`'s fallback rather than a real
+/// `sun.nio.fs.{Unix,Windows}FileAttributes`.
+///
+/// `java.nio.file.attribute.BasicFileAttributes` is an INTERFACE in every real
+/// JDK, so no genuine instance can ever carry that class id — a hit here is
+/// unambiguously our own stub.
+///
+/// Why this matters: `ensure_synthetic_class` declares a slot COUNT but ZERO
+/// named fields, so `set_field_by_name` silently drops the write and
+/// `get_field_by_name` answers `Object(None)`. Every attribute
+/// `basic_file_attributes_store` wrote by name vanished, and every predicate
+/// below read back its default — a plain file reported `isRegularFile() ==
+/// false`, `size() == 0` and epoch timestamps. The accessors therefore switch
+/// to the fixed slot layout below for this class.
+pub(crate) fn basic_file_attributes_is_synthetic(
+    ctx: &dyn NativeContext,
+    attrs: ObjectRef,
+) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(attrs))
+        .as_deref()
+        == Some("java/nio/file/attribute/BasicFileAttributes")
+}
+
+/// Slot layout of the synthetic `BasicFileAttributes` stub (5 slots — keep in
+/// sync with the `alloc_concurrent_synthetic(..., 5)` call in
+/// `basic_file_attributes_alloc`). The mode word uses the Unix `st_mode`
+/// encoding (type bits | permission bits) on every host so the shared
+/// predicates can decode it uniformly.
+pub(crate) const BFA_SYN_SLOT_MODE: usize = 0;
+pub(crate) const BFA_SYN_SLOT_SIZE: usize = 1;
+pub(crate) const BFA_SYN_SLOT_CREATION: usize = 2;
+pub(crate) const BFA_SYN_SLOT_ACCESS: usize = 3;
+pub(crate) const BFA_SYN_SLOT_MODIFIED: usize = 4;
+
+/// Read the synthetic stub's `st_mode`-encoded mode word.
+fn basic_file_attributes_syn_mode(ctx: &dyn NativeContext, attrs: ObjectRef) -> i32 {
+    match ctx.get_field(attrs, BFA_SYN_SLOT_MODE) {
+        Value::Int(v) => v,
+        Value::Long(v) => v as i32,
+        _ => 0,
+    }
+}
+
 pub(crate) fn basic_file_attributes_time_millis(
     ctx: &dyn NativeContext,
     attrs: ObjectRef,
     which: &str,
 ) -> i64 {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        let slot = match which {
+            "creation" => BFA_SYN_SLOT_CREATION,
+            "access" => BFA_SYN_SLOT_ACCESS,
+            _ => BFA_SYN_SLOT_MODIFIED,
+        };
+        return match ctx.get_field(attrs, slot) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+    }
     let field = if basic_file_attributes_is_windows(ctx, attrs) {
         match which {
             "creation" => "creationTime",
@@ -13098,6 +13169,9 @@ pub(crate) fn basic_file_attributes_time_millis(
 }
 
 pub(crate) fn basic_file_attributes_is_dir(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return basic_file_attributes_syn_mode(ctx, attrs) & UNIX_S_IFMT == 0o040000;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         return matches!(ctx.get_field_by_name(attrs, "fileAttrs"), Value::Int(v) if v & 0x10 != 0);
     }
@@ -13113,6 +13187,9 @@ pub(crate) const WIN_ATTR_DIRECTORY: i32 = 0x10;
 pub(crate) const WIN_ATTR_REPARSE_POINT: i32 = 0x400;
 
 pub(crate) fn basic_file_attributes_is_symlink(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return basic_file_attributes_syn_mode(ctx, attrs) & UNIX_S_IFMT == UNIX_S_IFLNK;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         return matches!(ctx.get_field_by_name(attrs, "fileAttrs"),
             Value::Int(v) if v & WIN_ATTR_REPARSE_POINT != 0);
@@ -13122,6 +13199,9 @@ pub(crate) fn basic_file_attributes_is_symlink(ctx: &dyn NativeContext, attrs: O
 }
 
 pub(crate) fn basic_file_attributes_is_regular(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return basic_file_attributes_syn_mode(ctx, attrs) & UNIX_S_IFMT == UNIX_S_IFREG;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         return matches!(ctx.get_field_by_name(attrs, "fileAttrs"),
             Value::Int(v) if v & (WIN_ATTR_DIRECTORY | WIN_ATTR_REPARSE_POINT) == 0);
@@ -13475,6 +13555,13 @@ pub(crate) fn basic_file_attributes_file_key(
 }
 
 pub(crate) fn basic_file_attributes_size(ctx: &dyn NativeContext, attrs: ObjectRef) -> i64 {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return match ctx.get_field(attrs, BFA_SYN_SLOT_SIZE) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+    }
     let field = if basic_file_attributes_is_windows(ctx, attrs) {
         "size"
     } else {
@@ -13496,6 +13583,22 @@ pub(crate) fn basic_file_attributes_store(
     modified_millis: i64,
     unix_perm_bits: i32,
 ) {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        // Synthetic stub: NO named fields exist, so every `set_field_by_name`
+        // below would be a silent no-op. Write the fixed slot layout the
+        // accessors read (`BFA_SYN_SLOT_*`).
+        let type_bits = if is_dir { 0o040000 } else { 0o100000 };
+        ctx.set_field(
+            attrs,
+            BFA_SYN_SLOT_MODE,
+            Value::Int(type_bits | (unix_perm_bits & 0o7777)),
+        );
+        ctx.set_field(attrs, BFA_SYN_SLOT_SIZE, Value::Long(size));
+        ctx.set_field(attrs, BFA_SYN_SLOT_CREATION, Value::Long(creation_millis));
+        ctx.set_field(attrs, BFA_SYN_SLOT_ACCESS, Value::Long(access_millis));
+        ctx.set_field(attrs, BFA_SYN_SLOT_MODIFIED, Value::Long(modified_millis));
+        return;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         ctx.set_field_by_name(
             attrs,
@@ -13686,7 +13789,15 @@ pub(crate) fn p59_files_read_attributes(
             // following read resolves the target (and the real JDK likewise
             // reports `isSymbolicLink() == false` there).
             if meta.file_type().is_symlink() {
-                if basic_file_attributes_is_windows(ctx, bfa) {
+                if basic_file_attributes_is_synthetic(ctx, bfa) {
+                    // Synthetic stub has no named fields — patch the slot.
+                    let cur = basic_file_attributes_syn_mode(ctx, bfa);
+                    ctx.set_field(
+                        bfa,
+                        BFA_SYN_SLOT_MODE,
+                        Value::Int((cur & !UNIX_S_IFMT) | UNIX_S_IFLNK),
+                    );
+                } else if basic_file_attributes_is_windows(ctx, bfa) {
                     let cur = match ctx.get_field_by_name(bfa, "fileAttrs") {
                         Value::Int(v) => v,
                         _ => 0,

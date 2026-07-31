@@ -15653,80 +15653,47 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // --- java.security.KeyPairGenerator — 1-field (algorithm=0) ---
-    // Argument check shared by both `KeyPairGenerator.initialize` overloads.
-    // `InvalidParameterException extends IllegalArgumentException`, which is
-    // the closest `RuntimeError` variant.
-    fn kpg_check_keysize(args: &[Value]) -> Result<(), MethodCallFailed> {
-        let keysize = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        if keysize <= 0 {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: format!("Invalid key size: {keysize}"),
-            }
-            .into());
-        }
-        Ok(())
-    }
-    let kpg = "java/security/KeyPairGenerator";
-    r.register(
-        kpg,
-        "getInstance",
-        "(Ljava/lang/String;)Ljava/security/KeyPairGenerator;",
-        |ctx, args| {
-            let algo = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/security/KeyPairGenerator", 1);
-            ctx.set_field(obj, 0, Value::Object(Some(algo)));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // W2: both `initialize` overloads accepted anything silently. There is no
-    // public key-size GETTER on `KeyPairGenerator`, so the size itself is not
-    // observable and storing it would be dead state — but the ARGUMENT CHECK
-    // is observable, and the real JDK rejects a nonsensical size with
-    // `InvalidParameterException` (a subclass of `IllegalArgumentException`)
-    // rather than pretending to configure the generator. Validate, then accept.
+    // --- java.security.KeyPairGenerator — RETIRED (2026-07-31) ---
     //
-    // NOTE (out of scope for the stub sweep, but adjacent): `generateKeyPair`
-    // below still hands back zero-length public/private keys regardless of the
-    // size requested here.
-    r.register(kpg, "initialize", "(I)V", |_ctx, args| {
-        kpg_check_keysize(args)?;
-        Ok(None)
-    });
-    r.register(
-        kpg,
-        "initialize",
-        "(ILjava/security/SecureRandom;)V",
-        |_ctx, args| {
-            kpg_check_keysize(args)?;
-            Ok(None)
-        },
-    );
-    r.register(
-        kpg,
-        "generateKeyPair",
-        "()Ljava/security/KeyPair;",
-        |ctx, _args| {
-            // Generate stub keys
-            let pub_key = alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 1);
-            let priv_key = alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 1);
-            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-            ctx.set_field(pub_key, 0, Value::Object(Some(empty)));
-            let empty2 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-            ctx.set_field(priv_key, 0, Value::Object(Some(empty2)));
-            let kp = alloc_concurrent_synthetic(ctx, "java/security/KeyPair", 2);
-            ctx.set_field(kp, 0, Value::Object(Some(pub_key)));
-            ctx.set_field(kp, 1, Value::Object(Some(priv_key)));
-            Ok(Some(Value::Object(Some(kp))))
-        },
-    );
-    r.register(kpg, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
+    // This phase used to register `getInstance`/`initialize`/`generateKeyPair`/
+    // `getAlgorithm` here. Registration is LAST-WINS and this registrar runs
+    // from `register_synthetic_overrides`, i.e. AFTER
+    // `register_essential_natives_with_shims` → `jca::register_jca_natives`,
+    // so these five stubs silently shadowed the complete implementation in
+    // `jca::key_factory` for the whole synthetic-JDK build.
+    //
+    // What the shadowing cost: `generateKeyPair` handed back a ONE-field
+    // `PublicKey`/`PrivateKey` carrying an empty `byte[]` at slot 0, while
+    // every reader in the tree — including the `Signature` block right below,
+    // and `jca::key_factory`'s own `PublicKey.getAlgorithm`/`getEncoded`
+    // natives, which were NOT shadowed — expects the five-slot key layout
+    // `alg_idx@0, bits@1, enc_len@2, key_id@3 (Long), der@4`. Reading an
+    // `Int` algorithm index out of a slot holding a `byte[]` reference is the
+    // classic writer-by-one-layout / reader-by-another defect: the keys had no
+    // `key_id`, so sign/verify degraded to an HMAC surrogate over the (empty)
+    // key bytes and TWO DIFFERENT KEY PAIRS PRODUCED IDENTICAL SIGNATURES —
+    // `Signature.verify` accepted a signature made with somebody else's key.
+    //
+    // Retiring these hands `KeyPairGenerator` back to `jca::key_factory`,
+    // whose `kpg_generate_key_pair` mints real RSA / P-256 material through
+    // `crypto_impl` and stores a `key_id` at slot 3. The `Signature` block
+    // below is the consumer of that layout and had to be reworked in the same
+    // change — the two are a coupled pair and must not be split.
+    //
+    // The one behaviour that lived ONLY here, `initialize`'s
+    // `InvalidParameterException` for a non-positive key size, has been moved
+    // into `jca::key_factory::kpg_initialize_int`.
 
     // --- java.security.Signature — 4-field (algorithm=0, mode=1, key=2, data=3) ---
     // mode: 0=uninitialized, 1=sign, 2=verify
+    //
+    // Coupled with the retired `KeyPairGenerator` block above: this registrar
+    // also wins over `jca::signature` (last-wins), and its sign/verify read the
+    // key's algorithm index from slot 0 and its `crypto_impl` `key_id` from
+    // slot 3 — i.e. they were always written against the FIVE-slot
+    // `jca::key_factory` key layout, not against the one-slot keys the local
+    // stub produced. Keys now arrive in that layout, and the real-crypto
+    // dispatch below is no longer compiled out.
     let sig = "java/security/Signature";
     r.register(
         sig,
@@ -15787,6 +15754,26 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    // The `(PrivateKey, SecureRandom)` overload must be registered HERE too.
+    // Left to `jca::signature`, it would seed that module's side tables and
+    // write its state to slots at `synthetic_base_offset` (past this 4-field
+    // carrier, so the writes are dropped) — leaving mode@1 at 0, and the
+    // `sign()` below would then reject a Signature the caller did initialize.
+    // The extra `SecureRandom` argument is ignored: `crypto_impl` seeds from
+    // the OS CSPRNG.
+    r.register(
+        sig,
+        "initSign",
+        "(Ljava/security/PrivateKey;Ljava/security/SecureRandom;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field(this, 1, Value::Int(1)); // sign mode
+            ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
+            let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+            ctx.set_field(this, 3, Value::Object(Some(data)));
+            Ok(None)
+        },
+    );
     r.register(
         sig,
         "initVerify",
@@ -15835,178 +15822,88 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
     // sign()[B — produce a real digital signature using the key's crypto backend
     r.register(sig, "sign", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let mode = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        if mode != 1 {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Signature not initialized for signing".into(),
-            }
-            .into());
-        }
-        // Read accumulated data
-        let data = match ctx.get_field(this, 3) {
-            Value::Object(Some(arr)) => cipher_read_bytes(ctx, arr),
-            _ => Vec::new(),
-        };
-        // Determine algorithm name
-        let algo = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        // Extract key object — try to detect 4-field key with key_id (field 3)
-        let signature = match ctx.get_field(this, 2) {
-            Value::Object(Some(key_obj)) => {
-                // Check if this is a 4-field key with a stored key_id
-                let alg_idx = match ctx.get_field(key_obj, 0) {
-                    Value::Int(i) => i,
-                    _ => -1,
-                };
-                let key_id = match ctx.get_field(key_obj, 3) {
-                    Value::Long(id) => id as u64,
-                    _ => 0,
-                };
-                if key_id > 0 {
-                    // Dispatch to real crypto backend based on algorithm
-                    let upper = algo.to_uppercase();
-                    #[cfg(feature = "legacy-synthetic-crypto")]
-                    {
-                        if upper == "ED25519" && alg_idx == 8 {
-                            crypto_impl::ed25519_sign(key_id, &data).unwrap_or_else(|| {
-                                tracing::warn!("Ed25519 sign failed for key_id {key_id}");
-                                Vec::new()
-                            })
-                        } else if upper.contains("ECDSA") && alg_idx == 7 {
-                            crypto_impl::ecdsa_sign(key_id, &data).unwrap_or_else(|| {
-                                tracing::warn!("ECDSA sign failed for key_id {key_id}");
-                                Vec::new()
-                            })
-                        } else if upper.contains("RSA") && alg_idx == 6 {
-                            crypto_impl::rsa_sign(key_id, &data).unwrap_or_else(|| {
-                                tracing::warn!("RSA sign failed for key_id {key_id}");
-                                Vec::new()
-                            })
-                        } else {
-                            // Fallback to HMAC-based for unrecognized combos
-                            let key_bytes = match ctx.get_field(key_obj, 0) {
-                                Value::Object(Some(enc_arr)) => cipher_read_bytes(ctx, enc_arr),
-                                _ => Vec::new(),
-                            };
-                            sig_compute(&algo, &key_bytes, &data)
-                        }
-                    }
-                    #[cfg(not(feature = "legacy-synthetic-crypto"))]
-                    {
-                        let _ = (alg_idx, upper);
-                        let key_bytes = match ctx.get_field(key_obj, 0) {
-                            Value::Object(Some(enc_arr)) => cipher_read_bytes(ctx, enc_arr),
-                            _ => Vec::new(),
-                        };
-                        sig_compute(&algo, &key_bytes, &data)
-                    }
-                } else {
-                    // Legacy path: key bytes in field 0
-                    let key_bytes = match ctx.get_field(key_obj, 0) {
-                        Value::Object(Some(enc_arr)) => cipher_read_bytes(ctx, enc_arr),
-                        _ => Vec::new(),
-                    };
-                    sig_compute(&algo, &key_bytes, &data)
-                }
-            }
-            _ => Vec::new(),
-        };
-        // Pad the HMAC-based fallback to the canonical signature length for
-        // the selected algorithm. Real JDK RSA signatures are 256 bytes
-        // (2048-bit modulus), ECDSA P-256 signatures are 64 bytes (two
-        // 32-byte scalars) and Ed25519 signatures are 64 bytes. Tests that
-        // build a synthetic unkeyed Signature expect the byte-length to
-        // match the declared algorithm even though the bytes themselves
-        // are HMAC-derived.
-        let signature = pad_signature_for_algo(&algo, signature);
+        let signature = sig_finish_sign(ctx, this)?;
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, signature.len());
         for (i, &b) in signature.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
-        // Reset data accumulator
-        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        ctx.set_field(this, 3, Value::Object(Some(empty)));
         Ok(Some(Value::Object(Some(arr))))
+    });
+    // sign([BII)I — same signature, written into a caller-supplied buffer.
+    //
+    // Previously unregistered here, so it fell through to `jca::signature`'s
+    // `sig_sign_into` — which reads the algorithm/state from side tables that
+    // only `jca::signature::sig_get_instance` populates. Because `getInstance`
+    // above shadows that native, every `sign(byte[],int,int)` on a synthetic
+    // JDK died with `IllegalStateException("Signature state missing post-GC or
+    // never initialized")`: a receiver built by one implementation handed to
+    // the other's reader. Registering the overload here keeps the whole
+    // Signature surface on ONE implementation.
+    r.register(sig, "sign", "([BII)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let out = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("Signature.sign: output buffer is null".into()),
+                }
+                .into())
+            }
+        };
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let max_len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        if off < 0 || max_len < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Signature.sign: bad offset/len {off}/{max_len}"),
+            }
+            .into());
+        }
+        let signature = sig_finish_sign(ctx, this)?;
+        // The JDK throws `SignatureException` rather than silently truncating —
+        // a short signature is indistinguishable from a forged one downstream.
+        if signature.len() > max_len as usize {
+            return Err(throw_jca_exc(
+                ctx,
+                "java/security/SignatureException",
+                &format!(
+                    "partial signatures not returned: need {} bytes, buffer has {max_len}",
+                    signature.len()
+                ),
+            ));
+        }
+        let off = off as usize;
+        for (i, &b) in signature.iter().enumerate() {
+            ctx.set_array_element(out, off + i, Value::Int(b as i8 as i32));
+        }
+        Ok(Some(Value::Int(signature.len() as i32)))
     });
     // verify([B)Z — verify a real digital signature
     r.register(sig, "verify", "([B)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let mode = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        if mode != 2 {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Signature not initialized for verification".into(),
-            }
-            .into());
-        }
         let provided = match args.get(1) {
             Some(Value::Object(Some(arr))) => cipher_read_bytes(ctx, *arr),
             _ => Vec::new(),
         };
-        // Read accumulated data
-        let data = match ctx.get_field(this, 3) {
-            Value::Object(Some(arr)) => cipher_read_bytes(ctx, arr),
+        let valid = sig_finish_verify(ctx, this, &provided)?;
+        Ok(Some(Value::Int(if valid { 1 } else { 0 })))
+    });
+    // verify([BII)Z — as above over a slice of the supplied buffer. Registered
+    // for the same reason as `sign([BII)I`: without it this one overload
+    // dispatches into `jca::signature`, whose side-table state a receiver made
+    // by the `getInstance` above never had.
+    r.register(sig, "verify", "([BII)Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+        let provided = match args.get(1) {
+            Some(Value::Object(Some(arr))) => {
+                let all = cipher_read_bytes(ctx, *arr);
+                let end = off.saturating_add(len).min(all.len());
+                all.get(off..end).map(|s| s.to_vec()).unwrap_or_default()
+            }
             _ => Vec::new(),
         };
-        let algo = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let valid = match ctx.get_field(this, 2) {
-            Value::Object(Some(key_obj)) => {
-                let alg_idx = match ctx.get_field(key_obj, 0) {
-                    Value::Int(i) => i,
-                    _ => -1,
-                };
-                let key_id = match ctx.get_field(key_obj, 3) {
-                    Value::Long(id) => id as u64,
-                    _ => 0,
-                };
-                if key_id > 0 {
-                    let upper = algo.to_uppercase();
-                    #[cfg(feature = "legacy-synthetic-crypto")]
-                    {
-                        if upper == "ED25519" && alg_idx == 8 {
-                            crypto_impl::ed25519_verify(key_id, &data, &provided).unwrap_or(false)
-                        } else if upper.contains("ECDSA") && alg_idx == 7 {
-                            crypto_impl::ecdsa_verify(key_id, &data, &provided).unwrap_or(false)
-                        } else if upper.contains("RSA") && alg_idx == 6 {
-                            crypto_impl::rsa_verify(key_id, &data, &provided).unwrap_or(false)
-                        } else {
-                            let key_bytes = match ctx.get_field(key_obj, 0) {
-                                Value::Object(Some(enc_arr)) => cipher_read_bytes(ctx, enc_arr),
-                                _ => Vec::new(),
-                            };
-                            let expected = sig_compute(&algo, &key_bytes, &data);
-                            ct_eq(&expected, &provided)
-                        }
-                    }
-                    #[cfg(not(feature = "legacy-synthetic-crypto"))]
-                    {
-                        let _ = (alg_idx, upper);
-                        let key_bytes = match ctx.get_field(key_obj, 0) {
-                            Value::Object(Some(enc_arr)) => cipher_read_bytes(ctx, enc_arr),
-                            _ => Vec::new(),
-                        };
-                        let expected = sig_compute(&algo, &key_bytes, &data);
-                        ct_eq(&expected, &provided)
-                    }
-                } else {
-                    let key_bytes = match ctx.get_field(key_obj, 0) {
-                        Value::Object(Some(enc_arr)) => cipher_read_bytes(ctx, enc_arr),
-                        _ => Vec::new(),
-                    };
-                    let expected =
-                        pad_signature_for_algo(&algo, sig_compute(&algo, &key_bytes, &data));
-                    ct_eq(&expected, &provided)
-                }
-            }
-            _ => false,
-        };
-        // Reset data accumulator
-        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        ctx.set_field(this, 3, Value::Object(Some(empty)));
+        let valid = sig_finish_verify(ctx, this, &provided)?;
         Ok(Some(Value::Int(if valid { 1 } else { 0 })))
     });
     r.register(sig, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
@@ -16041,6 +15938,172 @@ fn pad_signature_for_algo(algo: &str, sig: Vec<u8>) -> Vec<u8> {
     let mut out = sig;
     out.resize(target_len, 0);
     out
+}
+
+/// The `crypto_impl` handle carried by a key minted by `jca::key_factory`:
+/// `(algorithm index @ slot 0, key_id @ slot 3)`.
+///
+/// `None` means "this carrier is not one of ours" — a bare object, a real JDK
+/// key implementation, or a legacy key that keeps raw bytes at slot 0. Callers
+/// then fall back to the keyed-HMAC surrogate below. The slot numbering is
+/// `jca::key_factory`'s `KEY_FIELD_ALGO` / `KEY_FIELD_KEYID`; the two must move
+/// together (synthetic classes have UNNAMED fields, so nothing but this comment
+/// links the writer to this reader).
+fn sig_key_handle(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<(i32, u64)> {
+    let alg_idx = match ctx.get_field(key_obj, 0) {
+        Value::Int(i) => i,
+        _ => return None,
+    };
+    // `Long` is what `alloc_public_key`/`alloc_private_key` store; accept a
+    // narrowed `Int` too, exactly as `jca::signature::extract_key_id_from_key`
+    // does — a slot with no declared descriptor can come back either way
+    // depending on the layout the synthetic class ended up with.
+    match ctx.get_field(key_obj, 3) {
+        Value::Long(id) if id > 0 => Some((alg_idx, id as u64)),
+        Value::Int(id) if id > 0 => Some((alg_idx, id as u64)),
+        _ => None,
+    }
+}
+
+/// Real signing through the `crypto_impl` backend for a key that carries a
+/// `key_id`. `None` when the requested JCA algorithm and the key's own
+/// algorithm do not agree (e.g. `SHA256withECDSA` against an RSA key), which
+/// leaves the caller on the surrogate path rather than emitting a signature
+/// from the wrong primitive.
+///
+/// The ECDSA hash split mirrors `jca::signature::sign_dispatch` exactly — both
+/// implementations must agree on which digest a given algorithm name means, or
+/// a signature made through one will not verify through the other.
+fn sig_backend_sign(algo: &str, alg_idx: i32, key_id: u64, data: &[u8]) -> Option<Vec<u8>> {
+    let upper = algo.to_uppercase();
+    if upper == "ED25519" && alg_idx == 8 {
+        crate::crypto_impl::ed25519_sign(key_id, data)
+    } else if upper.contains("ECDSA") && alg_idx == 7 {
+        if upper.contains("SHA256") || upper.contains("SHA-256") {
+            crate::crypto_impl::ecdsa_sign_sha256(key_id, data)
+        } else {
+            crate::crypto_impl::ecdsa_sign(key_id, data)
+        }
+    } else if upper.contains("RSA") && alg_idx == 6 {
+        crate::crypto_impl::rsa_sign(key_id, data)
+    } else {
+        None
+    }
+}
+
+/// Verification counterpart of [`sig_backend_sign`]; the algorithm/hash
+/// selection must stay identical to it.
+fn sig_backend_verify(
+    algo: &str,
+    alg_idx: i32,
+    key_id: u64,
+    data: &[u8],
+    provided: &[u8],
+) -> Option<bool> {
+    let upper = algo.to_uppercase();
+    if upper == "ED25519" && alg_idx == 8 {
+        crate::crypto_impl::ed25519_verify(key_id, data, provided)
+    } else if upper.contains("ECDSA") && alg_idx == 7 {
+        if upper.contains("SHA256") || upper.contains("SHA-256") {
+            crate::crypto_impl::ecdsa_verify_sha256(key_id, data, provided)
+        } else {
+            crate::crypto_impl::ecdsa_verify(key_id, data, provided)
+        }
+    } else if upper.contains("RSA") && alg_idx == 6 {
+        crate::crypto_impl::rsa_verify(key_id, data, provided)
+    } else {
+        None
+    }
+}
+
+/// Read `(algorithm name, accumulated payload)` off a Signature receiver and
+/// clear the accumulator, mirroring the JDK's "sign()/verify() reset the
+/// engine" contract.
+fn sig_take_state(ctx: &mut dyn NativeContext, this: ObjectRef) -> (String, Vec<u8>) {
+    let data = match ctx.get_field(this, 3) {
+        Value::Object(Some(arr)) => cipher_read_bytes(ctx, arr),
+        _ => Vec::new(),
+    };
+    let algo = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+    ctx.set_field(this, 3, Value::Object(Some(empty)));
+    (algo, data)
+}
+
+/// The keyed-HMAC surrogate used when the key carries no `crypto_impl` handle
+/// (an unkeyed or legacy carrier). Deterministic, so `verify` can recompute it.
+/// Padded to the algorithm's canonical signature length — see
+/// [`pad_signature_for_algo`]. NOT applied to real signatures: padding a real
+/// 512-bit RSA signature out to 256 bytes would make it fail its own verify.
+fn sig_surrogate(
+    ctx: &mut dyn NativeContext,
+    key_obj: ObjectRef,
+    algo: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let key_bytes = match ctx.get_field(key_obj, 0) {
+        Value::Object(Some(enc_arr)) => cipher_read_bytes(ctx, enc_arr),
+        _ => Vec::new(),
+    };
+    pad_signature_for_algo(algo, sig_compute(algo, &key_bytes, data))
+}
+
+/// Shared body of `Signature.sign()[B` and `Signature.sign([BII)I`.
+fn sig_finish_sign(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    let mode = ctx.get_field(this, 1).as_int().unwrap_or(0);
+    if mode != 1 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Signature not initialized for signing".into(),
+        }
+        .into());
+    }
+    let (algo, data) = sig_take_state(ctx, this);
+    let key_obj = match ctx.get_field(this, 2) {
+        Value::Object(Some(k)) => k,
+        // No key at all: preserve the historical "canonical-length zero-fill"
+        // shape so an unkeyed synthetic Signature still reports a plausible
+        // signature length. `verify` answers `false` for this case.
+        _ => return Ok(pad_signature_for_algo(&algo, Vec::new())),
+    };
+    if let Some((alg_idx, key_id)) = sig_key_handle(ctx, key_obj) {
+        if let Some(bytes) = sig_backend_sign(&algo, alg_idx, key_id, &data) {
+            return Ok(bytes);
+        }
+    }
+    Ok(sig_surrogate(ctx, key_obj, &algo, &data))
+}
+
+/// Shared body of `Signature.verify([B)Z` and `Signature.verify([BII)Z`.
+fn sig_finish_verify(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    provided: &[u8],
+) -> Result<bool, MethodCallFailed> {
+    let mode = ctx.get_field(this, 1).as_int().unwrap_or(0);
+    if mode != 2 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Signature not initialized for verification".into(),
+        }
+        .into());
+    }
+    let (algo, data) = sig_take_state(ctx, this);
+    let key_obj = match ctx.get_field(this, 2) {
+        Value::Object(Some(k)) => k,
+        _ => return Ok(false),
+    };
+    if let Some((alg_idx, key_id)) = sig_key_handle(ctx, key_obj) {
+        if let Some(ok) = sig_backend_verify(&algo, alg_idx, key_id, &data, provided) {
+            return Ok(ok);
+        }
+    }
+    let expected = sig_surrogate(ctx, key_obj, &algo, &data);
+    Ok(ct_eq(&expected, provided))
 }
 
 /// Append bytes to the Signature data accumulator (field 3)
