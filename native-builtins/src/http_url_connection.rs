@@ -1801,11 +1801,28 @@ fn pool_start_reaper() {
         .spawn(|| {
             loop {
                 std::thread::sleep(POOL_REAPER_TICK);
+                if pool_sweep_idle() {
+                    continue;
+                }
+                // The pool looks empty, so this thread wants to exit. Publish
+                // "not running" BEFORE the final check, not after: a `pool_put`
+                // that raced us in between would find the latch still set,
+                // decline to start a reaper, and leave its connection open for
+                // the life of the VM — the exact leak this thread exists to
+                // prevent. Having published, re-check; if something did arrive,
+                // re-acquire the latch and keep going (or exit, if that racing
+                // `pool_put` already started a replacement).
+                POOL_REAPER_RUNNING.store(false, Ordering::Release);
                 if !pool_sweep_idle() {
                     break;
                 }
+                if POOL_REAPER_RUNNING
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    break;
+                }
             }
-            POOL_REAPER_RUNNING.store(false, Ordering::Release);
         });
     if spawned.is_err() {
         // Could not spawn (thread limit): clear the latch so a later
