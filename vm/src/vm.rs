@@ -50659,18 +50659,57 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // List.copyOf just returns input
+        // `List.copyOf` over a REAL collection. This used to pass `null` and
+        // assert it came straight back — "just returns input", which was the
+        // old passthrough stub's behaviour. The JDK throws NullPointerException
+        // for a null argument, so probing null asserted a contract neither the
+        // JDK nor this VM has; copying an actual list is what the method is
+        // for.
+        let src = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 2);
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(src))],
+        )
+        .unwrap();
+        for v in [7, 8] {
+            let boxed = alloc_receiver(&shared, &mut thread, "java/lang/Integer", 1);
+            shared.mem.heap.set_field(boxed, 0, Value::Int(v));
+            call_native(
+                &shared,
+                &mut thread,
+                "java/util/ArrayList",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(src)), Value::Object(Some(boxed))],
+            )
+            .unwrap();
+        }
         let result = call_native(
             &shared,
             &mut thread,
             "java/util/List",
             "copyOf",
             "(Ljava/util/Collection;)Ljava/util/List;",
-            &[Value::Object(None)],
+            &[Value::Object(Some(src))],
         )
         .unwrap()
         .unwrap();
-        assert_eq!(result, Value::Object(None));
+        let copy = result.as_object().expect("copyOf must return a list");
+        let size = call_native(
+            &shared,
+            &mut thread,
+            "java/util/List",
+            "size",
+            "()I",
+            &[Value::Object(Some(copy))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(size, Value::Int(2), "the copy must hold both elements");
     }
 
     #[test]
