@@ -21434,6 +21434,21 @@ pub(super) fn execute_invokevirtual_cached(
                     // docs/known-issues/h2/
                     // bug-h2-suite-residual-fail-triage.md.
                     let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+                    // JVMS §4.4.1: an array type inherits its method table
+                    // from `java.lang.Object`, but an array's header stores
+                    // its COMPONENT class id (`ClassId(0)` for primitive
+                    // arrays). Comparing that raw id against the cached
+                    // receiver class therefore lets a `Foo[]` receiver hit an
+                    // entry installed for a plain `Foo` and run `Foo`'s body
+                    // with the array as `this` — `new Foo[3].toString()`
+                    // returned `Foo`'s override reading array element 0 as
+                    // field 0. Cede to the slow path, which routes array
+                    // receivers through `Object` (same guard as
+                    // `execute_invokevirtual_vtable_fast` and the JIT
+                    // MIC/PIC's `receiver_is_plain_object`).
+                    if shared.mem.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+                        return Ok(CachedCallResult::CacheMiss);
+                    }
                     let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
                     if crate::jit::profile::is_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
@@ -22009,6 +22024,21 @@ pub(super) fn execute_invokevirtual_cached(
                     // docs/known-issues/h2/
                     // bug-h2-suite-residual-fail-triage.md.
                     let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+                    // JVMS §4.4.1: an array type inherits its method table
+                    // from `java.lang.Object`, but an array's header stores
+                    // its COMPONENT class id (`ClassId(0)` for primitive
+                    // arrays). Comparing that raw id against the cached
+                    // receiver class therefore lets a `Foo[]` receiver hit an
+                    // entry installed for a plain `Foo` and run `Foo`'s body
+                    // with the array as `this` — `new Foo[3].toString()`
+                    // returned `Foo`'s override reading array element 0 as
+                    // field 0. Cede to the slow path, which routes array
+                    // receivers through `Object` (same guard as
+                    // `execute_invokevirtual_vtable_fast` and the JIT
+                    // MIC/PIC's `receiver_is_plain_object`).
+                    if shared.mem.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+                        return Ok(CachedCallResult::CacheMiss);
+                    }
                     let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
                     if crate::jit::profile::is_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
@@ -22217,6 +22247,21 @@ pub(super) fn execute_invokevirtual_cached(
                         // See docs/known-issues/h2/
                         // bug-h2-suite-residual-fail-triage.md.
                         let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+                        // JVMS §4.4.1: an array type inherits its method table
+                        // from `java.lang.Object`, but an array's header stores
+                        // its COMPONENT class id (`ClassId(0)` for primitive
+                        // arrays). Comparing that raw id against the cached
+                        // receiver class therefore lets a `Foo[]` receiver hit an
+                        // entry installed for a plain `Foo` and run `Foo`'s body
+                        // with the array as `this` — `new Foo[3].toString()`
+                        // returned `Foo`'s override reading array element 0 as
+                        // field 0. Cede to the slow path, which routes array
+                        // receivers through `Object` (same guard as
+                        // `execute_invokevirtual_vtable_fast` and the JIT
+                        // MIC/PIC's `receiver_is_plain_object`).
+                        if shared.mem.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+                            return Ok(CachedCallResult::CacheMiss);
+                        }
                         let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
                         if crate::jit::profile::is_profiling_enabled() {
                             let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);

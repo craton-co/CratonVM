@@ -9076,16 +9076,72 @@ impl GenerationalHeap {
     {
         self.try_alloc_young_initialized(size, init)
             .unwrap_or_else(|| {
-                let from = self.young_from.lock();
-                eprintln!(
-                    "FATAL: OutOfMemoryError: young gen exhausted — tried to allocate {} bytes, \
-                 from-space has {}/{} used",
-                    size,
-                    from.used(),
-                    from.capacity(),
-                );
+                self.report_fatal_oom(size);
                 std::process::abort();
             })
+    }
+
+    /// Print the full generational picture behind a "both generations are
+    /// exhausted" abort.
+    ///
+    /// The historical one-line message named only the young from-space, which
+    /// reads as "the young gen is too small" even when the actual blocker is a
+    /// full (or badly fragmented) old generation — the spill target every
+    /// panicking allocator tries before it reaches here. Naming old-gen
+    /// occupancy, its largest free block, and the GC counters separates the
+    /// three very different situations that land on this line: a genuinely
+    /// full heap, a heap that is mostly garbage but was never collected
+    /// (`minor_gc` stuck), and an old gen with free bytes but no block large
+    /// enough for the request.
+    fn report_fatal_oom(&self, size: usize) {
+        let (yf_used, yf_cap) = {
+            let f = self.young_from.lock();
+            (f.used(), f.capacity())
+        };
+        let (yt_used, yt_cap) = {
+            let t = self.young_to.lock();
+            (t.used(), t.capacity())
+        };
+        let (og_used, og_cap, og_largest, og_blocks) = {
+            let og = self.old_gen.lock();
+            (
+                og.used(),
+                og.capacity(),
+                og.largest_free_block(),
+                og.free_block_count(),
+            )
+        };
+        let s = self.stats.snapshot();
+        eprintln!(
+            "FATAL: OutOfMemoryError: young gen exhausted — tried to allocate {} bytes, \
+             from-space has {}/{} used",
+            size, yf_used, yf_cap,
+        );
+        eprintln!(
+            "FATAL-OOM detail: young_to {}/{} used; old_gen {}/{} used \
+             (largest free block {}, {} free blocks); minor_gc={} major_gc={} \
+             promoted_bytes={} old_allocs={} young_allocs={}",
+            yt_used,
+            yt_cap,
+            og_used,
+            og_cap,
+            og_largest,
+            og_blocks,
+            s.minor_gc_count,
+            s.major_gc_count,
+            s.bytes_promoted,
+            s.old_allocations,
+            s.young_allocations,
+        );
+        // Opt-in: the allocating call chain. Release builds carry line tables,
+        // so this names the exact panicking-allocator caller — i.e. which
+        // native / VM-internal path could not tolerate a GC-and-retry.
+        if std::env::var_os("CRATONVM_DBG_OOM_BT").is_some() {
+            eprintln!(
+                "FATAL-OOM backtrace:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
     }
 
     /// Generate the next identity hash code.

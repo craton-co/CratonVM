@@ -13,6 +13,7 @@
 - [Running Programs](user-guide/running-programs.md)
 - [Command-Line Reference](user-guide/cli-reference.md)
 - [Configuration](user-guide/configuration.md)
+- [JDK-Only Mode](user-guide/jdk-only-mode.md)
 - [Memory & Garbage Collection](user-guide/memory-and-gc.md)
 - [The JIT Compiler](user-guide/jit-compiler.md)
 - [Modules (JPMS)](user-guide/modules.md)
