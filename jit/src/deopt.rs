@@ -197,6 +197,26 @@ pub struct VirtualObjectState {
     pub field_values: Vec<FrameValue>,
 }
 
+/// Can a [`FrameState`] be turned back into an interpreter frame?
+///
+/// `false` as soon as any live local or operand-stack slot is
+/// [`FrameValue::Unsupported`] — the marker the snapshot emitter writes when it
+/// cannot determine a slot JVM width/type. The VM resume sink
+/// (`build_deopt_frame_inner`) maps such a slot to `None` and refuses the
+/// resume, so a deopt point carrying one is unresumable by construction.
+///
+/// Callers that emit an UNCONDITIONAL trap (the `invokedynamic` uncommon trap)
+/// use this to bail the whole compile: an artifact that always traps at a point
+/// it can never resume from fails on its first compiled call with
+/// `InternalError: precise deoptimization unavailable ... refusing
+/// side-effecting replay`, which is strictly worse than staying interpreted.
+pub fn frame_state_is_resumable(fs: &FrameState) -> bool {
+    !fs.locals
+        .iter()
+        .chain(fs.stack.iter())
+        .any(|v| matches!(v, FrameValue::Unsupported))
+}
+
 /// Lock/monitor state for a single object.
 #[derive(Debug, Clone)]
 pub struct MonitorInfo {
@@ -1662,6 +1682,50 @@ pub fn count_virtual_objects(frame: &FrameState) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fs(locals: Vec<FrameValue>, stack: Vec<FrameValue>) -> FrameState {
+        FrameState {
+            method_key: "T.m:()V".to_string(),
+            bci: 0,
+            locals,
+            stack,
+            monitors: Vec::new(),
+            caller: None,
+        }
+    }
+
+    /// Regression witness for the 2026-07-31 `unresumable-indy-trap` compile
+    /// bail (`x64.rs`, opcode `0xba`). `Unsupported` in ANY live slot -- locals
+    /// or operand stack -- makes the frame unresumable; everything the resume
+    /// sink can map (including `Undefined`, which becomes `Int(0)`) does not.
+    /// Inverting this predicate re-arms the `InternalError: precise
+    /// deoptimization unavailable ... refusing side-effecting replay` failure
+    /// that took out javac `ClassReader.readInnerClasses` and the whole Spring
+    /// AOT in-process-compilation cluster.
+    #[test]
+    fn frame_state_resumability_tracks_unsupported_slots() {
+        assert!(frame_state_is_resumable(&fs(vec![], vec![])));
+        assert!(frame_state_is_resumable(&fs(
+            vec![FrameValue::Object(0), FrameValue::Int(3), FrameValue::Undefined],
+            vec![FrameValue::Object(0x1000), FrameValue::Long(7)],
+        )));
+        assert!(
+            !frame_state_is_resumable(&fs(vec![FrameValue::Unsupported], vec![])),
+            "an Unsupported LOCAL must make the frame unresumable"
+        );
+        assert!(
+            !frame_state_is_resumable(&fs(
+                vec![FrameValue::Object(0)],
+                vec![
+                    FrameValue::Object(0x1000),
+                    FrameValue::Unsupported,
+                    FrameValue::Object(0x2000),
+                ],
+            )),
+            "an Unsupported STACK slot under an indy argument -- the javac \
+             ClassReader.readInnerClasses shape -- must make the frame unresumable"
+        );
+    }
 
     // -- per-bci de-spec registry (Step 9 follow-up c) ---------------------
 

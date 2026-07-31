@@ -478,29 +478,45 @@ fn should_skip_jit_internal(
     // `JdkClientHttpRequest.lambda$buildRequest$0`,
     // `AnnotatedTypeMetadata.getAllAnnotationAttributes`).
     //
-    // All eleven were re-tested on this dev tip with a build-time kill switch
-    // that lifted them individually, and none of the miscompiles they
-    // document still reproduces -- the underlying JIT defects were fixed by
-    // dev drift between 2026-07-25 and 2026-07-30. The differential is
-    // recorded in
-    // `docs/internal/spring-jit-bans-inventory-and-ban-lift-experiment-20260730.md`;
-    // the short version:
+    // The eight javac-family bans were all workarounds for ONE producer
+    // defect, fixed 2026-07-31 in `jit/src/x64.rs`s `invokedynamic` (0xba)
+    // arm. That opcode lowers to an UNCONDITIONAL uncommon trap plus a frame
+    // snapshot the interpreter resumes from. The snapshot types the call
+    // sites own arguments exactly, but every operand-stack entry BELOW them
+    // falls back to the method-level `uses_long_float_double` gate and is
+    // recorded `Unsupported` -- so in a method that touches any wide value,
+    // an `int` sitting under the indy argument is unmappable, the resume sink
+    // refuses ("precise deoptimization unavailable ... refusing side-effecting
+    // replay"), and the method dies with an `InternalError` on its FIRST
+    // compiled call. javac `ClassReader.readInnerClasses` bci 41 is the
+    // canonical instance (`optPoolEntry(int, IntFunction, Object)`).
+    // The fix checks the snapshot with `deopt::frame_state_is_resumable` and
+    // bails the compile when it is unresumable, so the method stays
+    // interpreted -- what these bans did by hand, decided from the actual
+    // snapshot instead of a hardcoded method list.
+    //
+    // Evidence (full write-up, including the false "these bans are stale"
+    // reading that preceded it, in
+    // `docs/internal/jit-bans/spring-jit-bans-inventory-and-ban-lift-experiment-20260730.md`):
     //
     //   * `JavacConsolidationProbe` (200 varied in-process javac compilations,
-    //     the repo's own witness for the javac family) fails at iteration 2 on
-    //     dev `351bf59b0` with the bans lifted and passes 200/200 on this tip
-    //     with them lifted;
-    //   * ten Spring AOT/codegen test classes produce byte-identical results
-    //     with the bans active and lifted on this tip;
-    //   * `BasicErrorControllerIntegrationTests` (the Spring Boot trio's own
-    //     witness) reproduces its failure on `351bf59b0` with those bans
-    //     lifted and is clean across repeated runs here.
+    //     the repo own witness for this family) fails at iteration 2 with the
+    //     bans lifted and no fix, and passes 200/200 with the fix;
+    //   * an H2 `CREATE ALIAS ... AS $$` probe goes 38/60 -> 60/60;
+    //   * all TEN Spring AOT/codegen witness classes pass, including four that
+    //     were failing WITH the bans in place (BeanDefinitionMethodGenerator
+    //     10/34 -> 34/34, AutowiredAnnotationBeanRegistrationAotContribution
+    //     0/14 -> 14/14, ApplicationContextAotGenerator 8/40 -> 40/40,
+    //     TestContextAotGeneratorIntegration 0/4 -> 4/4);
+    //   * `BasicErrorControllerIntegrationTests`, the Spring Boot trio own
+    //     witness, reproduces its failure on dev `351bf59b0` with those bans
+    //     lifted and is clean on this tip.
     //
     // The unit tests below are the regression witnesses: they now assert
     // JIT-ELIGIBILITY for all eleven methods, so re-adding a ban silently is
-    // a test failure. If a javac-family miscompile ever comes back, prefer
-    // fixing the lowering over re-adding a per-method ban -- this family has
-    // regressed twice from unrelated x64 backend changes.
+    // a test failure. If a javac-family miscompile ever comes back, fix the
+    // lowering -- a per-method ban hides the defect everywhere else it occurs,
+    // which is exactly what happened here for two weeks.
 
     // SPRINGBOOT-WITHOUT-JACKSON.2 -- REMOVED 2026-07-26. Re-verified with a
     // standalone probe (`SpringBootLoadClassProbe.java`, package-local to

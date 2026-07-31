@@ -1,16 +1,30 @@
 # Spring-related JIT bans in `vm/src/jit/skip_list.rs` — inventory, ban-lift experiment, and removal
 
-**Status: ✅ RESOLVED (2026-07-30). All 11 bans inventoried here have been
-REMOVED from `vm/src/jit/skip_list.rs`.** The 2026-07-30 morning experiment
-(Part 2) found all 8 javac-family bans still necessary on dev `351bf59b0`;
-re-running the same experiment the same evening on dev `9ac1feffe` found none
-of them necessary any more — the underlying JIT defects had been fixed by dev
-drift in between. The three 2026-07-29 Spring Boot bans were tested for the
-first time in this session (the earlier session had no `apps/spring-boot`) and
-are likewise no longer necessary. The gates, the `SkipReason` variants, and
-the unit tests asserting the bans were in force are all gone; those tests now
-assert the opposite (JIT-ELIGIBILITY), so a silent re-introduction is a test
-failure.
+**Status: ✅ RESOLVED (2026-07-31). All 11 bans inventoried here have been
+REMOVED from `vm/src/jit/skip_list.rs`, and the JIT defect the eight
+javac-family ones existed for has been FIXED** (`jit/src/x64.rs`, opcode
+`0xba`: an `invokedynamic` uncommon trap whose frame snapshot cannot be
+materialised now bails the compile instead of producing an artifact that
+`InternalError`s on its first call).
+
+Read Parts 3-4 with Part 5 in hand. Parts 3-4 measured the bans as *stale* —
+and they were, on the dev tips available at the time — but for the wrong
+reason: `dev` was briefly not tiering up instance methods, so the offending
+javac methods simply were not compiled. The next dev merge restored
+instance-method tier-up and every failure came straight back, which is what
+led to the actual root cause in Part 5. The removal stands because the
+producer is fixed, not because the bans were unnecessary.
+
+Fixing the producer also closed four Spring AOT classes that had been failing
+in *every* arm, with the bans active — `BeanDefinitionMethodGeneratorTests`
+10/34 → 34/34, `AutowiredAnnotationBeanRegistrationAotContributionTests` 0/14
+→ 14/14, `ApplicationContextAotGeneratorTests` 8/40 → 40/40,
+`TestContextAotGeneratorIntegrationTests` 0/4 → 4/4. All ten witness classes
+now pass.
+
+The gates, the `SkipReason` variants, and the unit tests asserting the bans
+were in force are gone; those tests now assert the opposite
+(JIT-ELIGIBILITY), so a silent re-introduction is a test failure.
 
 ## Context
 
@@ -357,4 +371,148 @@ The pristine-dev control was built from a detached worktree at
 `376114f635` with no changes of any kind, and fails at the same rate. So the
 regression arrived on `dev` between `9ac1feffe` and `376114f635`; this branch
 neither causes nor worsens it. Written up separately as
+`docs/known-issues/springboot-basicerrorcontroller-checkcast-abort-20260731.md`.
+
+## Part 5 — the bans were NOT stale after all: the real root cause, and the fix
+
+Parts 3-4 concluded the javac-family bans were stale because nothing
+reproduced with them lifted on dev `9ac1feffe`/`376114f635`. That conclusion
+was **wrong in its reasoning even though the removal was right in the end**,
+and the next dev merge exposed it immediately.
+
+Merging `origin/dev` at `e4f9191d6f` ("restore instance-method tier-up default
+by gating the bg-compile promotion") brought the failures straight back on the
+ban-free build:
+
+| Witness | before that merge | after it |
+|---|---|---|
+| `JavacConsolidationProbe 200` | OK 200/200 | **FAIL at iteration 2** |
+| `H2AliasProbe 60` | OK 60/60 | **38/60** |
+| `JavacLoopRepro2 60` | OK 60/60 | **38/60** |
+
+So the bans had never stopped being load-bearing. What had happened is that
+`dev` was, for a window, not tiering up instance methods at all — the javac
+methods simply were not being compiled, which looks exactly like "the bug is
+fixed" from the outside. Restoring instance-method tier-up restored the bug.
+(This is the standing "symptom gone may mean the method is no longer compiled"
+trap, and Parts 3-4 walked into it despite explicitly checking that
+`Types.erasure`/`ClassFinder.fillIn`/`Symbol$ClassSymbol.complete` *were*
+being compiled — those three compiled fine; the method that actually breaks,
+`ClassReader.readInnerClasses`, was not reaching the backend in the probe
+workloads at the time.)
+
+### Root cause
+
+The failure is fail-closed and names itself:
+
+```
+java.lang.InternalError: JIT dispatch into
+com/sun/tools/javac/jvm/ClassReader.readInnerClasses(...) failed: internal
+error: precise deoptimization unavailable for ...readInnerClasses(...) at bci
+41 (the frame could not be materialised from its map, ...); refusing
+side-effecting replay
+```
+
+bci 41 in `readInnerClasses` is an `invokedynamic`. The JIT never executes an
+`invokedynamic`: opcode `0xba` lowers to an **unconditional** uncommon trap
+that deopts to the interpreter, and `emit_osr_exit_map_at_reason` records a
+frame snapshot there so the interpreter can resume precisely at that bci.
+
+Dumping the snapshot (a new `CRATONVM_DBG_DEOPTSLOT` trace) shows why the
+resume refuses:
+
+```
+[DBG_DEOPTSLOT] com/sun/tools/javac/jvm/ClassReader.readInnerClasses:(...)V bci=41
+  locals=[Object(..), Object(..), Int(1), Int(0), Undefined, Int(36), Undefined, ...]
+  stack =[Object(..), Unsupported, Object(..)]
+```
+
+The operand stack at that bci is `[ClassReader, int, PoolReader]` — javac is
+building the call `optPoolEntry(int, IntFunction, Object)` and the
+`invokedynamic` produces only the `IntFunction`. The snapshot emitter types
+operand-stack entries two ways:
+
+* the top `N` entries are the indy call site's own arguments, typed exactly
+  from its descriptor (`indy_stack_arg_types`, the 2026-07-07 "indy-arg-types"
+  fix) — here that covers only the `PoolReader`;
+* every other entry falls back to `uses_long_float_double`, a **method-level**
+  gate: if the method touches any `long`/`float`/`double` anywhere, a non-oop
+  stack slot could be a truncated cat-2 value, so it is recorded
+  `Unsupported` rather than guessed.
+
+`readInnerClasses` does use wide values elsewhere, so the `int` sitting
+*underneath* the indy argument becomes `Unsupported`. `fv_to_value` maps
+`Unsupported` to `None`, `build_deopt_frame_inner` returns `None`, and the
+resume sink correctly refuses to replay a side-effecting method from bci 0.
+
+The result is the worst possible combination: the trap is **unconditional**,
+so the very first compiled call reaches a deopt point the VM can never resume
+from, and the method dies with an `InternalError`. Every one of the eight
+javac-family bans was a hand-written workaround for one instance of this.
+
+### The fix
+
+`jit/src/x64.rs`, opcode `0xba`: after emitting the trap's snapshot, check it
+with the new `deopt::frame_state_is_resumable` and, if any live slot is
+`Unsupported`, `buf.mark_overflowed()` — the existing "abandon this compile"
+signal. The method stays interpreted instead of being compiled into a
+guaranteed `InternalError`.
+
+This is deliberately narrow: it applies only at the unconditional indy trap,
+where an unresumable snapshot is a *certainty* rather than a rare path.
+Measured blast radius on the H2 alias workload: **7 compile-bails against
+1569 successful compiles (0.45%)**.
+
+### Results
+
+All ten Spring AOT/codegen witness classes, on dev `e4f9191d6f` with all 11
+bans removed and this fix in:
+
+| Class | with the bans (any earlier arm) | bans removed + this fix |
+|---|---|---|
+| `beans.factory.aot.InstanceSupplierCodeGeneratorTests` | OK 24/26 | OK 24/26 |
+| `beans.factory.aot.BeanDefinitionMethodGeneratorTests` | FAIL 10/34 | **OK 34/34** |
+| `beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests` | FAIL 0/14 | **OK 14/14** |
+| `aot.nativex.FileNativeConfigurationWriterTests` | OK 7/7 | OK 7/7 |
+| `beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests` | OK 44/44 | OK 44/44 |
+| `beans.factory.aot.CodeWarningsTests` | OK 23/23 | OK 23/23 |
+| `core.test.tools.TestCompilerTests` | OK 22/22 | OK 22/22 |
+| `context.index.processor.CandidateComponentsIndexerTests` | OK 24/24 | OK 24/24 |
+| `context.aot.ApplicationContextAotGeneratorTests` | FAIL 8/40 | **OK 40/40** |
+| `test.context.aot.TestContextAotGeneratorIntegrationTests` | FAIL 0/4 | **OK 4/4** |
+
+Four classes that were broken in *every* arm of Parts 3-4 — including with
+all bans active — are now green. The per-method bans had been suppressing the
+javac methods they named while leaving the same defect live everywhere else it
+occurred; fixing the producer closes the whole cluster.
+
+Probes: `JavacConsolidationProbe 200` OK ×2, `H2AliasProbe 60` OK 60/60 ×2,
+`JavaLoopRepro2 60` OK 60/60. Unit tests: `cargo test --release -p
+cratonvm-jit --lib` 1060 passed / 0 failed (including the new
+`frame_state_resumability_tracks_unsupported_slots`), `-p cratonvm-vm --lib`
+2300 passed / 0 failed, `--lib skip_list` 76 passed / 0 failed.
+
+### Correction to Part 4's `StackWalker` residual
+
+Part 4 filed the `StackWalker$StackFrame.getDeclaringClass()` NPE as a
+non-JIT known issue, on the strength of a `--nojit` run that also failed.
+That measurement was taken against the wrong binary. Re-measured properly on
+one build:
+
+| binary | JIT | result |
+|---|---|---|
+| pre-fix | on | FAIL 1/14 |
+| pre-fix | `--nojit` | **OK 14/14** |
+| with this fix | on | OK 14/14 |
+| with this fix | `--nojit` | OK 14/14 |
+
+It was this JIT defect all along — log4j's `StackLocator.getCallerClass`
+walks the stack through `Stream.dropWhile` with a lambda, i.e. through an
+`invokedynamic`, and the unresumable trap took out the frame walk. The
+known-issue doc filed for it in Part 4 has been withdrawn.
+
+The other Part 4 residual — `BasicErrorControllerIntegrationTests` aborting
+with `checkcast: not an object reference` — is **not** fixed by this and is
+confirmed independent (it reproduces on pristine `dev` with every ban still
+in place). It stays filed at
 `docs/known-issues/springboot-basicerrorcontroller-checkcast-abort-20260731.md`.
