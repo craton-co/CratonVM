@@ -26,7 +26,38 @@ use std::collections::{HashMap, HashSet};
 pub type NodeId = u32;
 
 /// Sentinel value — "no node".
+///
+/// **Deprecated for new code.** This is a *value-domain* sentinel: it lives in
+/// the same `u32` space as a real [`NodeId`], so every read of an id table has
+/// to remember to test for it, and a forgotten test silently indexes
+/// `nodes[u32::MAX]` (panic) or, worse, treats "undefined" as node 4294967295.
+/// New code should use the `Option<NodeId>` accessors instead —
+/// [`node_id_opt`], [`Node::input_opt`], [`Graph::node_opt`],
+/// [`Graph::is_valid_id`], [`SafepointSnapshot::local_opt`] /
+/// [`SafepointSnapshot::stack_opt`] — and only convert back to the sentinel at
+/// the boundary of code that still stores it (`ir_lower`, `ir_optimize`,
+/// `ir_schedule`, `lib.rs`).
+///
+/// The constant stays exported because those files still reference it. It can
+/// never collide with a real id: [`Graph::add`] hands out ids starting at 0 and
+/// increasing by one, so a collision would need `u32::MAX` live nodes — orders
+/// of magnitude past every IR size cap. `Graph::add` carries a `debug_assert!`
+/// that pins the invariant rather than leaving it to arithmetic folklore.
 pub const NO_NODE: NodeId = u32::MAX;
+
+/// Lift a sentinel-carrying id into an `Option`: `None` for [`NO_NODE`].
+///
+/// The one-line bridge between the old value-domain sentinel and the checked
+/// accessors. Note this only rejects the sentinel — it does not check the id
+/// against a graph; use [`Graph::node_opt`] when the graph is in hand.
+#[inline]
+pub fn node_id_opt(id: NodeId) -> Option<NodeId> {
+    if id == NO_NODE {
+        None
+    } else {
+        Some(id)
+    }
+}
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -50,6 +81,88 @@ pub enum IrType {
     /// Memory-ordering token (enforces load/store sequencing).
     Memory,
 }
+
+// ── Type lattice ─────────────────────────────────────────────────────
+
+/// True for the JVM category-1 *integer family*.
+///
+/// [`IrType::Int`] is already the widest member: `boolean`, `byte`, `char`,
+/// `short` and `int` all decode to it (see the enum doc), and the narrowing
+/// conversions `I2B`/`I2C`/`I2S` also produce it. The predicate exists so the
+/// sub-width join rule has one named home — if a narrower variant is ever
+/// added to [`IrType`], it belongs here and the join keeps widening to `Int`
+/// instead of falling into the reject arm.
+fn is_int_family(t: IrType) -> bool {
+    matches!(t, IrType::Int)
+}
+
+/// True when `node` is the null literal.
+///
+/// This IR has **no distinct null type** — there is no `IrType::Null`, and
+/// adding one would break every exhaustive `match` on [`IrType`] in the other
+/// pipeline files. A null literal is therefore represented as
+/// `Op::Const(0)` *typed* [`IrType::Ref`], which makes the JVMS rule "null
+/// joins with any reference type to that reference type" fall straight out of
+/// `Ref ⊔ Ref = Ref` in [`join_data_type`].
+///
+/// The corollary matters more than the predicate: an `Op::Const(0)` typed
+/// `Int` is **not** a null. Accepting it as one would make every genuine
+/// `int`/reference merge join silently to `Ref`, which is exactly the
+/// unsound direction (the GC would then scan an arbitrary integer as an oop).
+pub fn is_null_const(node: &Node) -> bool {
+    matches!(node.op, Op::Const(0)) && node.ty == IrType::Ref
+}
+
+/// Join (least upper bound) of two IR value types.
+///
+/// This is the lattice a φ node's type is folded over
+/// ([`Graph::phi_data_type_checked`]). `None` means the two types have no
+/// common value representation — the merge is *untypeable*, which for verified
+/// bytecode can only happen on a slot that is dead at the merge point.
+///
+/// Rules:
+/// - identical types join to themselves (`Ref ⊔ Ref = Ref` is the conservative
+///   "some common reference" — this IR models every oop with one `Ref`, so no
+///   class-hierarchy least-upper-bound is computed or needed);
+/// - the integer sub-widths (`boolean`/`byte`/`char`/`short`/`int`) join to the
+///   widest integer, [`IrType::Int`] (see `is_int_family`);
+/// - `null ⊔ Ref = Ref` — subsumed by the identity rule, because a null literal
+///   is typed `Ref` (see [`is_null_const`]);
+/// - `Float` joins only with `Float`, `Double` only with `Double`, `Long` only
+///   with `Long`, `Ref` only with `Ref`;
+/// - [`IrType::Void`] is the absence of a value, so it never joins — not even
+///   with itself;
+/// - everything else (any category conflict: `Ref`/`Int`, `Float`/`Int`,
+///   `Int`/`Long`, `Float`/`Double`, …) returns `None`.
+///
+/// The operation is commutative and associative, so folding it left-to-right
+/// over a φ's inputs is order-independent.
+pub fn join_data_type(a: IrType, b: IrType) -> Option<IrType> {
+    // `Void` is "no value at all", not a value type: it has no join partner.
+    if a == IrType::Void || b == IrType::Void {
+        return None;
+    }
+    if a == b {
+        return Some(a);
+    }
+    if is_int_family(a) && is_int_family(b) {
+        return Some(IrType::Int);
+    }
+    // Category conflict — `Ref`/`Int`, `Float`/`Int`, `Int`/`Long`,
+    // `Float`/`Double`, `Control`/anything, `Memory`/anything.
+    None
+}
+
+/// The φ type used when [`Graph::phi_data_type_checked`] cannot prove one.
+///
+/// `Int` is the conservative answer here, and specifically *not* `Ref`: a φ
+/// typed `Ref` becomes a GC root (`ir_lower::zero_ref_phi_slots`, the
+/// oop-map/deopt `StackSlotRef` classification), so guessing `Ref` for a slot
+/// we could not type would hand the collector an arbitrary machine word to
+/// dereference. `Int` keeps the slot out of the oop map, which is the
+/// historical behaviour and the failure mode that degrades rather than
+/// corrupts. Reaching it is always reported (see `report_phi_type_fallback`).
+pub const PHI_TYPE_FALLBACK: IrType = IrType::Int;
 
 // ── Comparison operators ─────────────────────────────────────────────
 
@@ -333,6 +446,28 @@ pub struct Node {
     pub bytecode_pc: Option<usize>,
 }
 
+impl Node {
+    /// Checked input read: the edge at `idx`, or `None` when the index is out
+    /// of range **or** the edge is the [`NO_NODE`] placeholder.
+    ///
+    /// Prefer this over `node.inputs[idx]` / `node.inputs.get(idx)`: both of
+    /// those hand back the sentinel as if it were an id, which is how a
+    /// `nodes[u32::MAX]` panic gets written.
+    #[inline]
+    pub fn input_opt(&self, idx: usize) -> Option<NodeId> {
+        self.inputs.get(idx).copied().and_then(node_id_opt)
+    }
+
+    /// The φ *value* inputs (i.e. `inputs[1..]`, skipping the merge/region
+    /// control edge), each lifted through [`node_id_opt`] so a placeholder
+    /// reads as `None` rather than as node `u32::MAX`.
+    ///
+    /// Meaningful only for `Op::Phi`; the caller is expected to know that.
+    pub fn phi_value_inputs(&self) -> impl Iterator<Item = Option<NodeId>> + '_ {
+        self.inputs.iter().skip(1).map(|&id| node_id_opt(id))
+    }
+}
+
 // ── Safepoint snapshots (deopt frame provenance) ─────────────────────
 
 /// A snapshot of the abstract interpreter state at a bytecode boundary,
@@ -360,6 +495,21 @@ pub struct SafepointSnapshot {
     pub stack: Vec<NodeId>,
 }
 
+impl SafepointSnapshot {
+    /// Checked read of local slot `idx`: `None` when the slot is out of range
+    /// or undefined ([`NO_NODE`]) at this bci.
+    #[inline]
+    pub fn local_opt(&self, idx: usize) -> Option<NodeId> {
+        self.locals.get(idx).copied().and_then(node_id_opt)
+    }
+
+    /// Checked read of operand-stack slot `idx` (0 = bottom of stack).
+    #[inline]
+    pub fn stack_opt(&self, idx: usize) -> Option<NodeId> {
+        self.stack.get(idx).copied().and_then(node_id_opt)
+    }
+}
+
 // ── Graph ────────────────────────────────────────────────────────────
 
 /// The IR graph — a flat arena of nodes with an entry and exit.
@@ -380,6 +530,15 @@ impl Graph {
     /// Allocate a new node, returning its `NodeId`.
     pub fn add(&mut self, op: Op, ty: IrType, inputs: Vec<NodeId>, pc: Option<usize>) -> NodeId {
         let id = self.nodes.len() as NodeId;
+        // Ids are dense from 0, so this can only fire if a graph ever reaches
+        // `u32::MAX` nodes — at which point a real id would be indistinguishable
+        // from the `NO_NODE` placeholder and every "is this slot defined?" test
+        // in the pipeline would invert. Pin the invariant rather than assume it.
+        debug_assert!(
+            id != NO_NODE,
+            "node id collided with the NO_NODE sentinel ({} nodes)",
+            self.nodes.len()
+        );
         self.nodes.push(Node {
             op,
             ty,
@@ -423,6 +582,100 @@ impl Graph {
     /// Number of live (non-dead) nodes.
     pub fn live_count(&self) -> usize {
         self.nodes.iter().filter(|n| n.op != Op::Dead).count()
+    }
+
+    // ── Checked id accessors ─────────────────────────────────────────
+    //
+    // The sentinel-free replacements for `id != NO_NODE && (id as usize) <
+    // nodes.len()`, which is spelled out (or half spelled out) at dozens of
+    // sites across the pipeline. See the [`NO_NODE`] doc.
+
+    /// True when `id` names a real node in this graph — i.e. it is neither the
+    /// [`NO_NODE`] placeholder nor out of range.
+    ///
+    /// Note this says nothing about liveness: a killed node (`Op::Dead`) still
+    /// has a valid id.
+    #[inline]
+    pub fn is_valid_id(&self, id: NodeId) -> bool {
+        id != NO_NODE && (id as usize) < self.nodes.len()
+    }
+
+    /// Checked node lookup: `None` for [`NO_NODE`] or an out-of-range id.
+    #[inline]
+    pub fn node_opt(&self, id: NodeId) -> Option<&Node> {
+        if id == NO_NODE {
+            return None;
+        }
+        self.nodes.get(id as usize)
+    }
+
+    /// Checked mutable node lookup — [`Graph::node_opt`]'s `&mut` twin.
+    #[inline]
+    pub fn node_opt_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        if id == NO_NODE {
+            return None;
+        }
+        self.nodes.get_mut(id as usize)
+    }
+
+    /// The value type of `id`, or `None` if `id` does not name a node.
+    #[inline]
+    pub fn type_of(&self, id: NodeId) -> Option<IrType> {
+        self.node_opt(id).map(|n| n.ty)
+    }
+
+    /// The data type of a `Op::Phi` with these `inputs`, or a description of
+    /// why one could not be proven.
+    ///
+    /// `inputs` is the φ's full input list — `[merge_or_region, val_0, val_1,
+    /// …]` — so `inputs[0]` (the control edge) is skipped and the remaining
+    /// value edges are folded with [`join_data_type`].
+    ///
+    /// Semantics:
+    /// - a value input that is [`NO_NODE`], out of range, or typed
+    ///   [`IrType::Void`] contributes nothing and is skipped. This is *normal*,
+    ///   not an error: `activate_loop_header` creates a loop-carried φ before
+    ///   the back-edge value exists, and a local can be uninitialised on one
+    ///   entry edge. `IrBuilder::retype_phi` re-runs the join once the
+    ///   back-edge input has been appended;
+    /// - `Err` when two inputs have no join (a category conflict — an untypeable
+    ///   merge), or when *no* input carries a usable type at all;
+    /// - `Ok` otherwise, with the joined type.
+    ///
+    /// The error is a `String` rather than a bail: the caller decides whether an
+    /// untypeable φ is fatal. The builder's infallible wrapper
+    /// (`IrBuilder::phi_data_type`) reports it and falls back to
+    /// [`PHI_TYPE_FALLBACK`].
+    pub fn phi_data_type_checked(&self, inputs: &[NodeId]) -> Result<IrType, String> {
+        let mut joined: Option<IrType> = None;
+        let mut unknown = 0usize;
+        for (k, &n) in inputs.iter().enumerate().skip(1) {
+            let ty = match self.node_opt(n) {
+                Some(node) if node.ty != IrType::Void => node.ty,
+                // Placeholder, out of range, or a void-producing node: no
+                // information, and not (on its own) a conflict.
+                _ => {
+                    unknown += 1;
+                    continue;
+                }
+            };
+            joined = Some(match joined {
+                None => ty,
+                Some(prev) => join_data_type(prev, ty).ok_or_else(|| {
+                    format!(
+                        "phi value input #{k} (node {n}) is {ty:?}, which does not \
+                         join with the {prev:?} of the preceding input(s)"
+                    )
+                })?,
+            });
+        }
+        joined.ok_or_else(|| {
+            format!(
+                "phi has no typed value input ({} value edge(s), {unknown} \
+                 undefined/void)",
+                inputs.len().saturating_sub(1)
+            )
+        })
     }
 
     /// Build a use-count vector: `uses[id]` = number of nodes that reference `id` as an input.
@@ -583,27 +836,73 @@ impl IrBuilder {
         self.ldc2w_info = info;
     }
 
-    /// inc 27: the data type for a merge / loop-carried `Op::Phi`, derived from
-    /// its value inputs (`inputs[0]` is the region/merge control). A `long`
-    /// (or `double`) value makes the phi that type, so `frame_value_for`
-    /// resolves the correct 64-bit width on a deopt-frame resume — the phi was
-    /// historically hardcoded `Int`, which would truncate a long on resume.
-    /// Codegen is unaffected (phi copies are unconditionally 64-bit `MOV`s and
-    /// every consumer picks width from its own `node.ty`); only the (currently
-    /// unwired) deopt-resume path reads the phi's own type. Scoped to category-2
-    /// (long/double) to avoid perturbing `Ref`/`Float` phi handling; defaults to
-    /// `Int` otherwise (the prior behaviour).
+    /// The data type for a merge / loop-carried `Op::Phi`, derived from its
+    /// value inputs (`inputs[0]` is the region/merge control) by folding the
+    /// [`join_data_type`] lattice — see [`Graph::phi_data_type_checked`].
+    ///
+    /// inc 27 typed a φ `Long`/`Double` when it saw one of those and defaulted
+    /// to `Int` for everything else, "to avoid perturbing `Ref`/`Float` phi
+    /// handling". That default is the bug this replaces: a *reference* merge
+    /// typed `Int` is invisible to `ir_lower::zero_ref_phi_slots` and to the
+    /// oop-map/`StackSlotRef` classification in `frame_value_for`, so the
+    /// merged oop is neither zero-initialised nor reported as a GC root, and a
+    /// deopt frame rebuilt from it carries an `Int` where the interpreter
+    /// expects a reference. A `Float` merge typed `Int` misresolves the same
+    /// way (`StackSlot` instead of `StackSlotFloat`).
+    ///
+    /// Machine codegen is unaffected by the widening: φ edge copies are
+    /// unconditionally 64-bit `MOV`s through RAX (`ir_lower::emit_phi_copies`
+    /// switches on nothing but `Memory`/`Control`/`Void`), and every consumer
+    /// picks its width from its own `node.ty`.
+    ///
+    /// Infallible by construction so no existing caller has to change: an
+    /// untypeable merge is *reported* and falls back to [`PHI_TYPE_FALLBACK`]
+    /// rather than silently answering `Int`. Callers that want the diagnosis
+    /// use [`Self::phi_data_type_checked`].
     fn phi_data_type(&self, inputs: &[NodeId]) -> IrType {
-        for &n in inputs.iter().skip(1) {
-            if n != NO_NODE {
-                if let Some(node) = self.graph.nodes.get(n as usize) {
-                    if matches!(node.ty, IrType::Long | IrType::Double) {
-                        return node.ty;
-                    }
-                }
+        match self.graph.phi_data_type_checked(inputs) {
+            Ok(ty) => ty,
+            Err(why) => {
+                report_phi_type_fallback(&why);
+                PHI_TYPE_FALLBACK
             }
         }
-        IrType::Int
+    }
+
+    /// [`Graph::phi_data_type_checked`] for the graph under construction: the
+    /// φ type these `inputs` prove, or a description of why they prove none.
+    pub fn phi_data_type_checked(&self, inputs: &[NodeId]) -> Result<IrType, String> {
+        self.graph.phi_data_type_checked(inputs)
+    }
+
+    /// Re-derive a φ's type after an input was appended *after* creation.
+    ///
+    /// A loop-carried φ is created at the header with only its entry value(s)
+    /// (the back-edge value does not exist yet — see
+    /// [`Self::activate_loop_header`]), so its type is a judgement made on
+    /// partial information. [`Self::patch_loop_backedge`] appends the back-edge
+    /// value and then calls this so the recorded type describes the *whole*
+    /// merge — e.g. a slot whose entry value was undefined (`NO_NODE`, no type
+    /// information, so the φ fell back to `Int`) but whose back-edge value is a
+    /// reference is retyped `Ref` and becomes a GC root.
+    ///
+    /// Never downgrades: memory/control φs are bookkeeping tokens and are left
+    /// alone, and if the widened input list no longer joins, the previously
+    /// derived type is kept (and the conflict reported) rather than replaced by
+    /// the fallback.
+    fn retype_phi(&mut self, phi: NodeId) {
+        let current = match self.graph.node_opt(phi) {
+            Some(node) => node.ty,
+            None => return,
+        };
+        if matches!(current, IrType::Memory | IrType::Control) {
+            return;
+        }
+        let inputs = self.graph.nodes[phi as usize].inputs.clone();
+        match self.graph.phi_data_type_checked(&inputs) {
+            Ok(ty) => self.graph.nodes[phi as usize].ty = ty,
+            Err(why) => report_phi_type_fallback(&why),
+        }
     }
 
     /// Re-lay-out the parameter locals with the JVM category-2 two-slot
@@ -680,12 +979,31 @@ impl IrBuilder {
         self.stack.push(id);
     }
 
+    /// Pop the top abstract-stack entry, or `None` on an empty stack (or a
+    /// `NO_NODE` placeholder entry). The checked form of [`Self::pop`].
+    fn pop_opt(&mut self) -> Option<NodeId> {
+        self.stack.pop().and_then(node_id_opt)
+    }
+
+    /// Top of the abstract stack, or `None` when empty/undefined.
+    fn peek_opt(&self) -> Option<NodeId> {
+        self.stack.last().copied().and_then(node_id_opt)
+    }
+
+    /// Sentinel-returning [`Self::pop_opt`], kept for the opcode lowerings that
+    /// still thread `NO_NODE` through to the graph.
     fn pop(&mut self) -> NodeId {
-        self.stack.pop().unwrap_or(NO_NODE)
+        self.pop_opt().unwrap_or(NO_NODE)
     }
 
     fn peek(&self) -> NodeId {
-        self.stack.last().copied().unwrap_or(NO_NODE)
+        self.peek_opt().unwrap_or(NO_NODE)
+    }
+
+    /// The current control token, or `None` in dead code (after an
+    /// unconditional transfer, where `ctrl` is cleared to [`NO_NODE`]).
+    fn ctrl_opt(&self) -> Option<NodeId> {
+        node_id_opt(self.ctrl)
     }
 
     // ── Node creation helpers ────────────────────────────────────────
@@ -813,7 +1131,7 @@ impl IrBuilder {
             if state
                 .local_snapshots
                 .iter()
-                .all(|s| s.get(i).copied().unwrap_or(NO_NODE) == NO_NODE)
+                .all(|s| s.get(i).copied().and_then(node_id_opt).is_none())
             {
                 continue;
             }
@@ -867,20 +1185,25 @@ impl IrBuilder {
         let back_ctrl = self.ctrl;
         self.graph.nodes[region as usize].inputs.push(back_ctrl);
 
+        // Appending the back-edge value completes the φ's input list, so its
+        // type is re-derived from the *whole* merge (`retype_phi`): the type
+        // recorded at header activation saw only the entry edge(s).
         for (i, &phi) in lp.local_phis.iter().enumerate() {
-            if phi != NO_NODE {
+            if let Some(phi) = node_id_opt(phi) {
                 let v = self.locals.get(i).copied().unwrap_or(NO_NODE);
                 self.graph.nodes[phi as usize].inputs.push(v);
+                self.retype_phi(phi);
             }
         }
         for (i, &phi) in lp.stack_phis.iter().enumerate() {
-            if phi != NO_NODE {
+            if let Some(phi) = node_id_opt(phi) {
                 let v = self.stack.get(i).copied().unwrap_or(NO_NODE);
                 self.graph.nodes[phi as usize].inputs.push(v);
+                self.retype_phi(phi);
             }
         }
-        if lp.mem_phi != NO_NODE {
-            self.graph.nodes[lp.mem_phi as usize].inputs.push(self.mem);
+        if let Some(mem_phi) = node_id_opt(lp.mem_phi) {
+            self.graph.nodes[mem_phi as usize].inputs.push(self.mem);
         }
         // Record this back-edge as a predecessor for completeness (so any later
         // consumer that scans MergeState sees the right pred count).
@@ -955,9 +1278,15 @@ impl IrBuilder {
                         for snap in &state.stack_snapshots {
                             phi_inputs.push(snap.get(slot_idx).copied().unwrap_or(NO_NODE));
                         }
+                        // Same lattice join as the local phis above. This site
+                        // was hardcoded `IrType::Int`, which mistyped every
+                        // operand-stack merge of a reference or FP value (the
+                        // `a ? x : y` shape merges on the stack, not in a
+                        // local) — see `phi_data_type`.
+                        let phi_ty = self.phi_data_type(&phi_inputs);
                         let phi = self
                             .graph
-                            .add(Op::Phi, IrType::Int, phi_inputs, Some(target_pc));
+                            .add(Op::Phi, phi_ty, phi_inputs, Some(target_pc));
                         self.stack[slot_idx] = phi;
                     }
                 }
@@ -1047,7 +1376,7 @@ impl IrBuilder {
                 // Add current state as predecessor (fall-through). On a loop
                 // header this is the forward-entry predecessor; the back-edge
                 // arrives later and is back-patched (see add_merge_predecessor).
-                if self.ctrl != NO_NODE {
+                if self.ctrl_opt().is_some() {
                     self.add_merge_predecessor(pc);
                 }
                 // Loop headers get eager loop-carried phis; forward joins use
@@ -1065,7 +1394,7 @@ impl IrBuilder {
             // set and the merge bookkeeping disagree, and continuing would
             // build the very orphan nodes the skip exists to prevent. Bail to
             // the single-pass backend instead of emitting them.
-            if self.ctrl == NO_NODE {
+            if self.ctrl_opt().is_none() {
                 return ir_build_bail(line!(), pc);
             }
 
@@ -1078,7 +1407,7 @@ impl IrBuilder {
             // NO_NODE, not itself a merge target) has no reachable frame state,
             // so it is skipped. These snapshots are emit-and-discard until the
             // lowerer resolves them — they do not affect codegen on their own.
-            if self.ctrl != NO_NODE {
+            if self.ctrl_opt().is_some() {
                 self.graph.safepoints.push(SafepointSnapshot {
                     bci: pc,
                     locals: self.locals.clone(),
@@ -2004,12 +2333,13 @@ impl IrBuilder {
                         // emitted. Eliding a `<init>` whose receiver is `this` or
                         // a parameter would skip a real superclass constructor
                         // (and hide any escape it performs).
-                        let recv = self.peek();
-                        let recv_is_new = recv != NO_NODE
-                            && matches!(
-                                self.graph.nodes.get(recv as usize).map(|n| &n.op),
-                                Some(Op::New { .. })
-                            );
+                        let recv_is_new = matches!(
+                            self.peek_opt().and_then(|r| self.graph.node_opt(r)),
+                            Some(Node {
+                                op: Op::New { .. },
+                                ..
+                            })
+                        );
                         if !recv_is_new {
                             return ir_build_bail(line!(), pc);
                         }
@@ -2729,6 +3059,32 @@ pub fn ir_build_bail_opcode<T>(op: u8, pc: usize) -> Option<T> {
         eprintln!("[ir] IrBuilder::build has no lowering for opcode {op:#04x} at bytecode pc {pc}");
     }
     None
+}
+
+/// Report a φ whose type could not be proven by the [`join_data_type`] lattice.
+///
+/// Observability for the one place the type system gives up. Silence here is
+/// what let "every reference merge is an `Int`" survive: the wrong type is not
+/// a crash, it is a missing GC root and a mistyped deopt frame value, both of
+/// which surface much later and somewhere else. Uses the same
+/// `CRATONVM_DBG_JITC` / `CRATONVM_DBG_IR_COMPILES` switch as the build bails
+/// ([`ir_build_bail`]) so one flag shows the whole IR-refusal picture, and is
+/// deliberately a report rather than a `debug_assert!`: an untypeable merge is
+/// a *dead* slot in verified bytecode, so it must degrade, not panic.
+///
+/// (If/when `crate::bailout` lands, this is the natural place to raise a
+/// `BailoutReason::IrVerification` instead of falling back — the fallback is
+/// what the current infallible signature forces.)
+#[cold]
+#[inline(never)]
+fn report_phi_type_fallback(why: &str) {
+    if ir_bail_reporting() {
+        eprintln!(
+            "[ir] phi type join failed: {why}; using the conservative {:?} \
+             (not a GC root)",
+            PHI_TYPE_FALLBACK
+        );
+    }
 }
 
 fn ir_bail_reporting() -> bool {
@@ -3630,5 +3986,312 @@ mod tests {
             "pc 4 is only reachable by falling through a goto — i.e. not at \
              all — so it must be excluded"
         );
+    }
+
+    // ── Type lattice / φ typing ──────────────────────────────────────
+
+    /// An empty arena for hand-built graphs (no Start / Proj preamble).
+    fn empty_graph() -> Graph {
+        Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        }
+    }
+
+    /// A value node of the given type, with no inputs.
+    fn value(graph: &mut Graph, ty: IrType) -> NodeId {
+        let op = match ty {
+            IrType::Float | IrType::Double => Op::ConstF(0),
+            IrType::Ref => Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            _ => Op::Const(1),
+        };
+        graph.add(op, ty, vec![], None)
+    }
+
+    #[test]
+    fn test_join_identical_types() {
+        for ty in [
+            IrType::Int,
+            IrType::Long,
+            IrType::Float,
+            IrType::Double,
+            IrType::Ref,
+        ] {
+            assert_eq!(
+                join_data_type(ty, ty),
+                Some(ty),
+                "{ty:?} must join with itself"
+            );
+        }
+        // The integer family widens to the widest integer, which in this IR is
+        // already `Int` (boolean/byte/char/short/int all decode to it).
+        assert_eq!(join_data_type(IrType::Int, IrType::Int), Some(IrType::Int));
+    }
+
+    #[test]
+    fn test_join_rejects_category_conflicts() {
+        // Every cross-category pair is untypeable, in both directions.
+        let conflicts = [
+            (IrType::Int, IrType::Long),
+            (IrType::Int, IrType::Float),
+            (IrType::Int, IrType::Double),
+            (IrType::Int, IrType::Ref),
+            (IrType::Float, IrType::Double),
+            (IrType::Float, IrType::Ref),
+            (IrType::Long, IrType::Double),
+            (IrType::Long, IrType::Ref),
+        ];
+        for (a, b) in conflicts {
+            assert_eq!(join_data_type(a, b), None, "{a:?} ⊔ {b:?} must not join");
+            assert_eq!(join_data_type(b, a), None, "{b:?} ⊔ {a:?} must not join");
+            // Specifically: a conflict must never answer `Int`. That silent
+            // answer is the bug this lattice exists to remove.
+            assert_ne!(join_data_type(a, b), Some(IrType::Int));
+        }
+        // `Void` is the absence of a value — it never joins, not even with
+        // itself.
+        assert_eq!(join_data_type(IrType::Void, IrType::Void), None);
+        assert_eq!(join_data_type(IrType::Void, IrType::Int), None);
+        assert_eq!(join_data_type(IrType::Ref, IrType::Void), None);
+    }
+
+    #[test]
+    fn test_phi_type_int_int() {
+        let mut g = empty_graph();
+        let m = g.add(Op::Merge, IrType::Control, vec![], None);
+        let a = value(&mut g, IrType::Int);
+        let b = value(&mut g, IrType::Int);
+        assert_eq!(g.phi_data_type_checked(&[m, a, b]), Ok(IrType::Int));
+    }
+
+    #[test]
+    fn test_phi_type_int_long_is_rejected() {
+        let mut g = empty_graph();
+        let m = g.add(Op::Merge, IrType::Control, vec![], None);
+        let a = value(&mut g, IrType::Int);
+        let b = value(&mut g, IrType::Long);
+        assert!(
+            g.phi_data_type_checked(&[m, a, b]).is_err(),
+            "an int/long merge has no common representation"
+        );
+    }
+
+    #[test]
+    fn test_phi_type_float_float() {
+        let mut g = empty_graph();
+        let m = g.add(Op::Merge, IrType::Control, vec![], None);
+        let a = value(&mut g, IrType::Float);
+        let b = value(&mut g, IrType::Float);
+        assert_eq!(g.phi_data_type_checked(&[m, a, b]), Ok(IrType::Float));
+    }
+
+    #[test]
+    fn test_phi_type_double_double() {
+        let mut g = empty_graph();
+        let m = g.add(Op::Merge, IrType::Control, vec![], None);
+        let a = value(&mut g, IrType::Double);
+        let b = value(&mut g, IrType::Double);
+        assert_eq!(g.phi_data_type_checked(&[m, a, b]), Ok(IrType::Double));
+    }
+
+    /// The headline regression: a float input must never produce an integer φ.
+    #[test]
+    fn test_phi_type_float_int_is_rejected_never_int() {
+        let mut g = empty_graph();
+        let m = g.add(Op::Merge, IrType::Control, vec![], None);
+        let f = value(&mut g, IrType::Float);
+        let i = value(&mut g, IrType::Int);
+        let checked = g.phi_data_type_checked(&[m, f, i]);
+        assert!(
+            checked.is_err(),
+            "float/int is untypeable; it must be reported, not answered `Int`: \
+             {checked:?}"
+        );
+        assert_ne!(checked, Ok(IrType::Int));
+    }
+
+    #[test]
+    fn test_phi_type_ref_ref_is_ref_not_int() {
+        let mut g = empty_graph();
+        let m = g.add(Op::Merge, IrType::Control, vec![], None);
+        let a = value(&mut g, IrType::Ref);
+        let b = value(&mut g, IrType::Ref);
+        // Historically this answered `Int`, which hid the merged oop from
+        // `zero_ref_phi_slots` and from the deopt `StackSlotRef` classification.
+        assert_eq!(g.phi_data_type_checked(&[m, a, b]), Ok(IrType::Ref));
+    }
+
+    #[test]
+    fn test_phi_type_ref_null_is_ref() {
+        let mut g = empty_graph();
+        let m = g.add(Op::Merge, IrType::Control, vec![], None);
+        let r = value(&mut g, IrType::Ref);
+        // A null literal: `Op::Const(0)` typed `Ref` (this IR has no distinct
+        // null type — see `is_null_const`).
+        let null = g.add(Op::Const(0), IrType::Ref, vec![], None);
+        assert!(is_null_const(&g.nodes[null as usize]));
+        assert_eq!(g.phi_data_type_checked(&[m, r, null]), Ok(IrType::Ref));
+        assert_eq!(g.phi_data_type_checked(&[m, null, r]), Ok(IrType::Ref));
+        // An integer zero is NOT a null, and must not launder an int/ref merge
+        // into `Ref` (that direction hands the GC a non-oop to dereference).
+        let int_zero = g.add(Op::Const(0), IrType::Int, vec![], None);
+        assert!(!is_null_const(&g.nodes[int_zero as usize]));
+        assert!(g.phi_data_type_checked(&[m, r, int_zero]).is_err());
+    }
+
+    #[test]
+    fn test_phi_type_ref_int_is_rejected() {
+        let mut g = empty_graph();
+        let m = g.add(Op::Merge, IrType::Control, vec![], None);
+        let r = value(&mut g, IrType::Ref);
+        let i = value(&mut g, IrType::Int);
+        assert!(g.phi_data_type_checked(&[m, r, i]).is_err());
+        assert!(g.phi_data_type_checked(&[m, i, r]).is_err());
+    }
+
+    #[test]
+    fn test_phi_type_skips_undefined_inputs() {
+        let mut g = empty_graph();
+        let m = g.add(Op::Merge, IrType::Control, vec![], None);
+        let r = value(&mut g, IrType::Ref);
+        // An entry edge on which the slot is uninitialised contributes no type
+        // information — it must not veto the ref typing.
+        assert_eq!(g.phi_data_type_checked(&[m, NO_NODE, r]), Ok(IrType::Ref));
+        // …and a φ with nothing but placeholders is an error, not `Int`.
+        assert!(g.phi_data_type_checked(&[m, NO_NODE, NO_NODE]).is_err());
+        // An out-of-range id is treated exactly like the placeholder.
+        let bogus = g.nodes.len() as NodeId + 7;
+        assert_eq!(g.phi_data_type_checked(&[m, bogus, r]), Ok(IrType::Ref));
+    }
+
+    /// A loop-carried φ is created before its back-edge value exists; appending
+    /// that value must re-derive the type (`patch_loop_backedge` → `retype_phi`).
+    #[test]
+    fn test_loop_carried_phi_retyped_when_second_input_arrives() {
+        let mut b = IrBuilder::new(0, 1);
+        let region = b.graph.add(Op::Region, IrType::Control, vec![], None);
+        // Entry edge: slot uninitialised — no type information, so the φ takes
+        // the conservative fallback.
+        let entry_inputs = vec![region, NO_NODE];
+        let ty0 = b.phi_data_type(&entry_inputs);
+        assert_eq!(ty0, PHI_TYPE_FALLBACK);
+        let phi = b.graph.add(Op::Phi, ty0, entry_inputs, None);
+
+        // Back-edge value: a reference. After the patch the φ is a GC root.
+        let back = b.graph.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 0,
+            },
+            IrType::Ref,
+            vec![],
+            None,
+        );
+        b.graph.nodes[phi as usize].inputs.push(back);
+        b.retype_phi(phi);
+        assert_eq!(
+            b.graph.nodes[phi as usize].ty,
+            IrType::Ref,
+            "the late back-edge input must retype the loop-carried φ"
+        );
+
+        // A late input that does NOT join keeps the already-derived type rather
+        // than downgrading it (and is reported, not silently applied).
+        let stray = b.graph.add(Op::Const(3), IrType::Int, vec![], None);
+        b.graph.nodes[phi as usize].inputs.push(stray);
+        b.retype_phi(phi);
+        assert_eq!(b.graph.nodes[phi as usize].ty, IrType::Ref);
+
+        // Memory φs are bookkeeping tokens and are never retyped as values.
+        let mem_phi = b.graph.add(Op::Phi, IrType::Memory, vec![region, back], None);
+        b.retype_phi(mem_phi);
+        assert_eq!(b.graph.nodes[mem_phi as usize].ty, IrType::Memory);
+    }
+
+    /// The infallible wrapper keeps its old signature and never panics: an
+    /// untypeable merge degrades to [`PHI_TYPE_FALLBACK`] (and is reported).
+    #[test]
+    fn test_phi_data_type_falls_back_on_conflict() {
+        let mut b = IrBuilder::new(0, 1);
+        let m = b.graph.add(Op::Merge, IrType::Control, vec![], None);
+        let r = b.graph.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            IrType::Ref,
+            vec![],
+            None,
+        );
+        let i = b.graph.add(Op::Const(1), IrType::Int, vec![], None);
+        assert!(b.phi_data_type_checked(&[m, r, i]).is_err());
+        assert_eq!(b.phi_data_type(&[m, r, i]), PHI_TYPE_FALLBACK);
+        // The fallback is deliberately NOT `Ref`: an unprovable slot must not
+        // be handed to the collector as an oop.
+        assert_ne!(PHI_TYPE_FALLBACK, IrType::Ref);
+    }
+
+    // ── Option-based id accessors ────────────────────────────────────
+
+    #[test]
+    fn test_checked_id_accessors() {
+        let mut g = empty_graph();
+        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = g.add(Op::Const(2), IrType::Long, vec![a, NO_NODE], None);
+
+        // node_id_opt / is_valid_id
+        assert_eq!(node_id_opt(a), Some(a));
+        assert_eq!(node_id_opt(NO_NODE), None);
+        assert!(g.is_valid_id(a));
+        assert!(g.is_valid_id(b));
+        assert!(!g.is_valid_id(NO_NODE));
+        assert!(!g.is_valid_id(g.nodes.len() as NodeId));
+
+        // node_opt / type_of
+        assert!(g.node_opt(NO_NODE).is_none());
+        assert!(g.node_opt(g.nodes.len() as NodeId).is_none());
+        assert_eq!(g.type_of(a), Some(IrType::Int));
+        assert_eq!(g.type_of(b), Some(IrType::Long));
+        assert_eq!(g.type_of(NO_NODE), None);
+        g.node_opt_mut(a).unwrap().ty = IrType::Ref;
+        assert_eq!(g.type_of(a), Some(IrType::Ref));
+
+        // Node::input_opt — placeholder and out-of-range both read as `None`.
+        let n = &g.nodes[b as usize];
+        assert_eq!(n.input_opt(0), Some(a));
+        assert_eq!(n.input_opt(1), None, "a NO_NODE edge is not an id");
+        assert_eq!(n.input_opt(2), None, "out of range");
+        let vals: Vec<Option<NodeId>> = n.phi_value_inputs().collect();
+        assert_eq!(vals, vec![None]);
+
+        // SafepointSnapshot accessors.
+        let snap = SafepointSnapshot {
+            bci: 0,
+            locals: vec![a, NO_NODE],
+            stack: vec![NO_NODE, b],
+        };
+        assert_eq!(snap.local_opt(0), Some(a));
+        assert_eq!(snap.local_opt(1), None);
+        assert_eq!(snap.local_opt(9), None);
+        assert_eq!(snap.stack_opt(0), None);
+        assert_eq!(snap.stack_opt(1), Some(b));
+        assert_eq!(snap.stack_opt(9), None);
+    }
+
+    /// Real ids are dense from 0 and can never alias the sentinel.
+    #[test]
+    fn test_allocated_ids_never_alias_the_sentinel() {
+        let mut g = empty_graph();
+        for i in 0..8 {
+            let id = g.add(Op::Const(i), IrType::Int, vec![], None);
+            assert_eq!(id, i as NodeId);
+            assert_ne!(id, NO_NODE);
+            assert!(g.is_valid_id(id));
+        }
     }
 }

@@ -43,14 +43,63 @@
 //! distances 16/12/8/7 == `v.rotate_left(n)`). Validated below against the
 //! canonical RFC 8439 §2.3.2 ChaCha20 block-function known-answer vector.
 
+use crate::failure::{CryptoFailure, CryptoResult};
+
+/// BouncyCastle's own rejection for an odd round count
+/// (`Salsa20Engine`/`ChaChaEngine`: `throw new IllegalArgumentException("Number
+/// of rounds must be even")`).
+///
+/// This matters more than it looks. The `for (i = rounds; i > 0; i -= 2)` loop
+/// simply runs one round fewer when `rounds` is odd, so an odd count produces a
+/// *plausible but wrong* keystream — no error, no crash, just a stream that
+/// will not interoperate and whose security properties are not the ones ChaCha
+/// was analysed under. It is the archetype of a failure disguised as output.
+fn check_rounds(rounds: i32) -> CryptoResult<()> {
+    if rounds % 2 != 0 {
+        return Err(CryptoFailure::illegal_argument(
+            "Number of rounds must be even",
+        ));
+    }
+    Ok(())
+}
+
+/// Fail-loud [`chacha_core`]: rejects an odd round count instead of silently
+/// running `rounds - 1` rounds.
+///
+/// Every in-tree caller already performs this check before invoking the
+/// infallible form (`native-builtins/src/phases_late/bouncycastle.rs:7233`);
+/// this expresses the same guard as a value the facade can throw.
+pub fn try_chacha_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) -> CryptoResult<()> {
+    check_rounds(rounds)?;
+    chacha_core(rounds, input, x);
+    Ok(())
+}
+
+/// Fail-loud [`salsa_core`]. Guard mirrors
+/// `native-builtins/src/phases_late/bouncycastle.rs:7260`.
+pub fn try_salsa_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) -> CryptoResult<()> {
+    check_rounds(rounds)?;
+    salsa_core(rounds, input, x);
+    Ok(())
+}
+
+/// Fail-loud [`permute`]. Guard mirrors
+/// `native-builtins/src/phases_late/bouncycastle.rs:7284`.
+pub fn try_permute(rounds: i32, x: &mut [i32; 16]) -> CryptoResult<()> {
+    check_rounds(rounds)?;
+    permute(rounds, x);
+    Ok(())
+}
+
 /// The ChaCha double-round loop, shared by both kernels. Applies `rounds`
 /// ChaCha rounds (one loop iteration = a column round + a diagonal round = 2
 /// rounds) to the 16-word state in place. Transcribed verbatim from BC's
 /// `chachaCore`/`Permute.permute` inner `for (i = rounds; i > 0; i -= 2)` loop.
 ///
 /// `rounds` must be even (BC throws `IllegalArgumentException` otherwise — the
-/// caller enforces this before calling). A non-positive `rounds` runs zero
-/// iterations, exactly like the Java `for` loop.
+/// caller enforces this before calling; see [`check_rounds`] and the `try_*`
+/// wrappers for the guard expressed as a catchable failure). A non-positive
+/// `rounds` runs zero iterations, exactly like the Java `for` loop.
 #[inline]
 fn chacha_rounds(s: &mut [u32; 16], rounds: i32) {
     let mut i = rounds;
@@ -437,6 +486,68 @@ mod tests {
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    // ---- fail-loud round-parity guards ----
+
+    /// An odd round count must raise, not quietly emit a `rounds - 1`
+    /// keystream. Covers all three kernels; the message is BouncyCastle's own.
+    #[test]
+    fn odd_round_counts_raise_illegal_argument() {
+        let input = [0i32; 16];
+        let mut x = [0i32; 16];
+        for rounds in [1i32, 7, 11, 19, 21, -3] {
+            let err = try_chacha_core(rounds, &input, &mut x)
+                .expect_err("odd round count must be rejected");
+            assert_eq!(err.java_class(), "java/lang/IllegalArgumentException");
+            assert_eq!(err.message(), "Number of rounds must be even");
+
+            assert!(try_salsa_core(rounds, &input, &mut x).is_err());
+            let mut y = [0i32; 16];
+            assert!(try_permute(rounds, &mut y).is_err());
+            // The refusal left the output untouched: no partial keystream was
+            // written that a caller could XOR against plaintext.
+            assert_eq!(y, [0i32; 16]);
+        }
+        assert_eq!(x, [0i32; 16]);
+    }
+
+    /// Supported (even) round counts still succeed and are byte-identical to
+    /// the infallible kernels — the guard refuses, it does not transform.
+    #[test]
+    fn even_round_counts_succeed_and_match_the_infallible_kernels() {
+        let input: [i32; 16] = RFC8439_INPUT.map(|w| w as i32);
+        for rounds in [0i32, 2, 8, 12, 20] {
+            let mut plain = [0i32; 16];
+            chacha_core(rounds, &input, &mut plain);
+            let mut checked = [0i32; 16];
+            try_chacha_core(rounds, &input, &mut checked).expect("even round count");
+            assert_eq!(plain, checked, "chacha_core mismatch at {rounds} rounds");
+
+            let mut plain = [0i32; 16];
+            salsa_core(rounds, &input, &mut plain);
+            let mut checked = [0i32; 16];
+            try_salsa_core(rounds, &input, &mut checked).expect("even round count");
+            assert_eq!(plain, checked, "salsa_core mismatch at {rounds} rounds");
+
+            let mut plain = input;
+            permute(rounds, &mut plain);
+            let mut checked = input;
+            try_permute(rounds, &mut checked).expect("even round count");
+            assert_eq!(plain, checked, "permute mismatch at {rounds} rounds");
+        }
+    }
+
+    /// The RFC-validated 20-round vector still verifies through the checked
+    /// entry point, so the guard cannot have perturbed the transform.
+    #[test]
+    fn try_chacha_core_matches_rfc8439_block() {
+        let input: [i32; 16] = RFC8439_INPUT.map(|w| w as i32);
+        let mut x = [0i32; 16];
+        try_chacha_core(20, &input, &mut x).expect("20 rounds is even");
+        for k in 0..16 {
+            assert_eq!(x[k] as u32, RFC8439_OUTPUT[k], "word {k} mismatch");
+        }
     }
 
     /// SPHINCS `hash_n_n` / `hash_2n_n` validated against HotSpot ground truth

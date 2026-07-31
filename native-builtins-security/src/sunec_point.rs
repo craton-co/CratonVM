@@ -74,6 +74,41 @@ fn internal_err(msg: &str) -> MethodCallFailed {
     .into()
 }
 
+/// `java.security.ProviderException` — the JDK's own unchecked exception for
+/// "a provider engine accepted the request and then could not complete it".
+/// It is the specification-correct type for an invariant violation reached
+/// from inside `sun.security.ec`, and unlike a checked `java.security`
+/// exception it does not need to be declared on `ECOperations.multiply`.
+const PROVIDER_EXCEPTION: &str = "java/security/ProviderException";
+
+/// Construct and throw a real Java exception of `class_name` (internal form)
+/// carrying `msg`.
+///
+/// Mirrors the facade's throw helper — `native-builtins/src/phases_early.rs:14672`
+/// (`throw_jca_exc`) and `native-builtins/src/phases_late/bouncycastle.rs:6040`
+/// (`bc_gost_throw_crypto_exception`) — which this crate cannot call directly
+/// (`native-builtins` depends on us, not the other way round).
+///
+/// Note the fallback: if the exception class itself cannot be constructed
+/// (synthetic-JDK mode, class absent from the boot path) we still raise an
+/// unchecked `IllegalStateException`. There is deliberately no arm that
+/// returns a value — a security engine that cannot report its failure must
+/// still fail, not answer.
+fn throw_jca(ctx: &mut dyn NativeContext, class_name: &str, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    match ctx.new_object_initialized(
+        class_name,
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalStateException {
+            message: format!("{class_name}: {msg}"),
+        }
+        .into(),
+    }
+}
+
 /// Invoke an instance method whose concrete class is taken from `receiver`'s
 /// runtime type (so interface/abstract methods like `asBigInteger` dispatch
 /// correctly), returning the (object) result.
@@ -187,11 +222,24 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let scalar_arr = obj(args.get(2).copied()).ok_or_else(|| internal_err("null scalar"))?;
 
     // Read scalar bytes (little-endian) — array read, no re-entrant call.
+    //
+    // The `if let Value::Int(..)` this replaces left `*dst` at its initialised
+    // zero whenever an element read did not yield an `Int` (wrong array kind,
+    // or a heap read that could not be serviced). That is the worst possible
+    // shape for a private-key scalar: the multiply then proceeds with silently
+    // zeroed limbs and returns a perfectly well-formed *wrong* point, which
+    // the caller signs or key-agrees with as though nothing happened. Refuse
+    // instead — a byte we could not read is not a byte worth guessing.
     let slen = ctx.array_length(scalar_arr);
     let mut scalar_le = vec![0u8; slen];
     for (i, dst) in scalar_le.iter_mut().enumerate() {
-        if let Value::Int(b) = ctx.get_array_element(scalar_arr, i) {
-            *dst = b as u8;
+        match ctx.get_array_element(scalar_arr, i) {
+            Value::Int(b) => *dst = b as u8,
+            other => {
+                return Err(internal_err(&format!(
+                    "native EC multiply: scalar byte[{i}] is not a byte ({other:?})"
+                )))
+            }
         }
     }
 
@@ -218,16 +266,37 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let p_field = ctx.pin_native_root(field);
 
     // Curve detection from the field's implementation class (P-256/384/521).
-    let field_cls = ctx
-        .class_name_of_id(ctx.class_id_of_object(field))
-        .unwrap_or_default();
+    //
+    // The `unwrap_or_default()` this replaces turned an unresolvable class id
+    // into the empty string, which then fell into the "unsupported curve" arm
+    // with a blank curve name in the message. Both conditions are refusals, but
+    // they are different refusals and the diagnostic must say which.
+    let field_cls = ctx.class_name_of_id(ctx.class_id_of_object(field));
+    let field_cls = match field_cls {
+        Some(c) => c,
+        None => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(throw_jca(
+                ctx,
+                PROVIDER_EXCEPTION,
+                "native EC multiply: field object has no resolvable class name",
+            ));
+        }
+    };
+    // SUPPORTED vs REJECTED: exactly P-256, P-384 and P-521 are implemented
+    // (`Curve::from_field_class`). Every other curve — including the ones the
+    // JDK itself still ships, e.g. secp256k1 — is refused here. There is no
+    // "closest match" fallback: multiplying on the wrong curve would produce a
+    // point that is structurally valid and cryptographically meaningless.
     let curve = match Curve::from_field_class(&field_cls) {
         Some(c) => c,
         None => {
             ctx.unpin_native_roots(pin_base);
-            return Err(internal_err(&format!(
-                "native EC multiply: unsupported curve field {field_cls}"
-            )));
+            return Err(throw_jca(
+                ctx,
+                PROVIDER_EXCEPTION,
+                &format!("native EC multiply: unsupported curve field {field_cls}"),
+            ));
         }
     };
     let n = curve.byte_len();
@@ -325,10 +394,13 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// Generate a curve `scalar_mul` over the RustCrypto curve crate `$krate` with
 /// field/scalar byte length `$nbytes`: `s · (x, y)` → affine `(rx, ry)` as
 /// big-endian `$nbytes`-byte vectors. `x`/`y` are big-endian affine coords
-/// (`$nbytes` bytes), `s_le` the little-endian scalar. Returns `None` on an
-/// invalid point or an identity (point-at-infinity) result — which the caller
-/// surfaces as an error (it does not occur for valid keygen/sign scalars, which
-/// are always in `[1, n)`).
+/// (`$nbytes` bytes), `s_le` the little-endian scalar.
+///
+/// Returns `None` — which the caller surfaces as a thrown exception — for a
+/// wrong-length coordinate, a point that is not on the curve, or a scalar with
+/// significant bytes beyond the field width. `Some((empty, empty))` is the
+/// point-at-infinity signal (see the `TRUST BOUNDARY` note inside). There is no
+/// input for which this returns a coordinate pair it is not confident in.
 macro_rules! impl_curve_scalar_mul {
     ($name:ident, $krate:ident, $nbytes:literal) => {
         fn $name(x: &[u8], y: &[u8], s_le: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -354,6 +426,17 @@ macro_rules! impl_curve_scalar_mul {
             };
 
             // scalar: little-endian → big-endian (n bytes).
+            //
+            // REFUSE rather than truncate. `take($nbytes)` on its own silently
+            // discards the high-order bytes of an over-long little-endian
+            // scalar, so `s` and `s mod 2^(8·nbytes)` become indistinguishable
+            // and the multiply answers a question the caller never asked — with
+            // a well-formed point, so nothing downstream notices. A trailing
+            // zero byte (BigInteger's sign padding, harmless) is still allowed;
+            // any *significant* excess byte is a hard refusal.
+            if s_le.len() > $nbytes && s_le[$nbytes..].iter().any(|b| *b != 0) {
+                return None;
+            }
             let mut be = [0u8; $nbytes];
             for (i, b) in s_le.iter().take($nbytes).enumerate() {
                 be[$nbytes - 1 - i] = *b;
@@ -362,13 +445,22 @@ macro_rules! impl_curve_scalar_mul {
             let scalar = if ct.is_some().into() {
                 ct.unwrap()
             } else {
-                // A non-canonical scalar (>= the group order `n`). SunEC reaches
-                // this ONLY in `ECDHKeyAgreement.validate`'s public-key order
-                // check, which multiplies the (already on-curve, verified just
-                // above) point by `n` and expects the neutral element: `n·P = O`.
-                // Signal identity so the caller returns SunEC's neutral
-                // `MutablePoint`. (Keygen/sign/real-ECDH scalars are always < n
-                // and take the canonical branch above.)
+                // TRUST BOUNDARY: a non-canonical scalar (>= the group order
+                // `n`) is reported as the neutral element rather than refused.
+                //
+                // This is load-bearing for `ECDHKeyAgreement.validate`, whose
+                // public-key order check multiplies the (already on-curve,
+                // verified just above) point by `n` and requires `n·P = O`.
+                // Keygen/sign/real-ECDH scalars are always in `[1, n)` and take
+                // the canonical branch above, so no legitimate call reaches
+                // here — but the conflation is real: if some future caller did
+                // pass a >= n scalar for an actual multiply, it would receive
+                // the identity instead of an error, and identity is a
+                // *plausible* answer. Narrowing this (accepting the neutral
+                // result only when the scalar equals `n` for the detected
+                // curve) needs the group order plumbed in per curve and
+                // end-to-end ECDH validation; tracked as a residual gap in
+                // docs/security/crypto-failure-contract.md.
                 return Some((Vec::new(), Vec::new()));
             };
 
@@ -414,4 +506,165 @@ pub fn register_sunec_point_intrinsics(registry: &mut NativeMethodRegistry) {
         "(Lsun/security/ec/point/AffinePoint;[B)Lsun/security/ec/point/MutablePoint;",
         native_ec_multiply,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use super::*;
+
+    /// The uncompressed affine coordinates of the P-256 base point, taken from
+    /// the `p256` crate itself so the test cannot drift from the curve it
+    /// exercises.
+    fn p256_generator() -> (Vec<u8>, Vec<u8>) {
+        let g = p256::AffinePoint::generator().to_encoded_point(false);
+        (
+            g.x().expect("generator has an x").to_vec(),
+            g.y().expect("generator has a y").to_vec(),
+        )
+    }
+
+    /// The P-256 group order `n`, big-endian.
+    const P256_ORDER_BE: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
+
+    fn le(be: &[u8]) -> Vec<u8> {
+        be.iter().rev().copied().collect()
+    }
+
+    // ---- supported curves are recognised; everything else is rejected ----
+
+    #[test]
+    fn only_p256_p384_p521_field_classes_are_accepted() {
+        for (cls, len) in [
+            ("sun/security/util/math/intpoly/IntegerPolynomialP256", 32),
+            (
+                "sun/security/util/math/intpoly/MontgomeryIntegerPolynomialP256",
+                32,
+            ),
+            ("sun/security/util/math/intpoly/IntegerPolynomialP384", 48),
+            ("sun/security/util/math/intpoly/IntegerPolynomialP521", 66),
+        ] {
+            let c = Curve::from_field_class(cls).expect("supported curve");
+            assert_eq!(c.byte_len(), len, "{cls}: wrong field width");
+        }
+    }
+
+    /// An unrecognised curve must produce `None` so the caller throws. In
+    /// particular the empty string — what the old `unwrap_or_default()`
+    /// produced for an unresolvable class id — must not match anything.
+    #[test]
+    fn unsupported_curve_field_classes_are_declined() {
+        for cls in [
+            "",
+            "sun/security/util/math/intpoly/IntegerPolynomial1305",
+            "sun/security/util/math/intpoly/IntegerPolynomial25519",
+            "sun/security/util/math/intpoly/IntegerPolynomialP192",
+            "org/example/Secp256k1Field",
+            "java/lang/Object",
+        ] {
+            assert!(
+                Curve::from_field_class(cls).is_none(),
+                "{cls} must not be accepted as a supported curve"
+            );
+        }
+    }
+
+    // ---- a valid multiply still succeeds ----
+
+    #[test]
+    fn generator_times_one_returns_the_generator() {
+        let (gx, gy) = p256_generator();
+        let (rx, ry) = scalar_mul_p256(&gx, &gy, &[1u8]).expect("1·G must succeed");
+        assert_eq!(rx, gx);
+        assert_eq!(ry, gy);
+    }
+
+    #[test]
+    fn generator_times_two_matches_the_curve_crate() {
+        let (gx, gy) = p256_generator();
+        let (rx, ry) = scalar_mul_p256(&gx, &gy, &[2u8]).expect("2·G must succeed");
+
+        let expect = (p256::ProjectivePoint::from(p256::AffinePoint::generator())
+            + p256::ProjectivePoint::from(p256::AffinePoint::generator()))
+        .to_affine()
+        .to_encoded_point(false);
+        assert_eq!(rx, expect.x().unwrap().to_vec());
+        assert_eq!(ry, expect.y().unwrap().to_vec());
+    }
+
+    // ---- malformed inputs are refused, not approximated ----
+
+    /// The fix under test: an over-long scalar used to be silently truncated to
+    /// its low `nbytes` bytes, so `s` and `s mod 2^256` returned the same point
+    /// with no indication that a different number had been multiplied.
+    #[test]
+    fn oversized_scalar_is_refused_not_truncated() {
+        let (gx, gy) = p256_generator();
+        // 33 little-endian bytes: value 1 + a significant 2^256 term.
+        let mut s = vec![0u8; 33];
+        s[0] = 1;
+        s[32] = 1;
+        assert!(
+            scalar_mul_p256(&gx, &gy, &s).is_none(),
+            "a scalar with significant bytes past the field width must be refused"
+        );
+
+        // Sanity: had it truncated, it would have produced exactly 1·G.
+        let (one_x, _) = scalar_mul_p256(&gx, &gy, &[1u8]).unwrap();
+        assert_eq!(one_x, gx, "truncation would have silently returned 1·G");
+    }
+
+    /// ...but a merely zero-padded scalar (BigInteger sign padding) is still
+    /// accepted. Refusing it would be a false positive on a legitimate call.
+    #[test]
+    fn zero_padded_oversized_scalar_is_still_accepted() {
+        let (gx, gy) = p256_generator();
+        let mut s = vec![0u8; 40];
+        s[0] = 1; // little-endian 1, padded with high zero bytes
+        let (rx, ry) = scalar_mul_p256(&gx, &gy, &s).expect("zero padding is harmless");
+        assert_eq!(rx, gx);
+        assert_eq!(ry, gy);
+    }
+
+    #[test]
+    fn wrong_length_coordinates_are_refused() {
+        let (gx, gy) = p256_generator();
+        assert!(scalar_mul_p256(&gx[..31], &gy, &[1u8]).is_none(), "short x");
+        assert!(scalar_mul_p256(&gx, &gy[..31], &[1u8]).is_none(), "short y");
+        assert!(scalar_mul_p256(&[], &[], &[1u8]).is_none(), "empty coords");
+        // P-384/P-521 must reject P-256-sized coordinates rather than pad them.
+        assert!(scalar_mul_p384(&gx, &gy, &[1u8]).is_none());
+        assert!(scalar_mul_p521(&gx, &gy, &[1u8]).is_none());
+    }
+
+    /// A point that is not on the curve must be refused. Accepting it would
+    /// hand back a "result" on some other curve entirely — the classic
+    /// invalid-curve attack.
+    #[test]
+    fn off_curve_point_is_refused() {
+        let (gx, mut gy) = p256_generator();
+        gy[31] ^= 0x01;
+        assert!(scalar_mul_p256(&gx, &gy, &[1u8]).is_none());
+    }
+
+    // ---- the documented point-at-infinity signal ----
+
+    /// `0·G` and `n·G` are both the neutral element, reported as empty
+    /// coordinate vectors (not as an error and not as a real point). This pins
+    /// the contract `ECDHKeyAgreement.validate` depends on; see the
+    /// `TRUST BOUNDARY` note on the non-canonical branch.
+    #[test]
+    fn identity_results_are_signalled_with_empty_coordinates() {
+        let (gx, gy) = p256_generator();
+        let zero = scalar_mul_p256(&gx, &gy, &[0u8; 32]).expect("0·G is defined");
+        assert_eq!(zero, (Vec::new(), Vec::new()), "0·G must be the identity");
+
+        let order = scalar_mul_p256(&gx, &gy, &le(&P256_ORDER_BE)).expect("n·G is defined");
+        assert_eq!(order, (Vec::new(), Vec::new()), "n·G must be the identity");
+    }
 }
