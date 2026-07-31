@@ -90,3 +90,42 @@ reports `cycles=25 coverage_fallbacks=0` and returns the HotSpot checksum
 path does not depend on IR frames proving coverage; it is what dev's
 `CRATONVM_MOVING_YOUNG_NO_JIT` rework unblocked. The IR contract extends the same
 guarantee to frames the optimizing tier produces.
+
+## Attempt 2 (same session): publication implemented, then reverted
+
+The publication step above was implemented in full — three reserved slots
+(sp-id, cached thread, shadow savebase), a `get_current_thread` fetch in the
+prologue, `emit_shadow_push` before each safepoint, `emit_shadow_reload` at the
+top of `emit_call_return_check` using RCX so RAX survives, and the
+self-recursive route excluded because it bypasses that choke point.
+
+It was correct as far as every fast check goes: `cargo test -p cratonvm-jit`
+1060 lib + every integration target 0 failed, `BinTreesClassic 18` returned
+`68332206` at both 512m and 2g with `cycles=25 coverage_fallbacks=0`, and the
+`--nojit` 128m bt16 returned `14985902`.
+
+**It was reverted because it regresses `ZonedDateTimeTest`: 302 s -> >1200 s.**
+
+The first hypothesis — that asserting coverage makes the verifier skip its
+early-out and band-scan every live frame — was WRONG. Gating the assertion off
+(`CRATONVM_JIT_IR_RELOC_MAPS`, default off) left the timeout in place, which
+rules the reader side out entirely. The cost is on the emission side, in what
+the publication machinery adds to every IR method regardless of whether the
+claim is made. In rough order of suspicion:
+
+1. **`fetch_current_thread` in the prologue** — a `CALL` on every IR method
+   ENTRY, including tiny hot ones. The single-pass backend has a "lazy prologue"
+   lever for exactly this (`shadow_pushed_any`: keep the fetch only if the
+   method actually publishes something). The IR version fetches unconditionally.
+   This is the first thing to try: make the fetch conditional on the method
+   having emitted at least one push, patching or NOP-ing it otherwise.
+2. the sp-id store at every `Op::Call`;
+3. the frame widening (+24 bytes) and the phi zeroing.
+
+`ASTParserLoadingTest` was unaffected throughout (138 s), so whatever it is
+scales with call density or method count rather than stack depth.
+
+Bisecting these needs one lever per item and a quiet host; each
+`ZonedDateTimeTest` datapoint is 5-20 minutes and the box has other tenants.
+Do not re-land any of it on the strength of unit tests and bt18 alone — both
+were green for the reverted version.
