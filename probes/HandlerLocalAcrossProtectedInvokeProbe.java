@@ -123,17 +123,39 @@ public final class HandlerLocalAcrossProtectedInvokeProbe {
             if (!want.equals(p.nested(plain, i))) failures++;
         }
 
-        // The null-errorHandler path must still propagate the original exception.
+        // The null-errorHandler path must still propagate the original
+        // exception. This is the actual Spring symptom: real Spring never sets
+        // an `errorHandler`, so `ifnull` at offset 6 must skip the protected
+        // region entirely — and the failure mode was that the compiled body
+        // entered it anyway and then NPE'd on the same local inside the
+        // handler. Run it many times, and AFTER the loop above, so the branch
+        // has been profiled the other way and the method is long since hot.
         p.errorHandler = null;
-        try {
-            p.invokeVirtual(plain, 1);
-            failures++;
-            System.out.println("FAIL null-handler path swallowed the exception");
-        } catch (IllegalStateException expected) {
-            // correct
-        } catch (Throwable t) {
-            failures++;
-            System.out.println("FAIL null-handler path threw " + t);
+        for (int i = 0; i < 10_000; i++) {
+            try {
+                p.invokeVirtual((i & 2) == 0 ? plain : sub, i);
+                failures++;
+                System.out.println("FAIL null-handler path swallowed the exception");
+                break;
+            } catch (IllegalStateException expected) {
+                // correct
+            } catch (Throwable t) {
+                failures++;
+                System.out.println("FAIL null-handler path threw " + t);
+                break;
+            }
+            try {
+                p.invokeInterface(iface, i);
+                failures++;
+                System.out.println("FAIL null-handler interface path swallowed the exception");
+                break;
+            } catch (IllegalStateException expected) {
+                // correct
+            } catch (Throwable t) {
+                failures++;
+                System.out.println("FAIL null-handler interface path threw " + t);
+                break;
+            }
         }
 
         if (failures != 0) {

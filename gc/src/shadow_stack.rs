@@ -85,7 +85,14 @@ pub struct ShadowStack {
 impl ShadowStack {
     /// Byte offset of the `top` field. Read by the JIT-emitted inline push.
     pub const TOP_OFFSET: usize = 0;
-    /// Byte offset of the `end` field. Read by the JIT-emitted overflow guard.
+    /// Byte offset of the `end` field. Read by the JIT-emitted overflow guard
+    /// that both backends emit ahead of every push (`x64::emit_shadow_push`,
+    /// `ir_lower::emit_shadow_push`): a push whose slots would not all fit
+    /// below `end` stores nothing, leaves `top` alone, and marks its saved-base
+    /// slot with bit 0 so the paired reload skips restoring homes from slots
+    /// that were never written. Bailing degrades that safepoint's root
+    /// publication — the runtime coverage verifier then rejects the moving-young
+    /// proof — but it is bounded; storing past `end` was not.
     pub const END_OFFSET: usize = 8;
     /// Byte offset of the `base` field.
     ///

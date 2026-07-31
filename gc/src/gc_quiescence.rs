@@ -28,8 +28,17 @@
 use crate::gc_flags;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// How deep any thread is inside a JIT call, process-wide.
+///
+/// Striped per thread: this is written on every interpreter/JIT boundary
+/// crossing and read only by the collector. As one shared `AtomicUsize` — with
+/// a `fetch_update` CAS *loop* on the leave side — it was one of the
+/// contended cache lines that stopped compiled code scaling past a couple of
+/// threads. See [`cratonvm_types::striped_counter`] for why summing stripes
+/// answers `is_active()` exactly as the single counter did.
 #[cfg(not(test))]
-static JIT_ACTIVE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static JIT_ACTIVE_DEPTH: cratonvm_types::striped_counter::StripedCounter =
+    cratonvm_types::striped_counter::StripedCounter::new();
 
 #[cfg(test)]
 thread_local! {
@@ -39,7 +48,11 @@ thread_local! {
 #[cfg(not(test))]
 #[inline]
 fn active_depth_enter() -> usize {
-    JIT_ACTIVE_DEPTH.fetch_add(1, Ordering::AcqRel) + 1
+    JIT_ACTIVE_DEPTH.inc();
+    // No caller uses the returned depth on the hot path, and summing every
+    // stripe to produce it would reintroduce exactly the cross-thread traffic
+    // the striping removes. Report this thread's own contribution instead.
+    1
 }
 
 #[cfg(test)]
@@ -55,13 +68,10 @@ fn active_depth_enter() -> usize {
 #[cfg(not(test))]
 #[inline]
 fn active_depth_leave() -> usize {
-    let prev = JIT_ACTIVE_DEPTH.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
-        Some(d.saturating_sub(1))
-    });
-    match prev {
-        Ok(p) => p.saturating_sub(1),
-        Err(_) => 0,
-    }
+    // Saturating per stripe, so a stray unbalanced leave can no longer cancel
+    // a *different* thread's live entry the way the single counter allowed.
+    JIT_ACTIVE_DEPTH.dec();
+    0
 }
 
 #[cfg(test)]
@@ -77,7 +87,20 @@ fn active_depth_leave() -> usize {
 #[cfg(not(test))]
 #[inline]
 fn active_depth_get() -> usize {
-    JIT_ACTIVE_DEPTH.load(Ordering::Acquire)
+    JIT_ACTIVE_DEPTH.get()
+}
+
+/// `active_depth_get() > 0` without summing every stripe.
+#[cfg(not(test))]
+#[inline]
+fn active_depth_nonzero() -> bool {
+    !JIT_ACTIVE_DEPTH.is_zero()
+}
+
+#[cfg(test)]
+#[inline]
+fn active_depth_nonzero() -> bool {
+    active_depth_get() > 0
 }
 
 #[cfg(test)]
@@ -88,8 +111,10 @@ fn active_depth_get() -> usize {
 
 /// DBG: total enter()/leave() calls — an imbalance means a leaked JIT entry
 /// that keeps the non-moving sweep wedged on after JIT calls have returned.
-pub static ENTER_COUNT: AtomicUsize = AtomicUsize::new(0);
-pub static LEAVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static ENTER_COUNT: cratonvm_types::striped_counter::StripedCounter =
+    cratonvm_types::striped_counter::StripedCounter::new();
+pub static LEAVE_COUNT: cratonvm_types::striped_counter::StripedCounter =
+    cratonvm_types::striped_counter::StripedCounter::new();
 
 // ---------------------------------------------------------------------------
 // Moving / compacting young generation — the ONE gate
@@ -636,7 +661,7 @@ pub fn moving_young_cycle_count() -> usize {
 /// use-after-free). `AcqRel` does not weaken the existing release
 /// visibility — it only adds the missing acquire half.
 pub fn enter() -> usize {
-    ENTER_COUNT.fetch_add(1, Ordering::Relaxed);
+    ENTER_COUNT.inc();
     active_depth_enter()
 }
 
@@ -645,14 +670,14 @@ pub fn enter() -> usize {
 /// debug-assert error to call this when the counter is already 0; the
 /// release version saturates at 0 so a stray pop never wraps the counter.
 pub fn leave() -> usize {
-    LEAVE_COUNT.fetch_add(1, Ordering::Relaxed);
+    LEAVE_COUNT.inc();
     active_depth_leave()
 }
 
 /// Returns true if any thread is currently inside a JIT call.
 #[inline]
 pub fn is_active() -> bool {
-    active_depth_get() > 0
+    active_depth_nonzero()
 }
 
 /// Current depth (mostly useful for tests and JFR diagnostics).
