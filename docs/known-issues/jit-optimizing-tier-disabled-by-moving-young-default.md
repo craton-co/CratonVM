@@ -330,3 +330,30 @@ describable to the root scan first (`chain_entry_rbp_is_foreign` in
 `vm/src/jit/conservative_roots.rs` detects the situation and gives up coverage;
 that is a fallback, not a fix). Acceptance gate for any future attempt: this
 class, 14 consecutive runs, on default flags.
+
+## Correction 2026-07-31 — "the optimizing tier does run on default flags" is not what it sounds like
+
+The scoping above is right and it did open the gate. What it did not do — and
+what the header of this document implies — is make the optimizing tier
+*produce bodies*. Measured with `CRATONVM_DBG_IR_COMPILES=1`, a default run
+produces approximately none, for two reasons that have nothing to do with
+moving-young:
+
+1. **`optimize=false` on nearly every compile.** The tier is selected outside
+   `cratonvm-jit`; the eager first-call single-pass compile caches a non-IR
+   body and preempts every later path. The gate this document scoped sits
+   *downstream* of a decision that rarely asks for C2 at all.
+2. **`compact_ref_fields_enabled()` (default TRUE) made `IrBuilder::build`
+   refuse every `getfield`/`putfield`** — most object-oriented Java — at stage
+   one, silently. Fixed 2026-07-31; the constraint now lives where the
+   layout-naive displacement is emitted.
+
+Both are documented in `docs/internal/jit-ir-relocation-map-contract.md`, along
+with the per-stage refusal reporting that makes this checkable instead of
+inferable. The practical consequence for THIS document: its verification table
+shows unit-test counts, which the scoping genuinely fixed, but nothing in it
+establishes runtime C2 coverage — and the ASTParser 376→138 s and Oracle
+322→93 s improvements credited to the scoping cannot have come from the
+optimizing tier, since it emitted nothing. `direct_jit_callee_calls_enabled`,
+scoped in the same commit and since re-gated, is the candidate and still needs
+re-measuring.
