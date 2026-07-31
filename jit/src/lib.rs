@@ -14681,12 +14681,22 @@ mod tests {
 
         clear_jit_recursive_cycle_methods_for_test();
         // This test exercises the direct-callee-compile path (`callee_compiler`
-        // below), which is opt-in by default — see
-        // `direct_jit_callee_calls_enabled`. Not OnceLock-cached, so setting it
-        // here is observed immediately; no other jit test asserts on
-        // invoke-info/PIC/MIC-slot counts, so this is safe under parallel
-        // `cargo test`.
-        std::env::set_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS", "1");
+        // below); see `direct_jit_callee_calls_enabled`.
+        // `CRATONVM_JIT_DIRECT_CALLEE_CALLS` is a *declared* flag, served from
+        // the process-wide snapshot that latches on the first read of any flag
+        // (`cratonvm_types::flags`). `set_var` here therefore did nothing at
+        // all once any earlier test in this binary had touched a flag — the
+        // assertions below were riding on the flag's default (enabled) rather
+        // than on the value this test asked for, and would have silently
+        // stopped testing the direct-callee path the day that default flipped.
+        // The override pins it for real, on this thread only, so it cannot
+        // perturb a parallel test.
+        let _direct_callee_calls = cratonvm_types::flags::override_thread(
+            cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+                "CRATONVM_JIT_DIRECT_CALLEE_CALLS",
+                Some("1"),
+            )]),
+        );
 
         let a_cached = CachedBytecodeMethod {
             declaring_class_id: cratonvm_types::ClassId::new(1),
@@ -14806,7 +14816,6 @@ mod tests {
         );
 
         clear_jit_recursive_cycle_methods_for_test();
-        std::env::remove_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS");
     }
 
     #[test]

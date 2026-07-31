@@ -2057,14 +2057,41 @@ mod tests {
     }
 
     /// Several tests below drive [`detect_real_jdk`] / [`require_real_jdk`]
-    /// by pointing `CRATONVM_JAVA_HOME` at a synthesised JDK tree.
+    /// by pointing `CRATONVM_JAVA_HOME` at a synthesised JDK tree, with
+    /// `JAVA_HOME` scrubbed so the next probe down cannot answer instead.
     ///
-    /// The `JAVA_HOME` / `CRATONVM_JAVA_HOME` env vars are process-wide,
-    /// so this test races with any concurrent test that also touches
-    /// them. We isolate by stashing/restoring and serialising via a
-    /// static mutex below.
+    /// The two variables need *different* mechanisms, and getting that wrong
+    /// is what made these tests vacuous for months:
+    ///
+    /// * `CRATONVM_JAVA_HOME` is a **declared** flag. `resolve_java_home`
+    ///   reads it through `flags::runtime_var`, which serves it from one
+    ///   process-wide snapshot latched on the first read of any flag. In this
+    ///   crate's test binary that latch has long since happened, so `set_var`
+    ///   here changed `environ` and nothing the code under test would read —
+    ///   the test then measured the developer's real JDK. It is overridden on
+    ///   the snapshot instead, for this thread only.
+    /// * `JAVA_HOME` is **not** declared and keeps `std::env`'s live-read
+    ///   semantics, so it still has to be stashed/restored in `environ` —
+    ///   which is process-wide and races concurrent tests, hence
+    ///   [`env_lock`].
+    fn with_scratch_java_home<R>(root: Option<&str>, f: impl FnOnce() -> R) -> R {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JAVA_HOME", root)],
+            || with_env("JAVA_HOME", None, f),
+        )
+    }
+
+    /// Set an **undeclared** environment variable for the duration of `f`.
+    ///
+    /// Declared `CRATONVM_*` flags must not go through here — see
+    /// [`with_scratch_java_home`] — so this asserts against them rather than
+    /// leaving the next caller to rediscover why their override did nothing.
     fn with_env<R>(key: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
-        let prev = cratonvm_types::flags::runtime_var_os(key);
+        debug_assert!(
+            !key.starts_with("CRATONVM_"),
+            "{key} looks like a declared flag; use flags::with_thread_overrides"
+        );
+        let prev = std::env::var_os(key);
         match value {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
@@ -2077,7 +2104,7 @@ mod tests {
         result
     }
 
-    /// Avoid env-var races between the detection tests.
+    /// Avoid `JAVA_HOME` races between the detection tests.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
@@ -2135,17 +2162,11 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         fake_jdk_with_jmod(tmp.path());
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let cfg = VmConfig::for_launcher();
-                    assert_eq!(cfg.jdk_mode(), JdkMode::Real);
-                    assert!(!cfg.use_synthetic_jdk);
-                });
-            },
-        );
+        with_scratch_java_home(tmp.path().to_str(), || {
+            let cfg = VmConfig::for_launcher();
+            assert_eq!(cfg.jdk_mode(), JdkMode::Real);
+            assert!(!cfg.use_synthetic_jdk);
+        });
     }
 
     /// The behaviour this file used to encode — "no JDK found ⇒ silently
@@ -2183,19 +2204,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Host with no usable JDK: the legacy implementation would have
         // returned synthetic here.
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    assert_eq!(
-                        VmConfig::with_host_jdk_default().jdk_mode(),
-                        VmConfig::for_launcher().jdk_mode()
-                    );
-                    assert_eq!(VmConfig::with_host_jdk_default().jdk_mode(), JdkMode::Real);
-                });
-            },
-        );
+        with_scratch_java_home(tmp.path().to_str(), || {
+            assert_eq!(
+                VmConfig::with_host_jdk_default().jdk_mode(),
+                VmConfig::for_launcher().jdk_mode()
+            );
+            assert_eq!(VmConfig::with_host_jdk_default().jdk_mode(), JdkMode::Real);
+        });
     }
 
     /// Explicit `--synthetic-jdk` opt-in must beat the launcher default:
@@ -2206,22 +2221,16 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         fake_jdk_with_jmod(tmp.path());
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let cfg = VmConfig::for_launcher().with_jdk_mode(JdkMode::Synthetic);
-                    assert_eq!(cfg.jdk_mode(), JdkMode::Synthetic);
-                    assert!(cfg.use_synthetic_jdk);
-                    // The legacy boolean setter must stay equivalent.
-                    assert_eq!(
-                        VmConfig::for_launcher().with_synthetic_jdk(true).jdk_mode(),
-                        JdkMode::Synthetic
-                    );
-                });
-            },
-        );
+        with_scratch_java_home(tmp.path().to_str(), || {
+            let cfg = VmConfig::for_launcher().with_jdk_mode(JdkMode::Synthetic);
+            assert_eq!(cfg.jdk_mode(), JdkMode::Synthetic);
+            assert!(cfg.use_synthetic_jdk);
+            // The legacy boolean setter must stay equivalent.
+            assert_eq!(
+                VmConfig::for_launcher().with_synthetic_jdk(true).jdk_mode(),
+                JdkMode::Synthetic
+            );
+        });
     }
 
     /// `VmConfig::default()` must remain hermetic (synthetic) so library
@@ -2292,19 +2301,12 @@ mod tests {
         let explicit = tmp.path().to_str().unwrap().to_string();
         // Explicit path wins even when the env points somewhere useless.
         let bogus = tempfile::tempdir().unwrap();
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(bogus.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let home =
-                        require_real_jdk(Some(explicit.as_str())).expect("explicit JDK is valid");
-                    assert_eq!(home, tmp.path());
-                    let described = describe_jdk_search(Some(explicit.as_str()));
-                    assert!(described.contains("--java-home"), "{described}");
-                });
-            },
-        );
+        with_scratch_java_home(bogus.path().to_str(), || {
+            let home = require_real_jdk(Some(explicit.as_str())).expect("explicit JDK is valid");
+            assert_eq!(home, tmp.path());
+            let described = describe_jdk_search(Some(explicit.as_str()));
+            assert!(described.contains("--java-home"), "{described}");
+        });
     }
 
     /// `require_synthetic_jdk` must agree with the compile-time feature —
