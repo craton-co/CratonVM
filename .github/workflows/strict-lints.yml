@@ -81,16 +81,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # `--all-targets` pulls in test and bench targets, where `unwrap`/`expect`
-      # are conventional and expected to dominate the count. That is intentional
-      # rather than noise: the point is a full inventory, and the summary step
-      # splits the totals per lint so production findings can be read separately.
       - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
 
+      # `--all-targets` pulls in test and bench targets, where `unwrap`/`expect`
+      # are conventional and expected to dominate the count. That is intentional
+      # rather than noise: the point is a full inventory, and the summary step
+      # splits the totals per lint so production findings can be read separately.
+      #
       # `set -o pipefail` is deliberately NOT set: this step must always reach
       # the artifact upload, and the job's exit status is carried by the
       # explicitly recorded `clippy exit status` line instead.

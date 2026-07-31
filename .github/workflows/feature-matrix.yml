@@ -43,14 +43,41 @@
 #     device and already have dedicated workflows (cuda-bridge.yml compiles both
 #     backends on public CI, gpu-selfhosted.yml runs on the self-hosted GPU box).
 #     Excluding them here keeps this workflow hardware-free.
+#
+# COST, STATED HONESTLY
+# ---------------------
+# The workspace declares 52 non-default features; 12 are gpu/cuda and excluded,
+# leaving 40 single-feature legs plus 2 baselines plus 11 curated combinations =
+# ~53 full-workspace `cargo check` runs per triggering event. That is the price
+# of the guarantee, and it is not small. Two dials exist if it needs lowering,
+# both of which trade coverage for time -- pick deliberately, and record which:
+#
+#   (a) Move the single-feature legs to `schedule:` and keep only the baselines
+#       and combinations on push/PR. Cheapest, and still catches the incident
+#       class that motivated this workflow -- one day later.
+#   (b) Collapse each feature NAME to its topmost forwarder. `cratonvm-embed/
+#       management` transitively enables `cratonvm-vm/management` and
+#       `cratonvm-native-builtins/management`, so the one leg covers all three.
+#       Careful: the reverse is NOT true. Enabling the leaf does not enable the
+#       forwarder's own `#[cfg(feature = "...")]` blocks, so collapsing to the
+#       LEAF instead of the ROOT silently deletes coverage.
+#
+# `paths-ignore` already removes the largest chunk of waste: a docs-only change
+# cannot alter which feature configurations compile.
 
 name: Feature matrix
 
 on:
   push:
     branches: [main, dev]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   pull_request:
     branches: [main, dev]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   workflow_dispatch:
 
 # A feature matrix is wide; superseded runs on the same ref are pure waste.
@@ -189,8 +216,9 @@ jobs:
       fail-fast: false
       # Wide but each leg is a `cargo check` against a warm shared cache. Capped
       # so a feature-matrix run cannot starve the blocking ci.yml jobs of
-      # concurrency.
-      max-parallel: 8
+      # concurrency -- ci.yml is what gates merges, and it must never be queued
+      # behind ~53 advisory-in-spirit compile checks.
+      max-parallel: 6
       matrix:
         cfg: ${{ fromJSON(needs.enumerate.outputs.configs) }}
     steps:

@@ -455,7 +455,10 @@ mod tests {
     #[test]
     fn bail_compile_formats_context() {
         fn f(pc: usize) -> CompileResult<u32> {
-            bail_compile!(BailoutReason::UnsupportedOpcode { opcode: 0xc4 }, "at pc {pc}");
+            bail_compile!(
+                BailoutReason::UnsupportedOpcode { opcode: 0xc4 },
+                "at pc {pc}"
+            );
         }
         let err = f(42).unwrap_err();
         assert_eq!(err.category(), "unsupported_opcode");

@@ -377,12 +377,12 @@ fn check_edges(graph: &Graph, v: &mut Violations) {
                 )),
                 // A removed *memory token* is an ordering defect, reported by
                 // the ordering lane; see `is_memory_token_input`.
-                Some(target) if target.op == Op::Dead && !is_memory_token_input(node, i) => v.add(
-                    format!(
+                Some(target) if target.op == Op::Dead && !is_memory_token_input(node, i) => {
+                    v.add(format!(
                         "{} input[{i}] = n{inp} refers to a removed (Dead) node",
                         label(graph, id)
-                    ),
-                ),
+                    ))
+                }
                 Some(_) => {}
             }
         }
@@ -637,7 +637,7 @@ fn check_control(graph: &Graph, v: &mut Violations) {
         }
         let mut found_return = false;
         while let Some(cur) = stack.pop() {
-            if matches!(node_at(graph, cur).map(|n| &n.op), Some(Op::Return)) {
+            if matches!(node_at(graph, cur), Some(n) if n.op == Op::Return) {
                 found_return = true;
             }
             let Some(succs) = succ.get(cur as usize) else {
@@ -796,6 +796,13 @@ fn check_types(graph: &Graph, v: &mut Violations) {
 
         // Phi: the declared type must be a valid join of the value inputs.
         if node.op == Op::Phi {
+            // A *memory* phi joins scheduling tokens, not values, and the
+            // builder deliberately reuses a value node as a token
+            // (`self.mem = load`, where the load is `IrType::Int`). Its inputs
+            // are therefore heterogeneous by design.
+            if node.ty == IrType::Memory {
+                continue;
+            }
             let mut join: Option<Cat> = None;
             let mut mixed = false;
             for &inp in node.inputs.iter().skip(1) {
@@ -1079,11 +1086,7 @@ mod tests {
     #[test]
     fn no_node_inside_a_phi_is_allowed() {
         let mut g = diamond_graph();
-        let phi = g
-            .nodes
-            .iter()
-            .position(|n| n.op == Op::Phi)
-            .expect("phi") as NodeId;
+        let phi = g.nodes.iter().position(|n| n.op == Op::Phi).expect("phi") as NodeId;
         g.nodes[phi as usize].inputs[1] = NO_NODE;
         // Structural + frame-state lanes must accept an undefined predecessor
         // value; only the type lane has an opinion, and it skips NO_NODE too.
@@ -1093,11 +1096,7 @@ mod tests {
     #[test]
     fn phi_arity_mismatch_is_rejected() {
         let mut g = diamond_graph();
-        let phi = g
-            .nodes
-            .iter()
-            .position(|n| n.op == Op::Phi)
-            .expect("phi") as NodeId;
+        let phi = g.nodes.iter().position(|n| n.op == Op::Phi).expect("phi") as NodeId;
         // Drop one value input: the merge still has two predecessors, so the
         // second edge would emit no parallel copy.
         g.nodes[phi as usize].inputs.pop();
@@ -1110,11 +1109,7 @@ mod tests {
     #[test]
     fn phi_not_anchored_at_a_merge_is_rejected() {
         let mut g = diamond_graph();
-        let phi = g
-            .nodes
-            .iter()
-            .position(|n| n.op == Op::Phi)
-            .expect("phi") as NodeId;
+        let phi = g.nodes.iter().position(|n| n.op == Op::Phi).expect("phi") as NodeId;
         g.nodes[phi as usize].inputs[0] = g.entry;
         let err = verify_graph(&g, "test", VerifyOptions::default()).unwrap_err();
         assert!(
@@ -1127,11 +1122,7 @@ mod tests {
     #[test]
     fn type_inconsistent_phi_is_rejected() {
         let mut g = diamond_graph();
-        let phi = g
-            .nodes
-            .iter()
-            .position(|n| n.op == Op::Phi)
-            .expect("phi") as NodeId;
+        let phi = g.nodes.iter().position(|n| n.op == Op::Phi).expect("phi") as NodeId;
         // Make one incoming value a reference while the other stays an int.
         let a = g.nodes[phi as usize].inputs[1];
         g.nodes[a as usize].ty = IrType::Ref;
@@ -1147,11 +1138,7 @@ mod tests {
     #[test]
     fn phi_typed_against_its_join_is_rejected() {
         let mut g = diamond_graph();
-        let phi = g
-            .nodes
-            .iter()
-            .position(|n| n.op == Op::Phi)
-            .expect("phi") as NodeId;
+        let phi = g.nodes.iter().position(|n| n.op == Op::Phi).expect("phi") as NodeId;
         // Both inputs are references, but the phi claims to be an int — the
         // `phi_data_type` defect the review names.
         for i in 1..g.nodes[phi as usize].inputs.len() {

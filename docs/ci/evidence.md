@@ -63,6 +63,15 @@ compiled from the moment it exists.
 **Why `--all-targets`.** Lib+bin scope would have caught 22 of those 349 errors.
 The rest lived in test modules, examples and benches.
 
+**Size and cost.** The workspace declares **52** non-default features across 13
+members. Twelve are `gpu`/`cuda` and are excluded, so the matrix is ~53 legs:
+40 single-feature, 2 baselines (`default` and `--no-default-features`), and 11
+curated combinations. That is the price of the guarantee. `paths-ignore` skips
+docs-only changes, `max-parallel` is capped at 6 so this can never queue ahead
+of the blocking `ci.yml` jobs, and the workflow header documents the two dials
+for reducing it further — including the trap that collapsing a feature to its
+*leaf* owner instead of its *root* forwarder silently deletes coverage.
+
 **Deliberate exclusion.** Feature names matching `gpu` or `cuda` are routed to
 [`cuda-bridge.yml`](../../.github/workflows/cuda-bridge.yml) and
 [`gpu-selfhosted.yml`](../../.github/workflows/gpu-selfhosted.yml), which have
