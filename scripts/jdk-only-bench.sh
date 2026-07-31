@@ -1416,8 +1416,12 @@ run_gate() {
     } > "$GATE_OUT"
 
     if [ ! -f "$BUDGETS" ]; then
-        gate_line NOT-EVAL "(all)" "budgets file not found: ${BUDGETS#"$ROOT"/}"
-        GATE_NOT_EVAL=$((GATE_NOT_EVAL + 1))
+        # A BREACH, not a NOT-EVAL. With no budget table there is no
+        # synthetic-stub invariant row, and a gate that exits 0 because it had
+        # nothing to check is indistinguishable from one that passed. Note that
+        # .gitignore excludes bench/, so this file can silently fail to land.
+        gate_line BREACH "(all)" "budgets file not found: ${BUDGETS#"$ROOT"/} — nothing was checked, including the synthetic-stub invariant"
+        GATE_FAIL=$((GATE_FAIL + 1))
     else
         # No pipeline here on purpose: a `while read` on the right of a pipe
         # runs in a subshell and every GATE_FAIL increment would be discarded.

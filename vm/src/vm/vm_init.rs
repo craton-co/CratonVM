@@ -4036,7 +4036,7 @@ impl SharedVm {
     /// Snapshot of the three **process-global** JDK-only violation sinks, in a
     /// stable order: `[jit-compile, jit-helpers, interpreter-dispatch]`.
     ///
-    /// The two sinks the report already folded — `refused_registrations()` and
+    /// The other two sinks the report folds — `refused_registrations()` and
     /// `origin_violations()` — are VM-scoped: they hang off this `SharedVm`'s
     /// registry and class manager. The three here are `static`s, because the
     /// sites that record them (a JIT compile-time bytecode scan, a JIT runtime
@@ -4079,6 +4079,10 @@ impl SharedVm {
         &self,
     ) -> [Vec<cratonvm_types::error::JdkOnlyViolation>; JDK_ONLY_PROCESS_SINKS] {
         if !self.compatibility_mode().is_jdk_only() {
+            // Written out rather than `std::array::from_fn` so that raising
+            // `JDK_ONLY_PROCESS_SINKS` for a new sink is a compile error here
+            // and in the array below, instead of silently returning a slot
+            // nothing ever fills.
             return [Vec::new(), Vec::new(), Vec::new()];
         }
         [
