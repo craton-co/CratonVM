@@ -9,7 +9,7 @@ assertion is about speed, with its own separate reason.
 
 | item | disposition after the 2026-07-30 re-derivation |
 |---|---|
-| 32.1 | OPEN. A dev regression, not a mapper problem, and now **fully accounted for**. **Cause 1 FIXED 2026-07-30** (instance tier-up default restored, ~8.4x). **Cause 2 = moving-young becoming active**, owned by [its own doc](../jit-optimizing-tier-disabled-by-moving-young-default.md). With both removed the test PASSES on both hostnames. No Tomcat work left. |
+| 32.1 | OPEN. A dev regression, not a mapper problem, and now **fully accounted for**. **Cause 1 FIXED 2026-07-30** (instance tier-up default restored, ~8.4x). **Cause 2 = moving-young becoming active** ([its own doc](../jit-optimizing-tier-disabled-by-moving-young-default.md)); a fix is written and pushed on `codex/fix-hibernate-five-takeover-20260730`, not yet on dev. With both removed the test PASSES on both hostnames. No Tomcat work left. |
 | 32.2 | ✅ **Not a defect** — passes on a quiet host. Genuinely load-sensitive; expect intermittency on a busy one. |
 | 32.3 | OPEN, improved ~12–16 %. Root cause identified as per-completion processing, not I/O; no further AIO work will close it. |
 | 32.4 | OPEN, and **harder than recorded** — belongs to doc [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md)'s family, not here. |
@@ -229,6 +229,24 @@ Do **not** "fix" this by turning moving-young off: the IR tier is disabled under
 it for a stated soundness reason (an IR frame publishes no exact-RBP or
 per-safepoint oop map, so it cannot prove or rewrite its roots for a relocating
 collection). That document owns the tradeoff.
+
+**A fix is already written and pushed, on `codex/fix-hibernate-five-takeover-20260730`
+(not yet on dev as of `aed6c3199`).** It does not weaken the contract — it
+*scopes* the two gates. `x64::moving_young_relocates_compiled_frames()` =
+`moving_young_enabled() && JIT_PUBLISHES_RELOCATION_CONTRACT`, and both
+`moving_young_disables_optimizing_tier` and `direct_jit_callee_calls_enabled`
+now read that instead of `moving_young_enabled()` directly. The argument is that
+the hazard is unreachable: `refresh_moving_young_coverage_for_current_thread`
+vetoes moving-young process-wide once `jit_code_range_count() != 0`, and every
+collection runs that refresh, so a relocating cycle only happens while the
+process holds no compiled code at all. The veto reads the same constant, so the
+two cannot drift apart.
+
+**32.1 should close when that branch merges** — the numbers above are exactly
+what its scoping restores. Re-run
+`run-doc04-residuals.ps1 -Only org.apache.catalina.mapper.TestMapperPerformance`
+on a quiet host to confirm rather than assuming. (Its own validation is recorded
+on that branch; this document has not independently re-verified it.)
 
 Genuinely eliminated, so nobody re-tests them: the ctor putfield-init ban
 (`CRATONVM_JIT_PUTFIELD_INIT=0` changes nothing — 24.2 vs 24.6 µs — and it is
