@@ -3084,6 +3084,9 @@ fn reloc_emit_enabled() -> bool {
                 // `live_frame_hi` is the spill cursor as it stands now, i.e.
                 // before this node's result slot is carved.
                 let sp_live_hi = self.next_spill;
+                self.emit_safepoint_map(sp_live_hi);
+                let slot = self.alloc_slot(id);
+                let num_args = node.inputs.len().saturating_sub(2);
                 // fib44-fix follow-up: invoke_kind 4 marks a self-recursive call
                 // the eligibility loop chose to emit as a DIRECT call to this
                 // method's own entry (CRATONVM_JIT_IR_SELFREC_DIRECT), bypassing
