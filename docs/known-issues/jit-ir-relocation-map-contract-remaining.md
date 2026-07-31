@@ -446,3 +446,44 @@ That leaves the two conjuncts ahead of it in
 control as well as the answer — if neither line appears, `try_compile_inner`
 itself is not on the path, which would be a third possibility nobody has
 considered.
+
+## ANSWERED: two causes, and `ir_compatible` is not either of them
+
+A probe at the top of `try_compile_inner` (verified in the built tree first)
+printing `optimize` and `moving_young_disables_optimizing_tier()`.
+`BinTreesClassic 16`, `CRATONVM_DBG_IR_COMPILES=1`:
+
+    2x  optimize=false  moving_young_disables_tier=false
+    1x  optimize=true   moving_young_disables_tier=false
+    refusals: 0   IR bodies: 0
+
+Three findings, and the first two retract earlier sections:
+
+1. **`moving_young_disables_tier=false` on every call.** The gate this branch
+   scoped is genuinely open. That part works.
+2. **Most compiles ask for `optimize=false`.** Two of the three calls are the
+   ordinary tier-up route requesting the single-pass backend *by design*. So
+   "the optimizing tier never runs" is substantially just "it is rarely
+   requested" — not a bug in the admission chain at all, and not something the
+   relocation contract can affect.
+3. **The one `optimize=true` call produced neither a refusal nor a body.**
+   Since `ir_reject` now logs every `ir_compatible` refusal, and no refusal was
+   logged, `ir_compatible` **passed** — and the compile was then rejected by a
+   conjunct AFTER it in the same `if`. The chain continues past `ir_compatible`
+   into the STUB-S8 exception-table condition and the rest; one of those is the
+   real refusal, and none of them are instrumented.
+
+So the suspect list has moved twice — first to `ir_compatible`, now past it —
+and each move came from adding one observation rather than one hypothesis.
+
+### Next
+
+Instrument the conjuncts AFTER `ir_compatible` in `try_compile_inner`'s `if`,
+the same way (`ir_reject`-style, one call per condition). That names the actual
+refusal for the `optimize=true` case in a single run.
+
+Then, separately, decide whether finding (2) matters: if the tier-up path is
+meant to request C2 for hot methods and does not, that is a much larger
+throughput question than the relocation contract, and it belongs in the
+tiered-manager work (`docs/feature-designs/wire-tiered-manager.md`), not here.
+The relocation contract is ready for whichever methods do reach the IR backend.
