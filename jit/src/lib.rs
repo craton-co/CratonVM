@@ -11988,13 +11988,12 @@ mod tests {
         fi.insert(10usize, (0usize, b'I')); // putfield field 0
         fi.insert(13usize, (0usize, b'I')); // getfield field 0
         builder.set_field_info(fi);
-        if cratonvm_types::compact_ref_fields_enabled() {
-            assert!(
-                builder.build(&code, 17).is_none(),
-                "compact field layout must bail to the checked single-pass path"
-            );
-            return;
-        }
+        // The builder used to refuse getfield/putfield outright whenever
+        // compact layout was on (the default), which made this test vacuous
+        // in every default run. The layout constraint now lives in
+        // `ir_lower::lower_inner`, where the layout-naive displacement is
+        // actually emitted, so the scalar-replacement assertions below now
+        // run for real.
         let mut graph = builder.build(&code, 17).expect("IR build");
         assert!(
             graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
@@ -12066,13 +12065,12 @@ mod tests {
         fi.insert(11usize, (0usize, b'I')); // putfield field 0
         fi.insert(15usize, (0usize, b'I')); // getfield field 0
         builder.set_field_info(fi);
-        if cratonvm_types::compact_ref_fields_enabled() {
-            assert!(
-                builder.build(&code, 19).is_none(),
-                "compact field layout must bail to the checked single-pass path"
-            );
-            return;
-        }
+        // The builder used to refuse getfield/putfield outright whenever
+        // compact layout was on (the default), which made this test vacuous
+        // in every default run. The layout constraint now lives in
+        // `ir_lower::lower_inner`, where the layout-naive displacement is
+        // actually emitted, so the scalar-replacement assertions below now
+        // run for real.
         let mut graph = builder
             .build(&code, 19)
             .expect("IR build must succeed with astore lowered");
@@ -12206,31 +12204,17 @@ mod tests {
             false,
             None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
-        if cratonvm_types::compact_ref_fields_enabled() {
-            // Compact field layout bails the IR builder on `new`/getfield/putfield
-            // (see the ir.rs field-op tests) before it ever reaches the
-            // elidable-`<init>` check, and this test deliberately supplies no
-            // `cp_invoke_resolver` (a correctly-elided `new` should never need
-            // single-pass's invoke resolution) — so there is no fallback and the
-            // compile bails entirely.
-            assert!(
-                r.is_none(),
-                "compact field layout must bail to the checked single-pass path, \
-                 which this test starves of a cp_invoke_resolver on purpose"
-            );
-            assert_eq!(
-                IR_LOWER_COMPILES.with(|c| c.get()),
-                0,
-                "compact field layout bails the IR pipeline before the elidable `new` can route through it"
-            );
-        } else {
-            assert!(r.is_some(), "an elidable `new` method must compile via IR");
-            assert_eq!(
-                IR_LOWER_COMPILES.with(|c| c.get()),
-                1,
-                "the elidable `new` method must route through the IR pipeline"
-            );
-        }
+        // Compact field layout used to bail the IR builder on
+        // `new`/getfield/putfield before the elidable-`<init>` check was
+        // ever reached, so under the default this test asserted only that
+        // nothing happened. The builder no longer refuses those opcodes.
+        assert!(r.is_some(), "an elidable `new` method must compile via IR");
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "the elidable `new` method must route through the IR pipeline"
+        );
+
 
         // Without it → the builder bails on the `invokespecial` → not the IR path.
         IR_LOWER_COMPILES.with(|c| c.set(0));

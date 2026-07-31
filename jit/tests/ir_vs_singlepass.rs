@@ -41,6 +41,40 @@ static TEST_REGION_BOUNDS: [std::sync::atomic::AtomicUsize; 6] = [
     std::sync::atomic::AtomicUsize::new(0),
 ];
 
+/// `jit_getfield` for this harness's synthetic receivers, which use the LEGACY
+/// uniform layout (`HEADER_SIZE + field_index * SLOT_SIZE`) that `make_object`
+/// writes — see `compile_opt_fields`: "no registered CompactLayout for this
+/// test's synthetic buffers". Null receiver → 0, matching the real helper's
+/// null path and the inline lowering's.
+///
+/// # Safety
+/// `obj` is either 0 or one of `make_object`'s live buffers, and `idx` is
+/// within its field count (the corpus resolves only fields it allocated).
+unsafe extern "C" fn legacy_getfield(_vm: i64, obj: i64, idx: i64) -> i64 {
+    if obj == 0 {
+        return 0;
+    }
+    let at = (obj as *const u8)
+        .add(HEADER_SIZE + idx as usize * SLOT_SIZE + FIELD_CELL_PAYLOAD32_OFFSET);
+    std::ptr::read_unaligned(at as *const i32) as i64
+}
+
+/// `jit_putfield_int` for the same buffers. Writes the identical three-part
+/// `Value::Int` cell the IR tier's inline store emits (discriminant, 32-bit
+/// payload, cleared high qword) so the two lowerings are byte-comparable.
+///
+/// # Safety
+/// Same contract as [`legacy_getfield`].
+unsafe extern "C" fn legacy_putfield_int(obj: i64, idx: i64, val: i64) {
+    if obj == 0 {
+        return;
+    }
+    let base = (obj as *mut u8).add(HEADER_SIZE + idx as usize * SLOT_SIZE);
+    std::ptr::write_unaligned(base as *mut u32, 0);
+    std::ptr::write_unaligned(base.add(FIELD_CELL_PAYLOAD32_OFFSET) as *mut i32, val as i32);
+    std::ptr::write_unaligned(base.add(8) as *mut u64, 0);
+}
+
 fn dummy_helpers() -> JitRuntimeHelpers {
     // guarded_inline_getfield_enabled() is default-ON (jit/src/x64.rs) --
     // this whole file's contract ("no runtime helper reachable" via the
@@ -86,8 +120,18 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         aastore: s,
         multianewarray_2d: s,
         arraylength: s,
-        getfield: s,
-        putfield_int: s,
+        // NOT the panicking stub. `ir_lower` lowers `Op::Load` through
+        // `getfield` whenever the address is present, and `Op::Store` through
+        // `putfield_int` whenever compact layout is on (it is, by default) —
+        // so the field corpus below genuinely reaches these. They used to be
+        // unreachable for a reason that made the corpus vacuous rather than
+        // safe: the IR builder refused every getfield/putfield method under
+        // compact layout, so `compile_opt_fields(.., optimize=true)` handed
+        // back a SINGLE-PASS body and the differential compared single-pass
+        // with itself. These two implement exactly the layout `make_object`
+        // writes, so the comparison is now real.
+        getfield: legacy_getfield as *const () as usize,
+        putfield_int: legacy_putfield_int as *const () as usize,
         putfield_long: s,
         putfield_float: s,
         putfield_double: s,
