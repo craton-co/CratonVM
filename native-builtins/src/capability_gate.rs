@@ -367,6 +367,9 @@ pub fn reset_raw_memory_gate_memo() {
 mod tests {
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
+    // `fd_table` is declared on `NativeSystemAccess`, not `NativeContext`; the
+    // trait must be in scope for the mock to expose it.
+    use cratonvm_native_api::NativeSystemAccess;
     use cratonvm_native_api::{
         capability_audit, install_capabilities, uninstall_capabilities, CapabilityKind,
         CapabilitySet, VmId,
