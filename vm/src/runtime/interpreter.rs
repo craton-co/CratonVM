@@ -2342,11 +2342,42 @@ fn process_references_after_gc(
     // was hardwired inert for G1/ZGC — dead finalize/cleaner/enqueue
     // addresses flowed through unguarded and `run_finalizers` later
     // dereferenced freed CSet memory (finalize-on-recycled-object UAF).
+    // OLD-GEN RECLAMATION FIX (HIB-CV-32 family,
+    // `TestMVStoreCachePerformance`): `pre_gc_addr_did_not_survive` has the
+    // same old-generation blind spot `is_addr_live` had — for the Generational
+    // heap it only rejects YOUNG addresses absent from the pointer map, and
+    // answers "survived" for every old-gen address on the grounds that a minor
+    // GC does not move old gen. That stops being true the moment the SAME
+    // cycle reclaims old-gen storage (mark-compact `major_gc`, or the in-place
+    // `sweep_old_gen_non_moving`): the pre-GC address of a reclaimed old-gen
+    // Reference / queue / cleaner action now names the zeroed compaction tail,
+    // a live object slid onto it, or a free block. The cleared/enqueue writes
+    // below then landed on an innocent occupant, and — worse — the finalize
+    // and cleaner loops handed that address to `run_finalizers` /
+    // `run_cleaner_actions`, which INVOKE Java methods on it.
+    //
+    // Every address that reaches this predicate belongs to the reference
+    // processor and was published as watched by
+    // `weakref_null_referents_pre_gc`, so `watched_pre_gc_addr_survived` is
+    // exact for it (both old-gen paths emit an identity `pointer_map` entry
+    // for watched survivors). OR the two verdicts: a "did not survive" from
+    // either predicate declines the write, which is always the safe
+    // direction, and keeps the young rule exactly as strict as before (the
+    // `bc math-ec 0x4` fix). Falls back to the young-only rule when the
+    // pre-GC publication pass is off, since then nothing was watched.
     let is_stale_young = |addr: usize| -> bool {
-        shared
+        let young_stale = shared
             .mem
             .heap
-            .pre_gc_addr_did_not_survive(addr, pointer_map)
+            .pre_gc_addr_did_not_survive(addr, pointer_map);
+        if !weakref_clear_enabled() {
+            return young_stale;
+        }
+        young_stale
+            || !shared
+                .mem
+                .heap
+                .watched_pre_gc_addr_survived(addr, pointer_map)
     };
 
     // Null referent field (field 0) on cleared weak/soft references.

@@ -1929,6 +1929,10 @@ impl VmHeap {
         if pointer_map.contains_key(&addr) {
             return true;
         }
+        // Bisection escape hatch — restores the pre-fix permissive predicate.
+        if crate::gc_flags().no_exact_refproc_survival {
+            return self.is_addr_live(addr);
+        }
         match self {
             VmHeap::Generational(h) => {
                 if h.is_old_gen_addr(addr) {
