@@ -761,6 +761,16 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // gen requires a COMPLETE, rewritable precise root map (see
     // `moving_young_enabled` and `collect_live_oop_homes`), so turning it on also
     // turns on the push/reload emission.
+    //
+    // NOT scoped to `moving_young_relocates_compiled_frames`, deliberately.
+    // Scoping it is *arguable* on the same invariant the admission gates use —
+    // the shadow stack exists to REWRITE references and relocation is vetoed —
+    // but it was measured and buys nothing: interleaved A/B on one binary,
+    // `BinTreesClassic 18` at 512m over 6 reps per lane gave medians 5640 ms
+    // (off) vs 6045 ms (on) with ranges 4913-7171 and 4187-7525, and
+    // `ASTParserLoadingTest` 189/199 s vs 183/406 s. No signal either way.
+    // Since it moves the emission side of an emission/root-scan agreement that
+    // must hold exactly, it is not worth taking risk for an unmeasurable win.
     // `CRATONVM_SHADOW_STACK` is read here, in `gc` and in `vm`, which is why
     // it lives in the shared `cratonvm_types::flags()` config rather than a
     // crate-private `getenv` cache: the emission side (this file) and the

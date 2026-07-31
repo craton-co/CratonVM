@@ -362,6 +362,13 @@ pub fn shadow_stack_enabled() -> bool {
     // `CRATONVM_MOVING_YOUNG` implies the shadow-stack root scan + remap: the
     // moving young gen relies on the complete precise map the shadow stack now
     // publishes (see `moving_young_enabled`).
+    //
+    // This formula MUST stay identical to the emission side,
+    // `jit::x64::shadow_stack_maps_enabled`, or the collector walks a shadow
+    // stack the codegen never pushed to. Both were tried scoped to
+    // `JIT_PUBLISHES_RELOCATION_CONTRACT` and both were reverted together: the
+    // scoping measured as no-change (see that function's comment), and moving
+    // one side of this agreement is not worth doing for an unmeasurable win.
     *ENABLED.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
     })

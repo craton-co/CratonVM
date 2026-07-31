@@ -36859,6 +36859,11 @@ mod flag_and_header_contracts {
     /// `CRATONVM_SHADOW_STACK` is likewise read by `jit`, `gc` and `vm`; the
     /// emission side and the root-scan side must agree or the collector walks
     /// a shadow stack the codegen never pushed to. Moving-young implies it.
+    ///
+    /// Deliberately still the BARE flag, not the relocation-scoped predicate:
+    /// scoping it was tried, measured as no-change, and reverted rather than
+    /// move one side of an exact agreement for nothing. See
+    /// `shadow_stack_maps_enabled`.
     #[test]
     fn shadow_stack_maps_enabled_is_central_flag_or_moving_young() {
         assert_eq!(
