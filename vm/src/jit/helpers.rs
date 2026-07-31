@@ -8820,7 +8820,28 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // resolution sites read `VIRTUAL_TARGET_CACHE`, so both need it revalidated
     // against the current class-identity generation first.
     flush_class_identity_dispatch_memos();
-    let redefine_jit_quiesced = hierarchy_was_redefined(vm, receiver_class_id);
+    // Flush this inline cache ONCE per redefinition, not on every dispatch.
+    //
+    // This was `hierarchy_was_redefined(vm, receiver_class_id)`, which is
+    // permanently true once any class in the receiver's superclass chain has
+    // been redefined. It sat in front of an unconditional `clear_compiled_entry`
+    // + `clear_entries`, so after a single `Mockito.mock(Foo.class)` every
+    // subsequent call on a `Foo` erased its own MIC and PIC and then re-resolved
+    // the target from scratch — for the life of the process. That is the bulk
+    // of the ~30 us/call redefined-dispatch cost.
+    //
+    // The slot now stamps the redefinition epoch it was last validated against
+    // (`JitMICSlot::redefine_epoch`, in what used to be padding). A mismatch
+    // means a redefinition has happened since this slot was populated, so the
+    // cached entry may name evicted code: flush, restamp, and resolve normally.
+    // A match means the slot was populated after the most recent redefinition
+    // and is as trustworthy as any other inline cache. Steady state is one
+    // relaxed load and a compare.
+    let epoch_now = cratonvm_jit::redefine_epoch();
+    let redefine_jit_quiesced = mic
+        .redefine_epoch
+        .swap(epoch_now, std::sync::atomic::Ordering::AcqRel)
+        != epoch_now;
     if redefine_jit_quiesced {
         mic.clear_compiled_entry();
         if pic_ptr != 0 {

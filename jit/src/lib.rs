@@ -4502,9 +4502,20 @@ pub struct JitMICSlot {
     /// Cached receiver ClassId (0 = empty/unpopulated).
     /// **JIT-hot — offset 0.**
     pub cached_class_id: std::sync::atomic::AtomicU32,
-    /// Padding so `cached_entry_ptr` lands at an 8-byte aligned offset
-    /// regardless of host alignment rules.
-    _pad0: u32,
+    /// Redefinition epoch this slot was last validated against.
+    ///
+    /// Occupies the 4 bytes that used to be pure padding at offset 4, so the
+    /// slot's size and every JIT-hot offset (`cached_class_id` 0,
+    /// `cached_entry_ptr` 8, `cached_needs_context` 16) are unchanged and
+    /// generated code needs no update — it never loads offset 4.
+    ///
+    /// Exists so a redefinition flushes each inline cache EXACTLY ONCE instead
+    /// of forever. The previous gate asked "has this class ever been
+    /// redefined?", which is permanently true, so a mocked class had its MIC
+    /// and PIC erased on every single dispatch and re-resolved from scratch
+    /// each call. That was the bulk of the ~30 µs/call cost measured in
+    /// `docs/known-issues/repros/redefine-call-cost`.
+    pub redefine_epoch: std::sync::atomic::AtomicU32,
     /// Cached method entry pointer for direct call on hit (0 = not resolved).
     /// This is the address of a compiled native/JIT function that can be called
     /// directly with the same calling convention as `invoke_or_native`.
@@ -4554,7 +4565,7 @@ impl JitMICSlot {
     pub fn new() -> Self {
         Self {
             cached_class_id: std::sync::atomic::AtomicU32::new(0),
-            _pad0: 0,
+            redefine_epoch: std::sync::atomic::AtomicU32::new(0),
             cached_entry_ptr: std::sync::atomic::AtomicU64::new(0),
             cached_needs_context: std::sync::atomic::AtomicBool::new(false),
             _pad1: [0; 7],
@@ -5810,6 +5821,27 @@ fn dbg_jit_pin_enabled() -> bool {
 /// bump has to be unconditional. Under-bumping there would leave an interpreted
 /// call site pinned to the interpreter forever after a background compile
 /// published its body.
+/// Process-wide count of JVMTI class redefinitions.
+///
+/// Bumped once per successful `redefineClass`. Inline-cache slots stamp the
+/// value they were last validated against, so a redefinition costs each slot
+/// one flush rather than a flush on every dispatch for the rest of the
+/// process. See [`JitMICSlot::redefine_epoch`].
+pub static REDEFINE_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Read the current redefinition epoch (one relaxed atomic load).
+#[inline]
+pub fn redefine_epoch() -> u32 {
+    REDEFINE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Record that a class was redefined. Invalidates every inline cache exactly
+/// once, lazily, as each slot is next dispatched through.
+#[inline]
+pub fn bump_redefine_epoch() {
+    REDEFINE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 pub fn jit_cache_generation() -> u64 {
     JIT_CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -7209,7 +7241,15 @@ pub fn ir_direct_calls_enabled() -> bool {
 /// (a relaxed atomic after the first call) and turns a cross-suite archaeology
 /// exercise into an observation.
 pub fn moving_young_disables_optimizing_tier() -> bool {
-    if !x64::moving_young_enabled() {
+    // The relocation predicate, not the bare flag. Keyed on
+    // `moving_young_enabled()` this reported the tier as disabled on every
+    // default build — true when it was written, no longer true now that the
+    // gate is scoped to whether a relocating collection can actually observe a
+    // compiled frame. Reporting the old answer would be worse than reporting
+    // nothing, since this function exists to make the interaction announce
+    // itself *accurately*. It goes quiet exactly when the tier really does run,
+    // and speaks again the moment `JIT_PUBLISHES_RELOCATION_CONTRACT` flips.
+    if !x64::moving_young_relocates_compiled_frames() {
         return false;
     }
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -7228,11 +7268,14 @@ pub fn moving_young_disables_optimizing_tier() -> bool {
 }
 
 pub fn direct_jit_callee_calls_enabled() -> bool {
-    // A raw JIT-to-JIT call has no callee JitEntryGuard. Moving-young must be
-    // able to rewrite every live frame, so it cannot use that edge until the
-    // direct-call stub publishes the callee metadata atomically. The dispatch
-    // bridge installs the guard and is therefore the safe route in this mode.
-    if x64::moving_young_enabled() {
+    // A raw JIT-to-JIT call has no callee JitEntryGuard, so the callee frame is
+    // not reachable from the entry chain and cannot be rewritten. That matters
+    // only if a collection can RELOCATE while such a frame is live; the runtime
+    // veto means it cannot (see `moving_young_relocates_compiled_frames`), so
+    // this gate is scoped to the same constant as the optimizing-tier gate
+    // rather than to the moving-young flag. The dispatch bridge, which installs
+    // the guard, remains the route the moment that contract is real.
+    if x64::moving_young_relocates_compiled_frames() {
         return false;
     }
 
@@ -8307,19 +8350,24 @@ fn try_compile_inner(
     // correctness risk. C2 (`optimize == true`, every non-tiered caller)
     // keeps the historical IR-first behaviour.
     if optimize
-        // IR lowering has no exact-RBP or safepoint-map publication. A
-        // mapless IR frame can be live when the moving young collector runs,
-        // but cannot prove or rewrite its roots. The x64 backend enables its
-        // complete frame-metadata protocol whenever moving-young is active.
-        // Keep IR off until it supplies the same relocation contract.
+        // IR lowering has no exact-RBP or safepoint-map publication, so a
+        // mapless IR frame must never be live while the young collector
+        // RELOCATES. The question this gate has to ask is therefore whether
+        // relocation can actually observe a compiled frame — NOT whether the
+        // moving-young flag happens to be set.
         //
-        // Because `DEFAULT_MOVING_YOUNG` is `true`, this term is FALSE on every
-        // default build: the optimizing tier never runs and every compile falls
-        // through to single-pass C1. That is a deliberate, documented trade —
+        // Keyed on the flag alone it fired on every default build
+        // (`DEFAULT_MOVING_YOUNG` is `true`), switching the optimizing tier off
+        // in exchange for a frame that cannot occur: the runtime vetoes
+        // moving-young whenever an un-rewritable compiled frame is live, so a
+        // relocating cycle never sees one. See
         // `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
-        // — but it landed silently, and reconstructing it cost a cross-suite
-        // archaeology exercise. `report_optimizing_tier_disabled` makes the
-        // interaction announce itself once per process instead.
+        // and `moving_young_relocates_compiled_frames` for the invariant.
+        //
+        // This scopes the gate; it does not remove it. When the JIT publishes a
+        // real relocation contract, `JIT_PUBLISHES_RELOCATION_CONTRACT` flips,
+        // the runtime veto lifts and this gate re-arms together with it — and
+        // `moving_young_disables_optimizing_tier` then announces itself again.
         && !moving_young_disables_optimizing_tier()
         && ir::ir_compatible(&scan)
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing

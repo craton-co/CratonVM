@@ -67,7 +67,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -493,6 +493,70 @@ pub enum BlockedAccessMode {
 ///
 /// See `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
 pub const DEFAULT_MOVING_YOUNG: bool = true;
+
+/// Whether the JIT publishes a complete, mechanically-enumerable **relocation
+/// contract** for its compiled frames — exact frame base, bounded spill band,
+/// and every live oop published as a rewritable root at every GC-capable
+/// safepoint, for *every* compiled entry kind (single-pass, optimizing IR, OSR,
+/// and frames entered by a direct JIT→JIT call, which push no entry guard).
+///
+/// # Why this exists, and why it is `false`
+///
+/// It is `false` because that contract does not hold today, and the collector
+/// already refuses to trust the JIT because of it. The guarantee comes from the
+/// **per-frame coverage proof**, not from any blanket rule: for each live
+/// compiled frame `conservative_roots` looks up the `OopMapEntry` matching that
+/// frame's recorded safepoint id and requires `moving_young_coverage_complete`.
+/// Finding **no** matching map is a refusal too — the check reports "not
+/// covered" rather than "nothing to object to". `memory::roots::collect_roots`
+/// runs that proof on the path of every collection and `gen_heap` diverts on
+/// its verdict, so:
+///
+/// > A frame that publishes no complete safepoint map can never be live during
+/// > a relocating young collection.
+///
+/// The optimizing IR backend publishes **no `oop_maps` at all** — `ir_lower.rs`
+/// emits none, and an empty vector means "no precise coverage" — so an IR frame
+/// always fails that proof and always forces the non-moving sweep. A frame
+/// entered by a direct JIT→JIT call pushes no entry guard and is likewise not
+/// reachable from the chain the proof walks.
+///
+/// (An earlier version of this note rested instead on a *process-wide* veto
+/// that fired whenever compiled code merely existed. That blanket has since
+/// become the opt-in `CRATONVM_MOVING_YOUNG_NO_JIT`, leaving the per-cycle
+/// proof as the default authority. The invariant the gates below rely on is
+/// unaffected: it never needed the blanket, only the per-frame proof, which is
+/// strictly narrower and still fails closed for exactly these frame kinds.)
+///
+/// That fact is what this constant names. Several JIT admission gates
+/// were written to protect the moving collector from frames it cannot rewrite —
+/// the optimizing IR tier, and direct JIT→JIT calls. Keyed on
+/// `moving_young` alone they fire whenever the *flag* is on, which under
+/// [`DEFAULT_MOVING_YOUNG`] is always — even though the state they guard against
+/// is unreachable. The cost is not theoretical: with the IR gate closed, every
+/// compile falls through to the single-pass backend and the optimizing tier
+/// contributes nothing (see
+/// `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`).
+///
+/// So the gates read this constant *in addition to* `moving_young`, and the
+/// runtime veto reads it too. One flip re-arms all of them together, which is
+/// the point: a future change that gives the JIT the real contract must not be
+/// able to lift the veto while leaving a gate disarmed, or vice versa.
+///
+/// # What flipping this to `true` requires
+///
+/// Not just IR safepoint maps. Every obligation the verifier in
+/// `conservative_roots` can report must hold in production traffic:
+/// unregistered JIT frames on the stack, unavailable exact frame bases,
+/// unbounded spill bands, live oops outside the published map, and the
+/// cross-thread handshake (`CROSS_THREAD_JIT_PEER`). The blanket veto was
+/// introduced precisely because all of those were observed failing.
+///
+/// This constant does **not** gate the map-publication machinery itself.
+/// `x64::shadow_stack_maps_enabled` and `collect_live_oop_homes` stay keyed on
+/// `moving_young`, so the single-pass backend keeps emitting and testing the
+/// protocol that a future flip depends on.
+pub const JIT_PUBLISHES_RELOCATION_CONTRACT: bool = false;
 
 /// Flags read by `cratonvm-gc` (and, for the shared ones, by `jit` and `vm`).
 ///
@@ -1871,6 +1935,123 @@ pub fn flags() -> &'static VmFlags {
     FLAGS.get_or_init(VmFlags::from_env)
 }
 
+/// Whether any [`FlagOverride`] is currently installed, anywhere in the
+/// process.
+///
+/// **For downstream memo layers.** `vm/src/runtime/env_cache.rs` memoises ~90
+/// hot flags on top of this snapshot, so a test override would otherwise be
+/// invisible to them: the memo latches on first read and never consults
+/// [`flags()`] again. A memo whose value is not `Copy`-cheap enough for
+/// [`MemoSlot`] consults this and recomputes from source while it is true.
+///
+/// A memo must NOT populate itself while this is true, or it would latch an
+/// override's value permanently and poison the rest of the process.
+#[inline]
+pub fn overrides_active() -> bool {
+    OVERRIDES_LIVE.load(Ordering::Relaxed) != 0
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Invalidatable memo slots
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One downstream memo of a flag, which installing an override invalidates.
+///
+/// # Why this exists rather than "just check [`overrides_active`]"
+///
+/// `vm/src/runtime/env_cache.rs` memoises ~90 flags that are read from the
+/// interpreter's per-bytecode path. Having each read ask "is an override
+/// installed?" measured at **+1.15% of `execute_instruction`** — the reader
+/// pays, forever, for a question whose answer is no in every real VM process.
+///
+/// So the cost moves to the writer instead. A slot holds its value inline in
+/// one `AtomicU8`, a read is a single relaxed load, and installing or dropping
+/// a [`FlagOverride`] walks every registered slot and resets it to unset. The
+/// memo then re-derives on its next read, and while the override is live
+/// [`publish`](Self::publish) declines to store, so nothing latches.
+///
+/// The encoding above `UNSET` is the caller's: `env_cache` uses 1/2 for
+/// `false`/`true` and 1/2/3 for `None`/`Some(false)`/`Some(true)`. Anything
+/// that does not fit a `u8` keeps the [`overrides_active`] check — none of
+/// those are on the per-bytecode path.
+#[derive(Debug)]
+pub struct MemoSlot {
+    state: AtomicU8,
+}
+
+/// The "not yet derived" state of a [`MemoSlot`]; every other value is the
+/// caller's own encoding.
+pub const MEMO_UNSET: u8 = 0;
+
+/// Every [`MemoSlot`] that has published at least once, so an override can
+/// find it. Written only on a memo's cold path and by override install/drop.
+static MEMO_SLOTS: std::sync::Mutex<Vec<&'static MemoSlot>> = std::sync::Mutex::new(Vec::new());
+
+impl MemoSlot {
+    /// A slot that has not derived its value yet.
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(MEMO_UNSET),
+        }
+    }
+
+    /// The memoised value, or [`MEMO_UNSET`] if it must be derived.
+    ///
+    /// The whole point of the type: one relaxed load of a static that is
+    /// dirtied only by a test installing an override. Deliberately returns the
+    /// raw byte rather than an `Option<u8>` — `u8` has no niche, so the
+    /// `Option` costs a discriminant materialisation on the hottest read in
+    /// the interpreter (worth 0.2% of `execute_instruction`, measured).
+    #[inline]
+    pub fn load(&self) -> u8 {
+        self.state.load(Ordering::Relaxed)
+    }
+
+    /// Memoise `value`, unless an override is installed.
+    ///
+    /// Registers the slot so a later override can reset it. Takes the registry
+    /// lock, which is what makes "no override is live" and "store" one step
+    /// with respect to a concurrent [`override_thread`] — without that, an
+    /// override installed between the check and the store would find the slot
+    /// already walked and leave a stale base value behind it.
+    ///
+    /// # Panics
+    ///
+    /// If `value` is [`MEMO_UNSET`] — that would encode "derive me again" and
+    /// spin the cold path forever.
+    pub fn publish(&'static self, value: u8) {
+        assert!(value != MEMO_UNSET, "MEMO_UNSET is not a publishable value");
+        let mut slots = MEMO_SLOTS.lock().unwrap_or_else(|p| p.into_inner());
+        if overrides_active() {
+            return;
+        }
+        if !slots.iter().any(|s| std::ptr::eq(*s, self)) {
+            slots.push(self);
+        }
+        self.state.store(value, Ordering::Relaxed);
+    }
+}
+
+impl Default for MemoSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reset every registered memo, and apply `delta` to the live-override count
+/// under the same lock so a concurrent [`MemoSlot::publish`] cannot interleave.
+fn invalidate_memos(delta: isize) {
+    let slots = MEMO_SLOTS.lock().unwrap_or_else(|p| p.into_inner());
+    if delta > 0 {
+        OVERRIDES_LIVE.fetch_add(1, Ordering::Release);
+    } else {
+        OVERRIDES_LIVE.fetch_sub(1, Ordering::Release);
+    }
+    for slot in slots.iter() {
+        slot.state.store(MEMO_UNSET, Ordering::Relaxed);
+    }
+}
+
 /// Which threads a [`FlagOverride`] applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverrideScope {
@@ -1907,7 +2088,7 @@ impl Drop for FlagOverride {
                 PROCESS_OVERRIDE.store(self.previous, Ordering::Release);
             }
         }
-        OVERRIDES_LIVE.fetch_sub(1, Ordering::Release);
+        invalidate_memos(-1);
     }
 }
 
@@ -1955,7 +2136,7 @@ fn as_raw(cfg: Option<&'static VmFlags>) -> *mut VmFlags {
 /// `cfg` is leaked, so this is for tests and not for a hot loop.
 pub fn override_thread(cfg: VmFlags) -> FlagOverride {
     let leaked: &'static VmFlags = Box::leak(Box::new(cfg));
-    OVERRIDES_LIVE.fetch_add(1, Ordering::Release);
+    invalidate_memos(1);
     let previous = THREAD_OVERRIDE.with(|slot| slot.replace(Some(leaked)));
     FlagOverride {
         scope: OverrideScope::Thread,
@@ -1977,7 +2158,7 @@ pub fn override_thread(cfg: VmFlags) -> FlagOverride {
 /// Same `env_cache` limitation and same leak as [`override_thread`].
 pub fn override_process(cfg: VmFlags) -> FlagOverride {
     let leaked: &'static VmFlags = Box::leak(Box::new(cfg));
-    OVERRIDES_LIVE.fetch_add(1, Ordering::Release);
+    invalidate_memos(1);
     let previous = PROCESS_OVERRIDE.swap(as_raw(Some(leaked)), Ordering::AcqRel);
     FlagOverride {
         scope: OverrideScope::Process,
@@ -2702,7 +2883,10 @@ mod tests {
     #[test]
     fn thread_override_wins_after_the_snapshot_has_latched() {
         let _lock = process_override_lock();
-        assert!(declared_flag_names().contains(PROBE), "probe must be declared");
+        assert!(
+            declared_flag_names().contains(PROBE),
+            "probe must be declared"
+        );
         let latched = probe();
         with_thread_overrides(&[(PROBE, Some("/scoped/repo"))], || {
             assert_eq!(probe().as_deref(), Some("/scoped/repo"));

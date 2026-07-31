@@ -1,6 +1,71 @@
 # The optimizing IR (C2) tier is disabled by default — `moving_young` turned it off
 
-**Status:** 🔴 **OPEN.** Not a regression in the IR pipeline itself; a
+**Status:** 🟢 **FIXED 2026-07-30** by scoping the gate (option 2 below).
+The tier runs on default flags again. Original report retained below.
+
+## Fix
+
+The gate asked the wrong question. It read `!x64::moving_young_enabled()`, but
+what it protects against is a mapless IR frame being live while the collector
+**relocates** — and relocation cannot observe a compiled frame at all today:
+`conservative_roots::refresh_moving_young_coverage_for_current_thread` vetoes
+moving-young process-wide as soon as `jit_code_range_count() != 0`, and
+`memory::roots::collect_roots` runs that refresh on the path of every
+collection. So a relocating cycle happens only while the process holds no
+compiled code. The gate was disabling the optimizing tier in exchange for a
+hazard that could not occur.
+
+`types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT` (`false`) now names that fact,
+and `x64::moving_young_relocates_compiled_frames()` = `moving_young_enabled() &&
+JIT_PUBLISHES_RELOCATION_CONTRACT` is what the two relocation-safety admission
+gates read — this one and `direct_jit_callee_calls_enabled`. The runtime veto
+reads the same constant, so a future change cannot lift the veto while leaving
+a gate disarmed. That is option 2 ("scope the gate") from the list below, done
+in a way that keeps option 1 the eventual answer.
+
+Map-publication machinery is deliberately untouched: `shadow_stack_maps_enabled`
+and `collect_live_oop_homes` still key on `moving_young`, so the single-pass
+backend keeps emitting and exercising the protocol a future flip depends on.
+Scoping those too was implemented, measured as no-change, and reverted — see
+the note in `shadow_stack_maps_enabled`.
+
+### Verification (default flags; these previously required `CRATONVM_NO_MOVING_YOUNG=1`)
+
+| target | before | after |
+|---|---|---|
+| `cratonvm-jit --lib` | 1043 passed / 13 failed | **1058 / 0** |
+| `jit tests/ir_vs_singlepass.rs` | 77 passed / 12 failed | **89 / 0** |
+| `cratonvm-jit` all targets | — | **every target 0 failed** |
+| `cratonvm-gc --lib` | — | **873 / 0** |
+| `cratonvm-vm --lib` | — | 2300 / 1 (pre-existing `/tmp` Unix-socket test on Windows) |
+
+`BinTreesClassic 18` returns the HotSpot checksum `68332206` at both `-Xmx2g`
+and `-Xmx512m`, and `[GC] moving_young: cycles=0` with every fallback still
+`jit-relocation-contract-unproven` — i.e. the collector's proof is unchanged and
+relocation remains vetoed. The fix removes a JIT self-handicap; it does not
+weaken the GC.
+
+Real-workload effect, Hibernate on default flags:
+
+| class | before | after | HotSpot |
+|---|---:|---:|---:|
+| `ASTParserLoadingTest` | 376 s | **~190 s** | 21 s |
+| `OracleInlineMutationStrategyIdTest` | 322 s | **188 s** | 41 s |
+| `jpa.lock.LockTest` | 34.5 s | **18.5 s** | 10 s |
+
+The first two now fit inside the suite's 300 s per-class cap. The
+`type.temporal` pair still exceeds it on default flags and still passes under
+`CRATONVM_NO_MOVING_YOUNG=1`, so a residual moving-young cost remains outside
+these two gates — `flush_scratch_registers` at every safepoint
+(`emit_pre_safepoint_spill_impl`) and the `can_elide_self_call_register_spill`
+proof are the untested candidates. Not yet measured: the box had nine other
+sessions' VMs running.
+
+---
+
+## Original report
+
+**Status at filing:** 🔴 OPEN. Not a regression in the IR pipeline itself; a
 consequence of an unrelated default flip that nothing flagged, because the test
 suite that would have caught it could not compile at the time.
 
