@@ -370,13 +370,22 @@ pub fn shadow_stack_enabled() -> bool {
     // BOTH sides at once; see `jit::x64::shadow_emission_moving_implication_enabled`.
     // This expression must stay character-for-character equivalent to the
     // emission side's.
+    //
+    // 2026-07-31 — the `moving_young_enabled() &&` term is REMOVED, on BOTH
+    // sides in the same change. Publication is how a JIT frame's live
+    // references become visible to the collector at all; that is not a
+    // property of which young collector runs. Keyed on moving-young, the
+    // documented opt-out `CRATONVM_NO_MOVING_YOUNG=1` withdrew it, and that
+    // lane faulted on a zeroed heap slot within seconds of real work.
+    // Restoring publication with `CRATONVM_SHADOW_STACK=1` and changing
+    // nothing else made the same runs clean. See
+    // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
     *ENABLED.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some()
-            || (moving_young_enabled()
-                && match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SHADOW_EMISSION") {
-                    Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-                    Err(_) => true,
-                })
+            || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SHADOW_EMISSION") {
+                Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                Err(_) => true,
+            }
     })
 }
 

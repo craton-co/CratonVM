@@ -3014,24 +3014,25 @@ impl Compiler {
         // no-change; see `shadow_stack_maps_enabled`), which leaves this and
         // the self-call spill-elision proof.
         //
-        // 2026-07-31 — the `moving_young_enabled()` term is REMOVED, and the
-        // paragraph above is answered: measured on `BinTreesClassic 18`
+        // The lever question is answered: measured on `BinTreesClassic 18`
         // @512m, five interleaved reps, `CRATONVM_JIT_MY_SCRATCH_FLUSH=0`
         // moves nothing (median 4117 ms against a 4281 ms default, ranges
-        // overlapping in both directions), so this is not the `type.temporal`
+        // overlapping in both directions), so this is NOT the `type.temporal`
         // residual it was added to bisect.
         //
-        // What it IS, is root visibility. This spills operand-stack values
-        // that live in a caller-saved SCRATCH register — which the
-        // callee-saved blind spill never covers — to frame slots the
-        // conservative scan reads. The claim that "the non-moving path has
-        // never called this and is the historically correct configuration" was
-        // true when written and is not now: the non-moving path is reached
-        // today only via `CRATONVM_NO_MOVING_YOUNG=1`, which withdrew this,
-        // the full-GPR safepoint spill and shadow publication in one move, and
-        // that lane faults on a reclaimed root within seconds. Root visibility
-        // is not a property of which young collector runs.
-        if scratch_flush_at_safepoint_enabled() {
+        // TRIED AND REVERTED 2026-07-31: dropping the `moving_young_enabled()`
+        // term, so the flush also runs in the non-moving lane where nothing
+        // else spills a caller-saved scratch oop. It is a plausible root-
+        // visibility fix and it made things WORSE — the
+        // `CRATONVM_NO_MOVING_YOUNG=1 CRATONVM_SHADOW_STACK=1` lane turned a
+        // clean run into a deterministic SIGILL (2/2), where the same lane on
+        // the same tree without this change runs clean (2/2). Calling it here
+        // reserves spill slots and rewrites `self.stack` at a point the
+        // non-precise frame layout did not budget for. Whoever revisits the
+        // non-moving lane's root visibility should start from the shadow
+        // publication instead — see
+        // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+        if moving_young_enabled() && scratch_flush_at_safepoint_enabled() {
             self.flush_scratch_registers();
         }
         // Capture the live-frame bound for the map this safepoint will record.
