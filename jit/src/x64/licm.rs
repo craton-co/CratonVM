@@ -1060,6 +1060,50 @@ pub(super) fn shadow_reload_raw() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_RAW_RELOAD").is_some())
 }
 
+/// Bisect toggle (`CRATONVM_JIT_SP_INLINE_IC=0`) — keep the single-pass
+/// backend's inline MIC/PIC cascade off even when
+/// `direct_jit_callee_calls_enabled()` allows raw JIT-to-JIT calls, so the raw
+/// *virtual* edge can be isolated from the raw *static/special* one. No effect
+/// when that master gate is already closed.
+pub(super) fn sp_inline_ic_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_SP_INLINE_IC").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
+/// Bisect toggle (`CRATONVM_JIT_SP_TAILCALL=0`) — demote the single-pass
+/// sibling tail-call (`epilogue-without-ret` + `JMP <callee entry>`) to an
+/// ordinary CALL. The tail edge only exists when the raw JIT-to-JIT gate is
+/// open, and it is the one raw shape that tears the caller's frame down before
+/// the callee runs.
+pub(super) fn sp_tailcall_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_SP_TAILCALL").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
+/// Diagnostic (`CRATONVM_SHADOW_OVERFLOW_DIAG`) — on a shadow-stack overflow
+/// bail, also record the compiling method's label so the leak can be named.
+/// The label is a leaked NUL-terminated copy, so it is only produced when this
+/// is set; the overflow *counter* is always maintained.
+pub(super) fn shadow_overflow_diag() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_OVERFLOW_DIAG").is_some()
+    })
+}
+
 /// spring-bug-10 bisect toggle (`CRATONVM_SHADOW_NO_SAVEBASE`) — disable the
 /// per-push saved-base frame slot and fall back to pure POP-ONLY reload (top -=
 /// n*8 off the live `top`). Lets us measure whether the savebase mechanism

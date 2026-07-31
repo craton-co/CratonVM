@@ -1105,6 +1105,29 @@ fn reloc_emit_enabled() -> bool {
         // MOV R11, [R10 + ss_top]      (current top)
         self.buf.emit(&[0x4D, 0x8B, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
+        // OVERFLOW GUARD (`ShadowStack::END_OFFSET`) — see the matching comment
+        // in the single-pass backend. Without it a push that runs past the end
+        // of the 2 MiB buffer keeps storing into the allocator arena behind it.
+        // LEA leaves flags alone, so the bump is undone between the CMP and the
+        // branch and R11 stays the only scratch. `top == end` is the legal
+        // exactly-full state, so the test is strictly-above.
+        let need = (offsets.len() as i32) * 8; // Cast: x86-64 disp32
+        let overflow = if crate::shadow_end_guard_enabled() {
+            // LEA R11,[R11+need] ; CMP R11,[R10+end] ; LEA R11,[R11-need]
+            self.buf.emit(&[0x4D, 0x8D, 0x9B]);
+            self.buf.emit(&need.to_le_bytes());
+            self.buf.emit(&[0x4D, 0x3B, 0x9A]);
+            self.buf.emit(&(ss_top + 8).to_le_bytes());
+            self.buf.emit(&[0x4D, 0x8D, 0x9B]);
+            self.buf.emit(&(-need).to_le_bytes());
+            // JA overflow
+            self.buf.emit(&[0x0F, 0x87]);
+            let p = self.buf.pos();
+            self.buf.emit(&[0, 0, 0, 0]);
+            Some(p)
+        } else {
+            None
+        };
         // MOV [rbp - savebase], R11    (base of THIS push)
         self.buf.emit(&[0x4C, 0x89, 0x9D]);
         self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
@@ -1118,8 +1141,37 @@ fn reloc_emit_enabled() -> bool {
         // MOV [R10 + ss_top], R11      (publish the new top)
         self.buf.emit(&[0x4D, 0x89, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
+        if let Some(overflow) = overflow {
+            // JMP done
+            self.buf.emit_byte(0xE9);
+            let done = self.buf.pos();
+            self.buf.emit(&[0, 0, 0, 0]);
+            self.patch_rel32_to_here(overflow);
+            // Overflow bail: nothing was stored and `top` is untouched. R11
+            // still holds the pre-push `top`; tag bit 0 (slot addresses are
+            // 8-aligned) so the paired reload skips its value-restore and only
+            // puts `top` back.
+            self.buf.emit(&[0x49, 0x83, 0xCB, 0x01]); // OR R11, 1
+            self.buf.emit(&[0x4C, 0x89, 0x9D]); // MOV [rbp - savebase], R11
+            self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+            self.emit_shadow_overflow_note();
+            self.patch_rel32_to_here(done);
+        }
         self.patch_rel32_to_here(skip);
         true
+    }
+
+    /// Bump the process-wide shadow-overflow bail counter
+    /// (`cratonvm_jit::SHADOW_OVERFLOW_COUNT`). RAX is pushed/popped around it
+    /// so the site stays transparent to whatever the call is staging.
+    fn emit_shadow_overflow_note(&mut self) {
+        // Cast through a raw pointer before converting the static's address.
+        let counter =
+            (&crate::SHADOW_OVERFLOW_COUNT as *const std::sync::atomic::AtomicUsize) as usize;
+        self.buf.emit_byte(0x50); // push rax
+        self.emit_mov_reg_imm64(RAX, counter as u64);
+        self.buf.emit(&[0xF0, 0x48, 0xFF, 0x00]); // lock inc qword [rax]
+        self.buf.emit_byte(0x58); // pop rax
     }
 
     /// Copy the (possibly rewritten) published values back into their frame
@@ -1152,6 +1204,14 @@ fn reloc_emit_enabled() -> bool {
         // live `top`, so an unbalanced intervening push cannot drift it)
         self.buf.emit(&[0x4C, 0x8B, 0x9D]);
         self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        // Overflow bail protocol (see `emit_shadow_push`): a tagged base means
+        // the push stored nothing, so the restore below would read slots that
+        // were never written. Skip to the tail, which only retracts `top`.
+        self.buf.emit(&[0x49, 0xF7, 0xC3]); // TEST R11, imm32
+        self.buf.emit(&1i32.to_le_bytes());
+        self.buf.emit(&[0x0F, 0x85]); // JNE overflow
+        let overflow = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
         for &off in &offsets {
             // MOV RCX, [R11] ; MOV [rbp - off], RCX ; LEA R11, [R11 + 8]
             self.buf.emit(&[0x49, 0x8B, 0x0B]);
@@ -1159,9 +1219,12 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&(-(off as i32)).to_le_bytes());
             self.buf.emit(&[0x4D, 0x8D, 0x5B, 0x08]);
         }
-        // MOV R11, [rbp - savebase] ; MOV [R10 + ss_top], R11  (retract top)
+        self.patch_rel32_to_here(overflow);
+        // MOV R11, [rbp - savebase] ; AND R11, ~1 ; MOV [R10 + ss_top], R11
+        // (retract top; the mask is a no-op unless the push bailed)
         self.buf.emit(&[0x4C, 0x8B, 0x9D]);
         self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        self.buf.emit(&[0x49, 0x83, 0xE3, 0xFE]);
         self.buf.emit(&[0x4D, 0x89, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
         self.patch_rel32_to_here(skip);
