@@ -1384,16 +1384,34 @@ pub(crate) fn native_p64_ll_reversed(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let size = match ctx.get_field(this, 2) {
-        Value::Int(v) => v as usize,
+    // Read through the LIST SURFACE, not raw slots.
+    //
+    // This used to walk the node chain directly, assuming `size` at slot 2,
+    // `tail` at slot 1, and each node's element at field 2 with `prev` at
+    // field 0. The live `LinkedList` in `cratonvm-native-collections` uses the
+    // opposite node layout — element 0, next 1, prev 2 — and keeps head/tail
+    // behind name-keyed accessors rather than those slots. So this read a
+    // node's `prev` as its element and walked off the chain immediately:
+    // `reversed()` returned an EMPTY list for any list built by `add`.
+    //
+    // `size()`/`get(i)` are layout-independent and work for every List
+    // implementation, which is what a default method on `SequencedCollection`
+    // should rely on anyway.
+    let size = match ctx.invoke_virtual(this, "size", "()I", &[])? {
+        Some(Value::Int(v)) if v > 0 => v as usize,
         _ => 0,
     };
-    // Collect elements by walking tail → head (using prev pointers: node field 0)
     let mut elements = Vec::with_capacity(size);
-    let mut cur = ctx.get_field(this, 1); // tail
-    while let Value::Object(Some(node)) = cur {
-        elements.push(ctx.get_field(node, 2)); // element
-        cur = ctx.get_field(node, 0); // prev
+    for i in (0..size).rev() {
+        let elem = ctx
+            .invoke_virtual(
+                this,
+                "get",
+                "(I)Ljava/lang/Object;",
+                &[Value::Int(i as i32)],
+            )?
+            .unwrap_or(Value::Object(None));
+        elements.push(elem);
     }
     // Build new ArrayList with reversed elements
     let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
@@ -1465,10 +1483,16 @@ pub(crate) fn native_p64_ll_get_first(
         }
         .into());
     }
-    match ctx.get_field(this, 0) {
-        Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, 2))),
-        _ => Ok(Some(Value::Object(None))),
-    }
+    // Read through the list surface. The raw-slot walk this replaced assumed
+    // head at 0 / tail at 1 and the node's element at field 2; the live
+    // LinkedList uses element 0, next 1, prev 2 and keeps head/tail behind
+    // name-keyed accessors — the same mismatch that made `reversed()` return
+    // an empty list. These two are currently shadowed by
+    // `cratonvm-native-collections`' own registrations, so the bug was latent
+    // rather than observable; fixed so a change in registration order cannot
+    // silently surface it.
+    let idx = if size > 0 { 0 } else { 0 };
+    ctx.invoke_virtual(this, "get", "(I)Ljava/lang/Object;", &[Value::Int(idx)])
 }
 
 pub(crate) fn native_p64_ll_get_last(
@@ -1486,10 +1510,16 @@ pub(crate) fn native_p64_ll_get_last(
         }
         .into());
     }
-    match ctx.get_field(this, 1) {
-        Value::Object(Some(tail)) => Ok(Some(ctx.get_field(tail, 2))),
-        _ => Ok(Some(Value::Object(None))),
-    }
+    // Read through the list surface. The raw-slot walk this replaced assumed
+    // head at 0 / tail at 1 and the node's element at field 2; the live
+    // LinkedList uses element 0, next 1, prev 2 and keeps head/tail behind
+    // name-keyed accessors — the same mismatch that made `reversed()` return
+    // an empty list. These two are currently shadowed by
+    // `cratonvm-native-collections`' own registrations, so the bug was latent
+    // rather than observable; fixed so a change in registration order cannot
+    // silently surface it.
+    let idx = if size > 0 { size - 1 } else { 0 };
+    ctx.invoke_virtual(this, "get", "(I)Ljava/lang/Object;", &[Value::Int(idx)])
 }
 
 // --- SequencedMap helpers ---
@@ -1551,21 +1581,56 @@ pub(crate) fn native_p64_sm_seq_entry_set(
 // LHM layout: buckets=0, size=1, capacity=2, head=3, tail=4
 // LHM node: key=0, value=1, hash=2, next=3, before=4, after=5
 
+/// First or last entry of a `SequencedMap`, read through the PUBLIC surface.
+///
+/// The `firstEntry`/`lastEntry` accessors used to read raw slots — head at 3,
+/// tail at 4, and each node's key/value at fields 0 and 1. The live
+/// `LinkedHashMap` in `cratonvm-native-collections` matches none of that: its
+/// nodes are `hash, key, value` (so field 0 is the HASH, not the key) and its
+/// head/tail live in a name-keyed overlay rather than those slots. Both
+/// accessors therefore returned null for every map built through `put`.
+///
+/// Iterating `entrySet()` is layout-independent, preserves the map's
+/// insertion order, and returns the map's own `Map.Entry` objects.
+fn p64_seq_map_edge_entry(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    want_last: bool,
+) -> MethodCallResult {
+    let entries = match ctx.invoke_virtual(this, "entrySet", "()Ljava/util/Set;", &[])? {
+        Some(Value::Object(Some(s))) => s,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let it = match ctx.invoke_virtual(entries, "iterator", "()Ljava/util/Iterator;", &[])? {
+        Some(Value::Object(Some(i))) => i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut found = Value::Object(None);
+    loop {
+        match ctx.invoke_virtual(it, "hasNext", "()Z", &[])? {
+            Some(Value::Int(1)) => {}
+            _ => break,
+        }
+        let next = ctx
+            .invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        if matches!(next, Value::Object(None)) {
+            break;
+        }
+        found = next;
+        if !want_last {
+            break;
+        }
+    }
+    Ok(Some(found))
+}
+
 pub(crate) fn native_p64_lhm_first_entry(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match ctx.get_field(this, 3) {
-        // head
-        Value::Object(Some(head)) => {
-            let key = ctx.get_field(head, 0);
-            let val = ctx.get_field(head, 1);
-            let entry = p64_make_entry(ctx, key, val);
-            Ok(Some(Value::Object(Some(entry))))
-        }
-        _ => Ok(Some(Value::Object(None))),
-    }
+    p64_seq_map_edge_entry(ctx, this, false)
 }
 
 pub(crate) fn native_p64_lhm_last_entry(
@@ -1573,16 +1638,7 @@ pub(crate) fn native_p64_lhm_last_entry(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match ctx.get_field(this, 4) {
-        // tail
-        Value::Object(Some(tail)) => {
-            let key = ctx.get_field(tail, 0);
-            let val = ctx.get_field(tail, 1);
-            let entry = p64_make_entry(ctx, key, val);
-            Ok(Some(Value::Object(Some(entry))))
-        }
-        _ => Ok(Some(Value::Object(None))),
-    }
+    p64_seq_map_edge_entry(ctx, this, true)
 }
 
 pub(crate) fn native_p64_lhm_seq_key_set(

@@ -411,6 +411,7 @@ version = "0.0.0"
 dependencies = [
  "cratonvm-classloading",
  "cratonvm-difftest",
+ "cratonvm-jfr",
  "cratonvm-native-builtins",
  "cratonvm-reader",
  "libfuzzer-sys",
@@ -423,6 +424,17 @@ dependencies = [
  "cratonvm-types",
  "parking_lot",
  "rustc-hash",
+ "tracing",
+]
+
+[[package]]
+name = "cratonvm-jfr"
+version = "0.3.0"
+dependencies = [
+ "cratonvm-types",
+ "parking_lot",
+ "rustc-hash",
+ "smallvec",
  "tracing",
 ]
 
