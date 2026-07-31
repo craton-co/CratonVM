@@ -944,17 +944,26 @@ come back":
 | `Map.get` on a `HashMap` | 822 | 3478 | 11.0 |
 | `ConcurrentMap.get` on a CHM | 958 | 3406 | 13.8 |
 
+Two things about that table, in order.
+
 The first row is there so the rest are read correctly: this probe shape (a loop
 inside a method entered once, so the loop reaches compiled code only through
 OSR) costs ~122 ns/iteration before any call at all, which is itself ~90x
-HotSpot and worth its own investigation. The **marginal** cost of adding the
-cheapest possible native call to that loop is therefore ~630 ns, and every
-richer native lands within a small factor of it. **The bodies are not the
-problem; entering and leaving a native is.**
+HotSpot and worth its own investigation.
 
-That marginal cost is what the remaining ratio is made of:
+And `String.length()` is **not a native** — CratonVM registers `length()` for
+`StringBuilder` and `BitSet`, not for `String`, so under a real JDK it is
+ordinary bytecode (`return value.length >> coder`). Its ~630 ns marginal cost
+is therefore the price of a **call that is not inlined**, and the two natives
+below it — both of which have thin direct helpers — land within 200-330 ns of
+that same floor. So the label to carry forward is *call boundary*, not *native
+dispatch*: the bodies are not the problem, and neither is native registration.
+HotSpot's 4 ns on the same rows is not a fast call, it is *no call* — it
+inlines all of them into the loop.
 
-* `NoCsCache` = **one** native call (`Charset.forName`).
+That marginal per-call cost is what the remaining ratio is made of:
+
+* `NoCsCache` = **one** un-inlined call (`Charset.forName`).
 * `FullCsCache` = **two** (`toLowerCase`, then `HashMap.get`).
 * `LazyCsCache` = **two**, plus one more Java call level
   (`CharsetCache.getCharset`), and its map is a `ConcurrentHashMap`.
@@ -963,23 +972,26 @@ The arithmetic works out: `toLowerCase` (1296) + `HashMap.get` (822) = 2118
 against `Charset.forName`'s 2290 — which is why `FullCsCache` and `NoCsCache`
 now finish within ~10-60% of each other and the assertion turns on noise. On
 HotSpot the floor is ~4 ns, so the *work* dominates and the caches win by 48x.
-On CratonVM the floor dominates, so an arm making two native calls cannot
-reliably beat one making one, however good the caching is. No further work on
-the charset cache, the dispatch helpers or the scaling counters changes that
+On CratonVM the floor dominates, so an arm making two calls cannot reliably
+beat one making one, however good the caching is. No further work on the
+charset cache, the dispatch helpers or the scaling counters changes that
 ordering.
 
-So this document's residual is now **exactly** the separate, already-known
-native-call dispatch overhead it has been deferring since 2026-07-30 ("the
-separate, already-known native-call dispatch overhead, and is not addressed
-here either"). It is a VM-wide project, not a Tomcat one. Doc 23 stays OPEN and
+So this document's residual is the same one it has been deferring since
+2026-07-30 as "the separate, already-known native-call dispatch overhead" —
+except that it is broader than that name suggests, because the cheapest row
+above is not a native at all. It is the cost of any call the JIT does not
+inline. That is a VM-wide project, not a Tomcat one. Doc 23 stays OPEN and
 should be closed by that work, not by more work on this test.
 
 Ranked next steps, with the evidence for each:
 
-1. **The per-native-call floor** (~750 ns/op at one thread, ~6400 at ten).
-   `NativeCallCostProbe` isolates it, and `String.length()` is the cheapest
-   possible target — no charset fixture needed. Worth roughly 2x on both cached
-   arms, and it is what closes this document.
+1. **The per-call floor** (~630 ns/op marginal at one thread). `String.length()`
+   in `NativeCallCostProbe` is the cheapest possible target — three bytecodes,
+   no native, no charset fixture — and HotSpot spends ~0 on it because it
+   inlines it. Worth roughly 2x on both cached arms and only 1x on the control,
+   which is exactly the direction this test needs; it is what closes this
+   document.
 2. **`ConcurrentHashMap.get` versus `HashMap.get`.**
    `probes/ChmVsHashMapProbe.java` reaches one warm map through four declared
    types, because the thin direct helper is selected by the call site's
