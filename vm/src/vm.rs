@@ -3357,8 +3357,12 @@ mod tests {
         )
         .unwrap();
 
-        // PUBLIC (0x0001) | SUPER (0x0020) = 0x0021
-        assert_eq!(result, Some(Value::Int(0x0021)));
+        // PUBLIC only. `Class.getModifiers()` reports SOURCE-level modifiers,
+        // and ACC_SUPER (0x0020) is not one — it is a classfile flag about
+        // invokespecial semantics. HotSpot masks it out too
+        // (JVM_RECOGNIZED_CLASS_MODIFIERS), so expecting 0x0021 here asserted
+        // a flag the JDK never reports.
+        assert_eq!(result, Some(Value::Int(0x0001)));
     }
 
     #[test]
@@ -60238,9 +60242,17 @@ mod tests {
     /// (Full integration test requires alloc_concurrent_synthetic for ctx.create_string in native code.)
     #[test]
     fn scanner_implementation_registered() {
+        // Same gap as `phase51_registrations`: the Scanner surface is split
+        // across crates — `close` and friends are registered by
+        // `cratonvm-native-io`, whose `register_io_natives` runs after
+        // `register_builtins` and deliberately overwrites the older entries.
+        // Building the registry from `register_builtins` alone could never see
+        // them. Mirror what `vm_init` builds.
         let registry = {
             let mut r = crate::native::registry::NativeMethodRegistry::new();
             crate::native::builtins::register_builtins(&mut r);
+            crate::native::io::register_io_natives(&mut r);
+            crate::native::collections::register_collections_natives(&mut r);
             r
         };
         let sc = "java/util/Scanner";
