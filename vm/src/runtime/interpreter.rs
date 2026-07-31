@@ -246,10 +246,23 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         // the reference processor (kept current by `update_after_gc` /
         // `remove_collected`); it points at a valid heap object header.
         let ref_obj = unsafe { ObjectRef::from_raw(ref_obj_addr as *mut u8) };
-        // Defensive: a real `java.lang.ref.Reference` always has >= 1 field
-        // (the referent at slot 0). Skip an undersized/zeroed slot rather than
-        // write OOB.
-        if shared.mem.heap.num_fields(ref_obj) >= 1 {
+        // HIB-WEAKREF-RECYCLE.1 (2026-07-31): a real `java.lang.ref.Reference`
+        // always has >= 2 instance fields (referent, queue) — the same
+        // invariant `process_references_after_gc`'s cleared/enqueue loops
+        // already rely on ("also covers old-gen reuse after a major GC").
+        // `>= 1` was too weak in exactly the case those loops call out: an
+        // entry whose Reference object was reclaimed by an old-gen sweep keeps
+        // a `reference_obj` address that `is_addr_live` still answers `true`
+        // for (`is_old_gen_addr` is a pure range check), so the entry is never
+        // pruned and this pass nulls slot 0 of whatever now occupies that
+        // memory. When the new occupant has 0 fields the `gen_heap` OOB guard
+        // catches it (observed 174x running Hibernate's
+        // `DefaultCatalogAndSchemaTest` under `--nojit`, receiver reading
+        // `class_id=0 java/lang/Object` and garbage `<unresolved>` ids, ending
+        // in SIGSEGV); when it has exactly 1 the write lands SILENTLY on a
+        // real field. Requiring >= 2 declines both, and can never skip a
+        // genuine Reference.
+        if shared.mem.heap.num_fields(ref_obj) >= 2 {
             // Slot 0 = REF_FIELD_REFERENT (matches the real JDK Reference layout
             // and the synthetic constant in native-builtins).
             //
@@ -2553,6 +2566,26 @@ fn process_references_after_gc(
             // SAFETY: both addresses are live post-collection object headers.
             let ro = unsafe { ObjectRef::from_raw(ref_obj_new as *mut u8) };
             let rt = unsafe { ObjectRef::from_raw(referent_new as *mut u8) };
+            // HIB-WEAKREF-RECYCLE.1 (2026-07-31): same belt-and-suspenders
+            // shape check the `cleared` loop above already applies, and for the
+            // same documented reason — neither the pointer map nor
+            // `is_addr_live` can tell a live old-gen Reference from freed
+            // old-gen memory that has been recycled, because `is_old_gen_addr`
+            // is a pure address-range test. A live `java.lang.ref.Reference`
+            // always has >= 2 instance fields; anything else at this address is
+            // the memory's new occupant, and writing slot 0 of it corrupts an
+            // unrelated object (or trips the `gen_heap` OOB guard, which is how
+            // this was found).
+            if shared.mem.heap.num_fields(ro) < 2 {
+                if straystack_enabled() {
+                    eprintln!(
+                        "[refproc] SKIP stale weak/phantom RESTORE ref @0x{:x} (num_fields={})",
+                        ref_obj_new,
+                        shared.mem.heap.num_fields(ro),
+                    );
+                }
+                continue;
+            }
             // Slot 0 = REF_FIELD_REFERENT. `set_field` fires the write barrier,
             // so a young referent restored into a promoted (old-gen) Reference
             // re-marks the old→young card.
@@ -2562,6 +2595,29 @@ fn process_references_after_gc(
         // side-lists stay bounded and the pre-GC null pass never dereferences a
         // freed Reference (same survivor predicate as everything above).
         ref_proc.remove_collected(&is_marked);
+        // HIB-WEAKREF-RECYCLE.1 (2026-07-31): `is_marked` cannot see old-gen
+        // reuse — `is_old_gen_addr` is a pure range check, so a weak/phantom
+        // entry whose Reference object was reclaimed by an old-gen sweep
+        // survives `remove_collected` forever and both referent passes keep
+        // targeting recycled memory every cycle. Follow up with the shape test:
+        // resolve each entry to its post-collection address exactly as the
+        // restore loop above does, and keep it only if a `Reference` (>= 2
+        // instance fields) is still what lives there. Runs BEFORE
+        // `update_after_gc`, so the stored addresses are still the pre-GC view
+        // the pointer map is keyed on.
+        let still_a_reference = |addr: usize| -> bool {
+            let cur = match pointer_map.get(&addr) {
+                Some(&a) => a,
+                None if shared.mem.heap.is_addr_live(addr) => addr,
+                None => return false,
+            };
+            // SAFETY: `cur` is a heap address the collector just reported as
+            // live (relocated target, or unmoved and in a live region), so its
+            // object header is mapped and readable.
+            let o = unsafe { ObjectRef::from_raw(cur as *mut u8) };
+            shared.mem.heap.num_fields(o) >= 2
+        };
+        ref_proc.retain_shaped_weak_phantom(&still_a_reference);
     }
 
     // Relocate all addresses in the ref processor to match the new heap layout

@@ -153,13 +153,22 @@ where it passes.
    1500m and 256m heaps, JIT and `--nojit`. So there is no positive evidence
    that the moving path ran during any of these runs, and "0 misparsed across
    the GC-stress matrix" must not be read as "survived N evacuations".
-   Note also that `[GC] moving_young: cycles=N` is **not** the counter to use
-   here: `record_moving_young_cycle` only fires when the moving collection
-   happens *while a JIT frame is live* (`gen_heap.rs`), so `cycles=0` under
-   `--nojit` is expected and says nothing. Anyone extending this work should
-   first establish a configuration in which the verifier actually reports, and
-   should treat the GC-stress lever as unproven until then — see
-   [[reference_inert_lever_is_not_an_elimination]].
+
+   For the JIT half this is expected and already tracked:
+   `docs/known-issues/hibernate/moving-young-inert-under-jit-throughput-tax-20260730.md`
+   shows a JIT-enabled Hibernate workload diverting **every** young collection
+   to the non-moving sweep (`compiled-frame-oop-not-published`,
+   `unregistered-jit-frame-on-stack`, …). The JIT witness runs here reproduce
+   that: 1-6 `[moving-young] fallback` warnings each. The `--nojit` half is not
+   explained by that document and was not chased further.
+
+   Also beware the obvious-looking counter: `[GC] moving_young: cycles=N` is
+   **not** the one to reach for. `record_moving_young_cycle` only fires when the
+   moving collection happens *while a JIT frame is live* (`gen_heap.rs`), so
+   `cycles=0` under `--nojit` is expected and says nothing either way. Anyone
+   extending this work should first establish a configuration in which the
+   verifier actually reports, and treat the GC-stress lever as unproven until
+   then — see [[reference_inert_lever_is_not_an_elimination]].
 
 The value of this change therefore rests on the other half, which does not
 depend on provoking the race: the defect class can no longer be written, and the

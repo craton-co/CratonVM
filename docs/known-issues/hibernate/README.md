@@ -27,23 +27,34 @@ No doc was moved or newly filed for any of these three — do not re-open them
 as regressions on a future ABORTED sighting without first checking whether
 HotSpot aborts the same tests for the same reason.
 
-## HANG classes in the fresh 4548-class run (2026-07-31) — one real harness gap, two stale-binary/contention margins
+## HANG classes in the fresh 4548-class run (2026-07-31) — one harness gap (now fixed, and hiding two real VM defects), two stale-binary/contention margins
 
 Four more classes report `HANG` (`process-died rc=124`) in the same
 2026-07-30/31 categorize run:
 
-- **[`boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` — the runner's per-class timeout accommodation is gone](qualfiedtablenaming-runner-timeout-floor-lost-20260731.md).**
-  A real, currently-open harness gap, **not** a VM regression: the
-  "Resolved 2026-07-22" fix recorded in
-  `../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-hang-cluster-20260721-FIXED.md`
-  (a 3600s per-class timeout floor + forced `--nojit` in `run-hib.sh`) is not
-  present in the current `run-hib.sh` — that script is wholly gitignored
-  (`apps/`), carries no commit history, and has already lost driver-file state
-  once before (2026-07-16 truncation). The class's own correctness fix
-  (`MutableBigInteger` AIOOBE quarantine, `41cdfdf94`) is untouched and not in
-  question; solo repro this session reconfirms genuine, continuous CPU-bound
-  work with zero stall signature, matching the class's own well-established
-  "clean but slow" profile. See the doc for the recommended re-implementation.
+- **`boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` — harness
+  gap RESOLVED 2026-07-31; the class turned out to be hiding two real VM
+  defects.** The lost runner accommodation is re-implemented and now durable
+  (tracked `apps/hib-suite-runner/class-overrides.tsv` + `run-hib.sh`,
+  force-added past the blanket `apps/` ignore, LF-pinned, self-reporting
+  `overrides=N (loaded)`) — retired to
+  `../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`.
+  **The class still does not pass.** Running it to completion for the first time
+  disproved the inherited "clean but slow, just needs a bigger timeout" premise:
+  HotSpot does it in 119.7 s on the same `-Xmx1500m`, while CratonVM fails in
+  both modes, for two newly-found reasons now tracked on their own:
+  - JIT on (the suite's lane) — [`OutOfMemoryError` on a 49 %-full heap](gc-overhead-limit-spurious-oom-at-half-full-heap-20260731.md)
+    at ~41 min. A manifestation of the already-open
+    [moving-young-inert-under-JIT](moving-young-inert-under-jit-throughput-tax-20260730.md)
+    gap, as a *correctness* failure rather than only a throughput tax.
+  - `--nojit` — [SIGSEGV from stale chain cursors in `map_resize_inner`](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md)
+    at ~20 min. Note this **inverts** the 2026-07-22 advice to force `--nojit`
+    for this class: `--nojit` is now the worse mode. A second corrupt writer in
+    the same runs (`HIB-WEAKREF-RECYCLE.1`, post-GC weak/phantom referent
+    restore) was root-caused and **fixed** on the same branch.
+
+  The class's `MutableBigInteger` AIOOBE quarantine (`41cdfdf94`) is untouched
+  and not in question.
 
 - **`bulkid.OracleInlineMutationStrategyIdTest` — stale binary, not a
   regression; already faster on current `dev`.** This class is a long-known,
@@ -120,6 +131,28 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   twelve witness runs. `HqlParseStress` now asserts that every parameter marker survives into
   `statement().getText()`; 3500 parses per arm across jit/nojit x default/GC-stress reproduce
   nothing on either binary, so the defect is likely downstream of the parse tree.
+
+- [`map_resize_inner` publishes stale chain heads into the resized bucket array](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md)
+  (OPEN; root cause located, fix not landed) — `HIB-MAPRESIZE-STALE.1`. The JDK-style
+  split walk holds `old_b`/`new_buckets`/`node_val` and all four lo/hi head/tail cursors
+  as bare Rust locals across two REFERENCE-typed `set_field` stores, each of which can
+  allocate a remembered-set entry through the write barrier and therefore complete a
+  moving young GC. The stale `lo_head`/`hi_head` are then published into `new_buckets`,
+  so the map permanently holds dangling chain heads and every later put walks freed
+  memory. SIGSEGV at ~17-20 min, three for three. Same class of bug — and the same fix
+  shape — as the ANTLR root defect retired above (which converted its whole module to
+  `NativeHandleScope` rather than patching sites one at a time) and as
+  `native_map_put_evict_pinned`'s own existing pin discipline a few hundred lines away in
+  the same file.
+
+- [Spurious `OutOfMemoryError` with 570 MB free](gc-overhead-limit-spurious-oom-at-half-full-heap-20260731.md)
+  (OPEN; proximate cause confirmed by differential) — `HIB-GCOVERHEAD-HALFFULL.1`. The
+  GC-overhead limit latches after 8 cycles that each free < 2 % of *capacity*, on a heap
+  that is only 49 % full with `promoted=0` on every cycle — the case
+  `note_gc_productivity`'s "wedged full old gen" reasoning explicitly does not cover.
+  `CRATONVM_GC_OVERHEAD_LIMIT=0` runs 85 min without an OOM where the default dies at 41.
+  Underneath it is the moving-young fallback below, showing up as a correctness failure
+  rather than only a throughput tax.
 
 - [`action.queue` GRAPH-default tests — blocked by flush-planner throughput](../../internal/fixed-suite-bugs/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md)
   (OPEN; one of two root causes fixed) — real-JDK CratonVM defaults

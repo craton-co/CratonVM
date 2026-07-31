@@ -75,9 +75,12 @@ single-method loop may not be enough to provoke it.
 **Caution for whoever picks this up:** `CRATONVM_GC_STRESS` multiplies minor
 collections (measured: 3 → 21 → 595 over the same workload) but the
 moving-young **verifier emits nothing** in any configuration tried, so there is
-no evidence those extra collections relocate anything. Do not treat a green
-GC-stress arm as having exercised the moving collector — read
-`[GC] moving_young: cycles=N` and the `[moving-young-verify]` lines first, and
-note that `cycles` only counts moving collections taken *while a JIT frame is
-live* (`gen_heap.rs`, `record_moving_young_cycle`), so `cycles=0` under
-`--nojit` is expected and means nothing either way.
+no evidence those extra collections relocate anything. Under the JIT that is
+expected — see
+`moving-young-inert-under-jit-throughput-tax-20260730.md`, which shows every
+young collection in a JIT-enabled Hibernate workload diverting to the
+non-moving sweep. Do not treat a green GC-stress arm as having exercised the
+moving collector, and note that `[GC] moving_young: cycles=N` only counts
+moving collections taken *while a JIT frame is live* (`gen_heap.rs`,
+`record_moving_young_cycle`), so `cycles=0` under `--nojit` is expected and
+means nothing either way.
