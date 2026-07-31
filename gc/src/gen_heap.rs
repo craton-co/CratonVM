@@ -3833,6 +3833,10 @@ impl GenerationalHeap {
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
+        // Fresh cycle: no old-gen reclamation has happened yet (see
+        // `gc_quiescence::OLD_GEN_RECLAIMED`). The moving path resets this in
+        // `collect_garbage_inner`; this path can be entered directly.
+        crate::gc_quiescence::set_old_gen_reclaimed(false);
         let mut result = self.sweep_young_non_moving(roots, finalizer_addrs);
         // Selective promotion commits young -> old relocations inside
         // `sweep_young_non_moving`. Registered external-root providers can own
@@ -3896,7 +3900,13 @@ impl GenerationalHeap {
             && old_capacity > 0
             && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
         {
-            let old_freed = self.sweep_old_gen_non_moving(roots);
+            let (old_freed, old_survivors) = self.sweep_old_gen_non_moving(roots);
+            // This cycle DID reclaim old-gen storage: a freed block is back on
+            // the free list, so an old-gen address is no longer self-evidently
+            // live. `old_survivors` carries the identity entries that make
+            // "absent from the map" an exact death proof for watched addresses.
+            crate::gc_quiescence::set_old_gen_reclaimed(true);
+            result.0.pointer_map.extend(old_survivors);
             result.0.stats.bytes_freed += old_freed;
             self.stats
                 .bytes_freed_old
@@ -3963,6 +3973,11 @@ impl GenerationalHeap {
             let on = *G.get_or_init(|| gc_flags().dbg_gcpause);
             PauseTimer(on.then(std::time::Instant::now))
         };
+        // Fresh cycle: no old-gen reclamation has happened yet. Phase 5 below
+        // sets this when the mark-compact major GC runs, and
+        // `run_non_moving_young_cycle` does the same for the in-place old
+        // sweep. See `gc_quiescence::OLD_GEN_RECLAIMED`.
+        crate::gc_quiescence::set_old_gen_reclaimed(false);
         // Phase 6 #1: spin-yield until every live `SafepointToken` has
         // dropped. While a kernel is reading a JVM array on the GPU, we
         // must not move that array — a single token held anywhere on
@@ -5388,6 +5403,12 @@ impl GenerationalHeap {
                 old_gen.used() * 100 / old_gen.capacity(),
             );
             let old_used_before = old_gen.used();
+            // Sliding compaction moves live old-gen objects and zeroes the
+            // freed tail, so an old-gen address stops being a survival proof
+            // from here on. `OldGen::compact` emits an identity entry for every
+            // watched object that stayed put, so `compact_map` membership is
+            // the exact replacement proof.
+            crate::gc_quiescence::set_old_gen_reclaimed(true);
             let compact_map = Self::major_gc(roots, &young_from, &mut old_gen);
             // CRITICAL FIX (heavy binary-trees GC corruption):
             //
@@ -7613,8 +7634,8 @@ impl GenerationalHeap {
                     eprintln!(
                         "[quiesce] FIRST corruption: quiescence depth={} enter_count={} leave_count={}",
                         crate::gc_quiescence::depth(),
-                        crate::gc_quiescence::ENTER_COUNT.load(Ordering::Relaxed),
-                        crate::gc_quiescence::LEAVE_COUNT.load(Ordering::Relaxed),
+                        crate::gc_quiescence::ENTER_COUNT.get(),
+                        crate::gc_quiescence::LEAVE_COUNT.get(),
                     );
                 }
                 tracing::warn!(
@@ -8387,13 +8408,20 @@ impl GenerationalHeap {
     /// Run a non-moving mark-sweep of old space while conservative JIT roots are
     /// active.  The supplied roots are copied only because the shared marker's
     /// compacting mode can rewrite its mutable root slice; this mode never does.
-    fn sweep_old_gen_non_moving(&self, roots: &[ObjectRef]) -> usize {
+    /// Returns `(bytes_reclaimed, watched_survivor_identity_map)`. The second
+    /// element is the survival proof post-GC reference processing needs: this
+    /// sweep frees dead old-gen blocks in place, so after it runs "the address
+    /// is inside old gen" no longer implies "the object is still there".
+    fn sweep_old_gen_non_moving(
+        &self,
+        roots: &[ObjectRef],
+    ) -> (usize, HashMap<usize, usize>) {
         let young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
         let mut root_shadow = roots.to_vec();
-        let _ = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
-        before.saturating_sub(old_gen.used())
+        let survivors = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
+        (before.saturating_sub(old_gen.used()), survivors)
     }
 
     /// Run a major garbage collection on the old generation using mark-compact.
@@ -8611,6 +8639,15 @@ impl GenerationalHeap {
         }
 
         if !compact {
+            // Watched addresses (every address the reference processor holds —
+            // see `ReferenceProcessor::all_tracked_addrs`) need an explicit
+            // survival proof from this sweep: it frees dead blocks in place,
+            // so post-GC reference processing can no longer infer survival
+            // from "the address is inside old gen". Emit an identity entry for
+            // each watched survivor, mirroring what `OldGen::compact` already
+            // does for watched objects that happen not to move.
+            let watched = crate::gc_quiescence::watched_referents_snapshot();
+            let mut watched_survivors: HashMap<usize, usize> = HashMap::new();
             let objects = old_gen.walk_objects();
             for (obj_ptr, total_size) in objects {
                 // SAFETY: `walk_objects` returns valid old-gen object starts.
@@ -8620,6 +8657,12 @@ impl GenerationalHeap {
                 let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
                 if header.gc_flags & GC_FLAG_MARKED != 0 {
                     header.gc_flags &= !GC_FLAG_MARKED;
+                    if watched
+                        .as_ref()
+                        .is_some_and(|w| w.contains(&(obj_ptr as usize)))
+                    {
+                        watched_survivors.insert(obj_ptr as usize, obj_ptr as usize);
+                    }
                 } else {
                     // A2 forensic breadcrumb (CRATONVM_DBG_A2): preserve the
                     // victim's pre-free identity so a later zero-header /
@@ -8639,7 +8682,7 @@ impl GenerationalHeap {
                     unsafe { old_gen.free(obj_ptr, total_size) };
                 }
             }
-            return HashMap::new();
+            return watched_survivors;
         }
 
         // ---- Compact phase ---- sliding compaction of old gen ----
@@ -13022,7 +13065,7 @@ mod tests {
         assert!(heap.is_in_old(roots[1].as_ptr()));
 
         let old_used_before = heap.old_gen_used();
-        let reclaimed = heap.sweep_old_gen_non_moving(&[live_old]);
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old]);
 
         assert!(
             reclaimed > 0,
@@ -13033,6 +13076,115 @@ mod tests {
             heap.get_field(live_old, 0).as_int(),
             Some(4242),
             "the rooted old object must stay at its original address"
+        );
+    }
+
+    /// HIB-CV-32-family regression (`TestMVStoreCachePerformance` SIGSEGV):
+    /// after an old-gen reclamation, a WATCHED old-gen address that did NOT
+    /// survive must be reported dead by the exact predicate post-GC reference
+    /// processing uses — even though the permissive `is_addr_live` still
+    /// reports every old-gen address live.
+    ///
+    /// Before the fix, reference processing judged such an entry "survived",
+    /// never pruned it, and every subsequent collection wrote a referent
+    /// pointer through the stale address into whatever now occupied that
+    /// memory (the zeroed compaction tail, or a live object slid onto it).
+    #[test]
+    fn in_place_old_sweep_proves_watched_survivors_and_dead_ones() {
+        let heap = GenerationalHeap::with_sizes(4 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        let dead = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(live, 0, Value::Int(4242));
+        heap.set_field(dead, 0, Value::Int(-1));
+
+        let mut roots = vec![live, dead];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let live_old = roots[0].as_ptr() as usize;
+        let dead_old = roots[1].as_ptr() as usize;
+        assert!(heap.is_in_old(live_old as *mut u8));
+        assert!(heap.is_in_old(dead_old as *mut u8));
+
+        // Both addresses are watched — exactly what the VM publishes for every
+        // address the reference processor holds.
+        crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
+        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]]);
+        crate::gc_quiescence::set_watched_referents(&[]);
+
+        assert!(reclaimed > 0, "the unreachable promotion must be reclaimed");
+        assert_eq!(
+            survivors.get(&live_old),
+            Some(&live_old),
+            "a watched old-gen survivor kept in place must get an IDENTITY \
+             pointer_map entry — that entry is the only survival proof post-GC \
+             reference processing has once old gen has been reclaimed"
+        );
+        assert!(
+            !survivors.contains_key(&dead_old),
+            "a reclaimed old-gen object must NOT be reported as a survivor"
+        );
+    }
+
+    /// Companion to the above for the mark-COMPACT major GC, and the direct
+    /// statement of the defect: `is_addr_live` answers `true` for a dead
+    /// old-gen address (by design — it cannot see the pointer map), so the
+    /// exact predicate must be the one reference processing consults.
+    #[test]
+    fn explicit_full_gc_marks_dead_old_gen_watched_addr_as_not_surviving() {
+        let heap = GenerationalHeap::with_sizes(4 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        let dead = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(live, 0, Value::Int(4242));
+        heap.set_field(dead, 0, Value::Int(-1));
+
+        let mut roots = vec![live, dead];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let live_old = roots[0].as_ptr() as usize;
+        let dead_old = roots[1].as_ptr() as usize;
+        assert!(heap.is_in_old(live_old as *mut u8));
+        assert!(heap.is_in_old(dead_old as *mut u8));
+
+        crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
+        // Drop the reference to `dead` and force the old-gen mark-compact.
+        let mut live_roots = vec![roots[0]];
+        crate::gc_quiescence::request_major_gc();
+        let result = heap.collect_garbage(&stw(), &mut live_roots, &monitors);
+        crate::gc_quiescence::set_watched_referents(&[]);
+
+        assert!(
+            crate::gc_quiescence::old_gen_reclaimed_last_cycle(),
+            "the explicit major-GC request must have run an old-gen reclamation"
+        );
+        // The permissive predicate cannot tell the two apart — this is the
+        // behaviour the fix stops reference processing from relying on.
+        assert!(
+            heap.is_old_gen_addr(dead_old),
+            "precondition: the stale address is still inside the old-gen arena"
+        );
+        // The exact predicate can: the survivor has an entry (identity or
+        // relocated), the dead one has none.
+        let survived = |a: usize| {
+            result.pointer_map.contains_key(&a)
+                || (heap.is_old_gen_addr(a)
+                    && !crate::gc_quiescence::old_gen_reclaimed_last_cycle())
+        };
+        assert!(
+            survived(live_roots[0].as_ptr() as usize),
+            "the surviving watched Reference must be provable as alive"
+        );
+        assert!(
+            !survived(dead_old),
+            "a reclaimed watched old-gen address must be provable as DEAD — \
+             otherwise post-GC reference processing writes a referent pointer \
+             through it into whatever now occupies that memory (HIB-CV-32 \
+             family: TestMVStoreCachePerformance SIGSEGV)"
         );
     }
 

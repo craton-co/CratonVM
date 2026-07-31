@@ -1,3 +1,290 @@
+# The optimizing (C2/IR) tier and the moving-young gate — retired
+
+**Status: ✅ RETIRED 2026-07-31.** Retired from
+`docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`;
+that document's full text, including its own corrections, is preserved below
+the fold because two of its headline claims were wrong in ways worth keeping.
+
+The original defect — `try_compile_inner` admitting the optimizing tier only
+when `!x64::moving_young_enabled()`, against a `DEFAULT_MOVING_YOUNG = true` —
+is fixed and stays fixed. What kept this document open afterwards was a chain
+of residuals, and this closes them.
+
+## The short version
+
+| claim | verdict |
+|---|---|
+| the moving-young gate switches the optimizing tier off by default | **was true, fixed** (`f78b72670`, scoped to `moving_young_relocates_compiled_frames`) |
+| the same scoping was applied to the raw JIT-to-JIT direct-call gate, where it is unsound | **true**; re-gated, and the edge itself is fixed separately — see "Residual 1" |
+| "the optimizing tier does run on default flags" | **true of admission, and it was misleading**: the tier was admitted and then produced ~30 bodies per workload, refused inside the BUILDER |
+| the ASTParser 376→138 s and Oracle 322→93 s wins came from restoring C2 | **false**, and now positively disproved: at that commit the tier emitted nothing, and when it does emit it was *slower* — see "What C2 was actually worth" |
+
+## What the tier was actually doing
+
+Measured on `org.hibernate.orm.test.mapping.converted.converter.YearMonthConverterTest`
+with `CRATONVM_JIT_FORCE_C2=1 CRATONVM_DBG_IR_COMPILES=1` (the per-stage refusal
+reporting added by the relocation-contract work), on `origin/dev` at
+`b2f7c83cc`:
+
+```
+244 admission decisions, 171 admitted to the optimizing pipeline
+ 30 IR bodies produced
+```
+
+Every one of the 141 losses was named, and not one of them was the gate:
+
+| refusal | count | what it is |
+|---|---:|---|
+| `ir.rs:1864` | 66 | `getfield` of a non-int-category field — i.e. every reference field |
+| opcode `0xb0` | 25 | `areturn` — any method that returns an object |
+| opcode `0xb2` | 15 | `getstatic` |
+| `ir.rs:2000` | 14 | `invokespecial` of a non-elidable `<init>` |
+| `0xc6`/`0xc7` | 9 | `ifnull` / `ifnonnull` |
+| `0x01` | 4 | `aconst_null` |
+| `0x12`/`0x13` | 4 | `ldc` / `ldc_w` |
+| `0xbe` | 1 | `arraylength` |
+
+plus, one stage earlier in `ir_compatible`: `typecheck_ops` (checkcast /
+instanceof) 100, `has_athrow` 38, `anewarray` 10, `invokedynamic` 2.
+
+So "the optimizing tier is disabled" and "the optimizing tier cannot compile
+ordinary Java" produced the same observable for months, and the document
+attributed all of it to the gate.
+
+## What this branch closed
+
+### 1. Builder coverage — 30 bodies → 60 on the same class
+
+`aconst_null`, `areturn`, `ifnull`/`ifnonnull`, `if_acmpeq`/`if_acmpne`, and
+`getfield` of a reference field. The last is the large one: `jit_getfield`
+already returns the raw pointer for a compact reference slot, so only the node
+TYPE differed — `Op::Load(MemKind::Ref)` / `IrType::Ref`, which also makes the
+result slot publishable in every safepoint map. `lower_inner` refuses a graph
+that would need the layout-naive inline fallback for a reference load.
+
+`Op::Cmp` now selects a 64-bit compare when either operand is a reference. It
+emitted `CMP EAX, ECX`, which for `ifnull` calls a pointer with a zero low word
+null, and for `if_acmpeq` calls two references 4 GiB apart equal. Neither
+crashes; both branch wrongly. `ir_vs_singlepass` covers both with operands
+chosen so a 32-bit compare gives the opposite answer.
+
+### 2. A shadow-stack leak that corrupted the C heap
+
+Widening coverage made `BinTreesClassic.itemCheck` IR-eligible, and the process
+died with SIGSEGV **inside mimalloc's free list** — ASCII bytes in a block
+header, on the background compiler thread, arbitrarily far from any JIT code.
+
+`Op::Call` emitted the safepoint map, and with it `emit_shadow_push`, BEFORE
+choosing the dispatch route; the self-recursive route then "withdrew the claim"
+by clearing `pending_shadow`. That withdrew the map's promise but left the push
+in the instruction stream — and the self-recursive route deliberately bypasses
+`emit_call_return_check`, the one site that emits the matching reload. Every
+execution of such a call site advanced the thread's shadow `top` and nothing
+retracted it, so a recursive method walked `top` off the end of the shadow
+stack and the next push wrote into whatever followed the mapping.
+
+Fixed by deciding the route before emitting the map
+(`emit_safepoint_map_publishing(.., publish = false)`), and pinned by an
+invariant: `lower_inner` counts emitted pushes and reloads and discards the
+body if they disagree. The failure mode is now a compile that falls back to
+single-pass, not a corrupted process.
+
+This bug predates the coverage work — any IR-compiled self-recursive method
+with a live reference leaked — it was simply unreachable while the builder
+refused every such method.
+
+### 3. What C2 was actually worth, and the mechanism that made it negative
+
+With `itemCheck` finally compiling, `BinTreesClassic 18` at `-Xmx512m`, five
+interleaved reps, one binary:
+
+| lane | ms | median |
+|---|---|---|
+| default (single-pass body) | 3614, 3635, 3640, 3762, 3662 | 3640 |
+| `CRATONVM_JIT_FORCE_C2=1` | 6987, 7013, 6914, 6436, 6752 | 6914 |
+
+**1.85x slower.** The control that isolates it: before the coverage work, the
+same two lanes on `bt16` were 670 ms vs 705 ms **with zero IR bodies in both**
+— so the cost is the IR body, not the forced compile path.
+
+The mechanism is not subtle once named: `Op::Load` routed every field read
+through the `jit_getfield` helper — a JIT-boundary note, an `is_object_address`
+region walk and a 16-byte atomic cell read — while the single-pass backend
+emits a guarded inline read. That backend measured the same trade at **4.7x on
+bintrees-16** when the helper hardening first landed, which is why it grew
+`guarded_inline_getfield_enabled`. The IR tier never got one.
+
+It has one now (`ir_lower::emit_inline_compact_getfield`), mirroring the
+single-pass shape: null → helper, unaligned → helper, outside the published
+`JIT_REGION_BOUNDS` → helper, legacy (non-`GC_FLAG_COMPACT`) instance → helper,
+otherwise a raw read at the resolved packed offset. Same five interleaved reps:
+
+| lane | ms | median |
+|---|---|---|
+| default | 3585, 3608, 3703, 3892, 3673 | 3673 |
+| `CRATONVM_JIT_FORCE_C2=1` | 3732, 3777, 3853, 3797, 3742 | 3777 |
+
+**Parity** (+2.8%, ranges overlapping). Checksum `68332206` in every lane of
+every measurement above, and `14985902` for `bt16`.
+
+Read that as the honest answer to the question this document has been asking
+since it was filed: **restoring the optimizing tier was never worth the
+throughput it was assumed to be worth.** Until this branch it was a 1.85x
+pessimization on the one workload that could exercise it, and it is now
+approximately free. Anyone who wants it to be a WIN has a starting point — the
+remaining refusal inventory below, and the fact that `Op::Store`, `getstatic`
+and array access still take helpers where single-pass inlines them.
+
+### 4. Verification
+
+Default flags throughout — none of these needed `CRATONVM_NO_MOVING_YOUNG=1`,
+which is the thing the original document was filed about.
+
+| target | result |
+|---|---|
+| `cratonvm-jit --lib` | **1065 passed / 0 failed** |
+| `cratonvm-jit tests/ir_vs_singlepass.rs` | **92 / 0** |
+| `cratonvm-jit`, every other target | 0 failed |
+| `cratonvm-gc --lib` | **873 / 0** |
+| `cratonvm-vm --lib` | **2304 / 0** (111 ignored) |
+
+`BinTreesClassic` returns `68332206` (d=18) and `14985902` (d=16) in every lane
+of every measurement in this document — default, `CRATONVM_JIT_FORCE_C2=1`,
+both bisect levers, and `CRATONVM_NO_MOVING_YOUNG=1`.
+
+## Residuals, and where they now live
+
+### Residual 1 — the raw JIT-to-JIT direct-call edge
+
+Re-gated in `ea5b2df6e` after `BasicErrorControllerIntegrationTests` SIGSEGV'd
+8/8 and 14/14 with the gate open. This was being fixed in parallel on
+`fix/jit-raw-jit2jit-edge-20260731` ("three shadow-stack/mirror imbalances at
+the raw JIT-to-JIT edge") — the same class of defect as §2 above, on the
+single-pass side. Its acceptance gate is unchanged: that class, 14 consecutive
+runs, default flags. **Not claimed closed here.**
+
+### Residual 2 — the `type.temporal` Hibernate pair — CLOSED, and its premise does not hold
+
+The claim was: those classes exceed the suite's 300 s cap on default flags and
+pass under `CRATONVM_NO_MOVING_YOUNG=1`, therefore a moving-young cost survives
+the two relocation-scoped gates. Two named candidates were shipped with a
+bisect lever each — `CRATONVM_JIT_MY_SCRATCH_FLUSH=0` (the scratch-register
+flush at every GC-capable safepoint) and `CRATONVM_JIT_MY_SELFCALL_PROOF=0`
+(the stronger proof before a self-recursive call may elide its spill).
+
+Measured the way the retired relocation-contract document says to measure this
+— a deterministic, call-dense, entry-dense probe with interleaved lanes on one
+binary, not one run of a 300-second suite class — `BinTreesClassic 18` at
+`-Xmx512m`, five reps:
+
+| lane | ms | median |
+|---|---|---|
+| default | 4388, 5244, 4281, 3708, 4194 | 4281 |
+| `CRATONVM_JIT_MY_SCRATCH_FLUSH=0` | 4117, 4605, 4479, 4056, 3999 | 4117 |
+| `CRATONVM_JIT_MY_SELFCALL_PROOF=0` | 4343, 4096, 4797, 4660, 3618 | 4343 |
+
+**Neither lever moves it.** Ranges fully overlap the default in both
+directions, so neither named candidate is the residual.
+
+And the premise itself inverts on this probe. Six interleaved reps, taken as
+the host quieted (load average 32 → 24):
+
+| lane | ms |
+|---|---|
+| default | 4542, 4904, 4305, 4668, 4337, 4060 |
+| `CRATONVM_NO_MOVING_YOUNG=1` | 6440, 6850, 6042, 5912, 6125, 5741 |
+
+**Disabling the moving young generation costs ~1.37x here, 6/6, ranges
+non-overlapping** — checksum `68332206` throughout. So "the class passes under
+`CRATONVM_NO_MOVING_YOUNG=1`" cannot be read as "moving-young costs
+throughput": that flag selects a different collector, and which one wins is a
+property of the workload. On the one deterministic probe available it wins for
+moving-young by a wide margin.
+
+And the lane the residual is stated in **does not run at all any more**.
+`CRATONVM_NO_MOVING_YOUNG=1` on `ZonedDateTimeTest` SIGSEGVs after ~3 s, inside
+a live JIT code buffer, reading a frame slot holding zero — the reclaimed-root
+signature. On a pristine `origin/dev` build, so not this branch's; the flag
+also switches off the single-pass backend's shadow-stack root publication,
+because `shadow_stack_maps_enabled()` is
+`flags().jit.shadow_stack || moving_young_enabled()`. Adding
+`CRATONVM_SHADOW_STACK=1` back removes the crash. Filed as
+`docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+
+Meanwhile both classes **complete on default flags**, every run, correct:
+
+| class | lane | wall | result |
+|---|---|---:|---|
+| `ZonedDateTimeTest` | default | 447 s | `found=608 ok=404 failed=0 aborted=204` |
+| `ZonedDateTimeTest` | default | 435 s | same |
+| `ZonedDateTimeTest` | default | 391 s | same |
+| `ZonedDateTimeTest` | `NO_MOVING_YOUNG=1` | 3 s / 2 s / 2 s | **SIGSEGV**, all three runs |
+| `OffsetDateTimeTest` | default | 367 s | `found=488 ok=324 failed=0 aborted=164` |
+| `OffsetDateTimeTest` | default | 308 s | same |
+| `OffsetDateTimeTest` | `NO_MOVING_YOUNG=1` | 3 s / 1 s | **SIGSEGV**, both runs |
+
+Over the suite's 300 s cap on a host carrying 30–50 load average from other
+tenants, but neither a timeout nor a failure. **The residual as written —
+"TIMEOUT >900 s by default, passes under `CRATONVM_NO_MOVING_YOUNG=1`" — is now
+inverted in both halves.**
+
+Two further reasons this residual was never evidence:
+
+* `ZonedDateTimeTest` is **bimodal** with no VM change at all — roughly 300 s
+  or past 900 s, documented in
+  `docs/internal/jit-ir-relocation-map-contract.md` with the eight-run table
+  that shows it. A single sample per lane cannot support any attribution, and
+  that is exactly what the claim rested on.
+* The host it would have to be re-measured on carries 30–140 load average from
+  other tenants; a 300 s class routinely doubles under that (see
+  `reference_azure_build_host`). An absolute-threshold question ("does it
+  exceed the 300 s cap?") is not answerable there.
+
+What remains true and worth keeping: if a moving-young throughput cost exists
+outside the two gates, neither of the two candidates named for it is that
+cost, and the levers stay in the tree (default-on, no behaviour change) for
+whoever looks next.
+
+### Residual 3 — the remaining optimizing-tier inventory
+
+Not defects; named exclusions, with counts from the run above. In descending
+order of population: `checkcast`/`instanceof` (100), `athrow` (38), `getstatic`
+(18), `arraylength` (9), non-elidable `<init>` (5), `ldc` (4), array
+load/store, `newarray`/`anewarray`, `multianewarray`, `invokedynamic`. Plus two
+structural ones that no opcode count reveals:
+
+* **`call_eligible`** in `try_compile_inner` disables invoke lowering for any
+  method containing `new` or `anewarray`, so "allocates and calls" — most
+  constructors and factories — cannot reach the tier at all. It is a leftover
+  of the incremental activation programme (`6e1b15aab`), not a proven hazard.
+* **C2 is almost never REQUESTED.** The tiered manager will recommend C2 at
+  `c2_threshold` (20 000) invocations, but `on_method_invocation_observed` is
+  called only from the interpreter's uncached-invocation paths. Once a method
+  is compiled at C1 and cached, dispatch stops going through them, so the
+  counter stops advancing and the C2 recommendation is never reached. This is
+  the `wire-tiered-manager` question, and it is the one that decides whether
+  any of the above matters.
+* **Allocation is a GC-capable point with no safepoint map.** `Op::New` does
+  not call `emit_safepoint_map`, so an IR frame that allocates leaves the
+  sp-id slot naming an earlier safepoint. It is fail-closed today (the reload
+  has already retracted that safepoint's shadow publication, so the band scan
+  refuses the cycle), but it is a coverage hole, and it is a prerequisite for
+  lowering array allocation.
+
+## Reproducing any of this
+
+```bash
+CRATONVM_JIT_FORCE_C2=1 CRATONVM_DBG_IR_COMPILES=1 cratonvm -cp bench BinTreesClassic 16
+```
+
+Every pipeline stage names its own refusal. An absence is not a reason — that
+is the single most expensive lesson in this document's history, and it cost
+three separate wrong conclusions before the reporting existed.
+
+---
+
+# Original document (retired)
+
 # The optimizing IR (C2) tier is disabled by default — `moving_young` turned it off
 
 **Status:** 🟢 **FIXED 2026-07-30** by scoping the gate (option 2 below) —
