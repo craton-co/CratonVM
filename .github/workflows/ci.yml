@@ -161,11 +161,18 @@ jobs:
       #
       #   before   reported 2584 of 3927 (2523 pass, 61 fail), then exit 1 with
       #            NO `test result` line — 1,343 tests never executed
-      #   now      test result: FAILED. 3714 passed; 97 failed; 115 ignored
-      #            (3714+97+115 = 3926, every test accounted for, exit 101)
+      #   now      test result: FAILED. 3734 passed; 89 failed; 115 ignored
+      #            (3734+89+115 = 3938, every test accounted for, exit 101)
       #
-      # So 61 was a floor twice over: the real total was 173, now down to 97.
-      # Measured on this branch AFTER merging origin/dev (140 commits).
+      # So 61 was a floor twice over: the real total was 173, now down to 89.
+      # Measured AFTER merging origin/dev (140 commits; the merge added 12
+      # tests, hence 3938 rather than 3926).
+      #
+      # NOTE when re-measuring: the test binary's hash changes whenever the
+      # dependency graph does, so `target/debug/deps/cratonvm_vm-<hash>.exe`
+      # is NOT a stable path. Take it from `cargo test --no-run`'s
+      # "Executable unittests" line; running a hardcoded path silently
+      # measured a pre-merge build here once.
       # Runtime is ~20 min, from 56 (`call_native` no longer rebuilds the whole
       # ~3,000-entry native registry on each of its ~10,000 calls).
       #
@@ -182,14 +189,26 @@ jobs:
       #
       # TWO things still block promotion. Both are measured:
       #
-      #  1. 97 failing tests. The systemic causes are exhausted — what is left
-      #     is a long tail, dominated by JDK surface that is simply not
-      #     implemented. These have ZERO registrations anywhere in the tree
-      #     (verified by search, not inferred): `java/io/StringReader`,
-      #     `java/util/zip/GZIPInputStream`, `GZIPOutputStream`,
-      #     `java/util/Timer`, `java/text/SimpleDateFormat`, `java/net/URL`'s
-      #     constructors, `DecimalFormat.toPattern`, `TimeZone.getID`. Clearing
-      #     them means implementing those APIs, not re-wiring a gate. The rest
+      #  1. 89 failing tests. The systemic causes are exhausted. The tail is
+      #     individual, and a chunk of it is NOT missing work — it is work that
+      #     was deliberately UNDONE, so "implementing" it would be a regression:
+      #       * `java/util/Timer` — the synthetic natives were deleted because
+      #         `schedule`/`scheduleAtFixedRate` were no-ops while real JDK
+      #         bytecode spins a TimerThread that actually fires tasks. See the
+      #         no-op `register_timer_natives` and its comment.
+      #       * `java/text/SimpleDateFormat` — same, per
+      #         `register_number_format_natives`.
+      #       * `CopyOnWriteArrayList.<init>` and the synthetic AQS/socket
+      #         constructors — dropped so real bytecode initialises the object.
+      #     `timer_basic` / `simple_date_format_basics_p57` /
+      #     `copy_on_write_arraylist_basic` assert the removed contract and
+      #     cannot pass without reintroducing the bug the removal fixed. They
+      #     need deleting or re-targeting — a coverage decision, not a fix.
+      #     Genuinely-absent APIs that WOULD be real work: `GZIPInputStream`,
+      #     `GZIPOutputStream`, `java/net/URL`'s constructors. (`StringReader`
+      #     and `StringWriter` turned out to exist in `cratonvm-native-io` all
+      #     along; the test just built a registry that could not see them.)
+      #     The rest
       #     is ~38 individual `assertion left == right` divergences plus
       #     singles; a few are genuine VM bugs worth their own fix, notably
       #     `g67_fork_increments_completed_count` hitting a live
