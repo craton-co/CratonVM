@@ -34,7 +34,9 @@ setsid "$WF/bin/standalone.sh" \
   > "$CONSOLE" 2>&1 &
 P=$!
 
-for i in $(seq 1 150); do
+# Generous: under heavy host load a boot plus a few thousand canary reps can
+# take minutes, and a timed-out boot is a wasted sample, not a signal.
+for i in $(seq 1 "${BOOT_WAIT_TICKS:-240}"); do
   if grep -qE "WFLYSRV0025|WFLYSRV0026|WFLYSRV0049.*aborted" "$CONSOLE" 2>/dev/null; then break; fi
   kill -0 $P 2>/dev/null || break
   sleep 2
