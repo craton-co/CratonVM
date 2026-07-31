@@ -54,10 +54,47 @@ reproducer from the known-issue doc, on Mockito 5.21 and JDK 25:
 | HotSpot 25 | 2 ns/call | 50 ns/call | 25× |
 | CratonVM | 1,822 ns/call | 245,653 ns/call | 134× |
 
-The multiplier improved from the original 451×, so the gate narrowing does
-something real. The bug is not closed: 245 µs against HotSpot's 50 ns is ~4,900×.
-The known-issue doc stays OPEN and now records that "the caches were keyed too
-coarsely" is not the whole story.
+The multiplier improved from the original 451×, so the gate narrowing did
+something real, but it did not close the bug: 245 µs against HotSpot's 50 ns.
+
+**Now closed — and the diagnosis in this section was wrong.** "The caches were
+keyed too coarsely" is not what cost the time, and neither was the standing
+hypothesis that a fresh `Arc<[u8]>` per call forced the quickened stream to be
+rebuilt. Instrumented, the intern table hits 1,995,011 times against 42 misses,
+`padded_bytecode` runs 72 times in the whole process, and `resolve_method_ref`
+161 times. Nothing was being re-resolved per call.
+
+What actually happened: five gates asked *"has this class ever been
+redefined?"* and treated `yes` as permanently unsafe. The generation only
+increases, so a class redefined once was barred from compiling, from OSR, from
+supplying a compiled callee, and from *using* compiled code — for the life of
+the process — while its MIC/PIC inline caches were erased on **every single
+dispatch**. An inline cache cleared on every call is worse than no inline
+cache. None of it protected anything: `redefine_class` already evicts every
+compiled artifact.
+
+The four admission gates are gone as redundant with that eviction, and the
+inline-cache flush is now epoch-based — one flush per slot per redefinition,
+stamped into what used to be padding in `JitMICSlot`, so no JIT-hot offset
+moved.
+
+| | before redefine | after redefine | multiplier |
+|---|--:|--:|--:|
+| before the fix | 691 ns/call | 33,773 ns/call | 46× |
+| after the fix | 314 ns/call | 361 ns/call | **1×** |
+
+Retired to
+[`../mockito-redefine-makes-every-call-40us-20260726.md`](../mockito-redefine-makes-every-call-40us-20260726.md),
+with a Mockito-free reproducer at `docs/known-issues/repros/redefine-call-cost/`
+and a correctness probe that fails if a recompilation ever picks up the
+pre-redefine body.
+
+The generalisable lesson is the one this whole audit keeps producing: the
+earlier section here reported a *measurement* (`--nojit` and `jit-on` agreeing
+after the mock) and drew the conclusion "so the JIT is not the factor." The
+numbers agreed because both arms were interpreted by then — the JIT-on arm had
+degraded *to* the `--nojit` arm. Two arms agreeing only rules a factor out if
+the factor is still varying between them.
 
 **P0 — Default synthetic runtime surface.** Real ForkJoinPool and real
 `java.net` sockets are now the default, with `CRATONVM_SYNTHETIC_FORKJOINPOOL` /
@@ -473,5 +510,18 @@ a build. That is the single most important sentence here.
 
 Tracked residuals: the formatting decision, the Spring CGLIB superclass
 evidence, the ForkJoinPool bypass question, the `libcratonvm` test-isolation
-defect, the `Test vm (synthetic-jdk)` harness abort, and the SbCostProbe gap
-(245 µs against HotSpot's 50 ns).
+defect, and the `Test vm (synthetic-jdk)` harness abort. The redefinition cost
+(245 µs/call) is **closed** — see the P0 item above.
+
+One finding this audit did not make and should have, recorded here because it
+is the same shape as the rest: **the optimizing JIT tier (C2) cannot run in a
+default build.** Its admission gate in `jit/src/lib.rs` requires
+`!x64::moving_young_enabled()`, and `DEFAULT_MOVING_YOUNG` is `true`, so every
+method falls through to the single-pass tier. That is correct as written — IR
+lowering publishes no exact-RBP or safepoint map, so a mapless IR frame could
+be live while the young generation relocates — but it was collateral from the
+moving-young default flip rather than a decision, and the response was to pin
+the IR tests to `moving_young = false` via `set_moving_young_override` so they
+would keep passing. The IR routing tests are green about a pipeline production
+never reaches. Re-enabling C2 is a backport of the frame-metadata protocol, not
+a flag.
