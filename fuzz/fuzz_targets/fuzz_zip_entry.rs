@@ -169,6 +169,14 @@ fn disable_jar_mmap_once() {
     });
 }
 
+/// Largest byte count anything inside an `archive_len`-byte archive can
+/// legitimately inflate to.
+fn inflate_bound(archive_len: usize) -> usize {
+    archive_len
+        .saturating_mul(MAX_DEFLATE_RATIO)
+        .saturating_add(RATIO_SLACK_BYTES)
+}
+
 /// Assert an entry the archive handed back respects both decompression
 /// bounds.
 fn assert_bounded_inflate(what: &str, len: usize, archive_len: usize) {
@@ -177,11 +185,8 @@ fn assert_bounded_inflate(what: &str, len: usize, archive_len: usize) {
         "{what} inflated to {len} bytes, past the \
          {MAX_UNCOMPRESSED_ENTRY_BYTES}-byte decompression-bomb clamp"
     );
-    let ratio_bound = archive_len
-        .saturating_mul(MAX_DEFLATE_RATIO)
-        .saturating_add(RATIO_SLACK_BYTES);
     assert!(
-        len <= ratio_bound,
+        len <= inflate_bound(archive_len),
         "{what} inflated to {len} bytes from a {archive_len}-byte archive, \
          past DEFLATE's {MAX_DEFLATE_RATIO}:1 maximum expansion"
     );
@@ -321,15 +326,21 @@ fuzz_target!(|data: &[u8]| {
     // continuation lines. Any `Class-Path:` it declares is resolved
     // against the archive's directory — a permissive-by-spec path that
     // must still stay bounded.
+    //
+    // Note the bound is the *inflated* size, not `archive_len`: the
+    // manifest is a compressed entry, so a 200-byte archive can carry a
+    // manifest with thousands of attributes. Bounding against the raw
+    // archive size here would be a false positive, not a finding.
     if let Some(info) = ClassPath::read_jar_manifest(path) {
+        let bound = inflate_bound(archive_len);
         assert!(
-            info.attributes.len() <= archive_len,
+            info.attributes.len() <= bound,
             "manifest of a {archive_len}-byte archive declared {} attributes",
             info.attributes.len()
         );
         let resolved = info.resolve_class_path(path);
         assert!(
-            resolved.len() <= archive_len,
+            resolved.len() <= bound,
             "manifest Class-Path resolved to {} entries from a {archive_len}-byte archive",
             resolved.len()
         );

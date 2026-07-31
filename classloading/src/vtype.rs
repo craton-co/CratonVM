@@ -686,6 +686,93 @@ pub(crate) fn is_known_jdk_interface(name: &str) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Descriptor well-formedness (JVMS §4.3.2 / §4.3.3)
+// ---------------------------------------------------------------------------
+
+/// Length in bytes of the field descriptor starting at `bytes[at]`, or `None`
+/// when the bytes at that position are not a well-formed field descriptor.
+///
+/// SECURITY: this is the single place that decides how far a descriptor
+/// extends. Every caller derives its slice bounds from the returned length, so
+/// a malformed descriptor produces `None` (→ rejection) instead of an
+/// out-of-range slice. The previous ad-hoc `find(';').unwrap_or(len - i)`
+/// arithmetic in [`param_types_from_descriptor`] computed an end index of
+/// `len + 1` for an unterminated `L` type and panicked on the slice — reachable
+/// from any `NameAndType` descriptor in an attacker-supplied constant pool.
+fn field_descriptor_len(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut i = at;
+    let mut dims = 0usize;
+    while i < bytes.len() && bytes[i] == b'[' {
+        dims += 1;
+        // JVMS §4.4.1: an array type descriptor is limited to 255 dimensions.
+        if dims > 255 {
+            return None;
+        }
+        i += 1;
+    }
+    let tag = *bytes.get(i)?;
+    match tag {
+        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' => Some(i + 1 - at),
+        b'L' => {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b';' {
+                // JVMS §4.2.1: an internal-form class name never contains
+                // `.`, `[` or `;`.
+                if bytes[j] == b'.' || bytes[j] == b'[' {
+                    return None;
+                }
+                j += 1;
+            }
+            if j >= bytes.len() || j == start {
+                // Unterminated, or `L;` with an empty class name.
+                return None;
+            }
+            Some(j + 1 - at)
+        }
+        _ => None,
+    }
+}
+
+/// Is `descriptor` a well-formed field descriptor (JVMS §4.3.2)?
+///
+/// Used by the verifier's constant-pool cross-checks: a `Fieldref`'s
+/// `NameAndType` must carry a field descriptor, and a malformed one must be a
+/// `VerifyError` rather than silently degrading to [`VType::Top`] (which the
+/// assignability lattice accepts from *any* value, so a bad descriptor on a
+/// `putstatic` would pop an arbitrary operand unchecked).
+pub fn is_valid_field_descriptor(descriptor: &str) -> bool {
+    let bytes = descriptor.as_bytes();
+    matches!(field_descriptor_len(bytes, 0), Some(n) if n == bytes.len())
+}
+
+/// Is `descriptor` a well-formed method descriptor (JVMS §4.3.3)?
+///
+/// Requires the `( … )` envelope, well-formed parameter descriptors, and a
+/// return descriptor that is either `V` or a well-formed field descriptor.
+pub fn is_valid_method_descriptor(descriptor: &str) -> bool {
+    let bytes = descriptor.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return false;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() && bytes[i] != b')' {
+        match field_descriptor_len(bytes, i) {
+            Some(n) => i += n,
+            None => return false,
+        }
+    }
+    if i >= bytes.len() {
+        return false; // no closing ')'
+    }
+    i += 1;
+    if bytes.get(i) == Some(&b'V') {
+        return i + 1 == bytes.len();
+    }
+    matches!(field_descriptor_len(bytes, i), Some(n) if i + n == bytes.len())
+}
+
 /// Parse a method descriptor's return type into a VType.
 ///
 /// Returns `None` for void (`V`).
@@ -707,71 +794,32 @@ pub fn return_type_from_descriptor(descriptor: &str) -> Option<VType> {
 pub fn param_types_from_descriptor(descriptor: &str) -> Vec<VType> {
     let mut types = Vec::new();
 
-    // Skip the opening '(' and stop at the closing ')'. A malformed
-    // descriptor with no leading '(' (in particular the empty string)
-    // must not panic on a `[1..]` slice — return an empty parameter list
-    // so verification fails cleanly downstream instead of crashing the
-    // verifier. `splitn`/`find` keep all indexing in-bounds.
-    let after_open = match descriptor.strip_prefix('(') {
-        Some(rest) => rest,
-        None => return types, // malformed: no '(' — no parameters
-    };
-    // Everything up to the first ')' (or the whole remainder if ')' is
-    // absent, which is itself malformed but handled without panic).
-    let inner = match after_open.find(')') {
-        Some(close) => &after_open[..close],
-        None => after_open,
-    };
-    let bytes = inner.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'B' | b'C' | b'I' | b'S' | b'Z' => {
-                types.push(VType::Int);
-                i += 1;
-            }
-            b'J' => {
-                types.push(VType::Long);
-                i += 1;
-            }
-            b'F' => {
-                types.push(VType::Float);
-                i += 1;
-            }
-            b'D' => {
-                types.push(VType::Double);
-                i += 1;
-            }
-            b'L' => {
-                let semi = inner[i..].find(';').unwrap_or(inner.len() - i);
-                let desc = &inner[i..i + semi + 1];
-                types.push(VType::from_field_descriptor(desc));
-                i += semi + 1;
-            }
-            b'[' => {
-                // Find the end of the array descriptor
-                let start = i;
-                while i < bytes.len() && bytes[i] == b'[' {
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    match bytes[i] {
-                        b'L' => {
-                            let semi = inner[i..].find(';').unwrap_or(inner.len() - i);
-                            i += semi + 1;
-                        }
-                        _ => {
-                            i += 1; // primitive element type
-                        }
-                    }
-                }
-                types.push(VType::ArrayRef(Arc::from(&inner[start..i])));
-            }
-            _ => {
-                i += 1; // skip unknown
-            }
-        }
+    // SECURITY: every slice bound below comes from `field_descriptor_len`,
+    // which never reports a length that runs past the end of the descriptor.
+    // The previous hand-rolled walk computed `i + semi + 1` from
+    // `find(';').unwrap_or(len - i)`, which is `len + 1` for an unterminated
+    // `L` type — an out-of-range slice, i.e. a verifier panic driven straight
+    // from an attacker-supplied `NameAndType` descriptor.
+    //
+    // A malformed descriptor stops the walk (rather than skipping the offending
+    // byte and continuing) so the caller sees a *short* parameter list. Callers
+    // that make a load decision reject malformed descriptors outright via
+    // [`is_valid_method_descriptor`]; stopping here is the fail-safe for the
+    // remaining diagnostic callers.
+    let bytes = descriptor.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return types; // malformed: no '(' — no parameters
+    }
+    let mut i = 1usize;
+    while i < bytes.len() && bytes[i] != b')' {
+        let Some(n) = field_descriptor_len(bytes, i) else {
+            break;
+        };
+        let Some(piece) = descriptor.get(i..i + n) else {
+            break;
+        };
+        types.push(VType::from_field_descriptor(piece));
+        i += n;
     }
 
     types

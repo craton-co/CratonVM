@@ -170,7 +170,17 @@ dist() {
         }'
 }
 
-dash() { if [ -n "${1:-}" ]; then printf '%s' "$1"; else printf '%s' '-'; fi; }
+# Every TSV cell goes through dash(): empty becomes "-" (which the
+# reliability gate reads as "not recorded", never as a value), and any
+# embedded tab or newline is flattened, because one stray newline in one cell
+# silently splits a sample row into two malformed rows.
+dash() {
+    local v=${1:-}
+    v=${v//$'\n'/ }
+    v=${v//$'\r'/ }
+    v=${v//$'\t'/ }
+    if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' '-'; fi
+}
 
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -d' ' -f1
@@ -337,7 +347,7 @@ run_one() {
     local thr0 thr1 pid line c khz deadline
     local -a arr
     RUN_MS=""; RUN_SUM=""; RUN_EXIT=0
-    RUN_CPUS=""; RUN_KMIN=""; RUN_KMAX=""; RUN_RSS=0; RUN_TIMEOUT_HIT=0
+    RUN_CPUS=""; RUN_KMIN=""; RUN_KMAX=""; RUN_RSS=""; RUN_TIMEOUT_HIT=0
     RUN_LOAD=$(read_load1)
     thr0=$(read_throttle)
 
@@ -374,14 +384,20 @@ run_one() {
             [ "$khz" -lt "$RUN_KMIN" ] && RUN_KMIN=$khz
             [ "$khz" -gt "$RUN_KMAX" ] && RUN_KMAX=$khz
         fi
-        while IFS= read -r line; do
-            case "$line" in
-                VmHWM:*)
-                    line=${line//[!0-9]/}
-                    [ -n "$line" ] && [ "$line" -gt "$RUN_RSS" ] && RUN_RSS=$line
-                    ;;
-            esac
-        done < "/proc/$pid/status" 2>/dev/null
+        # VmHWM is the kernel's own high-water mark, so sampling it at any
+        # cadence still yields the true peak as long as we read it once.
+        if [ -r "/proc/$pid/status" ]; then
+            while IFS= read -r line; do
+                case "$line" in
+                    VmHWM:*)
+                        line=${line//[!0-9]/}
+                        if [ -n "$line" ] && { [ -z "$RUN_RSS" ] || [ "$line" -gt "$RUN_RSS" ]; }; then
+                            RUN_RSS=$line
+                        fi
+                        ;;
+                esac
+            done < "/proc/$pid/status"
+        fi
         if [ "$(date +%s)" -ge "$deadline" ]; then
             kill -9 "$pid" 2>/dev/null
             RUN_TIMEOUT_HIT=1
@@ -404,19 +420,24 @@ run_one() {
     RUN_SUM=$(printf '%s' "$line" | grep -oE '\[[-0-9]+\]' | tr -d '[]')
 
     # Shutdown summaries the VM already produces, when it produced them.
-    RUN_C1=$(grep -oE 'compiles: c1=[0-9]+' "$err" | head -1 | grep -oE '[0-9]+$')
-    RUN_C2=$(grep -oE 'c2=[0-9]+ osr=' "$err" | head -1 | grep -oE '[0-9]+' | head -1)
-    RUN_OSR=$(grep -oE 'osr=[0-9]+' "$err" | head -1 | grep -oE '[0-9]+')
-    RUN_DEOPT=$(grep -oE 'deopts=[0-9]+' "$err" | head -1 | grep -oE '[0-9]+')
-    RUN_CTIME=$(grep -oE 'total_compile_time_ms=[0-9]+' "$err" | head -1 | grep -oE '[0-9]+')
-    local gcline
+    # Every extraction anchors the digits with `[0-9]+$` on a single matched
+    # token: `grep -oE 'p50_us=[0-9]+' | grep -oE '[0-9]+'` returns TWO lines
+    # ("50" and "9800"), which is exactly how a stray newline gets into a TSV
+    # cell and silently splits a sample row in half.
+    local cseg gcline
+    cseg=$(grep -oE 'compiles: c1=[0-9]+ c2=[0-9]+ osr=[0-9]+ deopts=[0-9]+ c2_bailouts=[0-9]+ total_compile_time_ms=[0-9]+' "$err" | head -1)
+    RUN_C1=$(printf '%s' "$cseg" | grep -oE 'c1=[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    RUN_C2=$(printf '%s' "$cseg" | grep -oE ' c2=[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    RUN_OSR=$(printf '%s' "$cseg" | grep -oE 'osr=[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    RUN_DEOPT=$(printf '%s' "$cseg" | grep -oE 'deopts=[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    RUN_CTIME=$(printf '%s' "$cseg" | grep -oE 'total_compile_time_ms=[0-9]+' | head -1 | grep -oE '[0-9]+$')
     gcline=$(grep -E '^\[GC-SUMMARY\] young ' "$err" | head -1)
-    RUN_GCN=$(printf '%s' "$gcline" | grep -oE 'count=[0-9]+' | grep -oE '[0-9]+')
-    RUN_GCP50=$(printf '%s' "$gcline" | grep -oE 'p50_us=[0-9]+' | grep -oE '[0-9]+')
-    RUN_GCP99=$(printf '%s' "$gcline" | grep -oE 'p99_us=[0-9]+' | grep -oE '[0-9]+')
-    RUN_GCMAX=$(printf '%s' "$gcline" | grep -oE 'max_us=[0-9]+' | grep -oE '[0-9]+')
+    RUN_GCN=$(printf '%s' "$gcline" | grep -oE 'count=[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    RUN_GCP50=$(printf '%s' "$gcline" | grep -oE 'p50_us=[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    RUN_GCP99=$(printf '%s' "$gcline" | grep -oE 'p99_us=[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    RUN_GCMAX=$(printf '%s' "$gcline" | grep -oE ' max_us=[0-9]+' | head -1 | grep -oE '[0-9]+$')
     RUN_MINOR=$(grep -oE 'generational: minor=[0-9]+' "$err" | head -1 | grep -oE '[0-9]+$')
-    RUN_MAJOR=$(grep -oE 'minor=[0-9]+ major=[0-9]+' "$err" | head -1 | grep -oE 'major=[0-9]+' | grep -oE '[0-9]+')
+    RUN_MAJOR=$(grep -oE 'major=[0-9]+' "$err" | head -1 | grep -oE '[0-9]+$')
     cp "$err" "$RESULTS/stderr-$phase-last.txt" 2>/dev/null
 }
 
