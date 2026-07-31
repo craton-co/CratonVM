@@ -16069,8 +16069,12 @@ mod layout_constant_inventory {
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8
-        // array-length load that guards every bounds check.
-        ("ir_lower.rs", [7, 3, 4, 0, 0, 0, 3, 0]),
+        // array-length load that guards every bounds check. The eighth
+        // `HEADER_SIZE` is the guarded inline compact `getfield`'s cell
+        // address (`HEADER_SIZE + packed_body_offset`) — a disp32 site, so it
+        // does not share the disp8 backwards-addressing hazard, but it does
+        // bake the header size into machine code.
+        ("ir_lower.rs", [8, 3, 4, 0, 0, 0, 3, 0]),
     ];
 
     fn source(file: &str) -> &'static str {
