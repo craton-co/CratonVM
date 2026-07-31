@@ -7069,8 +7069,10 @@ fn native_map_put_evict(
     // in attributes for annotation [...ComponentScan$Filter]` in
     // `ComponentScanAnnotationParser.parse` for `@SpringBootApplication`.
     let cid = ctx.class_id_of_object(this);
-    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // `mut`: `materialize_hm_int_fast` below can collect, so these are re-read
+    // from their pins across it (HIB-MAPPUT-PINORDER.1).
+    let mut key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut value = args.get(2).copied().unwrap_or(Value::Object(None));
     // PERF (collections-classification-cost): this block used to be a
     // `class_name_of_id` for the exact-HashMap test PLUS a second full
     // superclass walk in the `else` arm, each hop of which allocated a
@@ -7095,7 +7097,24 @@ fn native_map_put_evict(
             // node table before inserting the new entry. Without this, the
             // node path sees an empty heap map and silently strands all prior
             // integer entries in the side store.
+            // HIB-MAPPUT-PINORDER.1 (2026-07-31): `materialize_hm_int_fast`
+            // re-puts every side-stored entry through
+            // `native_map_put_evict_pinned`, which allocates a node per entry —
+            // so it can collect. `key_val`/`value` were copied out of `args`
+            // above and are bare Rust locals here; the pins that protect them
+            // are not taken until after this call, and PINNING AN ALREADY-STALE
+            // ADDRESS PRESERVES THE STALENESS (see the pin-time canary in
+            // `vm_exec::pin_native_root`). Pin them across the materialisation
+            // and re-read afterwards, so the pins taken below root the current
+            // addresses. `this` is already handled — it comes back as the
+            // return value.
+            let mat_base = ctx.pin_native_root(this);
+            let mat_key = pin_value(ctx, key_val);
+            let mat_val = pin_value(ctx, value);
             this = materialize_hm_int_fast(ctx, this)?;
+            key_val = read_pinned_elem(ctx, mat_key, key_val);
+            value = read_pinned_elem(ctx, mat_val, value);
+            ctx.unpin_native_roots(mat_base);
         } else {
             // Walk parent chain to detect LinkedHashMap or TreeMap ancestry.
             // Without the TreeMap branch, the `java/util/Map.put` interface
@@ -7176,12 +7195,22 @@ pub fn native_hashmap_put_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let mut key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut value = args.get(2).copied().unwrap_or(Value::Object(None));
     if let Some(result) = try_hm_int_fast_put(ctx, this, key_val, value) {
         return result;
     }
+    // HIB-MAPPUT-PINORDER.1 — same ordering hazard as `native_map_put_evict`:
+    // `materialize_hm_int_fast` allocates a node per side-stored entry, so it
+    // can collect, and the pins below would otherwise root already-stale
+    // key/value addresses.
+    let mat_base = ctx.pin_native_root(this);
+    let mat_key = pin_value(ctx, key_val);
+    let mat_val = pin_value(ctx, value);
     let this = materialize_hm_int_fast(ctx, this)?;
+    key_val = read_pinned_elem(ctx, mat_key, key_val);
+    value = read_pinned_elem(ctx, mat_val, value);
+    ctx.unpin_native_roots(mat_base);
     let put_pin_base = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key_val);
     let value_pin = pin_value(ctx, value);

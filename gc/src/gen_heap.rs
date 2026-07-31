@@ -1893,9 +1893,12 @@ impl GenerationalHeap {
                 // SAFETY: `fwd_ptr` is a non-null forwarding address (checked above) installed by evacuation,
                 // pointing at the object's live relocated header; read-only, diagnostic-only (stale-objref debug) path.
                 let fwd_header = unsafe { &*(fwd_ptr as *const ObjectHeader) };
+                // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`.
+                // `fwd_ptr` came out of a header this very diagnostic suspects,
+                // so its target is not trustworthy enough to decode as an enum.
                 (
                     fwd_header.class_id.as_u32(),
-                    format!("{:?}", fwd_header.kind),
+                    format!("0x{:02x}", fwd_header.kind as u8),
                 )
             } else {
                 (u32::MAX, "<null-forward>".to_string())
@@ -1931,10 +1934,10 @@ impl GenerationalHeap {
                                 / crate::card_table::CARD_SIZE;
                             let _ = write!(
                                 holders,
-                                "\n  OLD holder {:p} class_id={} kind={:?} slot={} card_dirty_now={}",
+                                "\n  OLD holder {:p} class_id={} kind=0x{:02x} slot={} card_dirty_now={}",
                                 optr,
                                 oh.class_id.as_u32(),
-                                oh.kind,
+                                oh.kind as u8,
                                 idx,
                                 self.card_table.is_dirty(cidx),
                             );
@@ -7856,8 +7859,8 @@ impl GenerationalHeap {
                 if foff > cursor && foff < cursor + total_size {
                     if gc_flags().dbg_a2 && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) < 30 {
                         eprintln!(
-                            "[A2-FL] CLAMP over-sized object @{} computed_size={} (kind={:?} class_id={}) oversteps free hole at {} — retaining + resyncing",
-                            cursor, total_size, header.kind, header.class_id.as_u32(), foff,
+                            "[A2-FL] CLAMP over-sized object @{} computed_size={} (kind=0x{:02x} class_id={}) oversteps free hole at {} — retaining + resyncing",
+                            cursor, total_size, header.kind as u8, header.class_id.as_u32(), foff,
                         );
                     }
                     A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
@@ -10733,24 +10736,43 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
 #[cold]
 #[inline(never)]
 fn warn_corrupt_array_header(header: &ObjectHeader) {
+    // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`. This
+    // header has already been judged corrupt, and `ArrayElementType`'s valid
+    // discriminants are 4..=11, so an out-of-range byte here is *more* likely
+    // than for `ObjectKind`, not less.
     tracing::warn!(
-        "GC: implausible array_length {} (element_type={:?}) in heap object \
+        "GC: implausible array_length {} (element_type=0x{:02x}) in heap object \
          header — treating as corrupt; caller will stop/skip the walk",
         header.array_length(),
-        header.element_type,
+        header.element_type as u8,
     );
 }
 
 /// Cold diagnostic for a non-`Object` kind reaching the legacy-object sizing
 /// arm. See [`warn_corrupt_array_header`] for why this is out-of-line.
+///
+/// Formats the RAW kind byte, never `header.kind` through `Debug`. This
+/// function is called *because* the kind is not `Object`, and one of the two
+/// documented reasons for that (see the call site in
+/// [`gen_object_total_size`]) is a byte that is not a valid `ObjectKind`
+/// discriminant at all — a `GAP_FILLER_CLASS_ID` sentinel puts the low byte of
+/// its length field (8/16/24/32) exactly where `kind` lives. The derived
+/// `Debug` for a `#[repr(u8)]` enum indexes a static variant-name table by
+/// discriminant, so `{:?}` on 8/16/24/32 reads a `&str` from past the end of
+/// that table and the formatter then walks a wild pointer — turning a
+/// recoverable corrupt-header detection into a hard `SIGSEGV` inside
+/// `core::fmt`. The sweep's own corrupt-header path already learned this (see
+/// the "format the RAW kind byte" note in `sweep_young_non_moving`); this is
+/// the same hazard at the sibling site, and it is the one that killed H2's
+/// `TestOutOfMemory` under sustained heap pressure.
 #[cold]
 #[inline(never)]
 fn warn_non_object_kind_in_object_arm(header: &ObjectHeader) {
     tracing::warn!(
-        "GC: header kind={:?} reached the legacy-object sizing arm (shape={}, \
+        "GC: header kind=0x{:02x} reached the legacy-object sizing arm (shape={}, \
          class_id={}); a region sentinel is not a sizable object — treating as \
          corrupt so the walker can re-sync.",
-        header.kind,
+        header.kind as u8,
         header.num_slots(),
         header.class_id.as_u32(),
     );
@@ -11238,7 +11260,11 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         // precede `gen_object_total_size`" notes); this is the backstop if one
         // does not. Note the optimiser is entitled to assume `kind` is in
         // 0..=2, so treat that second case as belt-and-braces, not a guarantee.
-        if header.kind != ObjectKind::Object {
+        // Compare the RAW byte rather than the enum: the paragraph above notes
+        // the optimiser may assume `kind` is a valid 0..=2 discriminant, which
+        // is precisely what would let it fold this screen away for the
+        // out-of-range case the screen exists to catch.
+        if header.kind as u8 != ObjectKind::Object as u8 {
             warn_non_object_kind_in_object_arm(header);
             return 0;
         }
@@ -12117,6 +12143,106 @@ mod tests {
         assert!(
             heap.young_spill_pressure(),
             "a post-clear spill must re-arm the flag"
+        );
+    }
+
+    /// Regression: a corrupt-header diagnostic must format the RAW kind byte,
+    /// never `header.kind` through `Debug`.
+    ///
+    /// `gen_object_total_size` calls `warn_non_object_kind_in_object_arm`
+    /// exactly when the kind is not `Object`, and one documented way to get
+    /// there is a byte that is not a valid `ObjectKind` discriminant at all —
+    /// a `GAP_FILLER_CLASS_ID` sentinel puts the low byte of its length field
+    /// (8/16/24/32) where `kind` lives. The derived `Debug` for a
+    /// `#[repr(u8)]` enum indexes a static variant-name table by discriminant,
+    /// so `{:?}` on 24 reads a `&str` from past the end of that table and the
+    /// formatter then walks a wild pointer: a hard `SIGSEGV` inside
+    /// `core::fmt`, from the very code whose job is to *report* the corruption
+    /// and let the walker re-sync.
+    ///
+    /// That is what killed H2's `org.h2.test.db.TestOutOfMemory` after ~5
+    /// minutes of sustained heap pressure (gdb: `next_code_point` <-
+    /// `core::fmt::write` <- `warn_non_object_kind_in_object_arm` <-
+    /// `gen_object_total_size` <- `scan_object_for_old_refs` <- `major_gc`).
+    ///
+    /// The subscriber below is load-bearing: `tracing::warn!` only materialises
+    /// its arguments if something is listening, so without one this test would
+    /// pass on the broken code.
+    #[test]
+    fn corrupt_kind_byte_is_reported_as_a_raw_byte_not_debug_formatted() {
+        use std::sync::{Arc, Mutex};
+
+        struct Capture(Arc<Mutex<String>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _i: &tracing::span::Id, _v: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _i: &tracing::span::Id, _f: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct V<'a>(&'a mut String);
+                impl tracing::field::Visit for V<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        // Forcing the format is the whole point: this is the
+                        // step that dereferenced the out-of-range variant name.
+                        let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                    }
+                }
+                if let Ok(mut guard) = self.0.lock() {
+                    event.record(&mut V(&mut guard));
+                }
+            }
+            fn enter(&self, _i: &tracing::span::Id) {}
+            fn exit(&self, _i: &tracing::span::Id) {}
+        }
+
+        // A header whose `kind` byte is 24 — the low byte of a 24-byte gap
+        // filler's length field, i.e. the exact real-world shape the call
+        // site's own comment names. `u64` backing gives the 8-byte alignment
+        // an `ObjectHeader` requires.
+        let mut backing = vec![0u64; HEADER_SIZE / 8 + 2];
+        let base = backing.as_mut_ptr() as *mut u8;
+        // SAFETY: `backing` is at least `HEADER_SIZE` bytes and 8-aligned.
+        unsafe {
+            std::ptr::write(
+                base as *mut ObjectHeader,
+                ObjectHeader::new(
+                    ClassId::new(7),
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    1,
+                    0,
+                    3,
+                ),
+            );
+            *base.add(OBJECT_KIND_OFFSET) = 24;
+        }
+        // SAFETY: the buffer holds a fully written header; the `kind` byte is
+        // deliberately out of range, which is precisely the state under test.
+        let header = unsafe { &*(base as *const ObjectHeader) };
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let sink = Capture(Arc::clone(&captured));
+        let size = tracing::subscriber::with_default(sink, || gen_object_total_size(header));
+
+        // The walker contract: an unsizable header reports 0 so the caller
+        // re-syncs rather than striding by a meaningless number.
+        assert_eq!(
+            size, 0,
+            "an out-of-range kind byte must be reported as unsizable",
+        );
+        let out = captured.lock().expect("capture mutex").clone();
+        assert!(
+            out.contains("kind=0x18"),
+            "the diagnostic must name the raw kind byte (0x18 = 24); got: {out}",
         );
     }
 
