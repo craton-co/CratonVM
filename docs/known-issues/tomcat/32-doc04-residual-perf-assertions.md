@@ -9,7 +9,7 @@ assertion is about speed, with its own separate reason.
 
 | item | disposition after the 2026-07-30 re-derivation |
 |---|---|
-| 32.1 | OPEN, **fully root-caused** — a dev regression, not a mapper problem. Closes when that is fixed; no Tomcat work left. |
+| 32.1 | OPEN. A dev regression, not a mapper problem. **Cause 1 FIXED 2026-07-30** — instance tier-up default restored, ~8.4x recovered. Cause 2, a diffuse ~4.5x in the same window, remains. No Tomcat work left either way. |
 | 32.2 | ✅ **Not a defect** — passes on a quiet host. Genuinely load-sensitive; expect intermittency on a busy one. |
 | 32.3 | OPEN, improved ~12–16 %. Root cause identified as per-completion processing, not I/O; no further AIO work will close it. |
 | 32.4 | OPEN, and **harder than recorded** — belongs to doc [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md)'s family, not here. |
@@ -123,14 +123,55 @@ today's binary rather than by inference (`CalleeTierUpProbe`, ns per call):
 
 **8.4×.** The flip was deliberate — the commit message records that the
 pre-decoded instance-call route "can strand a live embedded server request
-(Spring Boot `MultipartAutoConfigurationTests`) after promotion" — so this is a
-load-bearing gate in the same family as doc
-[30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md)'s RBC.6/RBC.7,
-not an accident. **Do not simply flip it back.** The real fix is to repair the
-pre-decoded instance-call route so tier-up can be re-enabled; what this document
-adds is the measured cost of leaving it off.
+(Spring Boot `MultipartAutoConfigurationTests`) after promotion" — so this was a
+load-bearing gate, not an accident, and flipping it back on its own would have
+re-opened the hazard.
 
-Note `git log -S jit_virtual_tierup` does **not** find this commit: `-S` counts
+#### FIXED 2026-07-30 — the hazard had one un-gated route, not four
+
+The stranding needs a callee that **declares an exception table**: a direct
+compiled entry has no interpreter boundary at which the callee's own handler can
+be resumed, so an implicit NPE/AIOOBE inside it bails out through the *caller's*
+epilogue and leaves a frame nobody can resume.
+
+`c28bdd687` gated exactly that on three of the four routes that can reach a
+direct entry — `mic_callee_has_exception_table` (MIC/PIC),
+`osr_callee_declares_handlers` (OSR), `try_jit_upgrade_with_gate`
+(inline-compile) — and missed the fourth, which is the **default** one: under
+`bg_compile` the background worker publishes and
+`execute_invokevirtual_cached`'s `jit_cache` probe promotes the site without
+consulting any gate. Turning the whole flag off was what actually held that
+route shut.
+
+The gap is now closed at the promotion site with the same predicate, reading
+`cached.exception_table` — carried on the callee's own cache entry, so it costs
+one field read rather than a class-manager lookup — and the default is ON again.
+
+Validation:
+
+* `CalleeTierUpProbe` 2 332 ns with the fix vs 25 127 ns with
+  `CRATONVM_JIT_VIRTUAL_TIERUP=0` — **~11× recovered**.
+* `CalleeHandlerRoutingProbe` (new): a hot handler-bearing instance callee that
+  takes its implicit exception only *after* the call site is promoted. Matches
+  HotSpot byte for byte with tier-up on and off.
+* Live embedded WebSocket server (`TestAsyncMessagesPerformance`) completes
+  normally in ~32 s gated / un-gated / off — no strand in any configuration.
+* JIT test sweep, 14 binaries serially: 13 fully green. The one failure,
+  `tier1_tests::t1_init_complexity_classifier_is_wired_through_jit`, is
+  pre-existing and owned by a *different* default (it passes under
+  `CRATONVM_JIT_PUTFIELD_INIT=0`).
+
+**What is NOT proven.** The original stranding could not be reproduced, so the
+new gate is correct by construction rather than demonstrated against the
+symptom: a deliberately un-gated control binary also matches HotSpot on the
+routing probe. `MultipartAutoConfigurationTests` is unusable as a gate right now
+— `module/spring-boot-servlet`'s jars date from 07-11 and predate
+`ErrorPageRegistrarBeanPostProcessor`, so all 12 cases fail with
+`NoClassDefFoundError` **identically with tier-up on and off**. Rebuild that
+module before trusting it. Revert lever if an embedded-server strand reappears:
+`CRATONVM_JIT_VIRTUAL_TIERUP=0`.
+
+Note `git log -S jit_virtual_tierup` does **not** find `c28bdd687`: `-S` counts
 occurrences of the string and the identifier count is unchanged, only
 `true` → `false`. Use `git log -G` or diff the window.
 

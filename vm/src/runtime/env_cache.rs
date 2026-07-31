@@ -522,18 +522,36 @@ pub fn bg_compile() -> bool {
 // opted in. See `docs/feature-designs/wire-tiered-manager.md` (Step 4).
 cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
 // Invocation-count tier-up for INSTANCE methods (invokevirtual/invokeinterface).
-// Default-OFF: the pre-decoded instance-call route can strand a live embedded
-// server request (Spring Boot MultipartAutoConfigurationTests) after promotion.
-// Static-method tier-up and JIT compilation through the normal checked
-// dispatcher remain enabled. Opt in for targeted performance work with
-// `CRATONVM_JIT_VIRTUAL_TIERUP=1` only after validating the workload.
+//
+// DEFAULT-ON. It was turned off wholesale in `c28bdd687` because the
+// pre-decoded instance-call route could strand a live embedded-server request
+// (Spring Boot `MultipartAutoConfigurationTests`) after promotion. That was a
+// real hazard but the wrong scope: the stranding needs a callee that DECLARES
+// AN EXCEPTION TABLE, because a direct compiled entry has no interpreter
+// boundary at which the callee's own handler can be resumed. The same commit
+// gated exactly that on the MIC/PIC route
+// (`mic_callee_has_exception_table`), the OSR direct-call route
+// (`osr_callee_declares_handlers`) and the inline-compile route
+// (`try_jit_upgrade_with_gate`) — but MISSED the `bg_compile` route, which is
+// the default one: the background worker publishes and
+// `execute_invokevirtual_cached`'s `jit_cache` probe promotes the site without
+// consulting any gate. That gap is now closed at the promotion site, so the
+// blanket default-OFF is no longer what is holding the hazard shut.
+//
+// Turning it off cost ~8.4x on ordinary instance-method bytecode — measured on
+// `CalleeTierUpProbe`, 2 432 ns on / 18 047 ns off — because `recycle()`-shaped
+// methods (plain field stores, no handlers) are exactly the ones the ban was
+// never about. See `docs/known-issues/tomcat/32-doc04-residual-perf-assertions.md`.
+//
+// Off-switch for diagnosis/bisection: `CRATONVM_JIT_VIRTUAL_TIERUP=0`.
 #[inline]
 pub fn jit_virtual_tierup() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_TIERUP") {
-        // Explicit opt-in only: nonzero/non-false enables; unset is safe.
+        // Explicit opt-out only: `0` / `false` disable; unset or any other
+        // value enables.
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     })
 }
 /// `CRATONVM_NATIVE_STRING_REGEX` — route `String.replaceAll` / `replaceFirst`
