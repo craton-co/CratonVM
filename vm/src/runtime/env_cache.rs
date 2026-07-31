@@ -392,29 +392,26 @@ pub fn real_proxy_super() -> bool {
 // index k with unchanged seq proves [0..k) stayed continuously frozen). See
 // `update_root_snapshot`. Local writes bump `exec_epoch`, so a frozen-frame
 // cache entry is reused only while that frame's root shape is unchanged. The
-// real ForkJoinPool lane bypasses both cache reuse and survive-GC remapping.
+// live guard on the cache is `roots::conservative_locals_enabled()`, read in
+// `update_root_snapshot`.
 //
-// KNOWN GAP — do not "fix" this by switching it to the resolved flag without
-// reading the analysis first. This is a *presence* test on
-// `CRATONVM_REAL_FORKJOINPOOL`, but real ForkJoinPool became the default and
-// that variable is now normally unset, so this predicate answers "was the
-// lane explicitly requested?" while the code above reads it as "are we in the
-// lane?". Under the default it says false on exactly the configuration that
-// IS the real lane, so the bypass no longer fires.
+// RETIRED 2026-07-31 — this is where `cached_is_set!(real_forkjoinpool,
+// "CRATONVM_REAL_FORKJOINPOOL")` used to live, and both cache sites bypassed
+// themselves when it was true. It was a *presence* test written while the real
+// pool was opt-in, so "the variable is set" and "we are in the real lane" were
+// the same statement. Real ForkJoinPool then became the default (opt out with
+// `CRATONVM_SYNTHETIC_FORKJOINPOOL`), nobody sets the old variable any more,
+// and the predicate went silently false on exactly the configuration it was
+// written to catch — the bypass had not fired on a default run since the flip.
 //
-// Pointing it at `flags().natives.real_forkjoinpool` makes the predicate
-// honest and is therefore the obvious fix. It is also wrong as a standalone
-// change: the flag is default-true, so the bypass would then fire always, the
-// frozen-frame cache would be dead on every run, and
-// `root_snapshot_cache_tests::local_write_invalidates_cached_deep_frame_roots`
-// fails (0 cached roots where it expects 2). Verified, not predicted.
-//
-// Deciding between "the hazard is now universal, so the cache must go" and
-// "the hazard was specific to the opt-in lane, so the bypass needs a narrower
-// trigger" needs GC-stress evidence nobody has gathered. Left as-is
-// deliberately, so the behaviour is unchanged while the question is open. See
-// docs/known-issues/rootsnap-cache-bypass-lost-its-trigger-20260730.md.
-cached_is_set!(real_forkjoinpool, "CRATONVM_REAL_FORKJOINPOOL");
+// It was removed rather than repointed at `flags().natives.real_forkjoinpool`
+// because the cache was first checked directly against the root loss the
+// bypass claimed to prevent: `CRATONVM_DBG_ROOTSNAP_VERIFY=1` re-scans every
+// frame the uncached way after each cached snapshot and reports any root the
+// cached snapshot lacks, and the real-lane Fork6/Fork6Hard GC-stress repros
+// reported none. Repointing it at the resolved flag would instead have fired
+// the bypass always and made the cache dead code on every run. See
+// docs/internal/rootsnap-cache-bypass-lost-its-trigger-RESOLVED-20260731.md.
 
 // DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang). Previously
 // default-OFF: `update_root_snapshot` rescans EVERY interpreter frame on every
@@ -1153,6 +1150,82 @@ pub fn real_bytecode_selector() -> &'static RealSelector {
 #[cfg(test)]
 mod tests {
     use super::parse_osr_backedge_enabled;
+
+    /// A `cached_is_set!` / `cached_is_ok!` predicate answers exactly one
+    /// question: "was this environment variable explicitly set?". Call sites
+    /// almost always want a different one: "is this feature active?". The two
+    /// coincide only while the feature's resolved default is *itself* a bare
+    /// presence test on the same variable — and they stop coinciding, silently
+    /// and without any call site changing, the moment that default moves.
+    ///
+    /// That is exactly how the real-ForkJoinPool root-snapshot-cache bypass
+    /// died: `real_forkjoinpool()` was a presence test on
+    /// `CRATONVM_REAL_FORKJOINPOOL`, the flag's default became
+    /// `!present(CRATONVM_SYNTHETIC_FORKJOINPOOL) || present(...)`, and the
+    /// predicate started answering `false` on the very configuration it
+    /// guarded. Nothing failed; the guard simply stopped running.
+    ///
+    /// So: no presence predicate in this file may name a variable that
+    /// `types/src/flags.rs` resolves with a compound default. Either the flag
+    /// default is a bare presence test (the two agree), or the call sites must
+    /// read the resolved flag instead of a presence test.
+    #[test]
+    fn no_presence_predicate_shadows_a_compound_flag_default() {
+        const ENV_CACHE_SRC: &str = include_str!("env_cache.rs");
+        const FLAGS_SRC: &str = include_str!("../../../types/src/flags.rs");
+
+        // Every env var behind a cached presence predicate in this file.
+        let mut presence_vars: Vec<&str> = Vec::new();
+        for line in ENV_CACHE_SRC.lines() {
+            let l = line.trim_start();
+            if l.starts_with("cached_is_set!(") || l.starts_with("cached_is_ok!(") {
+                if let Some(var) = l.split('"').nth(1) {
+                    presence_vars.push(var);
+                }
+            }
+        }
+        assert!(
+            presence_vars.len() > 20,
+            "the scanner found only {} presence predicates — it stopped matching \
+             the macro call shape it audits, so this gate is inert",
+            presence_vars.len()
+        );
+
+        // The flags.rs field initializer that resolves a given variable: from
+        // just after the previous initializer's `,` up to this one's.
+        fn initializer_around(src: &str, idx: usize) -> &str {
+            let mut start = src[..idx].rfind(",\n").map(|p| p + 2).unwrap_or(0);
+            if let Some(brace) = src[start..idx].rfind('{') {
+                start += brace + 1;
+            }
+            let end = src[idx..].find(",\n").map(|p| idx + p).unwrap_or(src.len());
+            &src[start..end]
+        }
+
+        let mut offenders: Vec<(&str, String)> = Vec::new();
+        for var in &presence_vars {
+            let needle = format!("present(src, \"{var}\")");
+            let mut from = 0;
+            while let Some(rel) = FLAGS_SRC[from..].find(&needle) {
+                let idx = from + rel;
+                from = idx + needle.len();
+                let init = initializer_around(FLAGS_SRC, idx);
+                // A default that can be true with the variable unset always
+                // reaches for another term: `||`, `&&`, or a negated presence.
+                if init.contains("||") || init.contains("&&") || init.contains("!present") {
+                    offenders.push((var, init.split_whitespace().collect::<Vec<_>>().join(" ")));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these env vars have a compound (non-presence) default in flags.rs \
+             but are still answered by a presence predicate in env_cache.rs, so \
+             the predicate now means \"explicitly requested\" and not \"active\": \
+             {offenders:?}"
+        );
+    }
 
     #[test]
     fn osr_backedge_defaults_on_and_has_explicit_opt_outs() {
