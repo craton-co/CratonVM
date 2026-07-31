@@ -8,8 +8,8 @@ confirmed by a negative control that reproduces the historical message
 byte-for-byte — that the previous "next discriminator" in this report was aimed
 at code which cannot produce the failure, that six genuine GC-rooting defects on
 that statement's CratonVM path were found and fixed, and that a campaign worth
-roughly 2.9 million executions of the suspect sequence produced zero
-occurrences against a historical rate near 1 in 1,400. This is a
+4,020,000 executions of the suspect sequence across 309 real WildFly boots
+produced zero occurrences against a historical rate near 1 in 1,400. This is a
 not-reproducible closure, not a demonstrated fix. The harness is committed at
 `docs/known-issues/repros/wfly0079-dup-attr/` and the reopening recipe at the
 bottom names exactly which of the two remaining producers a fresh occurrence
@@ -117,6 +117,11 @@ Both remain valid and are consistent with the localization above: the duplicate
 does not come from running the method twice, it comes from one run of the method
 registering one name twice.
 
+Housekeeping for anyone following the old instructions: the `DUPCALL3X` /
+`DUPREG2X` instrumentation those campaigns used no longer exists anywhere in
+the tree — it survives only as a mention in this file's history. Use the
+committed harness instead.
+
 ## Fixes landed on that path
 
 `new HashSet<>(Arrays.asList(add_attributes))` runs entirely in CratonVM
@@ -147,6 +152,27 @@ protected the callee's own copy.
 A moving cycle leaves those locals naming from-space; the non-moving sweep
 cannot see them as live at all and reclaims-and-zeroes them. These are real
 defects — but see the scope limit below before reading them as *the* producer.
+
+Commits: `04396f7388` (the six holes) and `ca0ea42997` (the reference-store
+refinement below), both in `native-collections/src/lib.rs`.
+
+**Read these as hardening, not as demonstrated bug fixes.** A deliberate attempt
+to trip them failed: `HashSetInitProbe` under `--nojit` (so the moving-young
+veto does not apply) with `CRATONVM_MOVING_YOUNG=1`,
+`CRATONVM_DBG_STALE_OBJREF=1`, `CRATONVM_DBG_STALE_OBJREF_CYCLES=3` and
+`CRATONVM_DBG_GC_STRESS=1048576` ran 2,000 constructions across 133 minor
+collections on the PRE-fix binary without the quarantine canary firing once. So
+these are defects against the crate's own stated rooting discipline — the same
+discipline whose violation elsewhere in this file was captured live during this
+very WildFly phase — but no capture ties them to `WFLYCTL0079`.
+
+The pins are held across the **reference-typed stores**, not merely across the
+allocation. `d6f483221c` (the concurrent `map_resize` chain-cursor fix)
+established that a reference `set_field`/`set_array_element` is itself a GC
+point, because its write barrier can allocate a remembered-set entry; these
+constructors do two such stores in a row (`table` at slot 0, then the mirror
+into the JDK-resolved `table` slot), so the second one needs a refreshed
+receiver and value.
 
 ## Why the relocation half of that hazard is currently dormant
 
@@ -182,14 +208,20 @@ The final configuration runs the canary on 8 concurrent threads. A
 single-threaded rep loop reproduces the rate but not the concurrency, and its
 later reps run after every other extension has finished, in a quiet VM.
 
+Boot counts are *completed* boots; a boot that timed out under build-host load
+is a discarded sample, not a result.
+
 | phase | binary | canary | boots | sequences | hits |
 |---|---|---|---|---|---|
-| 1 | pre-fix | warm, 1 thread × 3,000 | 27 | 81,000 | 0 |
+| 1 | pre-fix | warm, 1 thread × 3,000 | 28 | 84,000 | 0 |
 | 2 | pre-fix | warm+cold, 1 thread × 6,000 | 36 | 216,000 | 0 |
-| 3 | post-fix | warm+cold+registry, 1 thread × 6,000 | 21 | 126,000 | 0 |
-| 4 | post-fix | warm+cold+registry, 8 threads × 2,000 | 160 | 2,560,000 | 0 |
+| 3 | `04396f7388` | warm+cold+registry, 1 thread × 6,000 | 20 | 120,000 | 0 |
+| 4 | `04396f7388` | warm+cold+registry, 8 threads × 2,000 | 159 | 2,544,000 | 0 |
+| 5 | `ca0ea42997` (shipped) | warm+cold+registry, 8 threads × 2,000 | 66 | 1,056,000 | 0 |
 
-`CAMPAIGN_PHASE5`
+Total: **4,020,000** executions of the suspect sequence across **309** real
+WildFly boots, zero occurrences. Against a historical rate near 1 in 1,400 that
+is on the order of 2,800 expected failures.
 
 Standalone probes, same result: `WflyAttrSetProbe` 400,000 rounds on the
 post-fix binary (8 threads, alternating warm/cold), plus 9,600 rounds spread
