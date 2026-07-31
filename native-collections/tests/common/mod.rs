@@ -73,6 +73,10 @@ pub struct MockCtx {
     /// Test hook: simulate a moving GC during every Java callback by relocating
     /// all currently pinned roots before `invoke_virtual` returns.
     relocate_pins_on_invoke: UnsafeCell<bool>,
+    /// Test hook: simulate a moving GC immediately before every heap
+    /// allocation. This exercises native graph builders that must pin raw
+    /// arguments and intermediate objects across `alloc_*` calls.
+    relocate_pins_on_alloc: bool,
 }
 
 impl Default for MockCtx {
@@ -131,6 +135,7 @@ impl MockCtx {
             invoke_virtual_log: UnsafeCell::new(Vec::new()),
             native_pin_roots: UnsafeCell::new(Vec::new()),
             relocate_pins_on_invoke: UnsafeCell::new(false),
+            relocate_pins_on_alloc: false,
         }
     }
 
@@ -165,6 +170,10 @@ impl MockCtx {
         unsafe {
             *self.relocate_pins_on_invoke.get() = enabled;
         }
+    }
+
+    pub fn set_relocate_pins_on_alloc(&mut self, enabled: bool) {
+        self.relocate_pins_on_alloc = enabled;
     }
 
     pub fn set_class_interfaces(&self, class_id: ClassId, interfaces: Vec<ClassId>) {
@@ -747,12 +756,18 @@ impl cratonvm_native_api::NativeHeapAccess for MockCtx {
     // ------------------------------------------------------------------
 
     fn new_array(&mut self, _et: ArrayElementType, length: usize) -> ObjectRef {
+        if self.relocate_pins_on_alloc {
+            self.relocate_native_pins();
+        }
         self.alloc_entry(HeapEntry::Array {
             elements: vec![Value::Int(0); length],
         })
     }
 
     fn new_ref_array(&mut self, _c: ClassId, length: usize) -> ObjectRef {
+        if self.relocate_pins_on_alloc {
+            self.relocate_native_pins();
+        }
         self.alloc_entry(HeapEntry::Array {
             elements: vec![Value::Object(None); length],
         })
@@ -855,6 +870,9 @@ impl cratonvm_native_api::NativeHeapAccess for MockCtx {
     }
 
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+        if self.relocate_pins_on_alloc {
+            self.relocate_native_pins();
+        }
         self.alloc_entry(HeapEntry::Object {
             class_id,
             fields: vec![Value::Object(None); num_fields],

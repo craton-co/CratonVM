@@ -638,21 +638,11 @@ one of the 100,000,000 lookups takes two acquisitions of one process-wide
 `RwLock` plus a failed compile probe. Reader-reader `parking_lot` contention on a
 single cache line at ten threads is exactly the flat ~3700 ns/op ceiling above.
 
-**Why it is not fixed here.** The obvious repair is a thread-local memo of
-`(call site, receiver ClassId) -> (dispatch class name, cacheable, globally
-named)`, flushed on the same three signals that already flush
-`VIRTUAL_DISPATCH_CACHE` (`any_class_redefined`, `jit_cache_generation`,
-`jit_supersede_epoch`). Two of the three components are safe to cache that way.
-`globally_named` is not: it is `get_loaded_class_id(name) == receiver_cid`, and
-that answer flips the moment a second loader defines the same name — a plain
-class *definition*, which none of those three signals covers. Caching a stale
-`true` would let a compiled entry be reused for a receiver whose name is no
-longer unique, i.e. dispatch into the wrong class's method: a silent-wrong-answer
-bug on the hottest path in the VM. The prerequisite is a class-definition/unload
-epoch counter on `ClassManager`, and there is none today (checked). With one,
-this is a small change, and it lifts a ceiling that applies to **every**
-multi-threaded workload whose inner loop crosses a native or an uncompilable
-callee — not just this test.
+**The repair, and what it actually moved.** Done — see the final section.
+It required a class-definition epoch on `ClassManager` first, because
+`globally_named` is `get_loaded_class_id(name) == receiver_cid` and that answer
+flips the moment a second loader defines the same name, which none of the three
+existing flush signals can see.
 
 The single-thread gap that remains (675 vs 20.2 ns/op on the full-cache arm) is
 the separate, already-known native-call dispatch overhead, and is not addressed
@@ -677,3 +667,86 @@ Regression check for the change set: the 62 `org.apache.tomcat.util.{buf,
 collections,http}` / `org.apache.catalina.util` classes run identically on dev
 and on this branch — 59 PASS, the same two `*LargeHeap` failures (they want more
 than the 2g used here) and the same `TestMethodPerformance` timeout on both.
+
+## Update 2026-07-30 (3) — the dispatch-target memo landed; the wall moved to a different lock
+
+The memo named in the previous section is implemented. `ClassManager` now
+carries a **class-definition epoch** (`class_definition_epoch`), bumped by the
+three mutations of `loaded_classes` — insert, remove, and the bulk retain in
+`unload_user_classes_inner` — which are the only state
+`get_loaded_class_id` consults. `vm/src/jit/helpers.rs` memoizes
+`(call site, receiver ClassId) -> (dispatch class name, cacheable_receiver,
+globally_named)` per thread, revalidated against that epoch, and the three hot
+resolution sites (`jit_invoke_dispatch`, and both the no-entry and full-miss
+arms of `jit_invoke_virtual_mic`) now read it instead of taking
+`class_manager.read()` twice per call.
+
+### It removed exactly what it was aimed at
+
+`perf record -F 499`, ten-thread `ScaleProbe`, same host, same run shape:
+
+| symbol | dev | with the memo |
+|---|---|---|
+| `RawRwLock::lock_shared_slow` | 12.50% | **3.18%** |
+| `virtual_dispatch_target_for_receiver` | 7.72% | **gone** |
+| `OrderedPlRwLock<T>::read` | 2.07% | below 1.5% |
+
+That is ~19 points of CPU taken off the `class_manager` read lock.
+
+### But the wall-clock barely moved, because the next lock is bigger
+
+| symbol | dev | with the memo |
+|---|---|---|
+| `RawMutex::lock_slow` | 7.71% | **12.12%** |
+| kernel (futex) | ~6% | ~12% |
+
+Total lock time is roughly conserved: the workload is still serialized, now on a
+plain `Mutex` rather than the `class_manager` `RwLock`. Ten-thread `ScaleProbe`
+moved from 3803/3011/3664/3540 ns/op to 3001/3412/3709/3253 — inside the noise
+for three of the four arms. Single-threaded cost is unchanged (`Solo`, eight
+runs per binary: median 826 ns/op both, means 837 vs 841), so the memo's hash
+probe costs what the uncontended lock it replaced cost.
+
+**The Mutex is `types/src/jit_activation.rs`.** It is one process-wide
+`Mutex<Registry>` holding two `FxHashMap`s, and `enter`/`exit` lock it on
+**every** compiled-frame activation — twice per JIT boundary crossing, from
+every mutator at once. It exists to keep a defining loader alive while one of
+its compiled frames is on the stack. `owners` is written only when code is
+published and read on every enter; `active` is a refcount per ClassId that only
+`active_class_ids()` (the unload path) ever reads in aggregate. Both halves are
+therefore fixable — a read-mostly structure for `owners`, per-thread counters
+walked at aggregation time for `active` — but that is class-unload safety
+machinery, a separate change from this one.
+
+Two smaller `class_manager` acquisitions also survive on the same path, both
+inside `try_jit_compile_callee`, which the no-entry arm calls every time:
+`named_method_is_synchronized` takes a read lock, and the JIT-cache probe takes
+another for `get_loaded_class_id(class_name)` — an answer the new memo has
+already computed and could hand it. Worth doing, but at 3.18% it is no longer
+where the time is.
+
+### Safety argument for the memo
+
+Two of the three memoized fields need no invalidation at all: **`ClassId`s are
+never reused.** `ClassStore` tombstones an unloaded slot (`classes: Vec<Option<
+Class>>`, with `unloaded_slots_are_tombstoned_and_never_reused` asserting it),
+so a live receiver's `ClassId` always denotes the same class, and its name and
+`ACC_INTERFACE` are fixed at definition. Only `globally_named` is mutable, and
+that is what the epoch tracks.
+
+A stale `globally_named` is additionally not exploitable today, because its one
+by-name consumer, `try_jit_compile_callee`, re-resolves the name under its own
+lock and `get_loaded_class_id` returns `None` on a multi-loader collision rather
+than guessing. The epoch is what makes the memo *locally* provable instead of
+resting on that distant invariant — and, as a side effect, it closes a gap
+`DISPATCH_CACHE` and `VIRTUAL_DISPATCH_CACHE` already had: they cache a compiled
+entry chosen on the strength of a `globally_named` test that nothing was
+re-running, and they now flush on the epoch too.
+
+`probes/LoaderNameCollisionDispatchProbe.java` is the regression net: two
+sibling loaders each define their own `Impl`, the first is driven hot alone so
+its memo entry is populated while the name is still unique, and only then does
+the colliding class appear. Note it passes **with the epoch flush disabled as
+well** — which is the honest reading of the paragraph above, not a claim that
+the probe proves the epoch necessary. It proves the memo does not break
+multi-loader dispatch, which is what it is for.

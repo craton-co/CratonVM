@@ -20778,7 +20778,8 @@ pub(super) fn try_execute_cached_trivial_instance_getter(
     cached: &CachedBytecodeMethod,
     args: &[Value],
 ) -> Result<Option<CachedCallResult>, MethodCallFailed> {
-    if cached.is_static
+    if !crate::runtime::env_cache::trivial_getter_fast_path()
+        || cached.is_static
         || cached.is_synchronized
         || cached.num_params != 0
         || args.len() != 1
@@ -20853,6 +20854,54 @@ pub(super) fn try_execute_cached_trivial_instance_getter(
     );
     if !return_matches_field {
         return Ok(None);
+    }
+
+    // CRATONVM_TRIVIAL_GETTER_VERIFY — resolve the same field reference the way
+    // the `getfield` opcode would and report any divergence.
+    //
+    // This exists because the fast path reads the `resolution_cache` raw, while
+    // the opcode goes through `resolve_field_ref_loader_aware`, which documents
+    // that a cache entry "may have been populated by a loader-blind helper" and
+    // refuses to trust one for a user-defined-loader caller. That made the fast
+    // path the prime suspect for the 2026-07-30 Hibernate HQL mis-parse. It was
+    // not: a full `ASTParserLoadingTest` run under this verifier reported ZERO
+    // divergences while still mis-parsing, and the same run passed 106/106 with
+    // `CRATONVM_NO_MOVING_YOUNG=1` — the defect was missing native roots in the
+    // ANTLR intrinsics. Keep the verifier so that conclusion stays one env var
+    // away from being re-checked instead of re-argued.
+    if crate::runtime::env_cache::trivial_getter_verify() {
+        if let Ok(authoritative) = resolve_field_ref_loader_aware(
+            shared,
+            thread,
+            cached.declaring_class_id,
+            field_cp_index,
+        ) {
+            if authoritative.field_index != field.field_index
+                || authoritative.desc_byte != field.desc_byte
+                || authoritative.is_reference != field.is_reference
+                || authoritative.is_volatile != field.is_volatile
+                || authoritative.declaring_class_id != field.declaring_class_id
+            {
+                eprintln!(
+                    "[TRIVIAL-GETTER-DIVERGENCE] {}.{}{} cp#{field_cp_index}: \
+                     cached(idx={} desc={} ref={} vol={} owner={:?}) != \
+                     loader_aware(idx={} desc={} ref={} vol={} owner={:?})",
+                    cached.class_name,
+                    cached.method_name,
+                    cached.method_descriptor,
+                    field.field_index,
+                    field.desc_byte as char,
+                    field.is_reference,
+                    field.is_volatile,
+                    field.declaring_class_id,
+                    authoritative.field_index,
+                    authoritative.desc_byte as char,
+                    authoritative.is_reference,
+                    authoritative.is_volatile,
+                    authoritative.declaring_class_id,
+                );
+            }
+        }
     }
 
     let Value::Object(Some(receiver)) = args[0] else {
@@ -21624,6 +21673,29 @@ pub(super) fn execute_invokevirtual_cached(
                         // this virtual promotion out of java.util; static
                         // compilation and ordinary direct dispatch remain on.
                         && !receiver_is_java_util
+                        // A handler-bearing callee must never be entered by a
+                        // DIRECT compiled call. `execute_jit_call_decoded`
+                        // below has no interpreter boundary at which the
+                        // callee's own exception table can be resumed, so an
+                        // implicit NPE/AIOOBE raised inside it bails out
+                        // through THIS caller's epilogue, past the only point
+                        // able to route it — leaving a pending exceptional
+                        // frame the caller cannot resume. On an embedded server
+                        // that surfaces as a request that never completes
+                        // (`MultipartAutoConfigurationTests`).
+                        //
+                        // `try_jit_upgrade_with_gate` already refuses these,
+                        // and so do the MIC/PIC and OSR direct-call sites
+                        // (`mic_callee_has_exception_table`,
+                        // `osr_callee_declares_handlers`). This route was the
+                        // gap: under `bg_compile` — the DEFAULT — the worker
+                        // publishes and the `jit_cache` probe below promotes
+                        // the site without consulting the gate, which is the
+                        // only reason `jit_virtual_tierup` had to be turned off
+                        // wholesale. `exception_table` is carried on the
+                        // callee's own cache entry, so this costs one field
+                        // read, not a class-manager lookup.
+                        && cached.exception_table.is_empty()
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
                         // Fast path: already compiled (by this counter or OSR)?

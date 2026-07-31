@@ -1453,23 +1453,76 @@ pub(crate) fn loader_object_for_namespace_id(ns_id: u32) -> Option<ObjectRef> {
 /// user loader its own namespace so an override-first redefinition of an
 /// already-loaded class does not collide with the original definer.
 pub fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> u32 {
+    loader_namespace_id_at(ctx, loader, 0)
+}
+
+/// `loader_namespace_id` with the parent-walk recursion depth threaded through.
+/// The depth cap only guards against a malformed `parent` cycle — real chains
+/// are 2-3 deep.
+fn loader_namespace_id_at(ctx: &mut dyn NativeContext, loader: ObjectRef, depth: usize) -> u32 {
     if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
         return 0;
     }
     if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
         if v > 0 {
+            // Synthetic-JDK mode keeps the id in a field slot, so this path
+            // never reaches the allocation below — the parent link has to be
+            // recorded here too or the chain is invisible in that mode.
+            record_parent_link(ctx, loader, v as u32, depth);
             return v as u32;
         }
     }
+    // Resolve the parent's namespace BEFORE taking the store lock: doing it
+    // afterwards re-enters this function (the parent may not have an id yet)
+    // against a non-reentrant `std::sync::Mutex`.
+    let parent_ns = parent_namespace_id(ctx, loader, depth);
     let mut map = loader_namespace_id_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(&(_, id)) = map.iter().find(|(l, _)| l.as_ptr() == loader.as_ptr()) {
+        drop(map);
+        cratonvm_classloading::register_user_loader_parent(id, parent_ns);
         return id;
     }
     let id = ctx.allocate_loader_id();
     map.push((loader, id));
+    drop(map);
+    cratonvm_classloading::register_user_loader_parent(id, parent_ns);
     id
+}
+
+/// Namespace id of `loader`'s delegation parent, allocating one for the parent
+/// if it does not have one yet. `0` for a built-in (or absent) parent.
+///
+/// Allocating eagerly matters: the child is normally the first of the pair to
+/// define a class, so a lazy "record it when the parent gets an id" scheme
+/// would leave the link permanently unset for exactly the case that needs it —
+/// Spring's `TestCompiler` `DynamicClassLoader` over a
+/// `@CompileWithForkedClassLoader` fork loader. Allocating an id for a loader
+/// that never defines a class costs nothing: ids come from a counter, and the
+/// class manager's `user_loaders` set is still only populated at define time.
+fn parent_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef, depth: usize) -> u32 {
+    if depth >= cratonvm_classloading::MAX_USER_LOADER_DEPTH {
+        return 0;
+    }
+    match classloader_parent(ctx, loader) {
+        Some(parent) if parent.as_ptr() != loader.as_ptr() => {
+            loader_namespace_id_at(ctx, parent, depth + 1)
+        }
+        _ => 0,
+    }
+}
+
+/// Record `loader`'s parent link when its namespace id was already known.
+/// A link once recorded — including the `0` that means "delegates to the
+/// built-in chain" — is never recomputed, so this stays a single map probe on
+/// the hot path.
+fn record_parent_link(ctx: &mut dyn NativeContext, loader: ObjectRef, id: u32, depth: usize) {
+    if id < 3 || cratonvm_classloading::user_loader_parent_known(id) {
+        return;
+    }
+    let parent_ns = parent_namespace_id(ctx, loader, depth);
+    cratonvm_classloading::register_user_loader_parent(id, parent_ns);
 }
 
 /// Read-only probe of a user loader's namespace id (no allocation). `None` when

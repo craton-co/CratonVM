@@ -2,6 +2,7 @@
 
 | | |
 |---|---|
+| **Sixth session** | 2026-07-30, branch `fix/spring-aot-cluster-20260730`, worktree `/data/data/wt-aot-20260730`, binaries `localbin/cratonvm-aot30-v*.bin`. Closed both reproducible AOT items and the architectural gap under them, plus a dev regression that had made **every** AOT probe die in 1.3 s. The third item is not an AOT defect — it is the separately-tracked Mockito redefine-throughput issue. See *Closed in the sixth session*. |
 | **Status** | OPEN — **1 residual class** (was 3 after the fourth session, 9 after the third, 19 before it, 57 before that, 127 before that). Thirteen VM bugs closed in the third session, seven in the fourth, three in the fifth; every one has a standalone HotSpot-vs-CratonVM probe. |
 | **Captured** | 2026-07-27 (third session), branch `fix/spring-buglist-final-20260727` merged into `origin/dev` at `1f538bf76`, Azure host `20.83.144.174`, real JDK 25, worktree `/data/data/wt-sprbuglist-20260727`, binaries `localbin/cratonvm-sprfinal-v*.bin`. Every number below was measured with the class run **in isolation** (`apps/spring-suite-runner/onea.sh <fqcn>`), not from a sharded batch — the shared host runs at load 25–100 and batch runs emit spurious FAIL/TIMEOUT rows. |
 | **Fourth session** | 2026-07-28, branch `fix/spring-nonaot-20260727` merged into `origin/dev`, worktree `/data/data/wt-spr-nonaot-20260727`, binaries `localbin/cratonvm-nonaot-v*.bin`. Took the five non-AOT residuals from LOADERR/0/2/2/6/26-27/165-170 to **fully green**, and turned the sixth (`RequestMappingMessageConversionIntegrationTests`) out to be a heap-sizing artifact rather than a linkage bug. See *Closed in the fourth session* below. |
@@ -358,7 +359,283 @@ loop, removed the profile's top three symbols —
 (4.9%) and `scan_active_jit_frames_with_sp` (4.9%) — none of which appears in
 the top twenty afterwards.
 
-## What is left (1 class)
+## Closed in the sixth session (2026-07-30)
+
+Branch `fix/spring-2tests-20260730`, worktree `/data/data/wt-spr2t-20260730`,
+binaries `localbin/cv-spr2t-v*.bin`, runner copy `/data/data/spr2t-runner`.
+Both classes the third/fourth sessions had written off as fixture artefacts
+turned out to have a real VM bug behind them.
+
+| class | before | after |
+|---|--:|--:|
+| `context.annotation.ConfigurationClassEnhancerTests` | 4/5 | **5/5** |
+| `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | 0/160, then TIMEOUT | **160/160** at the DEFAULT heap |
+
+### `ConfigurationClassEnhancerTests.withPublicClass` — the enhancer ignored the requested loader
+
+The third session recorded this one as failing "identically on HotSpot in this
+checkout". It does — but only because `KRun` does not pass
+`--add-opens java.base/java.lang=ALL-UNNAMED`. Spring's CGLIB fork says so in
+`ReflectUtils.defineClass` itself ("Avoid through JVM startup with
+--add-opens=java.base/java.lang=ALL-UNNAMED"): without it the reflective
+`ClassLoader.defineClass` is inaccessible and the generated class falls back to
+the neighbour-class loader. **With** the flag HotSpot is 5/5, so the flag — not
+the assertion — was the artefact.
+
+CratonVM answered the config class's own loader for all four loaders because
+`cce_enhance` (`native-builtins/src/cglib_enhancer.rs`, a native replacement for
+`ConfigurationClassEnhancer.enhance`) never read its `classLoader` argument at
+all. It now performs the same arbitration `enhance` does, measured against
+HotSpot with `probes/CceProbe.java`, which prints the real answer per loader:
+
+| loader | HotSpot (with `--add-opens`) | why |
+|---|---|---|
+| `URLClassLoader` | the loader itself | public config class, plain delegation |
+| `OverridingClassLoader` | its PARENT | it defines its OWN copy of the superclass |
+| `CustomSmartClassLoader` | its PARENT | `SmartClassLoader.getOriginalClassLoader()` |
+| `BasicSmartClassLoader` | the loader itself | `publicDefineClass`, no local override |
+
+So the native now: resolves a `SmartClassLoader` through
+`getOriginalClassLoader()`; falls back to the config class's loader when
+`reliesOnPackageVisibility` holds (package-private class, constructor or
+`@Bean` method — this is what keeps `withNonPublic*` at PARENT); and otherwise
+asks the target loader to `loadClass` the superclass name, using it only when
+the answer is the SAME class the JVM would resolve at define time. The chosen
+namespace then keys the `$$SpringCGLIB$$<n>` counter, the class cache and the
+define, so `Class.getClassLoader()` reports the loader Spring asked for
+(`native_class_get_class_loader`'s `loader_type >= 3` arm already maps a
+namespace id back to its loader object — no extra attribution needed).
+
+### `RequestMappingMessageConversionIntegrationTests` — two bugs, neither a linkage bug
+
+The fourth session called this one a heap-sizing artefact ("160/160 at a 6 GB
+heap"). On current `dev` it is **0/160**, and the 6 GB dependency is a real GC
+livelock:
+
+1. **`Socket.setOption` refused every not-yet-connected socket.** Apache
+   HttpClient 5's `DefaultHttpClientConnectionOperator.configureSocket` sets
+   `TCP_KEEPIDLE`/`TCP_KEEPINTERVAL`/`TCP_KEEPCOUNT` through `jdk.net.Sockets`
+   BEFORE `Socket.connect` — Spring's `RestClient` picks that request factory
+   whenever httpclient5 is on the classpath, so this failed all 160 tests with
+   *"Socket.setOption: socket is not connected"*. HotSpot allows it:
+   `Socket.getImpl()` runs `createImpl(true)`, so the fd exists before connect
+   and the option is still in effect afterwards. `net_phase_e.rs` now retains
+   such options in `SockSide::pending_options` and applies them when `connect`
+   publishes the stream — the same retained-setting treatment `read_timeout_ms`
+   already had — and `getOption` answers from that retention. A CLOSED socket
+   still raises. Repro: `probes/SockCfgProbe.java` (HotSpot prints
+   `preconnect setOption OK`, CratonVM used to print `THREW`), end-to-end
+   `probes/RcProbe.java`.
+
+2. **The young-GC trigger livelocked against a sweep that cannot get under
+   it.** With that fixed the class still wedged at test 151/160 at the default
+   4 GB heap — ~zero forward progress for 8+ minutes at 200% CPU. It is not
+   "slow": `CRATONVM_DBG_YOUNG_TRIGGER=1` (new) shows
+   `cursor=1023MB free_list=512MB live=511MB threshold=512MB`, i.e. the live
+   young set sits one megabyte above the trigger. Any collection that runs
+   while compiled code exists is forced onto the NON-MOVING sweep
+   (`conservative_roots::refresh_moving_young_coverage_for_current_thread`
+   marks `JIT_RELOCATION_UNSUPPORTED` whenever `jit_code_range_count() != 0`),
+   which reclaims in place and cannot move that live set out of young — so
+   `needs_gc` stayed true on essentially every allocation. `gen_heap.rs` now
+   samples `live` once per completed collection and, when a collection leaves
+   it at or above the trigger, requires a further 1/16 of capacity of real
+   growth before collecting again, capped at
+   `NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT` so collection is deferred and never
+   abandoned (allocation failure → old-gen spill → GC-and-retry is still the
+   backstop). Result: **160/160 in 8–11 min at the stock 4 GB default**, no
+   fallback storm. `bench/BinTreesClassic 18` is unchanged (checksum
+   68332206; 2404/2640 ms after vs 2537/2503 ms before, same loaded host).
+
+HotSpot reference for the class: 160/160 in 12.3 s, peak RSS 545 MB.
+CratonVM after the fixes: 160/160, peak RSS 2.6 GB. The remaining ~40x wall
+clock and ~5x footprint are the standing interpreter/GC gap, not this class.
+
+### Noted while verifying, NOT caused by these fixes
+
+`context.aot.ApplicationContextAotGeneratorTests` (8/40) and
+`test.context.aot.TestContextAotGeneratorIntegrationTests` (0/4) both failed on
+current `dev` while these fixes were being verified, and both reproduce
+identically on a binary built from pristine `dev` (`e255f60fb1`). That is the
+loader-blind `StackWalker.StackFrame.getDeclaringClass()` bug the AOT-cluster
+session diagnosed and fixed — see *First: everything was broken, and not by
+this cluster* below.
+
+| item | before | after |
+|---|--:|--:|
+| chunk 3 — `bean.override.BeanOverrideHandlerTests` (AssertJ soft assertions) | 39/42 | **42/42** (= HotSpot) |
+| chunk 9 — `mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests` (CGLIB proxy) | 4/4 **fail** | **8/8** for the chunk (= HotSpot) |
+| chunk 6 | 31/33 | **33/33** — CratonVM now passes two the HotSpot harness itself fails |
+| chunks 0, 19 | already matching | unchanged, still matching |
+
+Single-class probes: `BeanOverrideHandlerTests` 16/19 → **19/19**,
+`MockitoSpyBeanAndSpringAopProxyIntegrationTests` 0/4 → **4/4**.
+
+### First: everything was broken, and not by this cluster
+
+Every AOT probe on `origin/dev@c8da3d9188` died in **1.3 seconds** with
+
+```
+NullPointerException: Cannot invoke "org.apache.commons.logging.Log.isDebugEnabled()"
+  because "this.logger" is null    at AbstractEnvironment.setActiveProfiles
+```
+
+Four layers deep: log4j-api's `StackLocator` walked the stack, a frame's
+`getDeclaringClass()` answered **null**, the NPE escaped
+`AbstractEnvironment`'s `logger` field initialiser, and
+`construct_real_standard_environment` **swallowed it with `.ok()?`** — handing
+Spring a synthetic `StandardEnvironment` allocated with no constructor at all.
+
+`declaring_class_native` resolved a frame's declaring class by NAME through
+`class_id_by_name`, which is `find_unique_class_by_name`: loader-blind AND
+ambiguity-strict, so it answers `None` the moment two loaders define the name.
+Under `@CompileWithForkedClassLoader` that is the normal state of every non-JDK
+class. The frame's own ClassId was already available and already resolved to a
+mirror by both frame builders — the accessors just never looked at it. They do
+now, and the swallowed failure is reported instead of hidden.
+
+### The two real items
+
+**A CGLIB AOP proxy inherited the wrong copy of its superclass.** This is the
+item the fifth session named and left open, and it turned out to be one
+instance of a much older architectural gap:
+`BUILTIN_LOADER_DELEGATION_CHAIN`'s doc comment said a user loader's parent
+chain "is modelled on the Java side … the Rust side never observes a deep
+parent walk for those". True for finding BYTES; never true for RESOLUTION
+against already-defined classes, which is entirely Rust-side. A class defined
+by `UserDefined(7)` could resolve a supertype only against its own namespace or
+`Bootstrap → Extension → Application`; a name defined by its own PARENT
+`UserDefined(3)` was invisible, so resolution fell through to the loader-blind
+global path — which, for a name that is also on the application classpath,
+**defines a second copy there** and links to it.
+
+Reduced to a ~1 s standalone witness with no Spring at all
+(`/data/data/pcprobe`, `ParentChainProbe`):
+
+```
+ParentLoader (child-first, parent = platform) defines its own Foo
+ChildLoader  (parent = ParentLoader)          defines its own Bar extends Foo
+
+HotSpot  : Bar.getSuperclass() == ParentLoader's Foo
+CratonVM : Bar.getSuperclass() == the APPLICATION loader's Foo
+```
+
+`loaders.rs` now records user-loader parents (`USER_LOADER_PARENTS`, written by
+the loader-namespace allocator, the only place that can see the Java
+`ClassLoader.parent` field) and `class_manager` walks them in
+`resolve_supertype` and in both requester-aware lookups, ahead of the built-in
+chain and ahead of the global fallback. `CRATONVM_LOADER_PARENT_CHAIN=0`
+restores the old behaviour, which is how the witness was A/B'd on one binary.
+
+**AssertJ soft assertions could not build their ByteBuddy proxy.** Not a
+ByteBuddy problem and not a generics problem: CratonVM's own ByteBuddy shims
+in `test_frameworks.rs` built their return values with
+`new_object_initialized(<literal name>, …)`, which takes only a name and so
+resolved globally — returning the APPLICATION loader's copy whoever called.
+Bytecode would have resolved that `new` through its own defining loader
+(JVMS §5.4.3.1).
+
+The mixed object graph breaks on the first enum comparison. `MgProbe4`, forked:
+
+```
+                       before                     HotSpot / after
+  mCls     ForLoadedMethod   AppClassLoader       ForkedClassLoader
+  sortCls  TypeDefinition$Sort AppClassLoader     ForkedClassLoader
+  varCls   TypeDefinition$Sort ForkedClassLoader  ForkedClassLoader
+  Sort.VARIABLE.equals(tv.getSort())   false      true
+```
+
+`MethodDescription$TypeSubstituting.getTypeVariables()` filters with
+`ofSort(Sort.VARIABLE)`; two different `Sort` classes means the filter drops
+every type variable, the generic method looks non-generic, and ByteBuddy cannot
+attach `T` when writing the access bridge —
+`IllegalArgumentException: Could not create type`. The shims now resolve
+through `class_id_by_name_via_referencing_class` anchored on the receiver.
+
+### The third item is not an AOT bug
+
+chunk 4 (`mockito.constructor.MockitoBeanByTypeLookupForConstructorParameters…`)
+still does not finish. `CRATONVM_DEFAULT_WATCHDOG_SEC=420` settles what it is:
+the main thread is in `TestCompiler.compile` → in-process javac →
+`JavaTokenizer` → … → `MockMethodAdvice` → `WeakConcurrentMap$LatentKey.hashCode`,
+spinning, not blocked. That is exactly
+[`mockito-redefine-makes-every-call-40us-20260726.md`](mockito-redefine-makes-every-call-40us-20260726.md),
+open since 2026-07-26, and it is reproducible in 90 seconds with `SbCostProbe`
+without Spring, JUnit or AOT anywhere. It should be tracked there, not here.
+
+### Full 20-chunk sweep, `cratonvm-aot30-v7.bin`
+
+All twenty chunks were re-run against the stored HotSpot baselines.
+**19 of 20 match HotSpot exactly**; chunk 6 is 33/33 where the HotSpot harness
+itself only manages 31/33. Chunk 4 is the only one that does not finish.
+
+| chunk | CratonVM | HotSpot |
+|--:|---|---|
+| 0 | 38/38 | 38/38 |
+| 1 | 37 found, 36 succ | same |
+| 2 | 6 found, 1 succ | same |
+| 3 | **42/42** (was 39/42) | 42/42 |
+| 4 | **does not finish** | 25 found, 24 succ |
+| 5 | 20/20 | 20/20 |
+| 6 | **33/33** | 33 found, 31 succ |
+| 7–19 | identical to HotSpot in every case | |
+
+(The `succ < found` rows are HotSpot's own probe artefacts — the TestNG
+engine's `ServiceConfigurationError` under the forked TCCL and
+`non-public interface is not defined by the given loader`. They are equal on
+both VMs, which is the point.)
+
+### NEW, found by merging with `origin/dev` at the end of the session
+
+`mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests` passes
+**4/4** with this session's fixes on `dev@c8da3d9188`, and **0/4** with the same
+fixes on `dev` as of 2026-07-30 evening. The failure has moved: it is no longer
+`Could not inject field` (that is the CGLIB defect, closed above) but
+
+```
+AssertionFailedError: expected: 1L but was: 69529817542L
+```
+
+— a `@MockitoSpyBean` stub being ignored, so the real method runs and returns a
+live `System.nanoTime()` reading. Same binary, same fixes, only the dev base
+differs, so this is a regression on `dev`, not from this branch. It is invisible
+on plain `dev` because without the CGLIB fix the test dies at injection before
+ever reaching the assertion.
+
+Not JIT-related (`--nojit` reproduces). The obvious suspect is the same day's
+`fix/deep-audit-retire-20260730`, which replaced the process-wide
+`any_class_redefined()` quiesce with per-class checks in
+`vm/src/runtime/redefine_state.rs` — the old blanket gate suppressed native
+shadows for everything, so it could not miss a woven class.
+
+**One thing already tried and reverted** (so it is not tried twice): those
+per-class checks resolve names through `get_loaded_class_id`, which probes the
+built-in chain in delegation order and therefore returns the APPLICATION
+loader's copy whenever one exists — generation 0 — even when the fork loader's
+copy right beside it is the woven one. Making the name-keyed checks answer
+"was ANY class under this name redefined" is strictly more correct, was
+implemented, and **did not change the result** (still 0/4), so it was reverted
+rather than shipped as an unverified widening of a gate someone had just
+deliberately narrowed. The loader-blindness is real and worth fixing; it is
+simply not the whole of this failure.
+
+Repro, ~2 minutes:
+
+```bash
+cd /data/data/aot20260726
+CRATONVM_BIN=<binary> TMO=600 XMX=2g ./oneaot.sh cg \
+  org.springframework.test.context.bean.override.mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests
+```
+
+## What is left
+
+1. `AotIntegrationTests#endToEndTestsForBeanOverrides` chunk 4, blocked on the
+   Mockito redefine-throughput issue above.
+2. The `@MockitoSpyBean` stub regression just described.
+
+Every other chunk matches HotSpot or beats it.
+
+## What the fifth session left (1 class)
 
 `test.context.aot.AotIntegrationTests`, and specifically
 `endToEndTestsForBeanOverrides`. It does **not** complete in 3 h on this host

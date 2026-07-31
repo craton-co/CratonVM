@@ -522,18 +522,36 @@ pub fn bg_compile() -> bool {
 // opted in. See `docs/feature-designs/wire-tiered-manager.md` (Step 4).
 cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
 // Invocation-count tier-up for INSTANCE methods (invokevirtual/invokeinterface).
-// Default-OFF: the pre-decoded instance-call route can strand a live embedded
-// server request (Spring Boot MultipartAutoConfigurationTests) after promotion.
-// Static-method tier-up and JIT compilation through the normal checked
-// dispatcher remain enabled. Opt in for targeted performance work with
-// `CRATONVM_JIT_VIRTUAL_TIERUP=1` only after validating the workload.
+//
+// DEFAULT-ON. It was turned off wholesale in `c28bdd687` because the
+// pre-decoded instance-call route could strand a live embedded-server request
+// (Spring Boot `MultipartAutoConfigurationTests`) after promotion. That was a
+// real hazard but the wrong scope: the stranding needs a callee that DECLARES
+// AN EXCEPTION TABLE, because a direct compiled entry has no interpreter
+// boundary at which the callee's own handler can be resumed. The same commit
+// gated exactly that on the MIC/PIC route
+// (`mic_callee_has_exception_table`), the OSR direct-call route
+// (`osr_callee_declares_handlers`) and the inline-compile route
+// (`try_jit_upgrade_with_gate`) — but MISSED the `bg_compile` route, which is
+// the default one: the background worker publishes and
+// `execute_invokevirtual_cached`'s `jit_cache` probe promotes the site without
+// consulting any gate. That gap is now closed at the promotion site, so the
+// blanket default-OFF is no longer what is holding the hazard shut.
+//
+// Turning it off cost ~8.4x on ordinary instance-method bytecode — measured on
+// `CalleeTierUpProbe`, 2 432 ns on / 18 047 ns off — because `recycle()`-shaped
+// methods (plain field stores, no handlers) are exactly the ones the ban was
+// never about. See `docs/known-issues/tomcat/32-doc04-residual-perf-assertions.md`.
+//
+// Off-switch for diagnosis/bisection: `CRATONVM_JIT_VIRTUAL_TIERUP=0`.
 #[inline]
 pub fn jit_virtual_tierup() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_TIERUP") {
-        // Explicit opt-in only: nonzero/non-false enables; unset is safe.
+        // Explicit opt-out only: `0` / `false` disable; unset or any other
+        // value enables.
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     })
 }
 /// `CRATONVM_NATIVE_STRING_REGEX` — route `String.replaceAll` / `replaceFirst`
@@ -629,6 +647,36 @@ cached_is_set!(ctor_direct_call_disabled, "CRATONVM_NO_CTOR_DIRECT_CALL");
 cached_is_set!(ctor_fix_dbg, "CRATONVM_DBG_CTOR_FIX");
 
 // ── Frame-trace and interpreter hot-path flags ──────────────────────────
+
+/// `CRATONVM_TRIVIAL_GETTER` — off-switch for `execute_invokevirtual_cached`'s
+/// stackless `aload_0; getfield; <x>return` accessor fast path. `0`/`off`/
+/// `false`/`no` disables it; anything else (including unset) leaves it on.
+///
+/// The fast path reimplements the `getfield` opcode's value semantics, so a
+/// divergence between the two would be a silent-wrong-value bug rather than a
+/// crash. It is also the single biggest change to `--nojit` allocation and
+/// safepoint timing on accessor-heavy workloads, which makes it the first
+/// suspect whenever an interpreter-only run starts producing nondeterministic
+/// wrong answers. Being able to A/B it within ONE binary is what let the
+/// Hibernate HQL mis-parse be attributed to the moving young collector instead
+/// (see `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`);
+/// keep the switch so the next such question costs one run, not one build.
+#[inline]
+pub fn trivial_getter_fast_path() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_TRIVIAL_GETTER") {
+            Ok(v) => !matches!(v.trim(), "0" | "off" | "false" | "no"),
+            Err(_) => true,
+        },
+    )
+}
+
+/// `CRATONVM_TRIVIAL_GETTER_VERIFY` — cross-check every trivial-accessor fast
+/// path hit against the loader-aware `getfield` resolver and report any
+/// divergence. Expensive (it performs the full resolution the fast path exists
+/// to avoid); diagnostic use only.
+cached_is_set!(trivial_getter_verify, "CRATONVM_TRIVIAL_GETTER_VERIFY");
 
 cached_is_set!(frame_trace, "CRATONVM_FRAME_TRACE");
 cached_is_set!(iae_trace_os, "CRATONVM_IAE_TRACE");
