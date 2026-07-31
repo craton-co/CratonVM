@@ -1,0 +1,49 @@
+# =============================================================================
+# class-overrides.tsv — per-class runner accommodations for run-hib.sh
+#
+# THIS FILE IS TRACKED IN GIT ON PURPOSE.
+#
+# `apps/` is gitignored wholesale (.gitignore:12), so everything else in
+# apps/hib-suite-runner/ carries no history: it cannot be diffed, blamed, or
+# restored, and it has already been silently lost twice —
+#   * 2026-07-16: the driver files (rerun.sh, common.args, CratonRunner.java,
+#     testlist.txt, ...) were truncated to zero bytes by local disk exhaustion
+#     and were restored from a hib-suite-runner.tar backup three weeks stale;
+#   * 2026-07-22 -> 2026-07-31: the per-class timeout/mode accommodation for
+#     DefaultCatalogAndSchemaTest was implemented, validated, documented as
+#     "Resolved", and then vanished from run-hib.sh with nothing to flag it.
+#     See docs/known-issues/... (now docs/internal/fixed-suite-bugs/hibernate/
+#     qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md).
+#
+# run-hib.sh and this table are force-added (`git add -f`) past the apps/
+# ignore so a future truncation or stale-backup restore shows up as a normal
+# `git status` modification instead of disappearing invisibly.
+#
+# -----------------------------------------------------------------------------
+# FORMAT — tab-separated, three columns. `#` comments and blank lines ignored.
+#
+#   <fully.qualified.TestClass>   <timeout-seconds | ->   <extra VM flags | ->
+#
+#   timeout   a FLOOR, not an absolute: the class runs with
+#             max(this, the run's --timeout/$TIMEOUT). `-` = no override.
+#   flags     extra CratonVM flags appended for this class only, before the
+#             @common.args argfile. Space-separated. Already-present flags are
+#             not duplicated. `-` = none.
+#
+# Verify the table is actually live before trusting a suite run:
+#     ./run-hib.sh overrides
+# A run whose header does not print `overrides=N (loaded)` is running without
+# these accommodations and will misreport the classes below.
+# -----------------------------------------------------------------------------
+
+# DefaultCatalogAndSchemaTest — 132-method @ParameterizedClass matrix whose
+# implicit FK/constraint naming goes through NamingHelper.hashedName ->
+# BigInteger.toString(35) -> java/math/MutableBigInteger. That class is
+# deliberately quarantined to the interpreter (41cdfdf94) to contain a real
+# JIT-corruption AIOOBE, which makes this one class legitimately slower than
+# the suite's flat 300s per-class cap — its clean whole-class runtimes are
+# 620,902-1,804,813 ms. Without a floor it is killed by `timeout` at 300s and
+# reported HANG on every full-suite run, with ms=0 and no @@RESULT, forever.
+# Root cause + evidence: docs/internal/fixed-suite-bugs/hibernate/
+# qualfiedtablenaming-hang-cluster-20260721-FIXED.md
+org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest	3600	-

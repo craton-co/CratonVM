@@ -2782,6 +2782,16 @@ fn iocp_drain(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult 
 // Public registration
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Sockets and worker threads are
+// bridge territory in principle, but not one registration in this function
+// resolves to an ACC_NATIVE method in JDK 25: 16 target ABSTRACT methods on
+// `java.nio.channels.AsynchronousSocketChannel` / `AsynchronousServerSocketChannel`
+// / `AsynchronousChannelGroup`, 10 shadow concrete bytecode, 9 name methods the
+// real classes do not declare. The genuine syscall boundary for async I/O in
+// JDK 25 lives one layer down in the `sun.nio.ch.*` implementation classes, and
+// registering on the abstract public API instead intercepts every channel
+// implementation. Evidence needed: `invocations` plus the receiver classes
+// actually seen, before deciding whether to move these down a layer.
 /// Register all AsynchronousSocketChannel / AsynchronousServerSocketChannel
 /// natives plus the AsynchronousChannelGroup methods backed by a real
 /// worker-thread pool. Idempotent.

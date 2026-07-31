@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# =============================================================================
+# run-hib.sh — CratonVM Hibernate ORM test-suite runner
+#
+# Runs Hibernate ORM JUnit5 test classes on CratonVM, fork-per-class (so a
+# crash/hang in one class never stops the rest), with per-class timing and full
+# logs persisted to disk.
+#
+# Classes are split into two categories (see passed.txt / others.txt):
+#   passed  — classes that pass on CratonVM
+#   others  — everything else (fail / hang / crash / loaderror)
+#
+# You choose: category, how many classes, the starting index, JIT on/off, and
+# real-JDK vs synthetic-JDK mode. Or run all 4 (JIT × JDK) modes concurrently,
+# one per background "thread".
+#
+# A few classes need more than the flat per-class wall cap, or need specific VM
+# flags. Those accommodations live in the TRACKED table `class-overrides.tsv`
+# next to this script (see that file's header for why it is tracked and how to
+# check it is actually loaded).
+#
+# Any extra CratonVM tuning goes through the environment: every CRATONVM_* env
+# var is inherited by the VM child processes automatically.
+# =============================================================================
+set -uo pipefail
+export MSYS2_ARG_CONV_EXCL='*'
+export MSYS_NO_PATHCONV=1
+
+# --- locations (Windows-form paths: the VM and JVM need native paths) --------
+HERE="C:/craton/CratonVM/apps/hib-suite-runner"
+COMMON="$HERE/common.args"          # -cp + sysprops + junit timeout
+RUNNER_CLASS="CratonRunner"         # compiled in $HERE, already on the classpath
+# The fixture data ($COMMON, the test lists, the compiled runner) only ever
+# exists in the main checkout, hence the hardcoded $HERE. The override table is
+# different: it is tracked, so it also exists next to whichever copy of this
+# script is being executed. Prefer that one, fall back to $HERE.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+OVERRIDES="${HIB_CLASS_OVERRIDES:-}"
+if [ -z "$OVERRIDES" ]; then
+  if [ -f "$SELF_DIR/class-overrides.tsv" ]; then OVERRIDES="$SELF_DIR/class-overrides.tsv"
+  else OVERRIDES="$HERE/class-overrides.tsv"; fi
+fi
+
+# --- JDK autodetect ----------------------------------------------------------
+# The real JDK moves around on this box (it has been `Program Files/Java/jdk-25`
+# and `Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot`). A hardcoded dead
+# default fails silently-ish: --java-home just breaks inside every forked VM and
+# the whole run reports CRASH per class. Probe for a real one instead, and
+# hard-fail with a usable message if none is found.
+detect_jdk() {
+  local c
+  for c in "C:/Program Files/Eclipse Adoptium"/jdk-25* \
+           "C:/Program Files/Java"/jdk-25* \
+           "C:/Program Files/Eclipse Adoptium"/jdk-2* \
+           "C:/Program Files/Java"/jdk-2*; do
+    [ -x "$c/bin/java.exe" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+# --- defaults (override via flags or env) ------------------------------------
+CV_BIN="${CV_BIN:-C:/craton/CratonVM-hibtest/target/release/cratonvm.exe}"
+JDK="${JDK:-$(detect_jdk)}"
+CV_XMX="${CV_XMX:-1500m}"
+SHARDS="${SHARDS:-6}"               # parallel forks per mode
+TIMEOUT="${TIMEOUT:-300}"          # per-class wall cap (s) -> HANG
+OUTROOT="${OUTROOT:-$HERE/runs}"
+USE_OVERRIDES=1                     # --no-overrides disables the table (A/B)
+
+CATEGORY="passed"
+JITMODE="on"
+JDKMODE="real"
+COUNT="0"                           # 0 = all from START to end
+START="0"
+ALLMODES="0"
+
+usage() {
+  cat <<'USAGE'
+run-hib.sh — run the Hibernate ORM suite on CratonVM
+
+USAGE:
+  run-hib.sh [options]
+
+OPTIONS:
+  --category <passed|others>   which list to run (default: passed)
+  --count <N>                  number of classes to run (default: 0 = all)
+  --start <IDX>                0-based start index into the category list (default: 0)
+  --jit <on|off>               JIT on, or off via --nojit (default: on)
+  --jdk <real|synthetic>       real-JDK (--java-home) or synthetic (--synthetic-jdk) (default: real)
+  --all-modes                  run all 4 modes (jit{on,off} x jdk{real,synthetic}) concurrently,
+                               each in its own background thread (ignores --jit/--jdk)
+  --timeout <SEC>              per-class hang timeout (default: 300); per-class
+                               overrides raise this as a floor, never lower it
+  --no-overrides               ignore class-overrides.tsv entirely (A/B checks)
+  --shards <N>                 parallel forks per mode (default: 6)
+  --bin <path>                 cratonvm.exe (default: $CV_BIN env or hibtest release)
+  --out <dir>                  output root (default: ./runs)
+  -h | --help
+
+SUB-COMMANDS:
+  run-hib.sh categorize        rebuild passed.txt / others.txt from a full run
+  run-hib.sh overrides         print the loaded per-class override table and exit
+
+CATEGORIES (regenerate authoritatively with:  run-hib.sh categorize):
+  passed.txt  / others.txt    in this folder
+
+PER-CLASS OVERRIDES:
+  class-overrides.tsv (tracked in git, next to this script) raises the wall cap
+  and/or adds VM flags for individual classes that the flat default misjudges.
+  Every run prints `overrides=N (loaded)` in its mode header; `overrides=0
+  (MISSING ...)` means the table is gone and known-slow classes will be
+  misreported as HANG. Check it with `run-hib.sh overrides`.
+
+ENV PASS-THROUGH:
+  Any CRATONVM_* variable in your environment is inherited by the VM, e.g.
+    CRATONVM_TIER_C2_THRESHOLD=200 run-hib.sh --count 50
+  Other knobs: CV_BIN, JDK, CV_XMX, SHARDS, TIMEOUT, OUTROOT
+
+EXAMPLES:
+  # first 200 passing classes, default (JIT on, real JDK)
+  run-hib.sh --category passed --count 200
+  # known-failing classes 0..50, JIT off
+  run-hib.sh --category others --count 50 --jit off
+  # classes 500..1000 of the passing set, synthetic JDK
+  run-hib.sh --category passed --start 500 --count 500 --jdk synthetic
+  # all 4 modes at once over the first 100 passing classes
+  run-hib.sh --category passed --count 100 --all-modes
+  # rebuild passed.txt / others.txt from a fresh full run
+  run-hib.sh categorize
+USAGE
+}
+
+# --- per-class override table ------------------------------------------------
+# Tab-separated: <class> <timeout-seconds|-> <extra VM flags|->.  The timeout is
+# a FLOOR (max with the run's own --timeout), never a cap; the flags are
+# appended ahead of the @common.args argfile and de-duplicated.  The table lives
+# in a tracked file precisely so it cannot silently disappear the way the
+# 2026-07-22 accommodation for DefaultCatalogAndSchemaTest did.
+declare -A CLASS_TIMEOUT_OVERRIDE=()
+declare -A CLASS_FLAGS_OVERRIDE=()
+OVERRIDES_STATE="disabled"
+
+load_overrides() {
+  CLASS_TIMEOUT_OVERRIDE=(); CLASS_FLAGS_OVERRIDE=()
+  if [ "$USE_OVERRIDES" != 1 ]; then OVERRIDES_STATE="disabled (--no-overrides)"; return 0; fi
+  if [ ! -f "$OVERRIDES" ]; then
+    OVERRIDES_STATE="MISSING $OVERRIDES"
+    echo "WARNING: per-class override table not found: $OVERRIDES" >&2
+    echo "WARNING: known-slow classes will be killed at the flat ${TIMEOUT}s cap and reported HANG." >&2
+    return 0
+  fi
+  local cls to fl _rest
+  # `${x%$'\r'}` on every field: this file is edited on Windows and can arrive
+  # with CRLF endings, which would otherwise poison the class-name key.
+  while IFS=$'\t' read -r cls to fl _rest || [ -n "${cls:-}" ]; do
+    cls="${cls%$'\r'}"; to="${to:-}"; to="${to%$'\r'}"; fl="${fl:-}"; fl="${fl%$'\r'}"
+    case "$cls" in ''|\#*) continue;; esac
+    if [ -n "$to" ] && [ "$to" != "-" ]; then
+      # Reject a non-numeric timeout loudly. Silently ignoring it would restore
+      # exactly the failure this table exists to prevent.
+      case "$to" in
+        *[!0-9]*|'') echo "WARNING: $OVERRIDES: non-numeric timeout '$to' for $cls — ignored" >&2;;
+        *) CLASS_TIMEOUT_OVERRIDE["$cls"]="$to";;
+      esac
+    fi
+    [ -n "$fl" ] && [ "$fl" != "-" ] && CLASS_FLAGS_OVERRIDE["$cls"]="$fl"
+  done < "$OVERRIDES"
+  local n=$(( ${#CLASS_TIMEOUT_OVERRIDE[@]} > ${#CLASS_FLAGS_OVERRIDE[@]} ? ${#CLASS_TIMEOUT_OVERRIDE[@]} : ${#CLASS_FLAGS_OVERRIDE[@]} ))
+  OVERRIDES_STATE="$n (loaded)"
+}
+
+print_overrides() {
+  echo "override table: $OVERRIDES"
+  echo "state: $OVERRIDES_STATE"
+  local k
+  for k in "${!CLASS_TIMEOUT_OVERRIDE[@]}"; do
+    printf '  %s  timeout=%ss flags=%s\n' "$k" "${CLASS_TIMEOUT_OVERRIDE[$k]}" "${CLASS_FLAGS_OVERRIDE[$k]:--}"
+  done
+  for k in "${!CLASS_FLAGS_OVERRIDE[@]}"; do
+    [ -n "${CLASS_TIMEOUT_OVERRIDE[$k]:-}" ] && continue
+    printf '  %s  timeout=-  flags=%s\n' "$k" "${CLASS_FLAGS_OVERRIDE[$k]}"
+  done
+}
+
+# --- categorize sub-command: (re)build passed.txt / others.txt ----------------
+if [ "${1:-}" = "categorize" ]; then
+  echo "[categorize] running the full testlist once (JIT on, real JDK) to split passed/others ..."
+  CATEGORIZE=1
+else
+  CATEGORIZE=0
+fi
+
+# --- arg parse ---------------------------------------------------------------
+SHOW_OVERRIDES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    categorize) shift;;
+    overrides)  SHOW_OVERRIDES=1; shift;;
+    --no-overrides) USE_OVERRIDES=0; shift;;
+    --category) CATEGORY="$2"; shift 2;;
+    --count)    COUNT="$2"; shift 2;;
+    --start)    START="$2"; shift 2;;
+    --jit)      JITMODE="$2"; shift 2;;
+    --jdk)      JDKMODE="$2"; shift 2;;
+    --all-modes) ALLMODES=1; shift;;
+    --timeout)  TIMEOUT="$2"; shift 2;;
+    --shards)   SHARDS="$2"; shift 2;;
+    --bin)      CV_BIN="$2"; shift 2;;
+    --out)      OUTROOT="$2"; shift 2;;
+    -h|--help)  usage; exit 0;;
+    *) echo "unknown option: $1" >&2; usage; exit 2;;
+  esac
+done
+
+load_overrides
+if [ "$SHOW_OVERRIDES" = 1 ]; then print_overrides; exit 0; fi
+
+# The forked VMs inherit this script's working directory, and Hibernate's own
+# test infrastructure resolves its JDBC URL through
+# `GradleParallelTestingResolver.getWorkerID`, which reads a worker-id file
+# relative to the CWD. Launched from anywhere but $HERE that read throws
+# FileNotFoundException -> "An error occurred when computing worker ID" ->
+# ExceptionInInitializerError in JdbcConnectionContext's <clinit>, and EVERY
+# class in the run is recorded as CRASH within a second. Pin the CWD so the
+# script is safe to invoke by absolute path from anywhere — resolving any
+# caller-relative --bin/--out against the ORIGINAL cwd first.
+ORIG_PWD="$PWD"
+abspath() { case "$1" in /*|[A-Za-z]:[/\\]*) printf '%s' "$1";; *) printf '%s/%s' "$ORIG_PWD" "$1";; esac; }
+CV_BIN="$(abspath "$CV_BIN")"
+OUTROOT="$(abspath "$OUTROOT")"
+cd "$HERE" || { echo "ERROR: cannot cd to fixture dir: $HERE" >&2; exit 1; }
+
+[ -f "$CV_BIN" ] || { echo "ERROR: cratonvm binary not found: $CV_BIN (set --bin or CV_BIN)" >&2; exit 1; }
+[ -f "$COMMON" ] || { echo "ERROR: common.args not found: $COMMON" >&2; exit 1; }
+[ -x "$JDK/bin/java.exe" ] || { echo "ERROR: real JDK not found: '${JDK:-<none detected>}' (set --jdk-home via JDK=... env)" >&2; exit 1; }
+mkdir -p "$OUTROOT"
+TS="$(date +%Y%m%d-%H%M%S)"
+
+# --- fork-per-class runner for one shard -------------------------------------
+# NOTE: this CratonRunner build takes class names directly as argv (one JVM
+# call per class here, for crash/hang isolation) and prints a single line
+# `@@RESULT <className> found=.. started=.. ok=.. failed=.. aborted=.. skipped=.. ms=..`
+# plus `@@BATCHEND failed_classes=N` — no @@BEGIN/@@FAIL/index markers, no
+# listfile/start-index argument support.
+# args: $1=listfile $2=shard-outdir ; reads global VMFLAGS_BASE array plus the
+# CLASS_TIMEOUT_OVERRIDE / CLASS_FLAGS_OVERRIDE tables
+run_shard() {
+  local LIST="$1" OUT="$2"
+  mkdir -p "$OUT"
+  local RAW="$OUT/raw.log" TSV="$OUT/results.tsv"
+  : > "$RAW"
+  printf 'idx\tclass\tstatus\tfound\tok\tfailed\taborted\tskipped\tms\tsig\n' > "$TSV"
+  local idx=0 cls tmp rc
+  while IFS= read -r cls; do
+    [ -z "$cls" ] && continue
+    # --- per-class accommodation (class-overrides.tsv) ------------------------
+    # timeout is a floor: a run that already asks for longer keeps its own value.
+    local cls_to cls_fl eff_to f
+    local -a eff_flags=("${VMFLAGS_BASE[@]}")
+    cls_to="${CLASS_TIMEOUT_OVERRIDE[$cls]:-}"
+    cls_fl="${CLASS_FLAGS_OVERRIDE[$cls]:-}"
+    eff_to="$TIMEOUT"
+    if [ -n "$cls_to" ] && [ "$cls_to" -gt "$TIMEOUT" ] 2>/dev/null; then eff_to="$cls_to"; fi
+    if [ -n "$cls_fl" ]; then
+      for f in $cls_fl; do
+        case " ${eff_flags[*]} " in *" $f "*) ;; *) eff_flags+=("$f");; esac
+      done
+    fi
+    if [ -n "$cls_to" ] || [ -n "$cls_fl" ]; then
+      echo "[override] $cls timeout=${eff_to}s (default ${TIMEOUT}s) extra_flags=${cls_fl:--}" >> "$RAW"
+      echo "[override] $cls timeout=${eff_to}s extra_flags=${cls_fl:--}" >> "$OUT/../overrides.log"
+    fi
+    eff_flags+=(@"$COMMON")
+
+    tmp=$(mktemp)
+    CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$eff_to" "$CV_BIN" "${eff_flags[@]}" \
+        -Dcraton.batch=1 "$RUNNER_CLASS" "$cls" >"$tmp" 2>>"$RAW"; rc=$?
+    cat "$tmp" >> "$RAW"
+    local rline found ok failed aborted skipped ms status sig
+    rline=$(grep "^@@RESULT " "$tmp" | head -1)
+    if [ -n "$rline" ]; then
+      found=$(printf '%s' "$rline"|grep -o 'found=[0-9]*'|cut -d= -f2); ok=$(printf '%s' "$rline"|grep -o 'ok=[0-9]*'|cut -d= -f2)
+      failed=$(printf '%s' "$rline"|grep -o 'failed=[0-9]*'|cut -d= -f2); aborted=$(printf '%s' "$rline"|grep -o 'aborted=[0-9]*'|cut -d= -f2)
+      skipped=$(printf '%s' "$rline"|grep -o 'skipped=[0-9]*'|cut -d= -f2); ms=$(printf '%s' "$rline"|grep -o 'ms=[0-9]*'|cut -d= -f2)
+      status=PASS
+      if [ "${failed:-0}" -gt 0 ]; then status=FAIL
+      elif [ "${aborted:-0}" -gt 0 ]; then status=ABORTED
+      elif [ "${found:-0}" -eq 0 ]; then status=NOTESTS; fi
+      sig=""
+      if [ "$status" = FAIL ]; then sig=$(grep -m1 -E "^(MethodSource|[A-Za-z][A-Za-z0-9_.]*(Exception|Error))" "$tmp" | head -c 160); fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$cls" "$status" "${found:-0}" "${ok:-0}" "${failed:-0}" "${aborted:-0}" "${skipped:-0}" "${ms:-0}" "$sig" >> "$TSV"
+    else
+      local st; if [ "$rc" -eq 124 ]; then st=HANG; else st=CRASH; fi
+      # record the cap that actually killed it, so a HANG row can never again be
+      # read as "stuck" when it merely outran a too-short per-class wall cap.
+      printf '%s\t%s\t%s\t0\t0\t0\t0\t0\t0\t%s rc=%s timeout=%ss\n' "$idx" "$cls" "$st" "process-died" "$rc" "$eff_to" >> "$TSV"
+    fi
+    rm -f "$tmp"
+    idx=$((idx+1))
+  done < "$LIST"
+}
+
+# --- run one mode (sharded) --------------------------------------------------
+# args: $1=label  $2=jit(on|off)  $3=jdk(real|synthetic)  $4=slice-listfile  $5=mode-outdir
+run_mode() {
+  local label="$1" jit="$2" jdk="$3" SLICE="$4" MODE="$5"
+  mkdir -p "$MODE"
+  # BASE = everything except the @argfile; run_shard appends any per-class flags
+  # and then the argfile, so a class override lands ahead of the -cp/-D block.
+  VMFLAGS_BASE=(--java-home "$JDK" --Xmx "$CV_XMX")
+  [ "$jit" = off ] && VMFLAGS_BASE+=(--nojit)
+  [ "$jdk" = synthetic ] && VMFLAGS_BASE+=(--synthetic-jdk)
+  local n; n=$(grep -c '' "$SLICE")
+  echo "[$label] $n classes | jit=$jit jdk=$jdk shards=$SHARDS timeout=${TIMEOUT}s overrides=$OVERRIDES_STATE bin=$CV_BIN"
+  local t0; t0=$(date +%s)
+  local s pids=()
+  for ((s=0; s<SHARDS; s++)); do awk -v n="$SHARDS" -v r="$s" 'NR%n==r' "$SLICE" > "$MODE/shard-$s.txt"; done
+  for ((s=0; s<SHARDS; s++)); do ( run_shard "$MODE/shard-$s.txt" "$MODE/shard-$s" ) & pids+=($!); done
+  for p in "${pids[@]}"; do wait "$p"; done
+  local t1; t1=$(date +%s); local secs=$((t1-t0))
+  # merge
+  local MERGED="$MODE/results.tsv"
+  head -1 "$MODE/shard-0/results.tsv" > "$MERGED" 2>/dev/null
+  for ((s=0; s<SHARDS; s++)); do tail -n +2 "$MODE/shard-$s/results.tsv" 2>/dev/null; done >> "$MERGED"
+  local rec; rec=$(( $(grep -c '' "$MERGED") - 1 ))
+  {
+    echo "mode=$label jit=$jit jdk=$jdk classes=$n recorded=$rec wall_seconds=$secs ($((secs/60))m$((secs%60))s) overrides=$OVERRIDES_STATE"
+    awk -F'\t' 'NR>1{c[$3]++; tms+=$9} END{printf "status:"; for(k in c) printf " %s=%d",k,c[k]; printf "  sum_class_ms=%d\n",tms}' "$MERGED"
+  } | tee "$MODE/SUMMARY.txt"
+}
+
+# --- resolve category list ---------------------------------------------------
+if [ "$CATEGORIZE" = 1 ]; then
+  SRCLIST="$HERE/testlist.txt"
+else
+  case "$CATEGORY" in
+    passed) SRCLIST="$HERE/passed.txt";;
+    others|failed) SRCLIST="$HERE/others.txt";;
+    *) echo "bad --category: $CATEGORY" >&2; exit 2;;
+  esac
+fi
+[ -f "$SRCLIST" ] || { echo "ERROR: list not found: $SRCLIST" >&2; exit 1; }
+
+# --- slice [START, START+COUNT) ----------------------------------------------
+SLICE="$OUTROOT/.slice-$TS.txt"
+if [ "$COUNT" -gt 0 ]; then
+  awk -v s="$START" -v c="$COUNT" 'NR>s && NR<=s+c' "$SRCLIST" > "$SLICE"
+else
+  awk -v s="$START" 'NR>s' "$SRCLIST" > "$SLICE"
+fi
+SLN=$(grep -c '' "$SLICE")
+echo "=== run-hib $TS :: category=$CATEGORY start=$START count=$COUNT -> $SLN classes ==="
+
+# --- categorize: run full list (jit on/real), then split ---------------------
+if [ "$CATEGORIZE" = 1 ]; then
+  RUN="$OUTROOT/categorize-$TS"
+  run_mode "categorize" on real "$SLICE" "$RUN"
+  awk -F'\t' 'NR>1 && $3=="PASS"{print $2}' "$RUN/results.tsv" | sort -u > "$HERE/passed.txt"
+  awk -F'\t' 'NR>1 && $3!="PASS"{print $2}' "$RUN/results.tsv" | sort -u > "$HERE/others.txt"
+  echo "rebuilt passed.txt=$(grep -c '' "$HERE/passed.txt")  others.txt=$(grep -c '' "$HERE/others.txt")"
+  rm -f "$SLICE"; exit 0
+fi
+
+# --- single mode or all 4 modes concurrently ---------------------------------
+RUN="$OUTROOT/run-$TS-$CATEGORY"
+mkdir -p "$RUN"
+echo "output: $RUN"
+GT0=$(date +%s)
+if [ "$ALLMODES" = 1 ]; then
+  declare -a MPIDS=()
+  run_mode "jiton-real"  on  real      "$SLICE" "$RUN/jiton-real"  > "$RUN/jiton-real.log"  2>&1 &  MPIDS+=($!)
+  run_mode "jitoff-real" off real      "$SLICE" "$RUN/jitoff-real" > "$RUN/jitoff-real.log" 2>&1 &  MPIDS+=($!)
+  run_mode "jiton-syn"   on  synthetic "$SLICE" "$RUN/jiton-syn"   > "$RUN/jiton-syn.log"   2>&1 &  MPIDS+=($!)
+  run_mode "jitoff-syn"  off synthetic "$SLICE" "$RUN/jitoff-syn"  > "$RUN/jitoff-syn.log"  2>&1 &  MPIDS+=($!)
+  echo "launched 4 modes concurrently (pids: ${MPIDS[*]}); logs in $RUN/<mode>.log"
+  for p in "${MPIDS[@]}"; do wait "$p"; done
+  echo "=== ALL-MODES SUMMARY ==="; for m in jiton-real jitoff-real jiton-syn jitoff-syn; do cat "$RUN/$m/SUMMARY.txt" 2>/dev/null; done
+else
+  run_mode "$JITMODE-$JDKMODE" "$JITMODE" "$JDKMODE" "$SLICE" "$RUN/$JITMODE-$JDKMODE"
+fi
+GT1=$(date +%s)
+echo "=== TOTAL wall: $(( (GT1-GT0)/60 ))m$(( (GT1-GT0)%60 ))s | results under $RUN ==="
+rm -f "$SLICE"

@@ -2674,9 +2674,17 @@ const S2DC_SOCK_ID: usize = 4;
 
 // ---- ByteBuffer helpers ----------------------------------------------------
 
-fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
+fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Option<ObjectRef> {
     use cratonvm_types::ArrayElementType;
-    let arr = ctx.new_array(ArrayElementType::Byte, cap);
+    // `ByteBuffer.allocate(n)` is caller-sized: `n` comes straight from Java,
+    // and on a full heap the backing `new byte[n]` must raise a *catchable*
+    // OutOfMemoryError (what HotSpot does) rather than abort the VM. This is
+    // the same fallible-allocator idiom as the ArrayList(int)/StringBuilder(int)
+    // capacity-constructor family — see
+    // `docs/internal/gaps/crash-01-arraylist-capacity-oom-abend.md`. Found via
+    // H2's `org.h2.test.db.TestOutOfMemory`, whose MVStore-on-memFS workload
+    // allocates ~76 MB buffers until the heap is gone.
+    let arr = ctx.try_new_array(ArrayElementType::Byte, cap)?;
     // GC-safety: `alloc_concurrent_synthetic` below allocates and can
     // trigger a collection that relocates `arr` (read again by
     // `bb_write_hb` immediately after); pin it and re-read.
@@ -2685,7 +2693,7 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
     bb_write_hb(ctx, buf, arr, cap as i32);
-    buf
+    Some(buf)
 }
 
 /// Initialise a synthetic ByteBuffer so BOTH the indexed-slot layout
@@ -4197,7 +4205,13 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
 
     r.register(bb, "allocate", "(I)Ljava/nio/ByteBuffer;", |ctx, args| {
         let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-        Ok(Some(Value::Object(Some(s2_bb_alloc(ctx, cap)))))
+        match s2_bb_alloc(ctx, cap) {
+            Some(buf) => Ok(Some(Value::Object(Some(buf)))),
+            None => Err(RuntimeError::OutOfMemoryError {
+                message: "Java heap space".to_string(),
+            }
+            .into()),
+        }
     });
     r.register(
         bb,

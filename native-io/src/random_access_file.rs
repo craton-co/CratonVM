@@ -525,6 +525,13 @@ fn native_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // Registration
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: bridge — 8 of the 11 registrations here resolve to
+// ACC_NATIVE methods on `java.io.RandomAccessFile` in JDK 25 (`open0`, `read0`,
+// `readBytes`, `write0`, `writeBytes`, `getFilePointer`, `seek0`, `length`,
+// `setLength`, `initIDs`). These are file-descriptor operations: the descriptor
+// lives in this crate's fd table and there is no bytecode fallback in the
+// image. Correctly `Bridge`, and correct for the right reason rather than by
+// inheritance — the category is set explicitly on the next line.
 pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
