@@ -217,16 +217,20 @@ jobs:
       #         count fixes it; it needs named synthetic fields or a slot
       #         fallback that does not disturb the real-JDK path.
       #         (`throwable_init_cause_sets_cause` and the `p93_*` pair.)
-      #     And one that is NOT a VM defect, recorded so it is not re-chased:
-      #       * The four `hashmap_compute` / `merge` / `replaceAll` tests build
-      #         a lambda call site javac cannot emit — SAM
-      #         `BiFunction.apply(Object,Object)Object` bound to the 1-arg impl
-      #         `System.identityHashCode(Object)I`. Real indy always produces a
-      #         synthetic `lambda$N` whose arity matches the SAM, so the VM is
-      #         not wrong to mishandle it; `coerce_lambda_args` stops coercing
-      #         at `impl_idx >= impl_params.len()` and leaves the extra arg in
-      #         place. Making the VM drop surplus args would mask genuine arity
-      #         bugs. These need a fixture whose impl arity matches the SAM.
+      #     And the `hashmap_compute` family, which splits in two:
+      #       * `compute_updates`, `merge_existing` and
+      #         `replace_all_updates_values` bind SAM
+      #         `BiFunction.apply(Object,Object)Object` to the 1-arg impl
+      #         `System.identityHashCode(Object)I` — a call site javac cannot
+      #         emit, since real indy always produces a synthetic `lambda$N`
+      #         whose arity matches the SAM. `coerce_lambda_args` stops at
+      #         `impl_idx >= impl_params.len()` and leaves the surplus arg in
+      #         place; teaching the VM to drop it would mask genuine arity
+      #         bugs. They need a fixture whose impl arity matches.
+      #       * `compute_if_absent_inserts` does NOT have that problem — its
+      #         `Function.apply(Object)Object` matches the 1-arg impl exactly —
+      #         and still returns a non-Int. Cause UNDETERMINED; do not assume
+      #         the arity story covers it.
       #         NOTE `CRATONVM_DBG_LAMBDA` produced no output even on the
       #         PASSING control test, so that hook is broken — its silence is
       #         not evidence of anything.
