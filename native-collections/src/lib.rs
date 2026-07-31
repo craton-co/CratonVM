@@ -1759,6 +1759,27 @@ fn pin_value(ctx: &mut dyn NativeContext, v: Value) -> usize {
     }
 }
 
+/// Pin an `Option<ObjectRef>` cursor, returning `usize::MAX` for `None`.
+/// Companion to [`opt_read`]; both exist for `map_resize_inner`'s chain-split
+/// walk, which carries four such cursors across a GC-capable reference store.
+#[inline]
+fn opt_pin(ctx: &mut dyn NativeContext, o: Option<ObjectRef>) -> usize {
+    match o {
+        Some(r) => ctx.pin_native_root(r),
+        None => usize::MAX,
+    }
+}
+
+/// Read back an `Option<ObjectRef>` cursor pinned with [`opt_pin`]. `None`
+/// cursors and unpinned handles are returned verbatim.
+#[inline]
+fn opt_read(ctx: &dyn NativeContext, handle: usize, o: Option<ObjectRef>) -> Option<ObjectRef> {
+    match o {
+        Some(r) if handle != usize::MAX => Some(ctx.read_native_pin(handle, r)),
+        _ => o,
+    }
+}
+
 /// Read back the (post-GC, forwarded) refs for a slice pinned with
 /// [`pin_value_slice`]. Non-object slots are returned verbatim.
 fn read_value_slice(ctx: &dyn NativeContext, handles: &[usize], orig: &[Value]) -> Vec<Value> {
@@ -5728,7 +5749,25 @@ fn map_resize_inner(
     // `bulk_array_copy` is still attempted as an optional fast path so
     // that if a future VM override does support reference arrays, we
     // skip the per-bucket head reads.
+    // HIB-MAPRESIZE-STALE.1 (2026-07-31) — the rehash below is NOT
+    // allocation-free, contrary to the `this_pin` comment above ("the split
+    // loop below reuses existing nodes (no further allocation), so one re-read
+    // suffices"). Its `set_field(node, NODE_FIELD_NEXT, ..)` and
+    // `set_array_element(new_buckets, ..)` calls are REFERENCE-typed stores, so
+    // each can allocate a remembered-set entry through the write barrier and
+    // therefore complete a moving young GC — the exact hazard
+    // `native_map_put_evict_pinned` documents and pins against. `old_b` and
+    // `new_buckets` are bare Rust locals invisible to `collect_roots`, so after
+    // such a GC they name pre-move addresses; the loops then write through
+    // freed nodes and, far worse, publish stale `lo_head`/`hi_head` into
+    // `new_buckets`, leaving the map with dangling chain heads permanently.
+    // Pin both arrays for the whole rehash and re-read them after every store
+    // that can collect.
+    let new_buckets_h = ctx.pin_native_root(new_buckets);
+    let mut new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
     if let Some(old_b) = old_buckets {
+        let old_b_h = ctx.pin_native_root(old_b);
+        let mut old_b = ctx.read_native_pin(old_b_h, old_b);
         let doubled = (new_cap as i64) == (old_cap as i64) * 2;
         if doubled {
             // Optional fast path: if the VM's bulk_array_copy supports
@@ -5771,18 +5810,60 @@ fn map_resize_inner(
                         _ => 0,
                     };
                     let next = ctx.get_field(node, NODE_FIELD_NEXT);
-                    if (key_hash & split_mask) == 0 {
+                    let is_lo = (key_hash & split_mask) == 0;
+                    // HIB-MAPRESIZE-STALE.1: the link store below is this
+                    // step's only GC point, and it only happens once a
+                    // partition already has a head — so the common
+                    // single-node bucket pays no pin at all. When it does
+                    // fire, pin every reference that has to outlive it and
+                    // re-read each one afterwards. The frame sits ABOVE the
+                    // two array pins, so unwinding it leaves those intact.
+                    let will_store = if is_lo {
+                        lo_head.is_some() && lo_tail.is_some()
+                    } else {
+                        hi_head.is_some() && hi_tail.is_some()
+                    };
+                    let mut node = node;
+                    let mut next = next;
+                    if will_store {
+                        let step_base = ctx.pin_native_root(node);
+                        let node_h = step_base;
+                        let next_h = pin_value(ctx, next);
+                        let lo_head_h = opt_pin(ctx, lo_head);
+                        let lo_tail_h = opt_pin(ctx, lo_tail);
+                        let hi_head_h = opt_pin(ctx, hi_head);
+                        let hi_tail_h = opt_pin(ctx, hi_tail);
+
+                        let tail = if is_lo { lo_tail } else { hi_tail };
+                        let tail_h = if is_lo { lo_tail_h } else { hi_tail_h };
+                        if let Some(t) = tail {
+                            let t = ctx.read_native_pin(tail_h, t);
+                            let linked = ctx.read_native_pin(node_h, node);
+                            ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(linked)));
+                        }
+
+                        // Everything below this line is post-GC.
+                        node = ctx.read_native_pin(node_h, node);
+                        next = read_pinned_elem(ctx, next_h, next);
+                        lo_head = opt_read(ctx, lo_head_h, lo_head);
+                        lo_tail = opt_read(ctx, lo_tail_h, lo_tail);
+                        hi_head = opt_read(ctx, hi_head_h, hi_head);
+                        hi_tail = opt_read(ctx, hi_tail_h, hi_tail);
+                        new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                        old_b = ctx.read_native_pin(old_b_h, old_b);
+                        ctx.unpin_native_roots(step_base);
+                    }
+                    // Assign this step's cursors from the (refreshed) node.
+                    // Emptiness is preserved by the refresh, so testing
+                    // `is_none()` here matches the `will_store` decision above.
+                    if is_lo {
                         if lo_head.is_none() {
                             lo_head = Some(node);
-                        } else if let Some(t) = lo_tail {
-                            ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(node)));
                         }
                         lo_tail = Some(node);
                     } else {
                         if hi_head.is_none() {
                             hi_head = Some(node);
-                        } else if let Some(t) = hi_tail {
-                            ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(node)));
                         }
                         hi_tail = Some(node);
                     }
@@ -5812,23 +5893,67 @@ fn map_resize_inner(
                         };
                         let next = ctx.get_field(node, NODE_FIELD_NEXT);
                         let new_idx = map_bucket_index(key_hash, new_cap);
+                        // HIB-MAPRESIZE-STALE.1: same hazard as the split walk
+                        // — both stores below are reference-typed and can
+                        // collect, and `node`/`next`/`new_buckets` are bare
+                        // locals across them.
+                        let step_base = ctx.pin_native_root(node);
+                        let node_h = step_base;
+                        let next_h = pin_value(ctx, next);
                         let existing = ctx.get_array_element(new_buckets, new_idx);
-                        ctx.set_field(node, NODE_FIELD_NEXT, existing);
-                        ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
-                        nv = next;
+                        let existing_h = pin_value(ctx, existing);
+                        let node_now = ctx.read_native_pin(node_h, node);
+                        ctx.set_field(
+                            node_now,
+                            NODE_FIELD_NEXT,
+                            read_pinned_elem(ctx, existing_h, existing),
+                        );
+                        new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                        let node_now = ctx.read_native_pin(node_h, node);
+                        ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node_now)));
+                        new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                        old_b = ctx.read_native_pin(old_b_h, old_b);
+                        nv = read_pinned_elem(ctx, next_h, next);
+                        ctx.unpin_native_roots(step_base);
                     }
                     continue;
                 }
-                // Terminate both partitioned chains.
-                if let Some(t) = lo_tail {
+                // HIB-MAPRESIZE-STALE.1: these four stores are the ones that
+                // actually PUBLISH the partitioned chains, so a stale
+                // `lo_head`/`hi_head` here is what corrupts the map for good.
+                // Two of them are reference-typed and can collect, so pin the
+                // cursors and refresh between stores.
+                // The frame is anchored on `new_buckets` rather than on one of
+                // the cursors: any cursor may legitimately be `None`, and a
+                // `usize::MAX` base would silently leak the rest of the frame.
+                let tail_base = ctx.pin_native_root(new_buckets);
+                let lo_head_h = opt_pin(ctx, lo_head);
+                let lo_tail_h = opt_pin(ctx, lo_tail);
+                let hi_head_h = opt_pin(ctx, hi_head);
+                let hi_tail_h = opt_pin(ctx, hi_tail);
+                // Terminate both partitioned chains. A null store does not fire
+                // the write barrier, but refresh anyway rather than depend on
+                // that staying true.
+                if let Some(t) = opt_read(ctx, lo_tail_h, lo_tail) {
                     ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(None));
                 }
-                if let Some(t) = hi_tail {
+                if let Some(t) = opt_read(ctx, hi_tail_h, hi_tail) {
                     ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(None));
                 }
                 // Overwrite the two slots (low keeps `i`, high goes to i+old_cap).
-                ctx.set_array_element(new_buckets, i, Value::Object(lo_head));
-                ctx.set_array_element(new_buckets, i + old_cap as usize, Value::Object(hi_head));
+                new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                let lo_head_now = opt_read(ctx, lo_head_h, lo_head);
+                ctx.set_array_element(new_buckets, i, Value::Object(lo_head_now));
+                new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                let hi_head_now = opt_read(ctx, hi_head_h, hi_head);
+                ctx.set_array_element(
+                    new_buckets,
+                    i + old_cap as usize,
+                    Value::Object(hi_head_now),
+                );
+                new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                old_b = ctx.read_native_pin(old_b_h, old_b);
+                ctx.unpin_native_roots(tail_base);
             }
         } else {
             // Legacy rebuild path: per-bucket re-insert (head-prepend).
@@ -5857,25 +5982,64 @@ fn map_resize_inner(
                                 i, steps
                             );
                             // Truncate: splice node alone, do not continue
+                            // (HIB-MAPRESIZE-STALE.1 pinning, as below).
                             let new_idx = map_bucket_index(key_hash, new_cap);
+                            let step_base = ctx.pin_native_root(node);
+                            let node_h = step_base;
                             let existing = ctx.get_array_element(new_buckets, new_idx);
-                            ctx.set_field(node, NODE_FIELD_NEXT, existing);
-                            ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
+                            let existing_h = pin_value(ctx, existing);
+                            let node_now = ctx.read_native_pin(node_h, node);
+                            ctx.set_field(
+                                node_now,
+                                NODE_FIELD_NEXT,
+                                read_pinned_elem(ctx, existing_h, existing),
+                            );
+                            new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                            let node_now = ctx.read_native_pin(node_h, node);
+                            ctx.set_array_element(
+                                new_buckets,
+                                new_idx,
+                                Value::Object(Some(node_now)),
+                            );
+                            new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                            old_b = ctx.read_native_pin(old_b_h, old_b);
+                            ctx.unpin_native_roots(step_base);
                             break;
                         }
                     }
 
-                    // Insert into new bucket
+                    // Insert into new bucket (HIB-MAPRESIZE-STALE.1 pinning:
+                    // both stores are reference-typed and can collect).
                     let new_idx = map_bucket_index(key_hash, new_cap);
+                    let step_base = ctx.pin_native_root(node);
+                    let node_h = step_base;
+                    let next_h = pin_value(ctx, next);
                     let existing = ctx.get_array_element(new_buckets, new_idx);
-                    ctx.set_field(node, NODE_FIELD_NEXT, existing);
-                    ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
-
-                    node_val = next;
+                    let existing_h = pin_value(ctx, existing);
+                    let node_now = ctx.read_native_pin(node_h, node);
+                    ctx.set_field(
+                        node_now,
+                        NODE_FIELD_NEXT,
+                        read_pinned_elem(ctx, existing_h, existing),
+                    );
+                    new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                    let node_now = ctx.read_native_pin(node_h, node);
+                    ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node_now)));
+                    new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
+                    old_b = ctx.read_native_pin(old_b_h, old_b);
+                    node_val = read_pinned_elem(ctx, next_h, next);
+                    ctx.unpin_native_roots(step_base);
                 }
             }
         }
+        ctx.unpin_native_roots(old_b_h);
     }
+    // HIB-MAPRESIZE-STALE.1: `this` was pinned before `alloc_ref_array` and
+    // re-read once, but the rehash above can now collect too, so the local was
+    // a pre-move address by the time the publication writes below used it.
+    // Re-read both roots one last time.
+    let this = ctx.read_native_pin(this_pin, this);
+    let new_buckets = ctx.read_native_pin(new_buckets_h, new_buckets);
 
     // Round-5 CRIT fix (publication race): publish the new buckets
     // array with a volatile/Release-style write so that concurrent
@@ -6367,8 +6531,17 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     if uses_native_hashtable_layout(ctx, this) {
+        // GC-safety: `alloc_ref_array` is a collection point and `this` is a
+        // bare local, so every store below must use a re-read reference.
+        let this_pin = ctx.pin_native_root(this);
         let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+        let buckets_pin = ctx.pin_native_root(buckets);
+        let this = ctx.read_native_pin(this_pin, this);
+        let buckets = ctx.read_native_pin(buckets_pin, buckets);
         ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        // The store above is a GC point (write barrier); refresh before reusing.
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
         set_map_size(ctx, this, 0);
         let cname = ctx
             .class_name_of_id(ctx.class_id_of_object(this))
@@ -6388,8 +6561,19 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         HM_INT_FAST_LAST_KEY.with(|cache| cache.set(None));
     }
     // Legacy synthetic layout — what every other native HashMap op expects.
+    // GC-safety: same hazard as the Hashtable branch above — `alloc_ref_array`
+    // can collect, and every field store from here on uses `this`.
+    // A reference-typed store is itself a GC point: its write barrier can
+    // allocate a remembered-set entry and complete a young collection (see
+    // the `map_resize` chain-cursor fix). Keep both pins live and re-read
+    // across every such store, not just across the allocation.
+    let this_pin = ctx.pin_native_root(this);
     let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+    let buckets_pin = ctx.pin_native_root(buckets);
+    let this = ctx.read_native_pin(this_pin, this);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    let this = ctx.read_native_pin(this_pin, this);
     set_map_size(ctx, this, 0);
     // S111r29: Resolve the JDK `table` slot (descriptor `[Ljava/util/HashMap$Node;`)
     // and store the bucket array there. Writing `Int(MAP_DEFAULT_CAPACITY)` to
@@ -6405,9 +6589,13 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
     if let Some(slot) = table_slot {
         if slot < ctx.object_num_fields(this) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let buckets = ctx.read_native_pin(buckets_pin, buckets);
             ctx.set_field(this, slot, Value::Object(Some(buckets)));
         }
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     if table_slot != Some(MAP_FIELD_CAPACITY) {
         ctx.set_field(
             this,
@@ -6463,8 +6651,23 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // sizes the table lazily, so `new HashMap(Integer.MAX_VALUE)` must not
     // abort); `cap` is rebound to the actually-allocated size so the JDK
     // `threshold`/`__capacity` fields below stay consistent with the table.
+    // GC-safety: `lhm_init_with_cap` pins `this` across the identical
+    // `alloc_bucket_table` call (confirmed live under CRATONVM_DBG_STALE_OBJREF
+    // during WildFly parallel-extension-add); the plain-HashMap constructor —
+    // which is what `new HashSet<>(...)`'s backing map goes through — never
+    // got the same treatment, so the bucket-array store below could land on a
+    // stale receiver and leave the fresh map with no table at all.
+    // A reference-typed store is itself a GC point: its write barrier can
+    // allocate a remembered-set entry and complete a young collection (see
+    // the `map_resize` chain-cursor fix). Keep both pins live and re-read
+    // across every such store, not just across the allocation.
+    let this_pin = ctx.pin_native_root(this);
     let (buckets, cap) = alloc_bucket_table(ctx, cap);
+    let buckets_pin = ctx.pin_native_root(buckets);
+    let this = ctx.read_native_pin(this_pin, this);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    let this = ctx.read_native_pin(this_pin, this);
     set_map_size(ctx, this, 0);
     // S111r29: see `native_map_init` for rationale. Mirror the bucket array
     // into the JDK `table` slot so `HashMap.resize()` bytecode sees an array
@@ -6473,9 +6676,13 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
     if let Some(slot) = table_slot {
         if slot < ctx.object_num_fields(this) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let buckets = ctx.read_native_pin(buckets_pin, buckets);
             ctx.set_field(this, slot, Value::Object(Some(buckets)));
         }
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     if table_slot != Some(MAP_FIELD_CAPACITY) {
         ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     }
@@ -6862,8 +7069,10 @@ fn native_map_put_evict(
     // in attributes for annotation [...ComponentScan$Filter]` in
     // `ComponentScanAnnotationParser.parse` for `@SpringBootApplication`.
     let cid = ctx.class_id_of_object(this);
-    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // `mut`: `materialize_hm_int_fast` below can collect, so these are re-read
+    // from their pins across it (HIB-MAPPUT-PINORDER.1).
+    let mut key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut value = args.get(2).copied().unwrap_or(Value::Object(None));
     // PERF (collections-classification-cost): this block used to be a
     // `class_name_of_id` for the exact-HashMap test PLUS a second full
     // superclass walk in the `else` arm, each hop of which allocated a
@@ -6888,7 +7097,24 @@ fn native_map_put_evict(
             // node table before inserting the new entry. Without this, the
             // node path sees an empty heap map and silently strands all prior
             // integer entries in the side store.
+            // HIB-MAPPUT-PINORDER.1 (2026-07-31): `materialize_hm_int_fast`
+            // re-puts every side-stored entry through
+            // `native_map_put_evict_pinned`, which allocates a node per entry —
+            // so it can collect. `key_val`/`value` were copied out of `args`
+            // above and are bare Rust locals here; the pins that protect them
+            // are not taken until after this call, and PINNING AN ALREADY-STALE
+            // ADDRESS PRESERVES THE STALENESS (see the pin-time canary in
+            // `vm_exec::pin_native_root`). Pin them across the materialisation
+            // and re-read afterwards, so the pins taken below root the current
+            // addresses. `this` is already handled — it comes back as the
+            // return value.
+            let mat_base = ctx.pin_native_root(this);
+            let mat_key = pin_value(ctx, key_val);
+            let mat_val = pin_value(ctx, value);
             this = materialize_hm_int_fast(ctx, this)?;
+            key_val = read_pinned_elem(ctx, mat_key, key_val);
+            value = read_pinned_elem(ctx, mat_val, value);
+            ctx.unpin_native_roots(mat_base);
         } else {
             // Walk parent chain to detect LinkedHashMap or TreeMap ancestry.
             // Without the TreeMap branch, the `java/util/Map.put` interface
@@ -6969,12 +7195,22 @@ pub fn native_hashmap_put_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    let mut key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut value = args.get(2).copied().unwrap_or(Value::Object(None));
     if let Some(result) = try_hm_int_fast_put(ctx, this, key_val, value) {
         return result;
     }
+    // HIB-MAPPUT-PINORDER.1 — same ordering hazard as `native_map_put_evict`:
+    // `materialize_hm_int_fast` allocates a node per side-stored entry, so it
+    // can collect, and the pins below would otherwise root already-stale
+    // key/value addresses.
+    let mat_base = ctx.pin_native_root(this);
+    let mat_key = pin_value(ctx, key_val);
+    let mat_val = pin_value(ctx, value);
     let this = materialize_hm_int_fast(ctx, this)?;
+    key_val = read_pinned_elem(ctx, mat_key, key_val);
+    value = read_pinned_elem(ctx, mat_val, value);
+    ctx.unpin_native_roots(mat_base);
     let put_pin_base = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key_val);
     let value_pin = pin_value(ctx, value);
@@ -7483,8 +7719,92 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
     }
 
+    // `CRATONVM_DBG_MAP_MISS_AUDIT` — a miss is normal, but a miss on a key the
+    // map still holds by reference identity is not. Only the identity case is
+    // reported, so this stays quiet on the millions of legitimate misses.
+    //
+    // Written for the Spring `@Bean` attribute flake: `ClassUtils`'
+    // `IdentityHashMap<Class,Class>` returned null for a key it demonstrably
+    // still contained, once in ~70 runs, with the map intact before and after.
+    // That shape — a single bad lookup against a healthy map — is invisible from
+    // Java, because by the time anything notices, the evidence is gone.
+    if dbg_map_miss_audit() {
+        let key_now = match read_pinned_elem(ctx, key_pin, key_val) {
+            Value::Object(Some(k)) => Some(k),
+            _ => key_ref,
+        };
+        if let Some(k) = key_now {
+            report_identity_present_miss(ctx, this, buckets, cap, k, hash, idx);
+        }
+    }
+
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(None)))
+}
+
+/// `true` iff `CRATONVM_DBG_MAP_MISS_AUDIT` is set. Cached: this is consulted on
+/// every map miss, which is a hot path.
+fn dbg_map_miss_audit() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MAP_MISS_AUDIT").is_some()
+    })
+}
+
+/// Re-walk every bucket after a miss. If a node's key is the SAME OBJECT as the
+/// one we searched for, the lookup was wrong and we print everything needed to
+/// say why: which bucket the key actually lives in versus the one we probed, and
+/// the stored node hash versus the hash we just computed.
+///
+/// Capped at `AUDIT_MAX_CAP` buckets so enabling this on a large map cannot turn
+/// a miss into an O(n) walk.
+fn report_identity_present_miss(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    buckets: ObjectRef,
+    cap: i32,
+    key: ObjectRef,
+    searched_hash: i32,
+    searched_idx: usize,
+) {
+    const AUDIT_MAX_CAP: i32 = 4096;
+    if cap <= 0 || cap > AUDIT_MAX_CAP {
+        return;
+    }
+    for b in 0..(cap as usize) {
+        let mut node_val = ctx.get_array_element(buckets, b);
+        let mut guard = 0usize;
+        while let Value::Object(Some(node)) = node_val {
+            guard += 1;
+            if guard > 4096 {
+                break;
+            }
+            if let Value::Object(Some(node_key)) = get_node_key(ctx, node) {
+                if node_key == key {
+                    let node_hash = get_node_hash(ctx, node);
+                    let key_class = ctx.class_name_of_id(ctx.class_id_of_object(key));
+                    eprintln!(
+                        "[MAP-MISS-AUDIT] map={:?} MISSED a key it still holds by identity: \
+                         key={:?} key_class={:?} searched_hash={} searched_bucket={} \
+                         found_in_bucket={} node_hash={} cap={} \
+                         (hash_mismatch={}, bucket_mismatch={})",
+                        this,
+                        key,
+                        key_class,
+                        searched_hash,
+                        searched_idx,
+                        b,
+                        node_hash,
+                        cap,
+                        node_hash != searched_hash,
+                        b != searched_idx,
+                    );
+                    return;
+                }
+            }
+            node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+        }
+    }
 }
 
 fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10048,11 +10368,22 @@ fn alloc_hs_backing(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) ->
         let total = ctx.class_num_total_fields(cid);
         let n = std::cmp::max(total, MAP_NUM_FIELDS);
         let m = ctx.alloc_object(cid, n);
+        // The freshly allocated backing map is referenced ONLY by this local
+        // until the caller stores it into the set's `map` field. Pin it across
+        // the initializer (which allocates the bucket table): a moving cycle
+        // would relocate it, and a non-moving sweep cannot even see it as live,
+        // so the returned reference could name reclaimed-and-reused memory.
+        let m_pin = ctx.pin_native_root(m);
         lhm_init_with_cap(ctx, m, cap.max(MAP_DEFAULT_CAPACITY));
+        let m = ctx.read_native_pin(m_pin, m);
+        ctx.unpin_native_roots(m_pin);
         m
     } else {
         let m = alloc_backing_map(ctx);
+        let m_pin = ctx.pin_native_root(m);
         let _ = native_map_init_capacity(ctx, &[Value::Object(Some(m)), Value::Int(cap as i32)]);
+        let m = ctx.read_native_pin(m_pin, m);
+        ctx.unpin_native_roots(m_pin);
         m
     }
 }
@@ -10062,8 +10393,13 @@ fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // `alloc_hs_backing` allocates and can therefore move `this`; the field
+    // store below would otherwise land on a from-space address.
+    let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -10076,8 +10412,12 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(c)) if *c > 0 => *c as usize,
         _ => MAP_DEFAULT_CAPACITY,
     };
+    // Same allocation-moves-`this` hazard as `native_hs_init`.
+    let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, cap);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -24134,6 +24474,20 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
     // backing alloc moves `this`, and every native_map_put below re-enters Java
     // (hashCode/equals, possible resize) moving `backing` + pending elems.
+    //
+    // `source` must be rooted BEFORE `alloc_hs_backing` too. That allocation is
+    // GC-capable, and `source` is a raw `args` value that is next dereferenced
+    // AFTER it, by `collect_collection_elements_or_real` below — a moving young
+    // GC in between leaves it pointing into from-space, so `new HashSet<>(coll)`
+    // reads its elements out of a dead (possibly already reused) object. This is
+    // the same hazard `native_map_init_from_map` guards with its `source_pin`
+    // (added after the live `NoSuchMethodError java/lang/Object.entrySet()`
+    // capture from `new HashMap<>(children)` during WildFly
+    // `parallel-extension-add`) and `native_al_init_from_collection` guards with
+    // its `src_pin`; the HashSet constructor was the one member of the family
+    // that never got it, and `new HashSet<>(Arrays.asList(...))` is on exactly
+    // that WildFly boot path.
+    let source_pin = ctx.pin_native_root(source);
     let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     let backing_pin = ctx.pin_native_root(backing);
@@ -24150,6 +24504,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // `Collections.unmodifiableList(arrayList)`) silently produced an
     // empty set — wiping every auto-configuration before filtering and
     // surfacing as `MissingWebServerFactoryBeanException` at boot.
+    let source = ctx.read_native_pin(source_pin, source);
     let elems = collect_collection_elements_or_real(ctx, source);
     let (_, elem_handles) = pin_value_slice(ctx, &elems);
     let sentinel = Value::Int(1);
@@ -24157,12 +24512,12 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
         let backing = ctx.read_native_pin(backing_pin, backing);
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
         if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel]) {
-            ctx.unpin_native_roots(this_pin);
+            ctx.unpin_native_roots(source_pin);
             return Err(e);
         }
     }
 
-    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(source_pin);
     Ok(None)
 }
 

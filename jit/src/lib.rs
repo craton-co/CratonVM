@@ -744,7 +744,7 @@ impl Drop for ExecutableBuffer {
         record_code_free(
             self.ptr as usize,
             self.capacity,
-            ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire),
+            ACTIVE_JIT_EXECUTIONS.get(),
         );
         if never_free_code_enabled() {
             return;
@@ -1463,10 +1463,12 @@ pub struct CompiledMethod {
     /// OSR metadata: per-local GPR register assignments from graph-coloring allocator.
     pub osr_local_assignments: Option<Vec<Option<u8>>>,
     /// OSR metadata: per-bytecode-PC "dead local" mask. `osr_dead_mask[pc]` bit
-    /// `i` set means local `i` is dead at that OSR entry PC and shares compiled
-    /// state risk with the live locals at that entry. OSR currently declines
-    /// those entries and falls back to the interpreter. Indexed like
-    /// `osr_pc_to_native`.
+    /// `i` set means local `i` is dead at that OSR entry PC AND its home
+    /// register is also some *live* local's home there (graph-colouring
+    /// coalescing reused the register once local `i`'s range ended). The OSR
+    /// trampoline skips loading exactly those locals, leaving each shared
+    /// register to its live owner — see [`osr_dead_local_entry_allowed`] for
+    /// why that is sufficient. Indexed like `osr_pc_to_native`.
     pub osr_dead_mask: Option<Vec<u64>>,
     /// OSR metadata: per-local XMM register assignments for float/double locals.
     pub osr_xmm_assignments: Option<Vec<Option<u8>>>,
@@ -1681,6 +1683,17 @@ pub struct CompiledMethod {
     /// (possibly-freed, under `CRATONVM_JIT_FREE_CODE=1`) box. The pointed-to
     /// guard is leaked (process-lifetime), so this raw pointer is always valid.
     pub deopt_epoch_guard: *const crate::deopt::DeoptEpochGuard,
+    /// `ClassId` of the class this body was published under, or
+    /// [`cratonvm_types::jit_activation::NO_OWNER_CLASS`] for an artifact that
+    /// was never published (test fixtures, probe bodies).
+    ///
+    /// Stamped by [`JitCache::put`] / [`JitCache::put_osr`] from the same
+    /// `declaring_class_id` they key the artifact on. It replaces the
+    /// `entry_ptr -> class_id` map `jit_activation` used to keep under a global
+    /// lock: every activation site already holds the `&CompiledMethod`, so the
+    /// lookup was pure overhead — and reading the owner off the live artifact
+    /// cannot return a retired entry's stale answer.
+    pub owner_class_id: u32,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -1692,7 +1705,6 @@ impl Drop for CompiledMethod {
         if dbg_stale_ic_enabled() {
             report_stale_ic_holders(entry);
         }
-        cratonvm_types::jit_activation::unregister_executable_owner(entry);
         unregister_jit_code_range(entry);
         if let Some(owners) = JIT_ENTRY_OWNERS.get() {
             let mut owners = owners.lock();
@@ -1820,6 +1832,7 @@ impl CompiledMethod {
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
+            owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
         }
     }
 
@@ -1885,6 +1898,7 @@ impl CompiledMethod {
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
+            owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
         }
     }
 
@@ -2202,12 +2216,25 @@ impl CompiledMethod {
     /// Lets the interpreter's OSR trigger reuse a cached compile instead of
     /// re-running the whole x64 pipeline on every trigger.
     pub fn can_osr_enter(&self, entry_pc: usize) -> bool {
-        if self
-            .osr_dead_mask
-            .as_ref()
-            .and_then(|m| m.get(entry_pc).copied())
-            .unwrap_or(0)
-            != 0
+        self.can_osr_enter_with(entry_pc, osr_dead_local_entry_allowed())
+    }
+
+    /// [`can_osr_enter`](Self::can_osr_enter) with the dead-local admission
+    /// supplied explicitly.
+    ///
+    /// [`osr_dead_local_entry_allowed`] latches its answer in a `OnceLock`, so
+    /// a test in this process cannot exercise both sides of the
+    /// `CRATONVM_JIT_OSR_DEAD_LOCALS` kill switch through the public entry
+    /// point — and that switch is the documented escape hatch for this
+    /// relaxation, so it is exactly the path that wants coverage.
+    pub fn can_osr_enter_with(&self, entry_pc: usize, allow_dead_locals: bool) -> bool {
+        if !allow_dead_locals
+            && self
+                .osr_dead_mask
+                .as_ref()
+                .and_then(|m| m.get(entry_pc).copied())
+                .unwrap_or(0)
+                != 0
         {
             return false;
         }
@@ -2245,15 +2272,19 @@ impl CompiledMethod {
         }
         let target_addr = self.entry as usize + native_offset as usize;
 
-        // A nonzero dead mask means at least one dead interpreter local shares a
-        // compiled location with a live local at this entry. Until OSR supports
-        // reconstructing that coalesced state, fall back to the interpreter.
+        // A nonzero dead mask names the locals the trampoline must NOT seed:
+        // each is dead here and shares its home register with a live local, so
+        // loading it would clobber the live owner. The trampoline skips exactly
+        // those (`dead_mask >> i & 1` → `continue`); see
+        // [`osr_dead_local_entry_allowed`] for why that is sufficient, and for
+        // the `CRATONVM_JIT_OSR_DEAD_LOCALS=0` kill switch that restores the
+        // historical "refuse the entry outright" behaviour.
         let dead_mask = self
             .osr_dead_mask
             .as_ref()
             .and_then(|m| m.get(entry_pc).copied())
             .unwrap_or(0);
-        if dead_mask != 0 {
+        if dead_mask != 0 && !osr_dead_local_entry_allowed() {
             return None;
         }
 
@@ -2287,6 +2318,83 @@ impl CompiledMethod {
 // ---------------------------------------------------------------------------
 // OSR (On-Stack Replacement) trampoline
 // ---------------------------------------------------------------------------
+
+/// Whether OSR may enter at a pc whose `osr_dead_mask` is non-zero, relying on
+/// the trampoline to skip seeding the masked locals.
+///
+/// **DEFAULT ON since 2026-07-31.** **Kill switch:
+/// `CRATONVM_JIT_OSR_DEAD_LOCALS=0`** (also `off` / `false` / `no`) restores
+/// the historical blanket refusal with no rebuild. If a run turns up a wrong
+/// result, a spurious NPE/SIGSEGV or a mis-sorted array, set that and re-run
+/// before doing anything else — it is the fastest attribution test for this
+/// change and separates it cleanly from everything else in the same binary.
+///
+/// ## What the mask means
+///
+/// `osr_dead_mask[pc]` bit `i` is set iff, at the block-start pc `pc`, local
+/// `i` is **dead** (not in that block's `live_in`), is **register-resident**,
+/// and its home register is **also the home of a local that IS live there**.
+/// Graph-colouring coalesced the two once local `i`'s range ended. Loading `i`
+/// at entry would drop the interpreter's stale value on top of the live
+/// owner's register.
+///
+/// ## Why skipping the load is sufficient
+///
+/// The historical refusal (`3415d052b`, 2026-07-03) called the skip "a
+/// coalesced state transition that was not proven safe". It is provable, from
+/// the allocator's own invariant:
+///
+/// 1. **A local has exactly one home for the whole method.** `local_assignments`
+///    is a `Vec<Option<u8>>` indexed by local; `x64::Compiler::reg_for_local`
+///    is the single reader and there is no live-range splitting, so there is no
+///    "at this pc register R belongs to someone else" state to express. The
+///    OSR copy only nulls entries (category-2 high halves), never re-points
+///    them.
+/// 2. **Two locals sharing a register are never both live-in at the same
+///    block start.** `regalloc::build_interference` unions, for every block,
+///    `live_in` against itself — every pair simultaneously live-in at a block
+///    boundary is marked interfering — and `regalloc_invariants_hold` fails the
+///    whole allocation (falling back to no register homes) if any interfering
+///    pair got the same colour. `RegAllocResult::block_live_in`, which the mask
+///    is computed from, is *the same* `blocks[i].live_in`.
+/// 3. Therefore at an OSR entry pc, of the locals homed to register `R`, **at
+///    most one is live**. The trampoline loads every non-masked local, which is
+///    exactly that one, so `R` ends up holding its correct value.
+/// 4. A masked local needs no value: dead means every path from `pc` redefines
+///    it before reading it. Its frame slot is not written either — but the
+///    trampoline already elides the frame-slot store for *every* register-homed
+///    local (dead or live), so that is not a new hole.
+///
+/// The refusal was introduced alongside the fix that actually closed the
+/// Hibernate regression it cites: the same commit threaded
+/// `compute_param_jvm_slots` / `param_slot_span` into the OSR compile so
+/// category-2 parameters (the `long limitRows` in that very
+/// `org.h2.command.query.Select.queryFlat` frame) land in the slots the body
+/// reads. That mismatch, not the dead-local skip, is what produced the NPE.
+///
+/// ## What this unblocks
+///
+/// The refusal is the second of the two gates behind Tomcat known-issue 30:
+/// once RBC.7 stopped refusing `invokedynamic` methods outright, every
+/// `loop … then System.out.println("…" + x)` shape compiled its OSR body
+/// successfully and was then turned away at the door, because the harness
+/// method's own parameter (`String[] args`, local 0) is dead at the loop head.
+/// A once-invoked method with its hot loop inline has no other route into
+/// compiled code.
+fn osr_dead_local_entry_allowed() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_DEAD_LOCALS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            ),
+            // Default: the trampoline's skip-the-load handles these entries.
+            Err(_) => true,
+        },
+    )
+}
 
 /// Global cache of emitted OSR trampolines, keyed by `target_addr`.
 ///
@@ -5840,8 +5948,15 @@ static JIT_ENTRY_OWNERS: std::sync::OnceLock<
     parking_lot::Mutex<FxHashMap<usize, std::sync::Weak<CompiledMethod>>>,
 > = std::sync::OnceLock::new();
 static JIT_CACHE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-static ACTIVE_JIT_EXECUTIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+/// How many compiled-frame activations are in flight process-wide.
+///
+/// Striped per thread: this is incremented and decremented on every
+/// interpreter/JIT boundary crossing, and read only when an artifact is
+/// retired. As one shared `AtomicUsize` it was a contended read-modify-write
+/// on a single cache line twice per Java call — see
+/// [`cratonvm_types::striped_counter`].
+static ACTIVE_JIT_EXECUTIONS: cratonvm_types::striped_counter::StripedCounter =
+    cratonvm_types::striped_counter::StripedCounter::new();
 static DEFERRED_JIT_OWNERS: std::sync::OnceLock<parking_lot::Mutex<Vec<Arc<CompiledMethod>>>> =
     std::sync::OnceLock::new();
 
@@ -6059,7 +6174,7 @@ fn drain_deferred_jit_owners_if_quiescent() {
     if jit_leak_code_enabled() {
         return;
     }
-    if ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire) != 0 {
+    if !ACTIVE_JIT_EXECUTIONS.is_zero() {
         return;
     }
     let retired = std::mem::take(&mut *deferred_jit_owners().lock());
@@ -6074,7 +6189,7 @@ fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
         deferred_jit_owners().lock().push(owner);
         return;
     }
-    if ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire) == 0 {
+    if ACTIVE_JIT_EXECUTIONS.is_zero() {
         drop(owner);
         return;
     }
@@ -6087,13 +6202,15 @@ fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
 /// Enter/leave the process-wide executable-code quiescence epoch. VM JIT entry
 /// guards call these at the same boundaries as their precise frame chain.
 pub fn jit_execution_enter() {
-    ACTIVE_JIT_EXECUTIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    ACTIVE_JIT_EXECUTIONS.inc();
 }
 
 pub fn jit_execution_leave() {
-    let previous = ACTIVE_JIT_EXECUTIONS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    debug_assert!(previous > 0, "unbalanced JIT execution leave");
-    if previous == 1 {
+    ACTIVE_JIT_EXECUTIONS.dec();
+    // The retirement drain only needs to run when this was the last activation
+    // anywhere. `is_zero` short-circuits on the first live stripe, so the
+    // common "some other thread is still in JIT" case costs one load.
+    if ACTIVE_JIT_EXECUTIONS.is_zero() {
         drain_deferred_jit_owners_if_quiescent();
     }
 }
@@ -6365,11 +6482,11 @@ impl JitCache {
             // later invocation, by which time the callee has a live body.
             return;
         }
+        // Stamp the declaring class before the artifact is shared: it is what
+        // `JitEntryGuard` reads to keep this class's defining loader alive
+        // while one of these frames is on a stack.
+        compiled.owner_class_id = declaring_class_id.as_u32();
         let arc = Arc::new(compiled);
-        cratonvm_types::jit_activation::register_executable_owner(
-            arc.entry_ptr() as usize,
-            declaring_class_id.as_u32(),
-        );
         // Stage 5 — register this method's code range for the GC RBP-chain
         // walker. Enabled when the precise gate is on (the registry is consulted
         // by `remap_active_jit_frames`) OR when the BUG-03 cross-thread STW JIT
@@ -6455,11 +6572,9 @@ impl JitCache {
             // later invocation, by which time the callee has a live body.
             return;
         }
+        // See the matching note in `put`.
+        compiled.owner_class_id = declaring_class_id.as_u32();
         let arc = Arc::new(compiled);
-        cratonvm_types::jit_activation::register_executable_owner(
-            arc.entry_ptr() as usize,
-            declaring_class_id.as_u32(),
-        );
         if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
             register_jit_code_range(
                 arc.entry_ptr() as usize,
@@ -7680,11 +7795,12 @@ pub fn jit_bail_list_size() -> usize {
 //
 // An OSR compile is requested for one specific back-edge PC, but the artifact
 // it produces decides for itself which PCs it will accept: `can_osr_enter`
-// refuses any PC whose `osr_dead_mask` is non-zero (a dead interpreter local
-// sharing a compiled location with a live one — state OSR cannot reconstruct).
-// Those two decisions are made by different parts of the pipeline, and they can
-// disagree: the compile succeeds and the resulting body then refuses the very
-// entry it was compiled for.
+// refuses any PC with no published native offset (the codegen writes -1 for a
+// pc strictly inside a LICM-hoisted loop body) and — under
+// `CRATONVM_JIT_OSR_DEAD_LOCALS=0` only — any PC whose `osr_dead_mask` is
+// non-zero. Those two decisions are made by different parts of the pipeline,
+// and they can disagree: the compile succeeds and the resulting body then
+// refuses the very entry it was compiled for.
 //
 // Nothing memoised that disagreement, so the next trip over the same back-edge
 // ran the FULL x64 pipeline again, for the same PC, to the same conclusion —
@@ -8108,57 +8224,109 @@ pub fn moving_young_disables_optimizing_tier() -> bool {
              compiles, but through the single-pass C1 backend only — the IR optimizer, its \
              inline caches and its direct-call lowering contribute nothing. \
              `CRATONVM_NO_MOVING_YOUNG=1` restores the optimizing tier and gives up compaction. \
-             See docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md",
+             See docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md",
         );
     }
     true
 }
 
-pub fn direct_jit_callee_calls_enabled() -> bool {
-    // A raw JIT-to-JIT call has no callee JitEntryGuard, so the callee frame is
-    // not reachable from the entry chain: the active-RBP mirror points at the
-    // callee while the root-chain metadata still names the caller, and a GC at
-    // that boundary can select an incompatible oop map and RECLAIM A LIVE ROOT
-    // (see the matching comment at the inline MIC/PIC emission site in
-    // `x64.rs`).
-    //
-    // 2026-07-31: this gate was scoped to `moving_young_relocates_compiled_frames()`
-    // on the argument that the hazard needs a RELOCATING collection and the
-    // runtime veto forbids one while such a frame is live. Measured, that
-    // argument does not hold: with the moving-young default on and this gate
-    // open, `BasicErrorControllerIntegrationTests` SIGSEGVs on EVERY run
-    // (14/14 + 8/8 on a pristine build), faulting on a read through a zeroed
-    // heap slot — the reclaimed-root signature the comment above predicts, not
-    // a relocation one. Closing this gate alone makes the same class 26/26
-    // clean, 5/5 runs, with the optimizing tier still enabled. Disabling only
-    // the IR half (`CRATONVM_JIT_IR_DIRECT_CALL=0`) does NOT help (3/3
-    // crashes), so the defect is in the single-pass backend's raw edge, which
-    // this gate had kept dark for months.
-    //
-    // So: back to the bare flag, which is the state that actually shipped. The
-    // OPTIMIZING-TIER gate stays scoped as
-    // `moving_young_relocates_compiled_frames()` — that one protects frames
-    // which DO carry a guard, and it is measured safe. These two gates ask
-    // different questions and must not share a predicate.
-    //
-    // This re-gates the edge; it does not fix it. Whoever reopens it needs to
-    // make an unguarded callee frame describable to the root scan first, and
-    // should re-run this class 14x as the acceptance gate.
-    // EXPERIMENT (temporary, 2026-07-31): `CRATONVM_JIT_DIRECT_CALLEE_CALLS=force`
-    // opens the gate under moving-young in the SAME binary, so the crashing and
-    // the clean arm differ only by an environment variable rather than by a
-    // build. Removed once the edge is fixed and the gate reopens for real.
-    let forced = matches!(
-        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS").as_deref(),
-        Ok("force")
-    );
-    if x64::moving_young_enabled() && !forced {
-        return false;
-    }
-    if forced {
-        return true;
-    }
+/// Bisect toggle (`CRATONVM_SHADOW_NO_END_GUARD`) — suppress the `end` overflow
+/// guard both backends emit ahead of a shadow push, restoring the pre-guard
+/// behaviour where an overrunning push stores straight on through the allocator
+/// arena. Only useful to confirm that a given failure IS the overflow.
+pub fn shadow_end_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NO_END_GUARD").is_none()
+    })
+}
 
+/// Number of times a JIT-emitted shadow-stack push hit the `end` guard and
+/// bailed instead of storing past the end of the thread's buffer.
+///
+/// Non-zero means at least one compiled method leaked pushes badly enough to
+/// exhaust a 2 MiB (256K-slot) shadow stack — before the guard existed that
+/// was silent heap corruption (the write ran on through the mimalloc arena,
+/// including the `JvmThread`, until it left the mapping ~170 MiB later). It
+/// also means the safepoints that bailed did NOT publish their oops, so their
+/// compile-time `moving_young_coverage_complete` claim is not backed at
+/// runtime; the per-cycle coverage verifier rejects the proof and the
+/// collection falls back to the non-moving sweep.
+pub static SHADOW_OVERFLOW_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Address of a leaked NUL-terminated method label recorded by the most recent
+/// shadow-stack overflow bail, or 0. Only written when
+/// `CRATONVM_SHADOW_OVERFLOW_DIAG` is set (the label allocation is a permanent
+/// leak, so it is not produced by default).
+pub static SHADOW_OVERFLOW_LABEL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `(overflow_count, last_method_label)` when at least one shadow-stack push
+/// has bailed on the `end` guard, else `None`.
+pub fn shadow_overflow_status() -> Option<(usize, Option<String>)> {
+    let n = SHADOW_OVERFLOW_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    if n == 0 {
+        return None;
+    }
+    let p = SHADOW_OVERFLOW_LABEL.load(std::sync::atomic::Ordering::Relaxed) as *const u8;
+    let label = if p.is_null() {
+        None
+    } else {
+        // SAFETY: the pointer, when non-zero, names a leaked NUL-terminated
+        // `str` produced by the compiler for the overflowing method; it is
+        // immortal and never rewritten in place.
+        unsafe { std::ffi::CStr::from_ptr(p as *const std::os::raw::c_char) }
+            .to_str()
+            .ok()
+            .map(|s| s.to_string())
+    };
+    Some((n, label))
+}
+
+pub fn direct_jit_callee_calls_enabled() -> bool {
+    // A raw JIT-to-JIT call produces a callee frame with no `JitEntryGuard`, so
+    // it is not reachable from the entry chain: the active-RBP mirror points at
+    // the callee while the root-chain metadata still names the caller.
+    //
+    // 2026-07-31, ROUND 1: the gate was closed under moving-young because
+    // `BasicErrorControllerIntegrationTests` SIGSEGV'd on every gate-open run,
+    // and the comment here blamed a GC "selecting an incompatible oop map and
+    // reclaiming a live root". ROUND 2 measured that and it is wrong on both
+    // counts. The root scan behaves correctly: `chain_entry_rbp_is_foreign`
+    // detects the unguarded callee frame, the per-cycle proof is incomplete,
+    // `moving_young_precise_only` refuses it, and the collection diverts to the
+    // non-moving sweep. Nothing is reclaimed. What actually killed the process
+    // was plain machine code:
+    //
+    //   The inline PIC cascade's inter-slot `JNE` was a `rel8`, sized by a
+    //   comment claiming "a single slot body is ~30 bytes". A slot body had
+    //   since grown the post-call innermost-RBP republish and the callee-deopt
+    //   service check, putting it past 127 bytes. The patch truncated the
+    //   displacement (`rel as u8`) behind a `debug_assert!`, so RELEASE builds
+    //   silently branched to `JNE -128` — into the middle of the pre-call
+    //   shadow-stack push. Executed from there, the push ran as an infinite
+    //   loop with nothing reloading `top`, marched off the end of the thread's
+    //   2 MiB shadow buffer, overwrote the allocator arena behind it (including
+    //   the `JvmThread`), and faulted ~170 MiB later at the arena end.
+    //
+    // Three things had to change before this could reopen, all of them fixes in
+    // their own right: the inter-slot branch is now `rel32` and no `rel8` patch
+    // may truncate (`patch_rel8_or_bail`); both backends now emit the `end`
+    // overflow guard `ShadowStack::END_OFFSET` was always documented as having
+    // (an overrunning push bails instead of corrupting the heap); and the
+    // single-pass sibling tail-call now restores the shadow `top` watermark its
+    // epilogue-without-ret used to skip.
+    //
+    // Acceptance: `BasicErrorControllerIntegrationTests`, default flags,
+    // 14 consecutive clean runs, plus a same-binary gate-closed control.
+    //
+    // The OPTIMIZING-TIER gate stays scoped as
+    // `moving_young_relocates_compiled_frames()` — that one protects frames
+    // which DO carry a guard. These two gates ask different questions and must
+    // not share a predicate; see
+    // `x64::flag_and_header_contracts::direct_jit_callee_calls_open_under_moving_young`.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
@@ -8834,6 +9002,61 @@ fn exc_table_c2_disabled() -> bool {
 /// `invokestatic`, which this list has always admitted, not something the
 /// opcodes added here introduced.
 #[cfg(target_arch = "x86_64")]
+/// Does `op`, inside a protected range, always exit through a call site that
+/// publishes a precise (reason-9) exceptional frame?
+///
+/// `invokespecial`/`invokestatic` and the monitor ops have always been here.
+/// `invokevirtual` (0xb6) and `invokeinterface` (0xb9) are here again as of
+/// 2026-07-31, and the reason they can be is that the hole that took them out
+/// has since been plugged in the codegen rather than in this list:
+/// `a523715a84` added the `protected_precise_handler_call` suppression to
+/// `x64.rs`, which forces a protected virtual/interface call onto the dispatch
+/// path (ending in `emit_post_invoke_exception_check`) instead of the inline
+/// MIC/PIC cascade — and the inline cascade machine-CALLing a raw entry, with
+/// nothing recording the caller's locals, is exactly what let Spring's
+/// `SimpleApplicationEventMulticaster.invokeListener` read its pre-`try`
+/// `errorHandler` local back as null. The narrowing landed in the same commit
+/// as the fix and was belt to its braces; `probes/HandlerLocalAcrossProtected
+/// InvokeProbe.java` is the acceptance test that the braces hold on their own.
+///
+/// The remaining lowerings a protected 0xb6/0xb9 can select all publish:
+/// the two that emit no call at all cannot throw; the inline-callee path is
+/// unreachable because `try_compile_inner` clears `inline_sites` under
+/// `precise_exception_frames`; the sibling tail-call is suppressed inside a
+/// protected range (`pc_is_protected`, x64.rs); and the direct-call and
+/// MIC/`jit_invoke_dispatch` paths both end in
+/// `emit_post_invoke_exception_check`.
+///
+/// `getfield`/`putfield` (0xb4/0xb5) are NOT here. They were added 2026-07-28
+/// in `5bf306bb0` alongside a precise null check, but that check has a single
+/// call site on the INLINED-CALLEE `putfield` path; the top-level arms keep an
+/// inline fast path that neither null-checks nor publishes a frame. Measured
+/// with `probes/Rbc6FieldProbe.java`: a `getfield` NPE inside a protected range
+/// let the handler read a non-parameter local as 0 instead of 38, and a
+/// `putfield` on a null receiver did not throw at all. Both are silent wrong
+/// answers, which is what RBC.6 exists to prevent. Re-admit them only together
+/// with a precise frame at the top-level field arms — see
+/// `docs/internal/fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md`.
+///
+/// `invokedynamic` (0xba) is deliberately absent too: it lowers to an
+/// unconditional deopt trap, not to a call site that publishes a frame.
+fn precise_frame_publishing_opcode(op: u8) -> bool {
+    if matches!(op, 0xb6 | 0xb9) {
+        return precise_virtual_invokes_enabled();
+    }
+    matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
+}
+
+/// Opt-out for admitting `invokevirtual`/`invokeinterface` above, so one
+/// binary can be A/B'd against itself.
+fn precise_virtual_invokes_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES").is_none()
+    })
+}
+
 fn precise_exception_frame_sites_supported(
     code: &[u8],
     code_len: usize,
@@ -8860,26 +9083,11 @@ fn precise_exception_frame_sites_supported(
     let mut pc = 0;
     while pc < code_len {
         let op = code[pc];
-        // 0xb6 invokevirtual, 0xb7 invokespecial, 0xb8 invokestatic,
-        // 0xb9 invokeinterface, 0xc2/0xc3 monitorenter/monitorexit.
-        // 0xba (invokedynamic) is deliberately NOT here: it lowers to an
-        // unconditional deopt trap, not to a call site that publishes a frame.
+        // Which opcodes are admitted, and why, is documented on
+        // `precise_frame_publishing_opcode`.
         if covered(pc)
             && may_throw_without_precise_frame(op)
-            // 0xb4/0xb5 (getfield/putfield) are NOT here. They were added
-            // 2026-07-28 in 5bf306bb0 alongside a precise null check, but that
-            // check has a single call site on the INLINED-CALLEE putfield path;
-            // the top-level arms keep an inline fast path that neither
-            // null-checks nor publishes a frame. Measured on this tree with
-            // probes/Rbc6FieldProbe.java: a `getfield` NPE inside a protected
-            // range let the handler read a non-parameter local as 0 instead of
-            // 38, and a `putfield` on a null receiver did not throw at all
-            // (returned the normal-path -1 instead of the handler's 66). Both
-            // are silent wrong answers, which is exactly what RBC.6 exists to
-            // prevent. Re-admit them only together with a precise frame at the
-            // top-level field arms -- see
-            // docs/known-issues/tomcat/23-charsetcache-pathological-slowdown.md.
-            && !matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
+            && !precise_frame_publishing_opcode(op)
         {
             return false;
         }
@@ -9326,7 +9534,7 @@ fn try_compile_inner(
         // in exchange for a frame that cannot occur: the runtime vetoes
         // moving-young whenever an un-rewritable compiled frame is live, so a
         // relocating cycle never sees one. See
-        // `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+        // `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`
         // and `moving_young_relocates_compiled_frames` for the invariant.
         //
         // This scopes the gate; it does not remove it. When the JIT publishes a
@@ -9417,6 +9625,11 @@ fn try_compile_inner(
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
+        // Compact-layout metadata for this method's field reads, for the
+        // lowerer's guarded inline `getfield`. Filled alongside the builder's
+        // `field_info` below.
+        let mut ir_compact_fields: std::collections::HashMap<usize, (u32, bool, u8)> =
+            std::collections::HashMap::new();
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
         builder.tdigest_scalar_kernel = cached.class_name.as_ref()
             == "org/elasticsearch/tdigest/Dist"
@@ -9472,10 +9685,22 @@ fn try_compile_inner(
             if let Some(resolver) = cp_field_resolver {
                 let mut fm = std::collections::HashMap::with_capacity(scan.field_ops.len());
                 for &(pc, cp_idx) in &scan.field_ops {
-                    if let Some((field_index, type_tag, _compact_slot)) = resolver(cp_idx) {
-                        // The IR builder only needs (field_index, type_tag); it
-                        // bails getfield/putfield to single-pass under compact.
+                    if let Some((field_index, type_tag, compact_slot)) = resolver(cp_idx) {
+                        // The builder needs (field_index, type_tag); the LOWERER
+                        // additionally takes the packed compact slot, so a field
+                        // read can be emitted inline instead of paying the
+                        // checked helper on every access. Only a genuinely
+                        // resolved slot enters the map — a fabricated `(0,
+                        // false)` steered the single-pass inline arm at a
+                        // garbage offset once already (the WildFly Host
+                        // Controller SIGSEGV), and `None` here simply keeps the
+                        // helper.
                         fm.insert(pc, (field_index, type_tag));
+                        if cratonvm_types::compact_ref_fields_enabled() {
+                            if let Some((c_off, c_ref)) = compact_slot {
+                                ir_compact_fields.insert(pc, (c_off, c_ref, type_tag));
+                            }
+                        }
                     }
                 }
                 builder.set_field_info(fm);
@@ -10176,6 +10401,7 @@ fn try_compile_inner(
                         sr_map.as_ref(),
                         &ir_direct_calls,
                         &ir_ic_slots,
+                        &ir_compact_fields,
                     );
                     drop(metrics_lower);
                     if let Some(mut compiled) = lowered {
@@ -14558,33 +14784,88 @@ mod tests {
         );
     }
 
+    /// Both sides of the `CRATONVM_JIT_OSR_DEAD_LOCALS` kill switch, through
+    /// the pure `can_osr_enter_with` so one process can pin both. The
+    /// no-native-offset refusal must hold either way: that one is not a
+    /// dead-local question at all.
     #[test]
-    fn test_can_osr_enter_rejects_dead_masked_entry() {
+    fn test_can_osr_enter_dead_masked_entry_both_sides() {
         let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
         buf.emit(&[0xC3]); // RET
         let mut cm = CompiledMethod::new(buf);
         cm.osr_pc_to_native = Some(vec![-1, 0, 4]);
         cm.osr_dead_mask = Some(vec![0, 0x80, 0]);
 
-        assert!(!cm.can_osr_enter(0), "negative native offset must bail");
+        for allow in [false, true] {
+            assert!(
+                !cm.can_osr_enter_with(0, allow),
+                "negative native offset must bail regardless of the dead-local knob (allow={allow})"
+            );
+            assert!(
+                cm.can_osr_enter_with(2, allow),
+                "zero dead mask remains OSR-eligible (allow={allow})"
+            );
+        }
         assert!(
-            !cm.can_osr_enter(1),
-            "dead coalesced locals are not safe OSR entries"
+            !cm.can_osr_enter_with(1, false),
+            "CRATONVM_JIT_OSR_DEAD_LOCALS=0 restores the blanket refusal"
         );
-        assert!(cm.can_osr_enter(2), "zero dead mask remains OSR-eligible");
+        assert!(
+            cm.can_osr_enter_with(1, true),
+            "default: the trampoline skips the masked locals, so the entry is admitted"
+        );
     }
 
-    #[cfg(target_arch = "x86_64")]
+    /// The public entry point agrees with the pure one under this process's
+    /// (latched) flag value, whichever way the environment set it.
     #[test]
-    fn test_osr_enter_rejects_dead_mask_before_trampoline() {
+    fn test_can_osr_enter_matches_the_flagged_variant() {
         let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
         buf.emit(&[0xC3]); // RET
         let mut cm = CompiledMethod::new(buf);
         cm.osr_pc_to_native = Some(vec![0]);
         cm.osr_dead_mask = Some(vec![0x80]);
 
-        let result = unsafe { cm.osr_enter(0, &[], 0, 0) };
-        assert_eq!(result, None);
+        let allow = osr_dead_local_entry_allowed();
+        assert_eq!(cm.can_osr_enter(0), cm.can_osr_enter_with(0, allow));
+    }
+
+    /// `osr_enter`'s dead-mask short-circuit, pinned on the one side a unit
+    /// test can pin.
+    ///
+    /// Only the REFUSING side is assertable here. Admitting means actually
+    /// running `osr_trampoline`, which builds a frame (pushes rbp, subtracts
+    /// `osr_frame_size`, spills the callee-saved set at `osr_callee_saved_base`)
+    /// and jumps to the target — so a stub body has to be a real compiled
+    /// method with matching frame metadata, not a bare `RET`. Entering a `RET`
+    /// stub returns into the middle of the trampoline's own prologue and
+    /// access-violates; an earlier version of this test did exactly that and
+    /// took the whole `cratonvm-jit` binary down with 0xC0000005.
+    ///
+    /// The admitted path's coverage is `probes/OsrDeadLocalProbe.java`, which
+    /// executes eight real coalescing shapes end to end and checksums every
+    /// result against HotSpot. The decision itself is pinned above by
+    /// `test_can_osr_enter_dead_masked_entry_both_sides`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_osr_enter_refuses_dead_mask_under_the_kill_switch() {
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET — never entered on this path.
+        let mut cm = CompiledMethod::new(buf);
+        cm.osr_pc_to_native = Some(vec![0]);
+        cm.osr_dead_mask = Some(vec![0x80]);
+
+        if osr_dead_local_entry_allowed() {
+            // Default: the refusal is gone, so there is nothing to assert that
+            // does not require entering the stub. Assert the decision instead.
+            assert!(cm.can_osr_enter_with(0, true));
+        } else {
+            assert_eq!(
+                unsafe { cm.osr_enter(0, &[], 0, 0) },
+                None,
+                "CRATONVM_JIT_OSR_DEAD_LOCALS=0 must still bail before the trampoline"
+            );
+        }
     }
 
     /// A crash handler must be able to tell "no compiled body covers this
@@ -17115,23 +17396,34 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn protected_virtual_and_interface_calls_stay_out_of_precise_exception_coverage() {
+    fn protected_virtual_and_interface_calls_are_precise_exception_covered() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
 
-        // 0xb6/0xb9 are deliberately NOT admitted. They were admitted once
-        // (2026-07-27) and removed again by a523715a84 together with the
-        // `protected_precise_handler_call` suppression in `x64.rs`, because
-        // admitting them let Spring's
-        // `SimpleApplicationEventMulticaster.invokeListener` compile and then
-        // read its own pre-`try` `errorHandler` local back as null inside the
-        // handler (springboot-rerun-20260728-small-residuals-cluster, Case 3).
+        // 0xb6/0xb9 ARE admitted (2026-07-31). They were admitted once before
+        // (2026-07-27) and removed again by `a523715a84`, because admitting
+        // them let Spring's `SimpleApplicationEventMulticaster.invokeListener`
+        // compile and then read its own pre-`try` `errorHandler` local back as
+        // null inside the handler
+        // (springboot-rerun-20260728-small-residuals-cluster, Case 3).
         //
-        // Re-widening is not free-standing work: it needs that Spring class
-        // (or an equivalent that actually compiles) re-verified first. Doc 23
-        // measured re-widening as worth NOTHING to
-        // `TestCharsetCachePerformance` now that `try`/`catch` methods reach
-        // the optimizing tier by other means, so there is no throughput
-        // argument for carrying the risk.
+        // What makes them safe now is that `a523715a84` did not only narrow
+        // this list — it also ADDED the `protected_precise_handler_call`
+        // suppression to `x64.rs`, which forces a protected virtual/interface
+        // call onto the dispatch path (ending in
+        // `emit_post_invoke_exception_check`, which records the caller's
+        // complete state) instead of the inline MIC/PIC cascade that CALLs a
+        // raw entry with nothing recording the caller's locals. That was the
+        // actual defect; the narrowing was belt to its braces.
+        //
+        // The acceptance test for the braces holding on their own is
+        // `probes/HandlerLocalAcrossProtectedInvokeProbe.java`, which builds
+        // the Spring shape — a non-parameter local assigned before the `try`,
+        // read back in the handler — through `invokevirtual`,
+        // `invokeinterface` and `invokespecial` throw sites, plus a nested
+        // `try`, a reassignment after the protected call, and the
+        // null-`errorHandler` path that must skip the protected region
+        // entirely. Re-verify with THAT probe, not by inspection, before
+        // touching this list again.
         let code = vec![
             0x2a, // 0: aload_0
             0xb6, 0x00, 0x01, // 1: invokevirtual #1
@@ -17150,10 +17442,28 @@ mod tests {
             handler_pc: 13,
             catch_type: 0,
         }];
-        assert!(!precise_exception_frame_sites_supported(
+        assert!(precise_exception_frame_sites_supported(
             &code,
             code.len(),
             &table,
+        ));
+
+        // `getfield`/`putfield` remain excluded — the top-level field arms
+        // still keep an inline fast path that neither null-checks nor
+        // publishes a frame. One `getfield` inside the same protected range is
+        // enough to withhold coverage.
+        let mut with_field = code.clone();
+        with_field.splice(1..1, [0xb4, 0x00, 0x03]);
+        let field_table = vec![ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 16,
+            handler_pc: 16,
+            catch_type: 0,
+        }];
+        assert!(!precise_exception_frame_sites_supported(
+            &with_field,
+            with_field.len(),
+            &field_table,
         ));
     }
 
@@ -17441,8 +17751,12 @@ mod layout_constant_inventory {
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8
-        // array-length load that guards every bounds check.
-        ("ir_lower.rs", [7, 3, 4, 0, 0, 0, 3, 0]),
+        // array-length load that guards every bounds check. The eighth
+        // `HEADER_SIZE` is the guarded inline compact `getfield`'s cell
+        // address (`HEADER_SIZE + packed_body_offset`) — a disp32 site, so it
+        // does not share the disp8 backwards-addressing hazard, but it does
+        // bake the header size into machine code.
+        ("ir_lower.rs", [8, 3, 4, 0, 0, 0, 3, 0]),
     ];
 
     fn source(file: &str) -> &'static str {

@@ -208,19 +208,20 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     // kept-in-place survivor the sweep retains (side-marked or header-marked),
     // which is exactly the survival proof the restore pass needs — the
     // referent half of this fix simply never covered the reference objects.
-    let watch_addrs: Vec<usize> = pairs
-        .iter()
-        .flat_map(|&(ref_obj, referent)| [ref_obj, referent])
-        .collect();
-    let queue_watch_addrs = {
+    // Old-gen reclamation fix (HIB-CV-32 family, TestMVStoreCachePerformance):
+    // publish EVERY address the processor holds, not just the weak/phantom
+    // pairs' and their queues'. `process_references` and `remove_collected`
+    // consult the survival predicate for soft/cleaner/finalizer entries too,
+    // and after an old-gen reclamation that predicate is only exact for
+    // addresses the collector was asked to prove — see
+    // `VmHeap::watched_pre_gc_addr_survived`. The set is bounded by the number
+    // of live `Reference` objects, and a non-surviving address simply never
+    // gets an entry, so widening it costs one hash insert per tracked
+    // reference and cannot over-retain.
+    let watch_addrs: Vec<usize> = {
         let rp = shared.mem.ref_processor.lock();
-        rp.weak_phantom_active_queue_addrs()
+        rp.all_tracked_addrs()
     };
-    let mut watched_reference_liveness = watch_addrs;
-    watched_reference_liveness.extend(queue_watch_addrs);
-    // Queue addresses need the same non-moving survival proof as their
-    // Reference objects; post-GC enqueue writes both endpoints.
-    let watch_addrs = watched_reference_liveness;
 
     if crate::runtime::env_cache::dbg_watchref() {
         eprintln!(
@@ -2314,8 +2315,24 @@ fn process_references_after_gc(
     // 1. It appears in the pointer map (evacuated/copied during collection), OR
     // 2. It resides in a live (non-collected) heap region (G1: Old/Humongous regions
     //    that weren't in the collection set are still live).
+    // Every address reaching this predicate belongs to the reference
+    // processor and was therefore published as watched by
+    // `weakref_null_referents_pre_gc` — so the exact predicate applies. It
+    // only differs from the permissive `is_addr_live` when this cycle
+    // reclaimed old-gen storage, in which case an old-gen address absent from
+    // the pointer map genuinely did not survive (see
+    // `VmHeap::watched_pre_gc_addr_survived`). Fall back to the permissive
+    // form when the pre-GC publication pass is switched off, since then no
+    // watch set was published and no identity entries were emitted.
     let is_marked = |addr: usize| -> bool {
-        pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
+        if weakref_clear_enabled() {
+            shared
+                .mem
+                .heap
+                .watched_pre_gc_addr_survived(addr, pointer_map)
+        } else {
+            pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
+        }
     };
 
     // The `0` third argument is deliberate, not a second hardcode: when the
@@ -2342,11 +2359,42 @@ fn process_references_after_gc(
     // was hardwired inert for G1/ZGC — dead finalize/cleaner/enqueue
     // addresses flowed through unguarded and `run_finalizers` later
     // dereferenced freed CSet memory (finalize-on-recycled-object UAF).
+    // OLD-GEN RECLAMATION FIX (HIB-CV-32 family,
+    // `TestMVStoreCachePerformance`): `pre_gc_addr_did_not_survive` has the
+    // same old-generation blind spot `is_addr_live` had — for the Generational
+    // heap it only rejects YOUNG addresses absent from the pointer map, and
+    // answers "survived" for every old-gen address on the grounds that a minor
+    // GC does not move old gen. That stops being true the moment the SAME
+    // cycle reclaims old-gen storage (mark-compact `major_gc`, or the in-place
+    // `sweep_old_gen_non_moving`): the pre-GC address of a reclaimed old-gen
+    // Reference / queue / cleaner action now names the zeroed compaction tail,
+    // a live object slid onto it, or a free block. The cleared/enqueue writes
+    // below then landed on an innocent occupant, and — worse — the finalize
+    // and cleaner loops handed that address to `run_finalizers` /
+    // `run_cleaner_actions`, which INVOKE Java methods on it.
+    //
+    // Every address that reaches this predicate belongs to the reference
+    // processor and was published as watched by
+    // `weakref_null_referents_pre_gc`, so `watched_pre_gc_addr_survived` is
+    // exact for it (both old-gen paths emit an identity `pointer_map` entry
+    // for watched survivors). OR the two verdicts: a "did not survive" from
+    // either predicate declines the write, which is always the safe
+    // direction, and keeps the young rule exactly as strict as before (the
+    // `bc math-ec 0x4` fix). Falls back to the young-only rule when the
+    // pre-GC publication pass is off, since then nothing was watched.
     let is_stale_young = |addr: usize| -> bool {
-        shared
+        let young_stale = shared
             .mem
             .heap
-            .pre_gc_addr_did_not_survive(addr, pointer_map)
+            .pre_gc_addr_did_not_survive(addr, pointer_map);
+        if !weakref_clear_enabled() {
+            return young_stale;
+        }
+        young_stale
+            || !shared
+                .mem
+                .heap
+                .watched_pre_gc_addr_survived(addr, pointer_map)
     };
 
     // Null referent field (field 0) on cleared weak/soft references.
@@ -2554,7 +2602,13 @@ fn process_references_after_gc(
             // not itself survive — never write through freed/reused memory.
             let ref_obj_new = match pointer_map.get(&ref_obj_old) {
                 Some(&a) => a,
-                None if shared.mem.heap.is_addr_live(ref_obj_old) => ref_obj_old,
+                None if shared
+                    .mem
+                    .heap
+                    .watched_pre_gc_addr_survived(ref_obj_old, pointer_map) =>
+                {
+                    ref_obj_old
+                }
                 None => continue,
             };
             // The referent survived (this entry was not cleared/enqueued): find
@@ -2562,7 +2616,13 @@ fn process_references_after_gc(
             // in place → live).
             let referent_new = match pointer_map.get(&referent_old) {
                 Some(&a) => a,
-                None if shared.mem.heap.is_addr_live(referent_old) => referent_old,
+                None if shared
+                    .mem
+                    .heap
+                    .watched_pre_gc_addr_survived(referent_old, pointer_map) =>
+                {
+                    referent_old
+                }
                 // Defensive: should not happen for an active entry, but never
                 // write a stale referent — leave the slot null.
                 None => continue,

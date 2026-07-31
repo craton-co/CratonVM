@@ -902,6 +902,10 @@ struct Compiler {
     /// not emitted.
     shadow_fetch_start: usize,
     shadow_fetch_end: usize,
+    /// Leaked NUL-terminated copy of `method_label`, materialised on first use
+    /// by the overflow-bail diagnostic (`CRATONVM_SHADOW_OVERFLOW_DIAG`) so the
+    /// bail can name the method without a helper call. `None` until then.
+    shadow_overflow_label: Option<usize>,
     /// Set true the first time `emit_shadow_push` emits a real push (non-empty
     /// homes). Gates whether the prologue fetch above is kept or NOP'd.
     shadow_pushed_any: bool,
@@ -1592,9 +1596,28 @@ impl Compiler {
         // the MIC/PIC cascade, allocation helpers, checkcast/instanceof) sit
         // in caller-saved/argument registers, which the callee-saved-only
         // spill never covers.
-        let precise_implies_reg_spill = precise_maps && !precise_reg_spill_disabled();
-        let safepoint_reg_spill = safepoint_reg_spill_enabled() || precise_implies_reg_spill;
-        let safepoint_reg_spill_all = safepoint_reg_spill_all() || precise_implies_reg_spill;
+        //
+        // 2026-07-31: this used to read `precise_maps && !…`, and `precise_maps`
+        // is `precise_jit_maps_enabled() || moving_young_enabled()`. So a
+        // ROOT-VISIBILITY mechanism was on only because moving-young defaults
+        // on, and `CRATONVM_NO_MOVING_YOUNG=1` silently withdrew it — together
+        // with the scratch flush in `emit_pre_safepoint_spill_impl` and shadow
+        // publication, all three keyed on the same flag. Each exists so the
+        // conservative scan can SEE a register-resident oop across a
+        // GC-capable call; none of them is moving-specific, and each was added
+        // to fix a real reclaimed-root crash. With all three gone at once the
+        // opt-out lane faulted on a zeroed heap slot within seconds of real
+        // work — Hibernate `ZonedDateTimeTest` / `OffsetDateTimeTest` (1–3 s,
+        // reproduced on a pristine dev build) and the Windows
+        // `DateSymbolsProbe` repro. See
+        // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+        //
+        // Keyed on its own opt-out alone, the DEFAULT path is byte-identical
+        // (`precise_reg_spill_disabled()` is opt-in and unset), and the
+        // non-moving lane gets the visibility the default lane already had.
+        let reg_spill_for_root_visibility = !precise_reg_spill_disabled();
+        let safepoint_reg_spill = safepoint_reg_spill_enabled() || reg_spill_for_root_visibility;
+        let safepoint_reg_spill_all = safepoint_reg_spill_all() || reg_spill_for_root_visibility;
         let safepoint_reg_spill_nostore = safepoint_reg_spill_nostore();
         // Register-only operand-stack-oop soundness (DEFAULT ON): flush
         // `CalleeSaved` operand-stack reference entries in `flush_scratch_
@@ -1965,6 +1988,7 @@ impl Compiler {
             pending_shadow_coverage_complete: false,
             shadow_fetch_start: 0,
             shadow_fetch_end: 0,
+            shadow_overflow_label: None,
             shadow_pushed_any: false,
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
@@ -3011,10 +3035,24 @@ impl Compiler {
         // no-change; see `shadow_stack_maps_enabled`), which leaves this and
         // the self-call spill-elision proof.
         //
-        // The non-moving path has never called this and is the historically
-        // correct configuration, so `0` returns to known-good codegen rather
-        // than inventing a new one. Kept default-ON until measured on a quiet
-        // host — the box had eight other sessions' VMs running when this landed.
+        // The lever question is answered: measured on `BinTreesClassic 18`
+        // @512m, five interleaved reps, `CRATONVM_JIT_MY_SCRATCH_FLUSH=0`
+        // moves nothing (median 4117 ms against a 4281 ms default, ranges
+        // overlapping in both directions), so this is NOT the `type.temporal`
+        // residual it was added to bisect.
+        //
+        // TRIED AND REVERTED 2026-07-31: dropping the `moving_young_enabled()`
+        // term, so the flush also runs in the non-moving lane where nothing
+        // else spills a caller-saved scratch oop. It is a plausible root-
+        // visibility fix and it made things WORSE — the
+        // `CRATONVM_NO_MOVING_YOUNG=1 CRATONVM_SHADOW_STACK=1` lane turned a
+        // clean run into a deterministic SIGILL (2/2), where the same lane on
+        // the same tree without this change runs clean (2/2). Calling it here
+        // reserves spill slots and rewrites `self.stack` at a point the
+        // non-precise frame layout did not budget for. Whoever revisits the
+        // non-moving lane's root visibility should start from the shadow
+        // publication instead — see
+        // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
         if moving_young_enabled() && scratch_flush_at_safepoint_enabled() {
             self.flush_scratch_registers();
         }
@@ -3539,10 +3577,35 @@ impl Compiler {
         self.emit_test_r64_r64(R10);
         let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
         self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+        let savebase_ok = self.shadow_savebase_slot_off != 0 && !shadow_no_savebase();
+        // OVERFLOW GUARD (`ShadowStack::END_OFFSET`). Without it a push that
+        // runs off the end of the 2 MiB buffer keeps storing straight through
+        // the allocator arena behind it — including the `JvmThread` — until it
+        // leaves the mapping ~170 MiB later. That is silent heap corruption,
+        // not a bail, and it is what an unbalanced push in a hot loop actually
+        // produces. LEA does not touch flags, so the bump can be undone
+        // between the CMP and the branch and no scratch register beyond R11 is
+        // needed (RAX may hold a staged value at this point).
+        //
+        // `top == end` is the legal "exactly full" state, so the test is
+        // strictly-above. On a bail nothing is stored and `top` is left where
+        // it was; the matching reload learns this from the tag bit set in the
+        // saved-base slot below (slot addresses are 8-aligned, so bit 0 is
+        // free) and skips the value-restore, which would otherwise read slots
+        // this push never wrote.
+        let need = (homes.len() as i32) * 8; // Cast: x86-64 disp32
+        let overflow = if savebase_ok && crate::shadow_end_guard_enabled() {
+            self.emit_lea_r64_mem_disp32(R11, R11, need);
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs `end`
+            self.emit_lea_r64_mem_disp32(R11, R11, -need); // flags preserved
+            Some(self.emit_jcc_rel32_patch(0x87)) // JA → would overrun
+        } else {
+            None
+        };
         // Save this push's base `top` so the matching reload restores from /
         // resets `top` to exactly here, immune to any intervening unbalanced
         // push that drifts `top` (spring-bug-10).
-        if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
+        if savebase_ok {
             self.emit_store_local(self.shadow_savebase_slot_off, R11);
         }
         for &home in &homes {
@@ -3559,6 +3622,17 @@ impl Compiler {
         }
         // Commit new top.
         self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+        if let Some(overflow) = overflow {
+            let done = self.emit_jmp_rel32_patch();
+            self.patch_rel32_to_here(overflow);
+            // Overflow bail. R11 still holds the pre-push `top` (the LEA was
+            // undone), which is exactly what the reload must restore `top` to.
+            // Tag it so the reload skips the value-restore.
+            self.emit_or_r64_imm8(R11, 1);
+            self.emit_store_local(self.shadow_savebase_slot_off, R11);
+            self.emit_shadow_overflow_note();
+            self.patch_rel32_to_here(done);
+        }
         self.patch_rel32_to_here(skip); // null-thread guard target
         self.pending_shadow = homes;
     }
@@ -3615,6 +3689,11 @@ impl Compiler {
         if shadow_pin_codegen() {
             if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
                 self.emit_load_local(R11, self.shadow_savebase_slot_off);
+                // Strip the overflow tag (see `emit_shadow_push`). A no-op on
+                // the normal path — slot addresses are 8-aligned — and on the
+                // bail path it recovers the pre-push `top`, which is the value
+                // this path wants anyway (it only pops, never restores).
+                self.emit_and_r64_imm8(R11, -2);
                 self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
                 let leave_lo = self.emit_jcc_rel32_patch(0x82); // JB  → leave top
                 self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs end
@@ -3640,13 +3719,25 @@ impl Compiler {
                                                  // savebase is invalid — the reload then leaves the home registers + `top`
                                                  // untouched instead of reading an out-of-bounds healed slot.
         let mut sr_patches: Vec<usize> = Vec::new();
+        // Set when the push emitted an overflow guard: the branch taken when
+        // its bail tag is present, resolved to the recovery block below.
+        let mut ovf_patch: Option<usize> = None;
         if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() && shadow_reload_raw() {
             // DIAGNOSTIC raw deref: load savebase and use it unvalidated, so a
             // corrupt value faults on the home-restore below (crash dump shows it).
+            // The overflow tag is still stripped — a legitimate overflow bail is
+            // not the corruption this mode is hunting.
             self.emit_load_local(R11, self.shadow_savebase_slot_off);
+            self.emit_and_r64_imm8(R11, -2);
         } else if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
             // R11 = savebase (the saved pre-push `top` for this safepoint).
             self.emit_load_local(R11, self.shadow_savebase_slot_off);
+            // Overflow bail protocol (see `emit_shadow_push`): bit 0 set means
+            // the paired push stored nothing, so the value-restore below would
+            // read slots that were never written. Take the tail block instead,
+            // which only puts `top` back where the push found it.
+            self.emit_test_r64_imm32(R11, 1);
+            ovf_patch = Some(self.emit_jcc_rel32_patch(0x85)); // JNE → bail path
             // spring-bug-10 hardening: validate savebase ∈ [base, end) BEFORE
             // dereferencing it for the home-restore below. The observed SIGSEGV
             // read 0xFFFF_FFFF_FFFF_FFFE from this slot — a corrupt / stale /
@@ -3707,6 +3798,24 @@ impl Compiler {
         self.patch_rel32_to_here(no_clamp);
         self.emit_mov_mem_disp32_r64(R10, R11, ss_top); // commit top = R11
         self.patch_rel32_to_here(after_pop);
+        if let Some(ovf) = ovf_patch {
+            // Overflow-bail recovery. Reached only from the tagged-savebase
+            // branch above, so it must not fall through from the normal path.
+            let past = self.emit_jmp_rel32_patch();
+            self.patch_rel32_to_here(ovf);
+            self.emit_load_local(R11, self.shadow_savebase_slot_off);
+            self.emit_and_r64_imm8(R11, -2); // recover the pre-push `top`
+            // Bound it before committing: an over-high `top` over-scans
+            // (harmless) but a wild one would widen the scan out of the buffer.
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
+            let leave_lo = self.emit_jcc_rel32_patch(0x82); // JB  → leave top
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs end
+            let leave_hi = self.emit_jcc_rel32_patch(0x87); // JA  → leave top
+            self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+            self.patch_rel32_to_here(leave_lo);
+            self.patch_rel32_to_here(leave_hi);
+            self.patch_rel32_to_here(past);
+        }
         // DBG (CRATONVM_DBG_SHADOW_RELOAD): for a single Reg home, if the reloaded
         // value is a non-pointer (< 0x10000) — the `1`-as-`this` bug — call the log
         // helper with (thread=R10, orig-savebase=[rbp-savebase_slot], slotval=home,
@@ -4360,22 +4469,28 @@ impl Compiler {
 
             // .nan: XOR EAX, EAX
             let nan_off = self.buf.pos();
-            self.buf
-                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8) // Cast: x86-64 immediate encoding
-                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+            // Widening: usize offset -> i64 (no truncation; for displacement math)
+            Self::patch_rel8_or_bail(&mut self.buf, jp_patch, nan_off as i64 - jp_patch as i64 - 1);
             self.buf.emit(&[0x31, 0xC0]);
 
             // .done:
             let done_off = self.buf.pos();
-            self.buf
-                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8) // Cast: x86-64 immediate encoding
-                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
-            self.buf
-                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8) // Cast: x86-64 immediate encoding
-                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
-            self.buf
-                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8) // Cast: x86-64 immediate encoding
-                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+            // Widening: usize offsets -> i64 (no truncation; for displacement math)
+            Self::patch_rel8_or_bail(
+                &mut self.buf,
+                jne_patch,
+                done_off as i64 - jne_patch as i64 - 1,
+            );
+            Self::patch_rel8_or_bail(
+                &mut self.buf,
+                jbe_patch,
+                done_off as i64 - jbe_patch as i64 - 1,
+            );
+            Self::patch_rel8_or_bail(
+                &mut self.buf,
+                jmp_patch,
+                done_off as i64 - jmp_patch as i64 - 1,
+            );
         } else {
             // 64-bit: CMP RAX with 0x8000000000000000
             // MOV RCX, 0x8000000000000000
@@ -4421,22 +4536,28 @@ impl Compiler {
 
             // .nan: XOR RAX, RAX (48 31 C0)
             let nan_off = self.buf.pos();
-            self.buf
-                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8) // Cast: x86-64 immediate encoding
-                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+            // Widening: usize offset -> i64 (no truncation; for displacement math)
+            Self::patch_rel8_or_bail(&mut self.buf, jp_patch, nan_off as i64 - jp_patch as i64 - 1);
             self.buf.emit(&[0x48, 0x31, 0xC0]);
 
             // .done:
             let done_off = self.buf.pos();
-            self.buf
-                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8) // Cast: x86-64 immediate encoding
-                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
-            self.buf
-                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8) // Cast: x86-64 immediate encoding
-                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
-            self.buf
-                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8) // Cast: x86-64 immediate encoding
-                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+            // Widening: usize offsets -> i64 (no truncation; for displacement math)
+            Self::patch_rel8_or_bail(
+                &mut self.buf,
+                jne_patch,
+                done_off as i64 - jne_patch as i64 - 1,
+            );
+            Self::patch_rel8_or_bail(
+                &mut self.buf,
+                jbe_patch,
+                done_off as i64 - jbe_patch as i64 - 1,
+            );
+            Self::patch_rel8_or_bail(
+                &mut self.buf,
+                jmp_patch,
+                done_off as i64 - jmp_patch as i64 - 1,
+            );
         }
     }
 
@@ -7648,6 +7769,23 @@ impl Compiler {
     /// the callee must already be live in ABI registers at the point
     /// of this call.
     fn emit_epilogue_without_ret(&mut self) {
+        // Shadow-stack: same watermark restore the real epilogue does. A tail
+        // call is a method exit — the callee returns straight to OUR caller, so
+        // nothing downstream would ever put `top` back where this activation
+        // found it, and a caller that tail-calls from inside a loop would
+        // accumulate one leak per iteration. R10/R11 are caller-saved and the
+        // callee's arguments live in ARG_REGS, so neither is disturbed.
+        if self.shadow_enabled
+            && self.helpers.get_current_thread != 0
+            && self.shadow_thread_slot_off != 0
+        {
+            self.emit_load_local(R10, self.shadow_thread_slot_off);
+            self.emit_test_r64_r64(R10);
+            let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+            self.emit_load_local(R11, self.shadow_savetop_slot_off);
+            self.emit_mov_mem_disp32_r64(R10, R11, self.shadow_off_in_thread);
+            self.patch_rel32_to_here(skip);
+        }
         let used_regs = self.alloc_used_regs.clone();
         for (i, &reg) in used_regs.iter().enumerate() {
             let offset = self.callee_saved_base + i as i32 * 8; // Cast: x86-64 immediate encoding
@@ -8100,6 +8238,64 @@ impl Compiler {
         self.buf.emit_byte(imm as u8); // Cast: x86-64 immediate encoding
     }
 
+    /// Emit `OR r64, imm8` (sign-extended). Used to set the shadow-stack
+    /// overflow tag bit in the saved-base slot.
+    fn emit_or_r64_imm8(&mut self, reg: u8, imm: i8) {
+        let mut rex = 0x48u8;
+        if reg >= 8 {
+            rex |= 0x01;
+        }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x83); // /1 = OR
+        self.buf.emit_byte(0xC8 | (reg & 7));
+        self.buf.emit_byte(imm as u8); // Cast: x86-64 immediate encoding
+    }
+
+    /// Emit `TEST r64, imm32` (sign-extended) — sets ZF when no selected bit is
+    /// set. Used to read the shadow-stack overflow tag out of a saved base.
+    fn emit_test_r64_imm32(&mut self, reg: u8, imm: i32) {
+        let mut rex = 0x48u8;
+        if reg >= 8 {
+            rex |= 0x01;
+        }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0xF7); // /0 = TEST r/m64, imm32
+        self.buf.emit_byte(0xC0 | (reg & 7));
+        self.buf.emit(&imm.to_le_bytes());
+    }
+
+    /// Emit the shadow-stack overflow bookkeeping: bump the process-wide bail
+    /// counter and, under `CRATONVM_SHADOW_OVERFLOW_DIAG`, record this method's
+    /// label. RAX is pushed/popped around it because this runs on a live call
+    /// site whose arguments are already staged.
+    fn emit_shadow_overflow_note(&mut self) {
+        // Cast through a raw pointer before converting the static's address.
+        let counter =
+            (&crate::SHADOW_OVERFLOW_COUNT as *const std::sync::atomic::AtomicUsize) as usize;
+        self.buf.emit_byte(0x50); // push rax
+        self.emit_mov_imm64_full(RAX, counter as i64); // Cast: baked address
+        self.buf.emit(&[0xF0, 0x48, 0xFF, 0x00]); // lock inc qword [rax]
+        if shadow_overflow_diag() {
+            let label = match self.shadow_overflow_label {
+                Some(p) => p,
+                None => {
+                    let owned: &'static str =
+                        Box::leak(format!("{}\0", self.method_label).into_boxed_str());
+                    let p = owned.as_ptr() as usize;
+                    self.shadow_overflow_label = Some(p);
+                    p
+                }
+            };
+            let sink =
+                (&crate::SHADOW_OVERFLOW_LABEL as *const std::sync::atomic::AtomicUsize) as usize;
+            // Cast: baked absolute address of a leaked NUL-terminated label.
+            self.emit_mov_imm64_full(RAX, label as i64);
+            self.buf.emit(&[0x48, 0xA3]); // mov moffs64, rax
+            self.buf.emit(&(sink as u64).to_le_bytes());
+        }
+        self.buf.emit_byte(0x58); // pop rax
+    }
+
     /// Emit `TEST r64, r64` — sets ZF if the register is zero.
     fn emit_test_r64_r64(&mut self, reg: u8) {
         let mut rex = 0x48u8;
@@ -8345,6 +8541,32 @@ impl Compiler {
         let patch = self.buf.pos();
         self.buf.emit(&[0u8; 4]);
         patch
+    }
+
+    /// Patch a `rel8` branch displacement, discarding the whole compile when it
+    /// does not fit.
+    ///
+    /// Truncating instead (`rel as u8`, which is what every one of these sites
+    /// used to do) does not produce a wrong-but-harmless branch: it produces a
+    /// branch to a DIFFERENT, attacker-irrelevant-but-arbitrary address, and on
+    /// x86 that address is usually the middle of an earlier instruction. The
+    /// inline-PIC cascade did exactly this — its inter-slot `JNE` wrapped to
+    /// `-128` once the per-slot body grew past 127 bytes and landed inside the
+    /// pre-call shadow-stack push, turning it into an unguarded infinite push
+    /// loop that walked off the end of the thread's shadow buffer. A
+    /// `debug_assert!` guarded it, which is to say nothing guarded it: release
+    /// is the only build where it matters.
+    ///
+    /// `mark_overflowed` makes the driver drop the half-emitted method and fall
+    /// back, which is always better than emitting the wrong branch.
+    fn patch_rel8_or_bail(buf: &mut ExecutableBuffer, patch: usize, rel: i64) {
+        match i8::try_from(rel) {
+            // Cast: rel8 displacement, range-checked immediately above.
+            Ok(v) => {
+                buf.try_patch_byte(patch, v as u8).ok();
+            }
+            Err(_) => buf.mark_overflowed(),
+        }
     }
 
     /// Patch a previously-emitted `rel32` displacement so it targets the
@@ -18379,8 +18601,8 @@ impl Compiler {
                                     (-128..=127).contains(&rel),
                                     "Arrays.equals intrinsic rel8 out of range: {rel}"
                                 );
-                                // Truncation: i64 -> u8 (short (rel8) branch displacement, range-checked)
-                                self.buf.try_patch_byte(patch, rel as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+                                // Widening: isize -> i64 (no truncation)
+                                Self::patch_rel8_or_bail(&mut self.buf, patch, rel as i64);
                             }
 
                             // boolean result in RAX → operand stack.
@@ -18681,8 +18903,9 @@ impl Compiler {
                             } else {
                                 ARG_REGS.len()
                             };
-                            let sibling_tail_ok =
-                                is_sibling_tail && arg_slots.len() <= sibling_reg_limit;
+                            let sibling_tail_ok = is_sibling_tail
+                                && arg_slots.len() <= sibling_reg_limit
+                                && sp_tailcall_enabled();
                             if sibling_tail_ok {
                                 // Load args into ABI registers, tear
                                 // down our frame, then JMP.
@@ -20745,8 +20968,12 @@ impl Compiler {
                             // interpreter-owned JitEntryGuard, leaving the
                             // active-RBP mirror pointing at the callee while
                             // the root-chain metadata still names the caller.
-                            // A GC at that boundary can therefore select an
-                            // incompatible oop map and reclaim a live root.
+                            // That is NOT a reclaim hazard, which is what this
+                            // comment used to claim: `chain_entry_rbp_is_foreign`
+                            // detects it, the moving-young coverage proof comes
+                            // back incomplete, and the cycle falls back to the
+                            // non-moving sweep. It costs precision, not
+                            // correctness — measured, nothing is reclaimed.
                             // `direct_jit_callee_calls_enabled()` gates the
                             // inline MIC path (default-ON — see its doc
                             // comment for the closing fixes and the
@@ -20780,6 +21007,7 @@ impl Compiler {
                                 && self.pc_is_protected(pc);
                             let inline_virtual_ic_allowed =
                                 crate::direct_jit_callee_calls_enabled()
+                                    && sp_inline_ic_enabled()
                                     && !regex_backtracking_frame
                                     && !protected_precise_handler_call;
                             let pic_inline =
@@ -21051,17 +21279,32 @@ impl Compiler {
                                     }
 
                                     if i + 1 < crate::JIT_PIC_ENTRIES {
-                                        // JNE rel8 → start of slot i+1
+                                        // JNE rel32 → start of slot i+1
                                         // (patched below once slot i+1's
                                         // start position is known).
-                                        // Inter-slot distances stay small
-                                        // (a single slot body is ~30
-                                        // bytes for n<=5), so rel8 is
-                                        // sufficient here — only the
-                                        // miss/needs_ctx branches need
-                                        // rel32 (see CRIT-3 comment above).
-                                        self.buf.emit(&[0x75, 0x00]);
-                                        let patch = self.buf.pos() - 1;
+                                        //
+                                        // This was rel8 on the claim that "a
+                                        // single slot body is ~30 bytes for
+                                        // n<=5". That stopped being true: a
+                                        // slot body now also carries the
+                                        // post-call innermost-RBP republish and
+                                        // the callee-deopt service check, which
+                                        // together put it well past 127 bytes.
+                                        // The patch truncated the displacement
+                                        // (`rel as u8`) behind a
+                                        // `debug_assert!`, so release builds
+                                        // silently got `JNE -128` — a branch
+                                        // into the middle of the pre-call
+                                        // shadow-stack push, which then ran as
+                                        // an unguarded infinite push loop and
+                                        // walked off the end of the thread's
+                                        // shadow buffer (SIGSEGV ~170 MiB
+                                        // later, at the arena end). Only
+                                        // reachable with raw JIT-to-JIT calls
+                                        // enabled, which is why the closed gate
+                                        // hid it. rel32 has no such cliff.
+                                        self.buf.emit(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+                                        let patch = self.buf.pos() - 4;
                                         next_slot_patches.push((patch, i + 1));
                                     } else {
                                         // Final slot: JNE rel32 → .miss
@@ -21211,15 +21454,17 @@ impl Compiler {
                                 for (jne_patch, target_slot) in &next_slot_patches {
                                     let slot_start = slot_starts[*target_slot];
                                     // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
-                                    let rel = (slot_start as i64) - (*jne_patch as i64 + 1);
+                                    let rel = (slot_start as i64) - (*jne_patch as i64 + 4);
                                     debug_assert!(
-                                        (-128..=127).contains(&rel),
-                                        "inline PIC inter-slot jne overflowed rel8 ({} bytes)",
+                                        // Widening: i32 bound -> i64 (range comparison)
+                                        (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
+                                        "inline PIC inter-slot jne overflowed rel32 ({} bytes)",
                                         rel
                                     );
-                                    self.buf
-                                        .try_patch_byte(*jne_patch, rel as u8) // Cast: rel8 displacement
-                                        .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+                                    // Cast: rel32 displacement. On Err,
+                                    // try_patch_i32 marks the buffer
+                                    // overflowed and the compile bails.
+                                    self.buf.try_patch_i32(*jne_patch, rel as i32).ok();
                                 }
 
                                 // .miss: patch all `je needs_ctx → .miss`
@@ -21570,9 +21815,7 @@ impl Compiler {
                                     "inline MIC done jump overflowed rel8 ({} bytes)",
                                     rel
                                 );
-                                self.buf
-                                    .try_patch_byte(patch, rel as u8) // Cast: rel8 displacement
-                                    .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+                                Self::patch_rel8_or_bail(&mut self.buf, patch, rel);
                             }
                             for patch in &done_patches32 {
                                 // `patch` points at the start of the rel32
@@ -37638,30 +37881,70 @@ mod flag_and_header_contracts {
         );
     }
 
-    /// The direct JIT-to-JIT call gate and the optimizing-tier gate ask
-    /// DIFFERENT questions and must not share a predicate.
+    /// The direct JIT-to-JIT call gate does NOT depend on the moving-young
+    /// flag, and must not be re-coupled to it.
     ///
-    /// The optimizing tier produces frames that carry a `JitEntryGuard`, so
-    /// scoping its gate to `moving_young_relocates_compiled_frames()` is sound.
-    /// A raw JIT-to-JIT call produces a callee frame with NO guard — invisible
-    /// to the entry chain for root scanning, not merely un-rewritable — so its
-    /// gate stays on the bare moving-young flag. Sharing the predicate made
-    /// `BasicErrorControllerIntegrationTests` SIGSEGV on every run; see
+    /// It was, for one day, because the raw edge SIGSEGV'd every run of
+    /// `BasicErrorControllerIntegrationTests` under moving-young and the frame
+    /// shape looked like the culprit. It was not: the crash was the inline PIC
+    /// cascade's inter-slot `JNE` truncating to `rel8` and branching into the
+    /// middle of the shadow-stack push. An unguarded callee frame costs the
+    /// moving-young coverage proof (the cycle falls back to the non-moving
+    /// sweep) but reclaims nothing, so gating the edge on the collector's mode
+    /// buys no safety — it only hides machine-code bugs behind a flag. See
     /// `crate::direct_jit_callee_calls_enabled` for the measurement.
     #[test]
-    fn direct_jit_callee_calls_stay_gated_off_under_moving_young() {
+    fn direct_jit_callee_calls_open_under_moving_young() {
+        if cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS").is_ok() {
+            // A caller-set off-switch legitimately closes the gate; this test
+            // is about the *default*, so it has nothing to assert here.
+            return;
+        }
         let saved = MOVING_YOUNG_OVERRIDE.with(|c| c.get());
         set_moving_young_override(Some(true));
+        let open = crate::direct_jit_callee_calls_enabled();
+        let ir_open = crate::ir_direct_calls_enabled();
+        set_moving_young_override(saved);
         assert!(
-            !crate::direct_jit_callee_calls_enabled(),
-            "a raw JIT-to-JIT edge leaves an unguarded callee frame the root scan cannot \
-             describe; it must stay closed whenever the young generation can move"
+            open,
+            "the raw JIT-to-JIT edge must not be re-gated on the collector's mode: an \
+             unguarded callee frame costs coverage, not correctness"
         );
         assert!(
-            !crate::ir_direct_calls_enabled(),
+            ir_open,
             "the IR direct-call lowering is subordinate to the same master switch"
         );
-        set_moving_young_override(saved);
+    }
+
+    /// A `rel8` branch displacement that does not fit must discard the compile,
+    /// never truncate.
+    ///
+    /// Truncation is not a near-miss: `rel as u8` turns an out-of-range forward
+    /// branch into a backward one, and on x86 the landing site is normally the
+    /// middle of an earlier instruction. The inline-PIC cascade shipped exactly
+    /// that — a `-128` wrap into the body of the pre-call shadow-stack push,
+    /// which then ran as an unguarded infinite push loop. `debug_assert!` was
+    /// the only guard, i.e. none, since release is where it matters.
+    #[test]
+    fn rel8_patch_out_of_range_bails_instead_of_truncating() {
+        let mut buf = ExecutableBuffer::new(4096).expect("test buffer");
+        // `0x75 0x00` — a JNE whose displacement byte is the patch site.
+        buf.emit(&[0x75, 0x00]);
+        let patch = buf.pos() - 1;
+        Compiler::patch_rel8_or_bail(&mut buf, patch, 127);
+        assert!(!buf.overflowed(), "an in-range rel8 must patch normally");
+        assert_eq!(buf.as_slice()[patch], 127);
+        Compiler::patch_rel8_or_bail(&mut buf, patch, 128);
+        assert!(
+            buf.overflowed(),
+            "a rel8 that does not fit must mark the buffer overflowed so the driver \
+             discards the method — truncating retargets the branch"
+        );
+        assert_eq!(
+            buf.as_slice()[patch],
+            127,
+            "the bail must leave the displacement byte alone"
+        );
     }
 
     /// The relocation-safety gates must ask "can a relocating collection see a
@@ -37686,7 +37969,7 @@ mod flag_and_header_contracts {
     /// moving-young for the whole process as soon as any compiled code exists.
     /// The optimizing tier must therefore NOT be disabled by the moving-young
     /// default — that trade bought nothing. Pins the regression that
-    /// `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+    /// `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`
     /// describes.
     #[test]
     fn optimizing_tier_is_not_disabled_while_relocation_is_vetoed() {
@@ -37704,23 +37987,34 @@ mod flag_and_header_contracts {
 
     /// `CRATONVM_SHADOW_STACK` is likewise read by `jit`, `gc` and `vm`; the
     /// emission side and the root-scan side must agree or the collector walks
-    /// a shadow stack the codegen never pushed to. Moving-young implies it.
+    /// a shadow stack the codegen never pushed to.
     ///
-    /// Deliberately still the BARE flag, not the relocation-scoped predicate:
-    /// scoping it was tried, measured as no-change, and reverted rather than
-    /// move one side of an exact agreement for nothing. See
-    /// `shadow_stack_maps_enabled`.
+    /// The moving-young implication is GONE (2026-07-31): publication is how a
+    /// JIT frame's live references reach the collector at all, so keying it on
+    /// the collector choice made `CRATONVM_NO_MOVING_YOUNG=1` withdraw root
+    /// visibility — that lane crashed on a reclaimed root within seconds. The
+    /// assertion below is what stops it coming back, and it also pins the two
+    /// sides to one expression.
     #[test]
-    fn shadow_stack_maps_enabled_is_central_flag_or_moving_young() {
+    fn shadow_stack_maps_enabled_does_not_depend_on_the_young_collector() {
         assert_eq!(
             shadow_stack_maps_enabled(),
             cratonvm_types::flags().jit.shadow_stack
-                || (moving_young_enabled() && shadow_emission_moving_implication_enabled()),
-            "shadow-stack codegen must be gated on the shared flag plus the moving-young \
-             implication (itself bisectable via CRATONVM_JIT_MY_SHADOW_EMISSION), not on a \
-             crate-private getenv. `vm::jit::conservative_roots::shadow_stack_enabled` must \
-             spell the SAME expression — they are two halves of one agreement"
+                || shadow_emission_moving_implication_enabled(),
+            "shadow-stack codegen must be gated on the shared flag plus its own opt-out \
+             (CRATONVM_JIT_MY_SHADOW_EMISSION), NOT on the young collector: root \
+             publication is not a property of which collector runs. \
+             `vm::jit::conservative_roots::shadow_stack_enabled` must spell the SAME \
+             expression — they are two halves of one agreement"
         );
+        // The property that actually matters, stated directly: turning the
+        // moving young generation off must not turn publication off with it.
+        crate::x64::set_moving_young_override(Some(false));
+        assert!(
+            shadow_stack_maps_enabled(),
+            "publication must survive CRATONVM_NO_MOVING_YOUNG=1"
+        );
+        crate::x64::set_moving_young_override(None);
     }
 
     /// Source-scan regression guard. Needles are assembled at runtime so this

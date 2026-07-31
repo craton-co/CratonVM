@@ -28,8 +28,17 @@
 use crate::gc_flags;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// How deep any thread is inside a JIT call, process-wide.
+///
+/// Striped per thread: this is written on every interpreter/JIT boundary
+/// crossing and read only by the collector. As one shared `AtomicUsize` — with
+/// a `fetch_update` CAS *loop* on the leave side — it was one of the
+/// contended cache lines that stopped compiled code scaling past a couple of
+/// threads. See [`cratonvm_types::striped_counter`] for why summing stripes
+/// answers `is_active()` exactly as the single counter did.
 #[cfg(not(test))]
-static JIT_ACTIVE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static JIT_ACTIVE_DEPTH: cratonvm_types::striped_counter::StripedCounter =
+    cratonvm_types::striped_counter::StripedCounter::new();
 
 #[cfg(test)]
 thread_local! {
@@ -39,7 +48,11 @@ thread_local! {
 #[cfg(not(test))]
 #[inline]
 fn active_depth_enter() -> usize {
-    JIT_ACTIVE_DEPTH.fetch_add(1, Ordering::AcqRel) + 1
+    JIT_ACTIVE_DEPTH.inc();
+    // No caller uses the returned depth on the hot path, and summing every
+    // stripe to produce it would reintroduce exactly the cross-thread traffic
+    // the striping removes. Report this thread's own contribution instead.
+    1
 }
 
 #[cfg(test)]
@@ -55,13 +68,10 @@ fn active_depth_enter() -> usize {
 #[cfg(not(test))]
 #[inline]
 fn active_depth_leave() -> usize {
-    let prev = JIT_ACTIVE_DEPTH.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
-        Some(d.saturating_sub(1))
-    });
-    match prev {
-        Ok(p) => p.saturating_sub(1),
-        Err(_) => 0,
-    }
+    // Saturating per stripe, so a stray unbalanced leave can no longer cancel
+    // a *different* thread's live entry the way the single counter allowed.
+    JIT_ACTIVE_DEPTH.dec();
+    0
 }
 
 #[cfg(test)]
@@ -77,7 +87,20 @@ fn active_depth_leave() -> usize {
 #[cfg(not(test))]
 #[inline]
 fn active_depth_get() -> usize {
-    JIT_ACTIVE_DEPTH.load(Ordering::Acquire)
+    JIT_ACTIVE_DEPTH.get()
+}
+
+/// `active_depth_get() > 0` without summing every stripe.
+#[cfg(not(test))]
+#[inline]
+fn active_depth_nonzero() -> bool {
+    !JIT_ACTIVE_DEPTH.is_zero()
+}
+
+#[cfg(test)]
+#[inline]
+fn active_depth_nonzero() -> bool {
+    active_depth_get() > 0
 }
 
 #[cfg(test)]
@@ -88,8 +111,10 @@ fn active_depth_get() -> usize {
 
 /// DBG: total enter()/leave() calls — an imbalance means a leaked JIT entry
 /// that keeps the non-moving sweep wedged on after JIT calls have returned.
-pub static ENTER_COUNT: AtomicUsize = AtomicUsize::new(0);
-pub static LEAVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static ENTER_COUNT: cratonvm_types::striped_counter::StripedCounter =
+    cratonvm_types::striped_counter::StripedCounter::new();
+pub static LEAVE_COUNT: cratonvm_types::striped_counter::StripedCounter =
+    cratonvm_types::striped_counter::StripedCounter::new();
 
 // ---------------------------------------------------------------------------
 // Moving / compacting young generation — the ONE gate
@@ -636,7 +661,7 @@ pub fn moving_young_cycle_count() -> usize {
 /// use-after-free). `AcqRel` does not weaken the existing release
 /// visibility — it only adds the missing acquire half.
 pub fn enter() -> usize {
-    ENTER_COUNT.fetch_add(1, Ordering::Relaxed);
+    ENTER_COUNT.inc();
     active_depth_enter()
 }
 
@@ -645,14 +670,14 @@ pub fn enter() -> usize {
 /// debug-assert error to call this when the counter is already 0; the
 /// release version saturates at 0 so a stray pop never wraps the counter.
 pub fn leave() -> usize {
-    LEAVE_COUNT.fetch_add(1, Ordering::Relaxed);
+    LEAVE_COUNT.inc();
     active_depth_leave()
 }
 
 /// Returns true if any thread is currently inside a JIT call.
 #[inline]
 pub fn is_active() -> bool {
-    active_depth_get() > 0
+    active_depth_nonzero()
 }
 
 /// Current depth (mostly useful for tests and JFR diagnostics).
@@ -761,6 +786,37 @@ pub fn force_non_moving_jit_roots() -> bool {
 thread_local! {
     static MAJOR_GC_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CLASS_UNLOAD_MARKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Did the collection this thread just ran reclaim OLD-generation storage?
+    ///
+    /// A minor cycle never touches old gen, so every old-gen address is still
+    /// exactly where it was and `VmHeap::is_addr_live` may (and does) report
+    /// all of them live. Once an old-gen reclamation runs — the mark-COMPACT
+    /// `major_gc` or the in-place `sweep_old_gen_non_moving` — that stops
+    /// being true: a dead old-gen object is slid over by a live neighbour or
+    /// returned to the free list, and the freed tail is zeroed. Post-GC
+    /// reference processing must then stop trusting "the address is inside
+    /// old gen" as a survival proof and require a `pointer_map` entry, which
+    /// both old-gen paths now emit (identity for stationary survivors) for
+    /// every watched address.
+    ///
+    /// Set by the collector, read by `VmHeap::watched_pre_gc_addr_survived`
+    /// on the same (collecting) thread inside the same STW window.
+    static OLD_GEN_RECLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record whether the collection now in flight reclaimed old-generation
+/// storage. Called with `false` at the start of every cycle and `true` by
+/// whichever old-gen path actually ran. See `OLD_GEN_RECLAIMED`.
+#[inline]
+pub fn set_old_gen_reclaimed(v: bool) {
+    OLD_GEN_RECLAIMED.with(|c| c.set(v));
+}
+
+/// Did the collection whose `pointer_map` is being consumed reclaim old-gen
+/// storage? See `OLD_GEN_RECLAIMED`.
+#[inline]
+pub fn old_gen_reclaimed_last_cycle() -> bool {
+    OLD_GEN_RECLAIMED.with(std::cell::Cell::get)
 }
 
 /// Run one root-gather operation for a collector's non-moving class-unloading

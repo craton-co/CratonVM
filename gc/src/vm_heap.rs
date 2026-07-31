@@ -1908,6 +1908,60 @@ impl VmHeap {
         }
     }
 
+    /// Exact post-collection survival verdict for a PRE-collection address
+    /// that was published as WATCHED before the collection ran (every address
+    /// the reference processor holds — see
+    /// `ReferenceProcessor::all_tracked_addrs`).
+    ///
+    /// This is the strict counterpart of [`Self::is_addr_live`], and exists
+    /// because that predicate's old-generation arm is deliberately permissive:
+    /// it answers `true` for *any* address inside the old-gen arena, which is
+    /// correct for a minor cycle (old gen is not touched, so nothing moved)
+    /// but wrong the moment an old-gen reclamation runs in the same cycle.
+    /// After a mark-compact `major_gc` a dead old-gen object has been slid
+    /// over by a live neighbour or left in the zeroed freed tail; after the
+    /// in-place `sweep_old_gen_non_moving` its block is back on the free list.
+    /// Reference processing then judged the dead entry "survived", never
+    /// pruned it, and every subsequent collection wrote a referent pointer
+    /// through the stale address into whatever now occupied that memory —
+    /// dropped by the `gen_heap::set_field` out-of-bounds guard when the
+    /// victim was the zeroed tail, and a silent dangling-pointer store into a
+    /// live object otherwise (`SIGSEGV` /
+    /// `gen_heap::read_slot: corrupt Value cell`, the HIB-CV-32 family; see
+    /// `docs/internal/fixed-suite-bugs/h2/bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`).
+    ///
+    /// Both old-gen paths now emit an identity `pointer_map` entry for every
+    /// watched address that survived without moving, so once
+    /// `gc_quiescence::old_gen_reclaimed_last_cycle()` is set, map membership
+    /// is a complete and exact proof.
+    pub fn watched_pre_gc_addr_survived(
+        &self,
+        addr: usize,
+        pointer_map: &std::collections::HashMap<usize, usize>,
+    ) -> bool {
+        if pointer_map.contains_key(&addr) {
+            return true;
+        }
+        // Bisection escape hatch — restores the pre-fix permissive predicate.
+        if crate::gc_flags().no_exact_refproc_survival {
+            return self.is_addr_live(addr);
+        }
+        match self {
+            VmHeap::Generational(h) => {
+                if h.is_old_gen_addr(addr) {
+                    return !crate::gc_quiescence::old_gen_reclaimed_last_cycle();
+                }
+                h.is_live_young_survivor(addr)
+            }
+            // G1/ZGC: `is_addr_live` is already exact (live-region membership
+            // / registry lookup), and neither has a generation whose addresses
+            // are trusted wholesale.
+            VmHeap::G1(_) => self.is_addr_live(addr),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => self.is_addr_live(addr),
+        }
+    }
+
     /// Generational: is `addr` inside EITHER young semispace? Used by
     /// reference processing to detect stale PRE-GC Reference addresses
     /// (young + absent from the pointer map ⇒ did not survive the GC).
