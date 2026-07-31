@@ -1,7 +1,9 @@
 # The optimizing IR (C2) tier is disabled by default — `moving_young` turned it off
 
-**Status:** 🟢 **FIXED 2026-07-30** by scoping the gate (option 2 below).
-The tier runs on default flags again. Original report retained below.
+**Status:** 🟢 **FIXED 2026-07-30** by scoping the gate (option 2 below) —
+but see the **2026-07-31 correction** at the bottom: the same scoping was
+applied to a SECOND gate (raw JIT-to-JIT direct calls) where it is unsound, and
+that half is reverted. The optimizing tier does run on default flags.
 
 ## Fix
 
@@ -260,3 +262,71 @@ thread-local, never set in production) instead of silently depending on the
 ambient default. That restores their coverage and, more importantly, makes the
 dependency visible at each call site — the absence of which is what let this go
 unseen.
+
+## 2026-07-31 correction — the direct-call half of the scoping was unsound
+
+The scoping above applied one predicate to **two** gates. Splitting them was
+required: the optimizing-tier half is correct and stays, the raw JIT-to-JIT
+direct-call half is reverted to the bare `moving_young_enabled()` flag.
+
+### What broke
+
+With both gates open on default flags,
+`org.springframework.boot.webmvc.autoconfigure.error.BasicErrorControllerIntegrationTests`
+**SIGSEGVs on every run** — 8/8 on a pristine `90652574cf` build, 14/14 on a
+later tip:
+
+```
+SIGSEGV at pc=0x…, addr=0x20040000000
+  r11=0x20040000000   slot[r10]: 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0
+  fault pc is in NO live registered code buffer
+```
+
+A read through a heap slot that reads back all zeros — the *reclaimed-root*
+signature, not a relocation one. It came with a flood of ~480
+`JIT try_patch_i32: offset out of bounds; marking buffer overflowed` warnings
+per run (the IR lowerer's buffer estimate does not budget for the direct-call /
+inline-IC sequences the open gate makes it emit; each such compile is discarded
+and falls back to C1).
+
+### Isolation
+
+| configuration | result |
+|---|---|
+| default (both gates open) | **SIGSEGV**, 8/8 and 14/14 |
+| `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` (optimizing tier still on) | **clean**, 26/26 tests, 5/5 runs |
+| `CRATONVM_JIT_IR_DIRECT_CALL=0` (IR half only) | **SIGSEGV**, 3/3 |
+| `CRATONVM_NO_MOVING_YOUNG=1` | inconclusive — the class does not finish inside 900 s in this configuration |
+
+So the optimizing tier itself is fine; the defect is in the **single-pass**
+backend's raw JIT-to-JIT edge, which this gate had kept dark for months and
+which the scoping switched on for the first time in production.
+
+### Why the original argument does not hold
+
+The scoping argument was "the hazard needs a RELOCATING collection, and the
+runtime veto forbids one while such a frame is live". But the hazard this gate
+guards is stated at the emission site in `x64.rs` and is broader than
+relocation:
+
+> The inline MIC/PIC path emits a raw CALL into another compiled body. That
+> bypasses the interpreter-owned JitEntryGuard, leaving the active-RBP mirror
+> pointing at the callee while the root-chain metadata still names the caller.
+> A GC at that boundary can therefore select an incompatible oop map and
+> **reclaim a live root**.
+
+Reclaiming a live root does not require the collector to move anything, so
+`moving_young_relocates_compiled_frames()` is the wrong predicate for this gate.
+The optimizing-tier gate is different: those frames DO carry a guard, so they
+are reachable from the entry chain and the relocation-scoped predicate is the
+right question there. **Two gates, two questions — they must not share a
+predicate**, which is now pinned by
+`x64::tests::direct_jit_callee_calls_stay_gated_off_under_moving_young`.
+
+### Status of the edge itself
+
+Re-gated, **not fixed**. Reopening it needs an unguarded callee frame to be
+describable to the root scan first (`chain_entry_rbp_is_foreign` in
+`vm/src/jit/conservative_roots.rs` detects the situation and gives up coverage;
+that is a fallback, not a fix). Acceptance gate for any future attempt: this
+class, 14 consecutive runs, on default flags.

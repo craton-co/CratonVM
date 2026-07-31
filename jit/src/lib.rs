@@ -7269,13 +7269,35 @@ pub fn moving_young_disables_optimizing_tier() -> bool {
 
 pub fn direct_jit_callee_calls_enabled() -> bool {
     // A raw JIT-to-JIT call has no callee JitEntryGuard, so the callee frame is
-    // not reachable from the entry chain and cannot be rewritten. That matters
-    // only if a collection can RELOCATE while such a frame is live; the runtime
-    // veto means it cannot (see `moving_young_relocates_compiled_frames`), so
-    // this gate is scoped to the same constant as the optimizing-tier gate
-    // rather than to the moving-young flag. The dispatch bridge, which installs
-    // the guard, remains the route the moment that contract is real.
-    if x64::moving_young_relocates_compiled_frames() {
+    // not reachable from the entry chain: the active-RBP mirror points at the
+    // callee while the root-chain metadata still names the caller, and a GC at
+    // that boundary can select an incompatible oop map and RECLAIM A LIVE ROOT
+    // (see the matching comment at the inline MIC/PIC emission site in
+    // `x64.rs`).
+    //
+    // 2026-07-31: this gate was scoped to `moving_young_relocates_compiled_frames()`
+    // on the argument that the hazard needs a RELOCATING collection and the
+    // runtime veto forbids one while such a frame is live. Measured, that
+    // argument does not hold: with the moving-young default on and this gate
+    // open, `BasicErrorControllerIntegrationTests` SIGSEGVs on EVERY run
+    // (14/14 + 8/8 on a pristine build), faulting on a read through a zeroed
+    // heap slot — the reclaimed-root signature the comment above predicts, not
+    // a relocation one. Closing this gate alone makes the same class 26/26
+    // clean, 5/5 runs, with the optimizing tier still enabled. Disabling only
+    // the IR half (`CRATONVM_JIT_IR_DIRECT_CALL=0`) does NOT help (3/3
+    // crashes), so the defect is in the single-pass backend's raw edge, which
+    // this gate had kept dark for months.
+    //
+    // So: back to the bare flag, which is the state that actually shipped. The
+    // OPTIMIZING-TIER gate stays scoped as
+    // `moving_young_relocates_compiled_frames()` — that one protects frames
+    // which DO carry a guard, and it is measured safe. These two gates ask
+    // different questions and must not share a predicate.
+    //
+    // This re-gates the edge; it does not fix it. Whoever reopens it needs to
+    // make an unguarded callee frame describable to the root scan first, and
+    // should re-run this class 14x as the acceptance gate.
+    if x64::moving_young_enabled() {
         return false;
     }
 

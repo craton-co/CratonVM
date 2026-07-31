@@ -36890,6 +36890,32 @@ mod flag_and_header_contracts {
         );
     }
 
+    /// The direct JIT-to-JIT call gate and the optimizing-tier gate ask
+    /// DIFFERENT questions and must not share a predicate.
+    ///
+    /// The optimizing tier produces frames that carry a `JitEntryGuard`, so
+    /// scoping its gate to `moving_young_relocates_compiled_frames()` is sound.
+    /// A raw JIT-to-JIT call produces a callee frame with NO guard — invisible
+    /// to the entry chain for root scanning, not merely un-rewritable — so its
+    /// gate stays on the bare moving-young flag. Sharing the predicate made
+    /// `BasicErrorControllerIntegrationTests` SIGSEGV on every run; see
+    /// `crate::direct_jit_callee_calls_enabled` for the measurement.
+    #[test]
+    fn direct_jit_callee_calls_stay_gated_off_under_moving_young() {
+        let saved = MOVING_YOUNG_OVERRIDE.with(|c| c.get());
+        set_moving_young_override(Some(true));
+        assert!(
+            !crate::direct_jit_callee_calls_enabled(),
+            "a raw JIT-to-JIT edge leaves an unguarded callee frame the root scan cannot \
+             describe; it must stay closed whenever the young generation can move"
+        );
+        assert!(
+            !crate::ir_direct_calls_enabled(),
+            "the IR direct-call lowering is subordinate to the same master switch"
+        );
+        set_moving_young_override(saved);
+    }
+
     /// The relocation-safety gates must ask "can a relocating collection see a
     /// compiled frame?", which is strictly narrower than "is moving-young on?".
     /// Equating the two is what switched the optimizing tier off by default.
