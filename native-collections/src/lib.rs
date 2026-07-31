@@ -18315,11 +18315,14 @@ const COLLECTOR_TAG_TO_MAP_SUPPLIER: i32 = 16;
 // back a Map where the `java.util.stream.Collectors` contract requires an
 // `Optional` — a silent wrong answer, not a crash.
 //
-// The band starts at 25, not 17, because `native-builtins` still spends 18 on
-// its (shadowed) collectingAndThen and 19..24 on averaging*/summing*, none of
-// which this table decodes. The `P56_COLLECTOR_*` names over there are now
-// `const` ALIASES of the constants below, so the two crates can no longer drift
-// apart again.
+// The band starts at 25, not 17, because when it was opened `native-builtins`
+// still spent 18 on its (shadowed) collectingAndThen and 19..24 on
+// averaging*/summing*. Those six have since moved into this table as well
+// (tags 31..36 below), so 17..24 are now entirely unallocated — do not recycle
+// them without re-checking every `set_field(c, 0, Value::Int(..))` in
+// `native-builtins` `phases_late::streams`. The `P56_COLLECTOR_*` names over
+// there are now `const` ALIASES of the constants below, so the two crates can no
+// longer drift apart again.
 /// `Collectors.minBy(Comparator)` — ARG1 = Comparator. Result is an
 /// `Optional`, empty for an empty stream.
 pub const COLLECTOR_TAG_MIN_BY: i32 = 25;
@@ -18343,6 +18346,47 @@ pub const COLLECTOR_TAG_SUMMARIZING_LONG: i32 = 29;
 /// `Collectors.summarizingDouble(ToDoubleFunction)` — ARG1 = the extractor.
 /// Result is a `java.util.DoubleSummaryStatistics` (sum/min/max are `Double`).
 pub const COLLECTOR_TAG_SUMMARIZING_DOUBLE: i32 = 30;
+
+// ---------------------------------------------------------------------------
+// Tags 31.. — `averaging*` / `summing*` / `teeing`, the rest of the same
+// `native-builtins`-only family.
+//
+// averaging*/summing* used to sit in a private 19..24 that this table did not
+// decode AT ALL: the tag fell through `is_known_collector_tag`, so
+// `collect(averagingInt(f))` was treated as an untagged JDK collector and the
+// caller got the raw accumulation `ArrayList` where the
+// `java.util.stream.Collectors` contract requires a `Double` (and `Integer` for
+// `summingInt`). Same silent-wrong-answer class as the 9..15 collisions above,
+// reached by a different route.
+// ---------------------------------------------------------------------------
+/// `Collectors.averagingInt(ToIntFunction)` — ARG1 = the extractor. Result is a
+/// boxed `Double`; an empty stream averages to 0.0, matching the JDK finisher
+/// (`count == 0 ? 0.0d : sum / count`), not NaN.
+pub const COLLECTOR_TAG_AVERAGING_INT: i32 = 31;
+/// `Collectors.averagingLong(ToLongFunction)` — ARG1 = the extractor, result
+/// is a boxed `Double`.
+pub const COLLECTOR_TAG_AVERAGING_LONG: i32 = 32;
+/// `Collectors.averagingDouble(ToDoubleFunction)` — ARG1 = the extractor,
+/// result is a boxed `Double`.
+pub const COLLECTOR_TAG_AVERAGING_DOUBLE: i32 = 33;
+/// `Collectors.summingInt(ToIntFunction)` — ARG1 = the extractor. Result is a
+/// boxed `Integer`, NOT a Long: the factory is declared
+/// `Collector<T,?,Integer>` and callers cast to `Integer`. Identity 0.
+pub const COLLECTOR_TAG_SUMMING_INT: i32 = 34;
+/// `Collectors.summingLong(ToLongFunction)` — ARG1 = the extractor, result is a
+/// boxed `Long`. Identity 0.
+pub const COLLECTOR_TAG_SUMMING_LONG: i32 = 35;
+/// `Collectors.summingDouble(ToDoubleFunction)` — ARG1 = the extractor, result
+/// is a boxed `Double`. Identity 0.0.
+pub const COLLECTOR_TAG_SUMMING_DOUBLE: i32 = 36;
+/// `Collectors.teeing(Collector, Collector, BiFunction)` — ARG1/ARG2 = the two
+/// downstream Collectors (each sees the whole stream), ARG3 = the merge
+/// BiFunction applied to the two downstream results. The `native-builtins`
+/// factory used to write tag 1 (`toList`) with both downstreams and the merger
+/// discarded — its comment claimed "Tag 9 … ARG1/ARG2 downstreams" while the
+/// body wrote 1 — so `collect(teeing(a, b, merge))` returned a List instead of
+/// whatever `merge` produces.
+pub const COLLECTOR_TAG_TEEING: i32 = 37;
 
 // `{Int,Long,Double}SummaryStatistics` 4-field synthetic layout. Must stay in
 // step with `native-builtins` `phases_late::streams::STATS_FIELD_*`, which
@@ -18622,6 +18666,13 @@ fn is_known_collector_tag(tag: i32) -> bool {
             | COLLECTOR_TAG_SUMMARIZING_INT
             | COLLECTOR_TAG_SUMMARIZING_LONG
             | COLLECTOR_TAG_SUMMARIZING_DOUBLE
+            | COLLECTOR_TAG_AVERAGING_INT
+            | COLLECTOR_TAG_AVERAGING_LONG
+            | COLLECTOR_TAG_AVERAGING_DOUBLE
+            | COLLECTOR_TAG_SUMMING_INT
+            | COLLECTOR_TAG_SUMMING_LONG
+            | COLLECTOR_TAG_SUMMING_DOUBLE
+            | COLLECTOR_TAG_TEEING
     )
 }
 
@@ -18855,10 +18906,11 @@ fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             ctx.set_field(long_obj, 0, Value::Long(n));
             Ok(Some(Value::Object(Some(long_obj))))
         }
-        // minBy / maxBy / filtering / summarizing* are non-identity finishes
-        // too: the accumulation container is a plain list of the elements, and
-        // the real result (Optional / downstream result / SummaryStatistics) is
-        // computed here. Without this arm a raw-protocol driver got the bare
+        // minBy / maxBy / filtering / summarizing* / averaging* / summing* /
+        // teeing are non-identity finishes too: the accumulation container is a
+        // plain list of the elements, and the real result (Optional / downstream
+        // result / SummaryStatistics / boxed Double|Integer|Long / merged pair)
+        // is computed here. Without this arm a raw-protocol driver got the bare
         // ArrayList — the same shape bug the eager `collect` path had.
         Some(
             tag @ (COLLECTOR_TAG_MIN_BY
@@ -18866,7 +18918,14 @@ fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             | COLLECTOR_TAG_FILTERING
             | COLLECTOR_TAG_SUMMARIZING_INT
             | COLLECTOR_TAG_SUMMARIZING_LONG
-            | COLLECTOR_TAG_SUMMARIZING_DOUBLE),
+            | COLLECTOR_TAG_SUMMARIZING_DOUBLE
+            | COLLECTOR_TAG_AVERAGING_INT
+            | COLLECTOR_TAG_AVERAGING_LONG
+            | COLLECTOR_TAG_AVERAGING_DOUBLE
+            | COLLECTOR_TAG_SUMMING_INT
+            | COLLECTOR_TAG_SUMMING_LONG
+            | COLLECTOR_TAG_SUMMING_DOUBLE
+            | COLLECTOR_TAG_TEEING),
         ) => {
             let c = match coll {
                 Value::Object(Some(c)) => c,
@@ -19310,8 +19369,8 @@ fn native_stream_collect_3arg(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 }
 
 /// Result computation for the `Collectors` factories that only `native-builtins`
-/// registers — tags 25..30, see the `COLLECTOR_TAG_MIN_BY`..
-/// `COLLECTOR_TAG_SUMMARIZING_DOUBLE` constants. Shared by
+/// registers — tags 25..37, see the `COLLECTOR_TAG_MIN_BY`..
+/// `COLLECTOR_TAG_TEEING` constants. Shared by
 /// `native_stream_collect`'s eager tag dispatch and by `finisher.apply(container)`
 /// on the raw four-method Collector protocol, so an external driver (Reactor's
 /// `MonoStreamCollector`, any hand-rolled supplier/accumulator/finisher loop)
@@ -19510,6 +19569,147 @@ fn collect_builtins_collector_tag(
                     }
                 }
                 Ok(Some(Value::Object(Some(stats))))
+            }
+            COLLECTOR_TAG_AVERAGING_INT
+            | COLLECTOR_TAG_AVERAGING_LONG
+            | COLLECTOR_TAG_AVERAGING_DOUBLE
+            | COLLECTOR_TAG_SUMMING_INT
+            | COLLECTOR_TAG_SUMMING_LONG
+            | COLLECTOR_TAG_SUMMING_DOUBLE => {
+                // Primitive SAMs, exactly as for summarizing*: the extractor is
+                // a `ToIntFunction`/`ToLongFunction`/`ToDoubleFunction`, so it
+                // must be entered through `applyAsInt`/`applyAsLong`/
+                // `applyAsDouble` — `Function.apply` is a different method and
+                // would miss the lambda's only implementation.
+                let (sam, sam_desc) = match tag {
+                    COLLECTOR_TAG_AVERAGING_INT | COLLECTOR_TAG_SUMMING_INT => {
+                        ("applyAsInt", "(Ljava/lang/Object;)I")
+                    }
+                    COLLECTOR_TAG_AVERAGING_LONG | COLLECTOR_TAG_SUMMING_LONG => {
+                        ("applyAsLong", "(Ljava/lang/Object;)J")
+                    }
+                    _ => ("applyAsDouble", "(Ljava/lang/Object;)D"),
+                };
+                let func = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let fn_pin = ctx.pin_native_root(func);
+                let mut scored: Vec<Value> = Vec::with_capacity(elements.len());
+                for i in 0..elements.len() {
+                    let func = ctx.read_native_pin(fn_pin, func);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    scored.push(
+                        ctx.invoke_virtual(func, sam, sam_desc, &[elem])?
+                            .unwrap_or(Value::Int(0)),
+                    );
+                }
+                // The extractor may hand back a widened/narrowed carrier
+                // (interpreter vs JIT return shapes differ for I/J/D), so read
+                // through a tolerant conversion rather than matching one variant.
+                let as_i64 = |v: &Value| -> i64 {
+                    match v {
+                        Value::Long(l) => *l,
+                        Value::Int(i) => *i as i64,
+                        Value::Double(d) => *d as i64,
+                        Value::Float(f) => *f as i64,
+                        _ => 0,
+                    }
+                };
+                let as_f64 = |v: &Value| -> f64 {
+                    match v {
+                        Value::Double(d) => *d,
+                        Value::Float(f) => *f as f64,
+                        Value::Long(l) => *l as f64,
+                        Value::Int(i) => *i as f64,
+                        _ => 0.0,
+                    }
+                };
+                // Every box below is allocated after the last Java call and the
+                // folds run no bytecode, so none of them needs a pin.
+                match tag {
+                    // `Collector<T,?,Integer>` — an `Integer`, not a Long: a
+                    // `(Integer) stream.collect(summingInt(f))` cast is the
+                    // normal call shape and a Long box would CCE there.
+                    COLLECTOR_TAG_SUMMING_INT => {
+                        let mut sum: i32 = 0;
+                        for v in &scored {
+                            sum = sum.wrapping_add(as_i64(v) as i32);
+                        }
+                        let b = alloc_synthetic(ctx, "java/lang/Integer", 1);
+                        ctx.set_field(b, 0, Value::Int(sum));
+                        Ok(Some(Value::Object(Some(b))))
+                    }
+                    COLLECTOR_TAG_SUMMING_LONG => {
+                        let mut sum: i64 = 0;
+                        for v in &scored {
+                            sum = sum.wrapping_add(as_i64(v));
+                        }
+                        let b = alloc_synthetic(ctx, "java/lang/Long", 1);
+                        ctx.set_field(b, 0, Value::Long(sum));
+                        Ok(Some(Value::Object(Some(b))))
+                    }
+                    COLLECTOR_TAG_SUMMING_DOUBLE => {
+                        let mut sum = 0.0f64;
+                        for v in &scored {
+                            sum += as_f64(v);
+                        }
+                        let b = alloc_synthetic(ctx, "java/lang/Double", 1);
+                        ctx.set_field(b, 0, Value::Double(sum));
+                        Ok(Some(Value::Object(Some(b))))
+                    }
+                    // averaging*: `sum / count`, and 0.0 rather than NaN on an
+                    // empty stream — the JDK finisher is
+                    // `count == 0 ? 0.0d : sum / count`.
+                    _ => {
+                        let mut sum = 0.0f64;
+                        for v in &scored {
+                            sum += as_f64(v);
+                        }
+                        let avg = if scored.is_empty() {
+                            0.0
+                        } else {
+                            sum / scored.len() as f64
+                        };
+                        let b = alloc_synthetic(ctx, "java/lang/Double", 1);
+                        ctx.set_field(b, 0, Value::Double(avg));
+                        Ok(Some(Value::Object(Some(b))))
+                    }
+                }
+            }
+            COLLECTOR_TAG_TEEING => {
+                let down1 = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let down2 = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+                let merger = match ctx.get_field(collector, COLLECTOR_FIELD_ARG3) {
+                    Value::Object(Some(r)) => r,
+                    // No merge function — the JDK would have NPE'd building the
+                    // collector; there is nothing meaningful to return.
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let d1_handle = pin_value(ctx, down1);
+                let d2_handle = pin_value(ctx, down2);
+                let merger_pin = ctx.pin_native_root(merger);
+                // BOTH downstreams see the WHOLE stream; the results are then
+                // merged. Same recursive sub-stream protocol `filtering` and
+                // `mapping` use, so a downstream may itself be tagged or a real
+                // JDK Collector — `native_stream_collect` sorts that out.
+                let elems1 = read_value_slice(ctx, &elem_handles, elements);
+                let s1 = make_stream(ctx, &elems1)?.unwrap_or(Value::Object(None));
+                let down1 = read_pinned_elem(ctx, d1_handle, down1);
+                let r1 = native_stream_collect(ctx, &[s1, down1])?.unwrap_or(Value::Object(None));
+                let r1_handle = pin_value(ctx, r1);
+                let elems2 = read_value_slice(ctx, &elem_handles, elements);
+                let s2 = make_stream(ctx, &elems2)?.unwrap_or(Value::Object(None));
+                let down2 = read_pinned_elem(ctx, d2_handle, down2);
+                let r2 = native_stream_collect(ctx, &[s2, down2])?.unwrap_or(Value::Object(None));
+                let merger = ctx.read_native_pin(merger_pin, merger);
+                let r1 = read_pinned_elem(ctx, r1_handle, r1);
+                ctx.invoke_virtual(
+                    merger,
+                    "apply",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[r1, r2],
+                )
             }
             _ => Ok(Some(Value::Object(None))),
         }
@@ -20463,15 +20663,23 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 ];
                 make_map_of(ctx, &pairs)
             }
-            // minBy / maxBy / filtering / summarizing{Int,Long,Double} — the
-            // factories `native-builtins` owns. Shared with the raw-protocol
+            // minBy / maxBy / filtering / summarizing{Int,Long,Double} /
+            // averaging{Int,Long,Double} / summing{Int,Long,Double} / teeing —
+            // the factories `native-builtins` owns. Shared with the raw-protocol
             // finisher so both drivers agree.
             COLLECTOR_TAG_MIN_BY
             | COLLECTOR_TAG_MAX_BY
             | COLLECTOR_TAG_FILTERING
             | COLLECTOR_TAG_SUMMARIZING_INT
             | COLLECTOR_TAG_SUMMARIZING_LONG
-            | COLLECTOR_TAG_SUMMARIZING_DOUBLE => {
+            | COLLECTOR_TAG_SUMMARIZING_DOUBLE
+            | COLLECTOR_TAG_AVERAGING_INT
+            | COLLECTOR_TAG_AVERAGING_LONG
+            | COLLECTOR_TAG_AVERAGING_DOUBLE
+            | COLLECTOR_TAG_SUMMING_INT
+            | COLLECTOR_TAG_SUMMING_LONG
+            | COLLECTOR_TAG_SUMMING_DOUBLE
+            | COLLECTOR_TAG_TEEING => {
                 // Refresh through the pins first: `stream_elements_mut` above
                 // can have moved every element out from under `elements`.
                 let elems = read_value_slice(ctx, &elem_handles, &elements);

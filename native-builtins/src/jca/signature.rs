@@ -387,7 +387,11 @@ fn extract_key_id_from_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> u64 {
     // `key_id` via the GC-stable identity map registered at keygen/import, so the
     // fast Rust sign/verify still applies. Check that FIRST; a synthetic key is
     // never in the map and falls through to its slot-3 `key_id`.
-    if let Some(id) = crypto_impl::rsa_realkey_map_get(ctx.identity_hash_code(key)) {
+    // The map is keyed `(vm_identity, identity_hash)`: an identity hash is
+    // unique only within one heap, and the map is a process-global static.
+    if let Some(id) =
+        crypto_impl::rsa_realkey_map_get(ctx.vm_identity(), ctx.identity_hash_code(key))
+    {
         return id;
     }
     match ctx.get_field(key, 3) {

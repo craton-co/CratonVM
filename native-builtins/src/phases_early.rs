@@ -10213,6 +10213,27 @@ fn tu_nanos_per(ordinal: i32) -> i64 {
     }
 }
 
+/// Scale `d` from a source unit (`from_nanos` per unit) into a target unit
+/// (`to_nanos` per unit), saturating instead of overflowing.
+///
+/// The naive `d * tu_nanos_per(o) / divisor` these conversions used to run
+/// overflows `i64` for perfectly ordinary arguments, because it multiplies up
+/// to nanoseconds *before* dividing back down: `MILLISECONDS.toMillis(x)`
+/// scales `x` by 10^6 only to divide it out again, so it blows up for any
+/// `x > ~9.2e12` even though the answer is just `x`. `DAYS.toNanos(106_752)`
+/// exceeds `i64::MAX` outright. In a debug build that is an "attempt to
+/// multiply with overflow" panic raised from inside a timeout conversion — a
+/// hard abort where the JDK would have returned a number; in release it wraps
+/// and hands back a *negative* timeout, which reads as "already expired".
+///
+/// `TimeUnit.convert`/`toXxx` in the real JDK saturate to `Long.MAX_VALUE` /
+/// `Long.MIN_VALUE`. Do the arithmetic in `i128` — `2^63 * 86_400_000_000_000`
+/// is ~2^110, comfortably inside it — and clamp on the way out.
+fn tu_scale(d: i64, from_nanos: i64, to_nanos: i64) -> i64 {
+    let scaled = (d as i128) * (from_nanos as i128) / (to_nanos.max(1) as i128);
+    scaled.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 /// Read a `TimeUnit`'s ordinal.
 ///
 /// The constants are minted as synthetic objects whose single field is
@@ -10322,7 +10343,11 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             let su = obj_arg(args, 2)?;
             let to = tu_ordinal(ctx, this);
             let so = tu_ordinal(ctx, su);
-            Ok(Some(Value::Long(dur * tu_nanos_per(so) / tu_nanos_per(to))))
+            Ok(Some(Value::Long(tu_scale(
+                dur,
+                tu_nanos_per(so),
+                tu_nanos_per(to),
+            ))))
         },
     );
     r.register(c, "toNanos", "(J)J", |ctx, args| {
@@ -10332,7 +10357,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let o = tu_ordinal(ctx, this);
-        Ok(Some(Value::Long(d * tu_nanos_per(o))))
+        Ok(Some(Value::Long(tu_scale(d, tu_nanos_per(o), 1))))
     });
     r.register(c, "toMicros", "(J)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10341,7 +10366,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let o = tu_ordinal(ctx, this);
-        Ok(Some(Value::Long(d * tu_nanos_per(o) / 1_000)))
+        Ok(Some(Value::Long(tu_scale(d, tu_nanos_per(o), 1_000))))
     });
     r.register(c, "toMillis", "(J)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10350,7 +10375,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let o = tu_ordinal(ctx, this);
-        Ok(Some(Value::Long(d * tu_nanos_per(o) / 1_000_000)))
+        Ok(Some(Value::Long(tu_scale(d, tu_nanos_per(o), 1_000_000))))
     });
     r.register(c, "toSeconds", "(J)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10359,7 +10384,11 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let o = tu_ordinal(ctx, this);
-        Ok(Some(Value::Long(d * tu_nanos_per(o) / 1_000_000_000)))
+        Ok(Some(Value::Long(tu_scale(
+            d,
+            tu_nanos_per(o),
+            1_000_000_000,
+        ))))
     });
     r.register(c, "toMinutes", "(J)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10368,7 +10397,11 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let o = tu_ordinal(ctx, this);
-        Ok(Some(Value::Long(d * tu_nanos_per(o) / 60_000_000_000)))
+        Ok(Some(Value::Long(tu_scale(
+            d,
+            tu_nanos_per(o),
+            60_000_000_000,
+        ))))
     });
     r.register(c, "toHours", "(J)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10377,7 +10410,11 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let o = tu_ordinal(ctx, this);
-        Ok(Some(Value::Long(d * tu_nanos_per(o) / 3_600_000_000_000)))
+        Ok(Some(Value::Long(tu_scale(
+            d,
+            tu_nanos_per(o),
+            3_600_000_000_000,
+        ))))
     });
     r.register(c, "toDays", "(J)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10386,7 +10423,11 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let o = tu_ordinal(ctx, this);
-        Ok(Some(Value::Long(d * tu_nanos_per(o) / 86_400_000_000_000)))
+        Ok(Some(Value::Long(tu_scale(
+            d,
+            tu_nanos_per(o),
+            86_400_000_000_000,
+        ))))
     });
     r.register(c, "name", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;

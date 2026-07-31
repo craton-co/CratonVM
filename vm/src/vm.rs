@@ -42163,11 +42163,40 @@ mod tests {
         assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(1));
     }
 
+    /// A `ToIntFunction` lambda whose `applyAsInt(Object)I` is `String.length`.
+    fn string_length_to_int_function(shared: &Arc<SharedVm>) -> ObjectRef {
+        make_lambda_proxy(
+            shared,
+            "java/util/function/ToIntFunction",
+            "applyAsInt",
+            "(Ljava/lang/Object;)I",
+            "java/lang/String",
+            "length",
+            "()I",
+            MethodHandleKind::InvokeVirtual,
+            vec![],
+            &[],
+        )
+    }
+
+    // `Collectors.averagingInt(f)` is `Collector<T,?,Double>` and
+    // `Collectors.summingInt(f)` is `Collector<T,?,Integer>`.
+    //
+    // These two used to assert `get_field(collector, 0) == Int(19)` / `Int(22)`
+    // — the raw tag `native-builtins` happened to write. Those numbers were in
+    // NO decoder table: `native_stream_collect` (the only registered
+    // `Stream.collect(Collector)`) rejected them in `is_known_collector_tag`,
+    // fell through to the untagged-JDK-collector path and returned the bare
+    // accumulation `ArrayList` — so `(Double) collect(averagingInt(f))` was a
+    // ClassCastException and the tests were green over it. Assert the
+    // `java.util.stream.Collectors` contract end-to-end instead: the tag is an
+    // implementation detail, the boxed result is the API.
+
     #[test]
     fn collectors_averaging_int_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let func = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let func = string_length_to_int_function(&shared);
         let collector = call_native(
             &shared,
             &mut thread,
@@ -42178,15 +42207,78 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(19));
+        // lengths 1, 3, 2 → 6 / 3 == 2.0
+        let stream = stream_of_strings(&shared, &mut thread, &["a", "bbb", "cc"]);
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
+            "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+            &[stream, collector],
+        )
+        .unwrap()
+        .unwrap();
+        // An ArrayList would hold its backing array in slot 0, not a Double.
+        assert_eq!(
+            shared.mem.heap.get_field(result.as_object().unwrap(), 0),
+            Value::Double(2.0),
+            "averagingInt must collect to a boxed Double, not the accumulation list"
+        );
+        assert_eq!(
+            call_native(
+                &shared,
+                &mut thread,
+                "java/lang/Double",
+                "doubleValue",
+                "()D",
+                &[result],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Double(2.0)
+        );
+    }
+
+    #[test]
+    fn collectors_averaging_int_empty_stream_is_zero_p56() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
+        let func = string_length_to_int_function(&shared);
+        let collector = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Collectors",
+            "averagingInt",
+            "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
+            &[Value::Object(Some(func))],
+        )
+        .unwrap()
+        .unwrap();
+        let stream = stream_of_strings(&shared, &mut thread, &[]);
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
+            "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+            &[stream, collector],
+        )
+        .unwrap()
+        .unwrap();
+        // The JDK finisher is `count == 0 ? 0.0d : sum / count` — 0.0, not NaN.
+        assert_eq!(
+            shared.mem.heap.get_field(result.as_object().unwrap(), 0),
+            Value::Double(0.0),
+            "averagingInt over an empty stream is 0.0"
+        );
     }
 
     #[test]
     fn collectors_summing_int_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let func = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let func = string_length_to_int_function(&shared);
         let collector = call_native(
             &shared,
             &mut thread,
@@ -42197,8 +42289,38 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(22));
+        // lengths 1, 3, 2 → 6
+        let stream = stream_of_strings(&shared, &mut thread, &["a", "bbb", "cc"]);
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
+            "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+            &[stream, collector],
+        )
+        .unwrap()
+        .unwrap();
+        // Integer, not Long: `Collectors.summingInt` is Collector<T,?,Integer>
+        // and callers cast to Integer.
+        assert_eq!(
+            shared.mem.heap.get_field(result.as_object().unwrap(), 0),
+            Value::Int(6),
+            "summingInt must collect to a boxed Integer, not the accumulation list"
+        );
+        assert_eq!(
+            call_native(
+                &shared,
+                &mut thread,
+                "java/lang/Integer",
+                "intValue",
+                "()I",
+                &[result],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(6)
+        );
     }
 
     #[test]
@@ -48531,15 +48653,72 @@ mod tests {
         assert!(matches!(rev, Value::Object(Some(_))));
     }
 
+    /// `Collectors.teeing(d1, d2, merge)` feeds the whole stream to BOTH
+    /// downstreams and returns `merge.apply(r1, r2)`.
+    ///
+    /// This used to assert only that the factory returned some object, which it
+    /// did — a `toList` collector with all three arguments thrown away (the
+    /// body wrote tag 1 while its comment claimed "Tag 9 … ARG1/ARG2
+    /// downstreams"). `collect(teeing(...))` therefore returned a List of the
+    /// stream elements and neither downstream nor the merger ever ran.
     #[test]
     fn collectors_teeing_p64() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
+        let d1 = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Collectors",
+            "joining",
+            "()Ljava/util/stream/Collector;",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let d2 = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Collectors",
+            "joining",
+            "()Ljava/util/stream/Collector;",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        // merge = (a, b) -> a.concat(b)
+        let merger = make_lambda_proxy(
+            &shared,
+            "java/util/function/BiFunction",
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            "java/lang/String",
+            "concat",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            MethodHandleKind::InvokeVirtual,
+            vec![],
+            &[],
+        );
         let c = call_native(&shared, &mut thread, "java/util/stream/Collectors",
             "teeing",
             "(Ljava/util/stream/Collector;Ljava/util/stream/Collector;Ljava/util/function/BiFunction;)Ljava/util/stream/Collector;",
-            &[Value::Object(None), Value::Object(None), Value::Object(None)]).unwrap().unwrap();
+            &[d1, d2, Value::Object(Some(merger))]).unwrap().unwrap();
         assert!(matches!(c, Value::Object(Some(_))));
+        let stream = stream_of_strings(&shared, &mut thread, &["a", "bbb", "cc"]);
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
+            "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+            &[stream, c],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            read_java_string(&shared.mem.heap, result.as_object().unwrap()),
+            Some("abbbccabbbcc".to_string()),
+            "teeing must merge both downstream results, not return a toList"
+        );
     }
 
     // ===== Phase 65 Tests =====

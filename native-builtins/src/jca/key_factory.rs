@@ -997,7 +997,9 @@ fn real_rsa_key_from_components(
             .into())
         }
     };
-    crypto_impl::rsa_realkey_map_set(ctx.identity_hash_code(key), key_id);
+    // VM-scoped key: an identity hash is unique only within one heap, and
+    // `RSA_REALKEY_MAP` is a process-global static (see its doc comment).
+    crypto_impl::rsa_realkey_map_set(ctx.vm_identity(), ctx.identity_hash_code(key), key_id);
     Ok(key)
 }
 
@@ -1080,7 +1082,8 @@ fn real_rsa_crt_private_key(
             .into())
         }
     };
-    crypto_impl::rsa_realkey_map_set(ctx.identity_hash_code(key), key_id);
+    // VM-scoped key -- see `RSA_REALKEY_MAP`'s doc comment.
+    crypto_impl::rsa_realkey_map_set(ctx.vm_identity(), ctx.identity_hash_code(key), key_id);
     Ok(key)
 }
 
@@ -1250,7 +1253,12 @@ fn register_rsa_pub_verify_material(ctx: &mut dyn NativeContext, key: ObjectRef)
                     },
                 },
             );
-            crypto_impl::rsa_realkey_map_set(ctx.identity_hash_code(key), key_id);
+            // VM-scoped key -- see `RSA_REALKEY_MAP`'s doc comment.
+            crypto_impl::rsa_realkey_map_set(
+                ctx.vm_identity(),
+                ctx.identity_hash_code(key),
+                key_id,
+            );
         }
     }
 }
@@ -1351,7 +1359,10 @@ fn register_rsa_priv_sign_material(ctx: &mut dyn NativeContext, key: ObjectRef) 
             },
         },
     );
-    crypto_impl::rsa_realkey_map_set(ihash, key_id);
+    // VM-scoped key -- see `RSA_REALKEY_MAP`'s doc comment. `ihash` was
+    // captured above while `key` was still pinned; `vm_identity()` is a
+    // property of the context, not the object, so it is safe to read here.
+    crypto_impl::rsa_realkey_map_set(ctx.vm_identity(), ihash, key_id);
 }
 
 fn read_string(ctx: &mut dyn NativeContext, args: &[Value], idx: usize) -> String {
