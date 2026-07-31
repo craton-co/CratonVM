@@ -4,14 +4,15 @@
 the reason has changed and is now specific. **Read the 2026-07-31 section at
 the end first — it supersedes every diagnosis above it.**
 
-The thread-scaling wall the previous status described is fixed: at the real
-test parameters the three arms are 3.7x / 2.6x / 5.9x faster, and the
-`LazyCsCache` arm alone went 459.5s → 76s. What is left is not a charset-cache
-problem, not a dispatch problem and not a scaling problem — it is the flat
-~750 ns CratonVM pays per *native call*, where HotSpot pays ~4 ns. The test
-compares one arm that makes one native call against two arms that make two, so
-it cannot pass until that floor comes down. The arithmetic is in *What the
-test actually needs now*.
+The thread-scaling wall the previous status described is fixed: the class goes
+from not finishing inside a 300s per-class timeout to a completed 154s run, and
+at its own parameters the three arms are 3.7x / 2.6x / 5.9x faster. What is
+left is not a charset-cache problem, not a dispatch problem and not a scaling
+problem — it is the ~630 ns marginal cost of **any call the JIT does not
+inline**, where HotSpot inlines the same calls and pays ~0. The test compares
+one arm that makes one such call against two arms that make two, so it cannot
+pass until that floor comes down. The arithmetic is in *What the test actually
+needs now*.
 
 Everything between here and that section is kept as the record of how the
 earlier layers were peeled off. Several of its conclusions were corrected
