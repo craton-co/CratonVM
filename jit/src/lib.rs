@@ -8551,6 +8551,11 @@ fn try_compile_inner(
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
+        // Compact-layout metadata for this method's field reads, for the
+        // lowerer's guarded inline `getfield`. Filled alongside the builder's
+        // `field_info` below.
+        let mut ir_compact_fields: std::collections::HashMap<usize, (u32, bool, u8)> =
+            std::collections::HashMap::new();
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
         builder.tdigest_scalar_kernel = cached.class_name.as_ref()
             == "org/elasticsearch/tdigest/Dist"
@@ -8606,10 +8611,22 @@ fn try_compile_inner(
             if let Some(resolver) = cp_field_resolver {
                 let mut fm = std::collections::HashMap::with_capacity(scan.field_ops.len());
                 for &(pc, cp_idx) in &scan.field_ops {
-                    if let Some((field_index, type_tag, _compact_slot)) = resolver(cp_idx) {
-                        // The IR builder only needs (field_index, type_tag); it
-                        // bails getfield/putfield to single-pass under compact.
+                    if let Some((field_index, type_tag, compact_slot)) = resolver(cp_idx) {
+                        // The builder needs (field_index, type_tag); the LOWERER
+                        // additionally takes the packed compact slot, so a field
+                        // read can be emitted inline instead of paying the
+                        // checked helper on every access. Only a genuinely
+                        // resolved slot enters the map — a fabricated `(0,
+                        // false)` steered the single-pass inline arm at a
+                        // garbage offset once already (the WildFly Host
+                        // Controller SIGSEGV), and `None` here simply keeps the
+                        // helper.
                         fm.insert(pc, (field_index, type_tag));
+                        if cratonvm_types::compact_ref_fields_enabled() {
+                            if let Some((c_off, c_ref)) = compact_slot {
+                                ir_compact_fields.insert(pc, (c_off, c_ref, type_tag));
+                            }
+                        }
                     }
                 }
                 builder.set_field_info(fm);
@@ -9170,6 +9187,7 @@ fn try_compile_inner(
                         sr_map.as_ref(),
                         &ir_direct_calls,
                         &ir_ic_slots,
+                        &ir_compact_fields,
                     ) {
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid

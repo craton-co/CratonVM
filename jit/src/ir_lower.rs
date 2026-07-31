@@ -272,6 +272,21 @@ struct Lowerer<'a> {
     thread_fetch_span: Option<(usize, usize)>,
     /// Did any safepoint actually emit a shadow push?
     shadow_pushed_any: bool,
+    /// Compact-layout metadata for the instance fields this method reads:
+    /// `bytecode_pc → (packed byte offset from the object body, is_reference,
+    /// descriptor tag)`. Empty ⇒ every `Op::Load` takes the checked helper.
+    ///
+    /// Present for the same reason the single-pass backend carries it: routing
+    /// every field read through `jit_getfield` costs a boundary note, a region
+    /// walk and a 16-byte atomic cell read on one of the hottest operations a
+    /// JIT emits. The single-pass backend measured that at 4.7x on bintrees-16
+    /// when the hardening first landed; the IR tier still paid it, which is why
+    /// a forced-C2 bt18 ran 1.85x slower than the C1 body it replaced.
+    compact_fields: HashMap<usize, (u32, bool, u8)>,
+    /// Address of the GC's published `JIT_REGION_BOUNDS` table, for the guarded
+    /// receiver check. Zero ⇒ no inline field read (the guard cannot be
+    /// emitted, so the helper stays).
+    region_bounds_addr: usize,
     /// Emitted shadow push / reload sequence counts.
     ///
     /// Every push must have exactly one reload: a push advances the thread's
@@ -388,6 +403,7 @@ impl<'a> Lowerer<'a> {
         sr_map: Option<&'a ScalarReplacementMap>,
         direct_calls: &'a HashMap<usize, (usize, bool)>,
         ic_slots: &'a HashMap<usize, (usize, usize)>,
+        compact_fields: &HashMap<usize, (u32, bool, u8)>,
     ) -> Self {
         // Frame homes of the reference PARAMETERS, in `[rbp - off]` form. Every
         // safepoint map republishes these; see `emit_safepoint_map`.
@@ -537,6 +553,8 @@ impl<'a> Lowerer<'a> {
             pending_shadow: Vec::new(),
             thread_fetch_span: None,
             shadow_pushed_any: false,
+            compact_fields: compact_fields.clone(),
+            region_bounds_addr: helpers.region_bounds_addr,
             shadow_pushes: 0,
             shadow_reloads: 0,
             locals_size,
@@ -1101,6 +1119,159 @@ fn reloc_emit_enabled() -> bool {
         self.patch_rel32_to_here(skip);
         self.shadow_pushes += 1;
         true
+    }
+
+    /// Guarded inline read of a compact instance field, with the checked
+    /// `jit_getfield` helper as the slow path. Returns `false` when the site is
+    /// not eligible, leaving the caller's helper-only lowering in place.
+    ///
+    /// Why this exists: routing every field read through the helper costs a
+    /// JIT-boundary note, an `is_object_address` region walk and a 16-byte
+    /// atomic cell read. When that hardening first landed on the single-pass
+    /// backend it cost 4.7x on bintrees-16, which is why that backend grew the
+    /// guarded inline path (`guarded_inline_getfield_enabled`). The IR tier
+    /// never got one, and it is the measured reason a forced-C2 `bt18` ran
+    /// **1.85x slower** than the single-pass body it replaced (3614-3762 ms vs
+    /// 6436-7013 ms, five interleaved reps) once reference field reads made
+    /// real methods IR-eligible. An optimizing tier that reads fields more
+    /// expensively than the baseline tier cannot be worth selecting.
+    ///
+    /// The shape mirrors `x64.rs`'s arm exactly, and deliberately keeps the
+    /// property that stops the stale-receiver SIGSEGV: never dereference a
+    /// receiver that is not null-free, 8-aligned and inside a published GC
+    /// region. Everything else — null, unaligned, out-of-heap, a legacy
+    /// (non-compact) instance of a compact class, or a width this arm does not
+    /// emit — branches to the helper, whose NPE / `i64::MIN` semantics are
+    /// unchanged. The one simplification against the single-pass version: the
+    /// legacy-layout receiver takes the helper rather than a second inline
+    /// path.
+    fn emit_inline_compact_getfield(
+        &mut self,
+        node_pc: Option<usize>,
+        node_ty: IrType,
+        base: NodeId,
+        field_index: i64,
+        slot: i32,
+    ) -> bool {
+        if self.getfield == 0 {
+            return false;
+        }
+        let Some(pc) = node_pc else {
+            return false;
+        };
+        let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&pc) else {
+            return false;
+        };
+        if crate::x64::narrow_oops_block_inline_fields() {
+            return false;
+        }
+        let raw_mode = crate::x64::inline_getfield_enabled();
+        let guarded = crate::x64::guarded_inline_getfield_enabled() && self.region_bounds_addr != 0;
+        if !raw_mode && !guarded {
+            return false;
+        }
+        // The node type and the resolved descriptor must agree. They can only
+        // disagree through a resolver that fabricated a compact slot — the
+        // WildFly Host Controller SIGSEGV — and the consequence of trusting it
+        // here would be a 32-bit sign-extended load of half a pointer.
+        let ref_node = node_ty == IrType::Ref;
+        let ref_tag = matches!(type_tag, b'L' | b'[');
+        if ref_node != ref_tag || ref_tag != c_is_ref {
+            return false;
+        }
+        if !ref_node && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+            return false;
+        }
+
+        let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+        let mut slow: Vec<usize> = Vec::new();
+
+        self.load_to_rax(self.slot_of(base));
+        // 1. null → slow (the helper raises the NPE).
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+        slow.push(self.emit_jcc_rel32(0x84)); // JZ
+        if guarded && !raw_mode {
+            // 2. alignment: the low three bits must be clear.
+            self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+            self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
+            slow.push(self.emit_jcc_rel32(0x85)); // JNZ
+                                                  // 3. containment in one of the three published regions.
+                                                  //    RDX = &JIT_REGION_BOUNDS = [b0, e0, b1, e1, b2, e2].
+            self.emit_mov_reg_imm64(RDX, self.region_bounds_addr as u64);
+            self.emit_cmp_rax_mem_rdx(0);
+            let below_b0 = self.emit_jcc_rel32(0x82); // JB → try region 1
+            self.emit_cmp_rax_mem_rdx(8);
+            let ok0 = self.emit_jcc_rel32(0x82); // JB → inside region 0
+            self.patch_rel32_to_here(below_b0);
+            self.emit_cmp_rax_mem_rdx(16);
+            let below_b1 = self.emit_jcc_rel32(0x82); // JB → try region 2
+            self.emit_cmp_rax_mem_rdx(24);
+            let ok1 = self.emit_jcc_rel32(0x82); // JB → inside region 1
+            self.patch_rel32_to_here(below_b1);
+            self.emit_cmp_rax_mem_rdx(32);
+            slow.push(self.emit_jcc_rel32(0x82)); // JB → slow
+            self.emit_cmp_rax_mem_rdx(40);
+            slow.push(self.emit_jcc_rel32(0x83)); // JAE → slow
+            self.patch_rel32_to_here(ok0);
+            self.patch_rel32_to_here(ok1);
+        }
+        // 4. per-OBJECT compactness. A class with a registered compact layout
+        //    can still have legacy 16-byte-cell instances (an allocation whose
+        //    `num_fields` disagrees with the layout falls back to the uniform
+        //    plan), and reading one at the packed offset yields a mangled
+        //    {tag, half-pointer} word.
+        self.buf.emit(&[0xF6, 0x80]); // TEST byte [RAX + disp32], imm8
+        self.buf
+            .emit(&(cratonvm_types::GC_FLAGS_OFFSET as i32).to_le_bytes());
+        self.buf.emit_byte(cratonvm_types::GC_FLAG_COMPACT);
+        slow.push(self.emit_jcc_rel32(0x84)); // JZ → slow (legacy instance)
+
+        // 5. the read itself. A compact reference field is the bare 8-byte
+        //    pointer at the cell base; a primitive is its tagless descriptor
+        //    width.
+        if ref_node {
+            self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX + disp32]
+            self.buf.emit(&cell_off.to_le_bytes());
+        } else {
+            match type_tag {
+                b'Z' => self.buf.emit(&[0x48, 0x0F, 0xB6, 0x80]), // MOVZX RAX, byte
+                b'B' => self.buf.emit(&[0x48, 0x0F, 0xBE, 0x80]), // MOVSX RAX, byte
+                b'C' => self.buf.emit(&[0x48, 0x0F, 0xB7, 0x80]), // MOVZX RAX, word
+                b'S' => self.buf.emit(&[0x48, 0x0F, 0xBF, 0x80]), // MOVSX RAX, word
+                _ => self.buf.emit(&[0x48, 0x63, 0x80]),          // MOVSXD RAX, dword
+            }
+            self.buf.emit(&cell_off.to_le_bytes());
+        }
+        self.buf.emit_byte(0xE9); // JMP rel32 → done
+        let done_patch = self.buf.pos();
+        self.buf.emit(&[0; 4]);
+
+        // --- slow path: the checked helper, byte-identical to the arm this
+        //     replaces, including the sentinel bail. ---
+        for p in slow {
+            self.patch_rel32_to_here(p);
+        }
+        self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as u64);
+        self.emit_mov_reg_imm64(RAX, self.getfield as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub
+        let exc_patch = self.buf.pos();
+        self.buf.emit(&[0; 4]);
+        self.call_exc_patches.push(exc_patch);
+
+        self.patch_rel32_to_here(done_patch);
+        self.store_rax(slot);
+        true
+    }
+
+    /// `CMP RAX, [RDX + disp32]` — REX.W + 3B /r, ModRM(mod=10, reg=RAX, rm=RDX).
+    fn emit_cmp_rax_mem_rdx(&mut self, disp: i32) {
+        self.buf.emit(&[0x48, 0x3B, 0x82]);
+        self.buf.emit(&disp.to_le_bytes());
     }
 
     /// Copy the (possibly rewritten) published values back into their frame
@@ -2631,6 +2802,21 @@ fn reloc_emit_enabled() -> bool {
                     Op::Const(v) => v,
                     _ => 0,
                 };
+                // Guarded inline read of a compact field, with the checked
+                // helper as the slow path — the same trade the single-pass
+                // backend makes. Returns false when this site is not eligible
+                // (no resolved compact slot, no published region bounds, gate
+                // off, or a width this arm does not emit), leaving the helper
+                // path below untouched.
+                if self.emit_inline_compact_getfield(
+                    node.bytecode_pc,
+                    node.ty,
+                    base,
+                    field_index,
+                    slot,
+                ) {
+                    return;
+                }
                 if self.getfield != 0 {
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
                     self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
@@ -3825,8 +4011,18 @@ pub fn lower(
     let empty: HashMap<usize, bool> = HashMap::new();
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
     lower_inner(
-        graph, schedule, num_params, num_locals, helpers, &empty, None, &no_direct, &no_ic,
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        &empty,
+        None,
+        &no_direct,
+        &no_ic,
+        &no_compact,
     )
 }
 
@@ -3845,6 +4041,7 @@ pub fn lower_with_branch_hints(
 ) -> Option<CompiledMethod> {
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
     lower_inner(
         graph,
         schedule,
@@ -3855,6 +4052,7 @@ pub fn lower_with_branch_hints(
         None,
         &no_direct,
         &no_ic,
+        &no_compact,
     )
 }
 
@@ -3875,8 +4073,18 @@ pub fn lower_with_scalar_deopt(
     let empty: HashMap<usize, bool> = HashMap::new();
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
     lower_inner(
-        graph, schedule, num_params, num_locals, helpers, &empty, sr_map, &no_direct, &no_ic,
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        &empty,
+        sr_map,
+        &no_direct,
+        &no_ic,
+        &no_compact,
     )
 }
 
@@ -3901,6 +4109,10 @@ pub(crate) fn lower_inner(
     // virtual / interface site served from an inline cache. Empty ⇒ every such
     // site keeps the historical helper dispatch.
     ic_slots: &HashMap<usize, (usize, usize)>,
+    // Guarded inline field reads: `pc → (packed body offset, is_reference,
+    // descriptor tag)` for every resolved compact instance field. Empty ⇒ every
+    // `Op::Load` takes the checked helper, as it always did.
+    compact_fields: &HashMap<usize, (u32, bool, u8)>,
 ) -> Option<CompiledMethod> {
     // A live object allocation is now supported by the common allocation
     // stub. A zero helper pointer is only possible in synthetic unit-test
@@ -3983,6 +4195,7 @@ pub(crate) fn lower_inner(
         sr_map,
         direct_calls,
         ic_slots,
+        compact_fields,
     );
 
     // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
@@ -4441,6 +4654,7 @@ mod tests {
 
         let empty_hints: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
         lower_inner(
             &graph,
             &schedule,
@@ -4451,6 +4665,7 @@ mod tests {
             None,
             &no_direct,
             ic,
+            &no_compact,
         )
         .expect("virtual-call method must lower")
         .code_bytes()
