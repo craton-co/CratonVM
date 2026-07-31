@@ -651,9 +651,9 @@ const BACKEND_GENERATIONAL: u8 = 1;
 const BACKEND_G1: u8 = 2;
 const BACKEND_ZGC: u8 = 3;
 
-const FLAG_JIT_ACTIVE: u8 = 1 << 0;
-const FLAG_UNREGISTERED_JIT_FRAME: u8 = 1 << 1;
-const FLAG_MOVING_YOUNG_REQUESTED: u8 = 1 << 2;
+const FLAG_JIT_ACTIVE: u8 = 0b001;
+const FLAG_UNREGISTERED_JIT_FRAME: u8 = 0b010;
+const FLAG_MOVING_YOUNG_REQUESTED: u8 = 0b100;
 
 impl DecisionSlot {
     const fn new() -> Self {

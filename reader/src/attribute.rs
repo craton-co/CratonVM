@@ -821,7 +821,8 @@ pub fn validate_attribute_shape(name: &str, body: &[u8]) -> Result<(), ClassRead
                 // declared `Code` body. The lazy decoder still performs
                 // the full constant-pool-keyed dispatch at first access.
                 let _name_index = buf.read_u16()?;
-                let nested_len = buf.read_u32()? as usize;
+                let nested_len =
+                    wire_len_to_usize("nested attribute_length", buf.read_u32()?)?;
                 if nested_len > buf.remaining() {
                     return Err(ClassReaderError::InvalidClassData {
                         message: format!(
@@ -967,8 +968,8 @@ pub fn decode_attribute_with_source_arc(
 /// attributes like `LineNumberTable`/`StackMapTable`; legitimate
 /// `Record`/`Code` nesting is never more than one or two levels). Mirrors
 /// [`MAX_ANNOTATION_DEPTH`] used for the annotation/element-value recursion
-/// below.
-const MAX_ATTRIBUTE_DEPTH: usize = 16;
+/// below. Canonical value lives in [`crate::limits::MAX_ATTRIBUTE_DEPTH`].
+const MAX_ATTRIBUTE_DEPTH: usize = crate::limits::MAX_ATTRIBUTE_DEPTH;
 
 /// Decode dispatch — switches on attribute name. Kept separate from
 /// [`decode_attribute_with_source`] so the post-parse length check lives
@@ -1583,7 +1584,15 @@ fn decode_attributes_vec(
     // `ByteView::new`'s bounds check on attributes like a nested
     // `StackMapTable` inside a `Code` body).
     let count = buf.read_u16()?;
-    let mut out = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
+    // An attribute_info costs at least its 6-byte header (u2 name index +
+    // u4 length), so the reservation is bounded by the bytes that remain
+    // rather than by the declared count.
+    const NESTED_ATTRIBUTE_HEADER_BYTES: usize = 6;
+    let mut out = Vec::with_capacity(bounded_capacity(
+        count as usize,
+        NESTED_ATTRIBUTE_HEADER_BYTES,
+        buf.remaining(),
+    ));
     for _ in 0..count {
         let name_index = buf.read_u16()?;
         // Refcount-bump clone of the pool-interned attribute name — no
@@ -1594,7 +1603,7 @@ fn decode_attributes_vec(
                     index: name_index,
                     message: "nested attribute name must reference a valid Utf8 entry".to_string(),
                 })?;
-        let length = buf.read_u32()? as usize;
+        let length = wire_len_to_usize("nested attribute_length", buf.read_u32()?)?;
         if length > buf.remaining() {
             return Err(ClassReaderError::InvalidClassData {
                 message: format!(
@@ -1728,8 +1737,9 @@ fn decode_code_body(
 /// Maximum nesting depth for the `decode_annotation` ⇄ `decode_element_value`
 /// mutual recursion. An untrusted annotation can nest `@`/`[` element values
 /// arbitrarily deep; without a cap that overflows the stack. 256 far exceeds
-/// anything a real compiler emits.
-const MAX_ANNOTATION_DEPTH: usize = 256;
+/// anything a real compiler emits. Canonical value lives in
+/// [`crate::limits::MAX_ANNOTATION_DEPTH`].
+const MAX_ANNOTATION_DEPTH: usize = crate::limits::MAX_ANNOTATION_DEPTH;
 
 /// Decode a single annotation structure (JVM spec 4.7.16).
 fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassReaderError> {
@@ -3511,5 +3521,296 @@ mod tests {
             matches!(res, Err(ClassReaderError::InvalidClassData { .. })),
             "deeply self-nested Record must be rejected with InvalidClassData, got {res:?}",
         );
+    }
+
+    // ── Count × entry-size boundary corpus ───────────────────────────────
+    //
+    // Every table attribute in this module is "u2/u1 count, then count
+    // fixed-size records". The tests below drive each one at
+    // `u16::MAX`/`u8::MAX` with an empty body (must reject, before any
+    // reservation proportional to the count) and at the exact declared
+    // size (must accept). The must-accept twins are what stop the
+    // must-reject assertions from passing vacuously — a parser that
+    // rejected every table would fail them.
+
+    fn empty_cp() -> ConstantPool {
+        ConstantPool::new(vec![ConstantPoolEntry::Tombstone])
+    }
+
+    #[test]
+    fn table_attributes_reject_a_count_larger_than_their_body() {
+        let cp = empty_cp();
+        // (name, declared-count encoding, one well-formed entry)
+        let cases: [(&str, Vec<u8>, Vec<u8>); 6] = [
+            (
+                "Exceptions",
+                u16::MAX.to_be_bytes().to_vec(),
+                vec![0x00, 0x07],
+            ),
+            (
+                "LineNumberTable",
+                u16::MAX.to_be_bytes().to_vec(),
+                vec![0, 0, 0, 5],
+            ),
+            (
+                "InnerClasses",
+                u16::MAX.to_be_bytes().to_vec(),
+                vec![0, 1, 0, 2, 0, 3, 0, 4],
+            ),
+            (
+                "LocalVariableTable",
+                u16::MAX.to_be_bytes().to_vec(),
+                vec![0, 0, 0, 1, 0, 2, 0, 3, 0, 4],
+            ),
+            (
+                "LocalVariableTypeTable",
+                u16::MAX.to_be_bytes().to_vec(),
+                vec![0, 0, 0, 1, 0, 2, 0, 3, 0, 4],
+            ),
+            ("MethodParameters", vec![u8::MAX], vec![0, 1, 0, 0]),
+        ];
+
+        for (name, max_count, entry) in cases {
+            // Must reject: the maximum count with no entry bytes at all.
+            assert!(
+                decode_attribute(name, &max_count, &cp).is_err(),
+                "{name}: a maximal count with an empty table must be rejected"
+            );
+
+            // Must accept: a count of exactly one, with exactly one entry.
+            let mut ok = if max_count.len() == 1 {
+                vec![1u8]
+            } else {
+                1u16.to_be_bytes().to_vec()
+            };
+            ok.extend_from_slice(&entry);
+            assert!(
+                decode_attribute(name, &ok, &cp).is_ok(),
+                "{name}: one declared entry with one entry present must parse"
+            );
+
+            // Off-by-one: two declared, one present.
+            let mut short = if max_count.len() == 1 {
+                vec![2u8]
+            } else {
+                2u16.to_be_bytes().to_vec()
+            };
+            short.extend_from_slice(&entry);
+            assert!(
+                decode_attribute(name, &short, &cp).is_err(),
+                "{name}: declaring one more entry than is present must be rejected"
+            );
+
+            // Zero-length: a count of zero with an empty body is legal.
+            let zero = if max_count.len() == 1 {
+                vec![0u8]
+            } else {
+                0u16.to_be_bytes().to_vec()
+            };
+            assert!(
+                decode_attribute(name, &zero, &cp).is_ok(),
+                "{name}: an empty table must parse"
+            );
+        }
+    }
+
+    /// Build a minimal well-formed `Code` body with the given
+    /// `code_length` field and `code_length` bytes of bytecode.
+    fn code_body_with_length(declared: u32, actual_code_bytes: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u16.to_be_bytes()); // max_stack
+        b.extend_from_slice(&1u16.to_be_bytes()); // max_locals
+        b.extend_from_slice(&declared.to_be_bytes()); // code_length
+        b.resize(b.len() + actual_code_bytes, 0xb1u8); // `return` opcodes
+        b.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+        b.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+        b
+    }
+
+    #[test]
+    fn code_length_boundaries_are_enforced_in_both_directions() {
+        let cp = empty_cp();
+
+        // Must accept: the smallest legal code_length (JVMS §4.7.3 says
+        // code_length > 0).
+        assert!(
+            decode_attribute("Code", &code_body_with_length(1, 1), &cp).is_ok(),
+            "code_length == 1 is the legal minimum and must parse"
+        );
+
+        // Must reject: zero.
+        assert!(
+            decode_attribute("Code", &code_body_with_length(0, 0), &cp).is_err(),
+            "code_length == 0 violates JVMS §4.7.3"
+        );
+
+        // Must reject: one past the 65 535 cap, and the u4 extremes. None
+        // of these may allocate the declared size — the body is far too
+        // short to hold it, and the range check fires first.
+        for declared in [
+            (crate::limits::MAX_CODE_LENGTH + 1) as u32,
+            i32::MAX as u32,
+            i32::MIN as u32, // 0x8000_0000 read as an unsigned u4
+            u32::MAX,
+        ] {
+            assert!(
+                decode_attribute("Code", &code_body_with_length(declared, 0), &cp).is_err(),
+                "code_length {declared} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn code_exception_table_count_is_bounded_by_the_body() {
+        let cp = empty_cp();
+
+        // Must reject: 65 535 exception-table entries in a body that holds
+        // none. `checked_span` computes 524 280 bytes, `read_bytes` refuses.
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&1u16.to_be_bytes()); // max_stack
+        hostile.extend_from_slice(&1u16.to_be_bytes()); // max_locals
+        hostile.extend_from_slice(&1u32.to_be_bytes()); // code_length
+        hostile.push(0xb1);
+        hostile.extend_from_slice(&u16::MAX.to_be_bytes()); // exception_table_length
+        assert!(decode_attribute("Code", &hostile, &cp).is_err());
+
+        // Must accept: one entry, present.
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&1u16.to_be_bytes());
+        ok.extend_from_slice(&1u16.to_be_bytes());
+        ok.extend_from_slice(&1u32.to_be_bytes());
+        ok.push(0xb1);
+        ok.extend_from_slice(&1u16.to_be_bytes()); // exception_table_length = 1
+        ok.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]); // one 8-byte entry
+        ok.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+        let attr = decode_attribute("Code", &ok, &cp).expect("one exception entry must parse");
+        match attr {
+            Attribute::Code(code) => assert_eq!(code.exception_table.len(), 1),
+            other => panic!("expected Code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_length_at_u32_extremes_is_rejected_not_truncated() {
+        // A nested attribute inside a `Code` body declaring a `u4` length
+        // at the 32-bit extremes must be rejected by the
+        // length-vs-remaining check, never narrowed into a short read.
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8(cratonvm_types::intern_arc("LineNumberTable")),
+        ]);
+        for declared in [u32::MAX, i32::MIN as u32, i32::MAX as u32, 1_000_000] {
+            let mut body = Vec::new();
+            body.extend_from_slice(&1u16.to_be_bytes()); // max_stack
+            body.extend_from_slice(&1u16.to_be_bytes()); // max_locals
+            body.extend_from_slice(&1u32.to_be_bytes()); // code_length
+            body.push(0xb1);
+            body.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+            body.extend_from_slice(&1u16.to_be_bytes()); // attributes_count = 1
+            body.extend_from_slice(&1u16.to_be_bytes()); // name_index
+            body.extend_from_slice(&declared.to_be_bytes()); // attribute_length
+            assert!(
+                decode_attribute("Code", &body, &cp).is_err(),
+                "nested attribute_length {declared} must be rejected"
+            );
+        }
+
+        // Must-accept twin: the same shape with an honest length.
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&1u16.to_be_bytes());
+        ok.extend_from_slice(&1u16.to_be_bytes());
+        ok.extend_from_slice(&1u32.to_be_bytes());
+        ok.push(0xb1);
+        ok.extend_from_slice(&0u16.to_be_bytes());
+        ok.extend_from_slice(&1u16.to_be_bytes()); // attributes_count = 1
+        ok.extend_from_slice(&1u16.to_be_bytes()); // name_index -> LineNumberTable
+        ok.extend_from_slice(&2u32.to_be_bytes()); // attribute_length = 2
+        ok.extend_from_slice(&0u16.to_be_bytes()); // line_number_table_length = 0
+        assert!(
+            decode_attribute("Code", &ok, &cp).is_ok(),
+            "an honestly-sized nested attribute must parse"
+        );
+    }
+
+    #[test]
+    fn annotation_nesting_is_accepted_up_to_the_cap_and_rejected_one_past_it() {
+        let cp = empty_cp();
+
+        // `RuntimeVisibleAnnotations` body:
+        //   u2 num_annotations = 1
+        //   annotation: u2 type_index, u2 num_element_value_pairs = 1,
+        //               u2 element_name_index, element_value
+        // Nest `[` (array) element values `depth` levels, ending in a
+        // constant. Each `[` level costs `depth + 1` in the decoder.
+        fn annotations_body(array_levels: usize) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&1u16.to_be_bytes()); // num_annotations
+            b.extend_from_slice(&0u16.to_be_bytes()); // type_index
+            b.extend_from_slice(&1u16.to_be_bytes()); // num_element_value_pairs
+            b.extend_from_slice(&0u16.to_be_bytes()); // element_name_index
+            for _ in 0..array_levels {
+                b.push(b'['); // array tag
+                b.extend_from_slice(&1u16.to_be_bytes()); // num_values = 1
+            }
+            b.push(b'I'); // const int element value
+            b.extend_from_slice(&0u16.to_be_bytes()); // const_value_index
+            b
+        }
+
+        // The element_value recursion starts at depth 1 (the pair's value)
+        // and each array level adds one, so `MAX_ANNOTATION_DEPTH - 2`
+        // array levels is comfortably inside the cap.
+        let inside = MAX_ANNOTATION_DEPTH - 4;
+        assert!(
+            decode_attribute("RuntimeVisibleAnnotations", &annotations_body(inside), &cp).is_ok(),
+            "annotation nesting inside the cap must parse"
+        );
+
+        // Far past the cap must be an error, not a stack overflow.
+        assert!(decode_attribute(
+            "RuntimeVisibleAnnotations",
+            &annotations_body(MAX_ANNOTATION_DEPTH + 16),
+            &cp
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn type_path_and_localvar_target_counts_stay_bounded() {
+        let cp = empty_cp();
+
+        // `RuntimeVisibleTypeAnnotations` with target_type 0x40
+        // (localvar_target): u2 table_length then 6 bytes per entry.
+        // Declaring 65 535 entries with an empty table must be rejected —
+        // `checked_span` yields 393 210 bytes, which `read_bytes` refuses.
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&1u16.to_be_bytes()); // num_annotations
+        hostile.push(0x40); // target_type = localvar_target
+        hostile.extend_from_slice(&u16::MAX.to_be_bytes()); // table_length
+        assert!(decode_attribute("RuntimeVisibleTypeAnnotations", &hostile, &cp).is_err());
+
+        // Must-accept twin: one entry, present, followed by an empty
+        // type_path and a bare annotation.
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&1u16.to_be_bytes()); // num_annotations
+        ok.push(0x40); // target_type
+        ok.extend_from_slice(&1u16.to_be_bytes()); // table_length = 1
+        ok.extend_from_slice(&[0, 0, 0, 1, 0, 2]); // one 6-byte entry
+        ok.push(0); // type_path length = 0
+        ok.extend_from_slice(&0u16.to_be_bytes()); // annotation type_index
+        ok.extend_from_slice(&0u16.to_be_bytes()); // num_element_value_pairs
+        assert!(
+            decode_attribute("RuntimeVisibleTypeAnnotations", &ok, &cp).is_ok(),
+            "a well-formed localvar_target type annotation must parse"
+        );
+
+        // `type_path` length is a u1, so 255 is its maximum. Declaring it
+        // with an empty path must fail; declaring 1 with one entry present
+        // must succeed (covered by the twin above at length 0).
+        let mut bad_path = Vec::new();
+        bad_path.extend_from_slice(&1u16.to_be_bytes());
+        bad_path.push(0x13); // target_type with an empty target_info
+        bad_path.push(u8::MAX); // type_path length = 255, no entries follow
+        assert!(decode_attribute("RuntimeVisibleTypeAnnotations", &bad_path, &cp).is_err());
     }
 }

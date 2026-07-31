@@ -117,7 +117,9 @@ pub struct MethodSig {
 /// dimensions recurse in the parser; an untrusted `Signature` attribute of
 /// nothing but `[` (or deeply nested `<...>`) would otherwise overflow the
 /// stack. 256 comfortably exceeds anything a real compiler emits.
-const MAX_SIG_DEPTH: usize = 256;
+///
+/// Canonical value lives in [`crate::limits::MAX_SIGNATURE_DEPTH`].
+const MAX_SIG_DEPTH: usize = crate::limits::MAX_SIGNATURE_DEPTH;
 
 struct SigParser<'a> {
     input: &'a [u8],

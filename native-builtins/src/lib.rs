@@ -4121,6 +4121,11 @@ pub mod t27_tls;
 pub mod t27_tls_cbc;
 pub mod t3_impl;
 pub mod tls;
+// Deny-by-default guard for the JSSE socket-factory surface: an
+// `SSLSocketFactory`/`SSLServerSocketFactory` overload with no TLS bridge must
+// raise rather than inherit `javax.net.{Socket,ServerSocket}Factory`'s
+// plaintext implementation. See `docs/security/tls-and-jca-failure-audit.md`.
+pub mod tls_deny;
 // Step 1 of the limb-based BigInteger rewrite (docs/biginteger-limb-rewrite-scope.md).
 // Additive only — nothing routes through it yet; later steps migrate the
 // BigInteger natives off the O(digits^2) decimal-string primitives onto this.

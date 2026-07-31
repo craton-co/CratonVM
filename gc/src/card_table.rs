@@ -728,7 +728,7 @@ impl CardTable {
     /// path.
     pub fn retained_bytes(&self) -> usize {
         let cells = self.cells.lock();
-        let map = cells.cards.len() * std::mem::size_of::<AtomicU8>();
+        let map = std::mem::size_of_val(&cells.cards[..]);
         let tracking = cells.dirty_cards.capacity() * std::mem::size_of::<usize>();
         drop(cells);
         let pending = self.pending_offsets.lock().capacity() * std::mem::size_of::<usize>();

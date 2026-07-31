@@ -790,9 +790,11 @@ pub fn note_current_bailout(bailout: &Bailout, phase: &str) {
     let Some(state) = current() else {
         return;
     };
+    // The `Result<RefMut<..>, _>` scrutinee is a temporary whose drop would
+    // otherwise run after `state`; the trailing semicolon ends its scope first.
     if let Ok(mut report) = state.report.try_borrow_mut() {
         push_bailout(&mut report, bailout, phase);
-    }
+    };
 }
 
 fn push_bailout(report: &mut CompilationReport, bailout: &Bailout, phase: &str) {

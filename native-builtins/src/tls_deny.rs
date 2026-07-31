@@ -97,6 +97,16 @@ impl TlsFactoryKind {
             TlsFactoryKind::ServerSocket => "javax/net/ServerSocketFactory",
         }
     }
+
+    /// Descriptors declared TLS-bridged for this surface. See the allowlists
+    /// below; used only to sharpen the refusal message, never to permit a
+    /// call.
+    pub(crate) fn bridged_overloads(self) -> &'static [&'static str] {
+        match self {
+            TlsFactoryKind::Socket => BRIDGED_SSL_SOCKET_FACTORY_OVERLOADS,
+            TlsFactoryKind::ServerSocket => BRIDGED_SSL_SERVER_SOCKET_FACTORY_OVERLOADS,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,26 +253,39 @@ pub(crate) fn deny_plaintext_fallback(
     }
     let tls_class = kind.tls_class().replace('/', ".");
     let base_class = kind.base_class().replace('/', ".");
+    // Two different defects reach here; say which one, because the fix differs.
+    // Either way the answer is the same refusal — the diagnosis never changes
+    // the outcome into a socket.
+    let diagnosis = if kind.bridged_overloads().contains(&descriptor) {
+        "the overload IS listed as TLS-bridged, so its bridge registration was \
+         lost or was overwritten by a later registration on the same triple \
+         (registry semantics are last-writer-wins)"
+    } else {
+        "the overload has no TLS bridge; register one on the TLS class and add \
+         its descriptor to tls_deny::BRIDGED_*, or record it in \
+         tls_deny::UNBRIDGED_* if it is knowingly unsupported"
+    };
     Err(throw_tls_exc(
         ctx,
         &format!(
             "{tls_class}.{method}{descriptor} has no TLS implementation in this VM. \
              Refusing to fall through to {base_class}'s plaintext implementation: \
              a cleartext socket must never be returned where TLS was requested. \
-             To support this overload, register an explicit bridge on {tls_class} \
-             and add its descriptor to tls_deny::BRIDGED_* ."
+             Diagnosis: {diagnosis}."
         ),
     ))
 }
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
-    use crate::test_utils::mock_ctx;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_native_api::NativeMethodRegistry;
 
     /// Allocate an object whose runtime class is `name`.
-    fn obj_of_class(ctx: &mut crate::test_utils::MockNativeContext, name: &str) -> ObjectRef {
+    fn obj_of_class(ctx: &mut MockNativeContext, name: &str) -> ObjectRef {
         let cid = ctx.ensure_class_initialized(name).expect("class");
         ctx.alloc_object(cid, 2)
     }
@@ -425,11 +448,12 @@ mod tests {
                     Some("javax/net/ssl/SSLException")
                 );
             }
+            // Fallback arm: still an error, still an `IOException`, still not
+            // a socket.
             MethodCallFailed::InternalError(e) => {
                 let text = format!("{e}");
                 assert!(text.contains("IOException"), "unexpected fallback: {text}");
             }
-            other => panic!("unexpected failure shape: {other:?}"),
         }
     }
 

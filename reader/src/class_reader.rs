@@ -17,7 +17,10 @@ use crate::field::ClassFileField;
 // Resource limits and the checked-arithmetic helpers that enforce them all
 // live in one place — see `reader/src/limits.rs` and
 // `docs/security/reader/limits.md` for the inventory.
-use crate::limits::{bounded_capacity, ensure_count_fits, MIN_CONSTANT_POOL_ENTRY_BYTES};
+use crate::limits::{
+    bounded_capacity, checked_end, ensure_count_fits, wire_len_to_usize,
+    MIN_CONSTANT_POOL_ENTRY_BYTES,
+};
 use crate::method::ClassFileMethod;
 use std::sync::Arc;
 use tracing::{debug, trace};
@@ -652,7 +655,10 @@ fn read_attributes(
                 message: "attribute name must reference a valid Utf8 entry".to_string(),
             }
         })?;
-        let length = buf.read_u32()? as usize;
+        // `attribute_length` is a u4 on the wire. `wire_len_to_usize` states
+        // the narrowing explicitly rather than relying on `u32 as usize`
+        // being lossless on every host the VM is built for.
+        let length = wire_len_to_usize("attribute_length", buf.read_u32()?)?;
 
         // Validate attribute length does not exceed remaining buffer before
         // we slice into it. Catches truncated class files (and a hostile
@@ -680,7 +686,11 @@ fn read_attributes(
         // eliminating the misalignment attack that the eager path's
         // snapshot/check wrapper guarded against.
         let _ = buf.read_bytes(length)?;
-        let end = start + length;
+        // `read_bytes` already proved `start + length` is inside the buffer,
+        // but compute the end with `checked_add` anyway: a wrapped `end`
+        // would produce a *reversed* range that later slicing would panic
+        // on rather than reject.
+        let end = checked_end("attribute body range", start, length)?;
 
         // Eager shape-only validation for a small, fixed set of
         // attribute kinds whose laziness would otherwise hide

@@ -427,6 +427,73 @@ fn sign_dispatch(alg: i32, key_id: u64, data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Whether `sign_dispatch`/`verify_dispatch` have a native arm for `alg` at
+/// all.
+///
+/// Kept in lock-step with the two `match`es by
+/// `tests::natively_dispatched_matches_the_dispatch_arms`. Used only to say
+/// *why* a dispatch returned `None`: an algorithm with no arm is "we cannot do
+/// this at all", an algorithm with an arm is "the key handle was not in the
+/// backing store". Both refuse; the messages differ.
+fn natively_dispatched(alg: i32) -> bool {
+    matches!(
+        alg,
+        SIG_SHA256_RSA
+            | SIG_PSS_SHA256
+            | SIG_PSS_SHA384
+            | SIG_PSS_SHA512
+            | SIG_SHA256_ECDSA
+            | SIG_SHA384_ECDSA
+            | SIG_ED25519
+    )
+}
+
+/// `java.security.SignatureException` — the checked exception that BOTH
+/// `Signature.sign()` and `Signature.verify()` declare, so every caller of
+/// either can catch it. Deliberately preferred over `NoSuchAlgorithmException`
+/// (undeclared here, and the algorithm was already accepted at `getInstance`
+/// time) and over `ProviderException` (unchecked, so it escapes the
+/// `catch (SignatureException)` that signature-verifying code is written
+/// around).
+const SIGNATURE_EXCEPTION: &str = "java/security/SignatureException";
+
+/// Refuse a `sign`/`verify` whose dispatch returned `None`.
+///
+/// **This is the core of the P0 fix in this file.** `None` from
+/// `sign_dispatch`/`verify_dispatch` means the cryptographic question was
+/// never asked — either no native arm exists for the algorithm, or the key
+/// handle is absent from `crypto_impl`'s key store (see
+/// `crypto_impl::rsa_verify`: `guard.get(&id).map(..)`, so `None` is
+/// unambiguously "no such key", never a verification outcome).
+///
+/// Before this, `sign()` did `.unwrap_or_default()` — an **empty `byte[]`
+/// presented as a signature** — and `verify()` did `.unwrap_or(false)`, which
+/// the caller cannot tell from a forgery. `false` is the answer to "is this
+/// signature valid?"; it is not the answer to "we never checked".
+fn refuse_unanswerable(
+    ctx: &mut dyn NativeContext,
+    alg: i32,
+    op: &str,
+) -> cratonvm_types::error::MethodCallFailed {
+    let why = if natively_dispatched(alg) {
+        "the key handle is not present in this VM's key store (the key was \
+         never registered, or was registered against a different Signature \
+         instance)"
+    } else {
+        "this VM has no native implementation for that algorithm"
+    };
+    crate::phases_early::throw_jca_exc(
+        ctx,
+        SIGNATURE_EXCEPTION,
+        &format!(
+            "Signature.{op} could not be performed for {} ({}): refusing to \
+             report a cryptographic result for an operation that never ran.",
+            algo_name(alg),
+            why
+        ),
+    )
+}
+
 fn verify_dispatch(alg: i32, key_id: u64, data: &[u8], sig: &[u8]) -> Option<bool> {
     match alg {
         SIG_SHA256_RSA => crypto_impl::rsa_verify(key_id, data, sig),
@@ -939,7 +1006,13 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // produced an apparent success).
     let data = take_data(ctx, this)?;
 
-    let sig_bytes = sign_dispatch(alg, key_id, &data).unwrap_or_default();
+    // P0: `.unwrap_or_default()` here produced an EMPTY byte[] and returned it
+    // as the signature. A caller storing that into a JWS/JAR/token sees a
+    // successful `sign()` and ships an unsigned artefact.
+    let sig_bytes = match sign_dispatch(alg, key_id, &data) {
+        Some(bytes) => bytes,
+        None => return Err(refuse_unanswerable(ctx, alg, "sign()")),
+    };
     let arr = alloc_byte_array(ctx, &sig_bytes);
     Ok(Some(Value::Object(Some(arr))))
 }

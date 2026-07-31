@@ -11920,6 +11920,27 @@ fn phase52_socket_connect(
     }
 }
 
+/// Deny-by-default guard, applied as the FIRST statement of every plaintext
+/// `createSocket` body below.
+///
+/// `javax.net.ssl.SSLSocketFactory` extends `javax.net.SocketFactory`, and
+/// native dispatch resolves up the hierarchy — so an `SSLSocketFactory`
+/// overload with no TLS bridge lands here and used to hand back a cleartext
+/// `java.net.Socket` for a call that asked for TLS. See
+/// `crate::tls_deny` for the full reasoning and
+/// `docs/security/tls-and-jca-failure-audit.md` for the audit.
+macro_rules! deny_tls_receiver {
+    ($ctx:expr, $args:expr, $kind:ident, $method:literal, $desc:literal) => {
+        crate::tls_deny::deny_plaintext_fallback(
+            $ctx,
+            $args,
+            crate::tls_deny::TlsFactoryKind::$kind,
+            $method,
+            $desc,
+        )?
+    };
+}
+
 pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -11933,7 +11954,8 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
             Ok(Some(Value::Object(Some(obj))))
         },
     );
-    r.register(sf, "createSocket", "()Ljava/net/Socket;", |ctx, _args| {
+    r.register(sf, "createSocket", "()Ljava/net/Socket;", |ctx, args| {
+        deny_tls_receiver!(ctx, args, Socket, "createSocket", "()Ljava/net/Socket;");
         Ok(Some(Value::Object(Some(phase52_alloc_socket(ctx)))))
     });
     r.register(
@@ -11941,6 +11963,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createSocket",
         "(Ljava/lang/String;I)Ljava/net/Socket;",
         |ctx, args| {
+            deny_tls_receiver!(
+                ctx,
+                args,
+                Socket,
+                "createSocket",
+                "(Ljava/lang/String;I)Ljava/net/Socket;"
+            );
             let host = args.get(1).copied().unwrap_or(Value::Object(None));
             let port = args.get(2).copied().unwrap_or(Value::Int(0));
             phase52_socket_connect(ctx, host, port)
@@ -11951,6 +11980,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createSocket",
         "(Ljava/net/InetAddress;I)Ljava/net/Socket;",
         |ctx, args| {
+            deny_tls_receiver!(
+                ctx,
+                args,
+                Socket,
+                "createSocket",
+                "(Ljava/net/InetAddress;I)Ljava/net/Socket;"
+            );
             let host = match args.get(1).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(addr)) => ctx
                     .invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
@@ -11968,6 +12004,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createSocket",
         "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;",
         |ctx, args| {
+            deny_tls_receiver!(
+                ctx,
+                args,
+                Socket,
+                "createSocket",
+                "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;"
+            );
             let host = args.get(1).copied().unwrap_or(Value::Object(None));
             let port = args.get(2).copied().unwrap_or(Value::Int(0));
             phase52_socket_connect(ctx, host, port)
@@ -11978,6 +12021,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createSocket",
         "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
         |ctx, args| {
+            deny_tls_receiver!(
+                ctx,
+                args,
+                Socket,
+                "createSocket",
+                "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;"
+            );
             let host = match args.get(1).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(addr)) => ctx
                     .invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
@@ -12070,17 +12120,39 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // NOTE: the no-arg overload is the one that was never bridged for TLS.
+    // `SSLServerSocketFactory.createServerSocket()` inherited this body and
+    // returned a plaintext `java.net.ServerSocket` for a TLS request; the
+    // three bound overloads below were each bridged individually in
+    // `t27_tls::register_sslserversocket` only after a field failure named
+    // them. The guard makes the refusal structural rather than per-overload.
     r.register(
         ssf,
         "createServerSocket",
         "()Ljava/net/ServerSocket;",
-        |ctx, _args| ctx.new_object_initialized("java/net/ServerSocket", "()V", &[]),
+        |ctx, args| {
+            deny_tls_receiver!(
+                ctx,
+                args,
+                ServerSocket,
+                "createServerSocket",
+                "()Ljava/net/ServerSocket;"
+            );
+            ctx.new_object_initialized("java/net/ServerSocket", "()V", &[])
+        },
     );
     r.register(
         ssf,
         "createServerSocket",
         "(I)Ljava/net/ServerSocket;",
         |ctx, args| {
+            deny_tls_receiver!(
+                ctx,
+                args,
+                ServerSocket,
+                "createServerSocket",
+                "(I)Ljava/net/ServerSocket;"
+            );
             let port = args.get(1).cloned().unwrap_or(Value::Int(0));
             ctx.new_object_initialized("java/net/ServerSocket", "(I)V", &[port])
         },
@@ -12090,6 +12162,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createServerSocket",
         "(II)Ljava/net/ServerSocket;",
         |ctx, args| {
+            deny_tls_receiver!(
+                ctx,
+                args,
+                ServerSocket,
+                "createServerSocket",
+                "(II)Ljava/net/ServerSocket;"
+            );
             let port = args.get(1).cloned().unwrap_or(Value::Int(0));
             let backlog = args.get(2).cloned().unwrap_or(Value::Int(50));
             ctx.new_object_initialized("java/net/ServerSocket", "(II)V", &[port, backlog])
@@ -12100,6 +12179,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createServerSocket",
         "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;",
         |ctx, args| {
+            deny_tls_receiver!(
+                ctx,
+                args,
+                ServerSocket,
+                "createServerSocket",
+                "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;"
+            );
             let port = args.get(1).cloned().unwrap_or(Value::Int(0));
             let backlog = args.get(2).cloned().unwrap_or(Value::Int(50));
             let addr = args.get(3).cloned().unwrap_or(Value::Object(None));
