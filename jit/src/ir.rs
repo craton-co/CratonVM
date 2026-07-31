@@ -3252,14 +3252,50 @@ mod tests {
     }
 
     #[test]
-    fn test_ir_getfield_bails_on_non_int_field() {
-        // A reference field (`L…;`) is not int-category → build bails.
-        let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+    fn test_ir_getfield_builds_a_ref_typed_load_for_a_reference_field() {
+        // A reference field (`L…;`) reads through the same checked helper and
+        // yields a `Ref`-typed `Op::Load(MemKind::Ref)`. The TYPE is the part
+        // that matters beyond "it builds": `emit_safepoint_map` publishes
+        // exactly the `Ref`-typed nodes, so an `Int`-typed load of a reference
+        // would leave a live oop out of every map.
+        //
+        // This used to assert the opposite — that the builder bails — which
+        // was the single largest exclusion in the optimizing tier (66 of 141
+        // builder refusals on a Hibernate class).
+        let code = [0x2a, 0xb4, 0x00, 0x02, 0xb0, 0, 0]; // aload_0; getfield; areturn
         let mut builder = IrBuilder::new(1, 1);
         let mut fi = HashMap::new();
         fi.insert(1usize, (0usize, b'L'));
         builder.set_field_info(fi);
-        assert!(builder.build(&code, 5).is_none());
+        let graph = builder
+            .build(&code, 5)
+            .expect("a reference-field getfield must build");
+        let load = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Load(MemKind::Ref)))
+            .expect("the reference field must lower to Op::Load(MemKind::Ref)");
+        assert_eq!(load.ty, IrType::Ref);
+    }
+
+    #[test]
+    fn test_ir_getfield_still_bails_on_a_wide_field() {
+        // `J`/`D`/`F` fields have no IR load lowering: the helper returns the
+        // int payload, and a category-2 value additionally needs the wide
+        // operand-stack shape. Still refused, and refused HERE rather than
+        // deeper in the pipeline.
+        for tag in [b'J', b'D', b'F'] {
+            let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+            let mut builder = IrBuilder::new(1, 1);
+            let mut fi = HashMap::new();
+            fi.insert(1usize, (0usize, tag));
+            builder.set_field_info(fi);
+            assert!(
+                builder.build(&code, 5).is_none(),
+                "field tag {} must not build",
+                tag as char
+            );
+        }
     }
 
     #[test]
