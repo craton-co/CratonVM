@@ -15,12 +15,15 @@ verifier reads via `published_shadow_values` and cross-checks against the frame
 band (`band_has_unpublished_young_word`).
 
 So `moving_young_coverage_complete: true` asserts *publication*, not
-*enumeration*. Setting it without publishing was measured: the verifier stops
-taking its cheap early-out, runs the full band scan on every live frame at every
-collection, and rejects with `compiled-frame-oop-not-published` —
-`ZonedDateTimeTest` went from a 302 s pass to a >1200 s timeout while still
-never relocating. It was also only *safe* because the band scan caught the false
-claim, which is soundness resting on the verifier catching a producer's lie.
+*enumeration*, and setting it without publishing is unsound in principle: it
+would be safe only because the band scan happens to catch the false claim, which
+is soundness resting on the verifier catching a producer's lie.
+
+**Correction — do not repeat this inference.** Attempt 1 also blamed that claim
+for a `ZonedDateTimeTest` regression (302 s -> >1200 s), reasoning that a `true`
+makes the verifier skip its early-out and band-scan every live frame. Attempt 2
+disproved it: with publication fully implemented and the assertion gated OFF,
+the timeout remained. The reader side is not the cost. See "Attempt 2" below.
 
 ## What remains
 
