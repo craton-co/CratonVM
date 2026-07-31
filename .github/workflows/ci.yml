@@ -241,7 +241,13 @@ jobs:
       #     KeyPairGenerator block so JCA owns the class — its `initialize`
       #     writes a side table the JCA `generateKeyPair` reads, so removing
       #     only the one registration would leave the two halves mismatched.
-      #     Wants crypto-suite verification, not a one-line edit.
+      #     ATTEMPTED AND REVERTED: removing the phase53 KeyPairGenerator block
+      #     so JCA owns the class made things WORSE — 4 m22 failures became 7.
+      #     phase53's `java/security/Signature` block is coupled to the stub's
+      #     key layout, so JCA keys flowing into phase53 signing broke two
+      #     roundtrip tests that had been passing. The two blocks are a matched
+      #     pair: retiring one means retiring both, and verifying the result
+      #     against the crypto suites, not just these unit tests.
       #
       #     The rest
       #     is ~38 individual `assertion left == right` divergences plus
