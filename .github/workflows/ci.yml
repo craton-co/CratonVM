@@ -217,14 +217,19 @@ jobs:
       #         count fixes it; it needs named synthetic fields or a slot
       #         fallback that does not disturb the real-JDK path.
       #         (`throwable_init_cause_sets_cause` and the `p93_*` pair.)
-      #       * Lambda SAM-to-impl ARITY MISMATCH looks unsupported: a
-      #         `BiFunction.apply(k, v)` SAM bound to a 1-arg impl
-      #         (`System.identityHashCode`) never reaches the lambda body,
-      #         while `invoke_virtual_lambda_dispatch_static` proves the same
-      #         machinery works at matching arity. (The four `hashmap_compute`
-      #         / `merge` / `replaceAll` tests.) NOTE `CRATONVM_DBG_LAMBDA`
-      #         produced no output even on the PASSING control test, so that
-      #         hook is itself broken — do not trust its silence.
+      #     And one that is NOT a VM defect, recorded so it is not re-chased:
+      #       * The four `hashmap_compute` / `merge` / `replaceAll` tests build
+      #         a lambda call site javac cannot emit — SAM
+      #         `BiFunction.apply(Object,Object)Object` bound to the 1-arg impl
+      #         `System.identityHashCode(Object)I`. Real indy always produces a
+      #         synthetic `lambda$N` whose arity matches the SAM, so the VM is
+      #         not wrong to mishandle it; `coerce_lambda_args` stops coercing
+      #         at `impl_idx >= impl_params.len()` and leaves the extra arg in
+      #         place. Making the VM drop surplus args would mask genuine arity
+      #         bugs. These need a fixture whose impl arity matches the SAM.
+      #         NOTE `CRATONVM_DBG_LAMBDA` produced no output even on the
+      #         PASSING control test, so that hook is broken — its silence is
+      #         not evidence of anything.
       #     The rest
       #     is ~38 individual `assertion left == right` divergences plus
       #     singles; a few are genuine VM bugs worth their own fix, notably
