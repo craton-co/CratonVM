@@ -55,6 +55,7 @@ pub use class_manager::is_bootstrap_appended_class;
 pub use class_manager::synthetic_stub_instance_field_count;
 pub use class_manager::{
     any_class_redefined,
+    class_definition_epoch,
     bump_jit_supersede_epoch,
     drain_pending_class_hooks,
     install_class_file_load_hook,
