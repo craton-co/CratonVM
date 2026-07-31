@@ -741,7 +741,7 @@ impl Drop for ExecutableBuffer {
         record_code_free(
             self.ptr as usize,
             self.capacity,
-            ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire),
+            ACTIVE_JIT_EXECUTIONS.get(),
         );
         if never_free_code_enabled() {
             return;
@@ -1678,6 +1678,17 @@ pub struct CompiledMethod {
     /// (possibly-freed, under `CRATONVM_JIT_FREE_CODE=1`) box. The pointed-to
     /// guard is leaked (process-lifetime), so this raw pointer is always valid.
     pub deopt_epoch_guard: *const crate::deopt::DeoptEpochGuard,
+    /// `ClassId` of the class this body was published under, or
+    /// [`cratonvm_types::jit_activation::NO_OWNER_CLASS`] for an artifact that
+    /// was never published (test fixtures, probe bodies).
+    ///
+    /// Stamped by [`JitCache::put`] / [`JitCache::put_osr`] from the same
+    /// `declaring_class_id` they key the artifact on. It replaces the
+    /// `entry_ptr -> class_id` map `jit_activation` used to keep under a global
+    /// lock: every activation site already holds the `&CompiledMethod`, so the
+    /// lookup was pure overhead — and reading the owner off the live artifact
+    /// cannot return a retired entry's stale answer.
+    pub owner_class_id: u32,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -1689,7 +1700,6 @@ impl Drop for CompiledMethod {
         if dbg_stale_ic_enabled() {
             report_stale_ic_holders(entry);
         }
-        cratonvm_types::jit_activation::unregister_executable_owner(entry);
         unregister_jit_code_range(entry);
         if let Some(owners) = JIT_ENTRY_OWNERS.get() {
             let mut owners = owners.lock();
@@ -1817,6 +1827,7 @@ impl CompiledMethod {
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
+            owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
         }
     }
 
@@ -1882,6 +1893,7 @@ impl CompiledMethod {
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
+            owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
         }
     }
 
@@ -5511,8 +5523,15 @@ static JIT_ENTRY_OWNERS: std::sync::OnceLock<
     parking_lot::Mutex<FxHashMap<usize, std::sync::Weak<CompiledMethod>>>,
 > = std::sync::OnceLock::new();
 static JIT_CACHE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-static ACTIVE_JIT_EXECUTIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+/// How many compiled-frame activations are in flight process-wide.
+///
+/// Striped per thread: this is incremented and decremented on every
+/// interpreter/JIT boundary crossing, and read only when an artifact is
+/// retired. As one shared `AtomicUsize` it was a contended read-modify-write
+/// on a single cache line twice per Java call — see
+/// [`cratonvm_types::striped_counter`].
+static ACTIVE_JIT_EXECUTIONS: cratonvm_types::striped_counter::StripedCounter =
+    cratonvm_types::striped_counter::StripedCounter::new();
 static DEFERRED_JIT_OWNERS: std::sync::OnceLock<parking_lot::Mutex<Vec<Arc<CompiledMethod>>>> =
     std::sync::OnceLock::new();
 
@@ -5707,7 +5726,7 @@ fn drain_deferred_jit_owners_if_quiescent() {
     if jit_leak_code_enabled() {
         return;
     }
-    if ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire) != 0 {
+    if !ACTIVE_JIT_EXECUTIONS.is_zero() {
         return;
     }
     let retired = std::mem::take(&mut *deferred_jit_owners().lock());
@@ -5722,7 +5741,7 @@ fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
         deferred_jit_owners().lock().push(owner);
         return;
     }
-    if ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire) == 0 {
+    if ACTIVE_JIT_EXECUTIONS.is_zero() {
         drop(owner);
         return;
     }
@@ -5735,13 +5754,15 @@ fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
 /// Enter/leave the process-wide executable-code quiescence epoch. VM JIT entry
 /// guards call these at the same boundaries as their precise frame chain.
 pub fn jit_execution_enter() {
-    ACTIVE_JIT_EXECUTIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    ACTIVE_JIT_EXECUTIONS.inc();
 }
 
 pub fn jit_execution_leave() {
-    let previous = ACTIVE_JIT_EXECUTIONS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    debug_assert!(previous > 0, "unbalanced JIT execution leave");
-    if previous == 1 {
+    ACTIVE_JIT_EXECUTIONS.dec();
+    // The retirement drain only needs to run when this was the last activation
+    // anywhere. `is_zero` short-circuits on the first live stripe, so the
+    // common "some other thread is still in JIT" case costs one load.
+    if ACTIVE_JIT_EXECUTIONS.is_zero() {
         drain_deferred_jit_owners_if_quiescent();
     }
 }
@@ -6013,11 +6034,11 @@ impl JitCache {
             // later invocation, by which time the callee has a live body.
             return;
         }
+        // Stamp the declaring class before the artifact is shared: it is what
+        // `JitEntryGuard` reads to keep this class's defining loader alive
+        // while one of these frames is on a stack.
+        compiled.owner_class_id = declaring_class_id.as_u32();
         let arc = Arc::new(compiled);
-        cratonvm_types::jit_activation::register_executable_owner(
-            arc.entry_ptr() as usize,
-            declaring_class_id.as_u32(),
-        );
         // Stage 5 — register this method's code range for the GC RBP-chain
         // walker. Enabled when the precise gate is on (the registry is consulted
         // by `remap_active_jit_frames`) OR when the BUG-03 cross-thread STW JIT
@@ -6103,11 +6124,9 @@ impl JitCache {
             // later invocation, by which time the callee has a live body.
             return;
         }
+        // See the matching note in `put`.
+        compiled.owner_class_id = declaring_class_id.as_u32();
         let arc = Arc::new(compiled);
-        cratonvm_types::jit_activation::register_executable_owner(
-            arc.entry_ptr() as usize,
-            declaring_class_id.as_u32(),
-        );
         if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
             register_jit_code_range(
                 arc.entry_ptr() as usize,

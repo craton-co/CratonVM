@@ -329,7 +329,13 @@ unsafe fn write_gs_qword(disp: usize, val: usize) {
 
 /// Process-wide counter of active JIT entries across all threads. Lets the GC
 /// quickly answer "is anyone in JIT?" without crossing thread boundaries.
-static GLOBAL_JIT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+///
+/// Striped per thread — it is written twice per interpreter/JIT boundary
+/// crossing and read only by the GC, so as one shared `AtomicUsize` it was a
+/// contended cache line on the hottest path in the VM. See
+/// [`cratonvm_types::striped_counter`].
+static GLOBAL_JIT_DEPTH: cratonvm_types::striped_counter::StripedCounter =
+    cratonvm_types::striped_counter::StripedCounter::new();
 
 /// Re-export the GC-side quiescence flag so VM call sites have a single
 /// canonical entry point. The flag itself lives in the gc crate (see
@@ -622,7 +628,7 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         top_rbp_set(0);
         n
     });
-    GLOBAL_JIT_DEPTH.fetch_add(1, Ordering::Release);
+    GLOBAL_JIT_DEPTH.inc();
     cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
     // compaction whenever any thread is inside a JIT call. NEW-12's
@@ -663,7 +669,7 @@ pub fn pop_jit_entry() -> Option<usize> {
         p
     });
     if let Some(entry) = popped {
-        GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
+        GLOBAL_JIT_DEPTH.dec();
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
         Some(entry.entry_sp)
@@ -736,7 +742,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         note_jit_boundary();
     }
     for _ in 0..pruned {
-        GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
+        GLOBAL_JIT_DEPTH.dec();
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
     }
@@ -764,7 +770,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
 pub struct JitEntryGuard {
     /// Depth at the moment of construction; used as a sanity check on drop.
     depth_at_push: usize,
-    active_class_id: Option<u32>,
+    active_class_id: Option<cratonvm_types::jit_activation::Activation>,
 }
 
 impl JitEntryGuard {
@@ -820,7 +826,9 @@ impl JitEntryGuard {
         let depth_at_push = push_entry_full(entry);
         Self {
             depth_at_push,
-            active_class_id: cratonvm_types::jit_activation::enter(cm.entry_ptr() as usize),
+            // The artifact itself carries its declaring class, so marking it
+            // active is a per-thread slot write — no map, no global lock.
+            active_class_id: cratonvm_types::jit_activation::enter(cm.owner_class_id),
         }
     }
 }
@@ -844,8 +852,8 @@ impl Drop for JitEntryGuard {
             "JitEntryGuard::drop: chain underflow (was depth {})",
             self.depth_at_push
         );
-        if let Some(class_id) = self.active_class_id.take() {
-            cratonvm_types::jit_activation::exit(class_id);
+        if let Some(activation) = self.active_class_id.take() {
+            cratonvm_types::jit_activation::exit(activation);
         }
     }
 }
@@ -2029,10 +2037,7 @@ const fn peer_jit_frames_present(global_depth: usize, local_depth: usize) -> boo
 /// means at least one peer is inside compiled code right now.
 #[inline]
 pub fn other_thread_in_jit() -> bool {
-    peer_jit_frames_present(
-        GLOBAL_JIT_DEPTH.load(Ordering::Acquire),
-        current_thread_jit_depth(),
-    )
+    peer_jit_frames_present(GLOBAL_JIT_DEPTH.get(), current_thread_jit_depth())
 }
 
 /// Collection-authoritative moving-young coverage refresh.
@@ -2078,7 +2083,7 @@ pub fn refresh_moving_young_coverage_for_collection() -> bool {
 /// JIT call. Used by the GC to decide whether compaction is safe.
 #[inline]
 pub fn any_thread_in_jit() -> bool {
-    GLOBAL_JIT_DEPTH.load(Ordering::Acquire) > 0
+    !GLOBAL_JIT_DEPTH.is_zero()
 }
 
 /// Returns the number of active JIT entries on the *current* thread.
@@ -2160,7 +2165,7 @@ fn warn_cross_thread_jit_gap() {
     if (hits & (hits - 1)) == 0 {
         tracing::warn!(
             cross_thread_jit_gap_hits = hits,
-            global_jit_depth = GLOBAL_JIT_DEPTH.load(Ordering::Acquire),
+            global_jit_depth = GLOBAL_JIT_DEPTH.get(),
             "scan_active_jit_frames: another thread holds live JIT frames while \
              this thread's JIT chain is empty — the thread-local scanner cannot \
              see the peer's JIT roots. They are covered ONLY by that peer's \
@@ -2177,7 +2182,7 @@ fn warn_cross_thread_jit_gap() {
              GLOBAL_JIT_DEPTH={} > 0). The thread-local conservative scanner \
              cannot enumerate a peer thread's JIT roots; a cross-thread STW JIT \
              root scan is required and is not yet implemented.",
-            GLOBAL_JIT_DEPTH.load(Ordering::Acquire),
+            GLOBAL_JIT_DEPTH.get(),
         );
     }
 }
