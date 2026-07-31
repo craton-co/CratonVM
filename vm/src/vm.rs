@@ -31972,6 +31972,37 @@ mod tests {
     fn locale_default_and_getters() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
+        // `Locale.getDefault()` and the `user.language`/`user.country` system
+        // properties are the SAME source of truth in a real JVM, so derive the
+        // expectation from the properties rather than hardcoding `en`/`US`.
+        // Hardcoding made this test host-dependent: it passed on Windows and on
+        // a bare CI shell (both resolve to en_US) but would disagree with the
+        // VM's own properties under e.g. `LANG=en_GB.UTF-8`.
+        // `Locale` normalises language to lower case and country to upper case,
+        // so the expectation is normalised the same way.
+        let (expect_lang, expect_country) = {
+            let props = shared.system_properties.read();
+            (
+                props
+                    .get("user.language")
+                    .cloned()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                props
+                    .get("user.country")
+                    .cloned()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase(),
+            )
+        };
+        // The POSIX `C` and `POSIX` locales — what a Linux shell with no
+        // `LANG`/`LC_ALL` reports — are mapped to English by the HotSpot
+        // launcher (`java_props_md.c`). The VM must never surface them raw:
+        // `Locale.getDefault().getLanguage()` is "en" there, never "C".
+        assert!(
+            !expect_lang.is_empty() && expect_lang != "c" && expect_lang != "posix",
+            "user.language must be a real language code, got {expect_lang:?}"
+        );
         let loc = call_native(
             &shared,
             &mut thread,
@@ -31994,7 +32025,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = lang {
-                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "en");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), expect_lang);
             } else {
                 panic!("expected string");
             }
@@ -32009,7 +32040,10 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = country {
-                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "US");
+                assert_eq!(
+                    read_java_string(&shared.mem.heap, s).unwrap(),
+                    expect_country
+                );
             } else {
                 panic!("expected string");
             }
@@ -71117,12 +71151,54 @@ mod tests {
 
     #[test]
     fn p86_chm_concurrent_iteration() {
-        // One thread writes while another reads size repeatedly.
-        // Proves reads don't block or corrupt during concurrent writes.
+        // One thread writes while another reads. Proves that concurrent reads
+        // neither block nor observe corrupt state.
+        //
+        // WHAT THIS TEST IS ALLOWED TO ASSERT. `ConcurrentHashMap` reads are
+        // *weakly consistent*: a read reflects the map's state at some point
+        // at or since it began, may or may not reflect an insertion that is
+        // still in flight, and never throws. Nothing orders the writer thread
+        // ahead of the reader thread either. The original version of this test
+        // looped the reader a fixed 200 times and then asserted
+        // `max_seen > 0` -- i.e. "the reader must have observed at least one
+        // of the writer's puts". Neither the JDK nor CratonVM promises that.
+        // Whenever the writer had not been scheduled by the time the reader
+        // burned through its 200 (very cheap) `size()` calls, `max_seen` was
+        // legitimately 0 and the assert fired: reproducible roughly 1 run in
+        // 60 even in isolation, and much more often under full-suite load.
+        // That was a bug in the test, not in the map, and it is why this test
+        // was a load-dependent flake.
+        //
+        // The properties below ARE guaranteed, and are what is asserted now:
+        //   1. Entries committed BEFORE the reader started are visible on
+        //      EVERY concurrent read: `size()` never drops below that
+        //      committed prefix, and `containsKey` on a pre-committed key
+        //      never misses -- even while the writer is putting into (and
+        //      resizing the bucket tables of) the segments underneath. A miss
+        //      there would be a torn read, not weak consistency.
+        //   2. With no removals in flight, an observed `size()` never goes
+        //      backwards and never exceeds the total that could possibly have
+        //      been inserted (no duplicated or garbage entry).
+        //   3. No lost updates: once both threads have joined, the map holds
+        //      exactly the baseline plus every writer key.
+        //   4. The two threads genuinely overlap: the reader keeps reading
+        //      until the writer publishes "done", so the concurrency under
+        //      test cannot be scheduled away (which is exactly what silently
+        //      happened on the runs that used to fail -- those runs asserted
+        //      nothing at all about concurrency).
+        const BASELINE: i32 = 8;
+        const WRITES: i32 = 100;
+        const MIN_READS: u64 = 200;
+        const PUT_SIG: &str = "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
+        const CONTAINS_SIG: &str = "(Ljava/lang/Object;)Z";
+
         let shared = p86_shared_with_collections();
         let chm_class = "java/util/concurrent/ConcurrentHashMap";
 
         let chm = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        // Commit BASELINE entries before either thread starts. These are the
+        // only entries a concurrent reader is entitled to demand.
+        let mut baseline_keys: Vec<ObjectRef> = Vec::new();
         {
             let mut thread = JvmThread::new(ThreadId(0), "main");
             p86_chm_call(
@@ -71134,34 +71210,76 @@ mod tests {
                 &[Value::Object(Some(chm))],
             )
             .unwrap();
+            for i in 0..BASELINE {
+                let key = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+                shared.mem.heap.set_field(key, 0, Value::Int(i));
+                let val = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+                shared.mem.heap.set_field(val, 0, Value::Int(i));
+                p86_chm_call(
+                    &shared,
+                    &mut thread,
+                    chm_class,
+                    "put",
+                    PUT_SIG,
+                    &[
+                        Value::Object(Some(chm)),
+                        Value::Object(Some(key)),
+                        Value::Object(Some(val)),
+                    ],
+                )
+                .unwrap();
+                baseline_keys.push(key);
+            }
+            let seeded = p86_chm_call(
+                &shared,
+                &mut thread,
+                chm_class,
+                "size",
+                "()I",
+                &[Value::Object(Some(chm))],
+            )
+            .unwrap()
+            .unwrap()
+            .as_int()
+            .unwrap();
+            assert_eq!(
+                seeded, BASELINE,
+                "baseline must be fully committed before the threads start"
+            );
+        }
+        // A key the reader probes on every iteration. It was committed before
+        // the reader thread existed, so a miss can only be a torn read.
+        let probe_key = baseline_keys[baseline_keys.len() / 2];
+
+        let writer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Publishes "done" even if the writer panics, so a writer failure can
+        // never degrade into a reader that spins forever.
+        struct DonePublisher(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DonePublisher {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
 
         let shared1 = shared.clone();
-        let shared2 = shared.clone();
-
-        // Writer thread
+        let done_publisher = DonePublisher(Arc::clone(&writer_done));
         let writer = std::thread::spawn(move || {
+            // Declared first so it drops LAST: the release-store that publishes
+            // every put below happens after the whole loop.
+            let _done = done_publisher;
             let mut thread = JvmThread::new(ThreadId(1), "writer");
-            for i in 0..100 {
+            for i in BASELINE..(BASELINE + WRITES) {
                 let key = shared1.mem.heap.alloc_object(ClassId::new(0), 1);
                 shared1.mem.heap.set_field(key, 0, Value::Int(i));
                 let val = shared1.mem.heap.alloc_object(ClassId::new(0), 1);
                 shared1.mem.heap.set_field(val, 0, Value::Int(i));
-                let cb = shared1
-                    .natives
-                    .native_methods
-                    .find(
-                        "java/util/concurrent/ConcurrentHashMap",
-                        "put",
-                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                    )
-                    .unwrap();
-                let mut ctx = NativeContextImpl {
-                    shared: &shared1,
-                    thread: &mut thread,
-                };
-                cb(
-                    &mut ctx,
+                p86_chm_call(
+                    &shared1,
+                    &mut thread,
+                    chm_class,
+                    "put",
+                    PUT_SIG,
                     &[
                         Value::Object(Some(chm)),
                         Value::Object(Some(key)),
@@ -71172,38 +71290,127 @@ mod tests {
             }
         });
 
-        // Reader thread: repeatedly check size (should be monotonically non-decreasing)
+        // Reader thread: reads concurrently until the writer signals completion
+        // (and for at least MIN_READS iterations, so the overlap is real).
+        let shared2 = shared.clone();
+        let done_watch = Arc::clone(&writer_done);
         let reader = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "reader");
             let mut max_seen = 0i32;
-            for _ in 0..200 {
-                let cb = shared2
-                    .natives
-                    .native_methods
-                    .find("java/util/concurrent/ConcurrentHashMap", "size", "()I")
-                    .unwrap();
-                let mut ctx = NativeContextImpl {
-                    shared: &shared2,
-                    thread: &mut thread,
-                };
-                let size = cb(&mut ctx, &[Value::Object(Some(chm))])
-                    .unwrap()
-                    .unwrap()
-                    .as_int()
-                    .unwrap();
+            let mut reads = 0u64;
+            loop {
+                // Sample the flag BEFORE the reads, so whichever read ends the
+                // loop is ordered after the writer's final put.
+                let writer_finished = done_watch.load(std::sync::atomic::Ordering::SeqCst);
+                let size = p86_chm_call(
+                    &shared2,
+                    &mut thread,
+                    chm_class,
+                    "size",
+                    "()I",
+                    &[Value::Object(Some(chm))],
+                )
+                .unwrap()
+                .unwrap()
+                .as_int()
+                .unwrap();
+                // (2) monotone, and never outside the only range the map can
+                // hold: below BASELINE would mean a committed entry vanished,
+                // above BASELINE+WRITES would mean a phantom entry appeared.
                 assert!(
                     size >= max_seen,
-                    "Size should not decrease: was {max_seen}, now {size}"
+                    "size must not decrease with no removals in flight: was {max_seen}, now {size}"
+                );
+                assert!(
+                    (BASELINE..=BASELINE + WRITES).contains(&size),
+                    "size {} outside the range the map can hold ({}..={})",
+                    size,
+                    BASELINE,
+                    BASELINE + WRITES
+                );
+                // (1) a pre-committed key is visible on EVERY concurrent read,
+                // including reads that race a segment resize.
+                let present = p86_chm_call(
+                    &shared2,
+                    &mut thread,
+                    chm_class,
+                    "containsKey",
+                    CONTAINS_SIG,
+                    &[Value::Object(Some(chm)), Value::Object(Some(probe_key))],
+                )
+                .unwrap()
+                .unwrap()
+                .as_int()
+                .unwrap();
+                assert_eq!(
+                    present, 1,
+                    "a key committed before the reader started must be visible \
+                     on every concurrent read (read #{reads}, size {size})"
                 );
                 max_seen = size;
+                reads += 1;
+                if writer_finished && reads >= MIN_READS {
+                    break;
+                }
                 std::thread::yield_now();
             }
-            max_seen
+            (max_seen, reads)
         });
 
         writer.join().unwrap();
-        let final_max = reader.join().unwrap();
-        assert!(final_max > 0, "Reader should have observed some entries");
+        let (final_max, reads) = reader.join().unwrap();
+        assert!(
+            reads >= MIN_READS,
+            "reader should have completed at least {MIN_READS} reads, got {reads}"
+        );
+        // (4) The loop only exits on a read taken after the writer published
+        // "done", so the reader must have observed the completed map. This is
+        // the deterministic replacement for the old, unguaranteed
+        // `final_max > 0`.
+        assert_eq!(
+            final_max,
+            BASELINE + WRITES,
+            "the reader's last read is ordered after the writer finished, \
+             so it must observe every entry"
+        );
+
+        // (3) No lost updates, measured single-threaded after both joins.
+        let mut thread = JvmThread::new(ThreadId(0), "verifier");
+        let size = p86_chm_call(
+            &shared,
+            &mut thread,
+            chm_class,
+            "size",
+            "()I",
+            &[Value::Object(Some(chm))],
+        )
+        .unwrap()
+        .unwrap()
+        .as_int()
+        .unwrap();
+        assert_eq!(
+            size,
+            BASELINE + WRITES,
+            "every concurrent put must be retained"
+        );
+        for (i, k) in baseline_keys.iter().enumerate() {
+            let present = p86_chm_call(
+                &shared,
+                &mut thread,
+                chm_class,
+                "containsKey",
+                CONTAINS_SIG,
+                &[Value::Object(Some(chm)), Value::Object(Some(*k))],
+            )
+            .unwrap()
+            .unwrap()
+            .as_int()
+            .unwrap();
+            assert_eq!(
+                present, 1,
+                "baseline key {i} must survive the concurrent writer"
+            );
+        }
     }
 
     #[test]

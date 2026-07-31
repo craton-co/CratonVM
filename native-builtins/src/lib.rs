@@ -37237,6 +37237,30 @@ fn native_synthetic_instant_is_after(
     )))
 }
 
+/// Civil date from a days-since-epoch count (Howard Hinnant's `civil_from_days`).
+///
+/// This lives here, ungated, on purpose. `util_time` is
+/// `#[cfg(feature = "synthetic-jdk")]` because it registers synthetic natives,
+/// but this function is pure calendar arithmetic with no VM dependency, and
+/// `iso_instant_string` below needs it in EVERY build. Calling
+/// `crate::util_time::epoch_day_to_ymd` from ungated code broke the
+/// default-feature build — which is what the blocking `cargo test --workspace`
+/// CI job runs, while every check in this module's own CI job passes
+/// `--features synthetic-jdk` and so never saw it.
+pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> (i32, i32, i32) {
+    let z = epoch_day + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as i32, d as i32)
+}
+
 /// `Instant.toString()` — ISO-8601, per `DateTimeFormatter.ISO_INSTANT`.
 ///
 /// This used to emit Rust's debug shape, `Instant(0.042000000)`, which is not
@@ -37250,7 +37274,7 @@ fn iso_instant_string(sec: i64, nano: i32) -> String {
     // day rather than truncating toward zero.
     let days = sec.div_euclid(86_400);
     let secs_of_day = sec.rem_euclid(86_400);
-    let (y, m, d) = crate::util_time::epoch_day_to_ymd(days);
+    let (y, m, d) = epoch_day_to_ymd(days);
     let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
     // Years outside 0..=9999 take an explicit sign, as ISO-8601 requires.
     let mut s = if (0..=9999).contains(&y) {

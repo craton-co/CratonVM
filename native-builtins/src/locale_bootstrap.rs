@@ -35,11 +35,91 @@ fn cached_default_locale() -> &'static Mutex<Option<ObjectRef>> {
 
 /// Map from synthetic Locale ObjectRef → (language, country, language_tag).
 /// Used by the getLanguage/getCountry/toLanguageTag native overrides.
-fn synthetic_locale_data(
-) -> &'static Mutex<HashMap<ObjectRef, (&'static str, &'static str, &'static str)>> {
-    static MAP: OnceLock<Mutex<HashMap<ObjectRef, (&'static str, &'static str, &'static str)>>> =
-        OnceLock::new();
+///
+/// Owned `String`s rather than `&'static str`: the default locale is resolved
+/// from `user.language`/`user.country` (or `$LC_ALL`/`$LC_MESSAGES`/`$LANG`)
+/// at run time, so the subtags are not compile-time constants.
+fn synthetic_locale_data() -> &'static Mutex<HashMap<ObjectRef, (String, String, String)>> {
+    static MAP: OnceLock<Mutex<HashMap<ObjectRef, (String, String, String)>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Normalise a `(language, country)` pair the way the HotSpot launcher does.
+///
+/// `java_props_md.c` maps the POSIX `C` and `POSIX` locales — and an
+/// unset/empty locale — onto **English/United States**, so on a bare Linux
+/// shell (`LANG` and `LC_ALL` unset, or `LANG=C`) a real JVM reports
+/// `Locale.getDefault().getLanguage() == "en"`, never `"C"`. Everything else
+/// is normalised to `Locale`'s casing convention: lower-case language,
+/// upper-case country.
+fn normalise_language_country(lang: &str, country: &str) -> (String, String) {
+    let lang = lang.trim();
+    if lang.is_empty() || lang.eq_ignore_ascii_case("C") || lang.eq_ignore_ascii_case("POSIX") {
+        return ("en".to_string(), "US".to_string());
+    }
+    (
+        lang.to_ascii_lowercase(),
+        country.trim().to_ascii_uppercase(),
+    )
+}
+
+/// Parse a POSIX locale string — `language[_COUNTRY][.codeset][@modifier]` —
+/// into `(language, country)`.
+///
+/// The `.codeset` and `@modifier` suffixes are dropped (`en_GB.UTF-8@euro` →
+/// `("en", "GB")`), a bare language yields an empty country (`en` →
+/// `("en", "")`), and `C` / `POSIX` / the empty string go through
+/// [`normalise_language_country`] to `("en", "US")` — including the
+/// glibc-flavoured spellings `C.UTF-8` and `POSIX.UTF-8`.
+pub(crate) fn parse_posix_locale(raw: &str) -> (String, String) {
+    // Take the part before the first `.` (codeset) or `@` (modifier); either
+    // may come first in practice, so split on both at once.
+    let base = raw.trim().split(['.', '@']).next().unwrap_or("").trim();
+    match base.split_once('_') {
+        // `language_COUNTRY[_variant]` — the variant is not part of the
+        // (language, country) answer this resolver returns.
+        Some((l, rest)) => {
+            let c = rest.split('_').next().unwrap_or("");
+            normalise_language_country(l, c)
+        }
+        None => normalise_language_country(base, ""),
+    }
+}
+
+/// The environment value a real JVM's default locale comes from.
+///
+/// Precedence follows POSIX/glibc `setlocale`, which the HotSpot launcher
+/// inherits: `LC_ALL` overrides every category, then the category variable
+/// (`LC_MESSAGES` for the display locale), then `LANG`. A variable that is set
+/// but empty does not select a locale, so it is skipped like an unset one.
+fn env_locale_value() -> String {
+    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(v) = cratonvm_types::flags::runtime_var(key) {
+            if !v.trim().is_empty() {
+                return v;
+            }
+        }
+    }
+    String::new()
+}
+
+/// Resolve the process default locale as `(language, country)`.
+///
+/// Single source of truth for every `Locale.getDefault()` native in this
+/// crate. In a real JVM `Locale.getDefault()` is seeded from the
+/// `user.language`/`user.country` system properties, which the launcher in
+/// turn derives from the environment — so those properties are consulted
+/// first (that is also what makes `-Duser.language=de` work, and what keeps
+/// `System.getProperty("user.language")` and `Locale.getDefault()` in
+/// agreement, as the JDK guarantees). The environment is the fallback for
+/// contexts with no property table populated yet.
+pub(crate) fn resolve_default_locale(ctx: &dyn NativeContext) -> (String, String) {
+    let prop_lang = ctx.get_system_property("user.language").unwrap_or_default();
+    if !prop_lang.trim().is_empty() {
+        let prop_country = ctx.get_system_property("user.country").unwrap_or_default();
+        return normalise_language_country(&prop_lang, &prop_country);
+    }
+    parse_posix_locale(&env_locale_value())
 }
 
 /// The language of a Locale this module synthesised (the cached `getDefault()`
@@ -50,7 +130,7 @@ pub(crate) fn synthetic_language(obj: ObjectRef) -> Option<String> {
     synthetic_locale_data()
         .lock()
         .get(&obj)
-        .map(|&(lang, _, _)| lang.to_string())
+        .map(|(lang, _, _)| lang.clone())
 }
 
 /// GC root scan for this module's cached synthetic Locale objects. The cached
@@ -97,7 +177,15 @@ pub fn gc_update_locale_refs(pointer_map: &HashMap<usize, usize>) {
     }
 }
 
-/// Construct (or return the cached) default Locale: synthetic `en_US`.
+/// Construct (or return the cached) default Locale.
+///
+/// The subtags come from [`resolve_default_locale`], i.e. the same
+/// `user.language`/`user.country` the VM publishes as system properties —
+/// `en`/`US` on a host with no locale environment, on `LANG=C`, and on
+/// `LANG=POSIX`, exactly as the HotSpot launcher's `java_props_md.c` maps
+/// them. It used to be hard-wired to `en_US`, which disagreed with
+/// `System.getProperty("user.language")` on any host that actually sets
+/// `LANG`.
 ///
 /// We use `alloc_concurrent_synthetic` instead of `ctx.new_object` because
 /// `Locale.<clinit>` itself calls `getDefault()` (and other adapter-chain code
@@ -114,17 +202,24 @@ fn get_or_create_default(ctx: &mut dyn NativeContext) -> MethodCallResult {
     // Allocate a synthetic Locale that bypasses <clinit>/<init> failures.
     // 32 slots is conservative: real JDK Locale has ~20 instance fields once
     // inherited fields are counted.
+    let (lang, country) = resolve_default_locale(&*ctx);
+    let tag = if country.is_empty() {
+        lang.clone()
+    } else {
+        format!("{lang}-{country}")
+    };
+
     let locale_obj = crate::alloc_concurrent_synthetic(ctx, "java/util/Locale", 32);
 
     synthetic_locale_data()
         .lock()
-        .insert(locale_obj, ("en", "US", "en-US"));
+        .insert(locale_obj, (lang.clone(), country.clone(), tag));
 
     // Populate the real-JDK `baseLocale` instance field. Without this, any
     // un-overridden `Locale` method that runs as bytecode (e.g.
     // `Locale.equals` -> `baseLocale.equals(...)`) NPEs on the null field.
     // `locale_populate` also records the data in the lib.rs side table.
-    crate::locale_populate(ctx, locale_obj, "en", "US", "");
+    crate::locale_populate(ctx, locale_obj, &lang, &country, "");
 
     *cached_default_locale().lock() = Some(locale_obj);
     Ok(Some(Value::Object(Some(locale_obj))))
@@ -150,9 +245,12 @@ fn base_locale_field(
 
 fn locale_language(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
-        let syn = synthetic_locale_data().lock().get(this).map(|&(l, _, _)| l);
+        let syn = synthetic_locale_data()
+            .lock()
+            .get(this)
+            .map(|(l, _, _)| l.clone());
         if let Some(lang) = syn {
-            return Ok(Some(Value::Object(Some(ctx.create_string(lang)))));
+            return Ok(Some(Value::Object(Some(ctx.create_string(&lang)))));
         }
         // `locale_populate` (lib.rs) records into a SECOND side table, and that
         // is the one `Locale.<init>`, `forLanguageTag` and the constants fill.
@@ -176,9 +274,12 @@ fn locale_country(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         if !c_side.is_empty() {
             return Ok(Some(Value::Object(Some(ctx.create_string(&c_side)))));
         }
-        let syn = synthetic_locale_data().lock().get(this).map(|&(_, c, _)| c);
+        let syn = synthetic_locale_data()
+            .lock()
+            .get(this)
+            .map(|(_, c, _)| c.clone());
         if let Some(country) = syn {
-            return Ok(Some(Value::Object(Some(ctx.create_string(country)))));
+            return Ok(Some(Value::Object(Some(ctx.create_string(&country)))));
         }
         if let Some(s) = base_locale_field(ctx, *this, "region") {
             return Ok(Some(Value::Object(Some(s))));
@@ -190,8 +291,14 @@ fn locale_country(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
         // Synthetic locales (our getDefault) carry a recorded BCP-47 tag.
-        if let Some(&(_, _, tag)) = synthetic_locale_data().lock().get(this) {
-            return Ok(Some(Value::Object(Some(ctx.create_string(tag)))));
+        // Cloned out of the map so the guard is dropped before `create_string`
+        // (which allocates, and can therefore re-enter).
+        let syn_tag = synthetic_locale_data()
+            .lock()
+            .get(this)
+            .map(|(_, _, t)| t.clone());
+        if let Some(tag) = syn_tag {
+            return Ok(Some(Value::Object(Some(ctx.create_string(&tag)))));
         }
         // See `locale_language`: the `locale_populate` side table is what the
         // constructors and constants fill, and a synthetic Locale has no
@@ -556,6 +663,15 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         get_available_locales,
     );
     // java.util.Locale.getDefault() — bypass the adapter chain.
+    //
+    // DUPLICATE-REGISTRATION NOTE: the no-arg overload below is registered a
+    // second time by `t3_impl::register_t311_i18n`, which
+    // `register_synthetic_overrides` runs AFTER `register_essential_natives`
+    // (this registrar). Registration is last-wins, so under
+    // `#[cfg(feature = "synthetic-jdk")]` the t3_impl copy is the live one and
+    // this one only runs in real-JDK mode. Both resolve their subtags through
+    // `resolve_default_locale` so the two modes agree; if you change the
+    // language/country policy here, change it there too (or delete one).
     registry.register(
         "java/util/Locale",
         "getDefault",
@@ -960,4 +1076,72 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     locale_const!("CHINESE", "zh", "");
 
     registry.set_category(__prev_cat);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_posix_locale;
+
+    /// The POSIX `C`/`POSIX` locales, and no locale at all, are English/US.
+    ///
+    /// This is the case a bare Linux shell (and ubuntu-latest CI) hits. The
+    /// HotSpot launcher's `java_props_md.c` maps them, so a real JVM reports
+    /// `Locale.getDefault().getLanguage() == "en"` — never `"C"`, which is what
+    /// CratonVM used to return by passing the environment value straight
+    /// through.
+    #[test]
+    fn posix_c_locale_maps_to_english() {
+        for raw in ["C", "POSIX", "C.UTF-8", "POSIX.UTF-8", "c", "", "   "] {
+            assert_eq!(
+                parse_posix_locale(raw),
+                ("en".to_string(), "US".to_string()),
+                "raw = {raw:?}"
+            );
+        }
+    }
+
+    /// `language_COUNTRY.codeset@modifier` — both suffixes are dropped, in
+    /// either order, and the casing is normalised the way `Locale` does it.
+    #[test]
+    fn posix_locale_strips_codeset_and_modifier() {
+        assert_eq!(
+            parse_posix_locale("en_GB.UTF-8@euro"),
+            ("en".to_string(), "GB".to_string())
+        );
+        assert_eq!(
+            parse_posix_locale("de_DE.ISO-8859-1"),
+            ("de".to_string(), "DE".to_string())
+        );
+        assert_eq!(
+            parse_posix_locale("sr_RS@latin"),
+            ("sr".to_string(), "RS".to_string())
+        );
+        assert_eq!(
+            parse_posix_locale("EN_gb"),
+            ("en".to_string(), "GB".to_string())
+        );
+        // A trailing variant is not part of the (language, country) answer.
+        assert_eq!(
+            parse_posix_locale("ca_ES_VALENCIA.UTF-8"),
+            ("ca".to_string(), "ES".to_string())
+        );
+    }
+
+    /// A bare language code keeps an empty country, as `new Locale("en")` does.
+    #[test]
+    fn posix_bare_language_has_empty_country() {
+        assert_eq!(
+            parse_posix_locale("en"),
+            ("en".to_string(), String::new())
+        );
+        assert_eq!(
+            parse_posix_locale("fr.UTF-8"),
+            ("fr".to_string(), String::new())
+        );
+        // `en_` — a country that is present but empty.
+        assert_eq!(
+            parse_posix_locale("en_"),
+            ("en".to_string(), String::new())
+        );
+    }
 }
