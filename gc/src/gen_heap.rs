@@ -9918,8 +9918,8 @@ impl GenerationalHeap {
         );
         // `as_nanos()` is a u128; a single refinement pass cannot plausibly run
         // for 584 years, but saturate rather than wrap if it somehow does.
-        crate::gc_metrics::record_refinement(started.elapsed().as_nanos().min(u128::from(u64::MAX))
-            as u64);
+        let nanos = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        crate::gc_metrics::record_refinement(nanos);
     }
 
     /// The refinement walk itself. Split out from [`Self::scan_dirty_cards`] so

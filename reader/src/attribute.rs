@@ -48,10 +48,15 @@ use crate::buffer::ClassFileBuffer;
 use crate::byte_view::{ByteView, SharedBytes};
 use crate::class_reader_error::ClassReaderError;
 use crate::constant_pool::ConstantPool;
-
-/// Safety cap for `Vec::with_capacity` to avoid excessive pre-allocation on
-/// malformed attribute bodies. Mirrors the constant in `class_reader.rs`.
-const PREALLOC_CAP: usize = 1024;
+// Every resource limit this module enforces — preallocation cap, nesting
+// depths, per-entry wire sizes — is defined once in `crate::limits`, along
+// with the checked-arithmetic helpers. See `docs/security/reader/limits.md`.
+use crate::limits::{
+    bounded_capacity, checked_end, checked_span, wire_len_to_usize, EXCEPTIONS_ENTRY_SIZE,
+    EXCEPTION_TABLE_ENTRY_SIZE, INNER_CLASS_ENTRY_SIZE, LINE_NUMBER_ENTRY_SIZE,
+    LOCALVAR_TARGET_ENTRY_SIZE, LOCAL_VARIABLE_ENTRY_SIZE, METHOD_PARAMETER_ENTRY_SIZE,
+    PREALLOC_CAP,
+};
 
 // ---------------------------------------------------------------------------
 // Canonical attribute-name interned arcs for Arc::ptr_eq dispatch.
@@ -1133,9 +1138,17 @@ fn decode_attribute_body(
         "Exceptions" => {
             // Round 7 audit fix (MED #6 / round-4 #4): bulk slice parse
             // of the u16 cp-index array.
+            //
+            // C2 remediation: the `count * entry_size` product goes through
+            // `checked_span` and the reservation through `bounded_capacity`
+            // so neither can be driven past the input length. `read_bytes`
+            // is still what proves the bytes are there.
             let num_exceptions = buf.read_u16()? as usize;
-            let bytes = buf.read_bytes(num_exceptions * 2)?;
-            let mut exception_indices = Vec::with_capacity(num_exceptions.min(PREALLOC_CAP));
+            let span = checked_span("Exceptions", num_exceptions, EXCEPTIONS_ENTRY_SIZE)?;
+            let capacity =
+                bounded_capacity(num_exceptions, EXCEPTIONS_ENTRY_SIZE, buf.remaining());
+            let bytes = buf.read_bytes(span)?;
+            let mut exception_indices = Vec::with_capacity(capacity);
             for chunk in bytes.chunks_exact(2) {
                 exception_indices.push(u16::from_be_bytes([chunk[0], chunk[1]]));
             }
@@ -1153,9 +1166,11 @@ fn decode_attribute_body(
             // (`unchecked_shl + or`) — 3-4× faster on bootstrap where
             // LineNumberTable is ubiquitous.
             let table_length = buf.read_u16()? as usize;
-            const ENTRY_SIZE: usize = 4; // start_pc(u16) + line_number(u16)
-            let bytes = buf.read_bytes(table_length * ENTRY_SIZE)?;
-            let mut entries = Vec::with_capacity(table_length.min(PREALLOC_CAP));
+            const ENTRY_SIZE: usize = LINE_NUMBER_ENTRY_SIZE; // start_pc + line_number
+            let span = checked_span("LineNumberTable", table_length, ENTRY_SIZE)?;
+            let capacity = bounded_capacity(table_length, ENTRY_SIZE, buf.remaining());
+            let bytes = buf.read_bytes(span)?;
+            let mut entries = Vec::with_capacity(capacity);
             for chunk in bytes.chunks_exact(ENTRY_SIZE) {
                 entries.push(LineNumberEntry {
                     start_pc: u16::from_be_bytes([chunk[0], chunk[1]]),
@@ -1168,9 +1183,11 @@ fn decode_attribute_body(
             // Round 7 audit fix (MED #6 / round-4 #4): bulk slice
             // parse — see LineNumberTable comment for rationale.
             let num_classes = buf.read_u16()? as usize;
-            const ENTRY_SIZE: usize = 8; // four u16 fields
-            let bytes = buf.read_bytes(num_classes * ENTRY_SIZE)?;
-            let mut classes = Vec::with_capacity(num_classes.min(PREALLOC_CAP));
+            const ENTRY_SIZE: usize = INNER_CLASS_ENTRY_SIZE; // four u16 fields
+            let span = checked_span("InnerClasses", num_classes, ENTRY_SIZE)?;
+            let capacity = bounded_capacity(num_classes, ENTRY_SIZE, buf.remaining());
+            let bytes = buf.read_bytes(span)?;
+            let mut classes = Vec::with_capacity(capacity);
             for chunk in bytes.chunks_exact(ENTRY_SIZE) {
                 classes.push(InnerClassInfo {
                     inner_class_info_index: u16::from_be_bytes([chunk[0], chunk[1]]),
@@ -1426,9 +1443,11 @@ fn decode_attribute_body(
         "LocalVariableTable" => {
             // Round 7 audit fix (MED #6 / round-4 #4): bulk slice parse.
             let table_length = buf.read_u16()? as usize;
-            const ENTRY_SIZE: usize = 10; // five u16 fields
-            let bytes = buf.read_bytes(table_length * ENTRY_SIZE)?;
-            let mut entries = Vec::with_capacity(table_length.min(PREALLOC_CAP));
+            const ENTRY_SIZE: usize = LOCAL_VARIABLE_ENTRY_SIZE; // five u16 fields
+            let span = checked_span("LocalVariableTable", table_length, ENTRY_SIZE)?;
+            let capacity = bounded_capacity(table_length, ENTRY_SIZE, buf.remaining());
+            let bytes = buf.read_bytes(span)?;
+            let mut entries = Vec::with_capacity(capacity);
             for chunk in bytes.chunks_exact(ENTRY_SIZE) {
                 entries.push(LocalVariableEntry {
                     start_pc: u16::from_be_bytes([chunk[0], chunk[1]]),
@@ -1443,9 +1462,11 @@ fn decode_attribute_body(
         "LocalVariableTypeTable" => {
             // Round 7 audit fix (MED #6 / round-4 #4): bulk slice parse.
             let table_length = buf.read_u16()? as usize;
-            const ENTRY_SIZE: usize = 10; // five u16 fields
-            let bytes = buf.read_bytes(table_length * ENTRY_SIZE)?;
-            let mut entries = Vec::with_capacity(table_length.min(PREALLOC_CAP));
+            const ENTRY_SIZE: usize = LOCAL_VARIABLE_ENTRY_SIZE; // five u16 fields
+            let span = checked_span("LocalVariableTypeTable", table_length, ENTRY_SIZE)?;
+            let capacity = bounded_capacity(table_length, ENTRY_SIZE, buf.remaining());
+            let bytes = buf.read_bytes(span)?;
+            let mut entries = Vec::with_capacity(capacity);
             for chunk in bytes.chunks_exact(ENTRY_SIZE) {
                 entries.push(LocalVariableTypeEntry {
                     start_pc: u16::from_be_bytes([chunk[0], chunk[1]]),
@@ -1462,9 +1483,11 @@ fn decode_attribute_body(
             // parse. `parameters_count` is u8 so the maximum payload
             // is 255*4 = 1020 bytes — a single small alloc.
             let parameters_count = buf.read_u8()? as usize;
-            const ENTRY_SIZE: usize = 4; // two u16 fields
-            let bytes = buf.read_bytes(parameters_count * ENTRY_SIZE)?;
-            let mut parameters = Vec::with_capacity(parameters_count.min(PREALLOC_CAP));
+            const ENTRY_SIZE: usize = METHOD_PARAMETER_ENTRY_SIZE; // two u16 fields
+            let span = checked_span("MethodParameters", parameters_count, ENTRY_SIZE)?;
+            let capacity = bounded_capacity(parameters_count, ENTRY_SIZE, buf.remaining());
+            let bytes = buf.read_bytes(span)?;
+            let mut parameters = Vec::with_capacity(capacity);
             for chunk in bytes.chunks_exact(ENTRY_SIZE) {
                 parameters.push(MethodParameter {
                     name_index: u16::from_be_bytes([chunk[0], chunk[1]]),

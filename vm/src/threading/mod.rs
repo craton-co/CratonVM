@@ -40,9 +40,7 @@ pub use gc_barrier::GcBarrier;
 pub use jvm_thread::{JvmThread, ParkState, ThreadId, ThreadKind};
 pub use monitor::MonitorTable;
 pub use thread_registry::ThreadRegistry;
-pub use thread_state::{
-    thread_state_census, RelocationRule, ThreadExecState, ThreadStateCensus,
-};
+pub use thread_state::{thread_state_census, RelocationRule, ThreadExecState, ThreadStateCensus};
 pub use virtual_scheduler::VirtualThreadScheduler;
 pub use virtual_threads::{
     Continuation, ContinuationScope, ContinuationState, ForkJoinScheduler, FrozenFrame, PinReason,

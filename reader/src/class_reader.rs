@@ -197,7 +197,17 @@ pub fn read_class_shared(source: SharedBytes) -> Result<ClassFile, ClassReaderEr
     // Methods
     let methods_count = buf.read_u16()?;
     validate_count("methods", methods_count, MAX_METHOD_COUNT)?;
-    let mut methods = Vec::with_capacity((methods_count as usize).min(PREALLOC_CAP));
+    ensure_count_fits(
+        "methods",
+        methods_count as usize,
+        METHOD_ENTRY_BYTES,
+        buf.remaining(),
+    )?;
+    let mut methods = Vec::with_capacity(bounded_capacity(
+        methods_count as usize,
+        METHOD_ENTRY_BYTES,
+        buf.remaining(),
+    ));
     for _ in 0..methods_count {
         methods.push(read_method(&mut buf, &constant_pool, &source)?);
     }
@@ -296,9 +306,25 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
         });
     }
     validate_count("constant_pool", count, MAX_CP_SIZE)?;
-    // `count` is a u16 read from the file, so it is already bounded at
-    // 65535 — there is no preallocation-DoS risk. Reserve the exact size
-    // up front to avoid reallocations while parsing large classes.
+    // `count` is a u16, so it is bounded at 65 535 — but 65 535
+    // `ConstantPoolEntry`s is still a multi-megabyte reservation that a
+    // *two-byte* header can demand from a file with nothing after it. The
+    // pool holds `count - 1` real entries (slot 0 is the reserved
+    // sentinel), and every `cp_info` costs at least
+    // `MIN_CONSTANT_POOL_ENTRY_BYTES` per slot it covers, so a declared
+    // count needing more bytes than the file has left is provably a lie.
+    // Reject it here rather than after the allocator has been asked for
+    // the memory. The bound is conservative — `buf.remaining()` still
+    // includes the post-pool sections, so no legal class file is refused.
+    ensure_count_fits(
+        "constant_pool",
+        (count as usize) - 1,
+        MIN_CONSTANT_POOL_ENTRY_BYTES,
+        buf.remaining(),
+    )?;
+    // With that check passed, `count` is itself bounded by the input
+    // length, so reserving the exact size is safe and avoids reallocations
+    // while parsing large classes.
     let mut entries: Vec<ConstantPoolEntry> = Vec::with_capacity(count as usize);
     entries.push(ConstantPoolEntry::Tombstone); // Index 0
 
@@ -601,7 +627,20 @@ fn read_attributes(
 ) -> Result<Vec<LazyAttribute>, ClassReaderError> {
     let count = buf.read_u16()?;
     validate_count("attributes", count, MAX_ATTRIBUTE_COUNT)?;
-    let mut attributes = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
+    // An attribute costs at least its 6-byte header, so a declared count
+    // needing more bytes than remain is a truncated/hostile file. Rejecting
+    // here means the reservation below is bounded by the input size.
+    ensure_count_fits(
+        "attributes",
+        count as usize,
+        ATTRIBUTE_HEADER_BYTES,
+        buf.remaining(),
+    )?;
+    let mut attributes = Vec::with_capacity(bounded_capacity(
+        count as usize,
+        ATTRIBUTE_HEADER_BYTES,
+        buf.remaining(),
+    ));
 
     for _ in 0..count {
         let name_index = buf.read_u16()?;
@@ -963,11 +1002,104 @@ mod tests {
     fn prealloc_cap_constant_exists_and_is_bounded() {
         // Verify the PREALLOC_CAP constant is set to a reasonable value
         // to prevent excessive pre-allocation on malformed class files.
-        assert!(PREALLOC_CAP > 0, "PREALLOC_CAP must be positive");
+        // The constant now lives in `crate::limits` so every parser in the
+        // crate shares one definition.
+        let cap = crate::limits::PREALLOC_CAP;
+        assert!(cap > 0, "PREALLOC_CAP must be positive");
         assert!(
-            PREALLOC_CAP <= 65536,
+            cap <= 65536,
             "PREALLOC_CAP should be bounded to prevent excessive allocation"
         );
+    }
+
+    // ── Declared-count vs. remaining-input boundary tests ────────────────
+    //
+    // Each "must reject" case below has a "must accept" twin built from the
+    // same helper with a count the input can actually hold, so the suite
+    // cannot pass by rejecting everything.
+
+    /// Build a class-file prefix up to (and including) `constant_pool_count`.
+    fn class_prefix_with_cp_count(count: u16) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xCAFEBABE_u32.to_be_bytes());
+        data.extend_from_slice(&0_u16.to_be_bytes()); // minor
+        data.extend_from_slice(&52_u16.to_be_bytes()); // major (Java 8)
+        data.extend_from_slice(&count.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn constant_pool_count_beyond_remaining_bytes_is_rejected_before_allocating() {
+        // A 10-byte file that claims 65 535 constant-pool slots. Without
+        // the `ensure_count_fits` guard this reserves ~1.5 MB and only
+        // then fails on the first tag read.
+        let data = class_prefix_with_cp_count(u16::MAX);
+        let err = read_class(&data).expect_err("hostile cp_count must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("constant_pool") && msg.contains("bytes"),
+            "expected a count-vs-remaining rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn constant_pool_count_within_remaining_bytes_is_not_rejected_by_the_size_guard() {
+        // Must-accept twin: the same guard must not fire on a pool whose
+        // declared slots fit in the bytes that follow. This file is still
+        // truncated (no access_flags/this_class), so it errors — but it
+        // must error *past* the size guard, i.e. not with that message.
+        let mut data = class_prefix_with_cp_count(2); // one real entry
+        data.push(1); // CONSTANT_Utf8
+        data.extend_from_slice(&4_u16.to_be_bytes());
+        data.extend_from_slice(b"Test");
+        let err = read_class(&data).expect_err("file is truncated after the pool");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("declared count"),
+            "the size guard must not fire on a pool that fits: {msg}"
+        );
+    }
+
+    #[test]
+    fn constant_pool_count_of_one_is_the_empty_pool_boundary() {
+        // count == 1 means "sentinel only, no entries" — zero-length
+        // boundary. The guard must not reject it even with no bytes left
+        // for entries (the file is still truncated afterwards, but for a
+        // different reason).
+        let data = class_prefix_with_cp_count(1);
+        let err = read_class(&data).expect_err("file ends after the pool count");
+        assert!(
+            !err.to_string().contains("declared count"),
+            "an empty constant pool must clear the size guard"
+        );
+        // And count == 0 is a JVMS §4.1 violation, rejected separately.
+        let zero = class_prefix_with_cp_count(0);
+        assert!(read_class(&zero).is_err());
+    }
+
+    #[test]
+    fn section_count_guards_reject_impossible_declarations() {
+        // Drive `ensure_count_fits` at exactly the boundary each top-level
+        // section uses, both directions. This is the unit-level twin of
+        // the whole-file tests above.
+        for (label, entry_bytes) in [
+            ("interfaces", INTERFACE_ENTRY_BYTES),
+            ("fields", FIELD_ENTRY_BYTES),
+            ("methods", METHOD_ENTRY_BYTES),
+            ("attributes", ATTRIBUTE_HEADER_BYTES),
+        ] {
+            // u16::MAX entries can never fit in a 40-byte tail.
+            assert!(
+                ensure_count_fits(label, u16::MAX as usize, entry_bytes, 40).is_err(),
+                "{label}: 65535 entries must not fit in 40 bytes"
+            );
+            // Exactly as many as fit is accepted; one more is not.
+            let fits = 40 / entry_bytes;
+            assert!(ensure_count_fits(label, fits, entry_bytes, 40).is_ok());
+            assert!(ensure_count_fits(label, fits + 1, entry_bytes, 40).is_err());
+            // Zero entries always fit, even in an empty tail.
+            assert!(ensure_count_fits(label, 0, entry_bytes, 0).is_ok());
+        }
     }
 
     #[test]
