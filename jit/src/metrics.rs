@@ -33,15 +33,17 @@
 //! ## Measured vs. not measured
 //!
 //! Several quantities the review names are not obtainable without changing
-//! modules this task does not own (`regalloc.rs`, `ir_lower.rs`). Reporting
-//! them as `0` would be worse than useless — a reader cannot tell "this method
-//! spilled nothing" from "nobody counts spills". Every numeric field is
-//! therefore a [`Measured<T>`], which renders as JSON `null` when no call site
-//! has supplied it. The uninstrumented fields today are
-//! [`CompilationReport::peak_live_values`], [`CompilationReport::spills`] and
+//! modules this task does not own (`regalloc.rs`). Reporting them as `0` would
+//! be worse than useless — a reader cannot tell "this method spilled nothing"
+//! from "nobody counts spills". Every numeric field is therefore a
+//! [`Measured<T>`], which renders as JSON `null` when no call site has supplied
+//! it. The uninstrumented fields today are [`CompilationReport::spills`] and
 //! [`CompilationReport::reloads`]; their setters exist and are wired to
 //! nothing, so a future `regalloc` change is a one-line addition rather than a
-//! schema change. `docs/jit/compiler-metrics.md` keeps the current inventory.
+//! schema change. [`CompilationReport::peak_live_values`] left that list once
+//! `ir_lower` gained liveness-based frame-slot colouring: its slot planner
+//! computes the peak, and [`note_current_peak_live_values`] carries it here.
+//! `docs/jit/compiler-metrics.md` keeps the current inventory.
 //!
 //! Likewise [`Phase::Encode`] and [`Phase::Install`] always report
 //! `not measured`: in this pipeline `ir_lower::lower_inner` and
@@ -478,18 +480,25 @@ pub struct CompilationReport {
     /// `graph.nodes.len()` immediately before lowering.
     pub nodes_at_lower: Measured<u32>,
     /// Nodes at lowering that are not `Op::Dead`. The gap against
-    /// `nodes_at_lower` is the arena the optimizer left behind — and, because
-    /// `ir_lower::estimate_frame_bytes` reserves 8 bytes per *arena* node, it
-    /// is also frame bytes paid for nothing.
+    /// `nodes_at_lower` is the arena the optimizer left behind. It is no longer
+    /// also a frame-size figure: `ir_lower::estimate_frame_bytes` budgets the
+    /// liveness-**coloured** slot count, so a dead arena node costs no frame
+    /// bytes. Compare [`peak_live_values`](Self::peak_live_values) against this
+    /// to see how much of the graph is simultaneously live.
     pub live_nodes_at_lower: Measured<u32>,
-    /// Peak simultaneously-live values. **Not measured** — `regalloc` computes
-    /// live ranges but publishes no peak, and this task does not own that file.
+    /// Peak simultaneously-live values — the maximum number of live ranges
+    /// covering any single program point, i.e. the floor a perfect frame-slot
+    /// colouring would reach. Supplied by `ir_lower`'s slot planner
+    /// (`SlotPlan::peak_live`) through
+    /// [`note_current_peak_live_values`]. Optimizing path only; the single-pass
+    /// backend computes no live ranges and leaves this unmeasured.
     pub peak_live_values: Measured<u32>,
-    /// Values spilled to the frame. **Not measured** — see
-    /// [`peak_live_values`](Self::peak_live_values).
+    /// Values spilled to the frame. **Not measured** — `regalloc` computes live
+    /// ranges but publishes no spill/reload counts, and this task does not own
+    /// that file.
     pub spills: Measured<u32>,
     /// Reloads from the frame. **Not measured** — see
-    /// [`peak_live_values`](Self::peak_live_values).
+    /// [`spills`](Self::spills).
     pub reloads: Measured<u32>,
     /// `CompiledMethod::frame_layout.frame_size` — bytes subtracted from RSP.
     pub frame_bytes: Measured<u32>,
@@ -951,8 +960,10 @@ impl CompileRecorder {
         });
     }
 
-    /// Peak simultaneously-live values. No call site yet — see
-    /// [`CompilationReport::peak_live_values`].
+    /// Peak simultaneously-live values, recorded against *this* recorder. The
+    /// compiler itself records through [`note_current_peak_live_values`]
+    /// (`ir_lower::lower_inner` has no recorder in scope); this form exists for
+    /// a caller that holds one. See [`CompilationReport::peak_live_values`].
     pub fn set_peak_live_values(&self, n: usize) {
         self.with_report(|r| {
             r.peak_live_values = Measured::Value(n.min(u32::MAX as usize) as u32)
@@ -960,13 +971,13 @@ impl CompileRecorder {
     }
 
     /// Spill count. No call site yet — see
-    /// [`CompilationReport::peak_live_values`].
+    /// [`CompilationReport::spills`].
     pub fn set_spills(&self, n: usize) {
         self.with_report(|r| r.spills = Measured::Value(n.min(u32::MAX as usize) as u32));
     }
 
     /// Reload count. No call site yet — see
-    /// [`CompilationReport::peak_live_values`].
+    /// [`CompilationReport::spills`].
     pub fn set_reloads(&self, n: usize) {
         self.with_report(|r| r.reloads = Measured::Value(n.min(u32::MAX as usize) as u32));
     }
