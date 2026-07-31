@@ -28995,78 +28995,24 @@ mod tests {
 
     #[test]
     fn copy_on_write_arraylist_basic() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = JvmThread::new(ThreadId(0), "test");
-
-        let list = alloc_receiver(&shared, &mut thread, "java/util/concurrent/CopyOnWriteArrayList", 2);
-        call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/CopyOnWriteArrayList",
-            "<init>",
-            "()V",
-            &[Value::Object(Some(list))],
-        )
-        .unwrap();
-
-        let empty = call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/CopyOnWriteArrayList",
-            "isEmpty",
-            "()Z",
-            &[Value::Object(Some(list))],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(empty, Value::Int(1));
-
-        // Add elements
-        let str1 = create_java_string(&shared, "hello");
-        call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/CopyOnWriteArrayList",
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(list)), Value::Object(Some(str1))],
-        )
-        .unwrap();
-
-        let str2 = create_java_string(&shared, "world");
-        call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/CopyOnWriteArrayList",
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(list)), Value::Object(Some(str2))],
-        )
-        .unwrap();
-
-        let size = call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/CopyOnWriteArrayList",
-            "size",
-            "()I",
-            &[Value::Object(Some(list))],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(size, Value::Int(2));
-
-        let v0 = call_native(
-            &shared,
-            &mut thread,
-            "java/util/concurrent/CopyOnWriteArrayList",
-            "get",
-            "(I)Ljava/lang/Object;",
-            &[Value::Object(Some(list)), Value::Int(0)],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(v0, Value::Object(Some(str1)));
+        // `CopyOnWriteArrayList.<init>()V` is deliberately NOT overridden so the
+        // real constructor runs and initialises `this.lock` — the registration
+        // comment in `native-builtins/src/util_concurrent_ext.rs` records that
+        // the previous override wrote the backing array into the `lock` slot
+        // and broke Spring's BeanPostProcessor lists. The mutators ARE bridged;
+        // only construction defers.
+        let registry = &*TEST_NATIVE_REGISTRY;
+        let cowal = "java/util/concurrent/CopyOnWriteArrayList";
+        assert!(
+            registry.find(cowal, "<init>", "()V").is_none(),
+            "COWAL construction must run real bytecode so `lock` is built",
+        );
+        assert!(
+            registry
+                .find(cowal, "add", "(Ljava/lang/Object;)Z")
+                .is_some(),
+            "COWAL mutators are permanent bridges and must stay registered",
+        );
     }
 
     #[test]
@@ -37399,29 +37345,30 @@ mod tests {
 
     #[test]
     fn timer_basic() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let timer = alloc_receiver(&shared, &mut thread, "java/util/Timer", 2);
-        call_native(
-            &shared,
-            &mut thread,
-            "java/util/Timer",
-            "<init>",
-            "()V",
-            &[Value::Object(Some(timer))],
-        )
-        .unwrap();
-        call_native(
-            &shared,
-            &mut thread,
-            "java/util/Timer",
-            "cancel",
-            "()V",
-            &[Value::Object(Some(timer))],
-        )
-        .unwrap();
-        let cancelled = shared.mem.heap.get_field(timer, 1);
-        assert_eq!(cancelled, Value::Int(1));
+        // `java.util.Timer`'s synthetic natives were REMOVED on purpose: the
+        // old `schedule`/`scheduleAtFixedRate` were no-ops that never ran the
+        // task, while real JDK bytecode spins a TimerThread that actually
+        // fires it (see the no-op `register_timer_natives` in
+        // `native-builtins/src/phases_early.rs`). This test used to construct a
+        // Timer through those natives and assert the synthetic `cancelled`
+        // field flipped — the very contract the removal deleted.
+        //
+        // Re-registering them to make that pass would reintroduce the
+        // silently-dropped tasks. So assert the removal instead: this fails if
+        // someone re-adds a synthetic Timer surface, which is the regression
+        // worth guarding.
+        let registry = &*TEST_NATIVE_REGISTRY;
+        for (method, desc) in [
+            ("<init>", "()V"),
+            ("schedule", "(Ljava/util/TimerTask;J)V"),
+            ("scheduleAtFixedRate", "(Ljava/util/TimerTask;JJ)V"),
+            ("cancel", "()V"),
+        ] {
+            assert!(
+                registry.find("java/util/Timer", method, desc).is_none(),
+                "java/util/Timer.{method}{desc} must stay unregistered so real                  JDK bytecode runs it — a synthetic Timer drops tasks silently",
+            );
+        }
     }
 
     /// `exchange` is a two-party rendezvous: each side blocks until a partner
@@ -42259,33 +42206,20 @@ mod tests {
 
     #[test]
     fn simple_date_format_basics_p57() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let sdf = alloc_receiver(&shared, &mut thread, "java/text/SimpleDateFormat", 1);
-        let pattern = create_java_string(&shared, "yyyy-MM-dd HH:mm:ss");
-        call_native(
-            &shared,
-            &mut thread,
-            "java/text/SimpleDateFormat",
-            "<init>",
-            "(Ljava/lang/String;)V",
-            &[Value::Object(Some(sdf)), Value::Object(Some(pattern))],
-        )
-        .unwrap();
-        let pat = call_native(
-            &shared,
-            &mut thread,
-            "java/text/SimpleDateFormat",
-            "toPattern",
-            "()Ljava/lang/String;",
-            &[Value::Object(Some(sdf))],
-        )
-        .unwrap()
-        .unwrap();
-        let p_ref = pat.as_object().unwrap();
-        assert_eq!(
-            read_java_string(&shared.mem.heap, p_ref),
-            Some("yyyy-MM-dd HH:mm:ss".to_string())
+        // Same disposition as `timer_basic`: `java.text.SimpleDateFormat`'s
+        // synthetic substitutes were removed so the real `.class` bytecode
+        // runs (see `register_number_format_natives`). This asserted the
+        // deleted `<init>(String)` contract.
+        let registry = &*TEST_NATIVE_REGISTRY;
+        assert!(
+            registry
+                .find(
+                    "java/text/SimpleDateFormat",
+                    "<init>",
+                    "(Ljava/lang/String;)V"
+                )
+                .is_none(),
+            "SimpleDateFormat must defer to real JDK bytecode; the synthetic              1-field substitute was removed deliberately",
         );
     }
 
