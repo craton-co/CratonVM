@@ -95,3 +95,31 @@ cd apps/h2database/h2
 ```
 Reproduced once this session (~170s); not yet confirmed deterministic
 across repeated runs.
+
+## Further carriers found 2026-07-31 (PBQ stale-ObjectRef session)
+
+Two more H2 classes hit this same `VersionedBitSet.<init>` →
+`java.lang.Thread.clone` → `CloneNotSupportedException` shape once the
+`PriorityBlockingQueue` stale-`ObjectRef`/STW-wedge bugs stopped hanging them
+(`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md`):
+
+- `org.h2.test.db.TestCompatibility` (`testConcurrentAutoIncrement`), **JIT on**,
+  via `TransactionStore.registerTransaction` → `VersionedBitSet.<init>`.
+- `org.h2.test.db.TestMultiThread` (`testConcurrentInsert`), **JIT on**, via
+  `TransactionStore.flipCommittingTransactionsBit` → `VersionedBitSet.<init>`,
+  surfaced as an `ExecutionException` on the worker's future.
+
+Two things this narrows down that `TestTempTables` alone did not:
+
+1. **`VersionedBitSet` is the common receiver, not `TestTempTables`' workload.**
+   Three unrelated H2 code paths reach it (`begin`, `registerTransaction`,
+   `flipCommittingTransactionsBit`); every one of them fails the same way. A
+   targeted probe should be a bare `class Sub extends java.util.BitSet` whose
+   ctor calls `super.clone()` — no H2, no database.
+2. **It is JIT-correlated.** The *same* `TestCompatibility` binary and workload
+   fails with `CloneNotSupportedException` under the default JIT-on
+   configuration and **passes outright (`rc=0`, 714 s) under `--nojit`** on the
+   same host. That is a much stronger signal than the "reproduced once,
+   determinism unknown" note above, and it argues for the dispatch hypothesis
+   (a compiled/inlined `clone()` call site resolving to the wrong receiver
+   class) over the stack-trace-fabrication hypothesis.
