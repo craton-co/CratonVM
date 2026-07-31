@@ -189,8 +189,16 @@ current default feature set, opt in explicitly:
 cratonvm-embed = { version = "0.3", features = ["vm-defaults"] }
 ```
 
+`vm-defaults` mirrors the VM crate's default set exactly (`awt` + `management`).
+The optional experiments are not in it — add `vm-experimental` for
+`experimental-serialization`, `experimental-aot`, and `experimental-debug`:
+
+```toml
+cratonvm-embed = { version = "0.3", features = ["vm-defaults", "vm-experimental"] }
+```
+
 Individual VM features can also be forwarded through the facade, including
-`awt`, `synthetic-jdk`, `experimental-tls`, and `gpu-offload`.
+`awt`, `synthetic-jdk`, `management`, and `gpu-offload`.
 
 The facade contract is the documented re-export list and helper functions.
 Because `Vm`, `SharedVm`, and `JvmThread` are concrete re-exports from

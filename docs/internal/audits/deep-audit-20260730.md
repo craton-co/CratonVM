@@ -115,6 +115,16 @@ noticed rather than shipped. Renaming the feature is the honest fix; removing
 it from the default build is not. `experimental-tls` is similarly misnamed: it
 is a no-op alias and the TLS implementation is always compiled.
 
+**Follow-up landed 2026-07-30.** Both renames are done: `experimental-jmx` →
+`management` (it gates the `sun.management` natives behind
+`java.lang.management` *and* the `javax.management` beans, so plain `jmx` would
+have been too narrow a name in the other direction), and `experimental-tls` →
+`deprecated-noop-tls`, which has zero `#[cfg(feature = ...)]` sites anywhere in
+the tree. Both old names remain as back-compat aliases — a feature that simply
+vanishes breaks downstream builds silently — and CI resolves the aliases in
+their own step, so a broken alias fails here rather than downstream. Removal is
+slated for 0.4.
+
 Worth stating plainly, since it is the second time on this branch: an audit item
 that reasons from a name rather than from what the code does will produce a
 change that looks like cleanup and is a regression.

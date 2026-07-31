@@ -37,18 +37,23 @@ jobs:
           distribution: 'oracle'
           java-version: '25'
 
-      # The NEW-11 default feature set is already:
-      #   experimental-tls, experimental-crypto, experimental-jmx,
-      #   experimental-serialization, experimental-aot, experimental-debug
-      # i.e. synthetic-jdk is NOT a default. Running with the default
-      # features is therefore equivalent to T2.1.1's requested command
-      # line. We spell the feature list out in full here so a future
-      # change to Cargo.toml defaults cannot silently weaken the gate.
+      # synthetic-jdk is deliberately absent, which is what makes this the
+      # T2.1.1 command line. The feature list is spelled out in full so a
+      # future change to Cargo.toml defaults cannot silently weaken the gate.
+      #
+      # `management` / `deprecated-noop-tls` are the post-2026-07-30 names for
+      # `experimental-jmx` / `experimental-tls`.
+      #
+      # PRE-EXISTING BREAKAGE: `experimental-crypto` has never been a declared
+      # feature, so this step cannot resolve as written. That predates the
+      # rename and is left as-is deliberately — this workflow is parked under
+      # `.github/.wf/` (not `.github/workflows/`) and CI does not run it. Fix
+      # the stale feature name before re-arming the job.
       - name: Test under no-default-natives feature set
         run: |
           cargo test -p cratonvm-vm \
             --no-default-features \
-            --features "experimental-tls,experimental-crypto,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug" \
+            --features "deprecated-noop-tls,experimental-crypto,management,experimental-serialization,experimental-aot,experimental-debug" \
             --all-targets
 
       # T2.1.2: run the HelloWorld smoke test with the audit flag + JSON

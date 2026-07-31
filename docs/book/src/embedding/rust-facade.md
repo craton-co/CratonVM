@@ -22,8 +22,12 @@ explicitly when you need it:
 cratonvm-embed = { version = "0.3", features = ["vm-defaults"] }
 ```
 
+`vm-defaults` mirrors the VM crate's default set exactly (`awt` + `management`).
+Add `vm-experimental` on top of it for `experimental-serialization`,
+`experimental-aot`, and `experimental-debug`.
+
 You can also enable individual forwarded features such as `awt`,
-`synthetic-jdk`, `experimental-tls`, or `gpu-offload`.
+`synthetic-jdk`, `management`, or `gpu-offload`.
 
 The facade contract is the documented re-export list and helper functions.
 Because `Vm`, `SharedVm`, and `JvmThread` are concrete re-exports from

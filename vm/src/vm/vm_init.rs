@@ -1713,7 +1713,7 @@ impl SharedVm {
                 // alloc_runtime_mxbean / alloc_thread_mxbean / etc., letting
                 // ForkedBooter.isDebugging() / dumpHelp() succeed and the
                 // forked test JVM continue past constructor.
-                #[cfg(feature = "experimental-jmx")]
+                #[cfg(feature = "management")]
                 cratonvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
                 // Synthetic-JDK-only: `MBeanServerFactory.createMBeanServer`/
                 // `newMBeanServer` overrides. Safe here because there is no
@@ -1721,7 +1721,7 @@ impl SharedVm {
                 // called from the real-JDK branch below — see the function
                 // doc for why (it broke `getPlatformMBeanServer()` interface
                 // dispatch when it leaked into real mode).
-                #[cfg(feature = "experimental-jmx")]
+                #[cfg(feature = "management")]
                 cratonvm_native_builtins::jmx::register_mbean_server_factory_synthetic(
                     &mut native_methods,
                 );
@@ -2326,7 +2326,7 @@ impl SharedVm {
             native_methods.set_category(__prev_instrument_bridge);
             // RKC16N.10: VMManagementImpl natives. See companion call
             // in the `feature = "synthetic-jdk"` branch above.
-            #[cfg(feature = "experimental-jmx")]
+            #[cfg(feature = "management")]
             cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
             // JMX-CLUSTER-20260720: do NOT register
             // `register_management_factory_platform_server_stub` here. It was
@@ -2360,28 +2360,28 @@ impl SharedVm {
             // to `getPlatformMXBean(Class)` which fails with
             // `IllegalArgumentException: ... is not a platform management
             // interface`, killing the forked test JVM constructor).
-            #[cfg(feature = "experimental-jmx")]
+            #[cfg(feature = "management")]
             cratonvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
             // RKC16N.11: rest of the sun.management.* native surface.
             // See companion calls in the `feature = "synthetic-jdk"`
             // branch above for the full rationale.
-            #[cfg(feature = "experimental-jmx")]
+            #[cfg(feature = "management")]
             cratonvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
-            #[cfg(feature = "experimental-jmx")]
+            #[cfg(feature = "management")]
             cratonvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
-            #[cfg(feature = "experimental-jmx")]
+            #[cfg(feature = "management")]
             cratonvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
             // Wave 1 / Task A: per-pool / per-manager MXBean natives.
             // See companion call in the synthetic-jdk branch above.
-            #[cfg(feature = "experimental-jmx")]
+            #[cfg(feature = "management")]
             cratonvm_native_builtins::jmx::register_memory_pool_impl(&mut native_methods);
-            #[cfg(feature = "experimental-jmx")]
+            #[cfg(feature = "management")]
             cratonvm_native_builtins::jmx::register_memory_manager_impl(&mut native_methods);
-            #[cfg(feature = "experimental-jmx")]
+            #[cfg(feature = "management")]
             cratonvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
-            #[cfg(feature = "experimental-jmx")]
+            #[cfg(feature = "management")]
             cratonvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
-            #[cfg(feature = "experimental-jmx")]
+            #[cfg(feature = "management")]
             cratonvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
             // SLF4J 1.7 binder stubs — see companion call in the synthetic-jdk
             // branch above for the rationale (Spring Boot 2.x fat-jar
@@ -2796,7 +2796,7 @@ impl SharedVm {
             std::sync::Arc::new(crate::runtime::offload::OffloadCacheRegistry::new());
 
         // The real-JDK platform-server bridge needs its interface methods.
-        #[cfg(feature = "experimental-jmx")]
+        #[cfg(feature = "management")]
         cratonvm_native_builtins::jmx::register_mbean_server(&mut native_methods);
 
         // Phase 3 closes here — `register_mbean_server` above is the LAST
