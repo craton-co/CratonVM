@@ -272,6 +272,19 @@ struct Lowerer<'a> {
     thread_fetch_span: Option<(usize, usize)>,
     /// Did any safepoint actually emit a shadow push?
     shadow_pushed_any: bool,
+    /// Emitted shadow push / reload sequence counts.
+    ///
+    /// Every push must have exactly one reload: a push advances the thread's
+    /// shadow `top`, and only the reload retracts it. An unmatched push walks
+    /// `top` forward once per execution of that site — which for a recursive
+    /// method means until it runs off the end of the shadow stack and starts
+    /// writing into whatever is mapped next (observed as heap corruption
+    /// inside the C allocator, not as anything resembling a JIT fault). The
+    /// self-recursive route did exactly this. `lower_inner` refuses to publish
+    /// a body when these disagree, so the failure mode is a compile that falls
+    /// back to single-pass instead of a corrupted process.
+    shadow_pushes: usize,
+    shadow_reloads: usize,
     /// Byte size of the Java-locals region, for the published `FrameLayout`.
     locals_size: i32,
     /// First operand-spill offset, i.e. the exclusive top of the reserved
@@ -524,6 +537,8 @@ impl<'a> Lowerer<'a> {
             pending_shadow: Vec::new(),
             thread_fetch_span: None,
             shadow_pushed_any: false,
+            shadow_pushes: 0,
+            shadow_reloads: 0,
             locals_size,
             first_spill,
             oop_maps: Vec::new(),
@@ -651,6 +666,19 @@ fn reloc_emit_enabled() -> bool {
     /// verifier finds the entry, sees the flag, and diverts to the non-moving
     /// sweep for that cycle.
     fn emit_safepoint_map(&mut self, live_hi: i32) {
+        self.emit_safepoint_map_publishing(live_hi, true)
+    }
+
+    /// [`Self::emit_safepoint_map`], with control over whether the shadow push
+    /// is emitted at all.
+    ///
+    /// `publish = false` is for a call route that bypasses
+    /// `emit_call_return_check` and therefore has no matching RELOAD. Such a
+    /// site still needs its id stored and its map recorded — see the doc
+    /// comment above for why skipping either is worse than a fail-closed map —
+    /// but it must NOT push, because an unmatched push advances the thread's
+    /// shadow `top` permanently.
+    fn emit_safepoint_map_publishing(&mut self, live_hi: i32, publish: bool) {
         if self.sp_id_slot_off <= 0 || !Self::reloc_emit_enabled() {
             return;
         }
@@ -702,7 +730,7 @@ fn reloc_emit_enabled() -> bool {
         // publish; an oop-free safepoint is still complete coverage, so the
         // claim below requires `coverable` AND (published OR nothing to
         // publish).
-        let published = self.emit_shadow_push(&slots);
+        let published = publish && self.emit_shadow_push(&slots);
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_RELOC").is_some() {
             eprintln!(
                 "[ir-reloc] safepoint id={id} slots={slots:?} coverable={coverable} \
@@ -1071,6 +1099,7 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&[0x4D, 0x89, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
         self.patch_rel32_to_here(skip);
+        self.shadow_pushes += 1;
         true
     }
 
@@ -1117,6 +1146,7 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&[0x4D, 0x89, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
         self.patch_rel32_to_here(skip);
+        self.shadow_reloads += 1;
     }
 
 
@@ -2798,27 +2828,36 @@ fn reloc_emit_enabled() -> bool {
                 // `live_frame_hi` is the spill cursor as it stands now, i.e.
                 // before this node's result slot is carved.
                 let sp_live_hi = self.next_spill;
-                self.emit_safepoint_map(sp_live_hi);
-                let slot = self.alloc_slot(id);
-                let num_args = node.inputs.len().saturating_sub(2);
                 // fib44-fix follow-up: invoke_kind 4 marks a self-recursive call
                 // the eligibility loop chose to emit as a DIRECT call to this
                 // method's own entry (CRATONVM_JIT_IR_SELFREC_DIRECT), bypassing
-                // the generic `jit_invoke_dispatch` helper. SAFETY: `info_ptr`
-                // points to a live `JitInvokeInfo` owned by `ir_call_infos` for
-                // the whole compile. `lower_data_node` has no post-`match` code,
-                // so an early `return` here fully handles the node.
-                if unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind } == 4 {
-                    // This route bypasses `emit_call_return_check`, so nothing
-                    // would reload the published values afterwards and the
-                    // frame would keep pre-relocation addresses. Withdraw the
-                    // claim for this safepoint and drop the pending homes; the
-                    // collector then diverts to the non-moving sweep whenever
-                    // such a frame is live, which is correct if unambitious.
-                    if let Some(last) = self.oop_maps.last_mut() {
-                        last.moving_young_coverage_complete = false;
-                    }
-                    self.pending_shadow.clear();
+                // the generic `jit_invoke_dispatch` helper — and with it
+                // `emit_call_return_check`, the one choke point that emits the
+                // matching shadow RELOAD. So this route must not PUBLISH in the
+                // first place.
+                //
+                // It used to publish and then "withdraw the claim" by clearing
+                // `pending_shadow` after `emit_safepoint_map` had already
+                // emitted the push. That withdrew the map's promise but left the
+                // push in the instruction stream, so every self-recursive call
+                // advanced the thread's shadow `top` and nothing ever retracted
+                // it. A recursive method compiled by this tier therefore walked
+                // `top` forward once per call until it ran off the end of the
+                // shadow stack and the next push wrote through into the C heap —
+                // observed as a SIGSEGV inside mimalloc's free list, with ASCII
+                // bytes in the block header, on `BinTreesClassic.itemCheck` the
+                // moment reference field reads made that method IR-eligible.
+                //
+                // SAFETY: `info_ptr` points to a live `JitInvokeInfo` owned by
+                // `ir_call_infos` for the whole compile.
+                let self_recursive =
+                    unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind } == 4;
+                self.emit_safepoint_map_publishing(sp_live_hi, !self_recursive);
+                let slot = self.alloc_slot(id);
+                let num_args = node.inputs.len().saturating_sub(2);
+                // `lower_data_node` has no post-`match` code, so an early
+                // `return` here fully handles the node.
+                if self_recursive {
                     self.emit_self_recursive_call(&node.inputs, slot, num_args);
                     return;
                 }
@@ -3980,6 +4019,27 @@ pub(crate) fn lower_inner(
     // `[rbp - 0]`, i.e. the saved caller RBP, as a data value. Discard the
     // artifact and let the caller fall back to the single-pass backend.
     if lowerer.unallocated_slot_use.get() {
+        return None;
+    }
+
+    // Soundness bail: every emitted shadow PUSH must have exactly one emitted
+    // RELOAD. The push advances the thread's shadow `top`; only the reload
+    // retracts it. An unmatched push leaks a few slots per execution of that
+    // site, so a recursive method walks `top` off the end of the shadow stack
+    // and the next push writes into whatever follows the mapping. That
+    // presents as heap corruption in an unrelated allocator, arbitrarily far
+    // from the JIT — the self-recursive call route did it, and it took a
+    // gdb backtrace showing ASCII bytes in a mimalloc free-list header to
+    // attribute. A static count is enough (both are emitted per site, not per
+    // path), and refusing the body is strictly better than shipping it.
+    if lowerer.shadow_pushes != lowerer.shadow_reloads {
+        if crate::ir_stage_reporting() {
+            eprintln!(
+                "[ir] lower_inner refused: {} shadow pushes vs {} reloads — \
+                 an unmatched push leaks the thread's shadow top",
+                lowerer.shadow_pushes, lowerer.shadow_reloads
+            );
+        }
         return None;
     }
 
