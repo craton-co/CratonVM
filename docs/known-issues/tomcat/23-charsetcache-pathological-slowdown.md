@@ -894,19 +894,25 @@ not land. `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1` opts in.
 ### What the whole change set is worth on the real class
 
 **The real class, under JUnit, one run each** (`probes/run-doc23-regression.ps1`,
-300s per-class timeout, same host, back to back):
+300s per-class timeout, same host, back to back, against `origin/dev`'s tip):
 
-| arm | dev | this branch |
+| arm | dev tip | this branch |
 |---|---|---|
-| `NoCsCache` (control) | 90.5s | 48.8s |
-| `FullCsCache` | 85.6s | 54.5s |
-| `LazyCsCache` | *still running at the 300s kill* | 73.0s |
-| whole class | **TIMEOUT** | 176s, completes |
+| `NoCsCache` (control) | 90.4s | 41.5s |
+| `FullCsCache` | 76.4s | 62.9s |
+| `LazyCsCache` | *still running at the 300s kill* | 49.9s |
+| whole class | **TIMEOUT** | 154s, completes |
 
-`dev` cannot finish the class inside 300s; this branch finishes it in 176s.
+`dev` cannot finish the class inside 300s; this branch finishes it in 154s.
 That is the headline: doc 23 opened on "the `LazyCsCache` arm alone takes 15
 minutes, which is what pushes the class past even a 1500s per-class timeout",
 and that part is over.
+
+Note how much the two cached arms move against each other run to run — in this
+one `LazyCsCache` (49.9s) came in *faster* than `FullCsCache` (62.9s), the
+reverse of the earlier run against the same tree (54.5s vs 73.0s). They are
+close enough now that their order is not stable, which is itself new: on dev
+the lazy arm was 5x the full one.
 
 The same three arms under `probes/Doc23Arms.java` at the class's own parameters
 (10,000,000 iterations x 10 threads) on an idle host, where `dev` can be given
@@ -1027,8 +1033,17 @@ CRATONVM_DBG_JIT_COMPILED=1 <cratonvm> ... 2>&1 | Select-String getCharset
 
 Regression check for the change set (`probes/run-doc23-regression.ps1`): of the
 63 `org.apache.tomcat.util.{buf,collections,http}` / `org.apache.catalina.util`
-classes, **62 give an identical verdict** on `origin/dev` and on this branch —
-including the same two `*LargeHeap` failures (they want more than the 2g used
-here) and the same `TestMethodPerformance` timeout. The single class that
-differs is `TestCharsetCachePerformance` itself, which goes from TIMEOUT to a
-completed FAIL.
+classes, **62 give an identical verdict** on `origin/dev`'s tip and on this
+branch merged on top of it — including the same two `*LargeHeap` failures (they
+want more than the 2g used here) and the same `TestMethodPerformance` timeout.
+The single class that differs is `TestCharsetCachePerformance` itself, which
+goes from TIMEOUT to a completed FAIL.
+
+Rust-side: `cargo test` is green for `cratonvm-jit`, `cratonvm-types` and
+`cratonvm-gc` (28 result groups, 0 failures), and
+`cargo test -p cratonvm-vm --test jit_local_exception_handler_tests` is 15/15.
+`cargo test -p cratonvm-vm` has two failures —
+`env_cache::tests::no_presence_predicate_shadows_a_compound_flag_default` and
+`serviceability::tests::obsaudit_attach_listener_creates_a_real_socket` — which
+were checked out and reproduced on **plain `origin/dev`** with identical
+messages, so they are pre-existing and unrelated to this change set.
