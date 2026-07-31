@@ -43,15 +43,15 @@ install, no `rt.jar`, one self-contained binary.
 CPU, vs HotSpot JDK 25 C2 (same flags both sides, medians of alternating
 fresh-process runs — full methodology in [BENCHMARK.md](BENCHMARK.md)):
 
-| Benchmark                         | JDK 25 C2 | CratonVM  | Ratio | Measured |
-|-----------------------------------|-----------|-----------|-------|-------|
-| Arithmetic (2B ops)               | 2,006 ms  | 4,895 ms  | 2.44x | 07-18 |
-| Fibonacci(44)                     | 1,719 ms  | 4,790 ms  | 2.79x | 07-18 |
-| Sieve (100K × 20,000)             | 2,851 ms  | 6,508 ms  | 2.28x | 07-18 |
-| Matrix 1280×1280                  | 2,349 ms  | 6,875 ms  | 2.93x | 07-18 |
-| HashMap (10M put/get)             | 1,017 ms  | 1,780 ms  | 1.75x | 07-30 |
-| String/Regex (100K)               | 55 ms     | 423 ms    | 7.7x  | 07-25 |
-| Binary Trees (depth 18)           | 176 ms    | 1,468 ms  | 8.34x | 07-18 |
+| Benchmark               | JDK 25 C2 | CratonVM  | Ratio | Measured |
+|-------------------------|-----------|-----------|-------|-------|
+| Arithmetic (2B ops)     | 2,006 ms  | 4,895 ms  | 2.44x | 07-18 |
+| Fibonacci(44)           | 1,719 ms  | 4,790 ms  | 2.79x | 07-18 |
+| Sieve (100K × 20K)      | 2,851 ms  | 6,508 ms  | 2.28x | 07-18 |
+| Matrix 1280×1280        | 2,349 ms  | 6,875 ms  | 2.93x | 07-18 |
+| HashMap (10M put/get)   | 1,017 ms  | 1,780 ms  | 1.75x | 07-30 |
+| String/Regex (100K)     | 55 ms     | 423 ms    | 7.7x  | 07-25 |
+| Binary Trees (depth 18) | 176 ms    | 1,468 ms  | 8.34x | 07-18 |
 
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
