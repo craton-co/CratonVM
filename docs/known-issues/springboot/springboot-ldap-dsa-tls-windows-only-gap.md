@@ -40,7 +40,7 @@ suites to the (already vendored) rustls fork. `rustls::sign::any_supported_type`
 therefore reports the generic "failed to parse private key as RSA, ECDSA, or
 EdDSA", which is the first half of the message above.
 
-`native-builtins/src/t27_tls.rs` then falls back, per platform:
+`../../../native-builtins/src/t27_tls.rs` then falls back, per platform:
 
 - `#[cfg(unix)]` → `legacy_dsa_acceptor`, an OpenSSL acceptor with
   `set_security_level(0)`, which accepts DSA and other legacy identities
@@ -59,7 +59,7 @@ rustls's DSA gap is long known and already has a working Unix fallback.
 Closing it means giving the Windows branch an OpenSSL-backed acceptor, i.e.
 putting OpenSSL into the Windows dependency graph. `openssl` is currently
 declared only under `[target.'cfg(unix)'.dependencies]` in
-`native-builtins/Cargo.toml`, deliberately — "Only the legacy DSA server
+`../../../native-builtins/Cargo.toml`, deliberately — "Only the legacy DSA server
 fallback needs OpenSSL's per-context security policy API. Keeping it
 Unix-scoped preserves the Windows dependency graph."
 
@@ -79,7 +79,7 @@ Other routes were considered and ruled out:
 - **Substituting a different key** — would stop testing the fixture's identity.
 
 This matches the posture already taken for the other legacy-crypto gaps in the
-rustls backend (`docs/internal/fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`,
+rustls backend (`../../internal/fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`,
 `rustls-tls11-protocol-not-supported.md`), with the added note that on Unix the
 gap *is* covered by the OpenSSL fallback.
 
