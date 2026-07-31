@@ -90,7 +90,7 @@ more sites. Two were live defects, not just latent ones:
 |---|---|---|
 | `libcratonvm/src/lib.rs` `with_fake_jdk` / `with_no_jdk` | the reported failure | thread override |
 | `vm/src/config.rs` — 4 JDK-detection tests | **vacuous**: measured the developer's real JDK, passed anyway because their assertions happen to hold for any JDK | thread override, via `with_scratch_java_home` |
-| `vm/src/vm.rs` `system_getenv_returns_value` | **`System.getenv` resolves through `runtime_var`, and `CRATONVM_TEST_VAR` is declared** — so this asserted on the snapshot, not on the `set_var` | thread override |
+| `vm/src/vm.rs` `system_getenv_returns_value` | **outright failing** under `--features synthetic-jdk` (see below) | thread override |
 | `vm/tests/wp8_10_jboss_modules_smoke.rs` | 7 tests each set a *different* `CRATONVM_JBOSS_MP_ROOT`; at most the first took effect, the rest pointed at an already-deleted tempdir | process override held by the fixture, serialised by `mp_root_lock` |
 | `native-builtins/src/lib.rs` — 4 `jboss.home.dir` fallback tests | ambient `CRATONVM_JBOSS_MP_ROOT` stayed in force; "must fall back" held for the wrong reason | thread override, via `with_jboss_env` |
 | `jit/src/lib.rs`, `jit/src/x64.rs` | `CRATONVM_JIT_DIRECT_CALLEE_CALLS=1` was a no-op; the assertions rode on the flag's *default* and would have silently stopped covering the direct-callee path if that default flipped | thread override |
@@ -105,6 +105,28 @@ a `CRATONVM_*` name.
 Child-process tests (`Command::env`, e.g. `vm/tests/jit_interp_differential.rs`,
 `difftest`) were never affected — the child reads its own environment before it
 latches anything.
+
+### `system_getenv_returns_value` was not merely vacuous — it was red
+
+`System.getenv` resolves through `flags::runtime_var`, and `CRATONVM_TEST_VAR`
+is a *declared* flag, so the lookup was answered from the snapshot. The test
+constructed a `SharedVm` (which reads flags, latching the snapshot) *before*
+calling `set_var`, so the write could never be seen: `getenv` returned null and
+the test panicked with `expected string`.
+
+Nobody saw it because `vm/src/vm.rs`'s whole test module is
+`#[cfg(all(test, feature = "synthetic-jdk"))]` and that feature is off by
+default — so neither `cargo test` nor `cargo check --all-targets` compiles it.
+Confirmed against the parent commit:
+
+```
+$ cargo test -p cratonvm-vm --lib --features synthetic-jdk system_getenv
+test vm::tests::system_getenv_returns_value ... FAILED
+  panicked at vm/src/vm.rs:11591:18: expected string
+```
+
+and passing after the fix. Worth remembering as a general point: a default-off
+feature gate hides its test module from every routine check in this workspace.
 
 ## Guard
 
@@ -132,6 +154,11 @@ override hooks document the limitation.
 cargo test -p libcratonvm --lib -- --test-threads=1
 cargo test -p cratonvm-types --lib flags::
 cargo test -p cratonvm-types --test flag_env_mutation_guard
+cargo test -p cratonvm-vm --lib --features synthetic-jdk system_getenv
+cargo test -p cratonvm-vm --test wp8_10_jboss_modules_smoke
+cargo test -p cratonvm-vm --test jit_deep_recursion_fault_recovery
+cargo test -p cratonvm-gc --test stale_objref_debug_assertion                           --test stale_objref_quarantine_ring
+cargo test -p cratonvm-native-builtins --lib bootstrap_property_fallback_tests
 ```
 
 The first is the original repro: it failed before, passes now. Non-vacuity of
