@@ -1167,6 +1167,48 @@ impl ReferenceProcessor {
         v
     }
 
+    /// Every heap address this processor holds a raw pointer to, across ALL
+    /// reference kinds (soft / weak / phantom / cleaner / finalizer): the
+    /// `Reference` object itself, its referent, and its `ReferenceQueue`.
+    ///
+    /// Published to `gc_quiescence::set_watched_referents` before each
+    /// collection. Both young collectors and the old-gen collector emit an
+    /// identity `pointer_map` entry for every watched address that SURVIVES
+    /// but does not move, which is what makes "absent from the pointer map"
+    /// an exact death proof for precisely the addresses post-GC reference
+    /// processing writes through — see
+    /// `VmHeap::watched_pre_gc_addr_survived`.
+    ///
+    /// Superset of [`Self::weak_phantom_active_pairs`] +
+    /// [`Self::weak_phantom_active_queue_addrs`], which covered only the
+    /// weak/phantom halves and only their non-cleared entries: the survival
+    /// predicate is consulted for soft/cleaner/finalizer entries too (via
+    /// `process_references` and `remove_collected`), so every one of them
+    /// needs the same proof.
+    pub fn all_tracked_addrs(&self) -> Vec<usize> {
+        let n = self.soft_refs.len()
+            + self.weak_refs.len()
+            + self.phantom_refs.len()
+            + self.cleaner_refs.len()
+            + self.finalizer_refs.len();
+        let mut v = Vec::with_capacity(n * 3);
+        for e in self
+            .soft_refs
+            .iter()
+            .chain(self.weak_refs.iter())
+            .chain(self.phantom_refs.iter())
+            .chain(self.cleaner_refs.iter())
+            .chain(self.finalizer_refs.iter())
+        {
+            v.push(e.reference_obj);
+            v.push(e.referent);
+            if let Some(q) = e.queue_addr {
+                v.push(q);
+            }
+        }
+        v
+    }
+
     /// Queue addresses for active Weak/Phantom references. These are live
     /// through the Reference object's queue field, but a non-moving young
     /// sweep needs an identity pointer-map entry before post-GC enqueue writes.
@@ -1611,6 +1653,24 @@ mod tests {
     }
 
     // 19. remove_collected cleans up dead Reference objects -----------------
+    #[test]
+    fn all_tracked_addrs_covers_every_reference_kind() {
+        let mut proc = ReferenceProcessor::new();
+        proc.discover_reference(ReferenceType::Soft, 100, 200, None);
+        proc.discover_reference(ReferenceType::Weak, 101, 201, Some(301));
+        proc.discover_reference(ReferenceType::Phantom, 102, 202, None);
+        proc.discover_reference(ReferenceType::Cleaner, 103, 203, None);
+        proc.discover_reference(ReferenceType::Finalizer, 104, 204, None);
+
+        let addrs = proc.all_tracked_addrs();
+        // Soft / cleaner / finalizer entries were NOT published before the
+        // old-gen-reclamation fix, so the collector emitted no survival proof
+        // for them and the exact post-GC predicate could not be used.
+        for a in [100, 200, 101, 201, 301, 102, 202, 103, 203, 104, 204] {
+            assert!(addrs.contains(&a), "address {a} must be published as watched");
+        }
+    }
+
     #[test]
     fn remove_collected_cleans_up() {
         let mut proc = ReferenceProcessor::new();
