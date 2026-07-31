@@ -335,14 +335,23 @@ mod tests {
     /// modulus at 4096 bits, so a **legitimate** larger key is rejected by the
     /// backend. The old code reported that as `false` — "the signature did not
     /// verify" — when in truth nothing was ever checked.
+    /// A 5008-bit odd big-endian magnitude — a plausible RSA modulus that is
+    /// past `RsaPublicKey::MAX_SIZE` (4096 bits). Built as raw bytes rather
+    /// than by `BigUint` arithmetic so the test does not depend on which
+    /// bignum backend `rsa` happens to re-export.
+    fn oversized_modulus_be() -> Vec<u8> {
+        let mut m = vec![0u8; 626];
+        m[0] = 0x80; // top bit set => exactly 5008 significant bits
+        m[625] = 0x01; // odd (an even modulus would trip a different check)
+        m
+    }
+
     #[test]
     fn oversized_but_legitimate_modulus_raises_invalid_key_not_false() {
         let (_, e, sig) = fixture(b"m");
-        // 5001-bit odd modulus: past RsaPublicKey::MAX_SIZE (4096 bits).
-        let big = (BigUint::from(1u8) << 5000u32) + BigUint::from(1u8);
         assert_raises(
             verify_rsa_pkcs1_v15_checked(
-                &big.to_bytes_be(),
+                &oversized_modulus_be(),
                 &e,
                 DigestAlgorithm::Sha256,
                 b"m",
@@ -391,12 +400,16 @@ mod tests {
     #[test]
     fn bool_wrapper_is_fail_closed_on_every_error_path() {
         let (n, e, sig) = fixture(b"m");
-        let big = (BigUint::from(1u8) << 5000u32) + BigUint::from(1u8);
         let cases: Vec<(&str, Vec<u8>, Vec<u8>, Vec<u8>)> = vec![
             ("empty modulus", vec![], e.clone(), sig.clone()),
             ("zero exponent", n.clone(), vec![0], sig.clone()),
             ("even exponent", n.clone(), vec![4], sig.clone()),
-            ("huge modulus", big.to_bytes_be(), e.clone(), sig.clone()),
+            (
+                "huge modulus",
+                oversized_modulus_be(),
+                e.clone(),
+                sig.clone(),
+            ),
             ("empty signature", n.clone(), e.clone(), vec![]),
             (
                 "short signature",

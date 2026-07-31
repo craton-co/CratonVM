@@ -101,6 +101,14 @@ const MAX_ENTRIES_READ: usize = 2;
 /// Traversal-shaped names probed on every input, independent of what the
 /// archive contains. Covers `..`, absolute POSIX and Windows paths, both
 /// separators, drive letters, NUL, and `./` current-directory references.
+///
+/// Each probe is routed only to the APIs whose filter actually rejects it,
+/// as decided by [`class_name_is_hostile`] / [`resource_name_is_hostile`].
+/// That matters for `/etc/passwd`: the resource APIs strip leading slashes
+/// first (HotSpot parity — `Class.getResource("/foo")` means `foo`), so
+/// after normalisation it is an ordinary relative name and asserting it is
+/// refused would be wrong. `find_class` does no such stripping and must
+/// refuse it.
 const TRAVERSAL_PROBES: [&str; 11] = [
     "../etc/passwd",
     "../../../../etc/shadow",
@@ -115,13 +123,28 @@ const TRAVERSAL_PROBES: [&str; 11] = [
     "java/lang/../../../etc/passwd",
 ];
 
-/// Mirrors the `is_safe_class_name` / `is_safe_resource_name` predicates in
-/// `classloading/src/class_path.rs:1024`. A name matching this must never
-/// resolve to bytes, no matter what the archive's central directory says.
-fn is_traversal_shaped(name: &str) -> bool {
+/// Exactly the negation of `is_safe_class_name`
+/// (`classloading/src/class_path.rs:1035`). `find_class` applies no
+/// normalisation, so this predicate is applied to the raw name.
+fn class_name_is_hostile(name: &str) -> bool {
     name.contains("..")
         || name.starts_with('/')
         || name.starts_with('\\')
+        || name.contains('\\')
+        || name.contains('\u{0}')
+        || name.contains(':')
+        || name.contains("./")
+}
+
+/// Exactly the negation of `is_safe_resource_name`
+/// (`classloading/src/class_path.rs:1024`) **after** the leading-slash
+/// strip every resource entry point performs first. `contains('\\')`
+/// subsumes that predicate's `starts_with('\\')` and `".\\"` clauses, and
+/// the trim rules out its `starts_with('/')` clause, so the two agree
+/// exactly.
+fn resource_name_is_hostile(name: &str) -> bool {
+    let name = name.trim_start_matches('/');
+    name.contains("..")
         || name.contains('\\')
         || name.contains('\u{0}')
         || name.contains(':')
@@ -212,14 +235,23 @@ fuzz_target!(|data: &[u8]| {
         );
 
         // ---- Traversal oracle over names the archive really contains ----
+        //
+        // This is the non-vacuous half: the entry is genuinely present in
+        // the central directory, so if the name filter ever regressed the
+        // lookup below would succeed and this assertion would fire.
         let mut read_budget = MAX_ENTRIES_READ;
         for name in &names {
-            if is_traversal_shaped(name) {
+            let resource = format!("{name}.class");
+            let hostile_class = class_name_is_hostile(name);
+            let hostile_resource = resource_name_is_hostile(&resource);
+
+            if hostile_class {
                 assert!(
                     cp.find_class(name).is_err(),
                     "find_class resolved traversal-shaped archive entry {name:?}"
                 );
-                let resource = format!("{name}.class");
+            }
+            if hostile_resource {
                 assert!(
                     cp.find_resource(&resource).is_none(),
                     "find_resource resolved traversal-shaped archive entry {resource:?}"
@@ -228,43 +260,55 @@ fuzz_target!(|data: &[u8]| {
                     !cp.contains_resource(&resource),
                     "contains_resource reported traversal-shaped entry {resource:?}"
                 );
+                assert!(
+                    cp.find_all_resource_bytes(&resource).is_empty(),
+                    "find_all_resource_bytes returned data for {resource:?}"
+                );
+            }
+            if hostile_class || hostile_resource {
                 continue;
             }
+
             // Benign names may resolve — but only to a bounded number of
             // bytes. This is the compression-ratio-bomb check.
             if read_budget > 0 {
                 read_budget -= 1;
-                if let Some(bytes) = cp.find_resource(&format!("{name}.class")) {
-                    assert_bounded_inflate("class entry", bytes.len(), archive_len);
+                if let Some(bytes) = cp.find_resource(&resource) {
+                    assert_bounded_inflate("resource entry", bytes.len(), archive_len);
                 }
                 if let Ok(shared) = cp.find_class(name) {
-                    assert_bounded_inflate("class entry", shared.as_ref().len(), archive_len);
+                    let bytes: &[u8] = shared.as_ref();
+                    assert_bounded_inflate("class entry", bytes.len(), archive_len);
                 }
             }
         }
 
         // ---- Fixed traversal probes, archive-independent ----
         for probe in TRAVERSAL_PROBES {
-            assert!(
-                cp.find_class(probe).is_err(),
-                "find_class accepted traversal probe {probe:?}"
-            );
-            assert!(
-                cp.find_resource(probe).is_none(),
-                "find_resource accepted traversal probe {probe:?}"
-            );
-            assert!(
-                !cp.contains_resource(probe),
-                "contains_resource accepted traversal probe {probe:?}"
-            );
-            assert!(
-                cp.find_all_resource_bytes(probe).is_empty(),
-                "find_all_resource_bytes returned data for traversal probe {probe:?}"
-            );
-            assert!(
-                cp.find_all_resource_urls(probe).is_empty(),
-                "find_all_resource_urls returned a URL for traversal probe {probe:?}"
-            );
+            if class_name_is_hostile(probe) {
+                assert!(
+                    cp.find_class(probe).is_err(),
+                    "find_class accepted traversal probe {probe:?}"
+                );
+            }
+            if resource_name_is_hostile(probe) {
+                assert!(
+                    cp.find_resource(probe).is_none(),
+                    "find_resource accepted traversal probe {probe:?}"
+                );
+                assert!(
+                    !cp.contains_resource(probe),
+                    "contains_resource accepted traversal probe {probe:?}"
+                );
+                assert!(
+                    cp.find_all_resource_bytes(probe).is_empty(),
+                    "find_all_resource_bytes returned data for traversal probe {probe:?}"
+                );
+                assert!(
+                    cp.find_all_resource_urls(probe).is_empty(),
+                    "find_all_resource_urls returned a URL for traversal probe {probe:?}"
+                );
+            }
         }
 
         // ---- Other archive-driven walks, panic-only ----

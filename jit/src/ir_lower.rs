@@ -910,12 +910,17 @@ fn reloc_emit_enabled() -> bool {
     /// A forward branch can target a merge block whose phis have not yet
     /// been lowered, so the destination slots must exist before any edge
     /// copy is emitted. Phis are skipped by `lower_data_node`.
-    fn prealloc_phi_slots(&mut self) {
+    ///
+    /// Fallible: this is the first thing that can exhaust the frame, and a
+    /// refusal here must reach `lower_inner` as a `FrameTooLarge` bailout
+    /// rather than a panic.
+    fn prealloc_phi_slots(&mut self) -> CompileResult<()> {
         for id in 0..self.graph.nodes.len() {
             if matches!(self.graph.nodes[id].op, Op::Phi) {
-                self.alloc_slot(id as NodeId);
+                self.alloc_slot_checked(id as NodeId)?;
             }
         }
+        Ok(())
     }
 
     /// Resolve the block that produces control token `ctrl` by walking up
@@ -1334,8 +1339,10 @@ fn reloc_emit_enabled() -> bool {
                 matches!(self.graph.nodes[id].op, Op::Phi)
                     && self.graph.nodes[id].ty == IrType::Ref
             })
-            .map(|id| (id, self.node_slot[id]))
-            .filter(|&(_, off)| off > 0)
+            // A phi with no location cannot be zeroed and must not be
+            // published; `prealloc_phi_slots` gives every phi one, so this
+            // filter drops nothing in a well-formed compile.
+            .filter_map(|id| self.node_slot[id].map(|off| (id, off.get() as i32)))
             .collect();
         for (id, off) in refs {
             // MOV qword [rbp - off], 0
@@ -3390,23 +3397,24 @@ fn reloc_emit_enabled() -> bool {
                 // The prologue stored param `idx` at `[rbp - (idx+1)*8]`. If
                 // the Param node was also scheduled it has its own spill slot
                 // holding the same value; prefer that, else the prologue slot.
-                let slot = self.node_slot[node_id as usize];
-                let off = if slot != 0 {
-                    slot
-                } else {
-                    ((idx as i32) + 1) * 8
+                let off = match self.node_slot.get(node_id as usize).copied().flatten() {
+                    Some(slot) => slot.get() as i32,
+                    None => ((idx as i32) + 1) * 8,
                 };
                 Self::typed_stack_slot(-off, node.ty)
             }
             _ => {
-                let slot = self.node_slot[node_id as usize];
-                if slot != 0 {
-                    Self::typed_stack_slot(-slot, node.ty)
-                } else {
+                match self.node_slot.get(node_id as usize).copied().flatten() {
+                    Some(slot) => Self::typed_stack_slot(-(slot.get() as i32), node.ty),
                     // No machine location assigned (unscheduled / dead in this
                     // naive lowerer). A real resolver would never see this for
                     // a value that is live at the safepoint; first-cut fallback.
-                    FrameValue::Undefined
+                    //
+                    // Note this is a deopt *description*, not an emitted
+                    // access: `Undefined` costs a whole-method re-run, it never
+                    // reads `[rbp - 0]`. That is why a missing location is
+                    // tolerated here and refused in `slot_of`.
+                    None => FrameValue::Undefined,
                 }
             }
         }

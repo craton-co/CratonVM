@@ -221,7 +221,10 @@ tsv_to_json() {  # tsv_to_json <tsv> <json> <array-key>
 # exactly the field a later reader would otherwise assume was checked.
 REVISION=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)
 [ -n "$REVISION" ] || REVISION="-"
-if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then REV_DIRTY=yes; else REV_DIRTY=no; fi
+# --untracked-files=no deliberately: enumerating untracked files means walking
+# target/, which takes minutes on a built tree. Tracked-file modifications are
+# what makes a revision non-reproducible; a stray untracked file does not.
+if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then REV_DIRTY=yes; else REV_DIRTY=no; fi
 BIN_SHA=$(sha256_of "$EXE")
 BENCH_SHA=$(sha256_of "$ROOT/bench/CratonBench.java")
 BASELINE_SHA=$(sha256_of "$BASELINE")
