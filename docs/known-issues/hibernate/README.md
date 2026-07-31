@@ -1,5 +1,69 @@
 # Hibernate ORM suite — open known issues
 
+## Audited, not a bug (2026-07-31) — ABORTED classes in the fresh 4548-class run
+
+Three classes show class-level **ABORTED** in the fresh 2026-07-30/31 full-suite
+categorize run (`apps/hib-suite-runner/analysis/06-full-suite-categorize-20260730/all-4548-classes-status.tsv`)
+but are confirmed benign, not regressions and not CratonVM bugs — isolated
+`CratonRunner` re-runs against both the fresh CratonVM binary and plain
+HotSpot (same JDK, same classpath, no CratonVM in the loop) produce
+byte-identical found/started/ok/failed/aborted counts:
+
+- `org.hibernate.orm.test.bytecode.enhancement.basic.InheritedTest` and
+  `.MappedSuperclassTest` — `found=4 ok=3 aborted=1` on both VMs. The abort is
+  `extendedEnhancementTest()`'s own `assumeTrue(...isAssignableFrom...)`,
+  which is false-by-construction under each class's eager
+  (non-lazy-loading) `@CustomEnhancementContext`. See the RE-VERIFICATION
+  2026-07-31 section of
+  `../../internal/fixed-suite-bugs/hibernate/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`.
+- `org.hibernate.orm.test.manytomanyassociationclass.surrogateid.generated.ManyToManyAssociationClassGeneratedIdTest`
+  — `found=6 ok=3 aborted=3` on both VMs. The 3 overridden test methods each
+  call `assumeFalse(queueType == QueueType.GRAPH, ...)`, which self-skips
+  under Hibernate's (now-restored) upstream GRAPH default. See §8 of
+  `../../internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`
+  and `../../internal/fixed-suite-bugs/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md`.
+
+No doc was moved or newly filed for any of these three — do not re-open them
+as regressions on a future ABORTED sighting without first checking whether
+HotSpot aborts the same tests for the same reason.
+
+## HANG classes in the fresh 4548-class run (2026-07-31) — one real harness gap, one stale binary
+
+Two more classes report `HANG` (`process-died rc=124`) in the same
+2026-07-30/31 categorize run:
+
+- **[`boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` — the runner's per-class timeout accommodation is gone](qualfiedtablenaming-runner-timeout-floor-lost-20260731.md).**
+  A real, currently-open harness gap, **not** a VM regression: the
+  "Resolved 2026-07-22" fix recorded in
+  `../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-hang-cluster-20260721-FIXED.md`
+  (a 3600s per-class timeout floor + forced `--nojit` in `run-hib.sh`) is not
+  present in the current `run-hib.sh` — that script is wholly gitignored
+  (`apps/`), carries no commit history, and has already lost driver-file state
+  once before (2026-07-16 truncation). The class's own correctness fix
+  (`MutableBigInteger` AIOOBE quarantine, `41cdfdf94`) is untouched and not in
+  question; solo repro this session reconfirms genuine, continuous CPU-bound
+  work with zero stall signature, matching the class's own well-established
+  "clean but slow" profile. See the doc for the recommended re-implementation.
+
+- **`bulkid.OracleInlineMutationStrategyIdTest` — stale binary, not a
+  regression; already faster on current `dev`.** This class is a long-known,
+  already-documented timeout-marginal residual (see the `GROUP BY` cluster
+  entry below and
+  `../../internal/fixed-suite-bugs/hibernate/h2-expressioncolumn-getvalue-native-bypasses-groupdata-20260727-FIXED.md`'s
+  residual section). The categorize run's binary
+  (`CratonVM-hib-local-0712-v3` @ `8e8a7b8cd`) predates two fixes merged into
+  `dev` hours later the same day/night
+  (`f78b72670` relocation-safety gate scoping, `11901e9a6` moving-young
+  liveness veto — both folded into `dev` via `edd95bc89`) that took this exact
+  class from ~322-442s down to 118.9s on a quiet host — see
+  `../../internal/repros/hib-five-20260730/RESULTS-final-20260731.md`. Solo
+  repro this session on the *same pre-fix binary* the categorize run used
+  completed in 212.7s (`found=6 ok=6 failed=0`) — under the 300s cap on its
+  own, so the full run's 8-way shard contention is what tipped this
+  marginal-timing class into a `HANG`, not a code defect. No doc needs
+  correcting; this is the already-understood "timeout-marginal class +
+  contended host" pattern, now additionally resolved on `dev` tip.
+
 ## Resolved (2026-07-30) — retired to `docs/internal/fixed-suite-bugs/hibernate/`
 
 - **HIB-BYTEBUDDY ban removed for good.** The 302-class crash spike was an older runtime
