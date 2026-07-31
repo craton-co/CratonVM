@@ -12702,9 +12702,46 @@ pub(super) fn execute_invokestatic_cached(
     match target {
         CachedInvokeTarget::Native {
             callback,
-            num_params: _,
+            num_params,
             gate: _,
         } => {
+            // Real-JDK `String.toLowerCase(Locale)` delegates to this static
+            // `StringLatin1` helper. The cached target already proves the
+            // callback and the three-reference signature, while the generic
+            // path below would still resolve and parse that descriptor on
+            // every cache hit. Retain the ordinary prevalidated native
+            // machinery for pinning, forwarding, exceptions and return
+            // coercion.
+            if num_params == 3
+                && cratonvm_native_builtins::lang_string::is_lower_case_native_callback(callback)
+            {
+                let locale = thread.frames[frame_idx]
+                    .stack
+                    .pop_compact_with_long_mark()?
+                    .0
+                    .decode_by_descriptor(b'L');
+                let value = thread.frames[frame_idx]
+                    .stack
+                    .pop_compact_with_long_mark()?
+                    .0
+                    .decode_by_descriptor(b'L');
+                let source = thread.frames[frame_idx]
+                    .stack
+                    .pop_compact_with_long_mark()?
+                    .0
+                    .decode_by_descriptor(b'L');
+                let mut args = [source, value, locale];
+                refresh_stale_object_args(shared, &mut args);
+                invoke_cached_native_callback_prevalidated(
+                    shared,
+                    thread,
+                    frame_idx,
+                    callback,
+                    &args,
+                    "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+                )?;
+                return Ok(CachedCallResult::Handled);
+            }
             let (args, method_descriptor) = pop_coerced_invoke_args_static(
                 shared,
                 caller_class_id,
@@ -20741,7 +20778,8 @@ pub(super) fn try_execute_cached_trivial_instance_getter(
     cached: &CachedBytecodeMethod,
     args: &[Value],
 ) -> Result<Option<CachedCallResult>, MethodCallFailed> {
-    if cached.is_static
+    if !crate::runtime::env_cache::trivial_getter_fast_path()
+        || cached.is_static
         || cached.is_synchronized
         || cached.num_params != 0
         || args.len() != 1
@@ -20816,6 +20854,54 @@ pub(super) fn try_execute_cached_trivial_instance_getter(
     );
     if !return_matches_field {
         return Ok(None);
+    }
+
+    // CRATONVM_TRIVIAL_GETTER_VERIFY — resolve the same field reference the way
+    // the `getfield` opcode would and report any divergence.
+    //
+    // This exists because the fast path reads the `resolution_cache` raw, while
+    // the opcode goes through `resolve_field_ref_loader_aware`, which documents
+    // that a cache entry "may have been populated by a loader-blind helper" and
+    // refuses to trust one for a user-defined-loader caller. That made the fast
+    // path the prime suspect for the 2026-07-30 Hibernate HQL mis-parse. It was
+    // not: a full `ASTParserLoadingTest` run under this verifier reported ZERO
+    // divergences while still mis-parsing, and the same run passed 106/106 with
+    // `CRATONVM_NO_MOVING_YOUNG=1` — the defect was missing native roots in the
+    // ANTLR intrinsics. Keep the verifier so that conclusion stays one env var
+    // away from being re-checked instead of re-argued.
+    if crate::runtime::env_cache::trivial_getter_verify() {
+        if let Ok(authoritative) = resolve_field_ref_loader_aware(
+            shared,
+            thread,
+            cached.declaring_class_id,
+            field_cp_index,
+        ) {
+            if authoritative.field_index != field.field_index
+                || authoritative.desc_byte != field.desc_byte
+                || authoritative.is_reference != field.is_reference
+                || authoritative.is_volatile != field.is_volatile
+                || authoritative.declaring_class_id != field.declaring_class_id
+            {
+                eprintln!(
+                    "[TRIVIAL-GETTER-DIVERGENCE] {}.{}{} cp#{field_cp_index}: \
+                     cached(idx={} desc={} ref={} vol={} owner={:?}) != \
+                     loader_aware(idx={} desc={} ref={} vol={} owner={:?})",
+                    cached.class_name,
+                    cached.method_name,
+                    cached.method_descriptor,
+                    field.field_index,
+                    field.desc_byte as char,
+                    field.is_reference,
+                    field.is_volatile,
+                    field.declaring_class_id,
+                    authoritative.field_index,
+                    authoritative.desc_byte as char,
+                    authoritative.is_reference,
+                    authoritative.is_volatile,
+                    authoritative.declaring_class_id,
+                );
+            }
+        }
     }
 
     let Value::Object(Some(receiver)) = args[0] else {
@@ -21838,6 +21924,46 @@ pub(super) fn execute_invokevirtual_cached(
                             callback,
                             &args,
                             &method_descriptor,
+                        )?;
+                        return Ok(CachedCallResult::Handled);
+                    }
+                    // The two hottest cache lookups in Tomcat are
+                    // `String.toLowerCase(Locale)` and `Map.get(Object)`.
+                    // Their virtual-native cache entries already prove both
+                    // receiver class and callback identity, but the generic
+                    // arm below still re-resolved the CP descriptor and
+                    // allocated a `Vec` for their two reference arguments on
+                    // every iteration. Pop the verifier-known reference pair
+                    // directly and retain the ordinary prevalidated native
+                    // call for pinning, GC remapping, exceptions and return
+                    // coercion.
+                    let cached_string_lower = num_params_usize == 1
+                        && cratonvm_native_builtins::lang_string::is_lower_case_native_callback(
+                            callback,
+                        );
+                    let cached_map_get = num_params_usize == 1
+                        && !cached_string_lower
+                        && cratonvm_native_collections::is_hot_map_get_native_callback(callback);
+                    if cached_string_lower || cached_map_get {
+                        let argument = thread.frames[frame_idx]
+                            .stack
+                            .pop_compact_with_long_mark()?
+                            .0
+                            .decode_by_descriptor(b'L');
+                        let receiver = thread.frames[frame_idx]
+                            .stack
+                            .pop_compact_with_long_mark()?
+                            .0
+                            .decode_by_descriptor(b'L');
+                        let mut args = [receiver, argument];
+                        refresh_stale_object_args(shared, &mut args);
+                        let descriptor = if cached_string_lower {
+                            "(Ljava/util/Locale;)Ljava/lang/String;"
+                        } else {
+                            "(Ljava/lang/Object;)Ljava/lang/Object;"
+                        };
+                        invoke_cached_native_callback_prevalidated(
+                            shared, thread, frame_idx, callback, &args, descriptor,
                         )?;
                         return Ok(CachedCallResult::Handled);
                     }

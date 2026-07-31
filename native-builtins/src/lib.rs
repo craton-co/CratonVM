@@ -7404,7 +7404,7 @@ pub fn register_essential_natives_with_shims(
         "java/lang/String",
         "toLowerCase",
         "()Ljava/lang/String;",
-        lang_string::native_string_to_lower_case_uncached,
+        lang_string::native_string_to_lower_case,
     );
     registry.register(
         "java/lang/String",
@@ -7416,7 +7416,7 @@ pub fn register_essential_natives_with_shims(
         "java/lang/String",
         "toLowerCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        lang_string::native_string_to_lower_case_uncached,
+        lang_string::native_string_to_lower_case,
     );
     registry.register(
         "java/lang/String",

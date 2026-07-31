@@ -113,8 +113,24 @@ fn native_sl_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return Ok(Some(Value::Object(None)));
     }
     let elem = ctx.get_array_element(arr, idx as usize);
-    ctx.set_field(this, 1, Value::Int(idx + 1));
-    Ok(Some(elem))
+    // `set_field` may collect. Keep the iterator, its snapshot, and the
+    // returned element rooted, then reread their forwarded references.
+    let this_pin = ctx.pin_native_root(this);
+    let _arr_pin = ctx.pin_native_root(arr);
+    let elem_pin = match elem {
+        Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+        _ => None,
+    };
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_cur, 1, Value::Int(idx + 1));
+    let elem_cur = match (elem, elem_pin) {
+        (Value::Object(Some(object)), Some(pin)) => {
+            Value::Object(Some(ctx.read_native_pin(pin, object)))
+        }
+        _ => elem,
+    };
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(elem_cur))
 }
 
 /// `BaseStream.sequential() / parallel() / unordered() / isParallel() / onClose(Runnable)`
@@ -266,10 +282,20 @@ fn native_stream_empty_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             // no backing array → empty iterator.
             _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
         };
+        // Allocating the iterator and storing either field can collect. Root
+        // the backing array and iterator shell and reread both after every
+        // allocation-capable operation.
+        let arr_pin = ctx.pin_native_root(arr);
         let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
-        ctx.set_field(itr, 0, Value::Object(Some(arr)));
-        ctx.set_field(itr, 1, Value::Int(0));
-        return Ok(Some(Value::Object(Some(itr))));
+        let itr_pin = ctx.pin_native_root(itr);
+        let itr_cur = ctx.read_native_pin(itr_pin, itr);
+        let arr_cur = ctx.read_native_pin(arr_pin, arr);
+        ctx.set_field(itr_cur, 0, Value::Object(Some(arr_cur)));
+        let itr_cur = ctx.read_native_pin(itr_pin, itr);
+        ctx.set_field(itr_cur, 1, Value::Int(0));
+        let itr_cur = ctx.read_native_pin(itr_pin, itr);
+        ctx.unpin_native_roots(arr_pin);
+        return Ok(Some(Value::Object(Some(itr_cur))));
     }
     let iter = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0);
     Ok(Some(Value::Object(Some(iter))))

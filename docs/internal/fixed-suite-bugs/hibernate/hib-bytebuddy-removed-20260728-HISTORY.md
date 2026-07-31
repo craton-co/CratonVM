@@ -1,17 +1,19 @@
-# HIB-BYTEBUDDY (`net/bytebuddy/`) — REMOVED 2026-07-28, RE-INSTATED 2026-07-29
+# HIB-BYTEBUDDY (`net/bytebuddy/`) — 2026-07-28 removal rationale (HISTORY ONLY)
 
-**SUPERSEDED 2026-07-29**: this removal was premature. Its 15-class sample was too narrow —
-a full 4548-class suite run surfaced 302 CRASH-status classes attributable to this exact ban's
-absence, spread far beyond the sampled `bytecode.enhancement` package (ByteBuddy's proxy/lazy-init
-machinery is invoked implicitly by ordinary entity mapping throughout the suite). The ban has been
-re-instated verbatim. See
-`hib-bytebuddy-reinstated-20260729-FIXED.md` for the full
-verification (298/302 previously-crashing classes now pass with the ban back). Everything below
-this line is the ORIGINAL (now-incorrect) removal rationale, kept for history — do not act on it.
+**SUPERSEDED — do not act on this document.** The topic is closed; the
+authoritative write-up is [`hib-bytebuddy-20260730-FIXED.md`](hib-bytebuddy-20260730-FIXED.md),
+which carries the real root cause (a JIT code-lifetime defect on an older
+runtime, not a Byte Buddy miscompile), the corrected account of the `--nojit`
+HQL residual, and the final validation.
 
-**Status (original, incorrect)**: removed (deleted, not commented out), re-verified with a real
-Hibernate ORM 8.0 fixture. `net/bytebuddy/` in `vm/src/jit/skip_list.rs`
-is JIT-eligible again.
+This file is retained only for what it documents about the *original* ban: which
+call chain it covered, the 2026-06-13 symptom, and the (too narrow) 15-class
+sample that motivated the first removal.
+
+Everything below this line is the original 2026-07-28 text.
+
+**Status:** removed (deleted, not commented out), re-verified with a real Hibernate ORM 8.0
+fixture. `net/bytebuddy/` in `vm/src/jit/skip_list.rs` is JIT-eligible.
 
 ## What it banned
 

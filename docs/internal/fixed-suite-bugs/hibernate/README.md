@@ -39,6 +39,7 @@ regression tracking — not committed (`../../../../apps` is gitignored).
 
 ## Resolved since this rerun
 
+- [HIB-BYTEBUDDY — the `net/bytebuddy/` blanket JIT ban is gone for good](hib-bytebuddy-20260730-FIXED.md) — the 302-class crash corpus was an older runtime unmapping a compiled body under a live frame, not a Byte Buddy miscompile; the ban only hid it. The exact 302 classes pass in both JIT and `--nojit` with no guard, and a unit test now fails the build if a blanket guard returns. Also carries the corrected root cause of the `--nojit` HQL mis-parse (missing native roots under the moving young collector, **not** the trivial-accessor fast path that was blamed and deleted on 2026-07-29). The 2026-07-28 removal rationale is kept as [history](hib-bytebuddy-removed-20260728-HISTORY.md).
 - [storedproc/resultmapping real-javac archive walker + JIT residual - FIXED](storedproc-resultmapping-javac-walk-maxdepth-jit-20260723-FIXED.md) - `StoredProcedureTest` and `ResultMappingTest` now complete 4/4 in both JIT and `--nojit`; the archive walker honors javac's non-recursive `maxDepth=1` listing contract and the one verified `Symbol$ClassSymbol.complete` JIT underflow is narrowly interpreted.
 - [qualfiedTableNaming timeout and JIT-corruption cluster - FIXED](qualfiedtablenaming-hang-cluster-20260721-FIXED.md) - the slow class now has a 3600-second floor and a narrow JIT-to-interpreter correctness quarantine after reproducible class-id-zero metadata-store drops; `NamespaceTest` passes in seconds.
 

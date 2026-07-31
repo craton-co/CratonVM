@@ -1136,9 +1136,18 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
         "(Ljava/security/PrivilegedAction;)Ljava/lang/Object;",
         |ctx, args| {
             let action = obj_arg(args, 0)?;
+            // The cache slow paths below can cooperate with a moving GC before
+            // `invoke_virtual` installs the Java `run()` receiver. Keep this
+            // freshly allocated action rooted for the whole privileged window
+            // and reread it at the dispatch boundary. JAXB exposed the stale
+            // form with `ReflectionNavigator$10`: its captured superclass
+            // search fields became unrelated live objects and `run()` repeated
+            // forever.
+            let action_pin = ctx.pin_native_root(action);
+            let action_cur = ctx.read_native_pin(action_pin, action);
             // Single class_id_of_object lookup, then everything is keyed by
             // the cached ClassId — no per-call format!() or PKCS#7 walk.
-            let cid = ctx.class_id_of_object(action);
+            let cid = ctx.class_id_of_object(action_cur);
             let cb = cached_action_code_base(ctx, cid);
             let digests = cached_signer_tokens(ctx, cid);
             let dbg = dbg_dopriv_enabled();
@@ -1147,8 +1156,10 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
                 eprintln!("[doPriv] ENTER action class={cls}");
             }
             push_privileged_frame_arc(cb, digests);
-            let result = ctx.invoke_virtual(action, "run", "()Ljava/lang/Object;", &[]);
+            let action_cur = ctx.read_native_pin(action_pin, action);
+            let result = ctx.invoke_virtual(action_cur, "run", "()Ljava/lang/Object;", &[]);
             pop_privileged_frame();
+            ctx.unpin_native_roots(action_pin);
             if dbg {
                 let cls = ctx.class_name_of_id(cid).unwrap_or_else(|| "?".to_string());
                 eprintln!("[doPriv] EXIT action class={cls} ok={}", result.is_ok());
@@ -1165,12 +1176,16 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
         "(Ljava/security/PrivilegedExceptionAction;)Ljava/lang/Object;",
         |ctx, args| {
             let action = obj_arg(args, 0)?;
-            let cid = ctx.class_id_of_object(action);
+            let action_pin = ctx.pin_native_root(action);
+            let action_cur = ctx.read_native_pin(action_pin, action);
+            let cid = ctx.class_id_of_object(action_cur);
             let cb = cached_action_code_base(ctx, cid);
             let digests = cached_signer_tokens(ctx, cid);
             push_privileged_frame_arc(cb, digests);
-            let result = ctx.invoke_virtual(action, "run", "()Ljava/lang/Object;", &[]);
+            let action_cur = ctx.read_native_pin(action_pin, action);
+            let result = ctx.invoke_virtual(action_cur, "run", "()Ljava/lang/Object;", &[]);
             pop_privileged_frame();
+            ctx.unpin_native_roots(action_pin);
             result
         },
     );
@@ -1184,12 +1199,16 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
         "(Ljava/security/PrivilegedAction;Ljava/security/AccessControlContext;)Ljava/lang/Object;",
         |ctx, args| {
             let action = obj_arg(args, 0)?;
-            let cid = ctx.class_id_of_object(action);
+            let action_pin = ctx.pin_native_root(action);
+            let action_cur = ctx.read_native_pin(action_pin, action);
+            let cid = ctx.class_id_of_object(action_cur);
             let cb = cached_action_code_base(ctx, cid);
             let digests = cached_signer_tokens(ctx, cid);
             push_privileged_frame_arc(cb, digests);
-            let result = ctx.invoke_virtual(action, "run", "()Ljava/lang/Object;", &[]);
+            let action_cur = ctx.read_native_pin(action_pin, action);
+            let result = ctx.invoke_virtual(action_cur, "run", "()Ljava/lang/Object;", &[]);
             pop_privileged_frame();
+            ctx.unpin_native_roots(action_pin);
             result
         },
     );
@@ -1587,6 +1606,11 @@ mod tests {
             &[Value::Object(Some(sm_obj))],
         );
         assert!(result.is_ok());
+        assert_eq!(
+            ctx.native_pin_count_for_test(),
+            0,
+            "doPrivileged must release its action root"
+        );
         assert!(result.unwrap().is_none());
     }
 
@@ -1822,6 +1846,11 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(Value::Int(42)));
+        assert_eq!(
+            ctx.native_pin_count_for_test(),
+            0,
+            "exception-action doPrivileged must release its action root"
+        );
     }
 
     #[test]
@@ -1851,6 +1880,11 @@ mod tests {
             &[Value::Object(Some(action)), Value::Object(Some(acc))],
         );
         assert!(result.is_ok());
+        assert_eq!(
+            ctx.native_pin_count_for_test(),
+            0,
+            "context overload must release its action root"
+        );
     }
 
     #[test]

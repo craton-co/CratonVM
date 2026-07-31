@@ -39,6 +39,7 @@ pub type SoaPool = Vec<(Vec<u64>, Vec<u8>)>;
 #[derive(Clone)]
 pub struct StringCaseCacheEntry {
     pub source: ObjectRef,
+    pub locale: Option<ObjectRef>,
     pub upper: bool,
     pub first: ObjectRef,
     pub second: ObjectRef,
@@ -49,9 +50,18 @@ pub struct StringCaseCacheEntry {
 pub struct JitHashMapStringNodeCacheEntry {
     pub map: ObjectRef,
     pub node: ObjectRef,
+    /// Exact String object passed to a HashMap or ConcurrentHashMap get. This
+    /// is rooted alongside the map/node pair and avoids content scans.
+    pub key_object: Option<ObjectRef>,
     pub key: String,
     pub mod_count_slot: usize,
     pub mod_count: i32,
+    /// `Some` selects the ConcurrentHashMap segment seqlock validity rule;
+    /// `None` retains the ordinary HashMap `modCount` rule above.
+    pub chm_generation: Option<u64>,
+    /// Stable identity hash of the CHM segment owning `node` when this is a
+    /// CHM entry. Storing the integer avoids a second GC root per cache entry.
+    pub chm_segment_id: Option<i32>,
 }
 
 // Pool size limits — prevent unbounded growth

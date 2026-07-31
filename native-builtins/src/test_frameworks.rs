@@ -1208,7 +1208,9 @@ fn native_bytebuddy_method_list_type_substituting_get(
         let method_description =
             method_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
         let visitor = visitor_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
-        ctx.new_object_initialized(
+        bytebuddy_new_near(
+            ctx,
+            this,
             "net/bytebuddy/description/method/MethodDescription$TypeSubstituting",
             "(Lnet/bytebuddy/description/type/TypeDescription$Generic;Lnet/bytebuddy/description/method/MethodDescription;Lnet/bytebuddy/description/type/TypeDescription$Generic$Visitor;)V",
             &[
@@ -1246,6 +1248,49 @@ fn native_bytebuddy_method_list_for_loaded_methods_size(
     result
 }
 
+/// Construct `class_name` in the loader namespace `receiver`'s own class lives
+/// in, rather than wherever a global by-name lookup happens to land.
+///
+/// Every one of these ByteBuddy shims re-implements a method that ByteBuddy
+/// would otherwise run as bytecode, and bytecode would have resolved the
+/// `new` through the DEFINING loader of the class holding it (JVMS 5.4.3.1).
+/// `new_object_initialized` takes only a name, so it resolved globally and
+/// returned the APPLICATION loader's copy no matter who called.
+///
+/// That is invisible until two loaders define ByteBuddy. Under Spring's
+/// `@CompileWithForkedClassLoader` they do, and the mixed object graph breaks
+/// on the first enum comparison: fork-loaded
+/// `MethodDescription$TypeSubstituting.getTypeVariables()` filters its list
+/// with `ofSort(Sort.VARIABLE)` against the FORK's `TypeDefinition$Sort`, while
+/// the app-loaded `MethodDescription$ForLoadedMethod` this helper used to
+/// return yields the APP's `Sort.VARIABLE`. Different enum constants of
+/// different Class objects, so the filter drops every type variable, the
+/// generic method looks non-generic, and ByteBuddy fails to attach `T` when it
+/// writes the access bridge:
+///
+///   IllegalArgumentException: Could not create type
+///     caused by: Cannot resolve T from ... ClassAssert$ByteBuddy$xxx
+///                                          .isInstanceOfSatisfying(?)
+///
+/// which is what made AssertJ's soft assertions unusable in Spring AOT replay
+/// (`BeanOverrideHandlerTests.forTestClassWith*`).
+///
+/// Falls back to the plain by-name construction when the receiver's own loader
+/// cannot resolve the name, which keeps single-loader runs byte-identical.
+fn bytebuddy_new_near(
+    ctx: &mut dyn NativeContext,
+    receiver: ObjectRef,
+    class_name: &str,
+    init_desc: &str,
+    init_args: &[Value],
+) -> MethodCallResult {
+    let near = ctx.class_id_of_object(receiver);
+    if let Ok(cid) = ctx.class_id_by_name_via_referencing_class(near, class_name) {
+        return ctx.new_object_initialized_with_class_id(cid, init_desc, init_args);
+    }
+    ctx.new_object_initialized(class_name, init_desc, init_args)
+}
+
 fn native_bytebuddy_method_list_for_loaded_methods_get(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1275,7 +1320,9 @@ fn native_bytebuddy_method_list_for_loaded_methods_get(
             let constructor_pin = constructor.map(|obj| (ctx.pin_native_root(obj), obj));
             let constructor =
                 constructor_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
-            return ctx.new_object_initialized(
+            return bytebuddy_new_near(
+                ctx,
+                this,
                 BYTEBUDDY_METHOD_DESCRIPTION_FOR_LOADED_CONSTRUCTOR,
                 "(Ljava/lang/reflect/Constructor;)V",
                 &[Value::Object(constructor)],
@@ -1286,7 +1333,9 @@ fn native_bytebuddy_method_list_for_loaded_methods_get(
         let method = bytebuddy_list_get_i32(ctx, methods, index - constructors_size)?;
         let method_pin = method.map(|obj| (ctx.pin_native_root(obj), obj));
         let method = method_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
-        ctx.new_object_initialized(
+        bytebuddy_new_near(
+            ctx,
+            this,
             BYTEBUDDY_METHOD_DESCRIPTION_FOR_LOADED_METHOD,
             "(Ljava/lang/reflect/Method;)V",
             &[Value::Object(method)],
@@ -1331,7 +1380,9 @@ fn native_bytebuddy_method_list_for_tokens_get(
         let declaring_type =
             declaring_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
         let token = token_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
-        ctx.new_object_initialized(
+        bytebuddy_new_near(
+            ctx,
+            this,
             "net/bytebuddy/description/method/MethodDescription$Latent",
             "(Lnet/bytebuddy/description/type/TypeDescription;Lnet/bytebuddy/description/method/MethodDescription$Token;)V",
             &[Value::Object(declaring_type), Value::Object(token)],
@@ -1390,7 +1441,9 @@ fn native_bytebuddy_field_list_for_tokens_get(
         let declaring_type =
             declaring_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
         let token = token_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
-        ctx.new_object_initialized(
+        bytebuddy_new_near(
+            ctx,
+            this,
             BYTEBUDDY_FIELD_DESCRIPTION_LATENT,
             "(Lnet/bytebuddy/description/type/TypeDescription;Lnet/bytebuddy/description/field/FieldDescription$Token;)V",
             &[Value::Object(declaring_type), Value::Object(token)],
@@ -1429,7 +1482,9 @@ fn native_bytebuddy_field_list_for_loaded_fields_get(
         let field = bytebuddy_list_get_i32(ctx, fields, index)?;
         let field_pin = field.map(|obj| (ctx.pin_native_root(obj), obj));
         let field = field_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
-        ctx.new_object_initialized(
+        bytebuddy_new_near(
+            ctx,
+            this,
             BYTEBUDDY_FIELD_DESCRIPTION_FOR_LOADED_FIELD,
             "(Ljava/lang/reflect/Field;)V",
             &[Value::Object(field)],
