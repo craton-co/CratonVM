@@ -3480,6 +3480,17 @@ fn windows_reset_wakeup_socket0_native(
 // Registration
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: unknown — needs census, and this function is the best
+// dead-registration candidate in the crate. Only 3 of the resolvable triples
+// are ACC_NATIVE in JDK 25; 28 name a CLASS that does not exist in the JDK 25
+// image at all (`sun.nio.ch.SelectorImpl` is not public API and the concrete
+// per-platform selectors differ by OS), and 9 more name a method the real class
+// does not declare. Under jdk-only-native-review.md rule 1 a registration whose
+// declaring class is absent is a compatibility shim, and under rule 5 one that
+// is never invoked is a dead registration to delete outright. Which of the two
+// applies is exactly what `invocations` answers. Do not delete on the class
+// -absent signal alone: the class set is JDK- and OS-dependent, and this audit
+// measured one image (JDK 25 on Windows) out of the declared 17/21/25 matrix.
 /// Register all `Selector` / `SelectionKey` / `SelectableChannel` natives
 /// at the JDK's canonical FQN strings. This is the single entry point
 /// `lib.rs` calls at boot.

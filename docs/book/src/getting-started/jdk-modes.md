@@ -8,8 +8,8 @@ behavior and coverage.
 
 | Mode | When it's used | What provides the standard library |
 |------|----------------|------------------------------------|
-| **Real JDK** | Default whenever a JDK is detected on the host | Real `java.base` bytecode loaded from the JDK's `java.base.jmod` (or `lib/modules` on a jlink image), backed by CratonVM's native methods |
-| **Synthetic** | Default when no JDK is detected, or forced with `--synthetic-jdk` | CratonVM's own Rust implementations of standard-library classes — no JDK required |
+| **Real JDK** | The `cratonvm` launcher default, or `--real-jdk` | Real `java.base` bytecode loaded from the JDK's `java.base.jmod` (or `lib/modules` on a jlink image), backed by CratonVM's native methods |
+| **Synthetic** | `--synthetic-jdk`, and the in-process embedding default | CratonVM's own Rust implementations of standard-library classes — no JDK required |
 
 In **real-JDK mode**, CratonVM loads the actual JDK class files and runs their
 bytecode, supplying the underlying `native` methods (the ones HotSpot would
@@ -23,20 +23,26 @@ comparing the two backends side by side.
 
 ## How the mode is chosen
 
-At startup the launcher probes the host for a real JDK. It looks, in order, at:
+The mode comes from an explicit flag (`--real-jdk` / `--synthetic-jdk`) or from
+a **fixed default** — never from what the host happens to have installed. The
+`cratonvm` launcher defaults to real-JDK; the in-process library default
+(`VmConfig::default()`) stays synthetic so hermetic tests and embedders that
+ship no JDK do not start resolving JMODs from the build machine's JDK.
+
+Once real-JDK mode is selected, the launcher searches for the installation to
+boot from, in order:
 
 1. The `--java-home` flag, if given.
 2. The `CRATONVM_JAVA_HOME` environment variable.
 3. The `JAVA_HOME` environment variable.
 4. A `java` executable on your `PATH`.
 
-If it finds a JDK containing `jmods/java.base.jmod` (or `lib/modules`), it boots
-in **real-JDK mode** from that JDK. Otherwise it falls back to **synthetic
-mode**.
-
-> The library default (the in-process `VmConfig::default()`) keeps synthetic
-> mode on for hermetic tests, but the `cratonvm` **launcher** flips to real-JDK
-> mode automatically whenever it detects a JDK on the host.
+It needs a JDK containing `jmods/java.base.jmod` (or `lib/modules`). If it finds
+none, the launch **fails** with a message naming everything it searched — it
+does not silently substitute the synthetic library, because a run whose standard
+library was chosen by the host is neither reproducible nor reportable. The same
+applies in reverse: `--synthetic-jdk` on a binary built without the
+`synthetic-jdk` Cargo feature is an error, not a downgrade.
 
 ## Forcing a mode
 
@@ -47,7 +53,8 @@ comparison):
 cratonvm --synthetic-jdk --classpath . HelloWorld
 ```
 
-`--synthetic-jdk` wins over `--java-home`.
+`--synthetic-jdk` wins over `--java-home`, and conflicts with both `--real-jdk`
+and `--jdk-only`.
 
 **Point at a specific JDK** for the boot/ext class path and JMOD loading:
 
@@ -65,14 +72,17 @@ CRATONVM_JAVA_HOME=/path/to/jdk-25 cratonvm --classpath . HelloWorld
 
 ## Which mode should I use?
 
-- **For maximum compatibility**, run in real-JDK mode (the default when a JDK is
-  installed). You get the real standard-library bytecode.
-- **For a self-contained binary** with no JDK dependency, rely on synthetic mode
-  (it activates automatically when no JDK is found) or force it with
-  `--synthetic-jdk`.
+- **For maximum compatibility**, run in real-JDK mode (the launcher default).
+  You get the real standard-library bytecode.
+- **For a self-contained binary** with no JDK dependency, force synthetic mode
+  with `--synthetic-jdk`, on a build compiled with the `synthetic-jdk` feature.
 
 Real-JDK mode is the project's primary direction; synthetic implementations are
 the standalone fallback and a tool for differential testing. Coverage and a few
 behavior switches differ between the two — see [Standard Library
 Coverage](../java-support/standard-library.md) and
 [Configuration](../user-guide/configuration.md).
+
+There is a third choice on top of the library selection: whether the VM may
+substitute for what the library does not provide. `--jdk-only` says it may not.
+See [JDK-Only Mode](../user-guide/jdk-only-mode.md).

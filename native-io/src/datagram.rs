@@ -407,6 +407,14 @@ fn dgram_unblock(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// `register_datagram_channel`, over `ctx.fd_table()`. This module registers
 /// only what that family does not cover, and resolves the channel through the
 /// same `dc_fd` — see the module doc for the registry split this replaced.
+// JDK-ONLY-CLASSIFY: unknown — needs census. Small function, but every one of
+// its resolvable triples targets an ABSTRACT method of
+// `java.nio.channels.DatagramChannel` (4) or a method absent from the real
+// class (1); none is ACC_NATIVE in JDK 25. Multicast join/leave IS a syscall,
+// so the behaviour is bridge-shaped, yet it is registered on the abstract
+// public API rather than on `sun.nio.ch.DatagramChannelImpl`, so the tag here
+// governs dispatch for any DatagramChannel subclass. Evidence needed: receiver
+// classes seen at dispatch.
 pub fn register_datagram_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
