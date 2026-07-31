@@ -153,156 +153,124 @@ jobs:
       - name: Test native-builtins (synthetic-jdk)
         run: cargo test -p cratonvm-native-builtins --lib --features synthetic-jdk
 
-      # ADVISORY, with a measurement rather than a guess.
+      # BLOCKING as of 2026-07-31. Promoted from advisory; the measurement
+      # trail is below because the numbers are the whole argument.
       #
-      # Both aborts are FIXED (2026-07-30/31) and the run now reports reliably:
-      # eleven consecutive full runs reached a `test result` line with no
-      # access violation. Measured on Windows, JDK 25:
+      #   before  reported 2584 of 3927 (2523 pass, 61 fail), then exit 1 with
+      #           NO `test result` line — 1,343 tests never executed, so "61"
+      #           was never the failure count.
+      #   then    173 failures, once the run could finish at all.
+      #   now     0 failed, on BOTH platforms: Windows 3825 passed / 0 failed,
+      #           Linux 3826 passed / 0 failed (exit 0). The one-test delta is
+      #           a cfg(unix)/cfg(not(unix)) pair, not a skipped test.
       #
-      #   before   reported 2584 of 3927 (2523 pass, 61 fail), then exit 1 with
-      #            NO `test result` line — 1,343 tests never executed
-      #   now      test result: FAILED. 3763 passed; 60 failed; 115 ignored
-      #            (3763+60+115 = 3938, every test accounted for, exit 101)
+      # The 61 was a floor twice over. Two process-global caches held heap
+      # addresses without scoping them to the VM that produced them, which
+      # `NativeContext::vm_identity`'s own doc comment forbids:
+      # `native-collections`' `widened_obj_key` aliased two VMs' collections
+      # onto one overlay slot, and `logmanager`/`logging_shims` did the same
+      # across ten tables. Both aborted the process mid-run.
       #
-      # So 61 was a floor twice over: the real total was 173, now down to 60.
+      # WHY THE FAILURES WERE WORTH FIXING RATHER THAN DELETING
       #
-      # The count moves by +/-1 between runs: `p86_chm_concurrent_iteration`
-      # passes in isolation AND within a `p86_` filtered run, but fails under
-      # full-suite load. A load-dependent flake like that would make the
-      # promoted gate red intermittently, so it needs fixing before promotion
-      # regardless of where the total lands.
-      # Measured AFTER merging origin/dev (140 commits; the merge added 12
-      # tests, hence 3938 rather than 3926).
+      # A large share were real defects that silently corrupted real programs:
+      #   * `Signature.verify` accepted a signature made with a DIFFERENT key.
+      #     The phase53 KeyPairGenerator/Signature stubs shadowed the complete
+      #     `jca` implementations and minted 1-field keys carrying no key_id,
+      #     while the real-crypto dispatch sat behind a default-off cfg — so
+      #     sign/verify degraded to an HMAC over empty key bytes and every key
+      #     produced the same signature.
+      #   * `Cleaner.register` built a Cleanable and dropped it on the floor.
+      #   * `Unsafe.allocateMemory` read the receiver as its size argument,
+      #     returned 0, and leaked every block (freeMemory early-returns on 0).
+      #   * `Collectors.minBy` returned a Map; `teeing` discarded all three of
+      #     its arguments; `averaging*`/`summing*` returned an ArrayList.
+      #   * `SECONDS.toNanos(1)` returned 1 — the TimeUnit ordinal was written
+      #     by name and read from slot 0.
+      #   * `ServerSocketChannel.bind`'s covariant-return descriptor was still
+      #     owned by a stale synthetic, so `accept()` never saw the listener.
       #
-      # NOTE when re-measuring: the test binary's hash changes whenever the
-      # dependency graph does, so `target/debug/deps/cratonvm_vm-<hash>.exe`
-      # is NOT a stable path. Take it from `cargo test --no-run`'s
-      # "Executable unittests" line; running a hardcoded path silently
-      # measured a pre-merge build here once.
-      # Runtime is ~20 min, from 56 (`call_native` no longer rebuilds the whole
-      # ~3,000-entry native registry on each of its ~10,000 calls).
+      # FOUR of the bugs had the SAME structural cause: one JDK method
+      # registered in two places, where `register` is last-wins
+      # (`native-api/src/registry.rs`, "last-registration-wins") and the LATER,
+      # WORSE copy won. TimeUnit, MutableCallSite.setTarget, KeyPairGenerator/
+      # Signature, and Locale.getDefault. Before concluding any native behaves
+      # as its source reads, grep for a second registration and check which
+      # file registers last.
       #
-      # Both aborts were the same defect class — a process-global cache holding
-      # heap addresses without scoping them to the VM that produced them, which
-      # `NativeContext::vm_identity`'s own doc comment forbids and ~20
-      # `native-builtins` call sites already respect. `native-collections`'
-      # `widened_obj_key` aliased two VMs' collections onto one overlay slot
-      # (every test receiver is `ClassId::new(0)`, so its class-id disambiguator
-      # could not tell them apart) and handed one VM an `ObjectRef` into
-      # another's heap. `logmanager`/`logging_shims` did the same across ten
-      # tables, killing ~2 of every 3 runs in `logging_extras_p71` and feeding
-      # foreign addresses to the GC root scan. Both are now VM-scoped.
+      # Tests were corrected — not deleted — where they pinned wrong behaviour
+      # as contract, each with the citation that made the VM right: interrupt
+      # CLEARS the flag (JLS 17.2.1); `Deflater.finished()` is set by
+      # `deflate()`, not `finish()` (asserting otherwise makes the canonical
+      # drain loop emit zero bytes); `publicLookup()` is UNCONDITIONAL 0x20
+      # (JDK 25 source — 0x21 is unreachable); a proxy is `jdk/proxy1/$Proxy0`,
+      # and pinning the old `Proxy$Instance` name would have locked the VM to
+      # its own fallback path.
       #
-      # TWO things still block promotion. Both are measured:
+      # LOAD-SENSITIVE FLAKES — the reason this can be blocking at all
       #
-      #  1. 60 failing tests. The systemic causes are exhausted. The tail is
-      #     individual, and a chunk of it is NOT missing work — it is work that
-      #     was deliberately UNDONE, so "implementing" it would be a regression:
-      #       * `java/util/Timer` — the synthetic natives were deleted because
-      #         `schedule`/`scheduleAtFixedRate` were no-ops while real JDK
-      #         bytecode spins a TimerThread that actually fires tasks. See the
-      #         no-op `register_timer_natives` and its comment.
-      #       * `java/text/SimpleDateFormat` — same, per
-      #         `register_number_format_natives`.
-      #       * `CopyOnWriteArrayList.<init>` and the synthetic AQS/socket
-      #         constructors — dropped so real bytecode initialises the object.
-      #     `timer_basic` / `simple_date_format_basics_p57` /
-      #     `copy_on_write_arraylist_basic` assert the removed contract and
-      #     cannot pass without reintroducing the bug the removal fixed. They
-      #     need deleting or re-targeting — a coverage decision, not a fix.
-      #     Genuinely-absent APIs that WOULD be real work: `GZIPInputStream`,
-      #     `GZIPOutputStream`, `java/net/URL`'s constructors. (`StringReader`
-      #     and `StringWriter` turned out to exist in `cratonvm-native-io` all
-      #     along; the test just built a registry that could not see them.)
+      # Twelve tests asserted fixed wall-clock bounds. They pass idle and fail
+      # under load, which is precisely what makes a promoted gate go red at
+      # random — worse than no gate, because it teaches people to ignore CI.
+      # All twelve now assert invariants instead. Measured on a 16-core Linux
+      # box under CPU burners plus concurrent suite loops:
+      #   p86_interrupt_unblocks_monitor_wait  40/800 red -> 0/1224
+      #   t19_k1 family (8 tests)              11/140 red -> 0/250
+      #   wakeup_reschedule_supersedes_stale   12/380 red -> 0/700
+      #   p86_chm_concurrent_iteration          1/60  red -> 0/702
       #
-      #     Two VM defects worth their own fix, both diagnosed but not fixed:
-      #       * Synthetic classes have NO named fields (`ensure_synthetic_class`
-      #         mints unnamed slots), and `write_throwable_field_cached`
-      #         resolves `cause` BY NAME — so on a synthetic Throwable the slot
-      #         write is skipped and the by-name write silently drops. No field
-      #         count fixes it; it needs named synthetic fields or a slot
-      #         fallback that does not disturb the real-JDK path.
-      #         (`throwable_init_cause_sets_cause` and the `p93_*` pair.)
-      #     (The `hashmap_compute` family is FIXED, and worth reading as a
-      #     cautionary tale: I diagnosed it twice as a lambda SAM-to-impl arity
-      #     mismatch and was wrong both times. All four simply returned a BOXED
-      #     result — the SAM returns `Ljava/lang/Object;`, so an `int` from the
-      #     implementation is boxed on the way out — while the tests asserted a
-      #     raw `Value::Int`. Printing the actual value in the assertion
-      #     settled in one run what two rounds of reading the dispatcher had
-      #     got backwards.)
+      # Two traps worth knowing before touching these again:
+      #   * A LOWER bound (`elapsed >= X`) is NOT the safe direction here.
+      #     These tests sample `start` AFTER spawning, so under load the sleeps
+      #     finish before the clock starts: `must wait for slowest: 134.294µs`.
+      #   * `t19_k1_deadline_exits_before_all_joined` measured NOTHING — five
+      #     30ms sleepers run concurrently, so on an idle box all finish at
+      #     ~30ms and the 60ms deadline never fires. A green fixed-bound timing
+      #     test may simply not be exercising its subject.
+      # The durable fix in every case: poll under a generous ceiling, and
+      # assert a state readout (a submission counter, a joined count, a
+      # completion flag) that has no timing dependence at all.
       #
-      #     One REAL VM defect found while triaging, not yet fixed:
-      #     `java/security/KeyPairGenerator.generateKeyPair` is registered
-      #     TWICE — the real JCA implementation in `jca/key_factory.rs`
-      #     (reached from lib.rs:18038) and a legacy stub in
-      #     `phases_early::register_phase53_security` (reached from
-      #     lib.rs:22648). The stub registers LAST and therefore WINS, so every
-      #     caller gets 1-field keys holding an empty byte array instead of the
-      #     JCA keys carrying algorithm and size. That is the
-      #     synthetic-stub-shadows-real-implementation hazard, in production
-      #     code and not only in tests (`m22_rsa_keygen`, `m22_ecdsa_keygen`,
-      #     `m22_rsa_sign_into_buffer`, `m22_ecdsa_different_keys_fail_verify`
-      #     are the symptom). Fixing it means retiring the whole phase53
-      #     KeyPairGenerator block so JCA owns the class — its `initialize`
-      #     writes a side table the JCA `generateKeyPair` reads, so removing
-      #     only the one registration would leave the two halves mismatched.
-      #     ATTEMPTED AND REVERTED: removing the phase53 KeyPairGenerator block
-      #     so JCA owns the class made things WORSE — 4 m22 failures became 7.
-      #     phase53's `java/security/Signature` block is coupled to the stub's
-      #     key layout, so JCA keys flowing into phase53 signing broke two
-      #     roundtrip tests that had been passing. The two blocks are a matched
-      #     pair: retiring one means retiring both, and verifying the result
-      #     against the crypto suites, not just these unit tests.
+      # RUNTIME AND THE TIMEOUT
       #
-      #     The rest
-      #     is ~38 individual `assertion left == right` divergences plus
-      #     singles; a few are genuine VM bugs worth their own fix, notably
-      #     `g67_fork_increments_completed_count` hitting a live
-      #     `unreachable!("self_arc is set during Vm::new")`.
+      # 873s on a 16-core Linux box, 1007s on Windows, and run-to-run variance
+      # is large — the same Linux suite measured 565s and 873s, and the sibling
+      # native-builtins suite 342s and 698s, all on identical code. A CI runner
+      # has fewer cores than either box, so assume slower still. The suite is
+      # genuinely more expensive than it
+      # was: it now performs real RSA keygen, real zlib deflate/inflate and
+      # real socket binds where it previously hit instant stubs. The 20-minute
+      # cap was set when this step was advisory and a timeout cost nothing;
+      # now a timeout would produce NO `test result` line at all — the exact
+      # failure this work removed. Raised to 40, which is headroom over the
+      # slowest observed run on a smaller runner, not a licence to grow.
       #
-      #     `real_jdk_hello_world_e2e` deserves its own look rather than a
-      #     threshold bump: it asserts that real-JDK mode registers < 2700
-      #     natives (so real bytecode runs instead of stubs) and observes
-      #     10,923. That is ~4x over and PRE-DATES this work — it read 10,900
-      #     before any of it. Whether the constant is stale or the real-JDK
-      #     registration set has genuinely grown is unresolved; bumping the
-      #     number would destroy the signal either way. Note the +23 is this
-      #     branch's `java.util.Locale` additions, which land in
-      #     `locale_bootstrap::register` and so count in both modes.
+      # ONE KNOWN NON-REPRODUCING FAILURE, deliberately not "fixed":
+      # `m22_rsa_sign_into_buffer` was reported red once and then passed 646
+      # consecutive runs under load, with no timing surface in the test or in
+      # `crypto_impl` and cross-VM aliasing ruled out (`vm_identity` is a
+      # never-reused counter). Most likely a shared-`target/` rebuild swapping
+      # the binary mid-run. If it recurs the panic text discriminates:
+      # "sign into buffer should write bytes" means `sign_dispatch` returned
+      # Err and `sig_sign_into` swallowed it via `.unwrap_or_default()`
+      # (`jca/signature.rs`) — a real VM bug worth escalating.
       #
-      #     One deliberately NOT done: `iterable_for_each` wants a native on
-      #     `java/lang/Iterable.forEach`, which looks like a one-line
-      #     registration pointing at the existing `native_al_for_each`. A native
-      #     on a supertype that broad intercepts every implementing class, so it
-      #     would shadow real user `forEach` implementations to make one test
-      #     pass. It needs a narrower mechanism.
+      # WHEN THIS STEP GOES RED
       #
-      #  2. Linux is unverified. Every number above is Windows; this job runs on
-      #     ubuntu-latest. The abort fixes are logic bugs in shared code so they
-      #     carry over, but platform-specific expectations exist in BOTH
-      #     directions — `string_format_percent_n_and_percent` hardcoded "\n"
-      #     for `%n`, which is `System.lineSeparator()`, so it passed on the CI
-      #     runner and failed on every Windows dev box until it was made
-      #     platform-honest. Assume some of the 102 are Windows-only and some
-      #     Linux-only until a Linux run says otherwise.
+      # Note `cargo check -p <crate>` builds the LIB ONLY — a crate's tests are
+      # a separate target. Checking just the lib once let a broken
+      # native-builtins test build through unnoticed; use --all-targets. And
+      # check BOTH feature configurations: every check during this work passed
+      # `--features synthetic-jdk`, which is why an ungated call into a
+      # `#[cfg(feature = "synthetic-jdk")]` module broke the DEFAULT build —
+      # i.e. the blocking `cargo test --workspace` job — and went unnoticed for
+      # a full session.
       #
-      # Sibling suites were re-run after these changes, because the per-VM
-      # signature change reaches crates the BLOCKING step above covers:
-      # native-builtins 3314 pass / 0 fail, native-collections 92/0, jfr 303/0.
-      # Note `cargo check -p <crate>` builds the lib only — a crate's tests are
-      # a separate target, and checking just the lib once let a broken
-      # native-builtins test build through unnoticed. Use --all-targets.
-      #
-      # The `cargo check --all-targets` step above is what is blocking, and it
-      # is what stops the module silently rotting out of compilability again —
-      # the failure mode that cost this repository 1,522 tests once already.
-      #
-      # To promote this: drive the failures to zero, confirm a clean
-      # `test result` line on Linux, then drop `continue-on-error`.
-      - name: Test vm (synthetic-jdk, advisory — see comment)
-        continue-on-error: true
-        timeout-minutes: 20
+      # The sibling `cargo check --all-targets` step above stays blocking too:
+      # it is what stops this module silently rotting out of compilability, the
+      # failure mode that cost this repository 1,522 tests once already.
+      - name: Test vm (synthetic-jdk)
+        timeout-minutes: 40
         run: cargo test -p cratonvm-vm --lib --features synthetic-jdk
 
   # The `experimental-*` features and `zgc` left the default set, so an ordinary
