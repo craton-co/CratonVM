@@ -3578,18 +3578,24 @@ fn native_antlr_parser_compute_reach_set(
         let Some(config) = antlr_config_set_at(&mut *scope, closure_set, index) else {
             continue;
         };
-        let config_h = scope.root(config);
         let Some(state) = antlr_ref_field(&mut *scope, config, "state", 0) else {
             continue;
         };
 
         if antlr_state_is_rule_stop(&mut *scope, state) {
             if full_ctx || token == -1 {
-                skipped_stop_states.push(config_h);
+                // Only the skipped stop-state configs outlive this loop, so
+                // only they take a root in the enclosing scope.
+                skipped_stop_states.push(scope.root(config));
             }
             continue;
         }
 
+        // Everything below lives for one closure-set entry; nest a scope so
+        // the per-entry roots are released as the walk advances instead of
+        // accumulating one per config.
+        let mut scope = NativeHandleScope::new(&mut *scope);
+        let config_h = scope.root(config);
         let count_args = [Value::Object(Some(state))];
         let transition_count =
             match native_antlr_atn_state_get_number_of_transitions(&mut *scope, &count_args)? {
@@ -4094,15 +4100,22 @@ fn antlr_atn_config_set_add_impl(
 
     let this = scope.get(&this_h);
     let config = scope.get(&config_h);
-    let existing_raw = if let Some(lookup) = antlr_ref_field(&mut *scope, this, "configLookup", 1)
-    {
-        antlr_config_lookup_get_or_add(&mut *scope, lookup, config)?
+    // `Some(_)` = an existing entry; `None` = "use `config` itself", which has
+    // to be re-read afterwards because the lookup/find above can collect.
+    let found = if let Some(lookup) = antlr_ref_field(&mut *scope, this, "configLookup", 1) {
+        Some(antlr_config_lookup_get_or_add(&mut *scope, lookup, config)?)
     } else if let Some(configs) = antlr_ref_field(&mut *scope, this, "configs", 2) {
-        antlr_config_list_find(&mut *scope, configs, config)?.unwrap_or(config)
+        antlr_config_list_find(&mut *scope, configs, config)?
     } else {
-        config
+        None
     };
-    let existing_h = scope.root(existing_raw);
+    let existing_h = match found {
+        Some(existing) => scope.root(existing),
+        None => {
+            let config = scope.get(&config_h);
+            scope.root(config)
+        }
+    };
 
     let this = scope.get(&this_h);
     let config = scope.get(&config_h);
@@ -5546,7 +5559,7 @@ fn antlr_merge_arrays(
         return Ok(previous);
     }
 
-    let (a, b, mut merge_cache) = roots!();
+    let (a, b, _) = roots!();
     let a_states = antlr_array_states(&mut *scope, a);
     let b_states = antlr_array_states(&mut *scope, b);
     // Both parent arrays are walked while the merge recursion allocates, so
@@ -5589,20 +5602,24 @@ fn antlr_merge_arrays(
                 merged_states.push(payload);
             } else {
                 let merged_parent = match (a_parent, b_parent) {
-                    (Some(pa), Some(pb)) => Some(antlr_merge_contexts(
-                        &mut *scope,
-                        pa,
-                        pb,
-                        root_is_wildcard,
-                        merge_cache,
-                    )?),
+                    (Some(pa), Some(pb)) => {
+                        // Re-read the cache immediately before the recursive
+                        // merge: an earlier iteration's merge may have moved it.
+                        let (_, _, merge_cache) = roots!();
+                        Some(antlr_merge_contexts(
+                            &mut *scope,
+                            pa,
+                            pb,
+                            root_is_wildcard,
+                            merge_cache,
+                        )?)
+                    }
                     (Some(pa), None) => Some(pa),
                     (None, Some(pb)) => Some(pb),
                     (None, None) => None,
                 };
                 merged_parents.push(merged_parent.map(|parent| scope.root(parent)));
                 merged_states.push(payload);
-                (_, _, merge_cache) = roots!();
             }
             i += 1;
             j += 1;
