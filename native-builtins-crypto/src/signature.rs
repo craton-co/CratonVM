@@ -161,31 +161,263 @@ pub fn verify_rsa_pkcs1_v15(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    use crate::failure::{INVALID_KEY_EXCEPTION, SIGNATURE_EXCEPTION};
     use rsa::pkcs1v15::SigningKey;
     use rsa::rand_core::OsRng;
     use rsa::signature::{SignatureEncoding, Signer};
     use rsa::traits::PublicKeyParts;
 
-    #[test]
-    fn valid_and_tampered_sha256_signatures_are_distinguished() {
+    /// One 1024-bit key + a SHA-256 signature over `msg`, reused by the cases
+    /// below (RSA keygen is the expensive part of this test module).
+    fn fixture(msg: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let private = rsa::RsaPrivateKey::new(&mut OsRng, 1024).expect("test key");
         let public = private.to_public_key();
         let signer = SigningKey::<Sha256>::new(private);
-        let sig = signer.sign(b"shared verifier").to_vec();
+        let sig = signer.sign(msg).to_vec();
+        (
+            public.n().to_bytes_be(),
+            public.e().to_bytes_be(),
+            sig,
+        )
+    }
+
+    // ---- supported algorithm succeeds; genuine mismatch stays a `false` ----
+
+    #[test]
+    fn valid_and_tampered_sha256_signatures_are_distinguished() {
+        let (n, e, sig) = fixture(b"shared verifier");
         assert!(verify_rsa_pkcs1_v15(
-            &public.n().to_bytes_be(),
-            &public.e().to_bytes_be(),
+            &n,
+            &e,
             DigestAlgorithm::Sha256,
             b"shared verifier",
             &sig,
         ));
         assert!(!verify_rsa_pkcs1_v15(
-            &public.n().to_bytes_be(),
-            &public.e().to_bytes_be(),
+            &n,
+            &e,
             DigestAlgorithm::Sha256,
             b"tampered",
             &sig,
+        ));
+    }
+
+    /// The single most important property in this file: a signature that is
+    /// well-formed but simply does not match the message is a **legitimate
+    /// negative security decision**. It must stay `Ok(false)` and must NOT be
+    /// promoted to an exception, or every caller that legitimately expects to
+    /// be told "no" starts seeing errors instead.
+    #[test]
+    fn genuine_mismatch_is_ok_false_not_an_error() {
+        let (n, e, sig) = fixture(b"the real message");
+        assert_eq!(
+            verify_rsa_pkcs1_v15_checked(&n, &e, DigestAlgorithm::Sha256, b"the real message", &sig),
+            Ok(true)
+        );
+        let mismatch =
+            verify_rsa_pkcs1_v15_checked(&n, &e, DigestAlgorithm::Sha256, b"a different message", &sig);
+        assert_eq!(
+            mismatch,
+            Ok(false),
+            "a real digest mismatch must remain a false, not become an exception"
+        );
+    }
+
+    /// A signature of the right length whose *bits* are garbage is still a
+    /// genuine negative (bad padding is what a forged signature looks like),
+    /// not a malformed-encoding error.
+    #[test]
+    fn corrupt_signature_bits_are_ok_false() {
+        let (n, e, mut sig) = fixture(b"payload");
+        sig[0] ^= 0xff;
+        assert_eq!(
+            verify_rsa_pkcs1_v15_checked(&n, &e, DigestAlgorithm::Sha256, b"payload", &sig),
+            Ok(false)
+        );
+    }
+
+    /// Every supported digest round-trips. Guards against a future edit that
+    /// wires one variant to the wrong hash — which would show up as a silent
+    /// verification failure rather than as an error.
+    #[test]
+    fn every_supported_digest_verifies_its_own_signature() {
+        let private = rsa::RsaPrivateKey::new(&mut OsRng, 1024).expect("test key");
+        let public = private.to_public_key();
+        let (n, e) = (public.n().to_bytes_be(), public.e().to_bytes_be());
+        let msg = b"multi-digest";
+
+        let cases: Vec<(DigestAlgorithm, Vec<u8>)> = vec![
+            (
+                DigestAlgorithm::Sha1,
+                SigningKey::<Sha1>::new(private.clone()).sign(msg).to_vec(),
+            ),
+            (
+                DigestAlgorithm::Sha256,
+                SigningKey::<Sha256>::new(private.clone()).sign(msg).to_vec(),
+            ),
+            (
+                DigestAlgorithm::Sha384,
+                SigningKey::<Sha384>::new(private.clone()).sign(msg).to_vec(),
+            ),
+            (
+                DigestAlgorithm::Sha512,
+                SigningKey::<Sha512>::new(private.clone()).sign(msg).to_vec(),
+            ),
+        ];
+        for (alg, sig) in cases {
+            assert_eq!(
+                verify_rsa_pkcs1_v15_checked(&n, &e, alg, msg, &sig),
+                Ok(true),
+                "digest {alg:?} failed to verify its own signature"
+            );
+        }
+    }
+
+    // ---- malformed key RAISES rather than returning `false` ----
+
+    fn assert_raises(result: CryptoResult<bool>, java_class: &str, what: &str) {
+        match result {
+            Err(e) => assert_eq!(e.java_class(), java_class, "{what}: wrong exception type"),
+            Ok(v) => panic!("{what}: returned Ok({v}) instead of raising {java_class}"),
+        }
+    }
+
+    #[test]
+    fn empty_modulus_raises_invalid_key() {
+        let (_, e, sig) = fixture(b"m");
+        assert_raises(
+            verify_rsa_pkcs1_v15_checked(&[], &e, DigestAlgorithm::Sha256, b"m", &sig),
+            INVALID_KEY_EXCEPTION,
+            "empty modulus",
+        );
+    }
+
+    #[test]
+    fn zero_modulus_raises_invalid_key() {
+        let (_, e, sig) = fixture(b"m");
+        assert_raises(
+            verify_rsa_pkcs1_v15_checked(&[0u8; 128], &e, DigestAlgorithm::Sha256, b"m", &sig),
+            INVALID_KEY_EXCEPTION,
+            "all-zero modulus",
+        );
+    }
+
+    #[test]
+    fn empty_or_zero_exponent_raises_invalid_key() {
+        let (n, _, sig) = fixture(b"m");
+        assert_raises(
+            verify_rsa_pkcs1_v15_checked(&n, &[], DigestAlgorithm::Sha256, b"m", &sig),
+            INVALID_KEY_EXCEPTION,
+            "empty exponent",
+        );
+        assert_raises(
+            verify_rsa_pkcs1_v15_checked(&n, &[0, 0, 0], DigestAlgorithm::Sha256, b"m", &sig),
+            INVALID_KEY_EXCEPTION,
+            "zero exponent",
+        );
+    }
+
+    #[test]
+    fn even_exponent_raises_invalid_key() {
+        let (n, _, sig) = fixture(b"m");
+        // e = 4 is even; RFC 8017 requires an odd public exponent.
+        assert_raises(
+            verify_rsa_pkcs1_v15_checked(&n, &[4], DigestAlgorithm::Sha256, b"m", &sig),
+            INVALID_KEY_EXCEPTION,
+            "even exponent",
+        );
+    }
+
+    /// The case that motivated this whole change: `RsaPublicKey::new` caps the
+    /// modulus at 4096 bits, so a **legitimate** larger key is rejected by the
+    /// backend. The old code reported that as `false` — "the signature did not
+    /// verify" — when in truth nothing was ever checked.
+    #[test]
+    fn oversized_but_legitimate_modulus_raises_invalid_key_not_false() {
+        let (_, e, sig) = fixture(b"m");
+        // 5001-bit odd modulus: past RsaPublicKey::MAX_SIZE (4096 bits).
+        let big = (BigUint::from(1u8) << 5000u32) + BigUint::from(1u8);
+        assert_raises(
+            verify_rsa_pkcs1_v15_checked(
+                &big.to_bytes_be(),
+                &e,
+                DigestAlgorithm::Sha256,
+                b"m",
+                &sig,
+            ),
+            INVALID_KEY_EXCEPTION,
+            "modulus over MAX_SIZE",
+        );
+    }
+
+    // ---- malformed signature encoding RAISES ----
+
+    #[test]
+    fn empty_signature_raises_signature_exception() {
+        let (n, e, _) = fixture(b"m");
+        assert_raises(
+            verify_rsa_pkcs1_v15_checked(&n, &e, DigestAlgorithm::Sha256, b"m", &[]),
+            SIGNATURE_EXCEPTION,
+            "empty signature",
+        );
+    }
+
+    #[test]
+    fn wrong_length_signature_raises_signature_exception() {
+        let (n, e, sig) = fixture(b"m");
+        let short = &sig[..sig.len() - 1];
+        assert_raises(
+            verify_rsa_pkcs1_v15_checked(&n, &e, DigestAlgorithm::Sha256, b"m", short),
+            SIGNATURE_EXCEPTION,
+            "truncated signature",
+        );
+        let mut long = sig.clone();
+        long.push(0);
+        assert_raises(
+            verify_rsa_pkcs1_v15_checked(&n, &e, DigestAlgorithm::Sha256, b"m", &long),
+            SIGNATURE_EXCEPTION,
+            "over-long signature",
+        );
+    }
+
+    // ---- the legacy bool wrapper is fail-closed ----
+
+    /// Every raising condition must collapse to `false`, never `true`, in the
+    /// compatibility wrapper. This is what makes the un-migrated signed-JAR
+    /// caller safe (if ambiguous) today.
+    #[test]
+    fn bool_wrapper_is_fail_closed_on_every_error_path() {
+        let (n, e, sig) = fixture(b"m");
+        let big = (BigUint::from(1u8) << 5000u32) + BigUint::from(1u8);
+        let cases: Vec<(&str, Vec<u8>, Vec<u8>, Vec<u8>)> = vec![
+            ("empty modulus", vec![], e.clone(), sig.clone()),
+            ("zero exponent", n.clone(), vec![0], sig.clone()),
+            ("even exponent", n.clone(), vec![4], sig.clone()),
+            ("huge modulus", big.to_bytes_be(), e.clone(), sig.clone()),
+            ("empty signature", n.clone(), e.clone(), vec![]),
+            (
+                "short signature",
+                n.clone(),
+                e.clone(),
+                sig[..sig.len() - 1].to_vec(),
+            ),
+        ];
+        for (what, nn, ee, ss) in cases {
+            assert!(
+                !verify_rsa_pkcs1_v15(&nn, &ee, DigestAlgorithm::Sha256, b"m", &ss),
+                "{what}: bool wrapper must fail closed"
+            );
+        }
+        // ...and it still returns true for the one case that deserves it.
+        assert!(verify_rsa_pkcs1_v15(
+            &n,
+            &e,
+            DigestAlgorithm::Sha256,
+            b"m",
+            &sig
         ));
     }
 }
