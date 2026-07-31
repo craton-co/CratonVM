@@ -401,3 +401,46 @@ TIMEOUT=600 bash rerun.sh gated_subset.txt gated`. Single class:
 -Dcraton.batch=1 CratonRunner <listfile> <idx>`. Per-class diagnostics: `CRATONVM_DBG_NSME=1`
 (dispatch class vs receiver), `CRATONVM_DBG_CCE=1` (checkcast failures). TRAP: Windows
 `timeout` does not kill a hung native cratonvm — taskkill before rebuild (it locks the binary).
+
+## RE-VERIFICATION 2026-07-31 — fresh full-suite ABORTED status audited, confirmed benign
+
+A fresh 4548-class categorize run (2026-07-30/31, worktree
+`CratonVM-hib-local-0712-v3`, dev merged with the real ByteBuddy fix — see
+`hib-bytebuddy-20260730-FIXED.md`) reports both `InheritedTest` and
+`MappedSuperclassTest` with class-level status **ABORTED**
+(`apps/hib-suite-runner/analysis/06-full-suite-categorize-20260730/all-4548-classes-status.tsv`,
+lines 738-739). This looked, out of context, like it could be the same kind of
+regression this doc has been burned by before (a hedge masking a live
+residual), so it was checked rather than assumed benign.
+
+Isolated re-run of both classes against the fresh binary
+(`CratonRunner org.hibernate.orm.test.bytecode.enhancement.basic.InheritedTest
+org.hibernate.orm.test.bytecode.enhancement.basic.MappedSuperclassTest`,
+`apps/hib-suite-runner`) reproduces this doc's own "Results" section exactly:
+
+```
+@@RESULT ....basic.InheritedTest         found=4 started=4 ok=3 failed=0 aborted=1 skipped=0
+@@RESULT ....basic.MappedSuperclassTest  found=4 started=4 ok=3 failed=0 aborted=1 skipped=0
+```
+
+The abort is `extendedEnhancementTest()`'s own
+`assumeTrue(PersistentAttributeInterceptable.class.isAssignableFrom(Employee.class))`,
+firing under each class's `EagerEnhancementContext`
+(`hasLazyLoadableAttributes() = false`, wired via `@CustomEnhancementContext({
+EnhancerTestContext.class, XxxTest.EagerEnhancementContext.class})` — a
+JUnit-extension-driven double-run, 2 contexts x 2 `@Test` methods = found=4).
+Under eager (non-lazy) enhancement `Employee` never gets the
+`PersistentAttributeInterceptable` interface, so the assumption is
+false-by-construction — this is Hibernate's own test intentionally skipping a
+lazy-loading-only check, not a CratonVM defect.
+
+Ran the identical `CratonRunner` invocation against real HotSpot (`java.exe`
+from the same JDK 25.0.3.9 install, same classpath argfile, no CratonVM in the
+loop at all) to rule out any doubt: **byte-identical counts**,
+`found=4 started=4 ok=3 failed=0 aborted=1 skipped=0` for both classes. The
+class-level "ABORTED" the categorize script emits is a side effect of that
+script treating any `aborted>0` class as non-clean, not a CratonVM-specific
+symptom — the doc's 2026-07-06 "ok=3/4 (1 aborted = the assumeTrue skip...,
+matching HotSpot)" claim holds exactly, unchanged, three weeks and a full
+ByteBuddy-JIT-ban retirement later. No doc correction needed; no new
+known-issue doc filed for this.

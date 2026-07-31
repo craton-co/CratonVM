@@ -4613,6 +4613,52 @@ impl GenerationalHeap {
             *root = unsafe { ObjectRef::from_raw(new_ptr) };
         }
 
+        // Phase 1a: forward the overlay-backed collections' Rust-side edges.
+        //
+        // LinkedList / LinkedHashMap / TreeMap / TreeSet keep their backing
+        // arrays in process-global side-tables, not in Java heap slots, so
+        // neither a root slot nor a dirty card can describe the edge. `roots`
+        // carries them ONLY when the VM's unconditional overlay scan ran
+        // (`native_roots::scan_collection_overlays`) — and the Generational
+        // collector deliberately SKIPS that scan while JIT quiescence is
+        // engaged, an unregistered JIT frame is on the stack, or a major GC is
+        // pending, relying instead on the marker walking each owner and
+        // pulling in `external_roots_for_owner`.
+        //
+        // `sweep_young_non_moving` (and `old_gen_gc`) implement that owner
+        // walk. This moving Cheney path never did: when the two conditions met
+        // — overlay scan skipped, moving young chosen — every overlay-held
+        // young array was silently reclaimed. The collection then read its own
+        // state through the relocation-invariant identity-hash key and got a
+        // dangling pointer whose zeroed header reads back as `ClassId(0)` with
+        // `array_length == 0`, surfacing far away as an `Int(0)` where an
+        // element belongs (`TreeSet.contains` → `ts_binary_search` →
+        // `Comparator.compare` → `checkcast: not an object reference`, or a
+        // SIGSEGV).
+        //
+        // Seed every current owner's refs, exactly as the non-moving young
+        // path does — a minor collection leaves old gen intact and cannot
+        // decide which owners will later prove dead. Only forwarding is needed
+        // here: the side tables themselves are repointed afterwards by
+        // `remap_external_roots` from `pointer_map`.
+        for overlay_ref in crate::external_roots::external_roots_for_matching_owners(&|_| true) {
+            let old_ptr = overlay_ref.as_ptr();
+            if !young_from.contains(old_ptr) {
+                continue;
+            }
+            let _ = Self::forward_object(
+                &young_from,
+                &young_object_starts,
+                &mut young_to,
+                &mut old_gen,
+                old_ptr,
+                &mut objects_copied,
+                &mut pointer_map,
+                &mut promoted_worklist,
+                force_promote_all,
+            );
+        }
+
         // Old-gen addresses needing card re-mark after Phase 3's `clear_all()`
         // (applied via `mark_dirty_bulk`). Declared before Phase 1b so a
         // PERSISTENT old→young edge processed via a dirty card whose referent

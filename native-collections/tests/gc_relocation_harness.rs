@@ -35,8 +35,8 @@ use cratonvm_native_collections::identity_hash::obj_key;
 use cratonvm_native_collections::{
     __test_lhm_get, __test_lhm_set, __test_ll_get, __test_ll_set, __test_tm_fast_get_str,
     __test_tm_fast_put_str, __test_tm_get_slot, __test_tm_set_slot, __test_ts_get_slot,
-    __test_ts_set_slot, gc_overlay_roots_for_collection, gc_scan_collection_overlay_roots,
-    gc_update_collection_overlay_refs,
+    __test_ts_set_slot, gc_overlay_roots_for_collection, gc_overlay_roots_for_matching_owners,
+    gc_scan_collection_overlay_roots, gc_update_collection_overlay_refs,
 };
 use cratonvm_types::{ObjectRef, Value};
 use std::collections::HashMap;
@@ -405,6 +405,30 @@ fn all_overlay_object_values_are_roots() {
             roots.iter().any(|r| r.as_ptr() == v.as_ptr()),
             "{} missing from GC roots — for_each_overlay_ref skipped this \
              overlay (B1/V1 class of bug)",
+            OVERLAY_LABELS[i]
+        );
+    }
+}
+
+/// The MOVING young collector cannot walk owners the way the non-moving
+/// marker does, so it seeds from
+/// `external_roots_for_matching_owners(&|_| true)` — every current owner's
+/// refs, regardless of generation. Coverage here is therefore load-bearing:
+/// an overlay this enumeration misses is a live backing array the moving
+/// collector silently reclaims, which is exactly the 2026-07-31
+/// `TreeSet.contains` -> `checkcast: not an object reference` abort.
+#[test]
+fn every_overlay_value_is_reachable_through_an_always_true_owner_predicate() {
+    let mut ctx = MockCtx::new();
+    let (_cols, vals) = plant_one_value_per_overlay(&mut ctx);
+
+    let roots = gc_overlay_roots_for_matching_owners(&|_| true);
+
+    for (i, v) in vals.iter().enumerate() {
+        assert!(
+            roots.iter().any(|r| r.as_ptr() == v.as_ptr()),
+            "{} missing from the always-true owner-predicate seed the moving \
+             young collector relies on",
             OVERLAY_LABELS[i]
         );
     }

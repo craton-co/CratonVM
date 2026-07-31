@@ -218,3 +218,27 @@ stays OPEN with a recommended scoped-handle approach and
   non-GRAPH default; run with an explicit queue type here, not waived.
 - `hibernate-atnstate-transitions-npe-intermittent-hql-parse-20260721-FIXED.md`
   — the 2026-07-22 pass over the same ANTLR file for the same defect class.
+
+## 8. RE-VERIFICATION 2026-07-31 — full 4548-class run, same class, same benign abort
+
+A subsequent fresh 4548-class categorize run (not the 302-class ByteBuddy
+corpus above) also reports `ManyToManyAssociationClassGeneratedIdTest` as
+ABORTED (`apps/hib-suite-runner/analysis/06-full-suite-categorize-20260730/all-4548-classes-status.tsv`,
+line 2626), this time with `found=6 started=6 ok=3 failed=0 aborted=3`
+(isolated `CratonRunner` re-run against the fresh `CratonVM-hib-local-0712-v3`
+binary reproduces this exactly). That is a different count than the single
+abort this section reported for the 302-class corpus, but the same root
+cause: the class overrides 3 of the 6 inherited
+`AbstractManyToManyAssociationClassTest` methods
+(`testRemoveAndAddEqualElement`, `testRemoveAndAddEqualCollection`,
+`testRemoveAndAddEqualElementNonKeyModified`), and each override's first line
+is `skipForGraphQueue(scope)` → `assumeFalse(queueType == QueueType.GRAPH,
+...)`. Since the `actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md`
+fix restored Hibernate's upstream GRAPH default, all 3 overridden methods
+assume-abort by design under the default queue type; the 3 non-overridden
+inherited methods run and pass normally (`ok=3`). Ran the same class through
+plain HotSpot (`java.exe`, same JDK, same classpath, no CratonVM in the loop):
+identical `found=6 started=6 ok=3 failed=0 aborted=3`. Confirms this
+section's original "documented flush-queue assumption abort... not waived"
+conclusion still holds against the full-suite run; no doc correction or new
+known-issue filed.

@@ -4502,9 +4502,20 @@ pub struct JitMICSlot {
     /// Cached receiver ClassId (0 = empty/unpopulated).
     /// **JIT-hot — offset 0.**
     pub cached_class_id: std::sync::atomic::AtomicU32,
-    /// Padding so `cached_entry_ptr` lands at an 8-byte aligned offset
-    /// regardless of host alignment rules.
-    _pad0: u32,
+    /// Redefinition epoch this slot was last validated against.
+    ///
+    /// Occupies the 4 bytes that used to be pure padding at offset 4, so the
+    /// slot's size and every JIT-hot offset (`cached_class_id` 0,
+    /// `cached_entry_ptr` 8, `cached_needs_context` 16) are unchanged and
+    /// generated code needs no update — it never loads offset 4.
+    ///
+    /// Exists so a redefinition flushes each inline cache EXACTLY ONCE instead
+    /// of forever. The previous gate asked "has this class ever been
+    /// redefined?", which is permanently true, so a mocked class had its MIC
+    /// and PIC erased on every single dispatch and re-resolved from scratch
+    /// each call. That was the bulk of the ~30 µs/call cost measured in
+    /// `docs/known-issues/repros/redefine-call-cost`.
+    pub redefine_epoch: std::sync::atomic::AtomicU32,
     /// Cached method entry pointer for direct call on hit (0 = not resolved).
     /// This is the address of a compiled native/JIT function that can be called
     /// directly with the same calling convention as `invoke_or_native`.
@@ -4554,7 +4565,7 @@ impl JitMICSlot {
     pub fn new() -> Self {
         Self {
             cached_class_id: std::sync::atomic::AtomicU32::new(0),
-            _pad0: 0,
+            redefine_epoch: std::sync::atomic::AtomicU32::new(0),
             cached_entry_ptr: std::sync::atomic::AtomicU64::new(0),
             cached_needs_context: std::sync::atomic::AtomicBool::new(false),
             _pad1: [0; 7],
@@ -5810,6 +5821,27 @@ fn dbg_jit_pin_enabled() -> bool {
 /// bump has to be unconditional. Under-bumping there would leave an interpreted
 /// call site pinned to the interpreter forever after a background compile
 /// published its body.
+/// Process-wide count of JVMTI class redefinitions.
+///
+/// Bumped once per successful `redefineClass`. Inline-cache slots stamp the
+/// value they were last validated against, so a redefinition costs each slot
+/// one flush rather than a flush on every dispatch for the rest of the
+/// process. See [`JitMICSlot::redefine_epoch`].
+pub static REDEFINE_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Read the current redefinition epoch (one relaxed atomic load).
+#[inline]
+pub fn redefine_epoch() -> u32 {
+    REDEFINE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Record that a class was redefined. Invalidates every inline cache exactly
+/// once, lazily, as each slot is next dispatched through.
+#[inline]
+pub fn bump_redefine_epoch() {
+    REDEFINE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 pub fn jit_cache_generation() -> u64 {
     JIT_CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }

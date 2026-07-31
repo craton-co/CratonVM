@@ -35,9 +35,12 @@ It is **not** a hang and **not** an AOT bug. `CRATONVM_DEFAULT_WATCHDOG_SEC=420`
 puts the main thread in `TestCompiler.compile` → in-process javac →
 `JavaTokenizer` → … → `MockMethodAdvice` → `WeakConcurrentMap$LatentKey.hashCode`,
 **spinning, not blocked**. That is
-[`mockito-redefine-makes-every-call-40us-20260726.md`](mockito-redefine-makes-every-call-40us-20260726.md),
-open since 2026-07-26, reproducible in 90 seconds with `SbCostProbe` and no
-Spring, JUnit or AOT anywhere. Track it there; do not re-diagnose it here.
+[`../internal/mockito-redefine-makes-every-call-40us-20260726.md`](../internal/mockito-redefine-makes-every-call-40us-20260726.md),
+**fixed on 2026-07-31** — a redefined class was permanently barred from being
+JIT-compiled and had its inline caches erased on every dispatch, which cost 46x
+per call. Reproduce with `docs/known-issues/repros/redefine-call-cost/` (no
+Mockito, Spring, JUnit or AOT). If this cluster still stalls, it is a different
+cause; do not re-diagnose the redefinition cost here.
 
 ## Reproducing
 
