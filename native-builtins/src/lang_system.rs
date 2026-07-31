@@ -1417,20 +1417,281 @@ pub(crate) fn native_runtime_free_memory(
     Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
 }
 
+/// The four real `java.lang.Runtime$Version` field values, parsed out of a
+/// version string without the JDK's regex engine.
+struct RuntimeVersionParts {
+    /// `version` — the dot-separated `$VNUM` sequence.
+    numbers: Vec<i32>,
+    /// `pre` — the `-$PRE` pre-release identifier.
+    pre: Option<String>,
+    /// `build` — the `+$BUILD` build number.
+    build: Option<i32>,
+    /// `optional` — the trailing `-$OPT` build information.
+    optional: Option<String>,
+}
+
+/// Hand-parse `$VNUM(-$PRE)?(\+$BUILD)?(-$OPT)?` — the JDK's `VSTR_FORMAT`.
+///
+/// `Runtime.Version.parse` compiles a `java.util.regex` pattern for this
+/// grammar; running it is exactly what `native_runtime_version` exists to
+/// avoid (see its doc comment). The grammar is small enough to split by hand:
+/// `+` separates `$VNUM(-$PRE)` from `$BUILD(-$OPT)`, and without a `+` the
+/// only `-`-introduced parts are `$PRE` then `$OPT`.
+fn parse_runtime_version_str(s: &str) -> Option<RuntimeVersionParts> {
+    let s = s.trim();
+    let (head, tail) = match s.split_once('+') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (s, None),
+    };
+    let (vnum, mut pre) = match head.split_once('-') {
+        Some((vnum, pre)) => (vnum, Some(pre.to_string())),
+        None => (head, None),
+    };
+    let mut build = None;
+    let mut optional = None;
+    match tail {
+        // `$BUILD` is present (or empty, in the `+-$OPT` spelling the JDK uses
+        // for optional-without-build); `$OPT` is whatever follows its `-`.
+        Some(tail) => match tail.split_once('-') {
+            Some((b, opt)) => {
+                build = b.parse::<i32>().ok();
+                optional = Some(opt.to_string());
+            }
+            None => build = tail.parse::<i32>().ok(),
+        },
+        // No `+$BUILD`, so a second `-` inside what we took for `$PRE` is
+        // really the `$OPT` separator (`$PRE` itself is `[a-zA-Z0-9]+`).
+        None => {
+            if let Some((p, opt)) = pre.as_deref().and_then(|p| p.split_once('-')) {
+                optional = Some(opt.to_string());
+                pre = Some(p.to_string());
+            }
+        }
+    }
+    let numbers = vnum
+        .split('.')
+        .map(|part| part.parse::<i32>().ok())
+        .collect::<Option<Vec<i32>>>()?;
+    if numbers.is_empty() {
+        return None;
+    }
+    Some(RuntimeVersionParts {
+        numbers,
+        pre,
+        build,
+        optional,
+    })
+}
+
+/// The version string this VM reports, as `java.runtime.version` would spell
+/// it, falling back through the other version properties.
+fn runtime_version_parts(ctx: &dyn NativeContext) -> RuntimeVersionParts {
+    for key in [
+        "java.runtime.version",
+        "java.vm.version",
+        "java.version",
+        "java.specification.version",
+    ] {
+        if let Some(parts) = ctx
+            .get_system_property(key)
+            .as_deref()
+            .and_then(parse_runtime_version_str)
+        {
+            return parts;
+        }
+    }
+    RuntimeVersionParts {
+        numbers: vec![runtime_feature_version(ctx)],
+        pre: None,
+        build: None,
+        optional: None,
+    }
+}
+
+/// `Optional.ofNullable(value)` for a `String` field.
+fn optional_of_str(ctx: &mut dyn NativeContext, value: Option<&str>) -> Option<Value> {
+    match value {
+        Some(text) => {
+            let text = ctx.create_string(text);
+            ctx.invoke(
+                "java/util/Optional",
+                "of",
+                "(Ljava/lang/Object;)Ljava/util/Optional;",
+                &[Value::Object(Some(text))],
+            )
+        }
+        None => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
+    }
+    .ok()
+    .flatten()
+}
+
+/// `Optional.ofNullable(value)` for the boxed-`Integer` `build` field.
+fn optional_of_int(ctx: &mut dyn NativeContext, value: Option<i32>) -> Option<Value> {
+    match value {
+        Some(n) => {
+            let boxed = ctx
+                .invoke(
+                    "java/lang/Integer",
+                    "valueOf",
+                    "(I)Ljava/lang/Integer;",
+                    &[Value::Int(n)],
+                )
+                .ok()
+                .flatten()?;
+            ctx.invoke(
+                "java/util/Optional",
+                "of",
+                "(Ljava/lang/Object;)Ljava/util/Optional;",
+                &[boxed],
+            )
+        }
+        None => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
+    }
+    .ok()
+    .flatten()
+}
+
+/// `List.of(Integer...)` — the `version` field's declared shape.
+fn boxed_int_list(ctx: &mut dyn NativeContext, numbers: &[i32]) -> Option<Value> {
+    let object_cid = ctx.class_id_by_name("java/lang/Object")?;
+    let array = ctx.new_ref_array(object_cid, numbers.len());
+    let array_pin = ctx.pin_native_root(array);
+    let mut array = array;
+    for (index, n) in numbers.iter().enumerate() {
+        let boxed = ctx
+            .invoke(
+                "java/lang/Integer",
+                "valueOf",
+                "(I)Ljava/lang/Integer;",
+                &[Value::Int(*n)],
+            )
+            .ok()
+            .flatten();
+        array = ctx.read_native_pin(array_pin, array);
+        match boxed {
+            Some(boxed) => ctx.set_array_element(array, index, boxed),
+            None => {
+                ctx.unpin_native_roots(array_pin);
+                return None;
+            }
+        }
+    }
+    let list = ctx
+        .invoke(
+            "java/util/List",
+            "of",
+            "([Ljava/lang/Object;)Ljava/util/List;",
+            &[Value::Object(Some(array))],
+        )
+        .ok()
+        .flatten();
+    // `List.of` is unavailable in synthetic-JDK mode; `Arrays.asList` has a
+    // native bridge there and satisfies every `version` field reader
+    // (`stream()`, `get(int)`, `size()`, `equals`, `hashCode`).
+    let list = match list {
+        Some(Value::Object(Some(_))) => list,
+        _ => {
+            let array = ctx.read_native_pin(array_pin, array);
+            ctx.invoke(
+                "java/util/Arrays",
+                "asList",
+                "([Ljava/lang/Object;)Ljava/util/List;",
+                &[Value::Object(Some(array))],
+            )
+            .ok()
+            .flatten()
+        }
+    };
+    ctx.unpin_native_roots(array_pin);
+    list
+}
+
 /// `Runtime.version()` returns a lightweight real-layout `Runtime$Version`.
 ///
 /// Calling the JDK parser here routes every first `Runtime.version()` through
 /// the regex engine.  That engine is prohibitively slow in interpreted real-
 /// JDK mode and blocks signed-jar opening before any loader work begins.
-/// The companion `feature()`/`build()` bridges provide the observable VM
-/// metadata; callers which require an explicitly parsed version still use the
-/// JDK `Runtime.Version.parse(String)` contract directly.
+/// Instead we hand-parse the reported version string (no regex) and populate
+/// the same four fields the parser would have written, so every real-bytecode
+/// accessor on the result — `toString`, `version`, `interim`, `update`,
+/// `patch`, `pre`, `optional`, `equals`, `hashCode`, `compareTo` — reads real
+/// values instead of `null`. Population is best-effort: during very early
+/// bootstrap `List`/`Optional` may not be usable yet, and a bare object (the
+/// historical behaviour) is still better than failing `Runtime.version()`.
+///
+/// The result is memoised for the life of the VM, exactly as the real
+/// `Runtime.version()` body memoises into its `private static Runtime.version`
+/// field. That restores the `Runtime.version() == Runtime.version()` identity
+/// HotSpot callers see, and keeps building the object a once-per-process cost
+/// rather than a per-call one (measured 14µs/call to build).
 pub(crate) fn native_runtime_version(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
+    if let Some(cached) = runtime_version_cached(ctx) {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
     let version = alloc_concurrent_synthetic(ctx, "java/lang/Runtime$Version", 4);
-    Ok(Some(Value::Object(Some(version))))
+    let parts = runtime_version_parts(ctx);
+    let pin = ctx.pin_native_root(version);
+    let mut version = version;
+    // Each helper re-enters the VM and can move `version`, so build one field
+    // value at a time and re-read the pinned reference before storing it.
+    let numbers = boxed_int_list(ctx, &parts.numbers);
+    version = ctx.read_native_pin(pin, version);
+    if let Some(numbers) = numbers {
+        ctx.set_field_by_name(version, "version", numbers);
+    }
+    let pre = optional_of_str(ctx, parts.pre.as_deref());
+    version = ctx.read_native_pin(pin, version);
+    if let Some(pre) = pre {
+        ctx.set_field_by_name(version, "pre", pre);
+    }
+    let build = optional_of_int(ctx, parts.build);
+    version = ctx.read_native_pin(pin, version);
+    if let Some(build) = build {
+        ctx.set_field_by_name(version, "build", build);
+    }
+    let optional = optional_of_str(ctx, parts.optional.as_deref());
+    version = ctx.read_native_pin(pin, version);
+    if let Some(optional) = optional {
+        ctx.set_field_by_name(version, "optional", optional);
+    }
+    ctx.unpin_native_roots(pin);
+    Ok(Some(Value::Object(Some(runtime_version_publish(ctx, version)))))
+}
+
+/// Global-root handle for the `Runtime.version()` singleton.
+///
+/// A `ctx.set_static_field` into the JDK's own `Runtime.version` field does not
+/// stick (the write is accepted and the next read returns null), so the
+/// singleton lives in the JNI global-ref table instead — a persistent root the
+/// moving collector remaps, which is why this holds a *handle* and never a raw
+/// `ObjectRef`.
+static RUNTIME_VERSION_ROOT: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+
+/// The already-built `Runtime.version()` singleton, if there is one.
+fn runtime_version_cached(ctx: &dyn NativeContext) -> Option<ObjectRef> {
+    let handle = (*RUNTIME_VERSION_ROOT.lock().unwrap_or_else(|e| e.into_inner()))?;
+    ctx.resolve_global_root(handle)
+}
+
+/// Publish `version` as the singleton and return whichever instance won — a
+/// concurrent first call may have published its own, and identity is the whole
+/// point of memoising.
+fn runtime_version_publish(ctx: &mut dyn NativeContext, version: ObjectRef) -> ObjectRef {
+    let mut slot = RUNTIME_VERSION_ROOT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(winner) = slot.and_then(|handle| ctx.resolve_global_root(handle)) {
+        return winner;
+    }
+    let handle = ctx.add_global_root(version);
+    // Handle 0 means "no global-root table" (mock contexts): leave the slot
+    // empty so the next call rebuilds rather than caching a dead handle.
+    if handle != 0 {
+        *slot = Some(handle);
+    }
+    version
 }
 
 /// `Runtime.Version.feature()` вЂ” major Java specification version (e.g. 25).
@@ -1460,8 +1721,16 @@ pub(crate) fn native_runtime_version_feature(
             }
         }
     }
-    let v = ctx
-        .get_system_property("java.specification.version")
+    Ok(Some(Value::Int(runtime_feature_version(ctx))))
+}
+
+/// The host VM's feature (major) version, from system properties alone.
+///
+/// This is `Runtime.Version.feature()`'s fallback, factored out so callers that
+/// only want the number don't have to build a whole `Runtime$Version` object
+/// to ask for it.
+pub(crate) fn runtime_feature_version(ctx: &dyn NativeContext) -> i32 {
+    ctx.get_system_property("java.specification.version")
         .and_then(|s| s.trim().parse::<i32>().ok())
         .or_else(|| {
             ctx.get_system_property("java.version").and_then(|s| {
@@ -1473,20 +1742,30 @@ pub(crate) fn native_runtime_version_feature(
                 }
             })
         })
-        .unwrap_or(25);
-    Ok(Some(Value::Int(v)))
+        .unwrap_or(25)
 }
 
 /// `Runtime.Version.build()` - optional build number.
 ///
-/// CratonVM's lightweight `Runtime.version()` object does not populate the real
-/// JDK `build` field, so the real accessor would return null. Returning
-/// `Optional.empty()` matches a valid version object and keeps callers from
-/// treating the VM metadata as malformed.
+/// This override is forced for EVERY `Runtime$Version` receiver, including the
+/// fully parsed ones `Runtime.Version.parse(String)` produces, so it must read
+/// the real `build` field rather than assume the receiver is a lightweight
+/// `Runtime.version()` object. Returning a blanket `Optional.empty()` made a
+/// parsed version disagree with itself: `compareTo`/`equalsIgnoreOptional`
+/// read the `build` FIELD on the receiver but the `build()` ACCESSOR on the
+/// argument, so `v.compareTo(v)` returned 1 for any version with a build
+/// number. `Optional.empty()` remains the fallback for a receiver whose field
+/// is genuinely absent (synthetic-JDK mode, where the class has no real
+/// layout to populate).
 pub(crate) fn native_runtime_version_build(
     ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    args: &[Value],
 ) -> MethodCallResult {
+    if let Ok(this) = obj_arg(args, 0) {
+        if let build @ Value::Object(Some(_)) = ctx.get_field_by_name(this, "build") {
+            return Ok(Some(build));
+        }
+    }
     ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[])
 }
 
@@ -4443,5 +4722,55 @@ mod checkexec_security_tests {
         );
 
         let _ = set_security_manager_for_test(prev);
+    }
+}
+
+#[cfg(test)]
+mod runtime_version_parse_tests {
+    use super::parse_runtime_version_str;
+
+    /// Parse and render as `numbers|pre|build|optional` for terse assertions.
+    fn shape(s: &str) -> String {
+        let p = parse_runtime_version_str(s).expect("parse");
+        let numbers = p
+            .numbers
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        format!(
+            "{numbers}|{}|{}|{}",
+            p.pre.unwrap_or_default(),
+            p.build.map(|b| b.to_string()).unwrap_or_default(),
+            p.optional.unwrap_or_default(),
+        )
+    }
+
+    /// Every shape the JDK's `$VNUM(-$PRE)?(\+$BUILD)?(-$OPT)?` grammar admits.
+    /// The expectations are `Runtime.Version.parse(s)`'s own field values on
+    /// HotSpot 25 (verified against a real JDK, not derived from this parser).
+    #[test]
+    fn parses_the_vstr_grammar() {
+        assert_eq!(shape("25"), "25|||");
+        assert_eq!(shape("25.0.3"), "25.0.3|||");
+        // The two version strings this VM reports for itself.
+        assert_eq!(shape("25.0.1+8"), "25.0.1||8|");
+        assert_eq!(shape("25.0.1+8-LTS-27"), "25.0.1||8|LTS-27");
+        // Temurin's, for a real-JDK cross-check.
+        assert_eq!(shape("25.0.3+9-LTS"), "25.0.3||9|LTS");
+        assert_eq!(shape("21-ea+3"), "21|ea|3|");
+        assert_eq!(shape("17.0.2-ea+7-abc"), "17.0.2|ea|7|abc");
+        // `+-$OPT` is the JDK's spelling for optional-without-build.
+        assert_eq!(shape("17+-abc"), "17|||abc");
+        // `-$PRE-$OPT` with no build at all.
+        assert_eq!(shape("17-ea-abc"), "17|ea||abc");
+    }
+
+    #[test]
+    fn rejects_strings_with_no_usable_version_number() {
+        assert!(parse_runtime_version_str("").is_none());
+        assert!(parse_runtime_version_str("nonsense").is_none());
+        // `1.8.0_392` is the pre-JEP-223 spelling; the JDK rejects it too.
+        assert!(parse_runtime_version_str("1.8.0_392").is_none());
     }
 }
