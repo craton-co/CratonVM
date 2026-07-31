@@ -201,6 +201,22 @@ throughput": that flag selects a different collector, and which one wins is a
 property of the workload. On the one deterministic probe available it wins for
 moving-young by a wide margin.
 
+And the lane the residual is stated in **does not run at all any more**.
+`CRATONVM_NO_MOVING_YOUNG=1` on `ZonedDateTimeTest` SIGSEGVs after ~3 s, inside
+a live JIT code buffer, reading a frame slot holding zero — the reclaimed-root
+signature. On a pristine `origin/dev` build, so not this branch's; the flag
+also switches off the single-pass backend's shadow-stack root publication,
+because `shadow_stack_maps_enabled()` is
+`flags().jit.shadow_stack || moving_young_enabled()`. Adding
+`CRATONVM_SHADOW_STACK=1` back removes the crash. Filed as
+`docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+
+Meanwhile the same class on **default flags completes**, twice, 447 s and
+435 s, `found=608 started=608 ok=404 failed=0 aborted=204` — over the suite's
+300 s cap on a host carrying 30–50 load average from other tenants, but neither
+a timeout nor a failure. The residual as written ("TIMEOUT by default, passes
+under the flag") is now inverted in both halves.
+
 Two further reasons this residual was never evidence:
 
 * `ZonedDateTimeTest` is **bimodal** with no VM change at all — roughly 300 s
