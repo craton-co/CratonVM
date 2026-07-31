@@ -805,7 +805,7 @@ struct Compiler {
     /// that survive the call un-spilled, PLUS any oop the JIT's per-slot oop
     /// tracking fails to classify. Fully conservative — the scanner re-validates
     /// each qword via `heap.is_object_address`, so non-oop register values are
-    /// ignored. No post-call reload is needed under the default non-moving young
+    /// ignored. No post-call reload is needed under the opt-out non-moving young
     /// sweep (the object is never relocated, so the register stays valid).
     /// Gated `CRATONVM_JIT_SAFEPOINT_REG_SPILL`; off → byte-identical default
     /// path (no slots reserved, no stores).
@@ -21605,6 +21605,46 @@ impl Compiler {
                     }
                     self.emit_osr_exit_map_at_reason(pc, crate::deopt::DeoptReason::UnreachedCode);
 
+                    // This trap is UNCONDITIONAL: every execution of this bci
+                    // deopts. So if the snapshot just built cannot be
+                    // materialised back into an interpreter frame, the method
+                    // is guaranteed to fail on its first compiled call --
+                    // `build_deopt_frame_inner` returns `None` and the resume
+                    // sink refuses with `precise deoptimization unavailable
+                    // ... refusing side-effecting replay`, a hard
+                    // `InternalError` rather than a slow path.
+                    //
+                    // The usual producer of an unmaterialisable slot here is
+                    // the coarse `wide_fp` gate in the snapshot's operand-stack
+                    // loop: in a method that touches any long/float/double, a
+                    // non-oop stack entry that is NOT one of this call site own
+                    // arguments has no per-entry width source and is recorded
+                    // `Unsupported`. javac `ClassReader.readInnerClasses` is
+                    // the canonical shape -- `optPoolEntry(int, IntFunction,
+                    // Object)` leaves an `int` underneath the lambda argument,
+                    // so the indy-arg tags type the top entry but not that one.
+                    //
+                    // Compiling such a method is strictly worse than
+                    // interpreting it, so bail the whole compile. This is what
+                    // the per-method SPRING-TESTCOMPILER / HIB-STOREDPROC-JIT
+                    // bans did by hand for the javac family; deciding it from
+                    // the snapshot itself covers every method with this shape
+                    // rather than the ones somebody happened to hit.
+                    let unresumable_trap = self
+                        .deopt_points
+                        .last()
+                        .is_some_and(|p| {
+                            !crate::deopt::frame_state_is_resumable(&p.frame_state)
+                        });
+                    if unresumable_trap {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                            eprintln!(
+                                "[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}"
+                            );
+                        }
+                        self.buf.mark_overflowed();
+                    }
+
                     let patch = self.emit_jmp_rel32_patch();
                     self.deopt_stubs.push((patch, pc, 8)); // 8 = DEOPT_REASON_UNREACHED_CODE
 
@@ -36351,11 +36391,21 @@ mod tests {
         // whenever the young generation can relocate. Pin the policy so the
         // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
         super::set_moving_young_override(Some(false));
-        // Not OnceLock-cached (see `direct_jit_callee_calls_enabled`), so
-        // setting it here is observed immediately; no other jit test asserts
-        // on invoke-info/PIC/MIC-slot counts, so this is safe under parallel
-        // `cargo test`.
-        std::env::set_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS", "1");
+        // `CRATONVM_JIT_DIRECT_CALLEE_CALLS` is a *declared* flag, served from
+        // the process-wide snapshot that latches on the first read of any flag
+        // (`cratonvm_types::flags`). `set_var` here therefore did nothing at
+        // all once any earlier test in this binary had touched a flag — the
+        // assertions below were riding on the flag's default (enabled) rather
+        // than on the value this test asked for, and would have silently
+        // stopped testing the direct-callee path the day that default flipped.
+        // The override pins it for real, on this thread only, so it cannot
+        // perturb a parallel test.
+        let _direct_callee_calls = cratonvm_types::flags::override_thread(
+            cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+                "CRATONVM_JIT_DIRECT_CALLEE_CALLS",
+                Some("1"),
+            )]),
+        );
         use crate::JitInvokeInfo;
         // Bytecode: a counted loop with a single invokevirtual.
         //
@@ -36480,7 +36530,6 @@ mod tests {
         // vm_ptr+1 ≤ ARG_REGS.len()). So 3 fresh MIC slots should be
         // minted (one per copy).
         let method = compiled.expect("invokevirtual-in-loop must compile");
-        std::env::remove_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS");
         // The compiled method does NOT carry the caller-supplied
         // PIC slot in its _jit_pic_slots (that vector is owned by
         // the caller in the production path; in this test the box

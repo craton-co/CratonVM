@@ -150,6 +150,24 @@ to sweeping), and at 2.1× on that workload — while being the only configurati
 that completes at `-Xmx512m` — moving-young is no longer disqualified on
 throughput.
 
+## Caveat on the 2026-07-26 numbers above (added 2026-07-30)
+
+The measurements in this document were taken in the window between
+`a5623891c` (07-01) and `9494c0680` (07-26), during which a stale reload of the
+innermost-RBP mirror left `PreciseFrameInfo::exact_rbp` at `0` on the GC path.
+`remap_active_jit_frames` requires a non-zero `exact_rbp`, so those moving
+cycles ran **without precisely remapping the innermost compiled frame**. The
+cycle counts and the hashbrown profile stand — the copy, the from-space walk and
+the bitmap fix are all upstream of that — but the per-cycle cost was measured
+slightly light, and the configuration was not the one that ships now. See
+`docs/internal/default-moving-young-enabled-20260730.md`.
+
+Re-measured on 2026-07-30 with the mirror defect and the coverage-proof false
+positives fixed, bt18 at `-Xmx512m` runs 25 moving cycles with a 4,220 ms
+median over five interleaved rounds and returns the HotSpot checksum — and the
+non-moving lanes now measure the same, so the 2.1x this document reports has
+closed on the current tree.
+
 ## Status: the default has flipped; these optimizations have not landed
 
 `types/src/flags.rs::DEFAULT_MOVING_YOUNG` is now `true`, with

@@ -35,16 +35,25 @@
 //! read of **any** flag now latches **all** of them, where previously each flag
 //! latched independently.
 //!
-//! In practice only three test binaries depend on the old behaviour, and each
-//! already documents that it must be its own binary and must `set_var` before
-//! anything else runs (`gc/tests/stale_objref_debug_assertion.rs`,
-//! `gc/tests/stale_objref_quarantine_ring.rs`). Those remain correct. New tests
-//! should use [`VmFlags::from_source`] with a [`MapSource`] instead of mutating
-//! the process environment, which is also what makes them safe under Rust 2024,
-//! where `set_var` is `unsafe`.
-//!
 //! [`install`] lets a launcher build the config explicitly — environment plus
 //! `-XX:` command-line flags — and publish it before anything reads a flag.
+//!
+//! # Overriding a flag in a test
+//!
+//! Use [`with_thread_overrides`] (or [`override_thread`] when a guard suits the
+//! call site better). A pure-parse test that needs no global state at all
+//! should still prefer [`VmFlags::from_source`] with a [`MapSource`].
+//!
+//! **Do not `set_var` a declared flag.** Because the snapshot latches on first
+//! read, `set_var` after any other test in the same binary has touched
+//! [`flags()`] mutates `environ` and nothing else — the test then passes only
+//! when it wins the race to initialise the snapshot, and quietly measures the
+//! developer's ambient environment when it loses. That is an order-dependent
+//! test that looks like a flake; the diagnosis is written up in
+//! `docs/internal/libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`, and
+//! `types/tests/flag_env_mutation_guard.rs` fails the build if a new one
+//! appears. (`set_var` is also `unsafe` under Rust 2024, so the override hooks
+//! are what keeps this tree edition-ready.)
 //!
 //! # Truth tables
 //!
@@ -55,8 +64,10 @@
 //! part of this refactor; naming each parser at each field is what makes the
 //! divergence visible enough to retire later, flag by flag, with benchmarks.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -142,6 +153,17 @@ impl MapSource {
     /// Set one entry, builder-style.
     pub fn with(mut self, name: &str, value: &str) -> Self {
         self.0.insert(name.to_string(), OsString::from(value));
+        self
+    }
+
+    /// Clear one entry, builder-style — the mirror of [`with`](Self::with).
+    ///
+    /// "Absent" and "set to the empty string" are different for several flags
+    /// (`cached_is_set!` in `vm/src/runtime/env_cache.rs` treats the empty
+    /// string as *set*), so a source layered over the real environment needs a
+    /// way to say "as if this had never been exported", not just "empty".
+    pub fn without(mut self, name: &str) -> Self {
+        self.0.remove(name);
         self
     }
 }
@@ -461,12 +483,13 @@ pub enum BlockedAccessMode {
 
 /// Compiled-in default for the moving (compacting) young generation.
 ///
-/// # This is the flip
+/// # Default-on contract
 ///
 /// `ARCHITECTURE.md` advertises a "generational semi-space collector (Cheney
 /// moving young gen)". The JIT, root gathering, and collector all now read
 /// [`GcFlags::moving_young`], so this single default switches them together.
-/// `CRATONVM_NO_MOVING_YOUNG` remains a compatibility opt-out.
+/// Keep this `true`: `CRATONVM_NO_MOVING_YOUNG` is the supported compatibility
+/// opt-out and the regression tests below pin both sides of that contract.
 ///
 /// See `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
 pub const DEFAULT_MOVING_YOUNG: bool = true;
@@ -479,18 +502,33 @@ pub const DEFAULT_MOVING_YOUNG: bool = true;
 ///
 /// # Why this exists, and why it is `false`
 ///
-/// It is `false` because that contract does not hold today, and the VM already
-/// says so at runtime:
-/// `conservative_roots::refresh_moving_young_coverage_for_current_thread`
-/// vetoes moving-young for the whole process as soon as
-/// `jit_code_range_count() != 0`. Since `memory::roots::collect_roots` runs that
-/// refresh on the path of *every* collection, the resulting invariant is:
+/// It is `false` because that contract does not hold today, and the collector
+/// already refuses to trust the JIT because of it. The guarantee comes from the
+/// **per-frame coverage proof**, not from any blanket rule: for each live
+/// compiled frame `conservative_roots` looks up the `OopMapEntry` matching that
+/// frame's recorded safepoint id and requires `moving_young_coverage_complete`.
+/// Finding **no** matching map is a refusal too — the check reports "not
+/// covered" rather than "nothing to object to". `memory::roots::collect_roots`
+/// runs that proof on the path of every collection and `gen_heap` diverts on
+/// its verdict, so:
 ///
-/// > A relocating young collection can only occur while the process holds **no
-/// > compiled code at all**. Therefore **no compiled frame can ever be live
-/// > during relocation.**
+/// > A frame that publishes no complete safepoint map can never be live during
+/// > a relocating young collection.
 ///
-/// That single fact is what this constant names. Several JIT admission gates
+/// The optimizing IR backend publishes **no `oop_maps` at all** — `ir_lower.rs`
+/// emits none, and an empty vector means "no precise coverage" — so an IR frame
+/// always fails that proof and always forces the non-moving sweep. A frame
+/// entered by a direct JIT→JIT call pushes no entry guard and is likewise not
+/// reachable from the chain the proof walks.
+///
+/// (An earlier version of this note rested instead on a *process-wide* veto
+/// that fired whenever compiled code merely existed. That blanket has since
+/// become the opt-in `CRATONVM_MOVING_YOUNG_NO_JIT`, leaving the per-cycle
+/// proof as the default authority. The invariant the gates below rely on is
+/// unaffected: it never needed the blanket, only the per-frame proof, which is
+/// strictly narrower and still fails closed for exactly these frame kinds.)
+///
+/// That fact is what this constant names. Several JIT admission gates
 /// were written to protect the moving collector from frames it cannot rewrite —
 /// the optimizing IR tier, and direct JIT→JIT calls. Keyed on
 /// `moving_young` alone they fire whenever the *flag* is on, which under
@@ -1778,6 +1816,33 @@ impl VmFlags {
         raw.0.extend(overrides.0);
         Self::from_source(&crate::flag_groups::resolve(&raw))
     }
+
+    /// Build from the process environment with per-name edits applied.
+    ///
+    /// `Some(value)` sets the variable; `None` makes it look **unset**, which
+    /// [`from_env_with_overrides`](Self::from_env_with_overrides) cannot
+    /// express (a `MapSource` overlay can only add). That asymmetry is what a
+    /// test wanting "resolve as if `CRATONVM_JAVA_HOME` were never exported"
+    /// runs into, so it gets its own constructor rather than a sentinel value.
+    ///
+    /// The edits are applied to the raw snapshot *before*
+    /// [`crate::flag_groups::resolve`], so overriding either a grouped
+    /// expression (`CRATONVM_JIT`) or the legacy key it expands to
+    /// (`CRATONVM_JIT_THRESHOLD`) behaves exactly as exporting it would.
+    pub fn from_env_with_edits(edits: &[(&str, Option<&str>)]) -> Self {
+        let mut raw = MapSource::from_process_env();
+        for (name, value) in edits {
+            match value {
+                Some(v) => {
+                    raw.0.insert((*name).to_string(), OsString::from(*v));
+                }
+                None => {
+                    raw.0.remove(*name);
+                }
+            }
+        }
+        Self::from_source(&crate::flag_groups::resolve(&raw))
+    }
 }
 
 static FLAGS: OnceLock<VmFlags> = OnceLock::new();
@@ -1805,13 +1870,326 @@ fn declared_flag_names() -> &'static HashSet<&'static str> {
     })
 }
 
+/// Number of live [`FlagOverride`] guards, process-wide.
+///
+/// This exists to keep [`flags()`] free on the production path. It is written
+/// only by the test hooks below, so in a real VM process it is a never-dirtied
+/// cache line whose load folds into the same predicted branch the `OnceLock`
+/// probe already emits, and neither the thread-local nor the process slot is
+/// touched at all. That is why the override support is compiled in
+/// unconditionally instead of hiding behind a Cargo feature: a feature would
+/// have to be enabled for the *whole* dependency graph during `cargo test`,
+/// flipping it on every `cargo test` / `cargo build` alternation and forcing a
+/// full workspace rebuild each way.
+static OVERRIDES_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// The calling thread's override, if any. See [`override_thread`].
+    ///
+    /// `Cell<Option<&'static _>>` has no destructor, so this registers no TLS
+    /// dtor and [`LocalKey::with`](std::thread::LocalKey::with) can never
+    /// observe a destroyed slot — but [`active_override`] still uses
+    /// `try_with`, because `flags()` is reachable from teardown paths.
+    static THREAD_OVERRIDE: Cell<Option<&'static VmFlags>> = const { Cell::new(None) };
+}
+
+/// The process-wide override, if any. See [`override_process`].
+///
+/// Only ever holds pointers obtained from `Box::leak`, so a load can never
+/// observe a dangling pointer — the worst a racing reader can see is a
+/// *stale* configuration, never freed memory.
+static PROCESS_OVERRIDE: AtomicPtr<VmFlags> = AtomicPtr::new(std::ptr::null_mut());
+
+/// The override in effect for the calling thread, thread scope winning.
+///
+/// Deliberately out of line: `flags()` is inlined at thousands of call sites
+/// and the thread-local access must not be duplicated into every one of them.
+#[inline(never)]
+fn active_override() -> Option<&'static VmFlags> {
+    if let Ok(Some(cfg)) = THREAD_OVERRIDE.try_with(|slot| slot.get()) {
+        return Some(cfg);
+    }
+    let raw = PROCESS_OVERRIDE.load(Ordering::Acquire);
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: `PROCESS_OVERRIDE` is written only by `override_process`, which
+    // stores `Box::leak`ed pointers. Those stay valid for the remainder of the
+    // process, so this reference is genuinely `'static`, and it is only ever
+    // handed out as a shared reference.
+    Some(unsafe { &*raw })
+}
+
 /// The process-wide configuration.
 ///
 /// Initialised from the environment on first call. See the module docs for the
-/// latching rules.
+/// latching rules, and [`override_thread`] / [`override_process`] for the
+/// test-support escape hatch from them.
 #[inline]
 pub fn flags() -> &'static VmFlags {
+    if OVERRIDES_LIVE.load(Ordering::Relaxed) != 0 {
+        if let Some(cfg) = active_override() {
+            return cfg;
+        }
+    }
     FLAGS.get_or_init(VmFlags::from_env)
+}
+
+/// Whether any [`FlagOverride`] is currently installed, anywhere in the
+/// process.
+///
+/// **For downstream memo layers.** `vm/src/runtime/env_cache.rs` memoises ~90
+/// hot flags on top of this snapshot, so a test override would otherwise be
+/// invisible to them: the memo latches on first read and never consults
+/// [`flags()`] again. A memo whose value is not `Copy`-cheap enough for
+/// [`MemoSlot`] consults this and recomputes from source while it is true.
+///
+/// A memo must NOT populate itself while this is true, or it would latch an
+/// override's value permanently and poison the rest of the process.
+#[inline]
+pub fn overrides_active() -> bool {
+    OVERRIDES_LIVE.load(Ordering::Relaxed) != 0
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Invalidatable memo slots
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One downstream memo of a flag, which installing an override invalidates.
+///
+/// # Why this exists rather than "just check [`overrides_active`]"
+///
+/// `vm/src/runtime/env_cache.rs` memoises ~90 flags that are read from the
+/// interpreter's per-bytecode path. Having each read ask "is an override
+/// installed?" measured at **+1.15% of `execute_instruction`** — the reader
+/// pays, forever, for a question whose answer is no in every real VM process.
+///
+/// So the cost moves to the writer instead. A slot holds its value inline in
+/// one `AtomicU8`, a read is a single relaxed load, and installing or dropping
+/// a [`FlagOverride`] walks every registered slot and resets it to unset. The
+/// memo then re-derives on its next read, and while the override is live
+/// [`publish`](Self::publish) declines to store, so nothing latches.
+///
+/// The encoding above `UNSET` is the caller's: `env_cache` uses 1/2 for
+/// `false`/`true` and 1/2/3 for `None`/`Some(false)`/`Some(true)`. Anything
+/// that does not fit a `u8` keeps the [`overrides_active`] check — none of
+/// those are on the per-bytecode path.
+#[derive(Debug)]
+pub struct MemoSlot {
+    state: AtomicU8,
+}
+
+/// The "not yet derived" state of a [`MemoSlot`]; every other value is the
+/// caller's own encoding.
+pub const MEMO_UNSET: u8 = 0;
+
+/// Every [`MemoSlot`] that has published at least once, so an override can
+/// find it. Written only on a memo's cold path and by override install/drop.
+static MEMO_SLOTS: std::sync::Mutex<Vec<&'static MemoSlot>> = std::sync::Mutex::new(Vec::new());
+
+impl MemoSlot {
+    /// A slot that has not derived its value yet.
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(MEMO_UNSET),
+        }
+    }
+
+    /// The memoised value, or [`MEMO_UNSET`] if it must be derived.
+    ///
+    /// The whole point of the type: one relaxed load of a static that is
+    /// dirtied only by a test installing an override. Deliberately returns the
+    /// raw byte rather than an `Option<u8>` — `u8` has no niche, so the
+    /// `Option` costs a discriminant materialisation on the hottest read in
+    /// the interpreter (worth 0.2% of `execute_instruction`, measured).
+    #[inline]
+    pub fn load(&self) -> u8 {
+        self.state.load(Ordering::Relaxed)
+    }
+
+    /// Memoise `value`, unless an override is installed.
+    ///
+    /// Registers the slot so a later override can reset it. Takes the registry
+    /// lock, which is what makes "no override is live" and "store" one step
+    /// with respect to a concurrent [`override_thread`] — without that, an
+    /// override installed between the check and the store would find the slot
+    /// already walked and leave a stale base value behind it.
+    ///
+    /// # Panics
+    ///
+    /// If `value` is [`MEMO_UNSET`] — that would encode "derive me again" and
+    /// spin the cold path forever.
+    pub fn publish(&'static self, value: u8) {
+        assert!(value != MEMO_UNSET, "MEMO_UNSET is not a publishable value");
+        let mut slots = MEMO_SLOTS.lock().unwrap_or_else(|p| p.into_inner());
+        if overrides_active() {
+            return;
+        }
+        if !slots.iter().any(|s| std::ptr::eq(*s, self)) {
+            slots.push(self);
+        }
+        self.state.store(value, Ordering::Relaxed);
+    }
+}
+
+impl Default for MemoSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reset every registered memo, and apply `delta` to the live-override count
+/// under the same lock so a concurrent [`MemoSlot::publish`] cannot interleave.
+fn invalidate_memos(delta: isize) {
+    let slots = MEMO_SLOTS.lock().unwrap_or_else(|p| p.into_inner());
+    if delta > 0 {
+        OVERRIDES_LIVE.fetch_add(1, Ordering::Release);
+    } else {
+        OVERRIDES_LIVE.fetch_sub(1, Ordering::Release);
+    }
+    for slot in slots.iter() {
+        slot.state.store(MEMO_UNSET, Ordering::Relaxed);
+    }
+}
+
+/// Which threads a [`FlagOverride`] applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideScope {
+    Thread,
+    Process,
+}
+
+/// Restores the previous flag configuration when dropped.
+///
+/// Holds a raw pointer so it is neither `Send` nor `Sync`: a thread-scoped
+/// guard that travelled to another thread would restore the wrong slot.
+#[must_use = "the override is reverted the moment the guard is dropped"]
+pub struct FlagOverride {
+    scope: OverrideScope,
+    previous: *mut VmFlags,
+}
+
+impl std::fmt::Debug for FlagOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlagOverride")
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for FlagOverride {
+    fn drop(&mut self) {
+        match self.scope {
+            OverrideScope::Thread => {
+                let previous = as_static(self.previous);
+                let _ = THREAD_OVERRIDE.try_with(|slot| slot.set(previous));
+            }
+            OverrideScope::Process => {
+                PROCESS_OVERRIDE.store(self.previous, Ordering::Release);
+            }
+        }
+        invalidate_memos(-1);
+    }
+}
+
+fn as_static(raw: *mut VmFlags) -> Option<&'static VmFlags> {
+    if raw.is_null() {
+        None
+    } else {
+        // SAFETY: as in `active_override` — every non-null pointer stored in
+        // either slot came from `Box::leak`.
+        Some(unsafe { &*raw })
+    }
+}
+
+fn as_raw(cfg: Option<&'static VmFlags>) -> *mut VmFlags {
+    cfg.map_or(std::ptr::null_mut(), |r| {
+        r as *const VmFlags as *mut VmFlags
+    })
+}
+
+/// **Test support.** Replace the flag snapshot seen by the *calling thread*
+/// until the returned guard is dropped.
+///
+/// This is the supported answer to "my test needs `CRATONVM_FOO=1`". Setting
+/// the environment variable is not: declared flags are served from one
+/// process-wide snapshot latched on first read (see the module docs), so
+/// `set_var` after any other test in the same binary has touched [`flags()`]
+/// changes `environ` and nothing else. A test written that way passes only
+/// when it wins the race to initialise the snapshot, and silently exercises
+/// the developer's ambient environment when it loses — the failure mode
+/// documented in
+/// `docs/internal/libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
+///
+/// Thread scope is the default because `cargo test` runs tests in parallel
+/// within one binary: an override installed here cannot perturb a concurrent
+/// test. Use [`override_process`] only when the code under test reads the flag
+/// from a thread this one spawned.
+///
+/// # Limitations
+///
+/// Flags cached *downstream* of this snapshot are not affected —
+/// `vm/src/runtime/env_cache.rs` memoises ~37 hot flags in their own
+/// `OnceLock`s, and those latch independently on first read. Overriding one of
+/// those is only reliable before its first read in the process.
+///
+/// `cfg` is leaked, so this is for tests and not for a hot loop.
+pub fn override_thread(cfg: VmFlags) -> FlagOverride {
+    let leaked: &'static VmFlags = Box::leak(Box::new(cfg));
+    invalidate_memos(1);
+    let previous = THREAD_OVERRIDE.with(|slot| slot.replace(Some(leaked)));
+    FlagOverride {
+        scope: OverrideScope::Thread,
+        previous: as_raw(previous),
+    }
+}
+
+/// **Test support.** Replace the flag snapshot seen by *every* thread until
+/// the returned guard is dropped.
+///
+/// Prefer [`override_thread`]. Reach for this only when the reader runs on a
+/// thread the test did not create — a booted `Vm`'s workers, a background JIT
+/// compile — since the whole process is affected and a concurrently running
+/// test that reads the same flag will see this value. Callers must serialise
+/// process-scoped overrides among themselves (a `static Mutex` in the test
+/// module is the usual way); nesting is supported, concurrent installs are
+/// not.
+///
+/// Same `env_cache` limitation and same leak as [`override_thread`].
+pub fn override_process(cfg: VmFlags) -> FlagOverride {
+    let leaked: &'static VmFlags = Box::leak(Box::new(cfg));
+    invalidate_memos(1);
+    let previous = PROCESS_OVERRIDE.swap(as_raw(Some(leaked)), Ordering::AcqRel);
+    FlagOverride {
+        scope: OverrideScope::Process,
+        previous,
+    }
+}
+
+/// **Test support.** Run `f` with the process environment's flags plus `edits`,
+/// visible to the calling thread only.
+///
+/// The ergonomic form of [`override_thread`] +
+/// [`VmFlags::from_env_with_edits`]. `None` means "as if unset".
+///
+/// ```no_run
+/// # use cratonvm_types::flags;
+/// flags::with_thread_overrides(&[("CRATONVM_JAVA_HOME", Some("/tmp/empty"))], || {
+///     // resolution here sees the override, whoever latched the snapshot first
+/// });
+/// ```
+pub fn with_thread_overrides<R>(edits: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+    let _guard = override_thread(VmFlags::from_env_with_edits(edits));
+    f()
+}
+
+/// **Test support.** Process-scoped sibling of [`with_thread_overrides`].
+///
+/// See [`override_process`] for when this is the right one and for the
+/// serialisation the caller owes.
+pub fn with_process_overrides<R>(edits: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+    let _guard = override_process(VmFlags::from_env_with_edits(edits));
+    f()
 }
 
 /// Read an environment value through the runtime configuration boundary.
@@ -1913,12 +2291,10 @@ mod tests {
     fn empty_source_matches_all_documented_defaults() {
         let f = VmFlags::from_source(&MapSource::empty());
         // Every opt-in flag is off…
-        // `moving_young` is no longer an opt-in — it tracks
-        // `DEFAULT_MOVING_YOUNG`, which is the single constant that flips the
-        // young generation to a copying collector. Assert against the constant,
-        // not against `false`, so the flip does not have to edit this test (and
-        // so this test cannot silently become the thing that blocks it).
-        assert_eq!(f.gc.moving_young, DEFAULT_MOVING_YOUNG);
+        // `moving_young` is no longer an opt-in. Pin the shipped default
+        // directly so an accidental reversion cannot hide behind the constant.
+        assert!(DEFAULT_MOVING_YOUNG);
+        assert!(f.gc.moving_young);
         assert!(!f.gc.card_table_only);
         assert!(!f.gc.dbg_a2);
         assert!(!f.jit.shadow_stack);
@@ -2040,6 +2416,10 @@ mod tests {
     /// never actually enable it in the case it exists for.
     #[test]
     fn moving_young_is_an_opt_out_with_a_compatibility_opt_in() {
+        assert!(
+            VmFlags::from_source(&MapSource::empty()).gc.moving_young,
+            "the shipped generational collector must compact young by default"
+        );
         assert!(
             !VmFlags::from_source(&src(&[("CRATONVM_NO_MOVING_YOUNG", "1")]))
                 .gc
@@ -2479,5 +2859,138 @@ mod tests {
         assert_eq!(f.natives.http_max_body, None);
         assert_eq!(f.natives.async_submit_grace_ms, None);
         assert_eq!(f.natives.max_inflated_bytes, None);
+    }
+
+    // ── Test-support overrides ────────────────────────────────────────────
+    //
+    // The property under test in every case below is the one the whole
+    // mechanism exists for: the override must win *after* the process
+    // snapshot has already latched. Each of these deliberately touches
+    // `flags()` first so the `OnceLock` is initialised before the override
+    // is installed — reproducing the situation in which `set_var` silently
+    // stops working.
+
+    /// The scalar used throughout: declared (so it is served from the frozen
+    /// snapshot rather than `std::env`), and inert — nothing in this crate
+    /// changes behaviour based on it, so an override cannot perturb a
+    /// concurrent test even in process scope.
+    const PROBE: &str = "CRATONVM_MAVEN_REPO_LOCAL";
+
+    fn probe() -> Option<String> {
+        runtime_var(PROBE).ok()
+    }
+
+    #[test]
+    fn thread_override_wins_after_the_snapshot_has_latched() {
+        let _lock = process_override_lock();
+        assert!(
+            declared_flag_names().contains(PROBE),
+            "probe must be declared"
+        );
+        let latched = probe();
+        with_thread_overrides(&[(PROBE, Some("/scoped/repo"))], || {
+            assert_eq!(probe().as_deref(), Some("/scoped/repo"));
+        });
+        assert_eq!(probe(), latched, "the guard must restore the snapshot");
+    }
+
+    #[test]
+    fn thread_override_can_make_a_set_flag_look_absent() {
+        let _lock = process_override_lock();
+        with_thread_overrides(&[(PROBE, Some("/present"))], || {
+            assert_eq!(probe().as_deref(), Some("/present"));
+            // Nested, and this time removing it entirely.
+            with_thread_overrides(&[(PROBE, None)], || {
+                assert_eq!(probe(), None);
+            });
+            assert_eq!(
+                probe().as_deref(),
+                Some("/present"),
+                "the inner guard must restore the OUTER override, not the snapshot"
+            );
+        });
+    }
+
+    #[test]
+    fn thread_override_is_invisible_to_other_threads() {
+        let _lock = process_override_lock();
+        let outside = probe();
+        with_thread_overrides(&[(PROBE, Some("/only/mine"))], || {
+            assert_eq!(probe().as_deref(), Some("/only/mine"));
+            let seen = std::thread::spawn(probe).join().expect("probe thread");
+            assert_eq!(
+                seen, outside,
+                "a thread-scoped override must not leak to a spawned thread"
+            );
+        });
+    }
+
+    #[test]
+    fn process_override_reaches_spawned_threads() {
+        // Serialised against the other process-scoped test: `override_process`
+        // is explicitly documented as requiring caller serialisation.
+        let _lock = process_override_lock();
+        let outside = probe();
+        with_process_overrides(&[(PROBE, Some("/every/thread"))], || {
+            let seen = std::thread::spawn(probe).join().expect("probe thread");
+            assert_eq!(seen.as_deref(), Some("/every/thread"));
+        });
+        assert_eq!(probe(), outside, "the guard must restore the snapshot");
+    }
+
+    #[test]
+    fn thread_scope_wins_over_process_scope() {
+        let _lock = process_override_lock();
+        with_process_overrides(&[(PROBE, Some("/process"))], || {
+            assert_eq!(probe().as_deref(), Some("/process"));
+            with_thread_overrides(&[(PROBE, Some("/thread"))], || {
+                assert_eq!(probe().as_deref(), Some("/thread"));
+            });
+            assert_eq!(probe().as_deref(), Some("/process"));
+        });
+    }
+
+    /// Dropping the last guard must take the fast path in [`flags`] back out
+    /// of circulation — otherwise every later `flags()` call in the process
+    /// pays for a thread-local probe forever.
+    #[test]
+    fn the_fast_path_gate_returns_to_zero() {
+        let _lock = process_override_lock();
+        assert_eq!(OVERRIDES_LIVE.load(Ordering::Relaxed), 0);
+        {
+            let _outer = override_process(VmFlags::from_env_with_edits(&[(PROBE, Some("a"))]));
+            let _inner = override_thread(VmFlags::from_env_with_edits(&[(PROBE, Some("b"))]));
+            assert_eq!(OVERRIDES_LIVE.load(Ordering::Relaxed), 2);
+        }
+        assert_eq!(OVERRIDES_LIVE.load(Ordering::Relaxed), 0);
+    }
+
+    /// An override must be a *complete* configuration, not a patch: every flag
+    /// the caller did not name keeps the value it would have had.
+    #[test]
+    fn an_override_only_changes_the_named_flags() {
+        let _lock = process_override_lock();
+        let before = format!("{:?}", flags().jit);
+        with_thread_overrides(&[(PROBE, Some("/repo"))], || {
+            assert_eq!(format!("{:?}", flags().jit), before);
+        });
+    }
+
+    /// Edits land before group resolution, so overriding a grouped expression
+    /// reaches the legacy keys it expands to.
+    #[test]
+    fn edits_are_resolved_through_the_flag_groups() {
+        let _lock = process_override_lock();
+        with_thread_overrides(&[("CRATONVM_JIT", Some("threshold=7"))], || {
+            assert_eq!(
+                runtime_var("CRATONVM_JIT_THRESHOLD").ok().as_deref(),
+                Some("7")
+            );
+        });
+    }
+
+    fn process_override_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 }

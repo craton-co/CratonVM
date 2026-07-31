@@ -5,17 +5,18 @@
 //! `gc/src/stale_objref_debug.rs` and
 //! docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
 //!
-//! Deliberately a SEPARATE test binary (one file under `gc/tests/`, one test
+//! Still a SEPARATE test binary (one file under `gc/tests/`, one test
 //! function) rather than a `#[test]` inside `gen_heap.rs`'s own module: the
-//! flag is read through a process-wide `OnceLock` that latches permanently
-//! on first read (matching every other `CRATONVM_DBG_*` flag in this
-//! codebase — see `vm/src/runtime/env_cache.rs`'s module doc comment).
-//! `cargo test` runs every `#[test]` within one file's binary in the SAME
-//! process, so if this lived alongside `gen_heap.rs`'s existing (much
-//! larger) test module, an earlier test could touch `get_header`/
-//! `collect_garbage_inner` first and permanently latch the flag to `false`
-//! before `set_var` below ever runs. A dedicated single-test file gets its
-//! own fresh process, guaranteeing `set_var` runs before the first read.
+//! flag changes how *every* minor GC in the process recycles its from-space
+//! arena, so it has no business being live while unrelated heap tests run.
+//!
+//! It no longer has to be, for correctness. `CRATONVM_DBG_STALE_OBJREF` is a
+//! declared flag served from the process-wide `cratonvm_types::flags`
+//! snapshot, which latches on the first read of ANY flag — so the `set_var`
+//! this test used to do worked only because it was the sole occupant of its
+//! binary, and would have silently become a no-op the day a second test was
+//! added to the file. The test installs a `flags::override_process` guard
+//! instead, which wins whether or not the snapshot has already latched.
 
 use std::collections::HashMap;
 
@@ -38,9 +39,14 @@ fn stw() -> StopTheWorldToken {
 
 #[test]
 fn stale_native_objref_is_caught_after_evacuation() {
-    // Must run before ANY other code in this process reads the flag (see
-    // the module doc comment above for why this has to be its own binary).
-    std::env::set_var("CRATONVM_DBG_STALE_OBJREF", "1");
+    // Held for the whole test: `gc_flags()` reads the snapshot live, so the
+    // quarantine behaviour under test is in force exactly while this guard is.
+    let _stale_objref = cratonvm_types::flags::override_process(
+        cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+            "CRATONVM_DBG_STALE_OBJREF",
+            Some("1"),
+        )]),
+    );
 
     let heap = GenerationalHeap::with_sizes(4 * 1024, 8 * 1024);
     let monitors = NoMonitors;

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — the process-wide gates were narrowed to per-class on 2026-07-30 and the reproducer **still fails**. Re-measured, not fixed. |
+| **Status** | OPEN — the process-wide gates were narrowed to per-class on 2026-07-30 and the reproducer **still fails**. Two independent 2026-07-30 re-measurements (one on Windows after the gate work, one on Azure) agree: still tens of µs per call, and the 2026-07-26 profile's leading hypothesis is now **ruled out**. |
 | **Category** | VM-PERFORMANCE (JVMTI redefine / interpreter caching) |
 | **Found** | 2026-07-26, Azure host `20.83.144.174`, dev `7cb040a97`, real JDK 25. |
 | **CratonVM** | ~40,950 ns per `StringBuilder.length()` call after `Mockito.mock(StringBuilder.class)` |
@@ -167,3 +167,71 @@ Two things NOT to try:
 an unrelated mock returns the right length, and
 `TypeUtils.parseType("java.lang.reflect.Method[]")` returns
 `[Ljava/lang/reflect/Method;`. This is purely a throughput defect.
+
+## 2026-07-30, second re-measurement (Azure) — the re-quickening hypothesis is dead
+
+The section above closes with *"the next step is unchanged — find what produces a
+fresh `Arc<[u8]>` for a redefined method's code on every invocation"*. It was
+checked on Azure the same day, and there is no such allocation left to find.
+
+`SbCostProbe` on `fix/spring-aot-cluster-20260730` (dev `c8da3d9188` + this
+session's loader fixes): **32 876 ns/call** after the mock, 350 ns before. So
+the defect is undiminished, and it is still what makes Spring's
+`AotIntegrationTests` chunk 4 look like a hang — a fresh watchdog dump
+(`CRATONVM_DEFAULT_WATCHDOG_SEC=420`) pins the main thread at
+`TestCompiler.compile` → javac `JavaTokenizer` → … →
+`WeakConcurrentMap$LatentKey.hashCode`, exactly as described above.
+
+**Do not re-chase "a fresh `Arc<[u8]>` per call".** The uncached invoke path
+already interns its padded bytecode per method identity
+(`frame::padded_bytecode_for_method`, and `Frame::new_from_arcs` uses it), so
+`quickened::intern` hits. `QuickenedCode::build` is no longer in the profile at
+all; `intern` itself is 3.3% (a shard read + hash per frame push) and
+`drop_in_place<QuickenedCode>` 0.9%.
+
+Fresh `perf record -F 199` over the post-mock phase, self time:
+
+```
+ 7.79%  NativeMethodRegistry::slot_for_exact
+ 4.25%  __memcmp_evex_movbe                 (the string compares inside it)
+ 4.09%  interpreter::execute_frame_from_index
+ 3.47%  _mi_page_malloc_zero
+ 3.33%  __memmove_avx512_unaligned_erms
+ 3.27%  quickened::intern
+ 2.63%  interpreter::execute_invokevirtual_cached
+ 2.56%  vm_exec::invoke_on_class_shared_inner
+ 2.21%  interpreter::execute_instruction
+ 1.94%  interpreter::resolve_field_ref_loader_aware
+ 1.82%  interpreter::resolve_class_loader_aware
+ 1.79%  vm_init::SharedVm::load_class_concurrent
+ 1.67%  interpreter::should_force_registered_native_over_bytecode
+ 1.57%  interpreter::resolve_method_metadata
+ 1.20%  jimage::JImageReader::find_resource
+ 1.01%  ClassManager::class_redefine_generation
+```
+
+The profile is **flat** — the largest item is under 8% — and it is dominated by
+by-name re-resolution (`slot_for_exact` + its `memcmp`, `resolve_*_loader_aware`,
+`load_class_concurrent`, `find_resource`). There is no single hot spot to
+remove; the whole uncached dispatch path runs per invocation.
+
+**One tried-and-rejected fix, so it is not tried twice.** The per-thread
+`native_shadow_cache` is keyed `(receiver_class_id, name_hash, desc_hash)` and
+`execute_invokevirtual_vtable_fast` **bypasses it entirely** whenever
+`any_class_redefined()` is true — i.e. permanently, from the first `mock()`.
+Replacing that with a process-wide redefine EPOCH folded into the cache key
+(so a redefinition retires entries instead of disabling the cache) is correct
+and was implemented and measured: **32 876 → 33 626 ns/call, i.e. no change.**
+`execute_invokevirtual_vtable_fast` does not appear in the profile at all for
+this workload, so the cache it guards is not on this path. The change was
+reverted rather than shipped unmeasured. If someone revisits it, do so for a
+workload where that fast path IS hot, and measure before landing.
+
+**Where to look next**, given the above: the cost is spread across the generic
+`execute()` path, so the question is why a redefined-class call site never
+reaches a cached invoke tier at all, not which single function is slow. Start
+by counting how many times `execute()` is entered per `length()` call — if the
+advice chain is ~15 nested uncached invokes, 33 µs is ~2 µs each and the fix is
+to make redefined-class call sites cacheable (per-class generation in the key)
+rather than to micro-optimise any one of the functions above.
+

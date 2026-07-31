@@ -1282,7 +1282,7 @@ impl VmHeap {
     /// holds a live JIT frame — the steady state at a 500-invocation JIT
     /// threshold; compaction's correctness blocker closed 2026-07-26
     /// (`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
-    /// but moving-young remains opt-in on throughput grounds. Under a
+    /// and moving-young is now the default. Under a
     /// non-moving, fragmenting heap "unused bytes" and "bytes an
     /// allocation can actually obtain" diverge without bound: a heap can be 60%
     /// unused and still fail a modest allocation because no single free run is

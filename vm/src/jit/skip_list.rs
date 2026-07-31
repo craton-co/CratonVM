@@ -109,150 +109,11 @@ pub enum SkipReason {
     /// JIT-only array-index corruption residual. Keep the implementation
     /// interpreted until the lowering defect is identified.
     BigIntegerArithmetic,
-    /// JavacTool.getTask loses the compiler file-manager context after tiered
-    /// compilation. Keep this cold compiler setup method interpreted until
-    /// its JIT lowering is understood.
-    JavacToolContext,
-    /// ClassReader.readClass corrupts a Symbol reference once tier-compiled
-    /// under repeated in-process compilation. Keep this classfile-parsing
-    /// method interpreted until its JIT lowering is understood.
-    ClassReaderReadClass,
-    /// Javac's `ClassFinder.fillIn` -- the method `ClassFinder.complete`
-    /// itself calls to do the actual symbol completion -- is a FIFTH
-    /// distinct JIT residual in the same repeated-in-process-compilation
-    /// scenario as `ClassReaderReadClass`/`ClassFinder.complete` above.
-    /// `ClassFinder.complete`'s own doc comment noted `fillIn` was
-    /// bisect-RULED-OUT for the two symptoms known at the time (a
-    /// deprecation-warning `-Werror` false positive and duplicated-token
-    /// generated source) -- but `fillIn` gets its own independent JIT
-    /// tier-up eligibility separate from its caller `complete` (forcing
-    /// `complete` to interpret does not prevent `fillIn` from itself
-    /// getting hot enough to tier up under a longer-running loop), and DOES
-    /// independently miscompile: `java.lang.NullPointerException` thrown
-    /// directly from `ClassFinder.fillIn` (JDK 25.0.3, line ~395) reached
-    /// via `Types.unboxedType` -> `ClassFinder.complete` -> `fillIn`
-    /// while attributing a `new Object[]{...}` array-initializer literal,
-    /// surfacing as real javac's own internal-compiler-error report rather
-    /// than a Spring-visible `CompilationException`. Reproduced
-    /// deterministically at iteration 38 of a Spring-free, ~30-line
-    /// standalone repro (`ToolProvider.getSystemJavaCompiler().getTask(...)
-    /// .call()` looped in one process, each iteration compiling a trivial
-    /// user class against a small JSpecify-`@Nullable`-annotated
-    /// `@FunctionalInterface` also in scope) -- with `ClassFinder.complete`
-    /// already interpreted per the fix above. Keep this symbol-completion
-    /// method interpreted until its own JIT lowering is understood too.
-    ClassFinderFillIn,
-    /// Javac's `ClassReader.readInnerClasses` -- the InnerClasses attribute
-    /// reader, a moderately complex loop (per-entry: 4 constant-pool-index
-    /// reads, an `adjustClassFlags` call, conditional `enterClass`/
-    /// `enterMember` calls and `ClassType.setEnclosingType` field writes) --
-    /// is a SIXTH distinct JIT residual in the same repeated-in-process-
-    /// javac-compilation family as `ClassReaderReadClass`/
-    /// `ClassFinder.complete`/`ClassFinderFillIn` above. Symptom: real
-    /// javac's own `class file truncated at offset N` diagnostic (thrown
-    /// from `ClassReader.nextChar`/`nextByte`/`nextInt` once the shared
-    /// `bp` buffer-position cursor has been driven past the end of the
-    /// classfile) -- consistent with the entry-count loop in this method's
-    /// own JIT-compiled body over- or under-consuming `nextChar()` calls per
-    /// iteration once tier-compiled, desynchronizing `bp` from every
-    /// subsequent attribute read for the rest of that classfile (and
-    /// possibly the next one read from the same shared `ClassReader`).
-    /// Bisected by binary search over every other method on `ClassReader`
-    /// (all TYPE_ANNOTATIONS/signature/attribute/nextByte-family candidates
-    /// ruled out first, since the trigger classfile has JSpecify
-    /// `@Nullable` TYPE_USE annotations on a generic method return type and
-    /// an array return type -- an initially much more obvious suspect that
-    /// turned out to be a red herring): `CRATONVM_JIT_BISECT_SKIP=.../
-    /// ClassReader.readInnerClasses` (this exact method alone) is
-    /// sufficient against a Spring-free, ~30-line standalone repro
-    /// (`ToolProvider.getSystemJavaCompiler().getTask(...).call()` looped
-    /// ~40x in one process, each iteration compiling a trivial user class
-    /// against a small JSpecify-annotated `@FunctionalInterface` also in
-    /// scope), reproducing deterministically at iteration 38 every time.
-    /// Confirmed JIT-only via `--nojit` (all iterations pass). Keep this
-    /// InnerClasses-attribute-reading method interpreted until its own JIT
-    /// lowering is understood.
-    ClassReaderReadInnerClasses,
-
-    /// Javac's `ClassReader.readAttrs` -- the shared per-member/per-class
-    /// attribute-dispatch loop (`readClassAttrs`/`readMemberAttrs` both
-    /// delegate straight into it: read an attribute count via `nextChar()`,
-    /// then loop that many times reading a name-index `nextChar()` + a
-    /// length `nextInt()` and either dispatching to a specific
-    /// `AttributeReader` or skipping `bp += attrLen`) -- is a SEVENTH
-    /// distinct JIT residual in the same repeated-in-process-javac-
-    /// compilation family as `ClassReaderReadClass`/`ClassFinder.complete`/
-    /// `ClassFinderFillIn`/`ClassReaderReadInnerClasses` above, same
-    /// "moderately complex counted loop over the shared `bp` cursor" shape.
-    /// Symptom: real javac's `bad class file... bad signature: "ourceFile"`
-    /// (a corrupted read of the `SourceFile` attribute's own name — the
-    /// leading `"S"` lost, i.e. the shared constant-pool-index/length cursor
-    /// desynchronized by a couple of bytes) surfacing while compiling
-    /// AOT-generated sources against `spring-core`/`spring-beans`/JDK
-    /// `.class` files pulled onto the classpath — found via
-    /// `ApplicationContextAotGeneratorTests$ConfigurationClassCglibProxy
-    /// .processAheadOfTimeWhenHasCglibProxyUseProxy`, which reproduces this
-    /// deterministically with default (Conservative) JIT settings despite
-    /// `readClass`/`readInnerClasses` already being interpreted. Confirmed
-    /// JIT-only (`--nojit`: pass) and isolated with `CRATONVM_JIT_DENY=
-    /// com/sun/tools/javac/jvm/ClassReader` (whole class: pass) then
-    /// narrowed with `CRATONVM_JIT_BISECT_SKIP=com/sun/tools/javac/jvm/
-    /// ClassReader.readAttrs` (this exact method alone: pass). Keep this
-    /// attribute-dispatch loop interpreted until its own JIT lowering is
-    /// understood.
-    ClassReaderReadAttrs,
-
-    /// Javac's `Symbol$ClassSymbol.complete` underflows the interpreter operand
-    /// stack after tiered compilation while H2 compiles a generated alias.
-    /// Keep this symbol-completion method interpreted until its invokespecial
-    /// lowering is corrected.
-    ClassSymbolComplete,
-
-    /// Spring's shaded JavaPoet `CodeBlock$Builder.add(String, Object...)`
-    /// (the $-placeholder format-string parser, reached from
-    /// `org/springframework/javapoet/CodeBlock$Builder`) is a FOURTH distinct
-    /// JIT residual in the same repeated-in-process-javac-compilation
-    /// scenario as `ClassReaderReadClass`/`ClassFinder.complete` above, but
-    /// this one is not in javac itself — it is in Spring's own code
-    /// generation support library. Two symptoms trace to this one method:
-    /// outright duplicated tokens in the generated source (e.g. `import
-    /// import ...`, `class class`) identical in shape to
-    /// `ClassFinder.complete`'s corruption, and a bogus
-    /// `ClassCastException: String cannot be cast to TypeName` thrown from
-    /// `argToType` — despite `argToType`'s own $T dispatch being guarded by
-    /// an `instanceof` immediately before the `checkcast` that throws,
-    /// which should be impossible to fail. Bisected the same way as the
-    /// javac residuals (`CRATONVM_JIT_DENY`/`CRATONVM_JIT_BISECT_SKIP`):
-    /// denying the whole `CodeBlock` class does nothing, denying
-    /// `CodeBlock$Builder` fixes both symptoms, and narrowing further rules
-    /// out `argToType`/`addArgument` individually (skipping either alone
-    /// leaves both failures) — only skipping `add` itself (the varargs
-    /// format-string entry point that walks the $ placeholders and dispatches
-    /// each argument, inlining `argToType`'s body into its own compiled code)
-    /// is sufficient. Keep `add` interpreted until the x64 lowering bug is
-    /// understood.
-    JavaPoetCodeBlockBuilderAdd,
     /// Spring Boot's `ModifiedClassPathClassLoader.loadClass` can spin in its
     /// nested class-path exclusion path once tier-compiled. Keep this one
     /// test-support loader method interpreted until its JIT lowering is
     /// understood.
     SpringBootModifiedClassPathLoader,
-    /// Spring Boot's zero-capture `ConditionEvaluationReport` mapping lambda
-    /// can return a raw `Object` after tiered compilation, corrupting the
-    /// report's `SortedMap<String, ConditionAndOutcomes>`. Keep the lambda
-    /// body interpreted until the JIT value-production defect is understood.
-    SpringBootConditionReportMapping,
-    /// Spring's JDK HTTP-client request builder lambda can resolve the
-    /// `String.CASE_INSENSITIVE_ORDER` comparator as a `Function` after
-    /// tiered compilation, attempting its nonexistent `apply(Object)` method.
-    /// Keep that exact request-building lambda interpreted until invokedynamic
-    /// interface-target lowering preserves the comparator's `compare` shape.
-    SpringBootJdkHttpRequestHeaderComparator,
-    /// Spring's annotation-attribute collector can dispatch its accumulator as
-    /// `Object.accept(Object, Object)` after tiered compilation. Keep the
-    /// one method that assembles the `MultiValueMap` interpreted until the
-    /// collector's functional-interface receiver is preserved by the JIT.
-    SpringAnnotatedMetadataAttributeCollector,
     /// `java/util/stream/MatchOps.makeInt/makeRef/makeLong/makeDouble`
     /// unconditionally reach an internal `invokedynamic` (lambda) call site
     /// that `jit_scan` lowers to an always-deopt uncommon trap
@@ -265,11 +126,6 @@ pub enum SkipReason {
     /// raw entry point (ES-PERF-20260719 testSlicesDense: 6928 deopt events
     /// for `makeInt` alone in a single test run).
     StreamMatchOpsUncommonTrap,
-    /// Javac's `Types.erasure` corrupts symbol/type completion state once
-    /// tier-compiled during repeated in-process compilation, surfacing later
-    /// as a null `Type` read in `Lower.boxIfNeeded`. Keep this hot
-    /// type-erasure method interpreted until its JIT lowering is understood.
-    TypesErasure,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -606,275 +462,61 @@ fn should_skip_jit_internal(
     }
 
 
-    // SPRING-TESTCOMPILER.1 (2026-07-18): Spring's TestCompiler performs one
-    // in-process javac invocation per fixture. Once the real JDK's
-    // `JavacTool.getTask` is tier-compiled, its `context.put(JavaFileManager,
-    // fileManager)` state does not survive into `ClassReader`: JDK 25 then
-    // aborts compilation with `AssertionError: FileManager initialization
-    // error`. The identical 65-test class passes under --nojit and under JIT
-    // when this method alone is excluded. This setup path is cold relative to
-    // application execution; keep it interpreted until the JIT producer is
-    // root-caused. The guard is deliberately unconditional: allowing a broad
-    // javac package experiment must not re-enable this known corrupting method.
-    if class_name == "com/sun/tools/javac/api/JavacTool" && method_name == "getTask" {
-        return Some(SkipReason::JavacToolContext);
-    }
-
-    // SPRING-TESTCOMPILER.2 (2026-07-20): a second, distinct JIT residual in
-    // the same repeated-in-process-javac-compilation scenario as
-    // SPRING-TESTCOMPILER.1 above, surfacing even with that fix in place.
-    // Standalone, Spring-free repro (no test framework involved):
-    // `ToolProvider.getSystemJavaCompiler().getTask(...).call()` looped ~20x
-    // in one process, each iteration compiling a trivial one-line class,
-    // deterministically starts throwing `java.lang.NullPointerException:
-    // Cannot read field "kind" because "sym" is null` from inside real
-    // javac's own `com.sun.tools.javac.code.Symbol.packge`, reached via
-    // `ClassReader.readClass` -> `readClassBuffer` -> `readClassFile` ->
-    // `ClassFinder.fillIn` -> `Modules$1.complete` (module-graph symbol
-    // completion during `Modules.setupAllModules`). Confirmed JIT-only:
-    // `--nojit` and `CRATONVM_JIT_THRESHOLD=100000` both make all 30
-    // iterations pass; `CRATONVM_JIT_DENY=com/sun/tools/javac/jvm/ClassReader`
-    // isolates it to this one class, and `CRATONVM_JIT_BISECT_SKIP=
-    // com/sun/tools/javac/jvm/ClassReader.readClass` (this exact method
-    // alone) is sufficient — ruling out `Symbol`, `ClassFinder`, and
-    // `Modules` as the miscompiled site despite each appearing in the
-    // stack trace. Not explained by repeated jimage re-reads (a
-    // `NativeImageBuffer.getNativeMap` call-count trace showed zero calls
-    // during the whole loop) or by heap size (identical failure at the
-    // default heap and at `--Xmx 4g`) or by the weak/phantom-reference GC
-    // clearing added in 994ae578b (`CRATONVM_WEAKREF_CLEAR=0` has no
-    // effect) — this is a genuine x64 JIT lowering defect in
-    // `readClass`'s own compiled body, not an accumulating-resource or
-    // GC-pressure artifact. This is very likely the true root cause behind
-    // most of the AOT cluster's `CompilationException: Unable to compile
-    // source` failures in `beans.factory.aot.*CodeGenerator*Tests` (each
-    // test method triggers its own in-process `TestCompiler.compile()`, so
-    // a whole-class run crosses this same tier-up point partway through).
-    // Keep `readClass` interpreted until the x64 lowering bug is found.
-    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readClass" {
-        return Some(SkipReason::ClassReaderReadClass);
-    }
-
-    // SPRING-TESTCOMPILER.3 (2026-07-20): a THIRD JIT residual in the same
-    // repeated-in-process-javac-compilation scenario as
-    // SPRING-TESTCOMPILER.2 above, surfacing even with `ClassReader.readClass`
-    // already interpreted. Two distinct symptoms trace to this one method:
+    // SPRING-TESTCOMPILER.1-4 / HIB-STOREDPROC-JIT.1 / TYPES-ERASURE.1 /
+    // SPRINGBOOT-CONDITION-REPORT.1 / SPRINGBOOT-HTTP-HEADER-COMPARATOR.1 /
+    // SPRINGBOOT-ANNOTATED-METADATA-COLLECTOR.1 -- ALL REMOVED 2026-07-30.
     //
-    // (a) `AutowiredAnnotationBeanRegistrationAotContributionTests`'s
-    //     `DeprecationTests` — Spring's `CodeWarnings.detectDeprecation`
-    //     correctly detects the `@Deprecated` member and DOES emit
-    //     `@SuppressWarnings("deprecation")` on the generated method (visible
-    //     in the dumped source), but real javac's `-Werror` still fails the
-    //     compile in "warnings found and -Werror specified" — i.e. the
-    //     suppression annotation is present in the source but not honored,
-    //     which is a javac-internal symbol/annotation-completion defect, not
-    //     a Spring codegen gap.
-    // (b) `BeanDefinitionMethodGeneratorTests` — outright duplicated tokens
-    //     in generated source, e.g. `import import
-    //     org.springframework.aot.generate.Generated;` and a mangled
-    //     `return return BeanInstanceSupplier...withGenerator(.withGenerator(...`
-    //     body — content corruption, not an exception at all, only visible by
-    //     inspecting the dumped source of an otherwise-silent
-    //     `CompilationException`/`IllegalStateException: Unable to parse
-    //     source file content`.
+    // Eleven per-method bans lived here: the eight in-process-javac-family
+    // ones (`com/sun/tools/javac/api/JavacTool.getTask`,
+    // `com/sun/tools/javac/jvm/ClassReader.readClass`/`.readInnerClasses`/
+    // `.readAttrs`, `com/sun/tools/javac/code/ClassFinder.fillIn`,
+    // `com/sun/tools/javac/code/Symbol$ClassSymbol.complete`,
+    // `com/sun/tools/javac/code/Types.erasure`,
+    // `org/springframework/javapoet/CodeBlock$Builder.add`) plus the three
+    // 2026-07-29 Spring Boot lambda/collector ones
+    // (`ConditionEvaluationReport.lambda$recordConditionEvaluation$0`,
+    // `JdkClientHttpRequest.lambda$buildRequest$0`,
+    // `AnnotatedTypeMetadata.getAllAnnotationAttributes`).
     //
-    // Bisected the same way as SPRING-TESTCOMPILER.2:
-    // `CRATONVM_JIT_DENY=com/sun/tools/javac/code/ClassFinder` fixes (a)
-    // (14/14 OK, was 11/14); `CRATONVM_JIT_BISECT_SKIP=
-    // com/sun/tools/javac/code/ClassFinder.complete` (this exact method
-    // alone, ruling out `fillIn` despite it being the frame actually named in
-    // SPRING-TESTCOMPILER.2's stack trace) is equally sufficient. Keep
-    // `complete` interpreted until the x64 lowering bug is found.
+    // The eight javac-family bans were all workarounds for ONE producer
+    // defect, fixed 2026-07-31 in `jit/src/x64.rs`s `invokedynamic` (0xba)
+    // arm. That opcode lowers to an UNCONDITIONAL uncommon trap plus a frame
+    // snapshot the interpreter resumes from. The snapshot types the call
+    // sites own arguments exactly, but every operand-stack entry BELOW them
+    // falls back to the method-level `uses_long_float_double` gate and is
+    // recorded `Unsupported` -- so in a method that touches any wide value,
+    // an `int` sitting under the indy argument is unmappable, the resume sink
+    // refuses ("precise deoptimization unavailable ... refusing side-effecting
+    // replay"), and the method dies with an `InternalError` on its FIRST
+    // compiled call. javac `ClassReader.readInnerClasses` bci 41 is the
+    // canonical instance (`optPoolEntry(int, IntFunction, Object)`).
+    // The fix checks the snapshot with `deopt::frame_state_is_resumable` and
+    // bails the compile when it is unresumable, so the method stays
+    // interpreted -- what these bans did by hand, decided from the actual
+    // snapshot instead of a hardcoded method list.
     //
-    // RE-VERIFIED 2026-07-27, and symptom (a)'s cause corrected. The
-    // "duplicate element 'value' in annotation @SuppressWarnings" defect
-    // found in 2026-07-26's javac sweep turned out to be a VM-wide
-    // `LinkedHashSet.remove` bug (it deleted the element but answered
-    // `false`, which is exactly when javac's `Annotate.attributeAnnotation`
-    // reports that error) and was fixed the same day -- so the open question
-    // that write-up left behind, "was SPRING-TESTCOMPILER.3's symptom (a)
-    // actually THAT bug rather than a JIT miscompile?", was tested directly.
-    // It was not. With the LinkedHashSet fix in place and this ban lifted (an
-    // env-gated build, all other bans left active):
+    // Evidence (full write-up, including the false "these bans are stale"
+    // reading that preceded it, in
+    // `docs/internal/jit-bans/spring-jit-bans-inventory-and-ban-lift-experiment-20260730.md`):
     //
-    //   AutowiredAnnotationBeanRegistrationAotContributionTests  14/14 -> 9/14
-    //       (exactly the 5 `DeprecationTests`, symptom (a) verbatim:
-    //        "warnings found and -Werror specified" against generated source
-    //        that does carry `@SuppressWarnings("deprecation")`)
-    //   BeanDefinitionMethodGeneratorTests                       34/34 -> 32/34
+    //   * `JavacConsolidationProbe` (200 varied in-process javac compilations,
+    //     the repo own witness for this family) fails at iteration 2 with the
+    //     bans lifted and no fix, and passes 200/200 with the fix;
+    //   * an H2 `CREATE ALIAS ... AS $$` probe goes 38/60 -> 60/60;
+    //   * all TEN Spring AOT/codegen witness classes pass, including four that
+    //     were failing WITH the bans in place (BeanDefinitionMethodGenerator
+    //     10/34 -> 34/34, AutowiredAnnotationBeanRegistrationAotContribution
+    //     0/14 -> 14/14, ApplicationContextAotGenerator 8/40 -> 40/40,
+    //     TestContextAotGeneratorIntegration 0/4 -> 4/4);
+    //   * `BasicErrorControllerIntegrationTests`, the Spring Boot trio own
+    //     witness, reproduces its failure on dev `351bf59b0` with those bans
+    //     lifted and is clean on this tip.
     //
-    // Both are 100% with this ban active, matching HotSpot JDK 25. So the ban
-    // stays.
-    //
-    // What that round DID buy is a Spring-free standalone reproducer where
-    // there was none: `DeprecationSuppressionProbe.java` (committed at
-    // docs/known-issues/repros/jitban-remaining-20260726/) reproduces symptom
-    // (a) at iteration ~21 in ~2 minutes. The shape is load-bearing -- the
-    // deprecated type must live in a SEPARATE, already-compiled `.class` file
-    // on the classpath. A single-file probe never reproduces it, because
-    // javac emits no deprecation warning at all when
-    // `s.outermostClass() == other.outermostClass()`.
-    //
-    // ROOT-CAUSED 2026-07-28. Symptom (a) is not an arithmetic or lowering
-    // defect in this method at all -- it is a JIT-compiled `finally` that
-    // never runs. `[PUTFIELD-WATCH]` on `Annotate.blockCount`
-    // (`CRATONVM_DBG_FIELD_WATCH=Annotate.blockCount`) shows the healthy
-    // compilations pairing `blockAnnotations()` (counter++) with
-    // `unblockAnnotationsNoFlush()` (counter--) and returning to 0, and the
-    // first failing compilation running five `blockAnnotations()` with no
-    // matching unblock, ending at 4. `complete` brackets its body in
-    // `try { annotate.blockAnnotations(); ... } finally {
-    // annotate.unblockAnnotationsNoFlush(); dependencies.pop(); }`, so a
-    // skipped `finally` leaves annotations blocked and `Annotate.flush()` a
-    // no-op for the rest of that compilation -- and javac throws
-    // `CompletionFailure` through `complete` constantly while resolving
-    // cross-compilation-unit references, which is exactly why the standalone
-    // reproducer needs the deprecated type in a separate `.class` file.
-    //
-    // Reduced to a 3-second, javac-free witness --
-    // `try { n++; thrower(); } finally { n--; }` in a loop where `thrower`
-    // throws every 7th call leaks one count per throw under JIT and zero
-    // under `--nojit` / HotSpot (`FinallyBalanceProbe`, `FinallyShapeProbe`,
-    // `FinallyThrowSiteProbe`, `CallPathProbe`, all committed at
-    // docs/known-issues/repros/jitban-remaining-20260726/). Only a catch-all
-    // (`catch_type == 0`) leaks; typed `catch`, `catch (Throwable)` and
-    // catch-and-rethrow are unaffected, because a catch-all has nothing but
-    // the pc range to match on.
-    //
-    // Three independent escape routes were found. TWO ARE FIXED (2026-07-28,
-    // this commit):
-    //
-    //   1. Foreign throw pc. `JitSignals::athrow_bci` was left holding the
-    //      bci that the CALLEE's compiled `athrow` lowering stashed, and the
-    //      interpreter range-checked that foreign pc against THIS method's
-    //      exception table. Fixed by stamping the invoke's own bci in the
-    //      post-invoke exception-check stub (`JitRuntimeHelpers::set_throw_bci`,
-    //      `emit_exception_check_stub` now emits one pad per distinct bci).
-    //   2. Whole-method re-execution. When a compiled caller invoked a
-    //      compiled callee that threw, `route_implicit_exc_through_callee`
-    //      answered by re-running the callee from its entry -- duplicating
-    //      every side effect the compiled attempt had already performed
-    //      before the throw. Fixed by resuming the callee AT its handler
-    //      instead (`interpreter::run_jit_callee_handler`).
-    //
-    // Lambda and method-reference dispatch now takes the same precise
-    // handler-resume drain as ordinary JIT entries. CallPathProbe validates
-    // all five routes, including both lambda forms, so complete is eligible
-    // for JIT again.
-    if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "fillIn" {
-        return Some(SkipReason::ClassFinderFillIn);
-    }
-
-    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readInnerClasses" {
-        return Some(SkipReason::ClassReaderReadInnerClasses);
-    }
-
-    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readAttrs" {
-        return Some(SkipReason::ClassReaderReadAttrs);
-    }
-
-    // HIB-STOREDPROC-JIT.1 (2026-07-23): H2's `CREATE ALIAS ... AS $$` invokes
-    // the real in-process javac compiler.  After this exact method tiers up,
-    // `Symbol$ClassSymbol.complete()` deterministically reaches an
-    // `invokespecial` with an empty operand stack, reported as
-    // `IllegalStateException: operand stack underflow`; H2 then fails to
-    // install `findUsers` and the Hibernate stored-procedure tests fail.  The
-    // class pair passes under `--nojit` and with only this method denied via
-    // `CRATONVM_JIT_BISECT_SKIP`, so keep the narrow compiler-internal method
-    // interpreted until the special-call lowering is root-caused.
-    if class_name == "com/sun/tools/javac/code/Symbol$ClassSymbol" && method_name == "complete" {
-        return Some(SkipReason::ClassSymbolComplete);
-
-    }
-
-    // TYPES-ERASURE.1 (2026-07-25): an EIGHTH distinct JIT residual in the
-    // same repeated-in-process-javac-compilation family as
-    // SPRING-TESTCOMPILER.1-4 / HIB-STOREDPROC-JIT.1 above, and likely the
-    // common root several of those entries were only symptoms of.
-    // Standalone, Spring-free repro (no test framework, no annotation
-    // processing): `ToolProvider.getSystemJavaCompiler().getTask(...).call()`
-    // looped in one process, each iteration compiling a fresh trivial
-    // `@Deprecated class TrivialN { public int x() { return N; } }` --
-    // deterministically starts throwing `java.lang.NullPointerException:
-    // Cannot invoke "com.sun.tools.javac.code.Type.hasTag(...)" because
-    // "type" is null` from real javac's own `Lower.boxIfNeeded` (reached via
-    // `Lower.visitReturn`) at iteration 8 and every iteration after, with
-    // none of the existing SPRING-TESTCOMPILER/HIB-STOREDPROC-JIT bans (all
-    // already interpreted) preventing it. Bisected with `CRATONVM_JIT_DENY`:
-    // the whole `com/sun/tools/javac/` package fixes it (confirming it is
-    // still this same javac-JIT family), narrowed to
-    // `com/sun/tools/javac/code/` alone (fixed), then to `Types` alone
-    // (fixed) after `Symbol` alone proved insufficient. Splitting the
-    // Types-family candidate set in half and then bisecting the remaining
-    // half individually (`memberType` alone: insufficient; `boxedClass` +
-    // `unboxedType` together: insufficient) isolated the single necessary
-    // method: `CRATONVM_JIT_BISECT_SKIP=com/sun/tools/javac/code/
-    // Types.erasure` alone is sufficient (40/40 OK, was 7/40). `erasure` is
-    // called constantly during symbol/type completion (including from the
-    // already-interpreted `ClassReader`/`ClassFinder`/
-    // `Symbol$ClassSymbol.complete` methods above), so this single
-    // miscompile plausibly explains most or all of SPRING-TESTCOMPILER.1-4's
-    // and HIB-STOREDPROC-JIT.1's symptoms too -- but that consolidation
-    // claim is NOT yet verified (would need a full regression pass with
-    // those seven bans removed and only this one in place) and is left as a
-    // follow-up; for now this is added as its own targeted,
-    // independently-verified ban. Keep `erasure` interpreted until the x64
-    // lowering bug is found.
-    if class_name == "com/sun/tools/javac/code/Types" && method_name == "erasure" {
-        return Some(SkipReason::TypesErasure);
-    }
-
-
-    // SPRING-TESTCOMPILER.4 (2026-07-21): see `JavaPoetCodeBlockBuilderAdd`
-    // doc comment above. Spring shades/relocates `com.palantir.javapoet` to
-    // `org.springframework.javapoet` at build time, hence the runtime
-    // package name below differs from the upstream library's own source.
-    if class_name == "org/springframework/javapoet/CodeBlock$Builder" && method_name == "add" {
-        return Some(SkipReason::JavaPoetCodeBlockBuilderAdd);
-    }
-
-    // SPRINGBOOT-CONDITION-REPORT.1 (2026-07-29): repeatedly booting the
-    // real `BasicErrorControllerIntegrationTests` application passes 26/26
-    // under `--nojit`, but with the JIT enabled the tenth application context
-    // can fail in `ConditionEvaluationReport.getConditionAndOutcomesBySource`
-    // with `Object cannot be cast to ConditionAndOutcomes`. The only writer
-    // of that typed map is `recordConditionEvaluation`'s zero-capture
-    // `computeIfAbsent` lambda. Bisection with
-    // `CRATONVM_JIT_BISECT_SKIP=...ConditionEvaluationReport.lambda$recordConditionEvaluation$0`
-    // removes the failure while retaining JIT coverage for the surrounding
-    // Spring Boot workload. Keep exactly that value-producing lambda
-    // interpreted; do not weaken the entire autoconfigure package.
-    if class_name == "org/springframework/boot/autoconfigure/condition/ConditionEvaluationReport"
-        && method_name == "lambda$recordConditionEvaluation$0"
-    {
-        return Some(SkipReason::SpringBootConditionReportMapping);
-    }
-
-    // SPRINGBOOT-HTTP-HEADER-COMPARATOR.1 (2026-07-29): the real
-    // BasicErrorControllerIntegrationTests class passes 26/26 under --nojit,
-    // but its JIT run can terminate in JdkClientHttpRequest's header-building
-    // lambda with a call to CaseInsensitiveComparator.apply(Object), followed
-    // by a fatal invalid-reference checkcast. The comparator is not a
-    // Function; this is a tiered invokedynamic interface-target mismatch.
-    // Keep only the exact lambda interpreted, retaining JIT coverage for the
-    // HTTP client and the rest of the Spring Boot class.
-    if class_name == "org/springframework/http/client/JdkClientHttpRequest"
-        && method_name == "lambda$buildRequest$0"
-    {
-        return Some(SkipReason::SpringBootJdkHttpRequestHeaderComparator);
-    }
-
-    // SPRINGBOOT-ANNOTATED-METADATA-COLLECTOR.1 (2026-07-29):
-    // AnnotatedTypeMetadata.getAllAnnotationAttributes passes under --nojit,
-    // but after tiered compilation it can invoke the stream collector
-    // accumulator as Object.accept(Object, Object). The result then corrupts
-    // ConditionEvaluationReport's typed map. Keep this exact collector setup
-    // method interpreted; it is cold bootstrap code, not application traffic.
-    if class_name == "org/springframework/core/type/AnnotatedTypeMetadata"
-        && method_name == "getAllAnnotationAttributes"
-    {
-        return Some(SkipReason::SpringAnnotatedMetadataAttributeCollector);
-    }
+    // The unit tests below are the regression witnesses: they now assert
+    // JIT-ELIGIBILITY for all eleven methods, so re-adding a ban silently is
+    // a test failure. If a javac-family miscompile ever comes back, fix the
+    // lowering -- a per-method ban hides the defect everywhere else it occurs,
+    // which is exactly what happened here for two weeks.
 
     // SPRINGBOOT-WITHOUT-JACKSON.2 -- REMOVED 2026-07-26. Re-verified with a
     // standalone probe (`SpringBootLoadClassProbe.java`, package-local to
@@ -1862,23 +1504,25 @@ fn should_skip_jit_internal(
         // regression witness for the currently-tested (BigInteger-still-
         // banned) configuration only.
 
-        // HIB-BYTEBUDDY -- REMOVED 2026-07-28. Provisional blanket ban since
-        // 2026-06-13 for ByteBuddy's runtime class-build chain
-        // (`net/bytebuddy/`) after `SimpleEnhancerTests` hung (rc=124) with the
-        // stack spinning in `TypeDefinition$Sort.describe` /
-        // `TypeDescription.represents` once those type-description methods
-        // were JIT-compiled -- believed to be the same "JIT'd build-chain
-        // receiver corruption / loop never returns" miscompile as HIB-PROXY.
-        // Re-tested 2026-07-28 against the general JIT correctness fixes that
-        // have landed since (loader_id decode fix, atomic-array RMW, and
-        // others): `SimpleEnhancerTests` (the named regression witness) now
-        // passes cleanly and FASTER than interpreted (1762ms vs. 2511ms
-        // baseline), and a 15-class A/B sample across
-        // `org/hibernate/orm/test/bytecode/enhancement/**` (lazy loading,
-        // proxies, merge, batching) came back byte-identical
-        // found/started/ok/failed counts in both arms -- 0 hangs, 0 new
-        // failures. Full evidence:
-        // `docs/known-issues/hibernate/hib-bytebuddy-removed-20260728.md`.
+        // HIB-BYTEBUDDY -- REMOVED FOR GOOD 2026-07-30. The initial 2026-07-28
+        // removal used only a 15-class Hibernate sample. A later no-ban run
+        // from the older 77389fa06 runtime crashed in 302 classes; its exact
+        // witness was an instruction-fetch fault in the middle of
+        // `ModifierReviewable$AbstractBase.matchesMask`.
+        //
+        // An instruction-fetch fault at a valid mid-body address is not the
+        // shape a bytecode miscompile takes -- a miscompile yields a wrong
+        // value or a data fault. It is the signature of a compiled body being
+        // unmapped while a live frame still executes it, and that runtime
+        // predated the three JIT code-lifetime fixes now on dev (3fe14734a,
+        // ac300e6f6, 463bd32e2). ByteBuddy is merely the most JIT-churn-heavy
+        // code in the suite -- it retires and republishes artifacts constantly
+        // -- so it is where that defect surfaced first, and the 2026-07-29 ban
+        // re-instatement hid it rather than fixing it. Current dev, with no
+        // `net/bytebuddy/` guard, passes the exact 302-class crash manifest in
+        // both JIT and --nojit modes. Full root-cause and marker accounting:
+        // `docs/internal/fixed-suite-bugs/hibernate/`
+        // `hib-bytebuddy-20260730-FIXED.md`.
         // TEST-HARNESS BLANKET BANS -- REMOVED 2026-07-27. Four blanket
         // package bans lived here together:
         //
@@ -4367,6 +4011,36 @@ mod tests {
     // =================================================================
 
     #[test]
+    fn bytebuddy_package_is_jit_eligible_after_full_hibernate_closure() {
+        // The first entry is the exact method named by the historical
+        // mid-body instruction-fetch crash. The other two are the original
+        // 2026-06-13 hang witnesses. None may be hidden by a blanket package
+        // guard again.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            for (class, method) in [
+                (
+                    "net/bytebuddy/description/ModifierReviewable$AbstractBase",
+                    "matchesMask",
+                ),
+                (
+                    "net/bytebuddy/description/type/TypeDescription",
+                    "represents",
+                ),
+                (
+                    "net/bytebuddy/description/type/TypeDefinition$Sort",
+                    "describe",
+                ),
+            ] {
+                assert_eq!(
+                    check(class, method, false, true, policy),
+                    None,
+                    "HIB-BYTEBUDDY closure gate: {class}.{method} must remain JIT-eligible"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tier1_skip_list_no_blanket_java_util_ban() {
         // 10 representative java/util methods that are NOT in the
         // targeted miscompile list. Under BOTH policies, all must
@@ -4649,7 +4323,7 @@ mod tests {
     }
 
     #[test]
-    fn javac_tool_get_task_is_unconditionally_interpreted() {
+    fn javac_tool_get_task_is_jit_eligible_after_spring_testcompiler_1_removal() {
         for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
             assert_eq!(
                 check(
@@ -4659,14 +4333,14 @@ mod tests {
                     true,
                     policy,
                 ),
-                Some(SkipReason::JavacToolContext),
-                "JavacTool.getTask must remain excluded under every policy",
+                None,
+                "JavacTool.getTask must be JIT-eligible now that SPRING-TESTCOMPILER.1 is removed",
             );
         }
     }
 
     #[test]
-    fn types_erasure_is_unconditionally_interpreted() {
+    fn types_erasure_is_jit_eligible_after_types_erasure_1_removal() {
         for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
             assert_eq!(
                 check(
@@ -4676,14 +4350,14 @@ mod tests {
                     true,
                     policy,
                 ),
-                Some(SkipReason::TypesErasure),
-                "Types.erasure must remain excluded under every policy",
+                None,
+                "Types.erasure must be JIT-eligible now that TYPES-ERASURE.1 is removed",
             );
         }
     }
 
     #[test]
-    fn spring_boot_condition_report_mapping_lambda_is_unconditionally_interpreted() {
+    fn spring_boot_condition_report_mapping_lambda_is_jit_eligible_after_removal() {
         for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
             assert_eq!(
                 check(
@@ -4693,14 +4367,14 @@ mod tests {
                     true,
                     policy,
                 ),
-                Some(SkipReason::SpringBootConditionReportMapping),
-                "the ConditionEvaluationReport mapping lambda must remain excluded under every policy",
+                None,
+                "the ConditionEvaluationReport mapping lambda must be JIT-eligible now that SPRINGBOOT-CONDITION-REPORT.1 is removed",
             );
         }
     }
 
     #[test]
-    fn spring_boot_jdk_http_header_comparator_lambda_is_unconditionally_interpreted() {
+    fn spring_boot_jdk_http_header_comparator_lambda_is_jit_eligible_after_removal() {
         for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
             assert_eq!(
                 check(
@@ -4710,14 +4384,14 @@ mod tests {
                     true,
                     policy,
                 ),
-                Some(SkipReason::SpringBootJdkHttpRequestHeaderComparator),
-                "the JDK HTTP request header comparator lambda must remain excluded under every policy",
+                None,
+                "the JDK HTTP request header comparator lambda must be JIT-eligible now that SPRINGBOOT-HTTP-HEADER-COMPARATOR.1 is removed",
             );
         }
     }
 
     #[test]
-    fn spring_annotated_metadata_attribute_collector_is_unconditionally_interpreted() {
+    fn spring_annotated_metadata_attribute_collector_is_jit_eligible_after_removal() {
         for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
             assert_eq!(
                 check(
@@ -4727,8 +4401,8 @@ mod tests {
                     true,
                     policy,
                 ),
-                Some(SkipReason::SpringAnnotatedMetadataAttributeCollector),
-                "the annotation metadata collector must remain excluded under every policy",
+                None,
+                "the annotation metadata collector must be JIT-eligible now that SPRINGBOOT-ANNOTATED-METADATA-COLLECTOR.1 is removed",
             );
         }
     }
@@ -4800,8 +4474,31 @@ mod tests {
         );
     }
 
+    /// Regression witness for the 2026-07-30 removal of the remaining
+    /// javac-family bans (`SPRING-TESTCOMPILER.2`/`.3`/`.4`): the four methods
+    /// that had no dedicated eligibility test of their own must now compile.
     #[test]
-    fn javac_class_symbol_complete_is_unconditionally_interpreted() {
+    fn javac_family_residual_methods_are_jit_eligible_after_removal() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            for (class_name, method_name) in [
+                ("com/sun/tools/javac/jvm/ClassReader", "readClass"),
+                ("com/sun/tools/javac/jvm/ClassReader", "readInnerClasses"),
+                ("com/sun/tools/javac/jvm/ClassReader", "readAttrs"),
+                ("com/sun/tools/javac/code/ClassFinder", "fillIn"),
+                ("org/springframework/javapoet/CodeBlock$Builder", "add"),
+            ] {
+                assert_eq!(
+                    check(class_name, method_name, false, true, policy),
+                    None,
+                    "{class_name}.{method_name} must be JIT-eligible now that the \
+                     javac-family bans are removed",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn javac_class_symbol_complete_is_jit_eligible_after_hib_storedproc_jit_1_removal() {
         for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
             assert_eq!(
                 check(
@@ -4811,8 +4508,8 @@ mod tests {
                     true,
                     policy,
                 ),
-                Some(SkipReason::ClassSymbolComplete),
-                "Javac ClassSymbol.complete must remain excluded under every policy",
+                None,
+                "Javac ClassSymbol.complete must be JIT-eligible now that HIB-STOREDPROC-JIT.1 is removed",
             );
         }
     }

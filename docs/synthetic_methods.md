@@ -150,30 +150,39 @@ running.
 The `experimental-*` features left the `cratonvm-vm` default set, so an ordinary
 `cargo build` no longer requests them and each must be asked for explicitly
 (`--features experimental-aot`, and so on). `synthetic-jdk` still implies
-`experimental-jmx`, because the legacy synthetic surface includes JMX bootstrap
+`management`, because the legacy synthetic surface includes JMX bootstrap
 classes.
 
 Whether that actually removes code depends on the feature. In
 `cratonvm-native-builtins`, `jmx`/`jmx_openmbean`, `aot`/`aot_pipeline` and
 `serialization` are `#[cfg]`-gated module declarations, so dropping the feature
-stops compiling them. `experimental-tls` is a **no-op alias** (NEW-13): the
-native-tls-backed `javax.net.ssl` implementation is always compiled and
-registered, and the feature is retained only so downstream requests and
-`check-cfg` keep resolving.
+stops compiling them.
 
-`experimental-jmx` is the exception that proves the naming is wrong. It stays in
-the default set, because what it gates is the `sun.management` native surface
-and `java.lang.management.ManagementFactory` is core JDK API the JDK's own
-bootstrap reaches. Removing it makes `getMemoryPoolMXBeans()` die with
-`UnsatisfiedLinkError: sun/management/VMManagementImpl.getVersion0()`. It is an
-experiment in name only.
+Two features were renamed on 2026-07-30 because their names described an intent
+the code does not have. Both old names remain as back-compat aliases so existing
+`--features` invocations keep building; both are slated for removal in 0.4.
+
+| Old name | New name | Why the old name was wrong |
+|---|---|---|
+| `experimental-jmx` | `management` | Not an experiment — it is default-on and load-bearing — and not confined to JMX: it gates the `sun.management` natives behind `java.lang.management` as well as the `javax.management` beans layered on top. |
+| `experimental-tls` | `deprecated-noop-tls` | It gates nothing at all. There is not one `#[cfg(feature = ...)]` site for it anywhere in the tree. |
+
+`management` stays in the default set because
+`java.lang.management.ManagementFactory` is core JDK API the JDK's own bootstrap
+reaches. Removing it makes `getMemoryPoolMXBeans()` die with
+`UnsatisfiedLinkError: sun/management/VMManagementImpl.getVersion0()`, which
+`vm/tests/wave1_a_jmx_mxbeans.rs` pins.
+
+`deprecated-noop-tls` (NEW-13) enables nothing: the native-tls-backed
+`javax.net.ssl` implementation is always compiled and registered. It is retained
+only so downstream feature requests and `check-cfg` keep resolving.
 
 | File(s) | Feature | In default build | Status |
 |---|---|---|---|
 | `serialization.rs` | `experimental-serialization` | **NO** | Partial — ObjectInputStream/ObjectOutputStream |
 | `aot.rs`, `aot_pipeline.rs` | `experimental-aot` | **NO** | GraalVM compat stubs |
-| `jmx.rs`, `jmx_openmbean.rs` | `experimental-jmx` | **YES** — required by `ManagementFactory` | Partial JMX bean registration |
-| `tls.rs`, `tls_impl.rs`, `t27_tls.rs` | `experimental-tls` (no-op alias) | **YES — always compiled** | TLS/SSL |
+| `jmx.rs`, `jmx_openmbean.rs` | `management` (was `experimental-jmx`) | **YES** — required by `ManagementFactory` | Partial JMX bean registration |
+| `tls.rs`, `tls_impl.rs`, `t27_tls.rs` | none — `deprecated-noop-tls` (was `experimental-tls`) gates nothing | **YES — always compiled** | TLS/SSL |
 | `bc_aes.rs`, `bc_chacha.rs`, `bc_newhope.rs`, `bc_newhope_tables.rs` | `legacy-synthetic-crypto` | **NO** | Old Bouncy Castle replacements |
 | `craton_gpu.rs` | `gpu-offload` | **NO** | GPU marshalling |
 | `jdk25_concurrency.rs`, `jdk25_language.rs`, `jdk25_patterns.rs`, `unsafe_jdk25.rs` | (none) | YES | JDK 25 forward-compat stubs |

@@ -244,6 +244,22 @@ pub(crate) struct SockSide {
     pub read_timeout_ms: i32,
     pub input_shutdown: i32,
     pub output_shutdown: i32,
+    /// `(level, optname, value)` triples set through `Socket.setOption` while
+    /// this Socket had no OS descriptor yet, in call order.
+    ///
+    /// A `new Socket()` has no fd in THIS surface until `connect` allocates its
+    /// `TcpStream`, but it does on HotSpot: `Socket.getImpl()` runs
+    /// `createImpl(true)`, so `setOption` before `connect` is legal and the
+    /// value is still in effect on the connected socket afterwards. Apache
+    /// HttpClient 5's `DefaultHttpClientConnectionOperator.configureSocket`
+    /// does exactly that for the `TCP_KEEPIDLE`/`TCP_KEEPINTERVAL`/
+    /// `TCP_KEEPCOUNT` family — every request through Spring's
+    /// `RestClient` — so refusing it failed all 160 tests of
+    /// `RequestMappingMessageConversionIntegrationTests` with
+    /// *"Socket.setOption: socket is not connected"*. Same retained-setting
+    /// treatment as `read_timeout_ms` above, applied by
+    /// [`apply_pending_socket_options`] once the stream exists.
+    pub pending_options: Vec<(i32, i32, i32)>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -305,6 +321,32 @@ fn sock_default() -> SockSide {
         read_timeout_ms: 0,
         input_shutdown: 0,
         output_shutdown: 0,
+        pending_options: Vec::new(),
+    }
+}
+
+/// Apply — and clear — every option `Socket.setOption` retained while this
+/// Socket had no descriptor. Called right after a `connect` publishes the
+/// stream id, the same point `read_timeout_ms` is replayed at.
+///
+/// A failing `setsockopt` here is deliberately not fatal: the connection is
+/// already up, and HotSpot would have applied these to the pre-connect fd where
+/// a rejection would have surfaced earlier. The option is dropped and the
+/// connect stands.
+fn apply_pending_socket_options(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let pending = {
+        let mut taken = Vec::new();
+        sock_set(ctx, this, |s| taken = std::mem::take(&mut s.pending_options));
+        taken
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let Some(fd) = sock_raw_descriptor(ctx, this) else {
+        return;
+    };
+    for (level, opt, value) in pending {
+        let _ = sock_set_option_int(fd, level, opt, value);
     }
 }
 
@@ -3676,6 +3718,8 @@ fn re1_connect_socket(
         s.closed = 0;
         s.stream_id = stream_id;
     });
+    apply_pending_socket_options(ctx, this_now);
+    let this_now = ctx.read_native_pin(pin_base, this);
     let _ = re1_init_socket_locks(ctx, this_now);
     ctx.unpin_native_roots(pin_base);
     Ok(None)
@@ -3834,11 +3878,28 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             };
-            let Some(fd) = sock_raw_descriptor(ctx, this) else {
-                return Err(ioex("Socket.setOption: socket is not connected"));
-            };
             let raw = ds_unbox_int(ctx, value);
-            sock_set_option_int(fd, level, opt, raw).map_err(|e| ioex(format!("{name}: {e}")))?;
+            match sock_raw_descriptor(ctx, this) {
+                Some(fd) => {
+                    sock_set_option_int(fd, level, opt, raw)
+                        .map_err(|e| ioex(format!("{name}: {e}")))?;
+                }
+                None => {
+                    // No descriptor yet. On HotSpot that is not an error —
+                    // `Socket.getImpl()` creates the impl on demand, so an
+                    // option set before `connect` is applied to the socket the
+                    // connect then uses. Retain it and replay it there
+                    // (`apply_pending_socket_options`). A CLOSED socket is a
+                    // genuine error, and keeps saying so.
+                    if sock_get(ctx, this).closed != 0 {
+                        return Err(ioex("Socket.setOption: socket is closed"));
+                    }
+                    sock_set(ctx, this, |s| {
+                        s.pending_options.retain(|&(l, o, _)| (l, o) != (level, opt));
+                        s.pending_options.push((level, opt, raw));
+                    });
+                }
+            }
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -3855,11 +3916,30 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             };
-            let Some(fd) = sock_raw_descriptor(ctx, this) else {
-                return Err(ioex("Socket.getOption: socket is not connected"));
-            };
-            let Some(raw) = sock_get_option_int(fd, level, opt) else {
-                return Err(ioex(format!("{name}: option is not readable")));
+            // Mirror of `setOption`: before `connect` the answer is whatever
+            // was retained for the not-yet-created descriptor.
+            let raw = match sock_raw_descriptor(ctx, this) {
+                Some(fd) => match sock_get_option_int(fd, level, opt) {
+                    Some(raw) => raw,
+                    None => return Err(ioex(format!("{name}: option is not readable"))),
+                },
+                None => {
+                    if sock_get(ctx, this).closed != 0 {
+                        return Err(ioex("Socket.getOption: socket is closed"));
+                    }
+                    match sock_get(ctx, this)
+                        .pending_options
+                        .iter()
+                        .rev()
+                        .find(|&&(l, o, _)| (l, o) == (level, opt))
+                    {
+                        Some(&(_, _, v)) => v,
+                        // An unconnected socket that was never told otherwise:
+                        // report the option off/zero rather than failing, which
+                        // is what reading a fresh fd would have answered.
+                        None => 0,
+                    }
+                }
             };
             if name == "SO_KEEPALIVE" {
                 return ctx.invoke(

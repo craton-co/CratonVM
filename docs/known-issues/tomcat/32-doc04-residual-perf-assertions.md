@@ -9,14 +9,15 @@ assertion is about speed, with its own separate reason.
 
 | item | disposition after the 2026-07-30 re-derivation |
 |---|---|
-| 32.1 | OPEN, **fully root-caused** — a dev regression, not a mapper problem. Closes when that is fixed; no Tomcat work left. |
+| 32.1 | OPEN. A dev regression, not a mapper problem, and now **fully accounted for**. **Cause 1 FIXED 2026-07-30** (instance tier-up default restored, ~8.4x). **Cause 2 = moving-young becoming active** ([its own doc](../jit-optimizing-tier-disabled-by-moving-young-default.md)); a fix is written and pushed on `codex/fix-hibernate-five-takeover-20260730`, not yet on dev. With both removed the test PASSES on both hostnames. No Tomcat work left. |
 | 32.2 | ✅ **Not a defect** — passes on a quiet host. Genuinely load-sensitive; expect intermittency on a busy one. |
 | 32.3 | OPEN, improved ~12–16 %. Root cause identified as per-completion processing, not I/O; no further AIO work will close it. |
 | 32.4 | OPEN, and **harder than recorded** — belongs to doc [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md)'s family, not here. |
 
-Nothing here is a Tomcat defect any more. Two items are consumers of VM-wide
-throughput problems and one is a test-shape artefact; only 32.1 has a
-single, named, fixable cause.
+Nothing here is a Tomcat defect any more. Three items are consumers of VM-wide
+throughput problems and one is a test-shape artefact. 32.1 is the only one
+whose causes are fully named: one is fixed, the other belongs to an existing
+document, and with both removed the test passes.
 
 HotSpot reference for all four, same host, same day: all PASS.
 
@@ -123,45 +124,136 @@ today's binary rather than by inference (`CalleeTierUpProbe`, ns per call):
 
 **8.4×.** The flip was deliberate — the commit message records that the
 pre-decoded instance-call route "can strand a live embedded server request
-(Spring Boot `MultipartAutoConfigurationTests`) after promotion" — so this is a
-load-bearing gate in the same family as doc
-[30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md)'s RBC.6/RBC.7,
-not an accident. **Do not simply flip it back.** The real fix is to repair the
-pre-decoded instance-call route so tier-up can be re-enabled; what this document
-adds is the measured cost of leaving it off.
+(Spring Boot `MultipartAutoConfigurationTests`) after promotion" — so this was a
+load-bearing gate, not an accident, and flipping it back on its own would have
+re-opened the hazard.
 
-Note `git log -S jit_virtual_tierup` does **not** find this commit: `-S` counts
+#### FIXED 2026-07-30 — the hazard had one un-gated route, not four
+
+The stranding needs a callee that **declares an exception table**: a direct
+compiled entry has no interpreter boundary at which the callee's own handler can
+be resumed, so an implicit NPE/AIOOBE inside it bails out through the *caller's*
+epilogue and leaves a frame nobody can resume.
+
+`c28bdd687` gated exactly that on three of the four routes that can reach a
+direct entry — `mic_callee_has_exception_table` (MIC/PIC),
+`osr_callee_declares_handlers` (OSR), `try_jit_upgrade_with_gate`
+(inline-compile) — and missed the fourth, which is the **default** one: under
+`bg_compile` the background worker publishes and
+`execute_invokevirtual_cached`'s `jit_cache` probe promotes the site without
+consulting any gate. Turning the whole flag off was what actually held that
+route shut.
+
+The gap is now closed at the promotion site with the same predicate, reading
+`cached.exception_table` — carried on the callee's own cache entry, so it costs
+one field read rather than a class-manager lookup — and the default is ON again.
+
+Validation:
+
+* `CalleeTierUpProbe` 2 332 ns with the fix vs 25 127 ns with
+  `CRATONVM_JIT_VIRTUAL_TIERUP=0` — **~11× recovered**.
+* `CalleeHandlerRoutingProbe` (new): a hot handler-bearing instance callee that
+  takes its implicit exception only *after* the call site is promoted. Matches
+  HotSpot byte for byte with tier-up on and off.
+* Live embedded WebSocket server (`TestAsyncMessagesPerformance`) completes
+  normally in ~32 s gated / un-gated / off — no strand in any configuration.
+* JIT test sweep, 14 binaries serially: 13 fully green. The one failure,
+  `tier1_tests::t1_init_complexity_classifier_is_wired_through_jit`, is
+  pre-existing and owned by a *different* default (it passes under
+  `CRATONVM_JIT_PUTFIELD_INIT=0`).
+
+**What is NOT proven.** The original stranding could not be reproduced, so the
+new gate is correct by construction rather than demonstrated against the
+symptom: a deliberately un-gated control binary also matches HotSpot on the
+routing probe. `MultipartAutoConfigurationTests` is unusable as a gate right now
+— `module/spring-boot-servlet`'s jars date from 07-11 and predate
+`ErrorPageRegistrarBeanPostProcessor`, so all 12 cases fail with
+`NoClassDefFoundError` **identically with tier-up on and off**. Rebuild that
+module before trusting it. Revert lever if an embedded-server strand reappears:
+`CRATONVM_JIT_VIRTUAL_TIERUP=0`.
+
+Note `git log -S jit_virtual_tierup` does **not** find `c28bdd687`: `-S` counts
 occurrences of the string and the identifier count is unchanged, only
 `true` → `false`. Use `git log -G` or diff the window.
 
-### Cause 2 — a second, smaller regression in the same window
+### Cause 2 — the moving-young generation becoming ACTIVE
 
-Flipping the gate back is **necessary but not sufficient**. With
-`CRATONVM_JIT_VIRTUAL_TIERUP=1` on today's binary the test's own loop runs
-4.87 s (`xxxxxxxxxxx`) and 5.07 s (`iowejoiejfoiew`) per 10⁶ calls against the
-5 000 ms budget — the harder hostname still fails, where dev `b695d468f` ran it
-in 2.19 s. `CalleeTierUpProbe` with the gate pinned on shows the same residual:
-520 ns (07-27) vs 2 314 ns (07-30), **4.45×**.
+Fixing cause 1 is **necessary but not sufficient**: with tier-up restored, the
+test's own loop still runs 5.72 s (`xxxxxxxxxxx`) and 8.16 s
+(`iowejoiejfoiew`) per 10⁶ calls against the 5 000 ms budget, where dev
+`b695d468f` ran the easy one in 2.19 s.
 
-This residual is **diffuse, not one commit**, so do not spend a bisect on it:
-bisecting the same window with the gate pinned on and a 1 200 ns threshold put
-`1a7e6e6dc` — early in the window — at 1 194 ns, already 2.3× over the 520 ns
-baseline. The cost is accumulated across several of the 07-29/07-30 JIT changes
-(the CratonBench Matrix/Fibonacci work and the dispatch fixes all land here)
-rather than concentrated in one.
+The rest is
+[jit-optimizing-tier-disabled-by-moving-young-default](../jit-optimizing-tier-disabled-by-moving-young-default.md).
+`moving_young` did not change its *flag* in this window — it started actually
+**engaging** (it had been `true`-but-inert). Two independent penalties follow
+from `x64::moving_young_enabled()`, both in `jit/src/lib.rs`:
 
-It is **not** the `moving_young` default flip described in
-[jit-optimizing-tier-disabled-by-moving-young-default](../jit-optimizing-tier-disabled-by-moving-young-default.md),
-even though that lands in the same window and has exactly the same shape ("a
-default flip silently disabled a JIT tier"). Tested directly: with the tier-up
-gate pinned on, `CRATONVM_MOVING_YOUNG=0` gives 2 415 ns against the default's
-2 377 ns — no change — where dev `b695d468f` reaches 628 ns.
+* `moving_young_disables_optimizing_tier()` — the C2/IR pipeline is skipped, so
+  every method compiles through the single-pass C1 backend. Visible in
+  `CRATONVM_DBG_JITC=1`: `MappingData.recycle` emits `len=3569` at *both*
+  `tier=C1 optimized=false` and `tier=C2 optimized=true` — byte-identical, i.e.
+  the C2 compile is a relabelled C1.
+* `direct_jit_callee_calls_enabled()` — JIT-to-JIT direct calls are refused, so
+  every compiled call goes through the dispatch bridge. That is precisely this
+  workload's shape: `MappingData.recycle` → 4× `MessageBytes.recycle` → 2×
+  `AbstractChunk.recycle` per iteration.
 
-Eliminated along the way, so nobody re-tests them: the ctor putfield-init ban
+Measured with `CRATONVM_NO_MOVING_YOUNG=1` on a dev build carrying the cause-1
+fix, two interleaved passes:
+
+| | default | `CRATONVM_NO_MOVING_YOUNG=1` |
+|---|---|---|
+| `MapperPerfProbe -mode recycle` | 2.48 / 2.51 µs | **0.80 / 0.79 µs** |
+| `CalleeTierUpProbe` | 2 422 / 2 375 ns | **617 / 677 ns** |
+| test loop, `xxxxxxxxxxx` | 5 724 ms | **2 262 ms** |
+| test loop, `iowejoiejfoiew` | 8 164 ms | **4 052 ms** |
+
+617–677 ns lands on dev `b695d468f`'s 520–628 ns, and 2 262 ms on its 2 190 ms.
+**With both causes removed the test passes on both hostnames, the hard one
+included** — so 32.1 is fully accounted for by exactly these two, with no
+unattributed residual.
+
+> **Correction.** An earlier revision of this document called cause 2 "diffuse,
+> not one commit" and explicitly ruled out `moving_young`, citing
+> `CRATONVM_MOVING_YOUNG=0` producing no change. **That was wrong, and the
+> reason is worth keeping:** the disabling lever is `CRATONVM_NO_MOVING_YOUNG=1`
+> (named in `moving_young_disables_optimizing_tier`'s own warning text);
+> `CRATONVM_MOVING_YOUNG=0` is not it and silently changed nothing, which reads
+> exactly like a successful elimination. The "diffuse" reading rested on a
+> bisect whose early step sat at 1 194 ns — consistent with moving-young having
+> engaged before that step, not with several small causes. **Verify a negative
+> lever actually moves something before trusting it as an elimination.**
+
+Do **not** "fix" this by turning moving-young off: the IR tier is disabled under
+it for a stated soundness reason (an IR frame publishes no exact-RBP or
+per-safepoint oop map, so it cannot prove or rewrite its roots for a relocating
+collection). That document owns the tradeoff.
+
+**A fix is already written and pushed, on `codex/fix-hibernate-five-takeover-20260730`
+(not yet on dev as of `aed6c3199`).** It does not weaken the contract — it
+*scopes* the two gates. `x64::moving_young_relocates_compiled_frames()` =
+`moving_young_enabled() && JIT_PUBLISHES_RELOCATION_CONTRACT`, and both
+`moving_young_disables_optimizing_tier` and `direct_jit_callee_calls_enabled`
+now read that instead of `moving_young_enabled()` directly. The argument is that
+the hazard is unreachable: `refresh_moving_young_coverage_for_current_thread`
+vetoes moving-young process-wide once `jit_code_range_count() != 0`, and every
+collection runs that refresh, so a relocating cycle only happens while the
+process holds no compiled code at all. The veto reads the same constant, so the
+two cannot drift apart.
+
+**32.1 should close when that branch merges** — the numbers above are exactly
+what its scoping restores. Re-run
+`run-doc04-residuals.ps1 -Only org.apache.catalina.mapper.TestMapperPerformance`
+on a quiet host to confirm rather than assuming. (Its own validation is recorded
+on that branch; this document has not independently re-verified it.)
+
+Genuinely eliminated, so nobody re-tests them: the ctor putfield-init ban
 (`CRATONVM_JIT_PUTFIELD_INIT=0` changes nothing — 24.2 vs 24.6 µs — and it is
 benign-by-default since 07-28), and the mapper shadow itself.
 
-**32.1 closes when both causes are fixed**; there is no mapper work to do.
+**32.1 closes when cause 2's owning document does**; cause 1 is already fixed
+and there is no mapper work to do.
 
 ---
 

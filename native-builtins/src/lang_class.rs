@@ -4366,6 +4366,12 @@ fn set_accessible_impl(
 
     // Only the `true` case needs the deep-reflection check.
     if flag != 0 {
+        if let Err(msg) = check_class_loader_define_class_is_encapsulated(ctx, this) {
+            return Err(
+                cratonvm_types::error::RuntimeError::InaccessibleObjectException { message: msg }
+                    .into(),
+            );
+        }
         // Field 0 on Field/Method/Constructor is the declaring-class mirror.
         let declaring_mirror = match ctx.get_field(this, 0) {
             Value::Object(Some(m)) => Some(m),
@@ -4393,6 +4399,96 @@ fn set_accessible_impl(
 
     ctx.set_field(this, flag_field_index, Value::Int(flag));
     Ok(None)
+}
+
+/// `java.base` does not `opens java.lang`, so classpath (unnamed-module) code
+/// cannot `setAccessible(true)` the protected `ClassLoader.defineClass`
+/// overloads. HotSpot enforces this; CratonVM's general module gate cannot,
+/// because classes loaded from the runtime image carry no `module_name` and so
+/// look like the unnamed module to
+/// [`check_deep_reflection_access`] — every `java.lang` target is then an
+/// unnamed→unnamed edge and is allowed.
+///
+/// Populating `module_name` for the whole boot image is the real repair, and it
+/// is a much larger change: it would start denying every `setAccessible` into
+/// `java.lang` that this VM currently permits. This encodes the ONE edge that
+/// has been measured against HotSpot and that demonstrably changes behaviour.
+///
+/// Why it matters. Spring CGLIB's `ReflectUtils` tries, in order: `Lookup
+/// .defineClass` when the requested loader equals the neighbour class's loader;
+/// then the reflective `ClassLoader.defineClass`; then `Lookup.defineClass` on
+/// the neighbour class *even though the loaders differ*. On HotSpot the middle
+/// option is unavailable, so an AOP proxy for a class in another loader lands
+/// in **its superclass's** loader — the same runtime package — and its
+/// package-private overrides really override. CratonVM allowed the middle
+/// option, so the proxy landed in the requested loader instead; a
+/// package-private method then cannot be overridden across the runtime-package
+/// boundary (JVMS 5.4.5), and `invokevirtual` on the proxy silently ran the
+/// superclass body. That is what made `@MockitoSpyBean` stubs vanish behind a
+/// Spring AOP proxy in AOT replay
+/// (`MockitoSpyBeanAndSpringAopProxyIntegrationTests`, 4/4 fail): no
+/// interceptor frame, no Mockito advice, just the real method.
+///
+/// Returns `Err(message)` when the access must be denied. JDK-internal callers
+/// keep their access — this is the same trust rule
+/// `check_reflection_module_access_with_target_id` applies.
+/// `CRATONVM_DBG_SETACC=1` — report who asked to make
+/// `ClassLoader.defineClass` accessible, and whether it was denied.
+fn dbg_set_accessible() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CRATONVM_DBG_SETACC").is_ok())
+}
+
+pub(crate) fn check_class_loader_define_class_is_encapsulated(
+    ctx: &mut dyn NativeContext,
+    accessible_object: ObjectRef,
+) -> Result<(), String> {
+    // Read the declaring class BY NAME: the real-JDK `Method` layout starts
+    // with `AccessibleObject.override`, not with `clazz`, so slot 0 is only the
+    // declaring-class mirror in the synthetic layout.
+    //
+    // Every `setAccessible(true)` in the process reaches this, so the
+    // declaring-class test comes first and nothing else is read until it hits.
+    let declaring = match ctx.get_field_by_name(accessible_object, "clazz") {
+        Value::Object(Some(m)) => Some(m),
+        _ => match ctx.get_field(accessible_object, 0) {
+            Value::Object(Some(m)) => Some(m),
+            _ => None,
+        },
+    };
+    match declaring.and_then(|m| mirror_class_name(ctx, m)).as_deref() {
+        Some("java/lang/ClassLoader") => {}
+        _ => return Ok(()),
+    }
+    let member = match ctx.get_field_by_name(accessible_object, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if member != "defineClass" {
+        return Ok(());
+    }
+    let trace = dbg_set_accessible();
+    // Trust the JDK's own frames, and VM-internal calls with no Java caller.
+    let Some(accessor_cid) = resolve_caller_class_id(ctx) else {
+        return Ok(());
+    };
+    let accessor_name = ctx.class_name_of_id(accessor_cid);
+    let accessor_loader_id = ctx.loader_id_of_class(accessor_cid);
+    if trace {
+        eprintln!(
+            "[setacc] ClassLoader.defineClass requested by {accessor_name:?}              loader={accessor_loader_id}"
+        );
+    }
+    if caller_is_jdk_internal(accessor_name.as_deref(), accessor_loader_id) {
+        return Ok(());
+    }
+    Err(
+        "Unable to make protected final java.lang.Class java.lang.ClassLoader.defineClass(\
+         java.lang.String,byte[],int,int,java.security.ProtectionDomain) throws \
+         java.lang.ClassFormatError accessible: module java.base does not \"opens java.lang\" \
+         to unnamed module"
+            .to_string(),
+    )
 }
 
 /// Field.setAccessible(boolean) вЂ” writes the accessible flag.
@@ -4617,10 +4713,13 @@ where
     let pin = ctx.pin_native_root(arr);
     for i in 0..len {
         let elem = make(ctx, i);
+        let elem_pin = ctx.pin_native_root(elem);
         // `make` may have moved `arr` (and the already-stored elements, which
         // are remapped through it); re-read the forwarded array reference.
         arr = ctx.read_native_pin(pin, arr);
-        ctx.set_array_element(arr, i, Value::Object(Some(elem)));
+        let elem_cur = ctx.read_native_pin(elem_pin, elem);
+        ctx.set_array_element(arr, i, Value::Object(Some(elem_cur)));
+        ctx.unpin_native_roots(elem_pin);
     }
     arr = ctx.read_native_pin(pin, arr);
     ctx.unpin_native_roots(pin);
@@ -10772,6 +10871,10 @@ fn wrap_annotation_in_real_proxy(
     ann_cid: ClassId,
     handler: ObjectRef,
 ) -> Option<ObjectRef> {
+    // Class definition and every object/array allocation below can collect.
+    // Keep the synthetic handler rooted until the generated proxy publishes it.
+    let handler_pin = ctx.pin_native_root(handler);
+
     // Cache under the SAME namespace `Proxy.newProxyInstance(annotationType
     // .getClassLoader(), [annotationType], handler)` would use вЂ” this is
     // exactly the call Spring's `synthesize()` makes. A hardcoded `0` here
@@ -10782,13 +10885,21 @@ fn wrap_annotation_in_real_proxy(
     // `getClass()`-equal, even once dispatch returns correct hashCode/equals.
     // Mirrors `native_proxy_new_instance`'s `proxy_loader_namespace()` use.
     let ann_mirror = ctx.get_class_mirror(ann_cid);
+    let ann_mirror_pin = ctx.pin_native_root(ann_mirror);
+    let ann_mirror_cur = ctx.read_native_pin(ann_mirror_pin, ann_mirror);
     let annotation_loader: Option<ObjectRef> =
-        match native_class_get_class_loader(ctx, &[Value::Object(Some(ann_mirror))]) {
+        match native_class_get_class_loader(ctx, &[Value::Object(Some(ann_mirror_cur))]) {
             Ok(Some(Value::Object(Some(loader_obj)))) => Some(loader_obj),
             _ => None,
         };
+    let annotation_loader_pin =
+        annotation_loader.map(|loader_obj| ctx.pin_native_root(loader_obj));
     let loader_namespace: u32 = annotation_loader
-        .map(|loader_obj| crate::proxy_loader_namespace(ctx, loader_obj))
+        .zip(annotation_loader_pin)
+        .map(|(loader_obj, pin)| {
+            let loader_cur = ctx.read_native_pin(pin, loader_obj);
+            crate::proxy_loader_namespace(ctx, loader_cur)
+        })
         .unwrap_or(0);
     let proxy_cid = match crate::define_or_get_proxy_class(ctx, loader_namespace, &[ann_cid]) {
         crate::ProxyClassOutcome::Real(cid) => cid,
@@ -10796,7 +10907,10 @@ fn wrap_annotation_in_real_proxy(
         // AnnotationProxy. This annotation path degrades gracefully and is
         // independently optional (see real_annotations_enabled) вЂ” it never throws,
         // even when the proxy STRICT mode is on.
-        _ => return None,
+        _ => {
+            ctx.unpin_native_roots(handler_pin);
+            return None;
+        }
     };
     if crate::nbflags().dbg_annproxy_wrap {
         let ann_name = ctx.class_name_of_id(ann_cid).unwrap_or_default();
@@ -10812,20 +10926,36 @@ fn wrap_annotation_in_real_proxy(
     // default (`defining_loader_for` returns None) even when the annotation
     // was loaded by a user-defined loader
     // (MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader).
-    if let Some(loader_obj) = annotation_loader {
-        if crate::classloader::is_user_defined_loader(ctx, loader_obj) {
-            crate::classloader::register_defining_loader(proxy_cid.as_u32(), loader_obj);
+    if let (Some(loader_obj), Some(pin)) = (annotation_loader, annotation_loader_pin) {
+        let loader_cur = ctx.read_native_pin(pin, loader_obj);
+        if crate::classloader::is_user_defined_loader(ctx, loader_cur) {
+            crate::classloader::register_defining_loader(proxy_cid.as_u32(), loader_cur);
         }
     }
     let n = ctx.class_num_total_fields(proxy_cid).max(3);
     let real = ctx.alloc_object(proxy_cid, n);
-    ctx.set_field(real, 0, Value::Object(Some(handler)));
-    let type_mirror = ctx.get_class_mirror(ann_cid);
+    let real_pin = ctx.pin_native_root(real);
+    let real_cur = ctx.read_native_pin(real_pin, real);
+    let handler_cur = ctx.read_native_pin(handler_pin, handler);
+    ctx.set_field(real_cur, 0, Value::Object(Some(handler_cur)));
+    let type_mirror = ctx.read_native_pin(ann_mirror_pin, ann_mirror);
     let iface_arr = ctx.new_ref_array(ClassId::new(0), 1);
-    ctx.set_array_element(iface_arr, 0, Value::Object(Some(type_mirror)));
-    ctx.set_field(real, 1, Value::Object(Some(iface_arr)));
-    ctx.set_field(real, 2, Value::Int(0));
-    Some(real)
+    let iface_arr_pin = ctx.pin_native_root(iface_arr);
+    let iface_arr_cur = ctx.read_native_pin(iface_arr_pin, iface_arr);
+    let type_mirror_cur = ctx.read_native_pin(ann_mirror_pin, type_mirror);
+    ctx.set_array_element(
+        iface_arr_cur,
+        0,
+        Value::Object(Some(type_mirror_cur)),
+    );
+    let real_cur = ctx.read_native_pin(real_pin, real);
+    let iface_arr_cur = ctx.read_native_pin(iface_arr_pin, iface_arr);
+    ctx.set_field(real_cur, 1, Value::Object(Some(iface_arr_cur)));
+    let real_cur = ctx.read_native_pin(real_pin, real);
+    ctx.set_field(real_cur, 2, Value::Int(0));
+    let real_cur = ctx.read_native_pin(real_pin, real);
+    ctx.unpin_native_roots(handler_pin);
+    Some(real_cur)
 }
 
 // ---------------------------------------------------------------------------
@@ -11396,6 +11526,10 @@ fn create_annotation_proxy(
     container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
 ) -> ObjectRef {
+    // Allocating the proxy itself can relocate a user-defined declaring
+    // loader before the first loader-aware annotation-type lookup.
+    let container_loader_pin =
+        container_loader.map(|loader| ctx.pin_native_root(loader));
     let mut proxy = alloc_concurrent_synthetic(
         ctx,
         "java/lang/annotation/AnnotationProxy",
@@ -11410,9 +11544,17 @@ fn create_annotation_proxy(
     // every use, matching the already-pinned `names_arr`/`values_arr` below.
     let proxy_pin = ctx.pin_native_root(proxy);
     let desc_str = ctx.create_string(&ann.type_descriptor);
-    let mut child_roots = vec![desc_str];
+    let desc_pin = ctx.pin_native_root(desc_str);
     proxy = ctx.read_native_pin(proxy_pin, proxy);
-    ctx.set_field(proxy, ANN_PROXY_TYPE_DESC, Value::Object(Some(desc_str)));
+    let desc_str_cur = ctx.read_native_pin(desc_pin, desc_str);
+    ctx.set_field(
+        proxy,
+        ANN_PROXY_TYPE_DESC,
+        Value::Object(Some(desc_str_cur)),
+    );
+    let desc_str_cur = ctx.read_native_pin(desc_pin, desc_str);
+    ctx.unpin_native_roots(desc_pin);
+    let mut child_roots = vec![desc_str_cur];
 
     let mut ann_class_id_opt = None;
     // Try to get the Class mirror for the annotation type. Load the annotation
@@ -11436,12 +11578,16 @@ fn create_annotation_proxy(
         // ModifiedClassPathClassLoader deliberately owns child copies of the
         // JAXB API and runtime; matching HotSpot requires this exact identity,
         // not its application-loader sibling.
-        let via_loader = container_loader.and_then(|loader| {
-            match resolve_annotation_class_via_loader(ctx, loader, class_name) {
-                Ok(mirror) => ctx.class_id_from_mirror(mirror).map(|cid| (cid, mirror)),
-                Err(_) => None,
+        let via_loader = match (container_loader, container_loader_pin) {
+            (Some(loader), Some(pin)) => {
+                let loader_cur = ctx.read_native_pin(pin, loader);
+                match resolve_annotation_class_via_loader(ctx, loader_cur, class_name) {
+                    Ok(mirror) => ctx.class_id_from_mirror(mirror).map(|cid| (cid, mirror)),
+                    Err(_) => None,
+                }
             }
-        });
+            _ => None,
+        };
         // App-loader classes do not have an ObjectRef recorded in
         // `defining_loader_for`, but they still carry a loader id in the class
         // manager. Prefer that namespace before the flat global index: once an
@@ -11463,9 +11609,17 @@ fn create_annotation_proxy(
         });
         if let Some((cid, mirror)) = cid_mirror {
             ann_class_id_opt = Some(cid);
-            child_roots.push(mirror);
+            let mirror_pin = ctx.pin_native_root(mirror);
             proxy = ctx.read_native_pin(proxy_pin, proxy);
-            ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
+            let mirror_cur = ctx.read_native_pin(mirror_pin, mirror);
+            ctx.set_field(
+                proxy,
+                ANN_PROXY_TYPE_MIRROR,
+                Value::Object(Some(mirror_cur)),
+            );
+            let mirror_cur = ctx.read_native_pin(mirror_pin, mirror);
+            ctx.unpin_native_roots(mirror_pin);
+            child_roots.push(mirror_cur);
         } else if crate::nbflags().iae_trace_ok {
             eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} вЂ” type mirror NOT set (class load failed)",
                 ann.type_descriptor, ann.type_descriptor);
@@ -11592,14 +11746,23 @@ fn create_annotation_proxy(
     // `pin_native_root`/`read_native_pin` contract.
     for (i, (name, val, ret_desc, default_owner)) in all_elements.iter().enumerate() {
         let name_str = ctx.create_string(name);
+        let name_pin = ctx.pin_native_root(name_str);
         names_arr = ctx.read_native_pin(names_pin, names_arr);
-        ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
+        let name_cur = ctx.read_native_pin(name_pin, name_str);
+        ctx.set_array_element(names_arr, i, Value::Object(Some(name_cur)));
+        ctx.unpin_native_roots(name_pin);
         let (value_container_class_id, value_container_loader) = match default_owner {
             Some(owner) => (
                 Some(*owner),
                 crate::classloader::defining_loader_for(owner.as_u32()),
             ),
-            None => (container_class_id, container_loader),
+            None => (
+                container_class_id,
+                match (container_loader, container_loader_pin) {
+                    (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
+                    _ => None,
+                },
+            ),
         };
         let java_val = annotation_element_to_java_typed(
             ctx,
@@ -11636,18 +11799,39 @@ fn create_annotation_proxy(
             );
         }
         values_arr = ctx.read_native_pin(values_pin, values_arr);
-        ctx.set_array_element(values_arr, i, java_val);
+        let java_val_pin = match java_val {
+            Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+            _ => None,
+        };
+        let java_val_cur = match (java_val, java_val_pin) {
+            (Value::Object(Some(object)), Some(pin)) => {
+                Value::Object(Some(ctx.read_native_pin(pin, object)))
+            }
+            _ => java_val,
+        };
+        ctx.set_array_element(values_arr, i, java_val_cur);
+        if let Some(pin) = java_val_pin {
+            ctx.unpin_native_roots(pin);
+        }
     }
     names_arr = ctx.read_native_pin(names_pin, names_arr);
     values_arr = ctx.read_native_pin(values_pin, values_arr);
-    ctx.unpin_native_roots(names_pin);
     proxy = ctx.read_native_pin(proxy_pin, proxy);
-    ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
+    ctx.set_field(
+        proxy,
+        ANN_PROXY_ELEM_NAMES,
+        Value::Object(Some(names_arr)),
+    );
+    proxy = ctx.read_native_pin(proxy_pin, proxy);
+    values_arr = ctx.read_native_pin(values_pin, values_arr);
     ctx.set_field(
         proxy,
         ANN_PROXY_ELEM_VALUES,
         Value::Object(Some(values_arr)),
     );
+    names_arr = ctx.read_native_pin(names_pin, names_arr);
+    values_arr = ctx.read_native_pin(values_pin, values_arr);
+    ctx.unpin_native_roots(names_pin);
     child_roots.push(names_arr);
     child_roots.push(values_arr);
 
@@ -11663,6 +11847,9 @@ fn create_annotation_proxy(
         if let Some(ann_cid) = ann_class_id_opt {
             if let Some(real) = wrap_annotation_in_real_proxy(ctx, ann_cid, proxy) {
                 ctx.unpin_native_roots(proxy_pin);
+                if let Some(pin) = container_loader_pin {
+                    ctx.unpin_native_roots(pin);
+                }
                 return real;
             }
             proxy = ctx.read_native_pin(proxy_pin, proxy);
@@ -11670,6 +11857,9 @@ fn create_annotation_proxy(
     }
     ctx.unpin_native_roots(proxy_pin);
     remember_annotation_proxy_child_roots(proxy, child_roots);
+    if let Some(pin) = container_loader_pin {
+        ctx.unpin_native_roots(pin);
+    }
     proxy
 }
 
@@ -11714,16 +11904,36 @@ fn normalize_single_annotation_array(
         _ => None,
     };
     let array = ctx.new_ref_array(component_id, 1);
+    let array_pin = ctx.pin_native_root(array);
     let element = match (value, value_pin) {
         (Value::Object(Some(object)), Some(pin)) => {
-            let forwarded = ctx.read_native_pin(pin, object);
-            ctx.unpin_native_roots(pin);
-            Value::Object(Some(forwarded))
+            Value::Object(Some(ctx.read_native_pin(pin, object)))
         }
         (other, _) => other,
     };
-    ctx.set_array_element(array, 0, element);
-    Value::Object(Some(array))
+    let array_cur = ctx.read_native_pin(array_pin, array);
+    ctx.set_array_element(array_cur, 0, element);
+    let array_cur = ctx.read_native_pin(array_pin, array);
+    if let Some(pin) = value_pin {
+        ctx.unpin_native_roots(pin);
+    } else {
+        ctx.unpin_native_roots(array_pin);
+    }
+    Value::Object(Some(array_cur))
+}
+
+fn boxed_annotation_primitive(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    value: Value,
+) -> Value {
+    let object = crate::alloc_concurrent_synthetic(ctx, class_name, 1);
+    let object_pin = ctx.pin_native_root(object);
+    let object_cur = ctx.read_native_pin(object_pin, object);
+    ctx.set_field(object_cur, 0, value);
+    let object_cur = ctx.read_native_pin(object_pin, object);
+    ctx.unpin_native_roots(object_pin);
+    Value::Object(Some(object_cur))
 }
 
 /// S111r19 вЂ” typed variant: when called for a known annotation-element method,
@@ -11743,7 +11953,9 @@ pub(crate) fn annotation_element_to_java_typed(
     annotation_class_id: Option<ClassId>,
 ) -> Value {
     use cratonvm_native_api::AnnotationElementValue;
-    match val {
+    let container_loader_pin =
+        container_loader.map(|loader| ctx.pin_native_root(loader));
+    let result = (|| match val {
         AnnotationElementValue::Int(v) => {
             // Round 18 fix: `AnnotationElementValue::Int` is overloaded for
             // boolean/byte/char/short/int (the `.class` AnnotationDefault
@@ -11765,24 +11977,16 @@ pub(crate) fn annotation_element_to_java_typed(
                 Some("S") => ("java/lang/Short", Value::Int(*v as i16 as i32)),
                 _ => ("java/lang/Integer", Value::Int(*v)),
             };
-            let obj = crate::alloc_concurrent_synthetic(ctx, wrapper, 1);
-            ctx.set_field(obj, 0, value);
-            Value::Object(Some(obj))
+            boxed_annotation_primitive(ctx, wrapper, value)
         }
         AnnotationElementValue::Long(v) => {
-            let obj = crate::alloc_concurrent_synthetic(ctx, "java/lang/Long", 1);
-            ctx.set_field(obj, 0, Value::Long(*v));
-            Value::Object(Some(obj))
+            boxed_annotation_primitive(ctx, "java/lang/Long", Value::Long(*v))
         }
         AnnotationElementValue::Float(v) => {
-            let obj = crate::alloc_concurrent_synthetic(ctx, "java/lang/Float", 1);
-            ctx.set_field(obj, 0, Value::Float(*v));
-            Value::Object(Some(obj))
+            boxed_annotation_primitive(ctx, "java/lang/Float", Value::Float(*v))
         }
         AnnotationElementValue::Double(v) => {
-            let obj = crate::alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
-            ctx.set_field(obj, 0, Value::Double(*v));
-            Value::Object(Some(obj))
+            boxed_annotation_primitive(ctx, "java/lang/Double", Value::Double(*v))
         }
         AnnotationElementValue::StringVal(s) => {
             let str_obj = ctx.create_string(s);
@@ -11825,7 +12029,11 @@ pub(crate) fn annotation_element_to_java_typed(
             // first via `loadClass`, so the SAME loader's copy backs both the
             // default value and the bytecode's own reference to the constant.
             let iae_trace = crate::nbflags().iae_trace_ok;
-            let via_loader = container_loader.and_then(|loader| {
+            let loader_cur = match (container_loader, container_loader_pin) {
+                (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
+                _ => None,
+            };
+            let via_loader = loader_cur.and_then(|loader| {
                 match resolve_annotation_class_via_loader(ctx, loader, class_name) {
                     Ok(mirror) => ctx.class_id_from_mirror(mirror),
                     Err(_) => None,
@@ -11867,7 +12075,9 @@ pub(crate) fn annotation_element_to_java_typed(
                 let class_mirror = ctx.get_class_mirror(enum_cid);
                 let class_mirror_pin = ctx.pin_native_root(class_mirror);
                 let name_str = ctx.create_string(const_name);
+                let name_pin = ctx.pin_native_root(name_str);
                 let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
+                let name_str = ctx.read_native_pin(name_pin, name_str);
                 let invoke_res = ctx.invoke(
                     "java/lang/Enum",
                     "valueOf",
@@ -11895,10 +12105,17 @@ pub(crate) fn annotation_element_to_java_typed(
                 eprintln!("ANN-ENUM FALLBACK class={class_name} const={const_name} ordinal=0");
             }
             let obj = alloc_concurrent_synthetic(ctx, class_name, 2);
+            let obj_pin = ctx.pin_native_root(obj);
             let name_str = ctx.create_string(const_name);
-            ctx.set_field(obj, 0, Value::Object(Some(name_str)));
-            ctx.set_field(obj, 1, Value::Int(0)); // ordinal
-            Value::Object(Some(obj))
+            let name_pin = ctx.pin_native_root(name_str);
+            let obj_cur = ctx.read_native_pin(obj_pin, obj);
+            let name_cur = ctx.read_native_pin(name_pin, name_str);
+            ctx.set_field(obj_cur, 0, Value::Object(Some(name_cur)));
+            let obj_cur = ctx.read_native_pin(obj_pin, obj);
+            ctx.set_field(obj_cur, 1, Value::Int(0)); // ordinal
+            let obj_cur = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
+            Value::Object(Some(obj_cur))
         }
         AnnotationElementValue::Class(desc) => {
             // Return Class mirror. If the target class is not yet loaded
@@ -11915,7 +12132,11 @@ pub(crate) fn annotation_element_to_java_typed(
                 // FilteringClassLoader that rejects the referenced type; without it
                 // the global resolve below would silently return the app-loaded
                 // class and the filter would be bypassed.
-                if let Some(loader) = container_loader {
+                let loader_cur = match (container_loader, container_loader_pin) {
+                    (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
+                    _ => None,
+                };
+                if let Some(loader) = loader_cur {
                     let owned = class_name.to_string();
                     match resolve_annotation_class_via_loader(ctx, loader, &owned) {
                         Ok(mirror) => {
@@ -12013,7 +12234,11 @@ pub(crate) fn annotation_element_to_java_typed(
             Value::Object(Some(descriptor_to_class_mirror(ctx, desc)))
         }
         AnnotationElementValue::Annotation(nested) => {
-            let proxy = create_annotation_proxy(ctx, nested, container_class_id, container_loader);
+            let loader_cur = match (container_loader, container_loader_pin) {
+                (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
+                _ => None,
+            };
+            let proxy = create_annotation_proxy(ctx, nested, container_class_id, loader_cur);
             normalize_single_annotation_array(ctx, Value::Object(Some(proxy)), return_type_desc)
         }
         AnnotationElementValue::Array(elems) => {
@@ -12079,6 +12304,7 @@ pub(crate) fn annotation_element_to_java_typed(
                 };
                 if let Some(et) = prim {
                     let arr = ctx.new_array(et, elems.len());
+                    let arr_pin = ctx.pin_native_root(arr);
                     for (i, elem) in elems.iter().enumerate() {
                         // `AnnotationElementValue::Int` is overloaded for
                         // Z/B/C/S/I (the CP encodes them all as int constants),
@@ -12101,9 +12327,12 @@ pub(crate) fn annotation_element_to_java_typed(
                                 _ => Value::Int(0),
                             },
                         };
-                        ctx.set_array_element(arr, i, pv);
+                        let arr_cur = ctx.read_native_pin(arr_pin, arr);
+                        ctx.set_array_element(arr_cur, i, pv);
                     }
-                    return Value::Object(Some(arr));
+                    let arr_cur = ctx.read_native_pin(arr_pin, arr);
+                    ctx.unpin_native_roots(arr_pin);
+                    return Value::Object(Some(arr_cur));
                 }
             }
             // S111r19 вЂ” when the array is **empty** (no first element to
@@ -12195,7 +12424,11 @@ pub(crate) fn annotation_element_to_java_typed(
             // RequestMethod[] but a RequestMethod[] value was returned"
             // (`test.context.aot.TestContextAotGeneratorIntegrationTests`,
             // `test.context.aot.AotIntegrationTests`). `probes/ForkArrProbe.java`.
-            let comp_cid = container_loader
+            let loader_cur = match (container_loader, container_loader_pin) {
+                (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
+                _ => None,
+            };
+            let comp_cid = loader_cur
                 .and_then(|loader| {
                     match resolve_annotation_class_via_loader(ctx, loader, &comp_name_owned) {
                         Ok(mirror) => ctx.class_id_from_mirror(mirror),
@@ -12257,17 +12490,31 @@ pub(crate) fn annotation_element_to_java_typed(
             let mut sentinel_index: Option<usize> = None;
             let mut arr = arr;
             for (i, elem) in elems.iter().enumerate() {
+                let loader_cur = match (container_loader, container_loader_pin) {
+                    (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
+                    _ => None,
+                };
                 let v = annotation_element_to_java_typed(
                     ctx,
                     elem,
                     elem_desc.as_deref(),
                     container_class_id,
-                    container_loader,
+                    loader_cur,
                     annotation_class_id,
                 );
                 arr = ctx.read_native_pin(arr_pin, arr);
+                let value_pin = match v {
+                    Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+                    _ => None,
+                };
+                let v_cur = match (v, value_pin) {
+                    (Value::Object(Some(object)), Some(pin)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, object)))
+                    }
+                    _ => v,
+                };
                 if is_class_component && sentinel_index.is_none() {
-                    if let Value::Object(Some(o)) = v {
+                    if let Value::Object(Some(o)) = v_cur {
                         if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
                             == Some("java/lang/TypeNotPresentException")
                         {
@@ -12285,7 +12532,10 @@ pub(crate) fn annotation_element_to_java_typed(
                 // unrelated `String` objects) under GC — the array is
                 // discarded below when a sentinel was found, but only AFTER
                 // it's fully built and briefly reachable in the normal way.
-                ctx.set_array_element(arr, i, v);
+                ctx.set_array_element(arr, i, v_cur);
+                if let Some(pin) = value_pin {
+                    ctx.unpin_native_roots(pin);
+                }
             }
             arr = ctx.read_native_pin(arr_pin, arr);
             ctx.unpin_native_roots(arr_pin);
@@ -12294,7 +12544,11 @@ pub(crate) fn annotation_element_to_java_typed(
             }
             Value::Object(Some(arr))
         }
+    })();
+    if let Some(pin) = container_loader_pin {
+        ctx.unpin_native_roots(pin);
     }
+    result
 }
 
 /// Build an Annotation[] array from annotation data.
@@ -12459,10 +12713,20 @@ fn build_annotation_array_for(
         .filter(|a| annotation_type_loadable_near(ctx, a, declaring_class_id))
         .collect();
     let container_loader = declaring_class_id.and_then(|cid| annotation_container_loader(ctx, cid));
+    let container_loader_pin =
+        container_loader.map(|loader| ctx.pin_native_root(loader));
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
-    build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
-        create_annotation_proxy(ctx, resolvable[i], declaring_class_id, container_loader)
-    })
+    let array = build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
+        let loader_cur = match (container_loader, container_loader_pin) {
+            (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
+            _ => None,
+        };
+        create_annotation_proxy(ctx, resolvable[i], declaring_class_id, loader_cur)
+    });
+    if let Some(pin) = container_loader_pin {
+        ctx.unpin_native_roots(pin);
+    }
+    array
 }
 
 /// Like [`build_annotation_array`] but routes each proxy through the per-class

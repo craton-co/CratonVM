@@ -1470,6 +1470,192 @@ unsafe fn virtual_dispatch_target_for_receiver(
     }
 }
 
+/// A resolved virtual/interface dispatch target, memoized per thread by
+/// [`virtual_dispatch_target_cached`].
+///
+/// `class_name` is an `Rc<str>` rather than the `Arc<str>` the uncached
+/// resolver returns, and that is deliberate: the memo lives in a thread-local
+/// and every consumer only ever needs `&str`, so a cache hit must not touch a
+/// refcount shared with other threads. An `Arc::clone` here would be an atomic
+/// RMW on one class's refcount from every mutator at once — the same contended
+/// cache line this memo exists to stop touching.
+#[derive(Clone)]
+struct CachedDispatchTarget {
+    class_name: std::rc::Rc<str>,
+    cacheable_receiver: bool,
+    /// `get_loaded_class_id(class_name) == Some(receiver_cid)` — the name
+    /// round-trips back to exactly this receiver class, so resolving a callee
+    /// *by name* cannot land in another loader's same-named class. Only
+    /// meaningful when `cacheable_receiver`.
+    globally_named: bool,
+}
+
+/// Clear-on-full bound for [`VIRTUAL_TARGET_CACHE`]. Entries are per
+/// (call site, receiver class) pair, so a long-running server with a large
+/// megamorphic surface could otherwise grow this without limit. Losing the
+/// memo just reverts to the (correct, slower) locked resolution — same
+/// bounded-cache posture as `ClassManager::note_synthetic_upgrade_absent`.
+const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
+
+thread_local! {
+    /// `(JitInvokeInfo ptr, receiver ClassId) -> CachedDispatchTarget`.
+    ///
+    /// Keyed exactly like `VIRTUAL_DISPATCH_CACHE`. Array receivers and
+    /// `ClassId(0)` never reach it — an array header carries its COMPONENT
+    /// class id, so `(site, class id)` does not identify one.
+    static VIRTUAL_TARGET_CACHE:
+        std::cell::RefCell<rustc_hash::FxHashMap<(usize, u32), CachedDispatchTarget>> =
+        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+
+    /// `(class_definition_epoch, any_class_redefined)` this thread last
+    /// flushed its class-identity dispatch memos at. See
+    /// [`flush_class_identity_dispatch_memos`].
+    static DISPATCH_MEMO_CLASS_IDENTITY: Cell<(u64, bool)> = const { Cell::new((0, false)) };
+}
+
+/// Flush this thread's dispatch memos whose validity depends on class
+/// *identity* — the name-to-`ClassId` mapping — as opposed to compiled-code
+/// lifetime.
+///
+/// Two atomic loads on the steady-state path, and nothing else.
+///
+/// `class_definition_epoch` moves whenever a class is defined or unloaded,
+/// which is precisely what can invalidate a memoized `globally_named` answer.
+/// None of the three signals `jit_invoke_dispatch` already checks covers that:
+/// a second loader defining the same name redefines nothing, publishes no
+/// compiled code, and supersedes no tier. So clearing `DISPATCH_CACHE` and
+/// `VIRTUAL_DISPATCH_CACHE` here also closes a hole those two already had —
+/// they cache a compiled entry chosen on the strength of a `globally_named`
+/// test that nothing was re-running.
+///
+/// `any_class_redefined` is folded in as cheap insurance. None of the three
+/// memoized fields can actually move under redefinition (a `ClassId`'s name
+/// and `ACC_INTERFACE` are fixed at definition, and redefinition rewrites
+/// method bodies in place), but it is a sticky bool whose single false->true
+/// transition costs one flush for the life of the process, so paying it is
+/// strictly cheaper than reasoning about every future redefinition path.
+fn flush_class_identity_dispatch_memos() {
+    let state = (
+        crate::classloading::class_definition_epoch(),
+        crate::classloading::any_class_redefined(),
+    );
+    DISPATCH_MEMO_CLASS_IDENTITY.with(|seen| {
+        if seen.get() != state {
+            seen.set(state);
+            VIRTUAL_TARGET_CACHE.with(|c| c.borrow_mut().clear());
+            DISPATCH_CACHE.with(|c| c.borrow_mut().clear());
+            VIRTUAL_DISPATCH_CACHE.with(|c| c.borrow_mut().clear());
+        }
+    });
+}
+
+/// [`virtual_dispatch_target_for_receiver`] *plus* the `globally_named`
+/// round-trip test, both served from a per-thread memo.
+///
+/// The uncached pair costs TWO `class_manager` read-lock acquisitions on every
+/// call — one to turn the receiver's `ClassId` into a name, one to check that
+/// the name resolves back to it — on the path taken by every virtual call
+/// whose inline cache holds no compiled entry. That is a third of all MIC
+/// calls, and unavoidably *every* call to a native callee, which can never
+/// have a compiled entry. At ten threads it was the single largest cost in the
+/// VM: reader-reader `parking_lot` contention on one cache line, ~13% of all
+/// CPU in `lock_shared_slow` alone, with every workload converging on the same
+/// per-op cost regardless of what it actually did
+/// (docs/known-issues/tomcat/23-charsetcache-pathological-slowdown.md).
+///
+/// Callers MUST have run [`flush_class_identity_dispatch_memos`] on this
+/// thread first — that is what makes a hit as fresh as a locked resolution.
+///
+/// SAFETY: identical contract to [`virtual_dispatch_target_for_receiver`].
+unsafe fn virtual_dispatch_target_cached(
+    vm: &SharedVm,
+    receiver: ObjectRef,
+    info: &JitInvokeInfo,
+    info_key: usize,
+) -> CachedDispatchTarget {
+    // KC26: array receivers store their COMPONENT class id in the header, so
+    // the `(site, class id)` key cannot tell `X[]` from `X`. Resolve them
+    // directly — array classes inherit Object's method table (JVMS §4.4.1).
+    if vm.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+        return CachedDispatchTarget {
+            class_name: std::rc::Rc::from("java/lang/Object"),
+            cacheable_receiver: false,
+            globally_named: false,
+        };
+    }
+
+    let cid = vm.mem.heap.class_id_of(receiver);
+    if cid == ClassId::new(0) {
+        // Not a class at all — a synthetic/unidentified receiver. The answer
+        // is a pure function of `info`, so there is nothing worth memoizing.
+        return CachedDispatchTarget {
+            class_name: if crate::vm::is_object_member(info.method_name, info.descriptor) {
+                std::rc::Rc::from("java/lang/Object")
+            } else {
+                std::rc::Rc::from(info.class_name)
+            },
+            cacheable_receiver: false,
+            globally_named: false,
+        };
+    }
+
+    let key = (info_key, cid.as_u32());
+    if let Some(hit) = VIRTUAL_TARGET_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+
+    // Miss. Resolve the name AND its round-trip under ONE read lock, where the
+    // uncached path took two.
+    let resolved = {
+        let cm = vm.classes.class_manager.read();
+        match cm.get_class(cid) {
+            None => CachedDispatchTarget {
+                class_name: std::rc::Rc::from(info.class_name),
+                cacheable_receiver: false,
+                globally_named: false,
+            },
+            Some(recv_class) => {
+                let recv_name = recv_class.name.clone();
+                let recv_is_iface = recv_class.is_interface();
+                let recv_is_bare_object = recv_name.as_ref() == "java/lang/Object";
+                let cp_is_not_object = info.class_name != "java/lang/Object";
+                if (recv_is_iface || recv_is_bare_object)
+                    && cp_is_not_object
+                    && !crate::vm::is_object_member(info.method_name, info.descriptor)
+                    && recv_name.as_ref() != info.class_name
+                {
+                    CachedDispatchTarget {
+                        class_name: std::rc::Rc::from(info.class_name),
+                        cacheable_receiver: false,
+                        globally_named: false,
+                    }
+                } else {
+                    let globally_named = cm.get_loaded_class_id(&recv_name) == Some(cid);
+                    CachedDispatchTarget {
+                        class_name: std::rc::Rc::from(&*recv_name),
+                        cacheable_receiver: true,
+                        globally_named,
+                    }
+                }
+            }
+        }
+    };
+
+    // Only the receiver-derived answers are worth keeping. The others are pure
+    // functions of `info` that cost one comparison to redo, and memoizing them
+    // would fill the map with entries no fast path consults.
+    if resolved.cacheable_receiver {
+        VIRTUAL_TARGET_CACHE.with(|c| {
+            let mut map = c.borrow_mut();
+            if map.len() >= VIRTUAL_TARGET_CACHE_CAP {
+                map.clear();
+            }
+            map.insert(key, resolved.clone());
+        });
+    }
+    resolved
+}
+
 /// Resolve the dispatch class for a virtual/interface bail
 /// (`bail_to_interpreter`, kinds 0/2). Null/non-object receivers fall back to
 /// the static call-site class so we never dispatch on an empty name.
@@ -6337,6 +6523,10 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // (`ctx.invoke_virtual`). Hot monomorphic virtual sites are already served
     // by the receiver-guarded MIC helper (`jit_invoke_virtual_mic`).
     let statically_bound = matches!(info.invoke_kind, 1 | 3);
+    // Class identity first: a name that no longer resolves to the ClassId a
+    // memo recorded it against invalidates every dispatch memo below, and none
+    // of the three signals that follow can see that happen.
+    flush_class_identity_dispatch_memos();
     let redefine_jit_quiesced =
         class_id_or_name_was_redefined(vm, info.declaring_class_id, info.class_name);
     if redefine_jit_quiesced {
@@ -6383,14 +6573,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         if raw != 0 && (raw & 7) == 0 && raw < (1u64 << 48) {
             let receiver = ObjectRef::from_raw(raw as usize as *mut u8);
             let receiver_cid = vm.mem.heap.class_id_of(receiver);
-            let target = virtual_dispatch_target_for_receiver(vm, receiver, info);
-            let globally_named = target.cacheable_receiver
-                && vm
-                    .classes
-                    .class_manager
-                    .read()
-                    .get_loaded_class_id(&target.class_name)
-                    == Some(receiver_cid);
+            let target = virtual_dispatch_target_cached(vm, receiver, info, info_key);
+            let globally_named = target.globally_named;
             // RBC.6 perf follow-up (docs/feature-designs/jit-local-exception-handlers.md)
             // — this used to also require `!mic_callee_has_exception_table(...)`,
             // excluding ANY callee that declares a local exception table from
@@ -8632,6 +8816,10 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     }
 
     let mic = &*(mic_ptr as *const JitMICSlot);
+    // Companion to the call in `jit_invoke_dispatch`: both of this function's
+    // resolution sites read `VIRTUAL_TARGET_CACHE`, so both need it revalidated
+    // against the current class-identity generation first.
+    flush_class_identity_dispatch_memos();
     let redefine_jit_quiesced = hierarchy_was_redefined(vm, receiver_class_id);
     if redefine_jit_quiesced {
         mic.clear_compiled_entry();
@@ -8785,7 +8973,8 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // `Enum.clone() → CloneNotSupportedException` for every array clone
         // of an enum type. Per JVMS §4.4.1, array classes inherit their
         // method table from `Object`; short-circuit accordingly.
-        let dispatch_target = virtual_dispatch_target_for_receiver(vm, receiver_ref, info);
+        let dispatch_target =
+            virtual_dispatch_target_cached(vm, receiver_ref, info, info_ptr as usize);
         let cacheable_receiver = dispatch_target.cacheable_receiver;
         // An entryless slot can be retargeted by another thread after the
         // class-id probe above. Its cached class name is therefore not a
@@ -8955,7 +9144,8 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // --- Cache miss: full resolution + update cache ---
     mic.record_miss();
 
-    let dispatch_target = virtual_dispatch_target_for_receiver(vm, receiver_ref, info);
+    let dispatch_target =
+        virtual_dispatch_target_cached(vm, receiver_ref, info, info_ptr as usize);
     let cacheable_receiver = dispatch_target.cacheable_receiver;
     let class_name = dispatch_target.class_name;
     if cv_trace {

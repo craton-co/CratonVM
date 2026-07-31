@@ -1453,10 +1453,23 @@ pub fn make_iterator_from_array(
     snapshot_array: ObjectRef,
     size: usize,
 ) -> MethodCallResult {
+    // GC-SAFETY: `alloc_synthetic` can run the iterator class's `<clinit>` and
+    // allocate, which relocates the snapshot array the caller handed us. Root
+    // it across the allocation and read both halves of the new graph back
+    // through their pins. Covered by
+    // `gc_native_pins::generic_snapshot_iterator_roots_array_and_shell_across_allocation`.
+    let array_pin = ctx.pin_native_root(snapshot_array);
     let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
     ctx.set_field(itr, 0, Value::Object(Some(snapshot_array)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.set_field(itr, 1, Value::Int(0));
+    let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.set_field(itr, 2, Value::Int(size as i32));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(array_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -1867,6 +1880,92 @@ fn chm_seg_lock_for(seg_id: i32) -> &'static parking_lot::RwLock<()> {
     &seg_locks()[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
+static SEG_RESIZE_EPOCHS: std::sync::OnceLock<
+    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
+> = std::sync::OnceLock::new();
+
+fn chm_seg_resize_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
+    let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &SEG_RESIZE_EPOCHS.get_or_init(|| {
+        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+}
+
+// Validity generation for the per-thread CHM String-node memo. Every CHM
+// mutator holds a `ChmMonitorGuard`, which bumps both striped counters below:
+// `SEG_MUTATION_ACTIVE` for as long as it may be altering nodes, and
+// `SEG_MUTATION_EPOCHS` once as it leaves. Deliberately separate from the
+// resize epoch, because a resize nests inside a mutator.
+//
+// A reader may memoize a node only if it saw `active == 0` both before and
+// after its chain walk AND the epoch did not move across it; validating a memo
+// hit later re-checks the same pair against the recorded epoch. Any mutator
+// whose window overlaps the walk is caught by one of those three observations,
+// because the epoch is bumped after the last node write and the in-flight
+// count is dropped after that.
+//
+// This is a counter plus an in-flight count rather than the usual single
+// odd/even parity word because a parity word needs the writers sharing one
+// stripe serialized against each other, and the only place to serialize them
+// is around `monitor_enter` — i.e. a host mutex held across a GC-safepoint
+// park. A thread blocked on such a mutex is not at a safepoint, so it would
+// stall every collection queued behind it.
+static SEG_MUTATION_EPOCHS: std::sync::OnceLock<
+    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
+> = std::sync::OnceLock::new();
+static SEG_MUTATION_ACTIVE: std::sync::OnceLock<
+    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
+> = std::sync::OnceLock::new();
+
+fn chm_seg_mutation_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
+    let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &SEG_MUTATION_EPOCHS.get_or_init(|| {
+        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+}
+
+fn chm_seg_mutation_active(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
+    let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &SEG_MUTATION_ACTIVE.get_or_init(|| {
+        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+}
+
+/// `(epoch, in-flight mutators)` for the stripe owning `seg_id`. The in-flight
+/// count is read first so a snapshot can never pair an already-advanced epoch
+/// with a stale-low count.
+fn chm_seg_mutation_snapshot(seg_id: i32) -> (u64, u64) {
+    let active = chm_seg_mutation_active(seg_id).load(std::sync::atomic::Ordering::Acquire);
+    let epoch = chm_seg_mutation_epoch(seg_id).load(std::sync::atomic::Ordering::Acquire);
+    (epoch, active)
+}
+
+struct ChmSegmentResizeGuard {
+    epoch: &'static std::sync::atomic::AtomicU64,
+    lock: Option<parking_lot::RwLockWriteGuard<'static, ()>>,
+}
+
+impl ChmSegmentResizeGuard {
+    fn acquire(seg_id: i32) -> Self {
+        // Take the stripe's write lock BEFORE marking the epoch odd, and
+        // release it after marking it even again. Bumping first would let two
+        // resizers sharing a stripe interleave their increments and leave the
+        // epoch EVEN while one of them is still relinking — which is exactly
+        // what an optimistic reader reads as "no resize in progress".
+        let lock = chm_seg_lock_for(seg_id).write();
+        let epoch = chm_seg_resize_epoch(seg_id);
+        epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self { epoch, lock: Some(lock) }
+    }
+}
+
+impl Drop for ChmSegmentResizeGuard {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.lock.take();
+    }
+}
+
 /// RAII guard for a native monitor (`ctx.monitor_enter` / `monitor_exit`).
 ///
 /// CRIT fix (round-5): the previous CHM write path performed
@@ -1910,6 +2009,12 @@ struct ChmMonitorGuard<'a> {
     /// write lock; every later toucher of that segment deadlocked). Drop
     /// re-reads the pin and exits the CURRENT address.
     pin: usize,
+    /// Bumped once on the way out, after the last node write. See
+    /// [`chm_seg_mutation_snapshot`].
+    mutation_epoch: &'static std::sync::atomic::AtomicU64,
+    /// Held up (`+1`) for the whole guarded section, so a reader can tell
+    /// "a mutator is in flight on this stripe" from "a mutator has finished".
+    mutation_active: &'static std::sync::atomic::AtomicU64,
     /// Phantom borrow tying the guard's lifetime parameter `'a` to a
     /// surrounding scope at the type level. Using
     /// `fn() -> &'a mut dyn NativeContext` rather than `&'a mut …` directly
@@ -1923,6 +2028,10 @@ struct ChmMonitorGuard<'a> {
 impl<'a> ChmMonitorGuard<'a> {
     fn acquire(ctx: &mut dyn NativeContext, seg: ObjectRef) -> Self {
         let pin = ctx.pin_native_root(seg);
+        let seg_id = ctx.identity_hash_code(seg);
+        let mutation_epoch = chm_seg_mutation_epoch(seg_id);
+        let mutation_active = chm_seg_mutation_active(seg_id);
+        mutation_active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         ctx.monitor_enter(seg);
         // SAFETY: the guard MUST be dropped before the `&mut dyn NativeContext`
         // borrow ends. We transmute away the lifetime so the guard doesn't
@@ -1939,6 +2048,8 @@ impl<'a> ChmMonitorGuard<'a> {
             ctx: ctx_ptr_static,
             seg,
             pin,
+            mutation_epoch,
+            mutation_active,
             _borrow: std::marker::PhantomData,
         }
     }
@@ -1963,6 +2074,10 @@ impl<'a> ChmMonitorGuard<'a> {
     /// (`pin_value`/`read_pinned_elem`) — for everything after this call.
     fn acquire_gc_safe(ctx: &mut dyn NativeContext, seg: ObjectRef) -> (Self, ObjectRef) {
         let pin = ctx.pin_native_root(seg);
+        let seg_id = ctx.identity_hash_code(seg);
+        let mutation_epoch = chm_seg_mutation_epoch(seg_id);
+        let mutation_active = chm_seg_mutation_active(seg_id);
+        mutation_active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let fixed = ctx.monitor_enter_gc_safe(seg);
         let fixed = ctx.read_native_pin(pin, fixed);
         // SAFETY: identical lifetime-erasure contract to `acquire` above.
@@ -1974,6 +2089,8 @@ impl<'a> ChmMonitorGuard<'a> {
                 ctx: ctx_ptr_static,
                 seg: fixed,
                 pin,
+                mutation_epoch,
+                mutation_active,
                 _borrow: std::marker::PhantomData,
             },
             fixed,
@@ -2007,6 +2124,15 @@ impl<'a> Drop for ChmMonitorGuard<'a> {
             (*ctx_ptr).monitor_exit(seg);
             (*ctx_ptr).unpin_native_roots(pin);
         }));
+        // Order matters: the epoch must advance after the last node write
+        // (and after `monitor_exit` publishes it), and the in-flight count
+        // must drop only after that. A reader that sees `active == 0` on both
+        // sides of its walk with an unchanged epoch has therefore observed no
+        // mutation of this stripe across the walk.
+        self.mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.mutation_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
         if result.is_err() {
             eprintln!(
                 "[CHM] monitor_exit panicked during ChmMonitorGuard::drop — ignoring to avoid double-panic abort"
@@ -5526,7 +5652,7 @@ fn map_resize_inner(
         // `parking_lot::RwLock::write` is infallible (no PoisonError),
         // so no `unwrap_or_else` wrapper is needed.
         let seg_id = ctx.identity_hash_code(this);
-        Some(chm_seg_lock_for(seg_id).write())
+        Some(ChmSegmentResizeGuard::acquire(seg_id))
     } else {
         None
     };
@@ -7150,7 +7276,7 @@ fn native_hashmap_get_string_fast(
         };
         if let Value::Object(Some(node_key)) = get_node_key(ctx, node) {
             if ctx.read_string(node_key).as_deref() == Some(key_text.as_str()) {
-                ctx.hashmap_string_node_cache_put(this, &key_text, node);
+                ctx.hashmap_string_node_cache_put(this, key, &key_text, node);
                 return Some(Ok(Some(get_node_value(ctx, node))));
             }
         }
@@ -7162,6 +7288,17 @@ fn native_hashmap_get_string_fast(
         }
         .into(),
     ))
+}
+
+/// Whether a cached virtual-native call is a two-object map lookup.
+///
+/// Both callbacks accept exactly `(receiver, key)` and preserve their own
+/// collision, equality, mutation and exception behavior. The interpreter uses
+/// this identity check only to reuse its prevalidated cached-native plumbing
+/// without re-resolving the already-known descriptor on every lookup.
+pub fn is_hot_map_get_native_callback(callback: cratonvm_native_api::NativeCallback) -> bool {
+    let callback = callback as usize;
+    callback == native_map_get as usize || callback == native_chm_get as usize
 }
 
 /// Exact-class HashMap get entry used after a receiver-ClassId guard.
@@ -29000,15 +29137,33 @@ fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     // ArrayDeque$Itr: field 0 = snapshot array, field 1 = cursor,
     // field 2 = backing ArrayDeque (so Iterator.remove() can mutate it).
+    // GC-SAFETY: `elems` are bare locals snapshotted out of the deque, and both
+    // `alloc_ref_array` and `alloc_synthetic` can collect — which moves the
+    // deque itself, the elements, and the array. Root the whole graph and read
+    // every part back through its pin before storing it. Covered by
+    // `gc_native_pins::array_deque_iterator_roots_snapshot_graph_across_allocations`.
+    let this_pin = ctx.pin_native_root(this);
     let elems = ad_collect_elements(ctx, this);
+    let elem_pins: Vec<usize> = elems.iter().map(|e| pin_value(ctx, *e)).collect();
     let arr = alloc_ref_array(ctx, elems.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, e) in elems.iter().enumerate() {
-        ctx.set_array_element(arr, i, *e);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let value = read_pinned_elem(ctx, elem_pins[i], *e);
+        ctx.set_array_element(arr, i, value);
     }
     let itr = alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.set_field(itr, 1, Value::Int(0));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(itr, 2, Value::Object(Some(this)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -37544,33 +37699,25 @@ fn chm_seg_get(
 /// key, or a chain containing any non-String key. Mixed-key maps and every
 /// exotic key type (enums, Thread mirrors, user-defined `equals`) therefore run
 /// exactly the code they ran before.
-fn native_chm_get_string_fast(
+fn native_chm_get_string_chain(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    seg: ObjectRef,
     key: ObjectRef,
-) -> Option<Value> {
-    let raw_hash = ctx.java_string_hash_code(key)?;
-    // Same spreading `map_hash_key` applies — this must agree with whatever
-    // bucket `put` chose.
-    let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
-    let seg = chm_segment_for(ctx, this, hash)?;
-    // The same stripe read lock the general path takes, for the same reason:
-    // serialize against `map_resize_concurrent`'s in-place NEXT relinking.
-    let seg_id = ctx.identity_hash_code(seg);
-    let _read_guard = chm_seg_lock_for(seg_id).read();
+    hash: i32,
+) -> Option<(Value, Option<ObjectRef>)> {
     let buckets = match ctx.get_field_volatile(seg, MAP_FIELD_BUCKETS) {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => arr,
-        _ => return Some(Value::Object(None)),
+        _ => return Some((Value::Object(None), None)),
     };
     let cap = ctx.array_length(buckets) as i32;
     if cap <= 0 {
-        return Some(Value::Object(None));
+        return Some((Value::Object(None), None));
     }
     let mut node_value = ctx.get_array_element(buckets, map_bucket_index(hash, cap));
     const CHAIN_WALK_LIMIT: usize = 4096;
     for _ in 0..CHAIN_WALK_LIMIT {
         let Value::Object(Some(node)) = node_value else {
-            return Some(Value::Object(None));
+            return Some((Value::Object(None), None));
         };
         let Value::Object(Some(node_key)) = get_node_key(ctx, node) else {
             // CHM rejects null keys, so this is an unexpected node shape —
@@ -37584,12 +37731,19 @@ fn native_chm_get_string_fast(
                 // itself in the value slot as a reservation marker; lock-free
                 // readers must read that as absent, exactly as `chm_seg_get`
                 // does (CHM-mapper-deadlock fix, 2026-07-21).
+                //
+                // Handing back no memoizable node with it is what keeps that
+                // marker out of the per-thread node memo — a memo hit answers
+                // later lookups WITHOUT re-running this filter, and the
+                // `computeIfAbsent` phases that install and then replace the
+                // marker deliberately run outside `ChmMonitorGuard`, so they
+                // never bump the mutation epoch that would evict the entry.
                 if let Value::Object(Some(v)) = value {
                     if std::ptr::eq(v.as_ptr(), seg.as_ptr()) {
-                        return Some(Value::Object(None));
+                        return Some((Value::Object(None), None));
                     }
                 }
-                return Some(value);
+                return Some((value, Some(node)));
             }
             Some(false) => {}
             // A non-String key on the chain — hand the whole lookup back so
@@ -37599,6 +37753,68 @@ fn native_chm_get_string_fast(
         node_value = ctx.get_field_volatile(node, NODE_FIELD_NEXT);
     }
     None
+}
+
+fn native_chm_get_string_fast(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: ObjectRef,
+) -> Option<Value> {
+    // The memo is keyed by the CHM receiver and the exact key String object,
+    // not by its segment. A validated hit therefore skips the String hash, the
+    // segment-array access, and the segment identity-hash minting that a
+    // regular CHM get requires.
+    if let Some((cached_seg_id, cached_generation, value)) =
+        ctx.chm_string_node_cache_get_object(this, key)
+    {
+        let (epoch, active) = chm_seg_mutation_snapshot(cached_seg_id);
+        if active == 0 && epoch == cached_generation {
+            return Some(value);
+        }
+    }
+    let raw_hash = ctx.java_string_hash_code(key)?;
+    let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
+    let seg = chm_segment_for(ctx, this, hash)?;
+    let seg_id = ctx.identity_hash_code(seg);
+    let before_mutation = chm_seg_mutation_snapshot(seg_id);
+
+    // Optimistic walk. The resize epoch is odd for exactly as long as a
+    // resizer holds this stripe's write lock, so an unchanged even epoch
+    // across the walk means no relinking overlapped it.
+    let resize_epoch = chm_seg_resize_epoch(seg_id);
+    let resize_before = resize_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let walked = if resize_before & 1 == 0 {
+        let result = native_chm_get_string_chain(ctx, seg, key, hash);
+        if resize_epoch.load(std::sync::atomic::Ordering::Acquire) == resize_before {
+            Some(result)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // The resize writer relinks existing node chains in place. If it overlapped
+    // the optimistic walk, redo the walk under the established stripe lock.
+    let (result, node) = match walked {
+        Some(result) => result?,
+        None => {
+            let _read_guard = chm_seg_lock_for(seg_id).read();
+            native_chm_get_string_chain(ctx, seg, key, hash)?
+        }
+    };
+
+    // Memoize only a node that no mutator touched across the walk. Re-sampling
+    // the stripe here, rather than trusting the pre-walk read, is what makes
+    // the recorded generation a promise about the walk itself.
+    if let Some(node) = node {
+        let after_mutation = chm_seg_mutation_snapshot(seg_id);
+        if before_mutation == after_mutation && before_mutation.1 == 0 {
+            if let Some(key_text) = ctx.read_string(key) {
+                ctx.chm_string_node_cache_put(this, seg_id, key, &key_text, node, before_mutation.0);
+            }
+        }
+    }
+    Some(result)
 }
 
 pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -41211,9 +41427,19 @@ fn alloc_unmod_list_itr(
     snapshot: ObjectRef,
     cursor: i32,
 ) -> ObjectRef {
+    // GC-SAFETY: same contract as `make_iterator_from_array` — the shell
+    // allocation can relocate the snapshot. Covered by
+    // `gc_native_pins::unmodifiable_list_iterator_roots_snapshot_graph_across_allocation`.
+    let snapshot_pin = ctx.pin_native_root(snapshot);
     let it = alloc_synthetic(ctx, UNMOD_LIST_ITR_CLASS, 2);
+    let it_pin = ctx.pin_native_root(it);
+    let it = ctx.read_native_pin(it_pin, it);
+    let snapshot = ctx.read_native_pin(snapshot_pin, snapshot);
     ctx.set_field(it, UNMOD_LIST_ITR_SNAPSHOT, Value::Object(Some(snapshot)));
+    let it = ctx.read_native_pin(it_pin, it);
     ctx.set_field(it, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor));
+    let it = ctx.read_native_pin(it_pin, it);
+    ctx.unpin_native_roots(snapshot_pin);
     it
 }
 

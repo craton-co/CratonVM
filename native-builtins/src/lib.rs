@@ -2605,115 +2605,121 @@ mod bootstrap_property_fallback_tests {
     };
     use std::sync::{Mutex, OnceLock};
 
+    /// `JBOSS_HOME` is an ordinary process variable — undeclared, so
+    /// `flags::runtime_var` gives it live `std::env` semantics and it must be
+    /// stashed/restored in `environ` under this lock.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Run `f` with the two `jboss.home.dir` inputs set as given.
+    ///
+    /// `CRATONVM_JBOSS_MP_ROOT` is a **declared** flag, served from the
+    /// process-wide snapshot that latches on the first read of any flag. In
+    /// this crate's test binary that has always already happened by the time
+    /// these tests run, so the `set_var`/`remove_var` pair they used to do
+    /// changed `environ` and nothing `jboss_home_dir_fallback` would read:
+    /// whatever `CRATONVM_JBOSS_MP_ROOT` the developer happened to have
+    /// exported stayed in force, and the "must fall back" assertions held for
+    /// the wrong reason. It is overridden on the snapshot instead — thread
+    /// scope, because every reader here runs on this thread.
+    fn with_jboss_env<R>(home: Option<&str>, mp_root: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _guard = env_lock();
+        let previous = std::env::var_os("JBOSS_HOME");
+        match home {
+            Some(v) => std::env::set_var("JBOSS_HOME", v),
+            None => std::env::remove_var("JBOSS_HOME"),
+        }
+        let result = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JBOSS_MP_ROOT", mp_root)],
+            f,
+        );
+        match previous {
+            Some(v) => std::env::set_var("JBOSS_HOME", v),
+            None => std::env::remove_var("JBOSS_HOME"),
+        }
+        result
     }
 
     #[test]
     fn jboss_home_dir_falls_back_to_jboss_home_env() {
-        let _guard = env_lock();
-        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
-        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
-        std::env::set_var("JBOSS_HOME", "/opt/wildfly");
-        std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
-
-        assert_eq!(
-            bootstrap_property_fallback("jboss.home.dir"),
-            Some("/opt/wildfly".to_string())
-        );
-
-        match old_home {
-            Some(v) => std::env::set_var("JBOSS_HOME", v),
-            None => std::env::remove_var("JBOSS_HOME"),
-        }
-        match old_mp {
-            Some(v) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", v),
-            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
-        }
+        with_jboss_env(Some("/opt/wildfly"), None, || {
+            assert_eq!(
+                bootstrap_property_fallback("jboss.home.dir"),
+                Some("/opt/wildfly".to_string())
+            );
+        });
     }
 
     #[test]
     fn jboss_home_dir_falls_back_to_module_path_property() {
-        let _guard = env_lock();
-        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
-        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
-        std::env::remove_var("JBOSS_HOME");
-        std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
-
-        let mut ctx = crate::test_utils::mock_ctx();
-        ctx.set_system_property("module.path", "/opt/wildfly/modules");
-        assert_eq!(
-            system_property_fallback(&ctx, "jboss.home.dir"),
-            Some("/opt/wildfly".to_string())
-        );
-
-        match old_home {
-            Some(v) => std::env::set_var("JBOSS_HOME", v),
-            None => std::env::remove_var("JBOSS_HOME"),
-        }
-        match old_mp {
-            Some(v) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", v),
-            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
-        }
+        with_jboss_env(None, None, || {
+            let mut ctx = crate::test_utils::mock_ctx();
+            ctx.set_system_property("module.path", "/opt/wildfly/modules");
+            assert_eq!(
+                system_property_fallback(&ctx, "jboss.home.dir"),
+                Some("/opt/wildfly".to_string())
+            );
+        });
     }
 
     #[test]
     fn jboss_home_dir_falls_back_to_java_class_path_property() {
-        let _guard = env_lock();
-        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
-        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
-        std::env::remove_var("JBOSS_HOME");
-        std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
+        with_jboss_env(None, None, || {
+            let mut ctx = crate::test_utils::mock_ctx();
+            ctx.set_system_property("java.class.path", "/opt/wildfly/jboss-modules.jar");
+            assert_eq!(
+                system_property_fallback(&ctx, "jboss.home.dir"),
+                Some("/opt/wildfly".to_string())
+            );
+        });
+    }
 
-        let mut ctx = crate::test_utils::mock_ctx();
-        ctx.set_system_property("java.class.path", "/opt/wildfly/jboss-modules.jar");
-        assert_eq!(
-            system_property_fallback(&ctx, "jboss.home.dir"),
-            Some("/opt/wildfly".to_string())
-        );
-
-        match old_home {
-            Some(v) => std::env::set_var("JBOSS_HOME", v),
-            None => std::env::remove_var("JBOSS_HOME"),
-        }
-        match old_mp {
-            Some(v) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", v),
-            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
-        }
+    /// `CRATONVM_JBOSS_MP_ROOT` beats the current-directory probe below it.
+    ///
+    /// The override is what makes this assertion mean anything: with the flag
+    /// served from the ambient snapshot, this test could not distinguish
+    /// "the module-path root won" from "nothing was set and the cwd probe
+    /// answered".
+    #[test]
+    fn jboss_home_dir_prefers_the_module_path_root_over_the_cwd() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cratonvm-wildfly-mp-root-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("modules")).unwrap();
+        let mp_root = tmp.join("modules");
+        with_jboss_env(None, mp_root.to_str(), || {
+            assert_eq!(
+                bootstrap_property_fallback("jboss.home.dir"),
+                Some(tmp.to_string_lossy().into_owned())
+            );
+        });
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn jboss_home_dir_falls_back_to_wildfly_current_dir() {
-        let _guard = env_lock();
-        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
-        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         let old_cwd = std::env::current_dir().unwrap();
-        std::env::remove_var("JBOSS_HOME");
-        std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
-
-        let tmp =
-            std::env::temp_dir().join(format!("cratonvm-wildfly-home-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "cratonvm-wildfly-home-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("modules")).unwrap();
         std::fs::write(tmp.join("jboss-modules.jar"), []).unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
 
-        assert_eq!(
-            bootstrap_property_fallback("jboss.home.dir"),
-            Some(tmp.to_string_lossy().into_owned())
-        );
+        let result = with_jboss_env(None, None, || {
+            std::env::set_current_dir(&tmp).unwrap();
+            let found = bootstrap_property_fallback("jboss.home.dir");
+            std::env::set_current_dir(&old_cwd).unwrap();
+            found
+        });
 
-        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(result, Some(tmp.to_string_lossy().into_owned()));
         let _ = std::fs::remove_dir_all(&tmp);
-        match old_home {
-            Some(v) => std::env::set_var("JBOSS_HOME", v),
-            None => std::env::remove_var("JBOSS_HOME"),
-        }
-        match old_mp {
-            Some(v) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", v),
-            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
-        }
     }
 }
 
@@ -4100,7 +4106,7 @@ pub mod util_time;
 pub mod charset;
 pub mod classloader_value_sidetable;
 pub mod jfr;
-#[cfg(feature = "experimental-jmx")]
+#[cfg(feature = "management")]
 pub mod jmx;
 pub mod panama;
 pub mod panama_libffi;
@@ -4484,7 +4490,7 @@ pub use xml_xerces::*;
 pub(crate) mod test_utils;
 
 use http2::*;
-#[cfg(feature = "experimental-jmx")]
+#[cfg(feature = "management")]
 use jmx::*;
 use lang_class::*;
 use lang_invoke::*;
@@ -7404,7 +7410,7 @@ pub fn register_essential_natives_with_shims(
         "java/lang/String",
         "toLowerCase",
         "()Ljava/lang/String;",
-        lang_string::native_string_to_lower_case_uncached,
+        lang_string::native_string_to_lower_case,
     );
     registry.register(
         "java/lang/String",
@@ -7416,7 +7422,7 @@ pub fn register_essential_natives_with_shims(
         "java/lang/String",
         "toLowerCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        lang_string::native_string_to_lower_case_uncached,
+        lang_string::native_string_to_lower_case,
     );
     registry.register(
         "java/lang/String",
@@ -15297,6 +15303,20 @@ pub fn register_essential_natives_with_shims(
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
+        // Same encapsulation gate the typed `setAccessible` natives apply --
+        // this shorthand variant must not become a way around it.
+        if flag != 0 {
+            if let Err(msg) =
+                lang_class::check_class_loader_define_class_is_encapsulated(ctx, this)
+            {
+                return Err(
+                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
+                        message: msg,
+                    }
+                    .into(),
+                );
+            }
+        }
         ctx.set_field_by_name(this, "override", Value::Int(flag));
         Ok(None)
     }
@@ -22790,7 +22810,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     crate::lang_invoke::register_t28_method_handle_completeness(registry);
 
     // --- Phase 8.4: JMX (Java Management Extensions) ---
-    #[cfg(feature = "experimental-jmx")]
+    #[cfg(feature = "management")]
     {
         register_jmx_natives(registry);
         // Pure-synthetic-JDK mode has no real `java.management` module, so the
