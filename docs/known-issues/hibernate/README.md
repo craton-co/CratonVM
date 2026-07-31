@@ -96,19 +96,30 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   `skip_list` unit test now fails the build if a blanket `net/bytebuddy/` guard is ever re-added.
   Full write-up: `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`.
 
+- **Native ANTLR intrinsics lose object roots under the moving young collector** — FIXED
+  2026-07-31. `ASTParserLoadingTest` rejected valid HQL nondeterministically because
+  `antlr_intrinsics.rs` held raw `ObjectRef` locals — and whole `Vec<ObjectRef>` config
+  snapshots — across allocating calls, so a moving young collection linked dead addresses into
+  the parser graph and the poisoned config was memoized as a DFA edge. **Not** the
+  trivial-accessor fast path that was blamed and deleted on 2026-07-29. Three per-site passes
+  each found "a few more" and none had a completion signal; the fourth changed the
+  representation: all 344 `pin_native_root` / `read_native_pin` / `unpin_native_roots` calls are
+  gone, replaced by `NativeHandleScope` / `NativeHandle`; config sets are walked by index out of
+  the rooted set; a guard test keeps the raw API out. Twelve further live unrooted sites were
+  fixed on the way through. Full write-up:
+  `docs/internal/fixed-suite-bugs/hibernate/antlr-native-roots-moving-young-hql-misparse-20260730-FIXED.md`.
+
 ## Open
 
-- [Native ANTLR intrinsics lose object roots under the moving young collector](antlr-native-roots-moving-young-hql-misparse-20260730.md)
-  (OPEN; root cause identified, many instances fixed across two independent efforts) —
-  `ASTParserLoadingTest` rejects valid HQL nondeterministically. `antlr_intrinsics.rs` holds raw
-  `ObjectRef` locals and whole `Vec<ObjectRef>` config snapshots across allocating calls, so a
-  moving young collection links dead addresses into the parser graph; the poisoned config is then
-  memoized as a DFA edge, which is why one mis-timed collection breaks a whole grammar path for
-  the rest of the process. **Not** the trivial-accessor fast path that was blamed and deleted on
-  2026-07-29: the verifier reports zero field-resolution divergences, and
-  `CRATONVM_NO_MOVING_YOUNG=1` passes 106/106. The 302-class corpus is clean on the current tree,
-  but the unsafe idiom is still the file's default style — the doc recommends a scoped handle type
-  to make it unrepresentable rather than further per-site auditing.
+- [HQL ordinal parameter silently dropped — `ordinal parameters []` under JIT](hql-ordinal-parameter-dropped-under-jit-20260731.md)
+  (OPEN; observed once, cause not located) — `ASTParserLoadingTest#testComponentNullnessChecks`
+  failed 1 run in 6 under JIT with `No parameter labelled '?1' in query with ordinal parameters []`.
+  The query parses without a syntax error but its ordinal parameter never reaches
+  `ParameterMetadataImpl`, so this is a *missing production*, not the rejected-parse shape of the
+  (now fixed) ANTLR moving-young root defect — zero `SyntaxException`s appeared in any of the
+  twelve witness runs. `HqlParseStress` now asserts that every parameter marker survives into
+  `statement().getText()`; 3500 parses per arm across jit/nojit x default/GC-stress reproduce
+  nothing on either binary, so the defect is likely downstream of the parse tree.
 
 - [`action.queue` GRAPH-default tests — blocked by flush-planner throughput](../../internal/fixed-suite-bugs/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md)
   (OPEN; one of two root causes fixed) — real-JDK CratonVM defaults
