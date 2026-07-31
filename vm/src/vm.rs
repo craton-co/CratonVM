@@ -562,8 +562,47 @@ mod tests {
         crate::native::builtins::register_builtins(&mut r);
         crate::native::io::register_io_natives(&mut r);
         crate::native::collections::register_collections_natives(&mut r);
+        // Real AQS is the VM's default, so `register_concurrent_natives` skips
+        // the synthetic `ReentrantLock` / `Lock` / `Condition` / `Semaphore`
+        // natives. That is right for the VM and wrong for this module: the
+        // fixtures here are hand-built receivers with no real
+        // `java.util.concurrent` bytecode behind them, so the real path cannot
+        // run, and without this the synthetic path is not registered either —
+        // leaving the lock and semaphore tests asserting natives that nothing
+        // would ever register. Opt in explicitly, the same choice
+        // `CRATONVM_SYNTHETIC_AQS=1` makes at runtime.
+        cratonvm_native_builtins::util_concurrent_ext::register_synthetic_aqs_natives(&mut r);
         r
     });
+
+    /// Allocate a receiver whose runtime class really is `class_name`.
+    ///
+    /// Most receivers in this module are hand-rolled as
+    /// `heap.alloc_object(ClassId::new(0), n)` — an object with no class
+    /// identity at all. That was fine when the natives keyed purely off slot
+    /// indices, and it is not any more: a growing number of them first ask
+    /// whether the receiver IS the class they implement, and quietly decline
+    /// when it is not. `is_hashset_native_backed` is the clearest case —
+    /// `HashSet.add` resolves its backing map through it, so against a
+    /// `ClassId::new(0)` receiver the whole native short-circuits and `add`
+    /// reports `false` for a brand-new element.
+    ///
+    /// `ensure_synthetic_class` registers (or reuses) a synthetic class of
+    /// that name with `num_fields` declared instance fields, which is what
+    /// `alloc_concurrent_synthetic` in `native-builtins` already does for the
+    /// same reason. Giving the receiver a real class id also stops every test
+    /// object in the process sharing id 0 — the ambiguity that let two VMs'
+    /// collections alias each other in `widened_obj_key`.
+    fn alloc_receiver(
+        shared: &Arc<SharedVm>,
+        thread: &mut JvmThread,
+        class_name: &str,
+        num_fields: usize,
+    ) -> ObjectRef {
+        let mut ctx = NativeContextImpl { shared, thread };
+        let cid = ctx.ensure_synthetic_class(class_name, num_fields);
+        ctx.alloc_object(cid, num_fields)
+    }
 
     /// Helper to call a native method by (class, name, descriptor).
     fn call_native(
@@ -5574,7 +5613,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create HashSet (1 field: backing map)
-        let set = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let set = alloc_receiver(&shared, &mut thread, "java/util/HashSet", 1);
         call_native(
             &shared,
             &mut thread,
@@ -5654,7 +5693,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let set = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let set = alloc_receiver(&shared, &mut thread, "java/util/HashSet", 1);
         call_native(
             &shared,
             &mut thread,
@@ -7785,7 +7824,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with ["a", "b", "c"]
-        let list_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let list_ref = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 2);
         call_native(
             &shared,
             &mut thread,
@@ -7813,7 +7852,7 @@ mod tests {
         // it's a static that takes Object. Instead, use a simpler approach:
         // Create a lambda that calls a native to record output.
         // Let's use PrintStream.println(String) with a captured PrintStream.
-        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let ps = alloc_receiver(&shared, &mut thread, "java/util/function/Consumer", 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -7846,7 +7885,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create HashSet and add "x"
-        let set_ref = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let set_ref = alloc_receiver(&shared, &mut thread, "java/util/HashSet", 1);
         call_native(
             &shared,
             &mut thread,
@@ -7868,7 +7907,7 @@ mod tests {
         .unwrap();
 
         // Consumer lambda → PrintStream.println
-        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let ps = alloc_receiver(&shared, &mut thread, "java/util/function/Consumer", 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -7901,7 +7940,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create HashMap with "k" → "v"
-        let map_ref = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let map_ref = alloc_receiver(&shared, &mut thread, "java/util/HashMap", 3);
         call_native(
             &shared,
             &mut thread,
@@ -7955,7 +7994,7 @@ mod tests {
         //
         // Let's just verify forEach runs to completion without errors.
         // The lambda will call a no-op: tempPrint(key).
-        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let ps = alloc_receiver(&shared, &mut thread, "java/util/function/BiConsumer", 0);
         // We'll create a lambda: accept(k, v) → println(k)
         // This works by: capture PrintStream, then impl is
         // PrintStream.println(String) with descriptor (Ljava/lang/String;)V
@@ -8027,7 +8066,7 @@ mod tests {
         };
 
         // Consumer: println(value)
-        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let ps = alloc_receiver(&shared, &mut thread, "java/util/function/Consumer", 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -8926,7 +8965,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with [10, 20]
-        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let list = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 2);
         call_native(
             &shared,
             &mut thread,
@@ -8937,7 +8976,7 @@ mod tests {
         )
         .unwrap();
         for val in [Value::Int(10), Value::Int(20)] {
-            let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+            let obj = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 1);
             shared.mem.heap.set_field(obj, 0, val);
             call_native(
                 &shared,
@@ -8994,7 +9033,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let map = alloc_receiver(&shared, &mut thread, "java/util/HashMap", 3);
         call_native(
             &shared,
             &mut thread,
@@ -9127,7 +9166,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let map = alloc_receiver(&shared, &mut thread, "java/util/HashMap", 3);
         call_native(
             &shared,
             &mut thread,
@@ -9192,7 +9231,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let map = alloc_receiver(&shared, &mut thread, "java/util/HashMap", 3);
         call_native(
             &shared,
             &mut thread,
@@ -9250,7 +9289,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let map = alloc_receiver(&shared, &mut thread, "java/util/HashMap", 3);
         call_native(
             &shared,
             &mut thread,
@@ -10156,7 +10195,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let ps = alloc_receiver(&shared, &mut thread, "java/util/function/Consumer", 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -11027,8 +11066,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let throwable = shared.mem.heap.alloc_object(ClassId::new(0), 2);
-        let cause = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let throwable = alloc_receiver(&shared, &mut thread, "java/lang/Throwable", 2);
+        let cause = alloc_receiver(&shared, &mut thread, "java/lang/Throwable", 2);
 
         let result = call_native(
             &shared,
@@ -11447,7 +11486,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create source list with elements
-        let src = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let src = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 2);
         call_native(
             &shared,
             &mut thread,
@@ -11479,7 +11518,7 @@ mod tests {
         .unwrap();
 
         // Create HashSet from the list
-        let set = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let set = alloc_receiver(&shared, &mut thread, "java/util/HashSet", 1);
         call_native(
             &shared,
             &mut thread,
@@ -11509,7 +11548,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create source map with one entry
-        let src = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let src = alloc_receiver(&shared, &mut thread, "java/util/HashMap", 3);
         call_native(
             &shared,
             &mut thread,
@@ -11536,7 +11575,7 @@ mod tests {
         .unwrap();
 
         // Copy constructor
-        let copy = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let copy = alloc_receiver(&shared, &mut thread, "java/util/HashMap", 3);
         call_native(
             &shared,
             &mut thread,
@@ -13486,7 +13525,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with Integer wrappers [3, 1, 2]
-        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let list = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 2);
         call_native(
             &shared,
             &mut thread,
@@ -13497,7 +13536,7 @@ mod tests {
         )
         .unwrap();
         for v in [3, 1, 2] {
-            let w = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+            let w = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 1);
             shared.mem.heap.set_field(w, 0, Value::Int(v));
             call_native(
                 &shared,
@@ -13567,7 +13606,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with [10, 20, 30]
-        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let list = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 2);
         call_native(
             &shared,
             &mut thread,
@@ -13578,7 +13617,7 @@ mod tests {
         )
         .unwrap();
         for v in [10, 20, 30] {
-            let w = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+            let w = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 1);
             shared.mem.heap.set_field(w, 0, Value::Int(v));
             call_native(
                 &shared,
@@ -17062,7 +17101,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = alloc_receiver(&shared, &mut thread, "java/util/LinkedHashMap", 5);
         call_native(
             &shared,
             &mut thread,
@@ -17119,7 +17158,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = alloc_receiver(&shared, &mut thread, "java/util/LinkedHashMap", 5);
         call_native(
             &shared,
             &mut thread,
@@ -17176,7 +17215,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = alloc_receiver(&shared, &mut thread, "java/util/LinkedHashMap", 5);
         call_native(
             &shared,
             &mut thread,
@@ -17255,7 +17294,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = alloc_receiver(&shared, &mut thread, "java/util/LinkedHashMap", 5);
         call_native(
             &shared,
             &mut thread,
@@ -17319,7 +17358,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = alloc_receiver(&shared, &mut thread, "java/util/LinkedHashMap", 5);
         call_native(
             &shared,
             &mut thread,
@@ -19303,7 +19342,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create target HashSet
-        let set = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let set = alloc_receiver(&shared, &mut thread, "java/util/HashSet", 1);
         call_native(
             &shared,
             &mut thread,
@@ -19332,7 +19371,7 @@ mod tests {
         .unwrap();
 
         // Create source ArrayList [B, C]
-        let src = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let src = alloc_receiver(&shared, &mut thread, "java/util/ArrayList", 2);
         call_native(
             &shared,
             &mut thread,
@@ -22873,7 +22912,7 @@ mod tests {
         let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(67));
 
         // BAIS requires 4 slots: buf/pos/mark/count (Session 83 layout).
-        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let bais = alloc_receiver(&shared, &mut thread, "java/io/ByteArrayInputStream", 4);
         call_native(
             &shared,
             &mut thread,
@@ -22953,7 +22992,7 @@ mod tests {
         }
 
         // BAIS requires 4 slots: buf/pos/mark/count (Session 83 layout).
-        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let bais = alloc_receiver(&shared, &mut thread, "java/io/ByteArrayInputStream", 4);
         call_native(
             &shared,
             &mut thread,
@@ -23050,7 +23089,7 @@ mod tests {
         }
 
         // BAIS requires 4 slots: buf/pos/mark/count (Session 83 layout).
-        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let bais = alloc_receiver(&shared, &mut thread, "java/io/ByteArrayInputStream", 4);
         call_native(
             &shared,
             &mut thread,
@@ -23097,7 +23136,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let baos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let baos = alloc_receiver(&shared, &mut thread, "java/io/ByteArrayOutputStream", 2);
         call_native(
             &shared,
             &mut thread,
@@ -23183,7 +23222,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let baos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let baos = alloc_receiver(&shared, &mut thread, "java/io/ByteArrayOutputStream", 2);
         call_native(
             &shared,
             &mut thread,
@@ -23228,7 +23267,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let baos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let baos = alloc_receiver(&shared, &mut thread, "java/io/ByteArrayOutputStream", 2);
         call_native(
             &shared,
             &mut thread,
@@ -27963,7 +28002,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let lock = alloc_receiver(&shared, &mut thread, "java/util/concurrent/locks/ReentrantLock", 3);
         call_native(
             &shared,
             &mut thread,
@@ -28050,7 +28089,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let lock = alloc_receiver(&shared, &mut thread, "java/util/concurrent/locks/ReentrantLock", 3);
         call_native(
             &shared,
             &mut thread,
@@ -28157,7 +28196,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let lock = alloc_receiver(&shared, &mut thread, "java/util/concurrent/locks/ReentrantLock", 3);
         call_native(
             &shared,
             &mut thread,
@@ -28208,7 +28247,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let lock = alloc_receiver(&shared, &mut thread, "java/util/concurrent/locks/ReentrantLock", 3);
         call_native(
             &shared,
             &mut thread,
@@ -28237,7 +28276,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let lock = alloc_receiver(&shared, &mut thread, "java/util/concurrent/locks/ReentrantLock", 3);
         call_native(
             &shared,
             &mut thread,
@@ -28431,7 +28470,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sem = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let sem = alloc_receiver(&shared, &mut thread, "java/util/concurrent/Semaphore", 2);
         call_native(
             &shared,
             &mut thread,
@@ -28506,7 +28545,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sem = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let sem = alloc_receiver(&shared, &mut thread, "java/util/concurrent/Semaphore", 2);
         call_native(
             &shared,
             &mut thread,
@@ -28549,7 +28588,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sem = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let sem = alloc_receiver(&shared, &mut thread, "java/util/concurrent/Semaphore", 2);
         call_native(
             &shared,
             &mut thread,
@@ -28604,7 +28643,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sem = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let sem = alloc_receiver(&shared, &mut thread, "java/util/concurrent/Semaphore", 2);
         call_native(
             &shared,
             &mut thread,
@@ -28645,7 +28684,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sem = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let sem = alloc_receiver(&shared, &mut thread, "java/util/concurrent/Semaphore", 2);
         call_native(
             &shared,
             &mut thread,
@@ -28927,7 +28966,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let list = alloc_receiver(&shared, &mut thread, "java/util/concurrent/CopyOnWriteArrayList", 2);
         call_native(
             &shared,
             &mut thread,
@@ -31439,7 +31478,7 @@ mod tests {
     fn decimal_format_pattern() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let df = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let df = alloc_receiver(&shared, &mut thread, "java/text/DecimalFormat", 3);
         let pattern = create_java_string(&shared, "#0.00");
         let _ = call_native(
             &shared,
@@ -31474,7 +31513,7 @@ mod tests {
     fn url_parse_and_getters() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let url = shared.mem.heap.alloc_object(ClassId::new(0), 6);
+        let url = alloc_receiver(&shared, &mut thread, "java/net/URL", 6);
         let url_str = create_java_string(&shared, "https://example.com:8080/path?key=value");
         let _ = call_native(
             &shared,
@@ -31569,8 +31608,8 @@ mod tests {
     fn url_to_string_and_equals() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let url1 = shared.mem.heap.alloc_object(ClassId::new(0), 6);
-        let url2 = shared.mem.heap.alloc_object(ClassId::new(0), 6);
+        let url1 = alloc_receiver(&shared, &mut thread, "java/net/URL", 6);
+        let url2 = alloc_receiver(&shared, &mut thread, "java/net/URL", 6);
         let s1 = create_java_string(&shared, "http://test.com/page");
         let s2 = create_java_string(&shared, "http://test.com/page");
         let _ = call_native(
@@ -31909,7 +31948,7 @@ mod tests {
     fn locale_to_string_and_to_tag() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let loc = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let loc = alloc_receiver(&shared, &mut thread, "java/util/Locale", 3);
         let lang = create_java_string(&shared, "en");
         let country = create_java_string(&shared, "US");
         let _ = call_native(
@@ -32327,7 +32366,7 @@ mod tests {
     fn rwlock_init_and_locks() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let rwl = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let rwl = alloc_receiver(&shared, &mut thread, "java/util/concurrent/locks/ReentrantReadWriteLock", 3);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -35908,7 +35947,7 @@ mod tests {
     fn thread_local_init_get_set_remove() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let tl = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let tl = alloc_receiver(&shared, &mut thread, "java/lang/ThreadLocal", 1);
         call_native(
             &shared,
             &mut thread,
@@ -37330,7 +37369,7 @@ mod tests {
     fn timer_basic() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let timer = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let timer = alloc_receiver(&shared, &mut thread, "java/util/Timer", 2);
         call_native(
             &shared,
             &mut thread,
@@ -38959,7 +38998,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Use default constructor (no connect) to test field layout
-        let sock = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let sock = alloc_receiver(&shared, &mut thread, "java/net/Socket", 5);
         call_native(
             &shared,
             &mut thread,
@@ -39028,7 +39067,7 @@ mod tests {
     fn server_socket_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ss = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let ss = alloc_receiver(&shared, &mut thread, "java/net/ServerSocket", 4);
         // Use port 0 for OS-assigned port to avoid conflicts
         call_native(
             &shared,
@@ -39130,7 +39169,7 @@ mod tests {
     fn service_loader_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let class_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let class_mirror = alloc_receiver(&shared, &mut thread, "java/util/ServiceLoader", 0);
         let sl = call_native(
             &shared,
             &mut thread,
@@ -39278,7 +39317,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Class mirror needs at least 2 fields: field 0 = ClassId (Int), field 1 = name (String)
-        let class_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let class_mirror = alloc_receiver(&shared, &mut thread, "java/lang/Class", 2);
         shared.mem.heap.set_field(class_mirror, 0, Value::Int(0)); // ClassId(0) - no record/sealed metadata
         let sealed = call_native(
             &shared,
@@ -39373,7 +39412,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Use default constructor + set host field manually to test getInetAddress
         // without needing a real TCP connection
-        let sock = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let sock = alloc_receiver(&shared, &mut thread, "java/net/Socket", 5);
         call_native(
             &shared,
             &mut thread,
@@ -39402,7 +39441,7 @@ mod tests {
     fn server_socket_with_backlog() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ss = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let ss = alloc_receiver(&shared, &mut thread, "java/net/ServerSocket", 4);
         // Use port 0 for OS-assigned to avoid conflicts
         call_native(
             &shared,
@@ -40065,11 +40104,11 @@ mod tests {
     fn log_record_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let level = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let level = alloc_receiver(&shared, &mut thread, "java/util/logging/LogRecord", 0);
         let msg = create_java_string(&shared, "test message");
         // LogRecord native handler requires 7 instance fields
         // (level, message, loggerName, thrown, parameters, millis, sequence).
-        let lr = shared.mem.heap.alloc_object(ClassId::new(0), 7);
+        let lr = alloc_receiver(&shared, &mut thread, "java/util/logging/LogRecord", 7);
         call_native(
             &shared,
             &mut thread,
@@ -41024,7 +41063,7 @@ mod tests {
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let _ = shared.mem.heap.set_array_element(arr_a, 0, Value::Int(1));
         let _ = shared.mem.heap.set_array_element(arr_a, 1, Value::Int(2));
-        let sa = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let sa = alloc_receiver(&shared, &mut thread, "java/util/stream/Stream", 1);
         shared.mem.heap.set_field(sa, 0, Value::Object(Some(arr_a)));
         let arr_b = shared
             .mem
@@ -41032,7 +41071,7 @@ mod tests {
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let _ = shared.mem.heap.set_array_element(arr_b, 0, Value::Int(3));
         let _ = shared.mem.heap.set_array_element(arr_b, 1, Value::Int(4));
-        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let sb = alloc_receiver(&shared, &mut thread, "java/util/stream/Stream", 1);
         shared.mem.heap.set_field(sb, 0, Value::Object(Some(arr_b)));
         let result = call_native(
             &shared,
@@ -41336,7 +41375,7 @@ mod tests {
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(5));
         let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(10));
-        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let stream = alloc_receiver(&shared, &mut thread, "java/util/stream/IntStream", 1);
         shared
             .mem
             .heap
@@ -41384,7 +41423,7 @@ mod tests {
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(42));
         let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(99));
-        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let stream = alloc_receiver(&shared, &mut thread, "java/util/stream/IntStream", 1);
         shared
             .mem
             .heap
@@ -41701,7 +41740,7 @@ mod tests {
             .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(s2)));
-        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let stream = alloc_receiver(&shared, &mut thread, "java/lang/String", 1);
         shared
             .mem
             .heap
@@ -42190,7 +42229,7 @@ mod tests {
     fn simple_date_format_basics_p57() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let sdf = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let sdf = alloc_receiver(&shared, &mut thread, "java/text/SimpleDateFormat", 1);
         let pattern = create_java_string(&shared, "yyyy-MM-dd HH:mm:ss");
         call_native(
             &shared,
@@ -42524,7 +42563,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Create empty CF then complete exceptionally
-        let cf = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let cf = alloc_receiver(&shared, &mut thread, "java/util/concurrent/CompletableFuture", 2);
         call_native(
             &shared,
             &mut thread,
@@ -42534,7 +42573,7 @@ mod tests {
             &[Value::Object(Some(cf))],
         )
         .unwrap();
-        let throwable = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let throwable = alloc_receiver(&shared, &mut thread, "java/util/concurrent/CompletableFuture", 2);
         let ok = call_native(
             &shared,
             &mut thread,
@@ -42741,7 +42780,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Test GZIPInputStream stub without stream delegation (invoke_virtual requires real class IDs)
         // Manually set up GZIPInputStream with null underlying stream
-        let gis = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let gis = alloc_receiver(&shared, &mut thread, "java/util/zip/GZIPInputStream", 2);
         shared.mem.heap.set_field(gis, 0, Value::Object(None)); // no underlying stream
         let arr = shared
             .mem
@@ -42779,7 +42818,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Create a BAOS
-        let baos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let baos = alloc_receiver(&shared, &mut thread, "java/io/ByteArrayOutputStream", 2);
         call_native(
             &shared,
             &mut thread,
@@ -42790,7 +42829,7 @@ mod tests {
         )
         .unwrap();
         // Create ZipOutputStream wrapping BAOS
-        let zos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let zos = alloc_receiver(&shared, &mut thread, "java/util/zip/ZipOutputStream", 2);
         call_native(
             &shared,
             &mut thread,
@@ -42802,7 +42841,7 @@ mod tests {
         .unwrap();
         // Put a new entry
         let name = create_java_string(&shared, "test.txt");
-        let entry = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let entry = alloc_receiver(&shared, &mut thread, "java/util/zip/ZipEntry", 4);
         call_native(
             &shared,
             &mut thread,
@@ -43677,7 +43716,7 @@ mod tests {
         let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(1));
         let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(2));
         let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(3));
-        let spl = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let spl = alloc_receiver(&shared, &mut thread, "java/util/stream/StreamSupport", 2);
         shared.mem.heap.set_field(spl, 0, Value::Object(Some(arr)));
         shared.mem.heap.set_field(spl, 1, Value::Int(0));
         // Create stream from spliterator
@@ -44344,7 +44383,7 @@ mod tests {
     fn submission_publisher_lifecycle_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let pub_obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let pub_obj = alloc_receiver(&shared, &mut thread, "java/util/concurrent/SubmissionPublisher", 3);
         call_native(
             &shared,
             &mut thread,
@@ -44458,7 +44497,7 @@ mod tests {
     fn callsite_mutable_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let cs = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let cs = alloc_receiver(&shared, &mut thread, "java/lang/invoke/MutableCallSite", 1);
         let mh = create_java_string(&shared, "fake_mh");
         call_native(
             &shared,
@@ -44682,7 +44721,7 @@ mod tests {
     fn process_handle_info_stubs_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ph = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let ph = alloc_receiver(&shared, &mut thread, "java/lang/ProcessHandle", 2);
         let info = call_native(
             &shared,
             &mut thread,
@@ -47303,7 +47342,7 @@ mod tests {
         let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(1));
         let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(2));
         let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(3));
-        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let stream = alloc_receiver(&shared, &mut thread, "java/util/stream/Stream", 1);
         shared
             .mem
             .heap
@@ -47376,14 +47415,14 @@ mod tests {
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let _ = shared.mem.heap.set_array_element(arr1, 0, Value::Int(1));
         let _ = shared.mem.heap.set_array_element(arr1, 1, Value::Int(2));
-        let s1 = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let s1 = alloc_receiver(&shared, &mut thread, "java/util/stream/Stream", 1);
         shared.mem.heap.set_field(s1, 0, Value::Object(Some(arr1)));
         let arr2 = shared
             .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 1);
         let _ = shared.mem.heap.set_array_element(arr2, 0, Value::Int(3));
-        let s2 = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let s2 = alloc_receiver(&shared, &mut thread, "java/util/stream/Stream", 1);
         shared.mem.heap.set_field(s2, 0, Value::Object(Some(arr2)));
         let result = call_native(
             &shared,
@@ -50772,7 +50811,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let gis = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let gis = alloc_receiver(&shared, &mut thread, "java/util/zip/GZIPInputStream", 2);
         call_native(
             &shared,
             &mut thread,
@@ -50815,7 +50854,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let gos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let gos = alloc_receiver(&shared, &mut thread, "java/util/zip/GZIPOutputStream", 2);
         call_native(
             &shared,
             &mut thread,
@@ -51778,7 +51817,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let defl = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let defl = alloc_receiver(&shared, &mut thread, "java/util/zip/Deflater", 4);
         call_native(
             &shared,
             &mut thread,
@@ -52645,7 +52684,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ss = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let ss = alloc_receiver(&shared, &mut thread, "java/net/ServerSocket", 4);
         call_native(
             &shared,
             &mut thread,
@@ -53953,7 +53992,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ll = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let ll = alloc_receiver(&shared, &mut thread, "java/util/LinkedList", 3);
         call_native(
             &shared,
             &mut thread,
@@ -54018,7 +54057,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = alloc_receiver(&shared, &mut thread, "java/util/LinkedHashMap", 5);
         call_native(
             &shared,
             &mut thread,
@@ -56521,7 +56560,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
 
         // Create a dummy handler object
-        let handler = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let handler = alloc_receiver(&shared, &mut thread, "java/lang/reflect/Proxy", 0);
 
         // Call Proxy.newProxyInstance
         let proxy_val = call_native(
@@ -58790,9 +58829,9 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create primary exception with 3+ fields (message, cause, suppressed)
-        let primary = shared.mem.heap.alloc_object(ClassId::new(0), 4);
-        let supp1 = shared.mem.heap.alloc_object(ClassId::new(0), 4);
-        let supp2 = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let primary = alloc_receiver(&shared, &mut thread, "java/lang/Throwable", 4);
+        let supp1 = alloc_receiver(&shared, &mut thread, "java/lang/Throwable", 4);
+        let supp2 = alloc_receiver(&shared, &mut thread, "java/lang/Throwable", 4);
 
         // Add two suppressed exceptions
         call_native(
@@ -60484,7 +60523,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let scope = shared.mem.heap.alloc_object(ClassId::new(0), 8);
+        let scope = alloc_receiver(&shared, &mut thread, "java/util/concurrent/StructuredTaskScope", 8);
         call_native(
             &shared,
             &mut thread,
@@ -61068,7 +61107,7 @@ mod tests {
         };
 
         // Create a fake SocketAddress
-        let sa = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let sa = alloc_receiver(&shared, &mut thread, "java/nio/channels/DatagramChannel", 2);
 
         // Connect
         call_native(
@@ -64655,7 +64694,7 @@ mod tests {
                 .heap
                 .set_array_element(bad_bytes, i, Value::Int(0));
         }
-        let cl = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let cl = alloc_receiver(&shared, &mut thread, "java/lang/ClassLoader", 4);
         let name_str = create_java_string(&shared, "com/test/Bad");
         let result = call_native(
             &shared,
@@ -64688,7 +64727,7 @@ mod tests {
             cratonvm_types::ArrayElementType::Byte,
             10,
         );
-        let cl = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let cl = alloc_receiver(&shared, &mut thread, "java/lang/ClassLoader", 4);
         let name_str = create_java_string(&shared, "com/test/Neg");
         let result = call_native(
             &shared,
@@ -64721,7 +64760,7 @@ mod tests {
             cratonvm_types::ArrayElementType::Byte,
             10,
         );
-        let cl = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let cl = alloc_receiver(&shared, &mut thread, "java/lang/ClassLoader", 4);
         let name_str = create_java_string(&shared, "com/test/OOB");
         let result = call_native(
             &shared,
@@ -66552,7 +66591,7 @@ mod tests {
         };
 
         // Create a SEVERE level (1000)
-        let severe = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let severe = alloc_receiver(&shared, &mut thread, "java/util/logging/Logger", 2);
         let severe_name = create_java_string(&shared, "SEVERE");
         shared
             .mem
@@ -66572,7 +66611,7 @@ mod tests {
         .unwrap();
 
         // INFO (800) should NOT be loggable at SEVERE (1000)
-        let info = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let info = alloc_receiver(&shared, &mut thread, "java/util/logging/Logger", 2);
         let info_name = create_java_string(&shared, "INFO");
         shared
             .mem
@@ -69070,8 +69109,8 @@ mod tests {
             .thread_registry
             .register(ThreadId(2), "t2", Some(t2_obj));
 
-        let tg = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let mut thread = JvmThread::new(ThreadId(0), "main");
+        let tg = alloc_receiver(&shared, &mut thread, "java/lang/ThreadGroup", 3);
         let name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -69830,9 +69869,29 @@ mod tests {
     // 90.3: JFR Event Emission
     // ---------------------------------------------------------------
 
-    #[test]
-    fn p90_jfr_gc_event_recorded() {
-        // JFR records a GC event when a recording is active.
+    /// Serializes the four `p90_jfr_*` tests below.
+    ///
+    /// They drain the process-global JFR ring, so running two of them at once
+    /// would let each steal the other's events.
+    static P90_JFR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `emit` with a recording active and return the events it produced.
+    ///
+    /// `emit_*` does NOT write into the recording's repository: it pushes onto
+    /// the per-thread ring that `RingRegistry::drain_all` collects, and nothing
+    /// moves ring events into a `Recording` unless a dump asks for them. These
+    /// tests used to start a recording, emit, and then read
+    /// `Recording::get_events()` — a repository nothing had filled — so they
+    /// asserted against an empty vector however well the emit worked. Draining
+    /// the ring is both what actually proves the emit fired and what
+    /// `cratonvm-jfr`'s own tests do.
+    ///
+    /// The recording still has to be started: every `emit_*` returns early
+    /// unless `cratonvm_jfr::is_enabled()`, which is what starting one sets.
+    fn p90_jfr_emitted(
+        emit: impl FnOnce(&mut cratonvm_jfr::FlightRecorder),
+    ) -> Vec<cratonvm_jfr::EventInstance> {
+        let _guard = P90_JFR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let shared = p90_shared();
         let rec_id = {
             let mut fr = shared.debug.flight_recorder.lock();
@@ -69840,24 +69899,25 @@ mod tests {
             fr.start_recording(id);
             id
         };
-        // Emit a GC event
+        // Discard whatever an earlier test left on this thread's ring so the
+        // events returned below are exactly the ones `emit` produced.
+        let _ = cratonvm_jfr::repository::global_ring_registry().drain_all();
         {
             let mut fr = shared.debug.flight_recorder.lock();
-            cratonvm_jfr::builtin::emit_gc_event(
-                &mut fr,
-                1,
-                "YoungGC",
-                "Allocation Failure",
-                1000,
-                500,
-            );
+            emit(&mut fr);
         }
-        let mut fr = shared.debug.flight_recorder.lock();
-        fr.stop_recording(rec_id);
-        let rec = fr.get_recording_mut(rec_id).unwrap();
-        let events = rec.get_events();
+        let drained = cratonvm_jfr::repository::global_ring_registry().drain_all();
+        shared.debug.flight_recorder.lock().stop_recording(rec_id);
+        drained
+    }
+
+    #[test]
+    fn p90_jfr_gc_event_recorded() {
+        let events = p90_jfr_emitted(|fr| {
+            cratonvm_jfr::builtin::emit_gc_event(fr, 1, "YoungGC", "Allocation Failure", 1000, 500);
+        });
         assert!(
-            events.len() >= 1,
+            !events.is_empty(),
             "GC event should be recorded, got {}",
             events.len()
         );
@@ -69865,31 +69925,18 @@ mod tests {
 
     #[test]
     fn p90_jfr_class_load_event_recorded() {
-        // JFR records a class load event when a recording is active.
-        let shared = p90_shared();
-        let rec_id = {
-            let mut fr = shared.debug.flight_recorder.lock();
-            let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
-            fr.start_recording(id);
-            id
-        };
-        {
-            let mut fr = shared.debug.flight_recorder.lock();
+        let events = p90_jfr_emitted(|fr| {
             cratonvm_jfr::builtin::emit_class_load_event(
-                &mut fr,
+                fr,
                 "java/lang/Object",
                 "app",
                 "app",
                 1000,
                 200,
             );
-        }
-        let mut fr = shared.debug.flight_recorder.lock();
-        fr.stop_recording(rec_id);
-        let rec = fr.get_recording_mut(rec_id).unwrap();
-        let events = rec.get_events();
+        });
         assert!(
-            events.len() >= 1,
+            !events.is_empty(),
             "ClassLoad event should be recorded, got {}",
             events.len()
         );
@@ -69897,25 +69944,10 @@ mod tests {
 
     #[test]
     fn p90_jfr_thread_start_end_events_recorded() {
-        // JFR records thread start and end events.
-        let shared = p90_shared();
-        let rec_id = {
-            let mut fr = shared.debug.flight_recorder.lock();
-            let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
-            fr.start_recording(id);
-            id
-        };
-        {
-            let mut fr = shared.debug.flight_recorder.lock();
-            cratonvm_jfr::builtin::emit_thread_start_event(
-                &mut fr, "worker-1", "platform", 1, 1000,
-            );
-            cratonvm_jfr::builtin::emit_thread_end_event(&mut fr, "worker-1", 1, 2000);
-        }
-        let mut fr = shared.debug.flight_recorder.lock();
-        fr.stop_recording(rec_id);
-        let rec = fr.get_recording_mut(rec_id).unwrap();
-        let events = rec.get_events();
+        let events = p90_jfr_emitted(|fr| {
+            cratonvm_jfr::builtin::emit_thread_start_event(fr, "worker-1", "platform", 1, 1000);
+            cratonvm_jfr::builtin::emit_thread_end_event(fr, "worker-1", 1, 2000);
+        });
         assert!(
             events.len() >= 2,
             "ThreadStart + ThreadEnd events should be recorded, got {}",
@@ -69925,18 +69957,9 @@ mod tests {
 
     #[test]
     fn p90_jfr_compilation_event_recorded() {
-        // JFR records a compilation event.
-        let shared = p90_shared();
-        let rec_id = {
-            let mut fr = shared.debug.flight_recorder.lock();
-            let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
-            fr.start_recording(id);
-            id
-        };
-        {
-            let mut fr = shared.debug.flight_recorder.lock();
+        let events = p90_jfr_emitted(|fr| {
             cratonvm_jfr::builtin::emit_compilation_event(
-                &mut fr,
+                fr,
                 "com/example/Main::main([Ljava/lang/String;)V",
                 1,
                 4,
@@ -69947,13 +69970,9 @@ mod tests {
                 1000,
                 500,
             );
-        }
-        let mut fr = shared.debug.flight_recorder.lock();
-        fr.stop_recording(rec_id);
-        let rec = fr.get_recording_mut(rec_id).unwrap();
-        let events = rec.get_events();
+        });
         assert!(
-            events.len() >= 1,
+            !events.is_empty(),
             "Compilation event should be recorded, got {}",
             events.len()
         );
@@ -71298,7 +71317,7 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create primary exception with 3 fields (message, cause, suppressed[])
-        let primary = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let primary = alloc_receiver(&shared, &mut thread, "java/lang/Throwable", 3);
         let msg = create_java_string(&shared, "primary error");
         shared
             .mem
@@ -71306,7 +71325,7 @@ public class SkippedTest {
             .set_field(primary, 0, Value::Object(Some(msg)));
 
         // Create suppressed exception
-        let suppressed = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let suppressed = alloc_receiver(&shared, &mut thread, "java/lang/Throwable", 3);
         let smsg = create_java_string(&shared, "close failed");
         shared
             .mem
@@ -71377,9 +71396,9 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Primary with two suppressions
-        let primary = shared.mem.heap.alloc_object(ClassId::new(0), 3);
-        let s1 = shared.mem.heap.alloc_object(ClassId::new(0), 3);
-        let s2 = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let primary = alloc_receiver(&shared, &mut thread, "java/lang/Throwable", 3);
+        let s1 = alloc_receiver(&shared, &mut thread, "java/lang/Throwable", 3);
+        let s2 = alloc_receiver(&shared, &mut thread, "java/lang/Throwable", 3);
 
         call_native(
             &shared,
@@ -74033,8 +74052,8 @@ public class SkippedTest {
             Value::Object(Some(o)) => o,
             _ => panic!(),
         };
-        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
-        let action = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let referent = alloc_receiver(&shared, &mut thread, "java/lang/ref/Cleaner", 1);
+        let action = alloc_receiver(&shared, &mut thread, "java/lang/ref/Cleaner", 1);
         let cleanable = call_native(
             &shared,
             &mut thread,

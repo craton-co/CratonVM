@@ -253,11 +253,15 @@ fn scan_msc(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
 fn remap_msc(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
     cratonvm_native_builtins::jboss_msc::gc_update_msc_service_refs(map);
 }
-fn scan_logmanager(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
-    cratonvm_native_builtins::logmanager::gc_scan_logmanager_roots(roots);
+// Scoped to THIS VM. The logmanager side-tables hold raw heap addresses, and
+// the process can own several heaps at once (the inline test module builds a
+// `SharedVm` per test). Reporting another VM's address as a root here would
+// hand the collector a pointer into a heap it does not own.
+fn scan_logmanager(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::logmanager::gc_scan_logmanager_roots(shared.vm_identity, roots);
 }
-fn remap_logmanager(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
-    cratonvm_native_builtins::logmanager::gc_update_logmanager_refs(map);
+fn remap_logmanager(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::logmanager::gc_update_logmanager_refs(shared.vm_identity, map);
 }
 fn scan_annotations(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(roots);

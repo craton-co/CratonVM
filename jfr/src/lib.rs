@@ -141,6 +141,36 @@ pub fn set_enabled(v: bool) {
     JFR_ENABLED.store(v, Ordering::Release);
 }
 
+/// Number of running recordings summed over every [`FlightRecorder`] in the
+/// process. [`is_enabled`] is `true` exactly while this is non-zero.
+static RUNNING_RECORDINGS: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+/// Publish a recorder's change in running-recording count.
+///
+/// `JFR_ENABLED` is process-global but a recorder's running set is not, so
+/// storing `!running_ids.is_empty()` directly — as `refresh_running_ids` used
+/// to — lets whichever recorder transitioned last decide the flag for all of
+/// them. With one recorder per process that is invisible; with several it is
+/// not, and `cratonvm-vm`'s test binary builds a `SharedVm`, and therefore a
+/// `FlightRecorder`, per test. A recorder with no recordings would call
+/// `set_enabled(false)` and silently switch JFR off underneath a concurrent
+/// test that had just started one, so every `emit_*` on that thread returned
+/// at its `is_enabled()` gate and the recording came back empty.
+///
+/// Tracking the total instead makes the flag mean what it says: some recording
+/// somewhere is running. Recorders report their own delta, so they compose.
+pub(crate) fn publish_running_delta(prev: usize, now: usize) {
+    let delta = now as isize - prev as isize;
+    let total = if delta == 0 {
+        RUNNING_RECORDINGS.load(Ordering::Acquire)
+    } else {
+        RUNNING_RECORDINGS.fetch_add(delta, Ordering::AcqRel) + delta
+    };
+    debug_assert!(total >= 0, "running-recording count went negative: {total}");
+    set_enabled(total > 0);
+}
+
 /// Create a new FlightRecorder with all built-in events registered.
 pub fn create_flight_recorder() -> FlightRecorder {
     let mut fr = FlightRecorder::new();

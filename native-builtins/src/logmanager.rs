@@ -130,38 +130,72 @@ pub(crate) const LOGGER_FIELD_PARENT: usize = 2;
 // Process-wide singleton state
 // ---------------------------------------------------------------------------
 
-/// Holds the `LogManager` singleton's raw ObjectRef address. Pointer
-/// identity is stable for the lifetime of the process — we never free
-/// this object. Stored as a `u64` so we can atomically swap through a
-/// single `OnceLock<Mutex<u64>>` without re-allocation across tests.
-fn singleton_cell() -> &'static Mutex<Option<u64>> {
-    static INSTANCE: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(None))
+/// Per-VM instance of a process-global side table.
+///
+/// Every table below caches raw heap addresses, and a heap address only means
+/// anything inside the VM that produced it. The process may hold several: the
+/// `cratonvm-vm` inline test module stands up an independent `SharedVm` per
+/// test, and `NativeContext::vm_identity`'s contract spells the rule out —
+/// "native side caches that store heap `ObjectRef`s must scope entries to this
+/// value".
+///
+/// Before this, `logger_registry` and friends were shared across all of them
+/// and commented "SAFETY: singleton-style lifetime". That holds for one VM and
+/// fails for two: `get_or_create_logger` handed a second VM the first VM's
+/// logger address, and `jul_logger_handlers_clear` faulted taking its identity
+/// hash — an intermittent EXCEPTION_ACCESS_VIOLATION that killed roughly two
+/// of every three full `--features synthetic-jdk` runs. The GC root scan read
+/// the same tables, so foreign addresses were being handed to the collector as
+/// roots as well.
+///
+/// The inner tables are leaked rather than reclaimed on VM teardown. That
+/// matches what the process already does (a `SharedVm` outlives its test) and
+/// keeps the returned `&'static Mutex<T>` shape the ~90 call sites expect, so
+/// scoping them cost a `vm` argument and nothing else.
+pub(crate) fn per_vm_table<T: Send + Default + 'static>(
+    slot: &'static OnceLock<Mutex<HashMap<usize, &'static Mutex<T>>>>,
+    vm: usize,
+) -> &'static Mutex<T> {
+    let outer = slot.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = outer.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(vm)
+        .or_insert_with(|| Box::leak(Box::new(Mutex::new(T::default()))))
 }
 
-/// Name -> `Logger` ObjectRef (as raw u64). Populated on first
+/// Holds the `LogManager` singleton's raw ObjectRef address, per VM. Pointer
+/// identity is stable for the lifetime of its VM — we never free this object.
+fn singleton_cell(vm: usize) -> &'static Mutex<Option<u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<Option<u64>>>>> =
+        OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
+}
+
+/// Name -> `Logger` ObjectRef (as raw u64), per VM. Populated on first
 /// `getLogger`/`addLogger`. Reads are cheap; a lock is acquired only
 /// during mutation.
-fn logger_registry() -> &'static Mutex<HashMap<String, u64>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+fn logger_registry(vm: usize) -> &'static Mutex<HashMap<String, u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<HashMap<String, u64>>>>> =
+        OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
 }
 
 /// JULI's `ClassLoaderLogManager` deliberately permits the same logger name
 /// in independent web application class loaders. Keep those synthetic loggers
 /// out of the default process-wide registry and key them by the stable identity
 /// hash of the current thread context class loader instead.
-fn tomcat_juli_logger_registry() -> &'static Mutex<HashMap<(i32, String), u64>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<(i32, String), u64>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+fn tomcat_juli_logger_registry(vm: usize) -> &'static Mutex<HashMap<(i32, String), u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<HashMap<(i32, String), u64>>>>> =
+        OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
 }
 
 /// Root handlers must be scoped by the thread context class loader as well:
 /// every web application uses the JUL root name `""`, but each has an
 /// independent FileHandler configuration.
-fn tomcat_juli_root_handler_registry() -> &'static Mutex<HashMap<i32, Vec<u64>>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<i32, Vec<u64>>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+fn tomcat_juli_root_handler_registry(vm: usize) -> &'static Mutex<HashMap<i32, Vec<u64>>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<HashMap<i32, Vec<u64>>>>>> =
+        OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
 }
 
 /// `LogManager.addConfigurationListener(Runnable)` registrations, in
@@ -182,9 +216,9 @@ fn tomcat_juli_root_handler_registry() -> &'static Mutex<HashMap<i32, Vec<u64>>>
 ///
 /// Rooted/remapped by `gc_scan_logmanager_roots` / `gc_update_logmanager_refs`
 /// like every other ObjectRef side-table in this module.
-fn config_listeners() -> &'static Mutex<Vec<u64>> {
-    static INSTANCE: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(Vec::new()))
+fn config_listeners(vm: usize) -> &'static Mutex<Vec<u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<Vec<u64>>>>> = OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
 }
 
 /// Explicit handlers installed on synthetic JUL loggers. The JDK normally
@@ -192,9 +226,10 @@ fn config_listeners() -> &'static Mutex<Vec<u64>> {
 /// deliberately does not model that private layout, so keep the Java-visible
 /// handler references here instead. This matters for framework log capture
 /// (Tomcat's `LogCapture` is one such user), not only console output.
-fn logger_handlers() -> &'static Mutex<HashMap<String, Vec<u64>>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<String, Vec<u64>>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+fn logger_handlers(vm: usize) -> &'static Mutex<HashMap<String, Vec<u64>>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<HashMap<String, Vec<u64>>>>>> =
+        OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
 }
 
 /// Explicit JUL levels for real Logger objects. Their private configuration
@@ -430,9 +465,10 @@ fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Option<Obje
 /// property, the JDK-default class is used as before — see
 /// `try_allocate_property_log_manager` for the loader-bypass rationale.
 fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
+    let vm = ctx.vm_identity();
     // Fast path: already cached.
     {
-        let guard = singleton_cell().lock().unwrap_or_else(|e| e.into_inner());
+        let guard = singleton_cell(vm).lock().unwrap_or_else(|e| e.into_inner());
         if let Some(addr) = *guard {
             if addr != 0 {
                 // SAFETY: the cached address was produced by `alloc_object`
@@ -454,7 +490,7 @@ fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef 
         Some(o) => o,
         None => allocate_log_manager(ctx, class_name),
     };
-    let mut guard = singleton_cell().lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = singleton_cell(vm).lock().unwrap_or_else(|e| e.into_inner());
     if let Some(addr) = *guard {
         if addr != 0 {
             // Another thread beat us; drop our allocation on the floor
@@ -530,7 +566,7 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
         // immediate dotted prefix instead made
         // `Logger.getLogger("com.example.Foo").getParent()` answer with a
         // `com.example` logger HotSpot never creates (it answers with the root).
-        let parent_name = nearest_existing_ancestor_name(name);
+        let parent_name = nearest_existing_ancestor_name(ctx.vm_identity(), name);
         let parent = get_or_create_logger(ctx, &parent_name);
         let parent_pin = ctx.pin_native_root(parent);
         obj = ctx.read_native_pin(obj_pin, obj);
@@ -549,8 +585,8 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
 /// This is JUL's `LogManager.LogNode.getParentLogger` rule. Walking the whole
 /// dotted prefix chain matters: `getLogger("a.b.c.d")` with only `a` present
 /// must parent to `a`, not to a freshly fabricated `a.b.c`.
-fn nearest_existing_ancestor_name(name: &str) -> String {
-    let reg = logger_registry().lock().unwrap_or_else(|e| e.into_inner());
+fn nearest_existing_ancestor_name(vm: usize, name: &str) -> String {
+    let reg = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
     let mut cur = name;
     while let Some(idx) = cur.rfind('.') {
         cur = &cur[..idx];
@@ -674,6 +710,7 @@ fn populate_real_logger_bundle(
 /// a non-null Logger for the `.info()` / `.warning()` fallback but the
 /// bad name never enters the registry.
 pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+    let vm = ctx.vm_identity();
     if !is_valid_logger_name(name) {
         tracing::warn!(
             rejected_name = %name,
@@ -682,7 +719,7 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> O
         return allocate_logger(ctx, "");
     }
     {
-        let reg = logger_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let reg = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&addr) = reg.get(name) {
             if addr != 0 {
                 // SAFETY: singleton-style lifetime.
@@ -696,7 +733,7 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> O
     // `LogNode.walkAndSetParent` when `addLogger` inserts an intermediate node.
     let mut reparent: Vec<u64> = Vec::new();
     {
-        let mut reg = logger_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let mut reg = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
         // Check again under the lock (TOCTOU); if another thread beat
         // us, return their logger and drop ours on the floor (it has
         // no external references yet).
@@ -831,6 +868,7 @@ fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
 }
 
 fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+    let vm = ctx.vm_identity();
     if !is_valid_logger_name(name) {
         return allocate_logger(ctx, "");
     }
@@ -845,7 +883,7 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
     }
     let context_loader_key = tomcat_context_loader_key(ctx);
     let key = (context_loader_key, name.to_string());
-    if let Some(&address) = tomcat_juli_logger_registry()
+    if let Some(&address) = tomcat_juli_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
@@ -897,7 +935,7 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
             // name-keyed compatibility table. Snapshot that current root list
             // into a distinct identity-keyed ArrayList so two webapps with
             // root name "" cannot subsequently overwrite one another.
-            let root_handlers = tomcat_juli_root_handler_registry()
+            let root_handlers = tomcat_juli_root_handler_registry(vm)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&context_loader_key)
@@ -921,7 +959,7 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
         }
     }
     logger = ctx.read_native_pin(logger_pin, logger);
-    let mut registry = tomcat_juli_logger_registry()
+    let mut registry = tomcat_juli_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(&address) = registry.get(&key) {
@@ -1046,34 +1084,34 @@ fn native_jul_logger_get_resource_bundle(
 /// don't see state bleed between parallel threads.
 #[cfg(test)]
 pub(crate) fn reset_state_for_tests() {
-    if let Ok(mut g) = singleton_cell().lock() {
+    if let Ok(mut g) = singleton_cell(vm).lock() {
         *g = None;
     }
-    if let Ok(mut r) = logger_registry().lock() {
+    if let Ok(mut r) = logger_registry(vm).lock() {
         r.clear();
     }
-    if let Ok(mut r) = tomcat_juli_logger_registry().lock() {
+    if let Ok(mut r) = tomcat_juli_logger_registry(vm).lock() {
         r.clear();
     }
-    if let Ok(mut r) = tomcat_juli_root_handler_registry().lock() {
+    if let Ok(mut r) = tomcat_juli_root_handler_registry(vm).lock() {
         r.clear();
     }
-    if let Ok(mut h) = logger_handlers().lock() {
+    if let Ok(mut h) = logger_handlers(vm).lock() {
         h.clear();
     }
-    if let Ok(mut l) = config_listeners().lock() {
+    if let Ok(mut l) = config_listeners(vm).lock() {
         l.clear();
     }
     if let Ok(mut m) = log_record_messages().lock() {
         m.clear();
     }
-    if let Ok(mut g) = jboss_log_context_singleton().lock() {
+    if let Ok(mut g) = jboss_log_context_singleton(vm).lock() {
         *g = None;
     }
-    if let Ok(mut r) = jboss_logger_registry().lock() {
+    if let Ok(mut r) = jboss_logger_registry(vm).lock() {
         r.clear();
     }
-    if let Ok(mut m) = attachments().lock() {
+    if let Ok(mut m) = attachments(vm).lock() {
         m.clear();
     }
 }
@@ -1118,6 +1156,7 @@ fn native_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     // `addLogger(Logger)` — args[0]=this, args[1]=Logger.
     let Some(Value::Object(Some(logger))) = args.get(1).cloned() else {
         // null Logger -> contract says NullPointerException, but we
@@ -1139,7 +1178,7 @@ fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         ctx.unpin_native_roots(logger_pin);
         return Ok(Some(Value::Int(0)));
     }
-    if logger_registry()
+    if logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains_key(&name)
@@ -1152,7 +1191,7 @@ fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // deliberately outside the registry lock because it may allocate.
     let _mirror = crate::wildfly_core::get_logger(&name);
     let logger = ctx.read_native_pin(logger_pin, logger);
-    let mut reg = logger_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut reg = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
     if reg.contains_key(&name) {
         ctx.unpin_native_roots(logger_pin);
         return Ok(Some(Value::Int(0)));
@@ -1305,9 +1344,10 @@ fn read_configuration_with_stream_impl(
 /// already registered is a no-op (identity comparison, exactly like the JDK's
 /// `IdentityHashMap`-backed set).
 fn native_add_configuration_listener(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     let this = args.first().cloned().unwrap_or(Value::Object(None));
     let Some(Value::Object(Some(listener))) = args.get(1).copied() else {
         return Err(RuntimeError::NullPointerException {
@@ -1316,7 +1356,7 @@ fn native_add_configuration_listener(
         .into());
     };
     let addr = listener.as_ptr() as u64;
-    let mut listeners = config_listeners().lock().unwrap_or_else(|e| e.into_inner());
+    let mut listeners = config_listeners(vm).lock().unwrap_or_else(|e| e.into_inner());
     if !listeners.contains(&addr) {
         listeners.push(addr);
     }
@@ -1328,9 +1368,10 @@ fn native_add_configuration_listener(
 /// Real JDK semantics: removing a listener that was never added is a no-op
 /// (not an error), and a `null` argument throws NPE.
 fn native_remove_configuration_listener(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     let Some(Value::Object(Some(listener))) = args.get(1).copied() else {
         return Err(RuntimeError::NullPointerException {
             message: Some("LogManager.removeConfigurationListener: listener is null".to_string()),
@@ -1338,7 +1379,7 @@ fn native_remove_configuration_listener(
         .into());
     };
     let addr = listener.as_ptr() as u64;
-    let mut listeners = config_listeners().lock().unwrap_or_else(|e| e.into_inner());
+    let mut listeners = config_listeners(vm).lock().unwrap_or_else(|e| e.into_inner());
     listeners.retain(|&a| a != addr);
     Ok(None)
 }
@@ -1350,6 +1391,7 @@ fn native_remove_configuration_listener(
 /// configuration read for the others — mirrored here by discarding the result
 /// of each `run()`.
 fn fire_configuration_listeners(ctx: &mut dyn NativeContext) {
+    let vm = ctx.vm_identity();
     // Re-entrancy guard: a listener whose `run()` itself calls
     // `readConfiguration`/`updateConfiguration` would otherwise recurse until
     // the stack blows. One notification per outermost read is the observable
@@ -1360,7 +1402,7 @@ fn fire_configuration_listeners(ctx: &mut dyn NativeContext) {
     // Snapshot under the lock and release it before any Java call: a listener
     // is free to call add/removeConfigurationListener, which would re-enter.
     let listeners: Vec<u64> = {
-        let guard = config_listeners().lock().unwrap_or_else(|e| e.into_inner());
+        let guard = config_listeners(vm).lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_empty() {
             return;
         }
@@ -1562,21 +1604,23 @@ fn apply_jul_config_entries(
     Ok(None)
 }
 
-fn native_reset(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_reset(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     // Drop all logger bindings but keep the manager singleton alive.
-    if let Ok(mut r) = logger_registry().lock() {
+    if let Ok(mut r) = logger_registry(vm).lock() {
         r.clear();
     }
-    if let Ok(mut r) = tomcat_juli_logger_registry().lock() {
+    if let Ok(mut r) = tomcat_juli_logger_registry(vm).lock() {
         r.clear();
     }
-    if let Ok(mut r) = tomcat_juli_root_handler_registry().lock() {
+    if let Ok(mut r) = tomcat_juli_root_handler_registry(vm).lock() {
         r.clear();
     }
     Ok(None)
 }
 
 fn native_get_logger_names(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     // Snapshot the names and pack into a synthetic Enumeration<String>.
     //
     // Layout (slot 0 = Object[] backing array, slot 1 = cursor int).
@@ -1584,7 +1628,7 @@ fn native_get_logger_names(ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
     // registered against `CLS_LOGGER_ENUMERATION` so the standard JDK
     // Enumeration API works on this shape.
     let names: Vec<String> = {
-        let r = logger_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let r = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
         r.keys().cloned().collect()
     };
 
@@ -1658,9 +1702,10 @@ fn native_enumeration_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // race-free initialisation path matches the JDK contract.
 
 type AttachKey = (u64, u64);
-fn attachments() -> &'static Mutex<HashMap<AttachKey, u64>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<AttachKey, u64>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+fn attachments(vm: usize) -> &'static Mutex<HashMap<AttachKey, u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<HashMap<AttachKey, u64>>>>> =
+        OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
 }
 
 fn obj_addr(v: &Value) -> u64 {
@@ -1672,15 +1717,16 @@ fn obj_addr(v: &Value) -> u64 {
 }
 
 fn native_jboss_logger_get_attachment(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     let this = args.first().map(obj_addr).unwrap_or(0);
     let key = args.get(1).map(obj_addr).unwrap_or(0);
     if this == 0 || key == 0 {
         return Ok(Some(Value::Object(None)));
     }
-    let map = attachments().lock().unwrap_or_else(|e| e.into_inner());
+    let map = attachments(vm).lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&addr) = map.get(&(this, key)) {
         if addr != 0 {
             // SAFETY: addresses produced by attach/attachIfAbsent are
@@ -1692,14 +1738,15 @@ fn native_jboss_logger_get_attachment(
     Ok(Some(Value::Object(None)))
 }
 
-fn native_jboss_logger_attach(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_attach(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     let this = args.first().map(obj_addr).unwrap_or(0);
     let key = args.get(1).map(obj_addr).unwrap_or(0);
     let value = args.get(2).map(obj_addr).unwrap_or(0);
     if this == 0 || key == 0 {
         return Ok(Some(Value::Object(None)));
     }
-    let mut map = attachments().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = attachments(vm).lock().unwrap_or_else(|e| e.into_inner());
     let prev = map.insert((this, key), value);
     Ok(Some(match prev {
         Some(addr) if addr != 0 => Value::Object(Some(unsafe { object_from_u64(addr) })),
@@ -1708,16 +1755,17 @@ fn native_jboss_logger_attach(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 fn native_jboss_logger_attach_if_absent(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     let this = args.first().map(obj_addr).unwrap_or(0);
     let key = args.get(1).map(obj_addr).unwrap_or(0);
     let value = args.get(2).map(obj_addr).unwrap_or(0);
     if this == 0 || key == 0 {
         return Ok(Some(Value::Object(None)));
     }
-    let mut map = attachments().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = attachments(vm).lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&addr) = map.get(&(this, key)) {
         if addr != 0 {
             return Ok(Some(Value::Object(Some(unsafe { object_from_u64(addr) }))));
@@ -1734,14 +1782,15 @@ fn native_jboss_logger_attach_if_absent(
 /// receiver so JBoss bytecode that walks the parent chain
 /// (`JBossLogManagerFacade.updateParents`) can call methods on it
 /// without NPE. All overridden methods on this class return null/empty.
-fn jboss_log_context_singleton() -> &'static Mutex<Option<u64>> {
-    static INSTANCE: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(None))
+fn jboss_log_context_singleton(vm: usize) -> &'static Mutex<Option<u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<Option<u64>>>>> = OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
 }
 
 fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let vm = ctx.vm_identity();
     {
-        let g = jboss_log_context_singleton()
+        let g = jboss_log_context_singleton(vm)
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(addr) = *g {
@@ -1762,7 +1811,7 @@ fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> ObjectRef {
     {
         ctx.set_field(obj, 0, Value::Object(Some(tree_lock)));
     }
-    let mut g = jboss_log_context_singleton()
+    let mut g = jboss_log_context_singleton(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(addr) = *g {
@@ -1798,13 +1847,14 @@ fn native_jboss_log_context_get_logger_if_exists(
 }
 
 /// Process-wide registry of synthetic `org/jboss/logmanager/Logger`
-/// instances keyed by name. Distinct from `logger_registry()` (which
+/// instances keyed by name. Distinct from `logger_registry(vm)` (which
 /// holds `java/util/logging/Logger` mirrors) so the JBoss-side overrides
 /// for `getAttachment` etc. dispatch on receivers whose concrete class
 /// is `org/jboss/logmanager/Logger`.
-fn jboss_logger_registry() -> &'static Mutex<HashMap<String, u64>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+fn jboss_logger_registry(vm: usize) -> &'static Mutex<HashMap<String, u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<HashMap<String, u64>>>>> =
+        OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
 }
 
 fn attach_minimal_jboss_logger_node(ctx: &mut dyn NativeContext, logger: ObjectRef) {
@@ -1822,6 +1872,7 @@ fn attach_minimal_jboss_logger_node(ctx: &mut dyn NativeContext, logger: ObjectR
 }
 
 fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+    let vm = ctx.vm_identity();
     if !is_valid_logger_name(name) {
         let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
         let name_obj = ctx.create_string("");
@@ -1830,7 +1881,7 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Object
         return obj;
     }
     {
-        let reg = jboss_logger_registry()
+        let reg = jboss_logger_registry(vm)
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(&addr) = reg.get(name) {
@@ -1845,7 +1896,7 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Object
     ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
     ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(None));
     attach_minimal_jboss_logger_node(ctx, obj);
-    let mut reg = jboss_logger_registry()
+    let mut reg = jboss_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(&addr) = reg.get(name) {
@@ -3243,6 +3294,7 @@ fn native_jul_log_record_get_message(
 
 /// Store an explicit handler without relying on the private JDK Logger layout.
 fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(handler)))) =
         (args.first(), args.get(1))
     else {
@@ -3258,7 +3310,7 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let handler_pin = ctx.pin_native_root(*handler);
     let name = read_jul_logger_name(ctx, *logger);
     let is_root = name.is_empty();
-    let mut all = logger_handlers().lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = logger_handlers(vm).lock().unwrap_or_else(|e| e.into_inner());
     let handlers = all.entry(name).or_default();
     if !handlers.iter().any(|&addr| addr == handler.as_ptr() as u64) {
         handlers.push(handler.as_ptr() as u64);
@@ -3266,7 +3318,7 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
     drop(all);
     if is_root && tomcat_classloader_log_manager_requested(ctx) {
         let loader_key = tomcat_context_loader_key(ctx);
-        let mut roots = tomcat_juli_root_handler_registry()
+        let mut roots = tomcat_juli_root_handler_registry(vm)
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let entries = roots.entry(loader_key).or_default();
@@ -3328,13 +3380,14 @@ fn native_jul_logger_remove_handler(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(handler)))) =
         (args.first(), args.get(1))
     else {
         return Ok(None);
     };
     let name = read_jul_logger_name(ctx, *logger);
-    let mut all = logger_handlers().lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = logger_handlers(vm).lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handlers) = all.get_mut(&name) {
         handlers.retain(|&addr| addr != handler.as_ptr() as u64);
     }
@@ -3432,6 +3485,7 @@ fn publish_jul_handlers_src(
     src_cls: Option<ObjectRef>,
     src_mth: Option<ObjectRef>,
 ) {
+    let vm = ctx.vm_identity();
     let (Some(logger), Some(level), Some(message)) = (logger, level, message) else {
         return;
     };
@@ -3456,7 +3510,7 @@ fn publish_jul_handlers_src(
     let message_pin = ctx.pin_native_root(message);
     let src_cls_pin = src_cls.map(|o| (ctx.pin_native_root(o), o));
     let src_mth_pin = src_mth.map(|o| (ctx.pin_native_root(o), o));
-    let handlers = logger_handlers()
+    let handlers = logger_handlers(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&read_jul_logger_name(ctx, logger))
@@ -4883,13 +4937,14 @@ fn log_simple(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
     crate::emit_framework_log(ctx, &format!("{level} [{logger_name}] {message}"));
 }
 
-fn native_jboss_logger_detach(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_detach(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let vm = ctx.vm_identity();
     let this = args.first().map(obj_addr).unwrap_or(0);
     let key = args.get(1).map(obj_addr).unwrap_or(0);
     if this == 0 || key == 0 {
         return Ok(Some(Value::Object(None)));
     }
-    let mut map = attachments().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = attachments(vm).lock().unwrap_or_else(|e| e.into_inner());
     let prev = map.remove(&(this, key));
     Ok(Some(match prev {
         Some(addr) if addr != 0 => Value::Object(Some(unsafe { object_from_u64(addr) })),
@@ -5025,7 +5080,7 @@ fn native_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// key / value so a moving collector relocates
 /// (rather than reclaims) them. Uses blocking locks that are never held across
 /// a Java allocation, so the allocating thread cannot self-deadlock here.
-pub fn gc_scan_logmanager_roots(out: &mut Vec<ObjectRef>) {
+pub fn gc_scan_logmanager_roots(vm: usize, out: &mut Vec<ObjectRef>) {
     // SAFETY (all `object_from_u64` calls below): the addresses were produced
     // by `as_ptr()` on live ObjectRefs allocated by this process's heap and
     // stored under these locks; reporting them as roots is exactly what keeps
@@ -5036,30 +5091,30 @@ pub fn gc_scan_logmanager_roots(out: &mut Vec<ObjectRef>) {
         }
     };
 
-    if let Some(addr) = *singleton_cell().lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(addr) = *singleton_cell(vm).lock().unwrap_or_else(|e| e.into_inner()) {
         push_addr(addr);
     }
-    if let Some(addr) = *jboss_log_context_singleton()
+    if let Some(addr) = *jboss_log_context_singleton(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
     {
         push_addr(addr);
     }
-    for &addr in logger_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-    {
-        push_addr(addr);
-    }
-    for &addr in tomcat_juli_logger_registry()
+    for &addr in logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
     {
         push_addr(addr);
     }
-    for handlers in tomcat_juli_root_handler_registry()
+    for &addr in tomcat_juli_logger_registry(vm)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
+        push_addr(addr);
+    }
+    for handlers in tomcat_juli_root_handler_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
@@ -5068,7 +5123,7 @@ pub fn gc_scan_logmanager_roots(out: &mut Vec<ObjectRef>) {
             push_addr(addr);
         }
     }
-    for &addr in jboss_logger_registry()
+    for &addr in jboss_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
@@ -5078,7 +5133,7 @@ pub fn gc_scan_logmanager_roots(out: &mut Vec<ObjectRef>) {
     // Configuration listeners are held ONLY by this table between
     // `addConfigurationListener` and the next `readConfiguration` — a caller
     // that registers a lambda inline keeps no other reference to it.
-    for &addr in config_listeners()
+    for &addr in config_listeners(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
@@ -5089,7 +5144,7 @@ pub fn gc_scan_logmanager_roots(out: &mut Vec<ObjectRef>) {
     // and stores the attached value address — all three are live Java objects
     // and must be rooted (the keys too, else the AttachmentKey decays and the
     // post-move key remap cannot find its new address).
-    for (&(this, key), &value) in attachments()
+    for (&(this, key), &value) in attachments(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
@@ -5105,7 +5160,7 @@ pub fn gc_scan_logmanager_roots(out: &mut Vec<ObjectRef>) {
 /// relocate; repoint every stored address — including BOTH halves of each
 /// `attachments` key — to its new location so later `object_from_u64`
 /// reconstructions resolve to the live object instead of a recycled slot.
-pub fn gc_update_logmanager_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_logmanager_refs(vm: usize, pointer_map: &std::collections::HashMap<usize, usize>) {
     if pointer_map.is_empty() {
         return;
     }
@@ -5129,27 +5184,27 @@ pub fn gc_update_logmanager_refs(pointer_map: &std::collections::HashMap<usize, 
         }
     };
 
-    remap_slot(&mut singleton_cell().lock().unwrap_or_else(|e| e.into_inner()));
+    remap_slot(&mut singleton_cell(vm).lock().unwrap_or_else(|e| e.into_inner()));
     remap_slot(
-        &mut jboss_log_context_singleton()
+        &mut jboss_log_context_singleton(vm)
             .lock()
             .unwrap_or_else(|e| e.into_inner()),
     );
-    for addr in logger_registry()
+    for addr in logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values_mut()
     {
         *addr = remap(*addr);
     }
-    for addr in tomcat_juli_logger_registry()
+    for addr in tomcat_juli_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values_mut()
     {
         *addr = remap(*addr);
     }
-    for handlers in tomcat_juli_root_handler_registry()
+    for handlers in tomcat_juli_root_handler_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values_mut()
@@ -5158,14 +5213,14 @@ pub fn gc_update_logmanager_refs(pointer_map: &std::collections::HashMap<usize, 
             *addr = remap(*addr);
         }
     }
-    for addr in jboss_logger_registry()
+    for addr in jboss_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values_mut()
     {
         *addr = remap(*addr);
     }
-    for addr in config_listeners()
+    for addr in config_listeners(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter_mut()
@@ -5176,7 +5231,7 @@ pub fn gc_update_logmanager_refs(pointer_map: &std::collections::HashMap<usize, 
     // the value address can relocate, so we cannot mutate values in place —
     // collect, remap key+value, and reinsert under the relocated key.
     {
-        let mut map = attachments().lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = attachments(vm).lock().unwrap_or_else(|e| e.into_inner());
         if !map.is_empty() {
             let rebuilt: HashMap<AttachKey, u64> = map
                 .drain()
@@ -5289,7 +5344,7 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     // wrong — `readConfiguration()`/`readConfiguration(InputStream)`/
     // `updateConfiguration(...)` are all really implemented in this module, and
     // the JDK fires the listener chain after each of them, so the drop WAS
-    // observable. They are now backed by `config_listeners()` and fired from
+    // observable. They are now backed by `config_listeners(vm)` and fired from
     // `fire_configuration_listeners`.
     registry.register(
         CLS_JUL_LOG_MANAGER,
@@ -6255,7 +6310,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            logger_handlers()
+            logger_handlers(vm)
                 .lock()
                 .unwrap()
                 .get("org.example.capture")
@@ -6282,7 +6337,7 @@ mod tests {
             &[Value::Object(Some(logger)), Value::Object(Some(handler))],
         )
         .unwrap();
-        assert!(logger_handlers()
+        assert!(logger_handlers(vm)
             .lock()
             .unwrap()
             .get("org.example.capture")
@@ -6613,7 +6668,7 @@ mod tests {
         // "d" and "d.e" as well, so the registry held 7 entries and
         // `getParent()` returned a logger HotSpot never creates.)
         {
-            let reg = logger_registry()
+            let reg = logger_registry(vm)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let mut names: Vec<&str> = reg.keys().map(|k| k.as_str()).collect();
@@ -6622,7 +6677,7 @@ mod tests {
         }
         native_reset(&mut ctx, &[Value::Object(Some(mgr))]).unwrap();
         assert!(
-            logger_registry()
+            logger_registry(vm)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty(),
@@ -6741,7 +6796,7 @@ mod tests {
             "bad names must not be cached (each call allocates a throw-away Logger)"
         );
         // Registry untouched.
-        assert!(logger_registry()
+        assert!(logger_registry(vm)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty());
@@ -6892,30 +6947,30 @@ mod tests {
     /// `LogContext` singleton, and every attachment receiver/key/value).
     fn cached_addrs_snapshot() -> Vec<u64> {
         let mut v = Vec::new();
-        if let Some(a) = *singleton_cell().lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(a) = *singleton_cell(vm).lock().unwrap_or_else(|e| e.into_inner()) {
             v.push(a);
         }
-        if let Some(a) = *jboss_log_context_singleton()
+        if let Some(a) = *jboss_log_context_singleton(vm)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
         {
             v.push(a);
         }
         v.extend(
-            logger_registry()
+            logger_registry(vm)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .values()
                 .copied(),
         );
         v.extend(
-            jboss_logger_registry()
+            jboss_logger_registry(vm)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .values()
                 .copied(),
         );
-        for (&(this, key), &value) in attachments()
+        for (&(this, key), &value) in attachments(vm)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()

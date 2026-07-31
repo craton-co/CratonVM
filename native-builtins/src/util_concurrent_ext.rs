@@ -841,68 +841,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // CountDownLatch/CyclicBarrier synthetic natives below are unaffected.
     let real_aqs = !crate::nbflags().synthetic_aqs || crate::nbflags().real_aqs;
     if !real_aqs {
-        // --- ReentrantLock ---
-        let rl = "java/util/concurrent/locks/ReentrantLock";
-        registry.register(rl, "<init>", "()V", native_rl_init);
-        registry.register(rl, "<init>", "(Z)V", native_rl_init_fair);
-        registry.register(rl, "lock", "()V", native_rl_lock);
-        registry.register(rl, "lockInterruptibly", "()V", native_rl_lock); // simplified
-        registry.register(rl, "unlock", "()V", native_rl_unlock);
-        registry.register(rl, "tryLock", "()Z", native_rl_try_lock);
-        registry.register(
-            rl,
-            "tryLock",
-            "(JLjava/util/concurrent/TimeUnit;)Z",
-            native_rl_try_lock_timeout,
-        );
-        registry.register(rl, "isLocked", "()Z", native_rl_is_locked);
-        registry.register(
-            rl,
-            "isHeldByCurrentThread",
-            "()Z",
-            native_rl_is_held_by_current_thread,
-        );
-        registry.register(rl, "getHoldCount", "()I", native_rl_get_hold_count);
-        registry.register(rl, "isFair", "()Z", native_rl_is_fair);
-        registry.register(
-            rl,
-            "newCondition",
-            "()Ljava/util/concurrent/locks/Condition;",
-            native_rl_new_condition,
-        );
-        registry.register(rl, "toString", "()Ljava/lang/String;", native_rl_to_string);
-
-        // Also register under Lock interface
-        let lock = "java/util/concurrent/locks/Lock";
-        registry.register(lock, "lock", "()V", native_rl_lock);
-        registry.register(lock, "unlock", "()V", native_rl_unlock);
-        registry.register(lock, "tryLock", "()Z", native_rl_try_lock);
-        registry.register(
-            lock,
-            "newCondition",
-            "()Ljava/util/concurrent/locks/Condition;",
-            native_rl_new_condition,
-        );
-
-        // --- Condition ---
-        let cond = "java/util/concurrent/locks/Condition";
-        registry.register(cond, "await", "()V", native_cond_await);
-        registry.register(cond, "awaitUninterruptibly", "()V", native_cond_await);
-        registry.register(
-            cond,
-            "await",
-            "(JLjava/util/concurrent/TimeUnit;)Z",
-            native_cond_await_timeout,
-        );
-        registry.register(cond, "awaitNanos", "(J)J", native_cond_await_nanos);
-        registry.register(
-            cond,
-            "awaitUntil",
-            "(Ljava/util/Date;)Z",
-            native_cond_await_until,
-        );
-        registry.register(cond, "signal", "()V", native_cond_signal);
-        registry.register(cond, "signalAll", "()V", native_cond_signal_all);
+        register_synthetic_aqs_natives(registry);
     } // end if !real_aqs
 
     // --- CountDownLatch ---
@@ -928,36 +867,8 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // See the matching early-registration guard above.  In the default real
     // AQS mode, Semaphore must keep its real `sync: Semaphore$Sync` field so
     // protected AQS operations invoked by third-party subclasses remain sound.
-    if !real_aqs {
-        let sem = "java/util/concurrent/Semaphore";
-        registry.register(sem, "<init>", "(I)V", native_sem_init);
-        registry.register(sem, "<init>", "(IZ)V", native_sem_init_fair);
-        registry.register(sem, "acquire", "()V", native_sem_acquire);
-        registry.register(sem, "acquire", "(I)V", native_sem_acquire_n);
-        registry.register(sem, "acquireUninterruptibly", "()V", native_sem_acquire);
-        // HikariCP's SuspendResumeLock may acquire all 10,000 permits at
-        // once; retain this synthetic-mode overload.
-        registry.register(sem, "acquireUninterruptibly", "(I)V", native_sem_acquire_n);
-        registry.register(sem, "release", "()V", native_sem_release);
-        registry.register(sem, "release", "(I)V", native_sem_release_n);
-        registry.register(sem, "tryAcquire", "()Z", native_sem_try_acquire);
-        registry.register(sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
-        registry.register(
-            sem,
-            "tryAcquire",
-            "(JLjava/util/concurrent/TimeUnit;)Z",
-            native_sem_try_acquire_timeout,
-        );
-        registry.register(sem, "availablePermits", "()I", native_sem_available_permits);
-        registry.register(sem, "drainPermits", "()I", native_sem_drain_permits);
-        registry.register(sem, "isFair", "()Z", native_sem_is_fair);
-        registry.register(
-            sem,
-            "toString",
-            "()Ljava/lang/String;",
-            native_sem_to_string,
-        );
-    }
+    // Semaphore's synthetic natives live in `register_synthetic_aqs_natives`
+    // alongside the lock ones; both are registered together above.
 
     // --- CyclicBarrier ---
     let cb = "java/util/concurrent/CyclicBarrier";
@@ -9711,4 +9622,115 @@ mod concurrency_tests {
             Value::Long(8)
         );
     }
+}
+
+
+/// The legacy synthetic `ReentrantLock` / `Lock` / `Condition` / `Semaphore`
+/// natives, split out of [`register_concurrent_natives`] so they have a name.
+///
+/// Production behaviour is unchanged: `register_concurrent_natives` calls this
+/// under exactly the `!real_aqs` condition the two inline blocks used to test,
+/// so the default real-AQS build still registers none of them.
+///
+/// It is public because otherwise this code is untestable. Real AQS became the
+/// default, which is right for the VM, but it left the synthetic implementation
+/// shipped and unreachable from any test: `cratonvm-vm`'s inline suite builds
+/// hand-rolled receivers with no real `java.util.concurrent` bytecode behind
+/// them, so it cannot exercise the real path, and the synthetic path was no
+/// longer registered for it to exercise either. Its tests were left asserting
+/// natives that the default build deliberately omits, and simply failed. A
+/// test registry can now opt in the same way `CRATONVM_SYNTHETIC_AQS=1` does
+/// at runtime.
+pub fn register_synthetic_aqs_natives(registry: &mut NativeMethodRegistry) {
+        // --- ReentrantLock ---
+        let rl = "java/util/concurrent/locks/ReentrantLock";
+        registry.register(rl, "<init>", "()V", native_rl_init);
+        registry.register(rl, "<init>", "(Z)V", native_rl_init_fair);
+        registry.register(rl, "lock", "()V", native_rl_lock);
+        registry.register(rl, "lockInterruptibly", "()V", native_rl_lock); // simplified
+        registry.register(rl, "unlock", "()V", native_rl_unlock);
+        registry.register(rl, "tryLock", "()Z", native_rl_try_lock);
+        registry.register(
+            rl,
+            "tryLock",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_rl_try_lock_timeout,
+        );
+        registry.register(rl, "isLocked", "()Z", native_rl_is_locked);
+        registry.register(
+            rl,
+            "isHeldByCurrentThread",
+            "()Z",
+            native_rl_is_held_by_current_thread,
+        );
+        registry.register(rl, "getHoldCount", "()I", native_rl_get_hold_count);
+        registry.register(rl, "isFair", "()Z", native_rl_is_fair);
+        registry.register(
+            rl,
+            "newCondition",
+            "()Ljava/util/concurrent/locks/Condition;",
+            native_rl_new_condition,
+        );
+        registry.register(rl, "toString", "()Ljava/lang/String;", native_rl_to_string);
+
+        // Also register under Lock interface
+        let lock = "java/util/concurrent/locks/Lock";
+        registry.register(lock, "lock", "()V", native_rl_lock);
+        registry.register(lock, "unlock", "()V", native_rl_unlock);
+        registry.register(lock, "tryLock", "()Z", native_rl_try_lock);
+        registry.register(
+            lock,
+            "newCondition",
+            "()Ljava/util/concurrent/locks/Condition;",
+            native_rl_new_condition,
+        );
+
+        // --- Condition ---
+        let cond = "java/util/concurrent/locks/Condition";
+        registry.register(cond, "await", "()V", native_cond_await);
+        registry.register(cond, "awaitUninterruptibly", "()V", native_cond_await);
+        registry.register(
+            cond,
+            "await",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_cond_await_timeout,
+        );
+        registry.register(cond, "awaitNanos", "(J)J", native_cond_await_nanos);
+        registry.register(
+            cond,
+            "awaitUntil",
+            "(Ljava/util/Date;)Z",
+            native_cond_await_until,
+        );
+        registry.register(cond, "signal", "()V", native_cond_signal);
+        registry.register(cond, "signalAll", "()V", native_cond_signal_all);
+
+        let sem = "java/util/concurrent/Semaphore";
+        registry.register(sem, "<init>", "(I)V", native_sem_init);
+        registry.register(sem, "<init>", "(IZ)V", native_sem_init_fair);
+        registry.register(sem, "acquire", "()V", native_sem_acquire);
+        registry.register(sem, "acquire", "(I)V", native_sem_acquire_n);
+        registry.register(sem, "acquireUninterruptibly", "()V", native_sem_acquire);
+        // HikariCP's SuspendResumeLock may acquire all 10,000 permits at
+        // once; retain this synthetic-mode overload.
+        registry.register(sem, "acquireUninterruptibly", "(I)V", native_sem_acquire_n);
+        registry.register(sem, "release", "()V", native_sem_release);
+        registry.register(sem, "release", "(I)V", native_sem_release_n);
+        registry.register(sem, "tryAcquire", "()Z", native_sem_try_acquire);
+        registry.register(sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
+        registry.register(
+            sem,
+            "tryAcquire",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_sem_try_acquire_timeout,
+        );
+        registry.register(sem, "availablePermits", "()I", native_sem_available_permits);
+        registry.register(sem, "drainPermits", "()I", native_sem_drain_permits);
+        registry.register(sem, "isFair", "()Z", native_sem_is_fair);
+        registry.register(
+            sem,
+            "toString",
+            "()Ljava/lang/String;",
+            native_sem_to_string,
+        );
 }
