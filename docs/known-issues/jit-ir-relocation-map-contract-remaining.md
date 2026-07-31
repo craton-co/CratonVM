@@ -487,3 +487,39 @@ meant to request C2 for hot methods and does not, that is a much larger
 throughput question than the relocation contract, and it belongs in the
 tiered-manager work (`docs/feature-designs/wire-tiered-manager.md`), not here.
 The relocation contract is ready for whichever methods do reach the IR backend.
+
+### The post-`ir_compatible` conjuncts, narrowed by inspection
+
+The chain continues (jit/src/lib.rs, after `ir::ir_compatible(&scan)`):
+
+```
+&& !(exc_table_c2_disabled() && !cached.exception_table.is_empty())
+&& !precise_exception_frames
+&& ((!method_uses_category2(..) && !method_uses_fp(..)) || <long/FP clauses>)
+… and more past that
+```
+
+Two are ruled out by inspection for the observed `optimize=true` case
+(`BinTreesClassic.itemCheck`):
+
+* `exc_table_c2_disabled()` reads `CRATONVM_JIT_NO_EXC_TABLE_C2`, which is
+  opt-in and unset, so that term is `true`;
+* `precise_exception_frames` is set only where RBC.6 fires — a handler reading a
+  local it never wrote. `itemCheck` has no `try`/`catch` at all, so it cannot.
+
+And `itemCheck(TreeNode) -> int` is category-2-free and FP-free, so the third
+clause should hold too. **So the refusal is in a conjunct further down than the
+ones read here**, and inspection has run out — the remaining terms need the same
+one-call-per-condition instrumentation, not more reading.
+
+That is the whole of the remaining work on this thread, and it is mechanical:
+add an `ir_reject`-style call to each conjunct from `exc_table_c2_disabled`
+onward, rebuild (verifying the patch is in the tree first — see the retraction
+above), and run `BinTreesClassic 16` once. The refusal names itself.
+
+Worth keeping in view while doing it: finding (2) above means this only ever
+affects the *rare* `optimize=true` compile. Even fully fixed, the contract
+covers whichever methods reach the IR backend — which today is close to none,
+because the tier-up path requests C1 by design. **Whether that is right is the
+larger and more valuable question**, and it lives in the tiered-manager work,
+not here.
