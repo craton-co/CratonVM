@@ -1481,6 +1481,24 @@ fn native_unsorted_set_comparator(
 }
 
 /// Register all collection native methods.
+// JDK-ONLY-CLASSIFY: stub — crate-wide verdict, applied by one line. The
+// `set_category(Bridge)` below is not a per-registration judgement: it is a
+// dynamic ambient assignment that every callee in this file inherits, and it
+// covers 1,195 of the crate's 1,219 registrations. Cross-checked against JDK 25
+// with `javap -p -s`, **not one** of those 1,195 targets an ACC_NATIVE method
+// (622 target methods with concrete bytecode, 214 are abstract interface
+// methods, the remainder are absent from the image or use a class name this
+// audit could not resolve statically). `java.util` is pure Java: there is no
+// VM/OS boundary in this crate to bridge to. The correct disposition for
+// almost everything here is jdk-only-native-review.md's rule 4 — "concrete
+// bytecode + incomplete replacement → delete from the strict path" — with a
+// small number of genuine `Intrinsic` promotions.
+//
+// DO NOT flip this line to `SyntheticStub` as a bulk edit. That is the exact
+// shape of the 2026-07-14 regression, at ~8x the blast radius, and the 214
+// abstract-interface registrations additionally decide dispatch for every USER
+// subclass, not just for `java.util` classes. Retag per subsystem, one PR each,
+// with schema-v2 `invocations` and `overwrote` evidence.
 pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_gc_root_provider();
     let __prev_cat = registry.current_category();
@@ -6098,6 +6116,15 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
     entries
 }
 
+// JDK-ONLY-CLASSIFY: stub — both registrations target `org.hibernate.*`, which
+// is not in any JDK boot image, so jdk-only-native-review.md rule 1 fires: no
+// real declaring class ⇒ CompatibilityShim, forbidden under `JdkOnly`. Note
+// these are third-party classes, not JDK classes: they are on the APPLICATION
+// class path when Hibernate is present and absent otherwise, so `--jdk-only`
+// must refuse the registration rather than the class. This is one of only two
+// lexically uncategorised registration sites in the whole crate; both inherit
+// `Bridge` dynamically from `register_collections_natives`, which is how a
+// third-party shim ends up wearing the tag reserved for VM/OS boundaries.
 fn register_hibernate_persistent_map_natives(r: &mut NativeMethodRegistry) {
     r.register(
         "org/hibernate/collection/spi/PersistentMap",
@@ -15678,6 +15705,14 @@ fn prim_stream_values(
     }
 }
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Same abstract-interface hazard as
+// `register_interface_natives`: 30 of 37 registrations here target abstract
+// methods of `java.util.stream.Stream` and friends. `java.util.stream` has no
+// ACC_NATIVE method anywhere, so nothing in this group is a bridge; the open
+// question is whether each entry should become an `Intrinsic` (the pipeline
+// fusion these natives perform is a real speedup) or be deleted so the JDK's
+// own `ReferencePipeline` runs. That question is answered by measurement, not
+// by `javap`. Do not retag without a benchmark and a differential run.
 fn register_stream_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -22898,6 +22933,15 @@ fn native_double_stream_map_to_int(
 // we register native methods for common interfaces that delegate to the concrete
 // implementations (ArrayList / HashSet).
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. 23 of these 34 registrations land
+// on ABSTRACT methods of `java.util` interfaces. An abstract method has no
+// bytecode, so jdk-only-native-review.md rule 3 says the strict disposition is
+// `MissingImplementation` rather than a stub — but that is only true if no
+// implementor is reached first. In practice a native on an abstract interface
+// method intercepts every implementing class, including user-defined ones, so
+// the tag here silently decides dispatch far outside `java.util`. Neither
+// `bridge` nor `stub` is defensible from source. Evidence needed: which of
+// these 23 are ever dispatched, and against which receiver classes.
 fn register_interface_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -24491,6 +24535,16 @@ const SJ_FIELD_SUFFIX: usize = 2;
 const SJ_FIELD_ELEMENTS: usize = 3;
 const SJ_FIELD_EMPTY_VALUE: usize = 4;
 
+// JDK-ONLY-CLASSIFY: stub — `java.util.StringJoiner` declares zero ACC_NATIVE
+// methods in JDK 25; all 7 registrations here shadow concrete bytecode using a
+// fabricated 5-slot layout (`SJ_FIELD_*` above) that does not match the real
+// class. This is the repo's clearest worked example of why the category must be
+// a per-registration decision rather than ambient state: the SAME seven
+// registrations are emitted under `Bridge` by `register_string_joiner_natives`
+// and under `SyntheticStub` by `register_string_joiner_stub_natives`, and the
+// only thing that distinguishes them is the `kind` argument this helper was
+// handed. Both are the same code registering the same triples; only the tag
+// differs, and the tag decides whether they survive `--jdk-only`.
 fn register_string_joiner_natives_with_category(
     registry: &mut NativeMethodRegistry,
     kind: cratonvm_native_api::NativeKind,
@@ -39583,6 +39637,19 @@ fn register_set_from_map_natives(r: &mut NativeMethodRegistry) {
 
 const PROPS_FIELD_DEFAULTS: usize = 3;
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. HIGHEST-RISK GROUP IN THIS CRATE.
+// All 43 registrations target `java.util.Properties` methods that have concrete
+// bytecode in JDK 25 and none that is ACC_NATIVE, which reads as "stub" on the
+// static evidence alone. Do not act on that reading. `Properties` is on the
+// real-JDK bootstrap path (`java.home` and friends are read out of it before
+// most of the class library is usable), and this repo has already shipped a
+// bootstrap failure — `InternalError: null property: java.home` — caused by a
+// whole function's worth of `Properties` registrations picking up the wrong
+// ambient category at a single call site. Anything that changes what survives
+// here must be proven with a full `--jdk-only` boot, not with `javap`.
+// Evidence needed before any retag: schema-v2 `invocations` for every triple in
+// this group across a real-JDK boot, plus `overwrote` to see which of these are
+// already being replaced by `native-builtins`' `register_properties_sidetable`.
 fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -42963,6 +43030,15 @@ fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
 // the bytecode side. NOT lock-free in the throughput sense; treat as a
 // correctness-only stopgap until a real Michael-Scott port lands.
 
+// JDK-ONLY-CLASSIFY: stub — correctly tagged already, and worth recording as
+// the crate's counter-example. `java.util.concurrent.LinkedBlockingDeque`
+// declares zero ACC_NATIVE methods in JDK 25; all 15 registrations shadow
+// concrete bytecode with a monitor-wrapped ArrayList, which the comment above
+// already calls "a correctness-only stopgap". This is the one place in
+// `native-collections` where a `set_category` states a per-subsystem judgement
+// instead of inheriting the crate-wide `Bridge`, and it reaches the right
+// answer. Under `--jdk-only` the registration is refused and the real
+// lock-free bytecode runs, which is the intended outcome.
 #[cfg(not(feature = "synthetic-jdk"))]
 fn register_linked_blocking_deque_stub_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();

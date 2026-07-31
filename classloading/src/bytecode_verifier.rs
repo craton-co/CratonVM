@@ -1052,6 +1052,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: crate::class_origin::ClassOrigin::VmInternal,
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
