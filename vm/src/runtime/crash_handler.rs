@@ -1513,6 +1513,15 @@ pub fn install_crash_handler() {
     let prev = std::panic::take_hook();
 
     std::panic::set_hook(Box::new(move |panic_info| {
+        // The native allocators' heap-exhaustion unwind is a HANDLED condition
+        // (`safe_native_call` turns it into a catchable
+        // `java.lang.OutOfMemoryError`), not a crash. Writing an
+        // `hs_err_pid<pid>.log` for it would be wrong on its own AND would latch
+        // the one-report-per-process guard below, silently suppressing the
+        // report for a later real crash. See `crate::runtime::native_oom`.
+        if crate::runtime::native_oom::is_native_oom_panic(panic_info) {
+            return;
+        }
         // Prevent recursive entry if the handler itself panics.
         if CRASH_IN_PROGRESS
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)

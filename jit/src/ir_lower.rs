@@ -223,7 +223,16 @@ struct Lowerer<'a> {
     /// Address of the checked `jit_getfield` helper. When present, `Op::Load`
     /// instance-field reads route through it so receivers are validated against
     /// the live heap before any object-header dereference.
+    ///
+    /// It is also the only compact-layout-correct `Op::Load` lowering: the
+    /// inline fallback derives `HEADER_SIZE + field_index*SLOT_SIZE`, which a
+    /// compact object does not obey. See [`compact_field_lowering_available`].
     getfield: usize,
+    /// Address of the `jit_putfield_int` helper — the compact-layout-correct
+    /// `Op::Store` lowering, for the same reason as `getfield` above. The
+    /// inline store is kept for the legacy (uniform-slot) layout, where it
+    /// avoids a call per field write.
+    putfield_int: usize,
     /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
     /// nodes use the same shared runtime-lowering stub as the baseline tier.
     new_object: usize,
@@ -243,6 +252,10 @@ struct Lowerer<'a> {
     /// now, rather than unioning every map in the method (unsound to relocate).
     sp_id_slot_off: i32,
     shadow_thread_slot_off: i32,
+    /// Frame offsets (`[rbp - off]`) of every reference PARAMETER's prologue
+    /// home. These are not node results, so the node scan cannot find them —
+    /// see [`Lowerer::emit_safepoint_map`].
+    ref_param_homes: Vec<i16>,
     shadow_savebase_slot_off: i32,
     /// Shadow `top` captured at method entry; restored by every exit. See the
     /// layout comment in `Lowerer::new`.
@@ -366,6 +379,23 @@ impl<'a> Lowerer<'a> {
         direct_calls: &'a HashMap<usize, (usize, bool)>,
         ic_slots: &'a HashMap<usize, (usize, usize)>,
     ) -> Self {
+        // Frame homes of the reference PARAMETERS, in `[rbp - off]` form. Every
+        // safepoint map republishes these; see `emit_safepoint_map`.
+        let ref_param_homes: Vec<i16> = graph
+            .nodes
+            .iter()
+            .filter_map(|n| match n.op {
+                Op::Param(idx) if n.ty == IrType::Ref => {
+                    let off = ((idx as i32) + 1) * 8;
+                    if off > 0 && off <= i16::MAX as i32 {
+                        Some(off as i16)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
         // Gap B: scan for `Op::Call` to size the call-related frame regions.
         // `needs_context` ⇒ the method takes the VM ptr as a hidden first arg
         // and reserves a context slot. `max_call_args` sizes the Java-argument
@@ -495,6 +525,7 @@ impl<'a> Lowerer<'a> {
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
             getfield: helpers.getfield,
+            putfield_int: helpers.putfield_int,
             new_object: helpers.new_object,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
@@ -502,6 +533,7 @@ impl<'a> Lowerer<'a> {
             context_slot_off,
             sp_id_slot_off,
             shadow_thread_slot_off,
+            ref_param_homes,
             shadow_savebase_slot_off,
             shadow_savetop_slot_off,
             get_current_thread: helpers.get_current_thread,
@@ -644,7 +676,19 @@ fn reloc_emit_enabled() -> bool {
         // Distinguish them, because the first is complete coverage and the
         // second is a refusal.
         let mut coverable = true;
-        let mut slots: Vec<i16> = Vec::new();
+        // Reference PARAMETER homes come first, because they are the one class
+        // of live oop that is not a node result and so cannot be found by the
+        // scan below. The prologue stores each incoming argument to
+        // `[rbp - (idx+1)*8]` and that word keeps holding the reference for the
+        // whole frame; `Op::Param`'s own spill slot is a COPY of it.
+        //
+        // Omitting them is not a partial claim, it is a false one: the band
+        // scan is conservative, so a single unpublished young word anywhere in
+        // the live band refuses the whole cycle. Measured on `IrEscapeProbe`
+        // (`CRATONVM_MOVING_YOUNG_BAND_DBG`), the two rejected words were
+        // `off=8 region=java-local` and `off=56 region=operand-spill` holding
+        // the SAME reference — the parameter home and its node copy.
+        let mut slots: Vec<i16> = self.ref_param_homes.clone();
         for id in 0..self.defined_nodes.len() {
             if !self.defined_nodes[id] || self.graph.nodes[id].ty != IrType::Ref {
                 continue;
@@ -676,6 +720,17 @@ fn reloc_emit_enabled() -> bool {
         // claim below requires `coverable` AND (published OR nothing to
         // publish).
         let published = self.emit_shadow_push(&slots);
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_RELOC").is_some() {
+            eprintln!(
+                "[ir-reloc] safepoint id={id} slots={slots:?} coverable={coverable} \
+                 published={published} thread_helper={:#x} thread_slot={} savebase={} \
+                 ss_off={}",
+                self.get_current_thread,
+                self.shadow_thread_slot_off,
+                self.shadow_savebase_slot_off,
+                self.shadow_off_in_thread,
+            );
+        }
         self.shadow_pushed_any |= published;
         self.pending_shadow = if published { slots.clone() } else { Vec::new() };
         let complete = coverable && (published || slots.is_empty());
@@ -851,8 +906,101 @@ fn reloc_emit_enabled() -> bool {
             self.emit_zero_frame_slot(self.shadow_thread_slot_off);
             self.emit_zero_frame_slot(self.shadow_savetop_slot_off);
         }
+        self.emit_frame_record();
         self.fetch_current_thread();
         self.zero_ref_phi_slots();
+    }
+
+    /// Publish this frame's exact RBP into the precise-maps innermost-RBP
+    /// mirror, exactly as the single-pass prologue does.
+    ///
+    /// Without it the collector cannot locate the frame at all:
+    /// `moving_young_frame_coverage_complete` needs an address to resolve
+    /// `sp_id_slot_off` and the map's slot offsets against, and
+    /// `PreciseFrameInfo::exact_rbp` is only ever a snapshot of this mirror. An
+    /// IR frame that never wrote it left the mirror holding `0`, and the
+    /// verifier refused the whole cycle with `missing-exact-rbp` — before it
+    /// ever looked at an oop map.
+    ///
+    /// That is why the relocation contract, though implemented and sound,
+    /// changed nothing observable: with `CRATONVM_JIT_FORCE_C2=1` on the
+    /// `IrEscapeProbe` the collector reported `cycles=0 coverage_fallbacks=14,
+    /// missing-exact-rbp=14` — every young collection diverted for want of a
+    /// nine-byte store, with the maps and the shadow publication both present
+    /// and correct. Emitted after the ABI parameter stores for the same reason
+    /// the single-pass backend does it there.
+    fn emit_frame_record(&mut self) {
+        if !crate::x64::precise_jit_maps_enabled() || self.frame_record == 0 {
+            return;
+        }
+        let disp = crate::x64::inline_rbp_tls_disp();
+        if disp != 0 {
+            self.emit_mov_tls_disp32_rbp(disp as u32);
+        } else {
+            // No usable TLS displacement on this target: fall back to the
+            // helper. Params are already in frame slots, so its caller-saved
+            // clobbers cost nothing here.
+            self.emit_mov_arg0_rbp();
+            self.emit_mov_reg_imm64(RAX, self.frame_record as u64);
+            self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        }
+    }
+
+    /// Restore this frame's RBP into the mirror after a call returned.
+    ///
+    /// A compiled callee publishes its OWN rbp on entry, so after it returns
+    /// the mirror names the wrong (now-dead) frame. The single-pass backend
+    /// republishes at every call site (`emit_post_call_rbp_republish`); the
+    /// shared allocation stub does the same
+    /// (`runtime_lowering::emit_post_call_frame_republish`). This is the IR
+    /// tier's equivalent, and it must not disturb RAX — the callee's return
+    /// value is still in it — which the inline TLS store satisfies for free.
+    fn emit_post_call_frame_record(&mut self) {
+        if !crate::x64::precise_jit_maps_enabled() || self.frame_record == 0 {
+            return;
+        }
+        let disp = crate::x64::inline_rbp_tls_disp();
+        if disp != 0 {
+            self.emit_mov_tls_disp32_rbp(disp as u32);
+            return;
+        }
+        self.buf.emit_byte(0x50); // PUSH RAX (preserve the Java return value)
+        #[cfg(target_os = "windows")]
+        const RESERVE: u8 = 40; // shadow space + alignment after the PUSH
+        #[cfg(not(target_os = "windows"))]
+        const RESERVE: u8 = 8; // restore 16-byte call-site alignment
+        self.buf.emit(&[0x48, 0x83, 0xEC, RESERVE]); // SUB RSP, reserve
+        self.emit_mov_arg0_rbp();
+        self.emit_mov_reg_imm64(RAX, self.frame_record as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        self.buf.emit(&[0x48, 0x83, 0xC4, RESERVE]); // ADD RSP, reserve
+        self.buf.emit_byte(0x58); // POP RAX
+    }
+
+    /// `MOV <arg0>, RBP` — for the helper form of the frame record, which is
+    /// reached only when no inline TLS displacement could be probed.
+    fn emit_mov_arg0_rbp(&mut self) {
+        const RBP_REG: u8 = 5;
+        let dest = CALL_ARG_REGS[0];
+        // REX.W (+ REX.B when the destination is R8..R15), MOV r/m64, r64.
+        self.buf
+            .emit_byte(0x48 | if dest >= 8 { 0x01 } else { 0x00 });
+        self.buf.emit_byte(0x89);
+        self.buf.emit_byte(0xC0 | (RBP_REG << 3) | (dest & 7));
+    }
+
+    /// `MOV <seg>:[disp32], RBP` — the 9-byte inline frame-record store.
+    ///
+    /// Byte-identical to the single-pass backend's `emit_mov_tls_disp32_rbp`;
+    /// both must write the SAME slot, since `inline_rbp_tls_disp()` is the one
+    /// source of truth the VM-side mirror accessor reads back.
+    fn emit_mov_tls_disp32_rbp(&mut self, disp32: u32) {
+        self.buf.emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+        self.buf.emit_byte(0x48); // REX.W
+        self.buf.emit_byte(0x89); // MOV r/m64, r64
+        self.buf.emit_byte(0x2C); // ModRM: reg=RBP, r/m=SIB
+        self.buf.emit_byte(0x25); // SIB: [disp32] absolute
+        self.buf.emit(&disp32.to_le_bytes());
     }
 
     /// Cache `*mut JvmThread` in its reserved slot.
@@ -1509,6 +1657,11 @@ fn reloc_emit_enabled() -> bool {
         let patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
         self.self_call_patches.push(patch);
+        // The recursive callee published ITS frame's RBP into the mirror on
+        // entry. This route bypasses `emit_call_return_check`, so it has to
+        // republish here or the mirror keeps naming the returned frame — which
+        // for a deeply recursive method is every frame but the right one.
+        self.emit_post_call_frame_record();
         // Exception/deopt sentinel — identical to the dispatch path's return
         // check. Integer/reference results cannot equal the full-width sentinel;
         // wide returns can legitimately carry those bits (for example
@@ -1982,6 +2135,13 @@ fn reloc_emit_enabled() -> bool {
         // value in RAX is untouched (see `emit_shadow_reload`). This is the one
         // site all three dispatch routes share; the self-recursive route does
         // not reach here and does not publish.
+        //
+        // The RBP republish comes first because the reload's own correctness
+        // does not depend on it, but the frame's identity to the collector
+        // does: the callee overwrote the mirror with its own RBP on entry, and
+        // any safepoint reached between here and the next call would otherwise
+        // resolve this frame's maps against a dead frame's base.
+        self.emit_post_call_frame_record();
         self.emit_shadow_reload();
         self.emit_mov_reg_imm64(R10, i64::MIN as u64);
         self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
@@ -2576,6 +2736,32 @@ fn reloc_emit_enabled() -> bool {
                 let pay_off = tag_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
                 let high_off = tag_off + 8; // the 8-byte payload region (Long/ref)
                 let bci = node.bytecode_pc.unwrap_or(0);
+                // Compact layout packs field offsets, so the uniform
+                // `field_index * SLOT_SIZE` displacement below is wrong for a
+                // compact object. Route the write through `jit_putfield_int`,
+                // which resolves the packed offset from the receiver's
+                // registered layout — the same helper the baseline tier uses.
+                //
+                // The null check stays INLINE and still deopts. The helper
+                // returns silently on an implausible receiver, so calling it
+                // unguarded would convert a NullPointerException into a
+                // dropped store — the exact silent-data-loss defect the inline
+                // path was fixed for in cd451faccc.
+                if cratonvm_types::compact_ref_fields_enabled() {
+                    self.load_to_rax(self.slot_of(base));
+                    self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                    self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+                    // jit_putfield_int(obj_ptr, field_index, val) — no context.
+                    // Receiver first: `load_reg_from_frame` into arg0 would be
+                    // clobbered by nothing here, but keep the order arg0..arg2
+                    // so a future stack-arg spill sees a conventional sequence.
+                    self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(base));
+                    self.emit_mov_reg_imm64(CALL_ARG_REGS[1], field_index as i64 as u64);
+                    self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(value));
+                    self.emit_mov_reg_imm64(RAX, self.putfield_int as u64);
+                    self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                    return;
+                }
                 // Receiver → RAX, value → RCX.
                 self.load_to_rax(self.slot_of(base));
                 self.load_to_rcx(self.slot_of(value));
@@ -3765,6 +3951,28 @@ pub(crate) fn lower_inner(
     {
         return None;
     }
+    // Compact field layout (default ON) packs field offsets, so `Op::Load` and
+    // `Op::Store`'s inline `HEADER_SIZE + field_index*SLOT_SIZE` displacements
+    // are wrong for a compact object. Both have a compact-correct alternative —
+    // the `jit_getfield` / `jit_putfield_int` helpers — so the only unlowerable
+    // combination is "compact layout on AND the helper address absent", which
+    // in practice means a synthetic unit-test helper table.
+    //
+    // This check used to live in `IrBuilder::build` as an unconditional bail on
+    // the getfield/putfield opcodes themselves, which refused every
+    // field-accessing method — most of real Java — from the optimizing tier
+    // regardless of which lowering would have been chosen. Keeping it here
+    // states the actual constraint: it is a property of one lowering, not of
+    // the opcode.
+    if cratonvm_types::compact_ref_fields_enabled() {
+        let needs_getfield_helper = helpers.getfield == 0
+            && graph.nodes.iter().any(|n| matches!(n.op, Op::Load(_)));
+        let needs_putfield_helper = helpers.putfield_int == 0
+            && graph.nodes.iter().any(|n| matches!(n.op, Op::Store(_)));
+        if needs_getfield_helper || needs_putfield_helper {
+            return None;
+        }
+    }
     // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
     // lowering: an arithmetic node emits well under 32 bytes, but a single
     // MIC + 4-way-PIC dual-ABI inline-cache site emits ~360 and a direct call
@@ -3861,6 +4069,8 @@ pub(crate) fn lower_inner(
 
     // Relocation-contract values, read off the lowerer before `buf` moves out.
     let sp_id_slot_off = lowerer.sp_id_slot_off;
+    let shadow_thread_slot_off = lowerer.shadow_thread_slot_off;
+    let shadow_savebase_slot_off = lowerer.shadow_savebase_slot_off;
     let oop_maps = std::mem::take(&mut lowerer.oop_maps);
     let locals_size = lowerer.locals_size;
     let first_spill = lowerer.first_spill;
@@ -3910,6 +4120,17 @@ pub(crate) fn lower_inner(
     cm.sp_id_slot_off = sp_id_slot_off;
     cm.oop_maps = oop_maps;
     cm.osr_frame_size = frame_size;
+    // Where the reader finds what the emission side published. Without these
+    // three, `shadow_window_from_frame` cannot even locate the shadow stack —
+    // it returns `None`, `published_shadow_values` yields the empty set, and
+    // EVERY published word then reads back as unpublished. That is not a
+    // partial failure that shows up as a smaller win: it makes a fully correct
+    // publication indistinguishable from no publication at all, and it is what
+    // `compiled-frame-oop-not-published` meant on `IrEscapeProbe` after the
+    // maps, the frame record and the parameter homes were all in place.
+    cm.shadow_thread_slot_off = shadow_thread_slot_off;
+    cm.shadow_savebase_slot_off = shadow_savebase_slot_off;
+    cm.shadow_off_in_thread = helpers.shadow_stack_offset_in_thread as i32;
     cm.frame_layout = super::FrameLayout {
         java_locals_hi: locals_size,
         // No LICM hoists, no scalar-replacement slots and no per-safepoint

@@ -7216,6 +7216,31 @@ pub fn jit_direct_call_requires_dispatch(
 /// IR-only opt-out for bisecting a regression to this lowering specifically
 /// (which restores the historical `jit_invoke_dispatch` route for every IR call
 /// site) without also disabling single-pass direct calls.
+/// `CRATONVM_JIT_FORCE_C2=1` — request the optimizing tier for every compile,
+/// overriding the caller's `optimize` argument. Default off. See the call site
+/// in `try_compile_inner` for why it exists.
+///
+/// NOT `OnceLock`-cached, matching [`direct_jit_callee_calls_enabled`]: read at
+/// compile time only, never on a runtime hot path, and caching would make it
+/// racy against whichever test thread compiles first.
+pub fn force_c2_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FORCE_C2").is_some()
+}
+
+/// Is per-stage reporting of the optimizing tier's refusals switched on?
+///
+/// The IR pipeline has four stages that can decline a method — `ir_compatible`,
+/// `IrBuilder::build`, the live-`NewArray` check, and `ir_lower::lower_inner` —
+/// and every one of them used to decline in silence, producing the identical
+/// observable: no IR body. That is what made "the optimizing tier emits nothing"
+/// unfalsifiable for the whole of the relocation-contract investigation
+/// (`docs/internal/jit-ir-relocation-map-contract.md`): the absence never named
+/// which stage produced it. Each stage now reports under this flag.
+pub fn ir_stage_reporting() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+        || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some()
+}
+
 pub fn ir_direct_calls_enabled() -> bool {
     if !direct_jit_callee_calls_enabled() {
         return false;
@@ -8382,6 +8407,63 @@ fn try_compile_inner(
     // method), so routing more methods to it is a throughput trade-off, never a
     // correctness risk. C2 (`optimize == true`, every non-tiered caller)
     // keeps the historical IR-first behaviour.
+    // `CRATONVM_JIT_FORCE_C2=1` (default off): treat every compile request as a
+    // C2 request. It exists because `optimize=false` is by far the commonest
+    // reason a method never reaches the optimizing tier, and it is decided
+    // OUTSIDE this crate by the tier-selection paths — so a probe written to
+    // exercise IR codegen could not reach it at all, no matter how it was
+    // shaped. That is not a hypothetical: the whole IR relocation-map contract
+    // could not be measured for want of one live IR frame at a young collection
+    // (`docs/internal/jit-ir-relocation-map-contract.md`), and every probe
+    // written for it was defeated by this one bit.
+    //
+    // It changes WHICH tier compiles a method, never what a compiled method
+    // does: the optimizing pipeline falls back to the same single-pass backend
+    // for anything it cannot lower, exactly as it does when the tier manager
+    // asks for C2 of its own accord.
+    let optimize = optimize || force_c2_enabled();
+    // The admission chain below is a conjunction of six independent terms, and
+    // failing any one of them falls silently through to the single-pass
+    // backend. That silence is what left "why does the optimizing tier produce
+    // no bodies?" unanswerable for the whole relocation-contract investigation
+    // (`docs/internal/jit-ir-relocation-map-contract.md`) — every term's
+    // failure looks exactly like every other's, and like the tier being off.
+    // Under `CRATONVM_DBG_JITC` / `CRATONVM_DBG_IR_COMPILES` each candidate now
+    // reports which term declined it. Evaluated lazily (and only under the
+    // flag) so the default path pays nothing.
+    if ir_stage_reporting() {
+        let verdict = if !optimize {
+            "optimize=false — the C1/fast tier was requested, not C2".to_string()
+        } else if moving_young_disables_optimizing_tier() {
+            "moving-young relocates compiled frames".to_string()
+        } else if !ir::ir_compatible(&scan) {
+            // `ir_compatible` has already printed the refused conjunct.
+            "ir_compatible refused (conjunct named above)".to_string()
+        } else if exc_table_c2_disabled() && !cached.exception_table.is_empty() {
+            "CRATONVM_JIT_NO_EXC_TABLE_C2=1 and the method has an exception table".to_string()
+        } else if precise_exception_frames {
+            "precise exception frames required (RBC.6: a handler reads a non-parameter local)"
+                .to_string()
+        } else {
+            let cat2 = method_uses_category2(code, code_len, &cached.method_descriptor);
+            let fp = method_uses_fp(code, code_len, &cached.method_descriptor);
+            if (!cat2 && !fp)
+                || (ir_emit_long && !fp)
+                || (ir_emit_fp && fp_in_body(code, code_len))
+            {
+                "admitted to the optimizing pipeline".to_string()
+            } else {
+                format!(
+                    "value shape not admitted (category2={cat2} fp={fp} \
+                     ir_emit_long={ir_emit_long} ir_emit_fp={ir_emit_fp})"
+                )
+            }
+        };
+        eprintln!(
+            "[ir] admission {}.{}{}: {verdict}",
+            cached.class_name, cached.method_name, cached.method_descriptor,
+        );
+    }
     if optimize
         // IR lowering has no exact-RBP or safepoint-map publication, so a
         // mapless IR frame must never be live while the young collector
@@ -8947,6 +9029,12 @@ fn try_compile_inner(
         // replacement could not fire on it — the signal that the IR builder is
         // missing an opcode the method uses (this is how the `astore` gap, which
         // silently disabled scalar-new on ALL real javac allocations, surfaced).
+        if built.is_none() && ir_stage_reporting() {
+            eprintln!(
+                "[ir] IrBuilder::build returned None for {}.{}{} — no IR body",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
         if built.is_none()
             && !scan.new_ops.is_empty()
             && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_NEW").is_some()
@@ -9047,6 +9135,12 @@ fn try_compile_inner(
                     .nodes
                     .iter()
                     .any(|n| matches!(n.op, ir::Op::NewArray { .. }));
+                if has_live_new_array && ir_stage_reporting() {
+                    eprintln!(
+                        "[ir] optimizing tier declined {}.{} — a live Op::NewArray survived",
+                        cached.class_name, cached.method_name
+                    );
+                }
                 if !has_live_new_array {
                     let schedule = ir_schedule::schedule(&graph);
                     // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
@@ -9165,6 +9259,12 @@ fn try_compile_inner(
                             );
                         }
                         return Some(compiled);
+                    }
+                    if ir_stage_reporting() {
+                        eprintln!(
+                            "[ir] ir_lower::lower_inner returned None for {}.{}{}",
+                            cached.class_name, cached.method_name, cached.method_descriptor,
+                        );
                     }
                 }
             } // end else (IR-lowering path)
@@ -11899,13 +11999,12 @@ mod tests {
         fi.insert(10usize, (0usize, b'I')); // putfield field 0
         fi.insert(13usize, (0usize, b'I')); // getfield field 0
         builder.set_field_info(fi);
-        if cratonvm_types::compact_ref_fields_enabled() {
-            assert!(
-                builder.build(&code, 17).is_none(),
-                "compact field layout must bail to the checked single-pass path"
-            );
-            return;
-        }
+        // The builder used to refuse getfield/putfield outright whenever
+        // compact layout was on (the default), which made this test vacuous
+        // in every default run. The layout constraint now lives in
+        // `ir_lower::lower_inner`, where the layout-naive displacement is
+        // actually emitted, so the scalar-replacement assertions below now
+        // run for real.
         let mut graph = builder.build(&code, 17).expect("IR build");
         assert!(
             graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
@@ -11977,13 +12076,12 @@ mod tests {
         fi.insert(11usize, (0usize, b'I')); // putfield field 0
         fi.insert(15usize, (0usize, b'I')); // getfield field 0
         builder.set_field_info(fi);
-        if cratonvm_types::compact_ref_fields_enabled() {
-            assert!(
-                builder.build(&code, 19).is_none(),
-                "compact field layout must bail to the checked single-pass path"
-            );
-            return;
-        }
+        // The builder used to refuse getfield/putfield outright whenever
+        // compact layout was on (the default), which made this test vacuous
+        // in every default run. The layout constraint now lives in
+        // `ir_lower::lower_inner`, where the layout-naive displacement is
+        // actually emitted, so the scalar-replacement assertions below now
+        // run for real.
         let mut graph = builder
             .build(&code, 19)
             .expect("IR build must succeed with astore lowered");
@@ -12117,31 +12215,17 @@ mod tests {
             false,
             None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
-        if cratonvm_types::compact_ref_fields_enabled() {
-            // Compact field layout bails the IR builder on `new`/getfield/putfield
-            // (see the ir.rs field-op tests) before it ever reaches the
-            // elidable-`<init>` check, and this test deliberately supplies no
-            // `cp_invoke_resolver` (a correctly-elided `new` should never need
-            // single-pass's invoke resolution) — so there is no fallback and the
-            // compile bails entirely.
-            assert!(
-                r.is_none(),
-                "compact field layout must bail to the checked single-pass path, \
-                 which this test starves of a cp_invoke_resolver on purpose"
-            );
-            assert_eq!(
-                IR_LOWER_COMPILES.with(|c| c.get()),
-                0,
-                "compact field layout bails the IR pipeline before the elidable `new` can route through it"
-            );
-        } else {
-            assert!(r.is_some(), "an elidable `new` method must compile via IR");
-            assert_eq!(
-                IR_LOWER_COMPILES.with(|c| c.get()),
-                1,
-                "the elidable `new` method must route through the IR pipeline"
-            );
-        }
+        // Compact field layout used to bail the IR builder on
+        // `new`/getfield/putfield before the elidable-`<init>` check was
+        // ever reached, so under the default this test asserted only that
+        // nothing happened. The builder no longer refuses those opcodes.
+        assert!(r.is_some(), "an elidable `new` method must compile via IR");
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "the elidable `new` method must route through the IR pipeline"
+        );
+
 
         // Without it → the builder bails on the `invokespecial` → not the IR path.
         IR_LOWER_COMPILES.with(|c| c.set(0));

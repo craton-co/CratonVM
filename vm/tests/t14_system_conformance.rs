@@ -33,10 +33,59 @@ fn compact_ws(src: &str) -> String {
     src.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// Byte offsets of every `register(` **call site** for this triple in the
+/// whitespace-free source. Each offset points at the `r` of `register(`.
+///
+/// The `register(` prefix is load-bearing: `native-builtins/src/lib.rs` also
+/// contains unit tests that assert on the same triples via
+/// `registry.find("class", "method", "descriptor")`, and matching the bare
+/// tuple would let one of those satisfy `registers()` even after the real
+/// registration was deleted.
+fn register_sites(compact: &str, class: &str, method: &str, desc: &str) -> Vec<usize> {
+    let needle = format!("register(\"{class}\",\"{method}\",\"{desc}\"");
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = compact[from..].find(&needle) {
+        out.push(from + rel);
+        from += rel + 1;
+    }
+    out
+}
+
 /// True if the (whitespace-free) source contains a
 /// `register("class", "method", "descriptor", ...)` call in any wrapping.
 fn registers(compact: &str, class: &str, method: &str, desc: &str) -> bool {
-    compact.contains(&format!("\"{class}\",\"{method}\",\"{desc}\""))
+    !register_sites(compact, class, method, desc).is_empty()
+}
+
+/// True if the `register(` call site at `site` carries a `#[cfg(...)]`
+/// attribute — i.e. it can be compiled out of some build configuration.
+///
+/// Anchored on the call itself rather than "is there a `#[cfg(` anywhere
+/// earlier in the statement": walk back over the receiver (`registry.`), then
+/// peel trailing `#[...]` attribute groups. Scanning the whole preceding
+/// statement would false-positive on any *comment* that quotes a `#[cfg(...)]`
+/// line — and the comment above `latestUserDefinedLoader0`, the native this
+/// check exists for, does exactly that.
+fn register_site_is_cfg_gated(compact: &str, site: usize) -> bool {
+    let head = &compact[..site];
+    let bytes = head.as_bytes();
+    let mut i = head.len();
+    if i > 0 && bytes[i - 1] == b'.' {
+        i -= 1; // the `.` of `registry.register(`
+        while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            i -= 1;
+        }
+    }
+    let mut tail = &head[..i];
+    while tail.ends_with(']') {
+        let Some(open) = tail.rfind("#[") else { break };
+        if tail[open..].starts_with("#[cfg(") {
+            return true;
+        }
+        tail = &tail[..open];
+    }
+    false
 }
 
 /// The ~240 chars following a `"class","method"` registration key in the
@@ -176,6 +225,205 @@ fn t14_all_vm_natives_registered() {
         VM_NATIVES.len(),
         VM_NATIVES.len(),
     );
+}
+
+// ===========================================================================
+// T14.3b — no VM native is compiled out of a default build
+// ===========================================================================
+
+/// `t14_all_vm_natives_registered` is a source-text scan, so it reports a
+/// registration as present even when a `#[cfg(feature = "...")]` attribute
+/// compiles it out. That false green is exactly how
+/// `jdk/internal/misc/VM.latestUserDefinedLoader0()` shipped unregistered for
+/// weeks: it sat behind `#[cfg(any(feature = "experimental-serialization",
+/// feature = "synthetic-jdk"))]`, neither of which is a default feature of
+/// `cratonvm-vm` or `cratonvm-cli`, so every plain
+/// `cargo build --release -p cratonvm-cli` threw `UnsatisfiedLinkError` on
+/// each `ObjectInputStream.readObject()` of an ordinary class.
+///
+/// This test closes the gap for the whole `VM_NATIVES` list: a triple whose
+/// every `register(` call site carries a `#[cfg(...)]` is a failure, whatever
+/// the condition. If some future VM native genuinely must be optional, add it
+/// to an explicit allow-list here with a written reason rather than deleting
+/// the check.
+#[test]
+fn t14_vm_natives_not_feature_gated() {
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
+    let mut gated: Vec<String> = Vec::new();
+
+    for &(method, descriptor) in VM_NATIVES {
+        let sites = register_sites(&compact, "jdk/internal/misc/VM", method, descriptor);
+        if sites.is_empty() {
+            continue; // absence is t14_all_vm_natives_registered's job
+        }
+        if !sites
+            .iter()
+            .any(|&site| !register_site_is_cfg_gated(&compact, site))
+        {
+            gated.push(format!("{method}{descriptor}"));
+        }
+    }
+
+    assert!(
+        gated.is_empty(),
+        "T14: {} VM native registration(s) are behind a #[cfg(...)] and so are \
+         absent from a default build:\n  {}",
+        gated.len(),
+        gated.join("\n  "),
+    );
+    eprintln!("[T14.3b] \u{2713} No jdk/internal/misc/VM native is feature-gated");
+}
+
+// ===========================================================================
+// T14.3c — every #[cfg]-gated native registration is on a declared allow-list
+// ===========================================================================
+
+/// `t14_vm_natives_not_feature_gated` above closes the hole for the
+/// `VM_NATIVES` list. This closes it for **every** native registration in
+/// `native-builtins/src/lib.rs`, because the mechanism that produced the
+/// `latestUserDefinedLoader0` bug was never specific to `jdk/internal/misc/VM`.
+///
+/// The mechanism: `libcratonvm` depends on `cratonvm-vm` with
+/// `experimental-serialization`/`-aot`/`-debug` enabled, and Cargo unifies
+/// features across every member built in one invocation. So
+/// `cargo build/test --workspace` (CI) resolves those features ON for
+/// `cratonvm-native-builtins`, while `cargo build --release -p cratonvm-cli`
+/// (what every suite runner uses) resolves them OFF. Any
+/// `#[cfg(feature = ...)]` on a registration is therefore a silent behaviour
+/// fork between the binary CI tests and the binary every suite runs — and both
+/// sides look green, because neither can see the other's configuration.
+///
+/// This test does not forbid gating. Some natives genuinely must be
+/// synthetic-only: in synthetic-JDK mode there is no JDK bytecode to fall back
+/// to, so the Rust implementation *is* the implementation. It forbids
+/// **undeclared** gating. Every gated registration is listed below with the
+/// reason it may differ between builds; a new one fails this test until
+/// somebody writes down why.
+///
+/// Two real gates were removed while this was written, both of which claimed a
+/// real-JDK-mode role in their own comments while being compiled out of every
+/// real-JDK-mode suite build: `jdk/internal/misc/VM.latestUserDefinedLoader0`
+/// (an `UnsatisfiedLinkError` on every `ObjectInputStream.readObject()`) and
+/// `serialization::register_reflection_factory_serialization`.
+#[test]
+fn t14_gated_registrations_are_declared() {
+    /// A `#[cfg]`-gated registration that is allowed to be absent from a
+    /// default build. `cfg` and `target` are matched against the trimmed
+    /// source lines exactly; `reason` is documentation for the next reader.
+    struct Allowed {
+        cfg: &'static str,
+        target: &'static str,
+        #[allow(dead_code)]
+        reason: &'static str,
+    }
+
+    let allowed = [
+        Allowed {
+            cfg: "#[cfg(feature = \"synthetic-jdk\")]",
+            target: "registry.register(",
+            reason: "java/lang/System.initPhase1/2/3 — synthetic-jdk only by \
+                     design. In real-JDK mode the JDK's own bytecode runs the \
+                     bootstrap, supported by the T14 SystemProps$Raw / \
+                     FileDescriptor natives.",
+        },
+        Allowed {
+            cfg: "#[cfg(feature = \"synthetic-jdk\")]",
+            target: "crate::wildfly_naming::register_jdk_naming_natives(registry);",
+            reason: "Synthetic JNDI. Must NOT be registered in real-JDK mode, \
+                     where it would shadow real provider selection.",
+        },
+        Allowed {
+            cfg: "#[cfg(feature = \"experimental-serialization\")]",
+            target: "serialization::register_serialization_natives(registry);",
+            reason: "The synthetic ObjectInputStream/ObjectOutputStream \
+                     implementation. Real-JDK mode owns those classes as \
+                     bytecode; this is the synthetic replacement.",
+        },
+        Allowed {
+            cfg: "#[cfg(feature = \"management\")]",
+            target: "register_jmx_natives(registry);",
+            reason: "`management` is a DEFAULT feature of cratonvm-vm, so it is                      ON in both the -p cratonvm-cli and --workspace resolves.                      It is opt-OUT (for musl / minimal builds via                      --no-default-features), not opt-in, so it cannot fork CI                      from a suite build the way the experimental-* features do.",
+        },
+        Allowed {
+            cfg: "#[cfg(feature = \"experimental-aot\")]",
+            target: "aot::register_aot_natives(registry);",
+            reason: "Experimental AOT surface, opt-in by design.",
+        },
+        Allowed {
+            cfg: "#[cfg(feature = \"experimental-aot\")]",
+            target: "cds::register_cds_natives(registry);",
+            reason: "Experimental CDS surface, opt-in by design.",
+        },
+    ];
+
+    let src = read_ws("native-builtins/src/lib.rs");
+    let lines: Vec<&str> = src.lines().collect();
+
+    // First source line after `from` that is neither blank nor a `//` comment.
+    let next_meaningful = |from: usize| -> Option<(usize, &str)> {
+        lines[from..]
+            .iter()
+            .enumerate()
+            .map(|(off, l)| (from + off, l.trim()))
+            .find(|(_, l)| !l.is_empty() && !l.starts_with("//"))
+    };
+
+    let mut undeclared: Vec<String> = Vec::new();
+    let mut declared = 0usize;
+
+    for (i, line) in lines.iter().enumerate() {
+        let cfg = line.trim();
+        if !cfg.starts_with("#[cfg(") {
+            continue;
+        }
+        let Some((at, mut target)) = next_meaningful(i + 1) else {
+            continue;
+        };
+        // A gate can wrap a braced block of registrations rather than a single
+        // call — `#[cfg(...)] { registry.register(...); ... }`. Step into it, or
+        // the gate reads as "not a registration" and is skipped silently, which
+        // is the exact blindness this test exists to remove.
+        if target == "{" {
+            match next_meaningful(at + 1) {
+                Some((_, inner)) => target = inner,
+                None => continue,
+            }
+        }
+        let is_registration = target.starts_with("registry.register(")
+            || (target.contains("register") && target.contains("(registry)"));
+        if !is_registration {
+            continue;
+        }
+        if allowed.iter().any(|a| a.cfg == cfg && a.target == target) {
+            declared += 1;
+            continue;
+        }
+        undeclared.push(format!("line {}: {cfg}  ->  {target}", i + 1));
+    }
+
+    assert!(
+        undeclared.is_empty(),
+        "T14: {} native registration(s) sit behind a #[cfg(...)] that is not on \
+         this test's allow-list:\n{}\n\nA gated registration is absent from \
+         `cargo build -p cratonvm-cli` (every suite runner) and present in \
+         `cargo build --workspace` (CI), so it forks the two builds silently. \
+         Either remove the gate, or add an entry to `allowed` recording why \
+         this native may legitimately differ between builds.",
+        undeclared.len(),
+        undeclared.join("\n"),
+    );
+
+    // Every allow-list entry must still correspond to real source. A stale
+    // entry would let a future gate of the same shape pass unnoticed.
+    assert_eq!(
+        declared,
+        allowed.len(),
+        "T14: matched {declared} gated registrations but the allow-list has {}. \
+         An entry no longer matches any source line — delete it, or fix its \
+         `cfg`/`target` text to match.",
+        allowed.len(),
+    );
+    eprintln!("[T14.3c] \u{2713} All {declared} gated native registrations are declared");
 }
 
 // ===========================================================================
