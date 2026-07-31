@@ -343,3 +343,36 @@ the same commit, `direct_jit_callee_calls_enabled`, is the likely source and
 should be credited (and re-measured) separately.
 
 Next step is (2): instrument the tier decision, not the backend.
+
+## Narrowed: the tier IS requested — `ir_compatible` is what rejects
+
+Follow-up to the zero-bodies result. The suspicion that the runtime never asks
+for the optimizing tier is **wrong**; `optimize = true` reaches `try_compile` on
+the live dispatch paths:
+
+* `vm/src/jit/helpers.rs:7170` — `try_jit_compile_callee(..., true)`, literal;
+* `vm/src/runtime/interpreter/invoke.rs:16445` and `:16598` — both pass a
+  literal `true` ("early-compile path is the optimized (C2-equivalent) tier",
+  "inline mutator compile path is the optimized (C2-equivalent) tier").
+
+And the admission gate this branch scoped is open by construction:
+`moving_young_disables_optimizing_tier()` delegates to
+`moving_young_relocates_compiled_frames()` = `moving_young_enabled() &&
+JIT_PUBLISHES_RELOCATION_CONTRACT`, and that constant is `false`.
+
+So with `optimize == true` and the moving-young term `false`, the only remaining
+conjunct in `try_compile_inner`'s admission is **`ir::ir_compatible(&scan)`**
+(and the per-method caps behind it). That is where the zero comes from.
+
+Next step, and it is small: `ir_compatible` currently answers `bool`, so a
+rejection is invisible. Give it a reason — an enum or a `tracing::debug!` per
+rejected conjunct (`has_athrow`, `!indy_ops.is_empty()`, `invoke_ops.len() >
+IR_MAX_INVOKES`, the field/bytecode-size caps) behind the existing
+`CRATONVM_DBG_JITC`, then run `IrRelocProbe` and read which one fires for
+`step`. Only after that does it make sense to ask whether the rejection is
+correct, whether the cap should move, or whether the probe should be reshaped.
+
+Note the shape of the mistake being avoided here: "the tier is off" was inferred
+twice from an absence (no IR bodies, then no live IR frames) without checking
+which conjunct produced it. The absence is the same in all cases; only the
+reason distinguishes them, and nothing currently reports the reason.
