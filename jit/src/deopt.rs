@@ -383,13 +383,30 @@ pub fn frame_state_is_resumable(fs: &FrameState) -> bool {
         .any(value_blocks_resume)
 }
 
-/// `true` when `v` (or, for a virtual object, any field reachable from it
-/// without crossing a `VirtualObjectRef` edge) cannot be turned into an
-/// interpreter value.
+/// `true` when `v` cannot be turned into an interpreter value: either it is
+/// itself unreconstructable, or it is a virtual object one of whose fields
+/// (transitively, without crossing a `VirtualObjectRef` edge) names a value an
+/// optimization deleted.
 fn value_blocks_resume(v: &FrameValue) -> bool {
     match v {
         FrameValue::Unsupported | FrameValue::MaterializationRequired(_) => true,
-        FrameValue::VirtualObject(state) => state.field_values.iter().any(value_blocks_resume),
+        FrameValue::VirtualObject(state) => state
+            .field_values
+            .iter()
+            .any(contains_materialization_required),
+        _ => false,
+    }
+}
+
+/// `true` when `v` is — or transitively contains as a virtual-object field —
+/// a [`FrameValue::MaterializationRequired`].
+fn contains_materialization_required(v: &FrameValue) -> bool {
+    match v {
+        FrameValue::MaterializationRequired(_) => true,
+        FrameValue::VirtualObject(state) => state
+            .field_values
+            .iter()
+            .any(contains_materialization_required),
         _ => false,
     }
 }
