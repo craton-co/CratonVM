@@ -313,6 +313,15 @@ pub static SWEEP_BAD_FORWARD_HITS: AtomicU64 = AtomicU64::new(0);
 /// allocated from, so out-of-extent headers are rejected without marking.
 pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// Old-gen mark-worklist entries whose `kind` byte is not a valid `ObjectKind`
+/// discriminant — i.e. the mark BFS was handed an address that is not an object
+/// base and decoded whatever bytes were there as an `ObjectHeader`.
+///
+/// See `docs/known-issues/gc/gc-old-gen-mark-accepts-unvalidated-addresses.md`.
+/// A non-zero value here means a side table is holding a dangling old-gen
+/// address, or a reference slot holds a non-base word.
+pub static OLDMARK_BAD_KIND_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// Conservative root candidates may be interior heap addresses.  Only the
 /// opt-in A2 forensic mode reports rejected candidates; normal collection
 /// silently discards an address that is not an object start.
@@ -8837,6 +8846,16 @@ impl GenerationalHeap {
 
     /// Scan a single object's reference slots for old-gen pointers and mark them.
     fn scan_object_for_old_refs(obj_ptr: *mut u8, old_gen: &OldGen, worklist: &mut Vec<*mut u8>) {
+        // A worklist entry whose `kind` byte is not a valid discriminant was
+        // never an object base: some push site handed us a dangling or interior
+        // address. Counted (not rejected) here — rejecting is the FIX, which is
+        // deliberately not part of this diagnostic commit. See
+        // `docs/known-issues/gc/gc-old-gen-mark-accepts-unvalidated-addresses.md`.
+        // SAFETY: every push site range-checked `obj_ptr` against old gen, so
+        // offset 4 is mapped.
+        if unsafe { *obj_ptr.add(OBJECT_KIND_OFFSET) } > 2 {
+            OLDMARK_BAD_KIND_HITS.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: `obj_ptr` is a live old-gen object from the mark worklist; its header is valid.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
         // DoHead comb-7 fix (2026-07-03): validate the claimed extent before
@@ -13689,6 +13708,154 @@ mod tests {
         let obj1 = heap.alloc_object(ClassId::new(0), 0);
         let obj2 = heap.alloc_object(ClassId::new(0), 0);
         assert_ne!(heap.identity_hash_code(obj1), heap.identity_hash_code(obj2),);
+    }
+
+    /// Half 1 of the open defect: after the NON-MOVING old-gen sweep,
+    /// `is_addr_live` still reports a freed block as live.
+    ///
+    /// `VmHeap::is_addr_live` answers `is_old_gen_addr(addr) ||
+    /// is_live_young_survivor(addr)`, and `is_old_gen_addr` is a bare range
+    /// check whose doc comment justifies itself with "a minor collection never
+    /// touches the old generation, so every old-gen object is live".
+    ///
+    /// That premise fails on the non-moving path.
+    /// `sweep_old_gen_non_moving` — the old-gen collector that runs whenever a
+    /// live JIT frame blocks the moving young collector, i.e. EVERY collection
+    /// in the H2 `TestOutOfMemory` window (`[moving-young] fallback:
+    /// reason=unregistered-jit-frame-on-stack`) — reclaims dead old-gen blocks
+    /// IN PLACE, and its own doc comment says "after it runs 'the address is
+    /// inside old gen' no longer implies 'the object is still there'". The two
+    /// comments contradict each other; this test shows which one is wrong.
+    ///
+    /// Consequence: every consumer that prunes a side table with
+    /// `pointer_map.contains_key(addr) || is_addr_live(addr)` — the `is_marked`
+    /// closure in `interpreter.rs` feeding `prune_external_roots`,
+    /// `reconcile_class_mirrors`/`rebuild_mirror_pins` and
+    /// `gc_reconcile_defining_loaders` — RETAINS the entry for a just-freed
+    /// object, leaving a dangling old-gen address for a later mark to decode.
+    ///
+    /// See `docs/known-issues/gc/gc-old-gen-mark-accepts-unvalidated-addresses.md`.
+    #[test]
+    #[ignore = "documents an OPEN defect: is_addr_live lies after the non-moving old-gen sweep"]
+    fn non_moving_old_sweep_leaves_is_addr_live_reporting_a_freed_block_as_live() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 8 * 1024);
+        let monitors = NoOpMonitors;
+
+        let keep = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(keep, 0, Value::Int(1));
+        let doomed = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(doomed, 0, Value::Int(2));
+
+        let mut roots = vec![keep, doomed];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        assert!(
+            heap.is_in_old(roots[0].as_ptr()) && heap.is_in_old(roots[1].as_ptr()),
+            "both objects must be promoted before the old-gen sweep is meaningful",
+        );
+
+        let keep = roots[0];
+        let doomed_addr = roots[1].as_ptr() as usize;
+
+        let live = vec![keep];
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live);
+        assert!(
+            reclaimed > 0,
+            "the sweep must actually have reclaimed the dropped object in place",
+        );
+
+        let vm = crate::vm_heap::VmHeap::Generational(heap);
+        assert!(
+            !vm.is_addr_live(doomed_addr),
+            "is_addr_live reported a block the non-moving old-gen sweep just \
+             freed in place (0x{doomed_addr:x}) as still live",
+        );
+    }
+
+    /// Half 2 of the open defect: the old-gen mark BFS accepts ANY in-range
+    /// word as an object base — no alignment test, no header plausibility test.
+    ///
+    /// `scan_object_for_old_refs` marks referents with
+    /// `if old_gen.contains(ref_ptr) { (*ref_ptr).gc_flags |= GC_FLAG_MARKED }`.
+    /// The ROOT seed in `old_gen_gc` documents this exact hazard and defends
+    /// against it ("ANY garbage address landing inside old gen's byte range got
+    /// `gc_flags` blindly RMW'd — the exact same corruption family, on the
+    /// OTHER generation"), but that screen was never carried to the BFS, to the
+    /// young->old ref-slot seed, or to the four pin/overlay seeds.
+    ///
+    /// Two consequences, both asserted here:
+    ///   * the mark bit is written into an unrelated LIVE object's payload,
+    ///     silently changing a Java field value — `0x41414141` becomes
+    ///     `0x43414141` (`|= GC_FLAG_MARKED`);
+    ///   * those payload bytes are then decoded as an `ObjectHeader`, which is
+    ///     how a byte that is not a valid `ObjectKind` discriminant reaches
+    ///     `gen_object_total_size` and the corrupt-header diagnostics.
+    ///
+    /// Together with the test above this is the whole path: a side table keeps
+    /// a dangling old-gen address because the prune predicate lies, and nothing
+    /// downstream re-checks it.
+    #[test]
+    #[ignore = "documents an OPEN defect: the old-gen mark BFS marks unvalidated addresses"]
+    fn old_gen_mark_accepts_an_interior_address_as_an_object_header() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let holder = heap.alloc_object(ClassId::new(0), 1);
+        let victim = heap.alloc_object(ClassId::new(0), 4);
+        for i in 0..4 {
+            heap.set_field(victim, i, Value::Int(0x4141_4141));
+        }
+        let mut roots = vec![holder, victim];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let (holder, victim) = (roots[0], roots[1]);
+        assert!(
+            heap.is_in_old(holder.as_ptr()) && heap.is_in_old(victim.as_ptr()),
+            "both objects must be in old gen for this to exercise the old-gen mark",
+        );
+
+        // An INTERIOR address of `victim`: 8-aligned, inside old gen, but not
+        // an object base. This is the shape a stale side-table entry takes once
+        // its block has been freed in place and the space reused.
+        let interior = unsafe { victim.as_ptr().add(HEADER_SIZE) };
+        assert!(
+            heap.is_in_old(interior),
+            "interior probe must stay in old gen"
+        );
+        // SAFETY: `interior` is a mapped old-gen address; storing it in a
+        // reference slot is exactly the state under test.
+        heap.set_field(
+            holder,
+            0,
+            Value::Object(Some(unsafe { ObjectRef::from_raw(interior) })),
+        );
+
+        let before = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            let mut major_roots = vec![holder, victim];
+            let _ =
+                GenerationalHeap::old_gen_gc(&mut major_roots, &young_from, &mut old_gen, false);
+        }
+        let after = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
+
+        let payload: Vec<i32> = (0..4)
+            .map(|i| heap.get_field(victim, i).as_int().unwrap_or(i32::MIN))
+            .collect();
+
+        assert_eq!(
+            payload,
+            vec![0x4141_4141_i32; 4],
+            "the old-gen mark wrote a mark bit into a LIVE object's payload",
+        );
+        assert_eq!(
+            after, before,
+            "the old-gen mark decoded an INTERIOR address as an ObjectHeader \
+             instead of rejecting it (bad-kind hits {before} -> {after})",
+        );
     }
 
     #[test]
