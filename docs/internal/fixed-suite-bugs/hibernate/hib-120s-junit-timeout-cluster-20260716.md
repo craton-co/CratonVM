@@ -614,3 +614,78 @@ doc was opened for either; this update is the record. Whether either
 individually re-trips the 120s guard on any given suite run is expected to
 keep depending on this shared host's instantaneous contention level, same as
 every other class in this cluster.
+
+## Recurrence check (2026-07-30/31): `BatchTest` and `DynamicBatchFetchTest` HANG again in the fresh 4548-class full-suite run -- same load-sensitive margin, moving-young mechanism explicitly ruled out
+
+A fresh full 4548-class categorize run (`apps/hib-suite-runner/runs/categorize-20260730-225515`,
+binary `CratonVM-hib-local-0712-v3` @ `8e8a7b8cd`, 8 shards, `TIMEOUT=300`,
+2026-07-30/31, `dev` merged with the real ByteBuddy fix) reports **both**
+`org.hibernate.orm.test.batch.BatchTest` and
+`org.hibernate.orm.test.batchfetch.DynamicBatchFetchTest` as `HANG`
+(`process-died rc=124`, zero `@@RESULT` ever printed):
+
+```
+org.hibernate.orm.test.batch.BatchTest                 HANG  process-died rc=124   (shard-4, raw.log)
+org.hibernate.orm.test.batchfetch.DynamicBatchFetchTest HANG  process-died rc=124   (shard-5, raw.log)
+```
+
+Both shard logs show the class actively working right up to the kill (JDBC
+insert/delete traffic for `BatchTest`'s `DataPoint` fixture, batched multi-id
+`IN` queries for `DynamicBatchFetchTest`'s `testMultiLoad`) -- no stall
+signature, no repeated identical log line, consistent with this cluster's own
+"genuinely computing, just too slow for this window" shape rather than a new
+deadlock.
+
+**This run's fresh evidence is directly relevant to a separate, newer doc**:
+[`docs/known-issues/hibernate/moving-young-inert-under-jit-throughput-tax-20260730.md`](../../../known-issues/hibernate/moving-young-inert-under-jit-throughput-tax-20260730.md)
+documents that the same categorize run's `OffsetDateTimeTest`/`ZonedDateTimeTest`
+HANGs are caused by moving-young young-generation collections being requested
+but never actually performed under a live JIT frame, and explicitly flags that
+"the moving-young tax specifically hits allocation-heavy classes that actually
+trigger young GCs under live JIT frames" -- `BatchTest`/`DynamicBatchFetchTest`
+looked like plausible additional witnesses of that exact mechanism (same HANG
+list, same run, same 300s-timeout shape). **That hypothesis is ruled out for
+both classes by direct A/B testing this session:**
+
+| Config | `BatchTest#testBatchInsertUpdate` | `DynamicBatchFetchTest#testMultiLoad` |
+|---|---|---|
+| Categorize binary (`CratonVM-hib-local-0712-v3`, pre-moving-young-fix), default | `found=4 ok=3 failed=1 ms=255477` -- internal 120s trip | `found=2 ok=1 failed=1 ms=212859` -- internal 120s trip |
+| Same binary, `CRATONVM_NO_MOVING_YOUNG=1` | `found=4 ok=3 failed=1 ms=248122` -- **same trip, no improvement** | `found=2 ok=1 failed=1 ms=255213` -- **same trip, no improvement** |
+| Fresh binary (`CratonVM-hibfive-takeover-20260730`, includes `11901e9a6` "veto moving-young on frame LIVENESS" + `f78b72670`), default flags | `found=4 ok=3 failed=1 ms=244517` -- **same trip, no improvement** | `found=2 ok=1 failed=1 ms=215835` -- **same trip, no improvement** |
+
+Neither the `CRATONVM_NO_MOVING_YOUNG=1` diagnostic override nor the actual
+2026-07-30 moving-young-liveness code fix (verified present via
+`git merge-base --is-ancestor 11901e9a6 HEAD` on the `CratonVM-hibfive-takeover-20260730`
+worktree) changes the outcome for either class -- all three configurations
+land within a few seconds of each other and trip the identical
+`TimeoutException` on the identical test method. `CRATONVM_GC_STATS=1` was
+active in every run above and **printed zero `[GC]` lines in any of them** --
+these two classes never trigger a single young collection in the first place
+(consistent with `BatchTest` already being characterized earlier in this same
+doc, in the `f377eb69` re-check section, as a JDBC-batching-heavy workload with
+"zero GC events for the entire ... run" for its sibling `InsertOrderingRCATest`).
+A mechanism that only costs anything when a moving collection is requested
+cannot explain a workload that never requests one. **These two classes are not
+witnesses of the moving-young tax** -- no addition made to that doc.
+
+**Classification: unchanged from this doc's own 2026-07-27 update above --
+same generic interpreter/JDBC-throughput margin, contended-host-dependent, not
+reopened.** All three repro configurations (run concurrently with several
+other sessions' own `cratonvm.exe` processes also exercising
+`type.temporal`/`qualfiedTableNaming`/this same batch workload on this shared
+host -- confirmed via `Get-CimInstance Win32_Process`) completed in
+213-255 seconds total, comfortably inside a generous 650s wrapper and well
+inside prior variance already on record in this doc (`BatchTest` 104273ms avg
+quiet-host solo, 126048ms quiet combined-acceptance, now 244-255s under today's
+contention; `DynamicBatchFetchTest` 98430-783098ms recorded range, now
+213-255s). Both land past the per-method 120s guard only because of that
+elevated wall-clock, exactly the shape this doc already established is
+load-dependent, not a discrete regression. The 8-way shard categorize run's
+`rc=124` (full 300s kill, not even a `@@RESULT`) is the same margin tripped
+harder, under heavier contention than this session's lighter (but nonzero)
+load. No code change indicated; no doc moved to `known-issues/`. See
+`docs/known-issues/hibernate/README.md`'s "HANG classes in the fresh
+4548-class run" section for the cross-reference (parallel treatment to that
+section's `OracleInlineMutationStrategyIdTest` entry, which the same fresh
+binary genuinely does speed up -- unlike these two, whose workload never
+touches the mechanism that fix addresses).

@@ -32056,7 +32056,7 @@ fn tm_set_force_array(ctx: &dyn NativeContext, this: ObjectRef) {
 /// fast-mode side-table entry. Called when a non-extractable key arrives
 /// at a map that previously had fast-mode entries — keeps state coherent
 /// across the mode flip without losing data.
-fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, this: ObjectRef) {
+fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, mut this: ObjectRef) {
     let key = tm_obj_key(ctx, this);
     // Snapshot fast-mode entries first, then drop the side-table entry.
     let entries: Vec<(TreeKey, Value)> = tm_fast_with(ctx, this, |bt| {
@@ -32075,8 +32075,8 @@ fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, this: ObjectRef) {
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
     // Ensure data array exists.
     if matches!(tm_get_slot(ctx, this, TM_FIELD_DATA), Value::Object(None)) {
-        let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-        tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
+        let (refreshed, _) = tm_install_backing_array(ctx, this, TM_DEFAULT_CAPACITY * 2);
+        this = refreshed;
     }
     // Now insert each entry through the array path. The fast-mode check
     // in `native_tm_put` will skip because `tm_force_array_set` is set
@@ -32770,6 +32770,60 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     }
 }
 
+/// Allocate a fresh backing array for `owner` and publish it into the overlay
+/// `DATA` slot with BOTH the owner and the new array pinned across every step.
+/// Returns the (possibly relocated) owner and array — callers MUST use the
+/// returned values, not their pre-call copies.
+///
+/// `alloc_ref_array` is a Java-heap allocation and can trigger a moving young
+/// collection that relocates `owner`. Storing through a pre-allocation `owner`
+/// registers the overlay under a STALE owner address in `overlay_owner_keys` —
+/// the reverse index the collector consults to answer "which side-table refs
+/// does this collection own?". The collection still reads its own state fine
+/// (the side-table key is the relocation-invariant identity hash), but the GC
+/// never associates the live object with its overlay, so the backing array is
+/// never rooted and a later collection reclaims it. What comes back is a zeroed
+/// header — `ClassId(0)`, `array_length == 0` — which surfaces far away as an
+/// `Int(0)` where an element should be (`TreeSet.contains` → `ts_binary_search`
+/// → `Comparator.compare` → `checkcast: not an object reference`).
+///
+/// `native_tm_put` already had this fix ("gcstress face-1"); every other
+/// TreeMap/TreeSet allocation site did not. Route them all through here.
+fn ts_install_backing_array(
+    ctx: &mut dyn NativeContext,
+    owner: ObjectRef,
+    cap: usize,
+) -> (ObjectRef, ObjectRef) {
+    let owner_pin = ctx.pin_native_root(owner);
+    let buf = alloc_ref_array(ctx, cap);
+    let buf_pin = ctx.pin_native_root(buf);
+    let owner = ctx.read_native_pin(owner_pin, owner);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    ts_set_slot(ctx, owner, TS_FIELD_DATA, Value::Object(Some(buf)));
+    let owner = ctx.read_native_pin(owner_pin, owner);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    ctx.unpin_native_roots(owner_pin);
+    (owner, buf)
+}
+
+/// TreeMap twin of [`ts_install_backing_array`] — same hazard, same contract.
+fn tm_install_backing_array(
+    ctx: &mut dyn NativeContext,
+    owner: ObjectRef,
+    cap: usize,
+) -> (ObjectRef, ObjectRef) {
+    let owner_pin = ctx.pin_native_root(owner);
+    let buf = alloc_ref_array(ctx, cap);
+    let buf_pin = ctx.pin_native_root(buf);
+    let owner = ctx.read_native_pin(owner_pin, owner);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    tm_set_slot(ctx, owner, TM_FIELD_DATA, Value::Object(Some(buf)));
+    let owner = ctx.read_native_pin(owner_pin, owner);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    ctx.unpin_native_roots(owner_pin);
+    (owner, buf)
+}
+
 /// Read a TreeSet "slot" (`TS_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
 /// address-keyed side-table. Returns layout-independent defaults when no
 /// entry exists yet.
@@ -33137,13 +33191,19 @@ fn ts_ensure_capacity(
     let this_pin = ctx.pin_native_root(this);
     let data_pin = ctx.pin_native_root(data);
     let new_arr = alloc_ref_array(ctx, new_cap);
+    // The freshly allocated array is a bare Rust local until it is published,
+    // and `ts_set_slot` can relocate it (see `ts_install_backing_array`). Pin
+    // it alongside the owner and re-read after the store.
+    let new_pin = ctx.pin_native_root(new_arr);
     let this = ctx.read_native_pin(this_pin, this);
     let data = ctx.read_native_pin(data_pin, data);
+    let new_arr = ctx.read_native_pin(new_pin, new_arr);
     for i in 0..(size as usize) {
         let v = ctx.get_array_element(data, i);
         ctx.set_array_element(new_arr, i, v);
     }
     ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(new_arr)));
+    let new_arr = ctx.read_native_pin(new_pin, new_arr);
     ctx.unpin_native_roots(this_pin);
     new_arr
 }
@@ -33518,8 +33578,7 @@ fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // make subsequent reads ignore the array store after clear()+put().
     let key = tm_obj_key(ctx, this);
     tm_fast_table().lock().unwrap().remove(&key);
-    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-    tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
+    let (this, _buf) = tm_install_backing_array(ctx, this, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
     Ok(None)
 }
@@ -34337,7 +34396,7 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -34374,8 +34433,8 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let data = match data_opt {
         Some(d) => d,
         None => {
-            let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-            tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
+            let (refreshed, buf) = tm_install_backing_array(ctx, this, TM_DEFAULT_CAPACITY * 2);
+            this = refreshed;
             buf
         }
     };
@@ -34957,8 +35016,7 @@ fn native_ts_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(None),
     };
     ih_seed(ctx, this);
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    let (this, _buf) = ts_install_backing_array(ctx, this, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, Value::Object(None));
     Ok(None)
@@ -34971,8 +35029,10 @@ fn native_ts_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     ih_seed(ctx, this);
     let cmp = args.get(1).copied().unwrap_or(Value::Object(None));
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    let cmp_pin = pin_value(ctx, cmp);
+    let (this, _buf) = ts_install_backing_array(ctx, this, TS_DEFAULT_CAPACITY);
+    let cmp = read_pinned_elem(ctx, cmp_pin, cmp);
+    ctx.unpin_native_roots(cmp_pin);
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, cmp);
     Ok(None)
@@ -34987,15 +35047,16 @@ fn native_ts_init_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let source = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-            ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+            let (this, _buf) = ts_install_backing_array(ctx, this, TS_DEFAULT_CAPACITY);
             ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
             ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, Value::Object(None));
             return Ok(None);
         }
     };
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    let source_pin = ctx.pin_native_root(source);
+    let (this, _buf) = ts_install_backing_array(ctx, this, TS_DEFAULT_CAPACITY);
+    let source = ctx.read_native_pin(source_pin, source);
+    ctx.unpin_native_roots(source_pin);
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, Value::Object(None));
     // Add elements from source. Use the `_or_real` collector so a foreign /
@@ -35019,17 +35080,20 @@ fn native_ts_init_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
         None => {
-            let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-            ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+            let elem_pin = pin_value(ctx, elem);
+            let (refreshed, buf) = ts_install_backing_array(ctx, this, TS_DEFAULT_CAPACITY);
+            elem = read_pinned_elem(ctx, elem_pin, elem);
+            ctx.unpin_native_roots(elem_pin);
+            this = refreshed;
             buf
         }
     };
@@ -35210,8 +35274,8 @@ fn native_ts_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 0,
     };
     // Initialize a fresh backing array + comparator, then add each element.
-    let buf = alloc_ref_array(ctx, (size as usize).max(TS_DEFAULT_CAPACITY));
-    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    let (this, _buf) =
+        ts_install_backing_array(ctx, this, (size as usize).max(TS_DEFAULT_CAPACITY));
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, comparator);
     for _ in 0..size {

@@ -317,6 +317,37 @@ along with the rest of this measurement kit; `apps/` itself is gitignored):
 | `testUpdate` | 3 408 ms | 256 155 ms | 75x |
 | **class** | **28 988 ms** | **1 127 560 ms** | **39x** |
 
+### Recurrence check 2026-07-31 — HANG in the fresh full-suite run is a stale binary + shard contention, not a new regression
+
+A fresh 4548-class categorize run
+(`apps/hib-suite-runner/runs/categorize-20260730-225515`, 8 shards, binary
+`CratonVM-hib-local-0712-v3` @ `8e8a7b8cd`) again reports this class `HANG`
+(`process-died rc=124`, idx 86). Two things resolve this without reopening
+anything:
+
+1. **The binary predates two dev-tip fixes that specifically help this
+   class.** `8e8a7b8cd` is an ancestor of current `dev` but does **not**
+   contain `f78b72670` (scopes the relocation-safety gate so the optimizing
+   C2/IR tier runs again — see
+   `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`)
+   or `11901e9a6` (fixes the moving-young veto to key on frame liveness
+   instead of compiled-code existence), both merged into `dev` via `edd95bc89`
+   after this binary was built. With both fixes, this exact class runs in
+   118.9s on a quiet host with default flags — see
+   `docs/internal/repros/hib-five-20260730/RESULTS-final-20260731.md`.
+2. **Solo repro this session, same pre-fix binary:** `found=6 started=6 ok=6
+   failed=0`, `ms=212676` (212.7s) — under the harness's 300s cap on its own,
+   even without either fix and even with several other CratonVM processes
+   from unrelated sessions competing for CPU on this shared host at the time.
+   That means the 8-way shard contention in the full categorize run (not any
+   code defect) is what tipped this already-known timeout-marginal class over
+   300s. See
+   `docs/known-issues/hibernate/README.md`'s 2026-07-31 HANG-classes entry.
+
+No doc correction needed beyond this note — the residual was never
+misclassified as "fixed," and the class is, if anything, faster today than
+when this section was written.
+
 **All six pass — `ok=6 failed=0`.** So the correctness story is closed: nothing in this
 class produces a wrong value on CratonVM. What fails, when it fails, is a wall-clock
 budget — and the previous revision's "wall-clock roulette, a different method each run"

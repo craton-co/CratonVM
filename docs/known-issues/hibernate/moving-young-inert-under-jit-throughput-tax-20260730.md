@@ -89,6 +89,24 @@ therefore **identical** — the cost is entirely on the *emission* side:
 So the workload pays for a complete rewritable root map at every safepoint and
 then never relocates a single object.
 
+## Additional witnesses (2026-07-31, full 4548-class suite)
+
+Same `org.hibernate.orm.test.type.temporal` package, same shape, milder outcome — these two
+don't hit the full 300s wrapper (no HANG) but lose a large fraction of their parameterized
+iterations to abort within the wrapper, consistent with the same per-safepoint emission tax
+applied to a slightly less allocation-heavy workload:
+
+| Class | found | ok | aborted | ms |
+|---|---:|---:|---:|---:|
+| `InstantTests` | 204 | 112 | 92 (45%) | 107949 |
+| `LocalDateTimeTest` | 162 | 90 | 72 (44%) | 113732 |
+
+Consistent with `ZonedDateTimeTest`'s own `ok=404 aborted=204` (33%) split reported above even
+in the *mitigated* (`CRATONVM_NO_MOVING_YOUNG=1`) configuration — some fraction of aborts in this
+whole class family look inherent to the per-test time budget under real JIT/GC timing, not solely
+attributable to the moving-young tax, but these two are the same mechanism family and don't need
+a separate doc.
+
 ## Not a universal tax
 
 `ASTParserLoadingTest` reports `[GC] moving_young: cycles=0

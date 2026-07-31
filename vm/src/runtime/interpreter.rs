@@ -18369,9 +18369,23 @@ fn execute_instruction(
                         .stack
                         .push(Value::Object(Some(obj_ref)))?;
                 }
-                _ => {
+                other => {
+                    // A non-reference where the verifier guarantees a
+                    // reference. Name the value AND the site: the bare
+                    // "not an object reference" text left nothing to work
+                    // with, and the usual producer is a deopt resume that
+                    // rebuilt a ref-typed operand-stack slot as an `Int`
+                    // (a `stack_oop_marks` / `FrameValue` typing miss).
+                    let f = &thread.frames[frame_idx];
                     return Err(VmError::Internal {
-                        message: "checkcast: not an object reference".to_string(),
+                        message: format!(
+                            "checkcast: not an object reference (got {other:?}) \
+                             at {}.{}{} pc={} cp#{index}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.last_instr_pc,
+                        ),
                     }
                     .into());
                 }
