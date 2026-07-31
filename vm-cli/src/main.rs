@@ -4684,6 +4684,13 @@ fn main() {
     let _default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         use std::io::Write;
+        // Handled heap-exhaustion unwind from the native allocators — the VM
+        // converts it into a catchable java.lang.OutOfMemoryError, so it is not
+        // a panic the user needs to see. (See
+        // `cratonvm_vm::runtime::native_oom`.)
+        if cratonvm_vm::runtime::native_oom::is_native_oom_panic(info) {
+            return;
+        }
         let msg = info
             .payload()
             .downcast_ref::<&str>()

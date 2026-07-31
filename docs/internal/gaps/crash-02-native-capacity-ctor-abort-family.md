@@ -81,6 +81,20 @@ acceptable; it never aborts).
 > Identical on baseline `8e8e47d9`, so unrelated to this fix. Tracked separately (correctness, not
 > in this crash/hang run's scope).
 
+## Family closed generically (2026-07-31)
+
+A fourth member turned up in H2 (`ByteBuffer.allocate(int)`, which aborted
+`org.h2.test.db.TestOutOfMemory` with `SIGABRT`), which made it clear that
+converting call sites one at a time does not converge — `native-builtins` has
+~1000 `ctx.new_array(..)` sites. The abort is now closed at the *boundary*
+instead: `vm/src/runtime/native_oom.rs` gives the native allocation helpers a
+scoped unwind channel (permitted only directly under `safe_native_call`'s
+`catch_unwind`, suspended for the duration of any JIT-compiled frame), and
+`safe_native_call_impl` converts it into a catchable
+`java.lang.OutOfMemoryError`. Every native reachable through `safe_native_call`
+is covered without touching its call site. See
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testoutofmemory-sigabrt-young-old-gen-both-exhausted-FIXED.md`.
+
 ## Notes
 - **Severity in practice:** low likelihood of organic occurrence in the Spring suite — real framework
   code passes *realistic* sizes to these ctors, not `Integer.MAX_VALUE`. crash-01 surfaced only

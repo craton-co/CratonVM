@@ -95,6 +95,29 @@ jobs:
 
       # Exact synthetic-stub ratchet. The committed baseline is intentionally
       # slack-free, so newly introduced application-visible stubs fail CI.
+      # `cargo test --workspace` above does NOT exercise the feature set a
+      # suite runner gets. `libcratonvm` depends on `cratonvm-vm` with
+      # `experimental-serialization` / `-aot` / `-debug` enabled, and a
+      # workspace-wide resolve unifies those onto `cratonvm-native-builtins`
+      # for every member — including `cratonvm-cli`. A plain
+      # `cargo build --release -p cratonvm-cli` resolves without them.
+      # (`cratonvm-embed` used to leak the same way; its defaults were cleaned
+      # up 2026-07-30. `libcratonvm`'s are deliberate — what the shipped
+      # .so/.dll contains is a release decision — so the split stays and gets
+      # tested instead.) Verify with:
+      #   cargo tree -e features -p cratonvm-cli  -i cratonvm-native-builtins
+      #   cargo tree -e features --workspace      -i cratonvm-native-builtins
+      #
+      # That split is how `jdk/internal/misc/VM.latestUserDefinedLoader0()`
+      # stayed registered in CI while every H2/Hibernate/Spring suite build
+      # threw `UnsatisfiedLinkError` on it — 63 of the Spring suite's 90 FAIL
+      # classes. A `-p`-scoped run resolves features the way a suite build does,
+      # so gaps of that shape fail here. Scoped to the WHOLE unit suite, not one
+      # module: the bug was not that a specific test was missing, it was that no
+      # test ran in this resolve at all.
+      - name: Default-feature native registry surface (no workspace unification)
+        run: cargo test -p cratonvm-native-builtins --lib
+
       - name: Synthetic-stub ratchet
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture

@@ -9388,14 +9388,60 @@ pub(crate) fn is_string_builder_layout_native_override(
         // writes through `String.checkIndex` against the compact
         // byte[]/coder layout, which CratonVM's synthetic builder doesn't
         // have, so it AIOOBE'd instead of writing the synthetic char[].
+        //
+        // 2026-07-31: the list below `setCharAt` was still incomplete, and
+        // `SbMethodMatrixProbe` (Spring-free: run each builder operation on a
+        // REAL builder before and after an unrelated
+        // `Mockito.mock(StringBuilder.class)`) named the survivors exactly.
+        // Six operations silently changed behaviour after the redefinition:
+        //
+        //   setLength(4)   'abcdefghij' -> len=4 but toString() == "a"
+        //   setLength(0)   left one stale char behind
+        //   deleteCharAt   'abcdefghij' -> len=9 but toString() == "a"
+        //   replace        ArrayStoreException (src=Byte, dest=Char)
+        //   ensureCapacity buffer overwritten with spaces
+        //   trimToSize     same
+        //   repeat         appended nothing
+        //
+        // Each has a registered native in `register_string_builder_natives`
+        // (`setLength(I)V`, `deleteCharAt(I)…`, `replace(IILjava/lang/String;)…`,
+        // `ensureCapacity(I)V`, `trimToSize()V`, `repeat(II)…`), so before the
+        // redefinition they all dispatched native and were correct; the
+        // redefinition evicted the shadow and handed them back to real JDK
+        // bodies that index a compact `byte[] value` / `byte coder` /
+        // `int count` layout CratonVM's two-field `char[]`/`int` builder does
+        // not have. Adding them here is the same trade `setCharAt` already
+        // makes: these mutate builder state, and nothing stubs them on a mock.
+        // `capacity`, `getCoder`, `getValue`, `reverse` and the `codePoint*`
+        // readers join for the same reason — they read `value`/`coder`
+        // directly and cannot be expressed against the synthetic layout.
+        //
+        // `length()` and `substring(int)` stay OUT of this list on purpose;
+        // see the long note below. They are the two operations
+        // `MockitoBeanByTypeLookupIntegrationTests` genuinely stubs and
+        // verifies on a mocked StringBuilder, so their native shadow must
+        // stay evictable for Mockito's woven advice to run.
         "<init>"
             | "append"
+            | "capacity"
             | "charAt"
+            | "codePointAt"
+            | "codePointBefore"
+            | "codePointCount"
             | "delete"
+            | "deleteCharAt"
+            | "ensureCapacity"
             | "getChars"
+            | "getCoder"
+            | "getValue"
             | "insert"
+            | "repeat"
+            | "replace"
+            | "reverse"
             | "setCharAt"
+            | "setLength"
             | "toString"
+            | "trimToSize"
     ) {
         return true;
     }
@@ -13609,6 +13655,96 @@ mod dynamic_dispatch_slot_tests {
                 assert_eq!(pic[0].0, 27);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod string_builder_layout_override_tests {
+    use super::is_string_builder_layout_native_override;
+
+    /// Every builder operation whose real JDK body indexes the compact
+    /// `byte[] value` / `byte coder` / `int count` layout must resolve through
+    /// CratonVM's native shim, because CratonVM's builders are a two-field
+    /// `char[]`/`int` synthetic. Before 2026-07-31 six of these were missing,
+    /// and a single `Mockito.mock(StringBuilder.class)` anywhere in the process
+    /// evicted their native shadow and silently corrupted every REAL builder —
+    /// which is what wedged javac's `JavaTokenizer` and made Spring's AOT
+    /// chunk 4 look like a hang. `SbMethodMatrixProbe` is the Java witness.
+    #[test]
+    fn forces_every_compact_layout_operation_native() {
+        for class in [
+            "java/lang/StringBuilder",
+            "java/lang/StringBuffer",
+            "java/lang/AbstractStringBuilder",
+        ] {
+            for (name, desc) in [
+                ("setLength", "(I)V"),
+                ("deleteCharAt", "(I)Ljava/lang/StringBuilder;"),
+                ("replace", "(IILjava/lang/String;)Ljava/lang/StringBuilder;"),
+                ("ensureCapacity", "(I)V"),
+                ("trimToSize", "()V"),
+                ("repeat", "(II)Ljava/lang/StringBuilder;"),
+                ("capacity", "()I"),
+                ("reverse", "()Ljava/lang/StringBuilder;"),
+                ("codePointAt", "(I)I"),
+                ("codePointBefore", "(I)I"),
+                ("codePointCount", "(II)I"),
+                ("getCoder", "()B"),
+                ("getValue", "()[B"),
+                // Already covered before this fix; kept so a future narrowing
+                // of the list is caught here too.
+                ("<init>", "(Ljava/lang/String;)V"),
+                ("append", "(C)Ljava/lang/StringBuilder;"),
+                ("charAt", "(I)C"),
+                ("delete", "(II)Ljava/lang/StringBuilder;"),
+                ("getChars", "(II[CI)V"),
+                ("insert", "(IC)Ljava/lang/StringBuilder;"),
+                ("setCharAt", "(IC)V"),
+                ("toString", "()Ljava/lang/String;"),
+                ("substring", "(II)Ljava/lang/String;"),
+            ] {
+                assert!(
+                    is_string_builder_layout_native_override(class, name, desc),
+                    "{class}.{name}{desc} must stay forced to its native shim"
+                );
+            }
+        }
+    }
+
+    /// The two operations `MockitoBeanByTypeLookupIntegrationTests` genuinely
+    /// stubs and verifies on a mocked `StringBuilder`. Their native shadow has
+    /// to stay evictable or Mockito's woven advice never runs and the stub is
+    /// silently ignored — see the long note on `length()` in the predicate.
+    #[test]
+    fn leaves_the_two_mockito_stubbed_operations_evictable() {
+        for class in [
+            "java/lang/StringBuilder",
+            "java/lang/StringBuffer",
+            "java/lang/AbstractStringBuilder",
+        ] {
+            assert!(!is_string_builder_layout_native_override(
+                class, "length", "()I"
+            ));
+            assert!(!is_string_builder_layout_native_override(
+                class,
+                "substring",
+                "(I)Ljava/lang/String;"
+            ));
+        }
+    }
+
+    #[test]
+    fn does_not_claim_unrelated_classes() {
+        assert!(!is_string_builder_layout_native_override(
+            "java/lang/String",
+            "setLength",
+            "(I)V"
+        ));
+        assert!(!is_string_builder_layout_native_override(
+            "java/util/ArrayList",
+            "trimToSize",
+            "()V"
+        ));
     }
 }
 
@@ -21628,6 +21764,21 @@ pub(super) fn execute_invokevirtual_cached(
                     // docs/known-issues/h2/
                     // bug-h2-suite-residual-fail-triage.md.
                     let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+                    // JVMS §4.4.1: an array type inherits its method table
+                    // from `java.lang.Object`, but an array's header stores
+                    // its COMPONENT class id (`ClassId(0)` for primitive
+                    // arrays). Comparing that raw id against the cached
+                    // receiver class therefore lets a `Foo[]` receiver hit an
+                    // entry installed for a plain `Foo` and run `Foo`'s body
+                    // with the array as `this` — `new Foo[3].toString()`
+                    // returned `Foo`'s override reading array element 0 as
+                    // field 0. Cede to the slow path, which routes array
+                    // receivers through `Object` (same guard as
+                    // `execute_invokevirtual_vtable_fast` and the JIT
+                    // MIC/PIC's `receiver_is_plain_object`).
+                    if shared.mem.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+                        return Ok(CachedCallResult::CacheMiss);
+                    }
                     let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
                     if crate::jit::profile::is_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
@@ -22203,6 +22354,21 @@ pub(super) fn execute_invokevirtual_cached(
                     // docs/known-issues/h2/
                     // bug-h2-suite-residual-fail-triage.md.
                     let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+                    // JVMS §4.4.1: an array type inherits its method table
+                    // from `java.lang.Object`, but an array's header stores
+                    // its COMPONENT class id (`ClassId(0)` for primitive
+                    // arrays). Comparing that raw id against the cached
+                    // receiver class therefore lets a `Foo[]` receiver hit an
+                    // entry installed for a plain `Foo` and run `Foo`'s body
+                    // with the array as `this` — `new Foo[3].toString()`
+                    // returned `Foo`'s override reading array element 0 as
+                    // field 0. Cede to the slow path, which routes array
+                    // receivers through `Object` (same guard as
+                    // `execute_invokevirtual_vtable_fast` and the JIT
+                    // MIC/PIC's `receiver_is_plain_object`).
+                    if shared.mem.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+                        return Ok(CachedCallResult::CacheMiss);
+                    }
                     let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
                     if crate::jit::profile::is_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
@@ -22411,6 +22577,21 @@ pub(super) fn execute_invokevirtual_cached(
                         // See docs/known-issues/h2/
                         // bug-h2-suite-residual-fail-triage.md.
                         let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+                        // JVMS §4.4.1: an array type inherits its method table
+                        // from `java.lang.Object`, but an array's header stores
+                        // its COMPONENT class id (`ClassId(0)` for primitive
+                        // arrays). Comparing that raw id against the cached
+                        // receiver class therefore lets a `Foo[]` receiver hit an
+                        // entry installed for a plain `Foo` and run `Foo`'s body
+                        // with the array as `this` — `new Foo[3].toString()`
+                        // returned `Foo`'s override reading array element 0 as
+                        // field 0. Cede to the slow path, which routes array
+                        // receivers through `Object` (same guard as
+                        // `execute_invokevirtual_vtable_fast` and the JIT
+                        // MIC/PIC's `receiver_is_plain_object`).
+                        if shared.mem.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+                            return Ok(CachedCallResult::CacheMiss);
+                        }
                         let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
                         if crate::jit::profile::is_profiling_enabled() {
                             let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);

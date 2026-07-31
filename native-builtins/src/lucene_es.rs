@@ -2846,13 +2846,28 @@ fn lucene_bbdin_this(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
     }
 }
 
+/// The readable byte count of a `ByteBuffersDataInput`.
+///
+/// The field is `size` — `private final long size` — and there is **no**
+/// `length` field on the class. Reading a name that does not exist is silent:
+/// `lucene_field_long` answers 0 for a missing field, so every bounds check in
+/// this shim compared against 0 and every single read threw
+/// `EOFException: Unexpected EOF` (or `ArrayIndexOutOfBoundsException` on the
+/// absolute-position accessors). `size()` itself looked fine throughout,
+/// because it is not intercepted — the real one-line getter ran and returned
+/// the real field. Route every size read through here so the name is stated
+/// exactly once.
+fn lucene_bbdin_size(ctx: &dyn NativeContext, this: ObjectRef) -> i64 {
+    lucene_field_long(ctx, this, "size")
+}
+
 fn lucene_bbdin_check_relative(
     ctx: &dyn NativeContext,
     this: ObjectRef,
     relative_pos: i64,
     width: usize,
 ) -> Result<i64, MethodCallFailed> {
-    let length = lucene_field_long(ctx, this, "length");
+    let length = lucene_bbdin_size(ctx, this);
     if relative_pos < 0 || (relative_pos as i128) + (width as i128) > length as i128 {
         return Err(lucene_aioobe(relative_pos as i32));
     }
@@ -2929,7 +2944,7 @@ fn lucene_bbdin_read_seq_bytes(
 ) -> Result<[u8; 8], MethodCallFailed> {
     let pos = lucene_field_long(ctx, this, "pos");
     let offset = lucene_field_long(ctx, this, "offset");
-    let length = lucene_field_long(ctx, this, "length");
+    let length = lucene_bbdin_size(ctx, this);
     if pos < offset || (pos - offset) as i128 + width as i128 > length as i128 {
         return Err(lucene_eof());
     }
@@ -3101,7 +3116,7 @@ fn lucene_bbdin_read_primitive_bytes(
     }
     let pos = lucene_field_long(ctx, this, "pos");
     let offset = lucene_field_long(ctx, this, "offset");
-    let length = lucene_field_long(ctx, this, "length");
+    let length = lucene_bbdin_size(ctx, this);
     if pos < offset || (pos - offset) as i128 + byte_len as i128 > length as i128 {
         return Err(lucene_eof());
     }
@@ -3178,7 +3193,7 @@ fn lucene_bbdin_read_bytes_common(
     if len == 0 {
         return Ok(None);
     }
-    let length = lucene_field_long(ctx, this, "length");
+    let length = lucene_bbdin_size(ctx, this);
     let offset = lucene_field_long(ctx, this, "offset");
     if relative_pos < 0 || (relative_pos as i128) + (len as i128) > length as i128 {
         return Err(lucene_eof());
@@ -3227,7 +3242,7 @@ pub(crate) fn native_lucene_byte_buffers_data_input_length(
     args: &[Value],
 ) -> MethodCallResult {
     let this = lucene_bbdin_this(args)?;
-    Ok(Some(Value::Long(lucene_field_long(ctx, this, "length"))))
+    Ok(Some(Value::Long(lucene_bbdin_size(ctx, this))))
 }
 
 pub(crate) fn native_lucene_byte_buffers_data_input_position(
@@ -3246,7 +3261,7 @@ pub(crate) fn native_lucene_byte_buffers_data_input_seek(
 ) -> MethodCallResult {
     let this = lucene_bbdin_this(args)?;
     let relative_pos = args.get(1).and_then(Value::as_long).unwrap_or(0);
-    let length = lucene_field_long(ctx, this, "length");
+    let length = lucene_bbdin_size(ctx, this);
     if relative_pos > length {
         ctx.set_field_by_name(this, "pos", Value::Long(length));
         return Err(lucene_eof());
@@ -3695,7 +3710,7 @@ pub(crate) fn native_lucene_byte_buffers_data_input_slice(
     let this = lucene_bbdin_this(args)?;
     let relative_offset = args.get(1).and_then(Value::as_long).unwrap_or(0);
     let requested_len = args.get(2).and_then(Value::as_long).unwrap_or(0);
-    let source_len = lucene_field_long(ctx, this, "length");
+    let source_len = lucene_bbdin_size(ctx, this);
     if relative_offset < 0
         || requested_len < 0
         || requested_len as i128 > source_len as i128 - relative_offset as i128
@@ -3732,7 +3747,7 @@ pub(crate) fn native_lucene_byte_buffers_data_input_slice(
         "blockMask",
         ctx.get_field_by_name(this, "blockMask"),
     );
-    ctx.set_field_by_name(new_obj, "length", Value::Long(requested_len));
+    ctx.set_field_by_name(new_obj, "size", Value::Long(requested_len));
     ctx.set_field_by_name(new_obj, "offset", Value::Long(absolute_offset));
     ctx.set_field_by_name(new_obj, "pos", Value::Long(absolute_offset));
 
