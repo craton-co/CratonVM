@@ -13290,6 +13290,15 @@ pub(crate) fn build_deopt_frame_inner(
     // operand STACK is already compact (one entry per value). Any unresolvable
     // slot (`Unsupported`/virtual/unresolved machine form) returns `None` → safe
     // re-run.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPTSLOT").is_some()
+        && (ir_deopt_locals(&rframe.locals).is_none()
+            || ir_deopt_frame_values(&rframe.stack).is_none())
+    {
+        eprintln!(
+            "[DBG_DEOPTSLOT] {} bci={} locals={:?} stack={:?}",
+            rframe.method_key, rframe.bci, rframe.locals, rframe.stack
+        );
+    }
     let locals = ir_deopt_locals(&rframe.locals)?;
     let stack_vals = ir_deopt_frame_values(&rframe.stack)?;
 

@@ -105,3 +105,34 @@ cd apps/h2database/h2
   -c "target/classes:target/test-classes:$(cat craton-testcp.txt)" \
   org.h2.test.db.TestLargeBlob
 ```
+
+## Residual observed (2026-07-30/31, twelfth-pass follow-up full-suite run)
+Recurred in a full 218-class suite run (`--jit off`, default `-Xmx 1g`):
+```
+OutOfMemoryError: Direct buffer memory: tried 20197376, used 1057820672, max 1073741824
+```
+`max=1073741824` is exactly 1 GiB — **the fix's `-Xmx`-derived cap is intact
+and correctly applied**, so this is not a regression of the original fix
+(which capped at a hardcoded 256 MiB regardless of `-Xmx`). `used=1057820672`
+(~1009 MiB) is genuinely right up against the correctly-sized 1 GiB ceiling,
+consistent with the doc's own already-acknowledged uncertainty about root
+cause #2 (slower reclaim under CratonVM letting more direct memory be
+"in-flight" at once than HotSpot at the same nominal cap) rather than a new
+defect — the doc's own verification section already flagged that its
+"root cause #2 not observed" conclusion was reached under a caveat
+("the Azure build host was under heavy concurrent load... wall-clock alone
+isn't a clean signal") that applies equally here.
+
+New observation worth a look if this is revisited: the log immediately
+preceding this OOM shows
+`STW cross-thread JIT takeover is still waiting for cooperative mutators
+rounds=64 pending=1 taken=0` repeating for several seconds right before the
+failure — a stop-the-world pause stalled waiting on one uncooperative
+mutator thread. Not investigated further this session, but plausible as a
+contributing mechanism for root cause #2: if MVStore's background
+chunk-writer thread (or whichever thread would otherwise free/flush direct
+buffers) is itself blocked behind this stall, in-flight direct-buffer usage
+could climb further than it would under a healthy STW cadence, independent
+of any GC/Cleaner-reclaim-speed question the original investigation
+targeted.
+

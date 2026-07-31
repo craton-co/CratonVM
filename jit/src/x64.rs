@@ -21582,6 +21582,46 @@ impl Compiler {
                     }
                     self.emit_osr_exit_map_at_reason(pc, crate::deopt::DeoptReason::UnreachedCode);
 
+                    // This trap is UNCONDITIONAL: every execution of this bci
+                    // deopts. So if the snapshot just built cannot be
+                    // materialised back into an interpreter frame, the method
+                    // is guaranteed to fail on its first compiled call --
+                    // `build_deopt_frame_inner` returns `None` and the resume
+                    // sink refuses with `precise deoptimization unavailable
+                    // ... refusing side-effecting replay`, a hard
+                    // `InternalError` rather than a slow path.
+                    //
+                    // The usual producer of an unmaterialisable slot here is
+                    // the coarse `wide_fp` gate in the snapshot's operand-stack
+                    // loop: in a method that touches any long/float/double, a
+                    // non-oop stack entry that is NOT one of this call site own
+                    // arguments has no per-entry width source and is recorded
+                    // `Unsupported`. javac `ClassReader.readInnerClasses` is
+                    // the canonical shape -- `optPoolEntry(int, IntFunction,
+                    // Object)` leaves an `int` underneath the lambda argument,
+                    // so the indy-arg tags type the top entry but not that one.
+                    //
+                    // Compiling such a method is strictly worse than
+                    // interpreting it, so bail the whole compile. This is what
+                    // the per-method SPRING-TESTCOMPILER / HIB-STOREDPROC-JIT
+                    // bans did by hand for the javac family; deciding it from
+                    // the snapshot itself covers every method with this shape
+                    // rather than the ones somebody happened to hit.
+                    let unresumable_trap = self
+                        .deopt_points
+                        .last()
+                        .is_some_and(|p| {
+                            !crate::deopt::frame_state_is_resumable(&p.frame_state)
+                        });
+                    if unresumable_trap {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                            eprintln!(
+                                "[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}"
+                            );
+                        }
+                        self.buf.mark_overflowed();
+                    }
+
                     let patch = self.emit_jmp_rel32_patch();
                     self.deopt_stubs.push((patch, pc, 8)); // 8 = DEOPT_REASON_UNREACHED_CODE
 
