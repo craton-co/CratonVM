@@ -1348,13 +1348,14 @@ pub(crate) static METRICS_TEST_LOCK: Mutex<()> = Mutex::new(());
 mod tests {
     use super::*;
 
-    /// The enable flag and the ring are process-wide, and the cargo harness
-    /// runs `#[test]`s in parallel threads of one process. Every test that
-    /// touches either takes this first, so they serialize against each other
-    /// (they cannot serialize against an unrelated `lib.rs` compile test, which
-    /// is why the assertions below are written to tolerate foreign reports
-    /// wherever they cannot exclude them). Defined one level up as
-    /// [`METRICS_TEST_LOCK`] so `ir_lower`'s wiring test shares it.
+    // The enable flag and the ring are process-wide, and the cargo harness
+    // runs `#[test]`s in parallel threads of one process. Every test that
+    // touches either takes this first, so they serialize against each other
+    // (they cannot serialize against an unrelated `lib.rs` compile test, which
+    // is why the assertions below are written to tolerate foreign reports
+    // wherever they cannot exclude them). Defined one level up as
+    // `METRICS_TEST_LOCK` so `ir_lower`'s wiring test shares the same lock —
+    // it flips the same process-wide enable flag from another module.
     use super::METRICS_TEST_LOCK as TEST_LOCK;
 
     fn sample(class: &str, outcome: Outcome, path: CompilerPath) -> CompilationReport {

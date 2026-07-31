@@ -6740,8 +6740,6 @@ mod tests {
     /// real compile; the wiring in `lower_inner` arms the moment it does.
     #[test]
     fn install_verifier_rejects_an_oop_map_deopt_map_disagreement() {
-        use crate::deopt::{DeoptAction, DeoptReason};
-
         let point = |locals: Vec<FrameValue>| DeoptimizationPoint {
             native_offset: 0x40,
             bci: 3,
@@ -6784,8 +6782,6 @@ mod tests {
     /// must not install.
     #[test]
     fn install_verifier_rejects_a_recipe_for_an_unmaterializable_removed_node() {
-        use crate::deopt::{DeoptAction, DeoptReason};
-
         let point = DeoptimizationPoint {
             native_offset: 0x10,
             bci: 1,
