@@ -41364,7 +41364,12 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(9));
+        // COLLECTOR_TAG_MAX_BY. The tags asserted here are native-collections'
+        // single collector namespace — the one `native_stream_collect` decodes.
+        // They were 9/10/12/13/19/22 while phases_late minted a second,
+        // write-only namespace that aliased live tags (minBy=10 decoded as
+        // GROUPING_BY_SUPPLIER, so `collect(minBy(cmp))` answered a Map).
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(18));
     }
 
     #[test]
@@ -41383,7 +41388,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(10));
+        // COLLECTOR_TAG_MIN_BY
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(17));
     }
 
     #[test]
@@ -41396,7 +41402,8 @@ mod tests {
             "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
             &[Value::Object(Some(func)), Value::Object(Some(downstream))]).unwrap().unwrap();
         let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(11));
+        // COLLECTOR_TAG_MAPPING
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(15));
     }
 
     #[test]
@@ -41409,7 +41416,8 @@ mod tests {
             "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
             &[Value::Object(Some(pred)), Value::Object(Some(downstream))]).unwrap().unwrap();
         let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(12));
+        // COLLECTOR_TAG_FILTERING
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(19));
     }
 
     #[test]
@@ -41428,7 +41436,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(13));
+        // COLLECTOR_TAG_SUMMARIZING_INT
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(20));
     }
 
     #[test]
@@ -41466,7 +41475,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(19));
+        // COLLECTOR_TAG_AVERAGING_INT
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(23));
     }
 
     #[test]
@@ -41485,7 +41495,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = collector.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(22));
+        // COLLECTOR_TAG_SUMMING_INT
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(26));
     }
 
     #[test]
@@ -47543,11 +47554,30 @@ mod tests {
     fn collectors_teeing_p64() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
+        let downstream1 = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let downstream2 = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let merger = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let c = call_native(&shared, &mut thread, "java/util/stream/Collectors",
             "teeing",
             "(Ljava/util/stream/Collector;Ljava/util/stream/Collector;Ljava/util/function/BiFunction;)Ljava/util/stream/Collector;",
-            &[Value::Object(None), Value::Object(None), Value::Object(None)]).unwrap().unwrap();
-        assert!(matches!(c, Value::Object(Some(_))));
+            &[Value::Object(Some(downstream1)), Value::Object(Some(downstream2)), Value::Object(Some(merger))]).unwrap().unwrap();
+        let c_ref = c.as_object().unwrap();
+        // COLLECTOR_TAG_TEEING. This used to hand back a bare toList collector
+        // (tag 1) that dropped all three arguments, so `collect(teeing(..))`
+        // answered a List of the elements instead of the merged result.
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(29));
+        assert_eq!(
+            shared.mem.heap.get_field(c_ref, 1),
+            Value::Object(Some(downstream1))
+        );
+        assert_eq!(
+            shared.mem.heap.get_field(c_ref, 2),
+            Value::Object(Some(downstream2))
+        );
+        assert_eq!(
+            shared.mem.heap.get_field(c_ref, 3),
+            Value::Object(Some(merger))
+        );
     }
 
     // ===== Phase 65 Tests =====
