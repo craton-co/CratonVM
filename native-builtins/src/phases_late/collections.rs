@@ -1384,16 +1384,34 @@ pub(crate) fn native_p64_ll_reversed(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let size = match ctx.get_field(this, 2) {
-        Value::Int(v) => v as usize,
+    // Read through the LIST SURFACE, not raw slots.
+    //
+    // This used to walk the node chain directly, assuming `size` at slot 2,
+    // `tail` at slot 1, and each node's element at field 2 with `prev` at
+    // field 0. The live `LinkedList` in `cratonvm-native-collections` uses the
+    // opposite node layout — element 0, next 1, prev 2 — and keeps head/tail
+    // behind name-keyed accessors rather than those slots. So this read a
+    // node's `prev` as its element and walked off the chain immediately:
+    // `reversed()` returned an EMPTY list for any list built by `add`.
+    //
+    // `size()`/`get(i)` are layout-independent and work for every List
+    // implementation, which is what a default method on `SequencedCollection`
+    // should rely on anyway.
+    let size = match ctx.invoke_virtual(this, "size", "()I", &[])? {
+        Some(Value::Int(v)) if v > 0 => v as usize,
         _ => 0,
     };
-    // Collect elements by walking tail → head (using prev pointers: node field 0)
     let mut elements = Vec::with_capacity(size);
-    let mut cur = ctx.get_field(this, 1); // tail
-    while let Value::Object(Some(node)) = cur {
-        elements.push(ctx.get_field(node, 2)); // element
-        cur = ctx.get_field(node, 0); // prev
+    for i in (0..size).rev() {
+        let elem = ctx
+            .invoke_virtual(
+                this,
+                "get",
+                "(I)Ljava/lang/Object;",
+                &[Value::Int(i as i32)],
+            )?
+            .unwrap_or(Value::Object(None));
+        elements.push(elem);
     }
     // Build new ArrayList with reversed elements
     let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
