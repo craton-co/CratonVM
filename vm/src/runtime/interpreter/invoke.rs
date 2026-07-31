@@ -14674,9 +14674,12 @@ pub(super) fn compile_osr_artifact(
     };
 
     // The compile succeeded but the body may still refuse to enter at the PC it
-    // was compiled for (non-zero `osr_dead_mask[entry_pc]`). Memo that so the
-    // next trip over this back-edge does not re-run the whole pipeline to the
-    // same conclusion; the artifact stays cached and other PCs are unaffected.
+    // was compiled for: no published native offset (the codegen writes -1 for a
+    // pc strictly inside a LICM-hoisted loop body, whose preheader an OSR entry
+    // would skip), or — only under `CRATONVM_JIT_OSR_DEAD_LOCALS=0` — a
+    // non-zero `osr_dead_mask[entry_pc]`. Memo that so the next trip over this
+    // back-edge does not re-run the whole pipeline to the same conclusion; the
+    // artifact stays cached and other PCs are unaffected.
     if !osr_reused && !compiled.can_osr_enter(entry_pc) {
         crate::jit::mark_osr_entry_rejected(
             &class_name,
@@ -14686,7 +14689,8 @@ pub(super) fn compile_osr_artifact(
         );
         if crate::runtime::env_cache::dbg_jitc() {
             eprintln!(
-                "[cratonvm-jitc] OSR-reject {}.{}{} entry_pc={} (dead_mask non-zero; memoed)",
+                "[cratonvm-jitc] OSR-reject {}.{}{} entry_pc={} (no enterable native offset\
+                 , or dead_mask non-zero with CRATONVM_JIT_OSR_DEAD_LOCALS=0; memoed)",
                 &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
             );
         }
