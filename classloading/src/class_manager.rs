@@ -5044,10 +5044,43 @@ impl ClassManager {
                 requesting_loader: Some(class.loader_id),
             };
             if defer_loader_sensitive_pass3 {
-                // Loader-sensitive class: harvest the maps, make no load
-                // decision. Publishing before registration is safe — the id is
-                // already minted, the store is the only other thing keyed by
+                // SECURITY: the deferral exists because this adapter's
+                // *assignability verdicts* can be wrong under two loaders that
+                // hold same-named classes — it is a statement about the
+                // hierarchy, not a licence to skip the structural envelope.
+                // Before this call the deferred path made NO load decision at
+                // all, so a class defined by a user-defined loader (i.e. every
+                // Spring / WildFly / H2 application class) could carry an
+                // out-of-range branch, a mid-instruction exception handler, an
+                // under-declared `max_locals` or a local operand past the end
+                // of the frame, and reach the interpreter unchallenged.
+                //
+                // `verify_class_structural_bytecode` is the hierarchy-INDEPENDENT
+                // half of Pass 3 (JVMS §4.9.1): decode, branch/handler bounds
+                // and instruction-boundary landing, local-index and `max_locals`
+                // conformance. It cannot produce the loader-confusion false
+                // rejections the deferral was introduced to avoid, because it
+                // never asks the hierarchy a question.
+                if let Err(verify_err) = crate::verifier::verify_class_structural_bytecode(&class) {
+                    self.loading_guard.remove(name);
+                    return Err(VmError::Linkage(verify_err));
+                }
+                // Loader-sensitive class: harvest the maps, make no *type-state*
+                // load decision. Publishing before registration is safe — the id
+                // is already minted, the store is the only other thing keyed by
                 // it, and nothing between here and `class_store.add` can fail.
+                //
+                // OBSERVABILITY: the type-state verdict was withheld, so the
+                // class's maps carry `FastPathVeto::IncompleteWalk` for any
+                // method whose walk did not finish and every consumer stays on
+                // the conservative path. See `docs/security/verifier/coverage.md`
+                // for what this deferral still leaves open.
+                debug!(
+                    class = %class.name,
+                    loader = %loader_id,
+                    "Pass 3 type-state verdict deferred (loader-sensitive); \
+                     structural bytecode verification enforced",
+                );
                 crate::verifier::publish_deferred_class_type_maps(&class, &hierarchy);
             } else if let Err(verify_err) =
                 crate::verifier::verify_class(&class, &self.class_store, &hierarchy)

@@ -7739,10 +7739,30 @@ fn native_bb_duplicate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let cap = view.cap;
     let mark = buf_read_mark(ctx, this);
     let dup = alloc_byte_buffer(ctx, cap as usize);
-    let dup_view = bb_storage_view(ctx, dup)?;
-    for i in 0..cap as usize {
-        let b = bb_read_byte(ctx, view, i)?;
-        bb_write_byte(ctx, dup_view, i, b)?;
+    // `duplicate()` SHARES content with the original — "changes to this
+    // buffer's content will be visible in the new buffer, and vice versa"
+    // (java.nio.ByteBuffer). This used to allocate a fresh array and COPY the
+    // bytes into it, so a write through either buffer was invisible to the
+    // other; only the independent position/limit/mark half of the contract
+    // held. Point the duplicate at the original's backing array instead.
+    //
+    // Both spellings are set for the same reason `alloc_byte_buffer` sets
+    // both: real heap-buffer subclasses read `hb`, the synthetic layout reads
+    // slot 0, and `bb_state` prefers `hb` when it resolves.
+    if let Value::Object(Some(shared_array)) = ctx.get_field(this, BB_FIELD_ARRAY) {
+        ctx.set_field(dup, BB_FIELD_ARRAY, Value::Object(Some(shared_array)));
+        ctx.set_field_by_name(dup, "hb", Value::Object(Some(shared_array)));
+    } else if let Value::Object(Some(shared_array)) = ctx.get_field_by_name(this, "hb") {
+        ctx.set_field(dup, BB_FIELD_ARRAY, Value::Object(Some(shared_array)));
+        ctx.set_field_by_name(dup, "hb", Value::Object(Some(shared_array)));
+    } else {
+        // No resolvable backing array (a direct buffer, say): fall back to the
+        // copy so the duplicate is at least readable.
+        let dup_view = bb_storage_view(ctx, dup)?;
+        for i in 0..cap as usize {
+            let b = bb_read_byte(ctx, view, i)?;
+            bb_write_byte(ctx, dup_view, i, b)?;
+        }
     }
     buf_write_metadata(ctx, dup, pos, lim, cap, mark);
     Ok(Some(Value::Object(Some(dup))))
@@ -8819,6 +8839,15 @@ fn native_sw_append_cs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 const DIS_FIELD_IN: usize = 0;
 const DOS_FIELD_OUT: usize = 0;
+/// Slot fallback for the `written` counter.
+///
+/// `written` is normally addressed by NAME, which works against a real-JDK
+/// `DataOutputStream`. A synthetically-allocated one has no field names at all
+/// (`ensure_synthetic_class` mints unnamed slots), so both the read and the
+/// write silently no-op and `size()` reported 0 no matter how many bytes went
+/// out. Keep the by-name path — it is the one that matches the real layout —
+/// and fall back to this slot when the name does not resolve.
+const DOS_WRITTEN_SLOT: usize = 1;
 // NOTE: `written` is NOT at a fixed low slot. The real JDK layout is
 // FilterOutputStream{out, closed, closeLock} then DataOutputStream{written, …},
 // so `written` lives at slot 3 — NOT slot 1 (which is `closed`). These natives
@@ -9680,7 +9709,7 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(None),
     };
     ctx.set_field(this, DOS_FIELD_OUT, args[1]);
-    ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(0));
+    dos_set_written(ctx, this, 0);
     // Real JDK 25's `DataOutputStream(OutputStream)` constructor also
     // allocates `private final byte[] writeBuffer = new byte[8]` -- an
     // internal scratch buffer real bytecode for `writeChars`/`writeUTF`
@@ -9711,6 +9740,29 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// (the pre-fix `writeUTF` loop handed a stale `this` to every iteration
 /// after a GC, tripping CRATONVM_DBG_STALE_OBJREF in the WildFly Host
 /// Controller).
+/// Read the `written` counter, by name where the receiver has real field
+/// names and from [`DOS_WRITTEN_SLOT`] otherwise.
+fn dos_written(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    if let Value::Int(w) = ctx.get_field_by_name(this, DOS_WRITTEN_FIELD) {
+        return w;
+    }
+    if ctx.object_num_fields(this) > DOS_WRITTEN_SLOT {
+        if let Value::Int(w) = ctx.get_field(this, DOS_WRITTEN_SLOT) {
+            return w;
+        }
+    }
+    0
+}
+
+/// Companion writer for [`dos_written`]. Writes BOTH spellings so a receiver
+/// that later resolves by name agrees with one that only has slots.
+fn dos_set_written(ctx: &mut dyn NativeContext, this: ObjectRef, v: i32) {
+    ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(v));
+    if ctx.object_num_fields(this) > DOS_WRITTEN_SLOT {
+        ctx.set_field(this, DOS_WRITTEN_SLOT, Value::Int(v));
+    }
+}
+
 fn dos_write_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -9725,11 +9777,8 @@ fn dos_write_one(
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     r?;
-    let written = match ctx.get_field_by_name(this, DOS_WRITTEN_FIELD) {
-        Value::Int(w) => w,
-        _ => 0,
-    };
-    ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(written + 1));
+    let written = dos_written(ctx, this);
+    dos_set_written(ctx, this, written + 1);
     Ok(this)
 }
 
@@ -9944,11 +9993,7 @@ fn native_dos_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let written = match ctx.get_field_by_name(this, DOS_WRITTEN_FIELD) {
-        Value::Int(w) => w,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(written)))
+    Ok(Some(Value::Int(dos_written(ctx, this))))
 }
 
 // ===========================================================================
@@ -15710,39 +15755,97 @@ const WE_NUM_FIELDS: usize = 2;
 /// [2] = open (Int) — 1=open, 0=closed
 const DC_NUM_FIELDS: usize = 3;
 
+/// Key for the `DatagramChannel` side tables below.
+///
+/// `(vm_identity, identity_hash_code)`. The identity hash alone is NOT unique
+/// across VMs — Rust tests routinely stand up several independent `Vm`s in one
+/// process, and these tables are process-global `OnceLock`s — so an unscoped
+/// key lets a channel in one VM resolve to another VM's socket. That is the
+/// process-global-native-cache bug class documented on
+/// `NativeContext::vm_identity`; scope every entry by it, exactly as
+/// `net_channels`'s `http_context_authenticators` does.
+///
+/// Note what is NOT stored here: no `ObjectRef`. The values are raw `FdId`s
+/// and plain flags, and the keys are identity hashes, which survive a moving
+/// GC unchanged. So — unlike a side table that holds heap references — none of
+/// these tables needs to be scanned or remapped by any collector path.
+type DcKey = (usize, i32);
+
+fn dc_key(ctx: &dyn NativeContext, channel: ObjectRef) -> DcKey {
+    (ctx.vm_identity(), ctx.identity_hash_code(channel))
+}
+
 /// Real-JDK `DatagramChannel` objects have a private implementation layout;
 /// their field zero is not CratonVM's UDP fd slot. Keep the fd out of that
 /// layout in an identity-hash keyed table, which remains valid across moving
 /// GC and is the convention used by the real NIO selector bridges.
-fn dc_fds() -> &'static Mutex<HashMap<i32, FdId>> {
-    static FDS: OnceLock<Mutex<HashMap<i32, FdId>>> = OnceLock::new();
+fn dc_fds() -> &'static Mutex<HashMap<DcKey, FdId>> {
+    static FDS: OnceLock<Mutex<HashMap<DcKey, FdId>>> = OnceLock::new();
     FDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // Connection state belongs beside the fd table mapping rather than in the
 // real JDK implementation object's private fields.  Identity hashes survive
 // moving GC, and an fd is connected exactly while this set contains it.
-fn dc_connected_channels() -> &'static Mutex<HashSet<i32>> {
-    static CONNECTED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+fn dc_connected_channels() -> &'static Mutex<HashSet<DcKey>> {
+    static CONNECTED: OnceLock<Mutex<HashSet<DcKey>>> = OnceLock::new();
     CONNECTED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Channels an explicit `configureBlocking(false)` has switched to
+/// non-blocking mode. Membership means non-blocking; ABSENCE means blocking,
+/// which is the JDK's documented initial state — "A newly-created channel is
+/// always in blocking mode" (`java.nio.channels.SelectableChannel`) — so a
+/// channel this family never saw answers `isBlocking() == true` for free.
+///
+/// Why a side table and not an object slot: `native_dc_open` allocates
+/// `DC_NUM_FIELDS` slots and a real-JDK `DatagramChannel`'s low slots belong
+/// to its own private implementation layout, so there is no slot this family
+/// may read or write. The retired 5-field synthetic layout's "blocking" slot 3
+/// is exactly the out-of-bounds/foreign read that must not be revived.
+///
+/// Before this table existed, `native_dc_configure_blocking` flipped the OS
+/// socket and recorded NOTHING Java-visible, so `isBlocking()` kept answering
+/// `true` after an explicit `configureBlocking(false)` — a real bug for any
+/// caller that then relies on non-blocking semantics.
+fn dc_nonblocking_channels() -> &'static Mutex<HashSet<DcKey>> {
+    static NONBLOCKING: OnceLock<Mutex<HashSet<DcKey>>> = OnceLock::new();
+    NONBLOCKING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 fn dc_mark_connected(ctx: &dyn NativeContext, channel: ObjectRef) {
-    dc_connected_channels()
-        .lock()
-        .insert(ctx.identity_hash_code(channel));
+    dc_connected_channels().lock().insert(dc_key(ctx, channel));
 }
 
 fn dc_clear_connected(ctx: &dyn NativeContext, channel: ObjectRef) {
-    dc_connected_channels()
-        .lock()
-        .remove(&ctx.identity_hash_code(channel));
+    dc_connected_channels().lock().remove(&dc_key(ctx, channel));
 }
 
 fn dc_is_connected(ctx: &dyn NativeContext, channel: ObjectRef) -> bool {
     dc_connected_channels()
         .lock()
-        .contains(&ctx.identity_hash_code(channel))
+        .contains(&dc_key(ctx, channel))
+}
+
+/// Record the channel's blocking mode. `blocking == true` is the default, and
+/// is stored as absence so a stale identity hash can never leave a fresh
+/// channel looking non-blocking.
+fn dc_set_blocking(ctx: &dyn NativeContext, channel: ObjectRef, blocking: bool) {
+    let key = dc_key(ctx, channel);
+    let mut nonblocking = dc_nonblocking_channels().lock();
+    if blocking {
+        nonblocking.remove(&key);
+    } else {
+        nonblocking.insert(key);
+    }
+}
+
+/// The channel's blocking mode, defaulting to blocking (the JDK's initial
+/// state) for any channel no `configureBlocking(false)` has touched.
+fn dc_is_blocking(ctx: &dyn NativeContext, channel: ObjectRef) -> bool {
+    !dc_nonblocking_channels()
+        .lock()
+        .contains(&dc_key(ctx, channel))
 }
 
 /// The UDP fd backing a `DatagramChannel`. This identity-hash table, plus the
@@ -15752,10 +15855,7 @@ fn dc_is_connected(ctx: &dyn NativeContext, channel: ObjectRef) -> bool {
 /// `datagram.rs` used to keep a parallel registry that nothing populated, so
 /// its `send` always failed with "no socket id" — see its module doc.
 pub(crate) fn dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
-    dc_fds()
-        .lock()
-        .get(&ctx.identity_hash_code(channel))
-        .copied()
+    dc_fds().lock().get(&dc_key(ctx, channel)).copied()
 }
 
 /// Expose the real-JDK DatagramChannel's fd-table identity to the selector
@@ -15773,12 +15873,20 @@ pub(crate) fn datagram_channel_udp_clone(
 }
 
 fn set_dc_fd(ctx: &dyn NativeContext, channel: ObjectRef, fd: FdId) {
-    dc_fds().lock().insert(ctx.identity_hash_code(channel), fd);
+    dc_fds().lock().insert(dc_key(ctx, channel), fd);
     dc_clear_connected(ctx, channel);
+    // `bind()` closes the old socket and opens a replacement, which the OS
+    // hands back in BLOCKING mode. Blocking mode is a property of the channel,
+    // not of whichever socket currently sits under it (`SelectableChannel`
+    // keeps it across `bind`), so re-apply the recorded mode to the new fd
+    // instead of letting a rebind silently revert a non-blocking channel.
+    let _ = ctx
+        .fd_table()
+        .udp_set_nonblocking(fd, !dc_is_blocking(ctx, channel));
 }
 
 fn remove_dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
-    dc_fds().lock().remove(&ctx.identity_hash_code(channel))
+    dc_fds().lock().remove(&dc_key(ctx, channel))
 }
 
 /// Selector layout: 3 fields
@@ -17217,6 +17325,12 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         native_dc_configure_blocking,
     );
 
+    // isBlocking() → boolean. Must be registered alongside the
+    // `configureBlocking` above — see `native_dc_is_blocking` for why the two
+    // other implementations of this signature (slot-3 readers) cannot observe
+    // this family's state.
+    r.register(dc, "isBlocking", "()Z", native_dc_is_blocking);
+
     // getLocalAddress() → SocketAddress
     r.register(
         dc,
@@ -17362,6 +17476,11 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
         })?;
 
     let dc = alloc_synthetic(ctx, "java/nio/channels/DatagramChannel", DC_NUM_FIELDS);
+    // "A newly-created channel is always in blocking mode"
+    // (`java.nio.channels.SelectableChannel`). Assert it rather than assume
+    // it: the side tables are keyed by identity hash, and a fresh object may
+    // reuse the hash of a collected channel that was switched to non-blocking.
+    dc_set_blocking(ctx, dc, true);
     set_dc_fd(ctx, dc, fd_id);
     Ok(Some(Value::Object(Some(dc))))
 }
@@ -17694,6 +17813,10 @@ fn native_dc_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn native_dc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     dc_clear_connected(ctx, this);
+    // Drop the blocking-mode override too, so the identity hash this channel
+    // releases cannot carry "non-blocking" over to a later channel that
+    // happens to be allocated with the same hash.
+    dc_set_blocking(ctx, this, true);
     if let Some(fd_id) = remove_dc_fd(ctx, this) {
         let _ = ctx.fd_table().close(fd_id);
     }
@@ -17712,11 +17835,37 @@ fn native_dc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Int(b)) => *b != 0,
         _ => true,
     };
+    // Record the mode FIRST, and unconditionally. `isBlocking()` is answered
+    // from this table (see `native_dc_is_blocking`), and it must reflect what
+    // the caller asked for even when there is no fd to flip — a channel this
+    // family never opened, or one already closed. This flip used to touch only
+    // the OS socket, so `configureBlocking(false)` left `isBlocking()`
+    // answering the JDK's initial `true` and Java code could not see the mode
+    // it had just selected.
+    dc_set_blocking(ctx, this, blocking);
     let Some(fd_id) = dc_fd(ctx, this) else {
         return Ok(Some(Value::Object(Some(this))));
     };
     let _ = ctx.fd_table().udp_set_nonblocking(fd_id, !blocking);
     Ok(Some(Value::Object(Some(this))))
+}
+
+/// `DatagramChannel.isBlocking()` for the fd-table-backed channel family.
+///
+/// Registered HERE, next to the `configureBlocking` that actually runs, rather
+/// than left to `net_channels`'s phase-72 entry or `nio_native`'s
+/// `t16_dc_is_blocking`. Native registration is last-wins
+/// (`native-api/src/registry.rs`) and `register_io_natives` re-runs
+/// `register_datagram_channel` AFTER `register_t16_channel_overrides`, so this
+/// family's `open`/`configureBlocking`/`close` win in every build. Both other
+/// readers answer from object slot 3 — the retired 5-field synthetic layout's
+/// blocking flag, which on the 3-slot fd-table channel this family allocates
+/// is an out-of-bounds read, and on a real-JDK `DatagramChannel` belongs to
+/// the JDK's own private layout. Pairing the reader with the writer is what
+/// keeps the two from disagreeing.
+fn native_dc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    Ok(Some(Value::Int(i32::from(dc_is_blocking(ctx, this)))))
 }
 
 fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

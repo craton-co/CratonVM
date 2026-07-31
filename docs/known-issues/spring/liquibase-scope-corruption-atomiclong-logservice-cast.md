@@ -1,6 +1,6 @@
-# Liquibase `Scope` per-thread state corruption: scope-id stack mismatch + `AtomicLong` misread as `LogService` — FIXED
+# Liquibase `Scope` per-thread state corruption: scope-id stack mismatch + `AtomicLong` misread as `LogService`
 
-**Status: FIXED 2026-07-28**
+**Status: OPEN — REGRESSED 2026-07-31.**
 
 ## Resolution
 
@@ -123,3 +123,53 @@ Liquibase's scope machinery fresh in the same thread every time).
 | Module | Class |
 |---|---|
 | `module/spring-boot-liquibase` | `org.springframework.boot.liquibase.autoconfigure.LiquibaseAutoConfigurationTests` (7/43 methods: `rollbackFile`, `whenAnalyticsEnabledIsFalseThenSpringLiquibaseHasAnalyticsDisabled`, `liquibaseConnectionDetailsAreUsedOverLiquibaseProperties`, `overrideDataSource`, `liquibaseDataSourceIsUsedOverLiquibaseConnectionDetails`, `lazyConnectionDataSource`, `changelogJson`) |
+| `module/spring-boot-hibernate` | `org.springframework.boot.hibernate.autoconfigure.HibernateJpaAutoConfigurationTests` (1/70: `testLiquibasePlusValidation`, 2026-07-31 regression) |
+
+## Regression note (2026-07-31)
+
+Recurred in a full-suite rerun (`craton-rerun-20260731`, `all-jit`) as a
+single failure in a different class,
+`org.springframework.boot.hibernate.autoconfigure.HibernateJpaAutoConfigurationTests#testLiquibasePlusValidation`
+(`module/spring-boot-hibernate`). This is exactly Shape 1 from the original
+report (scope-id stack mismatch), unchanged down to the wording:
+
+```
+org.springframework.beans.factory.BeanCreationException: Error creating bean
+with name 'entityManagerFactory' ...: Failed to initialize dependency
+'liquibase' of LoadTimeWeaverAware bean 'entityManagerFactory': Error
+creating bean with name 'liquibase' defined in
+org.springframework.boot.liquibase.autoconfigure.LiquibaseAutoConfiguration$LiquibaseConfiguration:
+java.lang.RuntimeException: Cannot end scope qmmhkkrlxm when currently at
+scope kphqthcfbd
+  liquibase.Scope.exit(Scope.java:288)
+  liquibase.Scope.child(Scope.java:252)
+  liquibase.Scope.child(Scope.java:240)
+  liquibase.Scope.child(Scope.java:219)
+  liquibase.integration.spring.SpringLiquibase.afterPropertiesSet(SpringLiquibase.java:272)
+```
+
+Log:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260731/all-jit/logs/module_spring-boot-hibernate.org.springframework.boot.hibernate.autoconfigure.HibernateJpa-100579f7d4ad.out.log`
+(the class's overall run took 1084959 ms / ~1085s, close to but under the
+suite's 1200s effective timeout for this class — this is a genuine single-test
+assertion failure at the end of a long run, not a timeout artifact: the JUnit
+Platform summary cleanly reports `70 tests started, 69 successful, 1 failed`
+and prints the full stack trace above).
+
+The 2026-07-28 "Resolution" above attributed both this shape and the
+`AtomicLong`/`LogService` shape to a stale-reference bug in the pre-moving-young
+GC path, closed by making the moving young collector the default. This rerun
+was on a build where moving young is still the default (see the `[jit]
+optimizing (C2/IR) tier DISABLED: the moving young generation is active`
+banner in the paired `.err.log`), so either that fix was incomplete/narrower
+than believed, or a separate regression re-broke the same Liquibase `Scope`
+code path. Substantial JIT/moving-young churn landed between 2026-07-28 and
+2026-07-31 (e.g. `ea5b2df6e` "keep raw JIT-to-JIT direct calls gated on the
+moving-young flag", `11901e9a6` "veto moving-young on frame LIVENESS, not on
+compiled code existing", `ea874f3c6` "refuse to compile an invokedynamic trap
+that cannot be resumed", `f78b72670` "scope the relocation-safety gates so
+the optimizing tier runs again") — any of these touch exactly the
+relocation/root-mapping machinery this bug's original two "Resolution"s (the
+2026-07-07 `jit_scan`/invokedynamic fix and the 2026-07-28 moving-young
+default) both hinged on. Not re-diagnosed to a specific commit this session —
+flagged as the next place to bisect.

@@ -27,6 +27,8 @@
 //! (it computes `(r >>> n) | (r << (32 - n))`). Validated by a FIPS-197 KAT
 //! below and end-to-end by BC's own `AESTest` vectors.
 
+use crate::failure::{CryptoFailure, CryptoResult};
+
 pub(crate) const AES_S: [u8; 256] = [
     99, 124, 119, 123, 242, 107, 111, 197, 48, 1, 103, 43, 254, 215, 171, 118, 202, 130, 201, 125,
     250, 89, 71, 240, 173, 212, 162, 175, 156, 164, 114, 192, 183, 253, 147, 38, 54, 63, 247, 204,
@@ -165,8 +167,74 @@ fn sibox(i: u32) -> u32 {
     AES_SI[(i & 255) as usize] as u32
 }
 
+/// The three legal expanded-schedule lengths: `ROUNDS + 1` for AES-128/192/256
+/// (10/12/14 rounds). [`generate_working_key`] produces exactly one of these.
+const VALID_SCHEDULE_LENS: [usize; 3] = [11, 13, 15];
+
+/// Preconditions shared by [`encrypt_block`] and [`decrypt_block`].
+///
+/// The schedule length is checked **exactly**, not merely for a lower bound.
+/// `rounds = kw.len() - 1` underflows for an empty schedule, and the round
+/// structure additionally reads `kw[rounds]` after the main loop, so lengths
+/// like 2 or 4 index out of bounds even though they are "non-empty". A block
+/// shorter than 16 bytes would panic in `le_to_u32`/`u32_to_le`.
+///
+/// The critical property is what this function does **not** offer: there is no
+/// "carry on with a degraded schedule" branch. A block cipher that quietly
+/// wrote a zero block, or encrypted under a truncated key, would hand the
+/// caller ciphertext-shaped bytes that are not ciphertext — the single worst
+/// outcome available here.
+fn check_block_args(kw: &[[u32; 4]], inb: &[u8], outb: &[u8]) -> CryptoResult<()> {
+    if !VALID_SCHEDULE_LENS.contains(&kw.len()) {
+        return Err(CryptoFailure::not_initialised(format!(
+            "AES engine not initialised: key schedule has {} round key(s), expected 11, 13 or 15",
+            kw.len()
+        )));
+    }
+    if inb.len() < 16 || outb.len() < 16 {
+        return Err(CryptoFailure::illegal_argument(format!(
+            "AES block must be 16 bytes (input {}, output {})",
+            inb.len(),
+            outb.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Fail-loud [`encrypt_block`]: validates the key schedule and block lengths
+/// and returns the JDK exception to raise instead of panicking.
+///
+/// Every in-tree caller of the infallible form already pre-checks
+/// `kw.len() >= 2` (`native-builtins/src/phases_late/bouncycastle.rs:6081`,
+/// `:6199`, `:6565`); this is the same guard expressed as a value the facade
+/// can turn into a catchable `IllegalStateException`, and made **exact** —
+/// their lower bound still admits `kw.len() == 2`, which indexes out of bounds
+/// on the final round.
+pub fn try_encrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) -> CryptoResult<()> {
+    check_block_args(kw, inb, outb)?;
+    encrypt_block(kw, inb, outb);
+    Ok(())
+}
+
+/// Fail-loud [`decrypt_block`]. See [`try_encrypt_block`].
+pub fn try_decrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) -> CryptoResult<()> {
+    check_block_args(kw, inb, outb)?;
+    decrypt_block(kw, inb, outb);
+    Ok(())
+}
+
 /// Port of `AESEngine.encryptBlock`. `kw` is the expanded key schedule
 /// (`KW[round][col]`); `inb`/`outb` are 16-byte blocks. `ROUNDS == kw.len()-1`.
+///
+/// # Panics
+///
+/// On a key schedule whose length is not 11/13/15, or a short block. This is a
+/// *loud* failure — it can never be mistaken for ciphertext — but it is not a
+/// catchable Java exception. Prefer [`try_encrypt_block`], which reports the
+/// same conditions as a failure the facade can throw. The signature is kept
+/// as-is for the existing `native-builtins` registrations, all of which
+/// validate the schedule first (though only with a `>= 2` lower bound — see
+/// [`check_block_args`]).
 pub fn encrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
     let rounds = kw.len() - 1;
     let c0 = le_to_u32(inb, 0);
@@ -234,6 +302,10 @@ pub fn encrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
 
 /// Port of `AESEngine.decryptBlock` (equivalent inverse cipher; `kw` is the
 /// decryption schedule BC produced via `generateWorkingKey(.., false)`).
+///
+/// # Panics
+///
+/// Same conditions as [`encrypt_block`]; prefer [`try_decrypt_block`].
 pub fn decrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
     let rounds = kw.len() - 1;
     let c0 = le_to_u32(inb, 0);
@@ -330,11 +402,34 @@ fn inv_mcol(x: u32) -> u32 {
     t0
 }
 
+/// Fail-loud [`generate_working_key`], naming the exception BouncyCastle's
+/// `AESEngine.generateWorkingKey` itself raises for a bad key length
+/// (`IllegalArgumentException("Key length not 128/192/256 bits.")`).
+///
+/// **Supported key lengths: 16, 24, 32 bytes only.** Everything else is
+/// explicitly rejected — there is deliberately no zero-pad or truncate-to-16
+/// fallback, because either would silently key the cipher with material the
+/// caller never supplied.
+pub fn try_generate_working_key(key: &[u8], for_encryption: bool) -> CryptoResult<Vec<[u32; 4]>> {
+    generate_working_key(key, for_encryption).ok_or_else(|| {
+        CryptoFailure::illegal_argument(format!(
+            "Key length not 128/192/256 bits. (got {} bytes)",
+            key.len()
+        ))
+    })
+}
+
 /// Port of `AESEngine.generateWorkingKey`. Returns the expanded schedule
 /// `KW[round][col]` for a 16/24/32-byte key, or `None` for an invalid length
 /// (the caller raises `IllegalArgumentException`, matching BC). `for_encryption
 /// == false` applies the equivalent-inverse-cipher `inv_mcol` to the middle
 /// round keys, exactly as BC does.
+///
+/// This one is already fail-loud in shape: `None` is not a usable schedule, so
+/// no caller can mistake it for a successful key expansion, and the in-tree
+/// caller does raise (`native-builtins/src/phases_late/bouncycastle.rs:5837`
+/// → `bc_aes_bad_key()`). [`try_generate_working_key`] simply attaches the JDK
+/// exception name to the same refusal.
 pub fn generate_working_key(key: &[u8], for_encryption: bool) -> Option<Vec<[u32; 4]>> {
     let key_len = key.len();
     if key_len < 16 || key_len > 32 || (key_len & 7) != 0 {
@@ -537,5 +632,117 @@ mod tests {
         assert!(generate_working_key(&[0u8; 15], true).is_none());
         assert!(generate_working_key(&[0u8; 20], true).is_none());
         assert!(generate_working_key(&[0u8; 33], true).is_none());
+    }
+
+    // ---- fail-loud guards ----
+
+    /// Exactly the three FIPS-197 key sizes are accepted; every other length
+    /// raises rather than producing a schedule from truncated/padded material.
+    #[test]
+    fn supported_key_lengths_succeed_and_others_raise() {
+        for len in [16usize, 24, 32] {
+            let k = vec![0u8; len];
+            assert!(
+                try_generate_working_key(&k, true).is_ok(),
+                "{len}-byte key should be supported"
+            );
+            assert!(try_generate_working_key(&k, false).is_ok());
+        }
+        for len in [0usize, 1, 8, 15, 17, 20, 23, 25, 31, 33, 64] {
+            let err = try_generate_working_key(&vec![0u8; len], true)
+                .expect_err("unsupported key length must be rejected");
+            assert_eq!(
+                err.java_class(),
+                "java/lang/IllegalArgumentException",
+                "{len}-byte key: wrong exception type"
+            );
+            assert!(
+                err.message().contains("128/192/256"),
+                "{len}-byte key: message should name the supported sizes"
+            );
+        }
+    }
+
+    /// An unkeyed or malformed engine must raise, not encrypt. Before the guard
+    /// an empty schedule underflowed `kw.len() - 1`, and a *non-empty* but
+    /// wrong-length one (2 or 4 entries) still ran off the end of `kw` on the
+    /// final round — so a lower bound alone would not have been enough.
+    #[test]
+    fn malformed_key_schedule_raises_illegal_state() {
+        let inb = [0u8; 16];
+        let mut outb = [0u8; 16];
+        for len in [0usize, 1, 2, 3, 4, 10, 12, 14, 16] {
+            let kw = vec![[0u32; 4]; len];
+            let err = try_encrypt_block(&kw, &inb, &mut outb)
+                .expect_err("malformed schedule must be rejected");
+            assert_eq!(
+                err.java_class(),
+                "java/lang/IllegalStateException",
+                "{len}-entry schedule: wrong exception type"
+            );
+            let err = try_decrypt_block(&kw, &inb, &mut outb)
+                .expect_err("malformed schedule must be rejected");
+            assert_eq!(err.java_class(), "java/lang/IllegalStateException");
+        }
+        // ...and the output buffer was left untouched — no zero "ciphertext"
+        // was produced that a caller could mistake for a real transform.
+        assert_eq!(outb, [0u8; 16]);
+    }
+
+    /// The three real AES schedule lengths are accepted, so the strict check
+    /// cannot reject a legitimately keyed engine.
+    #[test]
+    fn every_real_key_size_produces_an_accepted_schedule() {
+        let inb = [0u8; 16];
+        let mut outb = [0u8; 16];
+        for key_len in [16usize, 24, 32] {
+            let kw = generate_working_key(&vec![0u8; key_len], true).unwrap();
+            assert!(
+                VALID_SCHEDULE_LENS.contains(&kw.len()),
+                "{key_len}-byte key produced a {}-entry schedule",
+                kw.len()
+            );
+            try_encrypt_block(&kw, &inb, &mut outb).expect("real schedule must be accepted");
+            let kw = generate_working_key(&vec![0u8; key_len], false).unwrap();
+            try_decrypt_block(&kw, &inb, &mut outb).expect("real schedule must be accepted");
+        }
+    }
+
+    /// A short input or output block raises rather than panicking on the
+    /// `le_to_u32`/`u32_to_le` index.
+    #[test]
+    fn short_block_raises_illegal_argument() {
+        let kw = generate_working_key(&[0u8; 16], true).unwrap();
+        let mut out16 = [0u8; 16];
+        let err = try_encrypt_block(&kw, &[0u8; 15], &mut out16).expect_err("short input");
+        assert_eq!(err.java_class(), "java/lang/IllegalArgumentException");
+
+        let mut out15 = [0u8; 15];
+        let err = try_encrypt_block(&kw, &[0u8; 16], &mut out15).expect_err("short output");
+        assert_eq!(err.java_class(), "java/lang/IllegalArgumentException");
+    }
+
+    /// The fail-loud wrappers must be byte-identical to the infallible pair on
+    /// every well-formed input — the guard adds a refusal, it does not change
+    /// the transform.
+    #[test]
+    fn try_wrappers_match_the_infallible_pair() {
+        let key = unhex("000102030405060708090a0b0c0d0e0f");
+        let pt = arr16("00112233445566778899aabbccddeeff");
+        let enc = generate_working_key(&key, true).unwrap();
+
+        let mut a = [0u8; 16];
+        encrypt_block(&enc, &pt, &mut a);
+        let mut b = [0u8; 16];
+        try_encrypt_block(&enc, &pt, &mut b).expect("well-formed input");
+        assert_eq!(a, b);
+
+        let dec = generate_working_key(&key, false).unwrap();
+        let mut c = [0u8; 16];
+        decrypt_block(&dec, &a, &mut c);
+        let mut d = [0u8; 16];
+        try_decrypt_block(&dec, &a, &mut d).expect("well-formed input");
+        assert_eq!(c, d);
+        assert_eq!(c, pt);
     }
 }

@@ -1455,18 +1455,26 @@ fn parse_primary(tokens: &[ExprToken], pos: &mut usize) -> Option<f64> {
 pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // Locale.getDefault() reads LANG/LC_ALL environment variables
+    // `Locale.getDefault()`.
+    //
+    // SHADOWING NOTE: this is the SECOND registration of this key.
+    // `locale_bootstrap::register` (reached from `register_essential_natives`)
+    // registers it first, and `register_synthetic_overrides` — which calls this
+    // function — runs after it, so under `#[cfg(feature = "synthetic-jdk")]`
+    // *this* closure is the one that runs (registration is last-wins). Both
+    // therefore have to resolve the locale the same way, which they now do via
+    // the single `locale_bootstrap::resolve_default_locale` helper.
+    //
+    // What used to be here: a hand-rolled `$LANG`-then-`$LC_ALL` parse with no
+    // C/POSIX mapping. On a bare Linux shell (`LANG=C`, the POSIX default, and
+    // what ubuntu-latest CI gives you) that reported language `"C"`. A real JVM
+    // never does: the HotSpot launcher's `java_props_md.c` maps the `C` and
+    // `POSIX` locales onto English, so `Locale.getDefault().getLanguage()` is
+    // `"en"` there. The precedence was inverted too (`LC_ALL` must override
+    // `LANG`, not the other way round).
     let loc = "java/util/Locale";
     r.register(loc, "getDefault", "()Ljava/util/Locale;", |ctx, _args| {
-        // Read LANG or LC_ALL from environment
-        let lang_env = cratonvm_types::flags::runtime_var("LANG")
-            .or_else(|_| cratonvm_types::flags::runtime_var("LC_ALL"))
-            .unwrap_or_else(|_| "en_US.UTF-8".to_string());
-        // Parse: "en_US.UTF-8" -> language=en, country=US
-        let base = lang_env.split('.').next().unwrap_or("en_US");
-        let parts: Vec<&str> = base.split('_').collect();
-        let language = parts.first().copied().unwrap_or("en");
-        let country = parts.get(1).copied().unwrap_or("");
+        let (language, country) = crate::locale_bootstrap::resolve_default_locale(&*ctx);
 
         // Use the shared `locale_alloc` helper: it records the
         // language/country in the ObjectRef-keyed side table and leaves the
@@ -1474,7 +1482,7 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
         // untouched. Writing Strings into those typed-object slots used to
         // poison real-JDK Locale bytecode dispatch (bogus
         // `NoSuchMethodError java/lang/String.getUnicodeLocaleType`).
-        let locale = crate::locale_alloc(ctx, language, country);
+        let locale = crate::locale_alloc(ctx, &language, &country);
         Ok(Some(Value::Object(Some(locale))))
     });
 

@@ -91,7 +91,15 @@ pub enum SkipReason {
     /// TCK class — exercises the `instanceof` JIT bug. (A1.2)
     /// REMOVED in NEW-1.2 — never produced. Kept for ABI/parser compatibility.
     TckClass,
-    /// `cratonvm/*` test fixture — broad ban for legacy reasons. (A1.4)
+    /// Historical name only — the `cratonvm/*` fixture ban it was introduced
+    /// for is long gone. This is now the GENERIC "banned" reason: the two
+    /// `CRATONVM_JIT_BISECT_*` development hooks return it (neither is a ban —
+    /// both are env-gated and inert by default), and so do four unrelated
+    /// targeted bans: the ANTLR `PredictionContext` cluster, one Tomcat lambda,
+    /// `org/apache/commons/logging/`, and `org/jboss/modules/`. Kept as the
+    /// variant name for ABI/parser compatibility with older JFR events and
+    /// logs — but do NOT read a `RustJvmTestFixture` in a census as "a test
+    /// fixture is banned". Grep the call sites; each carries its real cause.
     RustJvmTestFixture,
     /// Finalizer-bearing class — JIT frames lacked GC stack maps. (A1.1)
     /// REMOVED in NEW-1.5 (conservative JIT root scan replaces precise maps).
@@ -916,8 +924,35 @@ fn should_skip_jit_internal(
     // `new TreeMap<>(session)` loses its comparator once the allocating method
     // is compiled, and reproduced in 60 lines of pure JDK code by
     // `apps/h2database-suite-runner/probes/TreeMapCmpProbe.java` (HotSpot
-    // 40000/40000, CratonVM fails from iteration ~503). LIFT THIS BAN once
-    // that is fixed; everything else is already in place.
+    // 40000/40000, CratonVM fails from iteration ~503).
+    //
+    // 2026-07-31 RE-MEASURED — the TreeMap defect is FIXED (that probe now
+    // passes 40000/40000 over four consecutive runs, and `TestMetaData` passes
+    // 3/3 lifted, having been FAIL 3/3), but the "+7 PASS" above no longer
+    // holds and the ban STAYS. A fresh full 218-class A/B, one binary and the
+    // `CRATONVM_JIT_ALLOW_PACKAGES=org/h2/` lever as the only difference:
+    //
+    //     banned  161 PASS / 22 FAIL / 34 HANG / 1 CRASH
+    //     lifted  161 PASS / 21 FAIL / 36 HANG / 0 CRASH
+    //
+    // PASS is a WASH, not +7. Every status change was re-run serially in
+    // isolation (3x per arm) because both suite arms shared a loaded host:
+    //   * `TestMemoryEstimator`  PASS 3/3 banned, FAIL 3/3 lifted — REAL, and
+    //     the new sole blocker. `AssertionError: Avg=99, err=0.2902…, pct=8 8`
+    //     at `TestMemoryEstimator.testEstimator:61` — H2's statistical
+    //     `MemoryEstimator` computes a wrong average once org/h2 is compiled.
+    //     Deterministic; a far better witness than the old TreeMap one.
+    //   * `TestCacheLongKeyLIRS` PASS 3/3 BOTH arms — the suite's PASS->HANG
+    //     was a load artifact, not a regression.
+    //   * Recovered: `TestCompatibility` FAIL->PASS, `TestIntPerfectHash`
+    //     HANG->PASS, `TestSynth` CRASH->FAIL.
+    //   * Already-failing classes that merely changed shape (they now burn the
+    //     300 s timeout instead of failing fast, costing suite wall time):
+    //     `TestMultiThread` and `TestGetGeneratedKeys`, both FAIL->HANG. Both
+    //     are tracked separately.
+    //
+    // LIFT THIS BAN once `TestMemoryEstimator` passes lifted; re-run the A/B
+    // rather than trusting either recorded number.
     if class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages) {
         return Some(SkipReason::RustJvmTestFixture);
     }
