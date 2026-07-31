@@ -321,6 +321,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "ir-compiles", on_key: Some("CRATONVM_DBG_IR_COMPILES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-long", on_key: Some("CRATONVM_DBG_IR_LONG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-reloc", on_key: Some("CRATONVM_DBG_IR_RELOC"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "ir-slots", on_key: Some("CRATONVM_DBG_IR_SLOTS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "irslot", on_key: Some("CRATONVM_DBG_IRSLOT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "isinstance", on_key: Some("CRATONVM_DBG_ISINSTANCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jar", on_key: Some("CRATONVM_DBG_JAR"), off_key: None, off_word: None },
@@ -690,8 +691,12 @@ pub const INVENTORY: &[E] = &[
     // the kill switch for the unconditional pre-lowering check. `off_word: "0"`
     // is what makes `CRATONVM_JIT=-verify-ir` reach that third state instead of
     // merely unsetting the variable back to the profile default.
+    E { group: Group::JIT, token: "verify-arena-order", on_key: Some("CRATONVM_JIT_VERIFY_ARENA_ORDER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-frame-states", on_key: Some("CRATONVM_JIT_VERIFY_FRAME_STATES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-ir", on_key: Some("CRATONVM_JIT_VERIFY_IR"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "verify-memory-chain", on_key: Some("CRATONVM_JIT_VERIFY_MEMORY_CHAIN"), off_key: None, off_word: None },
+    // Compatibility alias: `check_schedule` was split into the memory-chain and
+    // arena-order lanes, and this token still seeds both when neither is set.
     E { group: Group::JIT, token: "verify-schedule", on_key: Some("CRATONVM_JIT_VERIFY_SCHEDULE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-types", on_key: Some("CRATONVM_JIT_VERIFY_TYPES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "virtual-tierup", on_key: Some("CRATONVM_JIT_VIRTUAL_TIERUP"), off_key: None, off_word: None },

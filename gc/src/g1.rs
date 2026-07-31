@@ -13163,7 +13163,11 @@ mod tests {
         let gc = G1Collector::new(cfg);
 
         let obj = gc.alloc_object(ClassId::new(1), 1);
-        let sentinel = cratonvm_types::GC_FLAG_COMPACT;
+        // `GC_FLAG_MARKED` is the safe sentinel here: G1 keeps liveness in
+        // per-region bitmaps and never reads this bit, whereas `GC_FLAG_COMPACT`
+        // changes how `object_total_size` measures the object and would make
+        // the test's own evacuation stride disagree with the allocation.
+        let sentinel = cratonvm_types::GC_FLAG_MARKED;
         unsafe {
             let h = &mut *(obj.as_ptr() as *mut ObjectHeader);
             h.gc_flags |= sentinel;
@@ -13316,7 +13320,7 @@ mod tests {
     fn cleanup_frees_a_zero_live_old_region_when_the_closure_is_complete() {
         let gc = make_collector();
         let obj = gc.alloc_object(ClassId::new(1), 1);
-        let idx = retype_region_of(gc_ref(&gc), obj.as_ptr() as usize, RegionType::Old);
+        let idx = retype_region_of(&gc, obj.as_ptr() as usize, RegionType::Old);
 
         gc.start_concurrent_mark();
         assert!(gc.mark_worklist.lock().is_empty());
@@ -13338,7 +13342,7 @@ mod tests {
     fn cleanup_with_an_undrained_gray_set_retains_every_region() {
         let gc = make_collector();
         let obj = gc.alloc_object(ClassId::new(1), 1);
-        let idx = retype_region_of(gc_ref(&gc), obj.as_ptr() as usize, RegionType::Old);
+        let idx = retype_region_of(&gc, obj.as_ptr() as usize, RegionType::Old);
 
         gc.start_concurrent_mark();
         // One gray entry the marker never got to. Its address is irrelevant —
@@ -13369,7 +13373,7 @@ mod tests {
         let big = gc.alloc_array(
             ClassId::new(1),
             ArrayElementType::Long,
-            (small_config().region_size / 8) as i32,
+            small_config().region_size / 8,
         );
         let start = gc
             .lookup_region_for_addr(big.as_ptr() as usize)
@@ -13398,11 +13402,7 @@ mod tests {
     fn a_humongous_span_is_a_contiguous_start_plus_continuations() {
         let gc = make_collector();
         let region_size = small_config().region_size;
-        let big = gc.alloc_array(
-            ClassId::new(1),
-            ArrayElementType::Long,
-            (region_size / 8) as i32,
-        );
+        let big = gc.alloc_array(ClassId::new(1), ArrayElementType::Long, region_size / 8);
         let start = gc
             .lookup_region_for_addr(big.as_ptr() as usize)
             .expect("humongous start region");
@@ -13590,11 +13590,11 @@ mod tests {
         let target = 1usize;
         let source = 2usize;
         gc.with_regions_mut(|rs| {
-            rs[target].region_type = RegionType::Old;
+            // Survivor, not Old: cleanup's in-place free applies only to Old
+            // regions, and the point of this test is the PRUNE, not the free.
+            rs[target].region_type = RegionType::Survivor;
             rs[source].region_type = RegionType::Old;
             rs[target].rset.add_reference(source);
-            // A live object in the target so cleanup does not free it too.
-            rs[target].cursor = 0;
         });
         assert!(gc.regions.lock()[target].rset.sources().contains(&source));
 
@@ -13626,11 +13626,5 @@ mod tests {
         assert!(text.contains("young=MOVING"), "{text}");
         assert!(text.contains("[GC] g1 cycle"), "{text}");
         assert!(text.contains("kind=young"), "{text}");
-    }
-
-    /// Identity helper: `with_regions_mut` takes `&self`, but the helper above
-    /// reads more naturally with an explicit borrow at the call site.
-    fn gc_ref(gc: &G1Collector) -> &G1Collector {
-        gc
     }
 }

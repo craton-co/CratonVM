@@ -1817,6 +1817,13 @@ pub struct VmFlags {
     pub io: IoFlags,
     /// Flags read only by `native-builtins`.
     pub natives: NativeFlags,
+    /// The subsystems migrated off direct environment reads under report P1:
+    /// the JIT IR verifier and metrics, the GC card counters, the thread-state
+    /// tripwire and the capability model. See [`crate::subsystem_config`] for
+    /// why these live in their own module rather than as more `bool` fields
+    /// here — every one of them is a tri-state, a path, a capacity or a mode
+    /// word, and the type is the point.
+    pub subsystems: crate::subsystem_config::SubsystemConfig,
     /// Resolved legacy values retained for configuration consumers that have
     /// not yet been converted to a typed field. Private so new code cannot
     /// widen the public configuration surface.
@@ -1834,6 +1841,7 @@ impl VmFlags {
             loader: LoaderFlags::from_source(src),
             io: IoFlags::from_source(src),
             natives: NativeFlags::from_source(src),
+            subsystems: crate::subsystem_config::SubsystemConfig::from_source(src),
             legacy_values: MapSource::declared_snapshot(src),
         }
     }

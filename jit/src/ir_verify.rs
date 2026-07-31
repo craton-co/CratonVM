@@ -72,8 +72,8 @@
 //!   consumers to the killed store's own incoming token first and *declines the
 //!   deletion* when it cannot. So this lane, too, is clean after
 //!   `ir_optimize::optimize` and on by default at `"post-optimize"`.
-//! * **arena order** ([`VerifyOptions::check_arena_order`]) — definition
-//!   -before-use approximated by arena index. This one is opt-in **and stays
+//! * **arena order** ([`VerifyOptions::check_arena_order`]) —
+//!   definition-before-use approximated by arena index. This one is opt-in **and stays
 //!   that way**, because it is not a soundness property: a `Graph` carries no
 //!   schedule, and GVN legitimately appends a replacement node *after* the
 //!   users it rewires to it, so the lane fires on essentially every optimized
@@ -82,8 +82,8 @@
 //!   `check_schedule` lane rather than left riding along with the memory-chain
 //!   check it has nothing in common with.
 //!
-//! Those two lanes are on at `"post-optimize"` and **not** at
-//! `"post-escape-analysis"` / `"pre-lower"`, because a second mutating pass
+//! The frame-state and memory-chain lanes are on at `"post-optimize"` and
+//! **not** at `"post-escape-analysis"` / `"pre-lower"`, because a second pass
 //! runs in between: `apply_ea_to_ir` (in `lib.rs`). It used to mark the
 //! scalar-replaced allocation, its stores and its loads `Op::Dead` while
 //! rewiring only `graph.nodes`, breaking both. Its two remaining stories are
@@ -106,7 +106,7 @@
 //! so it cannot decline. It has two triggers, and the verifier treats them
 //! differently on purpose:
 //!
-//! * **a category conflict** (`Ref` merging with `Int`, `Int` with `Long`, …)
+//! * **a lattice conflict** (`Ref` merging with `Int`, `Int` with `Long`, …)
 //!   is a **violation**. It is a real type conflict, and the fallback is the
 //!   unsound-in-the-quiet-direction answer: a reference merge typed `Int` is
 //!   invisible to `ir_lower::zero_ref_phi_slots` and to the oop map, so the

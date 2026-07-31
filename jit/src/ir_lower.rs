@@ -450,7 +450,7 @@ impl<'a> Lowerer<'a> {
 
         // Frame layout (rbp downward): locals, [context slot], spills, [args
         // staging], 16-byte stack-arg reserve, 32-byte shadow. Reserve slots for
-        // locals + max_nodes spills + shadow. The 16-byte tail above the shadow
+        // locals + one per COLOUR + shadow. The 16-byte tail above the shadow
         // region holds in-frame stack args for any helper called without
         // `emit_stack_arg_setup`; see the matching comment in `x64.rs`
         // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
@@ -476,7 +476,8 @@ impl<'a> Lowerer<'a> {
         // construction rather than by two hand-kept-in-sync expressions. The
         // check has already refused anything above `DEFAULT_MAX_FRAME_BYTES`
         // (32 KiB), so every i32 term below is small and cannot overflow —
-        // previously `(max_nodes as i32) * 8` on a pathological graph could.
+        // previously `(graph.nodes.len() as i32) * 8` on a pathological graph
+        // could.
         let frame_size = estimate_frame_bytes(num_locals, slot_plan.slots, &needs) as i32;
         debug_assert_eq!(
             frame_size,
@@ -678,12 +679,8 @@ impl<'a> Lowerer<'a> {
                         "ir_lower: the slot plan has no colour for a value being lowered",
                     ),
                     format!(
-                        "n{id} ({:?}) reached alloc_slot with no planned frame slot",
-                        self.graph
-                            .nodes
-                            .get(id as usize)
-                            .map(|n| &n.op)
-                            .unwrap_or(&Op::Dead)
+                        "n{id} reached alloc_slot with no planned frame slot (op {:?})",
+                        self.graph.nodes.get(id as usize).map(|n| &n.op),
                     ),
                 ))
             }
@@ -4011,11 +4008,12 @@ fn reloc_emit_enabled() -> bool {
 //
 // The lowerer used to size its frame straight from `graph.nodes.len()` — one
 // 8-byte spill slot per node, unconditionally — and then `assert!` its way out
-// if a slot fell past the cap. Two problems: `max_nodes * 8` on a pathological
+// if a slot fell past the cap. Two problems: `nodes * 8` on a pathological
 // graph overflows the `i32` frame arithmetic before any check runs, and the
 // assertion is a panic on the compiler thread for what is only a compiler
 // resource limit. Both are now decided up front, from the same numbers the
-// frame is actually built from.
+// frame is actually built from — and the spill term itself is now the
+// liveness-coloured slot count ([`plan_slots`]) rather than the node count.
 
 /// What a graph demands of the frame beyond its own spills. Shared by
 /// [`Lowerer::new`] (which builds the frame) and [`estimate_frame_bytes`]
@@ -7231,16 +7229,22 @@ mod tests {
         verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
 
         let (_pos, span) = emission_positions(&graph, &schedule);
-        // The loop: the outermost back edge (a successor at or before its own
-        // block index) and the header it returns to.
-        let (header, latch) = schedule
-            .blocks
-            .iter()
-            .enumerate()
-            .flat_map(|(b, block)| block.successors.iter().map(move |&s| (s, b)))
-            .filter(|&(s, b)| s <= b)
-            .max_by_key(|&(_, b)| b)
-            .expect("the counted loop has a back edge");
+        // The loop: the last back edge (a successor at or before its own block
+        // index — the same test `lower_block` uses to place a safepoint poll)
+        // and the header it returns to.
+        let mut back_edge: Option<(usize, usize)> = None;
+        for (b, block) in schedule.blocks.iter().enumerate() {
+            for &s in &block.successors {
+                if s <= b {
+                    back_edge = Some((s, b));
+                }
+            }
+        }
+        let (header, latch) = back_edge.expect("the counted loop has a back edge");
+        assert!(
+            header < latch,
+            "precondition: the loop spans more than one block ({header}..={latch})",
+        );
 
         let n_node = graph
             .nodes

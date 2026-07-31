@@ -1,0 +1,743 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! Per-call-site capability gates for the `native-builtins` native surface.
+//!
+//! # What this is
+//!
+//! `native-api`'s [`CapabilitySet`] is the policy; this module is the set of
+//! **gates** that consult it from inside `native-builtins`. It exists as its
+//! own module for three reasons:
+//!
+//! 1. A gate needs a [`CapabilitySet`], and the only way to reach one from a
+//!    native is `ctx.vm_capabilities()` — an `Option<Arc<…>>` that every call
+//!    site would otherwise have to unwrap by hand, with a different fallback
+//!    each time. Getting that fallback wrong in one place is a silent hole.
+//! 2. The checked openers on [`FileDescriptorTable`] take `&CapabilitySet`,
+//!    not `&dyn NativeContext`. The adaptation is mechanical and belongs in
+//!    one place.
+//! 3. `grep capability_gate:: native-builtins/src` is then the complete list
+//!    of gated sites in this crate, which is what
+//!    `docs/security/capability-wiring.md` is derived from.
+//!
+//! # Nothing here changes behaviour by default
+//!
+//! With no policy installed for the VM (today's configuration — nothing calls
+//! `install_capabilities` yet) every helper takes the `None` arm and calls the
+//! exact unchecked operation the call site used before. With a policy in
+//! [`CapabilityMode::Permissive`] the check records the use and returns `Ok`.
+//! Only [`CapabilityMode::Enforce`] can refuse.
+//!
+//! # Order of operations
+//!
+//! Every file/socket helper delegates to the `_checked` opener, which runs the
+//! capability check **before the fd is reserved and before the syscall**. A
+//! denial therefore consumes no descriptor, creates no file and attempts no
+//! connection.
+//!
+//! # The raw-memory gate is not like the others
+//!
+//! [`gate_raw_memory`] sits under `Unsafe.get*/put*` at a raw address — a path
+//! `java.nio.Bits`, direct `ByteBuffer` and every `Unsafe`-backed JDK
+//! collection drive per element. A full [`CapabilitySet::check`] there is a
+//! `String` allocation (to build the scope), a `Mutex` acquisition and a
+//! `BTreeMap` lookup **per byte**, which is not affordable. See
+//! [`gate_raw_memory`] for the memo that makes the permissive path a
+//! thread-local load and an integer compare, and for exactly what that costs
+//! in audit fidelity.
+
+use std::cell::Cell;
+use std::thread::LocalKey;
+
+use cratonvm_native_api::fd_table::{FdCapabilityError, FdId};
+use cratonvm_native_api::{Capability, CapabilityCheck, CapabilityMode, NativeContext};
+use cratonvm_types::error::MethodCallFailed;
+
+// ---------------------------------------------------------------------------
+// File openers
+// ---------------------------------------------------------------------------
+
+/// `fd_table().open_read(path)`, gated on `FileRead(path)`.
+///
+/// `#[track_caller]` so the audit report names the *native* that opened the
+/// file, not this helper.
+#[track_caller]
+pub fn open_read_gated(ctx: &dyn NativeContext, path: &str) -> Result<FdId, FdCapabilityError> {
+    match ctx.vm_capabilities() {
+        Some(caps) => ctx.fd_table().open_read_checked(&caps, path),
+        None => Ok(ctx.fd_table().open_read(path)?),
+    }
+}
+
+/// `fd_table().open_write(path, append)`, gated on `FileWrite(path)`.
+#[track_caller]
+pub fn open_write_gated(
+    ctx: &dyn NativeContext,
+    path: &str,
+    append: bool,
+) -> Result<FdId, FdCapabilityError> {
+    match ctx.vm_capabilities() {
+        Some(caps) => ctx.fd_table().open_write_checked(&caps, path, append),
+        None => Ok(ctx.fd_table().open_write(path, append)?),
+    }
+}
+
+/// `fd_table().open_read_write(path, create)`, gated on **both** `FileRead`
+/// and `FileWrite` — the fd it hands back can do either.
+#[track_caller]
+pub fn open_read_write_gated(
+    ctx: &dyn NativeContext,
+    path: &str,
+    create: bool,
+) -> Result<FdId, FdCapabilityError> {
+    match ctx.vm_capabilities() {
+        Some(caps) => ctx.fd_table().open_read_write_checked(&caps, path, create),
+        None => Ok(ctx.fd_table().open_read_write(path, create)?),
+    }
+}
+
+/// `fd_table().open_random_access(path, write)`, gated on `FileRead` plus
+/// `FileWrite` when `write`.
+#[track_caller]
+pub fn open_random_access_gated(
+    ctx: &dyn NativeContext,
+    path: &str,
+    write: bool,
+) -> Result<FdId, FdCapabilityError> {
+    match ctx.vm_capabilities() {
+        Some(caps) => ctx.fd_table().open_random_access_checked(&caps, path, write),
+        None => Ok(ctx.fd_table().open_random_access(path, write)?),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Socket openers
+// ---------------------------------------------------------------------------
+
+/// `fd_table().open_tcp_connect(addr)`, gated on `Network(addr)`.
+#[track_caller]
+pub fn open_tcp_connect_gated(
+    ctx: &dyn NativeContext,
+    addr: &str,
+) -> Result<FdId, FdCapabilityError> {
+    match ctx.vm_capabilities() {
+        Some(caps) => ctx.fd_table().open_tcp_connect_checked(&caps, addr),
+        None => Ok(ctx.fd_table().open_tcp_connect(addr)?),
+    }
+}
+
+/// `fd_table().open_tcp_listener(addr)`, gated on `Network(bind addr)`.
+///
+/// Binding is its own authority, not a weaker form of connecting: a listener
+/// on `0.0.0.0:8080` exposes the host rather than reaching out from it.
+#[track_caller]
+pub fn open_tcp_listener_gated(
+    ctx: &dyn NativeContext,
+    addr: &str,
+) -> Result<FdId, FdCapabilityError> {
+    match ctx.vm_capabilities() {
+        Some(caps) => ctx.fd_table().open_tcp_listener_checked(&caps, addr),
+        None => Ok(ctx.fd_table().open_tcp_listener(addr)?),
+    }
+}
+
+/// `fd_table().open_udp(bind_addr)`, gated on `Network`. A `None` bind address
+/// checks as `Scope::Any`, which only an unscoped grant admits (fail closed).
+#[track_caller]
+pub fn open_udp_gated(
+    ctx: &dyn NativeContext,
+    bind_addr: Option<&str>,
+) -> Result<FdId, FdCapabilityError> {
+    match ctx.vm_capabilities() {
+        Some(caps) => ctx.fd_table().open_udp_checked(&caps, bind_addr),
+        None => Ok(ctx.fd_table().open_udp(bind_addr)?),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bare capability gates (for sites that do not go through the fd table)
+// ---------------------------------------------------------------------------
+
+/// Gate a network operation that does **not** allocate through the fd table —
+/// e.g. the plain `ServerSocket.bind` path, which binds a `std::net::TcpListener`
+/// directly and files it in `servlet::s2_alloc_listener`.
+#[track_caller]
+pub fn gate_network(ctx: &dyn NativeContext, addr: &str) -> Result<(), MethodCallFailed> {
+    ctx.check_capability_or_throw(Capability::network(addr))
+}
+
+/// Gate a host-process spawn on `ProcessSpawn(program)`.
+///
+/// Deliberately independent of `native-io`'s CWD-confinement profile: that
+/// profile is opt-in and off by default, so without this gate the capability
+/// layer never learns a spawn happened at all (audit row **P3**).
+#[track_caller]
+pub fn gate_process_spawn(ctx: &dyn NativeContext, program: &str) -> Result<(), MethodCallFailed> {
+    ctx.check_capability_or_throw(Capability::process_spawn(program))
+}
+
+/// Gate the creation or invocation of an FFM upcall stub on
+/// `ForeignUpcall(target)` (audit rows **F3**/**F4**).
+#[track_caller]
+pub fn gate_foreign_upcall(ctx: &dyn NativeContext, target: &str) -> Result<(), MethodCallFailed> {
+    ctx.check_capability_or_throw(Capability::foreign_upcall(target))
+}
+
+/// Gate an FFM downcall on `ForeignDowncall(symbol)`.
+#[track_caller]
+pub fn gate_foreign_downcall(
+    ctx: &dyn NativeContext,
+    symbol: &str,
+) -> Result<(), MethodCallFailed> {
+    ctx.check_capability_or_throw(Capability::foreign_downcall(symbol))
+}
+
+/// Gate a native-library load on `LibraryLoad(name)`.
+#[track_caller]
+pub fn gate_library_load(ctx: &dyn NativeContext, name: &str) -> Result<(), MethodCallFailed> {
+    ctx.check_capability_or_throw(Capability::library_load(name))
+}
+
+// ---------------------------------------------------------------------------
+// Raw memory — the hot path
+// ---------------------------------------------------------------------------
+
+/// The scope name every raw-address `Unsafe` get/put reports.
+///
+/// One name for the whole family, matching item 20 of the ordered work list in
+/// `docs/security/native-capabilities.md`: `CapabilityKind::RawMemory` does not
+/// distinguish reading from writing, so splitting the scope would produce two
+/// audit rows a deployment has to grant together anyway.
+pub const RAW_MEMORY_UNSAFE_ADDRESS: &str = "Unsafe.rawAddress";
+
+/// What the raw-memory gate learned about this VM's policy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RawGate {
+    /// No policy installed for this VM. This is today's default and the gate
+    /// is then a thread-local load plus an integer compare, forever.
+    NoPolicy,
+    /// A `Permissive` policy, and this thread has already recorded one use.
+    /// Subsequent calls on this thread are transparent — see the fidelity note
+    /// on [`gate_raw_memory`].
+    PermissiveRecorded,
+    /// `Audit` or `Enforce`: every call must reach `CapabilitySet::check`,
+    /// because the per-call tally (and, under `Enforce`, the refusal) is the
+    /// whole point of those modes.
+    Checked,
+}
+
+thread_local! {
+    /// `(vm_identity, state)` memo for [`gate_raw_memory`]. `Cell` of a `Copy`
+    /// payload: no `RefCell` borrow flag, no `Arc` clone, no allocation.
+    static RAW_MEMORY_GATE: Cell<Option<(usize, RawGate)>> = const { Cell::new(None) };
+}
+
+fn raw_memory_slot() -> &'static LocalKey<Cell<Option<(usize, RawGate)>>> {
+    &RAW_MEMORY_GATE
+}
+
+/// Gate a raw-address memory access on `RawMemory("Unsafe.rawAddress")`.
+///
+/// # Why this is memoized and the file/socket gates are not
+///
+/// The file and socket gates are followed by a syscall, so the cost of
+/// building a scope and taking the audit lock is noise. This gate is not: it
+/// sits under `Unsafe.getByte(long)` / `putByte(long, byte)`, which Netty's
+/// pooled direct buffers and `java.nio.Bits` drive one element at a time. A
+/// full `CapabilitySet::check` per call is a `String` allocation (`Scope::name`),
+/// a `Mutex` acquisition and a `BTreeMap` lookup keyed on that `String` —
+/// per byte, and contended across every thread of the VM.
+///
+/// So the resolved verdict is memoized per `(thread, vm_identity)`:
+///
+/// | policy | first call on the thread | every later call |
+/// |---|---|---|
+/// | none installed (**default**) | one `capabilities_for` lookup | TLS load + `usize` compare |
+/// | `Permissive` | one full `check` (records the use, its count and first site) | TLS load + `usize` compare |
+/// | `Audit` / `Enforce` | full `check` | full `check` |
+///
+/// # The fidelity this trades away, stated plainly
+///
+/// Under `Permissive`, `RawMemory` is recorded **once per thread**, not once
+/// per access. The audit report therefore names the capability, its scope and
+/// its first call site correctly, and under-reports `count`. That is the one
+/// number the report's purpose — deriving a least-privilege grant set — does
+/// not depend on. `Audit` mode, which exists precisely to price an `Enforce`
+/// flip, takes the `Checked` arm and counts every call exactly.
+///
+/// # Staleness
+///
+/// The memo assumes a VM installs its policy during init, before Java code
+/// runs — which is what item 3 of the work list specifies. A policy installed
+/// *after* a thread has already taken a raw-memory path would not be seen by
+/// that thread. [`reset_raw_memory_gate_memo`] exists for tests and for any
+/// embedder that installs late.
+///
+/// The clean fix is out of this crate: a `capability::any_capabilities_installed()`
+/// backed by a relaxed `AtomicUsize` counter in `native-api` would let this be
+/// a single atomic load with no memo and no staleness at all. See
+/// `docs/security/capability-wiring.md`.
+#[track_caller]
+#[inline]
+pub fn gate_raw_memory(ctx: &dyn NativeContext, op: &str) -> Result<(), MethodCallFailed> {
+    let vm = ctx.vm_identity();
+    if let Some((cached_vm, state)) = raw_memory_slot().with(Cell::get) {
+        if cached_vm == vm && state != RawGate::Checked {
+            return Ok(());
+        }
+    }
+    gate_raw_memory_slow(ctx, op, vm)
+}
+
+#[track_caller]
+#[cold]
+fn gate_raw_memory_slow(
+    ctx: &dyn NativeContext,
+    op: &str,
+    vm: usize,
+) -> Result<(), MethodCallFailed> {
+    let Some(caps) = ctx.vm_capabilities() else {
+        raw_memory_slot().with(|c| c.set(Some((vm, RawGate::NoPolicy))));
+        return Ok(());
+    };
+    let outcome = caps.check_or_throw(Capability::raw_memory(op));
+    let state = if caps.mode() == CapabilityMode::Permissive {
+        RawGate::PermissiveRecorded
+    } else {
+        RawGate::Checked
+    };
+    raw_memory_slot().with(|c| c.set(Some((vm, state))));
+    outcome
+}
+
+/// Drop this thread's raw-memory memo, so the next call re-resolves the
+/// policy. Tests that install a policy after a raw-memory access — and
+/// embedders that install one late — must call this.
+pub fn reset_raw_memory_gate_memo() {
+    raw_memory_slot().with(|c| c.set(None));
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_native_api::{
+        capability_audit, install_capabilities, uninstall_capabilities, CapabilityKind,
+        CapabilitySet, VmId,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    /// `MockNativeContext::vm_identity()` is the default `0` for every mock, and
+    /// `install_capabilities` is keyed on exactly that — so two capability
+    /// tests running concurrently would install over each other. Serialize
+    /// them, the same shape as `panama::tests::NATIVE_ACCESS_TEST_LOCK`.
+    fn capability_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Install `set` for the mock's VM for the duration of the guard.
+    struct PolicyGuard {
+        vm: VmId,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl PolicyGuard {
+        fn install(set: CapabilitySet) -> PolicyGuard {
+            let lock = capability_test_lock();
+            let vm = set.vm();
+            install_capabilities(Arc::new(set));
+            reset_raw_memory_gate_memo();
+            PolicyGuard { vm, _lock: lock }
+        }
+    }
+
+    impl Drop for PolicyGuard {
+        fn drop(&mut self) {
+            uninstall_capabilities(self.vm);
+            reset_raw_memory_gate_memo();
+        }
+    }
+
+    /// The VM the mock context reports.
+    const MOCK_VM: VmId = VmId::from_raw(0);
+
+    fn policy(mode: CapabilityMode, grants: &str) -> CapabilitySet {
+        let mut set = CapabilitySet::new(MOCK_VM, mode);
+        if !grants.is_empty() {
+            let bad = set.grant_from_list(grants);
+            assert!(bad.is_empty(), "unparseable grants: {bad:?}");
+        }
+        set
+    }
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(tag: &str) -> String {
+        let n = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!(
+                "cratonvm_capgate_{}_{}_{}.bin",
+                std::process::id(),
+                n,
+                tag
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn write_file(path: &str, bytes: &[u8]) {
+        std::fs::write(path, bytes).expect("temp file must be writable");
+    }
+
+    /// How many times the audit recorded `kind` with any scope.
+    fn recorded(kind: CapabilityKind) -> u64 {
+        capability_audit(MOCK_VM)
+            .map(|r| {
+                r.uses
+                    .iter()
+                    .filter(|u| u.capability.kind() == kind)
+                    .map(|u| u.count)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // No policy at all — the configuration every existing test runs in
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_policy_installed_means_the_helpers_are_the_raw_openers() {
+        let _lock = capability_test_lock();
+        uninstall_capabilities(MOCK_VM);
+        reset_raw_memory_gate_memo();
+
+        let ctx = mock_ctx();
+        let path = temp_path("nopolicy");
+        write_file(&path, b"craton");
+
+        let fd = open_read_gated(&ctx, &path).expect("read must succeed with no policy");
+        let mut buf = [0u8; 6];
+        let n = ctx.fd_table().read_bytes(fd, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"craton");
+        let _ = ctx.fd_table().close(fd);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS).is_ok(),
+            "raw memory is ungated when no policy is installed"
+        );
+        assert!(capability_audit(MOCK_VM).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Permissive — allows, and is observably identical to the ungated path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn permissive_allows_a_read_and_changes_nothing_observable() {
+        let ctx = mock_ctx();
+        let path = temp_path("permissive");
+        write_file(&path, b"0123456789");
+
+        // Baseline: the raw opener, no policy installed.
+        let (baseline_bytes, baseline_len) = {
+            let _lock = capability_test_lock();
+            uninstall_capabilities(MOCK_VM);
+            let fd = ctx.fd_table().open_read(&path).unwrap();
+            let mut buf = [0u8; 10];
+            let n = ctx.fd_table().read_bytes(fd, &mut buf).unwrap();
+            let _ = ctx.fd_table().close(fd);
+            (buf, n)
+        };
+
+        // Same operation through the gate, under a Permissive policy with no
+        // grants at all. Same fd semantics, same bytes, same success.
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Permissive, ""));
+        let fd = open_read_gated(&ctx, &path).expect("permissive must allow");
+        let mut buf = [0u8; 10];
+        let n = ctx.fd_table().read_bytes(fd, &mut buf).unwrap();
+        let _ = ctx.fd_table().close(fd);
+
+        assert_eq!(n, baseline_len, "gated read returned a different length");
+        assert_eq!(buf, baseline_bytes, "gated read returned different bytes");
+
+        // And the use was recorded, so the audit report is not silent.
+        assert!(
+            recorded(CapabilityKind::FileRead) >= 1,
+            "permissive must still record the file-read"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn permissive_records_the_normalized_path_scope_and_the_native_call_site() {
+        let ctx = mock_ctx();
+        let path = temp_path("scope");
+        write_file(&path, b"x");
+
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Permissive, ""));
+        let fd = open_read_gated(&ctx, &path).unwrap();
+        let _ = ctx.fd_table().close(fd);
+
+        let report = capability_audit(MOCK_VM).expect("a policy is installed");
+        let row = report
+            .uses
+            .iter()
+            .find(|u| u.capability.kind() == CapabilityKind::FileRead)
+            .expect("file-read must appear in the report");
+        // `#[track_caller]` must carry through the helper: the recorded site is
+        // this test file, not capability_gate's internals.
+        assert!(
+            row.first_site.file.ends_with("capability_gate.rs"),
+            "first site should be the calling native, got {}",
+            row.first_site
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit — allows, records, and tallies what an Enforce flip would refuse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn audit_allows_but_tallies_the_ungranted_use() {
+        let ctx = mock_ctx();
+        let path = temp_path("audit");
+        write_file(&path, b"audit");
+
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Audit, ""));
+        let fd = open_read_gated(&ctx, &path).expect("audit mode must still allow");
+        let _ = ctx.fd_table().close(fd);
+
+        let report = capability_audit(MOCK_VM).expect("a policy is installed");
+        assert_eq!(
+            report.mode,
+            CapabilityMode::Audit,
+            "the report must name the mode it ran in"
+        );
+        assert!(report.total_checks() >= 1, "audit mode must record the use");
+        assert!(
+            report.total_ungranted() >= 1,
+            "with no grants, audit must price the Enforce flip"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn audit_counts_every_raw_memory_access_not_just_the_first() {
+        let ctx = mock_ctx();
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Audit, ""));
+
+        for _ in 0..5 {
+            gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS).expect("audit allows");
+        }
+        assert_eq!(
+            recorded(CapabilityKind::RawMemory),
+            5,
+            "Audit mode takes the Checked arm and must not memoize"
+        );
+    }
+
+    #[test]
+    fn permissive_raw_memory_records_the_capability_then_goes_transparent() {
+        let ctx = mock_ctx();
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Permissive, ""));
+
+        for _ in 0..64 {
+            gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS).expect("permissive allows");
+        }
+        // Present in the report (so the capability is discoverable) but counted
+        // once per thread, which is the documented trade — see the doc comment.
+        assert_eq!(
+            recorded(CapabilityKind::RawMemory),
+            1,
+            "permissive raw-memory is recorded once per thread by design"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Enforce — denies, and a denial has no observable effect
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn enforce_denies_an_ungranted_read() {
+        let ctx = mock_ctx();
+        let path = temp_path("denyread");
+        write_file(&path, b"secret");
+
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, "file-read:/nowhere"));
+        let err = open_read_gated(&ctx, &path).expect_err("enforce must refuse");
+        assert!(
+            matches!(err, FdCapabilityError::Denied(_)),
+            "refusal must be a capability denial, not an I/O error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_denied_read_reserves_no_descriptor() {
+        let ctx = mock_ctx();
+        let path = temp_path("nofd");
+        write_file(&path, b"secret");
+
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, "file-read:/nowhere"));
+        // Two probes of the fd counter around the denial: an fd reserved by the
+        // refused open would show up as a gap between them.
+        let before = ctx.fd_table().open_read(&path).unwrap();
+        let denied = open_read_gated(&ctx, &path);
+        let after = ctx.fd_table().open_read(&path).unwrap();
+        assert!(denied.is_err());
+        assert_eq!(
+            after,
+            before + 1,
+            "the denied open must not have consumed an fd"
+        );
+        let _ = ctx.fd_table().close(before);
+        let _ = ctx.fd_table().close(after);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_denied_write_creates_no_file() {
+        let ctx = mock_ctx();
+        let path = temp_path("nocreate");
+        assert!(!std::path::Path::new(&path).exists());
+
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, "file-write:/nowhere"));
+        let denied = open_write_gated(&ctx, &path, false);
+        assert!(matches!(denied, Err(FdCapabilityError::Denied(_))));
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "a refused write must not have created the file"
+        );
+    }
+
+    #[test]
+    fn enforce_admits_a_granted_path_and_refuses_a_traversal_out_of_it() {
+        let ctx = mock_ctx();
+        let dir = std::env::temp_dir();
+        let root = dir.to_string_lossy().into_owned();
+        let path = temp_path("granted");
+        write_file(&path, b"ok");
+
+        let grants = format!("file-read:{root}");
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, &grants));
+
+        let fd = open_read_gated(&ctx, &path).expect("a file under the granted root is admitted");
+        let _ = ctx.fd_table().close(fd);
+
+        // `..` is resolved before the prefix test, so this is not under the root.
+        let escape = format!("{root}/../etc/passwd");
+        assert!(
+            matches!(
+                open_read_gated(&ctx, &escape),
+                Err(FdCapabilityError::Denied(_))
+            ),
+            "a traversal out of the granted root must be refused, not merely fail to open"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_write_open_needs_both_capabilities() {
+        let ctx = mock_ctx();
+        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        let path = temp_path("rwboth");
+        write_file(&path, b"rw");
+
+        // Read granted, write not.
+        let grants = format!("file-read:{root}");
+        let guard = PolicyGuard::install(policy(CapabilityMode::Enforce, &grants));
+        assert!(
+            matches!(
+                open_read_write_gated(&ctx, &path, false),
+                Err(FdCapabilityError::Denied(_))
+            ),
+            "an fd that can write needs file-write too"
+        );
+        drop(guard);
+
+        let grants = format!("file-read:{root};file-write:{root}");
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, &grants));
+        let fd = open_read_write_gated(&ctx, &path, false).expect("both granted");
+        let _ = ctx.fd_table().close(fd);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enforce_denies_an_ungranted_bind_and_binds_nothing() {
+        let ctx = mock_ctx();
+        let _guard = PolicyGuard::install(policy(
+            CapabilityMode::Enforce,
+            "network:127.0.0.1:9000-9100",
+        ));
+        // Port 0 is outside the granted range.
+        let denied = open_tcp_listener_gated(&ctx, "127.0.0.1:0");
+        assert!(
+            matches!(denied, Err(FdCapabilityError::Denied(_))),
+            "bind outside the granted port range must be refused"
+        );
+        assert!(
+            recorded(CapabilityKind::Network) >= 1,
+            "the refused bind must still be recorded"
+        );
+    }
+
+    #[test]
+    fn enforce_denies_raw_memory_and_keeps_denying_it() {
+        let ctx = mock_ctx();
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, ""));
+        for _ in 0..3 {
+            let err = gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS)
+                .expect_err("enforce with no raw-memory grant must refuse");
+            // The refusal is a SecurityException-shaped failure.
+            assert!(
+                format!("{err:?}").contains("SecurityException"),
+                "denial must map to SecurityException, got {err:?}"
+            );
+        }
+        assert_eq!(
+            recorded(CapabilityKind::RawMemory),
+            3,
+            "Enforce must not memoize the verdict away"
+        );
+    }
+
+    #[test]
+    fn a_raw_memory_grant_admits_the_unsafe_address_scope() {
+        let ctx = mock_ctx();
+        let grants = format!("raw-memory:{RAW_MEMORY_UNSAFE_ADDRESS}");
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Enforce, &grants));
+        gate_raw_memory(&ctx, RAW_MEMORY_UNSAFE_ADDRESS).expect("the exact scope is granted");
+    }
+
+    #[test]
+    fn process_spawn_and_foreign_gates_record_their_scopes() {
+        let ctx = mock_ctx();
+        let _guard = PolicyGuard::install(policy(CapabilityMode::Audit, ""));
+
+        gate_process_spawn(&ctx, "/bin/sh").expect("audit allows");
+        gate_foreign_upcall(&ctx, "com.example.Callback::onEvent").expect("audit allows");
+        gate_foreign_downcall(&ctx, "snprintf").expect("audit allows");
+        gate_network(&ctx, "example.invalid:443").expect("audit allows");
+
+        let report = capability_audit(MOCK_VM).unwrap();
+        let grants = report.suggested_grants();
+        assert!(grants.contains("process-spawn:"), "{grants}");
+        assert!(
+            grants.contains("foreign-upcall:com.example.Callback::onEvent"),
+            "{grants}"
+        );
+        assert!(grants.contains("foreign-downcall:snprintf"), "{grants}");
+        assert!(grants.contains("network:example.invalid:443"), "{grants}");
+    }
+}

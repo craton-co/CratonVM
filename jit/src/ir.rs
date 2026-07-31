@@ -1397,7 +1397,15 @@ impl Graph {
     }
 
     /// Build a use-count vector: `uses[id]` = number of nodes that reference `id` as an input.
+    ///
+    /// Reads the maintained [`UseLists`] when they are current, and otherwise
+    /// falls back to the historical scan. Both produce the same vector: an
+    /// entry per referencing input *slot*, snapshot slots excluded, edges to
+    /// [`NO_NODE`] or to an id past the end of the arena ignored.
     pub fn use_counts(&self) -> Vec<u32> {
+        if self.use_lists_current() {
+            return self.uses.users.iter().map(|u| u.len() as u32).collect();
+        }
         let mut counts = vec![0u32; self.nodes.len()];
         for node in &self.nodes {
             for &inp in &node.inputs {
@@ -1407,6 +1415,455 @@ impl Graph {
             }
         }
         counts
+    }
+
+    // ── Incremental def-use edges ────────────────────────────────────
+
+    /// True when the maintained [`UseLists`] describe this graph and may be
+    /// consulted.
+    ///
+    /// Cheap enough to call on every mutation: a flag, a thread-local read and
+    /// two length comparisons. `sp_len` catches snapshots pushed through the
+    /// public `safepoints` field; the epoch catches edges written through the
+    /// public `Node::inputs` field.
+    #[inline]
+    pub fn use_lists_valid(&self) -> bool {
+        self.use_lists_current()
+    }
+
+    #[inline]
+    fn use_lists_current(&self) -> bool {
+        self.uses.tracking
+            && self.uses.valid
+            && self.uses.epoch == edge_epoch()
+            && self.uses.users.len() == self.nodes.len()
+            && self.uses.sp_len == self.safepoints.len()
+    }
+
+    /// Turn def-use maintenance on or off. On by default.
+    ///
+    /// Turning it off drops the derived state and sends every mutation down the
+    /// historical full-scan path — the escape hatch if a caller ever needs the
+    /// pre-incremental behaviour bit for bit.
+    pub fn set_use_tracking(&mut self, on: bool) {
+        self.uses.tracking = on;
+        if !on {
+            self.uses.discard();
+        }
+    }
+
+    /// Derive the def-use edges from a full scan of the graph.
+    ///
+    /// `O(nodes + edges + snapshot slots)`. Called automatically whenever a
+    /// mutation finds the lists stale; public so a pass that is about to do
+    /// many rewrites can pay for it up front.
+    pub fn rebuild_use_lists(&mut self) {
+        let num_nodes = self.nodes.len();
+        self.uses.tracking = true;
+        self.uses.users = vec![Inputs::new(); num_nodes];
+        self.uses.sp_users = vec![Vec::new(); num_nodes];
+        self.uses.dangling = false;
+        {
+            let (nodes, uses) = (&self.nodes, &mut self.uses);
+            for (uid, node) in nodes.iter().enumerate() {
+                for &inp in node.inputs.as_slice() {
+                    uses.record_input(inp, uid as NodeId, num_nodes);
+                }
+            }
+        }
+        {
+            let (safepoints, uses) = (&self.safepoints, &mut self.uses);
+            for (si, sp) in safepoints.iter().enumerate() {
+                for (k, &v) in sp.locals.iter().enumerate() {
+                    uses.record_slot(
+                        v,
+                        SafepointSlot {
+                            snapshot: si as u32,
+                            kind: SlotKind::Local,
+                            slot: k as u32,
+                        },
+                        num_nodes,
+                    );
+                }
+                for (k, &v) in sp.stack.iter().enumerate() {
+                    uses.record_slot(
+                        v,
+                        SafepointSlot {
+                            snapshot: si as u32,
+                            kind: SlotKind::Stack,
+                            slot: k as u32,
+                        },
+                        num_nodes,
+                    );
+                }
+            }
+        }
+        self.uses.sp_len = self.safepoints.len();
+        self.uses.valid = true;
+        self.uses.rebuilds += 1;
+        self.uses.epoch = edge_epoch();
+    }
+
+    /// Make the def-use edges current, deriving them if they are not.
+    pub fn ensure_use_lists(&mut self) {
+        if self.uses.tracking && !self.use_lists_current() {
+            self.rebuild_use_lists();
+        }
+    }
+
+    /// Number of input slots naming `id`, in O(1) when the lists are current.
+    ///
+    /// The single-node form of [`Graph::use_counts`]; same definition, same
+    /// exclusions (snapshot slots do not count).
+    pub fn use_count(&self, id: NodeId) -> u32 {
+        if self.use_lists_current() {
+            return self
+                .uses
+                .users
+                .get(id as usize)
+                .map_or(0, |u| u.len() as u32);
+        }
+        if id == NO_NODE {
+            return 0;
+        }
+        let mut n = 0u32;
+        for node in &self.nodes {
+            for &inp in &node.inputs {
+                if inp == id {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// The distinct nodes that reference `id` as an input, in no particular
+    /// order.
+    pub fn users_of(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = Vec::new();
+        if self.use_lists_current() {
+            if let Some(list) = self.uses.users.get(id as usize) {
+                for &u in list.as_slice() {
+                    if !out.contains(&u) {
+                        out.push(u);
+                    }
+                }
+            }
+            return out;
+        }
+        if id == NO_NODE {
+            return out;
+        }
+        for (uid, node) in self.nodes.iter().enumerate() {
+            if node.inputs.as_slice().contains(&id) {
+                out.push(uid as NodeId);
+            }
+        }
+        out
+    }
+
+    /// The snapshot slots that reference `id`.
+    pub fn safepoint_users_of(&self, id: NodeId) -> Vec<SafepointSlot> {
+        let mut out: Vec<SafepointSlot> = Vec::new();
+        if id == NO_NODE {
+            return out;
+        }
+        if self.use_lists_current() {
+            if let Some(list) = self.uses.sp_users.get(id as usize) {
+                // Superset: re-check each slot's current value.
+                for &r in list {
+                    let live = self.safepoints.get(r.snapshot as usize).and_then(|sp| {
+                        match r.kind {
+                            SlotKind::Local => sp.locals.get(r.slot as usize),
+                            SlotKind::Stack => sp.stack.get(r.slot as usize),
+                        }
+                        .copied()
+                    });
+                    if live == Some(id) && !out.contains(&r) {
+                        out.push(r);
+                    }
+                }
+            }
+            return out;
+        }
+        for (si, sp) in self.safepoints.iter().enumerate() {
+            for (k, &v) in sp.locals.iter().enumerate() {
+                if v == id {
+                    out.push(SafepointSlot {
+                        snapshot: si as u32,
+                        kind: SlotKind::Local,
+                        slot: k as u32,
+                    });
+                }
+            }
+            for (k, &v) in sp.stack.iter().enumerate() {
+                if v == id {
+                    out.push(SafepointSlot {
+                        snapshot: si as u32,
+                        kind: SlotKind::Stack,
+                        slot: k as u32,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    // ── Tracked edge mutation ────────────────────────────────────────
+    //
+    // The write half of the def-use invariant. Every one of these keeps the
+    // lists current; the equivalent direct write through `Node::inputs` or
+    // `Graph::safepoints` is still legal but costs a rebuild.
+
+    /// Overwrite input slot `idx` of `node`. `false` when the node or the slot
+    /// does not exist.
+    pub fn set_input(&mut self, node: NodeId, idx: usize, new: NodeId) -> bool {
+        if !self.is_valid_id(node) || idx >= self.nodes[node as usize].inputs.len() {
+            return false;
+        }
+        let current = self.use_lists_current();
+        let num_nodes = self.nodes.len();
+        let old = {
+            let slots = self.nodes[node as usize].inputs.slots_mut();
+            let old = slots[idx];
+            slots[idx] = new;
+            old
+        };
+        if current {
+            if old != NO_NODE && (old as usize) < num_nodes {
+                self.uses.users[old as usize].swap_remove_first_untracked(node);
+            }
+            self.uses.record_input(new, node, num_nodes);
+            self.uses.epoch = edge_epoch();
+        } else {
+            bump_edge_epoch();
+        }
+        true
+    }
+
+    /// Append an input edge to `node`. `false` when the node does not exist.
+    pub fn push_input(&mut self, node: NodeId, new: NodeId) -> bool {
+        if !self.is_valid_id(node) {
+            return false;
+        }
+        let current = self.use_lists_current();
+        let num_nodes = self.nodes.len();
+        self.nodes[node as usize].inputs.push_untracked(new);
+        if current {
+            self.uses.record_input(new, node, num_nodes);
+            self.uses.epoch = edge_epoch();
+        } else {
+            bump_edge_epoch();
+        }
+        true
+    }
+
+    /// Replace the whole edge list of `node`. `false` when it does not exist.
+    pub fn set_inputs(&mut self, node: NodeId, inputs: impl Into<Inputs>) -> bool {
+        if !self.is_valid_id(node) {
+            return false;
+        }
+        let current = self.use_lists_current();
+        let num_nodes = self.nodes.len();
+        let new_inputs = inputs.into();
+        let old = std::mem::replace(&mut self.nodes[node as usize].inputs, new_inputs);
+        if current {
+            for &inp in old.as_slice() {
+                if inp != NO_NODE && (inp as usize) < num_nodes {
+                    self.uses.users[inp as usize].swap_remove_first_untracked(node);
+                }
+            }
+            let (nodes, uses) = (&self.nodes, &mut self.uses);
+            for &inp in nodes[node as usize].inputs.as_slice() {
+                uses.record_input(inp, node, num_nodes);
+            }
+            self.uses.epoch = edge_epoch();
+        } else {
+            bump_edge_epoch();
+        }
+        true
+    }
+
+    /// Drop every input edge of `node` (without marking it dead). `false` when
+    /// it does not exist.
+    pub fn clear_inputs(&mut self, node: NodeId) -> bool {
+        self.set_inputs(node, Inputs::new())
+    }
+
+    /// Append a safepoint snapshot, recording the node references it carries.
+    pub fn push_safepoint(&mut self, sp: SafepointSnapshot) {
+        let current = self.use_lists_current();
+        let si = self.safepoints.len() as u32;
+        self.safepoints.push(sp);
+        if current {
+            let num_nodes = self.nodes.len();
+            let (safepoints, uses) = (&self.safepoints, &mut self.uses);
+            let snap = &safepoints[si as usize];
+            for (k, &v) in snap.locals.iter().enumerate() {
+                uses.record_slot(
+                    v,
+                    SafepointSlot {
+                        snapshot: si,
+                        kind: SlotKind::Local,
+                        slot: k as u32,
+                    },
+                    num_nodes,
+                );
+            }
+            for (k, &v) in snap.stack.iter().enumerate() {
+                uses.record_slot(
+                    v,
+                    SafepointSlot {
+                        snapshot: si,
+                        kind: SlotKind::Stack,
+                        slot: k as u32,
+                    },
+                    num_nodes,
+                );
+            }
+            self.uses.sp_len = self.safepoints.len();
+            self.uses.epoch = edge_epoch();
+        }
+    }
+
+    /// Overwrite one snapshot slot. `false` when the snapshot or slot does not
+    /// exist.
+    ///
+    /// Use this rather than `graph.safepoints[i].locals[k] = v` whenever the
+    /// new value is a real node id: a direct write that *installs* a reference
+    /// is the one edit the def-use edges cannot notice.
+    pub fn set_safepoint_slot(
+        &mut self,
+        snapshot: usize,
+        kind: SlotKind,
+        slot: usize,
+        new: NodeId,
+    ) -> bool {
+        let current = self.use_lists_current();
+        let num_nodes = self.nodes.len();
+        let sp = match self.safepoints.get_mut(snapshot) {
+            Some(sp) => sp,
+            None => return false,
+        };
+        let cell = match kind {
+            SlotKind::Local => sp.locals.get_mut(slot),
+            SlotKind::Stack => sp.stack.get_mut(slot),
+        };
+        let cell = match cell {
+            Some(c) => c,
+            None => return false,
+        };
+        *cell = new;
+        if current {
+            self.uses.record_slot(
+                new,
+                SafepointSlot {
+                    snapshot: snapshot as u32,
+                    kind,
+                    slot: slot as u32,
+                },
+                num_nodes,
+            );
+            self.uses.epoch = edge_epoch();
+        }
+        // The stale entry left on the previous value is harmless: every rewrite
+        // re-checks the slot before touching it (see `UseLists`).
+        true
+    }
+
+    // ── Verification / instrumentation ───────────────────────────────
+
+    /// Re-derive the def-use edges by a full scan and compare them with the
+    /// maintained ones.
+    ///
+    /// `Ok(())` when they agree — or when the lists are not current, in which
+    /// case they make no claim and the next mutation re-derives them anyway.
+    /// Cheap to call from a test or from `ir_verify`; it allocates two
+    /// scratch vectors and touches every edge once.
+    ///
+    /// Checked:
+    /// - the derived vectors are sized to the arena;
+    /// - `users[i]` is exactly the multiset of input slots naming `i`
+    ///   (so `users[i].len()` is the `use_counts` entry for `i`);
+    /// - `sp_users[i]` *contains* every snapshot slot naming `i`. Extra entries
+    ///   are tolerated by design — see [`UseLists`] — because a slot cleared
+    ///   through the public `safepoints` field cannot notify the list, and a
+    ///   stale entry only ever costs a re-check.
+    pub fn verify_use_lists(&self) -> Result<(), String> {
+        if !self.use_lists_current() {
+            return Ok(());
+        }
+        let num_nodes = self.nodes.len();
+        if self.uses.users.len() != num_nodes || self.uses.sp_users.len() != num_nodes {
+            return Err(format!(
+                "use lists are sized {} / {} for a {}-node graph",
+                self.uses.users.len(),
+                self.uses.sp_users.len(),
+                num_nodes
+            ));
+        }
+
+        let mut expect_users: Vec<Vec<NodeId>> = vec![Vec::new(); num_nodes];
+        for (uid, node) in self.nodes.iter().enumerate() {
+            for &inp in node.inputs.as_slice() {
+                if inp != NO_NODE && (inp as usize) < num_nodes {
+                    expect_users[inp as usize].push(uid as NodeId);
+                }
+            }
+        }
+        for (id, expect) in expect_users.iter_mut().enumerate() {
+            let mut got: Vec<NodeId> = self.uses.users[id].as_slice().to_vec();
+            got.sort_unstable();
+            expect.sort_unstable();
+            if got != *expect {
+                return Err(format!(
+                    "use list for node {id} is {got:?}, the graph says {expect:?}"
+                ));
+            }
+        }
+
+        for (si, sp) in self.safepoints.iter().enumerate() {
+            let halves = [
+                (SlotKind::Local, &sp.locals),
+                (SlotKind::Stack, &sp.stack),
+            ];
+            for (kind, values) in halves {
+                for (k, &v) in values.iter().enumerate() {
+                    if v == NO_NODE || (v as usize) >= num_nodes {
+                        continue;
+                    }
+                    let want = SafepointSlot {
+                        snapshot: si as u32,
+                        kind,
+                        slot: k as u32,
+                    };
+                    if !self.uses.sp_users[v as usize].contains(&want) {
+                        return Err(format!(
+                            "safepoint slot {want:?} names node {v}, but is missing \
+                             from its use list"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Input slots examined by [`Graph::replace_all_uses`] since the counter
+    /// was last reset. The measurement hook — see the def-use tests.
+    pub fn use_list_slots_examined(&self) -> u64 {
+        self.uses.examined
+    }
+
+    /// Full rebuilds of the def-use edges since the counter was last reset.
+    pub fn use_list_rebuilds(&self) -> u64 {
+        self.uses.rebuilds
+    }
+
+    /// Zero the instrumentation counters.
+    pub fn reset_use_list_stats(&mut self) {
+        self.uses.examined = 0;
+        self.uses.rebuilds = 0;
     }
 }
 
@@ -1513,7 +1970,12 @@ impl IrBuilder {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: UseLists::new(),
         };
+        // The builder appends: every edge it writes goes through the tracked
+        // mutators, so the def-use edges are maintained from an empty graph
+        // rather than derived by a scan once optimization starts.
+        graph.rebuild_use_lists();
 
         // Node 0: Start
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
@@ -1829,7 +2291,7 @@ impl IrBuilder {
         let region = state.merge_id;
         // The region's control inputs are the forward-entry ctrls so far; the
         // back-edge ctrl is appended in patch_loop_backedge.
-        self.graph.nodes[region as usize].inputs = state.ctrl_inputs.clone();
+        self.graph.set_inputs(region, state.ctrl_inputs.clone());
         self.ctrl = region;
 
         // Memory phi: [region, entry_mem_0, …]; back-edge mem appended later.
@@ -1901,7 +2363,7 @@ impl IrBuilder {
         };
         let region = self.merges[&target_pc].merge_id;
         let back_ctrl = self.ctrl;
-        self.graph.nodes[region as usize].inputs.push(back_ctrl);
+        self.graph.push_input(region, back_ctrl);
 
         // Appending the back-edge value completes the φ's input list, so its
         // type is re-derived from the *whole* merge (`retype_phi`): the type
@@ -1909,19 +2371,19 @@ impl IrBuilder {
         for (i, &phi) in lp.local_phis.iter().enumerate() {
             if let Some(phi) = node_id_opt(phi) {
                 let v = self.locals.get(i).copied().unwrap_or(NO_NODE);
-                self.graph.nodes[phi as usize].inputs.push(v);
+                self.graph.push_input(phi, v);
                 self.retype_phi(phi);
             }
         }
         for (i, &phi) in lp.stack_phis.iter().enumerate() {
             if let Some(phi) = node_id_opt(phi) {
                 let v = self.stack.get(i).copied().unwrap_or(NO_NODE);
-                self.graph.nodes[phi as usize].inputs.push(v);
+                self.graph.push_input(phi, v);
                 self.retype_phi(phi);
             }
         }
         if let Some(mem_phi) = node_id_opt(lp.mem_phi) {
-            self.graph.nodes[mem_phi as usize].inputs.push(self.mem);
+            self.graph.push_input(mem_phi, self.mem);
         }
         // Record this back-edge as a predecessor for completeness (so any later
         // consumer that scans MergeState sees the right pred count).
@@ -1943,7 +2405,7 @@ impl IrBuilder {
 
         // Update merge node inputs
         let merge_id = state.merge_id;
-        self.graph.nodes[merge_id as usize].inputs = state.ctrl_inputs.clone();
+        self.graph.set_inputs(merge_id, state.ctrl_inputs.clone());
         self.ctrl = merge_id;
 
         // Create phi for memory
@@ -2126,7 +2588,7 @@ impl IrBuilder {
             // so it is skipped. These snapshots are emit-and-discard until the
             // lowerer resolves them — they do not affect codegen on their own.
             if self.ctrl_opt().is_some() {
-                self.graph.safepoints.push(SafepointSnapshot {
+                self.graph.push_safepoint(SafepointSnapshot {
                     bci: pc,
                     locals: self.locals.clone(),
                     stack: self.stack.clone(),
@@ -4296,6 +4758,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: UseLists::new(),
         };
         let a = graph.add(Op::Const(1), IrType::Int, vec![], None);
         let b = graph.add(Op::Const(2), IrType::Int, vec![], None);
@@ -4715,6 +5178,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: UseLists::new(),
         }
     }
 
