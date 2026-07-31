@@ -93,42 +93,29 @@ const SF_LINENUMBER: usize = 3;
 const SF_BCI: usize = 4;
 const SF_DECL_INTERNAL: usize = 5;
 
-/// Slot 6 of the 8-slot `java/lang/StackWalker$StackFrame` carrier built by
-/// [`crate::phases_late::reflect_invoke::populate_stack_frame`]: the declaring
-/// class's `Class` mirror, resolved eagerly from the frame's own `ClassId`.
-/// Only meaningful on that carrier — always read it behind an
-/// [`as_class_mirror`] check, since the 6-slot `StackFrameInfo` synthetic has
-/// no such slot and the real JDK class holds `ste` there.
-const SF_DECL_MIRROR: usize = 6;
-
-/// Return `value` iff it is a `java.lang.Class` mirror.
+/// `java.lang.ClassFrameInfo.RETAIN_CLASS_REF` — the bit of the frame's
+/// `flags` field that records whether the `StackWalker` that produced the
+/// frame was created with `Option.RETAIN_CLASS_REFERENCE`.
 ///
-/// The frame carriers in this VM disagree about which slot (if any) holds the
-/// declaring class, and two of them hold something else entirely in the slots
-/// the others use for it. Type-checking the value rather than trusting the
-/// slot is what lets one accessor serve all of them.
-fn as_class_mirror(ctx: &mut dyn NativeContext, value: Value) -> Option<Value> {
-    let Value::Object(Some(obj)) = value else {
-        return None;
-    };
-    let class_id = ctx.class_id_of_object(obj);
-    match ctx.class_name_of_id(class_id).as_deref() {
-        Some("java/lang/Class") => Some(Value::Object(Some(obj))),
+/// The real `ClassFrameInfo(StackWalker)` constructor copies it out of the
+/// walker; `populate_sfi` does the same via [`walker_retains_class_ref`].
+/// JDK 25's `ClassFrameInfo.RETAIN_CLASS_REF_BIT` is `1 << 27`. The low
+/// 24 bits are reserved for the member-info flags, including
+/// `Modifier.NATIVE` (`0x100`).
+pub(crate) const SF_FLAG_RETAIN_CLASS_REF: i32 = 0x0800_0000;
+
+/// Return the real-JDK carrier's RETAIN_CLASS_REFERENCE state when the
+/// receiver has a `ClassFrameInfo.flags` field. Synthetic StackFrame carriers
+/// do not have that field and return `None`.
+pub(crate) fn class_frame_retains_class_ref(
+    ctx: &mut dyn NativeContext,
+    frame: cratonvm_types::ObjectRef,
+) -> Option<bool> {
+    match ctx.get_field_by_name(frame, "flags") {
+        Value::Int(flags) => Some((flags & SF_FLAG_RETAIN_CLASS_REF) != 0),
         _ => None,
     }
 }
-
-/// `java.lang.ClassFrameInfo.RETAIN_CLASS_REF` — the bit of the frame's
-/// `flags` field that records whether the `StackWalker` that produced the frame
-/// was created with `Option.RETAIN_CLASS_REFERENCE`.
-///
-/// JDK 25's `ClassFrameInfo(StackWalker)` constructor stores
-/// `RETAIN_CLASS_REF_BIT` as `1 << 27`, and `retainClassRef()` tests that exact
-/// mask. The lower 24 bits are member-information flags, including
-/// `java.lang.reflect.Modifier` bits (`0x100` = `Modifier.NATIVE`). Using bit
-/// zero here makes a retained frame look disabled to the JDK and causes
-/// `getDeclaringClass()` to throw `UnsupportedOperationException`.
-const SF_FLAG_RETAIN_CLASS_REF: i32 = 0x0800_0000;
 
 /// Read the `RETAIN_CLASS_REFERENCE` setting of the `StackWalker` that owns an
 /// `AbstractStackWalker` receiver, so `populate_sfi` can record it in each
@@ -184,6 +171,21 @@ fn walker_retains_class_ref(
 /// (see [`walker_retains_class_ref`]); it lands in the frame's `flags` word so
 /// `ClassFrameInfo.ensureRetainClassRefEnabled()` can answer honestly instead
 /// of reading a hard-coded `0` and rejecting every frame.
+/// The p59 `StackWalker.walk`/`forEach` natives build this carrier
+/// (`phases_late::reflect_invoke::populate_stack_frame`). It is a bare
+/// synthetic whose slots are addressed by index, not by name.
+const P59_STACK_FRAME: &str = "java/lang/StackWalker$StackFrame";
+
+/// Slot of the eagerly-resolved declaring-class mirror on [`P59_STACK_FRAME`].
+const P59_SF_DECL_MIRROR: usize = 6;
+
+/// True when `obj` is a `java.lang.Class` mirror rather than, say, the
+/// `ResolvedMethodName` a real-JDK `ClassFrameInfo` can hold.
+fn is_class_mirror(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+        .is_some_and(|n| n == "java/lang/Class")
+}
+
 fn populate_sfi(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,
@@ -203,6 +205,12 @@ fn populate_sfi(
     let cid = entry
         .class_id
         .or_else(|| ctx.class_id_by_name(&entry.class_name));
+    if cid.is_none() && crate::nbflags().sfi_null_trace {
+        eprintln!(
+            "[SFI-NULL-TRACE populate] no ClassId for frame {}.{} (entry.class_id={:?}, by-name lookup also missed)",
+            entry.class_name, entry.method_name, entry.class_id
+        );
+    }
     let dotted = match cid {
         Some(c) => crate::lang_class::dotted_class_name(c, &entry.class_name),
         None => std::sync::Arc::from(entry.class_name.replace('/', ".")),
@@ -848,6 +856,25 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // This method is specified to be available only when the walker
+            // requested RETAIN_CLASS_REFERENCE.  `populate_sfi` records that
+            // option on every frame, so do not let the native override bypass
+            // the JDK guard that the bytecode normally executes first.
+            if matches!(class_frame_retains_class_ref(ctx, this), Some(false)) {
+                return Err(MethodCallFailed::from(
+                    RuntimeError::UnsupportedOperationException {
+                        message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+                    },
+                ));
+            }
+            // Same ordering rule as `declaring_class_native`: the mirror
+            // `populate_sfi` resolved from the frame's own ClassId outranks a
+            // fresh, loader-blind, ambiguity-strict by-name lookup.
+            if let Value::Object(Some(m)) = ctx.get_field_by_name(this, "classOrMemberName") {
+                if is_class_mirror(ctx, m) {
+                    return Ok(Some(Value::Object(Some(m))));
+                }
+            }
             let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
@@ -1081,48 +1108,60 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        // Prefer the mirror `populate_sfi` wrote into `classOrMemberName`.
-        // That write came from the frame's OWN `ClassId`, so it names the exact
-        // copy of the class the frame is executing. Re-deriving the class from
-        // the internal name instead goes through `find_unique_class_by_name`,
-        // which answers `None` whenever two loaders have their own copy of the
-        // same name -- routine under Spring Boot's `@WithResource` /
-        // `ClassPathOverrides` forked loaders (see
-        // reference_multiple_class_copies_are_normal_under_isolating_loaders),
-        // and the reason log4j2's `StackLocator.getCallerClass` NPE'd on a null
-        // `getDeclaringClass()` for `AbstractEnvironment`.
-        //
-        // Read it through the object's own layout (`get_field_by_name`), not a
-        // name-keyed `ClassFrameInfo` slot lookup: these frames are synthetic
-        // allocations whose slot numbering need not match the real JDK class.
-        // Guard on the value actually being a `Class` -- a real-JDK-built
-        // `ClassFrameInfo` can hold a `ResolvedMethodName` here instead.
-        // (Read the field into a local first: `f(ctx, ctx.get(..))` borrows
-        // `ctx` both mutably and immutably in one expression.)
-        let class_or_member = ctx.get_field_by_name(this, "classOrMemberName");
-        if let Some(mirror) = as_class_mirror(ctx, class_or_member) {
-            return Ok(Some(mirror));
+        // Keep the package-private bridge aligned with the public accessor:
+        // callers that arrive through ClassFrameInfo must not bypass the
+        // RETAIN_CLASS_REFERENCE contract either.
+        if matches!(class_frame_retains_class_ref(ctx, this), Some(false)) {
+            return Err(MethodCallFailed::from(
+                RuntimeError::UnsupportedOperationException {
+                    message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+                },
+            ));
         }
-        // Next: slot 6 of the 8-slot `StackWalker$StackFrame` carrier that
-        // `phases_late::reflect_invoke::populate_stack_frame` builds -- the
-        // *other* frame carrier in this VM, and the one `StackWalker.walk`
-        // actually produces in real-JDK mode. It stores the declaring-class
-        // mirror there, eagerly resolved from the frame's own `ClassId`. This
-        // registration shadows that module's own slot-6 accessor for
-        // `StackWalker$StackFrame.getDeclaringClass`, so without reading it
-        // here the mirror was simply never consulted.
+        // The mirror `populate_sfi` already resolved wins, and it is read
+        // BY NAME off this carrier rather than through a `resolve_field_index`
+        // on `java/lang/ClassFrameInfo` (which needs that class to be loaded
+        // and unambiguous just to compute a slot).
         //
-        // The `as_class_mirror` guard is what makes this safe for the other
-        // carriers: a 6-slot `populate_sfi` frame has no slot 6 at all, and a
-        // real-JDK `StackFrameInfo` holds its `ste` (a `StackTraceElement`)
-        // there -- neither is a `Class`, so neither is returned.
-        if ctx.object_num_fields(this) > SF_DECL_MIRROR {
-            let slot6 = ctx.get_field(this, SF_DECL_MIRROR);
-            if let Some(mirror) = as_class_mirror(ctx, slot6) {
-                return Ok(Some(mirror));
+        // It used to be the other way round -- `SF_DECL_INTERNAL` +
+        // `class_id_by_name` first, this only as a fallback -- and that is
+        // unsound for exactly the reason `StackTraceEntry::class_id`'s doc
+        // comment gives: `class_id_by_name` is `find_unique_class_by_name`, so
+        // it is both loader-blind AND ambiguity-strict, answering `None` the
+        // moment two loaders define the name. Under
+        // `@CompileWithForkedClassLoader` that is the NORMAL state for every
+        // non-JDK class, log4j-api's `StackLocator` included: its own frame's
+        // `getDeclaringClass()` came back null, `LogFactory.getLog` NPE'd
+        // inside `AbstractEnvironment`'s field initialiser, and the swallowed
+        // failure left Spring running on a synthetic Environment whose
+        // `logger` was null. `populate_sfi` prefers the frame's OWN ClassId
+        // precisely so this never has to guess; it just was not being asked.
+        if let Value::Object(Some(m)) = ctx.get_field_by_name(this, "classOrMemberName") {
+            // Only a Class mirror. A real-JDK-built `ClassFrameInfo` can hold a
+            // `ResolvedMethodName` here, which is not what this returns.
+            if is_class_mirror(ctx, m) {
+                return Ok(Some(Value::Object(Some(m))));
             }
         }
-        // Next: the internal-name slot we always populate.
+        // This native is registered for the p59 `StackWalker$StackFrame`
+        // carrier as well (see `register_p59_stackwalker`), and that one is a
+        // bare synthetic with UNNAMED slots -- its eagerly-resolved mirror
+        // lives in slot 6, so the `classOrMemberName` read above cannot see
+        // it. Without this arm the carrier fell all the way through to the
+        // by-name lookup and answered null for every frame whose class two
+        // loaders define.
+        if ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .is_some_and(|n| n == P59_STACK_FRAME)
+            && ctx.object_num_fields(this) > P59_SF_DECL_MIRROR
+        {
+            if let Value::Object(Some(m)) = ctx.get_field(this, P59_SF_DECL_MIRROR) {
+                if is_class_mirror(ctx, m) {
+                    return Ok(Some(Value::Object(Some(m))));
+                }
+            }
+        }
+        // Only then the internal-name slot, resolved by name.
         if let Value::Object(Some(s)) = ctx.get_field(this, SF_DECL_INTERNAL) {
             let internal = ctx.read_string(s).unwrap_or_default();
             if !internal.is_empty() {
@@ -1137,8 +1176,6 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 }
             }
         }
-        // Fall back: real-JDK layout has `classOrMemberName` at the
-        // first ClassFrameInfo slot. Resolve by name and read it.
         if let Some(idx) = ctx.resolve_field_index("java/lang/ClassFrameInfo", "classOrMemberName")
         {
             let v = ctx.get_field(this, idx);
@@ -1151,29 +1188,8 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::from("<no SF_DECL_INTERNAL>"),
             };
-            let com = match ctx.get_field_by_name(this, "classOrMemberName") {
-                Value::Object(Some(o)) => {
-                    let cid = ctx.class_id_of_object(o);
-                    format!("obj of {:?}", ctx.class_name_of_id(cid))
-                }
-                Value::Object(None) => String::from("null"),
-                other => format!("{other:?}"),
-            };
-            let fields = ctx.object_num_fields(this);
-            let slot6 = if fields > SF_DECL_MIRROR {
-                match ctx.get_field(this, SF_DECL_MIRROR) {
-                    Value::Object(Some(o)) => {
-                        let cid = ctx.class_id_of_object(o);
-                        format!("obj of {:?}", ctx.class_name_of_id(cid))
-                    }
-                    Value::Object(None) => String::from("null"),
-                    other => format!("{other:?}"),
-                }
-            } else {
-                String::from("<absent>")
-            };
             eprintln!(
-                "[SFI-NULL-TRACE] declaringClass() returning NULL for frame internal={internal:?} resolved_cid={:?} classOrMemberName={com} fields={fields} slot6={slot6}",
+                "[SFI-NULL-TRACE] declaringClass() returning NULL for frame internal={internal:?} resolved_cid={:?}",
                 if internal.is_empty() { None } else { ctx.class_id_by_name(&internal) }
             );
         }
@@ -1193,12 +1209,6 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "java/lang/ClassFrameInfo",
-        "getDeclaringClass",
-        "()Ljava/lang/Class;",
-        declaring_class_native,
-    );
-    registry.register(
-        "java/lang/StackWalker$StackFrame",
         "getDeclaringClass",
         "()Ljava/lang/Class;",
         declaring_class_native,
@@ -1358,11 +1368,11 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            let Value::Int(flags) = ctx.get_field_by_name(this, "flags") else {
+            let Some(retains_class_ref) = class_frame_retains_class_ref(ctx, this) else {
                 // No `flags` field on this carrier — fail open.
                 return Ok(None);
             };
-            if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
+            if !retains_class_ref {
                 return Err(MethodCallFailed::from(
                     RuntimeError::UnsupportedOperationException {
                         message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
@@ -1384,6 +1394,12 @@ mod tests {
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
+
+    #[test]
+    fn retain_class_reference_bit_matches_jdk_25_class_frame_info_layout() {
+        assert_eq!(SF_FLAG_RETAIN_CLASS_REF, 1 << 27);
+        assert_eq!(SF_FLAG_RETAIN_CLASS_REF & 0x00ff_ffff, 0);
+    }
 
     #[test]
     fn register_lang_stackwalker_adds_natives() {

@@ -53,12 +53,21 @@ loader-exact mirror sitting in slot 6 was never consulted.
 
 **Fix** (`native-builtins/src/lang_stackwalker.rs`): `declaring_class_native`
 now prefers the per-frame mirror — `classOrMemberName` read through the
-object's own layout, then slot 6 — before falling back to the by-name lookup.
-Both reads go through a new `as_class_mirror` helper that returns the value
-only if it really is a `java.lang.Class`, which is what makes one accessor safe
-for all three carriers (the 6-slot synthetic has no slot 6; a real-JDK
-`StackFrameInfo` holds its `ste` there; a real `ClassFrameInfo` can hold a
-`ResolvedMethodName` in `classOrMemberName`).
+object's own layout, then the p59 carrier's slot 6 — before falling back to the
+by-name lookup, with a `Class`-mirror type check on both reads. That check is
+what makes one accessor safe for all three carriers (the 6-slot synthetic has
+no slot 6; a real-JDK `StackFrameInfo` holds its `ste` there; a real
+`ClassFrameInfo` can hold a `ResolvedMethodName` in `classOrMemberName`).
+
+**Two sessions found this independently.** A concurrent session landed the same
+repair on `dev` as `1660283ca4` ("a frame's declaring class comes from the
+frame, not a by-name lookup") while this branch was in flight. On merge the
+conflict was resolved in favour of **dev's version**, which is strictly
+stronger: it also enforces the `RETAIN_CLASS_REFERENCE` contract on the
+package-private `declaringClass()` bridge, and it gates the slot-6 read on the
+carrier actually being the p59 `StackWalker$StackFrame` rather than on a field
+count. The verification numbers below were measured against this branch's
+equivalent implementation.
 
 **Verified**: 61/61 pass on Linux (where HotSpot is also 61/61).
 
