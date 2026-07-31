@@ -21009,6 +21009,25 @@ impl Compiler {
                                     }
                                     // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
                                     self.buf.emit(&[0x41, 0xFF, 0xD3]);
+                                    // A compiled callee's prologue publishes
+                                    // ITS rbp into the innermost-RBP mirror the
+                                    // GC reads. Nothing on the return path of a
+                                    // raw JIT-to-JIT call restores this
+                                    // caller's, so without this the mirror
+                                    // names a DEAD frame from here on and the
+                                    // next GC applies THIS method's oop map to
+                                    // whatever has since reused that stack
+                                    // memory. The MIC arm below and the hashed
+                                    // stub have always republished; this
+                                    // cascade did not, and since a PIC slot is
+                                    // allocated eagerly at every eligible site
+                                    // (`pic_inline` wins over `mic_inline`
+                                    // whenever `pic_ptr` is Some) it is the arm
+                                    // that actually runs. See
+                                    // `conservative_roots::top_rbp_mirror_write`
+                                    // for the Rust-side analogue of the same
+                                    // contract.
+                                    self.emit_post_call_rbp_republish();
                                     self.emit_inline_callee_deopt_check(
                                         info,
                                         n,
