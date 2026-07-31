@@ -361,10 +361,13 @@ pub struct VirtualObjectState {
 /// (`build_deopt_frame_inner`) maps both to `None` and refuses the resume, so a
 /// deopt point carrying one is unresumable by construction.
 ///
-/// The scan reaches into [`FrameValue::VirtualObject`] field graphs as well: a
-/// materialised object with an unreconstructable field is no more resumable
-/// than an unreconstructable local, and the producer already refuses to emit
-/// one (`ir_lower::frame_value_for_object`), so this only pins the invariant.
+/// The scan reaches into [`FrameValue::VirtualObject`] field graphs for the
+/// eliminated marker only: materializing an object whose field held a deleted
+/// value would store a `null` into a field that held a live reference.
+/// `Unsupported` *inside* a virtual object is deliberately left as it always
+/// was (not propagated) — the producers already refuse to emit such a field
+/// (`ir_lower::frame_value_for_object`), and widening the predicate there would
+/// silently change which methods the `invokedynamic` trap bail rejects.
 /// Recursion terminates because a `VirtualObjectRef` edge is *not* followed —
 /// it is the cycle/sharing terminator.
 ///

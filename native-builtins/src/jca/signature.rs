@@ -1033,7 +1033,13 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // could orphan the buffer after GC compaction and the empty-fallback
     // produced an apparent success).
     let data = take_data(ctx, this)?;
-    let sig_bytes = sign_dispatch(alg, key_id, &data).unwrap_or_default();
+    // P0, as in `sig_sign`: an empty signature written into the caller's
+    // buffer with a `written` count of 0 reads as "signed, zero-length" rather
+    // than "not signed".
+    let sig_bytes = match sign_dispatch(alg, key_id, &data) {
+        Some(bytes) => bytes,
+        None => return Err(refuse_unanswerable(ctx, alg, "sign(byte[],int,int)")),
+    };
 
     let off = match args.get(2) {
         Some(Value::Int(n)) => *n as usize,
@@ -1104,7 +1110,15 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         _ => Vec::new(),
     };
 
-    let ok = verify_dispatch(alg, key_id, &data, &provided).unwrap_or(false);
+    // P0. `Some(false)` is a PRESERVED NEGATIVE — the signature really was
+    // checked against the key and really did not match; that is the security
+    // decision the caller asked for and it stays a `false`. `None` is
+    // "never checked" and now raises. `.unwrap_or(false)` conflated the two,
+    // so an unusable key was reported as a bad signature.
+    let ok = match verify_dispatch(alg, key_id, &data, &provided) {
+        Some(answer) => answer,
+        None => return Err(refuse_unanswerable(ctx, alg, "verify()")),
+    };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -1137,7 +1151,12 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(arr))) => read_byte_array_range(ctx, *arr, off, len),
         _ => Vec::new(),
     };
-    let ok = verify_dispatch(alg, key_id, &data, &provided).unwrap_or(false);
+    // P0 — same split as `sig_verify`: `Some(false)` is the preserved genuine
+    // negative, `None` is "the question was never asked" and raises.
+    let ok = match verify_dispatch(alg, key_id, &data, &provided) {
+        Some(answer) => answer,
+        None => return Err(refuse_unanswerable(ctx, alg, "verify(byte[],int,int)")),
+    };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 

@@ -38,7 +38,7 @@ name suggests.
 
 | # | Entry point | file:line | Check today | Reachable with no policy consultation? | Scope |
 |---|---|---|---|---|---|
-| P1 | `Runtime.exec*` → `runtime_spawn_process` | `native-builtins/src/lang_system.rs:1903` | `check_exec_or_throw` → `SecurityManager.checkExec` | Yes when **no SM installed** (the default) — `check_exec_or_throw` returns `Ok(())` immediately (`lang_system.rs:1852`) | **process-global** (`SECURITY_MANAGER`) |
+| P1 | `Runtime.exec*` → `runtime_spawn_process` | `native-builtins/src/lang_system.rs:1903` | `check_exec_or_throw` → `SecurityManager.checkExec` | Yes when **no SM installed** (the default) — `check_exec_or_throw` returns `Ok(())` immediately (`lang_system.rs:1850`) | **process-global** (`SECURITY_MANAGER`) |
 | P2 | `ProcessBuilder.start` (phases_late) | `native-builtins/src/phases_late.rs:1459` | same | same | process-global |
 | P3 | `ProcessBuilder.start` (native-io real spawn) | `native-io/src/process.rs:443` → `validate_spawn_program` | CWD-confinement check, **opt-in and off by default** (`native-io/src/process.rs:338`: "Default (unconfined) profile: JDK-faithful, spawn freely") | **Yes** by default | **process-global** (`PATH_CONFINE_TO_CWD`) |
 | P4 | Panama downcall to `execve`/`CreateProcessW` | `native-builtins/src/panama.rs:2323` | `require_native_access` only — never reaches `checkExec`. This bypass is called out in a standing `Audit TODO (Panama)` at `lang_system.rs:1837` | Yes, whenever native access is granted | process-global |
@@ -141,7 +141,7 @@ like an unscoped variant.
   would be a bypass. So `/data/../etc/passwd` becomes `/etc/passwd` and cannot
   satisfy a `/data` grant, while `/data/sub/../file` becomes `/data/file` and
   can — matching the JDK's own behaviour, which `native-io`'s
-  `has_escaping_parent_segment` documents at `native-io/src/lib.rs:236-258`.
+  `has_escaping_parent_segment` documents at `native-io/src/lib.rs:240-258`.
 * A shared textual prefix is not containment: `/data` does not admit
   `/database/file`.
 * `Endpoint` grants match host by `*`, `*.suffix` (the suffix domain and
@@ -466,9 +466,9 @@ the consequences are concrete:
    `System.setSecurityManager(null)` disarms VM B's `Runtime.exec` and
    `System.loadLibrary` gates, because both consult
    `get_security_manager(...).is_none()` and return `Ok(())` on `None`
-   (`security_manager.rs:83`, `lang_system.rs:1852`).
+   (`security_manager.rs:83`, `lang_system.rs:1850`).
 3. **The same applies to every other global.** `set_native_access_enabled`
-   (`panama.rs:117`) and `set_path_confine_to_cwd` are process-wide setters; a
+   (`panama.rs:122`) and `set_path_confine_to_cwd` are process-wide setters; a
    permissive embedder and a hardened one cannot coexist.
 4. **GC coupling.** The singleton stores `(identity_key, ObjectRef)` and re-reads
    the current address through `read_var_handle_root` on *the calling context*.
@@ -554,10 +554,10 @@ is the list of places to apply it.
 
 ### 8.1 With `CRATONVM_UNTRUSTED_CODE=1`
 
-The existing hardening profile (`native-io/src/lib.rs:193`) closes some of this:
+The existing hardening profile (`native-io/src/lib.rs:194`) closes some of this:
 CWD confinement is forced on and fails closed, host native access is denied
 (`security_manager.rs:75`), and `--enable-native-access` is refused
-(`panama.rs:113`). It does **not** close I2 (the `native-builtins` `nio_file`
+(`panama.rs:124`). It does **not** close I2 (the `native-builtins` `nio_file`
 natives bypass `validate_path` entirely), I6 (server socket bind), M2 (raw
 `Unsafe` addresses), F3/F4 (upcalls), or any network destination beyond the
 metadata addresses.
