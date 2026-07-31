@@ -159,25 +159,40 @@ Every run died in round 3 or 4 (`testCache(10, …)`); none ever reached the
 | both fixes (repeat) | `--nojit` | **exit 0**, 3038 s | 0 |
 | + merged `origin/dev` | `--nojit` | **exit 0**, 2871 s | 0 |
 | + merged `origin/dev` | JIT | **exit 0**, 3160 s | 0 |
+| + merged (repeat) | `--nojit` | **exit 0**, 3867 s | 0 |
+| final integrated tree | `--nojit` | **exit 0**, 2687 s | 0 |
+
+Six clean completions where there had been none, plus
+`org.h2.test.jdbc.TestGetGeneratedKeys` exit 0 with 0 corrupt-cell reports
+in both arms.
 
 Intermediate stage, recorded honestly: with only the FIRST commit in, the
 corrupt-write burst was already gone (98,559 → 0 and 64,960 → 0) but the
 process still `SIGSEGV`'d — the second commit (`is_stale_young`) is what
 made the workload complete. Both are needed.
 
-**One residual failure, not reproduced since.** A repeat of the JIT arm on
-the pre-merge build (i.e. without the 96 `origin/dev` commits this branch
-later merged) failed at 2269 s with `ClassCastException: java.lang.Object
-cannot be cast to org.h2.mvstore.Page` out of
-`FileStore.readPageFromCache`, and **zero** guard hits. That is a
-different signature from anything above — no stale-write burst, no corrupt
-cell — and it has not recurred on the merged build (2 for 2 clean, plus a
-third `--nojit` repeat clean). It is recorded here rather than swept up:
-if `TestMVStoreCachePerformance` regresses again, this is the shape to
-look for, and it is NOT the defect this doc describes. A fourth repeat
-(JIT, merged build) was killed by the host's OOM killer at load average
-379 with 0 GB free — an environment casualty, log clean to the last line,
-not a VM result.
+**Three post-fix runs that did not reach exit 0, none showing this
+defect's signature** (all three: **zero** guard hits, zero corrupt cells,
+no SIGSEGV):
+
+* A JIT repeat on the **pre-merge** build failed at 2269 s with
+  `ClassCastException: java.lang.Object cannot be cast to
+  org.h2.mvstore.Page` out of `FileStore.readPageFromCache`. Not reproduced
+  on the merged build. If `TestMVStoreCachePerformance` regresses again,
+  this is the shape to look for — and it is NOT what this doc describes.
+* A JIT repeat was killed by the **host's** OOM killer (exit 137) at load
+  average 379 with 0 GB free, log clean to the last line. Environment
+  casualty, not a VM result.
+* The JIT arm on the final integrated tree ran into a **catchable**
+  `java.lang.OutOfMemoryError` ("native allocation could not be satisfied",
+  535 elements) in round 4, after ~20 minutes of continuous
+  `[moving-young] fallback: xt-helper-window-conservative-scan` — i.e. the
+  young generation running the fragmenting non-moving sweep back-to-back
+  under 10–100 threads at `--Xmx 1g`. That is a
+  fragmentation/throughput problem in the moving-young coverage machinery,
+  orthogonal to reference-processing correctness, and it degrades safely
+  (a catchable Java exception, not corruption). See the observations
+  section below.
 
 Unit tests: 877 `cratonvm-gc`, 3153 `cratonvm-native-builtins`, 2326
 `cratonvm-vm`, 453 `cratonvm-types` — all pass. New regressions:
@@ -221,9 +236,19 @@ Unit tests: 877 `cratonvm-gc`, 3153 `cratonvm-native-builtins`, 2326
   `missing-exact-rbp`, `active-safepoint-map-incomplete`,
   `cross-thread-jit-peer`) — i.e. the young generation is repeatedly NOT a
   copying collector under this workload. That is the documented, safe
-  diversion, and it is orthogonal to this defect (the `--nojit` arm, which
-  takes none of those fallbacks, reproduced the bug just as hard). Worth its
-  own investigation for throughput reasons, not correctness ones.
+  diversion, and it is orthogonal to this defect: the `--nojit` arm takes
+  none of those fallbacks and reproduced the bug just as hard.
+
+  It is not free, though. On the final integrated tree the JIT arm spent
+  ~20 minutes in back-to-back `xt-helper-window-conservative-scan`
+  fallbacks and then raised a catchable `OutOfMemoryError` on a 535-element
+  native allocation at `--Xmx 1g` — the fragmenting free-list allocator
+  never getting a compaction while 10–100 reader threads keep a helper
+  window open. That is a **separate, open** throughput/fragmentation issue
+  in the moving-young coverage machinery; it degrades safely and shows
+  none of this defect's signatures (zero guard hits, zero corrupt cells).
+  A good starting point is why `xt-helper-window` can stay latched for
+  minutes at a time under this thread count.
 
 ## Repro (historical)
 
