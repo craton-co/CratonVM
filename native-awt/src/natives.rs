@@ -3432,6 +3432,8 @@ mod tests {
     /// Build a fake `ObjectRef` for tests — guaranteed 8-aligned & non-null.
     fn fake_object_ref(seed: u64) -> ObjectRef {
         let ptr = ((seed + 1) << 3) as *mut u8;
+        // SAFETY: the arithmetic above constructs a unique non-null,
+        // eight-byte-aligned sentinel used only as an opaque test identity.
         unsafe { ObjectRef::from_raw(ptr) }
     }
 

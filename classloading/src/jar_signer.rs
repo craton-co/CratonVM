@@ -1505,34 +1505,21 @@ fn rsa_pkcs1v15_verify(
     message: &[u8],
     signature: &[u8],
 ) -> SigVerify {
-    let k = key.k;
-    if k < 11 || signature.len() != k {
-        return SigVerify::Bad;
-    }
-    let s = BigUint::from_bytes_be(signature);
-    // Reject s >= n (RFC 8017 step requires 0 <= s < n).
-    if s.cmp(&key.n) != std::cmp::Ordering::Less {
-        return SigVerify::Bad;
-    }
-    let m = s.modpow(&key.e, &key.n);
-    let em = m.to_bytes_be_padded(k);
-
-    let hash = raw_digest(digest_alg, message);
-    let prefix = digest_info_prefix(digest_alg);
-    let t_len = prefix.len() + hash.len();
-    if k < t_len + 11 {
-        return SigVerify::Bad;
-    }
-    let ps_len = k - t_len - 3;
-    let mut expected = Vec::with_capacity(k);
-    expected.push(0x00);
-    expected.push(0x01);
-    expected.extend(std::iter::repeat(0xff).take(ps_len));
-    expected.push(0x00);
-    expected.extend_from_slice(prefix);
-    expected.extend_from_slice(&hash);
-
-    if ct_eq(&em, &expected) {
+    use cratonvm_native_builtins_crypto::signature::{verify_rsa_pkcs1_v15, DigestAlgorithm};
+    let digest = match digest_alg {
+        DigestAlg::Sha1 => DigestAlgorithm::Sha1,
+        DigestAlg::Sha256 => DigestAlgorithm::Sha256,
+        DigestAlg::Sha384 => DigestAlgorithm::Sha384,
+        DigestAlg::Sha512 => DigestAlgorithm::Sha512,
+    };
+    let exponent_len = (key.e.bit_length() + 7) / 8;
+    if verify_rsa_pkcs1_v15(
+        &key.n.to_bytes_be_padded(key.k),
+        &key.e.to_bytes_be_padded(exponent_len),
+        digest,
+        message,
+        signature,
+    ) {
         SigVerify::Ok
     } else {
         SigVerify::Bad

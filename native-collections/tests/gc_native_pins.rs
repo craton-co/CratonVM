@@ -21,9 +21,390 @@ const HM: &str = "java/util/HashMap";
 const CHM: &str = "java/util/concurrent/ConcurrentHashMap";
 const LHM: &str = "java/util/LinkedHashMap";
 const TM: &str = "java/util/TreeMap";
+const AD: &str = "java/util/ArrayDeque";
+const COLLECTIONS: &str = "java/util/Collections";
+const UNMOD_COLLECTION: &str = "cratonvm/internal/UnmodifiableCollection";
+const UNMOD_LIST: &str = "cratonvm/internal/UnmodifiableList";
+const UNMOD_LIST_ITR: &str = "cratonvm/internal/UnmodifiableListItr";
 
 fn object_value(ctx: &mut MockCtx, class_id: u32) -> Value {
     Value::Object(Some(ctx.alloc_object_simple(class_id)))
+}
+
+#[test]
+fn generic_snapshot_iterator_roots_array_and_shell_across_allocation() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let snapshot = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
+    let e1 = object_value(&mut ctx, 891);
+    let e2 = object_value(&mut ctx, 892);
+    ctx.set_array_element(snapshot, 0, e1);
+    ctx.set_array_element(snapshot, 1, e2);
+
+    ctx.set_relocate_pins_on_alloc(true);
+    let iterator = match cratonvm_native_collections::make_iterator_from_array(
+        &mut ctx,
+        snapshot,
+        2,
+    )
+    .unwrap()
+    {
+        Some(Value::Object(Some(iterator))) => iterator,
+        other => panic!("expected snapshot iterator, got {other:?}"),
+    };
+    ctx.set_relocate_pins_on_alloc(false);
+
+    let forwarded_snapshot = match ctx.get_field(iterator, 0) {
+        Value::Object(Some(snapshot)) => snapshot,
+        other => panic!("iterator lost snapshot array: {other:?}"),
+    };
+    assert_ne!(
+        forwarded_snapshot, snapshot,
+        "snapshot must be read through its forwarding pin"
+    );
+    for expected_cid in [891, 892] {
+        assert_eq!(
+            call(
+                &reg,
+                &mut ctx,
+                "java/util/HashMap$KeyItr",
+                "hasNext",
+                "()Z",
+                &[Value::Object(Some(iterator))],
+            )
+            .unwrap(),
+            Some(Value::Int(1))
+        );
+        let value = call(
+            &reg,
+            &mut ctx,
+            "java/util/HashMap$KeyItr",
+            "next",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(iterator))],
+        )
+        .unwrap();
+        let object = match value {
+            Some(Value::Object(Some(object))) => object,
+            other => panic!("expected snapshot element, got {other:?}"),
+        };
+        assert_eq!(ctx.class_id_of_object(object).as_u32(), expected_cid);
+    }
+}
+
+#[test]
+fn array_deque_iterator_roots_snapshot_graph_across_allocations() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let deque_cid = ctx.ensure_class_initialized(AD).unwrap();
+    let deque = ctx.alloc_object(deque_cid, 4);
+    call(
+        &reg,
+        &mut ctx,
+        AD,
+        "<init>",
+        "()V",
+        &[Value::Object(Some(deque))],
+    )
+    .unwrap();
+    let e1 = object_value(&mut ctx, 901);
+    let e2 = object_value(&mut ctx, 902);
+    for value in [e1, e2] {
+        call(
+            &reg,
+            &mut ctx,
+            AD,
+            "addLast",
+            "(Ljava/lang/Object;)V",
+            &[Value::Object(Some(deque)), value],
+        )
+        .unwrap();
+    }
+
+    ctx.set_relocate_pins_on_alloc(true);
+    let iterator = match call(
+        &reg,
+        &mut ctx,
+        AD,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(deque))],
+    )
+    .unwrap()
+    {
+        Some(Value::Object(Some(iterator))) => iterator,
+        other => panic!("expected ArrayDeque iterator, got {other:?}"),
+    };
+    ctx.set_relocate_pins_on_alloc(false);
+
+    let backing = match ctx.get_field(iterator, 2) {
+        Value::Object(Some(backing)) => backing,
+        other => panic!("iterator lost backing deque: {other:?}"),
+    };
+    assert_ne!(
+        backing, deque,
+        "backing deque must be read back through its forwarding pin"
+    );
+    assert_eq!(ctx.class_id_of_object(backing), deque_cid);
+
+    for expected_cid in [901, 902] {
+        assert_eq!(
+            call(
+                &reg,
+                &mut ctx,
+                "java/util/ArrayDeque$Itr",
+                "hasNext",
+                "()Z",
+                &[Value::Object(Some(iterator))],
+            )
+            .unwrap(),
+            Some(Value::Int(1))
+        );
+        let value = call(
+            &reg,
+            &mut ctx,
+            "java/util/ArrayDeque$Itr",
+            "next",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(iterator))],
+        )
+        .unwrap();
+        let object = match value {
+            Some(Value::Object(Some(object))) => object,
+            other => panic!("expected snapshot element, got {other:?}"),
+        };
+        assert_eq!(ctx.class_id_of_object(object).as_u32(), expected_cid);
+    }
+    assert_eq!(
+        call(
+            &reg,
+            &mut ctx,
+            "java/util/ArrayDeque$Itr",
+            "hasNext",
+            "()Z",
+            &[Value::Object(Some(iterator))],
+        )
+        .unwrap(),
+        Some(Value::Int(0))
+    );
+}
+
+#[test]
+fn arraylist_iterator_roots_backing_list_across_allocation() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let list = new_arraylist(&reg, &mut ctx);
+    let list_cid = ctx.class_id_of_object(list);
+    let e1 = object_value(&mut ctx, 911);
+    let e2 = object_value(&mut ctx, 912);
+    for value in [e1, e2] {
+        call(
+            &reg,
+            &mut ctx,
+            AL,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), value],
+        )
+        .unwrap();
+    }
+
+    ctx.set_relocate_pins_on_alloc(true);
+    let iterator = match call(
+        &reg,
+        &mut ctx,
+        AL,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(list))],
+    )
+    .unwrap()
+    {
+        Some(Value::Object(Some(iterator))) => iterator,
+        other => panic!("expected ArrayList iterator, got {other:?}"),
+    };
+    ctx.set_relocate_pins_on_alloc(false);
+
+    let backing = match ctx.get_field(iterator, 3) {
+        Value::Object(Some(backing)) => backing,
+        other => panic!("iterator lost backing list: {other:?}"),
+    };
+    assert_ne!(
+        backing, list,
+        "backing list must be read back through its forwarding pin"
+    );
+    assert_eq!(ctx.class_id_of_object(backing), list_cid);
+
+    for expected_cid in [911, 912] {
+        assert_eq!(
+            call(
+                &reg,
+                &mut ctx,
+                "java/util/ArrayList$Itr",
+                "hasNext",
+                "()Z",
+                &[Value::Object(Some(iterator))],
+            )
+            .unwrap(),
+            Some(Value::Int(1))
+        );
+        let value = call(
+            &reg,
+            &mut ctx,
+            "java/util/ArrayList$Itr",
+            "next",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(iterator))],
+        )
+        .unwrap();
+        let object = match value {
+            Some(Value::Object(Some(object))) => object,
+            other => panic!("expected list element, got {other:?}"),
+        };
+        assert_eq!(ctx.class_id_of_object(object).as_u32(), expected_cid);
+    }
+    assert_eq!(
+        call(
+            &reg,
+            &mut ctx,
+            "java/util/ArrayList$Itr",
+            "hasNext",
+            "()Z",
+            &[Value::Object(Some(iterator))],
+        )
+        .unwrap(),
+        Some(Value::Int(0))
+    );
+}
+
+#[test]
+fn unmodifiable_wrapper_roots_backing_and_wrapper_across_allocation() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let backing = new_arraylist(&reg, &mut ctx);
+    let backing_cid = ctx.class_id_of_object(backing);
+
+    ctx.set_relocate_pins_on_alloc(true);
+    let wrapper = match call(
+        &reg,
+        &mut ctx,
+        COLLECTIONS,
+        "unmodifiableCollection",
+        "(Ljava/util/Collection;)Ljava/util/Collection;",
+        &[Value::Object(Some(backing))],
+    )
+    .unwrap()
+    {
+        Some(Value::Object(Some(wrapper))) => wrapper,
+        other => panic!("expected unmodifiable wrapper, got {other:?}"),
+    };
+    ctx.set_relocate_pins_on_alloc(false);
+
+    assert_eq!(
+        ctx.class_name_of_id(ctx.class_id_of_object(wrapper)).as_deref(),
+        Some(UNMOD_COLLECTION)
+    );
+    let forwarded_backing = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(backing)) => backing,
+        other => panic!("wrapper lost backing collection: {other:?}"),
+    };
+    assert_ne!(
+        forwarded_backing, backing,
+        "backing collection must be read through its forwarding pin"
+    );
+    assert_eq!(ctx.class_id_of_object(forwarded_backing), backing_cid);
+}
+
+#[test]
+fn unmodifiable_list_iterator_roots_snapshot_graph_across_allocation() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let backing = new_arraylist(&reg, &mut ctx);
+    let wrapper = match call(
+        &reg,
+        &mut ctx,
+        COLLECTIONS,
+        "unmodifiableList",
+        "(Ljava/util/List;)Ljava/util/List;",
+        &[Value::Object(Some(backing))],
+    )
+    .unwrap()
+    {
+        Some(Value::Object(Some(wrapper))) => wrapper,
+        other => panic!("expected unmodifiable list, got {other:?}"),
+    };
+    let snapshot = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
+    let e1 = object_value(&mut ctx, 921);
+    let e2 = object_value(&mut ctx, 922);
+    ctx.set_array_element(snapshot, 0, e1);
+    ctx.set_array_element(snapshot, 1, e2);
+    ctx.set_invoke_virtual_result(Ok(Some(Value::Object(Some(snapshot)))));
+
+    ctx.set_relocate_pins_on_alloc(true);
+    let iterator = match call(
+        &reg,
+        &mut ctx,
+        UNMOD_LIST,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(wrapper))],
+    )
+    .unwrap()
+    {
+        Some(Value::Object(Some(iterator))) => iterator,
+        other => panic!("expected unmodifiable list iterator, got {other:?}"),
+    };
+    ctx.set_relocate_pins_on_alloc(false);
+
+    let forwarded_snapshot = match ctx.get_field(iterator, 0) {
+        Value::Object(Some(snapshot)) => snapshot,
+        other => panic!("iterator lost snapshot array: {other:?}"),
+    };
+    assert_ne!(
+        forwarded_snapshot, snapshot,
+        "snapshot must be read through its forwarding pin"
+    );
+    assert_eq!(ctx.array_length(forwarded_snapshot), 2);
+    for expected_cid in [921, 922] {
+        assert_eq!(
+            call(
+                &reg,
+                &mut ctx,
+                UNMOD_LIST_ITR,
+                "hasNext",
+                "()Z",
+                &[Value::Object(Some(iterator))],
+            )
+            .unwrap(),
+            Some(Value::Int(1))
+        );
+        let value = call(
+            &reg,
+            &mut ctx,
+            UNMOD_LIST_ITR,
+            "next",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(iterator))],
+        )
+        .unwrap();
+        let object = match value {
+            Some(Value::Object(Some(object))) => object,
+            other => panic!("expected snapshot element, got {other:?}"),
+        };
+        assert_eq!(ctx.class_id_of_object(object).as_u32(), expected_cid);
+    }
+    assert_eq!(
+        call(
+            &reg,
+            &mut ctx,
+            UNMOD_LIST_ITR,
+            "hasNext",
+            "()Z",
+            &[Value::Object(Some(iterator))],
+        )
+        .unwrap(),
+        Some(Value::Int(0))
+    );
 }
 
 #[test]

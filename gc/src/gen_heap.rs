@@ -76,10 +76,10 @@ const PROMOTION_AGE: u8 = 3;
 /// GC threshold: trigger minor GC when young from-space usage exceeds this %.
 const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 
-/// The default non-moving young collector does not need Cheney-copy headroom:
+/// The opt-out non-moving young collector does not need Cheney-copy headroom:
 /// it reclaims dead spans in place and falls back to allocation-failure GC for
 /// fragmentation.  Let transient allocation fill most of the active semi-space
-/// before paying the O(heap) mark/sweep cost.  The moving-young opt-in retains
+/// before paying the O(heap) mark/sweep cost.  The default moving path retains
 /// the conservative 50% trigger above so the to-space can hold all survivors.
 /// Keeping a 10% reserve also leaves room for TLAB refill granularity and avoids
 /// turning every near-capacity refill into an allocation-failure collection.
@@ -3508,7 +3508,7 @@ impl GenerationalHeap {
         // remains the hard backstop against fragmentation under-collection.
         let live = used.saturating_sub(from.free_list_bytes());
         // Cheney copying needs the unused half as worst-case survivor
-        // headroom. The default non-moving collector instead sweeps in place,
+        // headroom. The opt-out non-moving collector instead sweeps in place,
         // so it can safely use the active semi-space almost to capacity.
         // Only select the larger threshold when the next normal young cycle is
         // guaranteed to take that path. In particular, `--nojit` collections

@@ -1120,12 +1120,15 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     // `module_native_access_enabled` wants.
     //
     // The announce point warns rather than throws, matching the JDK 24/25
-    // default `--illegal-native-access=warn`. The hard denial stays where
-    // CratonVM already enforces it — `panama::require_native_access` on the
-    // downcall and raw-address `MemorySegment` paths — because
-    // `ensureNativeAccess` also fires on paths this VM does not gate
-    // (`System.loadLibrary`, `SymbolLookup.libraryLookup`), and throwing here
-    // under the default `NativeAccessPolicy::None` would break all of them.
+    // default `--illegal-native-access=warn`. The hard denial stays at the
+    // operations themselves, where CratonVM already enforces it:
+    // `panama::require_native_access` on the downcall, raw-address
+    // `MemorySegment` and `SymbolLookup.libraryLookup` paths, and
+    // `security_manager::check_host_native_access_or_throw` on
+    // `System.load`/`loadLibrary`, `Runtime.load*`,
+    // `NativeLibraries.load` and `RawNativeLibraries.load0`. Throwing *here*
+    // instead would deny under the default `NativeAccessPolicy::None`, i.e.
+    // on every announce, which is not the JDK's default posture.
     r.register(
         refl2,
         "ensureNativeAccess",

@@ -76,26 +76,30 @@ fn lookup_process_native_symbol(name: &str) -> Option<usize> {
     #[cfg(target_os = "windows")]
     {
         for lib in ["ucrtbase.dll\0", "msvcrt.dll\0", "vcruntime140.dll\0"] {
+            // SAFETY: each literal is NUL-terminated and Windows owns the
+            // returned module handle for the process lifetime.
             let handle = unsafe { GetModuleHandleA(lib.as_ptr() as *const i8) };
             if handle.is_null() {
                 continue;
             }
+            // SAFETY: `handle` is non-null and `c_name` is a live CString.
             let addr = unsafe { GetProcAddress(handle, c_name.as_ptr()) };
             if !addr.is_null() {
                 return Some(addr as usize);
             }
         }
-        return None;
+        None
     }
     #[cfg(not(target_os = "windows"))]
     {
+        // SAFETY: `c_name` is NUL-terminated and `RTLD_DEFAULT` requests a
+        // process-wide symbol lookup without transferring ownership.
         let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
         if !addr.is_null() {
             return Some(addr as usize);
         }
+        lookup_known_system_library_symbol(name, c_name.as_c_str())
     }
-
-    lookup_known_system_library_symbol(name, c_name.as_c_str())
 }
 
 /// DBG (CRATONVM_DBG_WATCHREF, extended): RandomizedContext WeakHashMap
@@ -2764,6 +2768,9 @@ impl<'a> NativeContextImpl<'a> {
         for entry in &self.thread.jit_hashmap_string_node_cache {
             snapshot.push(entry.map);
             snapshot.push(entry.node);
+            if let Some(key_object) = entry.key_object {
+                snapshot.push(key_object);
+            }
         }
         // TOMCAT-JNDIREALM-JIT.3 (2026-07-26) — the ASCII case-conversion
         // cache, under the identical contract as the HashMap node cache above:
@@ -2778,6 +2785,9 @@ impl<'a> NativeContextImpl<'a> {
             snapshot.push(entry.source);
             snapshot.push(entry.first);
             snapshot.push(entry.second);
+            if let Some(locale) = entry.locale {
+                snapshot.push(locale);
+            }
         }
         // JNI local references (INT-5): this thread's `JNI_LOCAL_FRAMES`
         // handles. A JNI native that obtained local refs and then re-entered
@@ -3107,6 +3117,12 @@ impl<'a> NativeContextImpl<'a> {
                         *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                     }
                 }
+                if let Some(key_object) = entry.key_object.as_mut() {
+                    let old_addr = key_object.as_ptr() as usize;
+                    if let Some(&new_addr) = fixup.get(&old_addr) {
+                        *key_object = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
+                }
             }
             // TOMCAT-JNDIREALM-JIT.3 — blocked-wake remap companion to the
             // ASCII case-conversion cache publish in
@@ -3118,6 +3134,12 @@ impl<'a> NativeContextImpl<'a> {
                     let old_addr = obj_ref.as_ptr() as usize;
                     if let Some(&new_addr) = fixup.get(&old_addr) {
                         *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
+                }
+                if let Some(locale) = entry.locale.as_mut() {
+                    let old_addr = locale.as_ptr() as usize;
+                    if let Some(&new_addr) = fixup.get(&old_addr) {
+                        *locale = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                     }
                 }
             }
@@ -5794,6 +5816,8 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             nest_host_class_name: opts.nest_host_class_name.clone(),
             privileged_define: opts.privileged_define,
             force_loader_faithful_linking: opts.force_loader_faithful_linking,
+            superclass_id_override: opts.superclass_id_override,
+            interface_id_overrides: opts.interface_id_overrides.clone(),
             ..Default::default()
         };
 
@@ -7339,11 +7363,21 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             // allocation for EVERY entry scanned on EVERY probe, on the hottest
             // map path in the VM, and this variant does not even look at that
             // key (it compares the Java String objects directly below).
-            let (entry_map, entry_node, mod_count_slot, entry_mod_count) = {
+            let (entry_map, entry_node, entry_key_object, mod_count_slot, entry_mod_count) = {
                 let entry = &self.thread.jit_hashmap_string_node_cache[index];
-                (entry.map, entry.node, entry.mod_count_slot, entry.mod_count)
+                if entry.chm_generation.is_some() {
+                    index += 1;
+                    continue;
+                }
+                (
+                    entry.map,
+                    entry.node,
+                    entry.key_object,
+                    entry.mod_count_slot,
+                    entry.mod_count,
+                )
             };
-            if entry_map != map {
+            if entry_map != map || entry_key_object != Some(key) {
                 index += 1;
                 continue;
             }
@@ -7355,15 +7389,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             }
-            let Value::Object(Some(node_key)) = self.shared.mem.heap.get_field(entry_node, 1)
-            else {
-                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
-                continue;
-            };
-            if compact_java_strings_equal(self.shared, key, node_key) {
-                return Some(self.shared.mem.heap.get_field(entry_node, 2));
-            }
-            index += 1;
+            return Some(self.shared.mem.heap.get_field(entry_node, 2));
         }
         None
     }
@@ -7376,7 +7402,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             // `String` allocation per entry scanned just to run this compare.
             let (entry_node, mod_count_slot, entry_mod_count) = {
                 let entry = &self.thread.jit_hashmap_string_node_cache[index];
-                if entry.map != map || entry.key != key {
+                if entry.chm_generation.is_some() || entry.map != map || entry.key != key {
                     index += 1;
                     continue;
                 }
@@ -7395,7 +7421,13 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         None
     }
 
-    fn hashmap_string_node_cache_put(&mut self, map: ObjectRef, key: &str, node: ObjectRef) {
+    fn hashmap_string_node_cache_put(
+        &mut self,
+        map: ObjectRef,
+        key_object: ObjectRef,
+        key: &str,
+        node: ObjectRef,
+    ) {
         let class_id = self.shared.mem.heap.class_id_of(map);
         let fields = self.shared.classes.class_manager.read();
         let Some(mod_count_slot) =
@@ -7411,11 +7443,18 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             .thread
             .jit_hashmap_string_node_cache
             .iter_mut()
-            .find(|entry| entry.map == map && entry.key == key)
+            .find(|entry| {
+                entry.chm_generation.is_none()
+                    && entry.map == map
+                    && entry.key_object == Some(key_object)
+            })
         {
             entry.node = node;
+            entry.key_object = Some(key_object);
             entry.mod_count_slot = mod_count_slot;
             entry.mod_count = mod_count;
+            entry.chm_generation = None;
+            entry.chm_segment_id = None;
             return;
         }
         if self.thread.jit_hashmap_string_node_cache.len() >= 32 {
@@ -7425,9 +7464,98 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             crate::threading::jvm_thread::JitHashMapStringNodeCacheEntry {
                 map,
                 node,
+                key_object: Some(key_object),
                 key: key.to_owned(),
                 mod_count_slot,
                 mod_count,
+                chm_generation: None,
+                chm_segment_id: None,
+            },
+        );
+    }
+
+    fn chm_string_node_cache_get_object(
+        &mut self,
+        map: ObjectRef,
+        key: ObjectRef,
+    ) -> Option<(i32, u64, Value)> {
+        let mut index = 0;
+        while index < self.thread.jit_hashmap_string_node_cache.len() {
+            let (entry_map, entry_node, entry_key_object, entry_generation, entry_segment_id) = {
+                let entry = &self.thread.jit_hashmap_string_node_cache[index];
+                (
+                    entry.map,
+                    entry.node,
+                    entry.key_object,
+                    entry.chm_generation,
+                    entry.chm_segment_id,
+                )
+            };
+            let (Some(generation), Some(segment_id)) = (entry_generation, entry_segment_id) else {
+                index += 1;
+                continue;
+            };
+            if entry_map != map || entry_key_object != Some(key) {
+                index += 1;
+                continue;
+            }
+            // NOTE: do NOT "harden" this with a `node.key == key` identity
+            // test. The entry was published after a CONTENT comparison
+            // (`java_strings_equal`), and a CHM's stored key is almost never
+            // the same object as the caller's lookup key — Tomcat's
+            // `CharsetCache` puts the name it built at construction and looks
+            // up a freshly lower-cased one. An identity test therefore misses
+            // on every hit and silently disables the memo (measured: the
+            // `LazyCsCache` arm goes 156s -> 201s). What makes the entry safe
+            // is the segment generation checked by the caller, plus the fact
+            // that no memoized node ever holds a `computeIfAbsent` reservation
+            // marker — the only CHM writes that skip `ChmMonitorGuard`, and so
+            // the only ones that do not advance that generation, are the
+            // marker install/replace phases, and `native_chm_get_string_chain`
+            // refuses to memoize a marker node.
+            return Some((segment_id, generation, self.shared.mem.heap.get_field(entry_node, 2)));
+        }
+        None
+    }
+
+    fn chm_string_node_cache_put(
+        &mut self,
+        map: ObjectRef,
+        segment_id: i32,
+        key_object: ObjectRef,
+        key: &str,
+        node: ObjectRef,
+        generation: u64,
+    ) {
+        if let Some(entry) = self
+            .thread
+            .jit_hashmap_string_node_cache
+            .iter_mut()
+            .find(|entry| {
+                entry.map == map
+                    && entry.key_object == Some(key_object)
+                    && entry.chm_generation.is_some()
+            })
+        {
+            entry.node = node;
+            entry.key_object = Some(key_object);
+            entry.chm_generation = Some(generation);
+            entry.chm_segment_id = Some(segment_id);
+            return;
+        }
+        if self.thread.jit_hashmap_string_node_cache.len() >= 32 {
+            self.thread.jit_hashmap_string_node_cache.remove(0);
+        }
+        self.thread.jit_hashmap_string_node_cache.push(
+            crate::threading::jvm_thread::JitHashMapStringNodeCacheEntry {
+                map,
+                node,
+                key_object: Some(key_object),
+                key: key.to_owned(),
+                mod_count_slot: 0,
+                mod_count: 0,
+                chm_generation: Some(generation),
+                chm_segment_id: Some(segment_id),
             },
         );
     }
@@ -8162,13 +8290,14 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     fn get_ascii_case_string_cached(
         &mut self,
         source: ObjectRef,
+        locale: Option<ObjectRef>,
         upper: bool,
     ) -> Option<ObjectRef> {
         let entry = self
             .thread
             .string_case_cache
             .iter_mut()
-            .find(|entry| entry.source == source && entry.upper == upper)?;
+            .find(|entry| entry.source == source && entry.locale == locale && entry.upper == upper)?;
         let result = if entry.next {
             entry.second
         } else {
@@ -8181,10 +8310,11 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     fn create_ascii_case_string_cached(
         &mut self,
         source: ObjectRef,
+        locale: Option<ObjectRef>,
         text: &str,
         upper: bool,
     ) -> ObjectRef {
-        if let Some(result) = self.get_ascii_case_string_cached(source, upper) {
+        if let Some(result) = self.get_ascii_case_string_cached(source, locale, upper) {
             return result;
         }
 
@@ -8206,6 +8336,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             .string_case_cache
             .push(crate::threading::jvm_thread::StringCaseCacheEntry {
                 source,
+                locale,
                 upper,
                 first,
                 second,

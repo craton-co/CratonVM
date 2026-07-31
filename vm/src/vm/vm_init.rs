@@ -1786,12 +1786,12 @@ impl SharedVm {
             // above. Real-JDK apps still need ReentrantLock / Condition / LBQ
             // drainTo natives (SLF4J replayEvents, Spring thread pools).
             cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
-                // MUST follow `register_concurrent_natives`: that call registers
-                // the old constant `ForkJoinPool.awaitQuiescence` -> true, and
-                // registration is last-write-wins. The real one polls this
-                // crate's async worker pool, which `native-collections` cannot
-                // see.
-                cratonvm_native_builtins::register_forkjoin_quiescence(&mut native_methods);
+            // MUST follow `register_concurrent_natives`: that call registers
+            // the old constant `ForkJoinPool.awaitQuiescence` -> true, and
+            // registration is last-write-wins. The real one polls this
+            // crate's async worker pool, which `native-collections` cannot
+            // see.
+            cratonvm_native_builtins::register_forkjoin_quiescence(&mut native_methods);
             cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
             // java.util.logging.FileHandler's natives are registered
             // (as part of register_p61_logging) only under
@@ -2326,6 +2326,7 @@ impl SharedVm {
             native_methods.set_category(__prev_instrument_bridge);
             // RKC16N.10: VMManagementImpl natives. See companion call
             // in the `feature = "synthetic-jdk"` branch above.
+            #[cfg(feature = "experimental-jmx")]
             cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
             // JMX-CLUSTER-20260720: do NOT register
             // `register_management_factory_platform_server_stub` here. It was
@@ -2364,15 +2365,23 @@ impl SharedVm {
             // RKC16N.11: rest of the sun.management.* native surface.
             // See companion calls in the `feature = "synthetic-jdk"`
             // branch above for the full rationale.
+            #[cfg(feature = "experimental-jmx")]
             cratonvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
+            #[cfg(feature = "experimental-jmx")]
             cratonvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
+            #[cfg(feature = "experimental-jmx")]
             cratonvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
             // Wave 1 / Task A: per-pool / per-manager MXBean natives.
             // See companion call in the synthetic-jdk branch above.
+            #[cfg(feature = "experimental-jmx")]
             cratonvm_native_builtins::jmx::register_memory_pool_impl(&mut native_methods);
+            #[cfg(feature = "experimental-jmx")]
             cratonvm_native_builtins::jmx::register_memory_manager_impl(&mut native_methods);
+            #[cfg(feature = "experimental-jmx")]
             cratonvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
+            #[cfg(feature = "experimental-jmx")]
             cratonvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
+            #[cfg(feature = "experimental-jmx")]
             cratonvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
             // SLF4J 1.7 binder stubs — see companion call in the synthetic-jdk
             // branch above for the rationale (Spring Boot 2.x fat-jar
@@ -2533,14 +2542,12 @@ impl SharedVm {
         // beans, no parallelism). App `-D` overrides this (config loop applies
         // over these defaults). HIB-CV-20.
         //
-        // EXCEPTION: when `CRATONVM_REAL_FORKJOINPOOL` is set, the registry runs
-        // the real ForkJoinPool, so Weld's concurrent `COMMON` deployer works
-        // (and clears the WELD-001301 the single-threaded path hits). Skip the
-        // NONE default then so Weld uses its own `COMMON` default — a clean
-        // one-flag opt-in for real concurrent CDI. Otherwise (synthetic pool,
-        // the default) seed NONE so Weld deploys single-threaded instead of
-        // hanging on `ForkJoinPool.commonPool().invokeAll`.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_FORKJOINPOOL").is_none() {
+        // The real ForkJoinPool path is the default, so Weld's concurrent
+        // `COMMON` deployer works (and clears the WELD-001301 the legacy
+        // single-threaded path hits). Only seed NONE when the explicit
+        // `CRATONVM_SYNTHETIC_FORKJOINPOOL` compatibility opt-out is active;
+        // that surface cannot service commonPool().invokeAll safely.
+        if !cratonvm_types::flags::flags().natives.real_forkjoinpool {
             sys_props.insert(
                 "org.jboss.weld.executor.threadPoolType".to_string(),
                 "NONE".to_string(),
@@ -2715,7 +2722,30 @@ impl SharedVm {
             );
         }
 
+        // AOT and CDS are explicitly compiled experiments and are no longer in
+        // the default feature set. A build that cannot honour `-XX:AOTMode` /
+        // `-XX:SharedArchiveFile` must say so: silently ignoring the request is
+        // exactly the "capability reads as landed but never runs" failure mode
+        // ARCHITECTURE.md's flag-default checklist exists to prevent.
+        #[cfg(not(feature = "experimental-aot"))]
+        {
+            if !matches!(config.aot_mode, crate::config::AotMode::Off) {
+                tracing::warn!(
+                    "AOT cache requested (-XX:AOTMode) but this build was compiled \
+                     without --features experimental-aot; the request is ignored"
+                );
+            }
+            if !matches!(config.cds_mode, crate::config::CdsMode::Off) {
+                tracing::warn!(
+                    "CDS requested (-XX:SharedArchiveFile / -Xshare) but this build \
+                     was compiled without --features experimental-aot; the request \
+                     is ignored"
+                );
+            }
+        }
+
         // Load CDS archive if configured
+        #[cfg(feature = "experimental-aot")]
         if matches!(
             config.cds_mode,
             crate::config::CdsMode::On | crate::config::CdsMode::Auto
@@ -2766,6 +2796,7 @@ impl SharedVm {
             std::sync::Arc::new(crate::runtime::offload::OffloadCacheRegistry::new());
 
         // The real-JDK platform-server bridge needs its interface methods.
+        #[cfg(feature = "experimental-jmx")]
         cratonvm_native_builtins::jmx::register_mbean_server(&mut native_methods);
 
         // Phase 3 closes here — `register_mbean_server` above is the LAST
@@ -3251,6 +3282,7 @@ fn class_info_adapter(class_id: u32) -> Option<(String, usize)> {
 impl SharedVm {
     /// Dump all loaded non-synthetic classes to a CDS archive file.
     /// Called on VM shutdown when `config.cds_mode == CdsMode::Dump`.
+    #[cfg(feature = "experimental-aot")]
     pub fn dump_cds_archive(&self) -> Result<usize, String> {
         let archive_path = self
             .config
@@ -3292,6 +3324,14 @@ impl SharedVm {
         let count = generator.entry_count();
         generator.write_archive()?;
         Ok(count)
+    }
+
+    /// CDS is an explicitly compiled experiment. Keep the public shutdown hook
+    /// available in production builds, but reject archive generation rather
+    /// than linking the experimental implementation accidentally.
+    #[cfg(not(feature = "experimental-aot"))]
+    pub fn dump_cds_archive(&self) -> Result<usize, String> {
+        Err("CDS support is not compiled; rebuild with --features experimental-aot".to_string())
     }
 
     /// Allocate a new synthetic ClassId for a lambda proxy.

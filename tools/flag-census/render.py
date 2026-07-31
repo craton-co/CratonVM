@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2024-2026 Craton Software Company
-"""Render `docs/internal/flag-census.md` from the scan in `census.py`.
+"""Render `docs/flag-census.md` from the scan in `census.py`.
 
 Usage:  python3 tools/flag-census/render.py [REPO_ROOT]
 
@@ -19,7 +19,7 @@ import census  # noqa: E402
 
 ROOT = sys.argv[1] if len(sys.argv) > 1 else \
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-OUT = os.path.join(ROOT, 'docs', 'internal', 'flag-census.md')
+OUT = os.path.join(ROOT, 'docs', 'flag-census.md')
 
 sites, nonrust = census.scan(ROOT)
 rows = census.aggregate(sites, nonrust)
@@ -170,7 +170,7 @@ w('| `CRATONVM_SELECTIVE_PROMOTE` | 13 | **No-op.** Real gate is `CRATONVM_NO_SE
 w('| `CRATONVM_PRECISE_INLINE_FRAME_RECORD` | 2 | **No-op.** Real gate is `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD` (`x64.rs:2288`), opt-out. |')
 w('| `CRATONVM_SHADOW_OSR_TRACK` | 14 | **No-op.** No read site; the surviving shadow-stack knobs are `CRATONVM_SHADOW_STACK` / `_PIN` / `_NOPUSH` / `_NORELOAD`. |')
 w('| `CRATONVM_JIT_SCAN_CACHE` | 1 | **No-op.** Real gate is `CRATONVM_NO_JIT_SCAN_CACHE` (`vm/src/jit/conservative_roots.rs:899`). |')
-w('| `CRATONVM_NONMOVING_YOUNG` / `CRATONVM_FORCE_MOVING` | 1 each | **No-op.** Real gates are `CRATONVM_MOVING_YOUNG` and `CRATONVM_ALLOW_MOVING_YOUNG`. |')
+w('| `CRATONVM_NONMOVING_YOUNG` / `CRATONVM_FORCE_MOVING` | 1 each | **No-op.** The real gate is the opt-out `CRATONVM_NO_MOVING_YOUNG` — the moving young gen is now the default (`DEFAULT_MOVING_YOUNG = true`), so `CRATONVM_MOVING_YOUNG` survives only as a no-op compatibility opt-in. (`CRATONVM_ALLOW_MOVING_YOUNG`, named here when this census was first generated, has since been removed outright.) |')
 w('| `CRATONVM_BUGS` / `CRATONVM_CRASHES` | 29 / 12 | Not flags at all — doc-internal shorthand that the scanner picks up. Harmless, listed for completeness. |')
 w('')
 w('The recurring pattern is a default flip: a flag `X` is introduced opt-in, later')

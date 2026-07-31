@@ -1,4 +1,4 @@
-# Where the moving young generation's throughput went
+# Moving-young collector throughput
 
 Slug: `moving-young-throughput` · 2026-07-26
 Follows `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`,
@@ -148,5 +148,43 @@ None of these changes the conclusion: bt18 is the worst case for a copying
 collector (a very large live set, so copying cost is near its maximum relative
 to sweeping), and at 2.1× on that workload — while being the only configuration
 that completes at `-Xmx512m` — moving-young is no longer disqualified on
-throughput. A default flip still needs a workload mix rather than one
-benchmark.
+throughput.
+
+## Caveat on the 2026-07-26 numbers above (added 2026-07-30)
+
+The measurements in this document were taken in the window between
+`a5623891c` (07-01) and `9494c0680` (07-26), during which a stale reload of the
+innermost-RBP mirror left `PreciseFrameInfo::exact_rbp` at `0` on the GC path.
+`remap_active_jit_frames` requires a non-zero `exact_rbp`, so those moving
+cycles ran **without precisely remapping the innermost compiled frame**. The
+cycle counts and the hashbrown profile stand — the copy, the from-space walk and
+the bitmap fix are all upstream of that — but the per-cycle cost was measured
+slightly light, and the configuration was not the one that ships now. See
+`docs/internal/default-moving-young-enabled-20260730.md`.
+
+Re-measured on 2026-07-30 with the mirror defect and the coverage-proof false
+positives fixed, bt18 at `-Xmx512m` runs 25 moving cycles with a 4,220 ms
+median over five interleaved rounds and returns the HotSpot checksum — and the
+non-moving lanes now measure the same, so the 2.1x this document reports has
+closed on the current tree.
+
+## Status: the default has flipped; these optimizations have not landed
+
+`types/src/flags.rs::DEFAULT_MOVING_YOUNG` is now `true`, with
+`CRATONVM_NO_MOVING_YOUNG` as the compatibility opt-out. The footprint result
+decided it: a configuration that cannot complete bt18 at `-Xmx512m` is not a
+safe default, whatever its steady-state throughput on a large heap.
+
+So the three residuals above are **open optimization work on the default
+path**, not preconditions for a flip that has not happened yet. They belong to
+the [framework and CPU throughput program](framework-throughput.md), and should
+be read together with the second gate documented in
+[`ARCHITECTURE.md`](../ARCHITECTURE.md#memory-gc-crate): the flag being on does
+not mean a given cycle compacted, so any profile must be read against
+`moving_young: cycles=N coverage_fallbacks=M` before time is attributed to
+compaction.
+
+The workload mix this document originally asked for is still owed. It is now a
+regression-budget question — whether the moving default costs more than its
+footprint win on the named CPU and framework workloads — rather than a go/no-go
+one.

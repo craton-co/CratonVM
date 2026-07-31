@@ -522,6 +522,29 @@ of `Could not create plugin of type … LoggerConfig: argument type mismatch` an
 probably the same defect seen from the other side, and closing this should
 close it too.
 
+#### Candidate fix landed 2026-07-30 — suite evidence still owed
+
+The investigation this section asks for was done, and a fix is on
+`fix/deep-audit-retire-20260730`. `lookup_define.rs` no longer lets the class
+manager pick the superclass by name at define time. `resolve_lookup_supertypes`
+resolves the generated class's direct supertypes through the **lookup class's**
+initiating loader (`class_id_by_name_via_referencing_class`) and passes the
+resulting identities down as `DefineClassOptions::superclass_id_override` /
+`interface_id_overrides`, which `define_class_full` validates against the class
+file's own supertype names before use — a mismatch is an
+`IncompatibleClassChangeError`, not a silent substitution. All three
+`Lookup.define*` paths now also request `force_loader_faithful_linking`.
+Acceptance tests in `lookup_define.rs` assert the options reach
+`define_class_full`.
+
+That is the mechanism the evidence above points at: with it, the CGLIB proxy in
+namespace 7 should inherit the fork's `DateService` (`cid=1899`) instead of
+defining a fresh copy in the app loader. **It has not been run against this
+class.** Closing this item needs `MockitoSpyBeanAndSpringAopProxyIntegrationTests`
+green on the Azure host under the *Reproducing* recipe below, plus a check that
+the log4j2 `LoggerConfig` plugin noise goes with it. Until that run exists,
+treat this as a hypothesis with a unit test, not as a closure.
+
 ## Reproducing
 
 Whole classes, from a copy of the suite runner:

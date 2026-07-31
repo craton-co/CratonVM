@@ -137,6 +137,17 @@ Row notes:
   by forcing ~6x more young collections) and was reverted. Full measurement
   history, isolation methodology, and the root-cause writeup are in
   [`binarytrees-bt18-half-gap-20260730.md`](docs/internal/performance/binarytrees-bt18-half-gap-20260730.md).
+- **Sieve** is three counted `boolean[]` loops, and single-pass BCE refuses
+  inclusive (`<=`) loops and non-`arr.length` bounds, so every element kept a
+  null and bounds check. A 2026-07-30 change added three fall-through-only
+  guarded preheaders — a block clear, a strided store, and the whole sieve
+  nest, the last of which scans eight bytes at a time for the next unmarked
+  index. Two independent 9-round interleaved same-binary A/B measurements
+  (`CRATONVM_JIT_BULK_BYTE_LOOPS=0` as the dev-equivalent control, all 54
+  runs checksum `9592`) cut the HotSpot gap by **94.35%** and **95.30%**,
+  moving the ratio from 1.85x to **1.05x**. Full measurements, the guard
+  contract, and the differential probe are in
+  [`cratonbench-sieve-half-gap-20260730.md`](docs/internal/performance/cratonbench-sieve-half-gap-20260730.md).
 
 ### The performance gate
 
@@ -182,10 +193,14 @@ documented round by round:
 
 Measured 2026-07-11 on a GeForce RTX 2060 (sm_75) against HotSpot JDK 25
 (C2) and TornadoVM 4.0.1 (PTX backend, `@Parallel`/`@Reduce` + TaskGraph
-API). CratonVM offload is **transparent**: plain static methods over
-primitive arrays, no annotations, no API
-(`cargo build --features gpu-driver`, run with `--gpu`). All timings are
-warm and include the full per-call H2D + kernel + D2H round-trip.
+API). CratonVM offload is **opt-in and automatic within a narrow envelope**:
+the kernels below are plain static methods over primitive arrays with no
+annotations and no API at the call site, but they require a GPU build and an
+explicit flag (`cargo build --features gpu-driver`, run with `--gpu`), and
+anything the analyzer doesn't accept stays on the CPU. All timings are warm
+and include the full per-call H2D + kernel + D2H round-trip. There is no
+self-hosted GPU hardware CI, so these are point-in-time measurements rather
+than a continuously enforced budget.
 
 | Kernel (N = 2²⁴)                         | HotSpot C2 | TornadoVM GPU | CratonVM GPU | vs HotSpot | vs TornadoVM |
 |------------------------------------------|------------|---------------|--------------|------------|--------------|
@@ -204,8 +219,8 @@ Notes:
   `vdivpd`); TornadoVM's diverges slightly — its PTX backend doesn't
   guarantee bit-exact division.
 - TornadoVM 4.0.1 throws `TornadoInternalError: unimplemented` on the
-  equivalent `@Reduce`-over-`LongArray` kernel; CratonVM's transparent
-  reduction handles it (slowly — a proper tree/shared-memory reduction is
+  equivalent `@Reduce`-over-`LongArray` kernel; CratonVM's automatic
+  `--gpu` path handles it (slowly — a proper tree/shared-memory reduction is
   an open item).
 - The multiply-add and dot-product rows are kept as honest counter-cases:
   CPU AVX2 stays competitive on MAD-dominated kernels at every size, and a

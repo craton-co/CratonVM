@@ -39,6 +39,7 @@ pub type SoaPool = Vec<(Vec<u64>, Vec<u8>)>;
 #[derive(Clone)]
 pub struct StringCaseCacheEntry {
     pub source: ObjectRef,
+    pub locale: Option<ObjectRef>,
     pub upper: bool,
     pub first: ObjectRef,
     pub second: ObjectRef,
@@ -49,9 +50,18 @@ pub struct StringCaseCacheEntry {
 pub struct JitHashMapStringNodeCacheEntry {
     pub map: ObjectRef,
     pub node: ObjectRef,
+    /// Exact String object passed to a HashMap or ConcurrentHashMap get. This
+    /// is rooted alongside the map/node pair and avoids content scans.
+    pub key_object: Option<ObjectRef>,
     pub key: String,
     pub mod_count_slot: usize,
     pub mod_count: i32,
+    /// `Some` selects the ConcurrentHashMap segment seqlock validity rule;
+    /// `None` retains the ordinary HashMap `modCount` rule above.
+    pub chm_generation: Option<u64>,
+    /// Stable identity hash of the CHM segment owning `node` when this is a
+    /// CHM entry. Storing the integer avoids a second GC root per cache entry.
+    pub chm_segment_id: Option<i32>,
 }
 
 // Pool size limits — prevent unbounded growth
@@ -474,10 +484,11 @@ pub struct JvmThread {
     /// the invoke cache repeatedly, and the old guard paid a native-registry hash
     /// lookup for every ancestor on every miss.
     ///
-    /// Keyed by `(receiver_class_id, method_name_hash, descriptor_hash)` and
-    /// bypassed whenever class redefinition is active, because redefine can
-    /// suppress native shadows for woven bytecode.
-    pub native_shadow_cache: FxHashMap<(u32, u64, u64), bool>,
+    /// Keyed by `(receiver_class_id, hierarchy_redefine_fingerprint,
+    /// method_name_hash, descriptor_hash)`. A redefine changes the
+    /// fingerprint of the affected class hierarchy, so those entries
+    /// self-invalidate without disabling this cache process-wide.
+    pub native_shadow_cache: FxHashMap<(u32, u64, u64, u64), bool>,
 
     /// Whether this is a platform or virtual thread (JEP 444, Java 21).
     pub kind: ThreadKind,
@@ -615,7 +626,9 @@ impl JvmThread {
     #[inline]
     pub fn vm_state_diagnostics_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VM_STATE").is_some())
+        *ENABLED.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VM_STATE").is_some()
+        })
     }
 
     /// Publish a short diagnostic state for STW census. No-op unless enabled.
@@ -687,10 +700,7 @@ impl JvmThread {
         }
         let (local_vals, local_tags, stack_vals, stack_tags) = frame.take_pool_parts();
         crate::runtime::frame::offer_frame_parts_to_tls_pool(
-            local_vals,
-            local_tags,
-            stack_vals,
-            stack_tags,
+            local_vals, local_tags, stack_vals, stack_tags,
         );
     }
 

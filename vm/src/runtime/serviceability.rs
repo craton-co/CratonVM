@@ -3558,7 +3558,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// A `JcmdProcessor` must NOT keep the VM alive.
     ///
     /// Its commands used to capture `Arc<dyn VmDiagnosticState>` clones, and
