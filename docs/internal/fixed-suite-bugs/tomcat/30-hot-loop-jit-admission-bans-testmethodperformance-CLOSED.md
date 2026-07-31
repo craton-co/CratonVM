@@ -1,24 +1,26 @@
 # Three conservative JIT-admission bans leave `TestMethodPerformance`'s whole hot path interpreted
 
-**Status:** 🟡 **The admission-ban thesis is CLOSED (2026-07-31). The document
-stays OPEN for two throughput residuals adopted from
-[32](../../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md)
-the same day**, which are not admission problems and never were — see
-[§ Adopted](#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32).
+**Status:** ✅ **CLOSED 2026-07-31.** Every admission ban this document names is
+settled, the "next lever" its last update identified is implemented, and every
+remaining item — its own residual plus the two adopted from
+[32](32-doc04-residual-perf-assertions-CLOSED.md) — has been root-caused to
+**one mechanism that is not an admission ban and is owned by other documents**:
+every `invokevirtual` from compiled code takes the generic dispatch helper. See
+[§ Adopted](#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32-and-where-they-went)
+for the measurement and the re-homing.
 
-Every admission ban this document names is settled and the "next lever" its
-last update identified is implemented — see
-[§ The three bans](#the-three-bans-and-how-each-ended). Two things this
-document asserted turned out to be wrong, and both are recorded there rather
-than quietly dropped: the per-pc local→location map it said ban 1b needed, and
-its claim that ban 2 had been lifted.
+Two things this document asserted turned out to be wrong, and both are recorded
+in [§ The three bans](#the-three-bans-and-how-each-ended) rather than quietly
+dropped: the per-pc local→location map it said ban 1b needed, and its claim
+that ban 2 had been lifted. A third — that 30.A/30.B are "codegen quality" —
+is corrected in § Adopted.
 
-Residual of [24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md)
+Residual of [24](24-stringcache-oom-under-load-FIXED.md)
 (whose `OutOfMemoryError` is FIXED). Family of
-[31](../../internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md),
+[31](31-synchronized-code-never-jit-compiled-FIXED.md),
 and of the retired
-[04](../../internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-CLOSED.md) /
-[29](../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md).
+[04](04-embedded-server-throughput-wall-CLOSED.md) /
+[29](29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md).
 
 > **Read this before chasing the number.** The headline "730x on the class" was
 > real, but its stated cause was wrong. With all three bans settled, loop
@@ -28,11 +30,13 @@ and of the retired
 > is a VM-wide baseline issue; it is measured and re-homed in
 > [§ Where the time actually goes](#where-the-time-actually-goes-re-derived-2026-07-31).
 >
-> The two adopted residuals below reached the same verdict independently, from
-> different tests: **their hot methods compile, and the compiled output is the
-> problem.** Three separate lines of evidence now say this family is codegen
-> and native-call quality, not admission gating. Do not send work at admission
+> The two adopted residuals below reach the same place from different tests,
+> and the mechanism is now named: **every `invokevirtual` from compiled code
+> goes through `jit_invoke_dispatch`, the generic helper, at 1-6 µs a call
+> against HotSpot's 5-9 ns.** Three independent lines of evidence say this
+> family is call dispatch, not admission gating. Do not send work at admission
 > gates on the strength of this document's title.
+
 ---
 
 ## Symptom (as originally recorded)
@@ -41,7 +45,7 @@ and of the retired
 iterations of `mb.setBytes(...); mb.toStringType();` and then 6 × 100 000 000
 of `Method.bytesToString(...)`. HotSpot finishes the class in **41.2 s**.
 
-Measured on the post-[24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md) binary, from
+Measured on the post-[24](24-stringcache-oom-under-load-FIXED.md) binary, from
 the class's own printout:
 
 ```
@@ -269,7 +273,7 @@ chain that does not compile — every one of its neighbours does:
 | `ByteChunk.toStringInternal(a, b)` | ✅ C1 full-compile |
 
 Its measured share is ~4 µs of a ~38 µs iteration (~10%). The canonical
-analysis of this gate is [23](23-charsetcache-pathological-slowdown.md),
+analysis of this gate is [23](../../../known-issues/tomcat/23-charsetcache-pathological-slowdown.md),
 which remains OPEN on its own residual (a thread-scaling wall in the dispatch
 helper, not an admission question).
 
@@ -560,61 +564,130 @@ For the decomposition rather than the class:
 <cratonvm.exe> -Xmx2g -cp "probes/out;$CP" MbChainCostProbe 6 100000
 ```
 
-## Adopted 2026-07-31 — two residuals from the retired tomcat/32
+## Adopted 2026-07-31 — two residuals from the retired tomcat/32, and where they went
 
-[32](../../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md)
-closed; two of its items are this document's family and move here with their
-numbers. **Both come with a correction to this document's own framing**: in
-neither case do the hot methods fail to compile. They compile, and the compiled
-output is ~100x off HotSpot. "Hot methods never compile" is the right story for
-`TestMethodPerformance`'s OSR-denied driving loop; it is the wrong story for
-these two, and reading them through it sends the work at admission gates that
-are not the problem.
+[32](32-doc04-residual-perf-assertions-CLOSED.md)
+closed and moved two of its items here. Both were filed as *"codegen quality —
+the hot methods compile, and the compiled output is ~100x off HotSpot"*.
+
+**Re-derived the same day, that framing is wrong too, and in a way that
+matters.** It is not codegen quality. Both reduce to a single mechanism —
+**every `invokevirtual` from compiled code goes through the generic dispatch
+helper** — which is owned by two other open documents. The measurements are
+below; the items themselves are re-homed, and this document closes.
+
+### The measurement that unifies them
+
+`probes/CallCostCompareProbe.java` times a user-defined class shaped exactly
+like `Calendar` (a virtual `get` that calls a guard method and then indexes an
+`int[]`) alongside the real thing, in one process, ns/op:
+
+| stage | HotSpot | CratonVM | ratio |
+|---|---|---|---|
+| `rawArrayRead` | 4 | 143 | 36× |
+| `userVirtualGet` (monomorphic) | 5 | **992** | 198× |
+| `userPolyVirtualGet` | 9 | **6 027** | 670× |
+| `calendarIsLenient` | 4 | 457 | 114× |
+| `calendarGetTimeZone` | 6 | 5 429 | 905× |
+| `calendarGet` | 13 | **12 981** | **1000×** |
+
+`CRATONVM_DBG=mic-prof` says why. Every one of those calls is logged by
+`[DISP_TRACE]`, which is emitted from **`jit_invoke_dispatch`** — the generic
+helper, which runs `note_jit_boundary()` and `jit_safepoint_flush_satb()` and a
+full resolution *per call*:
+
+```
+99 373 x [DISP_TRACE] CallCostCompareProbe$Shape.internalGet(I)I kind=0
+99 373 x [DISP_TRACE] CallCostCompareProbe$Shape.complete()V     kind=0
+```
+
+`internalGet` is declared **`final`**. It cannot be overridden, so it is
+trivially devirtualizable, and it still takes the generic path 99 373 times.
+
+### The one prerequisite: `final` / CHA devirtualization
+
+**`invokevirtual` cannot take the direct-call path at all.** That path admits
+only `invokestatic` and non-`<init>` `invokespecial` (`jit/src/lib.rs`, the
+`ir_direct && (is_static || is_special)` guard) — statically bound calls, where
+the resolved callee is the only possible target. A `final` method is *also* the
+only possible target, by JVMS guarantee, and is not admitted. So `Calendar.get`
+→ `complete()` / `internalGet()` takes the helper regardless.
+
+This was checked against the direct-call gate rather than assumed, and the first
+attempt was wrong — recorded because the mistake is the instructive part.
+
+The raw JIT-to-JIT gate (`direct_jit_callee_calls_enabled`) was closed under
+moving-young for most of this investigation, and forcing it open *appeared* to
+buy ~1.8× on the Calendar path. **That measurement did not survive.** It
+compared two different binaries. `dev` then fixed the underlying defect
+([`jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md`](../../jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md)
+— a `rel8` `JNE` in the PIC cascade silently truncated by `rel as u8`, landing
+inside the pre-call shadow-stack push) and reopened the gate by default. Re-run
+properly as a one-knob A/B on ONE binary, `CRATONVM_JIT_DIRECT_CALLEE_CALLS`
+default vs `=0`:
+
+| stage | gate on | gate off |
+|---|---|---|
+| `userVirtualGet` | 1 115 | 1 148 |
+| `userPolyVirtualGet` | 6 590 | 6 271 |
+| `calendarGet` | 16 611 | 19 485 |
+
+**No difference** — exactly what the guard above predicts, since none of these
+sites is static or special. (That run was on a host at 79-100% from other
+tenants, so read the columns against each other and not the absolutes.)
+
+So there is **one** prerequisite, not two: admit provably-monomorphic
+`invokevirtual` — `final` methods and `final` classes first, CHA after — to the
+direct-call path. Until then, the gate being open buys this family nothing.
 
 ### 30.A — `juli.TestOneLineFormatterPerformance.testDateFormat` (was 32.4)
 
 Asserts `DateFormatCache` beats `String.format`, 10^6 iterations each. The test
 feeds `System.nanoTime()` to a formatter cached on `time / 1000`, so it misses
 essentially every call and the miss path — a bare `SimpleDateFormat.format` —
-is what is measured. End to end 2026-07-31, loaded host:
+is what is measured. `String.format` is a **Rust intrinsic** on CratonVM
+(measured 1.5× HotSpot, 2 840 vs 1 933 ns), so the assertion reduces to
+"compiled Java must beat a Rust intrinsic".
 
-```
-StringFormatImpl        4 730 855 700 ns
-DateFormatCacheImpl   606 794 187 200 ns      -- 128x short
-```
+Decomposed with `probes/DateFormatChainProbe.java` and
+`probes/DateFormatPatternProbe.java` (ns/op, HotSpot vs CratonVM):
 
-`CRATONVM_DBG_JITC` shows both hot methods compiling —
-`SimpleDateFormat.format` at `len=1708`, `subFormat` at `len=64359` — so this
-is codegen quality, not admission:
-
-| operation | HotSpot | CratonVM |
+| stage | HotSpot | CratonVM |
 |---|---|---|
-| `SimpleDateFormat.format` (same Date) | 2.3–2.5 µs | 250–300 µs |
-| `DateFormatSymbols.getInstance(Locale.US)` | 1.1–1.2 µs | 50–62 µs |
-| `new DateFormatSymbols(Locale.US)` | 0.5–1.1 µs | 28–34 µs |
+| pattern `"ss"` — ONE 2-digit numeric field | 59 | 39 828 |
+| pattern `"MMM"` | 332 | 277 008 |
+| full `"dd-MMM-yyyy HH:mm:ss"` | 247 | 193 175 |
+| `Calendar.setTimeInMillis` alone | 150 | 30 795 |
+| `Calendar.get` on an already-computed calendar | 33 | 10 071 |
 
-Closing it needs `SimpleDateFormat.format` at ≲ 4.7 µs, which is where
-`String.format` lands **because on CratonVM that side is a Rust intrinsic**. The
-assertion therefore reduces to "compiled Java must match a Rust intrinsic", and
-**optimising `String.format` makes this test harder to pass** — worth knowing
-before anyone treats the fast side as an improvement target.
+**Two corrections to what was previously recorded here.**
 
-Separately actionable but *not* a lever for this test:
-`java/text/DateFormatSymbols.getProviderInstance` fails codegen
-(`compile-bail … backend_attempted=true`, `tier_fail_count=3`), which
-`CRATONVM_DBG_JIT_METHOD_STATS` classifies as "not policy — these are bugs". It
-is reached ~2x per `String.format` call, i.e. it is on the fast side.
+* *"Both hot methods compile, so this is codegen quality."* They do compile —
+  but so does everything else on the path. `SimpleDateFormat.format("ss")` in
+  isolation (`probes/SdfOnlyProbe.java`) costs **51 µs with
+  `hot_but_stuck_in_interpreter=0`** — zero compile failures anywhere. The cost
+  is the ~40 dispatch-helper round trips the format performs, not the quality of
+  any compiled body.
+* *"`DateFormatSymbols.getProviderInstance` fails codegen"* — true, and also
+  **not the cause**, for the same reason: the `"ss"` path never reaches it and
+  is still 870× off. See
+  [`jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md`](../../../known-issues/jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md),
+  which is worth fixing on its own merits and should stop being cited for this
+  test.
 
-Repro: `cratonvm.exe -Xmx2g -cp <probes-out> DateFmtProbe` and
-`… DateSymbolsProbe 1000`.
+Closing 30.A means `SimpleDateFormat.format` at ≲ 4.7 µs against today's 193 µs
+— **41×** — on a path whose per-call cost is 200-1000× HotSpot. That is the
+dispatch work above, not a fix to this test.
+
+**Re-homed to** [`jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md`](../../jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md)
+(prerequisite 1) with the devirtualization gap (prerequisite 2) recorded there.
 
 ### 30.B — `TestAsyncMessagesPerformance`'s SEQ2 residual (was 32.3)
 
 32.3's binding SEQ1 assertion was a real defect and is **fixed** (`9f7095ed9`,
 the bulk `ByteBuffer` natives copying one byte per accessor call): SEQ0 4→1 and
 SEQ1 500→86–143 across interleaved reps. What remains is SEQ2 — the gap between
-the 16 KiB message and the 4 KiB message, tolerance 100, actual 495–500 — and
-it is here because it is measured to be general Java throughput.
+the 16 KiB message and the 4 KiB message, tolerance 100, actual 495–500.
 
 `CRATONVM_DBG_AIO_INLINE` (`9bef50216`) splits the ~1.3 ms gap, n=1000
 not-ready reads:
@@ -628,8 +701,13 @@ queue_mean=35us   deliver_mean=46us
 * **444 µs** the worker genuinely blocked waiting for the peer,
 * **~775 µs** client-side Java between the two `onMessage` callbacks.
 
-Thread wake-up is ruled out too: a Semaphore round-trip is 20.5 µs against
+Thread wake-up is ruled out: a Semaphore round-trip is 20.5 µs against
 HotSpot's 10.5 µs and `park`/`unpark` is *faster* than HotSpot at 8.1 vs 10.3 µs
 (`probes/ParkPingPongProbe`). The test runs the embedded server and the client
 in one process, so the 444 µs peer turnaround is also our VM executing Tomcat's
-send path. **No further AIO or buffer work will close SEQ2.**
+send path. **No further AIO or buffer work will close SEQ2** — the 775 µs of
+client-side Java and the 444 µs of server-side Java are the same dispatch cost
+30.A isolates, measured through a socket instead of a date formatter.
+
+**Re-homed to the same place as 30.A.** Nothing here is Tomcat-specific and
+nothing here is an admission ban.
