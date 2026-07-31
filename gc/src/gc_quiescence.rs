@@ -786,6 +786,37 @@ pub fn force_non_moving_jit_roots() -> bool {
 thread_local! {
     static MAJOR_GC_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CLASS_UNLOAD_MARKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Did the collection this thread just ran reclaim OLD-generation storage?
+    ///
+    /// A minor cycle never touches old gen, so every old-gen address is still
+    /// exactly where it was and `VmHeap::is_addr_live` may (and does) report
+    /// all of them live. Once an old-gen reclamation runs — the mark-COMPACT
+    /// `major_gc` or the in-place `sweep_old_gen_non_moving` — that stops
+    /// being true: a dead old-gen object is slid over by a live neighbour or
+    /// returned to the free list, and the freed tail is zeroed. Post-GC
+    /// reference processing must then stop trusting "the address is inside
+    /// old gen" as a survival proof and require a `pointer_map` entry, which
+    /// both old-gen paths now emit (identity for stationary survivors) for
+    /// every watched address.
+    ///
+    /// Set by the collector, read by `VmHeap::watched_pre_gc_addr_survived`
+    /// on the same (collecting) thread inside the same STW window.
+    static OLD_GEN_RECLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record whether the collection now in flight reclaimed old-generation
+/// storage. Called with `false` at the start of every cycle and `true` by
+/// whichever old-gen path actually ran. See `OLD_GEN_RECLAIMED`.
+#[inline]
+pub fn set_old_gen_reclaimed(v: bool) {
+    OLD_GEN_RECLAIMED.with(|c| c.set(v));
+}
+
+/// Did the collection whose `pointer_map` is being consumed reclaim old-gen
+/// storage? See `OLD_GEN_RECLAIMED`.
+#[inline]
+pub fn old_gen_reclaimed_last_cycle() -> bool {
+    OLD_GEN_RECLAIMED.with(std::cell::Cell::get)
 }
 
 /// Run one root-gather operation for a collector's non-moving class-unloading
