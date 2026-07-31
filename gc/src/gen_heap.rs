@@ -142,6 +142,34 @@ const fn young_gc_trigger_bytes(
 /// frame, which is the only case the feature exists for. A live JIT frame now
 /// forces the non-moving sweep exactly when moving-young is not in effect;
 /// when it IS in effect, the per-cycle coverage proof decides, not a flag.
+///
+/// # Why `moving_young_requested` is not the whole answer
+///
+/// Requesting moving-young does not make the next cycle moving. While
+/// [`cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT`] is `false`,
+/// `conservative_roots::refresh_moving_young_coverage_for_current_thread`
+/// vetoes moving-young for the whole process as soon as any compiled code
+/// exists, so a cycle taken with a live JIT frame — which is exactly what the
+/// `jit_active || unregistered || jit_allocation_frame` term above requires —
+/// is **guaranteed** to divert to the non-moving sweep. Saying otherwise costs
+/// real throughput and buys nothing:
+///
+/// the answer here picks the young-GC *trigger*. `false` selects the Cheney
+/// threshold, which must reserve the unused semi-space as worst-case survivor
+/// headroom; `true` selects `NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT` (90%),
+/// because an in-place sweep needs no headroom. So on a default JIT run the
+/// heap was collecting at the copying-collector's early threshold and then
+/// diverting every one of those collections to the in-place sweep — roughly
+/// double the collections, each a whole-heap sweep, for a copy that never
+/// happened. Allocation-heavy workloads feel it directly: it is what kept
+/// `type.temporal` over its cap (>1500 s vs 777 s under
+/// `CRATONVM_NO_MOVING_YOUNG=1`) after four codegen suspects had been
+/// eliminated by bisection.
+///
+/// Fail-safe direction: this must only report `true` when the sweep is
+/// *certain*, since a moving cycle taken against the 90% trigger could exhaust
+/// its copy reserve. The veto provides that certainty, and both halves read the
+/// same constant, so they cannot disagree.
 #[inline]
 const fn next_young_gc_is_guaranteed_non_moving(
     jit_active: bool,
@@ -152,7 +180,8 @@ const fn next_young_gc_is_guaranteed_non_moving(
 ) -> bool {
     !force_moving
         && (jit_active || unregistered_jit_frame || jit_allocation_frame)
-        && !moving_young_requested
+        && (!moving_young_requested
+            || !cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT)
 }
 
 /// "Humongous" object threshold as a percentage of the young semi-space
@@ -11955,14 +11984,40 @@ mod tests {
         // arch-2026-07-26: moving-young alone is now sufficient. There is no
         // second `CRATONVM_ALLOW_MOVING_YOUNG` opt-in to also satisfy — the
         // per-cycle coverage proof, not a flag, decides at collection time.
+        //
+        // ...but "requested" is not "will happen". While the JIT publishes no
+        // relocation contract the process-wide veto guarantees these cycles take
+        // the sweep, so the trigger must size for the sweep. Both states are
+        // pinned here so this test stays honest when the constant flips.
+        if cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT {
+            assert!(
+                !next_young_gc_is_guaranteed_non_moving(true, false, true, true, false),
+                "with a published relocation contract a requested moving cycle can really \
+                 move, so the trigger must preserve Cheney copy headroom",
+            );
+            assert!(
+                !next_young_gc_is_guaranteed_non_moving(true, true, true, true, false),
+                "moving-young sizes for the copy even with an unregistered frame flagged \
+                 (that cycle may fall back, but the trigger must not assume it will)",
+            );
+        } else {
+            assert!(
+                next_young_gc_is_guaranteed_non_moving(true, false, true, true, false),
+                "without a published relocation contract, a cycle with a live JIT frame is \
+                 VETOED to the non-moving sweep — sizing it for a Cheney copy that cannot \
+                 happen just doubles the collection count (trigger 500 vs 900 here)",
+            );
+            assert!(
+                next_young_gc_is_guaranteed_non_moving(true, true, true, true, false),
+                "an unregistered frame is still a live compiled frame, so the veto applies \
+                 and the sweep is still guaranteed",
+            );
+        }
+        // Independent of the contract: no live compiled frame ⇒ no veto ⇒ the
+        // cycle really may move, so keep the copy headroom.
         assert!(
-            !next_young_gc_is_guaranteed_non_moving(true, false, true, true, false),
-            "moving-young must preserve Cheney copy headroom without a second opt-in",
-        );
-        assert!(
-            !next_young_gc_is_guaranteed_non_moving(true, true, true, true, false),
-            "moving-young sizes for the copy even with an unregistered frame flagged \
-             (that cycle may fall back, but the trigger must not assume it will)",
+            !next_young_gc_is_guaranteed_non_moving(false, false, false, true, false),
+            "a JIT-quiescent cycle is not vetoed and may move, so it must size for the copy",
         );
         assert!(
             !next_young_gc_is_guaranteed_non_moving(true, false, true, false, true),

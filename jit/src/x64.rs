@@ -2982,7 +2982,24 @@ impl Compiler {
         if self.failed {
             return;
         }
-        if moving_young_enabled() {
+        // Bisect lever, default = current behaviour. `CRATONVM_JIT_MY_SCRATCH_FLUSH=0`
+        // drops this flush when relocation is vetoed anyway.
+        //
+        // Why it is a candidate: this runs at EVERY GC-capable safepoint under
+        // `moving_young`, and it is one of the few remaining costs that
+        // `CRATONVM_NO_MOVING_YOUNG=1` removes but the relocation-scoped
+        // admission gates do not. The `type.temporal` Hibernate classes still
+        // exceed the 300 s cap on default flags while passing under that
+        // variable, so a residual of this shape is unaccounted for. Shadow
+        // push/reload has already been eliminated as the cause (measured
+        // no-change; see `shadow_stack_maps_enabled`), which leaves this and
+        // the self-call spill-elision proof.
+        //
+        // The non-moving path has never called this and is the historically
+        // correct configuration, so `0` returns to known-good codegen rather
+        // than inventing a new one. Kept default-ON until measured on a quiet
+        // host — the box had eight other sessions' VMs running when this landed.
+        if moving_young_enabled() && scratch_flush_at_safepoint_enabled() {
             self.flush_scratch_registers();
         }
         // Capture the live-frame bound for the map this safepoint will record.
@@ -3075,11 +3092,13 @@ impl Compiler {
         if self.failed {
             return;
         }
-        if self.shadow_enabled || moving_young_enabled() {
+        // Must mirror `can_elide_self_call_register_spill` exactly — see the
+        // note there. Both read `self_call_moving_proof_enabled()`.
+        if self.shadow_enabled || self_call_moving_proof_enabled() {
             let coverage_complete = self.moving_young_safepoint_coverage_complete();
             let live_oop_home_count = self.collect_live_oop_homes().len();
             if !moving_oop_free_self_call_is_publishable(
-                moving_young_enabled(),
+                self_call_moving_proof_enabled(),
                 coverage_complete,
                 live_oop_home_count,
             ) {
@@ -3277,9 +3296,13 @@ impl Compiler {
             return false;
         }
 
-        if self.shadow_enabled || moving_young_enabled() {
+        // `self_call_moving_proof_enabled()` rather than `moving_young_enabled()`:
+        // the paired emitter `emit_safepoint_metadata_only` reads the SAME
+        // predicate and fails the compile closed if the two ever disagree, so
+        // they must move together. Default-identical to the old expression.
+        if self.shadow_enabled || self_call_moving_proof_enabled() {
             return moving_oop_free_self_call_is_publishable(
-                moving_young_enabled(),
+                self_call_moving_proof_enabled(),
                 self.moving_young_safepoint_coverage_complete(),
                 self.collect_live_oop_homes().len(),
             );
@@ -36867,16 +36890,62 @@ mod flag_and_header_contracts {
         );
     }
 
+    /// The relocation-safety gates must ask "can a relocating collection see a
+    /// compiled frame?", which is strictly narrower than "is moving-young on?".
+    /// Equating the two is what switched the optimizing tier off by default.
+    #[test]
+    fn relocates_compiled_frames_implies_moving_young_but_not_conversely() {
+        assert!(
+            !moving_young_relocates_compiled_frames() || moving_young_enabled(),
+            "relocation of compiled frames must imply the moving young gen is on"
+        );
+        assert_eq!(
+            moving_young_relocates_compiled_frames(),
+            moving_young_enabled() && cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT,
+            "the predicate must be exactly `moving_young && JIT_PUBLISHES_RELOCATION_CONTRACT` — \
+             the same constant the runtime veto in conservative_roots reads, or the veto and \
+             these gates can drift apart"
+        );
+    }
+
+    /// While the JIT publishes no relocation contract, the runtime vetoes
+    /// moving-young for the whole process as soon as any compiled code exists.
+    /// The optimizing tier must therefore NOT be disabled by the moving-young
+    /// default — that trade bought nothing. Pins the regression that
+    /// `docs/known-issues/jit-optimizing-tier-disabled-by-moving-young-default.md`
+    /// describes.
+    #[test]
+    fn optimizing_tier_is_not_disabled_while_relocation_is_vetoed() {
+        if cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT {
+            // Contract landed: the gates are supposed to be armed again.
+            return;
+        }
+        assert!(
+            !moving_young_relocates_compiled_frames(),
+            "with no published relocation contract, no compiled frame can be live during a \
+             relocating young collection, so the IR/direct-call gates must be open regardless \
+             of the moving-young default"
+        );
+    }
+
     /// `CRATONVM_SHADOW_STACK` is likewise read by `jit`, `gc` and `vm`; the
     /// emission side and the root-scan side must agree or the collector walks
     /// a shadow stack the codegen never pushed to. Moving-young implies it.
+    ///
+    /// Deliberately still the BARE flag, not the relocation-scoped predicate:
+    /// scoping it was tried, measured as no-change, and reverted rather than
+    /// move one side of an exact agreement for nothing. See
+    /// `shadow_stack_maps_enabled`.
     #[test]
     fn shadow_stack_maps_enabled_is_central_flag_or_moving_young() {
         assert_eq!(
             shadow_stack_maps_enabled(),
-            cratonvm_types::flags().jit.shadow_stack || moving_young_enabled(),
-            "shadow-stack codegen must be gated on the shared flag (plus the moving-young \
-             implication), not on a crate-private getenv"
+            cratonvm_types::flags().jit.shadow_stack
+                || (moving_young_enabled() && shadow_emission_moving_implication_enabled()),
+            "shadow-stack codegen must be gated on the shared flag plus the moving-young \
+             implication (itself bisectable via CRATONVM_JIT_MY_SHADOW_EMISSION), not on a \
+             crate-private getenv. `vm::jit::conservative_roots::shadow_stack_enabled` must \
+             spell the SAME expression — they are two halves of one agreement"
         );
     }
 

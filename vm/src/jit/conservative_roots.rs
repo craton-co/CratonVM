@@ -359,8 +359,24 @@ pub fn shadow_stack_enabled() -> bool {
     // `CRATONVM_MOVING_YOUNG` implies the shadow-stack root scan + remap: the
     // moving young gen relies on the complete precise map the shadow stack now
     // publishes (see `moving_young_enabled`).
+    //
+    // This formula MUST stay identical to the emission side,
+    // `jit::x64::shadow_stack_maps_enabled`, or the collector walks a shadow
+    // stack the codegen never pushed to. Both were tried scoped to
+    // `JIT_PUBLISHES_RELOCATION_CONTRACT` and both were reverted together: the
+    // scoping measured as no-change (see that function's comment), and moving
+    // one side of this agreement is not worth doing for an unmeasurable win.
+    // `CRATONVM_JIT_MY_SHADOW_EMISSION=0` drops the moving-young implication on
+    // BOTH sides at once; see `jit::x64::shadow_emission_moving_implication_enabled`.
+    // This expression must stay character-for-character equivalent to the
+    // emission side's.
     *ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some()
+            || (moving_young_enabled()
+                && match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SHADOW_EMISSION") {
+                    Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                    Err(_) => true,
+                })
     })
 }
 
@@ -1754,6 +1770,7 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
     // the blanket for a bisect or an emergency — the same fail-closed
     // direction, no longer the only available setting.
     if moving_young_no_jit() && cratonvm_jit::jit_code_range_count() != 0 {
+
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
             cratonvm_gc::gc_quiescence::incomplete_reason::JIT_RELOCATION_UNSUPPORTED,
         );
