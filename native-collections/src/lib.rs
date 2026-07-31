@@ -18211,6 +18211,68 @@ const COLLECTOR_TAG_MAPPING: i32 = 15;
 /// `Collectors.toMap(keyFn, valFn, mergeFn, supplier)`.
 /// ARG1=keyFn, ARG2=valFn, ARG3=mergeFn, ARG4=supplier.
 const COLLECTOR_TAG_TO_MAP_SUPPLIER: i32 = 16;
+// ---------------------------------------------------------------------------
+// Tags 17+ arrived when a SECOND collector tag namespace was folded into this
+// one. `native-builtins`' `phases_late::streams` used to mint its own
+// `P56_COLLECTOR_*` numbers (maxBy=9, minBy=10, filtering=12,
+// summarizingInt/Long/Double=13/14/15, …) that nothing ever decoded — this
+// file owns the only registered `Stream.collect(Collector)` — while aliasing
+// live tags above. `Collectors.minBy(cmp)` was stamped 10, so
+// `stream.collect(minBy(cmp))` came back through GROUPING_BY_SUPPLIER and
+// answered a Map instead of an Optional; maxBy/filtering/summarizing* were
+// wrong the same way. Every producer, in either crate, now mints through the
+// `make_*_collector` helpers below, so there is one namespace to keep
+// consistent: a new tag must be added here, to `is_known_collector_tag`, and
+// to the `native_stream_collect` match.
+/// `Collectors.minBy(Comparator)` — ARG1=comparator. Reduces to an `Optional`
+/// (empty when the stream is empty), like `Stream.min(Comparator)`.
+const COLLECTOR_TAG_MIN_BY: i32 = 17;
+/// `Collectors.maxBy(Comparator)` — ARG1=comparator. See [`COLLECTOR_TAG_MIN_BY`].
+const COLLECTOR_TAG_MAX_BY: i32 = 18;
+/// `Collectors.filtering(Predicate, Collector)` — ARG1=predicate, ARG2=downstream
+/// Collector fed only the elements the predicate accepts.
+const COLLECTOR_TAG_FILTERING: i32 = 19;
+/// `Collectors.summarizingInt(ToIntFunction)` — ARG1=extractor. Yields a
+/// `java.util.IntSummaryStatistics` in the layout `native-builtins`'
+/// `phases_late::streams` accessors read (see [`STATS_FIELD_COUNT`]).
+const COLLECTOR_TAG_SUMMARIZING_INT: i32 = 20;
+/// `Collectors.summarizingLong(ToLongFunction)` — ARG1=extractor.
+const COLLECTOR_TAG_SUMMARIZING_LONG: i32 = 21;
+/// `Collectors.summarizingDouble(ToDoubleFunction)` — ARG1=extractor.
+const COLLECTOR_TAG_SUMMARIZING_DOUBLE: i32 = 22;
+/// `Collectors.averagingInt(ToIntFunction)` — ARG1=extractor. Yields a boxed
+/// `Double` (0.0 for an empty stream), matching the JDK.
+const COLLECTOR_TAG_AVERAGING_INT: i32 = 23;
+/// `Collectors.averagingLong(ToLongFunction)` — ARG1=extractor.
+const COLLECTOR_TAG_AVERAGING_LONG: i32 = 24;
+/// `Collectors.averagingDouble(ToDoubleFunction)` — ARG1=extractor.
+const COLLECTOR_TAG_AVERAGING_DOUBLE: i32 = 25;
+/// `Collectors.summingInt(ToIntFunction)` — ARG1=extractor. Yields a boxed
+/// `Integer`; the sum wraps at 32 bits exactly as the JDK's `int` accumulator does.
+const COLLECTOR_TAG_SUMMING_INT: i32 = 26;
+/// `Collectors.summingLong(ToLongFunction)` — ARG1=extractor. Yields a boxed `Long`.
+const COLLECTOR_TAG_SUMMING_LONG: i32 = 27;
+/// `Collectors.summingDouble(ToDoubleFunction)` — ARG1=extractor. Yields a boxed `Double`.
+const COLLECTOR_TAG_SUMMING_DOUBLE: i32 = 28;
+/// `Collectors.teeing(Collector, Collector, BiFunction)` — ARG1/ARG2 are the two
+/// downstream Collectors, both fed the SAME elements, ARG3 the BiFunction that
+/// merges their two results. Registered synthetic for the reason `mapping` is
+/// (see [`COLLECTOR_TAG_MAPPING`]): the real `Collectors.teeing` bytecode calls
+/// `downstream.accumulator()` eagerly, which AbstractMethodErrors on our tagged
+/// synthetic downstreams. Until this tag existed, `teeing` handed back a bare
+/// `toList` collector and dropped both downstreams and the merger on the floor.
+const COLLECTOR_TAG_TEEING: i32 = 29;
+
+// Field layout of the synthetic `java.util.{Int,Long,Double}SummaryStatistics`
+// the summarizing collectors build. Mirrors — and must stay in step with — the
+// `STATS_FIELD_*` layout that `native-builtins`' `phases_late::streams`
+// allocates and whose registered getters (`getCount`/`getSum`/`getMin`/
+// `getMax`/`accept`) read, and the real JDK's field declaration order.
+const STATS_FIELD_COUNT: usize = 0;
+const STATS_FIELD_SUM: usize = 1;
+const STATS_FIELD_MIN: usize = 2;
+const STATS_FIELD_MAX: usize = 3;
+const STATS_NUM_FIELDS: usize = 4;
 
 fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -18353,6 +18415,91 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
         native_collectors_mapping,
     );
+    // minBy/maxBy/filtering/summarizing*/averaging*/summing*. `native-builtins`
+    // (phase 56) registers the same factories and mints through the shared
+    // `make_*_collector` helpers, so whichever registration wins produces the
+    // same object. Before tags 17+ these were produced ONLY there, in a second
+    // tag namespace nothing decodes — `collect(minBy(cmp))` answered a Map.
+    r.register(
+        c,
+        "minBy",
+        "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
+        native_collectors_min_by,
+    );
+    r.register(
+        c,
+        "maxBy",
+        "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
+        native_collectors_max_by,
+    );
+    r.register(
+        c,
+        "filtering",
+        "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
+        native_collectors_filtering,
+    );
+    r.register(
+        c,
+        "summarizingInt",
+        "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summarizing_int,
+    );
+    r.register(
+        c,
+        "summarizingLong",
+        "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summarizing_long,
+    );
+    r.register(
+        c,
+        "summarizingDouble",
+        "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summarizing_double,
+    );
+    r.register(
+        c,
+        "averagingInt",
+        "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
+        native_collectors_averaging_int,
+    );
+    r.register(
+        c,
+        "averagingLong",
+        "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
+        native_collectors_averaging_long,
+    );
+    r.register(
+        c,
+        "averagingDouble",
+        "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
+        native_collectors_averaging_double,
+    );
+    r.register(
+        c,
+        "summingInt",
+        "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summing_int,
+    );
+    r.register(
+        c,
+        "summingLong",
+        "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summing_long,
+    );
+    r.register(
+        c,
+        "summingDouble",
+        "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
+        native_collectors_summing_double,
+    );
+    // teeing — also registered by native-builtins (phase 64), which delegates to
+    // the same mint helper.
+    r.register(
+        c,
+        "teeing",
+        "(Ljava/util/stream/Collector;Ljava/util/stream/Collector;Ljava/util/function/BiFunction;)Ljava/util/stream/Collector;",
+        native_collectors_teeing,
+    );
     // Our synthetic Collector objects need a `characteristics()` method that
     // returns a non-null Set — JDK stream internals (e.g.
     // ReduceOps$3.getOpFlags) call `collector.characteristics().contains(UNORDERED)`,
@@ -18474,6 +18621,19 @@ fn is_known_collector_tag(tag: i32) -> bool {
             | COLLECTOR_TAG_TO_COLLECTION
             | COLLECTOR_TAG_MAPPING
             | COLLECTOR_TAG_TO_MAP_SUPPLIER
+            | COLLECTOR_TAG_MIN_BY
+            | COLLECTOR_TAG_MAX_BY
+            | COLLECTOR_TAG_FILTERING
+            | COLLECTOR_TAG_SUMMARIZING_INT
+            | COLLECTOR_TAG_SUMMARIZING_LONG
+            | COLLECTOR_TAG_SUMMARIZING_DOUBLE
+            | COLLECTOR_TAG_AVERAGING_INT
+            | COLLECTOR_TAG_AVERAGING_LONG
+            | COLLECTOR_TAG_AVERAGING_DOUBLE
+            | COLLECTOR_TAG_SUMMING_INT
+            | COLLECTOR_TAG_SUMMING_LONG
+            | COLLECTOR_TAG_SUMMING_DOUBLE
+            | COLLECTOR_TAG_TEEING
     )
 }
 
@@ -18752,6 +18912,274 @@ pub fn make_to_set_collector(ctx: &mut dyn NativeContext) -> ObjectRef {
     make_collector(ctx, COLLECTOR_TAG_TO_SET)
 }
 
+/// Allocate a tagged Collector carrying one captured argument in ARG1.
+///
+/// The argument is rooted across the allocation: `make_collector` allocates,
+/// and a moving young GC there relocates the argument while this frame still
+/// holds its pre-GC address (native stale-local family).
+fn make_collector_arg1(ctx: &mut dyn NativeContext, tag: i32, arg: Value) -> ObjectRef {
+    let arg_pin = pin_value(ctx, arg);
+    let c = make_collector(ctx, tag);
+    let arg = read_pinned_elem(ctx, arg_pin, arg);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, arg);
+    if arg_pin != usize::MAX {
+        ctx.unpin_native_roots(arg_pin);
+    }
+    c
+}
+
+/// Two-argument form of [`make_collector_arg1`] (ARG1, ARG2).
+fn make_collector_arg2(
+    ctx: &mut dyn NativeContext,
+    tag: i32,
+    arg1: Value,
+    arg2: Value,
+) -> ObjectRef {
+    let pin1 = pin_value(ctx, arg1);
+    let pin2 = pin_value(ctx, arg2);
+    let c = make_collector(ctx, tag);
+    let arg1 = read_pinned_elem(ctx, pin1, arg1);
+    let arg2 = read_pinned_elem(ctx, pin2, arg2);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, arg1);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, arg2);
+    let base = if pin1 != usize::MAX { pin1 } else { pin2 };
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
+    c
+}
+
+/// Three-argument form of [`make_collector_arg1`] (ARG1, ARG2, ARG3).
+fn make_collector_arg3(
+    ctx: &mut dyn NativeContext,
+    tag: i32,
+    arg1: Value,
+    arg2: Value,
+    arg3: Value,
+) -> ObjectRef {
+    let pin1 = pin_value(ctx, arg1);
+    let pin2 = pin_value(ctx, arg2);
+    let pin3 = pin_value(ctx, arg3);
+    let c = make_collector(ctx, tag);
+    let arg1 = read_pinned_elem(ctx, pin1, arg1);
+    let arg2 = read_pinned_elem(ctx, pin2, arg2);
+    let arg3 = read_pinned_elem(ctx, pin3, arg3);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, arg1);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, arg2);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, arg3);
+    // Pins are a stack: releasing the first one pushed releases all three.
+    let base = [pin1, pin2, pin3]
+        .into_iter()
+        .find(|p| *p != usize::MAX)
+        .unwrap_or(usize::MAX);
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
+    c
+}
+
+// The `make_*_collector` mint points below are `pub` because `native-builtins`
+// registers the same `java/util/stream/Collectors` factories (phase 56) and
+// must produce byte-identical objects — registration is last-wins, and the
+// crates disagreeing on the tag is exactly the bug tags 17+ fixed.
+
+/// `Collectors.minBy(Comparator)`.
+pub fn make_min_by_collector(ctx: &mut dyn NativeContext, comparator: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_MIN_BY, comparator)
+}
+
+/// `Collectors.maxBy(Comparator)`.
+pub fn make_max_by_collector(ctx: &mut dyn NativeContext, comparator: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_MAX_BY, comparator)
+}
+
+/// `Collectors.filtering(Predicate, Collector)`.
+pub fn make_filtering_collector(
+    ctx: &mut dyn NativeContext,
+    predicate: Value,
+    downstream: Value,
+) -> ObjectRef {
+    make_collector_arg2(ctx, COLLECTOR_TAG_FILTERING, predicate, downstream)
+}
+
+/// `Collectors.mapping(Function, Collector)`.
+pub fn make_mapping_collector(
+    ctx: &mut dyn NativeContext,
+    mapper: Value,
+    downstream: Value,
+) -> ObjectRef {
+    make_collector_arg2(ctx, COLLECTOR_TAG_MAPPING, mapper, downstream)
+}
+
+/// `Collectors.collectingAndThen(Collector, Function)`.
+pub fn make_collecting_and_then_collector(
+    ctx: &mut dyn NativeContext,
+    downstream: Value,
+    finisher: Value,
+) -> ObjectRef {
+    make_collector_arg2(ctx, COLLECTOR_TAG_COLLECTING_AND_THEN, downstream, finisher)
+}
+
+/// `Collectors.summarizingInt(ToIntFunction)`.
+pub fn make_summarizing_int_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMARIZING_INT, extractor)
+}
+
+/// `Collectors.summarizingLong(ToLongFunction)`.
+pub fn make_summarizing_long_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMARIZING_LONG, extractor)
+}
+
+/// `Collectors.summarizingDouble(ToDoubleFunction)`.
+pub fn make_summarizing_double_collector(
+    ctx: &mut dyn NativeContext,
+    extractor: Value,
+) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMARIZING_DOUBLE, extractor)
+}
+
+/// `Collectors.averagingInt(ToIntFunction)`.
+pub fn make_averaging_int_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_AVERAGING_INT, extractor)
+}
+
+/// `Collectors.averagingLong(ToLongFunction)`.
+pub fn make_averaging_long_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_AVERAGING_LONG, extractor)
+}
+
+/// `Collectors.averagingDouble(ToDoubleFunction)`.
+pub fn make_averaging_double_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_AVERAGING_DOUBLE, extractor)
+}
+
+/// `Collectors.summingInt(ToIntFunction)`.
+pub fn make_summing_int_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMING_INT, extractor)
+}
+
+/// `Collectors.summingLong(ToLongFunction)`.
+pub fn make_summing_long_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMING_LONG, extractor)
+}
+
+/// `Collectors.summingDouble(ToDoubleFunction)`.
+pub fn make_summing_double_collector(ctx: &mut dyn NativeContext, extractor: Value) -> ObjectRef {
+    make_collector_arg1(ctx, COLLECTOR_TAG_SUMMING_DOUBLE, extractor)
+}
+
+/// `Collectors.teeing(Collector, Collector, BiFunction)`.
+pub fn make_teeing_collector(
+    ctx: &mut dyn NativeContext,
+    downstream1: Value,
+    downstream2: Value,
+    merger: Value,
+) -> ObjectRef {
+    make_collector_arg3(ctx, COLLECTOR_TAG_TEEING, downstream1, downstream2, merger)
+}
+
+fn native_collectors_min_by(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let cmp = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_min_by_collector(ctx, cmp);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_max_by(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let cmp = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_max_by_collector(ctx, cmp);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_filtering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let predicate = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+    let c = make_filtering_collector(ctx, predicate, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summarizing_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summarizing_int_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summarizing_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summarizing_long_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summarizing_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summarizing_double_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_averaging_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_averaging_int_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_averaging_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_averaging_long_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_averaging_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_averaging_double_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summing_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summing_int_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summing_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summing_long_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_summing_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let f = args.first().copied().unwrap_or(Value::Object(None));
+    let c = make_summing_double_collector(ctx, f);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+fn native_collectors_teeing(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let downstream1 = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream2 = args.get(1).copied().unwrap_or(Value::Object(None));
+    let merger = args.get(2).copied().unwrap_or(Value::Object(None));
+    let c = make_teeing_collector(ctx, downstream1, downstream2, merger);
+    Ok(Some(Value::Object(Some(c))))
+}
+
 fn native_collectors_to_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let c = make_collector(ctx, COLLECTOR_TAG_TO_LIST);
     Ok(Some(Value::Object(Some(c))))
@@ -18802,11 +19230,9 @@ fn native_collectors_collecting_and_then(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_COLLECTING_AND_THEN);
     let downstream = args.first().copied().unwrap_or(Value::Object(None));
     let finisher = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, downstream);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG2, finisher);
+    let c = make_collecting_and_then_collector(ctx, downstream, finisher);
     Ok(Some(Value::Object(Some(c))))
 }
 
@@ -18875,11 +19301,9 @@ fn native_collectors_grouping_by_downstream(
 
 /// `Collectors.mapping(mapper, downstream)` — ARG1=mapper, ARG2=downstream.
 fn native_collectors_mapping(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let c = make_collector(ctx, COLLECTOR_TAG_MAPPING);
     let mapper = args.first().copied().unwrap_or(Value::Object(None));
     let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(c, COLLECTOR_FIELD_ARG1, mapper);
-    ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
+    let c = make_mapping_collector(ctx, mapper, downstream);
     Ok(Some(Value::Object(Some(c))))
 }
 
@@ -19139,6 +19563,115 @@ fn native_stream_collect_3arg(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let container = read_pinned_elem(ctx, cont_handle, container);
     ctx.unpin_native_roots(sup_pin);
     Ok(Some(container))
+}
+
+/// Invoke a summarizing/averaging/summing collector's primitive extractor SAM
+/// (`applyAsInt`/`applyAsLong`/`applyAsDouble`) on every element and return the
+/// raw primitive results.
+///
+/// cceres3: the SAM re-enters Java and can trigger a moving young collection, so
+/// the extractor and each element are re-read through their pins per iteration.
+/// The pin pushed here is released by the single `unpin_native_roots` that
+/// [`native_stream_collect`] runs after its tag dispatch.
+fn collector_extract_primitives(
+    ctx: &mut dyn NativeContext,
+    extractor: Value,
+    elements: &[Value],
+    elem_handles: &[usize],
+    method: &str,
+    descriptor: &str,
+) -> Result<Vec<Value>, MethodCallFailed> {
+    let extractor = match extractor {
+        Value::Object(Some(f)) => f,
+        // A null extractor NPEs in the JDK. Answer "no values" so the caller
+        // still hands back a well-formed (empty) result object.
+        _ => return Ok(Vec::new()),
+    };
+    let fn_pin = ctx.pin_native_root(extractor);
+    let mut out = Vec::with_capacity(elements.len());
+    for i in 0..elements.len() {
+        let extractor = ctx.read_native_pin(fn_pin, extractor);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let v = ctx.invoke_virtual(extractor, method, descriptor, &[elem])?;
+        out.push(v.unwrap_or(Value::Int(0)));
+    }
+    Ok(out)
+}
+
+/// Widen a primitive extractor result to `i64`. The SAM's declared return type
+/// already fixes the shape; this only tolerates a dispatch path that hands back
+/// a wider/narrower primitive than the descriptor promised.
+fn value_as_i64(v: Value) -> i64 {
+    match v {
+        Value::Int(i) => i as i64,
+        Value::Long(l) => l,
+        Value::Double(d) => d as i64,
+        Value::Float(f) => f as i64,
+        _ => 0,
+    }
+}
+
+/// `f64` counterpart of [`value_as_i64`].
+fn value_as_f64(v: Value) -> f64 {
+    match v {
+        Value::Int(i) => i as f64,
+        Value::Long(l) => l as f64,
+        Value::Double(d) => d,
+        Value::Float(f) => f as f64,
+        _ => 0.0,
+    }
+}
+
+/// Box a primitive collector result as its `java.lang.*` wrapper.
+///
+/// `Stream.collect` is declared `(Ljava/util/stream/Collector;)Ljava/lang/Object;`,
+/// so a bare primitive `Value` here is coerced away and the caller reads back
+/// null — the trap documented at length on the COUNTING arm.
+fn box_primitive_result(ctx: &mut dyn NativeContext, v: Value) -> Value {
+    let (class_name, descriptor) = match v {
+        Value::Int(_) => ("java/lang/Integer", "(I)Ljava/lang/Integer;"),
+        Value::Long(_) => ("java/lang/Long", "(J)Ljava/lang/Long;"),
+        Value::Double(_) => ("java/lang/Double", "(D)Ljava/lang/Double;"),
+        other => return other,
+    };
+    if let Ok(Some(boxed @ Value::Object(Some(_)))) =
+        ctx.invoke(class_name, "valueOf", descriptor, &[v])
+    {
+        return boxed;
+    }
+    // No real `valueOf` to run: fall back to the wrapper's single value slot,
+    // the same shape the COUNTING arm's boxed Long uses.
+    let o = alloc_synthetic(ctx, class_name, 1);
+    ctx.set_field(o, 0, v);
+    Value::Object(Some(o))
+}
+
+/// Build the synthetic `java.util.*SummaryStatistics` a summarizing collector
+/// returns, in the [`STATS_FIELD_COUNT`] layout.
+fn make_summary_statistics(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    count: i64,
+    sum: Value,
+    min: Value,
+    max: Value,
+) -> Value {
+    // In real-JDK mode the loaded class declares more instance fields than the
+    // four slots CratonVM's accessors use (`DoubleSummaryStatistics` also
+    // carries `sumCompensation`/`simpleSum`). Allocate the larger of the two so
+    // real bytecode reading a later slot cannot run off the end of the object —
+    // the same sizing `alloc_concurrent_synthetic` applies on the
+    // native-builtins side, which owns the getters for these four slots.
+    let num_fields = match ctx.ensure_class_initialized(class_name) {
+        Ok(cid) => STATS_NUM_FIELDS.max(ctx.class_num_total_fields(cid)),
+        Err(_) => STATS_NUM_FIELDS,
+    };
+    let stats = alloc_synthetic(ctx, class_name, num_fields);
+    ctx.set_field(stats, STATS_FIELD_COUNT, Value::Long(count));
+    ctx.set_field(stats, STATS_FIELD_SUM, sum);
+    ctx.set_field(stats, STATS_FIELD_MIN, min);
+    ctx.set_field(stats, STATS_FIELD_MAX, max);
+    Value::Object(Some(stats))
 }
 
 fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20085,6 +20618,275 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     (Value::Object(Some(false_key)), false_v),
                 ];
                 make_map_of(ctx, &pairs)
+            }
+            COLLECTOR_TAG_MIN_BY | COLLECTOR_TAG_MAX_BY => {
+                // `Collectors.minBy/maxBy(cmp)` reduce to an `Optional` (empty for
+                // an empty stream) — the same walk as `Stream.min`/`Stream.max`.
+                let comparator = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+                let comparator = match comparator {
+                    Value::Object(Some(r)) if !elements.is_empty() => r,
+                    _ => return Ok(Some(Value::Object(Some(opt)))),
+                };
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                let opt_pin = ctx.pin_native_root(opt);
+                let cmp_pin = ctx.pin_native_root(comparator);
+                let mut best = elements[0];
+                let mut best_handle = elem_handles[0];
+                for i in 1..elements.len() {
+                    let comparator = ctx.read_native_pin(cmp_pin, comparator);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let best_arg = read_pinned_elem(ctx, best_handle, best);
+                    let cmp = comparator_compare(ctx, comparator, elem, best_arg)?;
+                    let better = match cmp {
+                        Some(Value::Int(v)) if tag == COLLECTOR_TAG_MIN_BY => v < 0,
+                        Some(Value::Int(v)) => v > 0,
+                        _ => false,
+                    };
+                    if better {
+                        best = elem;
+                        best_handle = elem_handles[i];
+                    }
+                }
+                let opt = ctx.read_native_pin(opt_pin, opt);
+                let best = read_pinned_elem(ctx, best_handle, best);
+                ctx.set_field(opt, OPT_FIELD_VALUE, best);
+                Ok(Some(Value::Object(Some(opt))))
+            }
+            COLLECTOR_TAG_FILTERING => {
+                // filtering(predicate, downstream): keep the elements the
+                // predicate accepts, then feed them to the downstream collector
+                // through the same recursive sub-stream protocol MAPPING uses.
+                let predicate = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                let pred_pin = ctx.pin_native_root(predicate);
+                let ds_handle = pin_value(ctx, downstream);
+                let mut kept = Vec::new();
+                let mut kept_handles: Vec<usize> = Vec::new();
+                for i in 0..elements.len() {
+                    let predicate = ctx.read_native_pin(pred_pin, predicate);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let keep = ctx
+                        .invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])?
+                        .unwrap_or(Value::Int(0));
+                    if matches!(keep, Value::Int(v) if v != 0) {
+                        kept.push(elements[i]);
+                        kept_handles.push(elem_handles[i]);
+                    }
+                }
+                let kept = read_value_slice(ctx, &kept_handles, &kept);
+                let inner_stream = make_stream(ctx, &kept)?.unwrap_or(Value::Object(None));
+                let downstream = read_pinned_elem(ctx, ds_handle, downstream);
+                native_stream_collect(ctx, &[inner_stream, downstream])
+            }
+            COLLECTOR_TAG_SUMMARIZING_INT => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsInt",
+                    "(Ljava/lang/Object;)I",
+                )?;
+                let mut sum = 0i64;
+                // Identity seeds, as the JDK's IntSummaryStatistics ctor uses:
+                // an empty statistics reports MAX_VALUE/MIN_VALUE, not 0/0.
+                let mut min = i32::MAX;
+                let mut max = i32::MIN;
+                for v in &vals {
+                    let i = value_as_i64(*v) as i32;
+                    sum += i as i64;
+                    min = min.min(i);
+                    max = max.max(i);
+                }
+                Ok(Some(make_summary_statistics(
+                    ctx,
+                    "java/util/IntSummaryStatistics",
+                    vals.len() as i64,
+                    Value::Long(sum),
+                    Value::Int(min),
+                    Value::Int(max),
+                )))
+            }
+            COLLECTOR_TAG_SUMMARIZING_LONG => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsLong",
+                    "(Ljava/lang/Object;)J",
+                )?;
+                let mut sum = 0i64;
+                let mut min = i64::MAX;
+                let mut max = i64::MIN;
+                for v in &vals {
+                    let l = value_as_i64(*v);
+                    sum = sum.wrapping_add(l);
+                    min = min.min(l);
+                    max = max.max(l);
+                }
+                Ok(Some(make_summary_statistics(
+                    ctx,
+                    "java/util/LongSummaryStatistics",
+                    vals.len() as i64,
+                    Value::Long(sum),
+                    Value::Long(min),
+                    Value::Long(max),
+                )))
+            }
+            COLLECTOR_TAG_SUMMARIZING_DOUBLE => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsDouble",
+                    "(Ljava/lang/Object;)D",
+                )?;
+                let mut sum = 0.0f64;
+                // DoubleSummaryStatistics seeds min/max with ±infinity.
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                for v in &vals {
+                    let d = value_as_f64(*v);
+                    sum += d;
+                    if d < min {
+                        min = d;
+                    }
+                    if d > max {
+                        max = d;
+                    }
+                }
+                Ok(Some(make_summary_statistics(
+                    ctx,
+                    "java/util/DoubleSummaryStatistics",
+                    vals.len() as i64,
+                    Value::Double(sum),
+                    Value::Double(min),
+                    Value::Double(max),
+                )))
+            }
+            COLLECTOR_TAG_AVERAGING_INT
+            | COLLECTOR_TAG_AVERAGING_LONG
+            | COLLECTOR_TAG_AVERAGING_DOUBLE => {
+                let (method, descriptor) = match tag {
+                    COLLECTOR_TAG_AVERAGING_INT => ("applyAsInt", "(Ljava/lang/Object;)I"),
+                    COLLECTOR_TAG_AVERAGING_LONG => ("applyAsLong", "(Ljava/lang/Object;)J"),
+                    _ => ("applyAsDouble", "(Ljava/lang/Object;)D"),
+                };
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    method,
+                    descriptor,
+                )?;
+                let sum: f64 = vals.iter().map(|v| value_as_f64(*v)).sum();
+                // The JDK's averaging* collectors answer 0.0 for an empty stream.
+                let avg = if vals.is_empty() {
+                    0.0
+                } else {
+                    sum / vals.len() as f64
+                };
+                Ok(Some(box_primitive_result(ctx, Value::Double(avg))))
+            }
+            COLLECTOR_TAG_SUMMING_INT => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsInt",
+                    "(Ljava/lang/Object;)I",
+                )?;
+                // `int` accumulator: wraps at 32 bits exactly like the JDK's.
+                let sum = vals
+                    .iter()
+                    .fold(0i32, |acc, v| acc.wrapping_add(value_as_i64(*v) as i32));
+                Ok(Some(box_primitive_result(ctx, Value::Int(sum))))
+            }
+            COLLECTOR_TAG_SUMMING_LONG => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsLong",
+                    "(Ljava/lang/Object;)J",
+                )?;
+                let sum = vals
+                    .iter()
+                    .fold(0i64, |acc, v| acc.wrapping_add(value_as_i64(*v)));
+                Ok(Some(box_primitive_result(ctx, Value::Long(sum))))
+            }
+            COLLECTOR_TAG_SUMMING_DOUBLE => {
+                let extractor = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let vals = collector_extract_primitives(
+                    ctx,
+                    extractor,
+                    &elements,
+                    &elem_handles,
+                    "applyAsDouble",
+                    "(Ljava/lang/Object;)D",
+                )?;
+                let sum: f64 = vals.iter().map(|v| value_as_f64(*v)).sum();
+                Ok(Some(box_primitive_result(ctx, Value::Double(sum))))
+            }
+            COLLECTOR_TAG_TEEING => {
+                // teeing(d1, d2, merger): run the SAME elements through both
+                // downstream collectors via the recursive sub-stream protocol
+                // COLLECTING_AND_THEN uses, then merge the two results.
+                let downstream1 = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let downstream2 = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+                let merger = match ctx.get_field(collector, COLLECTOR_FIELD_ARG3) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                // cceres3: pin across GC-capable call (stream stale-at-store
+                // wave) — each sub-collect allocates and re-enters Java, so the
+                // merger, both downstreams, and the FIRST result (which has to
+                // survive the second collect) are all rooted.
+                let merger_pin = ctx.pin_native_root(merger);
+                let ds1_handle = pin_value(ctx, downstream1);
+                let ds2_handle = pin_value(ctx, downstream2);
+
+                let elems = read_value_slice(ctx, &elem_handles, &elements);
+                let stream1 = make_stream(ctx, &elems)?.unwrap_or(Value::Object(None));
+                let downstream1 = read_pinned_elem(ctx, ds1_handle, downstream1);
+                let result1 = native_stream_collect(ctx, &[stream1, downstream1])?
+                    .unwrap_or(Value::Object(None));
+                let result1_handle = pin_value(ctx, result1);
+
+                // Re-read the elements: the first collect may have moved them.
+                let elems = read_value_slice(ctx, &elem_handles, &elements);
+                let stream2 = make_stream(ctx, &elems)?.unwrap_or(Value::Object(None));
+                let downstream2 = read_pinned_elem(ctx, ds2_handle, downstream2);
+                let result2 = native_stream_collect(ctx, &[stream2, downstream2])?
+                    .unwrap_or(Value::Object(None));
+
+                let merger = ctx.read_native_pin(merger_pin, merger);
+                let result1 = read_pinned_elem(ctx, result1_handle, result1);
+                let merged = ctx
+                    .invoke_virtual(
+                        merger,
+                        "apply",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[result1, result2],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                Ok(Some(merged))
             }
             _ => Ok(Some(Value::Object(None))),
         }
@@ -51137,5 +51939,195 @@ mod tests {
         assert!(range_long_elements(0, STREAM_RANGE_MAX_ELEMENTS + 1).is_err());
         assert!(range_long_elements(0, STREAM_RANGE_MAX_ELEMENTS).is_ok());
         assert!(range_long_elements(10, -5).unwrap().is_empty());
+    }
+
+    /// Every `Collectors.*` factory must mint a DISTINCT tag that
+    /// `is_known_collector_tag` accepts, because `native_stream_collect`'s tag
+    /// dispatch is the only thing that ever reads a collector.
+    ///
+    /// This is the invariant that broke: `native-builtins`' phase-56 factories
+    /// minted a private second namespace (maxBy=9, minBy=10, filtering=12,
+    /// summarizing*=13/14/15) that aliased the tags below, so
+    /// `stream.collect(Collectors.minBy(cmp))` was decoded as
+    /// `groupingBy(classifier, supplier, downstream)` and answered a Map.
+    /// The "tags are exactly 1..=N" check makes a colliding or unregistered
+    /// new tag fail here rather than silently in a stream pipeline.
+    #[test]
+    fn collector_factories_mint_unique_decodable_tags() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        let null = Value::Object(None);
+        let obj = |r: MethodCallResult| -> ObjectRef {
+            match r {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                other => panic!("collector factory returned {other:?}"),
+            }
+        };
+        // One representative factory per tag. Aliases (toUnmodifiableList →
+        // toList, joining(d,p,s) → JOINING_DELIM) are deliberately omitted.
+        let mints: Vec<(&str, ObjectRef)> = vec![
+            ("toList", obj(native_collectors_to_list(&mut ctx, &[]))),
+            ("toSet", obj(native_collectors_to_set(&mut ctx, &[]))),
+            ("joining", obj(native_collectors_joining(&mut ctx, &[]))),
+            (
+                "joining(delim)",
+                obj(native_collectors_joining_delim(&mut ctx, &[null])),
+            ),
+            ("toMap", obj(native_collectors_to_map(&mut ctx, &[]))),
+            ("counting", obj(native_collectors_counting(&mut ctx, &[]))),
+            (
+                "groupingBy",
+                obj(native_collectors_grouping_by(&mut ctx, &[null])),
+            ),
+            (
+                "partitioningBy",
+                obj(native_collectors_partitioning_by(&mut ctx, &[null])),
+            ),
+            (
+                "groupingBy(downstream)",
+                obj(native_collectors_grouping_by_downstream(&mut ctx, &[null])),
+            ),
+            (
+                "groupingBy(supplier)",
+                obj(native_collectors_grouping_by_supplier(&mut ctx, &[null])),
+            ),
+            (
+                "partitioningBy(downstream)",
+                obj(native_collectors_partitioning_by_downstream(
+                    &mut ctx,
+                    &[null],
+                )),
+            ),
+            (
+                "toMap(merge)",
+                obj(native_collectors_to_map_merge(&mut ctx, &[null])),
+            ),
+            (
+                "collectingAndThen",
+                obj(native_collectors_collecting_and_then(&mut ctx, &[null])),
+            ),
+            (
+                "toCollection",
+                obj(native_collectors_to_collection(&mut ctx, &[null])),
+            ),
+            ("mapping", obj(native_collectors_mapping(&mut ctx, &[null]))),
+            (
+                "toMap(supplier)",
+                obj(native_collectors_to_map_supplier(&mut ctx, &[null])),
+            ),
+            ("minBy", obj(native_collectors_min_by(&mut ctx, &[null]))),
+            ("maxBy", obj(native_collectors_max_by(&mut ctx, &[null]))),
+            (
+                "filtering",
+                obj(native_collectors_filtering(&mut ctx, &[null])),
+            ),
+            (
+                "summarizingInt",
+                obj(native_collectors_summarizing_int(&mut ctx, &[null])),
+            ),
+            (
+                "summarizingLong",
+                obj(native_collectors_summarizing_long(&mut ctx, &[null])),
+            ),
+            (
+                "summarizingDouble",
+                obj(native_collectors_summarizing_double(&mut ctx, &[null])),
+            ),
+            (
+                "averagingInt",
+                obj(native_collectors_averaging_int(&mut ctx, &[null])),
+            ),
+            (
+                "averagingLong",
+                obj(native_collectors_averaging_long(&mut ctx, &[null])),
+            ),
+            (
+                "averagingDouble",
+                obj(native_collectors_averaging_double(&mut ctx, &[null])),
+            ),
+            (
+                "summingInt",
+                obj(native_collectors_summing_int(&mut ctx, &[null])),
+            ),
+            (
+                "summingLong",
+                obj(native_collectors_summing_long(&mut ctx, &[null])),
+            ),
+            (
+                "summingDouble",
+                obj(native_collectors_summing_double(&mut ctx, &[null])),
+            ),
+            ("teeing", obj(native_collectors_teeing(&mut ctx, &[null]))),
+        ];
+
+        let mut seen: Vec<(&str, i32)> = Vec::new();
+        for (name, c) in mints {
+            assert!(
+                ctx.object_num_fields(c) >= COLLECTOR_NUM_FIELDS,
+                "{name}: collector layout is undersized ({} fields)",
+                ctx.object_num_fields(c)
+            );
+            let tag = match ctx.get_field(c, COLLECTOR_FIELD_TAG) {
+                Value::Int(t) => t,
+                other => panic!("{name}: non-int tag {other:?}"),
+            };
+            assert!(
+                is_known_collector_tag(tag),
+                "{name}: tag {tag} is not decodable by native_stream_collect"
+            );
+            if let Some((prev, _)) = seen.iter().find(|(_, t)| *t == tag) {
+                panic!("{name} and {prev} both mint tag {tag}");
+            }
+            seen.push((name, tag));
+        }
+
+        let mut tags: Vec<i32> = seen.iter().map(|(_, t)| *t).collect();
+        tags.sort_unstable();
+        let expected: Vec<i32> = (1..=seen.len() as i32).collect();
+        assert_eq!(
+            tags, expected,
+            "collector tags must be a dense 1..=N range with one factory each"
+        );
+    }
+
+    /// `collect(minBy/maxBy(cmp))` must answer an `Optional`, which is what
+    /// regressed: those collectors were tagged 10 and 9 — GROUPING_BY_SUPPLIER
+    /// and GROUPING_BY_DOWNSTREAM here — so `collect` returned a Map.
+    #[test]
+    fn collect_min_by_max_by_yield_optional() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        // Every mock object reports ClassId(0); naming it makes `stream_elements`
+        // take the synthetic-stream path. The Collector/Optional allocations are
+        // recognised by layout (field count), not by name.
+        ctx.define_class(ClassId::new(0), "java/util/stream/Stream");
+
+        let elements = [Value::Int(3), Value::Int(1), Value::Int(2)];
+        let arr = ctx.new_ref_array(ClassId::new(0), elements.len());
+        for (i, v) in elements.iter().enumerate() {
+            ctx.set_array_element(arr, i, *v);
+        }
+        let stream = ctx.alloc_object(ClassId::new(0), STREAM_NUM_FIELDS);
+        ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+
+        let natural = make_comparator(&mut ctx, CMP_TAG_NATURAL_ORDER);
+        for (tag_maker, expected) in [
+            (
+                make_min_by_collector as fn(&mut dyn NativeContext, Value) -> ObjectRef,
+                Value::Int(1),
+            ),
+            (make_max_by_collector, Value::Int(3)),
+        ] {
+            let collector = tag_maker(&mut ctx, Value::Object(Some(natural)));
+            let result = native_stream_collect(
+                &mut ctx,
+                &[Value::Object(Some(stream)), Value::Object(Some(collector))],
+            );
+            let opt = match result {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                other => panic!("collect returned {other:?}"),
+            };
+            assert_eq!(ctx.get_field(opt, OPT_FIELD_VALUE), expected);
+        }
     }
 }
