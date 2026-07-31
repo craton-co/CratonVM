@@ -24,7 +24,16 @@ manufacturing a fake 420 s -> 602 s regression. `Kill-Tree` here uses
 a `@@RESULT ... ms=979555` in a class the harness recorded as `TIMEOUT` at
 900 000 ms — a result longer than the cap that produced it means the kill failed.
 
-**2. `aborted` is not a failure.** JUnit `Assumptions.abort` (dialect gating)
+**2. Never sweep strays by process NAME on this box.** `Get-Process -Name
+cratonvm` matches every session's binary, not yours. An earlier version of
+`run-hib.ps1` did exactly that and reaped 8 live `cratonvm.exe` processes
+belonging to `C:\craton\CratonVM-hib-local-0712-v3` — another agent's parallel
+Hibernate run. Match on `ExecutablePath` instead (`Get-OwnStrays`). Related:
+`taskkill` writes to stderr for the ordinary "already exited" case, and
+`& taskkill ... 2>&1 |` turns that into a `NativeCommandError` that aborts the
+whole script under `$ErrorActionPreference='Stop'` — use `*> $null` in a `try`.
+
+**3. `aborted` is not a failure.** JUnit `Assumptions.abort` (dialect gating)
 produces large aborted counts here — `OffsetDateTimeTest` aborts 164 of 488 —
 and **HotSpot reports exactly the same counts**. Scoring `started == ok` as the
 pass condition marks a healthy run as `PARTIAL`. PASS is `failed == 0 &&

@@ -20,13 +20,28 @@ $ErrorActionPreference = 'Stop'
 # a silently-failed kill is indistinguishable from a clean one in the logs and
 # poisons every subsequent timing on this host.
 function Kill-Tree([int]$ProcId) {
-    & taskkill /PID $ProcId /T /F 2>&1 | Out-Null
+    # `2>&1 |` turns taskkill's stderr into NativeCommandError records, which
+    # under `$ErrorActionPreference='Stop'` abort the whole run — and taskkill
+    # writes to stderr for the perfectly normal "process already exited" case.
+    # Swallow it explicitly instead.
+    try { & taskkill /PID $ProcId /T /F *> $null } catch {}
     for ($i = 0; $i -lt 60; $i++) {
         if (-not (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)) { return $true }
         Start-Sleep -Milliseconds 500
     }
     Write-Warning "PID $ProcId survived taskkill /T /F after 30 s"
     return $false
+}
+
+# Strays belonging to THIS harness only — matched on the executable path, never
+# on the process name. Other sessions on this shared box run their own
+# `cratonvm.exe` out of their own worktrees; killing by name reaps their work
+# and silently corrupts their measurements as well as ours.
+function Get-OwnStrays([string]$ExePath) {
+    $full = try { [System.IO.Path]::GetFullPath($ExePath) } catch { $ExePath }
+    Get-CimInstance Win32_Process -Filter "Name='cratonvm.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -ieq $full) } |
+        ForEach-Object { $_.ProcessId }
 }
 
 $fixture = 'C:\craton\CratonVM\apps\hib-suite-runner'
@@ -64,10 +79,12 @@ foreach ($cls in $Classes) {
 
     # Refuse to start while a previous run's VM is still alive — an ineffective
     # kill otherwise overlaps two JVMs and silently inflates the next class.
-    $stray = @(Get-Process -Name 'cratonvm' -ErrorAction SilentlyContinue)
+    # Scoped to our own executable path (see Get-OwnStrays).
+    $exePathForStrays = $Exe
+    $stray = @(Get-OwnStrays $exePathForStrays)
     if ($stray.Count -gt 0) {
-        Write-Warning "killing $($stray.Count) stray cratonvm process(es) before $short"
-        foreach ($p in $stray) { Kill-Tree $p.Id }
+        Write-Warning "killing $($stray.Count) stray process(es) from THIS harness before $short"
+        foreach ($p in $stray) { Kill-Tree $p }
     }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
