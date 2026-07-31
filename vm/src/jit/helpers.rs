@@ -582,10 +582,45 @@ pub fn restore_jit_thread(scope: JitThreadScope) {
             // scan range.
             unsafe { (*cur).shadow_stack.set_top(saved_top) };
         }
+        report_shadow_overflow_once();
     }
     JIT_THREAD.with(|t| t.set(scope.prev_ptr));
     #[cfg(debug_assertions)]
     restore_jit_borrow(scope.prev_borrow);
+}
+
+/// One-shot warning when a JIT-emitted shadow-stack push has hit the `end`
+/// guard and bailed. Checked at the JIT→Rust boundary (which is where the
+/// watermark heal already runs) because the bail itself cannot call out — its
+/// site has the callee's arguments staged in the ABI registers.
+///
+/// A bail is not a crash, but it is not free either: the safepoints that bailed
+/// published no oops, so their `moving_young_coverage_complete` claim is not
+/// backed at runtime and every collection from then on falls back to the
+/// non-moving sweep. It always means some compiled method leaks pushes.
+fn report_shadow_overflow_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some((count, label)) = cratonvm_jit::shadow_overflow_status() else {
+        return;
+    };
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "[JIT] shadow-stack overflow: {} push(es) bailed on the `end` guard{} \
+         — a compiled method is leaking shadow pushes; GC precision has \
+         degraded to the non-moving sweep. Set CRATONVM_SHADOW_OVERFLOW_DIAG=1 \
+         to name the method.",
+        count,
+        match label.as_deref() {
+            Some(m) => format!(" (last: {})", m),
+            None => String::new(),
+        }
+    );
 }
 
 /// Clear the JIT thread pointer after JIT execution completes.

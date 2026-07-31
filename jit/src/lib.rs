@@ -7757,51 +7757,103 @@ pub fn moving_young_disables_optimizing_tier() -> bool {
     true
 }
 
-pub fn direct_jit_callee_calls_enabled() -> bool {
-    // A raw JIT-to-JIT call has no callee JitEntryGuard, so the callee frame is
-    // not reachable from the entry chain: the active-RBP mirror points at the
-    // callee while the root-chain metadata still names the caller, and a GC at
-    // that boundary can select an incompatible oop map and RECLAIM A LIVE ROOT
-    // (see the matching comment at the inline MIC/PIC emission site in
-    // `x64.rs`).
-    //
-    // 2026-07-31: this gate was scoped to `moving_young_relocates_compiled_frames()`
-    // on the argument that the hazard needs a RELOCATING collection and the
-    // runtime veto forbids one while such a frame is live. Measured, that
-    // argument does not hold: with the moving-young default on and this gate
-    // open, `BasicErrorControllerIntegrationTests` SIGSEGVs on EVERY run
-    // (14/14 + 8/8 on a pristine build), faulting on a read through a zeroed
-    // heap slot — the reclaimed-root signature the comment above predicts, not
-    // a relocation one. Closing this gate alone makes the same class 26/26
-    // clean, 5/5 runs, with the optimizing tier still enabled. Disabling only
-    // the IR half (`CRATONVM_JIT_IR_DIRECT_CALL=0`) does NOT help (3/3
-    // crashes), so the defect is in the single-pass backend's raw edge, which
-    // this gate had kept dark for months.
-    //
-    // So: back to the bare flag, which is the state that actually shipped. The
-    // OPTIMIZING-TIER gate stays scoped as
-    // `moving_young_relocates_compiled_frames()` — that one protects frames
-    // which DO carry a guard, and it is measured safe. These two gates ask
-    // different questions and must not share a predicate.
-    //
-    // This re-gates the edge; it does not fix it. Whoever reopens it needs to
-    // make an unguarded callee frame describable to the root scan first, and
-    // should re-run this class 14x as the acceptance gate.
-    // EXPERIMENT (temporary, 2026-07-31): `CRATONVM_JIT_DIRECT_CALLEE_CALLS=force`
-    // opens the gate under moving-young in the SAME binary, so the crashing and
-    // the clean arm differ only by an environment variable rather than by a
-    // build. Removed once the edge is fixed and the gate reopens for real.
-    let forced = matches!(
-        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS").as_deref(),
-        Ok("force")
-    );
-    if x64::moving_young_enabled() && !forced {
-        return false;
-    }
-    if forced {
-        return true;
-    }
+/// Bisect toggle (`CRATONVM_SHADOW_NO_END_GUARD`) — suppress the `end` overflow
+/// guard both backends emit ahead of a shadow push, restoring the pre-guard
+/// behaviour where an overrunning push stores straight on through the allocator
+/// arena. Only useful to confirm that a given failure IS the overflow.
+pub fn shadow_end_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NO_END_GUARD").is_none()
+    })
+}
 
+/// Number of times a JIT-emitted shadow-stack push hit the `end` guard and
+/// bailed instead of storing past the end of the thread's buffer.
+///
+/// Non-zero means at least one compiled method leaked pushes badly enough to
+/// exhaust a 2 MiB (256K-slot) shadow stack — before the guard existed that
+/// was silent heap corruption (the write ran on through the mimalloc arena,
+/// including the `JvmThread`, until it left the mapping ~170 MiB later). It
+/// also means the safepoints that bailed did NOT publish their oops, so their
+/// compile-time `moving_young_coverage_complete` claim is not backed at
+/// runtime; the per-cycle coverage verifier rejects the proof and the
+/// collection falls back to the non-moving sweep.
+pub static SHADOW_OVERFLOW_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Address of a leaked NUL-terminated method label recorded by the most recent
+/// shadow-stack overflow bail, or 0. Only written when
+/// `CRATONVM_SHADOW_OVERFLOW_DIAG` is set (the label allocation is a permanent
+/// leak, so it is not produced by default).
+pub static SHADOW_OVERFLOW_LABEL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `(overflow_count, last_method_label)` when at least one shadow-stack push
+/// has bailed on the `end` guard, else `None`.
+pub fn shadow_overflow_status() -> Option<(usize, Option<String>)> {
+    let n = SHADOW_OVERFLOW_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    if n == 0 {
+        return None;
+    }
+    let p = SHADOW_OVERFLOW_LABEL.load(std::sync::atomic::Ordering::Relaxed) as *const u8;
+    let label = if p.is_null() {
+        None
+    } else {
+        // SAFETY: the pointer, when non-zero, names a leaked NUL-terminated
+        // `str` produced by the compiler for the overflowing method; it is
+        // immortal and never rewritten in place.
+        unsafe { std::ffi::CStr::from_ptr(p as *const std::os::raw::c_char) }
+            .to_str()
+            .ok()
+            .map(|s| s.to_string())
+    };
+    Some((n, label))
+}
+
+pub fn direct_jit_callee_calls_enabled() -> bool {
+    // A raw JIT-to-JIT call produces a callee frame with no `JitEntryGuard`, so
+    // it is not reachable from the entry chain: the active-RBP mirror points at
+    // the callee while the root-chain metadata still names the caller.
+    //
+    // 2026-07-31, ROUND 1: the gate was closed under moving-young because
+    // `BasicErrorControllerIntegrationTests` SIGSEGV'd on every gate-open run,
+    // and the comment here blamed a GC "selecting an incompatible oop map and
+    // reclaiming a live root". ROUND 2 measured that and it is wrong on both
+    // counts. The root scan behaves correctly: `chain_entry_rbp_is_foreign`
+    // detects the unguarded callee frame, the per-cycle proof is incomplete,
+    // `moving_young_precise_only` refuses it, and the collection diverts to the
+    // non-moving sweep. Nothing is reclaimed. What actually killed the process
+    // was plain machine code:
+    //
+    //   The inline PIC cascade's inter-slot `JNE` was a `rel8`, sized by a
+    //   comment claiming "a single slot body is ~30 bytes". A slot body had
+    //   since grown the post-call innermost-RBP republish and the callee-deopt
+    //   service check, putting it past 127 bytes. The patch truncated the
+    //   displacement (`rel as u8`) behind a `debug_assert!`, so RELEASE builds
+    //   silently branched to `JNE -128` — into the middle of the pre-call
+    //   shadow-stack push. Executed from there, the push ran as an infinite
+    //   loop with nothing reloading `top`, marched off the end of the thread's
+    //   2 MiB shadow buffer, overwrote the allocator arena behind it (including
+    //   the `JvmThread`), and faulted ~170 MiB later at the arena end.
+    //
+    // Three things had to change before this could reopen, all of them fixes in
+    // their own right: the inter-slot branch is now `rel32` and no `rel8` patch
+    // may truncate (`patch_rel8_or_bail`); both backends now emit the `end`
+    // overflow guard `ShadowStack::END_OFFSET` was always documented as having
+    // (an overrunning push bails instead of corrupting the heap); and the
+    // single-pass sibling tail-call now restores the shadow `top` watermark its
+    // epilogue-without-ret used to skip.
+    //
+    // Acceptance: `BasicErrorControllerIntegrationTests`, default flags,
+    // 14 consecutive clean runs, plus a same-binary gate-closed control.
+    //
+    // The OPTIMIZING-TIER gate stays scoped as
+    // `moving_young_relocates_compiled_frames()` — that one protects frames
+    // which DO carry a guard. These two gates ask different questions and must
+    // not share a predicate; see
+    // `x64::flag_and_header_contracts::direct_jit_callee_calls_open_under_moving_young`.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
