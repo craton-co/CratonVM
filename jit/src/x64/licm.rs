@@ -742,18 +742,18 @@ pub(super) unsafe fn read_fs_qword(offset: isize) -> usize {
 /// (`CRATONVM_SHADOW_STACK`). When on, each GC-capable safepoint pushes every
 /// live oop (operand-stack entries AND oop locals) onto the thread's shadow
 /// stack and reloads them after the call, so a *moving* collector can rewrite
-/// every JIT-held reference precisely (see `gc/src/shadow_stack.rs`). Off by
-/// default → no extra codegen, byte-identical to the legacy path.
+/// every JIT-held reference precisely (see `gc/src/shadow_stack.rs`). The
+/// standalone `CRATONVM_SHADOW_STACK` knob remains opt-in; the default moving
+/// young generation turns this mechanism on through [`moving_young_enabled`].
 ///
-/// **EXPERIMENTAL — retained default-off scaffolding (precise-jit-maps-default.md
-/// Step 6 decision, 2026-06-22).** This is the moving-relocation scaffolding for
-/// a potential future moving/compacting young gen (`default-moving-young-gen.md`,
-/// currently *design / not started*); it is **not** the correctness path (the
-/// precise-maps default uses the non-moving sweep + conservative backstop) and is
-/// **partial** (the moving Cheney path under-counts bt18 → 67674804). It is
-/// **kept, not removed**, but must stay default-off and **must not be combined
-/// with `CRATONVM_PRECISE_JIT_MAPS`** — the two interfere and reclaim. Do not
-/// enable in production.
+/// This doc used to carry an "EXPERIMENTAL — must stay default-off, the moving
+/// Cheney path under-counts bt18 → 67674804" warning. That described the
+/// incomplete 2026-06-22 standalone experiment. The default moving-young path
+/// now publishes complete oop homes, reloads them after safepoints, and falls
+/// back to a non-moving cycle for any cycle whose coverage is not proven; it
+/// returns the HotSpot checksum at every bintrees depth and heap size measured.
+/// See `docs/feature-designs/default-moving-young-gen.md` and
+/// `docs/internal/default-moving-young-enabled-20260730.md`.
 pub fn shadow_stack_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -790,8 +790,11 @@ pub fn shadow_stack_maps_enabled() -> bool {
 /// each JIT-held reference and rewrite its home in place. This completeness is
 /// what lets `gen_heap::collect_garbage_inner` run the moving cycle while JIT
 /// frames are live (the conservative frame scan is then suppressed — a
-/// fully-precise frame needs no conservative backstop). Off by default; gated so
-/// it can be validated against the bt18 = 68332206 invariant before any flip.
+/// fully-precise frame needs no conservative backstop). Enabled by default;
+/// `CRATONVM_NO_MOVING_YOUNG=1` retains the non-moving compatibility path. The
+/// bt18 = 68332206 invariant it was gated behind is now checked with the moving
+/// cycle actually running (25 of them at `-Xmx512m`), not merely with the flag
+/// requested.
 ///
 /// See `docs/feature-designs/default-moving-young-gen.md`.
 ///
@@ -802,10 +805,8 @@ pub fn shadow_stack_maps_enabled() -> bool {
 /// disagree about whether the feature was on — and the two halves of this
 /// feature are only sound *together*: the JIT must publish the complete
 /// rewritable root map and the collector must run the moving cycle. It now
-/// reads the centralized [`cratonvm_types::flags`] field, which is parsed from
-/// the same variable with the same `is_some()` presence semantics, so this is
-/// behaviour-preserving today and lets the default be flipped in one place
-/// later. Do NOT re-introduce a local `getenv` here.
+/// reads the centralized [`cratonvm_types::flags`] field. The compiled default
+/// is on, in `DEFAULT_MOVING_YOUNG`. Do NOT re-introduce a local `getenv` here.
 #[inline]
 thread_local! {
     /// Per-thread override for [`moving_young_enabled`]; `None` = use the

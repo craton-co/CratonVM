@@ -29,7 +29,7 @@ Status legend:
 | `DatagramChannel` (UDP) | Full | Full | Full | [`datagram.rs`](../native-io/src/datagram.rs) |
 | Multicast (join/leave/loopback) | Full | Full | Full | [`datagram.rs`](../native-io/src/datagram.rs), [`net.rs`](../native-io/src/net.rs) |
 | Source-specific multicast block (IGMPv3) | Stub — Java-side filter only, no `IP_BLOCK_SOURCE` setsockopt ([`datagram.rs:514`](../native-io/src/datagram.rs)) | Stub | Stub | [`datagram.rs:514`](../native-io/src/datagram.rs) |
-| TLS sockets (`SSLSocket`) | Partial — feature-gated behind `experimental-tls` in [`native-builtins/`](../native-builtins/src/); does not match HotSpot's full JSSE matrix | Partial | Partial | `native-builtins` |
+| TLS sockets (`SSLSocket`) | Partial — always compiled in [`native-builtins/`](../native-builtins/src/), not feature-gated; does not match HotSpot's full JSSE matrix | Partial | Partial | `native-builtins` |
 | `AnonymousFileChannel` (memory-only `FileChannel`) | Full | Full | Full | [`lib.rs`](../native-io/src/lib.rs) |
 | `WatchService` | Full (`inotify` via `notify` crate) | Full (`ReadDirectoryChangesW`) | Full (`FSEvents`) | [`watch.rs`](../native-io/src/watch.rs) |
 | `Process` / `ProcessBuilder` spawn | Full (Linux-specific `native_unix_fork_and_exec` path) | Full (`CreateProcess`) | Partial — uses the generic `std::process` path; no `posix_spawn` fast path | [`process.rs`](../native-io/src/process.rs) |

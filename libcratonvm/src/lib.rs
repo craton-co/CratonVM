@@ -2439,13 +2439,29 @@ mod tests {
     // happens to have a JDK installed, which is exactly the non-determinism
     // this whole change exists to remove.
 
-    /// `JAVA_HOME` / `CRATONVM_JAVA_HOME` are process-wide; serialise.
+    /// `JAVA_HOME` is process-wide; serialise.
+    ///
+    /// `CRATONVM_JAVA_HOME` no longer needs this — it is a *declared* flag and
+    /// is now overridden per-thread through
+    /// [`cratonvm_types::flags::with_thread_overrides`] — but `JAVA_HOME` is
+    /// not declared, so it keeps `std::env`'s live-read semantics and still
+    /// has to be stashed and restored under a lock.
     fn jdk_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Set an **undeclared** environment variable for the duration of `f`.
+    ///
+    /// Declared `CRATONVM_*` flags must not go through here: they are served
+    /// from the frozen [`cratonvm_types::flags::flags`] snapshot, so mutating
+    /// `environ` would change nothing that the code under test reads. Use
+    /// `flags::with_thread_overrides` for those.
     fn with_env<R>(key: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        debug_assert!(
+            !key.starts_with("CRATONVM_"),
+            "{key} looks like a declared flag; use flags::with_thread_overrides"
+        );
         let prev = std::env::var_os(key);
         match value {
             Some(v) => std::env::set_var(key, v),
@@ -2495,13 +2511,28 @@ mod tests {
         }
     }
 
+    /// Run `f` with the JDK search pointed at `root`.
+    ///
+    /// `CRATONVM_JAVA_HOME` is a declared flag, so it is overridden on the
+    /// [`cratonvm_types::flags`] snapshot for this thread rather than by
+    /// `set_var`. `resolve_java_home` reads it through
+    /// `flags::runtime_var`, which means an `environ` write would have been
+    /// ignored by every test but whichever one happened to run first and latch
+    /// the snapshot — the defect these fixtures existed to avoid in the first
+    /// place. `JAVA_HOME` is *not* declared and keeps live-read semantics, so
+    /// it still goes through `with_env`.
+    fn with_java_home<R>(root: &str, f: impl FnOnce() -> R) -> R {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JAVA_HOME", Some(root))],
+            || with_env("JAVA_HOME", None, f),
+        )
+    }
+
     /// Run `f` with the process pointed at a synthesised real JDK.
     fn with_fake_jdk<R>(tag: &str, f: impl FnOnce() -> R) -> R {
         let _guard = jdk_env_lock();
         let jdk = ScratchJdk::new(tag, true);
-        with_env("CRATONVM_JAVA_HOME", Some(jdk.path()), || {
-            with_env("JAVA_HOME", None, f)
-        })
+        with_java_home(jdk.path(), f)
     }
 
     /// Run `f` with no usable JDK.
@@ -2514,9 +2545,7 @@ mod tests {
     fn with_no_jdk<R>(tag: &str, f: impl FnOnce() -> R) -> R {
         let _guard = jdk_env_lock();
         let empty = ScratchJdk::new(tag, false);
-        with_env("CRATONVM_JAVA_HOME", Some(empty.path()), || {
-            with_env("JAVA_HOME", None, f)
-        })
+        with_java_home(empty.path(), f)
     }
 
     // `JavaVMInitArgs::ignoreUnrecognized` is a JNI `jboolean` (`u8`), not a
@@ -3452,8 +3481,15 @@ mod tests {
 
         // Foreign attach is default-ON (step 7); set it explicitly so the soak
         // is deterministic regardless of any ambient `CRATONVM_FOREIGN_ATTACH=0`
-        // opt-out in the environment.
-        std::env::set_var("CRATONVM_FOREIGN_ATTACH", "1");
+        // opt-out in the environment. Process-scoped: the attaching threads
+        // this soak spawns below must see it too, and it is held for the whole
+        // test body.
+        let _foreign_attach = cratonvm_types::flags::override_process(
+            cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+                "CRATONVM_FOREIGN_ATTACH",
+                Some("1"),
+            )]),
+        );
         // Print a symbolized native backtrace on any access violation.
         cratonvm_vm::runtime::crash_handler::install_hardware_fault_handler();
 

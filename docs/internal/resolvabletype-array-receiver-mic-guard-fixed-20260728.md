@@ -149,6 +149,12 @@ aborts at `live_monitor_ops_execute_direct_runtime_stubs` (SIGSEGV) on pristine
 dev too. Both are pre-existing and unrelated; targeted `ir_lower` /
 `runtime_lowering` / `x64::flag_and_header` filters are green.
 
+> **Resolved 2026-07-30.** Those three were stale *tests*, not defects: each
+> asserted behaviour a later deliberate change had replaced —
+> `allow_putfield_init`'s 07-28 default flip for the two constructor tests,
+> SPR-PROXY.1's 07-28 re-ban for the proxy one. Retargeted; see
+> [`dev-stale-jit-tests-fixed-20260730.md`](dev-stale-jit-tests-fixed-20260730.md).
+
 ## Second, independent bug fixed in the same session
 
 Reproducing `S01_Context` under `CRATONVM_JIT_THRESHOLD=1` on current dev no

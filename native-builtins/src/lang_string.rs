@@ -3663,6 +3663,15 @@ fn string_case_impl(
     lowercase: bool,
     memoize: bool,
 ) -> MethodCallResult {
+    // A cached result is valid only for the same Locale object. Checking it
+    // before resolving the language avoids a contended synthetic-locale lookup
+    // for repeated ASCII case conversion, while preserving Turkish/Lithuanian
+    // and other locale-specific mappings.
+    if memoize {
+        if let Some(result) = ctx.get_ascii_case_string_cached(this, locale, !lowercase) {
+            return Ok(Some(Value::Object(Some(result))));
+        }
+    }
     let lang = crate::locale_language_for_case_mapping(ctx, locale);
     if crate::case_map::is_locale_dependent(&lang) {
         let src = ctx.read_string(this).unwrap_or_default();
@@ -3679,11 +3688,6 @@ fn string_case_impl(
         ))));
     }
 
-    if memoize {
-        if let Some(result) = ctx.get_ascii_case_string_cached(this, !lowercase) {
-            return Ok(Some(Value::Object(Some(result))));
-        }
-    }
     let mut folded = ctx.read_string(this).unwrap_or_default();
     let changed = if folded.is_ascii() {
         let changed = folded.bytes().any(|byte| {
@@ -3715,7 +3719,7 @@ fn string_case_impl(
     let result = if !changed {
         this
     } else if memoize {
-        ctx.create_ascii_case_string_cached(this, &folded, !lowercase)
+        ctx.create_ascii_case_string_cached(this, locale, &folded, !lowercase)
     } else {
         ctx.create_string_uninterned_gc_safe(&folded)
     };
@@ -3771,6 +3775,35 @@ pub(crate) fn native_string_to_lower_case_uncached(
     args: &[Value],
 ) -> MethodCallResult {
     string_case_native(ctx, args, true, false)
+}
+
+/// StringLatin1.toLowerCase(String, byte[], Locale).
+///
+/// The compact-string helper carries the source String and Locale in slots zero
+/// and two respectively. Keep it as a named callback so the cached static
+/// invoke path can recognize its fixed reference-only signature without
+/// re-resolving the method descriptor on every lookup.
+pub fn native_string_latin1_to_lower_case(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = args.first().cloned().unwrap_or(Value::Object(None));
+    let locale = args.get(2).cloned().unwrap_or(Value::Object(None));
+    native_string_to_lower_case(ctx, &[this, locale])
+}
+
+/// Whether a cached virtual-native call is one of the String lower-case
+/// implementations with the one-object Locale argument.
+///
+/// The interpreter uses this identity check to avoid re-resolving the
+/// descriptor and allocating an argument Vec at every already-cached call
+/// site. Both variants have the exact same Java signature and native safety
+/// contract.
+pub fn is_lower_case_native_callback(callback: cratonvm_native_api::NativeCallback) -> bool {
+    let callback = callback as usize;
+    callback == native_string_to_lower_case as usize
+        || callback == native_string_to_lower_case_uncached as usize
+        || callback == native_string_latin1_to_lower_case as usize
 }
 
 /// `String.toLowerCase(Locale)` for the JIT's thin direct-call helpers, which

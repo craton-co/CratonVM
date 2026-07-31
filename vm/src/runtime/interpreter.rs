@@ -781,11 +781,17 @@ fn stw_take_over_and_wait(
             for entry in peer.jit_hashmap_string_node_cache.iter() {
                 xt_roots.push(entry.map);
                 xt_roots.push(entry.node);
+                if let Some(key_object) = entry.key_object {
+                    xt_roots.push(key_object);
+                }
             }
             for entry in peer.string_case_cache.iter() {
                 xt_roots.push(entry.source);
                 xt_roots.push(entry.first);
                 xt_roots.push(entry.second);
+                if let Some(locale) = entry.locale {
+                    xt_roots.push(locale);
+                }
             }
         }
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some() {
@@ -3523,9 +3529,53 @@ fn rootsnap_dbg_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOTSNAP").is_some())
 }
+/// DBG (CRATONVM_DBG_ROOTSNAP_VERIFY): after the frozen-frame cache builds a
+/// snapshot, re-scan every frame the default (uncached) way and diff the two.
+/// The cached path claims to be byte-identical to the default path; any root
+/// the fresh scan reports that the cached snapshot lacks is a LOST ROOT —
+/// precisely the failure the retired real-ForkJoinPool bypass claimed to
+/// prevent, and the check that retired it (see `update_root_snapshot`). Prints
+/// a line per miss plus a periodic tally; run it under `CRATONVM_DBG_ROOTSNAP`
+/// so the tally shows how much of the snapshot came from the cache. Costs a
+/// full extra frame scan per snapshot, so it is a diagnostic, not a default:
+/// unset, this is one cached `OnceLock` read.
+fn rootsnap_verify_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOTSNAP_VERIFY").is_some()
+    })
+}
+
+/// Print period for the two DBG tallies (`CRATONVM_DBG_ROOTSNAP_EVERY`,
+/// default 200k). Short workloads publish far fewer snapshots than that, so a
+/// smaller period is what makes "the cache was actually exercised" visible
+/// rather than assumed.
+fn rootsnap_dbg_every() -> u64 {
+    use std::sync::OnceLock;
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_ROOTSNAP_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(200_000)
+    })
+}
+
 static ROOTSNAP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ROOTSNAP_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ROOTSNAP_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Cache engagement (`CRATONVM_DBG_ROOTSNAP`): snapshots that took the cached
+// path, and how many frames / roots those reused instead of re-scanning.
+static ROOTSNAP_CACHED_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROOTSNAP_REUSED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROOTSNAP_REUSED_ROOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Cache soundness (`CRATONVM_DBG_ROOTSNAP_VERIFY`): snapshots diffed against a
+// fresh full scan, and the roots the cached snapshot was missing.
+static ROOTSNAP_VERIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROOTSNAP_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROOTSNAP_MISS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Scan ONE frame's GC roots (locals + operand stack, with the operand-stack
 /// pointer-shaped-Long validation) onto the end of `out`. This is exactly the
@@ -3651,16 +3701,34 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     let mut snapshot = snap_arc.lock();
     snapshot.clear();
 
-    // The frozen-frame cache yields to the default path in the real
-    // ForkJoinPool lane, which is now the default rather than opt-in.
-    // Those native overrides recursively re-enter Java from
-    // `fork`/`join`/`submit`; frames that look prefix-stable to the cache can
-    // still expose changing local/operand roots around those native returns.
-    // The default full-frame scan keeps that GC-stress path exact while the
-    // cache remains enabled for the deep-stack native-heavy workloads it fixes.
+    // The frozen-frame cache yields to the default path while the
+    // conservative-locals hardening is engaged: the cached `scan_frame_roots`
+    // does not run `scan_locals_conservative`, so caching under it could drop a
+    // lost-tag local from the snapshot. `conservative_locals_enabled()` reads
+    // the RESOLVED real-ForkJoinPool flag and is additionally gated on GC
+    // quiescence, i.e. it answers "is the hardening running right now" rather
+    // than "was the lane explicitly requested".
+    //
+    // There is no separate real-ForkJoinPool bypass any more (2026-07-31): the
+    // old one keyed off the PRESENCE of `CRATONVM_REAL_FORKJOINPOOL`, which
+    // stopped being set when the real pool became the default, so it had not
+    // fired on a default run since that flip. Before removing it the cache was
+    // measured against the loss it claimed to prevent — see
+    // `rootsnap_verify_enabled` (`CRATONVM_DBG_ROOTSNAP_VERIFY`), which
+    // re-scans every frame the uncached way after each cached snapshot and
+    // reports any root the cached snapshot lacks; the real-lane
+    // Fork6/Fork6Hard GC-stress repros reported none.
+    //
+    // The mechanism behind that result: the real-FJP lane keeps a Bridge native
+    // surface for `submit`/`invoke`/`fork`/`join`, which runs every task INLINE
+    // on the submitting thread (measured: every `compute()` in this lane runs
+    // on `main`, vs 15 pool workers on HotSpot). The hazard the bypass
+    // described — a pool worker holding a forked subtask in its own frames
+    // across a peer-triggered collection — has no thread to happen on. If real
+    // ForkJoinPool ever gains workers that actually execute tasks, re-run the
+    // verifier against that lane before trusting this.
     let conservative_locals = crate::memory::roots::conservative_locals_enabled();
-    let real_forkjoinpool = crate::runtime::env_cache::real_forkjoinpool();
-    if crate::runtime::env_cache::rootsnap_cache() && !conservative_locals && !real_forkjoinpool {
+    if crate::runtime::env_cache::rootsnap_cache() && !conservative_locals {
         // ── Frozen-frame cached path ────────────────────────────────────────
         // Reuse the cached roots of the deep, continuously-frozen frames and
         // re-scan only the churning top. Correctness rests on the LIFO stack
@@ -3700,6 +3768,18 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         // never cached.
         let mut new_cache: Vec<((u64, u64), Vec<ObjectRef>)> =
             Vec::with_capacity(len.saturating_sub(1));
+        if _rs_t0.is_some() {
+            use std::sync::atomic::Ordering::Relaxed;
+            ROOTSNAP_CACHED_CALLS.fetch_add(1, Relaxed);
+            ROOTSNAP_REUSED_FRAMES.fetch_add(reuse as u64, Relaxed);
+            ROOTSNAP_REUSED_ROOTS.fetch_add(
+                thread.rs_cache[..reuse]
+                    .iter()
+                    .map(|e| e.1.len() as u64)
+                    .sum::<u64>(),
+                Relaxed,
+            );
+        }
         // (a) reused frozen frames — copy their cached roots into the snapshot
         //     and carry the entry forward (move, no re-alloc).
         for i in 0..reuse {
@@ -3720,6 +3800,47 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         }
         thread.rs_cache = new_cache;
         thread.rs_cache_gen = gen;
+        if rootsnap_verify_enabled() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut fresh: Vec<ObjectRef> = Vec::with_capacity(snapshot.len());
+            for frame in &thread.frames {
+                scan_frame_roots(frame, &mut fresh, &shared.mem.heap);
+            }
+            ROOTSNAP_VERIFIED.fetch_add(1, Relaxed);
+            let have: std::collections::HashSet<usize> =
+                snapshot.iter().map(|o| o.as_ptr() as usize).collect();
+            let mut missed = 0u64;
+            for (i, o) in fresh.iter().enumerate() {
+                let a = o.as_ptr() as usize;
+                if !have.contains(&a) {
+                    missed += 1;
+                    if ROOTSNAP_MISSES.load(Relaxed) < 40 {
+                        eprintln!(
+                            "[ROOTSNAP-MISS] tid={} depth={} reuse={} fresh_idx={} addr=0x{a:x} top={}.{}",
+                            thread.thread_id.0,
+                            len,
+                            reuse,
+                            i,
+                            thread.frames[len - 1].class_name(),
+                            thread.frames[len - 1].method_name(),
+                        );
+                    }
+                }
+            }
+            if missed > 0 {
+                ROOTSNAP_MISSES.fetch_add(missed, Relaxed);
+                ROOTSNAP_MISS_CALLS.fetch_add(1, Relaxed);
+            }
+            let n = ROOTSNAP_VERIFIED.load(Relaxed);
+            if n == 1 || n % rootsnap_dbg_every() == 0 {
+                eprintln!(
+                    "[ROOTSNAP-VERIFY] verified_snapshots={} miss_snapshots={} missed_roots={}",
+                    n,
+                    ROOTSNAP_MISS_CALLS.load(Relaxed),
+                    ROOTSNAP_MISSES.load(Relaxed),
+                );
+            }
+        }
     } else {
         // ── Default path (unchanged) ────────────────────────────────────────
         // Multi-thread non-moving-sweep root hardening (Fork6): see
@@ -3800,6 +3921,9 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     for entry in &thread.jit_hashmap_string_node_cache {
         snapshot.push(entry.map);
         snapshot.push(entry.node);
+        if let Some(key_object) = entry.key_object {
+            snapshot.push(key_object);
+        }
     }
     // TOMCAT-JNDIREALM-JIT.3 (2026-07-26) — the ASCII case-conversion cache,
     // exactly the same contract as the HashMap node cache above. It was wired
@@ -3816,6 +3940,9 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         snapshot.push(entry.source);
         snapshot.push(entry.first);
         snapshot.push(entry.second);
+        if let Some(locale) = entry.locale {
+            snapshot.push(locale);
+        }
     }
     // JNI local references (INT-5, safepoint half): a JNI native that
     // obtained local refs and re-entered Java parks HERE — and a
@@ -3935,17 +4062,20 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         ROOTSNAP_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
         // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
         ROOTSNAP_FRAMES.fetch_add(nframes as u64, Relaxed);
-        if calls % 200_000 == 0 {
+        if calls == 1 || calls % rootsnap_dbg_every() == 0 {
             let nanos = ROOTSNAP_NANOS.load(Relaxed);
             let frames = ROOTSNAP_FRAMES.load(Relaxed);
             eprintln!(
-                "[ROOTSNAP] calls={} total_ms={} avg_us={:.2} avg_frames={:.1}",
+                "[ROOTSNAP] calls={} total_ms={} avg_us={:.2} avg_frames={:.1} cached_calls={} reused_frames={} reused_roots={}",
                 calls,
                 nanos / 1_000_000,
                 // Cast: numeric/representation conversion
                 (nanos as f64 / calls as f64) / 1000.0,
                 // Cast: numeric/representation conversion
                 frames as f64 / calls as f64,
+                ROOTSNAP_CACHED_CALLS.load(Relaxed),
+                ROOTSNAP_REUSED_FRAMES.load(Relaxed),
+                ROOTSNAP_REUSED_ROOTS.load(Relaxed),
             );
         }
     }
@@ -4372,6 +4502,12 @@ pub(crate) fn apply_pointer_map_to_thread(
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
+        if let Some(key_object) = entry.key_object.as_mut() {
+            let old_addr = key_object.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *key_object = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
     }
     // TOMCAT-JNDIREALM-JIT.3 — remap companion to the publish added above.
     // Same reasoning as the HashMap node cache: the entries are raw
@@ -4382,6 +4518,12 @@ pub(crate) fn apply_pointer_map_to_thread(
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        if let Some(locale) = entry.locale.as_mut() {
+            let old_addr = locale.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *locale = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
     }
@@ -4485,10 +4627,14 @@ pub(crate) fn apply_pointer_map_to_thread(
 /// this thread's objects WITHOUT calling this leaves `rs_cache_gen` stale, so
 /// the gen gate rebuilds the cache from scratch; a stale cached address is
 /// never trusted. Default-on with opt-outs (`CRATONVM_ROOTSNAP_CACHE=0` or
-/// `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC=0`), and bypassed in the opt-in real
-/// ForkJoinPool lane. Must be called at every site that applies a `pointer_map`
-/// to a thread's frames (`apply_pointer_map_to_thread` here, `update_all_roots`
-/// in memory/gc.rs); missing one only costs a rebuild, never correctness.
+/// `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC=0`). Must be called at every site that
+/// applies a `pointer_map` to a thread's frames (`apply_pointer_map_to_thread`
+/// here, `update_all_roots` in memory/gc.rs); missing one only costs a rebuild,
+/// never correctness. (Until 2026-07-31 this also cleared the cache outright in
+/// the "real ForkJoinPool lane", keyed off a presence test on
+/// `CRATONVM_REAL_FORKJOINPOOL` that stopped being set when that lane became
+/// the default — see `env_cache.rs` for why that bypass was retired instead of
+/// repointed.)
 pub(crate) fn remap_rs_cache_after_gc(
     thread: &mut JvmThread,
     pointer_map: &std::collections::HashMap<usize, usize>,
@@ -4496,7 +4642,6 @@ pub(crate) fn remap_rs_cache_after_gc(
 ) {
     if !crate::runtime::env_cache::rootsnap_cache()
         || !crate::runtime::env_cache::rootsnap_cache_survive_gc()
-        || crate::runtime::env_cache::real_forkjoinpool()
     {
         thread.rs_cache.clear();
         return;
@@ -13174,6 +13319,15 @@ pub(crate) fn build_deopt_frame_inner(
     // operand STACK is already compact (one entry per value). Any unresolvable
     // slot (`Unsupported`/virtual/unresolved machine form) returns `None` → safe
     // re-run.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPTSLOT").is_some()
+        && (ir_deopt_locals(&rframe.locals).is_none()
+            || ir_deopt_frame_values(&rframe.stack).is_none())
+    {
+        eprintln!(
+            "[DBG_DEOPTSLOT] {} bci={} locals={:?} stack={:?}",
+            rframe.method_key, rframe.bci, rframe.locals, rframe.stack
+        );
+    }
     let locals = ir_deopt_locals(&rframe.locals)?;
     let stack_vals = ir_deopt_frame_values(&rframe.stack)?;
 
