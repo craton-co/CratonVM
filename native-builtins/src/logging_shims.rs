@@ -1438,8 +1438,16 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(l))) => ctx.get_field(*l, 1).as_int().unwrap_or(800),
                 _ => 800,
             };
+            // Slot 1 holds EITHER a `Level` object or its raw int value:
+            // `java/util/logging/Logger.setLevel` is registered twice in this
+            // file, and the later registration (which wins) stores
+            // `Value::Int(level_val)` where the earlier one stored the Level
+            // object. Reading only the object shape meant every `setLevel`
+            // silently left this at the INFO default, so `isLoggable` said yes
+            // to everything — `logger.setLevel(SEVERE)` did not suppress INFO.
             let current = match ctx.get_field(this, LOGGER_FIELD_LEVEL) {
                 Value::Object(Some(l)) => ctx.get_field(l, 1).as_int().unwrap_or(800),
+                Value::Int(v) => v,
                 _ => 800, // default INFO
             };
             // A message is loggable if its level >= logger's current level

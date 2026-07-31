@@ -4688,6 +4688,13 @@ pub(crate) fn native_jul_logger_is_loggable(
                 })
                 .and_then(|n| jul_standard_level_value(&n))
         })
+        .or_else(|| {
+            // Synthetic `Level`: no field NAMES at all, so neither lookup
+            // above resolves. The VM's own synthetic Level layout is
+            // (name = slot 0, value = slot 1) — the same shape
+            // `logging_shims`' `setLevel`/`isLoggable` read.
+            level_obj.and_then(|o| synthetic_level_value(ctx, o))
+        })
         .unwrap_or(800);
     let configured_threshold = logger
         .and_then(|logger| match ctx.get_field_by_name(logger, "config") {
@@ -4700,6 +4707,24 @@ pub(crate) fn native_jul_logger_is_loggable(
             },
             _ => None,
         })
+        .or_else(|| {
+            // Same for the logger's own configured level: a synthetic Logger
+            // keeps it in slot 1, holding EITHER a `Level` object or the raw
+            // int (the two `setLevel` registrations in `logging_shims` store
+            // different shapes; the later one wins). Without this the
+            // threshold stayed at the INFO default, so `setLevel(SEVERE)`
+            // suppressed nothing.
+            logger.and_then(|logger| {
+                if ctx.object_num_fields(logger) <= LOGGER_FIELD_LEVEL {
+                    return None;
+                }
+                match ctx.get_field(logger, LOGGER_FIELD_LEVEL) {
+                    Value::Int(v) => Some(v),
+                    Value::Object(Some(level)) => synthetic_level_value(ctx, level),
+                    _ => None,
+                }
+            })
+        })
         .unwrap_or(800);
     let threshold = logger
         .map(|logger| read_jul_logger_name(ctx, logger))
@@ -4710,6 +4735,25 @@ pub(crate) fn native_jul_logger_is_loggable(
     } else {
         0
     })))
+}
+
+/// Read a synthetic `Level`'s int value: slot 1 directly, or slot 0's name
+/// mapped through [`jul_standard_level_value`]. Used only after the by-name
+/// lookups fail, i.e. for a receiver with no field names at all.
+fn synthetic_level_value(ctx: &mut dyn NativeContext, level: ObjectRef) -> Option<i32> {
+    if ctx.object_num_fields(level) > 1 {
+        if let Value::Int(v) = ctx.get_field(level, 1) {
+            return Some(v);
+        }
+    }
+    if ctx.object_num_fields(level) > 0 {
+        if let Value::Object(Some(s)) = ctx.get_field(level, 0) {
+            if let Some(n) = ctx.read_string(s) {
+                return jul_standard_level_value(&n);
+            }
+        }
+    }
+    None
 }
 
 /// Map one of the 9 standard `java.util.logging.Level` names to its `int`
