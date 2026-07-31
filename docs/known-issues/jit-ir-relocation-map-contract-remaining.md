@@ -523,3 +523,46 @@ covers whichever methods reach the IR backend — which today is close to none,
 because the tier-up path requests C1 by design. **Whether that is right is the
 larger and more valuable question**, and it lives in the tiered-manager work,
 not here.
+
+### Resolved by construction: the admission chain PASSES; the pipeline bails inside
+
+Reading the condition to its end (`jit/src/lib.rs`, the `if` closes at the
+`{` before `let num_params = prologue_param_slots;`), the full chain is:
+
+```
+if optimize
+    && !moving_young_disables_optimizing_tier()
+    && ir::ir_compatible(&scan)
+    && !(exc_table_c2_disabled() && !cached.exception_table.is_empty())
+    && !precise_exception_frames
+    && ((!cat2 && !fp) || (ir_emit_long && !fp) || (ir_emit_fp && fp_in_body))
+```
+
+For the observed `optimize=true` case, `BinTreesClassic.itemCheck`:
+
+| conjunct | value | why |
+|---|---|---|
+| `optimize` | true | observed |
+| `!moving_young_disables_optimizing_tier()` | true | observed (`=false`) |
+| `ir::ir_compatible(&scan)` | true | no refusal logged, and every refusal now logs |
+| `!(exc_table_c2_disabled() && …)` | true | that variable is opt-in and unset |
+| `!precise_exception_frames` | true | only set where RBC.6 fires; `itemCheck` has no handler |
+| `(!cat2 && !fp)` | true | `itemCheck(TreeNode) -> int` is category-2-free and FP-free |
+
+**All six pass.** So the block IS entered and the IR pipeline is run — and no
+body results, which means it bails *inside* build → schedule → lower and returns
+`None`, after which the caller silently falls through to single-pass.
+
+`lower_inner` alone has three such bails, each already commented as a
+"soundness bail": `unallocated_slot_use` (a node emitted with no frame slot),
+`buf.overflowed()` (an under-estimated buffer), and the earlier `ir_compatible`
+paths. `IrBuilder::build` can return `None` too. **None of them log.**
+
+So the search is over and the target is named: it is not the admission chain at
+all, it is a silent `None` from the IR pipeline itself. Instrument those bail
+sites — they are few, all already marked in comments — and one run names it.
+
+This also explains, without any further measurement, why every probe in this
+investigation saw zero IR bodies while `cargo test -p cratonvm-jit` exercises IR
+heavily: the tests call `lower()` on graphs they construct directly, bypassing
+the build-from-bytecode step where the production bail happens.
