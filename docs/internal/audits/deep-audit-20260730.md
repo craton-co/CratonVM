@@ -66,7 +66,8 @@ already were; the audit's claim there was stale). The stub ratchet is now exact 
 157 of 9,320 registrations, zero slack — and CI runs the whole `synthetic_diff`
 suite rather than five named cases.
 
-The flip left a live bug behind it, and it is **filed, not fixed**.
+The flip left a live bug behind it. It was **filed here, and has since been
+fixed** — see the resolution note at the end of this item.
 `vm/src/runtime/env_cache.rs` answers "are we in the real ForkJoinPool lane?" by
 testing whether `CRATONVM_REAL_FORKJOINPOOL` is *present*. Once real
 ForkJoinPool became the default that variable is normally unset, so the reader
@@ -80,14 +81,30 @@ would be dead on every run, and
 fails. That was measured, not predicted — the change was made, the suite caught
 it, and it was reverted. Choosing between "the hazard is universal now, retire
 the cache" and "the hazard was specific to the opt-in lane, narrow the trigger"
-needs GC-stress evidence nobody has. Behaviour is left exactly as it was, with
-the analysis in
-[`../../known-issues/rootsnap-cache-bypass-lost-its-trigger-20260730.md`](../../known-issues/rootsnap-cache-bypass-lost-its-trigger-20260730.md).
+needs GC-stress evidence nobody has.
+
+**RESOLVED 2026-07-31** (`fix/rootsnap-cache-trigger-20260730`): the evidence was
+gathered and it chose neither. A new default-inert verifier
+(`CRATONVM_DBG_ROOTSNAP_VERIFY`) re-scans every frame the uncached way after each
+cached snapshot and reports any root the cached snapshot lacks; across the
+real-lane `Fork6`/`Fork6Hard` GC-stress repros it reported none, over 25,600
+verified snapshots on the largest run, with the cache engaged on every one of
+them. The mechanism: this lane's Bridge natives run every ForkJoinTask inline on
+the submitting thread (`COMPUTE_THREADS=[main]` against HotSpot's 15 workers), so
+the worker-frame hazard the bypass described has no thread to occur on. The
+bypass was removed rather than repointed or replaced with a narrower trigger, and
+a regression gate — `env_cache::tests::no_presence_predicate_shadows_a_compound_flag_default`
+— now fails the build if any presence predicate names a variable whose flag
+default is compound. Full writeup:
+[`../rootsnap-cache-bypass-lost-its-trigger-RESOLVED-20260731.md`](../rootsnap-cache-bypass-lost-its-trigger-RESOLVED-20260731.md).
 
 The lesson generalises past this one flag: after a default flip, every
 *presence* test on the old opt-in env var is a suspect, because it silently
 starts answering "was this requested?" when the caller asks "is this active?" —
-two questions with the same answer right up until the flip.
+two questions with the same answer right up until the flip. The full sweep
+(51 `cached_is_set!` predicates, ~209 `runtime_var_os(…).is_some()` sites) is in
+the resolution note; this flag was the only live instance, and the gate test now
+keeps it that way.
 
 **P1 — Experimental features out of the default build. Partly rejected, with
 evidence.** `vm`'s default set is `["awt", "experimental-jmx"]`. A new
@@ -488,6 +505,7 @@ CI. **Nothing in this file has ever run in CI**, because the job has not reached
 a build. That is the single most important sentence here.
 
 Tracked residuals: the formatting decision, the Spring CGLIB superclass
-evidence, the ForkJoinPool bypass question, the `libcratonvm` test-isolation
-defect, the `Test vm (synthetic-jdk)` harness abort, and the SbCostProbe gap
-(245 µs against HotSpot's 50 ns).
+evidence, the `libcratonvm` test-isolation defect, the `Test vm (synthetic-jdk)`
+harness abort, and the SbCostProbe gap (245 µs against HotSpot's 50 ns). The
+ForkJoinPool bypass question is closed — see the resolution note in the P0 item
+above.
