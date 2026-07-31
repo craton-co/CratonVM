@@ -45315,7 +45315,12 @@ fn native_pbq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // Family-1 stale-ObjectRef fix (2026-07-31): `alloc_ref_array` can trigger
+    // a young collection that relocates/promotes `this`, so pin it across the
+    // allocation and write the fields through the forwarded reference.
+    let h_this = ctx.pin_native_root(this);
     let arr = alloc_ref_array(ctx, PBQ_DEFAULT_CAPACITY);
+    let this = ctx.read_native_pin(h_this, this);
     ctx.set_field(this, PBQ_FIELD_DATA, Value::Object(Some(arr)));
     ctx.set_field(this, PBQ_FIELD_SIZE, Value::Int(0));
     // Our synthetic offer/poll/peek/etc. manage queue(slot 0)/size(slot 1)
@@ -45330,6 +45335,7 @@ fn native_pbq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if !ctx.is_class_synthetic_stub("java/util/concurrent/PriorityBlockingQueue") {
         pbq_seed_real_lock(ctx, this);
     }
+    ctx.unpin_native_roots(h_this);
     Ok(None)
 }
 
@@ -45369,21 +45375,44 @@ fn pbq_seed_real_lock(ctx: &mut dyn NativeContext, this: ObjectRef) {
     ctx.unpin_native_roots(h_this);
 }
 
-fn pbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) {
+/// Grow the backing array so it can hold `needed` elements.
+///
+/// Family-1 stale-ObjectRef fix (2026-07-31): `alloc_ref_array` below is a real
+/// heap allocation that can trigger a young collection, which relocates (or
+/// promotes) both `this` and the *existing* backing array. Both are therefore
+/// pinned across the allocation and re-read through their pins before the copy
+/// loop and the field write - copying out of a stale `arr` would splice
+/// whatever now occupies that address into the queue. Returns the current
+/// (possibly forwarded) `this` so the caller never reuses its pre-call copy.
+#[must_use]
+fn pbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) -> ObjectRef {
+    let h_this = ctx.pin_native_root(this);
     let arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
         Value::Object(Some(a)) => a,
-        _ => return,
+        _ => {
+            ctx.unpin_native_roots(h_this);
+            return this;
+        }
     };
     let old_len = ctx.array_length(arr);
     if needed <= old_len {
-        return;
+        ctx.unpin_native_roots(h_this);
+        return this;
     }
+    let h_arr = ctx.pin_native_root(arr);
     let new_len = (old_len * 2).max(needed).max(PBQ_DEFAULT_CAPACITY);
     let new_arr = alloc_ref_array(ctx, new_len);
+    // Re-read both through their pins: the allocation above may have moved
+    // them. (`new_arr` itself needs no pin - nothing below it allocates.)
+    let this = ctx.read_native_pin(h_this, this);
+    let arr = ctx.read_native_pin(h_arr, arr);
     for i in 0..old_len {
-        ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+        let v = ctx.get_array_element(arr, i);
+        ctx.set_array_element(new_arr, i, v);
     }
     ctx.set_field(this, PBQ_FIELD_DATA, Value::Object(Some(new_arr)));
+    ctx.unpin_native_roots(h_this);
+    this
 }
 
 fn pbq_reject_null_element(elem: Value) -> Result<(), MethodCallFailed> {
@@ -45396,16 +45425,46 @@ fn pbq_reject_null_element(elem: Value) -> Result<(), MethodCallFailed> {
     Ok(())
 }
 
+/// Insert `elem` into the sorted backing array (caller holds the monitor).
+///
+/// Family-1 stale-ObjectRef fix (2026-07-31): the binary search below calls
+/// `tree_compare`, which for anything that is not a `String` or a homogeneous
+/// primitive wrapper dispatches the element's **real, interpreted**
+/// `Comparable.compareTo()` - a full re-entry into the VM that can allocate and
+/// trigger a young collection. Every raw `ObjectRef` this function still uses
+/// *after* such a call must be pinned and re-read through its pin, exactly like
+/// the sibling `tm_binary_search` (see its doc comment). That is all three of:
+///
+/// * `arr` - dereferenced by `get_array_element` on the *next* loop iteration
+///   and by the post-loop shift/insert. A stale `arr` decodes to whatever now
+///   occupies that address; observed as a `gen_heap` "left: Object, right:
+///   Array" assertion failure in the isolated repro.
+/// * `elem` - re-passed to `tree_compare` on every iteration and finally stored
+///   by `set_array_element(arr, low, elem)`. A stale `elem` writes a dangling
+///   reference into the queue that a later `offer()`/`poll()` reads back as an
+///   unrelated object - H2 MVStore's "java.lang.Object cannot be cast to
+///   org.h2.mvstore.FileStore$RemovedPageInfo".
+/// * `this` - written by the trailing `set_field(PBQ_FIELD_SIZE)`.
+///
+/// `pbq_ensure_capacity` also allocates, hence it returns the forwarded `this`.
 fn pbq_offer_locked(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) -> MethodCallResult {
     let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
-    pbq_ensure_capacity(ctx, this, (size + 1) as usize);
-    let arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
+    let h_this = ctx.pin_native_root(this);
+    let h_elem = pin_value(ctx, elem);
+    let mut elem = elem;
+    let mut this = pbq_ensure_capacity(ctx, this, (size + 1) as usize);
+    elem = read_pinned_elem(ctx, h_elem, elem);
+    let mut arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Int(1))),
+        _ => {
+            ctx.unpin_native_roots(h_this);
+            return Ok(Some(Value::Int(1)));
+        }
     };
+    let h_arr = ctx.pin_native_root(arr);
     // Binary search for insertion position using natural ordering.
     let comparator = Value::Object(None);
     let mut low: usize = 0;
@@ -45413,7 +45472,17 @@ fn pbq_offer_locked(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) -
     while low < high {
         let mid = low + (high - low) / 2;
         let mid_elem = ctx.get_array_element(arr, mid);
-        let cmp = tree_compare(ctx, &comparator, mid_elem, elem)?;
+        let cmp = match tree_compare(ctx, &comparator, mid_elem, elem) {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.unpin_native_roots(h_this);
+                return Err(e);
+            }
+        };
+        // The comparison ran real bytecode - refresh everything reused below.
+        this = ctx.read_native_pin(h_this, this);
+        arr = ctx.read_native_pin(h_arr, arr);
+        elem = read_pinned_elem(ctx, h_elem, elem);
         if cmp < 0 {
             low = mid + 1;
         } else {
@@ -45427,6 +45496,7 @@ fn pbq_offer_locked(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) -
     }
     ctx.set_array_element(arr, low, elem);
     ctx.set_field(this, PBQ_FIELD_SIZE, Value::Int(size + 1));
+    ctx.unpin_native_roots(h_this);
     Ok(Some(Value::Int(1)))
 }
 
@@ -45460,12 +45530,32 @@ fn native_pbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     pbq_reject_null_element(elem)?;
-    ctx.monitor_enter(this);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `monitor_enter` can park this
+    // thread and `pbq_offer_locked` re-enters the interpreter through the
+    // element's `compareTo`, so a collection can run between any two lines
+    // here. Pin `this`/`elem` for the whole critical section and re-read them
+    // through their pins before every subsequent use.
+    let h_this = ctx.pin_native_root(this);
+    let h_elem = pin_value(ctx, elem);
+    // STW-safepoint fix (2026-07-31): `monitor_enter_gc_safe`, not the plain
+    // `monitor_enter`. A plain enter blocks as a *counted* mutator, so a writer
+    // waiting on this queue's monitor never arrives at a concurrent
+    // stop-the-world barrier and the whole VM wedges ("STW cross-thread JIT
+    // takeover is still waiting for cooperative mutators rounds=64 pending=3
+    // taken=0"). The escape hatch is only sound for callers that pin and
+    // re-read every raw ref across the wait, which is exactly what the pins
+    // above now provide - same contract as `ChmMonitorGuard::acquire_gc_safe`.
+    let this = ctx.monitor_enter_gc_safe(this);
+    let this = ctx.read_native_pin(h_this, this);
+    let elem = read_pinned_elem(ctx, h_elem, elem);
     let result = pbq_offer_locked(ctx, this, elem);
+    let this = ctx.read_native_pin(h_this, this);
     if result.is_ok() {
         let _ = ctx.monitor_notify_all(this);
     }
+    let this = ctx.read_native_pin(h_this, this);
     ctx.monitor_exit(this);
+    ctx.unpin_native_roots(h_this);
     result
 }
 
@@ -45474,9 +45564,18 @@ fn native_pbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.monitor_enter(this);
+    // Family-1 stale-ObjectRef fix (2026-07-31): `monitor_enter` can park this
+    // thread, so `this` may be relocated before the dequeue runs; the dequeued
+    // head likewise has to survive `monitor_exit`.
+    let h_this = ctx.pin_native_root(this);
+    // STW-safepoint fix (2026-07-31) - see `native_pbq_offer`.
+    let this = ctx.monitor_enter_gc_safe(this);
+    let this = ctx.read_native_pin(h_this, this);
     let head = pbq_poll_locked(ctx, this);
+    let h_head = pin_value(ctx, head);
     ctx.monitor_exit(this);
+    let head = read_pinned_elem(ctx, h_head, head);
+    ctx.unpin_native_roots(h_this);
     Ok(Some(head))
 }
 
@@ -45509,7 +45608,14 @@ fn native_pbq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.monitor_enter(this);
+    // Family-1 stale-ObjectRef fix (2026-07-31): this method blocks - both
+    // `monitor_enter` and every `monitor_wait` iteration are points at which
+    // another thread can run a collection that relocates `this`. Pin it and
+    // re-read it through the pin after each blocking call.
+    let h_this = ctx.pin_native_root(this);
+    // STW-safepoint fix (2026-07-31) - see `native_pbq_offer`.
+    let this = ctx.monitor_enter_gc_safe(this);
+    let mut this = ctx.read_native_pin(h_this, this);
     loop {
         let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
             Value::Int(v) => v,
@@ -45519,9 +45625,13 @@ fn native_pbq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             break;
         }
         let _ = ctx.monitor_wait(this, Some(50));
+        this = ctx.read_native_pin(h_this, this);
     }
     let head = pbq_poll_locked(ctx, this);
+    let h_head = pin_value(ctx, head);
     ctx.monitor_exit(this);
+    let head = read_pinned_elem(ctx, h_head, head);
+    ctx.unpin_native_roots(h_this);
     Ok(Some(head))
 }
 
