@@ -643,10 +643,7 @@ pub fn host_thread_enter_native() -> bool {
     // this OS thread is in no registry entry at all, so it is absent from
     // `alive_count` and occupies no `expected` slot — the counter-only path
     // below is then exactly right.
-    let tid = shared
-        .threads
-        .thread_registry
-        .thread_id_for_current_os_tid();
+    let tid = shared.threads.thread_registry.thread_id_for_current_os_tid();
     if let Some(tid) = tid {
         // Raise the identity flag BEFORE the counter, matching every other
         // blocking-region entry (`deposit_root_snapshot` then
@@ -673,10 +670,7 @@ pub fn host_thread_enter_native() -> bool {
         // The fallback id is unchanged from the pre-fix behaviour: for an
         // unregistered caller it only answers "am I the initiator", and such a
         // thread never is.
-        let _ = shared
-            .mem
-            .gc_barrier
-            .arrive_and_wait_auto(tid.unwrap_or(ThreadId(0)));
+        let _ = shared.mem.gc_barrier.arrive_and_wait_auto(tid.unwrap_or(ThreadId(0)));
     }
     true
 }
@@ -706,10 +700,7 @@ pub fn host_thread_leave_native() -> bool {
         Some(s) => s,
         None => return false,
     };
-    let tid = shared
-        .threads
-        .thread_registry
-        .thread_id_for_current_os_tid();
+    let tid = shared.threads.thread_registry.thread_id_for_current_os_tid();
     shared.mem.gc_barrier.mark_blocked_region_leave();
     if let Some(tid) = tid {
         if let Some(gc_block_state) = shared.threads.thread_registry.gc_block_state_of(tid) {
@@ -728,10 +719,7 @@ pub fn host_thread_leave_native() -> bool {
         // that a caller broke the "no live Java roots while parked" contract.
         // Its own `store(false)` is a no-op here: the barrier already cleared
         // the flag above.
-        shared
-            .threads
-            .thread_registry
-            .mark_native_thread_unblocked(tid);
+        shared.threads.thread_registry.mark_native_thread_unblocked(tid);
     }
     true
 }
@@ -7374,10 +7362,10 @@ mod tests {
         );
 
         // Same call shape as `runtime/interpreter.rs`'s GC initiator.
-        assert!(shared.mem.gc_barrier.request_stw_counted_with_live_blocked(
-            init,
-            || (alive as u32, blocked as u32, blocked_tids),
-        ));
+        let requested = shared.mem.gc_barrier.request_stw_counted_with_live_blocked(init, || {
+            (alive as u32, blocked as u32, blocked_tids)
+        });
+        assert!(requested);
         assert_eq!(
             shared.mem.gc_barrier.pending_count(),
             0,

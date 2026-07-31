@@ -25,6 +25,7 @@ use crate::native::registry::{
     NativeThreadBlocker, StackTraceEntry,
 };
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
+use crate::threading::thread_state::{self, ThreadExecState};
 use crate::types::{jlong_bits_as_aligned_object_ptr, ObjectRef, Value};
 
 use super::SharedVm;
@@ -1554,6 +1555,44 @@ fn safe_native_call_impl(
     } else {
         false
     };
+
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // `NativeRunning` is the state the STW census deliberately WAITS for — "a
+    // *running* native still holds raw `ObjectRef`s in Rust locals and must be
+    // waited for so the copying collector does not relocate objects under it"
+    // (`gc_barrier.rs`). This is the funnel every native dispatch passes
+    // through, so recording here covers them all.
+    //
+    // The prior state is restored rather than assumed: this call site is
+    // reached from the interpreter (`JavaRunning`), from compiled code
+    // (`CompiledUninterruptible`) and from a re-entrant native, and inventing
+    // an edge the code does not perform is what the tripwire is meant to
+    // catch. Restoring on `Drop` covers the `catch_unwind`-caught panic and
+    // the early returns below it. A native that opened a blocking region and
+    // came back is left in whatever `end_blocking_region` recorded until this
+    // guard restores the caller's state — both are tabled edges.
+    struct NativeStateGuard(ThreadExecState);
+    impl Drop for NativeStateGuard {
+        fn drop(&mut self) {
+            thread_state::record_transition(self.0, "vm_exec::safe_native_call_impl:return");
+        }
+    }
+    let _native_state_guard = NativeStateGuard(match thread_state::current_state() {
+        // `Starting` is ALSO the recorder's answer for a thread it has never
+        // observed (`current_state`'s doc), and this funnel is often the first
+        // thing a carrier records. Restoring it would assert the one thing the
+        // table says cannot be true of a thread that just ran a native
+        // (`Starting -> NativeRunning` is deliberately absent), and would then
+        // repeat on that thread's every later native call. Resume as
+        // `JavaRunning`: the state such a thread demonstrably reached, and the
+        // tabled return edge from a native.
+        ThreadExecState::Starting => ThreadExecState::JavaRunning,
+        prior => prior,
+    });
+    thread_state::record_transition(
+        ThreadExecState::NativeRunning,
+        "vm_exec::safe_native_call_impl",
+    );
 
     let result = {
         // Heap-exhaustion unwind permission. The callback below runs directly

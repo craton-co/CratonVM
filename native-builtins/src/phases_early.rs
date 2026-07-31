@@ -14774,6 +14774,26 @@ pub(crate) fn throw_jca_exc(
     .into()
 }
 
+/// Refuse a `Signature.verify()` whose backend never ran.
+///
+/// The `crypto_impl` verify backends return `Option<bool>`: `Some(_)` is the
+/// real cryptographic answer, `None` means the key handle was absent or the
+/// backend refused the key outright. `java.security.SignatureException` is
+/// what `verify()` declares, so the refusal is catchable exactly where a
+/// caller already handles verification failure — while remaining
+/// distinguishable from the `false` that a genuine mismatch produces.
+pub(crate) fn verify_never_ran(ctx: &mut dyn NativeContext, algorithm: &str) -> MethodCallFailed {
+    throw_jca_exc(
+        ctx,
+        "java/security/SignatureException",
+        &format!(
+            "Signature.verify: {algorithm} verification could not be performed \
+             (no usable key for this Signature). Refusing to report a signature \
+             as invalid when it was never checked."
+        ),
+    )
+}
+
 /// Execute doFinal: encrypt or decrypt accumulated data using the configured algorithm
 fn cipher_do_final(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
     let mode = ctx.get_field(this, CIPHER_MODE).as_int().unwrap_or(0);
@@ -16070,12 +16090,29 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                     let upper = algo.to_uppercase();
                     #[cfg(feature = "legacy-synthetic-crypto")]
                     {
+                        // P0: these three used to be `.unwrap_or(false)`. The
+                        // backends return `Option<bool>`, where `Some(false)`
+                        // is "checked, and it does not match" — a genuine
+                        // negative that must stay a `false` — and `None` is
+                        // "never checked" (no such key handle, or the backend
+                        // refused the key). Collapsing `None` to `false`
+                        // reports an unusable key as a forged signature. See
+                        // `docs/security/tls-and-jca-failure-audit.md`.
                         if upper == "ED25519" && alg_idx == 8 {
-                            crypto_impl::ed25519_verify(key_id, &data, &provided).unwrap_or(false)
+                            match crypto_impl::ed25519_verify(key_id, &data, &provided) {
+                                Some(answer) => answer,
+                                None => return Err(verify_never_ran(ctx, &algo)),
+                            }
                         } else if upper.contains("ECDSA") && alg_idx == 7 {
-                            crypto_impl::ecdsa_verify(key_id, &data, &provided).unwrap_or(false)
+                            match crypto_impl::ecdsa_verify(key_id, &data, &provided) {
+                                Some(answer) => answer,
+                                None => return Err(verify_never_ran(ctx, &algo)),
+                            }
                         } else if upper.contains("RSA") && alg_idx == 6 {
-                            crypto_impl::rsa_verify(key_id, &data, &provided).unwrap_or(false)
+                            match crypto_impl::rsa_verify(key_id, &data, &provided) {
+                                Some(answer) => answer,
+                                None => return Err(verify_never_ran(ctx, &algo)),
+                            }
                         } else {
                             let key_bytes = match ctx.get_field(key_obj, 0) {
                                 Value::Object(Some(enc_arr)) => cipher_read_bytes(ctx, enc_arr),
@@ -16105,7 +16142,19 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                     ct_eq(&expected, &provided)
                 }
             }
-            _ => false,
+            // P0: a null key with `mode == VERIFY` used to report `false` —
+            // "this signature is invalid" — for a Signature that was never
+            // given anything to verify against. `initVerify(null)` is an
+            // invalid key, not a failed verification.
+            _ => {
+                return Err(throw_jca_exc(
+                    ctx,
+                    "java/security/InvalidKeyException",
+                    "Signature.verify: no verification key was installed by \
+                     initVerify(); refusing to report a signature as invalid \
+                     when nothing was checked against it",
+                ))
+            }
         };
         // Reset data accumulator
         let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);

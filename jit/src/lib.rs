@@ -6916,12 +6916,317 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
 // Escape analysis: apply EA results to the IR graph
 // ---------------------------------------------------------------------------
 
+// ── Memory-token chain surgery (EA-local twin of `ir_optimize`'s) ────
+//
+// Every memory-effecting node carries an incoming *memory token* naming the
+// previous writer and hands itself on as the token for the next one. That chain
+// is the only ordering relation the IR has between two writes. Marking such a
+// node `Op::Dead` without first rewiring its token consumers leaves the
+// surviving memory operation's token slot pointing into the hole: it has lost
+// the transitive ordering edge to everything written before the deleted node,
+// and the scheduler is then free to hoist it above those writes. That is the
+// defect `ir_optimize::eliminate_dead_stores` was fixed for in f00cc5dd8; this
+// pass had exactly the same hole — for its stores, its loads AND its `Op::New`.
+//
+// DE-DUPLICATION NOTE: `ir_optimize::memory_token_slot` (ir_optimize.rs:1682)
+// and `ir_optimize::is_memory_token_slot` (ir_optimize.rs:1708) are the
+// reference predicates and the two below are equivalent to them, but both are
+// private to that module. Changing those two declarations to `pub(crate) fn`
+// lets `ea_memory_token_slot` / `ea_is_memory_token_slot` be deleted outright
+// and the originals imported instead. The *kill* helper,
+// `kill_store_splicing_memory_chain`, is deliberately NOT reused even if it
+// were public: it is `Op::Store`-only, and it refuses any node a safepoint slot
+// names — whereas an eliminated `Op::New` must KEEP being named by its snapshot
+// slots, because that slot is the virtual-object descriptor
+// `ir_lower::resolve_frame_state` resolves through `ScalarReplacementMap`.
+
+/// The input slot carrying `node`'s incoming memory token, or `None` when this
+/// op does not consume one.
+///
+/// Mirrors `ir_optimize::memory_token_slot`, arity guard included: the compact
+/// hand-built `[base, value]` `Store` layout's slot 1 is a *value*, not a token,
+/// so only the documented full `[ctrl, mem, …]` form has one.
+fn ea_memory_token_slot(node: &ir::Node) -> Option<usize> {
+    let min_full_arity = match node.op {
+        ir::Op::Load(_) => 3,           // [ctrl, mem, base]
+        ir::Op::Store(_) => 4,          // [ctrl, mem, base, value]
+        ir::Op::ArrayLoad(_) => 4,      // [ctrl, mem, array, index]
+        ir::Op::ArrayStore(_) => 5,     // [ctrl, mem, array, index, value]
+        ir::Op::ArrayLength => 3,       // [ctrl, mem, array_ref]
+        ir::Op::New { .. } => 2,        // [ctrl, mem]
+        ir::Op::NewArray { .. } => 3,   // [ctrl, mem, length]
+        ir::Op::Call { .. } => 2,       // [ctrl, mem, args…]
+        ir::Op::LambdaIntToDouble => 4, // [ctrl, mem, lambda, index]
+        _ => return None,
+    };
+    if node.inputs.len() >= min_full_arity {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// True when input `idx` of `node` is a memory *token* — an ordering edge
+/// naming the previous writer — rather than a value the node reads. Mirrors
+/// `ir_optimize::is_memory_token_slot`; a memory-typed φ is the one op whose
+/// token edges are every value input rather than a single slot.
+fn ea_is_memory_token_slot(node: &ir::Node, idx: usize) -> bool {
+    if matches!(node.op, ir::Op::Phi) {
+        return node.ty == ir::IrType::Memory && idx >= 1;
+    }
+    ea_memory_token_slot(node) == Some(idx)
+}
+
+/// Whether `victim` can be spliced out of the memory-token chain: either
+/// nothing names it as a token, or it has an incoming token of its own to hand
+/// on to whoever does.
+///
+/// Same bias as `ir_optimize::kill_store_splicing_memory_chain`: a node we
+/// decline to delete is a missed optimization, a node deleted out of a chain we
+/// could not repair is wrong code.
+fn ea_splice_feasible(ir_graph: &ir::Graph, victim: ir::NodeId) -> bool {
+    let named_as_token = ir_graph.nodes.iter().any(|n| {
+        n.op != ir::Op::Dead
+            && n.inputs
+                .iter()
+                .enumerate()
+                .any(|(i, &inp)| inp == victim && ea_is_memory_token_slot(n, i))
+    });
+    if !named_as_token {
+        return true;
+    }
+    ir_graph
+        .node_opt(victim)
+        .and_then(|n| ea_memory_token_slot(n).and_then(|s| n.input_opt(s)))
+        .is_some()
+}
+
+/// True when some safepoint snapshot slot names `id`.
+fn ea_snapshot_names(ir_graph: &ir::Graph, id: ir::NodeId) -> bool {
+    ir_graph
+        .safepoints
+        .iter()
+        .any(|sp| sp.locals.iter().chain(sp.stack.iter()).any(|&v| v == id))
+}
+
+/// How [`apply_ea_to_ir`] retires one node.
+#[derive(Clone, Copy)]
+enum EaVictimKind {
+    /// Every *non-token* reference — node input and safepoint snapshot slot
+    /// alike — is rewired to this replacement value before the node is killed.
+    /// Used for a scalar-replaced field `Op::Load`, whose value is known.
+    Forwarded(ir::NodeId),
+    /// Killed outright. Planning has already proved that the only references
+    /// left are memory tokens (spliced at kill time) and — for an eliminated
+    /// `Op::New` — safepoint slots that deliberately keep naming it.
+    Eliminated,
+}
+
+/// One scalar-replacement candidate's decided edit, computed without touching
+/// the graph so a refusal costs nothing and can never leave a half-applied
+/// object behind.
+struct EaScalarPlan {
+    /// `(load node, replacement value)` per field load to forward. The value is
+    /// `None` for a never-stored field until the shared zero default is made.
+    loads: Vec<(ir::NodeId, Option<ir::NodeId>)>,
+    /// The allocation and its field stores — killed only when `elide_alloc`.
+    new_node: ir::NodeId,
+    stores: Vec<ir::NodeId>,
+    /// Whether the allocation itself (and its initialising stores) may go.
+    elide_alloc: bool,
+}
+
+/// Decide what may be done to one scalar-replacement candidate. Pure: it never
+/// mutates `ir_graph`. `None` refuses the object entirely (it stays allocated,
+/// its stores stay, its loads stay).
+fn plan_scalar_replacement(
+    ir_graph: &ir::Graph,
+    reverse_map: &HashMap<escape_analysis::NodeId, ir::NodeId>,
+    info: &escape_analysis::ScalarReplacementInfo,
+    deopt_descriptor_available: bool,
+) -> Option<EaScalarPlan> {
+    let new_node = *reverse_map.get(&info.alloc_node)?;
+    if !matches!(ir_graph.node_opt(new_node)?.op, ir::Op::New { .. }) {
+        return None;
+    }
+
+    // The field index a load/store accesses. Must match the index the EA bridge
+    // keyed its field edges by: the real index from the `Const` offset operand
+    // of a full-layout production node, falling back to the `MemKind`-derived
+    // index for a compact / hand-built one.
+    let field_index = |id: ir::NodeId| -> Option<usize> {
+        if let Some(f) = ir_load_store_field_index(ir_graph, id) {
+            return Some(f);
+        }
+        match &ir_graph.node_opt(id)?.op {
+            ir::Op::Load(mk) | ir::Op::Store(mk) => Some(*mk as usize),
+            _ => None,
+        }
+    };
+
+    let mut loads: Vec<(ir::NodeId, usize)> = Vec::new();
+    for &ea_load in &info.replaced_loads {
+        // An EA node with no IR counterpart names nothing we can kill.
+        let l = match reverse_map.get(&ea_load) {
+            Some(&l) => l,
+            None => continue,
+        };
+        if !matches!(ir_graph.node_opt(l)?.op, ir::Op::Load(_)) {
+            return None;
+        }
+        loads.push((l, field_index(l)?));
+    }
+    let mut stores: Vec<(ir::NodeId, usize)> = Vec::new();
+    for &ea_store in &info.eliminated_stores {
+        let s = match reverse_map.get(&ea_store) {
+            Some(&s) => s,
+            None => continue,
+        };
+        if !matches!(ir_graph.node_opt(s)?.op, ir::Op::Store(_)) {
+            return None;
+        }
+        stores.push((s, field_index(s)?));
+    }
+
+    // LAST-WRITE-WINS HAZARD. `info.field_values[f]` records the value of the
+    // LAST store to field `f` in program order, and this pass forwards *every*
+    // replaced load of `f` to it — including a load that runs BEFORE that store
+    // and therefore reads a value the object does not hold yet (`Foo o = new
+    // Foo(); int a = o.x; o.x = 42;` would fold `a` to 42). Node ids are
+    // assigned in creation = program order, the same ordering
+    // `escape_analysis::find_scalar_replacements` itself uses to pick the
+    // winning store, so a store id above a load id means the store is later.
+    // Refuse the object rather than forward a value from its future.
+    for &(l, lf) in &loads {
+        if stores.iter().any(|&(s, sf)| sf == lf && s > l) {
+            return None;
+        }
+    }
+
+    let mut load_plans: Vec<(ir::NodeId, Option<ir::NodeId>)> = Vec::with_capacity(loads.len());
+    for &(l, f) in &loads {
+        // The value the load resolves to: the stored field value, or — when the
+        // field was never stored — the freshly-allocated object's zero default
+        // (`None` here; the caller materialises one shared `Const(0)`).
+        // Soundness of that default rests on the object being genuinely
+        // zero-initialised: the front end only admits allocations whose
+        // constructor sets no non-zero field.
+        let value = match info.field_values.get(f) {
+            Some(Some(ea_val)) => match reverse_map.get(ea_val) {
+                Some(&v) if ir_graph.node_opt(v).is_some_and(|n| n.op != ir::Op::Dead) => Some(v),
+                // The stored value has no live IR node, so this load cannot be
+                // described. REFUSE — the previous code killed the load anyway
+                // and left its consumers reading an `Op::Dead` node.
+                _ => return None,
+            },
+            Some(None) => None,
+            // Field index outside the object's field vector: the bridge and the
+            // analysis disagree about this access. Refuse rather than guess.
+            None => return None,
+        };
+        load_plans.push((l, value));
+    }
+    for &(l, _) in &load_plans {
+        if !ea_splice_feasible(ir_graph, l) {
+            return None;
+        }
+    }
+
+    // ── May the ALLOCATION itself go? ────────────────────────────────
+    //
+    // Killing the `Op::New` removes the object from the machine frame, so a
+    // deopt snapshot slot that names it can only be reconstructed from the
+    // virtual-object descriptor (`ir_lower::ScalarReplacementMap` →
+    // `FrameValue::VirtualObject`). When that descriptor will NOT be emitted —
+    // the flags are off, or `build_scalar_replacement_map` would omit this
+    // object — the slot resolves to `FrameValue::Undefined`, which every resume
+    // sink turns into `Value::Int(0)`: a NULL where a live object was. That is
+    // precisely the silent wrong-reconstruction `deopt`'s
+    // `FrameValue::MaterializationRequired` exists to make impossible, and a
+    // `SafepointSnapshot` slot — a bare `NodeId` — cannot spell it.
+    //
+    // So keep the allocation AND its initialising stores. The object is then a
+    // real, correctly-initialised heap object at the safepoint whose slot
+    // resolves the ordinary way (`StackSlotRef`), and the load forwarding above
+    // still applies: this costs the elided allocation, not the optimization.
+    let mut elide_alloc = true;
+    if stores.iter().any(|&(s, _)| ea_snapshot_names(ir_graph, s)) {
+        // A snapshot naming a `Store` is already malformed — a store produces no
+        // value a frame can be rebuilt from — but it is not this pass's business
+        // to silently retarget it.
+        elide_alloc = false;
+    }
+    if ea_snapshot_names(ir_graph, new_node)
+        && !(deopt_descriptor_available
+            && virtual_object_info_for(ir_graph, reverse_map, info).is_some())
+    {
+        elide_alloc = false;
+    }
+    if !ea_splice_feasible(ir_graph, new_node)
+        || stores
+            .iter()
+            .any(|&(s, _)| !ea_splice_feasible(ir_graph, s))
+    {
+        elide_alloc = false;
+    }
+    // Nothing outside the object's own (about to be killed) nodes may still read
+    // the allocation or one of its stores as a VALUE. EA's escape rule should
+    // already guarantee that; this is the belt-and-braces check that keeps a
+    // bridge gap from turning into a live use of a removed node.
+    if elide_alloc {
+        'outer: for (idx, n) in ir_graph.nodes.iter().enumerate() {
+            let id = idx as ir::NodeId;
+            if n.op == ir::Op::Dead
+                || id == new_node
+                || stores.iter().any(|&(s, _)| s == id)
+                || load_plans.iter().any(|&(l, _)| l == id)
+            {
+                continue;
+            }
+            for (i, &inp) in n.inputs.iter().enumerate() {
+                let names_victim = inp == new_node || stores.iter().any(|&(s, _)| s == inp);
+                if names_victim && !ea_is_memory_token_slot(n, i) {
+                    elide_alloc = false;
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    if load_plans.is_empty() && !elide_alloc {
+        return None; // nothing left to do for this object
+    }
+    Some(EaScalarPlan {
+        loads: load_plans,
+        new_node,
+        stores: stores.into_iter().map(|(s, _)| s).collect(),
+        elide_alloc,
+    })
+}
+
 /// Apply escape analysis results back onto the IR graph.
 ///
-/// Maps EA node IDs back to IR node IDs using the reverse of `id_map`,
-/// then performs scalar replacement (redirect load uses, kill stores and
-/// allocations) and lock elision (kill monitor nodes) by marking nodes
-/// as `ir::Op::Dead`.
+/// Maps EA node IDs back to IR node IDs using the reverse of `id_map`, then
+/// performs scalar replacement (forward each field load to the stored value,
+/// kill the stores and the allocation) and lock elision, by marking nodes as
+/// `ir::Op::Dead`.
+///
+/// It runs after `ir_optimize::optimize` and is the last mutator before
+/// `ir_schedule::schedule` / `ir_lower::lower_inner`, so the two invariants it
+/// used to break are ones nothing downstream repairs:
+///
+/// * **the memory-token chain** — every node killed here is first *spliced* out
+///   of the chain (consumers naming it as a token are rewired to its own
+///   incoming token), exactly as `ir_optimize::eliminate_dead_stores` does. It
+///   previously killed loads, stores and the `Op::New` with a plain
+///   `op = Op::Dead`, leaving the next memory operation's token slot pointing at
+///   a removed node — and, worse, rewrote token slots naming a forwarded load to
+///   that load's *data* replacement, so an ordering edge became a data edge.
+/// * **safepoint snapshots** — `graph.safepoints` were never touched. A slot
+///   naming a forwarded load now follows the value (it used to keep naming the
+///   killed load ⇒ `FrameValue::Undefined` ⇒ a wrong value at deopt), and the
+///   allocation is only elided when a slot naming it can still be described.
+///   See `plan_scalar_replacement` for that rule.
 fn apply_ea_to_ir(
     ir_graph: &mut ir::Graph,
     id_map: &[escape_analysis::NodeId],
@@ -6935,103 +7240,176 @@ fn apply_ea_to_ir(
         }
     }
 
-    // Apply scalar replacements
+    // Will the lowerer be handed a `ScalarReplacementMap` at all? This MUST be
+    // the same predicate the caller uses to decide whether to call
+    // `build_scalar_replacement_map` (the EA block in `try_compile_inner`); if
+    // the two ever disagree, an elided allocation loses its deopt descriptor.
+    let deopt_descriptor_available = scalar_deopt_enabled() && deopt_real_enabled();
+
+    // ── Phase 1: plan (no mutation) ──────────────────────────────────
+    let mut plans: Vec<EaScalarPlan> = Vec::new();
     for info in &ea_result.scalar_replaceable {
-        // For each replaced load, redirect all IR nodes that read from it
-        // to read from the stored field value instead, then mark it dead.
-        for &ea_load in &info.replaced_loads {
-            let ir_load = match reverse_map.get(&ea_load) {
-                Some(&id) => id,
-                None => continue,
-            };
-            let idx = ir_load as usize;
-            if idx >= ir_graph.nodes.len() {
-                continue;
-            }
+        if let Some(plan) =
+            plan_scalar_replacement(ir_graph, &reverse_map, info, deopt_descriptor_available)
+        {
+            plans.push(plan);
+        }
+    }
 
-            // Determine the field index of this load so we can look up the
-            // replacement value in `field_values`. It must match the index the
-            // EA bridge keyed field edges by: the real field index from the
-            // `Const` offset operand (full-layout production load), falling back
-            // to the `MemKind`-derived index for a compact/hand-built node.
-            if info.field_values.is_empty() {
-                continue;
-            }
-            let ea_field_idx = match ir_load_store_field_index(ir_graph, ir_load) {
-                Some(f) => f,
-                None => match &ir_graph.nodes[idx].op {
-                    ir::Op::Load(mk) => *mk as usize,
-                    _ => continue,
-                },
-            };
-
-            // The value the load resolves to: the stored field value, or — when
-            // the field was never stored (`field_values[idx] == None`) — the
-            // freshly-allocated object's zero default. WITHOUT the latter, a
-            // load of an un-stored field was killed below with NO replacement,
-            // leaving its consumers reading a dead node (a miscompile that was
-            // latent only because scalar replacement does not yet fire on
-            // production IR). A `Const(0)` is the correct default for a
-            // zero-initialised object's int field. (Soundness depends on the
-            // object being genuinely zero-initialised — the caller must only
-            // admit allocations whose constructor sets no non-zero field.)
-            let replacement: Option<ir::NodeId> = if ea_field_idx < info.field_values.len() {
-                match info.field_values[ea_field_idx] {
-                    Some(ea_val) => reverse_map.get(&ea_val).copied(),
-                    None => Some(ir_graph.add(ir::Op::Const(0), ir::IrType::Int, vec![], None)),
-                }
-            } else {
-                None
-            };
-
-            if let Some(ir_val) = replacement {
-                // Redirect: replace all references to ir_load with ir_val
-                // across the entire IR graph.
-                let load_id = ir_load;
-                for node in ir_graph.nodes.iter_mut() {
-                    for inp in node.inputs.iter_mut() {
-                        if *inp == load_id {
-                            *inp = ir_val;
-                        }
+    // Materialise ONE shared zero default for every never-stored field load
+    // (the old code appended a fresh `Const(0)` per load).
+    let mut zero_default: Option<ir::NodeId> = None;
+    for plan in plans.iter_mut() {
+        for (_, value) in plan.loads.iter_mut() {
+            if value.is_none() {
+                let z = match zero_default {
+                    Some(z) => z,
+                    None => {
+                        let z = ir_graph.add(ir::Op::Const(0), ir::IrType::Int, vec![], None);
+                        zero_default = Some(z);
+                        z
                     }
-                }
-            }
-
-            // Mark load as dead
-            ir_graph.nodes[idx].op = ir::Op::Dead;
-            ir_graph.nodes[idx].inputs.clear();
-        }
-
-        // Mark eliminated stores as dead
-        for &ea_store in &info.eliminated_stores {
-            if let Some(&ir_store) = reverse_map.get(&ea_store) {
-                let idx = ir_store as usize;
-                if idx < ir_graph.nodes.len() {
-                    ir_graph.nodes[idx].op = ir::Op::Dead;
-                    ir_graph.nodes[idx].inputs.clear();
-                }
-            }
-        }
-
-        // Mark the allocation as dead
-        if let Some(&ir_alloc) = reverse_map.get(&info.alloc_node) {
-            let idx = ir_alloc as usize;
-            if idx < ir_graph.nodes.len() {
-                ir_graph.nodes[idx].op = ir::Op::Dead;
-                ir_graph.nodes[idx].inputs.clear();
+                };
+                *value = Some(z);
             }
         }
     }
 
-    // Apply lock elision
-    for &ea_lock in &ea_result.elide_locks {
-        if let Some(&ir_lock) = reverse_map.get(&ea_lock) {
-            let idx = ir_lock as usize;
-            if idx < ir_graph.nodes.len() {
-                ir_graph.nodes[idx].op = ir::Op::Dead;
-                ir_graph.nodes[idx].inputs.clear();
+    // ── Phase 2: collect victims, then apply in ascending node id ────
+    //
+    // Ascending order matters for the splice: a victim's incoming token is an
+    // earlier (smaller-id) node, so by the time we reach a victim, every token
+    // it could name has already been rewritten or recorded in `spliced`.
+    let mut victims: Vec<(ir::NodeId, EaVictimKind)> = Vec::new();
+    for plan in &plans {
+        for &(load, value) in &plan.loads {
+            if let Some(v) = value {
+                victims.push((load, EaVictimKind::Forwarded(v)));
             }
         }
+        if plan.elide_alloc {
+            for &store in &plan.stores {
+                victims.push((store, EaVictimKind::Eliminated));
+            }
+            victims.push((plan.new_node, EaVictimKind::Eliminated));
+        }
+    }
+
+    // Lock elision. `escape_analysis_from_ir` never produces
+    // `escape_analysis::Op::MonitorEnter` / `MonitorExit` (`ir_op_to_ea_op` has
+    // no arm that can), so `elide_locks` is empty for every IR-derived graph and
+    // this loop is a no-op today. It is kept — and now routed through the same
+    // splice and the same reference checks — so it cannot become the next chain
+    // break if a monitor op is added to the bridge. A monitor node that a
+    // snapshot slot or a value input still names is left ALIVE:
+    // `deopt::EliminationCause::ElidedLock` has no representation in a
+    // `SafepointSnapshot`, so the elision would be undescribable.
+    for &ea_lock in &ea_result.elide_locks {
+        let ir_lock = match reverse_map.get(&ea_lock) {
+            Some(&id) => id,
+            None => continue,
+        };
+        if ir_graph.node_opt(ir_lock).is_none()
+            || ea_snapshot_names(ir_graph, ir_lock)
+            || !ea_splice_feasible(ir_graph, ir_lock)
+        {
+            continue;
+        }
+        let value_used = ir_graph.nodes.iter().any(|n| {
+            n.op != ir::Op::Dead
+                && n.inputs
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &inp)| inp == ir_lock && !ea_is_memory_token_slot(n, i))
+        });
+        if !value_used {
+            victims.push((ir_lock, EaVictimKind::Eliminated));
+        }
+    }
+
+    victims.sort_by_key(|&(id, _)| id);
+    victims.dedup_by_key(|&mut (id, _)| id);
+
+    // `spliced[v]` = the live memory token `v` handed on when it was killed;
+    // `forwarded[v]` = the value a killed load resolved to. Both are followed
+    // transitively so a chain of kills never lands on an already-dead node.
+    let mut spliced: HashMap<ir::NodeId, ir::NodeId> = HashMap::new();
+    let mut forwarded: HashMap<ir::NodeId, ir::NodeId> = HashMap::new();
+    let node_count = ir_graph.nodes.len();
+    for (victim, kind) in victims {
+        // The token this victim hands on, followed through earlier splices so a
+        // run of chained kills closes onto a LIVE node instead of relocating the
+        // break one link along.
+        let mut token = ir_graph
+            .node_opt(victim)
+            .and_then(|n| ea_memory_token_slot(n).and_then(|s| n.input_opt(s)));
+        for _ in 0..=node_count {
+            match token {
+                Some(t) if !ir_graph.node_opt(t).is_some_and(|n| n.op != ir::Op::Dead) => {
+                    token = spliced.get(&t).copied();
+                }
+                _ => break,
+            }
+        }
+        // Likewise for the replacement value: a load can resolve to a value that
+        // is itself a load this pass retires.
+        let kind = match kind {
+            EaVictimKind::Forwarded(v) => {
+                let mut r = v;
+                for _ in 0..=node_count {
+                    match forwarded.get(&r) {
+                        Some(&next) => r = next,
+                        None => break,
+                    }
+                }
+                EaVictimKind::Forwarded(r)
+            }
+            k => k,
+        };
+
+        for n in ir_graph.nodes.iter_mut() {
+            if n.op == ir::Op::Dead {
+                continue;
+            }
+            let mem_phi = matches!(n.op, ir::Op::Phi) && n.ty == ir::IrType::Memory;
+            let token_slot = ea_memory_token_slot(n);
+            for (i, inp) in n.inputs.iter_mut().enumerate() {
+                if *inp != victim {
+                    continue;
+                }
+                let is_token = if mem_phi { i >= 1 } else { token_slot == Some(i) };
+                if is_token {
+                    // An ordering edge follows the CHAIN, never the data
+                    // replacement — the bug the old blanket rewrite had.
+                    if let Some(t) = token {
+                        *inp = t;
+                    }
+                } else if let EaVictimKind::Forwarded(v) = kind {
+                    *inp = v;
+                }
+            }
+        }
+        // Safepoint snapshots are references too: a slot naming a forwarded load
+        // must follow the value, exactly as `ir::Graph::replace_all_uses` does.
+        // A slot naming an eliminated `Op::New` is deliberately LEFT in place —
+        // that slot is the "materialise this virtual object" descriptor, and
+        // planning has already refused the elision when no descriptor will exist.
+        if let EaVictimKind::Forwarded(v) = kind {
+            forwarded.insert(victim, v);
+            for sp in ir_graph.safepoints.iter_mut() {
+                for slot in sp.locals.iter_mut().chain(sp.stack.iter_mut()) {
+                    if *slot == victim {
+                        *slot = v;
+                    }
+                }
+            }
+        }
+        if let Some(t) = token {
+            spliced.insert(victim, t);
+        }
+        let idx = victim as usize;
+        ir_graph.nodes[idx].op = ir::Op::Dead;
+        ir_graph.nodes[idx].inputs.clear();
     }
 }
 
@@ -7057,10 +7435,36 @@ fn build_scalar_replacement_map(
             reverse_map.insert(ea_id, ir_id as ir::NodeId);
         }
     }
+    let mut objects: HashMap<ir::NodeId, ir_lower::VirtualObjectInfo> = HashMap::new();
+    for info in &ea_result.scalar_replaceable {
+        if let Some((ir_new, vo)) = virtual_object_info_for(ir_graph, &reverse_map, info) {
+            objects.insert(ir_new, vo);
+        }
+    }
+    ir_lower::ScalarReplacementMap { objects }
+}
+
+/// The [`ir_lower::VirtualObjectInfo`] describing one scalar-replacement
+/// candidate, keyed by the IR `NodeId` of its `Op::New`, or `None` when the
+/// object cannot be described to the deopt producer at all.
+///
+/// Split out of [`build_scalar_replacement_map`] so [`plan_scalar_replacement`]
+/// can ask the *same* question — "will this object have a virtual-object
+/// descriptor?" — before it decides whether eliding the allocation is safe. Two
+/// copies of this admission rule would mean an object the map omits could still
+/// have its `Op::New` killed, and its snapshot slot would then resolve to
+/// `FrameValue::Undefined` (a silent null).
+///
+/// MUST be called on the pre-`apply_ea_to_ir` graph: it reads the control
+/// inputs of nodes that pass clears.
+fn virtual_object_info_for(
+    ir_graph: &ir::Graph,
+    reverse_map: &HashMap<escape_analysis::NodeId, ir::NodeId>,
+    info: &escape_analysis::ScalarReplacementInfo,
+) -> Option<(ir::NodeId, ir_lower::VirtualObjectInfo)> {
     // Control input (slot 0) of a node, used to recover a node's block for the
     // dominance gate AFTER the node itself is marked `Op::Dead` (its inputs are
-    // cleared then, but the captured control node stays live). MUST be called
-    // before `apply_ea_to_ir`.
+    // cleared then, but the captured control node stays live).
     let ctrl_of = |n: ir::NodeId| -> Option<ir::NodeId> {
         ir_graph
             .nodes
@@ -7068,56 +7472,40 @@ fn build_scalar_replacement_map(
             .and_then(|node| node.inputs.first().copied())
             .filter(|&c| c != ir::NO_NODE)
     };
-    let mut objects: HashMap<ir::NodeId, ir_lower::VirtualObjectInfo> = HashMap::new();
-    'obj: for info in &ea_result.scalar_replaceable {
-        let ir_new = match reverse_map.get(&info.alloc_node) {
-            Some(&id) => id,
-            None => continue,
-        };
-        // Control of the allocation — bail (omit) if it has none (hand-built /
-        // malformed), so the producer can't emit without a dominance anchor.
-        let new_ctrl = match ctrl_of(ir_new) {
-            Some(c) => c,
-            None => continue,
-        };
-        // Per-field IR value node. A `None` EA entry is a never-stored field
-        // (zero default). A `Some(ea)` that fails to map back to an IR node means
-        // we cannot reconstruct that field — omit the whole object (safe).
-        let mut field_values: Vec<Option<ir::NodeId>> = Vec::with_capacity(info.field_values.len());
-        for fv in &info.field_values {
-            match fv {
-                None => field_values.push(None),
-                Some(ea) => match reverse_map.get(ea) {
-                    Some(&ir_id) => field_values.push(Some(ir_id)),
-                    None => continue 'obj,
-                },
-            }
+    let ir_new = *reverse_map.get(&info.alloc_node)?;
+    // Control of the allocation — bail (omit) if it has none (hand-built /
+    // malformed), so the producer can't emit without a dominance anchor.
+    let new_ctrl = ctrl_of(ir_new)?;
+    // Per-field IR value node. A `None` EA entry is a never-stored field
+    // (zero default). A `Some(ea)` that fails to map back to an IR node means
+    // we cannot reconstruct that field — omit the whole object (safe).
+    let mut field_values: Vec<Option<ir::NodeId>> = Vec::with_capacity(info.field_values.len());
+    for fv in &info.field_values {
+        match fv {
+            None => field_values.push(None),
+            Some(ea) => field_values.push(Some(*reverse_map.get(ea)?)),
         }
-        // Capture each eliminated store's control node (its block). A store with
-        // no resolvable control omits the object (can't prove dominance).
-        let mut store_ctrls: Vec<ir::NodeId> = Vec::with_capacity(info.eliminated_stores.len());
-        for ea in &info.eliminated_stores {
-            let ir_store = match reverse_map.get(ea) {
-                Some(&id) => id,
-                None => continue, // a store with no IR node can't have executed observably
-            };
-            match ctrl_of(ir_store) {
-                Some(c) => store_ctrls.push(c),
-                None => continue 'obj,
-            }
-        }
-        objects.insert(
-            ir_new,
-            ir_lower::VirtualObjectInfo {
-                class_id: info.class_id,
-                num_fields: info.num_fields,
-                field_values,
-                new_ctrl,
-                store_ctrls,
-            },
-        );
     }
-    ir_lower::ScalarReplacementMap { objects }
+    // Capture each eliminated store's control node (its block). A store with
+    // no resolvable control omits the object (can't prove dominance).
+    let mut store_ctrls: Vec<ir::NodeId> = Vec::with_capacity(info.eliminated_stores.len());
+    for ea in &info.eliminated_stores {
+        let ir_store = match reverse_map.get(ea) {
+            Some(&id) => id,
+            None => continue, // a store with no IR node can't have executed observably
+        };
+        store_ctrls.push(ctrl_of(ir_store)?);
+    }
+    Some((
+        ir_new,
+        ir_lower::VirtualObjectInfo {
+            class_id: info.class_id,
+            num_fields: info.num_fields,
+            field_values,
+            new_ctrl,
+            store_ctrls,
+        },
+    ))
 }
 
 /// Verify `graph` and, on failure, record a structured bailout.
@@ -12606,6 +12994,252 @@ mod tests {
         );
     }
 
+    // ── apply_ea_to_ir: safepoints and the memory-token chain ────────────
+    //
+    // `apply_ea_to_ir` runs after `ir_optimize::optimize` and is the last
+    // mutator before `ir_schedule::schedule`, so nothing downstream repairs a
+    // snapshot slot it strands or a memory-token chain it breaks. The four tests
+    // below pin both.
+
+    /// `Object o = new Foo(); o.f1 = 42; return o.f1;` in the PRODUCTION full
+    /// layout (`[ctrl, mem, base, offset, value]`), with no safepoints yet.
+    struct EaFixture {
+        g: crate::ir::Graph,
+        mem: crate::ir::NodeId,
+        newobj: crate::ir::NodeId,
+        val: crate::ir::NodeId,
+        store: crate::ir::NodeId,
+        load: crate::ir::NodeId,
+    }
+
+    fn ea_full_layout_fixture() -> EaFixture {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 2,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let off = g.add(Op::Const(1), IrType::Int, vec![], None); // field index 1
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, val],
+            None,
+        );
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, store, newobj, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.entry = start;
+        g.exit = ret;
+        EaFixture {
+            g,
+            mem,
+            newobj,
+            val,
+            store,
+            load,
+        }
+    }
+
+    fn run_ea(g: &mut crate::ir::Graph) {
+        let (ea, id_map) = escape_analysis_from_ir(g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "fixture precondition: the non-escaping New is scalar-replaceable"
+        );
+        apply_ea_to_ir(g, &id_map, &result);
+    }
+
+    /// No live node may take its memory token from a removed node — the
+    /// invariant `ir_verify`'s memory-chain lane reports on, asserted directly so
+    /// the test does not depend on which lanes that module currently enables.
+    fn assert_memory_chain_intact(g: &crate::ir::Graph) {
+        for (idx, n) in g.nodes.iter().enumerate() {
+            if n.op == crate::ir::Op::Dead {
+                continue;
+            }
+            for (i, &inp) in n.inputs.iter().enumerate() {
+                if inp == crate::ir::NO_NODE || !ea_is_memory_token_slot(n, i) {
+                    continue;
+                }
+                let target = g
+                    .nodes
+                    .get(inp as usize)
+                    .unwrap_or_else(|| panic!("n{idx} memory token n{inp} is out of range"));
+                assert_ne!(
+                    target.op,
+                    crate::ir::Op::Dead,
+                    "n{idx}:{:?} takes its memory token from removed node n{inp}",
+                    n.op
+                );
+            }
+        }
+    }
+
+    /// Run the verifier's frame-state lane (and only it, on top of the always-on
+    /// structural lane) over a post-EA graph.
+    fn assert_frame_state_lane_clean(g: &crate::ir::Graph) {
+        let mut opts = crate::ir_verify::VerifyOptions::structural();
+        opts.check_frame_states = true;
+        if let Err(b) = crate::ir_verify::verify_graph(g, "post-escape-analysis", opts) {
+            panic!("frame-state lane rejected a post-apply_ea_to_ir graph: {b}");
+        }
+    }
+
+    // A scalar-replaced object that is LIVE ACROSS A SAFEPOINT either
+    // materialises correctly or is not scalar-replaced. With
+    // `CRATONVM_SCALAR_DEOPT` unset (the default, and what the test harness
+    // runs with) no `FrameValue::VirtualObject` descriptor is emitted, so
+    // killing the `Op::New` would leave the snapshot slot resolving to
+    // `FrameValue::Undefined` — `Value::Int(0)`, i.e. a NULL where a live object
+    // was. The pass refuses the allocation elision; the field load is still
+    // forwarded, so the cost is one allocation, not the optimization.
+    #[test]
+    fn ea_refuses_to_elide_an_allocation_a_safepoint_names() {
+        use crate::ir::{Op, SafepointSnapshot, NO_NODE};
+
+        let mut f = ea_full_layout_fixture();
+        f.g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![f.newobj],
+        });
+        run_ea(&mut f.g);
+
+        assert!(
+            matches!(f.g.nodes[f.newobj as usize].op, Op::New { .. }),
+            "the allocation must survive: a deopt snapshot names it and no \
+             virtual-object descriptor will be emitted for it"
+        );
+        assert!(
+            matches!(f.g.nodes[f.store as usize].op, Op::Store(_)),
+            "the initialising store must survive with the allocation, or the \
+             surviving object would reach deopt with an unwritten field"
+        );
+        assert_eq!(
+            f.g.nodes[f.load as usize].op,
+            Op::Dead,
+            "the field load is still forwarded to the stored value"
+        );
+        let ret = f.g.nodes[f.g.exit as usize].inputs[1];
+        assert_eq!(ret, f.val, "the load's consumer reads the stored constant");
+        assert_eq!(
+            f.g.safepoints[0].stack[0], f.newobj,
+            "the snapshot slot still names the (live) allocation"
+        );
+        assert_memory_chain_intact(&f.g);
+        assert_frame_state_lane_clean(&f.g);
+    }
+
+    // The mirror case: no snapshot slot names the allocation, so eliding it
+    // cannot strand a frame state and the full scalar replacement applies.
+    #[test]
+    fn ea_elides_an_allocation_no_safepoint_names() {
+        use crate::ir::{Op, SafepointSnapshot, NO_NODE};
+
+        let mut f = ea_full_layout_fixture();
+        f.g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![f.val],
+        });
+        run_ea(&mut f.g);
+
+        assert_eq!(f.g.nodes[f.newobj as usize].op, Op::Dead, "New killed");
+        assert_eq!(f.g.nodes[f.store as usize].op, Op::Dead, "Store killed");
+        assert_eq!(f.g.nodes[f.load as usize].op, Op::Dead, "Load killed");
+        assert_eq!(
+            f.g.nodes[f.g.exit as usize].inputs[1],
+            f.val,
+            "the load result is redirected to the stored value"
+        );
+        assert_memory_chain_intact(&f.g);
+        assert_frame_state_lane_clean(&f.g);
+    }
+
+    // A snapshot slot naming a SCALAR-REPLACED LOAD must follow the value, the
+    // way `ir::Graph::replace_all_uses` does for every other rewrite. The pass
+    // used to rewrite `graph.nodes` only, so the slot kept naming the killed
+    // load and the deopt frame rebuilt that local from `FrameValue::Undefined`.
+    #[test]
+    fn ea_safepoint_slot_naming_a_replaced_load_follows_the_value() {
+        use crate::ir::{Op, SafepointSnapshot, NO_NODE};
+
+        let mut f = ea_full_layout_fixture();
+        f.g.safepoints.push(SafepointSnapshot {
+            bci: 13,
+            locals: vec![f.load],
+            stack: vec![NO_NODE],
+        });
+        run_ea(&mut f.g);
+
+        assert_eq!(f.g.nodes[f.load as usize].op, Op::Dead, "the load is killed");
+        assert_eq!(
+            f.g.safepoints[0].locals[0], f.val,
+            "the snapshot slot follows the load to its replacement value"
+        );
+        assert_memory_chain_intact(&f.g);
+        assert_frame_state_lane_clean(&f.g);
+    }
+
+    // Killing a store in this pass must leave the memory-token chain intact: the
+    // next memory operation is spliced onto the killed store's OWN incoming
+    // token, not left naming an `Op::Dead` node (and not, as the old code did,
+    // rewritten to the killed load's *data* replacement — an ordering edge
+    // silently turned into a data edge).
+    #[test]
+    fn ea_killed_store_leaves_the_memory_chain_intact() {
+        use crate::ir::{IrType, MemKind, Op};
+
+        let mut f = ea_full_layout_fixture();
+        // A later, unrelated field read whose memory token is the (about to be
+        // killed) load: `[ctrl, mem=load, base=param, offset]`.
+        let ctrl = f.g.nodes[f.newobj as usize].inputs[0];
+        let param = f.g.add(Op::Param(0), IrType::Ref, vec![], None);
+        let off0 = f.g.add(Op::Const(0), IrType::Int, vec![], None);
+        let trailing = f.g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, f.load, param, off0],
+            None,
+        );
+
+        run_ea(&mut f.g);
+
+        assert_eq!(f.g.nodes[f.store as usize].op, Op::Dead, "Store killed");
+        assert_eq!(f.g.nodes[f.load as usize].op, Op::Dead, "Load killed");
+        assert_eq!(
+            f.g.nodes[trailing as usize].inputs[1], f.mem,
+            "the trailing load is spliced onto the chain the killed store/load \
+             inherited from, not left pointing into the hole"
+        );
+        assert_ne!(
+            f.g.nodes[trailing as usize].inputs[1], f.val,
+            "a memory token must never be rewritten to a data replacement"
+        );
+        assert_memory_chain_intact(&f.g);
+    }
+
     // ── Op::New emission + scalar replacement, end-to-end via the builder ──
     //
     // The builder lowers `new` to `Op::New` and elides a trivial `<init>` on a
@@ -12661,10 +13295,8 @@ mod tests {
         );
         apply_ea_to_ir(&mut graph, &id_map, &result);
 
-        assert!(
-            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
-            "the New must be scalar-replaced away"
-        );
+        // The FIELD ACCESS is still scalar-replaced: the load folds to the
+        // stored constant.
         let ret = graph
             .nodes
             .iter()
@@ -12676,6 +13308,58 @@ mod tests {
             Op::Const(42),
             "the field load must resolve to the stored value (42)"
         );
+        // The ALLOCATION, however, is retained. The builder records a safepoint
+        // snapshot at every bytecode boundary, and the fresh reference sits on
+        // the operand stack (and, in the astore variant, in a local) at several
+        // of them — so a snapshot slot names the `Op::New`. With
+        // `CRATONVM_SCALAR_DEOPT` off no `FrameValue::VirtualObject` descriptor
+        // is emitted for it, and killing it would leave those slots resolving to
+        // `FrameValue::Undefined` ⇒ `Value::Int(0)` ⇒ a NULL where a live object
+        // was. `apply_ea_to_ir` refuses the elision instead; see the "May the
+        // ALLOCATION itself go?" block in `plan_scalar_replacement`.
+        assert!(
+            graph.safepoints.iter().any(|sp| sp
+                .locals
+                .iter()
+                .chain(sp.stack.iter())
+                .any(|&s| matches!(graph.nodes.get(s as usize), Some(n) if matches!(n.op, Op::New { .. })))),
+            "precondition: a deopt snapshot slot names the allocation"
+        );
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New is retained because a deopt snapshot names it and no \
+             virtual-object descriptor will be emitted"
+        );
+        assert_no_snapshot_names_a_dead_node(&graph);
+    }
+
+    /// Every safepoint snapshot slot must name a live node — the condition
+    /// `ir_verify::check_frame_states` enforces, restated where the EA tests can
+    /// assert it directly.
+    fn assert_no_snapshot_names_a_dead_node(graph: &crate::ir::Graph) {
+        for (si, sp) in graph.safepoints.iter().enumerate() {
+            for (kind, i, s) in sp
+                .locals
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| ("local", i, s))
+                .chain(sp.stack.iter().enumerate().map(|(i, &s)| ("stack", i, s)))
+            {
+                if s == crate::ir::NO_NODE {
+                    continue;
+                }
+                let node = graph
+                    .nodes
+                    .get(s as usize)
+                    .unwrap_or_else(|| panic!("safepoint[{si}] {kind}[{i}] = n{s} out of range"));
+                assert_ne!(
+                    node.op,
+                    crate::ir::Op::Dead,
+                    "safepoint[{si}] at bci {} {kind}[{i}] = n{s} names a removed node",
+                    sp.bci
+                );
+            }
+        }
     }
 
     // REGRESSION (astore gap): the same scalar-replacement end-to-end, but the
@@ -12739,10 +13423,6 @@ mod tests {
             "the astore-local non-escaping new must be scalar-replaceable"
         );
         apply_ea_to_ir(&mut graph, &id_map, &result);
-        assert!(
-            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
-            "the New must be scalar-replaced away"
-        );
         let ret = graph
             .nodes
             .iter()
@@ -12754,6 +13434,14 @@ mod tests {
             Op::Const(42),
             "the field load (via astore/aload local) must resolve to the stored value (42)"
         );
+        // Same rule as `ir_new_scalar_replaces_end_to_end`: the allocation is
+        // live in a deopt snapshot (here in local 0 as well as on the stack), so
+        // the elision is refused and the object stays real and initialised.
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New is retained because a deopt snapshot names it"
+        );
+        assert_no_snapshot_names_a_dead_node(&graph);
     }
 
     // A `<init>` whose receiver is NOT a fresh `new` (e.g. a super() call on

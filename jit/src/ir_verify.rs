@@ -38,63 +38,147 @@
 //! The *structural* lane (edge validity, arity, phi/merge alignment, control
 //! integrity) always runs — it is the class of defect that produces silent
 //! wrong code, and it has no false positives on graphs the current front end
-//! builds. The *type*, *frame-state* and *schedule* lanes are opt-in through
-//! [`VerifyOptions`], because:
+//! builds. Four further lanes are selected by [`VerifyOptions`]; three of them
+//! were opt-in because of defects that have since been fixed on this branch,
+//! and this section is the record of what changed.
 //!
-//! * **types** — `IrBuilder::phi_data_type` currently returns `Int` for a phi
-//!   whose inputs are references or floats (the review's "Make node types
-//!   complete" item). Until that lands, the type lane would reject graphs the
-//!   compiler handles correctly today, so enabling it by default would trade
-//!   real coverage for a finding we already have written down.
-//! * **frame states** — `ir_optimize::eliminate_dead_nodes` documents that
-//!   safepoint snapshots are deliberately *not* DCE roots ("a value killed
-//!   here resolves to `Undefined`"), so after optimization essentially every
-//!   graph has snapshot slots pointing at removed nodes. That is a known,
-//!   written-down modelling gap, not something to lose coverage over.
-//! * **schedule** — this lane covers *ordering*: arena-order
-//!   definition-before-use (a heuristic — a `Graph` carries no schedule, and
-//!   GVN and `apply_ea_to_ir` append replacement nodes *after* their users)
-//!   and memory-token chain integrity. The latter is off by default because
-//!   `ir_optimize::eliminate_dead_stores` kills an overwritten store with a
-//!   plain `Graph::kill` and no `replace_all_uses`, leaving the *next* memory
-//!   operation's token slot pointing at a removed node. That is a real defect
-//!   — the surviving store loses its transitive ordering edges — but it is a
-//!   defect in a pass this module does not own, and rejecting every method
-//!   that hits it would trade a large amount of optimized code for a finding
-//!   that one grep already establishes.
+//! * **types** ([`VerifyOptions::check_types`]) — the lattice is
+//!   [`crate::ir::join_data_type`], *not* a private one. It used to be a
+//!   private coarse "category" join in this file, in which `Int` and `Long`
+//!   were the same category; that was written when `IrBuilder::phi_data_type`
+//!   really did answer `Int` for every φ that was not `Long`/`Double`, so a
+//!   finer lattice would have rejected graphs the compiler handled. That is no
+//!   longer true: `phi_data_type` now folds `join_data_type` over the φ's value
+//!   inputs (`Graph::phi_data_type_checked`), and `join_data_type` *rejects*
+//!   an `Int`/`Long` merge. A verifier running a coarser lattice than the
+//!   compiler proves nothing about the compiler, so the two are now the same
+//!   function. See "The φ fallback" below.
+//! * **frame states** ([`VerifyOptions::check_frame_states`]) —
+//!   `ir_optimize::eliminate_dead_nodes` used to document safepoint snapshots
+//!   as deliberately *not* DCE roots ("a value killed here resolves to
+//!   `Undefined`"), so every optimized graph accumulated snapshot slots
+//!   pointing at removed nodes. That policy is reversed: every value a snapshot
+//!   names is now a DCE root, and a slot that some *earlier* pass already
+//!   stranded is normalised to `NO_NODE` before the mark phase. This lane is
+//!   therefore clean after `ir_optimize::optimize` and is **on by default at
+//!   the `"post-optimize"` hook** — see [`VerifyOptions::for_phase`].
+//! * **memory chain** ([`VerifyOptions::check_memory_chain`]) — a memory
+//!   operation whose incoming token names a removed node has lost the
+//!   transitive dependency on everything that wrote before it, so the scheduler
+//!   may hoist it above those writes. `ir_optimize::eliminate_dead_stores` used
+//!   to produce exactly that, killing an overwritten store with a plain
+//!   `Graph::kill` and no `replace_all_uses`. It now routes every store
+//!   deletion through `kill_store_splicing_memory_chain`, which rewires the
+//!   consumers to the killed store's own incoming token first and *declines the
+//!   deletion* when it cannot. So this lane, too, is clean after
+//!   `ir_optimize::optimize` and on by default at `"post-optimize"`.
+//! * **arena order** ([`VerifyOptions::check_arena_order`]) — definition
+//!   -before-use approximated by arena index. This one is opt-in **and stays
+//!   that way**, because it is not a soundness property: a `Graph` carries no
+//!   schedule, and GVN legitimately appends a replacement node *after* the
+//!   users it rewires to it, so the lane fires on essentially every optimized
+//!   graph by construction. It is a debugging aid for hand-built graphs and
+//!   front-end output, which is why it was split out of the old combined
+//!   `check_schedule` lane rather than left riding along with the memory-chain
+//!   check it has nothing in common with.
 //!
-//! Enable them with `CRATONVM_JIT_VERIFY_TYPES=1`,
-//! `CRATONVM_JIT_VERIFY_FRAME_STATES=1`, `CRATONVM_JIT_VERIFY_SCHEDULE=1`, or
-//! by passing [`VerifyOptions::all`] directly.
+//! What is still *not* on by default at `"pre-lower"` is the pair of lanes
+//! above that `ir_optimize` fixed, because a second mutating pass runs after
+//! it: `apply_ea_to_ir` (in `lib.rs`) marks the scalar-replaced allocation, its
+//! stores and its loads `Op::Dead` while rewiring only `graph.nodes` — it never
+//! touches `graph.safepoints`, and it does not splice the memory chain. Until
+//! it does, both lanes have real false positives after escape analysis. The
+//! single switch is [`APPLY_EA_ROUTES_SAFEPOINTS_AND_MEMORY`].
+//!
+//! ## The φ fallback
+//!
+//! `ir::PHI_TYPE_FALLBACK` (`Int`) is what `IrBuilder::phi_data_type` answers
+//! when `phi_data_type_checked` proves no type — it is infallible by signature,
+//! so it cannot decline. It has two triggers, and the verifier treats them
+//! differently on purpose:
+//!
+//! * **a category conflict** (`Ref` merging with `Int`, `Int` with `Long`, …)
+//!   is a **violation**. It is a real type conflict, and the fallback is the
+//!   unsound-in-the-quiet-direction answer: a reference merge typed `Int` is
+//!   invisible to `ir_lower::zero_ref_phi_slots` and to the oop map, so the
+//!   merged oop is neither zero-initialised nor reported as a GC root. The
+//!   verifier names it rather than letting it reach the lowerer.
+//! * **no typed value input at all** (every value edge `NO_NODE`, out of range,
+//!   removed, or `Void`) is **tolerated**. That is a slot which is dead at the
+//!   merge, which verified bytecode is allowed to have; the always-on lane
+//!   already accepts `NO_NODE` in a φ value slot, and the fallback's `Int`
+//!   keeps it out of the oop map, which is the correct answer for a slot
+//!   nothing reads.
+//!
+//! ## Enabling lanes
+//!
+//! `CRATONVM_JIT_VERIFY_TYPES=1`, `CRATONVM_JIT_VERIFY_FRAME_STATES=1`,
+//! `CRATONVM_JIT_VERIFY_MEMORY_CHAIN=1`, `CRATONVM_JIT_VERIFY_ARENA_ORDER=1`,
+//! or the compatibility alias `CRATONVM_JIT_VERIFY_SCHEDULE=1` (which enables
+//! the two lanes the old combined name covered). [`VerifyOptions::all`] turns
+//! everything on directly.
 
 use crate::bailout::{Bailout, BailoutReason, CompileResult};
-use crate::ir::{Graph, IrType, Node, NodeId, Op, NO_NODE};
+use crate::ir::{join_data_type, Graph, IrType, Node, NodeId, Op, NO_NODE};
 
 // ── Options ──────────────────────────────────────────────────────────
+
+/// Whether `apply_ea_to_ir` (`jit/src/lib.rs`) keeps `graph.safepoints` and the
+/// memory-token chain consistent when it deletes a scalar-replaced allocation.
+///
+/// **This constant is the entire "turn the remaining lanes on at `pre-lower`"
+/// change.** Flip it to `true` once `apply_ea_to_ir`, in addition to rewiring
+/// `graph.nodes`, (a) retargets or clears every `graph.safepoints` slot naming
+/// a node it marks `Op::Dead`, and (b) splices each killed store/allocation out
+/// of the memory-token chain the way `ir_optimize::kill_store_splicing_memory_chain`
+/// does. Nothing else needs to change: [`VerifyOptions::for_phase`] reads it.
+///
+/// It is `false` today because `apply_ea_to_ir` does neither — it marks the
+/// allocation, its eliminated stores and its replaced loads `Op::Dead` and
+/// clears their inputs, and its "replace all references" loop iterates
+/// `ir_graph.nodes` only. So after escape analysis a snapshot slot can name a
+/// removed node (frame-state lane) and a surviving memory op can take its token
+/// from one (memory-chain lane), and both lanes would reject correct-enough
+/// graphs at `"post-escape-analysis"` and `"pre-lower"`.
+pub const APPLY_EA_ROUTES_SAFEPOINTS_AND_MEMORY: bool = false;
+
+/// The phase name `lib.rs` passes for the verification that runs immediately
+/// after `ir_optimize::optimize` and *before* `apply_ea_to_ir`. This is the one
+/// hook at which every lane `ir_optimize` fixed is known clean.
+pub const PHASE_POST_OPTIMIZE: &str = "post-optimize";
 
 /// Which optional verification lanes to run. The structural lane is not
 /// listed because it is unconditional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifyOptions {
-    /// Check the type lattice: phi joins, and reference/float/integer flow.
+    /// Check the type lattice ([`crate::ir::join_data_type`]): φ joins, and
+    /// reference/float/integer flow into arithmetic.
     pub check_types: bool,
     /// Check safepoint snapshots (deopt frame states).
     pub check_frame_states: bool,
-    /// Check ordering: definition-before-use in arena order (a heuristic — see
-    /// the module docs) and memory-token chain integrity.
-    pub check_schedule: bool,
+    /// Check memory-token chain integrity: no memory operation may take its
+    /// incoming token from a removed node.
+    pub check_memory_chain: bool,
+    /// Check definition-before-use in *arena* order.
+    ///
+    /// A heuristic, not a soundness property — a `Graph` carries no schedule,
+    /// and GVN appends a replacement node after the users it rewires to it — so
+    /// this fires on essentially every optimized graph and is never enabled by
+    /// [`VerifyOptions::for_phase`]. See the module docs.
+    pub check_arena_order: bool,
 }
 
 impl Default for VerifyOptions {
-    /// Types and frame states on, schedule off. This is the "I built this
-    /// graph and expect it to be clean" setting used by tests and by explicit
-    /// stress runs — *not* what the production pre-lowering hook uses (that
-    /// one is [`VerifyOptions::from_env`]).
+    /// Types, frame states and the memory chain on; arena order off. This is
+    /// the "I built this graph and expect it to be clean" setting used by tests
+    /// and by explicit stress runs — *not* what the production hooks use (those
+    /// use [`VerifyOptions::for_phase`]).
     fn default() -> Self {
         VerifyOptions {
             check_types: true,
             check_frame_states: true,
-            check_schedule: false,
+            check_memory_chain: true,
+            check_arena_order: false,
         }
     }
 }
@@ -105,29 +189,68 @@ impl VerifyOptions {
         VerifyOptions {
             check_types: false,
             check_frame_states: false,
-            check_schedule: false,
+            check_memory_chain: false,
+            check_arena_order: false,
         }
     }
 
-    /// Every lane.
+    /// Every lane, including the heuristic arena-order one.
     pub const fn all() -> Self {
         VerifyOptions {
             check_types: true,
             check_frame_states: true,
-            check_schedule: true,
+            check_memory_chain: true,
+            check_arena_order: true,
         }
     }
 
     /// Structural lane plus whichever optional lanes the environment enables.
     ///
-    /// This is what the compiler itself uses, so the default production
-    /// behaviour is "structural only" — see the module docs for why each
-    /// optional lane is opt-in.
+    /// Purely the environment: no lane is on unless a flag says so. Production
+    /// hooks want [`VerifyOptions::for_phase`], which layers the
+    /// known-clean-at-this-phase defaults on top of this.
+    ///
+    /// `CRATONVM_JIT_VERIFY_SCHEDULE` is kept as a compatibility alias for the
+    /// two lanes that used to be one `check_schedule` flag, so an operator's
+    /// existing incantation keeps meaning what it meant.
     pub fn from_env() -> Self {
+        let schedule = env_flag("CRATONVM_JIT_VERIFY_SCHEDULE").unwrap_or(false);
         VerifyOptions {
             check_types: env_flag("CRATONVM_JIT_VERIFY_TYPES").unwrap_or(false),
             check_frame_states: env_flag("CRATONVM_JIT_VERIFY_FRAME_STATES").unwrap_or(false),
-            check_schedule: env_flag("CRATONVM_JIT_VERIFY_SCHEDULE").unwrap_or(false),
+            check_memory_chain: env_flag("CRATONVM_JIT_VERIFY_MEMORY_CHAIN").unwrap_or(schedule),
+            check_arena_order: env_flag("CRATONVM_JIT_VERIFY_ARENA_ORDER").unwrap_or(schedule),
+        }
+    }
+
+    /// The lanes to run at `phase`: [`VerifyOptions::from_env`] plus every lane
+    /// that is known clean *at that point in the pipeline*.
+    ///
+    /// This is what the compiler's hooks should use. The environment can only
+    /// add lanes here, never remove them — an operator who needs a lane off
+    /// wholesale has `CRATONVM_JIT_VERIFY_IR=0`, which disables the gate rather
+    /// than silently narrowing it.
+    ///
+    /// Phase model:
+    ///
+    /// * [`PHASE_POST_OPTIMIZE`] runs between `ir_optimize::optimize` and
+    ///   `apply_ea_to_ir`, so the frame-state and memory-chain lanes are on:
+    ///   `eliminate_dead_nodes` roots and normalises snapshot slots, and
+    ///   `kill_store_splicing_memory_chain` keeps the token chain closed.
+    /// * every other phase (`"post-escape-analysis"`, `"pre-lower"`) runs after
+    ///   `apply_ea_to_ir`, which does neither, so those two lanes stay opt-in
+    ///   until [`APPLY_EA_ROUTES_SAFEPOINTS_AND_MEMORY`] says otherwise.
+    /// * the arena-order lane is never enabled here at any phase — it is a
+    ///   heuristic that GVN violates by construction (module docs).
+    pub fn for_phase(phase: &str) -> Self {
+        let env = VerifyOptions::from_env();
+        // Before EA, or after an EA that has learnt to route both.
+        let ea_clean = phase == PHASE_POST_OPTIMIZE || APPLY_EA_ROUTES_SAFEPOINTS_AND_MEMORY;
+        VerifyOptions {
+            check_types: env.check_types,
+            check_frame_states: env.check_frame_states || ea_clean,
+            check_memory_chain: env.check_memory_chain || ea_clean,
+            check_arena_order: env.check_arena_order,
         }
     }
 }
@@ -244,11 +367,21 @@ pub fn verify_graph(graph: &Graph, phase: &str, opts: VerifyOptions) -> CompileR
     if opts.check_frame_states {
         check_frame_states(graph, &mut v);
     }
-    if opts.check_schedule {
-        check_schedule(graph, &mut v);
+    if opts.check_memory_chain {
+        check_memory_chain(graph, &mut v);
+    }
+    if opts.check_arena_order {
+        check_arena_order(graph, &mut v);
     }
 
     v.into_result(phase)
+}
+
+/// [`verify_graph`] with the lane selection [`VerifyOptions::for_phase`] picks
+/// for `phase`. The shape a pipeline hook wants: it knows its phase name and
+/// nothing else about verification policy.
+pub fn verify_graph_at_phase(graph: &Graph, phase: &str) -> CompileResult<()> {
+    verify_graph(graph, phase, VerifyOptions::for_phase(phase))
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────
@@ -328,25 +461,50 @@ fn no_node_allowed(node: &Node, input_index: usize) -> bool {
 /// naming the previous writer, not a value anything reads.
 ///
 /// The distinction matters because a token pointing at a removed node is a
-/// broken ordering edge (the ordering lane's business, and something
-/// `eliminate_dead_stores` currently produces), while a *data* input pointing
-/// at a removed node is a guaranteed wrong-value read — a hard structural
-/// violation. Collapsing the two would make the always-on lane reject graphs
-/// the compiler handles today.
+/// broken ordering edge (the memory-chain lane's business), while a *data*
+/// input pointing at a removed node is a guaranteed wrong-value read — a hard
+/// structural violation reported by the always-on edge lane. Collapsing the two
+/// would either lose the wrong-value finding or reject graphs on an ordering
+/// complaint from the lane that may not have false positives.
+///
+/// **This must agree with `ir_optimize::memory_token_slot`**, which is the
+/// predicate the *producer* side uses when it splices a killed store out of the
+/// chain: a splice that disagreed with this would leave exactly the edge this
+/// checks pointing at a dead node. The two differed in two ways and both are
+/// reconciled here:
+///
+/// * `Op::ArrayLength` is `[ctrl, mem, array_ref]` per `ir::Op` and
+///   `memory_token_slot` classifies it; this function used to omit it, so a
+///   removed token in an `ArrayLength` was reported by the *structural* lane as
+///   a wrong-value read. It is now classified.
+/// * `memory_token_slot` guards each op with the minimum arity of its
+///   documented `[ctrl, mem, …]` form, because `store_operands`/`load_base`
+///   also accept compact hand-built and EA-bridge layouts whose slot 1 is a
+///   *value* (a compact `Store` is `[base, value]`). The same guard is applied
+///   here, with the same numbers. For every op but `ArrayLength` this is a
+///   no-op on graphs that pass the arity lane; for `ArrayLength`, whose arity
+///   range is deliberately `1..=3`, it is what distinguishes the production
+///   `[ctrl, mem, array]` form from the hand-built `[array]` one.
 fn is_memory_token_input(node: &Node, input_index: usize) -> bool {
-    match node.op {
-        Op::Load(_)
-        | Op::Store(_)
-        | Op::ArrayLoad(_)
-        | Op::ArrayStore(_)
-        | Op::New { .. }
-        | Op::NewArray { .. }
-        | Op::Call { .. }
-        | Op::LambdaIntToDouble => input_index == 1,
-        // A memory phi's value inputs are all tokens.
-        Op::Phi => node.ty == IrType::Memory && input_index >= 1,
-        _ => false,
+    // A memory phi's value inputs are all tokens, one per predecessor.
+    if matches!(node.op, Op::Phi) {
+        return node.ty == IrType::Memory && input_index >= 1;
     }
+    // Minimum input count of the documented full `[ctrl, mem, …]` form. Kept
+    // numerically identical to `ir_optimize::memory_token_slot`.
+    let min_full_arity = match node.op {
+        Op::Load(_) => 3,           // [ctrl, mem, base]
+        Op::Store(_) => 4,          // [ctrl, mem, base, value]
+        Op::ArrayLoad(_) => 4,      // [ctrl, mem, array, index]
+        Op::ArrayStore(_) => 5,     // [ctrl, mem, array, index, value]
+        Op::ArrayLength => 3,       // [ctrl, mem, array_ref]
+        Op::New { .. } => 2,        // [ctrl, mem]
+        Op::NewArray { .. } => 3,   // [ctrl, mem, length]
+        Op::Call { .. } => 2,       // [ctrl, mem, args…]
+        Op::LambdaIntToDouble => 4, // [ctrl, mem, lambda, index]
+        _ => return false,
+    };
+    input_index == 1 && node.inputs.len() >= min_full_arity
 }
 
 // ── Lane: edges ──────────────────────────────────────────────────────
@@ -376,7 +534,7 @@ fn check_edges(graph: &Graph, v: &mut Violations) {
                     graph.nodes.len()
                 )),
                 // A removed *memory token* is an ordering defect, reported by
-                // the ordering lane; see `is_memory_token_input`.
+                // the memory-chain lane; see `is_memory_token_input`.
                 Some(target) if target.op == Op::Dead && !is_memory_token_input(node, i) => {
                     v.add(format!(
                         "{} input[{i}] = n{inp} refers to a removed (Dead) node",
@@ -668,47 +826,36 @@ fn check_control(graph: &Graph, v: &mut Violations) {
 
 // ── Lane: types ──────────────────────────────────────────────────────
 
-/// Coarse type category. The lattice join is defined *within* a category
-/// (`Int ⊔ Long = Long`); across categories it is undefined, which is exactly
-/// the defect this lane looks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Cat {
-    Integer,
-    Float,
-    Ref,
-    Memory,
-    Control,
-    Void,
-}
-
-fn category(t: IrType) -> Cat {
+/// Human name for an [`IrType`], for violation messages.
+///
+/// There is deliberately no *category* coarsening here any more. This lane used
+/// to fold `Int`/`Long` into one "integer" category and `Float`/`Double` into
+/// one "floating-point" category, and join within a category. That private
+/// lattice is gone: [`crate::ir::join_data_type`] is the lattice the compiler
+/// itself folds over a φ's inputs, it rejects `Int ⊔ Long` and `Float ⊔ Double`,
+/// and a verifier that accepted joins the compiler rejects would prove nothing
+/// about the compiler. Per-type names keep the messages as specific as the
+/// lattice now is.
+fn type_name(t: IrType) -> &'static str {
     match t {
-        IrType::Int | IrType::Long => Cat::Integer,
-        IrType::Float | IrType::Double => Cat::Float,
-        IrType::Ref => Cat::Ref,
-        IrType::Memory => Cat::Memory,
-        IrType::Control => Cat::Control,
-        IrType::Void => Cat::Void,
+        IrType::Int => "int",
+        IrType::Long => "long",
+        IrType::Float => "float",
+        IrType::Double => "double",
+        IrType::Ref => "reference",
+        IrType::Memory => "memory",
+        IrType::Control => "control",
+        IrType::Void => "void",
     }
 }
 
-fn cat_name(c: Cat) -> &'static str {
-    match c {
-        Cat::Integer => "integer",
-        Cat::Float => "floating-point",
-        Cat::Ref => "reference",
-        Cat::Memory => "memory",
-        Cat::Control => "control",
-        Cat::Void => "void",
-    }
-}
-
-/// Ops whose result category must equal every operand's category.
+/// Ops whose result type must equal every operand's type.
 ///
 /// Comparisons (`Cmp`/`LCmp`/`FCmp`) and conversions (`I2L`, `D2I`, …) are
-/// excluded by construction: crossing categories is what they are *for*.
+/// excluded by construction: crossing types is what they are *for*.
 /// Shifts are included but only for operand 0 — `lshl` shifts a `Long` by an
-/// `Int`.
+/// `Int`, which under the unified lattice is a genuine `Int`/`Long` non-join
+/// and would otherwise be reported.
 fn is_homogeneous_arith(op: &Op) -> bool {
     matches!(
         op,
@@ -727,7 +874,7 @@ fn is_homogeneous_arith(op: &Op) -> bool {
     )
 }
 
-/// Number of leading operands of `op` whose category must match the result.
+/// Number of leading operands of `op` whose type must match the result.
 fn homogeneous_operand_count(op: &Op, arity: usize) -> usize {
     match op {
         Op::Shl | Op::Shr | Op::UShr => 1.min(arity),
@@ -787,6 +934,33 @@ fn data_input_indices(node: &Node) -> Vec<usize> {
     }
 }
 
+/// Fold [`crate::ir::join_data_type`] over a φ's value inputs exactly the way
+/// `Graph::phi_data_type_checked` does, and report the *first* conflict.
+///
+/// `Ok(None)` means "no value input carried a type at all" — the tolerated
+/// half of the φ fallback (see the module docs); `Ok(Some(t))` is the proven
+/// join; `Err((prev, ty))` is a genuine non-join, the half that is a violation.
+///
+/// Kept structurally parallel to `phi_data_type_checked` on purpose: the whole
+/// point of the unification is that the verifier answers the same question the
+/// builder did, so if that function's skip rules change this one must follow.
+fn phi_join(graph: &Graph, node: &Node) -> Result<Option<IrType>, (IrType, IrType)> {
+    let mut joined: Option<IrType> = None;
+    for &inp in node.inputs.iter().skip(1) {
+        // `NO_NODE`, out of range, removed, or `Void`: no information, and not
+        // on its own a conflict — same rule as `phi_data_type_checked`.
+        let ty = match node_at(graph, inp) {
+            Some(src) if src.op != Op::Dead && src.ty != IrType::Void => src.ty,
+            _ => continue,
+        };
+        joined = Some(match joined {
+            None => ty,
+            Some(prev) => join_data_type(prev, ty).ok_or((prev, ty))?,
+        });
+    }
+    Ok(joined)
+}
+
 fn check_types(graph: &Graph, v: &mut Violations) {
     for (idx, node) in graph.nodes.iter().enumerate() {
         if node.op == Op::Dead {
@@ -794,7 +968,7 @@ fn check_types(graph: &Graph, v: &mut Violations) {
         }
         let id = idx as NodeId;
 
-        // Phi: the declared type must be a valid join of the value inputs.
+        // Phi: the declared type must be the join of the value inputs.
         if node.op == Op::Phi {
             // A *memory* phi joins scheduling tokens, not values, and the
             // builder deliberately reuses a value node as a token
@@ -803,53 +977,36 @@ fn check_types(graph: &Graph, v: &mut Violations) {
             if node.ty == IrType::Memory {
                 continue;
             }
-            let mut join: Option<Cat> = None;
-            let mut mixed = false;
-            for &inp in node.inputs.iter().skip(1) {
-                if inp == NO_NODE {
-                    continue;
-                }
-                let Some(src) = node_at(graph, inp) else {
-                    continue;
-                };
-                if src.op == Op::Dead {
-                    continue;
-                }
-                let c = category(src.ty);
-                match join {
-                    None => join = Some(c),
-                    Some(prev) if prev != c => {
-                        if !mixed {
-                            mixed = true;
-                            v.add(format!(
-                                "{} joins incompatible input categories ({} and {}) — there is \
-                                 no lattice join for them",
-                                label(graph, id),
-                                cat_name(prev),
-                                cat_name(c)
-                            ));
-                        }
+            match phi_join(graph, node) {
+                Err((prev, ty)) => v.add(format!(
+                    "{} joins incompatible input types ({} and {}) — ir::join_data_type has no \
+                     join for them, so ir::PHI_TYPE_FALLBACK ({}) is what the builder recorded",
+                    label(graph, id),
+                    type_name(prev),
+                    type_name(ty),
+                    type_name(crate::ir::PHI_TYPE_FALLBACK)
+                )),
+                // No typed value input: a slot that is dead at this merge. The
+                // tolerated half of the φ fallback — see the module docs.
+                Ok(None) => {}
+                Ok(Some(j)) => {
+                    if j != node.ty {
+                        v.add(format!(
+                            "{} is typed {} but joins {} inputs",
+                            label(graph, id),
+                            type_name(node.ty),
+                            type_name(j)
+                        ));
                     }
-                    Some(_) => {}
-                }
-            }
-            if let Some(j) = join {
-                if !mixed && j != category(node.ty) {
-                    v.add(format!(
-                        "{} is typed {} but joins {} inputs",
-                        label(graph, id),
-                        cat_name(category(node.ty)),
-                        cat_name(j)
-                    ));
                 }
             }
             continue;
         }
 
         // Non-phi: control/void tokens may not flow into a data use, and a
-        // homogeneous arithmetic node's operands must share its category.
+        // homogeneous arithmetic node's operands must share its type.
         let data_idx = data_input_indices(node);
-        let result_cat = category(node.ty);
+        let result_ty = node.ty;
         let homogeneous = is_homogeneous_arith(&node.op);
         let homogeneous_upto = homogeneous_operand_count(&node.op, node.inputs.len());
         for i in data_idx {
@@ -862,23 +1019,23 @@ fn check_types(graph: &Graph, v: &mut Violations) {
             if src.op == Op::Dead {
                 continue;
             }
-            let c = category(src.ty);
-            if matches!(c, Cat::Control | Cat::Void) {
+            let ty = src.ty;
+            if matches!(ty, IrType::Control | IrType::Void) {
                 v.add(format!(
                     "{} input[{i}] = {} is a {} token used as a data value",
                     label(graph, id),
                     label(graph, inp),
-                    cat_name(c)
+                    type_name(ty)
                 ));
                 continue;
             }
-            if homogeneous && i < homogeneous_upto && c != result_cat {
+            if homogeneous && i < homogeneous_upto && ty != result_ty {
                 v.add(format!(
                     "{} produces {} but input[{i}] = {} is {}",
                     label(graph, id),
-                    cat_name(result_cat),
+                    type_name(result_ty),
                     label(graph, inp),
-                    cat_name(c)
+                    type_name(ty)
                 ));
             }
         }
@@ -889,6 +1046,13 @@ fn check_types(graph: &Graph, v: &mut Violations) {
 
 /// Safepoint snapshots must reference live nodes and describe a plausible
 /// interpreter frame.
+///
+/// `ir_optimize::eliminate_dead_nodes` now roots every value a snapshot names
+/// and normalises an already-stranded slot to `NO_NODE`, so this lane is clean
+/// after `ir_optimize::optimize` and [`VerifyOptions::for_phase`] enables it at
+/// [`PHASE_POST_OPTIMIZE`]. It is *not* yet clean after `apply_ea_to_ir`, which
+/// marks nodes `Op::Dead` without touching `graph.safepoints` — see
+/// [`APPLY_EA_ROUTES_SAFEPOINTS_AND_MEMORY`].
 fn check_frame_states(graph: &Graph, v: &mut Violations) {
     for (si, sp) in graph.safepoints.iter().enumerate() {
         if sp.locals.len() > MAX_JVM_FRAME_SLOTS {
@@ -932,28 +1096,30 @@ fn check_frame_states(graph: &Graph, v: &mut Violations) {
     }
 }
 
-// ── Lane: schedule ───────────────────────────────────────────────────
+// ── Lane: memory chain ───────────────────────────────────────────────
 
-/// Ordering: arena-order definition-before-use, plus memory-token chain
-/// integrity.
+/// Memory-token chain integrity: no live memory operation may take its incoming
+/// token from a removed node.
 ///
-/// A `Graph` carries no schedule, so definition-before-use is approximated by
-/// arena order: `Graph::add` appends, so a node built by the front end always
-/// has smaller-numbered inputs. Phis (loop back-edges), merges (back-edge
-/// control) and any node the optimizer rewired to a later-appended replacement
-/// are exempt.
+/// A token names the previous writer, and it is the only ordering relation the
+/// IR has between two writes. A token pointing at an `Op::Dead` node has lost
+/// the transitive dependency on everything that wrote before it, so the
+/// scheduler is free to hoist the operation above those writes — a wrong-code
+/// risk, not untidiness.
 ///
-/// The memory-chain check is the other half of ordering: a memory operation
-/// whose incoming token names a removed node has lost the transitive
-/// dependency on everything that wrote before it, so the scheduler is free to
-/// hoist it above those writes.
-fn check_schedule(graph: &Graph, v: &mut Violations) {
+/// This was the *second half* of a combined `check_schedule` lane. It is split
+/// out because the two halves answer unrelated questions and have opposite
+/// readiness: this one is a soundness property that `ir_optimize` now upholds
+/// (`kill_store_splicing_memory_chain` rewires consumers to the killed store's
+/// own token, and declines the deletion when it cannot), so
+/// [`VerifyOptions::for_phase`] enables it at [`PHASE_POST_OPTIMIZE`]. Its old
+/// bunkmate, [`check_arena_order`], is a heuristic that fires on every optimized
+/// graph.
+fn check_memory_chain(graph: &Graph, v: &mut Violations) {
     for (idx, node) in graph.nodes.iter().enumerate() {
         if node.op == Op::Dead {
             continue;
         }
-        let id = idx as NodeId;
-
         for (i, &inp) in node.inputs.iter().enumerate() {
             if inp == NO_NODE || inp as usize >= graph.nodes.len() {
                 continue;
@@ -962,10 +1128,43 @@ fn check_schedule(graph: &Graph, v: &mut Violations) {
                 v.add(format!(
                     "{} takes its memory token from removed node n{inp} — the ordering edge to \
                      everything that wrote before it is gone",
-                    label(graph, id)
+                    label(graph, idx as NodeId)
                 ));
             }
-            if matches!(node.op, Op::Phi | Op::Merge | Op::Region) {
+        }
+    }
+}
+
+// ── Lane: arena order ────────────────────────────────────────────────
+
+/// Definition-before-use approximated by *arena* order.
+///
+/// A `Graph` carries no schedule, so there is no real definition-before-use
+/// question to ask: this lane substitutes arena index, on the observation that
+/// `Graph::add` appends, so a node the front end built always has
+/// smaller-numbered inputs. Phis (loop back-edges) and merges/regions
+/// (back-edge control) are exempt by construction.
+///
+/// **This is a heuristic and it stays opt-in.** GVN rewires a user to a
+/// replacement node it appended *after* that user, and `apply_ea_to_ir` appends
+/// the `Const(0)` default for a never-stored scalar-replaced field the same way,
+/// so a correct optimized graph violates it as a matter of routine.
+/// [`VerifyOptions::for_phase`] therefore never enables it at any phase; it is
+/// for hand-built graphs, front-end output, and a human asking "did something
+/// rewire this backwards?". Dropping it outright would lose the one cheap check
+/// that catches a front end emitting a use before its definition, which is why
+/// it survives as its own flag rather than being deleted.
+fn check_arena_order(graph: &Graph, v: &mut Violations) {
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        if node.op == Op::Dead {
+            continue;
+        }
+        if matches!(node.op, Op::Phi | Op::Merge | Op::Region) {
+            continue;
+        }
+        let id = idx as NodeId;
+        for (i, &inp) in node.inputs.iter().enumerate() {
+            if inp == NO_NODE || inp as usize >= graph.nodes.len() {
                 continue;
             }
             if inp > id {
@@ -1128,11 +1327,87 @@ mod tests {
         g.nodes[a as usize].ty = IrType::Ref;
         let err = verify_graph(&g, "test", VerifyOptions::all()).unwrap_err();
         let m = message(&err);
-        assert!(m.contains("incompatible input categories"), "{m}");
+        assert!(m.contains("incompatible input types"), "{m}");
         assert!(m.contains("reference"), "{m}");
-        // …and the structural lane alone must NOT reject it, which is what
-        // makes the type lane safe to keep opt-in for now.
+        // The message names the fallback the builder would have recorded, so a
+        // reader does not have to know `ir::PHI_TYPE_FALLBACK` by heart.
+        assert!(m.contains(type_name(crate::ir::PHI_TYPE_FALLBACK)), "{m}");
+        // …and the structural lane alone must NOT reject it: this is a type
+        // defect, not a shape defect.
         assert!(verify_graph(&g, "test", VerifyOptions::structural()).is_ok());
+    }
+
+    /// The unified lattice's headline consequence: `ir::join_data_type` rejects
+    /// an `Int`/`Long` merge, and the verifier — which now folds that exact
+    /// function — must reject it too. Under the old private `Cat` lattice both
+    /// were the one `Integer` category and this graph verified clean, so the
+    /// type lane was proving something weaker than the compiler enforces.
+    #[test]
+    fn int_and_long_no_longer_share_a_category() {
+        assert!(
+            crate::ir::join_data_type(IrType::Int, IrType::Long).is_none(),
+            "the compiler's lattice must reject int/long for this lane to"
+        );
+        let mut g = diamond_graph();
+        let phi = g.nodes.iter().position(|n| n.op == Op::Phi).expect("phi") as NodeId;
+        let a = g.nodes[phi as usize].inputs[1];
+        g.nodes[a as usize].ty = IrType::Long;
+        let err = verify_graph(&g, "test", VerifyOptions::all()).unwrap_err();
+        let m = message(&err);
+        assert!(m.contains("incompatible input types"), "{m}");
+        assert!(m.contains("long"), "{m}");
+        assert!(m.contains("int"), "{m}");
+    }
+
+    /// The other half of the same unification: `Float`/`Double` were one
+    /// "floating-point" category and are now distinct.
+    #[test]
+    fn float_and_double_no_longer_share_a_category() {
+        assert!(crate::ir::join_data_type(IrType::Float, IrType::Double).is_none());
+        let mut g = diamond_graph();
+        let phi = g.nodes.iter().position(|n| n.op == Op::Phi).expect("phi") as NodeId;
+        g.nodes[phi as usize].ty = IrType::Float;
+        let a = g.nodes[phi as usize].inputs[1];
+        let b = g.nodes[phi as usize].inputs[2];
+        g.nodes[a as usize].ty = IrType::Float;
+        g.nodes[b as usize].ty = IrType::Double;
+        let err = verify_graph(&g, "test", VerifyOptions::all()).unwrap_err();
+        let m = message(&err);
+        assert!(m.contains("incompatible input types"), "{m}");
+        assert!(m.contains("double"), "{m}");
+    }
+
+    /// The φ fallback, conflict half: a real type conflict IS a violation, and
+    /// the always-on lane must still accept the shape. See the module docs.
+    #[test]
+    fn phi_type_fallback_on_a_conflict_is_a_violation() {
+        assert_eq!(crate::ir::PHI_TYPE_FALLBACK, IrType::Int);
+        let mut g = diamond_graph();
+        let phi = g.nodes.iter().position(|n| n.op == Op::Phi).expect("phi") as NodeId;
+        // Exactly the shape `phi_data_type` cannot type: a Ref and an Int
+        // merging, with the φ carrying the `Int` fallback the builder recorded.
+        let a = g.nodes[phi as usize].inputs[1];
+        g.nodes[a as usize].ty = IrType::Ref;
+        assert_eq!(g.nodes[phi as usize].ty, crate::ir::PHI_TYPE_FALLBACK);
+        assert!(verify_graph(&g, "test", VerifyOptions::structural()).is_ok());
+        assert!(verify_graph(&g, "test", VerifyOptions::default()).is_err());
+    }
+
+    /// The φ fallback, degenerate half: a φ no input types is a slot that is
+    /// dead at the merge, which verified bytecode may have. Tolerated — the
+    /// fallback's `Int` keeps it out of the oop map, the right answer for a slot
+    /// nothing reads.
+    #[test]
+    fn phi_with_no_typed_input_is_tolerated() {
+        let mut g = diamond_graph();
+        let phi = g.nodes.iter().position(|n| n.op == Op::Phi).expect("phi") as NodeId;
+        let n = g.nodes[phi as usize].inputs.len();
+        for i in 1..n {
+            g.nodes[phi as usize].inputs[i] = NO_NODE;
+        }
+        assert_eq!(g.nodes[phi as usize].ty, crate::ir::PHI_TYPE_FALLBACK);
+        let r = verify_graph(&g, "test", VerifyOptions::all());
+        assert!(r.is_ok(), "{}", r.unwrap_err());
     }
 
     #[test]
@@ -1147,7 +1422,7 @@ mod tests {
         }
         let err = verify_graph(&g, "test", VerifyOptions::all()).unwrap_err();
         let m = message(&err);
-        assert!(m.contains("typed integer but joins reference"), "{m}");
+        assert!(m.contains("typed int but joins reference"), "{m}");
     }
 
     #[test]
@@ -1160,7 +1435,7 @@ mod tests {
         g.nodes[ret].inputs[1] = sum;
         let err = verify_graph(&g, "test", VerifyOptions::default()).unwrap_err();
         let m = message(&err);
-        assert!(m.contains("produces integer"), "{m}");
+        assert!(m.contains("produces int"), "{m}");
         assert!(m.contains("reference"), "{m}");
         // Structural-only must accept it: nothing about the *shape* is wrong.
         assert!(verify_graph(&g, "test", VerifyOptions::structural()).is_ok());
@@ -1229,13 +1504,18 @@ mod tests {
         );
     }
 
-    /// `ir_optimize::eliminate_dead_stores` kills an overwritten store without
-    /// rewiring the memory chain, so the surviving store's token slot names a
-    /// removed node. That is an ordering defect, not a wrong-value one, and
-    /// the always-on structural lane must not reject it — see
-    /// `is_memory_token_input`.
+    /// A store killed without splicing the memory chain leaves the surviving
+    /// store's token slot naming a removed node. That is an *ordering* defect,
+    /// not a wrong-value one: the always-on structural lane must not reject it
+    /// (see `is_memory_token_input`), and the memory-chain lane must.
+    ///
+    /// `ir_optimize::eliminate_dead_stores` no longer produces this — it routes
+    /// every deletion through `kill_store_splicing_memory_chain` — which is
+    /// exactly why the lane is now safe to enable at `"post-optimize"`. The
+    /// shape is built by hand here because the pass that used to emit it does
+    /// not any more.
     #[test]
-    fn removed_memory_token_is_an_ordering_finding_not_a_structural_one() {
+    fn removed_memory_token_is_a_chain_finding_not_a_structural_one() {
         let mut g = linear_graph();
         let ctrl = g.nodes[g.exit as usize].inputs[0];
         let mem = g
@@ -1261,14 +1541,77 @@ mod tests {
         assert!(verify_graph(&g, "test", VerifyOptions::all()).is_ok());
         g.kill(st1);
         // Structural / type / frame-state lanes: unchanged verdict.
-        let r = verify_graph(&g, "test", VerifyOptions::default());
+        let lanes_without_the_chain = VerifyOptions {
+            check_memory_chain: false,
+            ..VerifyOptions::default()
+        };
+        let r = verify_graph(&g, "test", lanes_without_the_chain);
         assert!(r.is_ok(), "{}", r.unwrap_err());
-        // Ordering lane: names it.
-        let err = verify_graph(&g, "test", VerifyOptions::all()).unwrap_err();
+        // Memory-chain lane: names it.
+        let err = verify_graph(&g, "test", VerifyOptions::default()).unwrap_err();
         let m = message(&err);
         assert!(m.contains("memory token"), "{m}");
         assert!(m.contains(&format!("n{st1}")), "{m}");
         let _ = st2;
+    }
+
+    /// `Op::ArrayLength` is `[ctrl, mem, array_ref]` per `ir::Op`, so its input
+    /// 1 is a memory token. `ir_optimize::memory_token_slot` has always said so;
+    /// this lane used to omit it, which meant a removed token in an
+    /// `ArrayLength` was reported by the *structural* lane as a wrong-value read
+    /// — the one classification the structural lane may not get wrong, because
+    /// it is the lane with no opt-out.
+    #[test]
+    fn array_length_input_one_is_a_memory_token() {
+        let mut g = linear_graph();
+        let ctrl = g.nodes[g.exit as usize].inputs[0];
+        let mem = g
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::Proj(1)))
+            .expect("memory projection") as NodeId;
+        let arr = g.add(Op::Const(0), IrType::Ref, vec![], None);
+        let st = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, arr, arr, arr],
+            None,
+        );
+        let len = g.add(Op::ArrayLength, IrType::Int, vec![ctrl, st, arr], None);
+        g.nodes[g.exit as usize].inputs[1] = len;
+        assert!(verify_graph(&g, "test", VerifyOptions::all()).is_ok());
+
+        g.kill(st);
+        // Structural lane stays quiet: this is an ordering edge, not a value.
+        assert!(verify_graph(&g, "test", VerifyOptions::structural()).is_ok());
+        // The chain lane names it.
+        let err = verify_graph(&g, "test", VerifyOptions::default()).unwrap_err();
+        let m = message(&err);
+        assert!(m.contains("memory token"), "{m}");
+        assert!(m.contains("ArrayLength"), "{m}");
+    }
+
+    /// The compact hand-built `[array]` form has no token to lose, and the
+    /// arity lane deliberately admits it (`ArrayLength` is `1..=3`). The
+    /// min-arity guard borrowed from `ir_optimize::memory_token_slot` is what
+    /// keeps the two forms apart.
+    #[test]
+    fn compact_array_length_has_no_memory_token() {
+        let arr = Node {
+            op: Op::ArrayLength,
+            ty: IrType::Int,
+            inputs: vec![7],
+            aux: None,
+        };
+        assert!(!is_memory_token_input(&arr, 1));
+        let full = Node {
+            op: Op::ArrayLength,
+            ty: IrType::Int,
+            inputs: vec![1, 2, 3],
+            aux: None,
+        };
+        assert!(is_memory_token_input(&full, 1));
+        assert!(!is_memory_token_input(&full, 2));
     }
 
     #[test]

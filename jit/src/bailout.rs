@@ -111,6 +111,18 @@ pub enum BailoutReason {
     /// The IR verifier rejected the graph. The `String` is the accumulated
     /// violation list produced by [`crate::ir_verify::verify_graph`].
     IrVerification(String),
+    /// The install-time deopt-metadata verifier rejected the emitted safepoint
+    /// descriptors. The `String` is the accumulated violation list produced by
+    /// `crate::deopt`'s verifier.
+    ///
+    /// Deliberately *not* folded into [`BailoutReason::IrVerification`]: the two
+    /// verify different artifacts at different times (a graph before lowering
+    /// vs. the metadata a finished code blob is about to be installed with), and
+    /// a metrics consumer that cannot tell them apart cannot tell "the front end
+    /// built a bad graph" from "the back end described a good graph badly".
+    /// `deopt.rs` used `IrVerification` with a `phase=deopt-metadata` context
+    /// only because this variant did not exist yet.
+    DeoptMetadata(String),
     /// A compiler invariant was broken. This is the variant that replaces a
     /// `panic!`: the method loses its optimized body, the VM does not die.
     Internal(&'static str),
@@ -133,7 +145,8 @@ impl BailoutReason {
             BailoutReason::CodeBufferExhausted { .. } => CATEGORIES[7],
             BailoutReason::UnallocatedValue { .. } => CATEGORIES[8],
             BailoutReason::IrVerification(_) => CATEGORIES[9],
-            BailoutReason::Internal(_) => CATEGORIES[10],
+            BailoutReason::DeoptMetadata(_) => CATEGORIES[10],
+            BailoutReason::Internal(_) => CATEGORIES[11],
         }
     }
 }
@@ -168,6 +181,9 @@ impl std::fmt::Display for BailoutReason {
                 write!(f, "value n{node} read before a location was assigned")
             }
             BailoutReason::IrVerification(msg) => write!(f, "IR verification failed: {msg}"),
+            BailoutReason::DeoptMetadata(msg) => {
+                write!(f, "deopt metadata verification failed: {msg}")
+            }
             BailoutReason::Internal(what) => write!(f, "internal compiler invariant: {what}"),
         }
     }
@@ -253,7 +269,7 @@ macro_rules! bail_compile {
 /// Every category name, in the order [`bailout_counts`] reports them. The index
 /// of a name here is its index into [`COUNTERS`]; `BailoutReason::category`
 /// returns elements of this array so the two can never disagree.
-const CATEGORIES: [&str; 11] = [
+const CATEGORIES: [&str; 12] = [
     "graph_too_large",
     "frame_too_large",
     "unsupported_opcode",
@@ -264,6 +280,7 @@ const CATEGORIES: [&str; 11] = [
     "code_buffer_exhausted",
     "unallocated_value",
     "ir_verification",
+    "deopt_metadata",
     "internal",
 ];
 
@@ -271,6 +288,7 @@ const CATEGORIES: [&str; 11] = [
 /// category set is closed, so this needs no allocation, no lock, and no
 /// initialization order.
 static COUNTERS: [AtomicU64; CATEGORIES.len()] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -349,6 +367,9 @@ mod tests {
             },
             BailoutReason::UnallocatedValue { node: 17 },
             BailoutReason::IrVerification("n3 input[0] is out of range".to_string()),
+            BailoutReason::DeoptMetadata(
+                "safepoint at bci 12: local[0] is MaterializationRequired".to_string(),
+            ),
             BailoutReason::Internal("schedule block count mismatch"),
         ]
     }
@@ -434,6 +455,48 @@ mod tests {
         }
         assert!(bailout_count("register_pressure").is_some());
         assert!(bailout_count("no_such_category").is_none());
+    }
+
+    /// The deopt-metadata reason is a *distinct* bucket from `ir_verification`,
+    /// not an alias for it: `deopt.rs` used to spell it as an `IrVerification`
+    /// with a `phase=deopt-metadata` context, and a metrics consumer could not
+    /// separate a bad graph from a badly-described good one.
+    #[test]
+    fn deopt_metadata_is_its_own_category_and_counter() {
+        let b = Bailout::with_context(
+            BailoutReason::DeoptMetadata("2 deopt-metadata violation(s): …".to_string()),
+            "phase=install",
+        );
+        assert_eq!(b.category(), "deopt_metadata");
+        assert_ne!(
+            b.category(),
+            BailoutReason::IrVerification(String::new()).category()
+        );
+
+        let s = b.to_string();
+        assert!(s.contains("deopt_metadata"), "{s}");
+        assert!(s.contains("deopt metadata verification failed"), "{s}");
+        assert!(s.contains("2 deopt-metadata violation(s)"), "{s}");
+        assert!(s.contains("phase=install"), "{s}");
+
+        // It has a counter of its own. Asserted as a delta, not an absolute:
+        // the table is process-wide and shared with every other test.
+        let before = bailout_count("deopt_metadata").expect("registered category");
+        record_bailout(&b);
+        assert!(bailout_count("deopt_metadata").unwrap() - before >= 1);
+    }
+
+    /// The positional `category()` → [`CATEGORIES`] mapping is what
+    /// `every_category_is_distinct_and_registered` proves in aggregate; this
+    /// pins the two indices that moved when `deopt_metadata` was inserted
+    /// *before* `internal` rather than appended.
+    #[test]
+    fn inserting_deopt_metadata_kept_internal_last() {
+        assert_eq!(CATEGORIES[9], "ir_verification");
+        assert_eq!(CATEGORIES[10], "deopt_metadata");
+        assert_eq!(CATEGORIES[11], "internal");
+        assert_eq!(CATEGORIES.len(), COUNTERS.len());
+        assert_eq!(*CATEGORIES.last().unwrap(), "internal");
     }
 
     #[test]

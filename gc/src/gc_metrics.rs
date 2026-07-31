@@ -768,7 +768,7 @@ pub fn last_collector_decision() -> Option<CollectorDecision> {
 /// disagreement about whether young collections move — see
 /// `docs/gc/tlab-and-card-audit.md` §3.
 pub fn collector_decision_report() -> String {
-    match last_collector_decision() {
+    let mut s = match last_collector_decision() {
         None => format!(
             "[GC] decision: no collection has run yet (moving_young_requested={})",
             crate::gc_quiescence::moving_young_enabled(),
@@ -784,7 +784,263 @@ pub fn collector_decision_report() -> String {
             ));
             s
         }
+    };
+    // G1 states its own last cycle. Absent on a Generational/ZGC run, so the
+    // report keeps its previous shape there byte-for-byte.
+    if let Some(g1) = last_g1_cycle() {
+        s.push('\n');
+        s.push_str(&g1.to_string());
     }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// G1 per-cycle decision record
+// ---------------------------------------------------------------------------
+
+/// Ways a G1 cycle can be **degraded** — i.e. still correct, but not doing what
+/// an undisturbed cycle would do.
+///
+/// Every flag here corresponds to a fail-safe the collector took rather than to
+/// a failure. They are recorded because each one silently changes what the
+/// pause reclaims, and none of them was previously visible from outside a
+/// debug build: an operator watching G1 fail to reclaim old gen had no way to
+/// tell "the mark closure was abandoned this cycle" from "there is no garbage".
+///
+/// See `docs/gc/g1-audit.md` for which invariant each one protects.
+pub mod g1_degraded {
+    /// Nothing unusual happened.
+    pub const NONE: u32 = 0;
+    /// At least one object could not be evacuated (to-space exhausted) and was
+    /// self-forwarded in place; its region was KEPT rather than freed
+    /// (`G1Collector::free_or_keep_cset`).
+    pub const EVACUATION_FAILURE: u32 = 1 << 0;
+    /// The same-pause drain of self-forwarded objects gave up (wedge or pass
+    /// cap) with live objects still parked in kept regions
+    /// (`retry_after_evacuation_failure`). The heap is coherent but not
+    /// reclaimed.
+    pub const EVACUATION_FAILURE_UNRESOLVED: u32 = 1 << 1;
+    /// The mark worklist hit `MARK_WORKLIST_CAP` during this cycle, so some
+    /// gray pushes were converted to black-without-scan and a conservative
+    /// whole-heap rescan was required.
+    pub const MARK_WORKLIST_OVERFLOW: u32 = 1 << 2;
+    /// A gray entry with an implausible header was skipped, so the closure may
+    /// be incomplete and `cleanup` retained every region this cycle.
+    pub const MARK_IMPLAUSIBLE_HEADER: u32 = 1 << 3;
+    /// `cleanup` ran with a NON-EMPTY gray set — the transitive closure was
+    /// never driven to a fixed point, so a zero-live verdict is not
+    /// trustworthy and every region was retained. This is the fail-safe for
+    /// the unenforced "drain the worklist before cleanup" precondition (see
+    /// `VmHeap::g1_signal_marking_complete`, which skips the remark).
+    pub const CLEANUP_CLOSURE_INCOMPLETE: u32 = 1 << 4;
+    /// At least one region was excluded from the collection set by a JNI
+    /// no-relocation pin (`G1Region::pinned`).
+    pub const JNI_PINNED_REGIONS_EXCLUDED: u32 = 1 << 5;
+    /// At least one region was excluded from the collection set because it
+    /// holds a conservatively-discovered JIT root or a frozen peer's
+    /// un-retired TLAB tail (`jit_pinned_region_set`).
+    pub const JIT_PINNED_REGIONS_EXCLUDED: u32 = 1 << 6;
+    /// The experimental parallel evacuator ran (`CRATONVM_G1_PARALLEL_EVAC`).
+    pub const PARALLEL_EVACUATOR: u32 = 1 << 7;
+    /// The collection set came out empty, so the pause did nothing.
+    pub const EMPTY_COLLECTION_SET: u32 = 1 << 8;
+
+    /// Every defined bit. A flag outside this mask is a programming error and
+    /// is rejected by `record_g1_cycle`'s `debug_assert!`.
+    pub const ALL: u32 = EVACUATION_FAILURE
+        | EVACUATION_FAILURE_UNRESOLVED
+        | MARK_WORKLIST_OVERFLOW
+        | MARK_IMPLAUSIBLE_HEADER
+        | CLEANUP_CLOSURE_INCOMPLETE
+        | JNI_PINNED_REGIONS_EXCLUDED
+        | JIT_PINNED_REGIONS_EXCLUDED
+        | PARALLEL_EVACUATOR
+        | EMPTY_COLLECTION_SET;
+
+    /// Stable labels, lowest bit first. A new flag cannot be added without a
+    /// label — `every_g1_degraded_flag_has_a_label` pins that.
+    pub fn labels(bits: u32) -> Vec<&'static str> {
+        const TABLE: &[(u32, &str)] = &[
+            (EVACUATION_FAILURE, "evacuation-failure-self-forwarded"),
+            (
+                EVACUATION_FAILURE_UNRESOLVED,
+                "evacuation-failure-drain-wedged",
+            ),
+            (MARK_WORKLIST_OVERFLOW, "mark-worklist-overflow-rescan"),
+            (MARK_IMPLAUSIBLE_HEADER, "mark-implausible-header-retain-all"),
+            (
+                CLEANUP_CLOSURE_INCOMPLETE,
+                "cleanup-closure-incomplete-retain-all",
+            ),
+            (JNI_PINNED_REGIONS_EXCLUDED, "jni-pinned-regions-excluded"),
+            (JIT_PINNED_REGIONS_EXCLUDED, "jit-pinned-regions-excluded"),
+            (PARALLEL_EVACUATOR, "experimental-parallel-evacuator"),
+            (EMPTY_COLLECTION_SET, "empty-collection-set"),
+        ];
+        TABLE
+            .iter()
+            .filter(|(bit, _)| bits & bit != 0)
+            .map(|(_, name)| *name)
+            .collect()
+    }
+}
+
+/// Which G1 pause shape recorded the facts.
+pub mod g1_cycle_kind {
+    pub const UNRECORDED: u8 = 0;
+    pub const YOUNG: u8 = 1;
+    pub const MIXED: u8 = 2;
+    pub const KEPT_REGION_DRAIN: u8 = 3;
+    pub const CONCURRENT_CLEANUP: u8 = 4;
+
+    pub fn label(code: u8) -> &'static str {
+        match code {
+            YOUNG => "young",
+            MIXED => "mixed",
+            KEPT_REGION_DRAIN => "kept-region-drain",
+            CONCURRENT_CLEANUP => "concurrent-cleanup",
+            _ => "unrecorded",
+        }
+    }
+}
+
+/// What a G1 cycle decided: which regions it took, which it was forced to
+/// leave, and which fail-safes fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct G1CycleFacts {
+    /// 1-based sequence number of the recorded G1 cycle.
+    pub sequence: u64,
+    /// [`g1_cycle_kind`] code.
+    pub kind: u8,
+    /// Young (Eden + Survivor) regions in the collection set.
+    pub cset_young: u32,
+    /// Old regions in the collection set (mixed pauses only).
+    pub cset_old: u32,
+    /// Collectable regions kept OUT of the collection set by a pin of either
+    /// vocabulary.
+    pub regions_pinned_out: u32,
+    /// Distinct remembered-set source regions the pause scanned.
+    pub rset_sources_scanned: u32,
+    /// Bitmask of [`g1_degraded`] flags.
+    pub degraded: u32,
+}
+
+impl std::fmt::Display for G1CycleFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[GC] g1 cycle #{seq}: kind={kind} cset_young={y} cset_old={o} \
+             pinned_out={p} rset_sources={r} degraded=",
+            seq = self.sequence,
+            kind = g1_cycle_kind::label(self.kind),
+            y = self.cset_young,
+            o = self.cset_old,
+            p = self.regions_pinned_out,
+            r = self.rset_sources_scanned,
+        )?;
+        let labels = g1_degraded::labels(self.degraded);
+        if labels.is_empty() {
+            write!(f, "none")
+        } else {
+            write!(f, "{}", labels.join(","))
+        }
+    }
+}
+
+struct G1CycleSlot {
+    sequence: AtomicU64,
+    kind: AtomicU8,
+    cset_young: AtomicU64,
+    cset_old: AtomicU64,
+    regions_pinned_out: AtomicU64,
+    rset_sources_scanned: AtomicU64,
+    degraded: AtomicU64,
+}
+
+impl G1CycleSlot {
+    const fn new() -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            kind: AtomicU8::new(g1_cycle_kind::UNRECORDED),
+            cset_young: AtomicU64::new(0),
+            cset_old: AtomicU64::new(0),
+            regions_pinned_out: AtomicU64::new(0),
+            rset_sources_scanned: AtomicU64::new(0),
+            degraded: AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(not(test))]
+static G1_CYCLE: G1CycleSlot = G1CycleSlot::new();
+
+#[cfg(not(test))]
+#[inline]
+fn with_g1_cycle<R>(f: impl FnOnce(&G1CycleSlot) -> R) -> R {
+    f(&G1_CYCLE)
+}
+
+#[cfg(test)]
+thread_local! {
+    static G1_CYCLE: G1CycleSlot = const { G1CycleSlot::new() };
+}
+
+#[cfg(test)]
+#[inline]
+fn with_g1_cycle<R>(f: impl FnOnce(&G1CycleSlot) -> R) -> R {
+    G1_CYCLE.with(f)
+}
+
+/// Record what a G1 pause (or the concurrent cleanup) decided.
+///
+/// Called from inside the pause, with the regions lock held, so the numbers
+/// describe the collection set that actually ran rather than a later
+/// re-derivation. `degraded` is a bitmask of [`g1_degraded`] flags.
+pub fn record_g1_cycle(
+    kind: u8,
+    cset_young: u32,
+    cset_old: u32,
+    regions_pinned_out: u32,
+    rset_sources_scanned: u32,
+    degraded: u32,
+) {
+    debug_assert!(
+        degraded & !g1_degraded::ALL == 0,
+        "record_g1_cycle: degraded mask {degraded:#x} has bits outside g1_degraded::ALL — \
+         a new flag was added without extending ALL (and therefore without a label)"
+    );
+    with_g1_cycle(|s| {
+        s.kind.store(kind, Ordering::Relaxed);
+        s.cset_young.store(cset_young as u64, Ordering::Relaxed);
+        s.cset_old.store(cset_old as u64, Ordering::Relaxed);
+        s.regions_pinned_out
+            .store(regions_pinned_out as u64, Ordering::Relaxed);
+        s.rset_sources_scanned
+            .store(rset_sources_scanned as u64, Ordering::Relaxed);
+        s.degraded.store(degraded as u64, Ordering::Relaxed);
+        // Written LAST, same publication rule as the collector decision slot.
+        s.sequence.fetch_add(1, Ordering::Release);
+    });
+}
+
+/// The facts recorded for the last G1 cycle, or `None` if this process has run
+/// none (every non-G1 run).
+pub fn last_g1_cycle() -> Option<G1CycleFacts> {
+    with_g1_cycle(|s| {
+        let sequence = s.sequence.load(Ordering::Acquire);
+        if sequence == 0 {
+            return None;
+        }
+        Some(G1CycleFacts {
+            sequence,
+            kind: s.kind.load(Ordering::Relaxed),
+            cset_young: s.cset_young.load(Ordering::Relaxed) as u32,
+            cset_old: s.cset_old.load(Ordering::Relaxed) as u32,
+            regions_pinned_out: s.regions_pinned_out.load(Ordering::Relaxed) as u32,
+            rset_sources_scanned: s.rset_sources_scanned.load(Ordering::Relaxed) as u32,
+            degraded: s.degraded.load(Ordering::Relaxed) as u32,
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -985,5 +1241,112 @@ mod tests {
             !text.contains("unproven_obligation"),
             "a proven cycle must not print a fallback obligation: {text}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // G1 per-cycle facts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_g1_degraded_flag_has_a_label() {
+        // Walk every bit in ALL and require a distinct, non-empty label. This
+        // is what stops a new fail-safe from being added to the collector and
+        // then printing as an opaque bitmask in the summary.
+        let mut seen: Vec<&str> = Vec::new();
+        for bit in 0..32u32 {
+            let mask = 1u32 << bit;
+            if g1_degraded::ALL & mask == 0 {
+                continue;
+            }
+            let labels = g1_degraded::labels(mask);
+            assert_eq!(labels.len(), 1, "bit {bit} must map to exactly one label");
+            assert!(!labels[0].is_empty(), "bit {bit} has an empty label");
+            assert!(
+                !seen.contains(&labels[0]),
+                "duplicate label {:?} for bit {bit}",
+                labels[0],
+            );
+            seen.push(labels[0]);
+        }
+        assert_eq!(
+            g1_degraded::labels(g1_degraded::NONE).len(),
+            0,
+            "an undegraded cycle names no fail-safe",
+        );
+        // A bit outside ALL contributes nothing rather than an "unknown" entry.
+        assert!(g1_degraded::labels(1 << 31).is_empty());
+    }
+
+    #[test]
+    fn g1_cycle_is_absent_until_a_g1_pause_records_one() {
+        // A Generational-only run must not grow a G1 line: this is the check
+        // that keeps the report honest about which backend produced it.
+        assert!(last_g1_cycle().is_none());
+        record_collector_decision(
+            "generational",
+            decision_reason::MOVING_NO_JIT_FRAMES,
+            incomplete_reason::NONE,
+        );
+        let text = collector_decision_report();
+        assert!(!text.contains("g1 cycle"), "{text}");
+    }
+
+    #[test]
+    fn g1_cycle_report_names_every_degraded_mode_that_fired() {
+        record_g1_cycle(
+            g1_cycle_kind::MIXED,
+            6,
+            2,
+            3,
+            11,
+            g1_degraded::EVACUATION_FAILURE
+                | g1_degraded::JIT_PINNED_REGIONS_EXCLUDED
+                | g1_degraded::MARK_WORKLIST_OVERFLOW,
+        );
+        let f = last_g1_cycle().expect("just recorded");
+        assert_eq!(f.sequence, 1);
+        assert_eq!(f.kind, g1_cycle_kind::MIXED);
+        assert_eq!((f.cset_young, f.cset_old), (6, 2));
+        assert_eq!(f.regions_pinned_out, 3);
+        assert_eq!(f.rset_sources_scanned, 11);
+
+        let text = f.to_string();
+        assert!(text.contains("kind=mixed"), "{text}");
+        assert!(text.contains("cset_young=6 cset_old=2"), "{text}");
+        assert!(text.contains("pinned_out=3"), "{text}");
+        assert!(text.contains("evacuation-failure-self-forwarded"), "{text}");
+        assert!(text.contains("jit-pinned-regions-excluded"), "{text}");
+        assert!(text.contains("mark-worklist-overflow-rescan"), "{text}");
+    }
+
+    #[test]
+    fn an_undegraded_g1_cycle_says_so_rather_than_printing_nothing() {
+        // "degraded=" with an empty tail would be indistinguishable from a
+        // truncated log line; a clean cycle must say `none` explicitly.
+        record_g1_cycle(g1_cycle_kind::YOUNG, 4, 0, 0, 2, g1_degraded::NONE);
+        let text = last_g1_cycle().unwrap().to_string();
+        assert!(text.contains("degraded=none"), "{text}");
+    }
+
+    #[test]
+    fn g1_cycle_line_is_appended_to_the_collector_decision_report() {
+        record_collector_decision(
+            "g1",
+            decision_reason::MOVING_BACKEND_ALWAYS_EVACUATES,
+            incomplete_reason::NONE,
+        );
+        record_g1_cycle(
+            g1_cycle_kind::YOUNG,
+            3,
+            0,
+            1,
+            5,
+            g1_degraded::JNI_PINNED_REGIONS_EXCLUDED,
+        );
+        let text = collector_decision_report();
+        assert!(text.contains("backend=g1"), "{text}");
+        assert!(text.contains("young=MOVING"), "{text}");
+        assert!(text.contains("[GC] g1 cycle #1"), "{text}");
+        assert!(text.contains("jni-pinned-regions-excluded"), "{text}");
     }
 }

@@ -103,27 +103,34 @@ mod threadreg_perf {
 }
 
 /// The calling OS thread's id, in the same encoding `ThreadEntry::os_tid`
-/// stores (`GetCurrentThreadId` on Windows, `gettid` on Linux). `0` means
-/// "this platform has no takeover/identity backend", which every caller must
-/// read as "unknown" — `0` is also the never-published sentinel in the entry.
+/// stores (`GetCurrentThreadId` on Windows, `gettid` on Linux) — see
+/// `ThreadRegistry::set_os_tid_current`, whose publication this reads back.
+/// `0` means "this platform has no takeover/identity backend", which every
+/// caller must read as "unknown": `0` is also the never-published sentinel in
+/// the entry.
+#[cfg(windows)]
 #[inline]
 fn current_os_tid() -> u32 {
-    #[cfg(windows)]
-    {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetCurrentThreadId() -> u32;
-        }
-        unsafe { GetCurrentThreadId() }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
     }
-    #[cfg(target_os = "linux")]
-    {
-        unsafe { libc::syscall(libc::SYS_gettid) as u32 }
-    }
-    #[cfg(all(not(windows), not(target_os = "linux")))]
-    {
-        0
-    }
+    unsafe { GetCurrentThreadId() }
+}
+
+/// Linux variant of [`current_os_tid`].
+#[cfg(target_os = "linux")]
+#[inline]
+fn current_os_tid() -> u32 {
+    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+}
+
+/// Fallback for platforms with no `os_tid` publication (the takeover machinery
+/// is Windows/Linux-only, and so is `set_os_tid_current`).
+#[cfg(all(not(windows), not(target_os = "linux")))]
+#[inline]
+fn current_os_tid() -> u32 {
+    0
 }
 
 /// An entry in the thread registry for one JVM thread.

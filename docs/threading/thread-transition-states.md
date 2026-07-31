@@ -430,3 +430,211 @@ In dependency order:
 Until step 1 lands, `docs/known-issues/` triage should treat a shadow/real
 disagreement as a *reporting* discrepancy, not a correctness one — the shadow
 is not in the decision path.
+
+---
+
+## 10. Census reconciliation (2026-07-31 follow-up)
+
+This section records the follow-up pass that acted on §6.1, §6.3 and §7.2. It
+does not restate them; it says which findings survived verification, what
+changed, and what is deliberately still open.
+
+### 10.1 §6.1 was real — and the VM already had a tripwire for its shape
+
+Verified against `dev` at `d18501d83`:
+
+* `jni::host_thread_enter_native` bumped `GcBarrier::threads_blocked` (#4) and
+  nothing else. It never raised `in_blocked_region` (#3).
+* Production keys `expected` off #3 only
+  (`interpreter.rs` → `request_stw_counted_with_live_blocked` →
+  `alive_count_blocked_and_os_tids`). #4 is read solely by the legacy
+  `request_stw` path.
+* The only test for it (`jni.rs::host_native_excludes_idle_thread_from_stw`)
+  drives that legacy path, so the identity census was never exercised.
+
+The decisive corroboration is in the VM itself: `stw_take_over_and_wait`
+(`runtime/interpreter.rs`) carries an **always-on** `[gcbarrier-tripwire]` that
+fires after 64 stuck takeover rounds and prints, verbatim, "a thread called
+`GcBarrier::enter_blocked()`/`mark_blocked_region_enter()` **WITHOUT** first
+depositing a root snapshot, so it is invisible to the production STW census but
+still occupies an `expected` slot no arrival can ever satisfy". That tripwire
+was added (2026-07-18) for a *different* call site with this exact shape;
+`host_thread_enter_native` was the remaining instance of it.
+
+**Fix.** Both halves now use the sequence `VmNativeThreadBlocker`
+(`vm/src/vm/vm_exec.rs`) already uses for VM-registered native carrier threads —
+i.e. the existing mechanism, not a new one:
+
+| | before | after |
+|---|---|---|
+| `host_thread_enter_native` | `mark_blocked_region_enter` (+ `arrive_and_wait_auto` if `pre_stw`) | `ThreadRegistry::mark_native_thread_blocked` **then** the same two steps |
+| `host_thread_leave_native` | `mark_blocked_region_leave` | `mark_blocked_region_leave`, then `GcBarrier::leave_blocked_region_flagged`, then `mark_native_thread_unblocked` for the side-table drain |
+
+The identity flag is raised *before* the counter and cleared *after* it, which
+is the ordering every other blocking site uses (`deposit_root_snapshot` →
+`enter_blocked`; `mark_blocked_region_leave` → `check_post_block_gc`). Either
+side of the race is then handled by machinery that already exists: a census
+serialized before the raise counts the thread and `arrive_and_wait_auto`
+supplies the arrival it waits for; a census serialized after excludes it, and
+`auto` resolves that from the pause's own `excluded_blocked` snapshot rather
+than guessing.
+
+**Naming the caller.** A host thread parked outside the VM has no `&mut
+JvmThread` and no `JNI_THREAD` binding — `with_jni_context` returns `None` on
+the creating thread by construction (`libcratonvm`'s own soak comments say so),
+so `deposit_root_snapshot` is unreachable from there. The identity link that
+*does* survive leaving the VM is the published `os_tid`, so the fix adds
+`ThreadRegistry::thread_id_for_current_os_tid()`. It answers `None` — falling
+back to exactly the pre-fix counter-only behaviour — when the calling OS thread
+is in no alive entry (then it is absent from `alive_count` too, so it occupies
+no `expected` slot and needs no exclusion), when *more than one* alive entry
+claims it (a mounted virtual thread republishes its carrier's `os_tid`; see
+10.5), or on a platform with no `os_tid` backend.
+
+**Residual, deliberately accepted.** `mark_native_thread_blocked` empties the
+published root snapshot, because the primitive's stated contract is that the
+caller holds no live Java roots while parked. That is safe for the intended
+caller (its `java.lang.Thread` mirror is a strong root of every alive registry
+entry — `memory/roots.rs` step 10b — and it owns no interpreter frames between
+`vm.invoke` calls), and it is the same trade the pre-existing native-carrier
+path takes. It does change the *misuse* failure mode: a caller that declares
+itself host-native while holding live Java roots used to hang, and now loses
+those roots silently. `CRATONVM_DBG_BLOCKGC` reports the tell (a non-empty
+discarded fixup at leave). Closing this properly means depositing through the
+registry-published `jvm_thread_addr`, which requires proving the caller is not
+simultaneously inside an interpreter `&mut JvmThread` borrow — not provable at
+that entry point today.
+
+**Test.** `jni.rs::host_native_excludes_idle_thread_from_the_identity_census`
+is the identity-path twin of the existing legacy-path test (which stays). It
+drives `alive_count_blocked_and_os_tids` +
+`request_stw_counted_with_live_blocked` — the production pair — and asserts the
+host-native thread is in `blocked_tids`, that `pending_count()` is 0, and that
+leaving clears the identity flag again. Without the fix it observes
+`blocked == 0`, `expected == 1`, `pending_count() == 1`.
+
+### 10.2 §6.3 — the bare flag stores
+
+Enumerated every `in_blocked_region` write in `vm/src/`:
+
+* `vm_exec.rs` (virtual-thread first mount) — the only bare `store(false)` on
+  a `JvmThread`'s own flag. The "virgin state" argument holds; it is now
+  pinned by two `debug_assert!`s (flag already down, `fixup` empty) that name
+  `check_post_block_gc` as the correct handler if it ever breaks.
+* `ThreadRegistry::mark_native_thread_unblocked` — the *other* bare
+  `store(false)`, and the one the audit did not name. Its caller
+  (`VmNativeThreadBlocker::leave_blocked`) waits out only the pause active at
+  `mark_blocked_region_leave`; a pause requested between that and the store
+  both excludes the thread and lets it run — finding 1(c) exactly. Both
+  callers (that one and the new `host_thread_leave_native`) now clear through
+  `leave_blocked_region_flagged` first and keep the registry call purely for
+  its side-table drain, where its store is a no-op.
+* `jni.rs:756` / `jni.rs:1019`, flagged by an earlier pass, are **not** this
+  bug: both are `store(true)` (raises), not bypassed clears. The second is
+  additionally redundant — the `deposit_root_snapshot()` on the line above
+  already raises the flag — but harmless, and left alone.
+
+### 10.3 §7.2 — the unwired states
+
+`CompiledUninterruptible`, `Deoptimizing` and `NativeRunning` are now recorded:
+
+| State | Site |
+|---|---|
+| `CompiledUninterruptible` | `conservative_roots::push_entry_full` (after the `GLOBAL_JIT_DEPTH` bump) |
+| → leave | `pop_jit_entry` and `prune_returned_jit_entries`, via `leaving_compiled_state(remaining)` |
+| `Deoptimizing` | `jit/helpers.rs::set_jit_deopt_pending` |
+| → leave | `interpreter::resume_from_ir_deopt` and `::real_frame_deopt_resume_and_despeculate` (resumed path only) |
+| `NativeRunning` | `vm_exec::safe_native_call_impl`, restored to the caller's prior state by a `Drop` guard |
+
+Two modelling choices are load-bearing, because the table is settled and a
+wiring pass must not manufacture edges the code does not perform:
+
+1. **Leaving compiled code with entries remaining.** `pop_jit_entry` records
+   `CompiledUninterruptible` again (a legal self-edge) unless the chain is now
+   empty, in which case it records `JavaRunning`. But if the thread is
+   `Deoptimizing`, it records `JavaRunning` regardless: `Deoptimizing`'s only
+   tabled successors are `JavaRunning`/`VmRunning`, so re-recording
+   `CompiledUninterruptible` for a nested pop would report a violation the code
+   is not committing. The consequence is that the shadow `Deoptimizing` window
+   usually ends at the pop rather than at frame materialisation; the two
+   interpreter resume sites are then no-op self-edges that exist to close the
+   window on any deopt path with no intervening pop.
+2. **Restoring after a native.** `current_state()` answers `Starting` both for
+   "not yet STW-ready" and for "never observed", and this funnel is often a
+   carrier's first record. Restoring `Starting` would assert the one thing the
+   table denies of a thread that just ran a native (`Starting -> NativeRunning`
+   is deliberately absent) and would repeat on every later native call, so the
+   guard resumes such a thread as `JavaRunning`.
+
+**Cost note.** `safe_native_call_impl` and `push_entry_full`/`pop_jit_entry`
+are hot paths, and `record_transition` is not free: `with_cell` clones an `Arc`
+(two atomic RMWs) on top of the TLS access and the relaxed load/store. That is
+two records per native call and two per JIT entry. If a benchmark regresses,
+the cheapest remedy is to gate *these* sites (not the barrier ones) on a cached
+process-global flag, which returns release builds to the §7.2 status quo — the
+shadow state is still in no decision path. `VmRunning` remains unwired.
+
+### 10.4 §6.2 in-JIT classification — real disagreement, not exploitable today
+
+The audit's claim is factually correct: `xt_root_scan` classifies a peer by
+`Rip` against the registered JIT code ranges, `GLOBAL_JIT_DEPTH` classifies by
+chain depth, and for a compiled frame that has called a Rust helper the two
+disagree. Both answers, however, currently fail *safe*:
+
+* **Arrival half.** `try_take` (Windows) / the signal handler (Linux) only keep
+  a peer frozen when its `Rip` is in a JIT range; anything else is resumed
+  immediately and — this is the load-bearing detail — is **not** appended to
+  `TakenOver::tids`. `stw_take_over_and_wait` derives `reduce_expected` solely
+  from newly added tids that also appear in `counted_os_tids`, so a
+  helper-window peer is never excused. It keeps its `expected` slot and the
+  initiator keeps waiting. The cost is latency, not an early release: the
+  takeover loop re-scans (on the `stw_takeover_should_scan` cadence) and
+  freezes it on a later pass once its `Rip` is back in JIT, or it returns to
+  the interpreter and arrives cooperatively.
+* **Relocation half.** `refresh_moving_young_coverage_for_collection` reads
+  `other_thread_in_jit()` — chain depth, which *stays elevated* across the
+  helper — and marks moving-young coverage incomplete. The over-approximating
+  side is the one wired to the "may I relocate?" question, which is the correct
+  polarity.
+* **The blocked variant is covered.** A compiled frame whose native *blocks*
+  (the A4 helper window) leaves `expected` legitimately via
+  `in_blocked_region`, and `helper_window_pass` — which runs after the barrier
+  is satisfied and is scoped to `blocked_os_tids()` — scans it and marks
+  coverage incomplete.
+
+So there is no state today in which a thread is both excused from the barrier
+and permitted to have its objects relocated on the strength of the *other*
+classifier. What must change before that stays true is precise:
+
+1. `reduce_expected` must never be driven by any classifier other than "this
+   peer is frozen right now, and I froze it". Any future "excuse it, it looks
+   like it is in JIT" shortcut keyed on `GLOBAL_JIT_DEPTH` reintroduces the
+   early-release bug directly.
+2. Conversely, if `any_thread_in_jit()` is ever narrowed to `Rip`-based
+   classification (e.g. "the peer is in a helper, so its registers are Rust's
+   problem"), the moving-young gate loses the helper window: the compiled
+   frame's spill slots are still live and still unrewritable while the helper
+   runs.
+3. The real fix is the P0 item the audit names — make entering compiled code
+   census-visible so `expected` is right at `request_stw` time and both
+   questions read one publication. Until then the two classifiers must stay
+   deliberately mismatched *in this direction*, and that intent belongs in a
+   comment at both sites.
+
+Adjacent, **unverified**, and worth its own investigation: a helper-window peer
+that is waiting on a Rust lock held by a thread already parked at the safepoint
+would not arrive until the pause completes, which the pause is waiting for. The
+frozen-peer set cannot cause this (a peer with `Rip` in JIT provably holds no
+VM lock), so it would have to come from a cooperative arrival made while
+holding a VM lock. Nothing here establishes that such an arrival exists.
+
+### 10.5 One-carrier-many-identities
+
+`thread_id_for_current_os_tid` returns `None` on ambiguity because a mounted
+virtual thread republishes its carrier's `os_tid` under the vthread's own
+`ThreadId` (`vm_exec.rs`'s mount path). The same ambiguity is visible in
+`stw_take_over_and_wait`'s excusal arithmetic, which reduces `expected` by a
+*count* of frozen OS threads while `expected` counts registry *entries*. If two
+alive, `stw_ready` entries can share one carrier, freezing that carrier excuses
+one and strands the other. Not investigated here — flagged because the two
+places make the same identity assumption.
