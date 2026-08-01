@@ -1659,14 +1659,50 @@ struct CachedDispatchTarget {
 /// bounded-cache posture as `ClassManager::note_synthetic_upgrade_absent`.
 const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
 
+/// Identity of one JIT call site, for every per-thread dispatch memo in this
+/// module: `(SharedVm::vm_identity, JitInvokeInfo pointer)`.
+///
+/// **The `vm_identity` half is load-bearing — do not drop it.** A
+/// `JitInvokeInfo` pointer alone does NOT identify a call site across VMs:
+///
+///  * several call sites pass the address of a process-global `static
+///    JitInvokeInfo` (`INTEGER_VALUE_OF_INFO`, `INTEGER_INT_VALUE_INFO`,
+///    `HASHMAP_PUT_DIRECT_INFO`, `HASHMAP_GET_DIRECT_INFO`,
+///    `CONCURRENT_HASHMAP_GET_DIRECT_INFO`, `STRING_LATIN1_LOWER_DIRECT_INFO`),
+///    which is literally the SAME address in every VM in the process;
+///  * every other info lives in `JitCache::invoke_info_arena`, a per-VM arena
+///    freed when that VM's `JitCache` drops, so a later VM's arena can hand
+///    out the same address.
+///
+/// What these memos hold is per-VM to the word: raw compiled entry pointers
+/// into one VM's code cache, receiver `ClassId`s, `NativeMethodId` census
+/// handles from one VM's registry, and resolved callee class names. A
+/// cross-VM hit therefore does not degrade to a slow path — it CALLs another
+/// VM's compiled body, or runs `java/util/HashMap`'s native against whatever
+/// class happens to hold that id in this VM. See
+/// `docs/known-issues/vm-jit-cache-keying.md`.
+///
+/// `vm_identity` is a monotonically issued counter (`vm_init.rs`
+/// `NEXT_VM_IDENTITY`), never an address, so it is never recycled — unlike a
+/// `&SharedVm` cast to `usize`, which a sequentially-created second VM can
+/// plausibly inherit from a dropped one.
+pub(crate) type JitSiteKey = (usize, usize);
+
+/// Build a [`JitSiteKey`]. Free function (not a method on `SharedVm`) so the
+/// keying can be unit-tested without constructing a VM.
+#[inline]
+pub(crate) fn jit_site_key(vm_identity: usize, info_ptr: usize) -> JitSiteKey {
+    (vm_identity, info_ptr)
+}
+
 thread_local! {
-    /// `(JitInvokeInfo ptr, receiver ClassId) -> CachedDispatchTarget`.
+    /// `(JitSiteKey, receiver ClassId) -> CachedDispatchTarget`.
     ///
     /// Keyed exactly like `VIRTUAL_DISPATCH_CACHE`. Array receivers and
     /// `ClassId(0)` never reach it — an array header carries its COMPONENT
     /// class id, so `(site, class id)` does not identify one.
     static VIRTUAL_TARGET_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<(usize, u32), CachedDispatchTarget>> =
+        std::cell::RefCell<rustc_hash::FxHashMap<(JitSiteKey, u32), CachedDispatchTarget>> =
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 
     /// `(class_definition_epoch, any_class_redefined)` this thread last
@@ -1839,11 +1875,9 @@ unsafe fn try_mic_rust_cached_entry(
     if !mic_rust_entry_cache_enabled() || !direct_virtual_compiled_callee_entry_enabled() {
         return None;
     }
-    let (entry, needs_ctx) = VIRTUAL_DISPATCH_CACHE.with(|dc| {
-        dc.borrow()
-            .get(&(info_ptr as usize, receiver_cid))
-            .map(|c| (c.entry, c.needs_context))
-    })?;
+    let key = (jit_site_key(vm.vm_identity, info_ptr as usize), receiver_cid);
+    let (entry, needs_ctx) =
+        VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow().get(&key).map(|c| (c.entry, c.needs_context)))?;
     let rc = try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice)?;
     if rc == i64::MIN {
         if let Some(v) = handle_compiled_callee_deopt_sentinel(
@@ -1865,6 +1899,7 @@ unsafe fn try_mic_rust_cached_entry(
 /// a failure to pin simply means the entry is not cached — never a dangling
 /// one.
 fn publish_mic_rust_cached_entry(
+    vm_identity: usize,
     info_ptr: i64,
     receiver_cid: u32,
     entry_ptr: usize,
@@ -1878,7 +1913,7 @@ fn publish_mic_rust_cached_entry(
     };
     VIRTUAL_DISPATCH_CACHE.with(|dc| {
         dc.borrow_mut().insert(
-            (info_ptr as usize, receiver_cid),
+            (jit_site_key(vm_identity, info_ptr as usize), receiver_cid),
             DispatchCache {
                 entry: entry_ptr,
                 needs_context: needs_ctx,
@@ -1910,7 +1945,7 @@ unsafe fn virtual_dispatch_target_cached(
     vm: &SharedVm,
     receiver: ObjectRef,
     info: &JitInvokeInfo,
-    info_key: usize,
+    info_key: JitSiteKey,
 ) -> CachedDispatchTarget {
     // KC26: array receivers store their COMPONENT class id in the header, so
     // the `(site, class id)` key cannot tell `X[]` from `X`. Resolve them
@@ -5200,22 +5235,70 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
 /// A dense bitmap indexed by `ClassId` makes the steady-state check one relaxed
 /// load plus a bit test. Ids outside the bitmap simply take the slow path, so
 /// the capacity bound is a performance choice, not a correctness one.
+///
+/// # VM scoping (2026-08-01)
+///
+/// `ClassId` is only unique *within* a VM. The bitmap used to be an unqualified
+/// process global, so VM A marking id 5000 initialized made
+/// [`jit_getstatic`]/[`jit_putstatic_object`] in VM B skip the JVMS §5.5
+/// initialization check for *its* class 5000 — a compiled `getstatic` that is
+/// the first-ever access to that class then reads the zero-initialized
+/// placeholder (`Value::Int(0)`, decoded as a null reference), which is exactly
+/// the `LineWrapper$FlushType` NPE this memo's own doc describes, resurrected
+/// by a second VM in the same process.
+///
+/// The table is therefore owned by exactly ONE VM: the first to touch it wins
+/// the `OWNER` latch, and every other VM answers `is_initialized == false` and
+/// takes the authoritative `ensure_class_initialized_shared` path forever. That
+/// is a correct-but-slower outcome for VM #2, and no shared mutable state can
+/// give a wrong answer. See `docs/known-issues/vm-jit-cache-keying.md`.
 mod class_init_memo {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     /// Covers class ids `[0, 1 << 20)` in 128 KiB, allocated on first use.
     const CAPACITY: usize = 1 << 20;
     const WORDS: usize = CAPACITY / 64;
+
+    /// `vm_identity` of the VM this table describes; `0` = unclaimed.
+    ///
+    /// `0` is a safe sentinel because `NEXT_VM_IDENTITY` (`vm/src/vm/vm_init.rs`)
+    /// is `AtomicUsize::new(1)` and only ever `fetch_add`s, so no `SharedVm`
+    /// can have identity 0.
+    static OWNER: AtomicUsize = AtomicUsize::new(0);
 
     fn bits() -> &'static [AtomicU64] {
         static BITS: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
         BITS.get_or_init(|| (0..WORDS).map(|_| AtomicU64::new(0)).collect())
     }
 
+    /// Does this table belong to `vm_identity`? Claims it if unowned.
+    /// One relaxed load in the steady state.
     #[inline]
-    pub fn is_initialized(class_id: u32) -> bool {
+    fn owned_by(vm_identity: usize) -> bool {
+        let owner = OWNER.load(Ordering::Relaxed);
+        if owner == vm_identity {
+            return true;
+        }
+        if owner != 0 {
+            return false;
+        }
+        OWNER
+            .compare_exchange(0, vm_identity, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Whether this table is currently claimed by `vm_identity` — read-only,
+    /// claims nothing.
+    #[cfg(test)]
+    #[inline]
+    pub fn owner() -> usize {
+        OWNER.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn is_initialized(vm_identity: usize, class_id: u32) -> bool {
         let idx = class_id as usize;
-        if idx >= CAPACITY {
+        if idx >= CAPACITY || !owned_by(vm_identity) {
             return false;
         }
         let w = bits()[idx / 64].load(Ordering::Relaxed);
@@ -5223,12 +5306,23 @@ mod class_init_memo {
     }
 
     #[inline]
-    pub fn mark_initialized(class_id: u32) {
+    pub fn mark_initialized(vm_identity: usize, class_id: u32) {
         let idx = class_id as usize;
-        if idx >= CAPACITY {
+        if idx >= CAPACITY || !owned_by(vm_identity) {
             return;
         }
         bits()[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Relaxed);
+    }
+
+    /// Drop the ownership claim and clear the table. Tests only — production
+    /// never un-claims (a VM's ids stay valid for its whole life, and the next
+    /// VM correctly falls through to the authoritative path).
+    #[cfg(test)]
+    pub fn reset_for_test() {
+        for w in bits() {
+            w.store(0, Ordering::Relaxed);
+        }
+        OWNER.store(0, Ordering::Relaxed);
     }
 }
 
@@ -5243,13 +5337,31 @@ mod class_init_memo {
 /// Keyed on the class id instead, the question is asked at most once per class
 /// and answered thereafter by two bit tests. Class ids are stable for the life
 /// of the VM, so the memo never needs invalidating.
+///
+/// # VM scoping (2026-08-01)
+///
+/// Same defect and same remedy as [`class_init_memo`]: `ClassId` is per-VM, and
+/// this table used to be an unqualified process global. Both directions were
+/// wrong across two VMs in one process — VM A recording "id 42 is not System"
+/// suppresses the `System.out`/`err` bootstrap intercept for VM B's *real*
+/// `java/lang/System` (so `println` silently no-ops on a null stream, the exact
+/// failure the intercept exists to prevent), and VM A recording "id 7 IS
+/// System" applies the intercept to an unrelated class's static reads in VM B.
+///
+/// The table is owned by exactly one VM via an `OWNER` latch; every other VM
+/// takes the authoritative `resolve` path (a `class_manager` read plus a name
+/// compare) on every call. Correct, and slower only for VM #2 onwards.
 mod system_class_memo {
     use crate::classloading::ClassId;
     use crate::vm::SharedVm;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     const CAPACITY: usize = 1 << 17;
     const WORDS: usize = CAPACITY / 64;
+
+    /// `vm_identity` of the VM this table describes; `0` = unclaimed. See
+    /// [`super::class_init_memo`] for why `0` cannot collide with a real VM.
+    static OWNER: AtomicUsize = AtomicUsize::new(0);
 
     fn table() -> &'static (Box<[AtomicU64]>, Box<[AtomicU64]>) {
         static T: std::sync::OnceLock<(Box<[AtomicU64]>, Box<[AtomicU64]>)> =
@@ -5260,6 +5372,27 @@ mod system_class_memo {
                 (0..WORDS).map(|_| AtomicU64::new(0)).collect(),
             )
         })
+    }
+
+    #[inline]
+    fn owned_by(vm_identity: usize) -> bool {
+        let owner = OWNER.load(Ordering::Relaxed);
+        if owner == vm_identity {
+            return true;
+        }
+        if owner != 0 {
+            return false;
+        }
+        OWNER
+            .compare_exchange(0, vm_identity, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Which VM currently owns the table (`0` = unclaimed).
+    #[cfg(test)]
+    #[inline]
+    pub fn owner() -> usize {
+        OWNER.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -5274,8 +5407,9 @@ mod system_class_memo {
 
     pub fn is_system(vm: &SharedVm, class_id: ClassId) -> bool {
         let idx = class_id.as_u32() as usize;
-        if idx >= CAPACITY {
-            // Unindexable id: fall back to the authoritative check.
+        if idx >= CAPACITY || !owned_by(vm.vm_identity) {
+            // Unindexable id, or a VM that does not own this table: fall back
+            // to the authoritative check.
             return resolve(vm, class_id);
         }
         let (resolved, is_sys) = table();
@@ -5297,34 +5431,26 @@ mod system_class_memo {
             .get_class(class_id)
             .is_some_and(|c| &*c.name == "java/lang/System")
     }
+
+    /// Drop the ownership claim and clear both bitmaps. Tests only.
+    #[cfg(test)]
+    pub fn reset_for_test() {
+        let (resolved, is_sys) = table();
+        for w in resolved.iter().chain(is_sys.iter()) {
+            w.store(0, Ordering::Relaxed);
+        }
+        OWNER.store(0, Ordering::Relaxed);
+    }
 }
 
-/// `java/lang/System`'s `ClassId`, resolved once.
-///
-/// `jit_getstatic` needs to know whether the field it is reading belongs to
-/// `java/lang/System` (the `out`/`err` bootstrap intercept). Asking that
-/// question by name meant a `class_manager` read lock plus a string compare on
-/// every static read from compiled code. The id is assigned during bootstrap
-/// and never changes, so it is cached after the first successful resolution.
-///
-/// Returns `None` until `java/lang/System` is loaded — before that there is no
-/// id that could match, so the caller's intercept correctly does not fire.
-fn system_class_id(vm: &SharedVm) -> Option<ClassId> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    /// `u32::MAX` = "not resolved yet"; any other value is the cached id.
-    static CACHED: AtomicU32 = AtomicU32::new(u32::MAX);
-    let cached = CACHED.load(Ordering::Relaxed);
-    if cached != u32::MAX {
-        return Some(ClassId::new(cached));
-    }
-    let id = vm
-        .classes
-        .class_manager
-        .read()
-        .get_loaded_class_id("java/lang/System")?;
-    CACHED.store(id.as_u32(), Ordering::Relaxed);
-    Some(id)
-}
+// `system_class_id` — a process-global `AtomicU32` holding `java/lang/System`'s
+// `ClassId`, "resolved once" — was DELETED on 2026-08-01. It had no callers
+// anywhere in the repository (`system_class_memo::is_system` superseded it),
+// and it was wrong for the same reason that memo was: the first VM in the
+// process to resolve System latched its id forever, so in a second VM the
+// `System.out`/`err` intercept would fire on whatever class happened to hold
+// that id and never on the real `java/lang/System`. Do not reintroduce it
+// without a `vm_identity` in the key.
 
 pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
     gs_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5371,7 +5497,7 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // `getstatic`'s ~35 ns. Initialization is monotonic, so the memo never
     // needs invalidating. See `class_init_memo`.
     let _gs_init = gs_prof::CycGuard::new(&gs_prof::CYC_INIT);
-    if !class_init_memo::is_initialized(class_id_raw as u32) {
+    if !class_init_memo::is_initialized(vm.vm_identity, class_id_raw as u32) {
         if let Some((thread, _guard)) = jit_thread_mut() {
             if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
                 use crate::error::MethodCallFailed;
@@ -5399,7 +5525,7 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
             // re-attempted per JVMS (the class enters the erroneous state and
             // subsequent attempts throw NoClassDefFoundError from the real
             // check, not from a stale memo).
-            class_init_memo::mark_initialized(class_id_raw as u32);
+            class_init_memo::mark_initialized(vm.vm_identity, class_id_raw as u32);
         }
     }
 
@@ -5951,7 +6077,7 @@ unsafe fn jit_typecheck_memoized(
     class_name_len: usize,
     lenient: bool,
 ) -> Option<bool> {
-    let vm_key = vm as *const SharedVm as usize;
+    let vm_key = vm.vm_identity;
     let key = (
         vm_key,
         class_name_ptr as usize,
@@ -6009,7 +6135,7 @@ fn jit_typecheck_target_cache_put(cache_key: (usize, usize, usize), target: Clas
 /// `is_subclass_of` directly: a hit can only ever replace a call that would
 /// have returned `true` with `true`.
 fn jit_is_subclass_of_cached(vm: &SharedVm, child: ClassId, parent: ClassId) -> bool {
-    let vm_key = vm as *const SharedVm as usize;
+    let vm_key = vm.vm_identity;
     let key = (vm_key, child.as_u32(), parent.as_u32());
     // JVMTI class redefinition cannot change superclass or interface identity,
     // so a positive subtype result remains valid across method-body changes.
@@ -6141,7 +6267,7 @@ unsafe fn jit_typecheck_resolve(
     // `if let` block (including the `else` branch), deadlocking any path that
     // later calls `load_class_concurrent` (which needs a write lock).
     let cache_key = (
-        vm as *const SharedVm as usize,
+        vm.vm_identity,
         class_name.as_ptr() as usize,
         class_name.len(),
     );
@@ -7076,35 +7202,44 @@ struct IntegerNativeDispatchCache {
     native_id: Option<cratonvm_native_api::NativeMethodId>,
 }
 
-// Thread-local map from JitInvokeInfo pointer -> cached JIT entry.
+// Thread-local map from [`JitSiteKey`] -> cached JIT entry.
 // Using a thread-local avoids synchronization on the hot path.
 // T10.9.B: FxHashMap — pointer values are internal; this is touched on every
 // JIT-dispatched invoke.
+//
+// The key is `(vm_identity, JitInvokeInfo pointer)`, NOT the pointer alone —
+// see [`JitSiteKey`] for why the pointer alone aliases across VMs and what a
+// cross-VM hit would execute. A thread reaches two VMs via JNI
+// `AttachCurrentThread`, or by being reused across `SharedVm`s in one test
+// process; thread-local is not per-VM.
 thread_local! {
-    static DISPATCH_CACHE: std::cell::RefCell<rustc_hash::FxHashMap<usize, DispatchCache>>
+    static DISPATCH_CACHE: std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, DispatchCache>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-    static DISPATCH_COUNTER: std::cell::RefCell<rustc_hash::FxHashMap<usize, u32>>
+    static DISPATCH_COUNTER: std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, u32>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     static OBJECT_NATIVE_DISPATCH_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<usize, NativeDispatchCache>>
+        std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, NativeDispatchCache>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     static INTEGER_NATIVE_DISPATCH_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<usize, Option<IntegerNativeDispatchCache>>>
+        std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, Option<IntegerNativeDispatchCache>>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     /// Real `java/lang/Integer` class discovered from the first ordinary
-    /// `valueOf` result in each VM. A new VM pointer invalidates the entry.
+    /// `valueOf` result in each VM, as `(vm_identity, class id)`. A different
+    /// VM identity invalidates the entry.
     static INTEGER_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
         const { std::cell::Cell::new(None) };
     /// Exact real-JDK `java/util/regex/Matcher` class id, discovered once per
-    /// VM for the virtual-MIC native fast path.
+    /// VM for the virtual-MIC native fast path. `(vm_identity, class id)`.
     static MATCHER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
         const { std::cell::Cell::new(None) };
-    // Virtual/interface call sites are keyed by their JIT metadata pointer AND
-    // the receiver's actual class id. A static CP owner is not sound here:
+    // Virtual/interface call sites are keyed by their JIT site key AND the
+    // receiver's actual class id. A static CP owner is not sound here:
     // an interface method may resolve to a receiver override.
-    static VIRTUAL_DISPATCH_CACHE: std::cell::RefCell<rustc_hash::FxHashMap<(usize, u32), DispatchCache>>
+    static VIRTUAL_DISPATCH_CACHE:
+        std::cell::RefCell<rustc_hash::FxHashMap<(JitSiteKey, u32), DispatchCache>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-    static VIRTUAL_DISPATCH_COUNTER: std::cell::RefCell<rustc_hash::FxHashMap<(usize, u32), u32>>
+    static VIRTUAL_DISPATCH_COUNTER:
+        std::cell::RefCell<rustc_hash::FxHashMap<(JitSiteKey, u32), u32>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
@@ -7595,7 +7730,10 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         return i64::MIN;
     }
 
-    let info_key = info_ptr as usize;
+    // `(vm_identity, info pointer)`. The VM half is not decoration: the direct
+    // helpers below pass the address of a process-global `static JitInvokeInfo`,
+    // which is identical in every VM. See [`JitSiteKey`].
+    let info_key = jit_site_key(vm.vm_identity, info_ptr as usize);
     // Cached exact-receiver native fast path — the FIRST per-callsite probe. The
     // resolution/insertion slow path stays further down (after the compile
     // probes); this early block only serves sites the cache has already
@@ -8472,7 +8610,7 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
     let vm = &*(vm_ptr as *const SharedVm);
     let value = value as i32;
     if !(-128..=127).contains(&value) {
-        let vm_key = vm as *const SharedVm as usize;
+        let vm_key = vm.vm_identity;
         let cached_class = INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
             cache
                 .get()
@@ -8591,7 +8729,7 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
         Some(Value::Object(Some(object))) => {
             INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
                 cache.set(Some((
-                    vm as *const SharedVm as usize,
+                    vm.vm_identity,
                     vm.mem.heap.class_id_of(object).as_u32(),
                 )))
             });
@@ -8724,7 +8862,7 @@ thread_local! {
 /// callers before the raw header read).
 unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
     let cid = std::ptr::read(receiver as usize as *const u32);
-    let vm_key = vm as *const SharedVm as usize;
+    let vm_key = vm.vm_identity;
     if HASHMAP_CLASS_CACHE.with(|c| c.get() == Some((vm_key, cid))) {
         return !class_was_redefined(vm, ClassId::new(cid));
     }
@@ -8749,7 +8887,7 @@ unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
 // receiver at the dispatch site.
 unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
     let cid = std::ptr::read(receiver as usize as *const u32);
-    let vm_key = vm as *const SharedVm as usize;
+    let vm_key = vm.vm_identity;
     if CONCURRENT_HASHMAP_CLASS_CACHE.with(|c| c.get() == Some((vm_key, cid))) {
         return !class_was_redefined(vm, ClassId::new(cid));
     }
@@ -9144,7 +9282,7 @@ fn call_integer_native_raw_inner(
     if matches!(entry.kind, IntegerNativeKind::ValueOf) {
         let value = args_slice[0] as i32;
         if !(-128..=127).contains(&value) {
-            let vm_key = vm as *const SharedVm as usize;
+            let vm_key = vm.vm_identity;
             let cached_class = INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
                 cache
                     .get()
@@ -9215,7 +9353,7 @@ fn call_integer_native_raw_inner(
         if let Some(Value::Object(Some(object))) = result {
             INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
                 cache.set(Some((
-                    vm as *const SharedVm as usize,
+                    vm.vm_identity,
                     vm.mem.heap.class_id_of(object).as_u32(),
                 )))
             });
@@ -9447,7 +9585,7 @@ fn call_stringbuilder_native_raw(
 
 #[inline]
 fn is_exact_matcher_class(vm: &SharedVm, class_id: ClassId) -> bool {
-    let vm_key = vm as *const SharedVm as usize;
+    let vm_key = vm.vm_identity;
     let raw_class_id = class_id.as_u32();
     if MATCHER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, raw_class_id))) {
         return true;
@@ -10412,8 +10550,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // `Enum.clone() → CloneNotSupportedException` for every array clone
         // of an enum type. Per JVMS §4.4.1, array classes inherit their
         // method table from `Object`; short-circuit accordingly.
-        let dispatch_target =
-            virtual_dispatch_target_cached(vm, receiver_ref, info, info_ptr as usize);
+        let dispatch_target = virtual_dispatch_target_cached(
+            vm,
+            receiver_ref,
+            info,
+            jit_site_key(vm.vm_identity, info_ptr as usize),
+        );
         let cacheable_receiver = dispatch_target.cacheable_receiver;
         let globally_named = dispatch_target.globally_named;
         // An entryless slot can be retargeted by another thread after the
@@ -10497,7 +10639,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 && cacheable_receiver
                 && globally_named
             {
-                publish_mic_rust_cached_entry(info_ptr, receiver_cid, entry_ptr, needs_ctx);
+                publish_mic_rust_cached_entry(
+                    vm.vm_identity,
+                    info_ptr,
+                    receiver_cid,
+                    entry_ptr,
+                    needs_ctx,
+                );
             }
             if callee_barred_by_table || callee_has_indy_trap {
                 mic_prof::bump(&mic_prof::PUB_BARRED);
@@ -10609,8 +10757,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // --- Cache miss: full resolution + update cache ---
     mic.record_miss();
 
-    let dispatch_target =
-        virtual_dispatch_target_cached(vm, receiver_ref, info, info_ptr as usize);
+    let dispatch_target = virtual_dispatch_target_cached(
+        vm,
+        receiver_ref,
+        info,
+        jit_site_key(vm.vm_identity, info_ptr as usize),
+    );
     let cacheable_receiver = dispatch_target.cacheable_receiver;
     let globally_named = dispatch_target.globally_named;
     let class_name = dispatch_target.class_name;
@@ -10671,7 +10823,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     let callee_has_indy_trap =
         compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor);
     if callee_barred_by_table && !callee_has_indy_trap && cacheable_receiver && globally_named {
-        publish_mic_rust_cached_entry(info_ptr, receiver_cid, entry_ptr as usize, needs_ctx);
+        publish_mic_rust_cached_entry(
+            vm.vm_identity,
+            info_ptr,
+            receiver_cid,
+            entry_ptr as usize,
+            needs_ctx,
+        );
     }
     if cacheable_receiver && !callee_barred_by_table && !callee_has_indy_trap {
         // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
@@ -11118,6 +11276,258 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Per-VM keying of the JIT dispatch memos
+    // (docs/known-issues/vm-jit-cache-keying.md)
+    // -----------------------------------------------------------------------
+
+    /// Serializes the tests that reset the two process-global, VM-owned
+    /// bitmaps (`class_init_memo`, `system_class_memo`). Nothing else in the
+    /// unit-test suite reaches them — only `jit_getstatic` does, and that
+    /// needs compiled code — but two of these tests running concurrently
+    /// would clear each other's claim.
+    static MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn memo_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        MEMO_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn jit_site_key_separates_vm_identities() {
+        let info_ptr = &INTEGER_VALUE_OF_INFO as *const JitInvokeInfo as usize;
+        assert_eq!(jit_site_key(1, info_ptr), jit_site_key(1, info_ptr));
+        assert_ne!(
+            jit_site_key(1, info_ptr),
+            jit_site_key(2, info_ptr),
+            "the same JitInvokeInfo address in two VMs must not be one key"
+        );
+        assert_ne!(jit_site_key(1, info_ptr), jit_site_key(1, info_ptr + 8));
+    }
+
+    /// The concrete premise behind [`JitSiteKey`]: the direct helpers dispatch
+    /// through the address of a `static JitInvokeInfo`, which is literally the
+    /// same `usize` in every VM in the process. Before the fix that address
+    /// WAS the whole cache key.
+    #[test]
+    fn static_invoke_infos_share_one_address_across_vms() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let a = SharedVm::new(VmConfig::default());
+        let b = SharedVm::new(VmConfig::default());
+        assert_ne!(a.vm_identity, b.vm_identity);
+
+        for ptr in [
+            &INTEGER_VALUE_OF_INFO as *const JitInvokeInfo as usize,
+            &INTEGER_INT_VALUE_INFO as *const JitInvokeInfo as usize,
+            &HASHMAP_PUT_DIRECT_INFO as *const JitInvokeInfo as usize,
+            &HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize,
+            &CONCURRENT_HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize,
+            &STRING_LATIN1_LOWER_DIRECT_INFO as *const JitInvokeInfo as usize,
+        ] {
+            assert_ne!(
+                jit_site_key(a.vm_identity, ptr),
+                jit_site_key(b.vm_identity, ptr),
+                "process-global JitInvokeInfo at 0x{ptr:x} must key differently per VM"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_cache_does_not_serve_another_vms_compiled_entry() {
+        let info_ptr = &HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize;
+        let vm_a = jit_site_key(11, info_ptr);
+        let vm_b = jit_site_key(12, info_ptr);
+
+        DISPATCH_CACHE.with(|dc| {
+            dc.borrow_mut().insert(
+                vm_a,
+                DispatchCache {
+                    entry: 0xdead_beef,
+                    needs_context: false,
+                    _owner: None,
+                },
+            );
+        });
+
+        let from_a = DISPATCH_CACHE.with(|dc| dc.borrow().get(&vm_a).map(|c| c.entry));
+        let from_b = DISPATCH_CACHE.with(|dc| dc.borrow().get(&vm_b).map(|c| c.entry));
+        DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+
+        assert_eq!(from_a, Some(0xdead_beef), "the owning VM must still hit");
+        assert_eq!(
+            from_b, None,
+            "another VM must never be handed a raw entry pointer into VM A's code cache"
+        );
+    }
+
+    #[test]
+    fn virtual_dispatch_cache_does_not_serve_another_vms_compiled_entry() {
+        let info_ptr = &CONCURRENT_HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize;
+        // The SAME receiver class id in both VMs — the collision that makes
+        // this cache miscompile-grade rather than merely stale.
+        let cid = 4242u32;
+        let key_a = (jit_site_key(21, info_ptr), cid);
+        let key_b = (jit_site_key(22, info_ptr), cid);
+
+        VIRTUAL_DISPATCH_CACHE.with(|dc| {
+            dc.borrow_mut().insert(
+                key_a,
+                DispatchCache {
+                    entry: 0x1234_5678,
+                    needs_context: true,
+                    _owner: None,
+                },
+            );
+        });
+        let from_a = VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow().get(&key_a).map(|c| c.entry));
+        let from_b = VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow().get(&key_b).map(|c| c.entry));
+        VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+
+        assert_eq!(from_a, Some(0x1234_5678));
+        assert_eq!(
+            from_b, None,
+            "identical (site, class id) in a different VM must not hit"
+        );
+    }
+
+    #[test]
+    fn virtual_target_cache_does_not_serve_another_vms_class_name() {
+        let info_ptr = &HASHMAP_PUT_DIRECT_INFO as *const JitInvokeInfo as usize;
+        let cid = 77u32;
+        let key_a = (jit_site_key(31, info_ptr), cid);
+        let key_b = (jit_site_key(32, info_ptr), cid);
+
+        VIRTUAL_TARGET_CACHE.with(|c| {
+            c.borrow_mut().insert(
+                key_a,
+                CachedDispatchTarget {
+                    class_name: std::rc::Rc::from("com/example/OnlyInVmA"),
+                    cacheable_receiver: true,
+                    globally_named: true,
+                },
+            );
+        });
+        let a_name =
+            VIRTUAL_TARGET_CACHE.with(|c| c.borrow().get(&key_a).map(|t| t.class_name.to_string()));
+        let b_hit = VIRTUAL_TARGET_CACHE.with(|c| c.borrow().get(&key_b).is_some());
+        VIRTUAL_TARGET_CACHE.with(|c| c.borrow_mut().clear());
+
+        assert_eq!(a_name.as_deref(), Some("com/example/OnlyInVmA"));
+        assert!(
+            !b_hit,
+            "a callee class name resolved in VM A must not be reused in VM B"
+        );
+    }
+
+    #[test]
+    fn integer_native_dispatch_cache_is_vm_scoped() {
+        // The value is irrelevant — `None` means "policy declined this
+        // optimization at this site", which is itself a per-VM answer (the
+        // execution policy and the native registry are both per-VM).
+        let info_ptr = &INTEGER_VALUE_OF_INFO as *const JitInvokeInfo as usize;
+        let key_a = jit_site_key(41, info_ptr);
+        let key_b = jit_site_key(42, info_ptr);
+
+        INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow_mut().insert(key_a, None));
+        let a_present = INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow().contains_key(&key_a));
+        let b_present = INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow().contains_key(&key_b));
+        INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow_mut().clear());
+
+        assert!(a_present);
+        assert!(
+            !b_present,
+            "a per-VM native admission decision must not leak to another VM"
+        );
+    }
+
+    #[test]
+    fn dispatch_counter_is_vm_scoped() {
+        let info_ptr = &HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize;
+        let key_a = jit_site_key(51, info_ptr);
+        let key_b = jit_site_key(52, info_ptr);
+        DISPATCH_COUNTER.with(|dc| {
+            let mut m = dc.borrow_mut();
+            *m.entry(key_a).or_insert(0) += 5;
+        });
+        let (a, b) = DISPATCH_COUNTER
+            .with(|dc| (dc.borrow().get(&key_a).copied(), dc.borrow().get(&key_b).copied()));
+        DISPATCH_COUNTER.with(|dc| dc.borrow_mut().clear());
+        assert_eq!(a, Some(5));
+        assert_eq!(b, None, "hotness counted in VM A must not tier up VM B");
+    }
+
+    #[test]
+    fn class_init_memo_is_not_shared_between_vms() {
+        let _g = memo_test_guard();
+        class_init_memo::reset_for_test();
+
+        let vm_a = 101usize;
+        let vm_b = 202usize;
+        let class_id = 5000u32;
+
+        assert!(!class_init_memo::is_initialized(vm_a, class_id));
+        class_init_memo::mark_initialized(vm_a, class_id);
+        assert!(
+            class_init_memo::is_initialized(vm_a, class_id),
+            "the owning VM keeps its fast path"
+        );
+        assert_eq!(class_init_memo::owner(), vm_a);
+        assert!(
+            !class_init_memo::is_initialized(vm_b, class_id),
+            "VM B must run the authoritative JVMS 5.5 init check for its own class {class_id}"
+        );
+        // VM B must not be able to poison the table either.
+        class_init_memo::mark_initialized(vm_b, 6000);
+        assert!(!class_init_memo::is_initialized(vm_b, 6000));
+        assert!(
+            !class_init_memo::is_initialized(vm_a, 6000),
+            "a non-owning VM must not publish into the owner's table"
+        );
+
+        class_init_memo::reset_for_test();
+    }
+
+    #[test]
+    fn class_init_memo_owner_latch_is_claimed_once() {
+        let _g = memo_test_guard();
+        class_init_memo::reset_for_test();
+        assert_eq!(class_init_memo::owner(), 0, "starts unclaimed");
+        assert!(!class_init_memo::is_initialized(7, 1));
+        assert_eq!(class_init_memo::owner(), 7, "first toucher claims it");
+        assert!(!class_init_memo::is_initialized(8, 1));
+        assert_eq!(class_init_memo::owner(), 7, "a later VM cannot steal it");
+        class_init_memo::reset_for_test();
+    }
+
+    #[test]
+    fn system_class_memo_is_owned_by_one_vm() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let _g = memo_test_guard();
+        system_class_memo::reset_for_test();
+
+        let a = SharedVm::new(VmConfig::default());
+        let b = SharedVm::new(VmConfig::default());
+        assert_ne!(a.vm_identity, b.vm_identity);
+
+        // Any query claims the table for the first VM to ask.
+        let _ = system_class_memo::is_system(&a, ClassId::new(9));
+        assert_eq!(system_class_memo::owner(), a.vm_identity);
+
+        // B's answers must come from the authoritative resolver, not A's bits.
+        // Whatever the answer is, asking must not transfer ownership.
+        let _ = system_class_memo::is_system(&b, ClassId::new(9));
+        assert_eq!(
+            system_class_memo::owner(),
+            a.vm_identity,
+            "a second VM must not take over the System-class bitmap"
+        );
+
+        system_class_memo::reset_for_test();
+    }
 
     #[test]
     fn native_dispatch_scratch_stays_inline_through_register_envelope() {

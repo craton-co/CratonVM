@@ -1474,6 +1474,26 @@ impl std::fmt::Display for CodeCacheLifecycleReport {
 /// share one, and the assertions this module's tests make against it are
 /// deltas and identities (which hold under interference) rather than absolute
 /// values. Tests that need absolute values build their own instance.
+///
+/// # Per-VM state audit: BENIGN — process scope is the CORRECT scope here
+///
+/// Checked by the 2026-08-01 `vm/src/jit/` cache-keying sweep
+/// (`docs/known-issues/vm-jit-cache-keying.md`) and deliberately left
+/// process-global. Two independent reasons:
+///
+///  * what it tracks is genuinely process-wide. `BodyExtent` names executable
+///    pages in one process-wide code arena, and the quiescence predicate is
+///    `conservative_roots::any_thread_in_jit()` — a process-wide striped depth.
+///    Reclaiming a page is only safe when NO thread anywhere is in compiled
+///    code, which is a property of the process, not of a VM.
+///  * the key cannot alias per-VM state. `MethodId` is
+///    `method_id(class, name, descriptor)`, a hash of the fully-qualified NAME
+///    triple — not a `ClassId`, not a loader id. Two VMs compiling
+///    `java/lang/String.hashCode()I` deliberately share a row, exactly like
+///    `runtime/frame.rs`'s content-hashed `padded_code_cache` in the round-1
+///    sweep. The worst a cross-VM "hit" does is merge two VMs' version counts
+///    in a diagnostic (`versions_of`), which is the intended process-wide
+///    census reading.
 static PROCESS_LIFECYCLE: CodeCacheLifecycle = CodeCacheLifecycle::new();
 
 /// The process-wide code-cache lifecycle.
