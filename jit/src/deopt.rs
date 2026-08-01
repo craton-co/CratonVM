@@ -2561,15 +2561,41 @@ impl FrameStateInterner {
     pub fn intern_with(&mut self, fs: &FrameState, semantics: ResumeSemantics) -> FrameStateId {
         let mut chain: Vec<&FrameState> = Vec::new();
         let mut cursor = Some(fs);
+        // Was the walk cut short with frames still above it?
+        let mut truncated = false;
         while let Some(scope) = cursor {
             chain.push(scope);
             if chain.len() >= MAX_SCOPE_CHAIN {
+                truncated = scope.caller.is_some();
                 break;
             }
             cursor = scope.caller.as_deref();
         }
 
-        let mut caller: Option<FrameStateId> = None;
+        // A cut chain must not be interned as if the last scope we kept were
+        // the bottom of the stack. That is the silent-truncation shape: every
+        // scope below the cut is well-formed, `chain_is_resumable` says clean,
+        // and the resume rebuilds a call stack the program never had — a
+        // *plausible* frame instead of the correct one, which is strictly worse
+        // than a refusal. Terminating the chain with an explicitly
+        // unreconstructable scope makes the cut visible to every consumer that
+        // already knows how to refuse one: `chain_is_resumable`,
+        // `frame_state_is_resumable` after materialization, and the
+        // `DeoptVerifier` scope lane (an out-of-range bci under a method key it
+        // has no limits for).
+        let mut caller: Option<FrameStateId> = if truncated {
+            Some(self.intern_scope(
+                "",
+                u32::MAX,
+                &[FrameValue::Unsupported],
+                &[],
+                &[],
+                None,
+                ResumeSemantics::for_caller_scope(),
+            ))
+        } else {
+            None
+        };
         for (depth, scope) in chain.iter().enumerate().rev() {
             let sem = if depth == 0 {
                 semantics
@@ -2989,6 +3015,17 @@ impl FrameStateInterner {
             let node = self.scope(handle)?;
             chain.push(node);
             if chain.len() >= MAX_SCOPE_CHAIN {
+                // Refuse, do not truncate. Returning the first
+                // `MAX_SCOPE_CHAIN` scopes with the last one's `caller` set to
+                // `None` would hand the caller a well-formed `FrameState` that
+                // describes a *different* call stack from the one that
+                // trapped, with nothing anywhere marking it short. `None`
+                // routes to the safe whole-method re-run instead; the
+                // `DeoptVerifier` turns it into
+                // `DeoptMetadataError::ScopeChainTooDeep`.
+                if node.caller.is_some() {
+                    return None;
+                }
                 break;
             }
             cursor = node.caller;
@@ -3059,6 +3096,14 @@ impl FrameStateInterner {
     /// [`Self::is_resumable`] for a scope **and** every inlined caller above
     /// it: a caller scope holding a value no one can rebuild is exactly as
     /// unresumable as the trapping scope holding one.
+    ///
+    /// Bounded by [`MAX_SCOPE_CHAIN`], and — like the owned
+    /// [`frame_state_is_resumable`] this mirrors — a chain that is still going
+    /// at the cap answers **`false`**, not `true`. Both callers are compile-time
+    /// admission gates deciding "may this artifact ever be entered", so
+    /// stopping the walk early and reporting `true` would admit an artifact on
+    /// the strength of scopes nobody looked at. Refusing costs a whole-method
+    /// re-run; admitting costs a wrong frame.
     pub fn chain_is_resumable(&self, id: FrameStateId) -> bool {
         let mut cursor = Some(id);
         let mut seen = 0;
@@ -3068,7 +3113,7 @@ impl FrameStateInterner {
             }
             seen += 1;
             if seen >= MAX_SCOPE_CHAIN {
-                break;
+                return self.caller(handle).is_none();
             }
             cursor = self.caller(handle);
         }
@@ -3346,6 +3391,62 @@ pub enum DeoptMetadataError {
     /// from one that has since been rebuilt. Its scope chain cannot be read at
     /// all, so nothing about the point is verifiable.
     UnknownFrameStateHandle { native_offset: u32, handle: u32 },
+    /// The inlined caller chain is longer than [`MAX_SCOPE_CHAIN`], so it
+    /// cannot be described in full. Reported rather than truncated: a chain
+    /// silently cut at the cap reconstructs a *plausible* stack (the frames
+    /// below the cut, with the outermost one claiming to be the bottom) instead
+    /// of the correct one.
+    ScopeChainTooDeep { native_offset: u32, cap: usize },
+    /// A frame-slot descriptor's offset does not address a word inside the
+    /// trapping frame. Every producer encodes a positive `[rbp - spill]` offset
+    /// as its negation, so a non-negative offset is either `[rbp]` (the saved
+    /// caller frame pointer) or a word in the *caller's* frame.
+    FrameSlotOutsideFrame { at: SlotRef, offset: i32 },
+    /// One frame word is described twice in the same scope with two different
+    /// JVM value categories. A machine word holds one value at one program
+    /// point, so at most one of the two descriptions can be right, and the
+    /// resume has no way to tell which.
+    SlotTypeConflict {
+        /// The second (conflicting) description.
+        at: SlotRef,
+        /// The first description of the same word.
+        first: SlotRef,
+        /// The `*(rbp + off)` offset both descriptions name.
+        offset: i32,
+        /// Category the first description claims.
+        first_kind: &'static str,
+        /// Category this description claims.
+        second_kind: &'static str,
+    },
+    /// The deopt map describes a location as a **primitive** that the oop map
+    /// for the same safepoint lists as holding a **live reference**. The two
+    /// disagree about the type of one word, so one of them is wrong: either the
+    /// resume hands the interpreter an `int` where a reference belongs, or the
+    /// collector relocates against a word that is not an object pointer.
+    PrimitiveSlotCoveredByOopMap {
+        at: SlotRef,
+        /// `"gpr"` for a register location, `"frame"` for a frame slot.
+        bank: &'static str,
+        /// The GPR number, or the positive `[rbp - off]` frame offset.
+        location: i32,
+        /// What the deopt map claims the location holds.
+        kind: &'static str,
+    },
+    /// A held monitor names an object the resume cannot lock: a value that is
+    /// not reference-shaped at all (an `int` cannot be a monitor), or an
+    /// explicit null. Either way the unwinding `monitorexit` count is wrong,
+    /// which deadlocks the next acquirer rather than failing visibly.
+    MonitorObjectNotAReference { at: SlotRef, detail: String },
+    /// The point's [`ResumeSemantics`] and its [`DeoptReason`] disagree about
+    /// whether a Java exception is pending. The two are read by *different*
+    /// consumers — `x64_deopt_entry` routes on `reason`, a resume sink reads
+    /// `semantics` — so a disagreement means one of them resumes a frame the
+    /// other one knows is exceptional.
+    ResumeSemanticsMismatch {
+        native_offset: u32,
+        reason: DeoptReason,
+        rethrow: bool,
+    },
 }
 
 impl fmt::Display for DeoptMetadataError {
@@ -3474,6 +3575,51 @@ impl fmt::Display for DeoptMetadataError {
                 f,
                 "pc+0x{native_offset:x}: frame-state handle #{handle} was not issued by this \
                  interner — the deopt point's scope chain is unreadable"
+            ),
+            Self::ScopeChainTooDeep { native_offset, cap } => write!(
+                f,
+                "pc+0x{native_offset:x}: inlined caller chain is deeper than the {cap}-scope cap — \
+                 the frames above the cut cannot be described, and a truncated chain resumes a \
+                 stack that never existed"
+            ),
+            Self::FrameSlotOutsideFrame { at, offset } => write!(
+                f,
+                "{at}: frame-slot offset {offset} does not address this frame — *(rbp{offset:+}) \
+                 is the saved frame pointer or the caller's frame, not a spill slot"
+            ),
+            Self::SlotTypeConflict {
+                at,
+                first,
+                offset,
+                first_kind,
+                second_kind,
+            } => write!(
+                f,
+                "{at}: describes *(rbp{offset:+}) as {second_kind}, but {first} already describes \
+                 the same word as {first_kind} — one machine word holds one value"
+            ),
+            Self::PrimitiveSlotCoveredByOopMap {
+                at,
+                bank,
+                location,
+                kind,
+            } => write!(
+                f,
+                "{at}: deopt map reads {bank}[{location}] as {kind}, but the oop map lists it as a \
+                 live reference — the resume and the collector disagree about the type of one word"
+            ),
+            Self::MonitorObjectNotAReference { at, detail } => {
+                write!(f, "{at}: monitor object is not lockable — {detail}")
+            }
+            Self::ResumeSemanticsMismatch {
+                native_offset,
+                reason,
+                rethrow,
+            } => write!(
+                f,
+                "pc+0x{native_offset:x}: reason {reason:?} and rethrow_exception={rethrow} \
+                 disagree about whether an exception is pending — the stash routing and the \
+                 resume sink would take opposite branches"
             ),
         }
     }
@@ -3689,13 +3835,63 @@ impl DeoptVerifier {
             });
         }
 
+        // ── exception-state agreement ────────────────────────────────
+        //
+        // `reason` and `semantics.rethrow_exception` answer the same question
+        // for two different consumers: `x64_deopt_entry` routes the frame to
+        // `LAST_EXCEPTIONAL` on `reason == PendingException`, while a resume
+        // sink that has learned to read `semantics` decides re-execute /
+        // resume / rethrow from the flag. If they disagree, one of them treats
+        // an exceptional frame as a resume point and executes past a call that
+        // never returned — which is the `finally`-not-run / leaked-`athrow`-bci
+        // defect shape, restated in metadata. Both directions are checked: a
+        // `PendingException` point that forgot the flag, and a flagged point
+        // whose reason will route it into `LAST_DEOPT`.
+        let pending = point.reason == DeoptReason::PendingException;
+        if pending != point.semantics.rethrow_exception {
+            out.push(DeoptMetadataError::ResumeSemanticsMismatch {
+                native_offset: point.native_offset,
+                reason: point.reason,
+                rethrow: point.semantics.rethrow_exception,
+            });
+        }
+
         let coverage = self.oop_coverage.get(&point.native_offset);
         let mut scope: Option<&FrameState> = Some(&point.frame_state);
         let mut depth = 0usize;
         while let Some(state) = scope {
+            // Bounded exactly like every other walk in this module
+            // (`frame_state_is_resumable`, `FrameStateInterner::materialize`):
+            // a chain this deep is a metadata defect, and checking only its
+            // first `MAX_SCOPE_CHAIN` scopes would report "clean" for a frame
+            // whose outer scopes were never looked at.
+            if depth >= MAX_SCOPE_CHAIN {
+                out.push(DeoptMetadataError::ScopeChainTooDeep {
+                    native_offset: point.native_offset,
+                    cap: MAX_SCOPE_CHAIN,
+                });
+                break;
+            }
             self.check_scope(point, state, depth, coverage, out);
             scope = state.caller.as_deref();
             depth += 1;
+        }
+    }
+
+    /// The JVM value category a machine-location descriptor claims for the word
+    /// it names, or `None` for a descriptor that names no machine word.
+    ///
+    /// Two descriptors of the *same* word must agree on this, which is what
+    /// [`DeoptMetadataError::SlotTypeConflict`] enforces. `"ref"` is also what
+    /// the oop-map agreement lanes join on.
+    fn slot_category(v: &FrameValue) -> Option<(i32, &'static str)> {
+        match v {
+            FrameValue::StackSlot(off) => Some((*off, "int")),
+            FrameValue::StackSlotRef(off) => Some((*off, "ref")),
+            FrameValue::StackSlotLong(off) => Some((*off, "long")),
+            FrameValue::StackSlotFloat(off) => Some((*off, "float")),
+            FrameValue::StackSlotDouble(off) => Some((*off, "double")),
+            _ => None,
         }
     }
 
@@ -3757,9 +3953,7 @@ impl DeoptVerifier {
         // per scope. References are validated at the end because a
         // `VirtualObjectRef` may legally precede its definition — the
         // materializer allocates all shells before wiring any field.
-        let mut defined: FxHashSet<usize> = FxHashSet::default();
-        let mut referenced: Vec<(SlotRef, usize)> = Vec::new();
-        let mut needs_oop_map = false;
+        let mut ctx = ScopeCheck::default();
 
         let base = |kind: SlotKind, index: usize| SlotRef {
             native_offset: point.native_offset,
@@ -3771,26 +3965,10 @@ impl DeoptVerifier {
         };
 
         for (i, v) in state.locals.iter().enumerate() {
-            self.check_value(
-                v,
-                &base(SlotKind::Local, i),
-                coverage,
-                &mut defined,
-                &mut referenced,
-                &mut needs_oop_map,
-                out,
-            );
+            self.check_value(v, &base(SlotKind::Local, i), coverage, &mut ctx, out);
         }
         for (i, v) in state.stack.iter().enumerate() {
-            self.check_value(
-                v,
-                &base(SlotKind::Stack, i),
-                coverage,
-                &mut defined,
-                &mut referenced,
-                &mut needs_oop_map,
-                out,
-            );
+            self.check_value(v, &base(SlotKind::Stack, i), coverage, &mut ctx, out);
         }
 
         // ── monitor lane ─────────────────────────────────────────────
@@ -3830,24 +4008,30 @@ impl DeoptVerifier {
                     ),
                 });
             }
-            self.check_value(
-                &m.object,
-                &at,
-                coverage,
-                &mut defined,
-                &mut referenced,
-                &mut needs_oop_map,
-                out,
-            );
+            // A monitor entry replays as `monitorenter` on the object it names,
+            // and the interpreter's method-exit path emits one `monitorexit`
+            // per entry. So the entry has to name something lockable. A
+            // primitive descriptor here is not a near-miss: the resume would
+            // build a `Value::Int`, the exit would try to unlock it, and the
+            // real monitor stays held — a hang in whatever thread asks for it
+            // next, arbitrarily far from the deopt that caused it. An explicit
+            // null is the same story with an NPE at the enter instead.
+            if let Some(detail) = monitor_object_defect(&m.object) {
+                out.push(DeoptMetadataError::MonitorObjectNotAReference {
+                    at: at.clone(),
+                    detail,
+                });
+            }
+            self.check_value(&m.object, &at, coverage, &mut ctx, out);
         }
 
-        for (at, id) in referenced {
-            if !defined.contains(&id) {
+        for (at, id) in std::mem::take(&mut ctx.referenced) {
+            if !ctx.defined.contains(&id) {
                 out.push(DeoptMetadataError::UndefinedVirtualObjectRef { at, id });
             }
         }
 
-        if needs_oop_map && coverage.is_none() && self.require_oop_map {
+        if ctx.needs_oop_map && coverage.is_none() && self.require_oop_map {
             out.push(DeoptMetadataError::MissingOopMap {
                 native_offset: point.native_offset,
                 bci: state.bci,
@@ -3856,21 +4040,79 @@ impl DeoptVerifier {
     }
 
     /// Check one `FrameValue`, recursing through virtual-object fields.
-    #[allow(clippy::too_many_arguments)]
     fn check_value(
         &self,
         v: &FrameValue,
         at: &SlotRef,
         coverage: Option<&OopCoverage>,
-        defined: &mut FxHashSet<usize>,
-        referenced: &mut Vec<(SlotRef, usize)>,
-        needs_oop_map: &mut bool,
+        ctx: &mut ScopeCheck,
         out: &mut Vec<DeoptMetadataError>,
     ) {
+        // ── frame-slot well-formedness, for every `StackSlot*` variant ──
+        //
+        // Two properties that hold for *all five* typed frame-slot variants
+        // and that nothing checked before, so they are done once here rather
+        // than five times in the match below.
+        if let Some((off, kind)) = Self::slot_category(v) {
+            // (1) The offset must address this frame. Every producer builds
+            // these as `-spill_off` from a strictly positive `[rbp - spill]`
+            // offset (`x64::frame_value_for_slot`, `x64::sr_field_values`,
+            // `ir_lower::typed_stack_slot`), so `off >= 0` cannot come from a
+            // correct emitter: `0` is `[rbp]`, the saved caller frame pointer
+            // — the one word `ir_lower::poison_slot` exists to keep the
+            // compiler from ever naming — and anything above it is the
+            // caller's frame or the return address. Reconstructing a local
+            // from there is a plausible-looking wrong value, which is worse
+            // than a refusal.
+            if off >= 0 {
+                out.push(DeoptMetadataError::FrameSlotOutsideFrame {
+                    at: at.clone(),
+                    offset: off,
+                });
+            }
+            // (2) One machine word, one value. Two slots may legitimately
+            // *share* a word (`aload_0` leaves local 0 and stack[0] naming the
+            // same spill), but then they agree on its type. Disagreeing is an
+            // internal contradiction that needs no external data to spot, and
+            // it is precisely how an `int` ends up reconstructed into a slot
+            // the interpreter reads as a reference.
+            // Cloned out of the map before the match so the lookup borrow ends
+            // here rather than spanning the `insert` in the `None` arm.
+            let prior = ctx.word_types.get(&off).cloned();
+            match prior {
+                Some((first, first_kind)) if first_kind != kind => {
+                    out.push(DeoptMetadataError::SlotTypeConflict {
+                        at: at.clone(),
+                        first,
+                        offset: off,
+                        first_kind,
+                        second_kind: kind,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    ctx.word_types.insert(off, (at.clone(), kind));
+                }
+            }
+        }
+
         match v {
             // ── register-file bounds ─────────────────────────────────
             FrameValue::Register(r) | FrameValue::RegisterLong(r) => {
                 self.check_gpr_index(*r, out);
+                self.check_primitive_not_in_oop_map(
+                    at,
+                    coverage,
+                    "gpr",
+                    *r as i32,
+                    if matches!(v, FrameValue::Register(_)) {
+                        "int"
+                    } else {
+                        "long"
+                    },
+                    |cov| cov.covers_register(*r),
+                    out,
+                );
             }
             FrameValue::XmmFloat(n) | FrameValue::XmmDouble(n) => {
                 if *n as usize >= 16 {
@@ -3883,7 +4125,7 @@ impl DeoptVerifier {
 
             // ── oop-map agreement ────────────────────────────────────
             FrameValue::RegisterRef(r) => {
-                *needs_oop_map = true;
+                ctx.needs_oop_map = true;
                 self.check_gpr_index(*r, out);
                 if let Some(cov) = coverage {
                     if cov.moving_young_coverage_complete && !cov.covers_register(*r) {
@@ -3895,7 +4137,7 @@ impl DeoptVerifier {
                 }
             }
             FrameValue::StackSlotRef(off) => {
-                *needs_oop_map = true;
+                ctx.needs_oop_map = true;
                 // Deopt spells the word as `*(rbp + off)` with `off < 0`; the
                 // oop map spells the same word as the positive `[rbp - off]`.
                 let positive = -*off;
@@ -3913,6 +4155,24 @@ impl DeoptVerifier {
                     }
                 }
             }
+            // The converse oop-map direction, for the four *primitive* frame
+            // slots. See `check_primitive_not_in_oop_map`.
+            FrameValue::StackSlot(off)
+            | FrameValue::StackSlotLong(off)
+            | FrameValue::StackSlotFloat(off)
+            | FrameValue::StackSlotDouble(off) => {
+                let positive = -*off;
+                let kind = Self::slot_category(v).map_or("primitive", |(_, k)| k);
+                self.check_primitive_not_in_oop_map(
+                    at,
+                    coverage,
+                    "frame",
+                    positive,
+                    kind,
+                    |cov| cov.covers_frame_slot(positive),
+                    out,
+                );
+            }
             FrameValue::Object(addr) if *addr != 0 => {
                 out.push(DeoptMetadataError::BakedObjectAddress {
                     at: at.clone(),
@@ -3922,7 +4182,7 @@ impl DeoptVerifier {
 
             // ── virtual objects ──────────────────────────────────────
             FrameValue::VirtualObject(state) => {
-                if !defined.insert(state.id) {
+                if !ctx.defined.insert(state.id) {
                     out.push(DeoptMetadataError::DuplicateVirtualObjectDefinition {
                         at: at.clone(),
                         id: state.id,
@@ -3950,18 +4210,10 @@ impl DeoptVerifier {
                 }
                 for (i, fv) in state.field_values.iter().enumerate() {
                     let field_at = at.field(state.id, i);
-                    self.check_value(
-                        fv,
-                        &field_at,
-                        coverage,
-                        defined,
-                        referenced,
-                        needs_oop_map,
-                        out,
-                    );
+                    self.check_value(fv, &field_at, coverage, ctx, out);
                 }
             }
-            FrameValue::VirtualObjectRef(id) => referenced.push((at.clone(), *id)),
+            FrameValue::VirtualObjectRef(id) => ctx.referenced.push((at.clone(), *id)),
 
             // ── eliminated vs. undefined ─────────────────────────────
             //
@@ -3985,6 +4237,118 @@ impl DeoptVerifier {
                 index: r,
             });
         }
+    }
+
+    /// The **converse** of the oop-map agreement rule: a location the deopt map
+    /// reads as a primitive must not be one the oop map lists as holding a live
+    /// reference.
+    ///
+    /// `docs/jit/deopt-metadata.md` §3 states the forward direction (a
+    /// reference the deopt map names must be one the GC updates) and then says
+    /// the converse — an oop-map slot the deopt map does not name — is *not* an
+    /// error, because the GC may legitimately track a spilled temporary the
+    /// interpreter frame does not resume from. That remains true, and this is
+    /// not that case: here the deopt map **does** name the word, and names it
+    /// as an `int`/`long`/`float`/`double`. One machine word at one safepoint
+    /// holds one value, so the two maps cannot both be right, and either
+    /// reading is unsound — the resume hands the interpreter a truncated `int`
+    /// where a live reference belongs (and drops the oop from the frame's root
+    /// set), or the collector relocates against a word that is not a pointer.
+    ///
+    /// Sound on the IR backend by construction rather than by luck: `plan_slots`
+    /// keeps disjoint `Ref` and `Prim` free lists, so "a colour is `Ref` or
+    /// `Prim` from its first assignment and never changes class"
+    /// (`jit/src/ir_lower.rs`, *Reference / primitive separation*). This lane is
+    /// the tripwire on that invariant, and a real check for any backend wired in
+    /// later whose deopt map and oop map are built from different sources — which
+    /// `jit/src/x64.rs` is (`local_oop_masks`/`stack_oop_marks` vs. the register
+    /// allocator's live sets).
+    ///
+    /// Gated on `moving_young_coverage_complete` for the same reason the forward
+    /// lane is: a map that does not claim completeness is a conservative
+    /// over-approximation the collector already refuses to move against, so a
+    /// disagreement there is not evidence of a defect.
+    #[allow(clippy::too_many_arguments)]
+    fn check_primitive_not_in_oop_map(
+        &self,
+        at: &SlotRef,
+        coverage: Option<&OopCoverage>,
+        bank: &'static str,
+        location: i32,
+        kind: &'static str,
+        covered: impl Fn(&OopCoverage) -> bool,
+        out: &mut Vec<DeoptMetadataError>,
+    ) {
+        let Some(cov) = coverage else { return };
+        if !cov.moving_young_coverage_complete {
+            return;
+        }
+        if covered(cov) {
+            out.push(DeoptMetadataError::PrimitiveSlotCoveredByOopMap {
+                at: at.clone(),
+                bank,
+                location,
+                kind,
+            });
+        }
+    }
+}
+
+/// Per-scope accumulators shared by every [`DeoptVerifier::check_value`] call
+/// for one scope.
+///
+/// Grouped into a struct rather than passed as five `&mut` parameters because
+/// the set grew past what a reader can keep straight at a call site, and every
+/// member has the same lifetime: one scope of one deopt point.
+#[derive(Default)]
+struct ScopeCheck {
+    /// Virtual-object ids *defined* (by a `VirtualObject`) in this scope.
+    defined: FxHashSet<usize>,
+    /// `VirtualObjectRef` edges, validated after the whole scope is walked (a
+    /// reference may legally precede its definition).
+    referenced: Vec<(SlotRef, usize)>,
+    /// Any reference-typed slot was seen, so this scope needs an oop map.
+    needs_oop_map: bool,
+    /// Frame word (`*(rbp + off)`) → the first descriptor that named it and the
+    /// JVM category that descriptor claimed. Drives
+    /// [`DeoptMetadataError::SlotTypeConflict`].
+    word_types: FxHashMap<i32, (SlotRef, &'static str)>,
+}
+
+/// Why `object` cannot serve as a held monitor, or `None` if it can.
+///
+/// A monitor entry is replayed as a `monitorenter` on resume and balanced by
+/// one `monitorexit` at method exit, so the recorded value has to be something
+/// the interpreter can lock. Two shapes cannot be:
+///
+/// * a **primitive** descriptor — the resume builds a `Value::Int`/`Long`/…,
+///   the exit tries to unlock it, and the real monitor is never released. The
+///   symptom is a hang in an unrelated thread, arbitrarily later.
+/// * an **explicit null** (`Object(0)`) — `monitorenter` on null throws, so no
+///   correct emitter records one; a null here means the emitter lost the
+///   object, not that the program locked nothing.
+///
+/// `Undefined`, `Unsupported` and `MaterializationRequired` are already
+/// reported by the surrounding [`DeoptMetadataError::UnbalancedMonitor`] arm,
+/// so they are deliberately not repeated here.
+fn monitor_object_defect(object: &FrameValue) -> Option<String> {
+    match object {
+        FrameValue::Object(0) => Some(
+            "the recorded object is null, and `monitorenter` on null throws rather than locking"
+                .to_string(),
+        ),
+        FrameValue::Object(_)
+        | FrameValue::StackSlotRef(_)
+        | FrameValue::RegisterRef(_)
+        | FrameValue::VirtualObject(_)
+        | FrameValue::VirtualObjectRef(_)
+        | FrameValue::Undefined
+        | FrameValue::Unsupported
+        | FrameValue::MaterializationRequired(_) => None,
+        other => Some(format!(
+            "{other:?} is a primitive descriptor, so the resume would `monitorenter` a \
+             non-reference and the matching `monitorexit` would never release the real lock"
+        )),
     }
 }
 
@@ -4012,6 +4376,18 @@ impl DeoptVerifier {
         for point in points {
             match interner.materialize_point(point) {
                 Some(p) => owned.push(p),
+                // `materialize` refuses for two different reasons and they are
+                // different findings. A handle the interner never issued means
+                // nothing about the point is readable; a chain past the cap
+                // means the point is readable but *undescribable*, and saying
+                // "unknown handle" would send a reader looking for the wrong
+                // bug. Distinguished by whether the root scope resolves.
+                None if interner.scope(point.frame_state).is_some() => {
+                    out.push(DeoptMetadataError::ScopeChainTooDeep {
+                        native_offset: point.native_offset,
+                        cap: MAX_SCOPE_CHAIN,
+                    })
+                }
                 None => out.push(DeoptMetadataError::UnknownFrameStateHandle {
                     native_offset: point.native_offset,
                     handle: point.frame_state.index(),
@@ -4038,11 +4414,10 @@ impl DeoptVerifier {
 
 /// Render a violation list as a compilation [`Bailout`].
 ///
-/// Uses [`BailoutReason::IrVerification`] with a `phase=deopt-metadata`
-/// context: the reason set in `bailout.rs` has no deopt-specific category yet
-/// (adding one is a change to a file this module does not own — see
-/// `docs/jit/deopt-metadata.md`), and `ir_verification` is the closest existing
-/// bucket, since this *is* a verifier rejecting emitted compiler output.
+/// Uses [`BailoutReason::DeoptMetadata`] (its own category in `bailout.rs`,
+/// so these are countable separately from IR-verification rejections) with the
+/// context `phase=install`, because that is the only point at which this runs:
+/// over emitted metadata, before the artifact becomes a `CompiledMethod`.
 fn deopt_metadata_bailout(errors: &[DeoptMetadataError]) -> Bailout {
     let shown = errors.len().min(MAX_REPORTED_DEOPT_VIOLATIONS);
     let mut msg = format!("{} deopt-metadata violation(s): ", errors.len());
@@ -4709,6 +5084,554 @@ mod deopt_metadata_tests {
                 index: 99,
             })
         );
+    }
+}
+
+/// The soundness lanes added by the deopt-metadata audit
+/// (`docs/jit/deopt-metadata-audit.md`). Each test fails against the verifier
+/// as it stood before that audit: every construct below passed verification.
+#[cfg(test)]
+mod deopt_metadata_soundness_tests {
+    use super::*;
+
+    const M: &str = "T.m:(I)I";
+
+    fn limits() -> MethodFrameLimits {
+        MethodFrameLimits::new(M, 32, 3, 2)
+    }
+
+    /// A point with no reference slots and no oop-map dependency, so each test
+    /// below introduces exactly one defect.
+    fn plain_point() -> DeoptimizationPoint {
+        DeoptimizationPoint {
+            native_offset: 0x40,
+            bci: 12,
+            reason: DeoptReason::BoundsCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: M.to_string(),
+                bci: 12,
+                locals: vec![FrameValue::Int(7)],
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            },
+            semantics: ResumeSemantics::REEXECUTE,
+        }
+    }
+
+    fn scoped() -> DeoptVerifier {
+        DeoptVerifier::new().with_method(limits())
+    }
+
+    fn rendered(errors: &[DeoptMetadataError]) -> String {
+        errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    // ── frame-slot addressing ────────────────────────────────────────
+
+    /// Every producer encodes a frame slot as the negation of a strictly
+    /// positive `[rbp - spill]` offset, so a non-negative offset addresses the
+    /// saved frame pointer (`0`) or the caller's frame. Reading a local from
+    /// there reconstructs a value that looks entirely plausible and is not the
+    /// program's.
+    #[test]
+    fn a_frame_slot_at_or_above_rbp_is_rejected() {
+        for bad in [
+            FrameValue::StackSlot(0),
+            FrameValue::StackSlot(16),
+            FrameValue::StackSlotLong(8),
+            FrameValue::StackSlotFloat(0),
+            FrameValue::StackSlotDouble(24),
+            FrameValue::StackSlotRef(0),
+        ] {
+            let mut p = plain_point();
+            p.frame_state.locals[0] = bad.clone();
+            let errs = scoped().violations(&[p]);
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, DeoptMetadataError::FrameSlotOutsideFrame { .. })),
+                "{bad:?} must be refused: {}",
+                rendered(&errs)
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_negative_frame_slot_is_accepted() {
+        let mut p = plain_point();
+        p.frame_state.locals[0] = FrameValue::StackSlot(-40);
+        assert!(scoped().violations(&[p]).is_empty());
+    }
+
+    /// The message names the word, not just "some slot is wrong".
+    #[test]
+    fn the_outside_frame_message_names_the_slot_and_the_offset() {
+        let mut p = plain_point();
+        p.frame_state.stack = vec![FrameValue::StackSlotRef(8)];
+        let msg = rendered(&scoped().violations(&[p]));
+        assert!(msg.contains("stack[0]"), "{msg}");
+        assert!(msg.contains("rbp+8"), "{msg}");
+    }
+
+    // ── one word, one type ───────────────────────────────────────────
+
+    /// A machine word holds one value at one program point. Describing it as a
+    /// reference in one slot and an `int` in another is an internal
+    /// contradiction, and it is exactly the shape that reconstructs an `int`
+    /// into a slot the interpreter reads as a reference.
+    #[test]
+    fn one_word_described_as_two_types_is_rejected() {
+        let mut p = plain_point();
+        p.frame_state.locals = vec![FrameValue::StackSlotRef(-40)];
+        p.frame_state.stack = vec![FrameValue::StackSlot(-40)];
+        let errs = DeoptVerifier::new().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::SlotTypeConflict {
+                    offset: -40,
+                    first_kind: "ref",
+                    second_kind: "int",
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        let msg = rendered(&errs);
+        assert!(msg.contains("local[0]"), "must name the first slot: {msg}");
+        assert!(msg.contains("stack[0]"), "must name the second slot: {msg}");
+    }
+
+    /// Sharing a word is legal — `aload_0` leaves local 0 and stack[0] naming
+    /// the same spill — as long as the two agree on its type.
+    #[test]
+    fn the_same_word_named_twice_with_the_same_type_is_fine() {
+        let mut p = plain_point();
+        p.frame_state.locals = vec![FrameValue::StackSlotRef(-40)];
+        p.frame_state.stack = vec![FrameValue::StackSlotRef(-40)];
+        assert!(DeoptVerifier::new().violations(&[p]).is_empty());
+    }
+
+    /// Cat-1 and cat-2 are different types even though both are "not a
+    /// reference": a `long` read as an `int` loses the upper 32 bits and the
+    /// second local slot.
+    #[test]
+    fn an_int_and_a_long_at_one_word_are_a_conflict() {
+        let mut p = plain_point();
+        p.frame_state.locals = vec![FrameValue::StackSlot(-40)];
+        p.frame_state.stack = vec![FrameValue::StackSlotLong(-40)];
+        let errs = DeoptVerifier::new().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::SlotTypeConflict {
+                    first_kind: "int",
+                    second_kind: "long",
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    // ── the converse oop-map direction ───────────────────────────────
+
+    /// The forward rule (a reference the deopt map names must be one the GC
+    /// updates) had a hole in the other direction: the deopt map could read a
+    /// word as an `int` that the oop map lists as a live reference. One of the
+    /// two is wrong and both readings are unsound.
+    #[test]
+    fn a_primitive_frame_slot_the_oop_map_calls_a_reference_is_rejected() {
+        let mut p = plain_point();
+        p.frame_state.locals[0] = FrameValue::StackSlot(-40);
+        let v = scoped().with_oop_map(0x40, OopCoverage::complete([40]));
+        let errs = v.violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::PrimitiveSlotCoveredByOopMap {
+                    bank: "frame",
+                    location: 40,
+                    kind: "int",
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("disagree about the type of one word"));
+    }
+
+    #[test]
+    fn a_primitive_register_the_oop_map_calls_a_reference_is_rejected() {
+        let mut p = plain_point();
+        p.frame_state.locals[0] = FrameValue::Register(3);
+        let v = scoped().with_oop_map(
+            0x40,
+            OopCoverage {
+                frame_slot_offsets: Vec::new(),
+                registers: vec![3],
+                moving_young_coverage_complete: true,
+            },
+        );
+        let errs = v.violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::PrimitiveSlotCoveredByOopMap {
+                    bank: "gpr",
+                    location: 3,
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    /// Same exemption as the forward lane: a map that does not claim
+    /// moving-young completeness is a conservative over-approximation the
+    /// collector already refuses to relocate against, so a disagreement there
+    /// is not evidence of a defect.
+    #[test]
+    fn an_incomplete_oop_map_does_not_flag_a_primitive_slot() {
+        let mut p = plain_point();
+        p.frame_state.locals[0] = FrameValue::StackSlot(-40);
+        let v = scoped().with_oop_map(
+            0x40,
+            OopCoverage {
+                frame_slot_offsets: vec![40],
+                registers: Vec::new(),
+                moving_young_coverage_complete: false,
+            },
+        );
+        assert!(v.violations(&[p]).is_empty());
+    }
+
+    /// The direction that is *not* an error, restated as a test so it stays
+    /// that way: the GC may track a spilled temporary the interpreter frame
+    /// does not resume from.
+    #[test]
+    fn an_oop_map_slot_the_deopt_map_never_names_is_not_an_error() {
+        let p = plain_point();
+        let v = scoped().with_oop_map(0x40, OopCoverage::complete([40, 48, 56]));
+        assert!(v.violations(&[p]).is_empty());
+    }
+
+    // ── monitors ─────────────────────────────────────────────────────
+
+    /// A monitor entry replays as `monitorenter` and is balanced by one
+    /// `monitorexit` at method exit. An entry naming a primitive descriptor
+    /// leaves the real lock held: a hang in an unrelated thread, arbitrarily
+    /// later, with nothing pointing back at the deopt.
+    #[test]
+    fn a_monitor_on_a_primitive_is_rejected() {
+        for bad in [
+            FrameValue::Int(5),
+            FrameValue::Long(5),
+            FrameValue::StackSlot(-40),
+            FrameValue::StackSlotLong(-40),
+            FrameValue::Register(2),
+            FrameValue::XmmDouble(1),
+        ] {
+            let mut p = plain_point();
+            p.frame_state.monitors = vec![MonitorInfo {
+                object: bad.clone(),
+                lock_depth: 1,
+            }];
+            let errs = scoped().violations(&[p]);
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    DeoptMetadataError::MonitorObjectNotAReference { .. }
+                )),
+                "monitor on {bad:?} must be refused: {}",
+                rendered(&errs)
+            );
+        }
+    }
+
+    /// `monitorenter` on null throws rather than locking, so a null monitor
+    /// object means the emitter lost the object — not that the program locked
+    /// nothing.
+    #[test]
+    fn a_monitor_on_null_is_rejected() {
+        let mut p = plain_point();
+        p.frame_state.monitors = vec![MonitorInfo {
+            object: FrameValue::Object(0),
+            lock_depth: 1,
+        }];
+        let errs = scoped().violations(&[p]);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                DeoptMetadataError::MonitorObjectNotAReference { .. }
+            )),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("null"));
+    }
+
+    /// The reference-shaped forms stay accepted, including a monitor on a
+    /// scalar-replaced object that will be materialized before the re-lock.
+    #[test]
+    fn reference_shaped_monitor_objects_are_accepted() {
+        for good in [
+            FrameValue::StackSlotRef(-40),
+            FrameValue::RegisterRef(4),
+            FrameValue::VirtualObjectRef(9),
+        ] {
+            let mut p = plain_point();
+            // A defining occurrence for the `VirtualObjectRef` case.
+            p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState {
+                id: 9,
+                class_id: 3,
+                num_fields: 0,
+                field_values: Vec::new(),
+            });
+            p.frame_state.monitors = vec![MonitorInfo {
+                object: good.clone(),
+                lock_depth: 2,
+            }];
+            let errs = scoped().violations(&[p]);
+            assert!(
+                !errs.iter().any(|e| matches!(
+                    e,
+                    DeoptMetadataError::MonitorObjectNotAReference { .. }
+                )),
+                "monitor on {good:?} must be accepted: {}",
+                rendered(&errs)
+            );
+        }
+    }
+
+    /// The monitor object goes through the same oop-map agreement lane as a
+    /// local: a lock the collector cannot see is re-acquired on a stale address
+    /// after a relocating young collection.
+    #[test]
+    fn a_monitor_object_is_checked_against_the_oop_map() {
+        let mut p = plain_point();
+        p.frame_state.monitors = vec![MonitorInfo {
+            object: FrameValue::StackSlotRef(-64),
+            lock_depth: 1,
+        }];
+        let v = scoped().with_oop_map(0x40, OopCoverage::complete([40]));
+        let errs = v.violations(&[p]);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                DeoptMetadataError::ReferenceNotInOopMap { frame_offset: 64, .. }
+            )),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("monitor[0]"));
+    }
+
+    // ── exception state ──────────────────────────────────────────────
+
+    /// `x64_deopt_entry` routes on `reason`; a resume sink reads `semantics`.
+    /// If the two disagree, one of them resumes a frame the other knows is
+    /// exceptional — the metadata restatement of "the `finally` block was not
+    /// run" and "the `athrow` bci leaked".
+    #[test]
+    fn a_pending_exception_point_without_rethrow_semantics_is_rejected() {
+        let mut p = plain_point();
+        p.reason = DeoptReason::PendingException;
+        p.semantics = ResumeSemantics::REEXECUTE;
+        let errs = scoped().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::ResumeSemanticsMismatch {
+                    reason: DeoptReason::PendingException,
+                    rethrow: false,
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    #[test]
+    fn a_rethrow_point_whose_reason_routes_it_to_the_resume_stash_is_rejected() {
+        let mut p = plain_point();
+        p.reason = DeoptReason::NullCheck;
+        p.semantics = ResumeSemantics::RETHROW;
+        let errs = scoped().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::ResumeSemanticsMismatch { rethrow: true, .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    /// What every producer stamps today (`ResumeSemantics::for_reason`) passes
+    /// for every reason, so the lane is a tripwire on a future producer rather
+    /// than a tax on the current ones.
+    #[test]
+    fn for_reason_agrees_with_the_lane_for_every_reason() {
+        for reason in [
+            DeoptReason::NullCheck,
+            DeoptReason::ClassCheck,
+            DeoptReason::BoundsCheck,
+            DeoptReason::DivByZero,
+            DeoptReason::ReceiverTypeChanged,
+            DeoptReason::ClassLoading,
+            DeoptReason::UninitializedAccess,
+            DeoptReason::TransferToInterpreter,
+            DeoptReason::UncommonTrap,
+            DeoptReason::SpeculationFailed,
+            DeoptReason::NotCompiled,
+            DeoptReason::UnreachedCode,
+            DeoptReason::OsrExit,
+            DeoptReason::PendingException,
+        ] {
+            let mut p = plain_point();
+            p.reason = reason;
+            p.semantics = ResumeSemantics::for_reason(reason);
+            let errs = scoped().violations(&[p]);
+            assert!(
+                !errs.iter().any(|e| matches!(
+                    e,
+                    DeoptMetadataError::ResumeSemanticsMismatch { .. }
+                )),
+                "{reason:?}: {}",
+                rendered(&errs)
+            );
+        }
+    }
+
+    // ── caller-chain depth ───────────────────────────────────────────
+
+    fn owned_chain(depth: usize) -> FrameState {
+        let mut fs = FrameState {
+            method_key: String::new(),
+            bci: 0,
+            locals: Vec::new(),
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        for i in 0..depth {
+            fs = FrameState {
+                method_key: String::new(),
+                bci: i as u32 + 1,
+                locals: Vec::new(),
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: Some(Box::new(fs)),
+            };
+        }
+        fs
+    }
+
+    /// The verifier used to walk a caller chain to its end with no bound and
+    /// report nothing about the fact that it was absurdly deep. Now the cap is
+    /// a finding: stopping at it and saying "clean" would report a verdict for
+    /// scopes nobody looked at.
+    #[test]
+    fn an_over_deep_owned_chain_is_reported_not_silently_accepted() {
+        let mut p = plain_point();
+        p.frame_state = owned_chain(MAX_SCOPE_CHAIN + 2);
+        p.frame_state.bci = p.bci;
+        let errs = DeoptVerifier::new().violations(&[p]);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, DeoptMetadataError::ScopeChainTooDeep { .. })),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    #[test]
+    fn a_chain_within_the_cap_is_walked_without_complaint() {
+        let mut p = plain_point();
+        p.frame_state = owned_chain(4);
+        p.frame_state.bci = p.bci;
+        assert!(DeoptVerifier::new().violations(&[p]).is_empty());
+    }
+
+    /// Interning used to cut a chain at the cap and hand back a state whose
+    /// outermost kept scope claimed to be the bottom of the stack: every scope
+    /// well-formed, `chain_is_resumable` true, and a resume that rebuilds a
+    /// call stack the program never had. The cut is now represented.
+    #[test]
+    fn interning_an_over_deep_chain_marks_the_cut_instead_of_dropping_the_outer_frames() {
+        let mut it = FrameStateInterner::new();
+        let id = it.intern(&owned_chain(MAX_SCOPE_CHAIN + 3));
+        assert!(
+            !it.chain_is_resumable(id),
+            "a chain that was cut must not read as resumable"
+        );
+        assert!(
+            it.materialize(id).is_none(),
+            "materializing a cut chain must refuse rather than return a short stack"
+        );
+    }
+
+    /// …and a chain that fits is unaffected: it round-trips whole.
+    #[test]
+    fn a_chain_within_the_cap_still_round_trips_through_interning() {
+        let mut it = FrameStateInterner::new();
+        let id = it.intern(&owned_chain(6));
+        assert!(it.chain_is_resumable(id));
+        let back = it.materialize(id).expect("a chain within the cap materializes");
+        let mut depth = 0;
+        let mut cursor = Some(&back);
+        while let Some(fs) = cursor {
+            depth += 1;
+            cursor = fs.caller.as_deref();
+        }
+        assert_eq!(depth, 7, "6 callers above the innermost scope");
+    }
+
+    /// A cut chain reaching the interned verifier is reported as what it is,
+    /// not as an unknown handle — the two send a reader looking for different
+    /// bugs.
+    #[test]
+    fn the_interned_verifier_names_an_over_deep_chain_rather_than_an_unknown_handle() {
+        let mut it = FrameStateInterner::new();
+        let mut p = plain_point();
+        p.frame_state = owned_chain(MAX_SCOPE_CHAIN + 3);
+        p.frame_state.bci = p.bci;
+        let interned = it.intern_point(&p);
+        let errs = DeoptVerifier::new().violations_interned(&it, &[interned]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::ScopeChainTooDeep { .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("truncated chain"));
+    }
+
+    /// The owned and handle-side resumability predicates must agree at the cap.
+    /// `frame_state_is_resumable` has always refused there; its handle-side
+    /// twin used to stop walking and answer `true`, which is a fail-open in a
+    /// compile-time admission gate.
+    #[test]
+    fn the_two_resumability_predicates_agree_at_the_cap() {
+        let deep = owned_chain(MAX_SCOPE_CHAIN + 1);
+        assert!(!frame_state_is_resumable(&deep));
+        let mut it = FrameStateInterner::new();
+        let id = it.intern(&deep);
+        assert_eq!(frame_state_is_resumable(&deep), it.chain_is_resumable(id));
     }
 }
 
