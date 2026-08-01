@@ -75,6 +75,18 @@ public class SealedBootstrapProbe {
     System.out.println("SEALED " + der.isSealed());
     Class<?>[] pub = der.getPermittedSubclasses();
     System.out.println("PUBLIC n=" + (pub == null ? -1 : pub.length));
+    // getNestMembers0() shares the same resolver, and had the same hole:
+    // nothing in this process has touched a nest member of these hosts.
+    for (String host : new String[] {
+        "java.lang.Character",
+        "java.lang.ProcessBuilder",
+        "java.util.concurrent.ConcurrentHashMap",
+    }) {
+      Class<?>[] m = Class.forName(host).getNestMembers();
+      int nulls = 0;
+      for (Class<?> x : m) if (x == null) nulls++;
+      System.out.println("NEST " + host + " n=" + m.length + " nulls=" + nulls);
+    }
     System.out.println("OK");
   }
 }
@@ -243,4 +255,42 @@ fn bootstrap_sealed_class_resolves_every_permitted_subclass() {
          isDirectSubType filter with all 8 entries (a null slot silently collapses it to \
          `[]`).\nstdout:\n{stdout}"
     );
+
+    // `getNestMembers0()` shares `resolve_nestmate_via_defining_loader`, so it
+    // carried the identical passive-lookup hole — and reported it more loudly.
+    // Measured pre-fix / post-fix / real HotSpot 25.0.3:
+    //   java.lang.Character                       1 / 5  / 5
+    //   java.lang.ProcessBuilder                  1 / 12 / 12
+    //   java.util.concurrent.ConcurrentHashMap   16 / 54 / 54
+    // Assert a floor rather than the exact count so a JDK that adds a nested
+    // class still passes; the floors are far above the pre-fix values.
+    for (host, floor) in [
+        ("java.lang.Character", 5usize),
+        ("java.lang.ProcessBuilder", 12),
+        ("java.util.concurrent.ConcurrentHashMap", 54),
+    ] {
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with(&format!("NEST {host} ")))
+            .unwrap_or_else(|| {
+                panic!("[sealed_bootstrap] no NEST line for {host}.\nstdout:\n{stdout}")
+            });
+        let n: usize = line
+            .split(" n=")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("[sealed_bootstrap] unparseable NEST line: {line}"));
+        assert!(
+            line.contains("nulls=0"),
+            "[sealed_bootstrap] getNestMembers() returned a null element for {host}: {line}"
+        );
+        assert!(
+            n >= floor,
+            "[sealed_bootstrap] {host} reported only {n} nest members (real HotSpot 25.0.3: \
+             {floor}). The bootstrap-loaded nest host is back on the passive \
+             `class_id_by_name` lookup and can only see members something else already \
+             loaded. Line: {line}"
+        );
+    }
 }

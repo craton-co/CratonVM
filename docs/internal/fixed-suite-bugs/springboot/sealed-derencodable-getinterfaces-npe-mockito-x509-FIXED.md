@@ -229,5 +229,20 @@ this bug had been masking (`asCertificate` calls
   site as `NO-THROW <-- WRONG`, which is expected.
 - The `getPermittedSubclasses` and `getNestMembers` natives share
   `resolve_nestmate_via_defining_loader`, so the bootstrap-loader fix applies
-  to nest members too — `Class.getNestMembers()` on a JDK-owned nest host had
-  the same passive-lookup hole.
+  to nest members too. `Class.getNestMembers()` on a JDK-owned nest host had
+  the same passive-lookup hole, and it was worse there — measured with
+  `probes/NestMembersBootstrapProbe.java`, in a process that has not touched
+  any nest member:
+
+  | Nest host | Pre-fix | Post-fix | Real HotSpot 25.0.3 |
+  |---|---:|---:|---:|
+  | `java.lang.Character` | 1 | **5** | 5 |
+  | `java.lang.ProcessBuilder` | 1 | **12** | 12 |
+  | `java.util.concurrent.ConcurrentHashMap` | 16 | **54** | 54 |
+  | `java.util.Map` | 2 | 2 | 2 |
+  | `java.security.KeyPair` | 1 | 1 | 1 |
+
+  Post-fix matches HotSpot on all five. `getNestMembers()` backs
+  `Lookup.defineHiddenClass` nestmate checks and private-member access
+  reflection, so this was a silent correctness gap of its own, not just a
+  cosmetic count.
