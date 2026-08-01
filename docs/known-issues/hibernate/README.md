@@ -47,11 +47,11 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
     at ~41 min. A manifestation of the already-open
     [moving-young-inert-under-JIT](moving-young-inert-under-jit-throughput-tax-20260730.md)
     gap, as a *correctness* failure rather than only a throughput tax.
-  - `--nojit` — [SIGSEGV from old-gen header corruption](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md)
-    at 35–43 min. (That doc's original `map_resize_inner` attribution is
-    RETRACTED; two of its three tangled defects are now fixed and the crash has
-    moved twice.) Note this **inverts** the 2026-07-22 advice to force `--nojit`
-    for this class: `--nojit` is now the worse mode. A second corrupt writer in
+  - `--nojit` — [the collector leaves reference fields UN-FORWARDED](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md).
+    The SIGSEGV is **fixed** (the class now completes, `rc=0` @ 5110 s, where it
+    crashed at 2103–2611 s), but it still does not match HotSpot: `found=99` vs
+    `132`, with JUnit `TestPlan` losing identifiers. That doc's original
+    `map_resize_inner` attribution is RETRACTED. A second corrupt writer in
     the same runs (`HIB-WEAKREF-RECYCLE.1`, post-GC weak/phantom referent
     restore) was root-caused and **fixed** on the same branch.
 

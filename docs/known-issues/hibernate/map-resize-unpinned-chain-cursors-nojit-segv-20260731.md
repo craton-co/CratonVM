@@ -1,8 +1,8 @@
-# Old-generation header corruption kills `DefaultCatalogAndSchemaTest` under `--nojit`
+# The collector leaves reference fields UN-FORWARDED — `DefaultCatalogAndSchemaTest` silently loses a third of its tests
 
 | | |
 |---|---|
-| **Status** | 🟠 **NARROWED, still OPEN.** Three of four tangled defects are fixed and the crash has moved twice; the class still SIGSEGVs. The residual is now **identified**: the collector leaves old-to-young reference fields UN-FORWARDED (see defect 3). |
+| **Status** | 🟠 **SIGSEGV FIXED, correctness residual OPEN.** The class now runs to completion (`rc=0`, 5110 s) instead of crashing at 2103–2611 s. It still does **not** match HotSpot: `found=99` vs `132`. The collector still leaves reference fields UN-FORWARDED (defect 3), which is the live defect. |
 | **ID** | `HIB-MAPRESIZE-STALE.1` |
 | **Found** | 2026-07-31, validating the `DefaultCatalogAndSchemaTest` runner accommodation ([`../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md)). |
 | **Repro** | [`probes/hib-mapresize-repro-20260731.sh`](../../../probes/hib-mapresize-repro-20260731.sh) — `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`, `--nojit`, `--Xmx 1500m`, real JDK, `-Dcraton.batch=1`. |
@@ -22,11 +22,36 @@ Same command, same host, same fixture.
 | A baseline | dev tip `32f9db9a2` | SIGSEGV rc=139 @ **2103 s** | `0x166AC79`, read past the exe image | 2 |
 | B collections fix | A + `fix/hib-mapresize-put-stale-20260731` | SIGSEGV rc=139 @ **2312 s** | `0x16707D9`, same site | 22 |
 | C merged | B + `origin/dev` (incl. `22107d512`) | SIGSEGV rc=139 @ **2611 s** | `0x2B55C3`, reading a **heap** address | 48 |
+| **F** | C + `origin/dev` (incl. **`c3dbb011a`**) | **rc=0 @ 5110 s**, `found=99 started=97 ok=97 failed=0` | — | 0 |
 
 A and B die in the same place for the same reason (defect 2). C survives that,
 logs 48 corrupt headers, re-syncs, runs five minutes longer, and then dies
-somewhere else entirely — dereferencing a heap address, not a module one. The
-corruption (defect 3) is the residual.
+somewhere else entirely — dereferencing a heap address, not a module one.
+
+**F does not crash at all.** `c3dbb011a`'s mark-worklist validation is what stops
+it: the symbolized frame (below) is `scan_object_for_old_refs` on an unvalidated
+worklist address, which is exactly what that commit screens.
+
+But F is **not** a pass. HotSpot gets `found=132 started=132 ok=132`; F gets
+`found=99 started=97 ok=97`. Thirty-three tests are never discovered, preceded in
+the log by
+
+```
+org.junit.platform.commons.PreconditionViolationException: No TestIdentifier with
+unique ID [[engine:junit-jupiter]/[class-template:…DefaultCatalogAndSchemaTest]]
+has been added to this TestPlan.
+```
+
+— JUnit's `TestPlan` losing identifiers out of its own map. Six dropped writes
+still precede it (log line 6356 vs 7269), at `index=5`/`index=4`/`index=1` on
+`num_slots=0` receivers — `LinkedHashMap$Node`'s `after`/`before`/`key` slots.
+And the deep verifier still reports **≥40 UN-FORWARDED fields per major GC** on F
+(the report caps at 40), against `pointer_map size=3295701`, with the same
+referrer shapes as on C.
+
+So `c3dbb011a` removed the crash, not the corruption. Defect 3 is unchanged and
+is now a **silent wrong answer** — a third of the class's tests quietly vanish —
+which is the worse failure mode of the two.
 
 ## The original diagnosis was wrong, which is why the first fix changed nothing
 
@@ -203,9 +228,13 @@ bogus extent, and walk into unmapped memory — and a bogus mark is equally a go
 explanation for the UN-FORWARDED edges above, since the compaction's notion of
 what is live and where it moved comes from that same mark.
 
-**This attribution is by symbolized frame plus matching commit, not by
-measurement yet.** `c3dbb011a` is merged into this branch; the confirming run is
-the repro on a binary built from that merge.
+**Measured since:** arm F (built from the merge that includes `c3dbb011a`) no
+longer crashes — `rc=0`, 5110 s. So the validation does fix the *fault*. It does
+**not** fix the un-forwarded edges: the same `CRATONVM_DBG_HEAP_STALE=1` run on F
+still reports the report-cap of 40 stale fields in a major collection, with the
+same referrer shapes. Whatever leaves those fields un-rewritten is still there;
+`c3dbb011a` stopped the mark from *walking into unmapped memory* on a bogus
+address, which is a different thing from making the mark complete.
 
 ### The class-loading lead (separate, and fixed)
 
