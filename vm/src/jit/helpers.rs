@@ -146,6 +146,20 @@ pub mod mic_prof {
     pub static DISP_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static CYC_DISP_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+    /// Why an entryless MIC hit failed to leave a callable entry behind.
+    /// `hit_entry == 0` while `hit_noentry` climbs means the slot never learns
+    /// a target, so every call re-pays the compile probe. These three separate
+    /// the candidate causes instead of leaving them to inference:
+    ///   * `probe_none`  — `try_jit_compile_callee` handed back nothing;
+    ///   * `barred`      — an exception-table / indy-trap callee, deliberately
+    ///                     kept on the helper path;
+    ///   * `published`   — `mic.update` was actually called with an entry, so a
+    ///                     still-zero `hit_entry` means the entry was
+    ///                     downgraded inside `jit_entry_publishable`.
+    pub static PUB_PROBE_NONE: AtomicU64 = AtomicU64::new(0);
+    pub static PUB_BARRED: AtomicU64 = AtomicU64::new(0);
+    pub static PUB_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some())
@@ -215,7 +229,8 @@ pub mod mic_prof {
         eprintln!(
             "[MIC_PROF] quiesce_depth={} mic_calls={} hit_entry={} hit_noentry={} miss={} lambda={} \
              cyc_mic_total={} cyc_hit_entry_call={} cyc_invoke={} cyc_compile_probe={} \
-             disp_calls={} cyc_disp_total={}",
+             disp_calls={} cyc_disp_total={} \
+             pub_probe_none={} pub_barred={} pub_published={} ic_refusals={} ic_unowned_pub={}",
             cratonvm_gc::gc_quiescence::depth(),
             g(&MIC_CALLS),
             g(&MIC_HIT_ENTRY),
@@ -228,6 +243,11 @@ pub mod mic_prof {
             g(&CYC_COMPILE_PROBE),
             g(&DISP_CALLS),
             g(&CYC_DISP_TOTAL),
+            g(&PUB_PROBE_NONE),
+            g(&PUB_BARRED),
+            g(&PUB_PUBLISHED),
+            cratonvm_jit::unowned_ic_entry_refusals(),
+            cratonvm_jit::unowned_ic_entry_publishes(),
         );
     }
 }
@@ -5167,6 +5187,78 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // class_id_raw and field_index were resolved at JIT compile time and refer to a valid static field.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// Lock-free "this class is already initialized" memo for the JIT static-field
+/// helpers.
+///
+/// `ensure_class_initialized_shared` already has an atomic fast path, but
+/// reaching that atomic still costs a `class_manager.read()` acquisition — per
+/// `getstatic`, in compiled code. Class initialization is **monotonic** (JVMS
+/// §5.5: a class that has completed initialization never returns to an
+/// uninitialized state, and redefinition does not re-run `<clinit>`), so once
+/// the answer is "initialized" it can be memoized forever without invalidation.
+///
+/// A dense bitmap indexed by `ClassId` makes the steady-state check one relaxed
+/// load plus a bit test. Ids outside the bitmap simply take the slow path, so
+/// the capacity bound is a performance choice, not a correctness one.
+mod class_init_memo {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Covers class ids `[0, 1 << 20)` in 128 KiB, allocated on first use.
+    const CAPACITY: usize = 1 << 20;
+    const WORDS: usize = CAPACITY / 64;
+
+    fn bits() -> &'static [AtomicU64] {
+        static BITS: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+        BITS.get_or_init(|| (0..WORDS).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    #[inline]
+    pub fn is_initialized(class_id: u32) -> bool {
+        let idx = class_id as usize;
+        if idx >= CAPACITY {
+            return false;
+        }
+        let w = bits()[idx / 64].load(Ordering::Relaxed);
+        w & (1u64 << (idx % 64)) != 0
+    }
+
+    #[inline]
+    pub fn mark_initialized(class_id: u32) {
+        let idx = class_id as usize;
+        if idx >= CAPACITY {
+            return;
+        }
+        bits()[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Relaxed);
+    }
+}
+
+/// `java/lang/System`'s `ClassId`, resolved once.
+///
+/// `jit_getstatic` needs to know whether the field it is reading belongs to
+/// `java/lang/System` (the `out`/`err` bootstrap intercept). Asking that
+/// question by name meant a `class_manager` read lock plus a string compare on
+/// every static read from compiled code. The id is assigned during bootstrap
+/// and never changes, so it is cached after the first successful resolution.
+///
+/// Returns `None` until `java/lang/System` is loaded — before that there is no
+/// id that could match, so the caller's intercept correctly does not fire.
+fn system_class_id(vm: &SharedVm) -> Option<ClassId> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    /// `u32::MAX` = "not resolved yet"; any other value is the cached id.
+    static CACHED: AtomicU32 = AtomicU32::new(u32::MAX);
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != u32::MAX {
+        return Some(ClassId::new(cached));
+    }
+    let id = vm
+        .classes
+        .class_manager
+        .read()
+        .get_loaded_class_id("java/lang/System")?;
+    CACHED.store(id.as_u32(), Ordering::Relaxed);
+    Some(id)
+}
+
 pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -5199,28 +5291,42 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // caller's `emit_post_invoke_exception_check` (added alongside this
     // fix in `jit/src/x64.rs`'s `0xb2` getstatic codegen) routes it through
     // the method's exception table instead of pushing a bogus value.
-    if let Some((thread, _guard)) = jit_thread_mut() {
-        if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
-            use crate::error::MethodCallFailed;
-            match err {
-                MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(exc);
-                }
-                MethodCallFailed::InternalError(vm_err) => {
-                    let msg = format!(
-                        "JIT getstatic class_id {class_id_raw} field_index {field_index} failed to initialize: {vm_err}"
-                    );
-                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
-                        vm,
-                        thread,
-                        "java/lang/InternalError",
-                        Some(&msg),
-                    ) {
+    //
+    // Steady state costs one relaxed load and a bit test, no lock at all:
+    // `ensure_class_initialized_shared`'s own fast path still needs a
+    // `class_manager.read()` to reach the per-class atomic, and paying that on
+    // every static read from compiled code was a measurable part of
+    // `getstatic`'s ~35 ns. Initialization is monotonic, so the memo never
+    // needs invalidating. See `class_init_memo`.
+    if !class_init_memo::is_initialized(class_id_raw as u32) {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
+                use crate::error::MethodCallFailed;
+                match err {
+                    MethodCallFailed::ExceptionThrown(exc) => {
                         set_jit_pending_exception(exc);
                     }
+                    MethodCallFailed::InternalError(vm_err) => {
+                        let msg = format!(
+                            "JIT getstatic class_id {class_id_raw} field_index {field_index} failed to initialize: {vm_err}"
+                        );
+                        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                            vm,
+                            thread,
+                            "java/lang/InternalError",
+                            Some(&msg),
+                        ) {
+                            set_jit_pending_exception(exc);
+                        }
+                    }
                 }
+                return i64::MIN;
             }
-            return i64::MIN;
+            // Only memoize a CONFIRMED success. A failed `<clinit>` must be
+            // re-attempted per JVMS (the class enters the erroneous state and
+            // subsequent attempts throw NoClassDefFoundError from the real
+            // check, not from a stale memo).
+            class_init_memo::mark_initialized(class_id_raw as u32);
         }
     }
 
@@ -5229,20 +5335,31 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // pre-built synthetic streams for these three fields. The JIT must do the same,
     // or jit_getstatic falls through to get_static_shared → Object(None) → null
     // receiver → println silently no-ops (arg0=0x0 in jit_invoke_dispatch).
-    let field_name = vm
-        .classes
-        .class_manager
-        .read()
-        .get_class(class_id)
-        .and_then(|c| {
-            if &*c.name == "java/lang/System" {
+    // The intercept concerns exactly ONE class, but the probe for it used to
+    // run on EVERY `getstatic`: a `class_manager.read()` acquisition, a
+    // `get_class`, and a string compare of the class name — per static field
+    // read, in compiled code. Measured on `probes/StaticFieldProbe.java`, a
+    // `getstatic` cost ~35 ns against HotSpot's ~1, and this was part of it.
+    //
+    // Resolve `java/lang/System`'s ClassId once and compare integers instead.
+    // Every other class now answers with a relaxed atomic load and an `==`,
+    // touching no lock at all. `java/lang/System` is loaded during bootstrap
+    // and its id is stable for the life of the VM, so a one-shot cache is
+    // sound; until it resolves we fall back to the id-less answer (`None`),
+    // which is what a not-yet-loaded System would have produced anyway.
+    let field_name = if system_class_id(vm) == Some(class_id) {
+        vm.classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .and_then(|c| {
                 c.fields
                     .get(field_index as usize)
                     .map(|f| f.name.to_string())
-            } else {
-                None
-            }
-        });
+            })
+    } else {
+        None
+    };
     if let Some(ref fname) = field_name {
         if fname == "out" || fname == "err" {
             // Honor System.setOut/setErr: if the static field was explicitly set
@@ -10195,6 +10312,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // Keep handler-bearing methods on the helper path. A raw compiled
         // entry can leave a pending exceptional frame that the caller cannot
         // safely resume while the HTTP request is still active.
+        if compile_res.is_none() {
+            mic_prof::bump(&mic_prof::PUB_PROBE_NONE);
+        }
         if let Some((_callee_pin, entry_ptr, needs_ctx)) = compile_res {
             // `_callee_pin` holds the callee artifact across the publications
             // below: `update`/`install` take their own keep-alive by resolving
@@ -10216,7 +10336,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             {
                 publish_mic_rust_cached_entry(info_ptr, receiver_cid, entry_ptr, needs_ctx);
             }
+            if callee_barred_by_table || callee_has_indy_trap {
+                mic_prof::bump(&mic_prof::PUB_BARRED);
+            }
             if !callee_barred_by_table && !callee_has_indy_trap {
+                mic_prof::bump(&mic_prof::PUB_PUBLISHED);
                 // Publish through `update`, never with a raw store: `update` is
                 // the only writer that also resolves and RETAINS the callee's
                 // `Arc<CompiledMethod>` in the slot's `compiled_owner`.
