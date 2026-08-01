@@ -6166,9 +6166,18 @@ impl G1Collector {
         // than per pause: this is the point at which the set is smallest and
         // final, and it costs one lock per region on a path that just walked
         // every region anyway.
+        //
+        // G1AUD-5: one entry is now `(source_index, generation)`, so the
+        // per-entry cost is `usize + u64`, not `usize`. Keeping the gauge in
+        // step with the representation matters more than the absolute number:
+        // `rset_bytes_per_live_byte` is the measurement that says whether the
+        // remembered set needs a real bound (audit §9 item 5), and a gauge that
+        // silently under-reports by a third would answer that question wrong.
+        const RSET_ENTRY_BYTES: usize =
+            std::mem::size_of::<usize>() + std::mem::size_of::<u64>();
         let rset_sources_total: usize = regions.iter().map(|r| r.rset.source_count()).sum();
         crate::gc_metrics::record_remembered_set_bytes(
-            (rset_sources_total * std::mem::size_of::<usize>()) as u64,
+            (rset_sources_total * RSET_ENTRY_BYTES) as u64,
         );
         let pinned_regions = regions.iter().filter(|r| r.pinned).count();
 
@@ -7006,32 +7015,6 @@ impl G1Collector {
         marking
     }
 
-    /// Post-write barrier: track cross-region references in remembered sets.
-    ///
-    /// Round-9 gc CRIT-8 — hot path: a per-thread cache of the
-    /// last-touched destination region pointer avoids re-acquiring the
-    /// heap-wide `regions` mutex on every reference store. Same-region
-    /// successive stores (the dominant pattern: tight loops populating
-    /// one array, append-to-list, etc.) hit the cache and take only the
-    /// per-RSet inner mutex.
-    ///
-    /// SAFETY invariant: the `Vec<G1Region>` backing `self.regions` is
-    /// created once in `G1Collector::new` with all `region_count`
-    /// entries and is **never resized** thereafter (`grep -n
-    /// 'regions.\\(push\\|resize\\|extend\\)' gc/src/g1.rs` returns no
-    /// matches). Therefore `&regions[i]` is address-stable for the
-    /// entire `G1Collector` lifetime, and a raw `*const G1Region`
-    /// captured under one lock acquisition remains valid for later
-    /// dereference even after the lock is released, as long as the
-    /// collector itself is still alive. The cached pointer is keyed by
-    /// both region index AND collector identity so a stale cache from a
-    /// previous collector instance never resurrects a dangling pointer.
-    /// Identity is the minted [`Self::instance_id`], NOT the collector's
-    /// address: `self as *const Self` ABAs when a later collector is
-    /// constructed at a dropped one's address (stack-slot or allocator
-    /// block reuse) with a matching epoch history, which let this fast
-    /// path write through a pointer into the dropped collector's freed
-    /// regions storage (intermittent 0xC0000374 under parallel gc tests).
     /// G1AUD-5 (defect G1-8) — the current remembered-set *generation*.
     ///
     /// This is [`Self::rset_cache_epoch`], reused as a monotone reclassification
@@ -7078,10 +7061,7 @@ impl G1Collector {
     /// no longer exists, resurrecting its referents). `Free` sources are left
     /// to `scan_source_region_for_cset_refs`'s own early return, which already
     /// handles them.
-    fn live_rset_sources(
-        regions: &[G1Region],
-        cset: &[usize],
-    ) -> std::collections::HashSet<usize> {
+    fn live_rset_sources(regions: &[G1Region], cset: &[usize]) -> std::collections::HashSet<usize> {
         let mut set = std::collections::HashSet::new();
         for &cset_idx in cset {
             // `sources_with_generations()` snapshots under the per-rset mutex
@@ -7095,6 +7075,32 @@ impl G1Collector {
         set
     }
 
+    /// Post-write barrier: track cross-region references in remembered sets.
+    ///
+    /// Round-9 gc CRIT-8 — hot path: a per-thread cache of the
+    /// last-touched destination region pointer avoids re-acquiring the
+    /// heap-wide `regions` mutex on every reference store. Same-region
+    /// successive stores (the dominant pattern: tight loops populating
+    /// one array, append-to-list, etc.) hit the cache and take only the
+    /// per-RSet inner mutex.
+    ///
+    /// SAFETY invariant: the `Vec<G1Region>` backing `self.regions` is
+    /// created once in `G1Collector::new` with all `region_count`
+    /// entries and is **never resized** thereafter (`grep -n
+    /// 'regions.\\(push\\|resize\\|extend\\)' gc/src/g1.rs` returns no
+    /// matches). Therefore `&regions[i]` is address-stable for the
+    /// entire `G1Collector` lifetime, and a raw `*const G1Region`
+    /// captured under one lock acquisition remains valid for later
+    /// dereference even after the lock is released, as long as the
+    /// collector itself is still alive. The cached pointer is keyed by
+    /// both region index AND collector identity so a stale cache from a
+    /// previous collector instance never resurrects a dangling pointer.
+    /// Identity is the minted [`Self::instance_id`], NOT the collector's
+    /// address: `self as *const Self` ABAs when a later collector is
+    /// constructed at a dropped one's address (stack-slot or allocator
+    /// block reuse) with a matching epoch history, which let this fast
+    /// path write through a pointer into the dropped collector's freed
+    /// regions storage (intermittent 0xC0000374 under parallel gc tests).
     pub fn post_write_barrier_rset(&self, src_obj: ObjectRef, stored_ref: ObjectRef) {
         let src_addr = src_obj.as_ptr() as usize;
         let dst_addr = stored_ref.as_ptr() as usize;
@@ -13802,6 +13808,263 @@ mod tests {
         assert!(
             !gc.regions.lock()[target].rset.sources().contains(&source),
             "an entry naming a Free source must be pruned, not carried forever"
+        );
+    }
+
+    /// G1AUD-5 (defect G1-8) — the "undead" entry.
+    ///
+    /// The Free-source prune above only catches a source that is STILL Free when
+    /// cleanup runs. The expensive case is the other one: a source that was
+    /// recycled and then immediately re-typed (a young pause frees a region, the
+    /// next allocation claims it as Eden). Such an entry is not Free, so it
+    /// survived every prune and every later pause re-walked that region
+    /// *wholesale* on behalf of an object zero-filled cycles ago — resurrecting
+    /// its referents. Entries now carry the generation they were recorded in and
+    /// regions the generation they were recycled in, which makes the stale ones
+    /// nameable on both the scan side and in cleanup.
+    #[test]
+    fn a_recycled_and_retyped_remembered_set_source_is_dropped_not_rewalked() {
+        let gc = make_collector();
+        let target = 1usize;
+        let source = 2usize;
+
+        let recorded_in = gc.rset_generation();
+        gc.with_regions_mut(|rs| {
+            rs[target].region_type = RegionType::Survivor;
+            rs[source].region_type = RegionType::Old;
+            rs[target]
+                .rset
+                .add_reference_in_generation(source, recorded_in);
+        });
+
+        // A pause recycles the source and the allocator immediately re-types it.
+        // Every recycle phase bumps the generation before it touches a region,
+        // so the reset stamp is strictly newer than the edge's.
+        gc.rset_cache_epoch.fetch_add(1, Ordering::Release);
+        let recycled_in = gc.rset_generation();
+        assert!(recycled_in > recorded_in);
+        gc.with_regions_mut(|rs| {
+            rs[source].reset(recycled_in);
+            // Re-typed, NOT left Free — that is exactly the case the old
+            // Free-only prune could not see. `Eden` also keeps cleanup's
+            // in-place free (Old-only) out of the picture, so the assertion
+            // below can only be satisfied by the generation prune.
+            rs[source].region_type = RegionType::Eden;
+        });
+
+        // The entry still exists, and the OLD Free-only test would keep it...
+        assert!(
+            gc.regions.lock()[target].rset.sources().contains(&source),
+            "precondition: the entry is still recorded and the source is not Free"
+        );
+        // ...but the scan side no longer offers it as a source to walk.
+        {
+            let regions = gc.regions.lock();
+            assert!(
+                G1Collector::rset_entry_is_stale(&regions, source, recorded_in),
+                "an edge recorded before the source was recycled is dead"
+            );
+            assert!(
+                !G1Collector::live_rset_sources(&regions, &[target]).contains(&source),
+                "a recycled-then-retyped source must NOT be walked wholesale again"
+            );
+        }
+
+        // And cleanup drops the entry outright, so it stops costing memory and
+        // a per-pause lookup.
+        gc.start_concurrent_mark();
+        gc.cleanup();
+        assert!(
+            !gc.regions.lock()[target].rset.sources().contains(&source),
+            "cleanup must prune an entry whose source was recycled, not only \
+             one whose source happens to still be Free"
+        );
+    }
+
+    /// The other half of G1AUD-5, and the one that would be a use-after-free if
+    /// it broke: an edge recorded AFTER the recycle names a live holder and must
+    /// survive both the scan-side filter and cleanup's prune. An entry with no
+    /// generation available at record time (`RSET_GENERATION_PINNED`) must also
+    /// survive — that is the fail-safe direction.
+    #[test]
+    fn a_remembered_set_edge_recorded_after_the_recycle_is_never_pruned() {
+        let gc = make_collector();
+        let target = 1usize;
+        let fresh = 2usize;
+        let unstamped = 3usize;
+
+        gc.rset_cache_epoch.fetch_add(1, Ordering::Release);
+        let recycled_in = gc.rset_generation();
+        gc.with_regions_mut(|rs| {
+            rs[target].region_type = RegionType::Survivor;
+            // `Eden`, not `Old`: cleanup frees a zero-live OLD region in place,
+            // which would turn these into Free sources and prune them for the
+            // wrong reason.
+            rs[fresh].reset(recycled_in);
+            rs[fresh].region_type = RegionType::Eden;
+            rs[unstamped].reset(recycled_in);
+            rs[unstamped].region_type = RegionType::Eden;
+        });
+
+        // Same generation as the reset: the Phase-4 rebuild records edges
+        // BEFORE Phase 5's frees, so `stale` is a strict `<` and this is kept.
+        gc.with_regions_mut(|rs| {
+            rs[target]
+                .rset
+                .add_reference_in_generation(fresh, recycled_in);
+            // No generation to hand — the deprecated/prototype entry point.
+            rs[target].rset.add_reference(unstamped);
+        });
+        assert_eq!(
+            gc.regions.lock()[target].rset.recorded_generation(unstamped),
+            Some(crate::region::RSET_GENERATION_PINNED),
+            "the generation-less entry point must record the never-prune stamp"
+        );
+
+        {
+            let regions = gc.regions.lock();
+            let live = G1Collector::live_rset_sources(&regions, &[target]);
+            assert!(live.contains(&fresh), "a same-generation edge is live");
+            assert!(
+                live.contains(&unstamped),
+                "an unstamped edge must be walked, never dropped — dropping a \
+                 live cross-region edge is a use-after-free"
+            );
+        }
+
+        gc.start_concurrent_mark();
+        gc.cleanup();
+        let sources = gc.regions.lock()[target].rset.sources();
+        assert!(sources.contains(&fresh));
+        assert!(sources.contains(&unstamped));
+    }
+
+    /// G1AUD-1, parallel half — the promotion stamp must be on BOTH evacuators.
+    ///
+    /// The JIT's inline reference-store fast paths read `GC_FLAG_OLD_GEN` to
+    /// decide "young receiver, no post barrier needed". If the parallel
+    /// evacuator ever stops stamping it, every promoted object reads as young
+    /// there, the remembered-set post barrier is skipped for JIT-compiled stores
+    /// into it, and the next young pause frees a still-live referent. The serial
+    /// twin is `promotion_stamps_the_old_generation_bit_the_jit_barrier_reads`.
+    #[test]
+    fn promotion_stamps_the_old_generation_bit_on_the_parallel_evacuator_too() {
+        let mut cfg = parallel_config(2, 8);
+        cfg.promotion_age = 1;
+        let gc = G1Collector::new(cfg);
+
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        assert_eq!(
+            gc.get_header(obj).gc_flags & GC_FLAG_OLD_GEN,
+            0,
+            "a freshly allocated Eden object is young"
+        );
+
+        let mut roots = vec![obj];
+        gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert_eq!(
+            gc.get_header(roots[0]).gc_flags & GC_FLAG_OLD_GEN,
+            0,
+            "a Survivor copy is still young and MUST NOT be stamped"
+        );
+
+        gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        let promoted = gc
+            .lookup_region_for_addr(roots[0].as_ptr() as usize)
+            .expect("promoted object is in a region");
+        assert_eq!(
+            gc.regions.lock()[promoted].region_type,
+            RegionType::Old,
+            "the object should have been promoted by the second parallel pass"
+        );
+        assert_ne!(
+            gc.get_header(roots[0]).gc_flags & GC_FLAG_OLD_GEN,
+            0,
+            "a promoted object MUST carry GC_FLAG_OLD_GEN on the parallel path \
+             too — the JIT reads the header, not the region table"
+        );
+    }
+
+    /// G1AUD-6 (defect G1-9) — the parallel evacuator must walk JIT-pinned
+    /// regions wholesale as remembered-set sources, exactly as the serial path
+    /// has since the original CSet-straddle UAF fix.
+    ///
+    /// A JIT-pinned region is excluded from the CSet, so it is never traced as a
+    /// from-space object; it is reached ONLY as a source. `jit_pinned_region_set`
+    /// is not gated on `gc_quiescence::is_active()` — it also contains every
+    /// region holding a published un-retired TLAB tail — so this set is
+    /// routinely non-empty with no thread in JIT at all, which is the
+    /// configuration G1-9's live-object corruption reproduces under.
+    ///
+    /// The test removes the remembered-set entry the barrier recorded, leaving
+    /// the wholesale walk as the only coverage. That is the store class the
+    /// serial path's defence exists for (a JIT-compiled store the collector
+    /// cannot assume went through `post_write_barrier_rset`). Before the fix the
+    /// parallel path lost Q here: not evacuated, not rewritten, and its region
+    /// zero-filled by Phase 5.
+    #[test]
+    fn a_jit_pinned_region_is_a_wholesale_rset_source_on_the_parallel_path_too() {
+        let gc = G1Collector::new(parallel_config(2, 8));
+        let p = gc.alloc_object(ClassId::new(1), 1);
+        let p_region = gc.lookup_region_for_addr(p.as_ptr() as usize).unwrap();
+        // Retire the current Eden so Q lands in a DIFFERENT region without
+        // filling P's region to the brim — this test publishes a reserved tail
+        // at the top of P's region and needs it to sit above the cursor, which
+        // the "allocate until the region rolls over" idiom used elsewhere would
+        // make impossible.
+        gc.current_eden.store(usize::MAX, Ordering::Relaxed);
+        let q = gc.alloc_object(ClassId::new(2), 1);
+        let q_region = gc.lookup_region_for_addr(q.as_ptr() as usize).unwrap();
+        assert_ne!(p_region, q_region, "Q must be cross-region from P");
+        gc.set_field(q, 0, Value::Int(1717));
+        gc.set_field(p, 0, Value::Object(Some(q)));
+
+        // Erase the barrier's record so the ONLY remaining coverage for Q is the
+        // wholesale walk of the pinned source.
+        gc.regions.lock()[q_region].rset.clear();
+        assert!(gc.regions.lock()[q_region].rset.sources().is_empty());
+
+        // Publish an un-retired TLAB tail in P's region. This is what puts the
+        // region into `jit_pinned_region_set()` with no thread in JIT. The span
+        // sits above the region's allocation cursor so no walk ever reaches it.
+        let (skip_start, skip_end) = {
+            let regions = gc.regions.lock();
+            let r = &regions[p_region];
+            let base = r.data.addr();
+            let len = r.data.len();
+            assert!(r.cursor + 64 < len, "the tail must sit above the cursor");
+            (base + len - 64, base + len)
+        };
+        gc.set_jit_tlab_skip_regions(&[(skip_start, skip_end)]);
+        assert!(
+            gc.jit_pinned_region_set().contains(&p_region),
+            "a published reserved tail must pin its region, JIT active or not"
+        );
+
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        gc.clear_jit_tlab_skip_regions();
+
+        let q_new = result
+            .pointer_map
+            .get(&(q.as_ptr() as usize))
+            .copied()
+            .expect(
+                "Q is reachable only from a JIT-pinned region with no rset entry; \
+                 the parallel path must walk that region wholesale as a source, \
+                 like the serial path does",
+            );
+        let q_new_ref = unsafe { ObjectRef::from_raw(q_new as *mut u8) };
+        assert_eq!(
+            gc.get_field(p, 0),
+            Value::Object(Some(q_new_ref)),
+            "the pinned holder's slot must be rewritten to Q's new location"
+        );
+        assert_eq!(gc.get_field(q_new_ref, 0).as_int(), Some(1717));
+        assert_eq!(
+            gc.regions.lock()[p_region].region_type,
+            RegionType::Eden,
+            "the pinned region itself must stay out of the CSet"
         );
     }
 

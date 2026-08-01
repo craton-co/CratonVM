@@ -165,7 +165,7 @@ pub enum Op {
     /// recorded depth, blocks, and reacquires it at that same depth. Every one
     /// of those three facts is destroyed by eliding the monitor, so an object
     /// with a live `MonitorWait` is refused both lock transforms outright — see
-    /// [`find_lock_elision_plans`].
+    /// `find_lock_elision_plans`.
     ///
     /// NOTE: no producer yet. `ir_op_to_ea_op` maps the underlying
     /// `invokevirtual` to [`Op::Call`], which arg-escapes the receiver and
@@ -188,7 +188,7 @@ pub enum Op {
     /// Present so lock **coarsening** can ask "does a deopt land between these
     /// two regions?". A deopt in a coarsened gap would reconstruct an
     /// interpreter frame whose monitor set says the object is *unlocked* while
-    /// the compiled frame holds it — see [`find_lock_coarsening_plans`].
+    /// the compiled frame holds it — see `find_lock_coarsening_plans`.
     ///
     /// NOTE: no producer yet. `ir::Graph` carries safepoints in a side table
     /// (`ir_graph.safepoints`), not as nodes, and `escape_analysis_from_ir`
@@ -793,7 +793,8 @@ pub struct EscapeAnalysisResult {
     pub partial_escapes: Vec<PartialEscapeInfo>,
     /// `(allocation, observing node)` pairs for every **live** observation of an
     /// object's identity: `Op::RefCompare`, `Op::IdentityHash`,
-    /// `Op::MonitorEnter`, `Op::MonitorExit`. Sorted and deduplicated.
+    /// `Op::MonitorEnter`, `Op::MonitorExit`, `Op::MonitorWait`,
+    /// `Op::MonitorNotify`. Sorted and deduplicated.
     ///
     /// Every allocation named here is excluded from
     /// [`Self::scalar_replaceable`], whatever its escape state. Removing the
@@ -1628,7 +1629,7 @@ fn resolve_field_load(
 // (a) LOCK ELISION — delete every monitor operation on a confined object
 // ════════════════════════════════════════════════════════════════════════
 //
-// Preconditions, all of which must hold ([`find_lock_elision_plans`]):
+// Preconditions, all of which must hold (`find_lock_elision_plans`):
 //
 //   E1. Every live monitor-family node in the WHOLE graph is attributable —
 //       `monitor_object` resolves its operand to exactly one allocation
@@ -1679,7 +1680,7 @@ fn resolve_field_load(
 // It deletes exactly two nodes — the inner `monitorexit`/`monitorenter` pair —
 // and moves the gap `B` inside the critical section.
 //
-// Preconditions ([`find_lock_coarsening_plans`]):
+// Preconditions (`find_lock_coarsening_plans`):
 //
 //   C1. E1 (attributability) and E2 (confined) and E3 (no wait/notify).
 //   C2. [`program_order_proves_dominance`] — without it "adjacent" and
@@ -1687,7 +1688,7 @@ fn resolve_field_load(
 //   C3. The object's monitor sequence is balanced and properly nested, and the
 //       two regions are both OUTERMOST (`depth == 0`).
 //   C4. Every node strictly between `first.exit` and `second.enter` is on the
-//       gap allowlist ([`gap_node_refusal`]): pure arithmetic, constants,
+//       gap allowlist (`gap_node_refusal`): pure arithmetic, constants,
 //       single-input φ copies, and field accesses on confined allocations of
 //       this graph. Nothing else.
 //
@@ -1769,7 +1770,7 @@ pub struct LockRegion {
 /// intentional and measurable rather than incidental.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LockRefusal {
-    /// A live monitor-family node's operand is [`OperandOrigin::Unknown`] — it
+    /// A live monitor-family node's operand is `OperandOrigin::Unknown` — it
     /// neither provably names one allocation of this graph nor provably names
     /// something outside it.
     ///
@@ -1871,6 +1872,41 @@ fn is_monitor_family(op: &Op) -> bool {
     )
 }
 
+/// True when `op` provably produces no reference value at all, so a φ input of
+/// this shape cannot carry an object.
+///
+/// The complement — `New`, `NewArray`, `Phi`, `Load`, `Param`, `Call` and
+/// **`Other`** — is what `ref_operand_origin` has to account for. `Op::Other`
+/// is deliberately on the *may be a reference* side even though
+/// [`is_ref_producer`] excludes it: that heuristic is allowed to be optimistic
+/// because its consumers only ever *add* escape, whereas here an unexamined φ
+/// input is the difference between eliding this object's monitor and eliding a
+/// monitor some other thread contends on.
+fn produces_no_reference(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Start
+            | Op::Return
+            | Op::If
+            | Op::Merge
+            | Op::Const(_)
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Store(_)
+            | Op::MonitorEnter
+            | Op::MonitorExit
+            | Op::MonitorWait
+            | Op::MonitorNotify
+            | Op::Safepoint
+            | Op::Throw
+            | Op::ArrayLength
+            | Op::RefCompare
+            | Op::IdentityHash
+            | Op::Dead
+    )
+}
+
 /// What a reference operand provably names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperandOrigin {
@@ -1892,7 +1928,7 @@ enum OperandOrigin {
 /// "Provably" is deliberately narrow: the walk follows [`Op::Phi`] copies and
 /// stops at an allocation or a parameter. A `Call` result, a field `Load`, an
 /// `Op::Other` or a φ mixing the two leaf kinds all answer
-/// [`OperandOrigin::Unknown`].
+/// `OperandOrigin::Unknown`.
 ///
 /// # Why not `ConnectionGraph::resolve_points_to`
 ///
@@ -1934,13 +1970,22 @@ fn ref_operand_origin(graph: &Graph, operand: NodeId) -> OperandOrigin {
             Op::Phi => {
                 let mut any_ref = false;
                 for &inp in &node.inputs {
-                    if is_ref_producer(graph, inp) {
-                        any_ref = true;
-                        work.push(inp);
+                    let inp_op = match graph.nodes.get(inp) {
+                        Some(x) => &x.op,
+                        None => return OperandOrigin::Unknown,
+                    };
+                    // Only a *provably* value-less input may be skipped — the
+                    // Merge control edge, a primitive. Everything else is
+                    // walked, and the walk answers `Unknown` for anything it
+                    // cannot name.
+                    if produces_no_reference(inp_op) {
+                        continue;
                     }
+                    any_ref = true;
+                    work.push(inp);
                 }
-                // A φ with no reference-producing input cannot be a reference
-                // at all; treat the operand as unnameable rather than assume.
+                // A φ with no reference input cannot be a reference at all;
+                // treat the operand as unnameable rather than assume.
                 if !any_ref {
                     return OperandOrigin::Unknown;
                 }
@@ -1993,7 +2038,7 @@ fn live_monitor_nodes(graph: &Graph) -> Vec<NodeId> {
         .collect()
 }
 
-/// The monitor nodes whose object is [`OperandOrigin::Unknown`].
+/// The monitor nodes whose object is `OperandOrigin::Unknown`.
 ///
 /// Non-empty means **no** lock transform may be applied anywhere in the
 /// method; see [`LockRefusal::AmbiguousMonitorOperand`]. A monitor on a
@@ -2016,8 +2061,8 @@ fn unattributable_monitors(graph: &Graph) -> Vec<NodeId> {
 /// True when a live `Object.wait`/`notify`/`notifyAll` names `object`.
 ///
 /// Exact rather than conservative, because it is only ever called after the
-/// [`unattributable_monitors`] guard has already rejected the graph if any
-/// monitor-family operand was [`OperandOrigin::Unknown`]. What is left is
+/// `unattributable_monitors` guard has already rejected the graph if any
+/// monitor-family operand was `OperandOrigin::Unknown`. What is left is
 /// provably this allocation or provably foreign.
 fn waits_or_notifies_on(graph: &Graph, object: NodeId) -> bool {
     graph.nodes.iter().enumerate().any(|(id, n)| {
@@ -2210,7 +2255,7 @@ fn find_lock_elision_plans(
     (plans, refusals)
 }
 
-/// Backwards-compatible flat view of [`find_lock_elision_plans`]: every monitor
+/// Backwards-compatible flat view of `find_lock_elision_plans`: every monitor
 /// node of every complete plan, ascending.
 ///
 /// Kept because it is the shape [`EscapeAnalysisResult::elide_locks`] has and
@@ -2234,11 +2279,15 @@ pub fn find_lock_elisions(cg: &ConnectionGraph, graph: &Graph) -> Vec<NodeId> {
 ///
 /// A plan names only its own two victims and is correct whether or not any
 /// elision was applied — which is the answer to the partial-application
-/// hazard: coarsening depends on no elision landing. Chained plans (three
-/// adjacent regions ⇒ two plans) are individually balance-preserving, so
-/// applying any subset in any order is safe. [`apply_lock_coarsening`]
-/// re-verifies the four nodes before mutating, so a plan whose monitors an
-/// elision already removed becomes a no-op rather than a double kill.
+/// hazard: coarsening depends on no elision landing.
+///
+/// [`apply_lock_coarsening`] re-verifies its four nodes before mutating, so
+/// applying any subset of the offered plans, in any order, leaves a balanced
+/// monitor structure. Chained plans (three adjacent regions ⇒ two plans) share
+/// a region, so the second one applied is *refused* rather than compounded;
+/// re-running the analysis on the mutated graph offers the now-adjacent pair,
+/// the same iterate-to-fixpoint story `find_identity_observations` documents
+/// for synchronized objects.
 fn find_lock_coarsening_plans(
     cg: &ConnectionGraph,
     graph: &Graph,
@@ -2730,7 +2779,7 @@ fn kill_node(graph: &mut Graph, id: NodeId) {
 /// Confinement. This function sees no [`ConnectionGraph`], so it validates the
 /// monitor *structure* and trusts the caller for the escape state. Its caller
 /// of record is [`apply_lock_elision_plan`], whose plans come from
-/// [`find_lock_elision_plans`] and are confined by construction.
+/// `find_lock_elision_plans` and are confined by construction.
 pub fn apply_lock_elision(graph: &mut Graph, lock_nodes: &[NodeId]) -> bool {
     let mut requested: Vec<NodeId> = lock_nodes
         .iter()
@@ -4914,5 +4963,806 @@ mod tests {
             s.no_escape + s.partial_escape + s.arg_escape + s.global_escape,
             s.total_allocations
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Lock elimination and coarsening
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // Every "MUST NOT" below is paired with the "MUST" that proves the refusal
+    // is a refusal and not an inability.
+
+    /// A fresh confined object with `num_fields` fields.
+    fn alloc(g: &mut Graph, class_id: u32, num_fields: usize) -> NodeId {
+        g.add_node(
+            Op::New {
+                class_id,
+                num_fields,
+            },
+            vec![],
+        )
+    }
+
+    /// The monitor nodes of `object`, ascending — what the graph *still* holds
+    /// after a transform, independent of any plan.
+    fn live_monitors_of(g: &Graph, object: NodeId) -> Vec<NodeId> {
+        (0..g.nodes.len())
+            .filter(|&id| matches!(g.nodes[id].op, Op::MonitorEnter | Op::MonitorExit))
+            .filter(|&id| monitor_object(g, id) == Some(object))
+            .collect()
+    }
+
+    // ── (a) Lock elision ──────────────────────────────────────────────
+
+    /// MUST: a confined object's monitor is elided, and it is offered as ONE
+    /// all-or-nothing plan naming every monitor on the object.
+    #[test]
+    fn confined_object_lock_is_elided_as_one_complete_plan() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let c = g.add_node(Op::Const(1), vec![]);
+        let enter = g.add_node(Op::MonitorEnter, vec![o]);
+        let _st = g.add_node(Op::Store(0), vec![o, c]);
+        let exit = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.escape_states.get(&o), Some(&EscapeState::NoEscape));
+        assert_eq!(r.lock_elisions.len(), 1);
+        assert_eq!(r.lock_elisions[0].object, o);
+        assert_eq!(
+            r.lock_elisions[0].monitors,
+            vec![enter, exit],
+            "the plan names EVERY monitor on the object — that is what makes \
+             it all-or-nothing"
+        );
+        assert_eq!(r.elide_locks, vec![enter, exit]);
+        assert_eq!(r.stats.locks_elided, 2);
+        assert_eq!(r.stats.lock_objects_elided, 1);
+        assert!(r.lock_refusals.is_empty());
+    }
+
+    /// MUST NOT: `wait()` requires the monitor to actually be held. Eliding it
+    /// turns a legal wait into `IllegalMonitorStateException`, and there is no
+    /// depth left to release to or reacquire at.
+    ///
+    /// Paired MUST: the identical graph without the `wait` elides.
+    #[test]
+    fn object_with_wait_is_never_elided() {
+        let build = |with_wait: bool| {
+            let mut g = Graph::new();
+            let o = alloc(&mut g, 1, 0);
+            let _enter = g.add_node(Op::MonitorEnter, vec![o]);
+            if with_wait {
+                g.add_node(Op::MonitorWait, vec![o]);
+            }
+            let _exit = g.add_node(Op::MonitorExit, vec![o]);
+            (g, o)
+        };
+
+        let (g, o) = build(true);
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.escape_states.get(&o),
+            Some(&EscapeState::NoEscape),
+            "waiting on a local object does not publish it — this is not an \
+             escape question"
+        );
+        assert!(r.elide_locks.is_empty(), "MUST NOT elide a waited-on monitor");
+        assert!(r.lock_elisions.is_empty());
+        assert!(r.lock_coarsening.is_empty());
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::WaitOrNotify)));
+
+        let (g, o) = build(false);
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.lock_elisions.len(),
+            1,
+            "MUST elide once nothing waits on the monitor"
+        );
+        assert_eq!(r.lock_elisions[0].object, o);
+    }
+
+    /// `notify`/`notifyAll` are the same rule: they too throw when the monitor
+    /// is not held, and a thread they could wake is a thread that reached the
+    /// object.
+    #[test]
+    fn object_with_notify_is_never_elided() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _enter = g.add_node(Op::MonitorEnter, vec![o]);
+        let _notify = g.add_node(Op::MonitorNotify, vec![o]);
+        let _exit = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(r.elide_locks.is_empty());
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::WaitOrNotify)));
+    }
+
+    /// A `wait` on a **caller-supplied** reference cannot be a wait on an
+    /// object this frame allocated and never published, so it must not block
+    /// that object's elision. The `Foreign` half of `OperandOrigin` is what
+    /// keeps `synchronized (local) {} … this.wait();` optimisable.
+    #[test]
+    fn a_wait_on_a_foreign_reference_does_not_block_a_local_object() {
+        let mut g = Graph::new();
+        let this = g.add_node(Op::Param(0), vec![]);
+        let o = alloc(&mut g, 1, 0);
+        let enter = g.add_node(Op::MonitorEnter, vec![o]);
+        let exit = g.add_node(Op::MonitorExit, vec![o]);
+        let _wait = g.add_node(Op::MonitorWait, vec![this]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.elide_locks, vec![enter, exit]);
+        assert!(!r
+            .lock_refusals
+            .iter()
+            .any(|&(_, why)| why == LockRefusal::WaitOrNotify));
+    }
+
+    /// MUST NOT: a monitor whose operand may be either a local allocation or a
+    /// caller-supplied reference is attributable to neither, and it poisons
+    /// **every** lock plan in the method — including the unrelated object's,
+    /// whose monitors would otherwise be elided.
+    ///
+    /// A singleton points-to set would have said "this is `a`" and elided a
+    /// lock that, on the parameter path, guards an object other threads share.
+    ///
+    /// Paired MUST: replace the parameter input with the allocation itself and
+    /// both objects elide.
+    #[test]
+    fn an_unattributable_monitor_operand_poisons_every_lock_plan() {
+        let build = |mix_in_param: bool| {
+            let mut g = Graph::new();
+            let p = g.add_node(Op::Param(0), vec![]);
+            let a = alloc(&mut g, 1, 0);
+            let b = alloc(&mut g, 2, 0);
+            let other = if mix_in_param { p } else { a };
+            let phi = g.add_node(Op::Phi, vec![a, other]);
+            let amb = g.add_node(Op::MonitorEnter, vec![phi]);
+            let _ambx = g.add_node(Op::MonitorExit, vec![phi]);
+            let _be = g.add_node(Op::MonitorEnter, vec![b]);
+            let _bx = g.add_node(Op::MonitorExit, vec![b]);
+            (g, a, b, amb)
+        };
+
+        let (g, _a, b, amb) = build(true);
+        let r = analyze_escapes(&g);
+        assert!(
+            r.elide_locks.is_empty(),
+            "MUST NOT elide anything while one monitor is unattributable — \
+             including object {b}'s own, perfectly confined, lock"
+        );
+        assert!(r.lock_coarsening.is_empty());
+        assert!(r
+            .lock_refusals
+            .contains(&(amb, LockRefusal::AmbiguousMonitorOperand)));
+
+        let (g, a, b, _) = build(false);
+        let r = analyze_escapes(&g);
+        let objects: Vec<NodeId> = r.lock_elisions.iter().map(|p| p.object).collect();
+        assert!(
+            objects.contains(&a) && objects.contains(&b),
+            "MUST elide both once every operand names exactly one allocation"
+        );
+    }
+
+    /// MUST NOT: an escaping object's monitor is real. Another thread can
+    /// contend on it, so both transforms are refused.
+    #[test]
+    fn escaping_object_lock_is_neither_elided_nor_coarsened() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        g.nodes[1].inputs.push(o); // Return
+        g.nodes[o].uses.push(1);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _c = g.add_node(Op::Const(0), vec![]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.escape_states.get(&o), Some(&EscapeState::GlobalEscape));
+        assert!(r.elide_locks.is_empty());
+        assert!(
+            r.lock_coarsening.is_empty(),
+            "MUST NOT coarsen an escaping object: extending its critical \
+             section can block a thread that wanted the monitor in the gap"
+        );
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::ObjectEscapes)));
+    }
+
+    // ── Recursive locking ─────────────────────────────────────────────
+
+    /// A reentrant `synchronized (o) { synchronized (o) { … } }` round-trips:
+    /// the regions pair at the right depths, the elision offer names all four
+    /// monitors, and applying it leaves an object with no monitors at all.
+    #[test]
+    fn recursive_locking_round_trips() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let regions = lock_regions(&g, o).expect("a balanced nest pairs up");
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            regions[0],
+            LockRegion {
+                enter: e1,
+                exit: x2,
+                depth: 0
+            },
+            "the OUTER region is e1..x2"
+        );
+        assert_eq!(
+            regions[1],
+            LockRegion {
+                enter: e2,
+                exit: x1,
+                depth: 1
+            },
+            "the INNER region is e2..x1 — pairing by nesting, not by order"
+        );
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.lock_elisions.len(), 1);
+        assert_eq!(r.lock_elisions[0].monitors, vec![e1, e2, x1, x2]);
+
+        let plan = r.lock_elisions[0].clone();
+        assert!(apply_lock_elision_plan(&mut g, &plan));
+        assert!(
+            live_monitors_of(&g, o).is_empty(),
+            "the whole nest goes, so the depth is 0 before and after"
+        );
+        assert!(lock_regions(&g, o).expect("still balanced").is_empty());
+    }
+
+    /// Removing the INNER pair of a reentrant nest is legal (one level of
+    /// reentry disappears, the outer region is untouched). Removing `e2` and
+    /// `x2` — which are not a pair — is not: it would silently narrow the outer
+    /// region. Both requests are "balanced" by a naive depth count; only the
+    /// region-pairing check tells them apart.
+    #[test]
+    fn partial_elision_is_accepted_only_when_whole_regions_go() {
+        let build = || {
+            let mut g = Graph::new();
+            let o = alloc(&mut g, 1, 0);
+            let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+            let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+            let x1 = g.add_node(Op::MonitorExit, vec![o]);
+            let x2 = g.add_node(Op::MonitorExit, vec![o]);
+            (g, o, e1, e2, x1, x2)
+        };
+
+        let (mut g, o, e1, e2, x1, x2) = build();
+        assert!(
+            apply_lock_elision(&mut g, &[e2, x1]),
+            "MUST: the inner region is a whole region"
+        );
+        assert_eq!(live_monitors_of(&g, o), vec![e1, x2]);
+
+        let (mut g, o, e1, e2, x1, x2) = build();
+        assert!(
+            !apply_lock_elision(&mut g, &[e2, x2]),
+            "MUST NOT: e2 pairs with x1, not x2"
+        );
+        assert_eq!(
+            live_monitors_of(&g, o),
+            vec![e1, e2, x1, x2],
+            "a refused request leaves the graph completely untouched"
+        );
+    }
+
+    /// THE PARTIAL-APPLICATION GUARD. `apply_ea_to_ir` filters `elide_locks`
+    /// node by node and can hand back a strict subset; a lone `monitorexit`
+    /// throws `IllegalMonitorStateException` and a lone `monitorenter` leaks the
+    /// monitor. The applier refuses rather than obeys.
+    #[test]
+    fn a_half_applied_elision_request_is_refused_whole() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let enter = g.add_node(Op::MonitorEnter, vec![o]);
+        let exit = g.add_node(Op::MonitorExit, vec![o]);
+
+        assert!(
+            !apply_lock_elision(&mut g, &[enter]),
+            "MUST NOT drop the enter and keep the exit"
+        );
+        assert!(!apply_lock_elision(&mut g, &[exit]));
+        assert_eq!(g.nodes[enter].op, Op::MonitorEnter);
+        assert_eq!(g.nodes[exit].op, Op::MonitorExit);
+
+        assert!(
+            apply_lock_elision(&mut g, &[enter, exit]),
+            "MUST apply the complete pair"
+        );
+        assert_eq!(g.nodes[enter].op, Op::Dead);
+        assert_eq!(g.nodes[exit].op, Op::Dead);
+    }
+
+    /// An unbalanced monitor sequence is not a sequence this analysis
+    /// understands, and `lock_regions` says so rather than guessing.
+    #[test]
+    fn an_unbalanced_monitor_sequence_is_refused() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _e = g.add_node(Op::MonitorEnter, vec![o]);
+        assert_eq!(lock_regions(&g, o), Err(LockRefusal::UnbalancedMonitors));
+
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _x = g.add_node(Op::MonitorExit, vec![o]);
+        assert_eq!(lock_regions(&g, o), Err(LockRefusal::UnbalancedMonitors));
+    }
+
+    // ── (b) Lock coarsening ───────────────────────────────────────────
+
+    /// MUST: two adjacent regions on a confined object, separated by pure
+    /// arithmetic, merge — and applying the plan leaves exactly one balanced
+    /// region.
+    #[test]
+    fn two_adjacent_regions_on_a_confined_object_are_coarsened() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _s1 = g.add_node(Op::Store(0), vec![o, c1]);
+        let x1 = g.add_node(Op::MonitorExit, vec![o]);
+        // The gap: pure, total, no safepoint, no throw.
+        let c2 = g.add_node(Op::Const(2), vec![]);
+        let sum = g.add_node(Op::Add, vec![c1, c2]);
+        let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _s2 = g.add_node(Op::Store(0), vec![o, sum]);
+        let x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.lock_coarsening.len(), 1);
+        assert_eq!(r.stats.locks_coarsened, 1);
+        let plan = r.lock_coarsening[0];
+        assert_eq!(plan.object, o);
+        assert_eq!(plan.surviving_enter(), e1);
+        assert_eq!(plan.removed_exit(), x1);
+        assert_eq!(plan.removed_enter(), e2);
+        assert_eq!(plan.surviving_exit(), x2);
+
+        assert!(apply_lock_coarsening(&mut g, &plan));
+        assert_eq!(g.nodes[x1].op, Op::Dead);
+        assert_eq!(g.nodes[e2].op, Op::Dead);
+        assert_eq!(
+            lock_regions(&g, o).expect("still balanced"),
+            vec![LockRegion {
+                enter: e1,
+                exit: x2,
+                depth: 0
+            }],
+            "one region, entered once and exited once"
+        );
+    }
+
+    /// MUST NOT: a throw between the two regions. In the source program the
+    /// monitor is NOT held at the throw, so unwinding releases nothing;
+    /// coarsening would make the compiled frame hold it there.
+    ///
+    /// The preservation argument is by exclusion, and this test states it as
+    /// such: the plan is refused, the two regions survive untouched, and the
+    /// throw still lies in the unlocked window between them.
+    ///
+    /// Paired MUST: replace the throw with an `Add` and the merge happens.
+    #[test]
+    fn a_throw_between_two_regions_refuses_the_merge_and_still_unlocks() {
+        let build = |throwing: bool| {
+            let mut g = Graph::new();
+            let p = g.add_node(Op::Param(0), vec![]);
+            let o = alloc(&mut g, 1, 0);
+            let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+            let x1 = g.add_node(Op::MonitorExit, vec![o]);
+            let gap = if throwing {
+                g.add_node(Op::Throw, vec![p])
+            } else {
+                g.add_node(Op::Add, vec![p, p])
+            };
+            let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+            let x2 = g.add_node(Op::MonitorExit, vec![o]);
+            (g, o, e1, x1, gap, e2, x2)
+        };
+
+        let (mut g, o, e1, x1, throw, e2, x2) = build(true);
+        let r = analyze_escapes(&g);
+        assert!(
+            r.lock_coarsening.is_empty(),
+            "MUST NOT coarsen across a node that can unwind monitors"
+        );
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::MayThrowInGap)));
+
+        // Nothing to apply, so unlock-on-throw is bit-for-bit the original's:
+        // the throw sits strictly inside the window where `o` is unlocked.
+        for plan in &r.lock_coarsening {
+            apply_lock_coarsening(&mut g, plan);
+        }
+        let regions = lock_regions(&g, o).expect("balanced");
+        assert_eq!(
+            regions,
+            vec![
+                LockRegion {
+                    enter: e1,
+                    exit: x1,
+                    depth: 0
+                },
+                LockRegion {
+                    enter: e2,
+                    exit: x2,
+                    depth: 0
+                }
+            ]
+        );
+        assert!(
+            throw > regions[0].exit && throw < regions[1].enter,
+            "the throw is in the unlocked gap, exactly where the source put it"
+        );
+
+        let (g, _o, _e1, _x1, _gap, _e2, _x2) = build(false);
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.lock_coarsening.len(),
+            1,
+            "MUST coarsen once the gap cannot throw"
+        );
+    }
+
+    /// MUST NOT: a deopt point in the gap. The interpreter frame rebuilt there
+    /// must NOT hold the monitor (the original had already run the first
+    /// `monitorexit`), while the coarsened compiled frame does. That
+    /// reconstruction is provably wrong, not merely unproven, so the merge is
+    /// refused outright rather than repaired.
+    ///
+    /// Paired MUST: safepoints *inside* either region are fine — coarsening
+    /// changes the held-monitor set only in the gap, so those frames
+    /// reconstruct exactly the monitor set they always did.
+    #[test]
+    fn a_deopt_point_in_the_gap_refuses_the_merge_but_one_inside_a_region_does_not() {
+        // Safepoint in the GAP.
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _sp = g.add_node(Op::Safepoint, vec![]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(
+            r.lock_coarsening.is_empty(),
+            "MUST NOT coarsen across a deopt point whose monitor set would be \
+             wrong after the merge"
+        );
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::SafepointInGap)));
+
+        // Safepoints INSIDE both regions, gap clean.
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _sp1 = g.add_node(Op::Safepoint, vec![]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _c = g.add_node(Op::Const(0), vec![]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _sp2 = g.add_node(Op::Safepoint, vec![]);
+        let x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.lock_coarsening.len(),
+            1,
+            "MUST coarsen: a deopt inside a region holds the same monitor set \
+             before and after the merge"
+        );
+        assert_eq!(r.lock_coarsening[0].surviving_enter(), e1);
+        assert_eq!(r.lock_coarsening[0].surviving_exit(), x2);
+    }
+
+    /// MUST NOT: a call in the gap. It is a safepoint, it can throw, and it is
+    /// how `Thread.holdsLock` and every blocking operation reach the gap — the
+    /// three ways the unlocked state is observable.
+    #[test]
+    fn a_call_in_the_gap_refuses_the_merge() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _call = g.add_node(Op::Call, vec![]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(r.lock_coarsening.is_empty());
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::MayThrowInGap)));
+    }
+
+    /// A `monitorexit`/`monitorenter` on a DIFFERENT object in the gap is an
+    /// observation of the lock state, and it is also the shape where a naive
+    /// merge could invert two lock orders. Refused.
+    #[test]
+    fn a_foreign_monitor_in_the_gap_refuses_the_merge() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let p = alloc(&mut g, 2, 0);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _pe = g.add_node(Op::MonitorEnter, vec![p]);
+        let _px = g.add_node(Op::MonitorExit, vec![p]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(r
+            .lock_coarsening
+            .iter()
+            .all(|plan| plan.object != o));
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::ObservableGap)));
+    }
+
+    /// Without a dominance proof "adjacent" and "between" are not answerable,
+    /// so coarsening is refused wholesale — while elision, which removes every
+    /// monitor and therefore needs no ordering, still fires.
+    #[test]
+    fn a_branch_refuses_coarsening_but_not_elision() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let cond = g.add_node(Op::Const(0), vec![]);
+        let _iff = g.add_node(Op::If, vec![cond]);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        assert!(!program_order_proves_dominance(&g));
+        let r = analyze_escapes(&g);
+        assert!(r.lock_coarsening.is_empty());
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::NoDominanceProof)));
+        assert_eq!(
+            r.elide_locks,
+            vec![e1, x1, e2, x2],
+            "removing EVERY monitor is balance-preserving on every path, so \
+             elision needs no ordering proof"
+        );
+    }
+
+    /// Coarsening merges only *outermost* regions. An inner recursive region is
+    /// not adjacent to anything: merging across it would change the reentry
+    /// depth the interpreter has to rebuild.
+    #[test]
+    fn coarsening_pairs_only_outermost_regions() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]); // depth 1
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let xo = g.add_node(Op::MonitorExit, vec![o]);
+        let _c = g.add_node(Op::Const(0), vec![]);
+        let e3 = g.add_node(Op::MonitorEnter, vec![o]);
+        let x3 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.lock_coarsening.len(), 1);
+        let plan = r.lock_coarsening[0];
+        assert_eq!(plan.surviving_enter(), e1);
+        assert_eq!(plan.removed_exit(), xo, "the OUTER exit, not the inner one");
+        assert_eq!(plan.removed_enter(), e3);
+        assert_eq!(plan.surviving_exit(), x3);
+    }
+
+    /// Three adjacent regions produce two chained plans that SHARE a region.
+    /// Each plan is individually balance-preserving, and the re-verification in
+    /// [`apply_lock_coarsening`] makes overlapping plans mutually exclusive
+    /// rather than compounding: whichever runs first wins, the other is dropped.
+    /// The graph is balanced after every subset, in every order.
+    ///
+    /// Merging all three is reached the same way a synchronized object reaches
+    /// scalar replacement — by re-running the analysis on the mutated graph.
+    #[test]
+    fn chained_coarsening_plans_are_safe_in_any_subset() {
+        let build = || {
+            let mut g = Graph::new();
+            let o = alloc(&mut g, 1, 0);
+            for _ in 0..3 {
+                g.add_node(Op::MonitorEnter, vec![o]);
+                g.add_node(Op::MonitorExit, vec![o]);
+                g.add_node(Op::Const(0), vec![]);
+            }
+            (g, o)
+        };
+
+        let (g, _o) = build();
+        let plans = analyze_escapes(&g).lock_coarsening;
+        assert_eq!(plans.len(), 2, "three regions ⇒ two adjacent pairs");
+
+        // Either plan alone: three regions become two.
+        for which in 0..2 {
+            let (mut g, o) = build();
+            assert!(apply_lock_coarsening(&mut g, &plans[which]));
+            assert_eq!(
+                lock_regions(&g, o).expect("balanced").len(),
+                2,
+                "applying one of two plans leaves two balanced regions"
+            );
+        }
+
+        // Both, in either order: the second overlaps the first and is dropped.
+        for order in [[0usize, 1usize], [1, 0]] {
+            let (mut g, o) = build();
+            assert!(apply_lock_coarsening(&mut g, &plans[order[0]]));
+            assert!(
+                !apply_lock_coarsening(&mut g, &plans[order[1]]),
+                "the two plans share a region; the second no longer describes \
+                 the graph and is refused rather than half-applied"
+            );
+            let regions = lock_regions(&g, o).expect("balanced");
+            assert_eq!(regions.len(), 2);
+
+            // Re-analysing the mutated graph offers the now-adjacent pair.
+            let again = analyze_escapes(&g).lock_coarsening;
+            assert_eq!(again.len(), 1);
+            assert!(apply_lock_coarsening(&mut g, &again[0]));
+            assert_eq!(
+                lock_regions(&g, o).expect("balanced").len(),
+                1,
+                "one region, entered once and exited once"
+            );
+        }
+    }
+
+    /// Coarsening depends on NO elision having landed, and re-verifies before
+    /// mutating. A plan whose pair an elision already removed is a no-op; a
+    /// plan whose *outer* monitor a partial elision removed is refused, so
+    /// coarsening never compounds an imbalance it did not create.
+    #[test]
+    fn coarsening_is_safe_under_partial_application_of_elision() {
+        let build = || {
+            let mut g = Graph::new();
+            let o = alloc(&mut g, 1, 0);
+            let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+            let x1 = g.add_node(Op::MonitorExit, vec![o]);
+            let _c = g.add_node(Op::Const(0), vec![]);
+            let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+            let x2 = g.add_node(Op::MonitorExit, vec![o]);
+            (g, o, e1, x1, e2, x2)
+        };
+
+        let (g, _o, _e1, _x1, _e2, _x2) = build();
+        let plan = analyze_escapes(&g).lock_coarsening[0];
+
+        // The elision landed in full: the pair is already gone.
+        let (mut g, o, _e1, _x1, _e2, _x2) = build();
+        let r = analyze_escapes(&g);
+        assert!(apply_lock_elision_plan(&mut g, &r.lock_elisions[0]));
+        assert!(
+            !apply_lock_coarsening(&mut g, &plan),
+            "no monitors left: the plan is dropped, not applied twice"
+        );
+        assert!(live_monitors_of(&g, o).is_empty());
+
+        // A partial elision took the OUTER enter only — the hazard case.
+        let (mut g, _o, e1, x1, e2, x2) = build();
+        g.nodes[e1].op = Op::Dead;
+        g.nodes[e1].inputs.clear();
+        assert!(
+            !apply_lock_coarsening(&mut g, &plan),
+            "MUST NOT merge onto an enter that is no longer there"
+        );
+        assert_eq!(g.nodes[x1].op, Op::MonitorExit);
+        assert_eq!(g.nodes[e2].op, Op::MonitorEnter);
+        assert_eq!(g.nodes[x2].op, Op::MonitorExit);
+    }
+
+    /// Field accesses on confined allocations of this graph ARE admitted in a
+    /// gap: they cannot fault (the holder is a `New` of this frame, so never
+    /// null) and no other thread can observe them.
+    #[test]
+    fn a_gap_of_confined_field_accesses_is_transparent() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let other = alloc(&mut g, 2, 1);
+        let c = g.add_node(Op::Const(7), vec![]);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _st = g.add_node(Op::Store(0), vec![other, c]);
+        let _ld = g.add_node(Op::Load(0), vec![other]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        let plan = r
+            .lock_coarsening
+            .iter()
+            .find(|p| p.object == o)
+            .expect("a confined-only gap is transparent");
+        assert_eq!(plan.surviving_enter(), e1);
+        assert_eq!(plan.surviving_exit(), x2);
+    }
+
+    /// …but a field access on a **caller-supplied** holder is not: it can raise
+    /// `NullPointerException`, which is a monitor-unwinding event, and other
+    /// threads can see the write.
+    #[test]
+    fn a_gap_touching_a_foreign_holder_is_not_transparent() {
+        let mut g = Graph::new();
+        let this = g.add_node(Op::Param(0), vec![]);
+        let o = alloc(&mut g, 1, 0);
+        let c = g.add_node(Op::Const(7), vec![]);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _st = g.add_node(Op::Store(0), vec![this, c]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(r.lock_coarsening.is_empty());
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::ObservableGap)));
+    }
+
+    /// Coarsening does not disturb the identity rule: a live monitor is still
+    /// an identity observation, so the object is not scalar-replaced until the
+    /// monitors are actually gone. The documented two-phase route still works
+    /// through the coarsened graph.
+    #[test]
+    fn coarsening_then_elision_still_unlocks_scalar_replacement() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let c = g.add_node(Op::Const(9), vec![]);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _st = g.add_node(Op::Store(0), vec![o, c]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _k = g.add_node(Op::Const(0), vec![]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+        let load = g.add_node(Op::Load(0), vec![o]);
+
+        let first = analyze_escapes(&g);
+        assert!(
+            first.scalar_replaceable.iter().all(|s| s.alloc_node != o),
+            "MUST NOT replace while a monitor observes the identity"
+        );
+        assert_eq!(first.stats.identity_blocked, 1);
+
+        let plan = first.lock_coarsening[0];
+        assert!(apply_lock_coarsening(&mut g, &plan));
+        let second = analyze_escapes(&g);
+        assert!(
+            second.scalar_replaceable.iter().all(|s| s.alloc_node != o),
+            "two monitors survive the merge — still observed"
+        );
+
+        assert!(apply_lock_elision_plan(&mut g, &second.lock_elisions[0]));
+        let third = analyze_escapes(&g);
+        let sr = third
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == o)
+            .expect("MUST replace once every monitor is dead");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c));
+    }
+
+    /// The refusal counters are the measurement that says what failing closed
+    /// costs, exactly as `identity_blocked` does for scalar replacement.
+    #[test]
+    fn lock_refusals_are_counted_and_deduplicated() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        g.nodes[1].inputs.push(o); // Return: escapes
+        g.nodes[o].uses.push(1);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.lock_refusals,
+            vec![(o, LockRefusal::ObjectEscapes)],
+            "the elision and coarsening finders both refuse it; the record is \
+             deduplicated"
+        );
+        assert_eq!(r.stats.locks_refused, 1);
+        assert_eq!(r.stats.locks_elided, 0);
+        assert_eq!(r.stats.locks_coarsened, 0);
     }
 }

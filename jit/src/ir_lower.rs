@@ -4234,12 +4234,24 @@ fn reloc_emit_enabled() -> bool {
     /// a resume has to rebuild them. When the scope names no
     /// `caller_snapshot` — or names one that does not exist — this emits a
     /// frame holding a single [`FrameValue::Unsupported`] rather than an empty
-    /// one. An empty caller frame is *silently wrong*: every resume sink maps a
-    /// missing slot to `Value::Int(0)`, so the interpreter would resume the
-    /// caller with all-zero locals and no error anywhere. `Unsupported` makes
-    /// the whole chain fail [`crate::deopt::frame_state_is_resumable`], so the
-    /// deopt takes the safe whole-method re-run instead. That predicate walks
-    /// the caller chain precisely so this cannot be resumed as if clean.
+    /// one. An empty caller frame is *silently wrong*: the resume sinks map a
+    /// missing slot to `Value::Int(0)`, so a future sink that learned to resume
+    /// chains would resume the caller with all-zero locals and no error
+    /// anywhere. `Unsupported` makes the whole chain fail
+    /// [`crate::deopt::frame_state_is_resumable`] — which walks the caller
+    /// chain precisely so this cannot pass as clean — and the artifact is
+    /// refused at admission instead.
+    ///
+    /// ## Known gap, unreachable today
+    ///
+    /// Each scope's values are resolved by its own [`Self::resolve_frame_values`]
+    /// call, so the `emitted` set that turns a repeated scalar-replaced object
+    /// into a `VirtualObjectRef` does not span scopes: an object live in BOTH a
+    /// callee and its caller would be *defined* twice, and the materializer
+    /// would rebuild two objects where the program had one. Unreachable while
+    /// the scope table is empty; a producer that starts building chains must
+    /// thread one `emitted` set through the whole chain first. See
+    /// `docs/jit/deopt-inline-scopes.md`.
     fn caller_chain_for(&self, index: usize) -> Option<Box<FrameState>> {
         if self.inline_scopes.is_empty() {
             return None;
@@ -8570,9 +8582,11 @@ mod tests {
     // ── Inlined caller scopes → `FrameState::caller` ─────────────────────
 
     /// A trivially lowerable graph (`Start → Proj ctrl/mem → Param(0) →
-    /// Return`) with no safepoints; the caller pushes whatever snapshots the
-    /// test needs.
-    fn scope_fixture_graph() -> Graph {
+    /// Const(7) → Return`) with no safepoints; the caller pushes whatever
+    /// snapshots the test needs. Returns the `Const` node id, which resolves to
+    /// `FrameValue::Int(7)` with no machine location — the simplest slot a
+    /// snapshot can name.
+    fn scope_fixture_graph() -> (Graph, NodeId) {
         let mut g = Graph {
             nodes: Vec::new(),
             entry: 0,
@@ -8584,9 +8598,10 @@ mod tests {
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
         let _mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
         let p0 = g.add(Op::Param(0), IrType::Int, vec![start], None);
+        let k = g.add(Op::Const(7), IrType::Int, vec![], None);
         let ret = g.add(Op::Return, IrType::Void, vec![ctrl, p0], None);
         g.exit = ret;
-        g
+        (g, k)
     }
 
     /// Resolve `graph.safepoints[index]` through a real `Lowerer` carrying
@@ -8622,7 +8637,7 @@ mod tests {
     /// flat. This is the byte-identical-behaviour witness for the whole change.
     #[test]
     fn an_empty_scope_table_still_produces_a_flat_frame() {
-        let mut g = scope_fixture_graph();
+        let (mut g, _k) = scope_fixture_graph();
         g.safepoints.push(SafepointSnapshot {
             bci: 4,
             locals: vec![NO_NODE],
@@ -8640,8 +8655,7 @@ mod tests {
     /// caller's own recorded snapshot, not from thin air.
     #[test]
     fn a_bound_snapshot_lowers_into_its_caller_scope() {
-        let mut g = scope_fixture_graph();
-        let k = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let (mut g, k) = scope_fixture_graph();
         // snapshot 0 = the caller's state at the invoke; snapshot 1 = the
         // inlined callee's state at the trapping bci.
         g.safepoints.push(SafepointSnapshot {
@@ -8683,8 +8697,7 @@ mod tests {
     #[test]
     fn caller_chains_of_depth_zero_through_four() {
         for depth in 0..=4usize {
-            let mut g = scope_fixture_graph();
-            let k = g.add(Op::Const(1), IrType::Int, vec![], None);
+            let (mut g, k) = scope_fixture_graph();
             // One caller snapshot per scope, then the trapping snapshot last.
             for d in 0..depth {
                 g.safepoints.push(SafepointSnapshot {
@@ -8732,12 +8745,13 @@ mod tests {
     }
 
     /// A caller scope whose own snapshot holds an unreconstructable slot must
-    /// be REFUSED, not resumed. The innermost scope here is spotless, so a
+    /// be REFUSED, not admitted. The innermost scope here is spotless, so a
     /// scope-local predicate would wave it through — which is precisely the
-    /// hazard `frame_state_is_resumable`'s caller walk closes.
+    /// hazard `frame_state_is_resumable`'s caller walk closes for the two
+    /// compile-time admission gates that consult it.
     #[test]
     fn a_caller_scope_holding_materialization_required_is_refused() {
-        let mut g = scope_fixture_graph();
+        let (mut g, _k) = scope_fixture_graph();
         // A snapshot slot naming a node id past the end of the arena resolves
         // to `MaterializationRequired` (see `frame_value_for`).
         let dangling: NodeId = 9_999;
@@ -8786,7 +8800,7 @@ mod tests {
     /// reconstructs as all-zero locals with no error anywhere.
     #[test]
     fn an_undescribed_caller_scope_is_unresumable_not_empty() {
-        let mut g = scope_fixture_graph();
+        let (mut g, _k) = scope_fixture_graph();
         g.safepoints.push(SafepointSnapshot {
             bci: 3,
             locals: vec![NO_NODE],

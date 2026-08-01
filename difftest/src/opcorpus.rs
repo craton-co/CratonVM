@@ -231,7 +231,7 @@ pub fn generator_index(config: &OpcodeCorpusConfig) -> GeneratorIndex {
 /// The one shape every generated program has. Placeholders are `@…@` rather
 /// than `{…}` so the Java braces need no escaping and the template reads as
 /// Java.
-const TEMPLATE: &str = r#"// difftest: strict (generated: opcode @HEX@ @MNEMONIC@)
+const TEMPLATE: &str = r###"// difftest: strict (generated: opcode @HEX@ @MNEMONIC@)
 //
 // Emitted by `cratonvm-difftest gen-opcodes`; do not edit by hand.
 //
@@ -269,7 +269,7 @@ public class @CLASS@ {
         System.out.println("##DIFFTEST-CHECKSUM## @CHECKSUM@ " + Long.toHexString(acc));
     }
 }
-"#;
+"###;
 
 /// Indent every non-blank line of `text` by `spaces`.
 fn indent(text: &str, spaces: usize) -> String {

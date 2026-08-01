@@ -14828,6 +14828,7 @@ mod deopt_step3_tests {
                 bci,
                 reason: cratonvm_jit::deopt::DeoptReason::BoundsCheck,
                 action: cratonvm_jit::deopt::DeoptAction::Reinterpret,
+                semantics: cratonvm_jit::deopt::ResumeSemantics::REEXECUTE,
                 speculation_id: 0,
                 frame_state: cratonvm_jit::deopt::FrameState {
                     method_key: String::new(),

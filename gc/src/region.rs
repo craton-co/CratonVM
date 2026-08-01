@@ -144,9 +144,7 @@ impl RememberedSet {
     pub fn add_reference_in_generation(&self, source_region: usize, generation: u64) {
         let mut guard = self.sources.lock();
         let slot = guard.entry(source_region).or_insert(generation);
-        if *slot < generation {
-            *slot = generation;
-        }
+        *slot = (*slot).max(generation);
     }
 
     /// Clear the remembered set.
@@ -1365,5 +1363,49 @@ mod tests {
         assert_eq!(rset.source_count(), 2);
         rset.clear();
         assert_eq!(rset.source_count(), 0);
+    }
+
+    /// G1AUD-5 (defect G1-8) — an entry carries the generation of the NEWEST
+    /// edge from that source.
+    ///
+    /// Keeping the newest is what makes the staleness test correct: a source
+    /// that was recycled and then wrote a fresh edge must not be pruned on the
+    /// strength of the older, dead edge's stamp. The generation-less entry point
+    /// records the never-prune stamp, which must dominate everything.
+    #[test]
+    fn remembered_set_entries_keep_the_newest_generation_stamp() {
+        let rset = RememberedSet::default();
+
+        rset.add_reference_in_generation(3, 7);
+        assert_eq!(rset.recorded_generation(3), Some(7));
+
+        // Older re-record: the live edge is still the newer one.
+        rset.add_reference_in_generation(3, 2);
+        assert_eq!(
+            rset.recorded_generation(3),
+            Some(7),
+            "an out-of-order add must not age an entry backwards — that would \
+             prune a live edge"
+        );
+
+        rset.add_reference_in_generation(3, 9);
+        assert_eq!(rset.recorded_generation(3), Some(9));
+        assert_eq!(rset.source_count(), 1, "still one source");
+
+        // The generation-less path pins the entry against age-based pruning.
+        rset.add_reference(3);
+        assert_eq!(rset.recorded_generation(3), Some(RSET_GENERATION_PINNED));
+        assert_eq!(rset.recorded_generation(4), None);
+
+        // The generation-aware retain sees both halves of every entry.
+        rset.add_reference_in_generation(4, 1);
+        let mut seen: Vec<(usize, u64)> = Vec::new();
+        rset.retain_sources_in_generation(|s, gen| {
+            seen.push((s, gen));
+            s == 4
+        });
+        seen.sort_unstable();
+        assert_eq!(seen, vec![(3, RSET_GENERATION_PINNED), (4, 1)]);
+        assert_eq!(rset.sources(), vec![4]);
     }
 }

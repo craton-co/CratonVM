@@ -388,14 +388,25 @@ pub struct VirtualObjectState {
 /// The scan follows `caller`. It has to: a deopt inside an inlined callee
 /// rebuilds *every* frame in the chain, so a caller scope holding a value no
 /// one can describe is exactly as unresumable as the trapping scope holding
-/// one — and it is the caller's locals that the interpreter would silently
-/// fill with `Value::Int(0)`.
+/// one — and it is the caller's locals that a resume would silently fill with
+/// `Value::Int(0)`.
 ///
-/// Every resume sink in the VM (`vm/src/vm.rs`, `vm/src/runtime/interpreter.rs`)
-/// calls this function and nothing else, so making it chain-aware is what stops
-/// the first inlined chain from resuming as if clean. It is behaviour-preserving
-/// until then: every producer sets `caller: None` today, and a one-scope chain
-/// is exactly the old predicate. The interned counterparts are
+/// It used to stop at the innermost scope, which was correct only because no
+/// producer built a chain. The callers are the two **compile-time** admission
+/// gates — `jit/src/x64.rs`'s unresumable-`invokedynamic`-trap bail and
+/// `CompiledMethod::osr_exit_policy` — and both are deciding "may this artifact
+/// ever be entered". An artifact whose only trap sits under an undescribable
+/// caller scope must fail that question, not pass it because the innermost
+/// frame happens to be clean.
+///
+/// (The VM's *resume* sinks are a separate, stricter gate: they refuse any
+/// `ReconstructedFrame` with a non-empty `caller_frames` outright —
+/// `vm/src/runtime/interpreter.rs:13393`, `:13616`, `:13959` — so an inlined
+/// chain currently never resumes at all. This predicate is what decides
+/// whether such a chain gets compiled in the first place.)
+///
+/// Behaviour-preserving today: every producer sets `caller: None`, and a
+/// one-scope chain is exactly the old predicate. The interned counterparts are
 /// [`FrameStateInterner::is_resumable`] (deliberately scope-local — it answers
 /// "is *this* scope clean") and [`FrameStateInterner::chain_is_resumable`],
 /// which is the handle-side equivalent of this function.
@@ -4755,13 +4766,13 @@ mod tests {
 
     /// The predicate follows `caller`.
     ///
-    /// This is the fix for a hazard that was latent only because nothing built
-    /// a chain: every resume sink in the VM calls `frame_state_is_resumable`
-    /// and nothing else, and it used to inspect the innermost scope alone. The
-    /// first inlined chain would therefore have resumed a caller frame whose
-    /// locals nobody could describe — filling them with `Value::Int(0)`, with
-    /// no error anywhere. `chain_is_resumable` already existed on the interned
-    /// side; this is its owned counterpart.
+    /// The predicate used to inspect the innermost scope alone, which was
+    /// correct only because no producer built a chain. Its callers are the two
+    /// compile-time admission gates (`x64.rs`'s unresumable-indy-trap bail and
+    /// `CompiledMethod::osr_exit_policy`), and both must answer "no" for an
+    /// artifact whose trap sits under a caller frame nobody can describe —
+    /// otherwise a clean innermost scope admits it. `chain_is_resumable`
+    /// already existed on the interned side; this is its owned counterpart.
     #[test]
     fn resumability_follows_the_whole_caller_chain() {
         let clean = || fs(vec![FrameValue::Int(1)], vec![]);
@@ -6446,6 +6457,52 @@ mod frame_state_interning_tests {
         );
         assert!(rendered(&errs).contains("unreadable"), "{}", rendered(&errs));
         assert!(verifier().verify_interned(&empty, &[point]).is_err());
+    }
+
+    /// `semantics` survives the interning round trip.
+    ///
+    /// It used to be re-derived from `DeoptReason` on the way *in* and dropped
+    /// on the way *out* (`materialize` has nowhere to put it), so a producer
+    /// that knew better than the reason-based convention could not say so.
+    /// Now `intern_point` reads the field and `materialize_point` restores it —
+    /// including the case where they disagree, which is the only case that
+    /// proves the value is carried rather than recomputed.
+    #[test]
+    fn point_semantics_survive_the_interning_round_trip() {
+        let mut it = FrameStateInterner::new();
+
+        // The convention case: what every producer stamps today.
+        let p = good_point();
+        assert_eq!(p.semantics, ResumeSemantics::for_reason(p.reason));
+        let conventional = it.intern_point(&p);
+        let back = it.materialize_point(&conventional).expect("round-trip");
+        assert_eq!(back.semantics, p.semantics);
+
+        // The case the field exists for: semantics that the reason does NOT
+        // imply. A resume point after a call that returned is `RESUME`, while
+        // `for_reason` would say `REEXECUTE` and call the callee twice.
+        let mut explicit = good_point();
+        explicit.semantics = ResumeSemantics::RESUME;
+        assert_ne!(
+            explicit.semantics,
+            ResumeSemantics::for_reason(explicit.reason),
+            "precondition: the reason must not already imply these semantics"
+        );
+        let interned = it.intern_point(&explicit);
+        assert_eq!(
+            it.semantics(interned.frame_state),
+            Some(ResumeSemantics::RESUME)
+        );
+        let back = it.materialize_point(&interned).expect("round-trip");
+        assert_eq!(
+            back.semantics,
+            ResumeSemantics::RESUME,
+            "materialize_point must read the interned semantics, not re-derive them"
+        );
+        // …and the rest of the point is untouched.
+        assert_eq!(back.native_offset, explicit.native_offset);
+        assert_eq!(back.bci, explicit.bci);
+        assert_eq!(back.reason, explicit.reason);
     }
 
     // ── unresumable states stay unresumable ──────────────────────────

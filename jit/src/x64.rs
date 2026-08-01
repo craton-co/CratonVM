@@ -23143,12 +23143,12 @@ fn gc_inert_selfrec_candidate(
 /// in interpreter-bci space with nothing to translate.
 ///
 /// The transform IS used, as the native unroller's admission oracle — see
-/// [`plan_native_unroll`] — but only its *verdict* is consumed; the rewritten
+/// `plan_native_unroll` — but only its *verdict* is consumed; the rewritten
 /// bytes are dropped.
 ///
 /// Flipping this to `true` is the single switch that hands loop unrolling to
 /// the bytecode rewriter, and it is deliberately the same switch that turns
-/// the native byte-copy unroller off (see [`native_unroller_enabled`]): the
+/// the native byte-copy unroller off (see `native_unroller_enabled`): the
 /// two must never both fire on one loop, or `k+1` bytecode copies get
 /// machine-code-duplicated `k+1` more times behind one back edge, giving
 /// `(k+1)^2` bodies per poll — a time-to-safepoint neither unroller's budget
@@ -23157,17 +23157,17 @@ fn gc_inert_selfrec_candidate(
 /// Do NOT flip it before every item in `docs/jit/loop-transform-wiring.md` is
 /// done. A half-wired rewrite records transformed PCs as interpreter bcis,
 /// which corrupts deopt and the GC's precise oop-map lookup silently.
-pub(crate) fn bytecode_loop_xform_rewrites_bytecode() -> bool {
+fn bytecode_loop_xform_rewrites_bytecode() -> bool {
     false
 }
 
 /// Is the native byte-copy unroller (the `0xa7` arm of `compile_bytecode`)
 /// the current owner of loop unrolling?
 ///
-/// Mutually exclusive with [`bytecode_loop_xform_rewrites_bytecode`] by
+/// Mutually exclusive with `bytecode_loop_xform_rewrites_bytecode` by
 /// construction — see that function for why the exclusion is a correctness
 /// requirement and not a tidiness one.
-pub(crate) fn native_unroller_enabled() -> bool {
+fn native_unroller_enabled() -> bool {
     !bytecode_loop_xform_rewrites_bytecode()
         && cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_UNROLL").is_none()
 }
@@ -38789,5 +38789,456 @@ mod flag_and_header_contracts {
             0,
             "mark_word must be 8-aligned for the atomic CAS in monitor.rs"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-unroller admission and bytecode-loop-transform provenance
+// ---------------------------------------------------------------------------
+//
+// Two unrollers exist in this backend and exactly one of them is live:
+//
+//   * the NATIVE byte-copy unroller in the `0xa7` arm of `compile_bytecode`,
+//     admitted by `plan_native_unroll`;
+//   * the BYTECODE rewriter in `x64::licm` (`plan_loop_peel` /
+//     `plan_loop_unroll`), which today is consulted only as the native one's
+//     admission oracle and never rewrites the code the emitter compiles.
+//
+// These tests pin the admission test (what the old `code[back_edge] == 0xa7`
+// + body-size heuristic was missing), the mutual exclusion, and the two
+// provenance contracts a future rewrite wiring must honour: deopt/oop-map
+// bcis stay INTERPRETER bcis, and an OSR entry lands on the steady-state copy
+// rather than a peeled prefix.
+#[cfg(test)]
+mod loop_unroll_admission {
+    use super::*;
+
+    /// `for (i = 0; i < n; i++) a[i] = 100 / (i - 3);`
+    ///
+    /// A textbook reducible counted loop: single entry, `goto` back edge, no
+    /// handlers, and two different throwing bcis inside the body. Header 2,
+    /// back edge 19, body 17 bytes, length 23. The static heuristic asks for
+    /// 3 extra copies.
+    fn shape_counted_loop() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3d, // 1: istore_2          i = 0
+            0x1c, // 2: iload_2           <- header
+            0x1b, // 3: iload_1
+            0xa2, 0x00, 0x12, // 4: if_icmpge 22
+            0x2a, // 7: aload_0
+            0x1c, // 8: iload_2
+            0x10, 0x64, // 9: bipush 100
+            0x1c, // 11: iload_2
+            0x06, // 12: iconst_3
+            0x64, // 13: isub
+            0x6c, // 14: idiv
+            0x4f, // 15: iastore
+            0x84, 0x02, 0x01, // 16: iinc 2, 1
+            0xa7, 0xff, 0xef, // 19: goto 2        <- back edge
+            0xb1, // 22: return
+        ]
+    }
+
+    /// The pre-header-bypass shape: a branch from *before* the loop straight
+    /// into the header (`AttributesImpl.ensureCapacity`). The region itself is
+    /// impeccable — the bytecode rewriter admits it — so only
+    /// `bypassable_headers` can refuse it. Header 11, back edge 25, length 30.
+    fn shape_bypassable_header() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1          i = 0
+            0x03, // 2: iconst_0
+            0x3d, // 3: istore_2          sum = 0
+            0x1a, // 4: iload_0
+            0x9a, 0x00, 0x06, // 5: ifne 11       <- external edge INTO the header
+            0x03, // 8: iconst_0
+            0x3d, // 9: istore_2
+            0x00, // 10: nop
+            0x1b, // 11: iload_1          <- header
+            0x1a, // 12: iload_0
+            0xa2, 0x00, 0x0f, // 13: if_icmpge 28
+            0x1c, // 16: iload_2
+            0x1b, // 17: iload_1
+            0x05, // 18: iconst_2
+            0x68, // 19: imul
+            0x60, // 20: iadd
+            0x3d, // 21: istore_2
+            0x84, 0x01, 0x01, // 22: iinc 1, 1
+            0xa7, 0xff, 0xf2, // 25: goto 11      <- back edge
+            0x1c, // 28: iload_2
+            0xac, // 29: ireturn
+        ]
+    }
+
+    /// An irreducible loop: the cycle `L1 → L2 → L1` is entered at BOTH
+    /// blocks. Its back edge is a plain `goto` and its body is 10 bytes, so it
+    /// sails through the old heuristic and only a domination/entry test can
+    /// refuse it. Header 7, back edge 17, length 21.
+    fn shape_irreducible() -> Vec<u8> {
+        vec![
+            0x1a, // 0: iload_0
+            0x99, 0x00, 0x0c, // 1: ifeq 13       -> enters the cycle at L2
+            0xa7, 0x00, 0x03, // 4: goto 7        -> enters the cycle at L1
+            0x84, 0x01, 0x01, // 7: L1: iinc 1, 1
+            0xa7, 0x00, 0x03, // 10: goto 13
+            0x1b, // 13: L2: iload_1
+            0x99, 0x00, 0x06, // 14: ifeq 20
+            0xa7, 0xff, 0xf6, // 17: goto 7       <- back edge
+            0xb1, // 20: return
+        ]
+    }
+
+    /// A reducible OUTER loop with no external entry — so
+    /// `find_bypassable_loop_headers` clears it — whose body contains an
+    /// irreducible two-entry cycle. This is the shape that proves the new gate
+    /// is more than the bypassable filter. Outer header 2, back edge 30,
+    /// length 35.
+    fn shape_irreducible_inner() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x1b, // 2: iload_1            <- outer header
+            0x1a, // 3: iload_0
+            0xa2, 0x00, 0x1d, // 4: if_icmpge 33
+            0x1b, // 7: iload_1
+            0x99, 0x00, 0x0c, // 8: ifeq 20        -> enters the inner cycle at B
+            0xa7, 0x00, 0x03, // 11: goto 14       -> enters the inner cycle at A
+            0x84, 0x01, 0x01, // 14: A: iinc 1, 1
+            0xa7, 0x00, 0x03, // 17: goto 20
+            0x1b, // 20: B: iload_1
+            0x99, 0x00, 0x06, // 21: ifeq 27
+            0xa7, 0xff, 0xf6, // 24: goto 14       <- inner back edge
+            0x84, 0x01, 0x01, // 27: iinc 1, 1
+            0xa7, 0xff, 0xe4, // 30: goto 2        <- outer back edge
+            0x1b, // 33: iload_1
+            0xac, // 34: ireturn
+        ]
+    }
+
+    /// A one-instruction loop whose header is reached by `goto_w` — the one
+    /// backward-capable branch the emitter never polls. Header 0, back edge 5.
+    fn shape_with_goto_w() -> Vec<u8> {
+        vec![
+            0xc8, 0x00, 0x00, 0x00, 0x05, // 0: goto_w 5
+            0xa7, 0xff, 0xfb, // 5: goto 0    <- back edge
+        ]
+    }
+
+    /// The OLD admission test, verbatim: a `goto` back edge and a body in the
+    /// `[5, 50]` size band. Used to prove the refusal tests are not vacuous.
+    fn old_heuristic_admits(code: &[u8], header: usize, back_edge: usize) -> bool {
+        code[back_edge] == 0xa7 && (5..=50).contains(&(back_edge - header))
+    }
+
+    #[test]
+    fn fixtures_carry_the_loops_the_old_heuristic_would_have_unrolled() {
+        for (code, len, want_loops) in [
+            (shape_counted_loop(), 23usize, vec![(2usize, 19usize)]),
+            (shape_bypassable_header(), 30, vec![(11, 25)]),
+            (shape_irreducible(), 21, vec![(7, 17)]),
+            (shape_irreducible_inner(), 35, vec![(14, 24), (2, 30)]),
+            (shape_with_goto_w(), 8, vec![(0, 5)]),
+        ] {
+            assert_eq!(code.len(), len, "fixture length");
+            assert_eq!(detect_loops(&code, len), want_loops, "fixture loops");
+            for &(header, back_edge) in &want_loops {
+                assert!(
+                    old_heuristic_admits(&code, header, back_edge),
+                    "the old gate must have admitted ({header}, {back_edge}) — \
+                     otherwise the refusal tests below prove nothing"
+                );
+            }
+        }
+    }
+
+    /// The native byte-copy unroller now refuses every loop whose control flow
+    /// it cannot duplicate: irreducible, multi-entry, irreducible inner cycle,
+    /// unpollable, or pre-header-bypassable. Each of these was admitted by the
+    /// old `0xa7` + body-size test.
+    #[test]
+    fn the_native_unroller_refuses_irreducible_and_multi_entry_loops() {
+        let none: FxHashSet<usize> = FxHashSet::default();
+
+        // Positive control: a plain counted loop is still unrolled, so the
+        // gate is not simply "refuse everything".
+        let ok = shape_counted_loop();
+        assert_eq!(
+            plan_native_unroll(&ok, 23, 2, 19, 3, &[], &none),
+            Some((2, 19, 3)),
+            "a single-entry reducible counted loop must still be unrolled"
+        );
+
+        // Irreducible: the cycle is entered at both of its blocks, so the
+        // header does not dominate its own region and "the bytes from header
+        // to back edge" are not one iteration of anything.
+        let irr = shape_irreducible();
+        assert_eq!(
+            plan_loop_unroll(&irr, 21, 7, 17, 3, &[]).unwrap_err(),
+            LoopXformRefusal::ExternalEntry
+        );
+        assert_eq!(plan_native_unroll(&irr, 21, 7, 17, 3, &[], &none), None);
+
+        // Irreducible INNER cycle. The outer loop is reducible and has no
+        // external entry, so `find_bypassable_loop_headers` does NOT flag it:
+        // this case is caught by the structural oracle alone.
+        let inner = shape_irreducible_inner();
+        assert!(
+            !find_bypassable_loop_headers(&inner, 35, &[(2, 30)], &[]).contains(&2),
+            "the bypassable filter must not be what refuses this one"
+        );
+        assert_eq!(
+            plan_loop_unroll(&inner, 35, 2, 30, 1, &[]).unwrap_err(),
+            LoopXformRefusal::IrreducibleInnerLoop
+        );
+        assert_eq!(plan_native_unroll(&inner, 35, 2, 30, 1, &[], &none), None);
+
+        // A backward `goto_w` reaches the header, and the emitter never polls
+        // at `goto_w`: duplicating bodies behind it would build an unpolled
+        // cycle whose time-to-safepoint is unbounded.
+        let wide = shape_with_goto_w();
+        assert_eq!(plan_native_unroll(&wide, 8, 0, 5, 3, &[], &none), None);
+
+        // Pre-header bypass. The region is impeccable — the rewriter admits
+        // it — so only `bypassable_headers` refuses, exactly as it does for
+        // the aaload/arith/FP hoists and the bulk-byte loops.
+        let byp = shape_bypassable_header();
+        assert!(plan_loop_unroll(&byp, 30, 11, 25, 3, &[]).is_ok());
+        let bypassable = find_bypassable_loop_headers(&byp, 30, &[(11, 25)], &[]);
+        assert!(bypassable.contains(&11), "fixture must be bypassable");
+        assert_eq!(
+            plan_native_unroll(&byp, 30, 11, 25, 3, &[], &none),
+            Some((11, 25, 3))
+        );
+        assert_eq!(
+            plan_native_unroll(&byp, 30, 11, 25, 3, &[], &bypassable),
+            None,
+            "a bypassable header must not be unrolled: pc_to_native[header] \
+             points PAST the pre-header, so no copy runs it"
+        );
+    }
+
+    /// A handler landing inside the duplicated region, or a protected range
+    /// only partially overlapping it, must refuse. The bytecode→native handler
+    /// ranges are derived from `pc_to_native`, which covers copy 0 only, so a
+    /// throw from copy `1..k` is not covered by the range that protects the
+    /// loop.
+    #[test]
+    fn the_native_unroller_refuses_a_handler_crossing_the_region() {
+        let none: FxHashSet<usize> = FxHashSet::default();
+        let code = shape_counted_loop();
+
+        // A range enclosing the WHOLE loop is legal — it widens with the
+        // copies — so this stays admitted.
+        assert_eq!(
+            plan_native_unroll(&code, 23, 2, 19, 3, &[(0, 23, 22)], &none),
+            Some((2, 19, 3)),
+            "a protected range enclosing the whole loop is legal"
+        );
+        // Handler inside the region.
+        assert_eq!(
+            plan_loop_unroll(&code, 23, 2, 19, 3, &[(0, 23, 10)]).unwrap_err(),
+            LoopXformRefusal::HandlerInRegion
+        );
+        assert_eq!(
+            plan_native_unroll(&code, 23, 2, 19, 3, &[(0, 23, 10)], &none),
+            None
+        );
+        // Range that starts before the header and ends inside the body.
+        assert_eq!(
+            plan_loop_unroll(&code, 23, 2, 19, 3, &[(0, 10, 22)]).unwrap_err(),
+            LoopXformRefusal::HandlerRangeStraddlesRegion
+        );
+        assert_eq!(
+            plan_native_unroll(&code, 23, 2, 19, 3, &[(0, 10, 22)], &none),
+            None
+        );
+    }
+
+    /// A zero/one PGO unroll factor must not unroll, and must not underflow.
+    /// The old code computed `pgo_factor - 1` directly.
+    #[test]
+    fn a_degenerate_unroll_factor_is_refused_not_underflowed() {
+        let none: FxHashSet<usize> = FxHashSet::default();
+        let code = shape_counted_loop();
+        for factor in [0usize, 1] {
+            assert_eq!(
+                plan_native_unroll(&code, 23, 2, 19, factor.saturating_sub(1), &[], &none),
+                None,
+                "factor {factor} must not unroll"
+            );
+        }
+        // …and an over-large factor is refused rather than clamped.
+        assert_eq!(
+            plan_native_unroll(&code, 23, 2, 19, LOOP_XFORM_MAX_COPIES + 1, &[], &none),
+            None
+        );
+    }
+
+    /// The two unrollers are never both live.
+    /// `bytecode_loop_xform_rewrites_bytecode` is the single switch and
+    /// `native_unroller_enabled` is its complement, so no configuration can
+    /// duplicate a body twice.
+    #[test]
+    fn the_two_unrollers_are_never_both_live() {
+        assert!(
+            !(bytecode_loop_xform_rewrites_bytecode() && native_unroller_enabled()),
+            "both unrollers live: k+1 bytecode copies would be machine-code \
+             duplicated k+1 more times behind ONE back-edge poll"
+        );
+        // Today the native one owns unrolling and the rewriter is oracle-only.
+        assert!(!bytecode_loop_xform_rewrites_bytecode());
+
+        // Oracle-only means: the rewriter really does produce different bytes,
+        // and the emitter really does not see them — `plan_native_unroll`
+        // hands back only the `(header, back_edge, copies)` triple, which is
+        // stated in original-bytecode coordinates.
+        let code = shape_counted_loop();
+        let x = plan_loop_unroll(&code, 23, 2, 19, 3, &[]).expect("admitted");
+        assert_ne!(x.code, code, "the rewriter is not the identity");
+        assert_eq!(x.code_len, 23 + 3 * 17);
+        assert_eq!(
+            plan_native_unroll(&code, 23, 2, 19, 3, &[], &FxHashSet::default()),
+            Some((2, 19, 3)),
+            "the triple stays in ORIGINAL coordinates: header 2 and back edge \
+             19 are interpreter bcis, not PCs in x.code"
+        );
+    }
+
+    /// The provenance contract a deopt / oop-map record must go through.
+    ///
+    /// Every byte of a transformed method maps back to the original bci it was
+    /// copied from, and the map is *not* the identity: output PCs run past the
+    /// end of the interpreter's method, so a consumer that recorded a raw
+    /// transformed PC as a `deopt_stubs` bci or an `OopMapEntry::bytecode_pc`
+    /// would be recording something the interpreter cannot resume at. This is
+    /// the acceptance criterion for wiring the rewriter — see
+    /// `docs/jit/loop-transform-wiring.md`.
+    #[test]
+    fn a_transformed_pc_is_never_an_interpreter_bci() {
+        let code = shape_counted_loop();
+        let len = 23usize;
+        for k in 1..=3usize {
+            for x in [
+                plan_loop_peel(&code, len, 2, 19, k, &[]).expect("peel"),
+                plan_loop_unroll(&code, len, 2, 19, k, &[]).expect("unroll"),
+            ] {
+                assert!(x.provenance_is_total(), "{:?} k={k}", x.kind);
+                assert!(x.code_len > len, "{:?} k={k}", x.kind);
+
+                let mut saw_divergence = false;
+                let mut pc = 0usize;
+                while pc < x.code_len {
+                    let bci = x.bci_at(pc).expect("provenance is total");
+                    assert!(
+                        bci < len,
+                        "{:?} k={k}: output pc {pc} maps to {bci}, not an \
+                         interpreter bci",
+                        x.kind
+                    );
+                    assert_eq!(
+                        x.code[pc], code[bci],
+                        "{:?} k={k}: output pc {pc} and bci {bci} disagree on \
+                         the opcode",
+                        x.kind
+                    );
+                    let out_len = bytecode_len_at(&x.code, pc);
+                    assert!(out_len > 0);
+                    assert_eq!(out_len, bytecode_len_at(&code, bci));
+                    if bci != pc {
+                        saw_divergence = true;
+                    }
+                    pc += out_len;
+                }
+                assert_eq!(pc, x.code_len, "{:?} k={k}: walk overran", x.kind);
+                assert!(
+                    saw_divergence,
+                    "{:?} k={k}: pc and bci never diverged, so the test cannot \
+                     detect a missing `bci_at`",
+                    x.kind
+                );
+                // The strong form: the back edge sits at a pc past the whole
+                // original method, so recording PCs would produce
+                // out-of-range bcis, not merely wrong ones.
+                assert!(x.back_edge_pc() >= len, "{:?} k={k}", x.kind);
+            }
+        }
+    }
+
+    /// OSR must enter the STEADY-STATE copy. Entering a peeled prefix re-runs
+    /// the peeled iterations, so the loop executes `k` times too many — the
+    /// same class of bug as the LICM pre-header bypass.
+    #[test]
+    fn osr_entry_lands_on_the_steady_state_copy_not_a_peeled_prefix() {
+        let code = shape_counted_loop();
+        let (len, header, back_edge, body_len) = (23usize, 2usize, 19usize, 17usize);
+        // Instruction starts inside the loop body — the bcis an OSR request
+        // can legitimately name.
+        let body_starts: Vec<usize> = {
+            let mut v = Vec::new();
+            let mut pc = header;
+            while pc < back_edge {
+                v.push(pc);
+                pc += bytecode_len_at(&code, pc);
+            }
+            v
+        };
+        assert_eq!(body_starts.first(), Some(&header));
+
+        for k in 1..=3usize {
+            let peel = plan_loop_peel(&code, len, header, back_edge, k, &[]).expect("peel");
+            let unroll = plan_loop_unroll(&code, len, header, back_edge, k, &[]).expect("unroll");
+
+            // Peel: the steady state is the LAST copy, and the header's OSR
+            // entry is emphatically not the header itself.
+            assert_eq!(peel.steady_state_base(), header + k * body_len);
+            assert_eq!(peel.osr_entry_pc(header), Some(peel.steady_state_base()));
+            assert_ne!(
+                peel.osr_entry_pc(header),
+                Some(header),
+                "k={k}: entering copy 0 would re-run {k} peeled iterations"
+            );
+            // Unroll: every copy runs every trip, so copy 0 IS the steady
+            // state and the header keeps its PC.
+            assert_eq!(unroll.steady_state_base(), header);
+            assert_eq!(unroll.osr_entry_pc(header), Some(header));
+
+            for x in [&peel, &unroll] {
+                for &bci in &body_starts {
+                    let entry = x.osr_entry_pc(bci).expect("bci is in range");
+                    assert!(
+                        entry >= x.steady_state_base() && entry <= x.back_edge_pc(),
+                        "{:?} k={k}: OSR entry {entry} for bci {bci} is outside \
+                         the steady-state copy [{}, {}]",
+                        x.kind,
+                        x.steady_state_base(),
+                        x.back_edge_pc()
+                    );
+                    // Round-trip: the entry's provenance is the bci asked for.
+                    assert_eq!(x.bci_at(entry), Some(bci), "{:?} k={k}", x.kind);
+                }
+            }
+
+            // Outside the region: a bci before the header does not move, and a
+            // bci past the back edge shifts by the copies.
+            assert_eq!(peel.osr_entry_pc(0), Some(0));
+            assert_eq!(unroll.osr_entry_pc(0), Some(0));
+            assert_eq!(peel.osr_entry_pc(22), Some(22 + k * body_len));
+            assert_eq!(unroll.osr_entry_pc(22), Some(22 + k * body_len));
+            assert_eq!(peel.osr_entry_pc(len), None);
+
+            // KNOWN GAP, asserted so it stays visible rather than latent: for
+            // Unroll the back-edge bci has no image in copy 0 (the back edge
+            // exists in the LAST copy only), and `osr_entry_pc` still answers
+            // `bci`, which in the output is the first byte of copy 1 — i.e.
+            // the header, not the back edge. A consumer of the rewriter must
+            // refuse OSR at `back_edge..back_edge_end` for an unrolled method.
+            // See `docs/jit/loop-transform-wiring.md`.
+            assert_eq!(unroll.osr_entry_pc(back_edge), Some(back_edge));
+            assert_eq!(unroll.bci_at(back_edge), Some(header));
+            // Peel has no such gap: its steady-state copy carries the back edge.
+            assert_eq!(peel.osr_entry_pc(back_edge), Some(peel.back_edge_pc()));
+            assert_eq!(peel.bci_at(peel.back_edge_pc()), Some(back_edge));
+        }
     }
 }

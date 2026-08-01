@@ -2620,6 +2620,19 @@ fn osr_refusal(tag: &'static str, context: impl Into<String>) -> bailout::Bailou
     b
 }
 
+/// The subset of [`OSR_REFUSAL_TAGS`] whose answer is a pure function of the
+/// *artifact*, and therefore reproduces for every future back-edge over the
+/// same pc. See [`osr_refusal_is_permanent`].
+pub const OSR_PERMANENT_REFUSAL_TAGS: [&str; 7] = [
+    OSR_REFUSE_NO_ENTRY_TABLE,
+    OSR_REFUSE_PC_NOT_AN_ENTRY,
+    OSR_REFUSE_DEAD_LOCAL_MASK,
+    OSR_REFUSE_UNDESCRIBABLE_SLOT,
+    OSR_REFUSE_INLINED_SCOPE,
+    OSR_REFUSE_UNCONDITIONAL_TRAP,
+    OSR_REFUSE_UNRESUMABLE_EXIT,
+];
+
 /// Is this refusal a pure function of the *artifact* (as opposed to the
 /// incoming interpreter state)?
 ///
@@ -2629,16 +2642,9 @@ fn osr_refusal(tag: &'static str, context: impl Into<String>) -> bailout::Bailou
 /// the next trip over the back-edge carries different locals.
 pub fn osr_refusal_is_permanent(b: &bailout::Bailout) -> bool {
     match &b.reason {
-        bailout::BailoutReason::UnsupportedShape(tag) => matches!(
-            *tag,
-            OSR_REFUSE_NO_ENTRY_TABLE
-                | OSR_REFUSE_PC_NOT_AN_ENTRY
-                | OSR_REFUSE_DEAD_LOCAL_MASK
-                | OSR_REFUSE_UNDESCRIBABLE_SLOT
-                | OSR_REFUSE_INLINED_SCOPE
-                | OSR_REFUSE_UNCONDITIONAL_TRAP
-                | OSR_REFUSE_UNRESUMABLE_EXIT
-        ),
+        bailout::BailoutReason::UnsupportedShape(tag) => {
+            OSR_PERMANENT_REFUSAL_TAGS.iter().any(|t| *t == *tag)
+        }
         _ => false,
     }
 }
@@ -2758,9 +2764,28 @@ impl OsrEntryPlan {
     ///  * held monitors → the in-place transfer has no re-lock path. Refuse.
     ///  * `bci` must be one this artifact actually recorded a deopt point for.
     ///    A bci from nowhere is a mis-routed stash, not a resume point.
+    ///  * that point's [`deopt::ResumeSemantics`] must be `REEXECUTE`. See
+    ///    below — this is the check that makes the returned bci *exact*.
     ///  * every operand-stack slot must be describable.
     ///  * every local must be describable, with one deliberate exception,
     ///    below.
+    ///
+    /// **The returned bci is always a re-execute point.** `ResumeSemantics`
+    /// distinguishes three things a snapshot bci can mean, and only one of them
+    /// is a bci the interpreter may be parked at:
+    ///
+    ///  * `REEXECUTE` — the bytecode at `bci` has not taken effect. Setting
+    ///    `frame.pc = bci` runs it, which is exactly right. An `OsrExit` at a
+    ///    loop header is this: the header iteration has not run.
+    ///  * `RESUME` — the bytecode at `bci` has *already* taken effect and the
+    ///    interpreter must continue *after* it. Handing that bci back would
+    ///    re-execute it — the same double-execution this API exists to prevent,
+    ///    one bytecode instead of one loop iteration. Computing the successor
+    ///    bci needs the method's bytecode, which this crate does not have, so
+    ///    such a point is refused at *admission* (`osr_exit_policy`) and again
+    ///    here.
+    ///  * `RETHROW` — not a resume point at all; the bci names a throwing
+    ///    instruction to be routed through the exception table. Refused.
     ///
     /// **`Unsupported` vs `MaterializationRequired` in a local.** An
     /// `Unsupported` local is tolerated: the 1-pass backend's
@@ -2801,12 +2826,22 @@ impl OsrEntryPlan {
                 ),
             ));
         }
-        if !artifact.deopt_points.iter().any(|p| p.bci == rframe.bci) {
+        let Some(point) = artifact.deopt_points.iter().find(|p| p.bci == rframe.bci) else {
             return Err(osr_refusal(
                 OSR_REFUSE_EXIT_REPLAY,
                 format!(
                     "exit bci {} is not a recorded deopt point of this artifact",
                     rframe.bci
+                ),
+            ));
+        };
+        if point.semantics != deopt::ResumeSemantics::REEXECUTE {
+            return Err(osr_refusal(
+                OSR_REFUSE_EXIT_REPLAY,
+                format!(
+                    "exit at bci {} has {:?}: the bci is not one the interpreter may be \
+                     parked at (only REEXECUTE points are exact resume points)",
+                    rframe.bci, point.semantics
                 ),
             ));
         }
@@ -2876,10 +2911,20 @@ impl CompiledMethod {
         }
         for p in &self.deopt_points {
             let fs = &p.frame_state;
+            // A recorded caller chain is *describable* — the good case — but
+            // the VM's in-place OSR-exit transfer is single-frame
+            // (`transfer_osr_exit_into_live_frame` bails on "inlined caller
+            // chain"), so it still cannot be resumed. Refuse at admission
+            // rather than after committing iterations. Lift this the same day
+            // that transfer grows a multi-frame path.
             if fs.caller.is_some() {
                 return Err(osr_refusal(
                     OSR_REFUSE_INLINED_SCOPE,
-                    format!("deopt point at bci {} has an inlined caller scope", p.bci),
+                    format!(
+                        "deopt point at bci {} has an inlined caller scope, which the \
+                         single-frame in-place OSR-exit transfer cannot resume",
+                        p.bci
+                    ),
                 ));
             }
             if !fs.monitors.is_empty() {
@@ -2893,6 +2938,23 @@ impl CompiledMethod {
                     OSR_REFUSE_UNRESUMABLE_EXIT,
                     format!(
                         "deopt point at bci {} ({:?}) reconstructs an unresumable frame",
+                        p.bci, p.reason
+                    ),
+                ));
+            }
+            // `RESUME` semantics mean "the bytecode at this bci already took
+            // effect; continue AFTER it". Parking the interpreter at that bci
+            // would re-execute it, and computing the successor bci needs the
+            // method's bytecode, which this crate does not have. `RETHROW`
+            // points are fine to *have* — they are stashed separately
+            // (`take_exceptional_frame`) and never routed to a resume — so only
+            // the plain `RESUME` shape disqualifies the entry.
+            if !p.semantics.reexecute && !p.semantics.rethrow_exception {
+                return Err(osr_refusal(
+                    OSR_REFUSE_UNRESUMABLE_EXIT,
+                    format!(
+                        "deopt point at bci {} ({:?}) has RESUME semantics: its successor \
+                         bci is not computable here",
                         p.bci, p.reason
                     ),
                 ));
@@ -2992,15 +3054,31 @@ impl CompiledMethod {
                 format!("{}: artifact carries an unconditional uncommon trap", label()),
             ));
         }
-        // `FrameState::caller` is `None` at every producer, so an artifact that
-        // inlined anything AND can take a frame-deopt exit cannot tell an
-        // outer-scope exit from one inside an inlined callee: both arrive under
-        // the outer method's key, and the callee's bci would be resumed as if
-        // it were an outer bci. Refuse rather than land the interpreter at a
-        // bogus pc. (Entry itself is safe — `osr_pc_to_native` is indexed by
-        // the outer method's code array, so an entry pc is always an
-        // outer-scope block start — the hazard is the exit.)
-        if !self.inlined_methods.is_empty() && !self.deopt_points.is_empty() {
+        // An artifact that inlined something and can also take a frame-deopt
+        // exit must be able to say which scope an exit belongs to. When no
+        // deopt point carries a caller chain, it cannot: an exit inside an
+        // inlined callee arrives under the OUTER method's key at the CALLEE's
+        // bci, indistinguishable from an outer-scope exit, and resuming it
+        // lands the interpreter at a bci that means something else entirely.
+        //
+        // (Entry itself is safe — `osr_pc_to_native` is indexed by the outer
+        // method's code array, so an entry pc is always an outer-scope block
+        // start. The hazard is the exit.)
+        //
+        // Written as "inlined AND no scope recorded anywhere" rather than
+        // "inlined AND has deopt points" so it relaxes on its own as producers
+        // start populating `FrameState::caller` (they do not yet — see
+        // `docs/jit/deopt-inline-scopes.md`). A chain that IS recorded is
+        // handled by `osr_exit_policy` below, which refuses it for a different
+        // and narrower reason: the VM's in-place transfer has no multi-frame
+        // path.
+        if !self.inlined_methods.is_empty()
+            && !self.deopt_points.is_empty()
+            && !self
+                .deopt_points
+                .iter()
+                .any(|p| p.frame_state.caller.is_some())
+        {
             return Err(osr_refusal(
                 OSR_REFUSE_INLINED_SCOPE,
                 format!(
@@ -17488,6 +17566,9 @@ mod tests {
 
     /// An `OsrExit`-tagged deopt point at `bci` — the loop-boundary snapshot
     /// that doubles as the *entry* contract at the same bci.
+    ///
+    /// `ResumeSemantics::for_reason(OsrExit)` is `REEXECUTE`, which is what a
+    /// loop-header snapshot means: the header iteration has not run.
     fn osr_t_exit_point(
         bci: u32,
         locals: Vec<deopt::FrameValue>,
@@ -17507,7 +17588,17 @@ mod tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: deopt::ResumeSemantics::for_reason(deopt::DeoptReason::OsrExit),
         }
+    }
+
+    /// The three-slot contract every fixture here uses: `[ref, int, int]`.
+    fn osr_t_contract_locals() -> Vec<deopt::FrameValue> {
+        vec![
+            deopt::FrameValue::StackSlotRef(-16),
+            deopt::FrameValue::Register(0),
+            deopt::FrameValue::Register(1),
+        ]
     }
 
     /// The interpreter tags for `[int[] a, int i, int sum]`.
@@ -17550,13 +17641,24 @@ mod tests {
         );
         // Permanence splits the taxonomy: artifact-only answers may be memoed
         // through `mark_osr_entry_rejected`; state-dependent ones may not.
-        assert!(osr_refusal_is_permanent(&osr_refusal(
-            OSR_REFUSE_PC_NOT_AN_ENTRY,
-            "probe"
-        )));
+        for tag in OSR_PERMANENT_REFUSAL_TAGS {
+            assert!(
+                OSR_REFUSAL_TAGS.contains(&tag),
+                "{tag} is permanent but not in the taxonomy"
+            );
+            assert!(osr_refusal_is_permanent(&osr_refusal(tag, "probe")));
+        }
         assert!(!osr_refusal_is_permanent(&osr_refusal(
             OSR_REFUSE_SLOT_TYPE,
             "probe"
+        )));
+        assert!(!osr_refusal_is_permanent(&osr_refusal(
+            OSR_REFUSE_OPERAND_STACK,
+            "probe"
+        )));
+        // A non-OSR bailout is never an OSR memo candidate.
+        assert!(!osr_refusal_is_permanent(&bailout::Bailout::new(
+            bailout::BailoutReason::RegisterPressure
         )));
     }
 
@@ -18131,7 +18233,8 @@ mod tests {
             Some(OSR_REFUSE_EXIT_REPLAY)
         );
 
-        // An inlined caller chain cannot be described at all.
+        // An inlined caller chain: describable or not, the VM's in-place
+        // OSR-exit transfer is single-frame, so it cannot be resumed here.
         let mut inlined = base.clone();
         inlined.caller_frames = vec![base.clone()];
         assert_eq!(
@@ -18147,6 +18250,74 @@ mod tests {
             osr_t_tag(&plan.resume_after_exit(&cm, &stray).unwrap_err()),
             Some(OSR_REFUSE_EXIT_REPLAY)
         );
+    }
+
+    /// `ResumeSemantics` decides whether a snapshot bci is a place the
+    /// interpreter may be *parked*, and only `REEXECUTE` is.
+    ///
+    /// A `RESUME` point means the bytecode at `bci` already took effect, so
+    /// parking there re-executes it — the same double-execution defect as
+    /// replaying a loop iteration, one bytecode at a time. Its successor bci
+    /// needs the method's bytecode, which this crate does not have, so such a
+    /// point disqualifies the OSR entry up front and is refused again on the
+    /// way out.
+    #[test]
+    fn only_reexecute_semantics_yield_an_exact_resume_point() {
+        // Sanity: the convention this rests on.
+        assert_eq!(
+            deopt::ResumeSemantics::for_reason(deopt::DeoptReason::OsrExit),
+            deopt::ResumeSemantics::REEXECUTE
+        );
+
+        let locals = [0x1234_5678i64, 200, 4950];
+
+        // A `RESUME`-semantics point anywhere in the artifact refuses the ENTRY
+        // — before any iteration is committed.
+        let mut cm = osr_t_artifact(3);
+        let mut resume_point = osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            osr_t_contract_locals(),
+            Vec::new(),
+        );
+        resume_point.semantics = deopt::ResumeSemantics::RESUME;
+        cm.deopt_points = vec![resume_point];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("a RESUME-semantics exit must refuse the entry");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_UNRESUMABLE_EXIT));
+        assert!(err.to_string().contains("RESUME"), "{err}");
+
+        // A `RETHROW` point may EXIST — it is stashed separately and never
+        // routed to a resume — so it must not disqualify the entry…
+        let mut cm = osr_t_artifact(3);
+        let mut rethrow = osr_t_exit_point(5, osr_t_contract_locals(), Vec::new());
+        rethrow.reason = deopt::DeoptReason::PendingException;
+        rethrow.semantics = deopt::ResumeSemantics::RETHROW;
+        cm.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            rethrow,
+        ];
+        let plan = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("a RETHROW point elsewhere in the body must not refuse the entry");
+
+        // …but a frame that arrives naming it is refused: its bci is a throwing
+        // instruction, not a resume point.
+        let rframe = deopt::ReconstructedFrame {
+            method_key: "craton/probe/OsrEntry.sum:([I)I".to_string(),
+            bci: 5,
+            locals: vec![
+                deopt::FrameValue::Object(0x1234_5678),
+                deopt::FrameValue::Int(700),
+                deopt::FrameValue::Int(0),
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        };
+        let err = plan.resume_after_exit(&cm, &rframe).unwrap_err();
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
+        assert!(err.to_string().contains("REEXECUTE"), "{err}");
     }
 
     /// A crash handler must be able to tell "no compiled body covers this

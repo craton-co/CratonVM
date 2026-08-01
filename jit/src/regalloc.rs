@@ -4795,7 +4795,15 @@ pub fn allocate_linear_scan(
 
         match choice {
             Some((reg, until)) => {
-                let end = until.unwrap_or(hi);
+                // `until` is the first position at which the register is NOT
+                // available (a clobber, or somebody else's fixed constraint),
+                // so the segment must stop one short of it. Ending *at* it
+                // would leave the value live in a register a call destroys —
+                // which `verify_allocation` now rejects outright.
+                let end = match until {
+                    Some(blocked) => blocked.saturating_sub(1),
+                    None => hi,
+                };
                 let segs = &mut reg_segments[node as usize];
                 segs.push((PosRange { lo, hi: end }, reg));
                 active.push(Active {
@@ -5270,5 +5278,1425 @@ fn ls_home_class(live: &LiveModel, id: usize) -> HomeClass {
         HomeClass::Ref
     } else {
         HomeClass::Prim
+    }
+}
+
+// ── Verification ─────────────────────────────────────────────────────
+
+/// Reject overlapping ranges within one shared resource.
+///
+/// `group` is every `(range, owner)` pair that occupies the resource. Sorting
+/// by start and comparing each entry against the furthest-reaching predecessor
+/// is linear and still catches a *nested* range, which a naive
+/// compare-with-the-previous-entry sweep misses.
+fn ls_check_disjoint(
+    what: &'static str,
+    resource: &str,
+    mut group: Vec<(PosRange, NodeId)>,
+) -> CompileResult<()> {
+    group.sort_by_key(|(r, id)| (r.lo, r.hi, *id));
+    let mut furthest: Option<(PosRange, NodeId)> = None;
+    for (r, id) in group {
+        if let Some((p, pid)) = furthest {
+            if p.overlaps(r) {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal(what),
+                    format!(
+                        "{resource}: n{pid} over [{}, {}] and n{id} over [{}, {}]",
+                        p.lo, p.hi, r.lo, r.hi
+                    ),
+                ));
+            }
+        }
+        if furthest.is_none_or(|(p, _)| r.hi > p.hi) {
+            furthest = Some((r, id));
+        }
+    }
+    Ok(())
+}
+
+/// Prove an [`Allocation`] is one a backend may emit.
+///
+/// This is the pass that turns "the heuristic looked right" into "the heuristic
+/// is right on this graph". [`allocate_linear_scan`] runs it before returning,
+/// so no caller can obtain an unverified allocation; it is exported because a
+/// consumer that *builds* or *rewrites* an allocation (a coalescer, a
+/// hand-written test fixture) has to be able to re-check its work.
+///
+/// Every failure is [`BailoutReason::Internal`] — a violation here is a
+/// compiler bug, not a property of the input program, and the pressure case is
+/// already reported as [`BailoutReason::RegisterPressure`] by the allocator
+/// itself. The method loses its optimized body; the VM does not die.
+///
+/// ## What is proved
+///
+/// 1. **Shape.** One timeline per graph node, and a value's segments tile its
+///    whole live range in order with no gap and no overlap.
+/// 2. **Register class.** Every register a value holds is in that value's class
+///    ([`RegClass::of`] its type) and is in the allocatable [`RegFile`].
+/// 3. **No aliasing.** Two *different* values never hold the same [`PhysReg`]
+///    at the same position, under the same endpoint-inclusive overlap rule the
+///    allocator and `ir_lower::plan_slots` use. This is the invariant the whole
+///    pass exists to keep.
+/// 4. **ABI.** No value is live in a register across a position that clobbers
+///    it, no value holds a register another value is pinned to at that
+///    position, and a pinned value never holds a *different* register at its
+///    pinned position. (A pinned value that was not promoted at all is not a
+///    violation: the prologue leaves it in its home slot, which is where every
+///    reader looks today.)
+/// 5. **The GC rule.** A `Ref` never holds a register across a safepoint — see
+///    the decision recorded on [`allocate_linear_scan`].
+/// 6. **Homes.** Two values that share a home word have disjoint live ranges,
+///    and a home word never mixes [`HomeClass`] pools, so the word the oop map
+///    names can never come to hold a primitive.
+/// 7. **Bookkeeping.** The event list is in position order and its kinds sum to
+///    the reported spill / reload / remat / move counts, so a metrics consumer
+///    cannot be handed a number the events do not support.
+pub fn verify_allocation(
+    graph: &Graph,
+    live: &LiveModel,
+    model: &MachineModel,
+    alloc: &Allocation,
+) -> CompileResult<()> {
+    let n = graph.nodes.len();
+    if alloc.segments.len() != n || alloc.stack_slot.len() != n {
+        return Err(Bailout::with_context(
+            BailoutReason::Internal("regalloc: allocation is not sized for the graph"),
+            format!(
+                "{n} nodes, {} timelines, {} homes",
+                alloc.segments.len(),
+                alloc.stack_slot.len()
+            ),
+        ));
+    }
+    // `ls_select_register` binary-searches the clobber list, so an unsorted one
+    // silently hides a clobber from the allocator. Check the invariant here
+    // rather than trust every producer of a `MachineModel`.
+    if model.clobbers.windows(2).any(|w| w[0].0 > w[1].0) {
+        return Err(Bailout::with_context(
+            BailoutReason::Internal("regalloc: the clobber list is not sorted by position"),
+            format!("{} clobber sites", model.clobbers.len()),
+        ));
+    }
+
+    let mut by_reg: BTreeMap<PhysReg, Vec<(PosRange, NodeId)>> = BTreeMap::new();
+    let mut by_home: BTreeMap<u32, Vec<(PosRange, NodeId)>> = BTreeMap::new();
+    let mut home_pool: BTreeMap<u32, (HomeClass, NodeId)> = BTreeMap::new();
+
+    for id in 0..n {
+        let node = id as NodeId;
+        let segs = &alloc.segments[id];
+        let wants = live.wants_loc.get(id).copied().unwrap_or(false);
+        let Some(range) = live.range.get(id).copied().flatten().filter(|_| wants) else {
+            if !segs.is_empty() {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("regalloc: a value-less node was given a location"),
+                    format!("n{node} has {} segments", segs.len()),
+                ));
+            }
+            continue;
+        };
+
+        // ── 1. The timeline tiles the live range ─────────────────────
+        let (Some(first), Some(last)) = (segs.first(), segs.last()) else {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal("regalloc: a live value has no location timeline"),
+                format!("n{node} over [{}, {}]", range.lo, range.hi),
+            ));
+        };
+        if first.range.lo != range.lo || last.range.hi != range.hi {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal("regalloc: a timeline does not cover the live range"),
+                format!(
+                    "n{node}: timeline [{}, {}] vs range [{}, {}]",
+                    first.range.lo, last.range.hi, range.lo, range.hi
+                ),
+            ));
+        }
+        for w in segs.windows(2) {
+            if w[0].range.hi.saturating_add(1) != w[1].range.lo {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("regalloc: a timeline has a gap or an overlap"),
+                    format!(
+                        "n{node}: [{}, {}] then [{}, {}]",
+                        w[0].range.lo, w[0].range.hi, w[1].range.lo, w[1].range.hi
+                    ),
+                ));
+            }
+        }
+
+        // ── 2/4/5. Per-segment class, ABI and GC rules ───────────────
+        let mut needs_home = false;
+        for seg in segs {
+            if seg.range.lo > seg.range.hi {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("regalloc: an empty segment"),
+                    format!("n{node}: [{}, {}]", seg.range.lo, seg.range.hi),
+                ));
+            }
+            let Some(reg) = seg.reg else {
+                needs_home = true;
+                continue;
+            };
+            if live.class.get(id).copied().flatten() != Some(reg.class) {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("regalloc: a value is in the wrong register class"),
+                    format!(
+                        "n{node} is {:?} but holds {reg}",
+                        live.class.get(id).copied().flatten()
+                    ),
+                ));
+            }
+            if !model.regs.contains(reg) {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("regalloc: a value holds a non-allocatable register"),
+                    format!("n{node} holds {reg}"),
+                ));
+            }
+            if live.pinned.get(id).copied().unwrap_or(false) {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("regalloc: a pinned value was promoted"),
+                    format!("n{node} holds {reg} over [{}, {}]", seg.range.lo, seg.range.hi),
+                ));
+            }
+            if live.is_ref.get(id).copied().unwrap_or(false)
+                && model.range_covers_safepoint(seg.range)
+            {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal(
+                        "regalloc: a reference holds a register across a safepoint",
+                    ),
+                    format!(
+                        "n{node} holds {reg} over [{}, {}], which the oop map cannot describe",
+                        seg.range.lo, seg.range.hi
+                    ),
+                ));
+            }
+            // No value may be live in a register a call (or a fixed-operand
+            // instruction) destroys.
+            let start = model.clobbers.partition_point(|(p, _)| *p < seg.range.lo);
+            for entry in model.clobbers[start..].iter() {
+                let pos = entry.0;
+                if pos > seg.range.hi {
+                    break;
+                }
+                if model.clobbered_at(pos).contains(&reg) {
+                    return Err(Bailout::with_context(
+                        BailoutReason::Internal(
+                            "regalloc: a value is live in a clobbered register",
+                        ),
+                        format!(
+                            "n{node} holds {reg} over [{}, {}], clobbered at {pos}",
+                            seg.range.lo, seg.range.hi
+                        ),
+                    ));
+                }
+            }
+            by_reg.entry(reg).or_default().push((seg.range, node));
+        }
+
+        // ── 6. Home words ────────────────────────────────────────────
+        if needs_home {
+            let Some(color) = alloc.stack_slot.get(id).copied().flatten() else {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("regalloc: a spilled value has no home word"),
+                    format!("n{node} over [{}, {}]", range.lo, range.hi),
+                ));
+            };
+            if color as usize >= alloc.stack_slots {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("regalloc: a home word is outside the frame plan"),
+                    format!("n{node} at word {color} of {}", alloc.stack_slots),
+                ));
+            }
+            let pool = ls_home_class(live, id);
+            // Copied out before the match so the `_` arm can insert: an
+            // outstanding `&` into the map would make that arm a borrow error.
+            let seen = home_pool.get(&color).copied();
+            match seen {
+                Some((existing, owner)) if existing != pool => {
+                    return Err(Bailout::with_context(
+                        BailoutReason::Internal("regalloc: a home word mixes two slot pools"),
+                        format!("word {color}: n{owner} is {existing:?}, n{node} is {pool:?}"),
+                    ));
+                }
+                _ => {
+                    home_pool.insert(color, (pool, node));
+                }
+            }
+            by_home.entry(color).or_default().push((range, node));
+        }
+    }
+
+    // ── 3. No two values in one register at one position ─────────────
+    for (reg, group) in by_reg {
+        ls_check_disjoint(
+            "regalloc: two values hold one register at the same position",
+            &reg.to_string(),
+            group,
+        )?;
+    }
+    for (color, group) in by_home {
+        ls_check_disjoint(
+            "regalloc: two values share one home word",
+            &format!("word {color}"),
+            group,
+        )?;
+    }
+
+    // ── 4b. Fixed (ABI) constraints ──────────────────────────────────
+    for f in &model.fixed {
+        if !model.regs.contains(f.reg) {
+            continue;
+        }
+        // The constrained value must not be sitting somewhere else.
+        if let Some(ValueLoc::Reg(actual)) = alloc.location_at(f.node, f.pos) {
+            if actual != f.reg {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal(
+                        "regalloc: an ABI-pinned value is in the wrong register",
+                    ),
+                    format!("n{} needs {} at {} but holds {actual}", f.node, f.reg, f.pos),
+                ));
+            }
+        }
+        // …and nobody else may be occupying the register it is pinned to.
+        for id in 0..n {
+            let other = id as NodeId;
+            if other == f.node {
+                continue;
+            }
+            if alloc.location_at(other, f.pos) == Some(ValueLoc::Reg(f.reg)) {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal(
+                        "regalloc: an ABI-pinned register is held by another value",
+                    ),
+                    format!("n{other} holds {} at {}, pinned to n{}", f.reg, f.pos, f.node),
+                ));
+            }
+        }
+    }
+
+    // ── 7. The event list supports the reported counts ───────────────
+    let (mut stores, mut loads, mut remats, mut moves) = (0usize, 0usize, 0usize, 0usize);
+    let mut prev_pos = 0usize;
+    for (i, e) in alloc.events.iter().enumerate() {
+        if i > 0 && e.pos < prev_pos {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal("regalloc: spill events are not in position order"),
+                format!("event {i} at {} follows {prev_pos}", e.pos),
+            ));
+        }
+        prev_pos = e.pos;
+        match e.kind {
+            SpillKind::Store => stores += 1,
+            SpillKind::Load => loads += 1,
+            SpillKind::Remat => remats += 1,
+            SpillKind::Move => moves += 1,
+        }
+    }
+    let reported = (alloc.spills, alloc.reloads, alloc.remats, alloc.reg_moves);
+    if (stores, loads, remats, moves) != reported {
+        return Err(Bailout::with_context(
+            BailoutReason::Internal("regalloc: the reported counts do not match the events"),
+            format!(
+                "events say {stores}/{loads}/{remats}/{moves}, report says {}/{}/{}/{}",
+                alloc.spills, alloc.reloads, alloc.remats, alloc.reg_moves
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+// ── Phi resolution: the parallel copy ────────────────────────────────
+
+/// One machine-level move in a *sequentialised* parallel copy.
+///
+/// The scratch is unnamed on purpose: it is whatever the backend already keeps
+/// free at an edge (RAX for `ir_lower::emit_phi_copies`, which routes every
+/// copy through it). Naming a register here would make the sequence wrong on
+/// any backend with a different scratch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyOp {
+    /// `to ← from`.
+    Move {
+        /// Where the value is read from.
+        from: ValueLoc,
+        /// Where it is written to.
+        to: ValueLoc,
+    },
+    /// `scratch ← from`. Emitted only to break a cycle, always followed later
+    /// by exactly one [`CopyOp::Restore`].
+    Save {
+        /// The location whose value is about to be overwritten.
+        from: ValueLoc,
+    },
+    /// `to ← scratch`.
+    Restore {
+        /// Where the saved value lands.
+        to: ValueLoc,
+    },
+}
+
+/// Sequentialise a parallel copy: `(destination, source)` pairs that all read
+/// their sources **before** any destination is written.
+///
+/// A phi web on one CFG edge is exactly such a copy. Emitting the pairs in
+/// order is wrong whenever a destination is also somebody's source — the
+/// classic case being a loop that swaps two locals, whose two phis are each
+/// other's incoming value:
+///
+/// ```text
+///   a' ← b
+///   b' ← a          emitted naively: a' ← b ; b' ← a'   →   both become b
+/// ```
+///
+/// This returns an order in which every read still sees the pre-copy value:
+/// destinations that nothing else reads go first, and when only cycles remain
+/// one element is parked in the scratch, which frees its predecessor and
+/// unwinds the rest of the cycle. Costs at most one [`CopyOp::Save`] /
+/// [`CopyOp::Restore`] pair per cycle and nothing at all on the acyclic
+/// majority.
+///
+/// Errors (as [`BailoutReason::Internal`]) when one destination is written
+/// twice, which is not a copy this can sequentialise — it is a malformed web.
+pub fn resolve_parallel_copy(copies: &[(ValueLoc, ValueLoc)]) -> CompileResult<Vec<CopyOp>> {
+    // `None` as a source means "the scratch", which is where a broken cycle
+    // parks the value the last move of that cycle has to read.
+    let mut pending: Vec<(ValueLoc, Option<ValueLoc>)> = Vec::with_capacity(copies.len());
+    for &(dst, src) in copies {
+        if dst == src {
+            // A copy to itself is not a move, and treating it as one would
+            // invent a false dependency that forces a scratch.
+            continue;
+        }
+        // Copied out before the match: an outstanding `&` into `pending` would
+        // make the `None` arm's push a borrow error.
+        let existing = pending.iter().find(|(d, _)| *d == dst).map(|(_, s)| *s);
+        match existing {
+            // The same pair listed twice is idempotent — a merge reached along
+            // two edges of the same predecessor asks for the identical write.
+            Some(s) if s == Some(src) => continue,
+            Some(_) => {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal(
+                        "regalloc: a parallel copy writes one destination twice",
+                    ),
+                    format!("{dst:?}"),
+                ));
+            }
+            None => pending.push((dst, Some(src))),
+        }
+    }
+
+    let mut out: Vec<CopyOp> = Vec::with_capacity(pending.len() + 2);
+    // Each pass either retires an entry or breaks one cycle (which immediately
+    // makes an entry retirable), so twice the entry count plus a constant
+    // bounds the loop even if the invariant above were ever violated.
+    let mut guard = pending.len().saturating_mul(2).saturating_add(4);
+    while !pending.is_empty() {
+        if guard == 0 {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal("regalloc: parallel copy sequencing did not terminate"),
+                format!("{} copies left", pending.len()),
+            ));
+        }
+        guard -= 1;
+
+        // A destination nothing still reads can be written now.
+        let ready = pending
+            .iter()
+            .position(|(d, _)| !pending.iter().any(|(_, s)| *s == Some(*d)));
+        match ready {
+            Some(i) => {
+                let (dst, src) = pending.remove(i);
+                out.push(match src {
+                    Some(from) => CopyOp::Move { from, to: dst },
+                    None => CopyOp::Restore { to: dst },
+                });
+            }
+            None => {
+                // Every remaining destination is also a source. Each has
+                // exactly one source (destinations are unique) and at least one
+                // reader, so what is left is a disjoint union of pure cycles.
+                // Park one element and its cycle unwinds.
+                let (cycle, _) = pending[0];
+                out.push(CopyOp::Save { from: cycle });
+                for (_, src) in pending.iter_mut() {
+                    if *src == Some(cycle) {
+                        *src = None;
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The parallel copy `pred_block`'s outgoing edge must perform.
+///
+/// One `(destination, source)` pair per phi value that flows along this edge,
+/// with the source read at the predecessor's **edge position** — the position
+/// [`build_live_model`] charges phi arguments to, so the locations here are the
+/// ones the allocation actually holds at the moment the copies run.
+///
+/// Destinations are always home words: phis are `pinned` (see [`LiveModel`]),
+/// so a phi is never promoted and its home is what every reader looks at.
+/// Feed the result to [`resolve_parallel_copy`] — the pairs are simultaneous,
+/// not sequential.
+pub fn phi_edge_copies(
+    graph: &Graph,
+    schedule: &Schedule,
+    live: &LiveModel,
+    alloc: &Allocation,
+    pred_block: usize,
+) -> CompileResult<Vec<(ValueLoc, ValueLoc)>> {
+    let mut copies: Vec<(ValueLoc, ValueLoc)> = Vec::new();
+    let Some(&(_, edge_pos)) = live.span.get(pred_block) else {
+        return Ok(copies);
+    };
+    let Some(pred) = schedule.blocks.get(pred_block) else {
+        return Ok(copies);
+    };
+    for &succ in &pred.successors {
+        let Some(merge_ctrl) = schedule.blocks.get(succ).map(|b| b.ctrl) else {
+            continue;
+        };
+        let Some(merge) = graph.nodes.get(merge_ctrl as usize) else {
+            continue;
+        };
+        if !matches!(merge.op, Op::Merge | Op::Region) {
+            continue;
+        }
+        for (pid, phi) in graph.nodes.iter().enumerate() {
+            if !matches!(phi.op, Op::Phi) {
+                continue;
+            }
+            // Memory and control phis are bookkeeping tokens with no machine
+            // value — the same filter `ir_lower::emit_phi_copies` applies.
+            if matches!(phi.ty, IrType::Memory | IrType::Control | IrType::Void) {
+                continue;
+            }
+            if phi.inputs.first().copied() != Some(merge_ctrl) {
+                continue;
+            }
+            for (k, &ctrl_in) in merge.inputs.iter().enumerate() {
+                if ls_ctrl_block_of(graph, schedule, ctrl_in) != Some(pred_block) {
+                    continue;
+                }
+                let Some(&v) = phi.inputs.get(k + 1) else {
+                    continue;
+                };
+                if v == NO_NODE {
+                    continue;
+                }
+                let Some(color) = alloc.stack_slot.get(pid).copied().flatten() else {
+                    return Err(Bailout::with_context(
+                        BailoutReason::Internal("regalloc: a phi has no home word to copy into"),
+                        format!("n{pid}"),
+                    ));
+                };
+                let Some(src) = alloc.location_at(v, edge_pos) else {
+                    return Err(Bailout::with_context(
+                        BailoutReason::UnallocatedValue { node: v },
+                        format!("n{v} has no location at edge position {edge_pos}"),
+                    ));
+                };
+                copies.push((ValueLoc::Slot(color), src));
+            }
+        }
+    }
+    Ok(copies)
+}
+
+// ── Metrics ──────────────────────────────────────────────────────────
+
+/// Publish an allocation's cost to a [`CompileRecorder`].
+///
+/// `CompilationReport::spills` / `::reloads` are declared `Measured<T>` and
+/// report "not measured" precisely because nothing computed them; this is the
+/// producer. Note the asymmetry with `peak_live_values`, which the compiler
+/// also records ambiently through `metrics::note_current_peak_live_values`
+/// because `ir_lower::lower_inner`'s signature is pinned and cannot take a
+/// recorder. The optimizing pipeline will need the same ambient form for these
+/// two — `metrics::note_current_spills` / `note_current_reloads`, mirroring
+/// `metrics.rs`'s existing `note_current_peak_live_values` — which this wave
+/// may not add; see `docs/jit/linear-scan-regalloc.md`.
+pub fn record_allocation_metrics(recorder: &CompileRecorder, alloc: &Allocation) {
+    recorder.set_peak_live_values(alloc.peak_live);
+    recorder.set_spills(alloc.spills);
+    recorder.set_reloads(alloc.reloads);
+}
+
+#[cfg(test)]
+mod linear_scan_tests {
+    use super::*;
+    use crate::ir::IrBuilder;
+    use crate::ir_schedule;
+
+    // ── Fixtures ─────────────────────────────────────────────────────
+
+    /// A hand-written single-block liveness model.
+    ///
+    /// [`build_live_model`] is exercised end to end at the bottom of this
+    /// module, on real scheduled graphs. These fixtures exist because the
+    /// allocator's interesting behaviour — who wins an eviction, where a split
+    /// lands, which register a clobber pushes a value out of — is a function of
+    /// *intervals*, and steering a scheduler into an exact pair of positions is
+    /// neither reliable nor the thing under test.
+    struct Fixture {
+        graph: Graph,
+        live: LiveModel,
+    }
+
+    impl Fixture {
+        fn new(total_positions: usize) -> Fixture {
+            Fixture {
+                graph: Graph {
+                    nodes: Vec::new(),
+                    entry: 0,
+                    exit: NO_NODE,
+                    safepoints: Vec::new(),
+                    uses: Default::default(),
+                },
+                live: LiveModel {
+                    pos_of: Vec::new(),
+                    span: vec![(0, total_positions.saturating_sub(1))],
+                    total_positions,
+                    block_of_pos: vec![0; total_positions],
+                    wants_loc: Vec::new(),
+                    range: Vec::new(),
+                    class: Vec::new(),
+                    is_ref: Vec::new(),
+                    pinned: Vec::new(),
+                    uses: Vec::new(),
+                    weight: Vec::new(),
+                    loop_depth: vec![0],
+                    peak_live: 0,
+                    converged: true,
+                },
+            }
+        }
+
+        fn value(&mut self, op: Op, ty: IrType, lo: usize, hi: usize, uses: &[usize]) -> NodeId {
+            self.push(op, ty, lo, hi, uses, false)
+        }
+
+        /// A value `ir_lower` owns the home of — a phi, or anything a deopt
+        /// frame names. Never promoted.
+        fn home_bound(&mut self, ty: IrType, lo: usize, hi: usize, uses: &[usize]) -> NodeId {
+            self.push(Op::Phi, ty, lo, hi, uses, true)
+        }
+
+        fn push(
+            &mut self,
+            op: Op,
+            ty: IrType,
+            lo: usize,
+            hi: usize,
+            uses: &[usize],
+            pin: bool,
+        ) -> NodeId {
+            let id = self.graph.add(op, ty, vec![], None);
+            assert_eq!(
+                id as usize,
+                self.live.wants_loc.len(),
+                "fixture node ids must stay dense"
+            );
+            assert!(
+                lo <= hi && hi < self.live.total_positions,
+                "interval [{lo}, {hi}] does not fit the fixture"
+            );
+            self.live.pos_of.push(Some(lo));
+            self.live.wants_loc.push(true);
+            self.live.range.push(Some(PosRange { lo, hi }));
+            self.live.class.push(RegClass::of(ty));
+            self.live.is_ref.push(ty == IrType::Ref);
+            self.live.pinned.push(pin);
+            let mut u: Vec<usize> = uses.to_vec();
+            u.sort_unstable();
+            u.dedup();
+            self.live.weight.push(u.len().max(1) as u64);
+            self.live.uses.push(u);
+            id
+        }
+
+        fn finish(mut self) -> (Graph, LiveModel) {
+            let mut delta = vec![0i64; self.live.total_positions + 2];
+            for r in self.live.range.iter().flatten() {
+                delta[r.lo] += 1;
+                delta[r.hi + 1] -= 1;
+            }
+            let (mut running, mut peak) = (0i64, 0i64);
+            for d in &delta {
+                running += d;
+                peak = peak.max(running);
+            }
+            self.live.peak_live = peak.max(0) as usize;
+            (self.graph, self.live)
+        }
+    }
+
+    /// `n` callee-saved GP registers, handed out r0 first.
+    fn gp(n: u8) -> RegFile {
+        RegFile::from_specs((0..n).map(|num| RegSpec {
+            reg: PhysReg::gp(num),
+            caller_saved: false,
+        }))
+    }
+
+    /// `volatile` caller-saved GP registers **first**, then `saved`
+    /// callee-saved ones. The preference order is what makes "a value that
+    /// crosses a call has to skip the volatile registers" observable: with the
+    /// callee-saved ones first every value would trivially survive.
+    fn gp_volatile_first(volatile: u8, saved: u8) -> RegFile {
+        RegFile::from_specs(
+            (0..volatile)
+                .map(|num| RegSpec {
+                    reg: PhysReg::gp(num),
+                    caller_saved: true,
+                })
+                .chain((volatile..volatile + saved).map(|num| RegSpec {
+                    reg: PhysReg::gp(num),
+                    caller_saved: false,
+                })),
+        )
+    }
+
+    fn bare_model(regs: RegFile) -> MachineModel {
+        MachineModel {
+            regs,
+            clobbers: Vec::new(),
+            fixed: Vec::new(),
+            safepoints: Vec::new(),
+        }
+    }
+
+    fn internal_message(err: &Bailout) -> String {
+        match &err.reason {
+            BailoutReason::Internal(msg) => (*msg).to_string(),
+            other => panic!("expected an Internal bailout, got {other:?}"),
+        }
+    }
+
+    // ── The allocator core ───────────────────────────────────────────
+
+    #[test]
+    fn non_overlapping_values_share_one_register() {
+        let mut f = Fixture::new(12);
+        let a = f.value(Op::Add, IrType::Int, 0, 3, &[3]);
+        let b = f.value(Op::Add, IrType::Int, 5, 8, &[8]);
+        let (graph, live) = f.finish();
+        let model = bare_model(gp(2));
+
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert_eq!(alloc.first_reg(a), Some(PhysReg::gp(0)));
+        assert_eq!(
+            alloc.first_reg(b),
+            Some(PhysReg::gp(0)),
+            "a dies at 3, so b may reuse r0 — that reuse is the whole point"
+        );
+        assert_eq!(alloc.promoted, 2);
+        assert_eq!((alloc.spills, alloc.reloads), (0, 0));
+        assert_eq!(alloc.stack_slots, 0, "neither value ever touches memory");
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+    }
+
+    #[test]
+    fn overlapping_values_never_share_a_register() {
+        let mut f = Fixture::new(12);
+        let a = f.value(Op::Add, IrType::Int, 0, 8, &[8]);
+        let b = f.value(Op::Add, IrType::Int, 2, 6, &[6]);
+        // `c` starts exactly where `a` ends. Overlap is endpoint-inclusive —
+        // a node's lowering may write its result before reading its operands —
+        // so this must NOT reuse a's register either.
+        let c = f.value(Op::Add, IrType::Int, 8, 10, &[10]);
+        let (graph, live) = f.finish();
+        let model = bare_model(gp(2));
+
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert_eq!(alloc.first_reg(a), Some(PhysReg::gp(0)));
+        assert_ne!(alloc.first_reg(b), alloc.first_reg(a));
+        assert_ne!(
+            alloc.first_reg(c),
+            alloc.first_reg(a),
+            "[0, 8] and [8, 10] touch at 8, which counts as overlapping"
+        );
+        assert_eq!(live.peak_live, 2);
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+    }
+
+    #[test]
+    fn a_call_clobbers_the_caller_saved_registers() {
+        let mut f = Fixture::new(12);
+        let across = f.value(Op::Add, IrType::Int, 0, 8, &[3, 8]);
+        let short = f.value(Op::Add, IrType::Int, 1, 3, &[3]);
+        let (graph, live) = f.finish();
+        let mut model = bare_model(gp_volatile_first(1, 1));
+        model.clobbers = vec![(5, vec![PhysReg::gp(0)])];
+        model.safepoints = vec![5];
+
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert_eq!(
+            alloc.first_reg(across),
+            Some(PhysReg::gp(1)),
+            "a value live across the call must land in the callee-saved register"
+        );
+        assert_eq!(
+            alloc.first_reg(short),
+            Some(PhysReg::gp(0)),
+            "a value that dies before the call may still use the volatile one"
+        );
+        for seg in &alloc.segments[across as usize] {
+            assert!(
+                !(seg.reg == Some(PhysReg::gp(0)) && seg.range.contains(5)),
+                "nothing may hold r0 at the call"
+            );
+        }
+        assert_eq!(
+            (alloc.spills, alloc.reloads),
+            (0, 0),
+            "the callee-saved register made the call cost nothing"
+        );
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+    }
+
+    #[test]
+    fn a_value_crossing_a_call_with_no_callee_saved_register_is_split_and_reloaded() {
+        let mut f = Fixture::new(12);
+        let v = f.value(Op::Add, IrType::Int, 0, 8, &[3, 8]);
+        let (graph, live) = f.finish();
+        // One register, and a call destroys it.
+        let mut model = bare_model(gp_volatile_first(1, 0));
+        model.clobbers = vec![(5, vec![PhysReg::gp(0)])];
+        model.safepoints = vec![5];
+
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        let segs = &alloc.segments[v as usize];
+        assert_eq!(segs.len(), 3, "prefix in r0, memory over the call, then back");
+        assert_eq!(
+            segs[0],
+            Segment {
+                range: PosRange { lo: 0, hi: 4 },
+                reg: Some(PhysReg::gp(0)),
+            },
+            "the register segment stops one short of the clobber, not on it"
+        );
+        assert_eq!(segs[1].reg, None);
+        assert_eq!(
+            segs[2],
+            Segment {
+                range: PosRange { lo: 8, hi: 8 },
+                reg: Some(PhysReg::gp(0)),
+            }
+        );
+        assert_eq!((alloc.spills, alloc.reloads, alloc.splits), (1, 1, 1));
+
+        let store = alloc
+            .events
+            .iter()
+            .find(|e| e.kind == SpillKind::Store)
+            .expect("one store");
+        assert_eq!(store.pos, 4, "the store may sink to the last live position");
+        let load = alloc
+            .events
+            .iter()
+            .find(|e| e.kind == SpillKind::Load)
+            .expect("one reload");
+        assert_eq!(
+            load.pos, 8,
+            "the reload lands on the next use, not on the split point"
+        );
+        assert_eq!(
+            alloc.stack_slot[v as usize],
+            Some(0),
+            "a value that touches memory needs a home word"
+        );
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+    }
+
+    #[test]
+    fn a_rematerializable_constant_is_evicted_but_never_stored() {
+        let mut f = Fixture::new(12);
+        // The constant is long-lived and cheap to recompute; the arithmetic
+        // value that wants the same single register is not.
+        let k = f.value(Op::Const(7), IrType::Int, 0, 10, &[2, 10]);
+        let x = f.value(Op::Add, IrType::Int, 1, 9, &[9]);
+        let (graph, live) = f.finish();
+        let model = bare_model(gp(1));
+
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert_eq!(
+            alloc.first_reg(x),
+            Some(PhysReg::gp(0)),
+            "the constant loses the register to the value that cannot be rebuilt"
+        );
+        assert_eq!(alloc.spills, 0, "a constant is never stored to memory");
+        assert_eq!(alloc.reloads, 0, "and never loaded back from it");
+        assert_eq!(alloc.remats, 1, "it is recomputed at its next use instead");
+        assert!(
+            !alloc.events.iter().any(|e| e.kind == SpillKind::Store),
+            "no store may be emitted for a rematerializable value"
+        );
+        let remat = alloc
+            .events
+            .iter()
+            .find(|e| e.kind == SpillKind::Remat)
+            .expect("one remat");
+        assert_eq!((remat.node, remat.pos), (k, 10));
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+    }
+
+    #[test]
+    fn an_entry_parameter_keeps_its_abi_register() {
+        let mut f = Fixture::new(10);
+        let p = f.value(Op::Param(0), IrType::Int, 0, 8, &[8]);
+        let q = f.value(Op::Add, IrType::Int, 1, 7, &[7]);
+        let (graph, live) = f.finish();
+        let mut model = bare_model(gp(3));
+        model.fixed = vec![FixedConstraint {
+            node: p,
+            pos: 0,
+            reg: PhysReg::gp(2),
+        }];
+
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert_eq!(
+            alloc.first_reg(p),
+            Some(PhysReg::gp(2)),
+            "the pinned register wins over the preference order"
+        );
+        assert_ne!(alloc.first_reg(q), Some(PhysReg::gp(2)));
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+    }
+
+    // ── The reference-at-a-safepoint decision ────────────────────────
+
+    #[test]
+    fn a_reference_live_across_a_safepoint_stays_in_memory() {
+        let mut f = Fixture::new(12);
+        let across = f.value(Op::Load(crate::ir::MemKind::Ref), IrType::Ref, 0, 8, &[8]);
+        let between = f.value(Op::Load(crate::ir::MemKind::Ref), IrType::Ref, 5, 7, &[7]);
+        let prim = f.value(Op::Add, IrType::Int, 0, 8, &[8]);
+        let (graph, live) = f.finish();
+        let mut model = bare_model(gp(4));
+        model.safepoints = vec![4];
+
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert!(
+            !alloc.is_promoted(across),
+            "the oop map describes frame words, so a reference that is live at a \
+             safepoint must be in one"
+        );
+        assert!(
+            alloc.stack_slot[across as usize].is_some(),
+            "and it must therefore have a home word"
+        );
+        assert!(
+            alloc.is_promoted(between),
+            "a reference that lives and dies strictly after the safepoint may take \
+             a register"
+        );
+        assert!(
+            alloc.is_promoted(prim),
+            "the rule is about references, not about crossing a safepoint"
+        );
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+    }
+
+    // ── The verifier ─────────────────────────────────────────────────
+
+    #[test]
+    fn verify_allocation_rejects_a_planted_register_alias() {
+        let mut f = Fixture::new(12);
+        let a = f.value(Op::Add, IrType::Int, 0, 8, &[8]);
+        let b = f.value(Op::Add, IrType::Int, 2, 6, &[6]);
+        let (graph, live) = f.finish();
+        let model = bare_model(gp(2));
+        let mut alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert_ne!(alloc.first_reg(a), alloc.first_reg(b));
+
+        // Two values live at the same position, one register.
+        let a_reg = alloc.first_reg(a);
+        alloc.segments[b as usize][0].reg = a_reg;
+        let err = verify_allocation(&graph, &live, &model, &alloc)
+            .expect_err("an alias must be rejected");
+        assert!(
+            internal_message(&err).contains("one register"),
+            "wrong diagnosis: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_allocation_rejects_a_register_class_violation() {
+        let mut f = Fixture::new(12);
+        let a = f.value(Op::Add, IrType::Int, 0, 8, &[8]);
+        let (graph, live) = f.finish();
+        let model = bare_model(RegFile::from_specs([
+            RegSpec {
+                reg: PhysReg::gp(0),
+                caller_saved: false,
+            },
+            RegSpec {
+                reg: PhysReg::xmm(0),
+                caller_saved: false,
+            },
+        ]));
+        let mut alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert_eq!(alloc.first_reg(a), Some(PhysReg::gp(0)));
+
+        // An integer parked in an SSE register: allocatable, but the wrong bank.
+        alloc.segments[a as usize][0].reg = Some(PhysReg::xmm(0));
+        let err = verify_allocation(&graph, &live, &model, &alloc)
+            .expect_err("a class violation must be rejected");
+        assert!(
+            internal_message(&err).contains("wrong register class"),
+            "wrong diagnosis: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_allocation_rejects_an_abi_violation() {
+        let mut f = Fixture::new(12);
+        let a = f.value(Op::Param(0), IrType::Int, 0, 8, &[8]);
+        let b = f.value(Op::Add, IrType::Int, 2, 6, &[6]);
+        // Home-bound: `ir_lower` owns this one's location, so it is never
+        // promoted and the pin below can only be about who else is in the way.
+        let homed = f.home_bound(IrType::Int, 0, 8, &[8]);
+        let (graph, live) = f.finish();
+        let model = bare_model(gp(2));
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert_eq!(alloc.first_reg(a), Some(PhysReg::gp(0)));
+        assert_eq!(alloc.first_reg(b), Some(PhysReg::gp(1)));
+        assert!(!alloc.is_promoted(homed));
+
+        // (a) the pinned value itself is in the wrong register.
+        let mut wrong_reg = bare_model(gp(2));
+        wrong_reg.fixed = vec![FixedConstraint {
+            node: a,
+            pos: 0,
+            reg: PhysReg::gp(1),
+        }];
+        let err = verify_allocation(&graph, &live, &wrong_reg, &alloc)
+            .expect_err("a misplaced ABI value must be rejected");
+        assert!(
+            internal_message(&err).contains("ABI-pinned value"),
+            "wrong diagnosis: {err:?}"
+        );
+
+        // (b) somebody else is occupying the register the ABI reserved.
+        let mut occupied = bare_model(gp(2));
+        occupied.fixed = vec![FixedConstraint {
+            node: homed,
+            pos: 4,
+            reg: PhysReg::gp(1),
+        }];
+        let err = verify_allocation(&graph, &live, &occupied, &alloc)
+            .expect_err("an occupied ABI register must be rejected");
+        assert!(
+            internal_message(&err).contains("ABI-pinned register"),
+            "wrong diagnosis: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_allocation_rejects_a_reference_in_a_register_at_a_safepoint() {
+        let mut f = Fixture::new(12);
+        let r = f.value(Op::Load(crate::ir::MemKind::Ref), IrType::Ref, 0, 8, &[8]);
+        let (graph, live) = f.finish();
+        let mut model = bare_model(gp(2));
+        model.safepoints = vec![4];
+        let mut alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert!(!alloc.is_promoted(r));
+
+        // The exact shape that produced a moving-GC use-after-free before: a
+        // live oop in a location the collector's frame walker cannot see.
+        alloc.segments[r as usize] = vec![Segment {
+            range: PosRange { lo: 0, hi: 8 },
+            reg: Some(PhysReg::gp(1)),
+        }];
+        let err = verify_allocation(&graph, &live, &model, &alloc)
+            .expect_err("an invisible oop must be rejected");
+        assert!(
+            internal_message(&err).contains("across a safepoint"),
+            "wrong diagnosis: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_allocation_rejects_a_timeline_gap() {
+        let mut f = Fixture::new(12);
+        let a = f.value(Op::Add, IrType::Int, 0, 8, &[8]);
+        let (graph, live) = f.finish();
+        let model = bare_model(gp(2));
+        let mut alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+
+        alloc.segments[a as usize][0].range.hi = 4;
+        let err = verify_allocation(&graph, &live, &model, &alloc)
+            .expect_err("an uncovered position must be rejected");
+        assert!(
+            internal_message(&err).contains("live range"),
+            "wrong diagnosis: {err:?}"
+        );
+    }
+
+    // ── Bailing rather than guessing ─────────────────────────────────
+
+    #[test]
+    fn an_unsatisfiable_fixed_constraint_bails_with_register_pressure() {
+        let mut f = Fixture::new(8);
+        let a = f.value(Op::Param(0), IrType::Int, 0, 6, &[6]);
+        let b = f.value(Op::Param(1), IrType::Int, 0, 6, &[6]);
+        let (graph, live) = f.finish();
+        let mut model = bare_model(gp(2));
+        model.fixed = vec![
+            FixedConstraint {
+                node: a,
+                pos: 0,
+                reg: PhysReg::gp(0),
+            },
+            FixedConstraint {
+                node: b,
+                pos: 0,
+                reg: PhysReg::gp(0),
+            },
+        ];
+
+        let err = allocate_linear_scan(&graph, &live, &model)
+            .expect_err("two values cannot share one register at one position");
+        assert!(
+            matches!(err.reason, BailoutReason::RegisterPressure),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_over_pressure_graph_bails_with_register_pressure() {
+        // Four long-lived values, each used every fourth position, over a single
+        // register: every promotion immediately costs a reload, which is the
+        // case linear scan must decline rather than churn through.
+        const LAST: usize = 120;
+        let mut f = Fixture::new(LAST + 1);
+        for i in 0..4usize {
+            let uses: Vec<usize> = ((i + 4)..=LAST).step_by(4).collect();
+            f.value(Op::Add, IrType::Int, i, LAST, &uses);
+        }
+        let (graph, live) = f.finish();
+        let model = bare_model(gp(1));
+
+        let err = allocate_linear_scan(&graph, &live, &model)
+            .expect_err("one register cannot serve four live values");
+        assert!(
+            matches!(err.reason, BailoutReason::RegisterPressure),
+            "{err:?}"
+        );
+        assert_eq!(live.peak_live, 4, "the report must carry the pressure");
+    }
+
+    // ── Parallel copy ────────────────────────────────────────────────
+
+    fn slot(n: u32) -> ValueLoc {
+        ValueLoc::Slot(n)
+    }
+
+    /// Apply a *sequentialised* copy and return the resulting location→value
+    /// map, so a test can compare it against the parallel semantics.
+    fn run_copies(start: &[(ValueLoc, u32)], ops: &[CopyOp]) -> HashMap<ValueLoc, u32> {
+        let mut state: HashMap<ValueLoc, u32> = start.iter().copied().collect();
+        let mut scratch: Option<u32> = None;
+        for op in ops {
+            match *op {
+                CopyOp::Move { from, to } => {
+                    let v = match state.get(&from) {
+                        Some(&v) => v,
+                        None => panic!("read of an uninitialised location {from:?}"),
+                    };
+                    state.insert(to, v);
+                }
+                CopyOp::Save { from } => {
+                    scratch = state.get(&from).copied();
+                }
+                CopyOp::Restore { to } => {
+                    let v = match scratch {
+                        Some(v) => v,
+                        None => panic!("restore with nothing saved"),
+                    };
+                    state.insert(to, v);
+                }
+            }
+        }
+        state
+    }
+
+    /// The semantics a phi web has: every destination receives its source's
+    /// value as it was *before* any copy ran.
+    fn parallel_result(
+        start: &[(ValueLoc, u32)],
+        copies: &[(ValueLoc, ValueLoc)],
+    ) -> HashMap<ValueLoc, u32> {
+        let before: HashMap<ValueLoc, u32> = start.iter().copied().collect();
+        let mut after = before.clone();
+        for &(dst, src) in copies {
+            match before.get(&src) {
+                Some(&v) => {
+                    after.insert(dst, v);
+                }
+                None => panic!("the fixture does not initialise {src:?}"),
+            }
+        }
+        after
+    }
+
+    /// Give every location the copy mentions a distinct starting value.
+    fn seed(copies: &[(ValueLoc, ValueLoc)]) -> Vec<(ValueLoc, u32)> {
+        let mut start: Vec<(ValueLoc, u32)> = Vec::new();
+        for &(dst, src) in copies {
+            for loc in [dst, src] {
+                if !start.iter().any(|(l, _)| *l == loc) {
+                    let next = 1000 + start.len() as u32;
+                    start.push((loc, next));
+                }
+            }
+        }
+        start
+    }
+
+    fn check_parallel(copies: &[(ValueLoc, ValueLoc)]) -> Vec<CopyOp> {
+        let ops = resolve_parallel_copy(copies).expect("sequentialises");
+        let start = seed(copies);
+        assert_eq!(
+            run_copies(&start, &ops),
+            parallel_result(&start, copies),
+            "sequentialised copy disagrees with the parallel one: {ops:?}"
+        );
+        ops
+    }
+
+    #[test]
+    fn a_copy_chain_writes_the_readers_first() {
+        // Naive order would emit `s1 ← s0` first and then read the overwritten
+        // s1 into s2.
+        let copies = [(slot(1), slot(0)), (slot(2), slot(1))];
+        let ops = check_parallel(&copies);
+        assert_eq!(
+            ops,
+            vec![
+                CopyOp::Move {
+                    from: slot(1),
+                    to: slot(2),
+                },
+                CopyOp::Move {
+                    from: slot(0),
+                    to: slot(1),
+                },
+            ],
+            "no scratch is needed for an acyclic web"
+        );
+    }
+
+    #[test]
+    fn a_two_element_phi_cycle_uses_the_scratch() {
+        // The swap loop's back edge: each phi's incoming value is the other phi.
+        let copies = [(slot(0), slot(1)), (slot(1), slot(0))];
+        let ops = check_parallel(&copies);
+        assert_eq!(
+            ops.iter()
+                .filter(|o| matches!(o, CopyOp::Save { .. }))
+                .count(),
+            1,
+            "exactly one save breaks a single cycle: {ops:?}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|o| matches!(o, CopyOp::Restore { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_three_element_phi_cycle_resolves() {
+        let copies = [(slot(0), slot(1)), (slot(1), slot(2)), (slot(2), slot(0))];
+        let ops = check_parallel(&copies);
+        assert_eq!(
+            ops.len(),
+            4,
+            "one save, two moves, one restore — the third move IS the restore: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_with_a_fan_out_resolves() {
+        // Two phis swap, a third reads one of them, and a register copy hangs
+        // off the other — a shape a real loop header produces.
+        let copies = [
+            (slot(0), slot(1)),
+            (slot(1), slot(0)),
+            (slot(2), slot(0)),
+            (ValueLoc::Reg(PhysReg::gp(3)), slot(1)),
+        ];
+        check_parallel(&copies);
+    }
+
+    #[test]
+    fn two_disjoint_cycles_resolve() {
+        let copies = [
+            (slot(0), slot(1)),
+            (slot(1), slot(0)),
+            (slot(2), slot(3)),
+            (slot(3), slot(2)),
+        ];
+        check_parallel(&copies);
+    }
+
+    #[test]
+    fn a_self_copy_is_dropped() {
+        let ops = resolve_parallel_copy(&[(slot(0), slot(0))]).expect("resolves");
+        assert!(ops.is_empty(), "copying a location to itself emits nothing");
+    }
+
+    #[test]
+    fn a_parallel_copy_with_a_duplicate_destination_is_rejected() {
+        let err = resolve_parallel_copy(&[(slot(0), slot(1)), (slot(0), slot(2))])
+            .expect_err("one destination, two sources is not a copy");
+        assert!(
+            internal_message(&err).contains("destination twice"),
+            "wrong diagnosis: {err:?}"
+        );
+    }
+
+    // ── End to end, on a real scheduled graph ────────────────────────
+
+    /// `int f(int n) { int a=1, b=2; for (int i=0; i<n; i++) swap(a, b); return a; }`
+    ///
+    /// The swap is done on the operand stack (`iload_1; iload_2; istore_1;
+    /// istore_2`), so it needs no temporary local — which makes the loop
+    /// header's two phis each other's back-edge value, i.e. a copy cycle.
+    fn swap_loop() -> (Graph, ir_schedule::Schedule) {
+        let code = [
+            0x04, 0x3c, // 0: iconst_1; istore_1        a = 1
+            0x05, 0x3d, // 2: iconst_2; istore_2        b = 2
+            0x03, 0x3e, // 4: iconst_0; istore_3        i = 0
+            0x1d, 0x1a, // 6: iload_3; iload_0          loop header
+            0xa2, 0x00, 0x0d, // 8: if_icmpge 21
+            0x1b, 0x1c, // 11: iload_1; iload_2         push a, then b
+            0x3c, 0x3d, // 13: istore_1; istore_2       a = b; b = old a
+            0x84, 0x03, 0x01, // 15: iinc 3, 1
+            0xa7, 0xff, 0xf4, // 18: goto 6
+            0x1b, 0xac, // 21: iload_1; ireturn
+            0, 0,
+        ];
+        let graph = IrBuilder::new(1, 4)
+            .build(&code, 23)
+            .expect("the swap loop builds");
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
+    #[test]
+    fn phi_arguments_are_consumed_at_the_predecessor_edge() {
+        let (graph, schedule) = swap_loop();
+        let live = build_live_model(&graph, &schedule);
+        assert!(live.converged, "a small loop must reach the fixed point");
+
+        let edges: HashSet<usize> = live.span.iter().map(|&(_, e)| e).collect();
+        let mut checked = 0usize;
+        for (pid, phi) in graph.nodes.iter().enumerate() {
+            if !matches!(phi.op, Op::Phi) || !live.wants_loc[pid] {
+                continue;
+            }
+            for v in phi.phi_value_inputs().flatten() {
+                if !live.wants_loc[v as usize] {
+                    continue;
+                }
+                assert!(
+                    live.uses[v as usize].iter().any(|u| edges.contains(u)),
+                    "n{v} feeds phi n{pid} but records no use at any outgoing edge — \
+                     the position model disagrees with ir_lower::plan_slots"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the swap loop must have phi arguments to check");
+    }
+
+    #[test]
+    fn a_loop_that_swaps_two_locals_needs_a_parallel_phi_copy() {
+        let (graph, schedule) = swap_loop();
+        let live = build_live_model(&graph, &schedule);
+        let model = MachineModel::for_graph(&graph, &schedule, &live, RegFile::x86_64());
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("the loop allocates");
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+
+        let mut saw_hazard = false;
+        for b in 0..schedule.blocks.len() {
+            let copies =
+                phi_edge_copies(&graph, &schedule, &live, &alloc, b).expect("edge copies");
+            if copies.is_empty() {
+                continue;
+            }
+            // A destination that is also somebody's source is exactly what a
+            // naive sequential emission clobbers.
+            if copies
+                .iter()
+                .any(|(dst, _)| copies.iter().any(|(_, src)| src == dst))
+            {
+                saw_hazard = true;
+            }
+            let ops = resolve_parallel_copy(&copies).expect("sequentialises");
+            let start = seed(&copies);
+            assert_eq!(
+                run_copies(&start, &ops),
+                parallel_result(&start, &copies),
+                "block {b}: the emitted order clobbers a source"
+            );
+        }
+        assert!(
+            saw_hazard,
+            "the back edge of a swap loop must produce a copy whose destination is \
+             also a source"
+        );
+    }
+
+    #[test]
+    fn a_scheduled_loop_allocates_and_verifies() {
+        let (graph, schedule) = swap_loop();
+        let live = build_live_model(&graph, &schedule);
+        let model = MachineModel::for_graph(&graph, &schedule, &live, RegFile::x86_64());
+        assert!(
+            !model.safepoints.is_empty(),
+            "a back edge polls, which publishes the oop map"
+        );
+
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+        assert_eq!(alloc.peak_live, live.peak_live);
+        // Every phi keeps the home word `ir_lower::emit_phi_copies` writes.
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if matches!(node.op, Op::Phi) && live.wants_loc[id] {
+                assert!(
+                    !alloc.is_promoted(id as NodeId),
+                    "phi n{id} must stay home-bound"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unconverged_model_promotes_nothing() {
+        let (graph, schedule) = swap_loop();
+        let mut live = build_live_model(&graph, &schedule);
+        // Simulate the skipped / non-converging fixed point: every value gets
+        // the whole method and is pinned, exactly as `build_live_model` leaves
+        // it when it cannot analyse a graph.
+        live.converged = false;
+        let model = MachineModel::for_graph(&graph, &schedule, &live, RegFile::x86_64());
+        let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        assert_eq!(
+            alloc.promoted, 0,
+            "an unanalysed graph keeps the frame layout ir_lower already had"
+        );
+        verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
     }
 }

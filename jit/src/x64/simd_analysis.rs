@@ -844,101 +844,101 @@ pub(crate) fn detect_loop_unswitch_candidates(
 // P2 — vectorization admission gate
 // ---------------------------------------------------------------------------
 
-/// Decides whether a counted loop *could* be vectorized — and emits nothing.
-///
-/// The deep-research report's P2 is an ordering claim, not a feature request:
-/// *"Vector work before alias, range, alignment, safepoint, and deopt metadata
-/// are sound will multiply wrong-code risk."* Those four dependencies now
-/// exist, so what this module adds is the thing that consumes them and says
-/// **no** — a gate, with a refusal taxonomy and a proof for every admission.
-///
-/// # What this module is not
-///
-/// There is no vector emitter here and nothing turns one on. Every admitted
-/// loop comes back as a [`VecPlan`]: a lane count, a tail plan, an alignment
-/// verdict, an overflow model, and a list of [`PreheaderGuard`]s that a future
-/// emitter **must** discharge. A consumer that cannot emit one of those guards
-/// has to treat the whole plan as refused — a partially-emitted guard set
-/// proves nothing, exactly as in [`crate::scev`].
-///
-/// # Where the facts come from
-///
-/// Nothing here re-derives a fact another pass already proves:
-///
-/// * **Stride, trip count, index range, overflow** — [`crate::scev`]. The
-///   [`CountedLoop`] is asked for [`CountedLoop::index_span`],
-///   [`CountedLoop::prove_index_in_bounds_of`] and
-///   [`CountedLoop::trip_count`]; its [`OverflowModel`] is copied into the
-///   plan rather than re-argued. A hand-rolled range check here would be the
-///   duplicated-proof failure the report's ordering exists to prevent.
-/// * **Aliasing** — [`Graph::may_alias`] over [`AliasClass`]. The dependence
-///   test asks the IR memory model whether two accesses *can* overlap and only
-///   then computes a distance from the affine subscripts. It never decides
-///   disjointness on its own.
-/// * **Vector width** — [`crate::x64::cpu_features`], through
-///   [`VectorIsa::detect`]. No width is ever assumed.
-///
-/// # The legality rule
-///
-/// The only transform this gate reasons about is **body widening**: iterations
-/// `b .. b+VF` run as one pass in which each scalar operation becomes one
-/// whole-vector operation, in the original program order. Everything below is
-/// stated against that transform and nothing else.
-///
-/// For a pair of memory accesses `E` (earlier in program order) and `L`
-/// (later), let `d` be the number of iterations such that `L` at iteration
-/// `k + d` touches what `E` touches at iteration `k`:
-///
-/// | `d` | preserved by widening? |
-/// |---|---|
-/// | no integer solution | there is no dependence at all |
-/// | `d == 0` | yes — within one vector pass `E`'s op still precedes `L`'s |
-/// | `d > 0` | yes, at **any** lane count — program order and iteration order agree |
-/// | `d < 0` | only when `VF <= |d|`; otherwise widening inverts the two |
-/// | unknown | no — refuse |
-///
-/// The `d < 0` row is the one that matters and it is why the distance is kept
-/// *signed* rather than collapsed into a flow/anti/output classification. An
-/// anti-dependence is not automatically safe and a flow dependence is not
-/// automatically fatal: `a[i] = a[i+1]` (a distance-1 anti-dependence) widens
-/// correctly because the whole vector load precedes the whole vector store,
-/// while `a[i-1] = x; y = a[i];` (also distance 1, also an anti-dependence)
-/// does not, because there the store is the earlier op. The kind is reported
-/// for diagnostics; the sign decides.
-///
-/// # Floating point
-///
-/// Reassociating `float`/`double` addition is **not** value-preserving, so a
-/// floating-point reduction is refused unless the caller passes
-/// [`FpRelaxation::AllowReassociation`]. The default is
-/// [`FpRelaxation::Strict`]. Three further FP facts are encoded rather than
-/// assumed:
-///
-/// * *Element-wise* FP arithmetic is admitted even under `Strict`. IEEE-754
-///   add/sub/mul/div are defined per operand pair; a lane computes exactly the
-///   scalar result, including NaN payload propagation and signed zeros. There
-///   is no reassociation because there is no accumulator.
-/// * FP `min`/`max` are refused **unconditionally**. `Math.min`/`Math.max` on
-///   `double` order `-0.0` below `+0.0` and return NaN if either operand is
-///   NaN; `MINPD`/`MAXPD` return the *second* operand for both of those cases.
-///   The relaxation flag does not cover this — it is a wrong answer, not a
-///   reordering.
-/// * Integer reduction *is* admitted under `Strict`. JVM `int`/`long`
-///   arithmetic is modular two's-complement, so `+`, `*`, `&`, `|`, `^` are
-///   associative and commutative over the whole domain: reassociating them is
-///   exact, and `PADDD`/`PMULLD` wrap identically to `iadd`/`imul`.
-///
-/// Integer `/` and `%` are refused: they trap per element
-/// (`ArithmeticException` on a zero divisor, and `Integer.MIN_VALUE / -1`
-/// overflows), which a lane cannot express.
-///
-/// # Hard refusals
-///
-/// Safepoints, deopt points, GC references, irreducible control flow,
-/// unprovable alignment on an ISA that requires it, and float reassociation
-/// are refusals with no lane count that rescues them. See [`VecRefusal`].
 pub mod vector_gate {
     #![allow(dead_code)]
+    //! Decides whether a counted loop *could* be vectorized — and emits nothing.
+    //!
+    //! The deep-research report's P2 is an ordering claim, not a feature request:
+    //! *"Vector work before alias, range, alignment, safepoint, and deopt metadata
+    //! are sound will multiply wrong-code risk."* Those four dependencies now
+    //! exist, so what this module adds is the thing that consumes them and says
+    //! **no** — a gate, with a refusal taxonomy and a proof for every admission.
+    //!
+    //! # What this module is not
+    //!
+    //! There is no vector emitter here and nothing turns one on. Every admitted
+    //! loop comes back as a [`VecPlan`]: a lane count, a tail plan, an alignment
+    //! verdict, an overflow model, and a list of [`PreheaderGuard`]s that a future
+    //! emitter **must** discharge. A consumer that cannot emit one of those guards
+    //! has to treat the whole plan as refused — a partially-emitted guard set
+    //! proves nothing, exactly as in [`crate::scev`].
+    //!
+    //! # Where the facts come from
+    //!
+    //! Nothing here re-derives a fact another pass already proves:
+    //!
+    //! * **Stride, trip count, index range, overflow** — [`crate::scev`]. The
+    //!   [`CountedLoop`] is asked for [`CountedLoop::index_span`],
+    //!   [`CountedLoop::prove_index_in_bounds_of`] and
+    //!   [`CountedLoop::trip_count`]; its [`OverflowModel`] is copied into the
+    //!   plan rather than re-argued. A hand-rolled range check here would be the
+    //!   duplicated-proof failure the report's ordering exists to prevent.
+    //! * **Aliasing** — [`Graph::may_alias`] over [`AliasClass`]. The dependence
+    //!   test asks the IR memory model whether two accesses *can* overlap and only
+    //!   then computes a distance from the affine subscripts. It never decides
+    //!   disjointness on its own.
+    //! * **Vector width** — `x64::cpu_features`, through
+    //!   [`VectorIsa::detect`]. No width is ever assumed.
+    //!
+    //! # The legality rule
+    //!
+    //! The only transform this gate reasons about is **body widening**: iterations
+    //! `b .. b+VF` run as one pass in which each scalar operation becomes one
+    //! whole-vector operation, in the original program order. Everything below is
+    //! stated against that transform and nothing else.
+    //!
+    //! For a pair of memory accesses `E` (earlier in program order) and `L`
+    //! (later), let `d` be the number of iterations such that `L` at iteration
+    //! `k + d` touches what `E` touches at iteration `k`:
+    //!
+    //! | `d` | preserved by widening? |
+    //! |---|---|
+    //! | no integer solution | there is no dependence at all |
+    //! | `d == 0` | yes — within one vector pass `E`'s op still precedes `L`'s |
+    //! | `d > 0` | yes, at **any** lane count — program order and iteration order agree |
+    //! | `d < 0` | only when `VF <= |d|`; otherwise widening inverts the two |
+    //! | unknown | no — refuse |
+    //!
+    //! The `d < 0` row is the one that matters and it is why the distance is kept
+    //! *signed* rather than collapsed into a flow/anti/output classification. An
+    //! anti-dependence is not automatically safe and a flow dependence is not
+    //! automatically fatal: `a[i] = a[i+1]` (a distance-1 anti-dependence) widens
+    //! correctly because the whole vector load precedes the whole vector store,
+    //! while `a[i-1] = x; y = a[i];` (also distance 1, also an anti-dependence)
+    //! does not, because there the store is the earlier op. The kind is reported
+    //! for diagnostics; the sign decides.
+    //!
+    //! # Floating point
+    //!
+    //! Reassociating `float`/`double` addition is **not** value-preserving, so a
+    //! floating-point reduction is refused unless the caller passes
+    //! [`FpRelaxation::AllowReassociation`]. The default is
+    //! [`FpRelaxation::Strict`]. Three further FP facts are encoded rather than
+    //! assumed:
+    //!
+    //! * *Element-wise* FP arithmetic is admitted even under `Strict`. IEEE-754
+    //!   add/sub/mul/div are defined per operand pair; a lane computes exactly the
+    //!   scalar result, including NaN payload propagation and signed zeros. There
+    //!   is no reassociation because there is no accumulator.
+    //! * FP `min`/`max` are refused **unconditionally**. `Math.min`/`Math.max` on
+    //!   `double` order `-0.0` below `+0.0` and return NaN if either operand is
+    //!   NaN; `MINPD`/`MAXPD` return the *second* operand for both of those cases.
+    //!   The relaxation flag does not cover this — it is a wrong answer, not a
+    //!   reordering.
+    //! * Integer reduction *is* admitted under `Strict`. JVM `int`/`long`
+    //!   arithmetic is modular two's-complement, so `+`, `*`, `&`, `|`, `^` are
+    //!   associative and commutative over the whole domain: reassociating them is
+    //!   exact, and `PADDD`/`PMULLD` wrap identically to `iadd`/`imul`.
+    //!
+    //! Integer `/` and `%` are refused: they trap per element
+    //! (`ArithmeticException` on a zero divisor, and `Integer.MIN_VALUE / -1`
+    //! overflows), which a lane cannot express.
+    //!
+    //! # Hard refusals
+    //!
+    //! Safepoints, deopt points, GC references, irreducible control flow,
+    //! unprovable alignment on an ISA that requires it, and float reassociation
+    //! are refusals with no lane count that rescues them. See [`VecRefusal`].
 
     use crate::ir::{AliasClass, Graph, MemEffect, MemKind, NodeId, NO_NODE};
     use crate::scev::{
@@ -2047,5 +2047,1138 @@ pub mod vector_gate {
             dependences,
             max_safe_lanes,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::ir::{AccessOffset, IrType, Op, UseLists};
+        use crate::scev::{AffineIv, BoundSource, ExitCmp, LoopForm, Stride};
+
+        // ── fixtures ────────────────────────────────────────────────────
+
+        fn empty_graph() -> Graph {
+            Graph {
+                nodes: Vec::new(),
+                entry: 0,
+                exit: NO_NODE,
+                safepoints: Vec::new(),
+                uses: UseLists::new(),
+            }
+        }
+
+        /// A reference the memory model knows is a fresh in-method allocation,
+        /// so two of them are provably distinct objects.
+        fn fresh_array(g: &mut Graph) -> NodeId {
+            g.add(Op::NewArray { element_type: 10 }, IrType::Ref, vec![], None)
+        }
+
+        /// A reference of unknown provenance. Two of them may be the same
+        /// object (`f(x, x)`), which is the runtime-alias case.
+        fn param_array(g: &mut Graph, i: u16) -> NodeId {
+            g.add(Op::Param(i), IrType::Ref, vec![], None)
+        }
+
+        /// A runtime subscript value. Distinct nodes are *not* provably
+        /// distinct offsets — only two unequal constants are — so every pair
+        /// of accesses to one array reaches the affine test.
+        fn subscript(g: &mut Graph) -> NodeId {
+            g.add(Op::Add, IrType::Int, vec![], None)
+        }
+
+        fn cell(array: NodeId, index: NodeId) -> AliasClass {
+            AliasClass::ArrayElem {
+                array,
+                index: AccessOffset::Dynamic(index),
+            }
+        }
+
+        /// `for (int i = start; i < bound; i++)`, IV in local 1.
+        fn counted_loop(start: i32, bound: i32) -> CountedLoop {
+            CountedLoop {
+                header_pc: 0,
+                back_edge_pc: 32,
+                iv: AffineIv {
+                    local: 1,
+                    init: IntRange::constant(start),
+                    stride: Stride::Const(1),
+                },
+                cmp: ExitCmp::Ge,
+                bound: BoundSource::Const(bound),
+                bound_range: IntRange::unknown(),
+                form: LoopForm::PreTested,
+                modified_locals: 1u64 << 1,
+                heap_stable: true,
+            }
+        }
+
+        struct Case {
+            counted: CountedLoop,
+            env: RangeEnv,
+            body: Vec<VecBodyOp>,
+            arith: Vec<VecArith>,
+            reducible: bool,
+            base_alignment: usize,
+            fp: FpRelaxation,
+            isa: VectorIsa,
+        }
+
+        impl Case {
+            fn new(body: Vec<VecBodyOp>) -> Case {
+                Case {
+                    counted: counted_loop(0, 1024),
+                    env: RangeEnv::new(),
+                    body,
+                    arith: Vec::new(),
+                    reducible: true,
+                    base_alignment: PROVEN_OBJECT_ALIGNMENT,
+                    fp: FpRelaxation::Strict,
+                    isa: VectorIsa::sse2(),
+                }
+            }
+
+            fn run(&self, g: &Graph) -> VecVerdict {
+                admit_vectorization(
+                    g,
+                    &VecCandidate {
+                        counted: &self.counted,
+                        env: &self.env,
+                        body: &self.body,
+                        arith: &self.arith,
+                        reducible: self.reducible,
+                        base_alignment: self.base_alignment,
+                        fp: self.fp,
+                        isa: self.isa,
+                    },
+                )
+            }
+        }
+
+        fn read(g: &mut Graph, array: NodeId, offset: i32, elem: MemKind) -> VecBodyOp {
+            let ix = subscript(g);
+            let node = subscript(g);
+            VecBodyOp::array(
+                node,
+                cell(array, ix),
+                AccessKind::Read,
+                elem,
+                IndexExpr::shifted(1, offset),
+            )
+        }
+
+        fn write(g: &mut Graph, array: NodeId, offset: i32, elem: MemKind) -> VecBodyOp {
+            let ix = subscript(g);
+            let node = subscript(g);
+            VecBodyOp::array(
+                node,
+                cell(array, ix),
+                AccessKind::Write,
+                elem,
+                IndexExpr::shifted(1, offset),
+            )
+        }
+
+        // ── the corpus ──────────────────────────────────────────────────
+        //
+        // Every refusal class below is paired with a "must admit" positive so
+        // that the gate is shown to refuse for the stated reason rather than
+        // out of general timidity.
+
+        /// `for i: c[i] = a[i] + b[i]` over three freshly-allocated `int[]`.
+        fn independent_int_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let (a, b, c) = (fresh_array(&mut g), fresh_array(&mut g), fresh_array(&mut g));
+            let body = vec![
+                read(&mut g, a, 0, MemKind::Int),
+                read(&mut g, b, 0, MemKind::Int),
+                write(&mut g, c, 0, MemKind::Int),
+            ];
+            let mut case = Case::new(body);
+            case.arith = vec![VecArith {
+                node: 0,
+                elem: MemKind::Int,
+                op: VecOp::Add,
+                reduction: false,
+            }];
+            (g, case)
+        }
+
+        /// `for i: sum += a[i]` over `int`. Reassociation of modular integer
+        /// addition is exact, so this is admitted under `Strict`.
+        fn int_reduction_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let a = fresh_array(&mut g);
+            let body = vec![read(&mut g, a, 0, MemKind::Int)];
+            let mut case = Case::new(body);
+            case.arith = vec![VecArith {
+                node: 0,
+                elem: MemKind::Int,
+                op: VecOp::Add,
+                reduction: true,
+            }];
+            (g, case)
+        }
+
+        /// `for i: c[i] = a[i] + b[i]` over `double`. Element-wise, so no
+        /// reassociation and no NaN-ordering question.
+        fn fp_elementwise_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let (a, b, c) = (fresh_array(&mut g), fresh_array(&mut g), fresh_array(&mut g));
+            let body = vec![
+                read(&mut g, a, 0, MemKind::Double),
+                read(&mut g, b, 0, MemKind::Double),
+                write(&mut g, c, 0, MemKind::Double),
+            ];
+            let mut case = Case::new(body);
+            case.arith = vec![VecArith {
+                node: 0,
+                elem: MemKind::Double,
+                op: VecOp::Add,
+                reduction: false,
+            }];
+            (g, case)
+        }
+
+        /// `for i: sum += a[i]` over `double`.
+        fn fp_reduction_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let a = fresh_array(&mut g);
+            let body = vec![read(&mut g, a, 0, MemKind::Double)];
+            let mut case = Case::new(body);
+            case.arith = vec![VecArith {
+                node: 0,
+                elem: MemKind::Double,
+                op: VecOp::Add,
+                reduction: true,
+            }];
+            (g, case)
+        }
+
+        fn fp_reduction_relaxed_loop() -> (Graph, Case) {
+            let (g, mut case) = fp_reduction_loop();
+            case.fp = FpRelaxation::AllowReassociation;
+            (g, case)
+        }
+
+        /// `for i: m = Math.max(m, a[i])` over `double`, with reassociation
+        /// already permitted. Still refused: `MAXPD` is not `Math.max`.
+        fn fp_max_reduction_loop() -> (Graph, Case) {
+            let (g, mut case) = fp_reduction_relaxed_loop();
+            case.arith = vec![VecArith {
+                node: 0,
+                elem: MemKind::Double,
+                op: VecOp::Max,
+                reduction: true,
+            }];
+            (g, case)
+        }
+
+        /// `for (i = 1; i < 1024; i++) a[i] = a[i-1];`
+        fn carried_distance_one_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let a = fresh_array(&mut g);
+            let body = vec![
+                read(&mut g, a, -1, MemKind::Int),
+                write(&mut g, a, 0, MemKind::Int),
+            ];
+            let mut case = Case::new(body);
+            case.counted = counted_loop(1, 1024);
+            (g, case)
+        }
+
+        /// `for (i = 4; i < 1024; i++) a[i] = a[i-4];` — the same shape at a
+        /// distance the vector width fits inside.
+        fn carried_distance_four_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let a = fresh_array(&mut g);
+            let body = vec![
+                read(&mut g, a, -4, MemKind::Int),
+                write(&mut g, a, 0, MemKind::Int),
+            ];
+            let mut case = Case::new(body);
+            case.counted = counted_loop(4, 1024);
+            (g, case)
+        }
+
+        /// `for (i = 0; i < 1023; i++) a[i] = a[i+1];` — an anti-dependence at
+        /// distance 1 that a widened body preserves, because the whole vector
+        /// load precedes the whole vector store.
+        fn forward_anti_dependence_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let a = fresh_array(&mut g);
+            let body = vec![
+                read(&mut g, a, 1, MemKind::Int),
+                write(&mut g, a, 0, MemKind::Int),
+            ];
+            let mut case = Case::new(body);
+            case.counted = counted_loop(0, 1023);
+            (g, case)
+        }
+
+        /// `for (i = 1; i < 1024; i++) { a[i-1] = k; x = a[i]; }` — the same
+        /// distance and the same *kind* as the loop above, refused because the
+        /// store is the earlier operation.
+        fn backward_anti_dependence_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let a = fresh_array(&mut g);
+            let body = vec![
+                write(&mut g, a, -1, MemKind::Int),
+                read(&mut g, a, 0, MemKind::Int),
+            ];
+            let mut case = Case::new(body);
+            case.counted = counted_loop(1, 1024);
+            (g, case)
+        }
+
+        /// `void f(int[] a, int[] b) { for i: b[i] = a[i]; }` — two parameters,
+        /// which the caller may have passed the same array twice.
+        fn aliasing_parameters_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let (a, b) = (param_array(&mut g, 0), param_array(&mut g, 1));
+            let body = vec![
+                read(&mut g, a, 0, MemKind::Int),
+                write(&mut g, b, 0, MemKind::Int),
+            ];
+            (g, Case::new(body))
+        }
+
+        /// The same shape over two freshly-allocated arrays, which the memory
+        /// model proves distinct.
+        fn distinct_allocation_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let (a, b) = (fresh_array(&mut g), fresh_array(&mut g));
+            let body = vec![
+                read(&mut g, a, 0, MemKind::Int),
+                write(&mut g, b, 0, MemKind::Int),
+            ];
+            (g, Case::new(body))
+        }
+
+        /// `for i: dst[i] = src[i];` over `Object[]`.
+        fn reference_array_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let (a, b) = (fresh_array(&mut g), fresh_array(&mut g));
+            let body = vec![
+                read(&mut g, a, 0, MemKind::Ref),
+                write(&mut g, b, 0, MemKind::Ref),
+            ];
+            (g, Case::new(body))
+        }
+
+        fn deopt_in_body_loop() -> (Graph, Case) {
+            let (mut g, mut case) = distinct_allocation_loop();
+            let guard = subscript(&mut g);
+            case.body.insert(
+                1,
+                VecBodyOp {
+                    deopts: true,
+                    ..VecBodyOp::pure(guard)
+                },
+            );
+            (g, case)
+        }
+
+        fn call_in_body_loop() -> (Graph, Case) {
+            let (mut g, mut case) = distinct_allocation_loop();
+            let call = subscript(&mut g);
+            case.body.insert(
+                1,
+                VecBodyOp {
+                    effect: MemEffect::OPAQUE,
+                    ..VecBodyOp::pure(call)
+                },
+            );
+            (g, case)
+        }
+
+        fn volatile_in_body_loop() -> (Graph, Case) {
+            let (mut g, mut case) = distinct_allocation_loop();
+            let v = fresh_array(&mut g);
+            let ix = subscript(&mut g);
+            let node = subscript(&mut g);
+            case.body.insert(
+                1,
+                VecBodyOp {
+                    effect: MemEffect::volatile_read(cell(v, ix)),
+                    ..VecBodyOp::pure(node)
+                },
+            );
+            (g, case)
+        }
+
+        fn irreducible_loop() -> (Graph, Case) {
+            let (g, mut case) = independent_int_loop();
+            case.reducible = false;
+            (g, case)
+        }
+
+        fn strict_alignment_unprovable_loop() -> (Graph, Case) {
+            let (g, mut case) = distinct_allocation_loop();
+            case.isa = VectorIsa::strict_align128();
+            (g, case)
+        }
+
+        fn strict_alignment_provable_loop() -> (Graph, Case) {
+            let (g, mut case) = strict_alignment_unprovable_loop();
+            case.base_alignment = 16;
+            (g, case)
+        }
+
+        /// `for i: c[i] = a[i] * b[i]` over `int` — needs `PMULLD`.
+        fn int_multiply_loop_sse2() -> (Graph, Case) {
+            let (g, mut case) = independent_int_loop();
+            case.arith = vec![VecArith {
+                node: 0,
+                elem: MemKind::Int,
+                op: VecOp::Mul,
+                reduction: false,
+            }];
+            (g, case)
+        }
+
+        fn int_multiply_loop_sse41() -> (Graph, Case) {
+            let (g, mut case) = int_multiply_loop_sse2();
+            case.isa = VectorIsa::sse41();
+            (g, case)
+        }
+
+        /// `for i: c[i] = a[i] / b[i]` over `int` — traps per element.
+        fn int_divide_loop() -> (Graph, Case) {
+            let (g, mut case) = independent_int_loop();
+            case.arith = vec![VecArith {
+                node: 0,
+                elem: MemKind::Int,
+                op: VecOp::Div,
+                reduction: false,
+            }];
+            (g, case)
+        }
+
+        /// `for (i = 0; i <= Integer.MAX_VALUE; i++)` — the IV wraps and no
+        /// runtime guard can prevent it.
+        fn wrapping_index_loop() -> (Graph, Case) {
+            let (g, mut case) = distinct_allocation_loop();
+            case.counted.cmp = ExitCmp::Gt; // `i <= bound`
+            case.counted.bound = BoundSource::Const(i32::MAX);
+            (g, case)
+        }
+
+        /// `for (i = 0; i <= n; i++)` with `n` near `Integer.MAX_VALUE`: the
+        /// no-wrap proof survives, but only behind a pre-header guard.
+        fn guarded_overflow_loop() -> (Graph, Case) {
+            let (g, mut case) = distinct_allocation_loop();
+            case.counted.cmp = ExitCmp::Gt;
+            case.counted.bound = BoundSource::Local(2);
+            case.env
+                .bind_local(2, IntRange::new(i32::MAX - 100, i32::MAX));
+            (g, case)
+        }
+
+        fn non_unit_stride_loop() -> (Graph, Case) {
+            let (g, mut case) = distinct_allocation_loop();
+            case.counted.iv.stride = Stride::Const(2);
+            (g, case)
+        }
+
+        /// `for (i = 0; i < n; i++)` with nothing known about `n`, so the loop
+        /// may run zero times.
+        fn unknown_trip_loop() -> (Graph, Case) {
+            let (g, mut case) = distinct_allocation_loop();
+            case.counted.bound = BoundSource::Local(2);
+            (g, case)
+        }
+
+        /// `for (i = 0; i < 1023; i++) b[i] = a[i];` — a trip count the lane
+        /// count does not divide.
+        fn remainder_tail_loop() -> (Graph, Case) {
+            let (g, mut case) = distinct_allocation_loop();
+            case.counted = counted_loop(0, 1023);
+            (g, case)
+        }
+
+        /// `for i: c[i] = obj.field;` — a field read is not an array element.
+        fn field_access_loop() -> (Graph, Case) {
+            let mut g = empty_graph();
+            let obj = fresh_array(&mut g);
+            let c = fresh_array(&mut g);
+            let node = subscript(&mut g);
+            let body = vec![
+                VecBodyOp {
+                    effect: MemEffect::read(AliasClass::Field {
+                        base: obj,
+                        offset: AccessOffset::Const(0),
+                    }),
+                    elem: Some(MemKind::Int),
+                    index: Some(IndexExpr::identity(1)),
+                    ..VecBodyOp::pure(node)
+                },
+                write(&mut g, c, 0, MemKind::Int),
+            ];
+            (g, Case::new(body))
+        }
+
+        /// Every loop the gate is measured against, with the verdict each one
+        /// is expected to get.
+        #[allow(clippy::type_complexity)]
+        fn corpus() -> Vec<(&'static str, Graph, Case, bool)> {
+            let entries: Vec<(&'static str, fn() -> (Graph, Case), bool)> = vec![
+                ("independent int", independent_int_loop, true),
+                ("int reduction", int_reduction_loop, true),
+                ("fp element-wise", fp_elementwise_loop, true),
+                ("fp reduction (strict)", fp_reduction_loop, false),
+                ("fp reduction (relaxed)", fp_reduction_relaxed_loop, true),
+                ("fp max reduction", fp_max_reduction_loop, false),
+                ("carried distance 1", carried_distance_one_loop, false),
+                ("carried distance 4", carried_distance_four_loop, true),
+                ("forward anti-dependence", forward_anti_dependence_loop, true),
+                (
+                    "backward anti-dependence",
+                    backward_anti_dependence_loop,
+                    false,
+                ),
+                ("aliasing parameters", aliasing_parameters_loop, false),
+                ("distinct allocations", distinct_allocation_loop, true),
+                ("reference array", reference_array_loop, false),
+                ("deopt in body", deopt_in_body_loop, false),
+                ("call in body", call_in_body_loop, false),
+                ("volatile in body", volatile_in_body_loop, false),
+                ("irreducible control", irreducible_loop, false),
+                (
+                    "strict alignment, unprovable",
+                    strict_alignment_unprovable_loop,
+                    false,
+                ),
+                (
+                    "strict alignment, provable",
+                    strict_alignment_provable_loop,
+                    true,
+                ),
+                ("int multiply on sse2", int_multiply_loop_sse2, false),
+                ("int multiply on sse4.1", int_multiply_loop_sse41, true),
+                ("int divide", int_divide_loop, false),
+                ("wrapping index", wrapping_index_loop, false),
+                ("guarded overflow", guarded_overflow_loop, true),
+                ("non-unit stride", non_unit_stride_loop, false),
+                ("remainder tail", remainder_tail_loop, true),
+                ("field access", field_access_loop, false),
+            ];
+            entries
+                .into_iter()
+                .map(|(name, build, expect)| {
+                    let (g, case) = build();
+                    (name, g, case, expect)
+                })
+                .collect()
+        }
+
+        // ── the dependence test, directly ───────────────────────────────
+
+        #[test]
+        fn distinct_allocations_have_no_dependence() {
+            let mut g = empty_graph();
+            let (a, b) = (fresh_array(&mut g), fresh_array(&mut g));
+            let (ia, ib) = (subscript(&mut g), subscript(&mut g));
+            let load = VecAccess {
+                node: 10,
+                class: cell(a, ia),
+                kind: AccessKind::Read,
+                elem: MemKind::Int,
+                index: IndexExpr::identity(1),
+            };
+            let store = VecAccess {
+                node: 11,
+                class: cell(b, ib),
+                kind: AccessKind::Write,
+                elem: MemKind::Int,
+                index: IndexExpr::identity(1),
+            };
+            assert_eq!(dependence_between(&g, &load, &store, 1), None);
+        }
+
+        #[test]
+        fn two_parameters_alias_with_no_computable_distance() {
+            let mut g = empty_graph();
+            let (a, b) = (param_array(&mut g, 0), param_array(&mut g, 1));
+            let (ia, ib) = (subscript(&mut g), subscript(&mut g));
+            let load = VecAccess {
+                node: 10,
+                class: cell(a, ia),
+                kind: AccessKind::Read,
+                elem: MemKind::Int,
+                index: IndexExpr::identity(1),
+            };
+            let store = VecAccess {
+                node: 11,
+                class: cell(b, ib),
+                kind: AccessKind::Write,
+                elem: MemKind::Int,
+                index: IndexExpr::identity(1),
+            };
+            let dep = dependence_between(&g, &load, &store, 1).expect("aliasing pair");
+            assert_eq!(dep.distance, DepDistance::Unknown);
+            assert_eq!(dep.kind, DepKind::Anti);
+        }
+
+        #[test]
+        fn read_read_pairs_never_depend() {
+            let mut g = empty_graph();
+            let a = param_array(&mut g, 0);
+            let (i1, i2) = (subscript(&mut g), subscript(&mut g));
+            let one = VecAccess {
+                node: 10,
+                class: cell(a, i1),
+                kind: AccessKind::Read,
+                elem: MemKind::Int,
+                index: IndexExpr::identity(1),
+            };
+            let two = VecAccess {
+                node: 11,
+                class: cell(a, i2),
+                kind: AccessKind::Read,
+                elem: MemKind::Int,
+                index: IndexExpr::shifted(1, 3),
+            };
+            assert_eq!(dependence_between(&g, &one, &two, 1), None);
+        }
+
+        #[test]
+        fn dependence_distance_is_signed_against_program_order() {
+            let mut g = empty_graph();
+            let a = fresh_array(&mut g);
+            let (i1, i2) = (subscript(&mut g), subscript(&mut g));
+            let make = |node, ix, kind, offset| VecAccess {
+                node,
+                class: cell(a, ix),
+                kind,
+                elem: MemKind::Int,
+                index: IndexExpr::shifted(1, offset),
+            };
+
+            // `a[i] = a[i-1]`: the load of `a[i-1]` is earlier in program
+            // order, and the store it depends on ran an iteration ago.
+            let load = make(10, i1, AccessKind::Read, -1);
+            let store = make(11, i2, AccessKind::Write, 0);
+            let dep = dependence_between(&g, &load, &store, 1).expect("dependence");
+            assert_eq!(dep.distance, DepDistance::Backward(1));
+            assert_eq!(dep.kind, DepKind::Flow);
+            assert_eq!(dep.source, 11, "the store is the source");
+            assert_eq!(dep.sink, 10, "the load is the sink");
+
+            // `a[i] = a[i+1]`: same kinds, same program order, opposite sign.
+            let load = make(10, i1, AccessKind::Read, 1);
+            let store = make(11, i2, AccessKind::Write, 0);
+            let dep = dependence_between(&g, &load, &store, 1).expect("dependence");
+            assert_eq!(dep.distance, DepDistance::Forward(1));
+            assert_eq!(dep.kind, DepKind::Anti);
+        }
+
+        #[test]
+        fn same_iteration_dependence_does_not_cap_the_width() {
+            let mut g = empty_graph();
+            let a = fresh_array(&mut g);
+            let (i1, i2) = (subscript(&mut g), subscript(&mut g));
+            let store = VecAccess {
+                node: 10,
+                class: cell(a, i1),
+                kind: AccessKind::Write,
+                elem: MemKind::Int,
+                index: IndexExpr::identity(1),
+            };
+            let load = VecAccess {
+                node: 11,
+                class: cell(a, i2),
+                kind: AccessKind::Read,
+                elem: MemKind::Int,
+                index: IndexExpr::identity(1),
+            };
+            let dep = dependence_between(&g, &store, &load, 1).expect("dependence");
+            assert_eq!(dep.distance, DepDistance::Same);
+            assert_eq!(dep.kind, DepKind::Flow);
+        }
+
+        #[test]
+        fn interleaved_subscripts_are_provably_independent() {
+            // `a[2i]` and `a[2i+1]` never name the same element.
+            let mut g = empty_graph();
+            let a = fresh_array(&mut g);
+            let (i1, i2) = (subscript(&mut g), subscript(&mut g));
+            let even = VecAccess {
+                node: 10,
+                class: cell(a, i1),
+                kind: AccessKind::Write,
+                elem: MemKind::Int,
+                index: IndexExpr {
+                    iv_local: 1,
+                    scale: 2,
+                    offset: 0,
+                },
+            };
+            let odd = VecAccess {
+                node: 11,
+                class: cell(a, i2),
+                kind: AccessKind::Read,
+                elem: MemKind::Int,
+                index: IndexExpr {
+                    iv_local: 1,
+                    scale: 2,
+                    offset: 1,
+                },
+            };
+            assert_eq!(dependence_between(&g, &even, &odd, 1), None);
+        }
+
+        // ── admission ───────────────────────────────────────────────────
+
+        #[test]
+        fn independent_int_loop_is_admitted_with_a_width_and_a_tail() {
+            let (g, case) = independent_int_loop();
+            let verdict = case.run(&g);
+            let plan = verdict.plan().unwrap_or_else(|| {
+                panic!("expected admission, got {:?}", verdict.refusals());
+            });
+            assert_eq!(plan.elem, MemKind::Int);
+            assert_eq!(plan.lanes, 4, "128-bit / 4-byte int");
+            assert_eq!(plan.width_bytes, 16);
+            assert_eq!(plan.tail, TailStrategy::None, "1024 is a multiple of 4");
+            assert_eq!(plan.trip.exact(), Some(1024));
+            assert_eq!(plan.max_safe_lanes, None, "no dependence caps the width");
+            assert_eq!(plan.overflow, OverflowModel::NoWrapProven);
+            assert_eq!(
+                plan.alignment,
+                Alignment::Unknown,
+                "an 8-byte-aligned object base cannot prove 16-byte element alignment"
+            );
+        }
+
+        #[test]
+        fn every_array_keeps_its_own_length_guard() {
+            let (g, case) = independent_int_loop();
+            let verdict = case.run(&g);
+            let plan = verdict.plan().expect("admitted");
+            let arrays: std::collections::BTreeSet<NodeId> =
+                plan.guards.iter().map(|entry| entry.array).collect();
+            assert_eq!(
+                arrays.len(),
+                3,
+                "three arrays must carry three obligations, not one deduplicated guard: {:?}",
+                plan.guards
+            );
+            assert!(plan
+                .guards
+                .iter()
+                .all(|entry| matches!(entry.guard, PreheaderGuard::LengthAtLeast(_))));
+        }
+
+        #[test]
+        fn a_trip_count_the_lane_count_does_not_divide_gets_a_scalar_tail() {
+            let (g, case) = remainder_tail_loop();
+            let verdict = case.run(&g);
+            let plan = verdict.plan().expect("admitted");
+            assert_eq!(plan.trip.exact(), Some(1023));
+            assert_eq!(
+                plan.tail,
+                TailStrategy::ScalarRemainder { max_iterations: 3 }
+            );
+        }
+
+        // ── refusals, each with its must-admit twin ─────────────────────
+
+        #[test]
+        fn a_loop_carried_dependence_is_refused() {
+            let (g, case) = carried_distance_one_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::LoopCarriedDependence(_))),
+                "{:?}",
+                verdict.refusals()
+            );
+
+            // Must admit: the same shape at distance 4 fits four lanes.
+            let (g, case) = carried_distance_four_loop();
+            let verdict = case.run(&g);
+            let plan = verdict.plan().unwrap_or_else(|| {
+                panic!("expected admission, got {:?}", verdict.refusals());
+            });
+            assert_eq!(plan.lanes, 4);
+            assert_eq!(plan.max_safe_lanes, Some(4));
+        }
+
+        #[test]
+        fn program_order_decides_whether_an_anti_dependence_is_fatal() {
+            let (g, case) = forward_anti_dependence_loop();
+            assert!(
+                case.run(&g).is_admitted(),
+                "load-before-store at distance 1 widens correctly"
+            );
+
+            let (g, case) = backward_anti_dependence_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::LoopCarriedDependence(_))),
+                "store-before-load at distance 1 must not: {:?}",
+                verdict.refusals()
+            );
+        }
+
+        #[test]
+        fn an_aliasing_pair_is_refused() {
+            let (g, case) = aliasing_parameters_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::UnknownAliasing { .. })),
+                "{:?}",
+                verdict.refusals()
+            );
+
+            // Must admit: the memory model proves two allocations distinct.
+            let (g, case) = distinct_allocation_loop();
+            assert!(case.run(&g).is_admitted());
+        }
+
+        #[test]
+        fn a_float_reduction_is_refused_by_default() {
+            let (g, case) = fp_reduction_loop();
+            let verdict = case.run(&g);
+            assert!(verdict.refused_for(VecRefusal::FloatReassociation {
+                elem: MemKind::Double,
+                op: VecOp::Add,
+            }));
+
+            // Must admit: the same reduction with the relaxation asked for.
+            let (g, case) = fp_reduction_relaxed_loop();
+            assert!(case.run(&g).is_admitted());
+
+            // Must admit: element-wise FP needs no relaxation at all, because
+            // a lane computes exactly the scalar IEEE-754 result.
+            let (g, case) = fp_elementwise_loop();
+            let verdict = case.run(&g);
+            let plan = verdict.plan().unwrap_or_else(|| {
+                panic!("expected admission, got {:?}", verdict.refusals());
+            });
+            assert_eq!(plan.lanes, 2, "128-bit / 8-byte double");
+        }
+
+        #[test]
+        fn nan_semantics_refuse_fp_min_max_even_when_reassociation_is_allowed() {
+            // Math.max orders -0.0 below +0.0 and propagates NaN; MAXPD does
+            // neither. That is a wrong answer, not a reordered one, so the
+            // relaxation flag does not reach it.
+            let (g, case) = fp_max_reduction_loop();
+            let verdict = case.run(&g);
+            assert!(verdict.refused_for(VecRefusal::NonIeeeVectorOp {
+                elem: MemKind::Double,
+                op: VecOp::Max,
+            }));
+
+            // Must admit: integer min/max has no NaN and no signed zero, so
+            // the only question is whether the ISA has the instruction.
+            let (g, mut case) = independent_int_loop();
+            case.isa = VectorIsa::sse41();
+            case.arith = vec![VecArith {
+                node: 0,
+                elem: MemKind::Int,
+                op: VecOp::Max,
+                reduction: true,
+            }];
+            assert!(case.run(&g).is_admitted());
+        }
+
+        #[test]
+        fn integer_overflow_is_lane_exact_but_index_overflow_is_not_assumed() {
+            // Modular two's-complement arithmetic is associative and
+            // commutative, so reassociating an integer reduction is exact and
+            // PADDD wraps exactly like iadd. Admitted under `Strict`.
+            let (g, case) = int_reduction_loop();
+            assert!(case.run(&g).is_admitted());
+
+            // Integer division is *not* total: `/ 0` throws and
+            // `MIN_VALUE / -1` overflows, neither of which a lane can raise.
+            let (g, case) = int_divide_loop();
+            let verdict = case.run(&g);
+            assert!(verdict.refused_for(VecRefusal::NonIeeeVectorOp {
+                elem: MemKind::Int,
+                op: VecOp::Div,
+            }));
+
+            // The *index* arithmetic gets no such licence: an induction
+            // variable that can wrap is refused by scev, not widened.
+            let (g, case) = wrapping_index_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict.refusals().iter().any(|r| matches!(
+                    r,
+                    VecRefusal::IndexNotProven {
+                        reason: RefusalReason::IvMayWrap,
+                        ..
+                    }
+                )),
+                "{:?}",
+                verdict.refusals()
+            );
+
+            // Must admit: a no-wrap proof that holds behind a pre-header guard
+            // is admitted — with the guard, and with the model recorded.
+            let (g, case) = guarded_overflow_loop();
+            let verdict = case.run(&g);
+            let plan = verdict.plan().unwrap_or_else(|| {
+                panic!("expected admission, got {:?}", verdict.refusals());
+            });
+            assert_eq!(plan.overflow, OverflowModel::NoWrapGuarded);
+            assert!(
+                plan.guards
+                    .iter()
+                    .any(|e| matches!(e.guard, PreheaderGuard::AtMost { .. })),
+                "the no-wrap obligation must be carried: {:?}",
+                plan.guards
+            );
+        }
+
+        #[test]
+        fn a_reference_array_loop_is_refused() {
+            let (g, case) = reference_array_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::GcReferenceAccess(_))),
+                "a vector store of oops bypasses the write barrier: {:?}",
+                verdict.refusals()
+            );
+
+            // Must admit: the same shape over primitives.
+            let (g, case) = distinct_allocation_loop();
+            assert!(case.run(&g).is_admitted());
+        }
+
+        #[test]
+        fn a_deopt_point_in_the_body_is_refused() {
+            let (g, case) = deopt_in_body_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::DeoptPointInBody(_))),
+                "{:?}",
+                verdict.refusals()
+            );
+
+            // Must admit: the identical loop without the guard node.
+            let (g, case) = distinct_allocation_loop();
+            assert!(case.run(&g).is_admitted());
+        }
+
+        #[test]
+        fn a_safepoint_in_the_body_is_refused() {
+            let (g, case) = call_in_body_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::SafepointInBody(_))),
+                "{:?}",
+                verdict.refusals()
+            );
+
+            // A volatile access is a different refusal for a different reason:
+            // the fence is per-iteration and widening would coalesce it.
+            let (g, case) = volatile_in_body_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::OrderedAccess(_))),
+                "{:?}",
+                verdict.refusals()
+            );
+
+            // Must admit: the loop with neither.
+            let (g, case) = distinct_allocation_loop();
+            assert!(case.run(&g).is_admitted());
+        }
+
+        #[test]
+        fn irreducible_control_flow_is_refused() {
+            let (g, case) = irreducible_loop();
+            assert!(case.run(&g).refused_for(VecRefusal::IrreducibleControl));
+
+            let (g, case) = independent_int_loop();
+            assert!(case.run(&g).is_admitted());
+        }
+
+        #[test]
+        fn unprovable_alignment_is_refused_only_where_the_isa_requires_it() {
+            let (g, case) = strict_alignment_unprovable_loop();
+            assert!(case
+                .run(&g)
+                .refused_for(VecRefusal::UnprovableAlignment { need: 16 }));
+
+            // Must admit: the same loop on a base the caller can prove aligned.
+            let (g, case) = strict_alignment_provable_loop();
+            let verdict = case.run(&g);
+            let plan = verdict.plan().unwrap_or_else(|| {
+                panic!("expected admission, got {:?}", verdict.refusals());
+            });
+            assert_eq!(plan.alignment, Alignment::Proven(16));
+
+            // And on x86 the same unprovable alignment is not a refusal at
+            // all, because MOVDQU is correct.
+            let (g, case) = distinct_allocation_loop();
+            let verdict = case.run(&g);
+            assert_eq!(verdict.plan().expect("admitted").alignment, Alignment::Unknown);
+        }
+
+        #[test]
+        fn a_missing_isa_feature_is_refused_not_assumed() {
+            let (g, case) = int_multiply_loop_sse2();
+            let verdict = case.run(&g);
+            assert!(
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::MissingIsaFeature(_))),
+                "{:?}",
+                verdict.refusals()
+            );
+
+            let (g, case) = int_multiply_loop_sse41();
+            assert!(case.run(&g).is_admitted());
+        }
+
+        #[test]
+        fn an_unbounded_trip_count_is_refused() {
+            let (g, case) = unknown_trip_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict.refusals().iter().any(|r| matches!(
+                    r,
+                    VecRefusal::TripCountTooSmall { min_trips: 0, .. }
+                )),
+                "a loop that may run zero times cannot enter a vector body: {:?}",
+                verdict.refusals()
+            );
+        }
+
+        #[test]
+        fn a_non_unit_step_is_refused() {
+            let (g, case) = non_unit_stride_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::NonUnitStep { .. })),
+                "{:?}",
+                verdict.refusals()
+            );
+        }
+
+        #[test]
+        fn a_non_array_access_is_refused() {
+            let (g, case) = field_access_loop();
+            let verdict = case.run(&g);
+            assert!(
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::UnstructuredMemoryAccess(_))),
+                "{:?}",
+                verdict.refusals()
+            );
+        }
+
+        // ── target detection ────────────────────────────────────────────
+
+        #[test]
+        fn the_width_comes_from_the_host_not_from_an_assumption() {
+            match VectorIsa::detect() {
+                Some(isa) => {
+                    assert!(isa.width_bytes >= 16);
+                    assert_eq!(isa.width_bytes % 16, 0);
+                    assert!(!isa.masked_tail, "no modelled ISA can mask a tail");
+                    if isa.width_bytes == 32 {
+                        assert!(crate::x64::has_avx2(), "256-bit claimed without AVX2");
+                    }
+                }
+                None => assert!(
+                    !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")),
+                    "a supported target reported no vector unit"
+                ),
+            }
+
+            // A target with no vector unit refuses outright rather than
+            // falling back to some assumed width.
+            let (g, mut case) = independent_int_loop();
+            case.isa = VectorIsa {
+                width_bytes: 0,
+                ..VectorIsa::sse2()
+            };
+            assert!(case.run(&g).refused_for(VecRefusal::NoVectorIsa));
+        }
+
+        #[test]
+        fn element_zero_alignment_is_not_provable_at_the_current_object_alignment() {
+            // HEADER_SIZE is 32 and the TLAB grid is 8-byte aligned, so the
+            // *base* is the limit, not the header. This is what makes every
+            // x86 plan come back `Alignment::Unknown`.
+            assert_eq!(HEADER_SIZE % 16, 0);
+            assert_eq!(
+                analyze_alignment(MemKind::Int, Some(0), PROVEN_OBJECT_ALIGNMENT, 16),
+                Alignment::Unknown
+            );
+            assert_eq!(
+                analyze_alignment(MemKind::Int, Some(0), 16, 16),
+                Alignment::Proven(16)
+            );
+            // Element 1 of an int[] sits at byte 36 — never 16-aligned.
+            assert_eq!(
+                analyze_alignment(MemKind::Int, Some(1), 64, 16),
+                Alignment::Unknown
+            );
+            // An unknown start index is an unknown alignment, never an
+            // assumed one.
+            assert_eq!(
+                analyze_alignment(MemKind::Int, None, 64, 16),
+                Alignment::Unknown
+            );
+        }
+
+        // ── the honest number ───────────────────────────────────────────
+
+        #[test]
+        fn the_corpus_verdicts_are_what_the_taxonomy_claims() {
+            let mut admitted = 0usize;
+            let mut total = 0usize;
+            for (name, g, case, expect) in corpus() {
+                let verdict = case.run(&g);
+                assert_eq!(
+                    verdict.is_admitted(),
+                    expect,
+                    "{name}: {:?}",
+                    verdict.refusals()
+                );
+                total += 1;
+                if verdict.is_admitted() {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(total, 27);
+            assert_eq!(
+                admitted, 11,
+                "11 of 27 corpus loops admitted; the rest name a refusal class"
+            );
+        }
     }
 }
