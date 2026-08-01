@@ -15552,6 +15552,15 @@ pub fn register_essential_natives_with_shims(
             // `name()` answer "Jersey" rather than "JERSEY". See
             // `lang_misc::enum_constant_name` for the full trail. The
             // primitive-tag degrade the descriptor-safety pass added is kept.
+            // `java.time.temporal.ChronoUnit` is a second witness with the same
+            // shape: it declares its own `name` holding the DISPLAY form, so a
+            // receiver-scoped read answered "Seconds" and
+            // `Enum.valueOf(ChronoUnit.class, "SECONDS")` matched nothing —
+            // which fell all the way through to every
+            // LocalDevToolsAutoConfigurationTests failing on
+            // `@DurationUnit(ChronoUnit.SECONDS)`.
+            // `probes/EnumShadowedNameFieldProbe.java` pins it, with
+            // `java.util.concurrent.TimeUnit` (no shadowing field) as control.
             Ok(Some(lang_misc::enum_constant_name(ctx, this)))
         },
     );
