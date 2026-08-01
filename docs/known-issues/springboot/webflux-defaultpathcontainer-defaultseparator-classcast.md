@@ -110,10 +110,15 @@ this time landing somewhere dereferenced unsafely instead of hitting a
 `checkcast`), or an unrelated second defect coinciding in the same run — not
 re-diagnosed at the source level this session. The
 `compiled-frame-oop-not-published` GC annotation on the crashing frame is
-worth noting given this cluster's other members (see the
-`springboot-basicerrorcontroller-checkcast-abort-20260731.md` doc in this
-same directory) trace to moving-young-generation root-publication gaps; a
-future investigation should check whether they share a cause.
+worth noting given this cluster's other members trace to
+moving-young-generation root-publication gaps; a future investigation should
+check whether they share a cause. That sibling doc lived in this directory as
+`springboot-basicerrorcontroller-checkcast-abort-20260731.md` and is now
+[`../../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md)
+(**FIXED 2026-08-01**). Its closure section names the specific
+root-publication defect — a collection-overlay owner-index re-key that was not
+single-step — which is worth checking against this crash before assuming a new
+cause.
 
 Logs:
 `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260731/all-jit/logs/module_spring-boot-webmvc.org.springframework.boot.webmvc.autoconfigure.actuate.endpoint.w-5454e505205d.{out,err}.log`

@@ -1,6 +1,193 @@
 # `BasicErrorControllerIntegrationTests` aborts with `checkcast: not an object reference`
 
-**Status: OPEN — REGRESSED 2026-07-31 (same day as the fix below).** Two
+**Status: FIXED 2026-08-01.** Retired from `docs/known-issues/`. Everything
+from "Original report (2026-07-31)" down is the earlier report, kept verbatim;
+what closed it is immediately below.
+
+---
+
+## Closure (2026-08-01)
+
+This doc had been "fixed" and reopened twice, both times on the strength of a
+clean run count. This round differs in one respect that matters: the defect
+found here is pinned by a unit test that **fails on the old code and passes on
+the new**, so a regression is a red test rather than a rediscovery.
+
+### What was already closed before this session
+
+Three GC fixes landed on `dev` after this doc's regression note was written,
+all on 2026-08-01, all inside the mechanism it describes:
+
+| commit | what it closed |
+|---|---|
+| `0b18f15eb` | publish this cycle's young relocation to the external-root providers **before** a same-cycle major GC — `old_gen_gc` seeds its mark worklist from exactly those side tables, so a major GC running inside the same collector call was reading pre-copy addresses |
+| `20cab92aa` | seed the in-place old sweep from this cycle's promotion destinations |
+| `c3dbb011a` | the old-gen mark must not accept unvalidated addresses; old-gen liveness must be free-list aware |
+
+The first is a direct answer to explanation (1) in the regression note ("the
+full run's different GC pressure/promotion pattern still reaches a code path
+the fix didn't cover"). That code path is the same-cycle major GC.
+
+### What this session found: a third instance of the same family
+
+Explanation (2) — "a third, still-undiscovered overlay/owner site" — had the
+family right and the location wrong. It is not an unpinned allocation site.
+It is the **owner index re-key**.
+
+`gc_update_collection_overlay_refs` relocated `overlay_owner_keys` entries
+**in place**, one move at a time:
+
+```rust
+for (old, new) in moves {
+    if let Some(keys) = owners.remove(&old) { /* merge keys into owners[new] */ }
+}
+```
+
+Every other remap in that file is a single-step lookup, which is what
+`pointer_map` means — the collector composes `young -> promoted -> compacted`
+chains into one hop before handing it over (`gen_heap.rs`, "CRITICAL FIX
+(heavy binary-trees GC corruption)"). In-place relocation is not single-step.
+A `pointer_map` may legitimately hold both `A -> B` and `B -> C`, because
+old-gen sliding compaction hands one live object the address another live
+object just vacated. Apply `A -> B` first and A's keys sit at B; the later
+`B -> C` then sweeps them onward together with B's own, so the collection that
+really is at B ends up with **no entry at its own address**.
+
+Nothing downstream catches that:
+
+* the side tables are keyed by the relocation-invariant identity hash, so the
+  collection keeps reading its own state correctly — the loss is invisible
+  until the backing array is actually gone;
+* only the GC's "which refs does this collection own?" question breaks, and
+  only on the paths that ask it **per owner**: the non-moving young marker and
+  `old_gen_gc`'s mark BFS. Those free a live backing array, which resurfaces
+  as `checkcast: not an object reference` in whatever reads the collection
+  next;
+* the moving young path seeds from
+  `external_roots_for_matching_owners(&|_| true)`, a union over every indexed
+  address, so it survives a misplaced entry **and cannot expose the bug** —
+  which is why this stayed invisible through a round of work whose subject was
+  precisely the moving young collector.
+
+Whether it fired depended on `HashMap` iteration order, and it needed two
+overlay-backed collections in old gen plus a compacting cycle that slid one
+onto the other's address. That is the profile of the thing this doc kept
+failing to reproduce.
+
+**Fix:** rebuild the index into a fresh map so every entry moves exactly once.
+Pinned by
+`overlay_owner_liveness_tests::a_chained_pointer_map_does_not_sweep_one_owners_keys_onto_another`,
+which uses an eight-hop chain — a two-address version passes half the time on
+the broken code, because applying the moves in reverse order happens to be
+harmless. Verified as a differential: **FAILED** against the old algorithm
+(`owner 2 moved to 0x5ead0d00 but its key is not recorded there`), passes
+against the new.
+
+A companion test,
+`gc_relocation_harness::owner_seeded_roots_follow_the_owner_across_a_relocation`,
+asserts the same property end-to-end for all five overlays: after the OWNER
+moves, its values must still be reachable both from the always-true seed and
+from a per-owner walk queried at the POST-move address.
+
+### A detector, so the next occurrence names itself
+
+`report_short_overlay_backing` (`native-collections/src/lib.rs`) reports a
+TreeMap/TreeSet whose overlay `size` no longer fits its backing array, at the
+read that first observes it:
+
+```
+[overlay-backing] TreeSet backing array is shorter than its size — the collector
+reclaimed or failed to remap it while the collection was still live.
+owner=0x… key=0x… size=5 needed=5 array_length=0 data=0x… data_class_id=0
+```
+
+Three separate investigations (2026-07-28, 07-31, and 07-31 again) each had to
+re-derive that chain backwards from a `checkcast` inside
+`String$CaseInsensitiveComparator.compare`, twice by hand-adding a throwaway
+probe. It is on unconditionally: it cannot fire unless the VM is already
+broken. It skips the two shapes that are legitimately short — a fast-mode
+`TreeMap`, which keeps its entries in `tm_fast_table` and leaves the array
+slot empty while still recording the count, and a map mid-conversion between
+the two modes.
+
+### Two probes that do NOT reproduce this — recorded so nobody re-runs them
+
+`probes/OverlayCaseInsensitiveTreeSetProbe.java` reproduces the production
+shape exactly (a `static final TreeSet<>(String.CASE_INSENSITIVE_ORDER)` built
+at class-init and read for the life of the process, i.e.
+`JdkClientHttpRequest.DISALLOWED_HEADERS`) under a moving young collector with
+same-cycle majors — `minor=16 major=12`, all 16 moving, confirmed with
+`CRATONVM_GC_STATS=1`. It passes 4/4 against **`9fcd1b63f`, the exact commit
+the regression was reported on**. So does
+`regression-suite/src/ROverlaySystemGcStress.java`, checked the same way in
+three configurations.
+
+Neither can express this defect, so a green run of either proves nothing about
+it. The probe is kept as a cheap smoke test with that stated in its own
+header. The only vehicle that has ever reproduced the abort is the real Spring
+Boot class.
+
+### The `whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade` residual — root-caused and fixed
+
+Not GC at all, and not a Jetty problem: `ServerSocketChannel.close()` did not
+close the listening socket.
+
+`ssc_accept` cloned the listener with `try_clone()` before its poll loop, so an
+acceptor thread parked there held a **duplicate OS handle** across the close.
+`sc_close` drops the registry entry — the registry is meant to be the sole
+owner, and dropping it is what closes the port — but the duplicate kept the
+port open until the acceptor next polled. Worse, the deregistration check sat
+only in the `WouldBlock` arm, so a connection that arrived after the close was
+returned by `accept()` and **served**.
+
+That is exactly what the test does: `shutDownGracefully` calls
+`connector.shutdown()` -> `ServerConnector.close()` -> `IO.close(_acceptChannel)`,
+all synchronously on the caller's thread, and the test then connects and
+expects `HttpHostConnectException`. It got `404 Not Found` — a real response
+from the server that was supposed to be closed — and only under load, because
+the window is one `ACCEPT_CLOSE_POLL` (10 ms) wide. Hence "passes standalone,
+fails inside the full 113-test class": the method passed 6/6 in isolation here
+before any fix, which is why the original report could not place it.
+
+**Fix:** poll the registry's own listener instead of a private duplicate —
+what the AF_UNIX twin (`uds_accept_close_aware`) has always done. The TCP path
+was the only one that *could* clone, and did.
+
+`probes/ServerChannelCloseRefusesConnectProbe.java` reduces it from a
+113-test class to a ten-second run: a real acceptor thread parked in
+`accept()`, a `close()` from another thread, then a connect. Interleaved arms,
+25 rounds each, 4 connect attempts per round:
+
+| build | refused | served after `close()` returned |
+|---|---:|---:|
+| HotSpot 25 | 100 | **0** |
+| `9fcd1b63f` (pre-fix) | 79 / 84 | **21 / 16** |
+| this fix | 100 / 100 | **0 / 0** |
+
+Also pinned by
+`socket_channel::tests::closing_the_registry_entry_closes_the_listening_port`,
+which asserts the OS-visible property — a connect to the port must fail —
+rather than the internal one, because the internal state was already correct
+while the socket stayed open.
+
+### Out of scope, still open
+
+`BasicErrorControllerIntegrationTests` is still **not green**: it fails 23/26
+under JIT with `IllegalStateException: Cannot bind to SpringApplication` ->
+`BindException` -> `NullPointerException` in `BindConverter.convert`. That is a
+different defect with its own doc —
+[`basicerrorcontroller-jit-only-failure-20260731.md`](../../../known-issues/springboot/basicerrorcontroller-jit-only-failure-20260731.md)
+— which exists specifically to record that this class is not a usable
+acceptance gate right now. It is JIT-only (`--nojit` and HotSpot both pass
+26/26) and unrelated to the collection-overlay mechanism above. The class
+still boots Tomcat 6 times per run in that state — more than the 4 boots this
+doc's abort needed — so runs of it are not vacuous for this doc's purpose.
+
+---
+
+## Original report (2026-07-31)
+
+**Status at the time: OPEN — REGRESSED 2026-07-31 (same day as the fix below).** Two
 independent GC bugs were fixed (`3211b8c74`): the moving young collector never
 rooted collection-overlay side-table references, and several TreeSet/TreeMap
 backing-array allocations published a pointer through a pre-allocation

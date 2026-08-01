@@ -3,10 +3,12 @@
 **Status: OPEN — REGRESSED 2026-07-31.** Originally fixed 2026-07-29 and
 retired from `docs/known-issues` after direct full-class validation in both
 JIT modes. Residual #1 (the `CaseInsensitiveComparator` checkcast abort) has
-its own separate, more detailed regression chain — see
-[`springboot-basicerrorcontroller-checkcast-abort-20260731.md`](springboot-basicerrorcontroller-checkcast-abort-20260731.md)
-for the GC root cause found 2026-07-31 and its own subsequent regression the
-same day. Residual #2 (the `ConditionEvaluationReport` mapping-lambda
+its own separate, more detailed regression chain, and is now **FIXED
+2026-08-01** — see
+[`../../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md)
+for the GC root cause found 2026-07-31, its subsequent regression the same
+day, and the overlay owner-index defect that closed it. Residual #2 (the
+`ConditionEvaluationReport` mapping-lambda
 corruption, fix #2 below) has now regressed independently — see "Regression
 note (2026-07-31)" below — surfacing in a sibling class,
 `BasicErrorControllerDirectMockMvcTests`, rather than the originally-reported
