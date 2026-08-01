@@ -4374,15 +4374,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         files,
         "isDirectory",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            let is_dir = match vfs_classify(&p) {
-                Some(kind) => matches!(kind, JarFsKind::Dir),
-                None => std::path::Path::new(&p).is_dir(),
-            };
-            Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
-        },
+        |ctx, args| Ok(Some(Value::Int(i32::from(p57_files_is_directory_impl(ctx, args))))),
     );
 
     r.register(
@@ -4390,16 +4382,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "isRegularFile",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
         |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            let is_file = match vfs_classify(&p) {
-                Some(kind) => matches!(kind, JarFsKind::File),
-                None if p57_link_options_nofollow(ctx, args.get(1)) => {
-                    std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file())
-                }
-                None => std::path::Path::new(&p).is_file(),
-            };
-            Ok(Some(Value::Int(if is_file { 1 } else { 0 })))
+            Ok(Some(Value::Int(i32::from(p57_files_is_regular_file_impl(
+                ctx, args,
+            )))))
         },
     );
 
@@ -5838,30 +5823,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         files,
         "exists",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            let exists = match vfs_classify(&p) {
-                Some(kind) => !matches!(kind, JarFsKind::Absent),
-                None => std::path::Path::new(&p).exists(),
-            };
-            Ok(Some(Value::Int(if exists { 1 } else { 0 })))
-        },
+        |ctx, args| Ok(Some(Value::Int(i32::from(p57_files_exists_impl(ctx, args))))),
     );
 
     r.register(
         files,
         "notExists",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            let exists = match vfs_classify(&p) {
-                Some(kind) => !matches!(kind, JarFsKind::Absent),
-                None => std::path::Path::new(&p).exists(),
-            };
-            Ok(Some(Value::Int(if !exists { 1 } else { 0 })))
-        },
+        |ctx, args| Ok(Some(Value::Int(i32::from(!p57_files_exists_impl(ctx, args))))),
     );
 
     r.register(
@@ -9017,6 +8986,59 @@ pub(crate) fn p57_link_options_nofollow(ctx: &mut dyn NativeContext, arg: Option
     matches!(arg, Some(Value::Object(Some(a))) if ctx.array_length(*a) > 0)
 }
 
+/// `Files.exists(Path, LinkOption...)`. Shared by the two registrations of this
+/// triple (`register_phase57_nio_file` and `register_p61_files_path`) so the
+/// pair cannot drift — they already had, and the NOFOLLOW_LINKS repair landed
+/// on the losing copy first.
+pub(crate) fn p57_files_exists_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> bool {
+    let Some(Value::Object(Some(path_ref))) = args.first() else {
+        return false;
+    };
+    let path_str = p57_read_path(ctx, *path_ref);
+    match vfs_classify(&path_str) {
+        Some(kind) => !matches!(kind, JarFsKind::Absent),
+        // NOFOLLOW_LINKS asks about the LINK, so a dangling symbolic link
+        // exists. `Path::exists()` resolves the link and answered false.
+        None if p57_link_options_nofollow(ctx, args.get(1)) => {
+            std::fs::symlink_metadata(&path_str).is_ok()
+        }
+        None => std::path::Path::new(&path_str).exists(),
+    }
+}
+
+/// `Files.isDirectory(Path, LinkOption...)`. Shared for the same reason as
+/// [`p57_files_exists_impl`].
+pub(crate) fn p57_files_is_directory_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> bool {
+    let Some(Value::Object(Some(path_ref))) = args.first() else {
+        return false;
+    };
+    let path_str = p57_read_path(ctx, *path_ref);
+    match vfs_classify(&path_str) {
+        Some(kind) => matches!(kind, JarFsKind::Dir),
+        // Under NOFOLLOW_LINKS a link to a directory is a LINK, not a directory.
+        None if p57_link_options_nofollow(ctx, args.get(1)) => {
+            std::fs::symlink_metadata(&path_str).is_ok_and(|m| m.is_dir())
+        }
+        None => std::path::Path::new(&path_str).is_dir(),
+    }
+}
+
+/// `Files.isRegularFile(Path, LinkOption...)`. Shared for the same reason as
+/// [`p57_files_exists_impl`].
+pub(crate) fn p57_files_is_regular_file_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> bool {
+    let Some(Value::Object(Some(path_ref))) = args.first() else {
+        return false;
+    };
+    let path_str = p57_read_path(ctx, *path_ref);
+    match vfs_classify(&path_str) {
+        Some(kind) => matches!(kind, JarFsKind::File),
+        None if p57_link_options_nofollow(ctx, args.get(1)) => {
+            std::fs::symlink_metadata(&path_str).is_ok_and(|m| m.is_file())
+        }
+        None => std::path::Path::new(&path_str).is_file(),
+    }
+}
+
 /// Whether a `FileVisitOption[]`/`Set<FileVisitOption>` argument asks for
 /// `FOLLOW_LINKS`.
 ///
@@ -9033,15 +9055,21 @@ pub(crate) fn p57_visit_options_follow_links(
         return false;
     };
     let o = *o;
-    let class_id = ctx.class_id_of_object(o);
-    let is_array = ctx
-        .class_name_of_id(class_id)
-        .is_some_and(|n| n.starts_with('['));
-    if is_array {
-        // Array form (`Files.walk(path, opts...)` varargs).
-        return ctx.array_length(o) > 0;
+    // Array form (`Files.walk(path, opts...)` varargs). `array_length` answers
+    // 0 for a non-array, so a positive length is proof of a non-empty array and
+    // nothing else needs asking.
+    if ctx.array_length(o) > 0 {
+        return true;
     }
-    // Set form (`Files.walkFileTree(path, Set<FileVisitOption>, ...)`).
+    // Either an EMPTY array or the Set form
+    // (`Files.walkFileTree(path, Set<FileVisitOption>, ...)`). Asking a Set is
+    // the only way to tell them apart, and `isEmpty` on an array simply fails
+    // to resolve — landing on the same `false` an empty array deserves.
+    //
+    // Do NOT discriminate on the class name first: an array's class name is not
+    // reliably resolvable here, and a miss silently sent every varargs
+    // `FOLLOW_LINKS` down the Set branch, which is how `Files.walk(p,
+    // FOLLOW_LINKS)` kept behaving as if the option had not been passed at all.
     match ctx.invoke_virtual(o, "isEmpty", "()Z", &[]) {
         Ok(Some(Value::Int(v))) => v == 0,
         _ => false,
@@ -14345,97 +14373,28 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
         files,
         "exists",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
-        |ctx, args| {
-            if let Some(Value::Object(Some(path_ref))) = args.first() {
-                let path_str = match ctx.get_field(*path_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => return Ok(Some(Value::Int(0))),
-                };
-                let exists = match vfs_classify(&path_str) {
-                    Some(kind) => !matches!(kind, JarFsKind::Absent),
-                    // NOFOLLOW_LINKS asks about the LINK, so a dangling
-                    // symbolic link exists. `Path::exists()` resolves the link
-                    // and answered false for one.
-                    None if p57_link_options_nofollow(ctx, args.get(1)) => {
-                        std::fs::symlink_metadata(&path_str).is_ok()
-                    }
-                    None => std::path::Path::new(&path_str).exists(),
-                };
-                Ok(Some(Value::Int(if exists { 1 } else { 0 })))
-            } else {
-                Ok(Some(Value::Int(0)))
-            }
-        },
+        |ctx, args| Ok(Some(Value::Int(i32::from(p57_files_exists_impl(ctx, args))))),
     );
     r.register(
         files,
         "notExists",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
-        |ctx, args| {
-            if let Some(Value::Object(Some(path_ref))) = args.first() {
-                let path_str = match ctx.get_field(*path_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => return Ok(Some(Value::Int(1))),
-                };
-                let exists = match vfs_classify(&path_str) {
-                    Some(kind) => !matches!(kind, JarFsKind::Absent),
-                    None if p57_link_options_nofollow(ctx, args.get(1)) => {
-                        std::fs::symlink_metadata(&path_str).is_ok()
-                    }
-                    None => std::path::Path::new(&path_str).exists(),
-                };
-                Ok(Some(Value::Int(if !exists { 1 } else { 0 })))
-            } else {
-                Ok(Some(Value::Int(1)))
-            }
-        },
+        |ctx, args| Ok(Some(Value::Int(i32::from(!p57_files_exists_impl(ctx, args))))),
     );
     r.register(
         files,
         "isDirectory",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
-        |ctx, args| {
-            if let Some(Value::Object(Some(path_ref))) = args.first() {
-                let path_str = match ctx.get_field(*path_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => return Ok(Some(Value::Int(0))),
-                };
-                let is_dir = match vfs_classify(&path_str) {
-                    Some(kind) => matches!(kind, JarFsKind::Dir),
-                    // Under NOFOLLOW_LINKS a link to a directory is a LINK,
-                    // not a directory.
-                    None if p57_link_options_nofollow(ctx, args.get(1)) => {
-                        std::fs::symlink_metadata(&path_str).is_ok_and(|m| m.is_dir())
-                    }
-                    None => std::path::Path::new(&path_str).is_dir(),
-                };
-                Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
-            } else {
-                Ok(Some(Value::Int(0)))
-            }
-        },
+        |ctx, args| Ok(Some(Value::Int(i32::from(p57_files_is_directory_impl(ctx, args))))),
     );
     r.register(
         files,
         "isRegularFile",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
         |ctx, args| {
-            if let Some(Value::Object(Some(path_ref))) = args.first() {
-                let path_str = match ctx.get_field(*path_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => return Ok(Some(Value::Int(0))),
-                };
-                let is_file = match vfs_classify(&path_str) {
-                    Some(kind) => matches!(kind, JarFsKind::File),
-                    None if p57_link_options_nofollow(ctx, args.get(1)) => {
-                        std::fs::symlink_metadata(&path_str).is_ok_and(|m| m.is_file())
-                    }
-                    None => std::path::Path::new(&path_str).is_file(),
-                };
-                Ok(Some(Value::Int(if is_file { 1 } else { 0 })))
-            } else {
-                Ok(Some(Value::Int(0)))
-            }
+            Ok(Some(Value::Int(i32::from(p57_files_is_regular_file_impl(
+                ctx, args,
+            )))))
         },
     );
     r.register(files, "size", "(Ljava/nio/file/Path;)J", p59_files_size);
