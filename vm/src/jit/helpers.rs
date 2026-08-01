@@ -6653,6 +6653,59 @@ pub unsafe extern "C" fn jit_checkcast(
         // the old fail-soft `0` — there the object's type is UNKNOWABLE, and
         // throwing would turn tolerated stale-reference reads into new
         // failures.
+        // H2-CID0 (2026-08-01): same flag-free reclaimed-memory verdict the
+        // interpreter's `checkcast` reporter emits. A compiled `checkcast` is
+        // where a hot accessor like `MVStore`'s `readPageFromCache` actually
+        // fails, and this path used to report nothing at all, so the run that
+        // reproduces produced no evidence. `java.lang.Object` is `ClassId(0)`,
+        // which is also the all-zero header the collector leaves over a
+        // reclaimed span; free-list membership tells the two apart.
+        // See docs/known-issues/h2/
+        // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+        if obj_class_id.as_u32() == 0 {
+            let addr = obj_ref.as_ptr() as usize;
+            if let Some((what, span, size)) = vm.mem.heap.reclaimed_hole_at(addr) {
+                static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{addr:#x}"),
+                        location = %what,
+                        span = format!("{span:#x}+{size:#x}"),
+                        target_class = %class_name,
+                        "JIT checkcast receiver points into RECLAIMED memory — a \
+                         still-referenced object was collected.",
+                    );
+                    // H2-CID0: name the victim, unconditionally.
+                    if let Some((cid, kind, site, seq)) =
+                        cratonvm_gc::gen_heap::old_freed_lookup(addr)
+                    {
+                        let orig = vm
+                            .classes
+                            .class_manager
+                            .try_read()
+                            .and_then(|cm| {
+                                cm.get_class(cratonvm_types::ClassId::new(cid))
+                                    .map(|c| c.name.to_string())
+                            })
+                            .unwrap_or_else(|| format!("class_id={cid}"));
+                        tracing::error!(
+                            target: "cratonvm::gc::guard",
+                            obj = format!("{addr:#x}"),
+                            original_class = %orig,
+                            original_kind = kind,
+                            freed_by = if site == 1 {
+                                "in-place old-gen sweep"
+                            } else {
+                                "old-gen mark-compact"
+                            },
+                            free_seq = seq,
+                            "…and the old-gen reclamation ring knows what that block held.",
+                        );
+                    }
+                }
+            }
+        }
         if let Some((thread, _jit_thread_guard)) = jit_thread_mut() {
             // Render an array receiver by its own descriptor. The header of a
             // reference array carries the COMPONENT class id, so the plain
