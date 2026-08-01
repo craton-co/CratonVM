@@ -3933,6 +3933,10 @@ fn run() -> Result<()> {
         vm.shared.mem.heap.print_gc_summary();
     }
 
+    // Per-segment `getstatic` cost, plus whether the lock-free statics index is
+    // actually being hit (`CRATONVM_DBG_GETSTATIC_PROF=1`).
+    cratonvm_vm::jit::helpers::gs_prof::dump();
+
     // T19.K1 — wait for non-daemon threads before exiting.
     //
     // Per the JVM specification, the VM keeps running until every

@@ -20,6 +20,192 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+/// One class's static-field storage, at a **stable, never-freed address**.
+///
+/// Static reads are the most expensive field access in compiled code (~35 ns
+/// against HotSpot's ~1 — see
+/// `docs/known-issues/jit-getstatic-costs-a-helper-call-20260731.md`). What is
+/// left after trimming the helper is the `RwLock` + hash probe that reaching a
+/// `Vec<Value>` inside an `FxHashMap` requires.
+///
+/// A `Vec` cannot be read without that lock, because a `resize` would move the
+/// buffer out from under a concurrent reader. This block therefore **leaks**
+/// its allocation: created once, never freed, and growth allocates a *new*
+/// block while leaving the old one mapped. A raw pointer handed out here stays
+/// valid for the life of the VM, which is what lets [`StaticsIndex`] serve
+/// reads with no lock at all.
+///
+/// Deliberately `Deref<Target = [Value]>` so call sites that index, iterate or
+/// take `.len()` keep working unchanged.
+pub struct StaticsBlock {
+    ptr: *mut Value,
+    len: usize,
+}
+
+// SAFETY: a plain owned allocation of `Value` (itself `Send + Sync`). All
+// mutation still happens under the `statics` write lock, exactly as when this
+// was a `Vec<Value>`; the raw pointer changes nothing about which thread may
+// touch it.
+unsafe impl Send for StaticsBlock {}
+unsafe impl Sync for StaticsBlock {}
+
+impl StaticsBlock {
+    /// Allocate `len` zero-initialized slots and leak them.
+    pub fn new(len: usize) -> Self {
+        Self::from_values(vec![Value::Int(0); len])
+    }
+
+    pub fn from_values(values: Vec<Value>) -> Self {
+        let leaked: &'static mut [Value] = Box::leak(values.into_boxed_slice());
+        Self {
+            ptr: leaked.as_mut_ptr(),
+            len: leaked.len(),
+        }
+    }
+
+    /// Base address of slot 0. Stable for the life of the VM.
+    #[inline]
+    pub fn base_ptr(&self) -> *mut Value {
+        self.ptr
+    }
+
+    #[inline]
+    pub fn slot_len(&self) -> usize {
+        self.len
+    }
+
+    /// Grow to at least `new_len`, preserving contents.
+    ///
+    /// The OLD block is intentionally left allocated: a lock-free reader may
+    /// still hold a pointer into it. Growth only fires when a write targets an
+    /// index past the class's declared field count — already the unexpected
+    /// path — so the leak is bounded by that rarity.
+    pub fn grow_to(&mut self, new_len: usize) {
+        if new_len <= self.len {
+            return;
+        }
+        let mut values = vec![Value::Int(0); new_len];
+        values[..self.len].copy_from_slice(self.as_slice());
+        let grown = Self::from_values(values);
+        self.ptr = grown.ptr;
+        self.len = grown.len;
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[Value] {
+        // SAFETY: `ptr`/`len` describe a leaked, never-freed allocation.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [Value] {
+        // SAFETY: as above; `&mut self` proves exclusive access.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl std::ops::Deref for StaticsBlock {
+    type Target = [Value];
+    #[inline]
+    fn deref(&self) -> &[Value] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for StaticsBlock {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [Value] {
+        self.as_mut_slice()
+    }
+}
+
+pub struct StaticsIndexSlot {
+    base: std::sync::atomic::AtomicPtr<Value>,
+    len: AtomicUsize,
+}
+
+/// Lock-free `ClassId -> statics base pointer` index.
+///
+/// Mirrors `ClassRealm::statics`, so a reader that needs one slot can skip the
+/// `RwLock` and the hash probe entirely. Entries are published when a class's
+/// [`StaticsBlock`] is created or grown; because blocks are never freed, a
+/// pointer read from here stays valid.
+///
+/// Ids at or beyond [`StaticsIndex::CAPACITY`] are simply not indexed and fall
+/// back to the map, making the capacity a performance bound, not a correctness
+/// one.
+pub struct StaticsIndex {
+    slots: OnceLock<Box<[StaticsIndexSlot]>>,
+}
+
+impl Default for StaticsIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StaticsIndex {
+    /// Covers class ids `[0, 1 << 17)`; ~1.5 MiB, allocated on first publish.
+    pub const CAPACITY: usize = 1 << 17;
+
+    pub const fn new() -> Self {
+        Self {
+            slots: OnceLock::new(),
+        }
+    }
+
+    fn slots(&self) -> &[StaticsIndexSlot] {
+        self.slots.get_or_init(|| {
+            (0..Self::CAPACITY)
+                .map(|_| StaticsIndexSlot {
+                    base: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+                    len: AtomicUsize::new(0),
+                })
+                .collect()
+        })
+    }
+
+    /// Publish (or re-publish, after a grow) a class's statics base.
+    ///
+    /// `len` is stored BEFORE `base`, and `base` with `Release`: a reader loads
+    /// `base` with `Acquire` and only then consults `len`, so a non-null base
+    /// can never be paired with a length that overstates its block.
+    pub fn publish(&self, class_id: ClassId, block: &StaticsBlock) {
+        let idx = class_id.as_u32() as usize;
+        if idx >= Self::CAPACITY {
+            return;
+        }
+        let slot = &self.slots()[idx];
+        slot.len.store(block.slot_len(), Ordering::Relaxed);
+        slot.base.store(block.base_ptr(), Ordering::Release);
+    }
+
+    /// Read one static slot without taking any lock.
+    ///
+    /// `None` means "not indexed / out of range" — the caller falls back to the
+    /// locked map path.
+    #[inline]
+    pub fn get(&self, class_id: ClassId, field_index: usize) -> Option<Value> {
+        let idx = class_id.as_u32() as usize;
+        if idx >= Self::CAPACITY {
+            return None;
+        }
+        // Never force the 1.5 MiB allocation for a VM that has not published.
+        let slots = self.slots.get()?;
+        let slot = &slots[idx];
+        let base = slot.base.load(Ordering::Acquire);
+        if base.is_null() || field_index >= slot.len.load(Ordering::Relaxed) {
+            return None;
+        }
+        // SAFETY: `base` points into a leaked, never-freed `StaticsBlock`, and
+        // `field_index` was bounds-checked against the length published for
+        // that same block. The read is unsynchronized against a concurrent
+        // `putstatic`, exactly as the JIT's inline `getfield` already is for
+        // instance-field cells.
+        Some(unsafe { *base.add(field_index) })
+    }
+}
+
 /// Class loading, linking, resolution and per-class caches. Owns the L10 lock.
 pub struct ClassRealm {
     /// Class loader and cache, protected by an RwLock.
@@ -51,7 +237,12 @@ pub struct ClassRealm {
     /// Static fields: class_id -> field_index -> Value.
     /// T10.9.B: FxHashMap — keys are internal ClassId, hot path accessed
     /// on every getstatic/putstatic bytecode.
-    pub statics: RwLock<FxHashMap<ClassId, Vec<Value>>>,
+    pub statics: RwLock<FxHashMap<ClassId, StaticsBlock>>,
+
+    /// Lock-free mirror of [`Self::statics`] for single-slot reads. Kept in
+    /// step by `set_static_shared` / the class-init path, which publish every
+    /// block they create or grow.
+    pub statics_index: StaticsIndex,
 
     /// Cache of resolved symbolic references (fields and methods).
     pub resolution_cache: RwLock<ResolutionCache>,
