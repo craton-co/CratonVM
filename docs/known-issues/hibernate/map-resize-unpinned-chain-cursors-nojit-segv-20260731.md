@@ -173,11 +173,39 @@ Two details worth keeping:
 - `pointer_map size=3436289` — 3.4 M objects moved in that cycle. Whatever the
   gap is, it survives a full compaction.
 
-Next question for whoever continues: are those 40 referrers in old-gen with a
-clean card (a missing write barrier on the store that created the edge), or in a
-region the mark/forward pass does not visit at all? `CRATONVM_DBG_GCWRITE` and
-the pre-GC remembered-set audit already in `gen_heap.rs` (search
-"pre-GC remembered-set audit") are the next instruments.
+### The faulting frame, symbolized
+
+A build with `RUSTFLAGS="-Cdebuginfo=2 -Cforce-frame-pointers=yes"` (separate
+`CARGO_TARGET_DIR`, so the ordinary `target/` cache is untouched) plus the
+report's own offline mode resolves the crash. Note the symbolizer needs the
+binary sitting **next to its `.pdb`** — copying just the `.exe` elsewhere yields
+`<unresolved>` for every frame:
+
+```
+$ CRATONVM_SYMBOLIZE="0x2B64B3,0x2ADC6A,0x1048F01" target-dbg/release/cratonvm.exe X
+0x2B64B3  cratonvm_gc::gen_heap::GenerationalHeap::old_gen_gc+0x12B3   [gen_heap.rs:8562]
+0x2ADC6A  cratonvm_gc::gen_heap::GenerationalHeap::collect_garbage_inner  [gen_heap.rs:5412]
+0x1048F01 cratonvm_vm::runtime::interpreter::maybe_gc                  [interpreter.rs:1463]
+```
+
+`gen_heap.rs:8562` is `Self::scan_object_for_old_refs(obj_ptr, …)` inside the
+old-gen mark **BFS**, dereferencing a pointer just popped off the worklist. The
+lines immediately above it are one of the worklist push sites: an
+`old_gen.contains(overlay_ptr)` bare range check followed by a blind
+`gc_flags |= GC_FLAG_MARKED` and a push.
+
+That is exactly the code `dev`'s `c3dbb011a` hardens — "seven of nine
+mark-worklist push sites validated nothing … a bare `old_gen.contains()` range
+check followed by a blind `gc_flags |= GC_FLAG_MARKED` RMW and a push", plus
+`is_addr_live` reporting freed old-gen blocks as live. An unvalidated address on
+that worklist makes `scan_object_for_old_refs` read a bogus header, compute a
+bogus extent, and walk into unmapped memory — and a bogus mark is equally a good
+explanation for the UN-FORWARDED edges above, since the compaction's notion of
+what is live and where it moved comes from that same mark.
+
+**This attribution is by symbolized frame plus matching commit, not by
+measurement yet.** `c3dbb011a` is merged into this branch; the confirming run is
+the repro on a binary built from that merge.
 
 ### The class-loading lead (separate, and fixed)
 
