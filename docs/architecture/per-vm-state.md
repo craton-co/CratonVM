@@ -44,15 +44,16 @@ VM-identity notion. Everything below reuses it. Do not introduce a second one.
 
 ---
 
-## 1. The security-manager finding — CONFIRMED
+## 1. The security-manager finding — CONFIRMED, and now **FIXED**
 
 ### Where it actually lives
 
 The review brief located it at `vm/src/native/security_manager.rs`. That path
 does not exist. The real file is **`native-builtins/src/security_manager.rs`**,
-which is outside this pass's edit scope; the required edit is specified in §5.
+which was outside the edit scope of the pass that found this; the edit
+specified in §5 has since landed there.
 
-### The bug
+### The bug (as found)
 
 ```rust
 // native-builtins/src/security_manager.rs:117
@@ -117,11 +118,45 @@ process-shared registry rather than per-VM ownership.
 
 ### Two more instances of the identical shape in the same file
 
-`ACTIVE_POLICY_OBJECT` (`:205`) and `SHARED_PERMISSION_COLLECTION` (`:216`) are
-byte-for-byte the same `(identity_key, ObjectRef)`-in-a-process-global pattern,
-read back through `ctx.read_var_handle_root(key).unwrap_or(cached)` at `:221`,
-`:266` and `:287`. They have the same cross-VM use-after-move. Any fix must
-cover all three.
+`ACTIVE_POLICY_OBJECT` and `SHARED_PERMISSION_COLLECTION` were byte-for-byte the
+same `(identity_key, ObjectRef)`-in-a-process-global pattern, read back through
+`ctx.read_var_handle_root(key).unwrap_or(cached)`. They had the same cross-VM
+use-after-move, and any fix had to cover all three.
+
+### What landed
+
+All three are gone, replaced together:
+
+* **Per-VM index.** `SECURITY_STATE: OnceLock<Mutex<HashMap<usize,
+  VmSecurityState>>>`, keyed by `NativeContext::vm_identity()` — the same
+  identity notion §0 Fact 2 insists on, not a second one. `VmSecurityState`
+  carries all three slots; `security_slot` / `set_security_slot` take the key
+  **from `ctx`**, so no call site can name another VM's row. Clearing the last
+  occupied slot drops the row instead of leaving an all-`None` shell.
+* **A real root source, which is what actually closes Fact 2.** Per-VM keying
+  alone would have fixed the *policy* leak and left the raw cached `ObjectRef`
+  still unrewritable. `gc_scan_security_manager_roots` /
+  `gc_update_security_manager_refs` are registered as the `"security-manager"`
+  source in `vm/src/memory/native_roots.rs` (`scan_security_manager` /
+  `remap_security_manager`), so the cached copy is scanned as a root and
+  rewritten through the pointer map — which is what
+  `docs/threading/objectref-concurrency-contract.md` requires of every address
+  holder.
+* **A stated lock discipline.** The state lock is never held across a Java
+  allocation or any re-entry into the VM, because the scan callback takes the
+  same lock at a safepoint; the lazy initialisers allocate first and publish
+  afterwards.
+
+The regression test above still earns its place: it pins the *underlying*
+property (a var-handle root installed in VM A is not resolvable from VM B), so
+it fails the moment someone re-introduces a process-shared registry rather than
+per-VM ownership.
+
+**Still citing this as open, in code comments** (not edited here — this document
+does not own `native-api/`): `native-api/src/capability.rs:15` and
+`native-api/src/registry.rs:2087`. Both name `SECURITY_MANAGER` as a
+process-global whose cached ref must be re-read through `read_var_handle_root`;
+neither is true any more.
 
 `ACTIVE_POLICY` (`:331`), `ACTIVE_POLICY_PATH` (`:344`), `REQUIRE_POLICY`
 (`:57`) and `DBG_DOPRIV` (`:38`) are process-global **policy** state (P1 rather
@@ -299,14 +334,22 @@ tests share the process.
 
 Not covered, and why:
 
-* *"Two VMs with conflicting security managers do not interfere"* and
+* ~~*"Two VMs with conflicting security managers do not interfere"* and
   *"`setSecurityManager(null)` in one VM leaves the other's gates armed"* cannot
-  be asserted until §5's fix lands — today they would simply document the bug as
-  behaviour. The var-handle test above pins the mechanism instead, and will fail
-  if someone "fixes" S1 by sharing a registry rather than owning the reference
-  per VM.
-* *"The security-manager reference survives a forced young GC"* likewise belongs
-  next to the fix, in `native-builtins`.
+  be asserted until §5's fix lands.~~ **Now covered**, next to the fix in
+  `native-builtins/src/security_manager.rs`:
+  `two_vms_hold_independent_security_managers`,
+  `clearing_one_vms_security_manager_leaves_the_other_armed`,
+  `policy_and_permission_slots_are_per_vm`,
+  `vm_teardown_does_not_disturb_the_other_vm`, and
+  `single_vm_behaviour_is_unchanged` (the no-regression side).
+* ~~*"The security-manager reference survives a forced young GC"* likewise
+  belongs next to the fix, in `native-builtins`.~~ **Now covered** by
+  `security_manager_ref_is_scanned_and_remapped_per_vm`, which is the test for
+  the root-source half rather than the keying half.
+* The var-handle test in the table above is still the right place for the
+  *mechanism*: it fails if someone re-"fixes" this by sharing a registry rather
+  than owning the reference per VM.
 
 ---
 
@@ -314,7 +357,15 @@ Not covered, and why:
 
 Listed in the order they must land.
 
-### 5.1 `native-builtins/src/security_manager.rs` — S1/S2/S3 (P0, use-after-move)
+### 5.1 `native-builtins/src/security_manager.rs` — S1/S2/S3 (P0, use-after-move) — **LANDED**
+
+> **Done.** Both halves below are in the tree. The storage is a
+> `vm_identity`-keyed `HashMap<usize, VmSecurityState>` rather than the
+> `Vec<(VmId, …)>` sketched here — the same index shape as `VM_CAPABILITIES`,
+> which is what this section asked for — and the `"security-manager"` root
+> source is registered in `vm/src/memory/native_roots.rs` exactly as written
+> below. The specification is kept because it is the template for the remaining
+> process-global policy state in §5.2 onward.
 
 Convert all three `(identity_key, ObjectRef)` process-global slots to
 `VmId`-keyed storage and root them in the owning VM.
@@ -359,8 +410,9 @@ fn remap_security_manager(shared: &crate::vm::SharedVm, map: &HashMap<usize, usi
 root_source!("security-manager", scan_security_manager, remap_security_manager),
 ```
 
-That half was **deliberately not landed here**: it cannot compile until the
-`native-builtins` functions exist, and the workspace must stay green.
+That half was deliberately not landed in the pass that wrote this — it cannot
+compile until the `native-builtins` functions exist, and the workspace must stay
+green. **Both halves have since landed together**, in that order.
 
 ### 5.2 `native-builtins/src/security_manager.rs` — S4/S5 (P1, policy)
 

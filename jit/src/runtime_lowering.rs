@@ -7,6 +7,35 @@
 //! optimization policies.  They must not, however, grow independent encodings
 //! for calls, allocation, locking, barriers, or dispatch.  This module is the
 //! common machine-lowering seam for those operations.
+//!
+//! # Baked addresses and what keeps each one alive
+//!
+//! Every function here writes at least one raw address into machine code that
+//! outlives this call.  The audit is in `docs/jit/code-cache-lifetime.md`; the
+//! summary belongs at the emission site:
+//!
+//! | Baked | By | Kept alive by |
+//! |---|---|---|
+//! | `target` (runtime helper) | `emit_new_object_stub`, `emit_new_object_cp_stub`, `emit_monitor_stub` | `JitRuntimeHelpers` function pointers — VM-lifetime `extern "C"` items, never unmapped |
+//! | `frame_record` | `emit_post_call_frame_republish` | same |
+//! | `service_helper` | `emit_callee_deopt_check` | same |
+//! | `info_ptr` (`*const JitInvokeInfo`) | `emit_callee_deopt_check` | the compiling artifact's `CompiledMethod::_jit_invoke_infos` — a `Vec<Box<..>>`, so growth moves the handles, never the pointees |
+//! | `pic` (`*const JitPICSlot`) | `emit_hashed_vtable_stub` | the compiling artifact's `CompiledMethod::_jit_pic_slots`, same shape |
+//! | `mega_entry_ptrs[i]` (loaded, then `CALL R11`) | `emit_hashed_vtable_stub` | **not baked** — read from the slot at dispatch time, and retained by that slot's `mega_compiled_owners[i]` `Arc<CompiledMethod>` |
+//!
+//! The one that is not a constant is the interesting one: the megamorphic way's
+//! entry pointer is *loaded* rather than baked, so it can be withdrawn.  It is
+//! only ever installed through `JitPICSlot::install_megamorphic`, which refuses
+//! any address `jit_entry_publishable` cannot retain, and the emitted probe
+//! tests the loaded pointer for zero before calling it — so a withdrawal
+//! (`invalidate_targets` / `clear_entries` zero the entry, then release the
+//! owner) degrades to a helper call rather than to a wild jump.
+//!
+//! Both slot pointers are single-artifact-scoped: a slot dies exactly when the
+//! code that names it dies, which is why no separate keep-alive is needed for
+//! the imm64 itself.  A replicated loop body shares ONE slot across its copies
+//! (`x64/licm.rs`), which does not change that — all copies live in the same
+//! artifact.
 
 use crate::{ExecutableBuffer, JitPICSlot};
 
@@ -285,6 +314,15 @@ pub(crate) fn emit_hashed_vtable_stub(
     if !crate::direct_jit_callee_calls_enabled() {
         return Vec::new();
     }
+    // A zero slot base would be baked as `MOV R10, 0` and then dereferenced —
+    // `CMP EDX,[R10+RCX*4+96]` — so the FIRST megamorphic dispatch through this
+    // site faults inside generated code, with a PC that names this method and an
+    // address that names nothing. Both callers filter a null slot today; refusing
+    // here means a third one cannot reintroduce that crash by omission. Emitting
+    // nothing leaves the site on its resolving helper, which is always correct.
+    if pic == 0 {
+        return Vec::new();
+    }
     if arg_offsets.is_empty()
         || arg_offsets.len() + 1 > ENTRY_ABI_REGS.len()
         || JitPICSlot::MEGA_SET_SHIFT >= 32
@@ -420,6 +458,44 @@ mod tests {
         assert!(
             guard_at < hash_at,
             "the kind guard must precede the class-id load (guard@{guard_at}, load@{hash_at})"
+        );
+    }
+
+    /// A null slot base must emit NOTHING. The alternative is `MOV R10, 0`
+    /// followed by a load through it: a fault inside generated code on the first
+    /// megamorphic dispatch, at a PC that names this method and an address that
+    /// names nothing.
+    #[test]
+    fn a_null_pic_slot_emits_no_stub() {
+        // No `set_moving_young_override` here on purpose: the gate this stub
+        // consults is `direct_jit_callee_calls_enabled`, which is env-only and
+        // default-ON. Mutating the process-global moving-young override would
+        // be a side effect on every concurrently-running test for no benefit.
+        let mut buf = ExecutableBuffer::new(4096).expect("buffer");
+        let patches = emit_hashed_vtable_stub(&mut buf, 0, 24, &[32, 40], 0, 0, 0);
+        assert!(
+            patches.is_empty(),
+            "a refused stub must hand back no continuation patches"
+        );
+        assert_eq!(
+            buf.pos(),
+            0,
+            "not one byte may be emitted for a slot the stub cannot address"
+        );
+    }
+
+    /// …and the control: a real slot address IS baked, so the guard above is a
+    /// refusal of the null case rather than a refusal of everything.
+    #[test]
+    fn a_real_pic_slot_is_baked_as_the_probe_base() {
+        let mut buf = ExecutableBuffer::new(4096).expect("buffer");
+        let slot = 0x7fff_0000_0000_2000usize;
+        emit_hashed_vtable_stub(&mut buf, slot, 24, &[32, 40], 0, 0, 0);
+        assert!(
+            buf.as_slice()
+                .windows(8)
+                .any(|w| w == (slot as u64).to_le_bytes()),
+            "the slot address must appear as an imm64 in the emitted probe"
         );
     }
 

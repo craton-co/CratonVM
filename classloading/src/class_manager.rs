@@ -35,8 +35,8 @@ use cratonvm_native_api::VmId;
 use tracing::debug;
 
 use crate::class::{
-    Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource, EnclosingMethodInfo,
-    InnerClassEntry, RecordComponentInfo,
+    ArrayInfo, Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource,
+    EnclosingMethodInfo, InnerClassEntry, RecordComponentInfo,
 };
 use crate::class_origin::{ClassOrigin, ClassOriginEntry};
 use crate::class_path::ClassPath;
@@ -72,6 +72,34 @@ pub const DEFAULT_CLASS_BYTES_CACHE_CAP: usize = 16 * 1024 * 1024;
 /// mean "we looked for real bytes and did not find them".
 const ENSURE_SYNTHETIC_STUB_REASON: &str =
     "VM-requested stand-in: ensure_synthetic_class called with no class file on any classpath entry";
+
+/// The refusal [`ClassManager::fabricate_class`] returns when it is asked to
+/// mint a compatibility stand-in for a name that two or more **distinct**
+/// classes already carry.
+///
+/// # Why this is a `LinkageError` and not a `ClassNotFound`
+///
+/// `ClassFileError::ClassNotFound` is what the `--jdk-only` policy refusal
+/// returns, and it is also what "absent" looks like everywhere else in this
+/// file. Reusing it here would put ambiguity back on top of absence at the call
+/// site — the exact collapse [`ClassManager::classify_loaded_name`] exists to
+/// undo, one layer up. A caller must be able to tell "there is no such class,
+/// go and load one" from "there are two, and you may not pick", because only
+/// the second is fixed by re-asking with an initiating loader.
+///
+/// `IncompatibleClassChangeError` is the `LinkageError` family HotSpot uses for
+/// loader-constraint violations, which is the same disease: one name, two
+/// runtime types.
+fn ambiguous_stand_in_refused(name: &str, definitions: usize) -> VmError {
+    VmError::Linkage(LinkageError::IncompatibleClassChangeError {
+        message: format!(
+            "ambiguous class name {name}: {definitions} distinct classes are already defined \
+             under it, so a synthetic stand-in filed under the bootstrap loader would shadow \
+             every one of them; refusing to fabricate. Re-ask with an initiating loader \
+             (ClassManager::find_class_by_name_for_loader / find_class_by_name_for_class)."
+        ),
+    })
+}
 
 /// Reason for the `java/lang/ProcessHandle` / `ProcessHandle$Info` exemption:
 /// the host JDK image may not carry these class files, but CratonVM implements
@@ -1865,6 +1893,12 @@ pub struct ClassManager {
     /// T10.9.B: FxHashSet — keys are internal class names during loading.
     loading_guard: FxHashSet<String>,
 
+    /// JVMS 5.3.4 loader constraints. Populated at supertype link time
+    /// (5.3.5 step 3: a class and its superclass must agree on the
+    /// superclass's name). Violations are RECORDED, not thrown — see the
+    /// module doc for why detection and enforcement are separated.
+    loader_constraints: crate::loader_constraints::LoaderConstraints,
+
     /// Names of synthetic-stub classes whose real `.class` is known to be
     /// absent from every current classpath.
     ///
@@ -2067,6 +2101,52 @@ pub struct ClassManager {
     /// Unbound until [`Self::bind_vm_id`] runs; see that method for the
     /// ordering requirement.
     metadata_realm: MetadataRealm,
+}
+
+/// What the class-name index knows about a name, with the three "no single
+/// answer" outcomes kept apart.
+///
+/// See [`ClassManager::classify_loaded_name`] for why the distinction is
+/// load-bearing: `Absent` and `Ambiguous` both surface as `None` from every
+/// `Option`-returning lookup in this file, and they demand opposite actions
+/// from the caller (load it vs. definitely do not load it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameResolution {
+    /// No loader has a class registered under this name, and none is hidden
+    /// behind it. Loading one is safe.
+    Absent,
+    /// Exactly one class carries this name. Several loaders may name it (a
+    /// delegation alias), which is still one class and still unique.
+    Unique(ClassId),
+    /// Two or more **distinct** classes carry this name. There is no correct
+    /// context-free answer. Re-ask with an initiating loader
+    /// ([`ClassManager::find_class_by_name_for_loader`] /
+    /// [`ClassManager::find_class_by_name_for_class`]) or fail — treating this
+    /// as `Absent` and loading a fresh copy makes it a three-way collision.
+    Ambiguous {
+        /// How many distinct `ClassId`s carry the name.
+        definitions: usize,
+    },
+}
+
+impl NameResolution {
+    /// The class id when the name resolves uniquely, `None` for both `Absent`
+    /// and `Ambiguous`. Provided for call sites that genuinely do not care why
+    /// there is no answer; anything that would *load* on a miss must match on
+    /// the variants instead.
+    #[inline]
+    pub fn unique(self) -> Option<ClassId> {
+        match self {
+            NameResolution::Unique(id) => Some(id),
+            NameResolution::Absent | NameResolution::Ambiguous { .. } => None,
+        }
+    }
+
+    /// True when more than one distinct class carries the name.
+    #[inline]
+    pub fn is_ambiguous(self) -> bool {
+        matches!(self, NameResolution::Ambiguous { .. })
+    }
 }
 
 /// Metadata released when a user-defined class loader is unloaded.
@@ -2430,6 +2510,7 @@ impl ClassManager {
             class_bytes_cache_cap: DEFAULT_CLASS_BYTES_CACHE_CAP,
             cds_class_cache: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             loading_guard: FxHashSet::default(),
+            loader_constraints: crate::loader_constraints::LoaderConstraints::new(),
             synthetic_upgrade_absent: FxHashSet::default(),
             vtable_descriptors: FxHashMap::with_capacity_and_hasher(256, Default::default()),
             skip_bytecode_verification: FxHashSet::default(),
@@ -3043,16 +3124,43 @@ impl ClassManager {
     //      and propagate the `ClassNotFoundException` up through the native's
     //      own error path.
     //   3. When no caller remains, delete this method.
+    ///
+    /// # Behaviour when the name is ambiguous
+    ///
+    /// This signature cannot report a failure, and the one failure it can now
+    /// meet is a name that two or more **distinct** classes already carry (see
+    /// [`Self::classify_loaded_name`]). Fabricating for such a name is the
+    /// defect this method is being retired for: the stub lands under
+    /// `(Bootstrap, name)`, the bootstrap loader is probed first, and the stub
+    /// therefore outranks *every* real class that made the name ambiguous.
+    ///
+    /// So the ambiguous case does **not** mint a stub under `name`. It returns
+    /// an [`Self::ambiguity_stand_in`] instead: a distinctly-named,
+    /// correctly-sized `cratonvm/synthetic/AmbiguousName$…` class registered
+    /// under a name nothing else resolves. The caller gets a `ClassId` it can
+    /// allocate against without corrupting the heap, the real classes keep
+    /// resolving, and any `checkcast` / `instanceof` / method lookup against
+    /// the *requested* name fails — loudly, and naming the stand-in. That is a
+    /// refusal wearing an infallible signature; a caller that can do better
+    /// should use [`Self::try_ensure_synthetic_class`], which says so in a
+    /// `Result`.
     pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-        self.fabricate_class(
+        let fabricated = self.fabricate_class(
             name,
             num_fields,
             ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON),
-            // Record the violation, then fabricate anyway — there is no error
-            // channel on this signature.
+            // Record the `--jdk-only` violation, then fabricate anyway — there
+            // is no error channel on this signature. NOTE: `enforce` governs
+            // only the jdk-only refusal. The ambiguity refusal added below is
+            // unconditional (it is a correctness gate, not a policy one), so an
+            // `Err` can still arrive here, and `.expect`ing it would turn a
+            // recoverable identity conflict into a VM abort.
             false,
-        )
-        .expect("non-enforcing fabrication never returns Err")
+        );
+        match fabricated {
+            Ok(id) => id,
+            Err(_) => self.ambiguity_stand_in(name, num_fields),
+        }
     }
 
     /// The enforcing sibling of [`Self::ensure_synthetic_class`].
@@ -3066,6 +3174,25 @@ impl ClassManager {
     /// This is the entry point for compatibility stand-ins whose caller *can*
     /// report a failure — chiefly the `java/util/function/Function$Identity`
     /// stand-in minted by the stream/function natives.
+    ///
+    /// # Two distinct refusals
+    ///
+    /// 1. **Policy** — `--jdk-only` forbids compatibility stand-ins at all.
+    ///    `ClassFileError::ClassNotFound`. Only under `JdkOnly`.
+    ///    *Migrating a call site from [`Self::ensure_synthetic_class`] to this
+    ///    method therefore also opts that call site into `--jdk-only`
+    ///    enforcement — which is step 2 of the wave-2 recipe above, but it is a
+    ///    second behaviour change riding along with the first, and under the
+    ///    default `Compatible` mode it changes nothing.*
+    /// 2. **Identity** — the name is already carried by two or more distinct
+    ///    classes, so a stand-in filed under `(Bootstrap, name)` would shadow
+    ///    all of them. `LinkageError::IncompatibleClassChangeError`, in **both**
+    ///    modes. See [`Self::classify_loaded_name`] and
+    ///    `docs/known-issues/synthetic-class-fallibility.md`.
+    ///
+    /// The two are deliberately different error shapes: a caller retrying with
+    /// an initiating loader (the right response to 2) must not confuse it with
+    /// a policy refusal it cannot retry out of.
     pub fn try_ensure_synthetic_class(
         &mut self,
         name: &str,
@@ -3094,6 +3221,16 @@ impl ClassManager {
     /// the other two entry points are for. Passing one anyway is a caller bug
     /// and is caught by a debug assertion rather than silently laundering a
     /// stub past the policy.
+    ///
+    /// # Why there is no `.expect` here any more
+    ///
+    /// Both of [`Self::fabricate_class`]'s refusals are gated on
+    /// `origin.is_compatibility_stub()`, which the debug assertion above says
+    /// is false for every caller — so in a debug build this cannot fail. In a
+    /// **release** build the assertion is compiled out, and a caller that did
+    /// pass a stub origin would reach the ambiguity gate and get an `Err`;
+    /// `.expect`ing it would abort the VM for what is a recoverable naming
+    /// conflict. The stand-in keeps the failure local to the one allocation.
     pub fn ensure_generated_class(
         &mut self,
         name: &str,
@@ -3106,8 +3243,63 @@ impl ClassManager {
              {name} was passed a CompatibilityStub origin — use \
              try_ensure_synthetic_class instead so the policy can see it",
         );
-        self.fabricate_class(name, num_fields, origin, false)
-            .expect("non-enforcing fabrication never returns Err")
+        let fabricated = self.fabricate_class(name, num_fields, origin, false);
+        match fabricated {
+            Ok(id) => id,
+            Err(_) => self.ambiguity_stand_in(name, num_fields),
+        }
+    }
+
+    /// The class handed back when a compatibility fabrication was refused and
+    /// the caller's signature has no way to say so.
+    ///
+    /// # The contract
+    ///
+    /// This is a **miss, not a guess**. It is emphatically *not* a stub for
+    /// `name`:
+    ///
+    /// * it is registered under `cratonvm/synthetic/AmbiguousName$<mangled
+    ///   name>$<fields>`, a name in the VM's own reserved namespace, so it can
+    ///   never be reached by a resolution of `name` and can never outrank the
+    ///   classes that made `name` ambiguous;
+    /// * it declares exactly `num_fields` slots, so an object allocated
+    ///   against it has a layout the GC's `get_field` bounds guard accepts —
+    ///   the alternative (`ClassId::new(0)`, `java/lang/Object`, zero fields)
+    ///   produces an undersized object that faults on the *first field write*,
+    ///   somewhere unrelated to the cause;
+    /// * it carries [`ClassOrigin::VmInternal`], because that is what it is: a
+    ///   VM bookkeeping shape. It is not a compatibility stand-in for anyone's
+    ///   class, so it must not be counted as one in the `--jdk-only` census.
+    ///
+    /// The `num_fields` suffix keeps two different requested shapes for the
+    /// same ambiguous name from colliding on one undersized stand-in.
+    ///
+    /// # What the caller sees
+    ///
+    /// A valid `ClassId` that fails every identity question about `name`:
+    /// `checkcast`/`instanceof` to `name` is false, a virtual call resolves to
+    /// nothing but `java/lang/Object`'s natives, and the class name in any
+    /// resulting `ClassCastException` / `NoSuchMethodError` message contains
+    /// the requested name — which is how this is diagnosed in the field.
+    fn ambiguity_stand_in(&mut self, name: &str, num_fields: usize) -> ClassId {
+        let mangled: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let stand_in = format!("cratonvm/synthetic/AmbiguousName${mangled}${num_fields}");
+        debug!(
+            requested = name,
+            stand_in = stand_in.as_str(),
+            "refusing to fabricate a stand-in under an ambiguous class name"
+        );
+        // `VmInternal` is not a compatibility stub, so neither of
+        // `fabricate_class`'s two refusals can fire for it and this recursion
+        // is exactly one level deep. `unwrap_or` rather than `expect` all the
+        // same: a future third refusal must not turn this into an abort, and
+        // `ClassId::new(0)` is the same last-resort the `NativeContext` default
+        // has always used.
+        self.fabricate_class(&stand_in, num_fields, ClassOrigin::VmInternal, false)
+            .unwrap_or(ClassId::new(0))
     }
 
     /// Shared body of the three `ensure_*_class` entry points.
@@ -3191,6 +3383,44 @@ impl ClassManager {
                 }
             }
             return Ok(id);
+        }
+        // ── Identity gate (classloading-identity-audit, Open 2) ───────────────
+        //
+        // `get_loaded_class_id` just answered `None`, and that single answer
+        // carries two opposite facts: *nobody* has this name (fabricate away),
+        // or **several distinct classes do** and it has no context-free answer
+        // (it returns `None` for exactly that case — "ambiguous is a miss, not
+        // a guess"). Everything below this line assumes the first reading. On
+        // the second, both of the remaining paths are wrong:
+        //
+        //   * the `load_class` retry would define a *third* copy of the name;
+        //   * the fabrication would file an empty stub under
+        //     `(Bootstrap, name)`, and since the built-in chain is probed
+        //     first, that stub then outranks **both** real classes for every
+        //     subsequent by-name resolution. Symptom in the field:
+        //     `NoSuchMethodError` / `<init> … has no Code attribute` on a class
+        //     that is demonstrably loaded. This is the Groovy
+        //     `$_run_closureN` shape — two `GroovyClassLoader$InnerLoader`s,
+        //     one name, two genuinely different classes.
+        //
+        // So refuse, and say which of the two it is. The gate is scoped to
+        // compatibility stand-ins on purpose: `ensure_generated_class` is
+        // minting a *new* VM class (a lambda, a proxy, an allocation shape)
+        // under a name it just constructed, which is a different question and
+        // one this lane deliberately does not answer.
+        //
+        // NOT covered, and tracked in
+        // `docs/known-issues/synthetic-class-fallibility.md`: when a built-in
+        // loader *also* has a class under the name, `get_loaded_class_id`
+        // returns that copy from the early return above and never reaches this
+        // gate. That is the pre-existing built-in-first delegation answer every
+        // context-free lookup in this file gives; closing it means migrating
+        // the early return itself to `classify_loaded_name`, which changes the
+        // answer for callers that are relying on it today.
+        if origin.is_compatibility_stub() {
+            if let NameResolution::Ambiguous { definitions } = self.classify_loaded_name(name) {
+                return Err(ambiguous_stand_in_refused(name, definitions));
+            }
         }
         // Not loaded yet: prefer the real `.class` file over a possibly
         // undersized synthetic stub. `ensure_synthetic_class` is frequently
@@ -3992,14 +4222,19 @@ impl ClassManager {
             );
         }
         // RKC16N.3: Reference- and primitive-array classes (`[X`) are
-        // *synthesised* by the bootstrap loader directly from the
-        // resolved component class — JVMS §5.3.3 explicitly says no
-        // class file is consulted. Short-circuit before any I/O so
-        // that `Class.forName("[Ljava/util/HashMap;")` succeeds without
+        // *synthesised* by the VM directly from the resolved component
+        // class — JVMS §5.3.3 explicitly says no class file is consulted.
+        // Short-circuit before any I/O so that
+        // `Class.forName("[Ljava/util/HashMap;")` succeeds without
         // scanning JMOD/classpath and without producing the
         // "synthetic stub" warning.
+        //
+        // This entry point carries no requesting loader, so it asks as the
+        // bootstrap loader would. See `load_array_class_for_loader` for the
+        // loader-faithful entry point and for why that keeps this arm's
+        // observable behaviour unchanged.
         if name.starts_with('[') {
-            return self.synthesize_array_class(name);
+            return self.load_array_class_for_loader(name, ClassLoaderId::Bootstrap);
         }
         // Fast path: loader-aware lookup via loaded_classes. See
         // `resolve_fast_path_class_id`'s doc comment for the runtime-
@@ -4644,6 +4879,30 @@ impl ClassManager {
             },
             None => None, // java/lang/Object has no superclass
         };
+
+        // JVMS 5.3.5 step 3 / 5.3.4: the class being defined and the loader
+        // that DEFINED its superclass must agree on the superclass's name.
+        // Without this, each loader can define its own copy and the verifier
+        // passes on both sides — it checks each against its own namespace —
+        // while field offsets and vtable indices are read against the wrong
+        // layout at run time. Recorded, not thrown: see
+        // `loader_constraints`'s module doc.
+        if let (Some(sup_name), Some(sup_id)) = (class_file.super_class.as_ref(), superclass_id)
+        {
+            let sup_loader = self.get_class(sup_id).map(|c| c.loader_id);
+            if let Some(sup_loader) = sup_loader {
+                let _ = self.loader_constraints.pin(
+                    sup_name,
+                    sup_loader.to_native_id(),
+                    sup_id.as_u32(),
+                );
+                let _ = self.loader_constraints.impose(
+                    sup_name,
+                    loader_id.to_native_id(),
+                    sup_loader.to_native_id(),
+                );
+            }
+        }
 
         // Recursively load all interfaces. Each `iface_name` is `&Arc<str>`;
         // deref to `&str` for `load_class`. Same loader-faithful preference as
@@ -7526,6 +7785,76 @@ impl ClassManager {
         None
     }
 
+    /// Classify a class name against the definition index, keeping the three
+    /// "no answer" outcomes apart.
+    ///
+    /// C2 review P1 (classloading identity): every context-free lookup in this
+    /// file collapses *absent* and *ambiguous* onto `None`
+    /// ([`Self::find_unique_class_by_name`], [`Self::get_loaded_class_id`],
+    /// [`Self::find_class_by_name`]). Returning `None` for ambiguity is the
+    /// correct **fail-closed** answer — picking one of several same-named
+    /// classes is type confusion — but it is only half the contract: a caller
+    /// that reads `None` as "nobody has this class" goes on to *load a second
+    /// copy*, which is precisely how the Spring AOT `argument type mismatch`
+    /// family and the Groovy `$_run_closureN` collapse were produced. The
+    /// collapse is unrecoverable at the call site because the two cases demand
+    /// opposite actions:
+    ///
+    ///   * `Absent`    — go and load it (there is nothing to conflict with).
+    ///   * `Ambiguous` — do NOT load; re-ask with an initiating loader via
+    ///     [`Self::find_class_by_name_for_loader`] /
+    ///     [`Self::find_class_by_name_for_class`], or fail.
+    ///   * `Unique`    — use it.
+    ///
+    /// O(1) against [`Self::name_definitions`]. Accepts either separator form
+    /// (`p/X` or `p.X`), matching [`Self::find_unique_class_by_name`].
+    pub fn classify_loaded_name(&self, name: &str) -> NameResolution {
+        // An already-internal name with no separator to translate is the
+        // overwhelmingly common case and both probe keys collapse onto it, so
+        // take it without allocating either `String`.
+        if !name.contains('.') && !name.contains('/') {
+            return self.classify_exact_name(name);
+        }
+        let slash = if name.contains('/') {
+            name.to_string()
+        } else {
+            name.replace('.', "/")
+        };
+        let dot = slash.replace('/', ".");
+        let slash_answer = self.classify_exact_name(&slash);
+        if !matches!(slash_answer, NameResolution::Absent) {
+            return slash_answer;
+        }
+        self.classify_exact_name(&dot)
+    }
+
+    /// [`Self::classify_loaded_name`] without separator normalisation.
+    fn classify_exact_name(&self, name: &str) -> NameResolution {
+        let Some(ids) = self.name_definitions.get(name) else {
+            return NameResolution::Absent;
+        };
+        let mut distinct = ids.keys();
+        let Some(&id) = distinct.next() else {
+            // An empty id set is retired by `release_name_definition`, so this
+            // is unreachable in practice; treat it as absent rather than
+            // asserting on a shape the index promises not to produce.
+            return NameResolution::Absent;
+        };
+        if distinct.next().is_some() {
+            return NameResolution::Ambiguous {
+                definitions: ids.len(),
+            };
+        }
+        // A hidden class is not reachable by name at all (JVMS §5.4.3.1 — a
+        // hidden class is never recorded in the loader's name table), so a lone
+        // hidden definition reads as absent, not as a usable unique answer.
+        if self.get_class(id).is_some_and(|class| !class.hidden) {
+            NameResolution::Unique(id)
+        } else {
+            NameResolution::Absent
+        }
+    }
+
     /// The one `ClassId` defined under `name`, or `None` when zero or more
     /// than one distinct class carries it (ambiguity is information loss, not
     /// permission to pick the first entry) or when the single match is hidden.
@@ -7533,15 +7862,10 @@ impl ClassManager {
     /// O(1) against [`Self::name_definitions`]; see that field for why the
     /// linear scan this replaced mattered so much.
     fn unique_visible_definition(&self, name: &str) -> Option<ClassId> {
-        let ids = self.name_definitions.get(name)?;
-        let mut distinct = ids.keys();
-        let id = *distinct.next()?;
-        if distinct.next().is_some() {
-            return None;
+        match self.classify_exact_name(name) {
+            NameResolution::Unique(id) => Some(id),
+            NameResolution::Absent | NameResolution::Ambiguous { .. } => None,
         }
-        self.get_class(id)
-            .is_some_and(|class| !class.hidden)
-            .then_some(id)
     }
 
     /// Sole writer of `loaded_classes` inserts -- keeps `name_definitions` in
@@ -7957,47 +8281,156 @@ impl ClassManager {
         Ok(id)
     }
 
+    /// The defining loader JVMS §5.3.3 assigns to an array class, given the
+    /// `ClassId` of its **immediate component** (`None` for a primitive
+    /// component).
+    ///
+    /// > If the component type is a `reference` type, the Java Virtual Machine
+    /// > marks C to have the defining loader of the component type as its
+    /// > defining loader. Otherwise, the Java Virtual Machine marks C to have
+    /// > the bootstrap class loader as its defining loader.
+    /// >
+    /// > — JVMS SE 21 §5.3.3, step 2
+    ///
+    /// **Deliberate narrowing.** A component defined by one of the three
+    /// *built-in* loaders is reported as `Bootstrap` rather than as
+    /// `Extension`/`Application`. The built-in loaders form a single
+    /// parent-first delegation chain (`BUILTIN_LOADER_DELEGATION_CHAIN`) that
+    /// is probed in order by every lookup in this file, so they can never hold
+    /// two distinct classes under one name — the isolation that §5.3.3 exists
+    /// to protect is not at risk there. Widening this to the exact built-in
+    /// loader would move the vast majority of array classes out of
+    /// [`Self::find_bootstrap_class_by_name`]'s and
+    /// `find_class_by_name_for_loader(_, Bootstrap)`'s reach (both stop at the
+    /// requester and never delegate *down*), which is a behaviour change on the
+    /// hottest lookup in the VM for no isolation benefit. Only a
+    /// `UserDefined` component loader — the case that genuinely produces two
+    /// same-named classes — yields a non-bootstrap array class.
+    /// See `docs/known-issues/array-class-defining-loader.md`.
+    fn array_defining_loader(&self, component_id: Option<ClassId>) -> ClassLoaderId {
+        match component_id
+            .and_then(|id| self.class_store.get(id))
+            .map(|component| component.loader_id)
+        {
+            Some(loader @ ClassLoaderId::UserDefined(_)) => loader,
+            _ => ClassLoaderId::Bootstrap,
+        }
+    }
+
+    /// The `ClassId` filed under *exactly* `(loader_id, name)` — one hash
+    /// probe, no delegation, no linear-scan fallback, no separator
+    /// normalisation.
+    ///
+    /// This is [`Self::class_defined_by_loader_exact`] without its cold
+    /// `ClassStore` scan, for callers that need an O(1) *read-lock* fast path
+    /// and are content to treat a miss as "ask the slow path". The array-class
+    /// resolver in `vm/src/runtime/interpreter.rs` is the motivating caller: it
+    /// must not use a delegating probe (that is the collapse JVMS §5.3.3
+    /// isolation exists to prevent) and must not pay an O(number of classes)
+    /// scan on every array reference from a user-loader-defined class.
+    pub fn loaded_class_under_exact_key(
+        &self,
+        name: &str,
+        loader_id: ClassLoaderId,
+    ) -> Option<ClassId> {
+        loaded_classes_probe(&self.loaded_classes, loader_id, name)
+    }
+
+    /// Load (synthesising on demand) the array class `name` **as
+    /// `requesting_loader` would see it** — JVMS §5.3.3.
+    ///
+    /// This is the loader-faithful entry point the flat
+    /// [`Self::load_class`] cannot be: `load_class` takes no loader, so its
+    /// `[` arm can only ask as the bootstrap loader does. Two isolating
+    /// loaders that each define their own `p/X` must get two *different*
+    /// `[Lp/X;` classes, because each one's component is a different class;
+    /// collapsing them is type confusion (the verifier and
+    /// `Class.getComponentType()` both read array-class identity).
+    ///
+    /// The array's map key is derived from the resolved component, never from
+    /// `requesting_loader` itself, so it is **canonical**: any two callers that
+    /// resolve the same component `ClassId` land on the same array class, and
+    /// callers that resolve different components land on different array
+    /// classes. `requesting_loader` only chooses *which* component is resolved.
+    ///
+    /// Behaviour for a built-in `requesting_loader` is unchanged from the
+    /// pre-existing bootstrap-only synthesis: such a loader can only reach the
+    /// built-in delegation chain, whose components map back to `Bootstrap` via
+    /// [`Self::array_defining_loader`].
+    pub fn load_array_class_for_loader(
+        &mut self,
+        name: &str,
+        requesting_loader: ClassLoaderId,
+    ) -> Result<ClassId, VmError> {
+        if !name.starts_with('[') {
+            return Err(VmError::ClassFile(ClassFileError::InvalidClassFile {
+                class_name: name.to_string(),
+                message: format!("load_array_class_for_loader called with non-array name {name}"),
+            }));
+        }
+        // Hot-path pre-probe, valid ONLY for a built-in requester. Such a
+        // requester cannot reach a user-defined namespace, so if the bootstrap
+        // key already holds this array name it is by construction the answer
+        // this call would compute — identical to the pre-2026-08-01 behaviour,
+        // at the same cost (one hash probe). A user-defined requester always
+        // pays the full component derivation, because for it the bootstrap
+        // entry may be *another* loader's array class.
+        if !matches!(requesting_loader, ClassLoaderId::UserDefined(_)) {
+            if let Some(id) =
+                loaded_classes_probe(&self.loaded_classes, ClassLoaderId::Bootstrap, name)
+            {
+                return Ok(id);
+            }
+        }
+        self.synthesize_array_class_for_loader(name, requesting_loader)
+    }
+
     /// RKC16N.3 — Synthesise a reference- or primitive-array class without
     /// any classpath I/O.
     ///
-    /// Per JVMS §5.3.3, an array class is *created* by the bootstrap class
-    /// loader directly from its component type — no `.class` file is ever
-    /// consulted. The synthesised `Class`:
+    /// Per JVMS §5.3.3 an array class is created by the VM directly from its
+    /// component type — no `.class` file is ever consulted — and is marked as
+    /// defined by *the defining loader of that component type* (bootstrap for
+    /// a primitive component). The synthesised `Class`:
     /// * has the original descriptor as its name (e.g. `[Ljava/util/HashMap;`,
     ///   `[I`, `[[Ljava/lang/Object;`),
     /// * has `superclass = java/lang/Object`,
     /// * implements `Cloneable` and `java.io.Serializable` (JLS §10.7),
     /// * is *not* marked `is_synthetic_stub` (it is a fully-formed array class,
-    ///   not a stand-in for missing bytecode), and
+    ///   not a stand-in for missing bytecode),
     /// * for reference-array types, recursively resolves the component class
     ///   so that `[[Ljava/util/HashMap;` triggers loading of
-    ///   `[Ljava/util/HashMap;` and `java/util/HashMap`.
+    ///   `[Ljava/util/HashMap;` and `java/util/HashMap`, and
+    /// * records that component in `Class::array_info`, which is what makes the
+    ///   array class's identity checkable rather than merely name-shaped.
     ///
-    /// The result is cached in the standard `loaded_classes` map under the
-    /// bootstrap loader, so two calls with the same name return the same
-    /// `ClassId`.
-    fn synthesize_array_class(&mut self, name: &str) -> Result<ClassId, VmError> {
+    /// The result is cached in `loaded_classes` under
+    /// `(component's defining loader, name)`, so two calls that resolve the
+    /// same component return the same `ClassId`.
+    fn synthesize_array_class_for_loader(
+        &mut self,
+        name: &str,
+        requesting_loader: ClassLoaderId,
+    ) -> Result<ClassId, VmError> {
         debug_assert!(
             name.starts_with('['),
             "synthesize_array_class called with non-array name {name}"
         );
 
-        // Cache hit — return the existing array `Class` so identity is stable.
-        if let Some(id) = self.get_loaded_class_id(name) {
-            return Ok(id);
-        }
-
-        // Recursively resolve the component class. We strip exactly one
-        // leading `[` and dispatch on the next character:
-        //   `[`  → another array (recurse via `load_class`, which routes back
-        //          here for `[`-prefixed names).
+        // Resolve the component class FIRST: the array's map key is derived
+        // from it (JVMS §5.3.3), so there is nothing to probe the cache with
+        // until it is known. We strip exactly one leading `[` and dispatch on
+        // the next character:
+        //   `[`  → another array; recurse with the SAME requesting loader, so
+        //          `[[Lp/X;` inherits `p/X`'s loader through `[Lp/X;`.
         //   `L…;` → reference component, e.g. `Ljava/util/HashMap;`. Strip the
-        //           leading `L` and trailing `;` and load the named class.
+        //           leading `L` and trailing `;` and resolve the named class.
         //   else → primitive component (`I`, `J`, `Z`, `B`, `S`, `C`, `F`, `D`).
         //          Primitive component classes have no `Class<?>` mirror in the
         //          ClassStore yet (they are surfaced lazily by the VM's
         //          `Class.getPrimitiveClass`), so we leave them unresolved
-        //          here. Anything that needs the component class (e.g.
+        //          here — and §5.3.3 makes such an array bootstrap-defined
+        //          anyway. Anything that needs the component class (e.g.
         //          `java.lang.Class.getComponentType()`) re-derives it from
         //          the array name.
         let rest = &name[1..];
@@ -8007,10 +8440,13 @@ impl ClassManager {
                 message: "array descriptor with empty component".to_string(),
             }));
         }
-        match rest.as_bytes()[0] {
+        let component_id: Option<ClassId> = match rest.as_bytes()[0] {
             b'[' => {
-                // Multi-dim array — synthesise the inner array first.
-                self.load_class(rest)?;
+                // Multi-dim array — synthesise the inner array first. The
+                // inner array is itself a reference type, so §5.3.3's rule
+                // recurses through it and `[[Lp/X;` ends up defined by the
+                // same loader as `p/X`.
+                Some(self.load_array_class_for_loader(rest, requesting_loader)?)
             }
             b'L' => {
                 // Reference component: must end with ';'.
@@ -8020,11 +8456,17 @@ impl ClassManager {
                         message: format!("malformed reference-array descriptor: {name}"),
                     }));
                 }
-                let component_name = &rest[1..rest.len() - 1];
-                // Recursively resolve the component. Bubbling errors up
-                // matches the JVMS rule that resolution of an array class
-                // resolves its element type first.
-                self.load_class(component_name)?;
+                let component_name = rest[1..rest.len() - 1].to_string();
+                // §5.3.3 step 1: "the algorithm of this section is applied
+                // recursively **using L**". Ask the requesting loader first;
+                // only when it has no answer at all does this fall back to the
+                // flat, loader-blind `load_class`. Bubbling the error up
+                // matches the JVMS rule that resolving an array class resolves
+                // its element type first.
+                match self.find_class_by_name_for_loader(&component_name, requesting_loader) {
+                    Some(id) => Some(id),
+                    None => Some(self.load_class(&component_name)?),
+                }
             }
             b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D' => {
                 // Primitive-array — nothing to recursively load.
@@ -8034,6 +8476,7 @@ impl ClassManager {
                         message: format!("malformed primitive-array descriptor: {name}"),
                     }));
                 }
+                None
             }
             _ => {
                 return Err(VmError::ClassFile(ClassFileError::InvalidClassFile {
@@ -8041,14 +8484,91 @@ impl ClassManager {
                     message: format!("unrecognised array component tag in {name}"),
                 }));
             }
+        };
+
+        // JVMS §5.3.3 step 2 — the defining loader, and therefore the map key.
+        let array_loader = self.array_defining_loader(component_id);
+
+        // Cache hit on the EXACT key. This is the only probe that is safe:
+        // a name-only / delegating probe is precisely the collapse this
+        // function exists to remove.
+        if let Some(id) = loaded_classes_probe(&self.loaded_classes, array_loader, name) {
+            // ...and the cached entry must still be an array over the component
+            // we just resolved. A loader id is never recycled, but a *class* id
+            // under a live loader is: `unload_user_classes` (the GC-driven
+            // path) can retire `p/X` without retiring `[Lp/X;`, and that same
+            // loader may then define a fresh `p/X`. Returning the cached array
+            // there would hand back a class whose component is a tombstone —
+            // aliasing two distinct `p/X`es onto one array class, which is the
+            // exact confusion this function exists to prevent. Fall through and
+            // re-synthesise instead; `loaded_classes_insert` displaces the
+            // stale key and `ClassStore` keeps the dead array as an unreachable
+            // tombstone, so no live reference is invalidated.
+            let cached_component = self
+                .class_store
+                .get(id)
+                .and_then(|class| class.array_info.as_ref())
+                .map(|info| info.component_class_id);
+            // `None` means a primitive-component array (no component to drift)
+            // or an array class minted before `array_info` was populated; both
+            // keep the pre-existing behaviour of trusting the cache.
+            if cached_component.is_none() || cached_component == component_id {
+                return Ok(id);
+            }
         }
 
-        // Re-check the cache: the recursive `load_class(component)` above
-        // can re-enter `synthesize_array_class` for the same `name` if the
-        // component descriptor is malformed and a caller had previously
-        // raced. Belt-and-braces.
-        if let Some(id) = self.get_loaded_class_id(name) {
-            return Ok(id);
+        // Migration: an array class filed under `(Bootstrap, name)` by the
+        // legacy loader-blind path (or before its component was re-homed into
+        // a user loader by `upgrade_synthetic_class`) is only *this* array
+        // class if it was built over the very same component. `array_info`
+        // records that component, so the question is answerable exactly rather
+        // than by re-deriving the component by name — which is the ambiguous
+        // lookup being removed here.
+        //
+        //   * same component  → re-key in place (identity must be preserved:
+        //     `p/X[].class == p/X[].class`), mirroring the
+        //     `upgrade_synthetic_class` re-home.
+        //   * different component, or an array class that predates
+        //     `array_info` and so cannot prove sameness → leave the bootstrap
+        //     entry untouched and mint a distinct array class under the
+        //     correct key. Aliasing two arrays over different components is
+        //     the type confusion; a second `ClassId` is merely a duplicate,
+        //     and the two are genuinely different classes in the case that
+        //     matters.
+        if array_loader != ClassLoaderId::Bootstrap {
+            if let Some(existing) =
+                loaded_classes_probe(&self.loaded_classes, ClassLoaderId::Bootstrap, name)
+            {
+                let same_component = self
+                    .class_store
+                    .get(existing)
+                    .and_then(|class| class.array_info.as_ref())
+                    .map(|info| info.component_class_id)
+                    == component_id;
+                if same_component {
+                    let key_name = self
+                        .class_store
+                        .get(existing)
+                        .map(|class| Arc::clone(&class.name))
+                        .unwrap_or_else(|| cratonvm_types::intern_arc(name));
+                    if let Some(class) = self.class_store.get_mut(existing) {
+                        class.loader_id = array_loader;
+                    }
+                    // Only retire the stale alias when it still names THIS
+                    // class — same guard as `upgrade_synthetic_class`.
+                    let stale_alias_is_ours = loaded_classes_probe(
+                        &self.loaded_classes,
+                        ClassLoaderId::Bootstrap,
+                        &key_name,
+                    ) == Some(existing);
+                    self.loaded_classes_insert((array_loader, Arc::clone(&key_name)), existing);
+                    self.user_loaders.insert(array_loader);
+                    if stale_alias_is_ours {
+                        self.loaded_classes_remove(&(ClassLoaderId::Bootstrap, key_name));
+                    }
+                    return Ok(existing);
+                }
+            }
         }
 
         // Resolve `java/lang/Object` and the JLS §10.7 array interfaces.
@@ -8065,6 +8585,14 @@ impl ClassManager {
             iface_ids.push(id);
         }
 
+        // Belt-and-braces: the `load_class` calls above can re-enter this
+        // function for the same `name` (a synthetic-stub fabrication for
+        // `java/lang/Object` runs arbitrary registration code). Re-probe the
+        // exact key before minting a second `ClassId` for it.
+        if let Some(id) = loaded_classes_probe(&self.loaded_classes, array_loader, name) {
+            return Ok(id);
+        }
+
         let id = self.class_store.next_id();
         // An array `Class` is `final`, `public`, and has the `ACC_ABSTRACT`
         // bit cleared — same surface flags `java.lang.Class` reports for
@@ -8074,9 +8602,20 @@ impl ClassManager {
         let access_flags =
             ClassAccessFlags::PUBLIC | ClassAccessFlags::FINAL | ClassAccessFlags::SUPER;
 
+        // `ArrayInfo` inputs: total `[` count and the innermost non-array type.
+        let array_dimension = name.bytes().take_while(|&b| b == b'[').count();
+        let leaf_descriptor = &name[array_dimension..];
+        let leaf_is_reference =
+            leaf_descriptor.starts_with('L') && leaf_descriptor.ends_with(';');
+        let leaf_component_name = if leaf_is_reference {
+            cratonvm_types::intern_arc(&leaf_descriptor[1..leaf_descriptor.len() - 1])
+        } else {
+            cratonvm_types::intern_arc(leaf_descriptor)
+        };
+
         let class = Class {
             id,
-            loader_id: ClassLoaderId::Bootstrap,
+            loader_id: array_loader,
             name: cratonvm_types::intern_arc(name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
@@ -8110,7 +8649,7 @@ impl ClassManager {
             hidden: false,
             module_name: Some("java.base".to_string()),
             // Crucially: an array class is NOT a synthetic stub — it is a
-            // fully-formed array class produced by the bootstrap loader.
+            // fully-formed array class produced by the VM itself.
             // Marking it stub would (a) emit a misleading log line and
             // (b) make `load_class` try to "upgrade" it from a non-existent
             // .class file on the next call.
@@ -8127,13 +8666,23 @@ impl ClassManager {
             has_finalizer: false,
             signature: None,
             code_source: None,
-            // RKC16N.3: array-class metadata not yet populated by this
-            // synthesis path — the field is currently write-only across
-            // the codebase, so leaving it `None` here matches every
-            // other call site (see access_control, verifier, vm.rs,
-            // benches, tests). Wire up real `ArrayInfo` once a consumer
-            // (e.g. `Class.getComponentType` fast-path) actually reads it.
-            array_info: None,
+            // RKC16N.3 / C2 review P1: array-class metadata IS populated now,
+            // and it has a consumer — the migration branch above reads
+            // `component_class_id` to decide whether a pre-existing
+            // bootstrap-keyed array class is the same class as this one. That
+            // question cannot be answered by re-deriving the component from the
+            // array *name*, because a name is exactly what does not identify a
+            // class. `None` for a primitive component: `[I`'s component has no
+            // `ClassId` in the store, and §5.3.3 makes such an array bootstrap-
+            // defined regardless, so there is nothing to witness.
+            array_info: component_id.map(|component_class_id| ArrayInfo {
+                component_class_id,
+                // Widening guard: an array descriptor is capped at 255
+                // dimensions by JVMS §4.4.1, and the reader rejects deeper
+                // ones, so this cannot truncate for a well-formed name.
+                array_dimension: array_dimension.min(u8::MAX as usize) as u8,
+                leaf_component_name,
+            }),
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             record_object_methods: std::sync::atomic::AtomicU8::new(0),
         };
@@ -8152,21 +8701,42 @@ impl ClassManager {
         // T10.9.E: clone the existing `Arc<str>` (refcount bump) instead
         // of allocating a fresh `String` for the map key.
         //
-        // Round 7 audit fix (CRIT #2): per JVMS §5.3.3, array classes
-        // are *created* by the bootstrap class loader regardless of the
-        // component type's defining loader. Assert that the freshly-
-        // built `Class` honours that invariant — a future contributor
-        // who experiments with per-loader array classes must update
-        // both the `Class::loader_id` field and the map key together.
+        // C2 review P1 (2026-08-01) — this used to `debug_assert_eq!` that
+        // `class.loader_id == Bootstrap`, citing "Round 7 audit fix (CRIT #2):
+        // per JVMS §5.3.3, array classes are *created* by the bootstrap class
+        // loader regardless of the component type's defining loader."
+        //
+        // That reading of §5.3.3 was **wrong**, and the assertion pinned the
+        // bug in place. §5.3.3 step 2 says, verbatim:
+        //
+        //   "If the component type is a reference type, the Java Virtual
+        //    Machine marks C to have the defining loader of the component type
+        //    as its defining loader. Otherwise, the Java Virtual Machine marks
+        //    C to have the bootstrap class loader as its defining loader."
+        //
+        // What §5.3.3 actually says about the bootstrap loader is that no
+        // *class file* is consulted — the array class is created by the VM, not
+        // found by a loader. That is a statement about class **creation**, not
+        // about the **defining loader**, and the old comment conflated the two.
+        //
+        // The invariant the assertion was protecting — that `Class::loader_id`
+        // and the `loaded_classes` key never disagree — is real, and is
+        // preserved: both now come from the single `array_loader` binding.
         debug_assert_eq!(
-            class.loader_id,
-            ClassLoaderId::Bootstrap,
-            "synthetic class creation paths must use Bootstrap loader (got {:?} for array {})",
-            class.loader_id,
+            class.loader_id, array_loader,
+            "array class {} must be keyed under its own defining loader",
             class.name,
         );
-        let key = (ClassLoaderId::Bootstrap, Arc::clone(&class.name));
+        let key = (array_loader, Arc::clone(&class.name));
         self.loaded_classes_insert(key, id);
+        // Keep the context-free probe (`get_loaded_class_id`,
+        // `find_class_by_name`) able to reach a user-loader-defined array
+        // class, exactly as `upgrade_synthetic_class` does for a re-homed
+        // class. `user_loaders` is a set of loader ids; inserting a built-in
+        // id would make the built-in chain get scanned twice, so gate it.
+        if matches!(array_loader, ClassLoaderId::UserDefined(_)) {
+            self.user_loaders.insert(array_loader);
+        }
         self.class_store.add(class);
 
         Ok(id)
@@ -8304,6 +8874,17 @@ impl ClassManager {
             .unwrap_or((0, 0));
         let final_num_total = num_total_fields.max(old_num_total);
 
+        // C2 review P1 (classloading identity): the defining loader recorded on
+        // the `Class` is about to change (see `class.loader_id = loader_id`
+        // below), and `loaded_classes` is keyed on `(defining loader, name)`.
+        // Capture the key this class is currently filed under so the map can be
+        // re-keyed in the same transaction — without that, the two disagree and
+        // a `(built-in loader, name)` entry keeps naming a class whose defining
+        // loader is a user-defined one.
+        let previous_loader_id = self.class_store.get(id).map(|c| c.loader_id);
+        let registered_name: Option<Arc<str>> =
+            self.class_store.get(id).map(|c| Arc::clone(&c.name));
+
         // Contract §5: "The in-place 'upgrade a stub to real' path must call
         // `set_origin`." Real bytes have just replaced the fabricated skeleton,
         // so the class stops being a compatibility stub and becomes whatever
@@ -8395,6 +8976,72 @@ impl ClassManager {
             // Compute has_finalizer
             class.has_finalizer = class.declares_finalize();
         }
+        // C2 review P1 (classloading identity): re-key `loaded_classes` to match
+        // the defining loader just installed above.
+        //
+        // A synthetic stub is always minted under `ClassLoaderId::Bootstrap`
+        // (`create_synthetic_stub` asserts it; array classes are NOT stubs and
+        // since the §5.3.3 fix are keyed under their component's defining
+        // loader — see `synthesize_array_class_for_loader`), so a stub is filed
+        // in `loaded_classes` under `(Bootstrap, name)`. This
+        // path then re-homes the `Class` to whichever loader actually supplied
+        // the real bytes — including, via `define_class_with_options`'s
+        // "upgrade the stub instead of minting a shadowed second ClassId" arm,
+        // a `ClassLoaderId::UserDefined`. Every other field was refreshed; the
+        // map key was not, leaving two defects:
+        //
+        //   * `loaded_classes` and `ClassStore` disagreed about the defining
+        //     loader, so `class_defined_by_loader_exact(name, user_loader)`
+        //     missed its O(1) index and only answered through the cold
+        //     linear-scan fallback.
+        //   * far worse, `(Bootstrap, name) -> id` kept resolving for
+        //     bootstrap/extension/application-initiated lookups
+        //     (`get_loaded_class_id`, `find_class_by_name_for_loader`,
+        //     `find_bootstrap_class_by_name`), i.e. a built-in loader
+        //     delegating DOWN into a user-defined loader's namespace. That is
+        //     the isolation break every other lookup in this file is written to
+        //     prevent (`built_in_lookup_is_parent_first_and_never_delegates_down`):
+        //     JDK code and an unrelated loader would share one `ClassId` for a
+        //     class only one of them defined, and a second user loader defining
+        //     the same name would then be silently outranked by the stale
+        //     built-in alias instead of reading as ambiguous.
+        //
+        // Deliberately narrow: only a re-home INTO a user-defined loader is
+        // corrected here. Built-in -> built-in re-homing (the ordinary "stub
+        // for a JDK class, real bytes later found on the application
+        // classpath" case) is left exactly as it was. The built-in chain is
+        // walked parent-first at lookup time, so `(Bootstrap, name)` there is a
+        // legitimate initiating-loader record for a name the bootstrap loader
+        // really did initiate; and *adding* the `(Application, name)` defining
+        // key would start making a subsequent `define_class` for that pair
+        // report a duplicate-define `LinkageError` where it currently mints a
+        // second copy. That is arguably the JVMS-correct outcome, but it is a
+        // behaviour change on the hottest path in the VM and is out of scope
+        // here — see `docs/known-issues/classloading-identity-audit.md`.
+        if let (Some(previous_loader_id), Some(registered_name)) =
+            (previous_loader_id, registered_name)
+        {
+            let rehomed_to_user_loader = previous_loader_id != loader_id
+                && matches!(loader_id, ClassLoaderId::UserDefined(_));
+            if rehomed_to_user_loader {
+                // Only retire the old key when it still names THIS class: a
+                // concurrent define may already have reassigned it, and
+                // removing someone else's entry would be a second, worse bug.
+                let stale_alias_is_ours = loaded_classes_probe(
+                    &self.loaded_classes,
+                    previous_loader_id,
+                    &registered_name,
+                ) == Some(id);
+                let stale_alias_is_builtin =
+                    !matches!(previous_loader_id, ClassLoaderId::UserDefined(_));
+                self.loaded_classes_insert((loader_id, Arc::clone(&registered_name)), id);
+                self.user_loaders.insert(loader_id);
+                if stale_alias_is_ours && stale_alias_is_builtin {
+                    self.loaded_classes_remove(&(previous_loader_id, registered_name));
+                }
+            }
+        }
+
         // Check parent's has_finalizer (needs separate borrow)
         let parent_has = superclass_id
             .and_then(|sid| self.class_store.get(sid))
@@ -8479,6 +9126,39 @@ impl ClassManager {
         // resolved against the stale layout. Mirrors the invalidation
         // `redefine_class` does for in-place bytecode replacement.
         fire_resolution_invalidate_hook(id.as_u32());
+
+        // NO vtable rebuild here, unlike `redefine_class` step 6 — and that is
+        // sound, not an oversight. Investigated 2026-08-01 off the back of the
+        // JEP 109 sibling bug (`refresh_inherited_vtable_descriptors`); the two
+        // properties that make it safe are pinned by
+        // `synthetic_stub_has_no_vtable_and_no_dispatchable_body`:
+        //
+        //   1. A compatibility stub NEVER has a vtable. Both mint paths
+        //      (`create_synthetic_stub` and `fabricate_class`) push straight
+        //      into `class_store` without calling `build_vtable_descriptors` or
+        //      firing the install hook, so `execute_invokevirtual_vtable_fast`
+        //      always answers `CacheMiss` for a stub receiver. There is no
+        //      stub-derived vtable entry this upgrade could leave stale.
+        //   2. A stub's methods are all `ACC_NATIVE` with no attributes
+        //      (`synthetic_stub_ctor_methods`), so they carry no Code — no
+        //      `Arc<CachedBytecodeMethod>` can be built from a stub body, and
+        //      therefore no stale *bytecode* snapshot can be sitting in a
+        //      thread's invoke cache or the promoted-invoke map either. That
+        //      matters because this path deliberately does NOT bump
+        //      `redefine_generations`, so `RedefineGate` would never evict one.
+        //
+        // What the missing rebuild costs is dispatch COVERAGE, never
+        // correctness: the upgraded class still has no vtable afterwards, and a
+        // subclass linked while its parent was a stub seeded its own descriptor
+        // vec from the parent's absent one. Both simply miss `lookup_slot` and
+        // fall to the (correct) slow path. Not worth a broad dispatch change on
+        // spec — a `CRATONVM_DBG_SYNUPGRADE` census over a Spring Boot JUnit
+        // class saw this branch's guard evaluated 6277 times and the upgrade
+        // itself taken ZERO times: every stub in the process is a VM-internal
+        // shape (`cratonvm/internal/*`, `java/util/HashMap$KeyItr`,
+        // `java/lang/annotation/AnnotationProxy`, `Proxy$Instance`, …) whose
+        // real bytes exist nowhere, so 3190 of 3205 stub-hits short-circuit on
+        // the known-absent memo and the remaining 15 scan and find nothing.
 
         // Cache the class bytes (FIFO-bounded helper).
         self.insert_class_bytes(id, bytes);
@@ -15165,6 +15845,348 @@ mod tests {
         );
     }
 
+    /// C2 review P1 (classloading identity) — a synthetic stub is always
+    /// filed under `(Bootstrap, name)`, and `upgrade_synthetic_class` re-homes
+    /// the `Class` to whichever loader supplied the real bytes. When that
+    /// loader is user-defined the map key MUST follow, or a built-in loader
+    /// goes on resolving a class it does not define — a built-in delegating
+    /// DOWN into a user namespace, which is the shape every other lookup in
+    /// this file refuses (see
+    /// `built_in_lookup_is_parent_first_and_never_delegates_down`).
+    #[test]
+    fn a_user_loader_upgrading_a_bootstrap_stub_takes_the_map_key_with_it() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let id = mgr.ensure_synthetic_class("Foo", 0);
+
+        // Precondition: the stub really is bootstrap-keyed.
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "Foo"),
+            Some(id),
+            "a fresh synthetic stub is filed under the bootstrap loader",
+        );
+
+        let user = ClassLoaderId::UserDefined(0x5EED_0001);
+        mgr.upgrade_synthetic_class(
+            id,
+            "Foo",
+            include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class")
+                .to_vec()
+                .into(),
+            user,
+        )
+        .expect("upgrade the synthetic Foo stub with the real fixture bytes");
+
+        // The `ClassStore` records the new defining loader ...
+        assert_eq!(
+            mgr.get_class(id).expect("class survives the upgrade").loader_id,
+            user,
+        );
+        // ... and so must `loaded_classes`, which is keyed on it.
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, user, "Foo"),
+            Some(id),
+            "the name index must agree with the ClassStore about the defining loader",
+        );
+        assert!(
+            mgr.user_loaders.contains(&user),
+            "the re-homed loader has to join the user-loader probe set, or a \
+             context-free lookup can no longer see this class at all",
+        );
+
+        // The stale built-in alias is gone: no built-in loader delegates down.
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "Foo"),
+            None,
+        );
+        assert_eq!(mgr.find_bootstrap_class_by_name("Foo"), None);
+        assert_eq!(
+            mgr.find_class_by_name_for_loader("Foo", ClassLoaderId::Bootstrap),
+            None,
+        );
+        assert_eq!(
+            mgr.find_class_by_name_for_loader("Foo", ClassLoaderId::Application),
+            None,
+        );
+
+        // The owning loader still resolves it, exactly and by delegation.
+        assert_eq!(mgr.class_defined_by_loader_exact("Foo", user), Some(id));
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", user), Some(id));
+    }
+
+    /// The natural two-loader shape: loader A takes ownership of `Foo` by
+    /// upgrading the bootstrap stub, loader B then defines its own `Foo`. The
+    /// two must stay distinct classes, each resolvable from its own loader,
+    /// and the context-free lookups must report the name as ambiguous rather
+    /// than handing back whichever copy a stale built-in alias named.
+    #[test]
+    fn two_user_loaders_defining_the_same_name_stay_distinct_and_read_as_ambiguous() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let first = ClassLoaderId::UserDefined(0x5EED_0002);
+        let second = ClassLoaderId::UserDefined(0x5EED_0003);
+
+        let id_a = mgr.ensure_synthetic_class("Foo", 0);
+        mgr.upgrade_synthetic_class(id_a, "Foo", v1.clone().into(), first)
+            .expect("first loader upgrades the stub");
+
+        let id_b = mgr
+            .define_class("Foo", &v1, second)
+            .expect("the second loader defines its own copy");
+
+        assert_ne!(
+            id_a, id_b,
+            "two loaders defining the same name are two classes, not one",
+        );
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", first), Some(id_a));
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", second), Some(id_b));
+
+        // Ambiguity is information loss, not permission to pick one.
+        assert_eq!(
+            mgr.find_unique_class_by_name("Foo"),
+            None,
+            "the unique-definition index must refuse an ambiguous name",
+        );
+        assert_eq!(
+            mgr.get_loaded_class_id("Foo"),
+            None,
+            "with no requester to disambiguate, a name two user loaders own is \
+             a miss; a stale bootstrap alias made it silently answer the first \
+             loader's copy",
+        );
+    }
+
+    /// C2 review P1 — `Absent` and `Ambiguous` must not both look like `None`.
+    /// A caller that loads on a miss has to be able to tell "nobody has this
+    /// name" from "two loaders each have their own class under it"; collapsing
+    /// them is how a second (then a third) copy of a class gets minted.
+    #[test]
+    fn name_classification_separates_absent_from_ambiguous() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        assert_eq!(mgr.classify_loaded_name("Foo"), NameResolution::Absent);
+        assert!(!mgr.classify_loaded_name("Foo").is_ambiguous());
+        assert_eq!(mgr.classify_loaded_name("Foo").unique(), None);
+
+        let first = ClassLoaderId::UserDefined(0x5EED_0004);
+        let second = ClassLoaderId::UserDefined(0x5EED_0005);
+
+        let id_a = mgr
+            .define_class("Foo", &v1, first)
+            .expect("first loader defines Foo");
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Unique(id_a)
+        );
+
+        let id_b = mgr
+            .define_class("Foo", &v1, second)
+            .expect("second loader defines its own Foo");
+        assert_ne!(id_a, id_b);
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Ambiguous { definitions: 2 },
+            "two distinct classes under one name is ambiguous, not absent",
+        );
+        assert!(mgr.classify_loaded_name("Foo").is_ambiguous());
+        assert_eq!(mgr.classify_loaded_name("Foo").unique(), None);
+        // The `Option`-returning lookups keep failing closed, as before.
+        assert_eq!(mgr.find_unique_class_by_name("Foo"), None);
+
+        // Retiring one copy restores a single correct answer.
+        let unloaded = mgr.unload_user_classes(&[id_b]);
+        assert_eq!(unloaded.len(), 1);
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Unique(id_a)
+        );
+        assert_eq!(mgr.find_unique_class_by_name("Foo"), Some(id_a));
+
+        // A name nobody ever defined stays `Absent`, in either separator form.
+        assert_eq!(
+            mgr.classify_loaded_name("never/Defined"),
+            NameResolution::Absent
+        );
+        assert_eq!(
+            mgr.classify_loaded_name("never.Defined"),
+            NameResolution::Absent
+        );
+    }
+
+    /// Two user loaders, one name, two distinct classes — then a native asks
+    /// for a compatibility stand-in under that name. Fabricating one files it
+    /// under `(Bootstrap, name)`, and because the built-in chain is probed
+    /// first, the empty stub then outranks BOTH real classes for every
+    /// subsequent by-name resolution. The fallible spelling must refuse, and
+    /// the refusal must be distinguishable from "absent".
+    #[test]
+    fn try_ensure_synthetic_class_refuses_an_ambiguous_name() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let first = ClassLoaderId::UserDefined(0x5EED_0010);
+        let second = ClassLoaderId::UserDefined(0x5EED_0011);
+
+        let id_a = mgr.define_class("Foo", &v1, first).expect("loader A");
+        let id_b = mgr.define_class("Foo", &v1, second).expect("loader B");
+        assert_ne!(id_a, id_b);
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Ambiguous { definitions: 2 },
+        );
+
+        let refused = mgr
+            .try_ensure_synthetic_class("Foo", 3)
+            .expect_err("an ambiguous name must not be fabricated for");
+        // Not a `ClassNotFound`: that is what the jdk-only policy refusal and
+        // plain absence both look like, and the caller's correct response to
+        // ambiguity (re-ask with an initiating loader) differs from both.
+        assert!(
+            matches!(
+                refused,
+                VmError::Linkage(LinkageError::IncompatibleClassChangeError { .. })
+            ),
+            "ambiguity refusal must not be spelled like absence: {refused:?}",
+        );
+        let rendered = refused.to_string();
+        assert!(rendered.contains("Foo"), "{rendered}");
+        assert!(rendered.contains('2'), "the count is diagnostic: {rendered}");
+
+        // Nothing was minted, nothing was re-homed: both real classes still
+        // resolve from their own loader and the name is still ambiguous.
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Ambiguous { definitions: 2 },
+        );
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", first), Some(id_a));
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", second), Some(id_b));
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "Foo"),
+            None,
+            "the refusal must not have filed a bootstrap alias for the name",
+        );
+    }
+
+    /// The infallible spelling has no channel for the refusal, so it must
+    /// degrade to something that is still a *miss*: a distinctly-named,
+    /// correctly-sized stand-in. What it must never do is the thing it used to
+    /// do — mint a stub under the ambiguous name itself.
+    #[test]
+    fn ensure_synthetic_class_hands_back_a_stand_in_not_a_shadowing_stub() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let first = ClassLoaderId::UserDefined(0x5EED_0012);
+        let second = ClassLoaderId::UserDefined(0x5EED_0013);
+        let id_a = mgr.define_class("Foo", &v1, first).expect("loader A");
+        let id_b = mgr.define_class("Foo", &v1, second).expect("loader B");
+
+        let stand_in = mgr.ensure_synthetic_class("Foo", 3);
+
+        assert_ne!(stand_in, id_a);
+        assert_ne!(stand_in, id_b);
+        let class = mgr.get_class(stand_in).expect("the stand-in is registered");
+        assert_ne!(
+            &*class.name, "Foo",
+            "the stand-in must not carry the ambiguous name",
+        );
+        assert!(
+            class.name.starts_with("cratonvm/synthetic/AmbiguousName$"),
+            "unexpected stand-in name: {}",
+            class.name,
+        );
+        assert!(
+            class.name.contains("Foo"),
+            "the requested name has to survive into the diagnostic: {}",
+            class.name,
+        );
+        assert_eq!(
+            class.num_total_fields, 3,
+            "an undersized stand-in faults on the first field write instead of \
+             at the cause",
+        );
+        assert!(
+            !class.origin.is_compatibility_stub(),
+            "the stand-in stands in for nobody's class; counting it as a \
+             compatibility stub would pollute the --jdk-only census",
+        );
+
+        // The real classes are untouched and the name is still ambiguous.
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Ambiguous { definitions: 2 },
+        );
+        assert_eq!(mgr.get_loaded_class_id("Foo"), None);
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "Foo"),
+            None,
+        );
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", first), Some(id_a));
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", second), Some(id_b));
+
+        // Idempotent: the same request returns the same stand-in rather than
+        // minting one per allocation.
+        assert_eq!(mgr.ensure_synthetic_class("Foo", 3), stand_in);
+        // A different requested shape gets its own stand-in, so a later,
+        // larger request is not served an undersized layout.
+        let wider = mgr.ensure_synthetic_class("Foo", 9);
+        assert_ne!(wider, stand_in);
+        assert_eq!(
+            mgr.get_class(wider).expect("wider stand-in").num_total_fields,
+            9,
+        );
+    }
+
+    /// The identity gate must be invisible to every name that is not
+    /// ambiguous — which is all of them, in every run that is not reproducing
+    /// this bug.
+    #[test]
+    fn fabrication_is_unchanged_for_absent_and_unique_names() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        // Absent → fabricate, filed under the bootstrap loader, memoized.
+        let id = mgr.ensure_synthetic_class("p/Absent", 2);
+        assert_eq!(&*mgr.get_class(id).expect("minted").name, "p/Absent");
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "p/Absent"),
+            Some(id),
+        );
+        assert_eq!(mgr.ensure_synthetic_class("p/Absent", 2), id);
+        assert_eq!(
+            mgr.classify_loaded_name("p/Absent"),
+            NameResolution::Unique(id),
+        );
+
+        // Unique → the existing early return, on both spellings.
+        assert_eq!(
+            mgr.try_ensure_synthetic_class("p/Absent", 2)
+                .expect("a unique name is not refused"),
+            id,
+        );
+
+        // And a fresh unique name through the fallible spelling.
+        let other = mgr
+            .try_ensure_synthetic_class("p/Other", 0)
+            .expect("an absent name is not refused");
+        assert_ne!(other, id);
+    }
+
+    /// Both separator spellings reach the same index entry.
+    #[test]
+    fn name_classification_normalises_the_separator() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let object = mgr
+            .load_class("java/lang/Object")
+            .expect("Object resolves (as a synthetic stub on an empty classpath)");
+        assert_eq!(
+            mgr.classify_loaded_name("java/lang/Object"),
+            NameResolution::Unique(object)
+        );
+        assert_eq!(
+            mgr.classify_loaded_name("java.lang.Object"),
+            NameResolution::Unique(object)
+        );
+    }
+
     #[test]
     fn class_manager_empty_classpath() {
         let mut mgr = ClassManager::new(&[], &[], &[]);
@@ -15185,6 +16207,385 @@ mod tests {
         let debug = format!("{mgr:?}");
         assert!(debug.contains("ClassManager"));
         assert!(debug.contains("loaded_count"));
+    }
+
+    // -----------------------------------------------------------------
+    // JVMS §5.3.3 — an array class's defining loader is the defining
+    // loader of its component type.
+    //
+    // > If the component type is a reference type, the Java Virtual
+    // > Machine marks C to have the defining loader of the component type
+    // > as its defining loader. Otherwise, the Java Virtual Machine marks
+    // > C to have the bootstrap class loader as its defining loader.
+    // >   — JVMS SE 21 §5.3.3, step 2
+    //
+    // The pre-2026-08-01 code hard-coded `Bootstrap` for every array class
+    // and `debug_assert`ed it, citing the same clause for the opposite
+    // conclusion. See `docs/known-issues/array-class-defining-loader.md`.
+    // -----------------------------------------------------------------
+
+    /// A `Foo` defined by a user loader gives a `[LFoo;` defined by that same
+    /// loader — not by the bootstrap loader.
+    #[test]
+    fn array_class_is_defined_by_its_components_loader() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let user = ClassLoaderId::UserDefined(0x5EED_0A01);
+
+        let foo = mgr
+            .define_class("Foo", &v1, user)
+            .expect("the user loader defines Foo");
+        let array = mgr
+            .load_array_class_for_loader("[LFoo;", user)
+            .expect("[LFoo; must synthesise for the loader that defines Foo");
+
+        let array_class = mgr.get_class(array).expect("array class is registered");
+        assert_eq!(
+            array_class.loader_id, user,
+            "JVMS 5.3.3 step 2: the array is defined by its component's defining loader",
+        );
+        assert_eq!(
+            array_class
+                .array_info
+                .as_ref()
+                .expect("a reference array records its component")
+                .component_class_id,
+            foo,
+            "the recorded component is this loader's Foo, which is what makes \
+             the array class's identity checkable rather than name-shaped",
+        );
+
+        // The map key follows the `Class`, exactly as for a re-homed class.
+        assert_eq!(
+            mgr.loaded_class_under_exact_key("[LFoo;", user),
+            Some(array),
+        );
+        assert_eq!(
+            mgr.loaded_class_under_exact_key("[LFoo;", ClassLoaderId::Bootstrap),
+            None,
+            "a bootstrap key here is a built-in loader delegating DOWN into a \
+             user namespace — the shape every lookup in this file refuses",
+        );
+        assert_eq!(mgr.find_bootstrap_class_by_name("[LFoo;"), None);
+
+        // Idempotent: identity must be stable, or `Foo[].class != Foo[].class`.
+        assert_eq!(
+            mgr.load_array_class_for_loader("[LFoo;", user).ok(),
+            Some(array),
+        );
+    }
+
+    /// The whole point: two loaders that each define their own `Foo` must get
+    /// two *different* `[LFoo;` classes. Collapsing them is type confusion —
+    /// the array store check and the verifier both read array class identity.
+    #[test]
+    fn two_loaders_with_their_own_foo_get_two_distinct_foo_array_classes() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let first = ClassLoaderId::UserDefined(0x5EED_0A02);
+        let second = ClassLoaderId::UserDefined(0x5EED_0A03);
+
+        let foo_a = mgr.define_class("Foo", &v1, first).expect("loader A's Foo");
+        let foo_b = mgr
+            .define_class("Foo", &v1, second)
+            .expect("loader B's own Foo");
+        assert_ne!(foo_a, foo_b, "precondition: two loaders, two Foos");
+
+        let array_a = mgr
+            .load_array_class_for_loader("[LFoo;", first)
+            .expect("A's [LFoo;");
+        let array_b = mgr
+            .load_array_class_for_loader("[LFoo;", second)
+            .expect("B's [LFoo;");
+
+        assert_ne!(
+            array_a, array_b,
+            "two distinct components mean two distinct array classes",
+        );
+        assert_eq!(mgr.get_class(array_a).unwrap().loader_id, first);
+        assert_eq!(mgr.get_class(array_b).unwrap().loader_id, second);
+        assert_eq!(
+            mgr.get_class(array_a)
+                .unwrap()
+                .array_info
+                .as_ref()
+                .unwrap()
+                .component_class_id,
+            foo_a,
+            "A's array must point back at A's Foo",
+        );
+        assert_eq!(
+            mgr.get_class(array_b)
+                .unwrap()
+                .array_info
+                .as_ref()
+                .unwrap()
+                .component_class_id,
+            foo_b,
+        );
+
+        // Fail closed: with two definitions the context-free lookups must
+        // refuse to pick one.
+        assert_eq!(
+            mgr.classify_loaded_name("[LFoo;"),
+            NameResolution::Ambiguous { definitions: 2 },
+        );
+        assert_eq!(mgr.find_unique_class_by_name("[LFoo;"), None);
+
+        // Each loader still resolves its own, exactly.
+        assert_eq!(
+            mgr.loaded_class_under_exact_key("[LFoo;", first),
+            Some(array_a),
+        );
+        assert_eq!(
+            mgr.loaded_class_under_exact_key("[LFoo;", second),
+            Some(array_b),
+        );
+    }
+
+    /// §5.3.3 recurses through the component, so a multi-dimensional array
+    /// inherits its *element* type's loader: `[[LFoo;`'s component is
+    /// `[LFoo;`, whose component is `Foo`.
+    #[test]
+    fn multidimensional_array_inherits_the_element_loader() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let user = ClassLoaderId::UserDefined(0x5EED_0A04);
+        mgr.define_class("Foo", &v1, user).expect("user Foo");
+
+        let outer = mgr
+            .load_array_class_for_loader("[[LFoo;", user)
+            .expect("[[LFoo; must synthesise");
+        let inner = mgr
+            .loaded_class_under_exact_key("[LFoo;", user)
+            .expect("the inner array is created first and keyed under the same loader");
+
+        assert_eq!(mgr.get_class(outer).unwrap().loader_id, user);
+        assert_eq!(mgr.get_class(inner).unwrap().loader_id, user);
+        let info = mgr
+            .get_class(outer)
+            .unwrap()
+            .array_info
+            .clone()
+            .expect("an array of arrays has a reference component");
+        assert_eq!(info.component_class_id, inner);
+        assert_eq!(info.array_dimension, 2);
+        assert_eq!(&*info.leaf_component_name, "Foo");
+    }
+
+    /// "Otherwise, the Java Virtual Machine marks C to have the bootstrap
+    /// class loader as its defining loader." A primitive component has no
+    /// defining loader to inherit, so `[I` is bootstrap-defined even when the
+    /// requesting loader is user-defined — and carries no `ArrayInfo`, because
+    /// a primitive pseudo-class has no `ClassId` to witness.
+    #[test]
+    fn primitive_component_arrays_stay_bootstrap_defined() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let user = ClassLoaderId::UserDefined(0x5EED_0A05);
+
+        let ints = mgr
+            .load_array_class_for_loader("[I", user)
+            .expect("[I synthesises");
+        let int_class = mgr.get_class(ints).unwrap();
+        assert_eq!(int_class.loader_id, ClassLoaderId::Bootstrap);
+        assert!(
+            int_class.array_info.is_none(),
+            "a primitive component has no ClassId, so inventing one would make \
+             ArrayInfo lie about class identity",
+        );
+        assert_eq!(
+            mgr.loaded_class_under_exact_key("[I", ClassLoaderId::Bootstrap),
+            Some(ints),
+        );
+
+        // `[[I`'s component is `[I` — a reference type — whose defining loader
+        // is the bootstrap loader, so the recursion still lands on Bootstrap.
+        let int_arrays = mgr
+            .load_array_class_for_loader("[[I", user)
+            .expect("[[I synthesises");
+        assert_ne!(ints, int_arrays);
+        let outer = mgr.get_class(int_arrays).unwrap();
+        assert_eq!(outer.loader_id, ClassLoaderId::Bootstrap);
+        let info = outer
+            .array_info
+            .as_ref()
+            .expect("[[I's component IS a reference type (the class [I)");
+        assert_eq!(info.component_class_id, ints);
+        assert_eq!(info.array_dimension, 2);
+        assert_eq!(&*info.leaf_component_name, "I");
+    }
+
+    /// Migration, positive half: an array class filed under `(Bootstrap, name)`
+    /// before its component was re-homed into a user loader is re-keyed in
+    /// place, because it *is* the same class — same component, so identity
+    /// (`Foo[].class == Foo[].class`) must be preserved rather than duplicated.
+    /// Template: `upgrade_synthetic_class`'s own re-key.
+    #[test]
+    fn a_bootstrap_keyed_array_is_rekeyed_when_its_component_is_rehomed() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        // Legacy state: the array is synthesised while its component is still
+        // a bootstrap-keyed synthetic stub.
+        let component = mgr.ensure_synthetic_class("Foo", 0);
+        let array = mgr
+            .load_class("[LFoo;")
+            .expect("array synthesis without I/O");
+        assert_eq!(
+            mgr.get_class(array).unwrap().loader_id,
+            ClassLoaderId::Bootstrap,
+        );
+        assert_eq!(
+            mgr.loaded_class_under_exact_key("[LFoo;", ClassLoaderId::Bootstrap),
+            Some(array),
+        );
+        assert_eq!(
+            mgr.get_class(array)
+                .unwrap()
+                .array_info
+                .as_ref()
+                .unwrap()
+                .component_class_id,
+            component,
+        );
+
+        // A user loader supplies the real bytes for the component, which
+        // re-homes it (the `upgrade_synthetic_class` path fixed earlier in this
+        // review). The array class's key is now stale.
+        let user = ClassLoaderId::UserDefined(0x5EED_0A06);
+        mgr.upgrade_synthetic_class(
+            component,
+            "Foo",
+            include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class")
+                .to_vec()
+                .into(),
+            user,
+        )
+        .expect("the user loader takes ownership of the component");
+        assert_eq!(mgr.get_class(component).unwrap().loader_id, user);
+
+        let again = mgr
+            .load_array_class_for_loader("[LFoo;", user)
+            .expect("the array resolves for the loader that now owns the component");
+        assert_eq!(
+            again, array,
+            "same component means the SAME array class — re-key, never duplicate",
+        );
+        assert_eq!(mgr.get_class(array).unwrap().loader_id, user);
+        assert_eq!(
+            mgr.loaded_class_under_exact_key("[LFoo;", user),
+            Some(array),
+        );
+        assert_eq!(
+            mgr.loaded_class_under_exact_key("[LFoo;", ClassLoaderId::Bootstrap),
+            None,
+            "the stale built-in alias must be retired with the re-key, or a \
+             built-in loader keeps resolving a class it does not define",
+        );
+        assert_eq!(mgr.find_bootstrap_class_by_name("[LFoo;"), None);
+    }
+
+    /// Migration, negative half — the one that matters. An existing
+    /// bootstrap-keyed array over a *different* component must NOT be aliased
+    /// onto the user loader's array. Refusing costs a duplicate `ClassId`;
+    /// aliasing costs type confusion, and this branch has already found three
+    /// loader-blind array/caller-loader sites.
+    #[test]
+    fn a_bootstrap_keyed_array_over_a_different_component_is_never_aliased() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        let foo_boot = mgr
+            .define_class("Foo", &v1, ClassLoaderId::Application)
+            .expect("a built-in (application-classpath) Foo");
+        // A built-in requester's array is bootstrap-keyed — see
+        // `array_defining_loader`'s deliberate narrowing.
+        let array_boot = mgr
+            .load_array_class_for_loader("[LFoo;", ClassLoaderId::Application)
+            .expect("the built-in chain synthesises over its own Foo");
+        assert_eq!(
+            mgr.get_class(array_boot).unwrap().loader_id,
+            ClassLoaderId::Bootstrap,
+        );
+        assert_eq!(
+            mgr.get_class(array_boot)
+                .unwrap()
+                .array_info
+                .as_ref()
+                .unwrap()
+                .component_class_id,
+            foo_boot,
+        );
+
+        // An isolating loader with its own Foo now asks for `[LFoo;`.
+        let user = ClassLoaderId::UserDefined(0x5EED_0A07);
+        let foo_user = mgr
+            .define_class("Foo", &v1, user)
+            .expect("the user loader defines its own Foo");
+        assert_ne!(foo_boot, foo_user);
+
+        let array_user = mgr
+            .load_array_class_for_loader("[LFoo;", user)
+            .expect("the user loader gets an array over ITS Foo");
+
+        assert_ne!(
+            array_user, array_boot,
+            "two components, two array classes — aliasing them is the bug",
+        );
+        assert_eq!(
+            mgr.get_class(array_user)
+                .unwrap()
+                .array_info
+                .as_ref()
+                .unwrap()
+                .component_class_id,
+            foo_user,
+        );
+        // The pre-existing bootstrap entry is left exactly as it was: nothing
+        // that already resolved `[LFoo;` through a built-in loader changes
+        // meaning under it.
+        assert_eq!(
+            mgr.loaded_class_under_exact_key("[LFoo;", ClassLoaderId::Bootstrap),
+            Some(array_boot),
+        );
+        assert_eq!(mgr.find_bootstrap_class_by_name("[LFoo;"), Some(array_boot));
+        assert_eq!(
+            mgr.loaded_class_under_exact_key("[LFoo;", user),
+            Some(array_user),
+        );
+        // And the name is now genuinely ambiguous, which the context-free
+        // lookups must report as a miss rather than a guess.
+        assert_eq!(
+            mgr.classify_loaded_name("[LFoo;"),
+            NameResolution::Ambiguous { definitions: 2 },
+        );
+        assert_eq!(mgr.find_unique_class_by_name("[LFoo;"), None);
+    }
+
+    /// A built-in requesting loader must see byte-identical behaviour to the
+    /// pre-fix code: every array whose component the built-in delegation chain
+    /// can reach stays bootstrap-keyed. This is the deliberate narrowing
+    /// documented on `array_defining_loader`; without it, array classes would
+    /// silently leave `find_bootstrap_class_by_name`'s reach.
+    #[test]
+    fn built_in_component_arrays_stay_bootstrap_keyed() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        mgr.define_class("Foo", &v1, ClassLoaderId::Application)
+            .expect("an application-classpath Foo");
+
+        let array = mgr
+            .load_array_class_for_loader("[LFoo;", ClassLoaderId::Application)
+            .expect("[LFoo; synthesises");
+        assert_eq!(
+            mgr.get_class(array).unwrap().loader_id,
+            ClassLoaderId::Bootstrap,
+            "the three built-in loaders are one parent-first chain and cannot \
+             hold two classes under one name, so they collapse onto Bootstrap",
+        );
+        assert_eq!(mgr.find_bootstrap_class_by_name("[LFoo;"), Some(array));
+        assert_eq!(mgr.get_loaded_class_id("[LFoo;"), Some(array));
+        // `load_class`'s loader-blind arm must agree with the loader-aware one.
+        assert_eq!(mgr.load_class("[LFoo;").ok(), Some(array));
     }
 
     /// RKC16N.3 — `Class.forName("[Ljava/util/HashMap;")` resolves by
@@ -16351,6 +17752,57 @@ mod tests {
             .unwrap();
         assert_eq!(unrelated.declaring_class_id, unrelated_id.as_u32());
         assert!(unrelated.dispatch.is_none());
+    }
+
+    /// The two properties that make `upgrade_synthetic_class`'s *absence* of a
+    /// vtable rebuild sound — asserted against the real mint path, not a
+    /// hand-built `Class`, so a future change to stub creation trips this test
+    /// rather than silently resurrecting the JEP 109 bug on the upgrade path.
+    ///
+    /// See the "NO vtable rebuild here" comment in `upgrade_synthetic_class`.
+    /// If either assertion starts failing, that path needs the rebuild (and,
+    /// because a synthetic upgrade may change the method set outright, a full
+    /// descendant re-derivation rather than
+    /// [`Self::refresh_inherited_vtable_descriptors`]'s slot-wise refresh).
+    #[test]
+    fn synthetic_stub_has_no_vtable_and_no_dispatchable_body() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let id = mgr.ensure_synthetic_class("java/lang/Throwable", 2);
+
+        assert!(
+            mgr.class_store
+                .get(id)
+                .is_some_and(|c| c.is_synthetic_stub),
+            "fixture must actually be a compatibility stub",
+        );
+
+        // 1. No vtable — so the upgrade has nothing stale to refresh, and
+        //    `execute_invokevirtual_vtable_fast` can only answer CacheMiss.
+        assert!(
+            mgr.vtable_descriptors_of(id).is_none(),
+            "a synthetic stub must never carry vtable descriptors; if it does, \
+             upgrade_synthetic_class must rebuild them",
+        );
+
+        // 2. No dispatchable body — so no `CachedBytecodeMethod` snapshot of a
+        //    stub can be cached anywhere and survive the upgrade (this path
+        //    does not bump `redefine_generations`, so `RedefineGate` would not
+        //    evict one). `java/lang/Throwable` is chosen because
+        //    `synthetic_stub_ctor_methods` gives it the richest stub method
+        //    table of any name, so the assertion has something to bite on.
+        let methods = &mgr.class_store.get(id).expect("stub present").methods;
+        assert!(
+            !methods.is_empty(),
+            "fixture must have stub methods for this assertion to mean anything",
+        );
+        for method in methods {
+            assert!(
+                method.code().is_none(),
+                "stub method {}{} must carry no Code attribute",
+                method.name,
+                method.descriptor,
+            );
+        }
     }
 
     /// T10.5 — install hook receives the freshly-built descriptor vec.

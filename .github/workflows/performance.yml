@@ -24,10 +24,17 @@ jobs:
       - name: Build release VM
         run: cargo build --release -p cratonvm-cli
 
+      # --reps must be >= the reliability gate's --min-samples (default 7) or
+      # the run is refused at *preflight* with exit 12 [SAMPLE-COUNT], before a
+      # single measurement is taken. 7 is the script's own default and the
+      # documented citable-evidence protocol; lowering --min-samples instead
+      # would weaken the per-phase CV and tail statistics this gate exists to
+      # produce, and make CI runs non-comparable with local ones at the default.
+      # The extra 2 reps × 3 phases cost ~7s of measurement.
       - name: Run priority performance budgets
         run: >
           bash regression-suite/perf/run-cratonbench-gate.sh
           -Exe "$PWD/target/release/cratonvm"
           --phases hashmap,stringregex,bintrees
-          --reps 5
+          --reps 7
           --tolerance 5
