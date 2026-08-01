@@ -160,8 +160,11 @@ Nothing below produced a single warning. Every run was 106/106.
 | dev | the class four times in ONE JVM: 13 bootstraps, 26 000 SQL statements, fully warm JIT | 3 |
 | dev | `CRATONVM_NO_MOVING_YOUNG=1` — *every* young collection takes the non-moving in-place old-gen sweep | 3 |
 | `7a8600b5e` (adds the lambda-proxy SAM fix) | the original hunt, `--par 6` × 4 rounds | 24 |
-| `4ad586e79` (the witness's own era, instrumented) | the original hunt, `--par 6` × 3 rounds | 18 |
+| `4ad586e79` (the witness's own era, instrumented) | the original hunt, `--par 6` × 2 complete rounds (a third was stopped part-way and is not counted) | 12 |
 | `4ad586e79` | `CRATONVM_NO_MOVING_YOUNG=1` | 4 |
+
+**61 runs reached `@@RESULT`**; all scored 106/106. One further run (the 3s
+JUnit timeout) is a deliberate rebuild loop and never produces a result.
 
 That last pair is the important one. The suspect collector path was forced on
 for whole runs, on **both** the current tree and the witness's own era, and

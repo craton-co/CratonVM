@@ -151,8 +151,8 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   warnings each, zero completed builds, until the wall cap. So it is self-feeding and **permanent**,
   which rules out a transient race and points at state nothing invalidates. Ruled out by
   measurement: the `getJavaType()` accessor (810k checks), `getTypeName()` over 30 mirrors (1.8M),
-  `VIRTUAL_TARGET_CACHE` recycling, 35 000 primings (fresh VM and post-suite), and 67 full runs of
-  the class across dev, the lambda-fix commit and the witness's own era — including forced
+  `VIRTUAL_TARGET_CACHE` recycling, 35 000 primings (fresh VM and post-suite), and 61 completed runs
+  of the class across dev, the lambda-fix commit and the witness's own era — including forced
   `CRATONVM_NO_MOVING_YOUNG=1`. The witness era no longer reproduces even its own 103/106 baseline
   on this host, which is the honest reason for the null result. Next: explain why
   `testNumericExpressionReturnTypes` stopped — the earliest divergence, and nothing records it.
