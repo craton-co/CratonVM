@@ -226,6 +226,22 @@ rebuilt and rerun on the merged tree (none of those commits touched
 - All 6 other Tomcat classes — PASS, unchanged, still no verifier message.
 - `TestSsl` — `Failures: 1` in 2 of 3 runs (the `testPost` flake above).
 
+`TestSSLHostConfigCompat` was measured properly rather than reported from a
+single run, because it failed once post-merge:
+
+| arm | result |
+|---|---|
+| pre-fix | `Failures: 22` — **all 22** the verifier message, **0** read timeouts |
+| post-fix, 5 runs | 3× `OK 78/78`, 2× `Failures: 1` (`testHostEC[JSSE-KEYSTORE]`, `Read timed out`) |
+| stock HotSpot control | `OK (78 tests)` |
+
+22 → 0/1. The residual `testHostEC` flake is **newly exposed, not newly
+caused**: pre-fix the class never got past endpoint identification, so it could
+not be observed, and this fix does no I/O — it cannot produce a socket read
+timeout. Filed separately as
+`docs/known-issues/tomcat/testsslhostconfigcompat-testhostec-read-timeout-20260801.md`
+rather than folded in here or left implied by a green summary.
+
 ## Not fixed here, and not caused here
 
 `TestSsl.testClientInitiatedRenegotiation[JSSE]` — a bare
