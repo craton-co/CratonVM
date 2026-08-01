@@ -11,9 +11,10 @@
 //!
 //! This module owns:
 //!
-//!   * The process-wide [`TRANSFORMER_CHAIN`] — a single ordered list
+//!   * The per-VM transformer chain (`TransformerChains`) — one ordered list
 //!     of `(transformer ObjectRef, canRetransform, nativeMethodPrefix)`
-//!     entries shared by every `InstrumentationImpl`.
+//!     entries per `vm_identity`, shared by every `InstrumentationImpl` in
+//!     that VM and by nothing outside it.
 //!   * The native-method registrations on `sun/instrument/InstrumentationImpl`
 //!     (`addTransformer0`, `removeTransformer`, `redefineClasses0`,
 //!     `retransformClasses0`, `getAllLoadedClasses0`,
@@ -35,7 +36,7 @@
 //!         |                                       |
 //!         v                                       v
 //!   ┌────────────────────────────────────────────────────┐
-//!   │  walk TRANSFORMER_CHAIN in registration order      │
+//!   │  walk THIS VM's chain in registration order        │
 //!   │  for each entry whose canRetransform == true:      │
 //!   │      bytes = transformer.transform(loader,         │
 //!   │                  className, classBeingRedefined,   │
@@ -63,7 +64,7 @@
 //! every transformation regardless of which API initiated it.
 
 use std::collections::HashMap;
-use std::sync::{Once, OnceLock, PoisonError, RwLock};
+use std::sync::{OnceLock, PoisonError, RwLock};
 
 use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
 use cratonvm_types::narrow_oop::ref_element_size;
@@ -76,7 +77,7 @@ use cratonvm_types::{
 // Transformer chain
 // ---------------------------------------------------------------------------
 
-/// One entry in the process-wide [`TRANSFORMER_CHAIN`].
+/// One entry in a VM's transformer chain (see `TransformerChains`).
 ///
 /// The Java `ClassFileTransformer` lives on the heap; we hold its
 /// `ObjectRef`. `can_retransform` records the boolean flag passed to
@@ -93,14 +94,59 @@ pub struct TransformerEntry {
     pub native_method_prefix: Option<String>,
 }
 
-/// Process-wide `ClassFileTransformer` chain. The Java spec mandates a
-/// single chain per JVM (per `Instrumentation` instance, but agents
-/// share the same `Instrumentation`).  Order matters — JDK runs
-/// transformers in registration order, threading each output as the
-/// next input.
-fn transformer_chain() -> &'static RwLock<Vec<TransformerEntry>> {
-    static INSTANCE: OnceLock<RwLock<Vec<TransformerEntry>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| RwLock::new(Vec::new()))
+/// `ClassFileTransformer` chains, **one per VM**, keyed on
+/// `NativeContext::vm_identity` / `SharedVm::vm_identity`.
+///
+/// The Java spec mandates a single chain per JVM (per `Instrumentation`
+/// instance, but agents share the same `Instrumentation`) — *per JVM*, not per
+/// process. Order matters within a chain: the JDK runs transformers in
+/// registration order, threading each output as the next input.
+///
+/// # Why this is keyed, and not a bare `Vec`
+///
+/// It used to be one process-wide `RwLock<Vec<TransformerEntry>>`. Entries hold
+/// raw `ObjectRef`s — addresses in the heap of whichever VM registered them —
+/// and this process can own several heaps at once (the inline test modules
+/// build a `SharedVm` per test; `libcratonvm` can create more than one VM).
+/// With a single chain:
+///
+///   * VM B's root scan reported VM A's transformer addresses to VM B's
+///     collector, and VM B's post-move fixup rewrote VM A's entries through
+///     VM B's relocation map — the "pointer into a heap this collector does
+///     not own" hazard that already scoped the logmanager, security-manager
+///     and `ObjectStreamClass` tables;
+///   * a transformer installed in VM A was visible to, and ran against, class
+///     loads in VM B;
+///   * `reset_transformer_chain()` in one VM wiped another's chain.
+///
+/// See `docs/known-issues/vm-process-global-state-round-2.md`.
+type TransformerChains = HashMap<usize, Vec<TransformerEntry>>;
+
+fn transformer_chains() -> &'static RwLock<TransformerChains> {
+    static INSTANCE: OnceLock<RwLock<TransformerChains>> = OnceLock::new();
+    INSTANCE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Run `f` against `vm`'s chain under the write lock, creating an empty chain
+/// if this VM has none yet. Recovers from lock poisoning rather than skipping:
+/// the GC halves below must never silently no-op.
+fn with_chain_mut<R>(vm: usize, f: impl FnOnce(&mut Vec<TransformerEntry>) -> R) -> R {
+    let mut chains = transformer_chains()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    f(chains.entry(vm).or_default())
+}
+
+/// Run `f` against `vm`'s chain under the read lock. An absent VM reads as an
+/// empty chain, so no entry is created just by looking.
+fn with_chain<R>(vm: usize, f: impl FnOnce(&[TransformerEntry]) -> R) -> R {
+    let chains = transformer_chains()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    match chains.get(&vm) {
+        Some(chain) => f(chain.as_slice()),
+        None => f(&[]),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -108,128 +154,118 @@ fn transformer_chain() -> &'static RwLock<Vec<TransformerEntry>> {
 // ---------------------------------------------------------------------------
 //
 // The transformer chain stores live Java `ClassFileTransformer` instances as
-// raw `ObjectRef`s (`TransformerEntry::transformer_ref`). Those references are
-// process-global state that the collector's stack/static walk never reaches,
-// so without the registration below a moving collection would (a) reclaim a
+// raw `ObjectRef`s (`TransformerEntry::transformer_ref`). Those references live
+// outside the heap, so the collector's stack/static walk never reaches them:
+// without the two halves below a moving collection would (a) reclaim a
 // transformer no Java root still points at — Mockito/JaCoCo register a
 // transformer once and hold it only on the Java agent side — and (b) leave
 // every surviving `transformer_ref` pointing at the object's *old* address
 // after compaction. Either one yields a use-after-free or a dispatch onto a
 // relocated object the next time `run_transformer_chain` invokes `transform`.
 //
-// We close that hole by registering this subsystem with the native-root
-// registry: `scan_transformer_roots` folds every held ref into the root set
-// (so the mark phase keeps the transformer alive) and `remap_transformer_refs`
-// rewrites each held ref through the collector's relocation map after a moving
-// collection. Registration is lazy and exactly-once (see
-// [`add_transformer_entry`]).
+// Both halves are driven from `memory::native_roots`' `"instrument-transformers"`
+// VM root source, which passes the OWNING `SharedVm` — so a collection in VM B
+// neither reports nor rewrites VM A's transformers. There is no lazy
+// registration step any more: the source is compiled into `VM_ROOT_SOURCES`, so
+// it is live from the VM's first collection rather than from the first
+// `addTransformer` call.
 
-/// Push every live transformer `ObjectRef` held by the chain into `roots`
+/// Push every live transformer `ObjectRef` held by `vm`'s chain into `roots`
 /// so the collector treats it as a GC root. Null refs are skipped.
 ///
 /// A GC must never miss a root, so on lock poisoning we recover the inner
 /// guard and scan anyway rather than silently dropping the roots (a poisoned
 /// chain still holds valid `ObjectRef`s that must survive the collection).
-fn scan_transformer_roots(roots: &mut Vec<ObjectRef>) {
-    let chain = transformer_chain()
-        .read()
-        .unwrap_or_else(PoisonError::into_inner);
-    for entry in chain.iter() {
-        // `transformer_ref` is a non-null `ObjectRef`; the null-transformer
-        // case is filtered out before an entry is ever pushed (see
-        // `native_add_transformer0`). Guard anyway in case a future caller
-        // seeds a sentinel.
-        if !entry.transformer_ref.as_ptr().is_null() {
-            roots.push(entry.transformer_ref);
+pub(crate) fn scan_transformer_roots(vm: usize, roots: &mut Vec<ObjectRef>) {
+    with_chain(vm, |chain| {
+        for entry in chain {
+            // `transformer_ref` is a non-null `ObjectRef`; the null-transformer
+            // case is filtered out before an entry is ever pushed (see
+            // `native_add_transformer0`). Guard anyway in case a future caller
+            // seeds a sentinel.
+            if !entry.transformer_ref.as_ptr().is_null() {
+                roots.push(entry.transformer_ref);
+            }
         }
-    }
+    });
 }
 
-/// Rewrite every held transformer `ObjectRef` through the collector's
+/// Rewrite every `ObjectRef` held by `vm`'s chain through the collector's
 /// `old-addr -> new-addr` relocation `map` after a moving collection. Refs
 /// absent from the map were not relocated and are left unchanged.
 ///
 /// As with [`scan_transformer_roots`], recover from lock poisoning rather than
 /// skip: an un-remapped ref left pointing at a relocated object is a
 /// use-after-free, so the remap must run even on a poisoned lock.
-fn remap_transformer_refs(map: &HashMap<usize, usize>) {
-    let mut chain = transformer_chain()
-        .write()
-        .unwrap_or_else(PoisonError::into_inner);
-    for entry in chain.iter_mut() {
-        let old_addr = entry.transformer_ref.as_ptr() as usize;
-        if let Some(&new_addr) = map.get(&old_addr) {
-            // SAFETY: `new_addr` is the relocated address the collector
-            // assigned to this same live object; it is non-null and
-            // heap-aligned by construction of the relocation map. Mirrors the
-            // remap convention used throughout `memory::gc`.
-            entry.transformer_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-        }
+///
+/// An empty `map` means nothing moved (the non-moving sweep); early-return so a
+/// VM with no transformers never touches the chain lock on that path.
+pub(crate) fn remap_transformer_refs(vm: usize, map: &HashMap<usize, usize>) {
+    if map.is_empty() {
+        return;
     }
-}
-
-/// Register [`scan_transformer_roots`]/[`remap_transformer_refs`] with the
-/// native-root registry exactly once. Idempotent and cheap to call on every
-/// transformer add; the `Once` collapses all but the first call to a load.
-fn ensure_transformer_root_source_registered() {
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| {
-        crate::memory::native_roots::register_native_root_source(
-            scan_transformer_roots,
-            remap_transformer_refs,
-        );
+    with_chain_mut(vm, |chain| {
+        for entry in chain.iter_mut() {
+            let old_addr = entry.transformer_ref.as_ptr() as usize;
+            if let Some(&new_addr) = map.get(&old_addr) {
+                // SAFETY: `new_addr` is the relocated address the collector
+                // assigned to this same live object; it is non-null and
+                // heap-aligned by construction of the relocation map. Mirrors
+                // the remap convention used throughout `memory::gc`.
+                entry.transformer_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
     });
 }
 
-/// Append `(transformer, canRetransform)` to the global chain. Used by
-/// both the `addTransformer0` native and the `addTransformer` helper on
+/// Drop `vm`'s row entirely. Called from `release_vm_native_state` when the
+/// last `Arc<SharedVm>` goes away: the entries hold addresses in a heap that no
+/// longer exists, and a later VM that happened to reuse the identity would
+/// otherwise inherit them as roots.
+///
+/// Idempotent — a second call removes nothing.
+pub fn forget_vm_transformers(vm: usize) {
+    let mut chains = transformer_chains()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    chains.remove(&vm);
+}
+
+/// Append `(transformer, canRetransform)` to `vm`'s chain. Used by both the
+/// `addTransformer0` native and the `addTransformer` helper on
 /// `cratonvm/Instrument`.  Order: appended at the end.
-pub fn add_transformer_entry(entry: TransformerEntry) {
-    // Lazily wire the chain into the GC root set on first use. Doing it here
-    // (rather than at startup) keeps the registry untouched for workloads that
-    // never install a transformer, and guarantees the source is live before
-    // any transformer ref can be reachable only from the chain.
-    ensure_transformer_root_source_registered();
-    if let Ok(mut chain) = transformer_chain().write() {
-        chain.push(entry);
-    }
+pub fn add_transformer_entry(vm: usize, entry: TransformerEntry) {
+    with_chain_mut(vm, |chain| chain.push(entry));
 }
 
-/// Remove the first entry whose `transformer_ref` pointer-equals
-/// `transformer`. Returns `true` if an entry was removed.
-pub fn remove_transformer_entry(transformer: ObjectRef) -> bool {
-    let mut chain = match transformer_chain().write() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    let before = chain.len();
-    chain.retain(|e| e.transformer_ref.as_ptr() != transformer.as_ptr());
-    before != chain.len()
+/// Remove the first entry in `vm`'s chain whose `transformer_ref`
+/// pointer-equals `transformer`. Returns `true` if an entry was removed.
+pub fn remove_transformer_entry(vm: usize, transformer: ObjectRef) -> bool {
+    with_chain_mut(vm, |chain| {
+        let before = chain.len();
+        chain.retain(|e| e.transformer_ref.as_ptr() != transformer.as_ptr());
+        before != chain.len()
+    })
 }
 
-/// Snapshot of every currently-registered transformer, in registration
-/// order. The snapshot is owned so the caller can iterate without
+/// Snapshot of every transformer currently registered in `vm`'s chain, in
+/// registration order. The snapshot is owned so the caller can iterate without
 /// holding the chain lock — important because invoking
 /// `transformer.transform(...)` re-enters the VM and may itself
 /// register or remove transformers (HotSpot's chain is reentrant-safe
 /// in the same way).
-pub fn snapshot_transformer_chain() -> Vec<TransformerEntry> {
-    transformer_chain()
-        .read()
-        .map(|c| c.clone())
-        .unwrap_or_default()
+pub fn snapshot_transformer_chain(vm: usize) -> Vec<TransformerEntry> {
+    with_chain(vm, |chain| chain.to_vec())
 }
 
-/// Returns the currently-registered transformer count.
-pub fn transformer_count() -> usize {
-    transformer_chain().read().map(|c| c.len()).unwrap_or(0)
+/// Returns the transformer count currently registered in `vm`'s chain.
+pub fn transformer_count(vm: usize) -> usize {
+    with_chain(vm, |chain| chain.len())
 }
 
-/// Reset the chain. Used by VM shutdown / test isolation.
-pub fn reset_transformer_chain() {
-    if let Ok(mut chain) = transformer_chain().write() {
-        chain.clear();
-    }
+/// Reset `vm`'s chain. Used by VM shutdown / test isolation.
+pub fn reset_transformer_chain(vm: usize) {
+    with_chain_mut(vm, |chain| chain.clear());
 }
 
 /// Public hook for Agent 2.4-C's `agent_loader.rs`. After a `-javaagent:`
@@ -241,15 +277,19 @@ pub fn reset_transformer_chain() {
 /// premain dispatch already runs Java code that drives `addTransformer0`,
 /// so the wrapper is mainly for symmetry / testing).
 pub fn add_premain_transformer(
+    vm: usize,
     transformer_ref: ObjectRef,
     can_retransform: bool,
     native_method_prefix: Option<String>,
 ) {
-    add_transformer_entry(TransformerEntry {
-        transformer_ref,
-        can_retransform,
-        native_method_prefix,
-    });
+    add_transformer_entry(
+        vm,
+        TransformerEntry {
+            transformer_ref,
+            can_retransform,
+            native_method_prefix,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -330,8 +370,9 @@ fn add_instrumentation_transformer(
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(transformer))
         .unwrap_or_default();
+    let vm = ctx.vm_identity();
     if class_name == MOCKITO_INLINE_TRANSFORMER {
-        for existing in snapshot_transformer_chain() {
+        for existing in snapshot_transformer_chain(vm) {
             let existing_name = ctx
                 .class_name_of_id(ctx.class_id_of_object(existing.transformer_ref))
                 .unwrap_or_default();
@@ -340,11 +381,14 @@ fn add_instrumentation_transformer(
             }
         }
     }
-    add_transformer_entry(TransformerEntry {
-        transformer_ref: transformer,
-        can_retransform,
-        native_method_prefix: None,
-    });
+    add_transformer_entry(
+        vm,
+        TransformerEntry {
+            transformer_ref: transformer,
+            can_retransform,
+            native_method_prefix: None,
+        },
+    );
 }
 
 fn native_add_transformer0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -359,12 +403,12 @@ fn native_add_transformer0(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 /// `boolean removeTransformer(ClassFileTransformer transformer)`.
 /// Args: [this, transformer].
-fn native_remove_transformer(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_remove_transformer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let transformer = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let removed = remove_transformer_entry(transformer);
+    let removed = remove_transformer_entry(ctx.vm_identity(), transformer);
     Ok(Some(Value::Int(if removed { 1 } else { 0 })))
 }
 
@@ -650,7 +694,7 @@ fn native_set_native_method_prefix0(
         Some(Value::Object(Some(s))) => ctx.read_string(*s),
         _ => None,
     };
-    if let Ok(mut chain) = transformer_chain().write() {
+    with_chain_mut(ctx.vm_identity(), |chain| {
         for entry in chain.iter_mut() {
             if entry.transformer_ref.as_ptr() == transformer.as_ptr() {
                 entry.native_method_prefix = prefix.clone();
@@ -660,10 +704,10 @@ fn native_set_native_method_prefix0(
                          consulted at native dispatch"
                     );
                 }
-                return Ok(None);
+                return;
             }
         }
-    }
+    });
     Ok(None)
 }
 
@@ -724,39 +768,39 @@ fn native_is_prefix_supported0(_ctx: &mut dyn NativeContext, _args: &[Value]) ->
 // Each of these is a **static** native (no receiver), so args[0] is the
 // first user argument. The InstrumentProbe app exercises these.
 
-fn native_bridge_add_transformer(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_bridge_add_transformer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let transformer = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    add_transformer_entry(TransformerEntry {
-        transformer_ref: transformer,
-        can_retransform: true,
-        native_method_prefix: None,
-    });
+    add_transformer_entry(
+        ctx.vm_identity(),
+        TransformerEntry {
+            transformer_ref: transformer,
+            can_retransform: true,
+            native_method_prefix: None,
+        },
+    );
     Ok(None)
 }
 
 fn native_bridge_remove_transformer(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let transformer = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(if remove_transformer_entry(transformer) {
-        1
-    } else {
-        0
-    })))
+    let removed = remove_transformer_entry(ctx.vm_identity(), transformer);
+    Ok(Some(Value::Int(if removed { 1 } else { 0 })))
 }
 
 fn native_bridge_get_transformer_count(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(transformer_count() as i32)))
+    Ok(Some(Value::Int(transformer_count(ctx.vm_identity()) as i32)))
 }
 
 fn native_bridge_get_all_loaded_classes(
@@ -917,7 +961,7 @@ fn alloc_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
 ///    5-arg form, so transformers that override either signature
 ///    work.
 ///
-/// 2. **Rust-side [`TRANSFORMER_CHAIN`]** (the surface the
+/// 2. **Rust-side transformer chain for this VM** (the surface the
 ///    in-process `cratonvm.Instrument.addTransformer` bridge and
 ///    [`add_premain_transformer`] use). For each entry we invoke
 ///    the legacy 5-arg `ClassFileTransformer.transform(ClassLoader,
@@ -947,7 +991,7 @@ fn run_transformer_chain(
     retransform_only: bool,
     inst_receiver: Option<ObjectRef>,
 ) -> Vec<u8> {
-    let rust_chain = snapshot_transformer_chain();
+    let rust_chain = snapshot_transformer_chain(ctx.vm_identity());
     if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
         eprintln!(
             "[RETRANSFORM]   run_transformer_chain: rust_chain={} entries, initial_bytes={}, retransform_only={retransform_only}",
@@ -978,7 +1022,7 @@ fn run_transformer_chain(
     //    we route every transformer registration through the rust-side
     //    chain by overriding the Java public method
     //    `InstrumentationImpl.addTransformer(transformer, canRetransform)`
-    //    with a native that records the transformer in [`TRANSFORMER_CHAIN`]
+    //    with a native that records the transformer in this VM's chain
     //    (see `register_instrumentation_natives`).
     //
     //    `inst_receiver` remains a parameter for future re-enablement of
@@ -1696,7 +1740,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
                     _ => None,
                 });
             }
-            if let Ok(mut chain) = transformer_chain().write() {
+            with_chain_mut(ctx.vm_identity(), |chain| {
                 let mut next = collected.into_iter();
                 for entry in chain.iter_mut() {
                     if entry.can_retransform != is_retransformable {
@@ -1707,7 +1751,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
                         None => break,
                     }
                 }
-            }
+            });
             Ok(None)
         },
     );
@@ -1852,7 +1896,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
     // `redefineClasses`, `isRetransformClassesSupported`,
     // `isRedefineClassesSupported`, `isNativeMethodPrefixSupported`,
     // `isModifiableClass`, `getObjectSize`, `getAllLoadedClasses`) is
-    // registered natively above and answers from `TRANSFORMER_CHAIN` and the
+    // registered natively above and answers from this VM's chain and the
     // VM's own class tables. There is no JVMTI env to record, so an empty
     // body IS the implementation. This registration also appears in
     // `interpreter.rs`'s force-native-override table so it beats the real
@@ -2014,57 +2058,91 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Transformer-chain tests
+    //
+    // Every test below uses its OWN `vm_identity`, so they are genuinely
+    // isolated from one another under `cargo test`'s parallel harness. They
+    // used to share one process-global chain and lean on
+    // `reset_transformer_chain()` at the top of each test for isolation, which
+    // only ever worked because no two of them happened to interleave.
+    // `unique_vm()` hands out a fresh identity per call; `fake_objref` refs are
+    // synthetic non-heap addresses, never dereferenced.
+    // -----------------------------------------------------------------------
+
+    /// A `vm_identity` no other test can collide with. Real identities are
+    /// `SharedVm` addresses; these are small counter values, which no real VM
+    /// can produce, so a test row can never shadow a production row either.
+    fn unique_vm() -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
     #[test]
     fn add_then_remove_transformer_roundtrip() {
-        reset_transformer_chain();
+        let vm = unique_vm();
         let t1 = fake_objref(0x1000);
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: t1,
-            can_retransform: false,
-            native_method_prefix: None,
-        });
-        assert_eq!(transformer_count(), 1);
-        let removed = remove_transformer_entry(t1);
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: t1,
+                can_retransform: false,
+                native_method_prefix: None,
+            },
+        );
+        assert_eq!(transformer_count(vm), 1);
+        let removed = remove_transformer_entry(vm, t1);
         assert!(removed);
-        assert_eq!(transformer_count(), 0);
+        assert_eq!(transformer_count(vm), 0);
+        forget_vm_transformers(vm);
     }
 
     #[test]
     fn remove_unknown_transformer_returns_false() {
-        reset_transformer_chain();
+        let vm = unique_vm();
         let t = fake_objref(0x2000);
-        assert!(!remove_transformer_entry(t));
+        assert!(!remove_transformer_entry(vm, t));
+        forget_vm_transformers(vm);
     }
 
     #[test]
     fn snapshot_preserves_order() {
-        reset_transformer_chain();
+        let vm = unique_vm();
         let t1 = fake_objref(0x1000);
         let t2 = fake_objref(0x2000);
         let t3 = fake_objref(0x3000);
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: t1,
-            can_retransform: true,
-            native_method_prefix: None,
-        });
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: t2,
-            can_retransform: false,
-            native_method_prefix: Some("$pfx".into()),
-        });
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: t3,
-            can_retransform: true,
-            native_method_prefix: None,
-        });
-        let snap = snapshot_transformer_chain();
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: t1,
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: t2,
+                can_retransform: false,
+                native_method_prefix: Some("$pfx".into()),
+            },
+        );
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: t3,
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+        let snap = snapshot_transformer_chain(vm);
         assert_eq!(snap.len(), 3);
         assert_eq!(snap[0].transformer_ref.as_ptr() as usize, 0x1000);
         assert_eq!(snap[1].transformer_ref.as_ptr() as usize, 0x2000);
         assert_eq!(snap[1].native_method_prefix.as_deref(), Some("$pfx"));
         assert_eq!(snap[2].transformer_ref.as_ptr() as usize, 0x3000);
-        // Cleanup.
-        reset_transformer_chain();
+        forget_vm_transformers(vm);
     }
 
     #[test]
@@ -2078,98 +2156,262 @@ mod tests {
 
     #[test]
     fn reset_clears_transformer_chain() {
-        reset_transformer_chain();
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: fake_objref(0x100),
-            can_retransform: true,
-            native_method_prefix: None,
-        });
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: fake_objref(0x200),
-            can_retransform: false,
-            native_method_prefix: None,
-        });
-        assert_eq!(transformer_count(), 2);
-        reset_transformer_chain();
-        assert_eq!(transformer_count(), 0);
+        let vm = unique_vm();
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: fake_objref(0x100),
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: fake_objref(0x200),
+                can_retransform: false,
+                native_method_prefix: None,
+            },
+        );
+        assert_eq!(transformer_count(vm), 2);
+        reset_transformer_chain(vm);
+        assert_eq!(transformer_count(vm), 0);
+        forget_vm_transformers(vm);
     }
 
     #[test]
     fn scan_transformer_roots_yields_every_ref() {
-        reset_transformer_chain();
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: fake_objref(0x1000),
-            can_retransform: true,
-            native_method_prefix: None,
-        });
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: fake_objref(0x2000),
-            can_retransform: false,
-            native_method_prefix: None,
-        });
+        let vm = unique_vm();
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: fake_objref(0x1000),
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: fake_objref(0x2000),
+                can_retransform: false,
+                native_method_prefix: None,
+            },
+        );
         let mut roots = Vec::new();
-        scan_transformer_roots(&mut roots);
+        scan_transformer_roots(vm, &mut roots);
         let addrs: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
         assert_eq!(addrs, vec![0x1000, 0x2000]);
-        reset_transformer_chain();
+        forget_vm_transformers(vm);
     }
 
     #[test]
     fn scan_transformer_roots_empty_chain_pushes_nothing() {
-        reset_transformer_chain();
+        let vm = unique_vm();
         let mut roots = Vec::new();
-        scan_transformer_roots(&mut roots);
+        scan_transformer_roots(vm, &mut roots);
         assert!(roots.is_empty());
     }
 
     #[test]
     fn remap_transformer_refs_rewrites_relocated_entries() {
-        reset_transformer_chain();
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: fake_objref(0x1000),
-            can_retransform: true,
-            native_method_prefix: None,
-        });
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: fake_objref(0x2000),
-            can_retransform: false,
-            native_method_prefix: None,
-        });
+        let vm = unique_vm();
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: fake_objref(0x1000),
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: fake_objref(0x2000),
+                can_retransform: false,
+                native_method_prefix: None,
+            },
+        );
         // Relocate only the first entry; the second is absent from the map
         // and must be left untouched.
         let mut map: HashMap<usize, usize> = HashMap::new();
         map.insert(0x1000, 0x9000);
-        remap_transformer_refs(&map);
-        let snap = snapshot_transformer_chain();
+        remap_transformer_refs(vm, &map);
+        let snap = snapshot_transformer_chain(vm);
         assert_eq!(snap[0].transformer_ref.as_ptr() as usize, 0x9000);
         assert_eq!(snap[1].transformer_ref.as_ptr() as usize, 0x2000);
-        reset_transformer_chain();
+        forget_vm_transformers(vm);
     }
 
     #[test]
     fn remap_transformer_refs_empty_map_is_noop() {
-        reset_transformer_chain();
-        add_transformer_entry(TransformerEntry {
-            transformer_ref: fake_objref(0x3000),
-            can_retransform: true,
-            native_method_prefix: None,
-        });
-        remap_transformer_refs(&HashMap::new());
-        let snap = snapshot_transformer_chain();
+        let vm = unique_vm();
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: fake_objref(0x3000),
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+        remap_transformer_refs(vm, &HashMap::new());
+        let snap = snapshot_transformer_chain(vm);
         assert_eq!(snap[0].transformer_ref.as_ptr() as usize, 0x3000);
-        reset_transformer_chain();
+        forget_vm_transformers(vm);
     }
 
     #[test]
     fn add_premain_transformer_appends_to_chain() {
-        reset_transformer_chain();
+        let vm = unique_vm();
         let t = fake_objref(0x4000);
-        add_premain_transformer(t, true, Some("__".into()));
-        let snap = snapshot_transformer_chain();
+        add_premain_transformer(vm, t, true, Some("__".into()));
+        let snap = snapshot_transformer_chain(vm);
         assert_eq!(snap.len(), 1);
         assert!(snap[0].can_retransform);
         assert_eq!(snap[0].native_method_prefix.as_deref(), Some("__"));
-        reset_transformer_chain();
+        forget_vm_transformers(vm);
+    }
+
+    // ----- per-VM isolation (PROCESS-GLOBAL-STATE ROUND 2) ------------------
+
+    /// The core isolation property: two VMs' chains are disjoint. Under the
+    /// old single process-global `Vec`, `vm_b`'s chain contained `vm_a`'s
+    /// transformer and both counts read 2.
+    #[test]
+    fn chains_are_per_vm() {
+        let vm_a = unique_vm();
+        let vm_b = unique_vm();
+        let ta = fake_objref(0xA000);
+        let tb = fake_objref(0xB000);
+        add_transformer_entry(
+            vm_a,
+            TransformerEntry {
+                transformer_ref: ta,
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+        add_transformer_entry(
+            vm_b,
+            TransformerEntry {
+                transformer_ref: tb,
+                can_retransform: false,
+                native_method_prefix: None,
+            },
+        );
+        assert_eq!(transformer_count(vm_a), 1);
+        assert_eq!(transformer_count(vm_b), 1);
+        assert_eq!(
+            snapshot_transformer_chain(vm_a)[0].transformer_ref.as_ptr() as usize,
+            0xA000
+        );
+        assert_eq!(
+            snapshot_transformer_chain(vm_b)[0].transformer_ref.as_ptr() as usize,
+            0xB000
+        );
+        // A remove aimed at B's transformer must not touch A's chain, and
+        // vice versa.
+        assert!(!remove_transformer_entry(vm_a, tb));
+        assert_eq!(transformer_count(vm_a), 1);
+        // Resetting one VM must leave the other alone.
+        reset_transformer_chain(vm_a);
+        assert_eq!(transformer_count(vm_a), 0);
+        assert_eq!(transformer_count(vm_b), 1);
+        forget_vm_transformers(vm_a);
+        forget_vm_transformers(vm_b);
+    }
+
+    /// The GC halves are the load-bearing ones: VM B's collection must neither
+    /// report VM A's addresses as roots (a pointer into a heap B does not own)
+    /// nor rewrite A's entries through B's relocation map.
+    #[test]
+    fn gc_halves_only_touch_the_owning_vm() {
+        let vm_a = unique_vm();
+        let vm_b = unique_vm();
+        add_transformer_entry(
+            vm_a,
+            TransformerEntry {
+                transformer_ref: fake_objref(0xA000),
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+        add_transformer_entry(
+            vm_b,
+            TransformerEntry {
+                transformer_ref: fake_objref(0xB000),
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+
+        let mut roots_b = Vec::new();
+        scan_transformer_roots(vm_b, &mut roots_b);
+        let addrs: Vec<usize> = roots_b.iter().map(|r| r.as_ptr() as usize).collect();
+        assert_eq!(
+            addrs,
+            vec![0xB000],
+            "VM B's scan must not report VM A's transformer address"
+        );
+
+        // B relocates the address A's entry happens to live at. A must be
+        // untouched.
+        let mut map: HashMap<usize, usize> = HashMap::new();
+        map.insert(0xA000, 0xDEAD_0000);
+        remap_transformer_refs(vm_b, &map);
+        assert_eq!(
+            snapshot_transformer_chain(vm_a)[0].transformer_ref.as_ptr() as usize,
+            0xA000,
+            "VM B's post-move fixup must not rewrite VM A's entries"
+        );
+        forget_vm_transformers(vm_a);
+        forget_vm_transformers(vm_b);
+    }
+
+    /// VM teardown drops the row. Without it, a long-lived host process that
+    /// creates and disposes of VMs accumulates chains full of addresses into
+    /// heaps that no longer exist, and a later VM that reuses the identity
+    /// inherits them as roots.
+    #[test]
+    fn forget_vm_transformers_drops_the_row_and_is_idempotent() {
+        let vm = unique_vm();
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: fake_objref(0xC000),
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+        assert_eq!(transformer_count(vm), 1);
+        forget_vm_transformers(vm);
+        assert_eq!(transformer_count(vm), 0);
+        let mut roots = Vec::new();
+        scan_transformer_roots(vm, &mut roots);
+        assert!(
+            roots.is_empty(),
+            "a released VM's transformers must not be reported as roots"
+        );
+        // Second call is a no-op, not a panic.
+        forget_vm_transformers(vm);
+        assert_eq!(transformer_count(vm), 0);
+    }
+
+    /// Reading an unknown VM must not create a row — otherwise the map grows
+    /// without bound on every `run_transformer_chain` in a VM that never
+    /// installed a transformer.
+    #[test]
+    fn reading_an_unknown_vm_does_not_create_a_row() {
+        let vm = unique_vm();
+        assert_eq!(transformer_count(vm), 0);
+        assert!(snapshot_transformer_chain(vm).is_empty());
+        let chains = transformer_chains()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !chains.contains_key(&vm),
+            "read-only access must not allocate a chain for the VM"
+        );
     }
 
     #[test]

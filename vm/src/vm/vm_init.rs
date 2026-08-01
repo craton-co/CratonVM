@@ -1349,7 +1349,55 @@ impl SharedVm {
             )
             .expect("bootstrap ClassesReady invariants");
 
+        // This VM's process-unique identity is allocated HERE rather than in the
+        // `Self { .. }` literal at the end of this function, for one reason: the
+        // capability policy is keyed on it (`VmId`), and the policy has to exist
+        // before the first `register_*` call. `NEXT_VM_IDENTITY` is a monotonic
+        // counter, so moving the `fetch_add` earlier changes nothing about the
+        // value or its uniqueness — only when it becomes available.
+        let vm_identity = NEXT_VM_IDENTITY.fetch_add(1, Ordering::Relaxed);
+
         let mut native_methods = NativeMethodRegistry::new();
+
+        // ── Capability policy, installed before ANY `register_*` pass ───────
+        //
+        // ORDERING IS LOAD-BEARING, in both directions:
+        //
+        //  * `set_capabilities` must precede the `register_*` passes because
+        //    `NativeMethodRegistry::register` is itself gated
+        //    (`Capability::NativeRegister`), and because `register()` is what
+        //    populates `sensitive_slots` — the precomputed
+        //    `slot -> CapabilityKind` map that makes the dispatch-side gate an
+        //    integer lookup. A policy installed after the ~3,100 boot
+        //    registrations would leave every one of them unclassified, so the
+        //    dispatch gate would be permanently blind even under `Enforce`.
+        //  * `install_capabilities` publishes the SAME `Arc` into the process
+        //    -wide `VmId -> CapabilitySet` index, which is how a native holding
+        //    only a `&dyn NativeContext` reaches this VM's policy
+        //    (`CapabilityCheck::check_capability`). One `Arc`, so the registry
+        //    gate, the ~35 per-call-site gates in `native-builtins`/`native-io`
+        //    and the dispatch gate all write to ONE audit log.
+        //    It is done here, at the earliest possible point, so no boot-time
+        //    native can run before the policy is visible — that window is
+        //    exactly what `capability_gate`'s per-thread raw-memory memo would
+        //    otherwise latch a stale `None` into.
+        //
+        // The default is `CapabilityMode::Permissive`: `from_env` reads
+        // `CRATONVM_CAPABILITY_MODE` / `CRATONVM_CAPABILITY_GRANTS`, and with
+        // neither set the result allows everything and merely counts it. So the
+        // default configuration is behaviour-identical to no policy at all,
+        // while `capability_audit(VmId)` can now actually report something.
+        //
+        // Per-VM, never a process global: two `SharedVm`s in one process get two
+        // `CapabilitySet`s under two `VmId`s, which is the cross-VM policy
+        // interference `native-api/src/capability.rs` exists to remove.
+        let capabilities = Arc::new(cratonvm_native_api::CapabilitySet::from_env(
+            cratonvm_native_api::VmId::from_raw(vm_identity),
+        ));
+        native_methods.set_capabilities(Arc::clone(&capabilities));
+        // `None` — a fresh `vm_identity` can never displace an existing entry.
+        let _displaced = cratonvm_native_api::install_capabilities(Arc::clone(&capabilities));
+
         // ── Native policy, installed before ANY `register_*` pass ──────────
         //
         // One line after construction and one line *above* the
@@ -3029,8 +3077,31 @@ impl SharedVm {
             .natives_ready(native_methods.len())
             .expect("bootstrap NativesReady invariants");
 
+        // The registration pass just pushed one `native-register:<class>.<method>`
+        // row into the audit log per registered native — ~3,100 in real-JDK
+        // mode, ~5,200 with `synthetic-jdk`. Under the default `Permissive` mode
+        // that is pure noise with a sharp edge: `MAX_AUDIT_ENTRIES` is 4,096, so
+        // in synthetic mode the map is FULL before `main()` runs and every
+        // subsequent file/socket/spawn use — the only thing the report exists to
+        // collect — is silently dropped, with `truncated` set. The same rows are
+        // already recorded, with provenance, by the registry's own census
+        // (`registrations` / `provenance` / `census()`), so nothing is lost.
+        //
+        // Cleared ONLY under `Permissive`. `Audit` and `Enforce` keep every row:
+        // in those modes an operator deliberately asked for the detail, and an
+        // `Enforce` run's *denied* registrations are exactly what they need to
+        // see. (Those modes still hit the 4,096 cap in synthetic mode — that is
+        // a `native-api` sizing question, reported separately, not something to
+        // paper over here.)
+        if capabilities.mode() == cratonvm_native_api::CapabilityMode::Permissive {
+            capabilities.reset_audit();
+        }
+
         let vm = Self {
-            vm_identity: NEXT_VM_IDENTITY.fetch_add(1, Ordering::Relaxed),
+            // Allocated at the top of this function, before the `register_*`
+            // pass, because the capability policy filed under this id has to be
+            // in the registry before it accepts its first registration.
+            vm_identity,
             config,
             #[cfg(feature = "gpu-offload")]
             offload_registry,
@@ -3153,6 +3224,9 @@ impl SharedVm {
                 // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
                 // policy when the environment is unset.
                 tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
+                compilation_broker: parking_lot::Mutex::new(
+                    crate::jit::tiered::CompilationBroker::with_default_policy(),
+                ),
                 deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
                 method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
                 method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
@@ -3205,10 +3279,28 @@ impl SharedVm {
             }
         }
 
-        // T6.3.1: install the process-wide JVMTI event manager if none was
-        // installed yet, and fire VMInit once all core subsystems are up.
-        // `install_global_manager` is idempotent so repeated `SharedVm::new`
-        // calls in the same process (rare; mostly test harnesses) are safe.
+        // T6.3.1: install this VM's JVMTI event manager, and fire VMInit once
+        // all core subsystems are up.
+        //
+        // Per-VM, not process-wide: a single global manager sent VM B's events
+        // to VM A's callbacks and dropped VM B's own manager on the floor.
+        crate::runtime::jvmti::install_manager_for_vm(
+            vm.vm_identity,
+            std::sync::Arc::new(crate::runtime::jvmti::JvmtiEventManager::new_for_vm(
+                vm.vm_identity,
+            )),
+        );
+        // AND the unattributed row, which is NOT redundant. Six delivery sites
+        // — VMInit, VMDeath, ClassLoad, ClassPrepare, GCStart, GCFinish —
+        // still resolve through `global_manager()`, which is an EXACT lookup
+        // of row 0 with no fallback. Installing only the per-VM row above left
+        // row 0 uninhabited in production, so every one of those events
+        // resolved `None` and was silently dropped. The per-VM lane's note
+        // that "their events land on the unattributed manager, which is
+        // exactly where they land today" was true only while this call site
+        // still populated row 0 — so it has to keep populating it until those
+        // sites are attributed. The test that should have caught this installs
+        // the row itself first, and so passes vacuously.
         crate::runtime::jvmti::install_global_manager(std::sync::Arc::new(
             crate::runtime::jvmti::JvmtiEventManager::new(),
         ));
@@ -3328,7 +3420,9 @@ impl SharedVm {
         // `Weak::upgrade()` returns None and the call is a no-op —
         // perfectly safe for unit tests that construct a SharedVm
         // outside an Arc.
-        crate::runtime::jvmti::fire_vm_init();
+        // Attributed: a row-0 agent used to see VMInit for every VM in the
+        // process. JVMTI specifies that it sees its own.
+        crate::runtime::jvmti::fire_vm_init_for_vm(vm.vm_identity);
 
         // Boot-cost summary. `SharedVm::new` is only part of startup — the
         // launcher still has to run `System.initPhase1/2/3` and load the
@@ -7185,6 +7279,70 @@ impl std::fmt::Debug for Vm {
 }
 
 // ---------------------------------------------------------------------------
+// Per-VM native/security state teardown
+// ---------------------------------------------------------------------------
+
+/// Release every piece of process-global state this VM filed under
+/// `vm_identity`.
+///
+/// Three rows today, all keyed on the identity and all of which would otherwise
+/// outlive the heap that produced them:
+///
+/// * the [`CapabilitySet`](cratonvm_native_api::CapabilitySet) installed by
+///   `SharedVm::new` — a long-lived host process that creates and disposes of
+///   VMs would otherwise accumulate dead entries in a `Vec` that every
+///   `capabilities_for` lookup scans linearly;
+/// * `native-builtins`' per-VM SecurityManager row, which holds raw heap
+///   `ObjectRef`s (the installed manager, the policy object, the shared
+///   permission collection). `forget_vm_security_state` had **no call site at
+///   all** before this, so those addresses survived the heap they pointed into
+///   and a later VM that reused the identity would have inherited them;
+/// * the `java.lang.instrument` `ClassFileTransformer` chain
+///   ([`crate::runtime::instrument`]), which likewise holds raw heap
+///   `ObjectRef`s — the live transformer mirrors registered by Mockito's
+///   MockMaker / JaCoCo's agent — and is a registered GC root source, so a
+///   surviving row would report addresses into a dead heap on a later VM's
+///   collection.
+///
+/// **Idempotent by construction** — `uninstall_capabilities` returns `None`,
+/// and `forget_vm_security_state` / `forget_vm_transformers` remove nothing on
+/// a second call — because it is deliberately invoked from two places (see
+/// below), and either may run first or alone.
+pub fn release_vm_native_state(vm_identity: usize) {
+    cratonvm_native_api::uninstall_capabilities(cratonvm_native_api::VmId::from_raw(vm_identity));
+    cratonvm_native_builtins::security_manager::forget_vm_security_state(vm_identity);
+    crate::runtime::instrument::forget_vm_transformers(vm_identity);
+    // Without this a disposed VM's JVMTI row leaks its agent's callback
+    // closures, and its listener flags keep every OTHER VM's interpreter on the
+    // slow path — the flags are a process-wide union by design.
+    crate::runtime::jvmti::forget_vm_jvmti_state(vm_identity);
+}
+
+/// The precise hook: the last `Arc<SharedVm>` is gone, so no thread can still
+/// reach this VM's policy.
+///
+/// This is where the release *belongs*, and for a bare `SharedVm::new(..)` (the
+/// ~1,500 unit-test VMs across the workspace, none of which build a `Vm`) it is
+/// the only hook that fires — without it every one of those tests would leak an
+/// entry into the process-wide capability index for the life of the test
+/// binary.
+///
+/// It is **not sufficient on its own**: `Vm::new` stores
+/// `JcmdProcessor::new_with_vm_state(shared.clone())` into
+/// `shared.debug.jcmd_processor`, a strong `Arc<dyn VmDiagnosticState>` pointing
+/// at the `SharedVm` that owns it. That reference cycle means a `Vm`-created
+/// `SharedVm` is never dropped, so `Drop for Vm` carries the release for that
+/// path (and, transitively, for `DestroyJavaVM` — `libcratonvm`'s
+/// `destroy_created_vm` teardown hook drops the parked `Vm`). If that cycle is
+/// ever broken, this impl becomes the single authority and the call in
+/// `Drop for Vm` can go.
+impl Drop for SharedVm {
+    fn drop(&mut self) {
+        release_vm_native_state(self.vm_identity);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AOT shutdown — flush training data on VM drop
 // ---------------------------------------------------------------------------
 
@@ -7249,7 +7407,31 @@ impl Drop for Vm {
         // agent callbacks see the final heap and subsystem state. One-shot
         // per Vm drop; the underlying `fire_vm_death` is idempotent and
         // gated on the global manager's enable flag.
-        crate::runtime::jvmti::fire_vm_death();
+        // Attributed, and it must stay ahead of `release_vm_native_state`
+        // below, which drops this VM's JVMTI row.
+        crate::runtime::jvmti::fire_vm_death_for_vm(self.shared.vm_identity);
+
+        // LAST, after the finalizer run and VMDeath above: those still execute
+        // Java and still go through natives, and a native that has just lost its
+        // capability policy silently reverts to allow-everything. Releasing here
+        // keeps the policy live for the whole of shutdown.
+        //
+        // This is the `DestroyJavaVM` path too: `libcratonvm::destroy_created_vm`
+        // (registered via `set_destroy_vm_hook`) takes the parked `Vm` out of
+        // `CREATED_VM` and drops it, which runs exactly this.
+        //
+        // `Drop for SharedVm` does the same thing and is the more precise hook,
+        // but it cannot be relied on here: `Vm::new` installs a `JcmdProcessor`
+        // holding a strong `Arc` back at its own `SharedVm`, so a `Vm`-created
+        // `SharedVm` is never dropped. `release_vm_native_state` is idempotent
+        // precisely so both hooks can exist.
+        //
+        // Caveat worth stating: other threads may still hold `Arc<SharedVm>`
+        // clones and still be executing Java when a `Vm` is dropped. Their gates
+        // resolve `None` from here on, i.e. they revert to the permissive
+        // default. That is a fail-open at shutdown, and it is the price of the
+        // reference cycle above, not of this ordering.
+        release_vm_native_state(self.shared.vm_identity);
     }
 }
 
@@ -14112,6 +14294,205 @@ mod tests {
             a.vm_identity, b.vm_identity,
             "two concurrently-live VMs must not share a vm_identity"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Capability policy: install at boot, release at teardown
+    // -----------------------------------------------------------------------
+
+    /// The whole point of the install: before it, all 35 wired gates in
+    /// `native-builtins` / `native-io` resolved `None` and `capability_audit`
+    /// answered `None` for every VM in the process.
+    ///
+    /// Both halves are asserted, and that they are the SAME `Arc` — the
+    /// registry-side gate and the per-call-site gates must share one audit log,
+    /// or a report is half the run.
+    #[test]
+    fn a_booted_vm_has_a_capability_policy_in_the_registry_and_the_index() {
+        let vm = SharedVm::new(VmConfig::default());
+        let id = cratonvm_native_api::VmId::from_raw(vm.vm_identity);
+
+        let in_registry = vm
+            .natives
+            .native_methods
+            .capabilities()
+            .expect("SharedVm::new must install a policy into its own registry");
+        let in_index = cratonvm_native_api::capabilities_for(id)
+            .expect("SharedVm::new must publish the policy under its VmId");
+        assert!(
+            Arc::ptr_eq(in_registry, &in_index),
+            "the registry gate and the per-call-site gates must share ONE set"
+        );
+        assert_eq!(in_index.vm(), id);
+        assert!(cratonvm_native_api::capability_audit(id).is_some());
+    }
+
+    /// The default must not change what any existing deployment does.
+    /// `Permissive` allows everything and merely counts it.
+    #[test]
+    fn the_boot_default_is_permissive_and_every_native_still_registers() {
+        let vm = SharedVm::new(VmConfig::default());
+        let caps = vm.natives.native_methods.capabilities().unwrap();
+        assert_eq!(caps.mode(), cratonvm_native_api::CapabilityMode::Permissive);
+        assert!(
+            caps.grants().is_empty(),
+            "no CRATONVM_CAPABILITY_GRANTS in the test environment"
+        );
+
+        // Registration is itself gated (`Capability::NativeRegister`), and the
+        // policy is installed BEFORE the `register_*` pass precisely so that
+        // gate can see it. Under `Permissive` it must admit every one of them.
+        assert!(
+            vm.natives.native_methods.len() > 100,
+            "the boot registration pass must not have been refused; only {} \
+             natives registered",
+            vm.natives.native_methods.len()
+        );
+        // …and a specific, well-known one, so the assertion above cannot pass on
+        // a registry that accepted a thousand natives and dropped the rest.
+        assert!(
+            vm.natives
+                .native_methods
+                .find("java/lang/Object", "hashCode", "()I")
+                .is_some(),
+            "java/lang/Object.hashCode must survive the registration gate"
+        );
+    }
+
+    /// The ~3,100 `native-register` rows the boot pass would otherwise leave in
+    /// the audit map are cleared under `Permissive` — `MAX_AUDIT_ENTRIES` is
+    /// 4,096, and a map already full of registration rows would drop the
+    /// file/socket/spawn uses the report exists to collect.
+    #[test]
+    fn the_permissive_boot_audit_starts_empty_so_runtime_uses_are_not_crowded_out() {
+        let vm = SharedVm::new(VmConfig::default());
+        let report = cratonvm_native_api::capability_audit(cratonvm_native_api::VmId::from_raw(
+            vm.vm_identity,
+        ))
+        .expect("installed");
+        assert!(
+            !report.truncated,
+            "the audit map must not already be at MAX_AUDIT_ENTRIES:\n{report}"
+        );
+        assert!(
+            report
+                .uses
+                .iter()
+                .all(|u| u.capability.kind() != cratonvm_native_api::CapabilityKind::NativeRegister),
+            "boot registration rows must not survive into the run's report:\n{report}"
+        );
+    }
+
+    /// Teardown. Without this a long-lived host process accumulates one dead
+    /// entry per disposed VM in the `Vec` that every `capabilities_for` lookup
+    /// scans, and — worse — `native-builtins`' per-VM SecurityManager row keeps
+    /// raw `ObjectRef`s into a heap that no longer exists.
+    #[test]
+    fn dropping_a_vm_releases_its_capability_and_security_state() {
+        let id;
+        {
+            let vm = SharedVm::new(VmConfig::default());
+            id = cratonvm_native_api::VmId::from_raw(vm.vm_identity);
+            assert!(cratonvm_native_api::capabilities_for(id).is_some());
+            // Seed the third row so its teardown is covered too. The ref is a
+            // synthetic non-heap address; it is only ever compared by pointer
+            // value, never dereferenced.
+            crate::runtime::instrument::add_transformer_entry(
+                vm.vm_identity,
+                crate::runtime::instrument::TransformerEntry {
+                    // SAFETY: non-null, 8-byte aligned, never dereferenced.
+                    transformer_ref: unsafe {
+                        cratonvm_types::ObjectRef::from_raw(0x5000usize as *mut u8)
+                    },
+                    can_retransform: true,
+                    native_method_prefix: None,
+                },
+            );
+            assert_eq!(
+                crate::runtime::instrument::transformer_count(vm.vm_identity),
+                1
+            );
+        }
+        assert!(
+            cratonvm_native_api::capabilities_for(id).is_none(),
+            "SharedVm::drop must uninstall this VM's policy"
+        );
+
+        // The security half. `forget_vm_security_state` has no public reader,
+        // so this asserts the observable postcondition: no VM-scoped
+        // SecurityManager root remains to be handed to a collector.
+        let mut roots = Vec::new();
+        cratonvm_native_builtins::security_manager::gc_scan_security_manager_roots(
+            id.as_usize(),
+            &mut roots,
+        );
+        assert!(roots.is_empty(), "security state outlived the VM");
+
+        // The instrument half: the transformer chain holds raw `ObjectRef`s
+        // into the dropped heap and is a registered GC root source, so a
+        // surviving row would be reported to a later VM's collector.
+        assert_eq!(
+            crate::runtime::instrument::transformer_count(id.as_usize()),
+            0,
+            "the transformer chain outlived the VM"
+        );
+    }
+
+    /// Both teardown hooks call it and either may run first (or alone — a
+    /// `Vm`-created `SharedVm` is never dropped, because `Vm::new` installs a
+    /// `JcmdProcessor` holding a strong `Arc` back at it).
+    #[test]
+    fn releasing_vm_native_state_twice_is_harmless() {
+        let vm = SharedVm::new(VmConfig::default());
+        let raw = vm.vm_identity;
+        release_vm_native_state(raw);
+        assert!(cratonvm_native_api::capabilities_for(cratonvm_native_api::VmId::from_raw(raw))
+            .is_none());
+        // Second call: no entry left, no panic, and the `SharedVm` drop below
+        // makes it a third.
+        release_vm_native_state(raw);
+        drop(vm);
+    }
+
+    /// Two VMs in one process get two sets under two ids, with two audit logs.
+    /// One policy shared by two VMs is the exact defect the capability model
+    /// exists to remove.
+    #[test]
+    fn two_vms_hold_independent_capability_sets() {
+        let a = SharedVm::new(VmConfig::default());
+        let b = SharedVm::new(VmConfig::default());
+        let ida = cratonvm_native_api::VmId::from_raw(a.vm_identity);
+        let idb = cratonvm_native_api::VmId::from_raw(b.vm_identity);
+        assert_ne!(ida, idb);
+
+        let ca = cratonvm_native_api::capabilities_for(ida).unwrap();
+        let cb = cratonvm_native_api::capabilities_for(idb).unwrap();
+        assert!(!Arc::ptr_eq(&ca, &cb), "two VMs must not share one set");
+
+        ca.check(cratonvm_native_api::Capability::file_read("/only-in-vm-a"))
+            .expect("Permissive");
+        let names = |set: &Arc<cratonvm_native_api::CapabilitySet>| {
+            set.audit_report()
+                .uses
+                .iter()
+                .map(|u| u.capability.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            names(&ca).iter().any(|n| n.contains("only-in-vm-a")),
+            "VM A must record its own use: {:?}",
+            names(&ca)
+        );
+        assert!(
+            !names(&cb).iter().any(|n| n.contains("only-in-vm-a")),
+            "VM B must never see VM A's traffic: {:?}",
+            names(&cb)
+        );
+
+        // And dropping one leaves the other's policy installed.
+        drop(a);
+        assert!(cratonvm_native_api::capabilities_for(ida).is_none());
+        assert!(cratonvm_native_api::capabilities_for(idb).is_some());
     }
 
     /// A `ClassId` names a DIFFERENT class in each VM (`ClassStore::next_id`

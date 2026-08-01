@@ -881,6 +881,45 @@ pub fn compile_java(
     Ok(class_name)
 }
 
+/// Compile many `.java` sources with as few `javac` invocations as possible.
+///
+/// [`compile_java`] pays a JVM start-up per program, which the ~200-program
+/// generated opcode corpus turns into minutes of CI wall time for no extra
+/// information — the coverage matrix needs the bytes, not per-program
+/// attribution. One `javac` per chunk produces the same bytes.
+///
+/// Chunked rather than one giant invocation because Windows caps a process
+/// command line at 32 767 characters, and a corpus that grew past that would
+/// fail in a way that reads like a compiler error rather than a length limit.
+///
+/// On failure the caller should fall back to [`compile_java`] per file: `javac`
+/// reports every error in a batch at once, so a batch failure does not say
+/// *which* program is broken, and attributing it to the whole corpus would hide
+/// the programs that are fine.
+pub fn compile_java_batch(
+    files: &[PathBuf],
+    out_dir: &Path,
+    jdk_home: Option<&Path>,
+    timeout: Duration,
+) -> Result<(), RunError> {
+    const CHUNK: usize = 50;
+    for chunk in files.chunks(CHUNK) {
+        let mut cmd = Command::new(javac_executable(jdk_home));
+        cmd.arg("-d").arg(out_dir);
+        for file in chunk {
+            cmd.arg(file);
+        }
+        let obs = run_subprocess(cmd, timeout)?;
+        if obs.exit_code != Some(0) || obs.timed_out {
+            return Err(RunError::CompileFailed {
+                program: format!("{} source file(s)", chunk.len()),
+                stderr: obs.stderr,
+            });
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -888,6 +927,13 @@ pub fn compile_java(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_batch_compile_never_spawns_javac() {
+        // Safe on a worker with no JDK: the matrix subcommand calls this before
+        // it knows whether the corpus contains any sources at all.
+        assert!(compile_java_batch(&[], Path::new("."), None, Duration::from_secs(1)).is_ok());
+    }
 
     #[test]
     fn parse_modes_round_trips_labels() {
