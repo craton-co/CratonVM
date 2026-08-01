@@ -17110,7 +17110,8 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.set_field(wk, WK_FIELD_PATH, Value::Object(Some(path_s)));
     ctx.set_field(wk, WK_FIELD_EVENTS, Value::Int(event_mask));
     ctx.set_field(wk, WK_FIELD_VALID, Value::Int(1));
-    let pending = ctx.new_array(ArrayElementType::Reference, 64);
+    // Length 0, not 64: the array's length IS the event count.
+    let pending = ctx.new_array(ArrayElementType::Reference, 0);
     ctx.set_field(wk, WK_FIELD_PENDING, Value::Object(Some(pending)));
 
     // Attach to the service's Java-side registration array.
@@ -17335,17 +17336,54 @@ fn native_ws_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn native_wk_poll_events(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     let pending = ctx.get_field(this, WK_FIELD_PENDING);
-    // Return the pending events array as a List (synthetic ArrayList)
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", 2);
-    if let Value::Object(Some(arr)) = pending {
-        let len = ctx.array_length(arr);
-        ctx.set_field(list, 0, Value::Object(Some(arr)));
-        ctx.set_field(list, 1, Value::Int(len as i32));
-    } else {
-        let empty = ctx.new_array(ArrayElementType::Reference, 0);
-        ctx.set_field(list, 0, Value::Object(Some(empty)));
-        ctx.set_field(list, 1, Value::Int(0));
+    // Build the List through `ArrayList.add`, not by writing slots 0/1 of a
+    // hand-allocated "ArrayList".
+    //
+    // `java.util.ArrayList` is a REAL class here, so its instances carry the
+    // real JDK layout (an inherited `modCount` among them) — index 0 and index
+    // 1 are NOT `elementData`/`size`. The old code wrote the event array and
+    // its length into whichever two slots those happened to be, and the
+    // resulting List iterated as EMPTY: `detect_events` produced the right
+    // events, `poll()` returned a valid WatchKey, and `key.pollEvents()` then
+    // handed back nothing. That is what every "Timeout while waiting for
+    // changes" in FileWatcherTests actually was, downstream of the mask and
+    // receiver-layout bugs that masked it.
+    let list = match ctx.new_object("java/util/ArrayList")? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "WatchKey.pollEvents: cannot allocate ArrayList".into(),
+            }
+            .into())
+        }
+    };
+    let Value::Object(Some(arr)) = pending else {
+        return Ok(Some(Value::Object(Some(list))));
+    };
+    // `add` runs real bytecode (allocating), so both the list being filled and
+    // the array being read are pinned across the loop.
+    let list_pin = ctx.pin_native_root(list);
+    let arr_pin = ctx.pin_native_root(arr);
+    let len = ctx.array_length(arr);
+    for i in 0..len {
+        let arr_now = ctx.read_native_pin(arr_pin, arr);
+        let event = match ctx.get_array_element(arr_now, i) {
+            Value::Object(Some(e)) => e,
+            // The pending array is allocated at its exact event count, but a
+            // reset-then-poll race can leave trailing nulls; skip them rather
+            // than surfacing null elements to the caller.
+            _ => continue,
+        };
+        let list_now = ctx.read_native_pin(list_pin, list);
+        ctx.invoke_virtual(
+            list_now,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(event))],
+        )?;
     }
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -17353,8 +17391,11 @@ fn native_wk_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let this = obj_arg92(args, 0)?;
     let valid = matches!(ctx.get_field(this, WK_FIELD_VALID), Value::Int(1));
     if valid {
-        // Clear pending events and re-snapshot
-        let pending = ctx.new_array(ArrayElementType::Reference, 64);
+        // Clear pending events. Length 0, not 64: the array's length IS the
+        // event count (`poll` allocates it at exactly `events.len()`), so a
+        // 64-slot reset array made a `pollEvents()` before the next `poll()`
+        // report 64 events, all null.
+        let pending = ctx.new_array(ArrayElementType::Reference, 0);
         ctx.set_field(this, WK_FIELD_PENDING, Value::Object(Some(pending)));
     }
     Ok(Some(Value::Int(if valid { 1 } else { 0 })))
@@ -17375,6 +17416,25 @@ fn native_wk_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 fn native_we_kind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     let kind_val = ctx.get_field(this, WE_FIELD_KIND);
+    // Hand back the REAL `StandardWatchEventKinds.ENTRY_*` constant when it can
+    // be resolved: callers compare kinds by identity
+    // (`if (event.kind() == ENTRY_CREATE)`), and a freshly allocated synthetic
+    // never matches. Fall back to the synthetic carrier otherwise.
+    let field = match kind_val {
+        Value::Int(EVENT_CREATE) => Some("ENTRY_CREATE"),
+        Value::Int(EVENT_DELETE) => Some("ENTRY_DELETE"),
+        Value::Int(EVENT_MODIFY) => Some("ENTRY_MODIFY"),
+        _ => None,
+    };
+    if let Some(field) = field {
+        if let Ok(cid) = ctx.ensure_class_initialized("java/nio/file/StandardWatchEventKinds") {
+            if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
+                if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
+                    return Ok(Some(v));
+                }
+            }
+        }
+    }
     let kind_obj = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
     ctx.set_field(kind_obj, 0, kind_val);
     Ok(Some(Value::Object(Some(kind_obj))))
