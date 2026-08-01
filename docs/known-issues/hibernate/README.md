@@ -53,9 +53,12 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
     runs to completion, `ok=121 failed=0`, with **zero** forced GCs.
     Two residuals, both separate from the OOM and neither a regression from the
     fix:
-    - `found=121` where HotSpot finds 132 — eleven `@ParameterizedClass`
-      invocations lost at the *container* level, invisible until the class first
-      ran to completion. See the FIXED doc's "Verification" section.
+    - A **non-deterministic** shortfall against HotSpot's 132, invisible until
+      the class first ran to completion. Two runs on the same binary disagree:
+      one reported `found=121 failed=0`, the other enumerated all 132 with one
+      genuine failure —
+      [`AbstractMethodError: AnnotatedElement.getDeclaredAnnotations() has no Code attribute`](annotatedelement-getdeclaredannotations-abstractmethoderror-20260731.md).
+      That test passes 3/3 in isolation, so it is in-class pollution.
     - 105 min against HotSpot's 120 s. That part *is* the
       [moving-young-inert-under-JIT](moving-young-inert-under-jit-throughput-tax-20260730.md)
       throughput tax, and it stays there.

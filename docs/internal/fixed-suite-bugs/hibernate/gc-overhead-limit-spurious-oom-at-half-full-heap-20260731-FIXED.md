@@ -144,12 +144,49 @@ promotion is no longer zero. Old-gen headroom keeps working.
   then only 7 more in the next 44 — is gone.
 
   `found=121` versus HotSpot's `found=132` is a **separate, newly-visible
-  defect**: eleven of the 132 `@ParameterizedClass` invocations are lost at the
-  *container* level (so `failed=0` and `CratonRunner`'s failure dump, gated on
-  `failed != 0`, stays silent). It could not have been seen before, because the
-  class had never once run to completion on CratonVM. It is not this defect and
-  not a regression from this fix; tracked separately. `options()` itself returns
-  a byte-identical 12-row list on both VMs, so the parameter matrix is sound.
+  defect**, described below. It is not this defect and not a regression from
+  this fix — it simply could not be seen before, because the class had never
+  once run to completion on CratonVM.
+
+### The residual, stated exactly
+
+Two full CratonVM runs of the class disagree with each other, so the residual is
+**non-deterministic** and is recorded here as two observations rather than one
+mechanism:
+
+| run | runner | result |
+|---|---|---|
+| A | `CratonRunner` (`-Dcraton.batch=1`) | `found=121 ok=121 failed=0` — 121 `HHH000490` lines |
+| B | `ListingRunner` (per-test listener) | **132 tests**, all 12 invocations × 11 methods present, 131 `SUCCESSFUL`, **1 `FAILED`** |
+| — | HotSpot, either runner | `132`, all successful |
+
+So run B contradicts the obvious reading of run A: the invocations are *not*
+systematically missing — run B enumerated all twelve, each with its full eleven
+methods. What run B found instead is a genuine VM defect on the very last
+invocation:
+
+```
+[class-template-invocation:#12]/[method:updateSchema_fromSessionFactory(DomainModelScope)]
+java.lang.AbstractMethodError: method java/lang/reflect/AnnotatedElement
+    .getDeclaredAnnotations()[Ljava/lang/annotation/Annotation;
+    has no Code attribute
+```
+
+`AnnotatedElement` is an interface and `getDeclaredAnnotations()` is abstract
+there, so this is a call that reached the interface declaration instead of the
+receiver's concrete override.
+
+It is **in-class pollution, not a property of that test**: selecting that exact
+unique id and running it alone passes on CratonVM 3 times out of 3 (and on
+HotSpot). It only fails behind the other 131 tests in the same JVM — the shape
+`reference_junit_request_method_defeats_inclass_repro` describes, and the reason
+each iteration on it costs a ~2-hour run.
+
+What is *not* in question: `options()` returns a byte-identical 12-row list on
+both VMs, so the parameter matrix itself is sound.
+
+Tracked separately as
+[`../../../known-issues/hibernate/annotatedelement-getdeclaredannotations-abstractmethoderror-20260731.md`](../../../known-issues/hibernate/annotatedelement-getdeclaredannotations-abstractmethoderror-20260731.md).
 - `cargo test -p cratonvm-gc --lib` — **881 passed, 0 failed**.
 - `cargo test -p cratonvm-vm --lib` — 2318 passed, 4 failed; all four
   (`jni_function_table_extended_to_234`, `jni_nio_slots_not_stub`,
