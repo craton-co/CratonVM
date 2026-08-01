@@ -1,9 +1,10 @@
 # `TestWsRemoteEndpointImplServerDeadlock`: the server session never reaches CLOSED
 
-**Status:** OPEN (diagnosed only). **HotSpot:** PASS (4/4).
-Found 2026-08-01 while fixing the separate inline-completion deadlock in the
-same test (`docs/internal/fixed-suite-bugs/tomcat/
-websocket-client-completion-on-app-thread-deadlock-FIXED.md`).
+**Status:** ROOT-CAUSED 2026-08-01. The defect is not in the WebSocket stack —
+it is a JIT miscompilation, filed separately at
+`docs/known-issues/jit-direct-call-arg1-clobbered-by-arg0.md`. **HotSpot:** PASS.
+Found while fixing the separate inline-completion deadlock in the same test
+(`docs/internal/fixed-suite-bugs/tomcat/websocket-client-completion-on-app-thread-deadlock-FIXED.md`).
 
 ## Symptom
 
@@ -15,64 +16,93 @@ java.lang.AssertionError: Close delay was [19034931192] ns
 ```
 
 19.03 s is the test's own polling ceiling (190 x 100 ms), i.e. the server
-`WsSession.state` never became `CLOSED` at all — not "closed slowly". When it
-fails it usually fails 3 of the 4 parameter combinations at once.
+`WsSession.state` never became `CLOSED` at all. When it fails it fails parameter
+combinations 0, 1 and 2 and never 3 — combination 3
+(`useAsyncIO=true, sendOnContainerThread=true`) passes for a degenerate reason:
+its server session dies immediately with `ClosedChannelException` and closes with
+code 1006, well inside the polling window.
 
-Measured 20 runs per binary, interleaved, on an idle box: 3/11 of completed
-runs before the inline-completion fix, 7/20 after (z ~= 0.45, p ~= 0.65 —
-unchanged by that fix, which addressed a different failure mode in the same
-test). Real JDK 25 on the same fixture: 4/4 PASS, so this is a CratonVM defect,
-not a fixture artifact.
+## The chain
 
-## What the test expects
+Established with an instrumented replica of the test (compiled outside the Tomcat
+fixture and prepended to the classpath), `tcpdump` on loopback, and
+`CRATONVM_DBG_SC_CLOSE=1`. **48 runs: `closedelay` and the count of Tomcat's
+"Executor rejected socket" warning agree 1:1, in every single run.**
 
-The client stops reading (its `@OnMessage` blocks on a latch), so the server's
-send loop fills the socket buffers and gives up after its 2 s per-message
-`Future.get` timeout. The client then closes the session. Tomcat bug 66508 is
-precisely that the server's processing of that close must not have to wait for
-the blocked send to time out; the test asserts the server reaches `CLOSED`
-within 10 s, and releases the client latch 1 s into polling so the backlog can
-drain.
+1. Under CratonVM the connector's exec pool grows from 10 to its full
+   `maxThreads=200` about 0.5 s into the test — CratonVM dispatches ~5,600
+   socket-processing tasks where HotSpot dispatches 524, so Tomcat's `TaskQueue`
+   does exactly what it is designed to do under load and spawns threads to the
+   cap. HotSpot's pool never leaves 10. (A throughput difference, not a defect;
+   it is the *precondition*, not the cause.)
 
-## What was observed
+2. At `poolSize == maxPoolSize` there is a benign race in Tomcat's own executor:
+   `TaskQueue.offer` can return `false` (asking for a new thread) just as
+   `addWorker` starts refusing, so `execute()` lands in its
+   `RejectedExecutionException` recovery path and calls `TaskQueue.force`.
+   HotSpot reaches this path too; there, `force` simply queues the task.
 
-`--stack-dump-on-timeout=15`, caught mid-poll on a failing run:
+3. `TaskQueue.force` throws only for `parent == null || parent.isShutdown()`.
+   On CratonVM it throws while the connector is running. Two independent
+   captures with a diagnostic shadow of `TaskQueue`:
 
-- `main` — at `testTemporaryDeadlockOnClientClose@249`, i.e. the polling loop
-  itself. Healthy; it is genuinely waiting on the server state.
-- **225 registered threads, 201 of them parked in
-  `AbstractQueuedSynchronizer$ConditionObject.awaitNanos`** — Tomcat's exec pool
-  grown to its full `maxThreads=200`, all idle in
-  `ThreadPoolExecutor.getTask()`.
-- `NioEndpoint$Poller.run` idle, `NioEndpoint.serverSocketAccept` idle.
-- No thread anywhere in a WebSocket write, a close handler, or
-  `Bug66508Client.onMessage`.
+   ```
+   [TASKQ] force-reject p1=@157489 sd1=true p2=@157489 sd2=false sd3=false
+           ctl=-536870712 (0xe00000c8) pool=200 max=200 thread=...-Poller
+   ```
 
-So by the time the delay is observable, nothing is working on the close: the
-client latch has already been released, the client is free, the server pool is
-idle, and the server session is simply still not `CLOSED`.
+   `parent` is the same non-null object on both reads; `isShutdown()` answers
+   `true` and then `false` microseconds later; `ctl` is `0xe00000c8`, negative,
+   so `runStateAtLeast(ctl.get(), SHUTDOWN)` — literally `c >= 0` — must be
+   false. A sampler reading `isShutdown()` on the same executor 50 ms either side
+   reports `false` throughout.
 
-Two things to chase, in order:
+4. `AbstractEndpoint.processSocket` catches the rejection and Tomcat closes the
+   socket at `NioEndpoint$Poller.processKey:1005`:
 
-1. **Why did the pool grow to 200?** A handful of threads should serve this
-   test. Reaching `maxThreads` suggests the poller re-dispatched the same
-   socket repeatedly, each dispatch taking a fresh thread. Worth confirming
-   against HotSpot's thread count on the same run.
-2. **Did the client's close frame reach the server, and was it processed?** The
-   client close is a Future-form write performed by an AIO worker, so the bytes
-   go out independently of completion delivery. Instrument the server-side
-   `WsSession` state transitions (`OPEN` -> `CLOSING` -> `CLOSED`) and the
-   frame reader to see whether the CLOSE frame arrives.
+   ```
+   [SC_CLOSE] id=0x60000001 local=127.0.0.1:37115 peer=127.0.0.1:54974
+     at NioChannel.close(NioChannel.java:109)
+     at NioEndpoint$NioSocketWrapper.doClose(NioEndpoint.java:1483)
+     at SocketWrapperBase.close(SocketWrapperBase.java:668)
+     at NioEndpoint$Poller.processKey(NioEndpoint.java:1005)
+   ```
+
+   This bypasses `WsSession` entirely, which is why the session stays `OPEN`,
+   `WsRemoteEndpointImplServer.closed` stays `false`, and no `onError` /
+   `onClose` fires.
+
+5. The close emits nothing on the wire: the server has ~2.6 MB queued with the
+   client's receive window at zero, so the FIN cannot be sent. 1.6 s later the
+   client's close frame arrives at a socket whose application has closed, and the
+   kernel answers with a bare RST:
+
+   ```
+   819.179148  client > server: Flags [P.], seq 168:176     # the 8-byte close frame
+   819.179229  server > client: Flags [R], seq ..., win 0   # 81 us later
+   ```
+
+   A passing run instead shows `server > client: Flags [.], ack 176` and the
+   session moves `OPEN -> CLOSING -> CLOSED`.
+
+6. The client's next read gets `ECONNRESET`, it stops draining at ~12 messages,
+   and the test polls out at 19.03 s with the server session still `OPEN`.
+
+Step 3 is the defect. It reduces to a JIT miscompilation of `f(g(), k)` where the
+callee compares its two int arguments — see
+`docs/known-issues/jit-direct-call-arg1-clobbered-by-arg0.md`, which carries the
+disassembly and a 20-line repro.
 
 ## Reproduction
 
-`/data/data/wsdead-probes/wsd.sh <exe> <outfile> [dump_after_s] [hard_timeout_s]`
-on the Azure host, against the Tomcat fixture at `/data/data/apps/tomcat`
-(classpath `.suite/cp-linux-fixed.txt`). Roughly 1 run in 3 fails; classify with
+`/data/data/wsdead-probes/probe-run.sh <exe> <outfile>` on the Azure host, with
+`PROBE_COMBOS=0` to run only the first parameter combination (~8 s per pass,
+~25 s per failure). Roughly 1 run in 3 fails; the rate varies with host load.
+Classify on either signature — they are equivalent:
 
 ```
-grep -q '^OK ('        -> PASS
-grep -q 'Close delay was' -> this bug
+grep -c 'Close delay was'            # the assertion
+grep -c 'Executor rejected socket'   # the cause, one per failure
 ```
 
-Real-JDK control: same command line with `/home/victor/jdk25/bin/java`.
+Real-JDK control: the same command line with `/home/victor/jdk25/bin/java`.
