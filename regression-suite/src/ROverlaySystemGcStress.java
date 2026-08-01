@@ -1,48 +1,34 @@
 /**
- * Regression: a `System.gc()` that runs a MAJOR collection inside a moving
- * young cycle must not reclaim the backing state of an overlay-backed
- * collection.
+ * Regression: the in-place old-gen sweep must not free an object this same
+ * cycle just PROMOTED (defect 4).
  *
- * CratonVM keeps `LinkedHashMap` / `LinkedHashSet` / `LinkedList` / `TreeMap` /
- * `TreeSet` state in process-global Rust side tables, reached by the collector
- * through `external_roots`. `System.gc()` sets `major_gc_requested()`, and that
- * flag makes `native_roots::scan_collection_overlays` SKIP the precise overlay
- * root scan — by design, because the major GC's owner walk is supposed to cover
- * it instead. The owner walk reads the side tables, and the moving young phase
- * that runs first leaves them holding PRE-copy addresses until the VM's post-GC
- * remap, which happens after the major GC has already swept. Anything the cycle
- * promoted is therefore unmarked and freed while the overlay holds the only
- * reference to it.
+ * `sweep_young_non_moving` copies each promoted survivor into old gen and
+ * clears its mark bit, so the copy arrives UNMARKED — and
+ * `sweep_old_gen_non_moving` frees every unmarked old-gen block. Most promoted
+ * objects are saved because the young phase rewrites surviving young objects'
+ * fields to the new addresses and `mark_young_to_old_refs` marks them from
+ * there. What that misses is an object whose ONLY reference is a root slot or a
+ * native side table — and CratonVM keeps `LinkedHashMap` / `LinkedHashSet` /
+ * `LinkedList` / `TreeMap` / `TreeSet` state in exactly such side tables, so
+ * they are the natural way to reach the gap from Java.
  *
- * The shape that matters is: an overlay-backed collection that survives long
- * enough to be PROMOTED, whose promoting cycle is also a `System.gc()`. So the
- * loop below keeps every collection alive across many explicit collections
- * rather than dropping them, and re-verifies the OLD ones each round — a fresh
- * map that never got promoted cannot express the bug.
+ * The shape that matters is a collection that survives long enough to be
+ * PROMOTED, in a cycle that also runs the old sweep. Hence: keep every bundle
+ * alive across many collections rather than dropping them, and re-verify the
+ * OLD ones each round — a fresh collection that was never promoted cannot
+ * express the bug. `System.gc()` is what makes the old sweep run below the 75%
+ * occupancy threshold.
  *
  * Deterministic output; the runner diffs it against HotSpot.
  *
- *   cratonvm --nojit --Xmx 256m ROverlaySystemGcStress
+ *   cratonvm --java-home <jdk> -cp build ROverlaySystemGcStress
  *
- * KNOWN FAILING with JIT ON against a real JDK, and deliberately NOT wired into
- * `run.sh`'s `CORE_CLASSES` for that reason — it would make the suite red on a
- * defect that has no accepted fix yet:
- *
- *     AssertionError: tm size 0 != 24 (bundle 0)
- *
- * and on `dev`'s own tip, harder:
- *
- *     ClassCastException: class java.lang.Object cannot be cast to Bundle
- *
- * That is defect 4 in
- * `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`:
- * the in-place old-gen sweep returns a LIVE promoted object's block to the free
- * list, because selective promotion leaves the roots on their pre-promotion
- * young addresses and the sweep's seed loop drops them as not-old-gen. Run it
- * by hand when working on that:
- *
- *   cratonvm --java-home <jdk> -cp build ROverlaySystemGcStress        # fails
- *   CRATONVM_OLD_SWEEP_JIT=0 cratonvm --java-home <jdk> -cp build ...  # passes
+ * Fails deterministically on an unfixed tree with JIT ON against a real JDK —
+ * `AssertionError: tm size 0 != 24 (bundle 0)`, and on dev's tip before the fix,
+ * `ClassCastException: class java.lang.Object cannot be cast to Bundle` (the
+ * freed block after another allocation got it). `CRATONVM_OLD_SWEEP_JIT=0` also
+ * makes it pass, which is what localised the defect to that sweep. `--nojit`
+ * passes either way, so run it with the JIT ON.
  */
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
