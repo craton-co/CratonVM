@@ -18835,6 +18835,68 @@ fn execute_instruction(
                                 }
                             }
                         }
+                        // RECLAIMED-LIVE-OBJECT reporter. `java.lang.Object`
+                        // is `ClassId(0)` — also the ALL-ZERO header the young
+                        // sweep writes over every span it reclaims — so a
+                        // checkcast that fails with `java.lang.Object` as the
+                        // ACTUAL class is ambiguous: an ordinary
+                        // `(String) new Object()`, or a reference to an object
+                        // the collector freed while it was still reachable.
+                        //
+                        // Nothing available on this path distinguishes the two
+                        // for free (`zero_forensics` and the sweep ring are
+                        // both gated), so this deliberately does NOT guess.
+                        // It consults the sweep ring, which is populated only
+                        // under `CRATONVM_DBG_SWEEP_ZERO`, and speaks only on a
+                        // HIT — where the address provably was a swept span and
+                        // the ring still knows what class it held. That names
+                        // the root-coverage gap, which is the whole question.
+                        //
+                        // Wiring this here is the point: the ring already had a
+                        // consumer on the stale-RECEIVER (invoke) path, but a
+                        // reclaimed object usually surfaces as a failed CAST
+                        // first, and that path reported nothing — so setting
+                        // the flag and reproducing still produced silence. See
+                        // docs/known-issues/h2/
+                        // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+                        if obj_class_name == "java/lang/Object"
+                            && target_class_name != "java/lang/Object"
+                        {
+                            let addr = obj_ref.as_ptr() as usize;
+                            if let Some((cid, kind, cycle, reason, initiator, blocked)) =
+                                cratonvm_gc::gen_heap::sweep_zero_lookup(addr)
+                            {
+                                static N: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                    let orig = shared
+                                        .classes
+                                        .class_manager
+                                        .try_read()
+                                        .and_then(|cm| {
+                                            cm.class_store
+                                                .get(cratonvm_types::ClassId::new(cid))
+                                                .map(|c| c.name.to_string())
+                                        })
+                                        .unwrap_or_else(|| format!("class_id={cid}"));
+                                    tracing::error!(
+                                        target: "cratonvm::gc::guard",
+                                        obj = format!("{addr:#x}"),
+                                        original_class = %orig,
+                                        original_kind = kind,
+                                        sweep_cycle = cycle,
+                                        gc_reason = reason,
+                                        gc_initiator = initiator,
+                                        threads_blocked = blocked,
+                                        target = %target_binary,
+                                        "checkcast receiver was RECLAIMED BY THE YOUNG SWEEP while \
+                                         still reachable — its header is the all-zero span the \
+                                         sweep wrote. The original class names the root-coverage \
+                                         gap.",
+                                    );
+                                }
+                            }
+                        }
                         return Err(RuntimeError::ClassCastException {
                             message: format!("{obj_binary} cannot be cast to {target_binary}"),
                         }

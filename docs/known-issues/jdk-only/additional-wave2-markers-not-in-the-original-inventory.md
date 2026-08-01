@@ -71,7 +71,7 @@ array **appended at the TAIL**, since `CLASS_ID_OFFSETS` / `ENTRY_PTR_OFFSETS` /
 `NEEDS_CONTEXT_OFFSETS` / `MEGA_*_OFFSET` are all emitted-code immediates.
 
 Fix this together with
-[cached invoke targets drop the `NativeKind`](cached-invoke-targets-drop-the-nativekind.md).
+[cached invoke targets retain and revalidate the `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md).
 A `NativeKind` stored in `CachedInvokeTarget` that is dropped again when the JIT
 installs an MIC slot buys nothing.
 

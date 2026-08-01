@@ -130,6 +130,31 @@ fn read_throwable_field(ctx: &mut dyn NativeContext, this: ObjectRef, field_name
     if !matches!(by_name, Value::Object(None)) {
         return by_name;
     }
+    // `Object(None)` is ambiguous: `get_field_by_name` answers it BOTH for a
+    // name the receiver has no field for (a synthetic stub -> the slot layout
+    // below is the only way to read it) AND for a real-JDK field that simply
+    // holds null. Only the first case may consult `synthetic_throwable_slot`,
+    // so ask whether the receiver's class actually declares/inherits the name.
+    //
+    // Without this check the fallback fired on every real-JDK `Throwable` whose
+    // `cause` is genuinely null and returned raw slot 1 — `detailMessage` in the
+    // real layout — so `getCause()` handed back the message `String`. Callers
+    // walking the cause chain then dispatched `Throwable` methods on a `String`:
+    // `NoSuchMethodError: java.lang.String.getMessage()` out of AssertJ's
+    // `ShouldHaveCause` for the five Spring JCache
+    // `cacheExceptionRewriteCallStack` tests, whose cached exception is a
+    // `SerializationUtils.clone()` round-trip (deserialization writes the fields
+    // directly, so `cause` really is null there rather than holding the JDK's
+    // `cause = this` sentinel). The same fallback also aliased
+    // `suppressedExceptions` onto slot 2 — the real layout's `cause` — so a real
+    // Throwable with no suppressed list reported its cause as one.
+    let class_id = ctx.class_id_of_object(this);
+    if ctx
+        .resolve_field_index_by_class_id(class_id, field_name)
+        .is_some()
+    {
+        return by_name;
+    }
     if let Some(slot) = synthetic_throwable_slot(field_name) {
         if slot < ctx.object_num_fields(this) {
             return ctx.get_field(this, slot);

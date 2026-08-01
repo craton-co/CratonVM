@@ -7684,6 +7684,13 @@ impl GenerationalHeap {
         let retain_dead_objects =
             sweep_zero_enabled() || crate::a2dbg::enabled() || gc_flags().dbg_sweep_census;
         let mut dead_regions: Vec<(usize, usize, u32, u8, usize)> = Vec::new();
+        // CRATONVM_DBG_SWEEP_LIVENESS: bases of the objects this walk decides to
+        // KEEP, so the assertion below can ask whether any of them still points
+        // into a span the walk decided to zero. Collected here rather than by a
+        // second walk because the walk is the only thing that knows the object
+        // grid — re-deriving it is exactly the desync hazard documented on
+        // `mark_young_to_old_refs`.
+        let mut young_survivors: Vec<usize> = Vec::new();
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
         // Index into `dead_regions` at the last trustworthy walk anchor
@@ -8267,6 +8274,9 @@ impl GenerationalHeap {
             } else if side_marked_survivor {
                 // Side-marked survivor: pure retention, no header writes.
                 objects_live += 1;
+                if gc_flags().dbg_sweep_liveness {
+                    young_survivors.push(obj_ptr as usize);
+                }
                 // Family-A fix follow-up: a side-marked survivor is kept in
                 // place exactly like a header-marked one (same "never moves"
                 // guarantee), so it needs the SAME watched-referent identity
@@ -8295,6 +8305,9 @@ impl GenerationalHeap {
                 header.gc_flags &= !GC_FLAG_MARKED;
                 header.gc_age = header.gc_age.saturating_add(1);
                 objects_live += 1;
+                if gc_flags().dbg_sweep_liveness {
+                    young_survivors.push(obj_ptr as usize);
+                }
                 // RandomizedContext WeakHashMap<Thread,...> fix (see
                 // gc_quiescence::is_watched_referent): this survivor is kept
                 // in place at its ORIGINAL address, so selective promotion
@@ -8405,6 +8418,106 @@ impl GenerationalHeap {
                 }
             }
         }
+        // ---- CRATONVM_DBG_SWEEP_LIVENESS, young side ----
+        //
+        // The old-gen half of this assertion (see `old_gen_gc`) came back CLEAN
+        // on the `--nojit` DefaultCatalogAndSchemaTest reproducer: SIGSEGV at
+        // 94/132 with zero hits, so no marked old-gen object still pointed at a
+        // block that sweep freed. But the corrupt receiver in that crash reads
+        // `class_id=0 num_slots=0` — *zeroed* memory — and zeroing is what the
+        // YOUNG sweep does to dead spans, not what `OldGen::free` does (it only
+        // returns the block to a free list, leaving the bytes in place). So the
+        // victim is a young object, and the question moves here.
+        //
+        // Checked from the OLD generation into the young dead spans, because
+        // that is exactly the edge in the failing workload: a promoted bucket
+        // array still pointing at a young chain node. A hit means the young mark
+        // missed an old->young root — the remembered-set/card path — and the
+        // sweep is about to zero a live node.
+        //
+        // Interior hits count: the spans are coalesced, so this asks "does a
+        // live old-gen ref point INTO a doomed span", which also catches a
+        // reference to a field cell rather than the object base.
+        if gc_flags().dbg_sweep_liveness && !dead_regions.is_empty() {
+            let base = from_base;
+            let mut spans: Vec<(usize, usize)> = dead_regions
+                .iter()
+                .map(|&(off, sz, _, _, _)| (base + off, sz))
+                .collect();
+            spans.sort_unstable();
+            let in_doomed = |addr: usize| -> bool {
+                match spans.binary_search_by(|&(s, _)| s.cmp(&addr)) {
+                    Ok(_) => true,
+                    Err(0) => false,
+                    Err(i) => {
+                        let (s, sz) = spans[i - 1];
+                        addr < s + sz
+                    }
+                }
+            };
+            let mut hits: Vec<(usize, u32, usize, usize)> = Vec::new();
+            {
+                // Use the guard this function already holds (taken at the top,
+                // alongside `young_from`). `parking_lot::Mutex` is NOT
+                // reentrant, so re-locking `self.old_gen` here would deadlock
+                // the collector at a safepoint — with every mutator thread
+                // already stopped, i.e. a silent whole-VM hang rather than a
+                // panic.
+                for (obj_ptr, _size) in old_gen.walk_objects() {
+                    // SAFETY: `walk_objects` yields valid old-gen object starts.
+                    let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                    // SAFETY: a walked old-gen object has a valid header and an
+                    // in-bounds body — `for_each_ref_slot`'s contract.
+                    unsafe {
+                        for_each_ref_slot(obj_ptr, h, |ref_ptr, slot| {
+                            let victim = ref_ptr as usize;
+                            if in_doomed(victim) && hits.len() < 64 {
+                                hits.push((victim, h.class_id.as_u32(), obj_ptr as usize, slot));
+                            }
+                        });
+                    }
+                }
+            }
+            // YOUNG->YOUNG. Three prior runs of this assertion came back clean
+            // (old->old, old->young, and the PIN-STALE canary), and the shape
+            // that remains is a young referrer holding a young victim — e.g. a
+            // bucket array and its chain nodes both allocated inside one test
+            // method, never promoted. `young_survivors` is collected by the
+            // walk itself, because the walk is the only thing that knows the
+            // object grid; re-deriving it by a second linear scan is the exact
+            // desync hazard `mark_young_to_old_refs` documents.
+            let young_referrers = std::mem::take(&mut young_survivors);
+            for &obj_ptr in &young_referrers {
+                // SAFETY: these bases came from the sweep walk itself, which
+                // only classifies spans it has parsed as valid object headers.
+                let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                // SAFETY: a survivor has a valid header and an in-bounds body —
+                // `for_each_ref_slot`'s contract.
+                unsafe {
+                    for_each_ref_slot(obj_ptr as *mut u8, h, |ref_ptr, slot| {
+                        let victim = ref_ptr as usize;
+                        if in_doomed(victim) && hits.len() < 64 {
+                            hits.push((victim, h.class_id.as_u32(), obj_ptr, slot));
+                        }
+                    });
+                }
+            }
+            if !hits.is_empty() {
+                eprintln!(
+                    "[SWEEP-LIVENESS young] {} live ref(s) point into {} young span(s) this sweep is about to zero ({} old-gen + {} young survivors scanned)",
+                    hits.len(),
+                    spans.len(),
+                    objects_live,
+                    young_referrers.len(),
+                );
+                for (victim, cid, referrer, slot) in hits.iter().take(12) {
+                    eprintln!(
+                        "[SWEEP-LIVENESS young]   victim=0x{victim:x} <- referrer=0x{referrer:x} class_id={cid} slot={slot}",
+                    );
+                }
+            }
+        }
+
         // Coalesce the newly-dead spans while they are still in walk order.
         // Publishing every object-sized hole first and sorting the arena free
         // list afterward made a bintrees18 collection allocate, sort, and merge
@@ -8958,6 +9071,86 @@ impl GenerationalHeap {
             let watched = crate::gc_quiescence::watched_referents_snapshot();
             let mut watched_survivors: HashMap<usize, usize> = HashMap::new();
             let objects = old_gen.walk_objects();
+
+            // ---- CRATONVM_DBG_SWEEP_LIVENESS: freed-while-referenced assertion ----
+            //
+            // This sweep decides liveness purely from `GC_FLAG_MARKED`, and the
+            // mark that set it has NINE worklist push sites of which only two
+            // validate their input (see
+            // docs/known-issues/gc-old-gen-mark-accepts-unvalidated-addresses.md).
+            // If the mark misses a root, this loop hands a still-referenced
+            // block back to the free list and the damage surfaces only much
+            // later, at whichever unlucky reader dereferences it next — exactly
+            // the shape of the `--nojit` map-node corruption (`tail_node`
+            // reading `num_slots=0 class_id=0` in `native_map_put_evict_pinned`,
+            // already dead before it was ever pinned).
+            //
+            // Catch it AT THE FREE, where victim and referrer are both still
+            // intact, instead of inferring it from the crash site. `=rescue`
+            // additionally retains the referenced block: if the workload then
+            // stops crashing, freed-while-live is proven causal, not correlated.
+            let sweep_liveness = gc_flags().dbg_sweep_liveness;
+            let sweep_rescue = sweep_liveness
+                && gc_flags()
+                    .dbg_sweep_liveness_value
+                    .as_deref()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("rescue"));
+            let mut doomed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            if sweep_liveness {
+                for (obj_ptr, _size) in &objects {
+                    // SAFETY: `walk_objects` yields valid old-gen object starts.
+                    let h = unsafe { &*(*obj_ptr as *const ObjectHeader) };
+                    if h.gc_flags & GC_FLAG_MARKED == 0 {
+                        doomed.insert(*obj_ptr as usize);
+                    }
+                }
+            }
+            // Keyed by victim, so a block referenced from many places is
+            // reported (and rescued) once. Value = (referrer, class_id, slot).
+            let mut referenced_doomed: HashMap<usize, (usize, u32, usize)> = HashMap::new();
+            if sweep_liveness && !doomed.is_empty() {
+                for (obj_ptr, _size) in &objects {
+                    // SAFETY: as above.
+                    let h = unsafe { &*(*obj_ptr as *const ObjectHeader) };
+                    if h.gc_flags & GC_FLAG_MARKED == 0 {
+                        continue; // itself doomed; its refs keep nothing alive
+                    }
+                    // SAFETY: a marked old-gen object has a valid header and an
+                    // in-bounds body — `for_each_ref_slot`'s contract.
+                    unsafe {
+                        for_each_ref_slot(*obj_ptr, h, |ref_ptr, slot| {
+                            let victim = ref_ptr as usize;
+                            if doomed.contains(&victim) {
+                                referenced_doomed.entry(victim).or_insert((
+                                    *obj_ptr as usize,
+                                    h.class_id.as_u32(),
+                                    slot,
+                                ));
+                            }
+                        });
+                    }
+                }
+                if !referenced_doomed.is_empty() {
+                    eprintln!(
+                        "[SWEEP-LIVENESS] {} of {} doomed old-gen blocks are STILL REFERENCED by a live old-gen object{}",
+                        referenced_doomed.len(),
+                        doomed.len(),
+                        if sweep_rescue { " (rescuing)" } else { "" },
+                    );
+                    for (victim, (referrer, referrer_cid, slot)) in referenced_doomed.iter().take(12)
+                    {
+                        // SAFETY: `victim` is a base `walk_objects` yielded.
+                        let vh = unsafe { &*(*victim as *const ObjectHeader) };
+                        eprintln!(
+                            "[SWEEP-LIVENESS]   victim=0x{victim:x} class_id={} num_slots={} \
+                             <- referrer=0x{referrer:x} class_id={referrer_cid} slot={slot}",
+                            vh.class_id.as_u32(),
+                            vh.num_slots(),
+                        );
+                    }
+                }
+            }
+
             for (obj_ptr, total_size) in objects {
                 // SAFETY: `walk_objects` returns valid old-gen object starts.
                 // Marked objects remain at their current address; every other
@@ -8972,6 +9165,15 @@ impl GenerationalHeap {
                     {
                         watched_survivors.insert(obj_ptr as usize, obj_ptr as usize);
                     }
+                } else if sweep_rescue && referenced_doomed.contains_key(&(obj_ptr as usize)) {
+                    // CRATONVM_DBG_SWEEP_LIVENESS=rescue: a live object still
+                    // points here, so keep the block. Diagnostic only — this
+                    // leaks whatever the mark genuinely missed, and exists to
+                    // answer "is freed-while-live the cause?" with a run, not
+                    // an argument. Clear the mark bit like the survivor arm so
+                    // the next cycle starts from a clean slate.
+                    let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
+                    header.gc_flags &= !GC_FLAG_MARKED;
                 } else {
                     // A2 forensic breadcrumb (CRATONVM_DBG_A2): preserve the
                     // victim's pre-free identity so a later zero-header /
@@ -14381,6 +14583,59 @@ mod tests {
             !vm.is_addr_live(doomed_addr),
             "is_addr_live reported a block the non-moving old-gen sweep just \
              freed in place (0x{doomed_addr:x}) as still live",
+        );
+    }
+
+    /// `CRATONVM_DBG_SWEEP_LIVENESS` must not cry wolf.
+    ///
+    /// The assertion's whole value is that a hit means something real, because
+    /// it is meant to be read off a 30-minute workload where a noisy detector is
+    /// worse than none. Its dangerous failure mode is therefore a FALSE
+    /// POSITIVE: flagging a block as "freed while referenced" when the mark did
+    /// its job and the block is genuinely retained.
+    ///
+    /// This drives the exact shape it inspects — a promoted holder whose ref
+    /// slot points at a promoted victim, swept with only the holder rooted — and
+    /// requires that the BFS marks the victim through that slot, so the victim
+    /// is not doomed at all and the detector has nothing to report.
+    ///
+    /// NOTE ON THE POSITIVE CASE: a true positive cannot be staged from this
+    /// level, because a marked referrer's slots are exactly what the BFS
+    /// traverses — by construction the victim gets marked too. Producing one
+    /// needs a genuinely missed root (e.g. the documented linear-walk desync in
+    /// `mark_young_to_old_refs`, which abandons the rest of the young->old scan),
+    /// which is what the assertion exists to catch in a real workload.
+    #[test]
+    fn sweep_liveness_assertion_does_not_flag_a_victim_the_bfs_legitimately_marks() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 8 * 1024);
+        let monitors = NoOpMonitors;
+
+        let holder = heap.alloc_object(ClassId::new(0), 1);
+        let victim = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(victim, 0, Value::Int(7));
+        heap.set_field(holder, 0, Value::Object(Some(victim)));
+
+        let mut roots = vec![holder, victim];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        assert!(
+            heap.is_in_old(roots[0].as_ptr()) && heap.is_in_old(roots[1].as_ptr()),
+            "both objects must be promoted before the old-gen sweep is meaningful",
+        );
+        let holder = roots[0];
+        let victim_addr = roots[1].as_ptr() as usize;
+
+        // Only the holder is rooted; the victim must survive via the holder's
+        // ref slot, which is precisely the edge the detector inspects.
+        let live = vec![holder];
+        let (_reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live);
+
+        let vm = crate::vm_heap::VmHeap::Generational(heap);
+        assert!(
+            vm.is_addr_live(victim_addr),
+            "the BFS must mark a victim reachable from a live holder's ref slot; \
+             if this fails the detector's premise is wrong, not just its output",
         );
     }
 

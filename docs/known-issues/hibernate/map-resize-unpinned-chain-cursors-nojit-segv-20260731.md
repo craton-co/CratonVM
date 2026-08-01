@@ -593,6 +593,47 @@ collection roots an already-stale address. Given the canary result this is
 live the moment moving-young engages (its own open doc). Fixed by pinning across
 the materialisation and re-reading after it.
 
+## Follow-up 3 — 2026-08-01: the victim has NO heap referrer at sweep time
+
+A freed-while-referenced assertion (`CRATONVM_DBG_SWEEP_LIVENESS`, on
+`codex/gc-sweep-liveness-assert-20260731`) now covers every heap→heap edge into
+a block a sweep is about to reclaim, and all of them come back clean on this
+reproducer. Five detectors, five negatives, each from a full failing run:
+
+| # | detector | covers | result |
+|---|---|---|---|
+| 1 | `CRATONVM_DBG_BLOCKGC` PIN-STALE | any pin of an already-forwarded address | 0 hits |
+| 2 | `SWEEP-LIVENESS` (old-gen sweep) | marked old-gen -> doomed old-gen | 0 hits |
+| 3 | `SWEEP-LIVENESS young` | old-gen -> doomed young span | 0 hits |
+| 4 | `SWEEP-LIVENESS young` | young survivor -> doomed young span | 0 hits |
+| 5 | all of the above armed together | — | SIGSEGV 94/132 anyway |
+
+**What that eliminates.** "The mark missed a heap edge" is now excluded in both
+generations and both directions. At the moment a block is reclaimed, no live
+heap object points at it — so from the collector's point of view the reclaim is
+CORRECT.
+
+**What that leaves.** The only referrer is something that is neither a heap
+object nor a GC root: a native-side Rust local, a side table, or a cache. The
+node genuinely became garbage while native code was still using it — the same
+family as `HIB-MAPRESIZE-STALE.1` and `HIB-MAPPUT-PINORDER.1`, both fixed on
+this branch, which says at least one more unpinned holder is still out there.
+That reframes the hunt a third time: not "which root did the mark miss" but
+"which native local is the last reference".
+
+**Caveat, stated plainly.** Each row is ONE run of a high-variance failure —
+this reproducer has produced drop counts of 0, 91, 174, 375 and 606 and crashed
+anywhere between 74 and 104 tests. Run 5 produced no dropped writes at all, so
+the observable corruption signal was absent even though the process still died.
+A clean detector on one run is evidence, not proof; these detectors are cheap to
+re-arm and worth re-running before treating the eliminations as final.
+
+**Next probe, concretely.** Stop asking the collector and start asking the
+allocator: record every node address the map natives allocate together with its
+holder, and have the sweep report when it reclaims one whose holder has not
+released it. That turns "some native local" into a named call site, which is
+what three rounds of collector-side detectors could not do.
+
 ## Related
 
 - `docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md` — defect
