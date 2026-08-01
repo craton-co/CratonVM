@@ -1178,8 +1178,13 @@ mod tests {
 
     /// Each failure kind is distinguishable — the whole point of not using
     /// `Option`.
+    ///
+    /// Eight of the nine kinds; `Pending` is excluded because constructing one
+    /// needs a live heap `ObjectRef`, which a unit test here cannot mint. Its
+    /// discriminant is covered by `ResolveError::kind`'s exhaustive match: the
+    /// compiler fails that match if a variant is added without a kind.
     #[test]
-    fn every_failure_kind_is_distinguishable() {
+    fn every_constructible_failure_kind_is_distinguishable() {
         let cases: Vec<(ResolveError, ResolveErrorKind)> = vec![
             (
                 ResolveError::NoSuchMethod {

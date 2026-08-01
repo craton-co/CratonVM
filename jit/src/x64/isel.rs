@@ -2388,6 +2388,68 @@ pub fn decode(bytes: &[u8], has_modrm: bool) -> Option<Decoded> {
     Some(d)
 }
 
+fn reg_name(kind: OpKind, reg: u8) -> &'static str {
+    let idx = usize::from(reg & 15);
+    match kind {
+        OpKind::Xmm => XMM_NAMES[idx],
+        _ => GPR64_NAMES[idx],
+    }
+}
+
+fn mem_text(base: u8, index: Option<u8>, scale: u8, disp: i64) -> String {
+    let mut s = format!("[{}", GPR64_NAMES[usize::from(base & 15)]);
+    if let Some(ix) = index {
+        s.push_str(&format!(" + {}*{}", GPR64_NAMES[usize::from(ix & 15)], scale));
+    }
+    if disp < 0 {
+        s.push_str(&format!(" - {}", disp.unsigned_abs()));
+    } else if disp > 0 {
+        s.push_str(&format!(" + {disp}"));
+    }
+    s.push(']');
+    s
+}
+
+/// Render a decoded instruction as text.
+///
+/// Operands are listed in **ModRM field order** — the `reg` field first, then
+/// the `r/m` field — not in Intel destination-first order, because half the
+/// x86 opcodes swap those roles and a rendering that quietly reorders them
+/// would hide exactly the mistake this is here to catch.
+///
+/// The pattern supplies one thing the byte stream cannot: whether a register
+/// field names a GPR or an XMM register. Everything else comes from `d`.
+pub fn render(p: &Pattern, d: &Decoded) -> String {
+    let mut ops: Vec<String> = Vec::new();
+    if p.enc.modrm {
+        match p.enc.reg {
+            RegF::Dst => ops.push(reg_name(p.dst, d.reg().unwrap_or(0)).to_string()),
+            RegF::Src => ops.push(reg_name(p.src, d.reg().unwrap_or(0)).to_string()),
+            RegF::Ext(n) => ops.push(format!("/{n}")),
+        }
+        match p.enc.rm {
+            RmF::RegDst => ops.push(reg_name(p.dst, d.rm_reg().unwrap_or(0)).to_string()),
+            RmF::RegSrc => ops.push(reg_name(p.src, d.rm_reg().unwrap_or(0)).to_string()),
+            RmF::Mem => ops.push(mem_text(
+                d.base().unwrap_or(0),
+                d.index(),
+                d.scale().unwrap_or(1),
+                d.disp,
+            )),
+            RmF::None => {}
+        }
+    } else if matches!(p.enc.opcode, Opcode::PlusReg(_)) {
+        // The register is folded into the opcode byte; recover it from there.
+        let low = d.opcode.last().copied().unwrap_or(0) & 7;
+        let full = ((d.rex.unwrap_or(0) & 0x01) << 3) | low;
+        ops.push(reg_name(p.dst, full).to_string());
+    }
+    if !d.imm.is_empty() {
+        ops.push(format!("imm{:02X?}", d.imm));
+    }
+    format!("{:?}({}) {}", p.op, p.name, ops.join(", "))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3730,7 +3792,12 @@ mod tests {
                     }
                     let d = decode(&e.bytes, p.enc.modrm)
                         .unwrap_or_else(|| panic!("`{}` produced undecodable bytes", p.name));
-                    assert_eq!(d.len, e.bytes.len(), "`{}` decoder length", p.name);
+                    let text = render(p, &d);
+                    assert_eq!(d.len, e.bytes.len(), "{text}: decoder length");
+                    assert!(
+                        !text.is_empty(),
+                        "every pattern must disassemble to something readable"
+                    );
 
                     // The opcode came back intact.
                     match p.enc.opcode {

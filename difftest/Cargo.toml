@@ -19,6 +19,7 @@ exclude = [
     "seeds/**",
     "seeds-jdk-only/**",
     "corpus/**",
+    "corpus-opcodes/**",
     "regression/**",
     "**/*.class",
 ]
