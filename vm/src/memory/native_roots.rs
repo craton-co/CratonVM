@@ -263,6 +263,27 @@ fn scan_logmanager(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
 fn remap_logmanager(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
     cratonvm_native_builtins::logmanager::gc_update_logmanager_refs(shared.vm_identity, map);
 }
+// Per-VM for the same reason as the logmanager above: the security manager, the
+// default `Policy` object and the shared `Permissions` collection are keyed on
+// `vm_identity` in `native-builtins`, so reporting another VM's address here
+// would hand the collector a pointer into a heap it does not own.
+//
+// The remap half is the load-bearing one. These refs used to be cached in
+// process-global statics the collector never rewrote — only the per-VM
+// `var_handle_roots` registry entry was remapped, leaving the cached copy stale
+// across a moving collection.
+fn scan_security_manager(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::security_manager::gc_scan_security_manager_roots(
+        shared.vm_identity,
+        roots,
+    );
+}
+fn remap_security_manager(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::security_manager::gc_update_security_manager_refs(
+        shared.vm_identity,
+        map,
+    );
+}
 fn scan_annotations(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(roots);
 }
@@ -341,6 +362,11 @@ fn remap_upcalls(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
 /// Compile-time inventory of every VM/native side table that owns movable
 /// references. Adding a source requires supplying scan and remap together.
 static VM_ROOT_SOURCES: &[VmRootSource] = &[
+    root_source!(
+        "security-manager",
+        scan_security_manager,
+        remap_security_manager
+    ),
     root_source!("boxed-value-caches", scan_value_caches, remap_value_caches),
     root_source!("unsafe-side-store", scan_unsafe, remap_unsafe),
     root_source!(

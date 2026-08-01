@@ -2608,6 +2608,10 @@ impl Compiler {
             bci: bci as u32,
             reason,
             action: DeoptAction::Reinterpret,
+            // Behaviour-preserving: `for_reason` is exactly the per-`DeoptReason`
+            // prose convention this site already relied on, now written down in
+            // one place instead of being inferred by each resume sink.
+            semantics: crate::deopt::ResumeSemantics::for_reason(reason),
             speculation_id: 0,
             frame_state: FrameState {
                 // Deopt-frame identity (jit-invokedynamic-groovy-regression root
