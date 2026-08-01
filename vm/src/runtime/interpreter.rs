@@ -1218,8 +1218,8 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // interpreter intrinsic), confirming the watch machinery works and that
         // a watched EC field really did flip to a small value before this GC.
         if crate::runtime::ec_watch::enabled() {
-            let watched = crate::runtime::ec_watch::size();
-            let gc_hits = crate::runtime::ec_watch::detect();
+            let watched = crate::runtime::ec_watch::size(shared.vm_identity);
+            let gc_hits = crate::runtime::ec_watch::detect(shared.vm_identity);
             if !gc_hits.is_empty() {
                 eprintln!(
                     "[ecwatch-GC] {} CORRUPTED-at-GC of {} watched cells:",
@@ -1270,12 +1270,12 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // relocated survivors — REMAP each watched holder through the
             // pointer_map so watches PERSIST across this GC (the corruption
             // frequently hits an object that survived the GC that wrote it).
-            crate::runtime::ec_watch::remap(&result.pointer_map);
+            crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
             // GC-EXIT detect: a watched cell that was clean at GC ENTRY (above)
             // but reads 0x4 here was corrupted *by collect_garbage itself*
             // (between entry and exit) — isolating GC-vs-mutator definitively.
             if crate::runtime::ec_watch::enabled() {
-                for (holder, idx, expected, now) in crate::runtime::ec_watch::detect() {
+                for (holder, idx, expected, now) in crate::runtime::ec_watch::detect(shared.vm_identity) {
                     eprintln!(
                         "[ecwatch-GCEXIT] holder@0x{holder:x} fld[{idx}]: 0x{expected:x} -> 0x{now:x} (corrupted DURING collect_garbage)"
                     );
@@ -1483,7 +1483,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // Update shared VM state (statics, string pool, etc.)
                 update_all_roots(shared, thread, &result.pointer_map);
                 // DBG (bc math-ec): remap watchpoints through the pointer_map.
-                crate::runtime::ec_watch::remap(&result.pointer_map);
+                crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
 
                 tracing::debug!(
                     "GC completed (multi-thread, {} threads): {} objects copied, {} bytes freed",
@@ -1654,7 +1654,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             .0;
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
-        crate::runtime::ec_watch::remap(&result.pointer_map);
+        crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
         // T19.3.G1 — count forced cycles (allocation-failure-driven) too.
         shared
             .mem
@@ -1723,7 +1723,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             // pairing at maybe_gc:419 / maybe_gc_forced:636); this multi-threaded
             // initiator path was missing it, so a relocating G1 evacuation left
             // ec_watch holders stale and the watchpoint read moved-away memory.
-            crate::runtime::ec_watch::remap(&result.pointer_map);
+            crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
             shared.mem.heap.clear_jit_tlab_skip_regions(); // BUG-03
@@ -1924,7 +1924,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         );
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
-        crate::runtime::ec_watch::remap(&result.pointer_map);
+        crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
         // Enqueue dead finalizable objects (their new addresses) for finalization
         for new_addr in &dead_finalizers {
             shared.mem.finalizer_thread.enqueue(*new_addr);
@@ -1996,7 +1996,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             // Step 5 GAP D: keep the ec_watch corruption-watch table consistent
             // across this multi-threaded finalizer collection (single-threaded
             // paths already remap it; this initiator path was missing the call).
-            crate::runtime::ec_watch::remap(&result.pointer_map);
+            crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
             for new_addr in &dead_finalizers {
                 shared.mem.finalizer_thread.enqueue(*new_addr);
             }
@@ -18770,6 +18770,7 @@ fn execute_instruction(
                     let recv_cid = shared.mem.heap.class_id_of(obj_ref);
                     if ec_is_watched_class(shared, recv_cid) {
                         crate::runtime::ec_watch::record(
+                            shared.vm_identity,
                             obj_ref,
                             field.field_index,
                             // Cast: object/code pointer to integer address
