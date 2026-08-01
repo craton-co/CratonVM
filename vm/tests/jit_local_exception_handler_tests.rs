@@ -249,6 +249,29 @@ fn test_precise_handler_frame_keeps_a_handler_only_local() {
     assert_eq!(precise_handler_mismatches("scopeMismatches"), 0);
 }
 
+#[test]
+fn test_compiled_callee_handler_resume_keeps_the_loop_iterator() {
+    if !precise_handler_frame_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    // `loopStep` is the `BindConverter.convert` shape: the non-parameter local
+    // at risk is the loop's own `Iterator`, which the handler never touches —
+    // it is read by the loop head the handler falls through to.
+    //
+    // The exception reaches `run_jit_callee_handler` (the sink that resumes a
+    // compiled CALLEE at its own handler, entered only when a COMPILED caller
+    // dispatched it — hence `loopCall`), and that sink rebuilt the frame from
+    // the incoming arguments alone, ignoring the precise reason-9 frame the
+    // compiled body had published. The iterator resumed as null and the next
+    // `hasNext()` NPE'd, taking 27 of 43 `LiquibaseAutoConfigurationTests`
+    // methods with it.
+    //
+    // Differential on one binary: `CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME=1`
+    // ⇒ 19498/20000 mismatches; default ⇒ 0.
+    assert_eq!(precise_handler_mismatches("loopMismatches"), 0);
+}
+
 fn osr_loop_progress_class_files_available() -> bool {
     let dir = test_resources_dir();
     std::path::Path::new(&format!("{dir}/cratonvm/JitOsrLoopProgress.class")).exists()

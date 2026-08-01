@@ -1094,7 +1094,10 @@ mod tests {
     #[test]
     fn gated_eq_ignores_stderr_unless_the_normalizer_gates_it() {
         let a = obs("42", "[cratonvm] chatter", Some(0));
-        let b = obs("42", "different chatter entirely", Some(0));
+        // Both must be *VM* chatter for the profile normalizer to strip both;
+        // `strip_vm_diagnostics` keys on the `[cratonvm]`/`[NativeBridge]`
+        // markers, so an unmarked line survives and is compared.
+        let b = obs("42", "[cratonvm] different chatter entirely", Some(0));
         assert!(gated_eq(&a, &b, &Normalizer::strict()));
         // Under the profile normalizer, chatter is stripped from both, so they
         // still match — drift is judged on what's left.

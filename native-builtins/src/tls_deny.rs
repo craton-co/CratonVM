@@ -524,8 +524,30 @@ mod tests {
     /// with no entry is a new silent-downgrade hole.
     #[test]
     fn every_plaintext_base_overload_is_accounted_for() {
-        let mut r = NativeMethodRegistry::new();
-        crate::phases_early::register_phase52_server_socket_factory(&mut r);
+        // The plaintext base only registers these overloads in SYNTHETIC
+        // net-socket mode. `real_net_sockets` is default-ON, and the registry
+        // drops every `javax/net/SocketFactory` native when it is — by
+        // design, so real JDK bytecode drives the real socket path. Without
+        // this override the registry is EMPTY here and the census below
+        // asserts against nothing, which is what made this test fail on a
+        // default build rather than on a broken one.
+        let r = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_SYNTHETIC_NET_SOCKETS", Some("1"))],
+            || {
+                let mut r = NativeMethodRegistry::new();
+                crate::phases_early::register_phase52_server_socket_factory(&mut r);
+                r
+            },
+        );
+        assert!(
+            r.find(
+                "javax/net/SocketFactory",
+                "getDefault",
+                "()Ljavax/net/SocketFactory;"
+            )
+            .is_some(),
+            "the synthetic-net-sockets override did not take effect, so the census below would pass vacuously"
+        );
 
         let socket_descs = [
             "()Ljava/net/Socket;",

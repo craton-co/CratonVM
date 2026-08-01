@@ -5009,6 +5009,16 @@ pub(crate) fn write_field_accessible_external(
 
 // --- Field getters (simple field reads) ---
 
+// `Field.getName` is registered `()Ljava/lang/String;`, `Field.getType`
+// `()Ljava/lang/Class;` and `Field.getDeclaringClass` `()Ljava/lang/Class;`,
+// so none of them may return a primitive `Value`. A plain `get_field_by_name`
+// can: it is not descriptor-aware, so an unwritten reference slot on a Field
+// mirror answers `Value::Int(0)` rather than `Object(None)`, and that tag then
+// reaches bytecode about to `areturn`/`checkcast` a reference. `ref_field`
+// reads by resolved index (descriptor-decoded) and degrades any non-reference
+// tag to null. `getModifiers` below is `()I` and stays on the by-name read —
+// there `Int(0)` is the correct answer for an unwritten slot.
+// See `docs/known-issues/by-name-field-reads.md`.
 pub(crate) fn native_field_get_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5017,7 +5027,7 @@ pub(crate) fn native_field_get_name(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "name")))
+    Ok(Some(crate::field_read::ref_field(ctx, this, "name")))
 }
 
 pub(crate) fn native_field_get_type(
@@ -5028,7 +5038,7 @@ pub(crate) fn native_field_get_type(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "type")))
+    Ok(Some(crate::field_read::ref_field(ctx, this, "type")))
 }
 
 pub(crate) fn native_field_get_modifiers(
@@ -5050,7 +5060,7 @@ pub(crate) fn native_field_get_declaring_class(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "clazz")))
+    Ok(Some(crate::field_read::ref_field(ctx, this, "clazz")))
 }
 
 fn ensure_static_field_declaring_class_initialized(
@@ -6687,6 +6697,9 @@ pub(crate) fn method_modifiers_value(
     method_int_field_value_or_legacy(ctx, method_obj, "modifiers", METHOD_LEGACY_SLOT_MODIFIERS)
 }
 
+/// `Method.getName` — `()Ljava/lang/String;`. See `native_field_get_name`:
+/// a by-name read cannot return a reference-typed answer for an unwritten
+/// slot, so resolve and read by index instead.
 pub(crate) fn native_method_get_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -6695,7 +6708,7 @@ pub(crate) fn native_method_get_name(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "name")))
+    Ok(Some(crate::field_read::ref_field(ctx, this, "name")))
 }
 
 pub(crate) fn native_method_get_return_type(
@@ -9116,7 +9129,14 @@ pub(crate) fn native_constructor_get_parameter_types(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "parameterTypes")))
+    // `()[Ljava/lang/Class;` — an array-typed return. `get_field_by_name`
+    // answers `Int(0)` for an unwritten `[…`-descriptor slot, which then
+    // reaches an `arraylength`/`aaload` as a non-reference.
+    Ok(Some(crate::field_read::ref_field(
+        ctx,
+        this,
+        "parameterTypes",
+    )))
 }
 
 pub(crate) fn native_constructor_get_modifiers(
@@ -9138,7 +9158,7 @@ pub(crate) fn native_constructor_get_declaring_class(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "clazz")))
+    Ok(Some(crate::field_read::ref_field(ctx, this, "clazz")))
 }
 
 pub(crate) fn native_constructor_get_parameter_count(
@@ -14427,7 +14447,9 @@ pub(crate) fn native_field_get_generic_type(
     }
     // Fallback: when no Signature attribute, getGenericType() в‰Ў getType().
     // The `type` field is the Class<?> mirror at the JDK-native layout slot.
-    Ok(Some(ctx.get_field_by_name(this, "type")))
+    // `()Ljava/lang/reflect/Type;` — read by resolved index so an unwritten
+    // slot answers null rather than `Int(0)`.
+    Ok(Some(crate::field_read::ref_field(ctx, this, "type")))
 }
 
 /// RecordComponent.getGenericType() вЂ” returns Type from the component's
@@ -14472,8 +14494,9 @@ pub(crate) fn native_record_component_get_generic_type(
             }
         }
     }
-    // Fallback: getGenericType() в‰Ў getType().
-    Ok(Some(ctx.get_field_by_name(this, "type")))
+    // Fallback: getGenericType() в‰Ў getType(). `()Ljava/lang/reflect/Type;` —
+    // see `native_field_get_generic_type` above.
+    Ok(Some(crate::field_read::ref_field(ctx, this, "type")))
 }
 
 // --- java.lang.reflect.Modifier ---

@@ -864,14 +864,21 @@ fn stw_take_over_and_wait(
         // Helper-window roots are conservative (unprovable coverage) — the
         // collection must stay non-moving so a false-positive candidate can
         // only over-retain, never relocate under a live JIT/blocked frame.
-        // xt-hardening (2026-07-03): this flag now ALSO disables selective
-        // promotion for the cycle (a frozen peer's registers can hold only a
-        // derived/interior pointer whose base would otherwise be evacuated
-        // from under it, then zeroed and re-served). Scoped to cycles with
-        // actually-frozen/scanned peers — reserved TLAB tails alone freeze
-        // nobody, and gating on them would starve promotion on every
-        // cooperative multi-threaded cycle.
+        // xt-hardening (2026-07-03): such a cycle ALSO disables selective
+        // promotion (a frozen peer's registers can hold only a derived/interior
+        // pointer whose base would otherwise be evacuated from under it, then
+        // zeroed and re-served). Scoped to cycles with actually-frozen/scanned
+        // peers — reserved TLAB tails alone freeze nobody, and gating on them
+        // would starve promotion on every cooperative multi-threaded cycle.
+        //
+        // HIB-GCOVERHEAD-HALFFULL.1: the promotion half now travels on its own
+        // narrow flag. `mark_moving_young_coverage_incomplete` acquired dozens
+        // of unrelated callers (every unproven compiled-frame oop map) and had
+        // stopped meaning "un-rewritable peer state" — see
+        // `gc_quiescence::unrewritable_peer_state`. Both are set here because
+        // this cycle genuinely satisfies both.
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
+        cratonvm_gc::gc_quiescence::mark_unrewritable_peer_state();
     }
     taken
 }
@@ -1211,8 +1218,8 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // interpreter intrinsic), confirming the watch machinery works and that
         // a watched EC field really did flip to a small value before this GC.
         if crate::runtime::ec_watch::enabled() {
-            let watched = crate::runtime::ec_watch::size();
-            let gc_hits = crate::runtime::ec_watch::detect();
+            let watched = crate::runtime::ec_watch::size(shared.vm_identity);
+            let gc_hits = crate::runtime::ec_watch::detect(shared.vm_identity);
             if !gc_hits.is_empty() {
                 eprintln!(
                     "[ecwatch-GC] {} CORRUPTED-at-GC of {} watched cells:",
@@ -1263,12 +1270,12 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // relocated survivors — REMAP each watched holder through the
             // pointer_map so watches PERSIST across this GC (the corruption
             // frequently hits an object that survived the GC that wrote it).
-            crate::runtime::ec_watch::remap(&result.pointer_map);
+            crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
             // GC-EXIT detect: a watched cell that was clean at GC ENTRY (above)
             // but reads 0x4 here was corrupted *by collect_garbage itself*
             // (between entry and exit) — isolating GC-vs-mutator definitively.
             if crate::runtime::ec_watch::enabled() {
-                for (holder, idx, expected, now) in crate::runtime::ec_watch::detect() {
+                for (holder, idx, expected, now) in crate::runtime::ec_watch::detect(shared.vm_identity) {
                     eprintln!(
                         "[ecwatch-GCEXIT] holder@0x{holder:x} fld[{idx}]: 0x{expected:x} -> 0x{now:x} (corrupted DURING collect_garbage)"
                     );
@@ -1476,7 +1483,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // Update shared VM state (statics, string pool, etc.)
                 update_all_roots(shared, thread, &result.pointer_map);
                 // DBG (bc math-ec): remap watchpoints through the pointer_map.
-                crate::runtime::ec_watch::remap(&result.pointer_map);
+                crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
 
                 tracing::debug!(
                     "GC completed (multi-thread, {} threads): {} objects copied, {} bytes freed",
@@ -1647,7 +1654,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             .0;
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
-        crate::runtime::ec_watch::remap(&result.pointer_map);
+        crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
         // T19.3.G1 — count forced cycles (allocation-failure-driven) too.
         shared
             .mem
@@ -1716,7 +1723,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             // pairing at maybe_gc:419 / maybe_gc_forced:636); this multi-threaded
             // initiator path was missing it, so a relocating G1 evacuation left
             // ec_watch holders stale and the watchpoint read moved-away memory.
-            crate::runtime::ec_watch::remap(&result.pointer_map);
+            crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
             shared.mem.heap.clear_jit_tlab_skip_regions(); // BUG-03
@@ -1735,8 +1742,9 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
 }
 
 /// Default number of consecutive unproductive allocation-failure GCs (each
-/// leaving the heap ≥98% full) after which the allocation paths declare OOM
-/// instead of continuing to GC-thrash. Overridable via
+/// freeing < 2% of capacity *while the old generation cannot absorb 2% of
+/// capacity* — see [`note_gc_productivity`]) after which the allocation paths
+/// declare OOM instead of continuing to GC-thrash. Overridable via
 /// `CRATONVM_GC_OVERHEAD_LIMIT` (set to `0` to disable the limit entirely).
 const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 
@@ -1745,7 +1753,9 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// the bytes it freed: `before - after` live bytes, where `before` is the live
 /// set at `maybe_gc_forced` entry (post-TLAB-retire) and `after` is the live set
 /// once the collection finishes. A forced GC that freed < 2% of total heap
-/// capacity counts toward the GC-overhead streak; one that freed more resets it.
+/// capacity counts toward the GC-overhead streak — provided the old generation
+/// is also too full to absorb 2% of capacity, see the HIB-GCOVERHEAD-HALFFULL.1
+/// note below; one that freed more resets the streak either way.
 ///
 /// The *freed-amount* signal (not post-GC fullness) is the right one for a
 /// generational heap: in a retained-allocation death-spiral the young semi-space
@@ -1760,6 +1770,27 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// more than 2% and resets it.
 /// Forced GCs only happen on genuine allocation failure (young full *and*
 /// promotion blocked), so this never fires during ordinary young-GC churn.
+///
+/// HIB-GCOVERHEAD-HALFFULL.1 (2026-07-31) — the freed-bytes test is only HALF
+/// of HotSpot's `UseGCOverheadLimit`, which additionally requires a free-space
+/// condition before it will convert GC pressure into an `OutOfMemoryError`.
+/// Without that half, any defect that stops young draining reads identically to
+/// the death spiral: `DefaultCatalogAndSchemaTest` died with `OutOfMemoryError`
+/// after thirty forced GCs on a heap that was **49 % full with 570 MB free**,
+/// because a 5 KB array allocation ran into a latched streak rather than a full
+/// heap. The condition added here is the death spiral's own defining fact, taken
+/// straight from the paragraph above: *"a wedged, ~full old generation cannot
+/// absorb 2 % of total heap capacity per cycle"*. So a cycle counts toward the
+/// streak only when the old generation genuinely cannot absorb that much. It is
+/// deliberately NOT a total-fullness gate — those were rejected for the reason
+/// stated above, and rightly.
+///
+/// This is the safety net, not the fix. The `promoted=0`-forever condition that
+/// exposed it was a real collector defect (selective promotion switched off by a
+/// flag that had changed meaning — see `gc_quiescence::unrewritable_peer_state`)
+/// and is fixed at its source. What this guarantees is that the next such defect
+/// surfaces as slowness, which is diagnosable, rather than as a spurious OOM on
+/// a half-empty heap, which is not.
 fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: u64) {
     let cap = shared.mem.heap.heap_capacity();
     if cap == 0 {
@@ -1782,9 +1813,17 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: 
     let freed = before_live
         .saturating_sub(after_live)
         .saturating_add(promoted);
-    // unproductive: freed < 2% of capacity
+    // The free-space half (see the doc comment): the old generation must be
+    // unable to absorb 2% of total capacity — the death spiral's own definition
+    // of "wedged" — before a sliver-freeing cycle counts toward the streak.
+    // Same 2%-of-`cap` yardstick as the freed-bytes test, so the two halves
+    // cannot drift apart.
+    let old_headroom = shared.mem.heap.old_gen_headroom();
     // Cast: numeric/representation conversion
-    let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
+    let old_gen_wedged = (old_headroom as u128) * 100 < (cap as u128) * 2;
+    // unproductive: freed < 2% of capacity AND the old gen is wedged
+    let freed_sliver = (freed as u128) * 100 < (cap as u128) * 2;
+    let unproductive = freed_sliver && old_gen_wedged;
     let streak = if unproductive {
         shared
             .mem
@@ -1800,14 +1839,20 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: 
     };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
         eprintln!(
-            "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
+            "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} \
+             freed={freed} cap={cap} old_headroom={old_headroom} freed_sliver={freed_sliver} \
+             old_gen_wedged={old_gen_wedged} unproductive={unproductive} streak={streak}"
         );
     }
 }
 
 /// Returns `true` when the heap has GC-thrashed past the overhead limit — i.e.
 /// `GC_OVERHEAD_LIMIT_CYCLES` consecutive forced GCs each freed < 2% of the
-/// heap. The allocation-failure paths call this right after `maybe_gc_forced`
+/// heap while the old generation was too full to absorb that much (both halves
+/// required — see `note_gc_productivity`, and
+/// `docs/internal/fixed-suite-bugs/hibernate/` for the spurious-OOM-at-49%-full
+/// report that added the second half).
+/// The allocation-failure paths call this right after `maybe_gc_forced`
 /// and, when it is `true`, surface a catchable `OutOfMemoryError` (the
 /// pre-allocated `singleton_oom`) instead of retrying into an O(n²) death-spiral
 /// on a heap full of live (retained) objects. Mirrors HotSpot's
@@ -1879,7 +1924,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         );
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
-        crate::runtime::ec_watch::remap(&result.pointer_map);
+        crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
         // Enqueue dead finalizable objects (their new addresses) for finalization
         for new_addr in &dead_finalizers {
             shared.mem.finalizer_thread.enqueue(*new_addr);
@@ -1951,7 +1996,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             // Step 5 GAP D: keep the ec_watch corruption-watch table consistent
             // across this multi-threaded finalizer collection (single-threaded
             // paths already remap it; this initiator path was missing the call).
-            crate::runtime::ec_watch::remap(&result.pointer_map);
+            crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
             for new_addr in &dead_finalizers {
                 shared.mem.finalizer_thread.enqueue(*new_addr);
             }
@@ -7632,7 +7677,7 @@ pub fn execute(
 
                     // Try to compile
                     let param_slots = args.len();
-                    let helpers = crate::jit::helpers::build_helpers();
+                    let helpers = crate::jit::helpers::build_helpers_for(shared);
                     // HIB-CV-20 — like the OSR path (and unlike the legacy
                     // `x64::compile` wrapper, which hardcodes `param_oop_mask = 0`),
                     // seed the local-oop dataflow with this method's reference
@@ -7985,7 +8030,7 @@ pub fn execute(
                             // hasn't been consulted yet (no frame pushed). Instead, save the
                             // exception and fall through to the interpreter, which will push a
                             // frame and route through the exception table.
-                            if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+                            if let Some(exc) = crate::jit::helpers::take_jit_pending_exception(thread) {
                                 // This legacy sink routes the exception against a
                                 // freshly pushed, method-entry frame rather than
                                 // through `route_jit_signal_exception`, so a frame
@@ -8445,7 +8490,7 @@ pub fn execute(
             frame.method_descriptor()
         );
     }
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
     if shared
         .mem
         .gc_barrier
@@ -8487,7 +8532,11 @@ pub fn execute(
                     .stack
                     .push(Value::Object(Some(exc_ref)));
                 thread.frames[frame_idx].pc = handler_pc;
-                fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                fire_jvmti_exception_catch(
+                    shared.vm_identity,
+                    &thread.frames[frame_idx],
+                    handler_pc,
+                );
                 // Fall through to execute_frame which will resume at handler_pc
             }
             None => {
@@ -8705,7 +8754,7 @@ pub(crate) fn execute_prebuilt_frame(
             frame.pc
         );
     }
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
     if shared
         .mem
         .gc_barrier
@@ -8834,10 +8883,17 @@ pub fn pop_and_recycle_frame_with_reason(
     // T17.Δ.2 — JVMTI MethodExit on exception unwind. Normal-return exits
     // are already fired from the return opcodes; here we handle only the
     // abrupt case. Cost when no agent is subscribed: single Acquire load.
+    //
+    // The guard is the process-wide union flag (over-approximates: it can be
+    // true because a *different* VM has a MethodExit listener); the delivery
+    // is `_for_vm`, which resolves this VM's environment and re-checks that
+    // environment's own enable set. Guards may over-approximate, delivery
+    // may not.
     if was_popped_by_exception && crate::runtime::jvmti::any_method_exit_listener_active() {
         if let Some(top) = thread.frames.last() {
             let method_id = synth_method_id(top);
-            crate::runtime::jvmti::fire_method_exit(
+            crate::runtime::jvmti::fire_method_exit_for_vm(
+                shared.vm_identity,
                 thread.thread_id.0,
                 method_id,
                 true,
@@ -8846,7 +8902,7 @@ pub fn pop_and_recycle_frame_with_reason(
         }
     }
     // T17.Δ.5 — JVMTI FramePop before the frame vanishes.
-    fire_jvmti_frame_pop_if_requested(thread, was_popped_by_exception);
+    fire_jvmti_frame_pop_if_requested(shared.vm_identity, thread, was_popped_by_exception);
     if let Some(f) = thread.frames.pop() {
         // Root-snapshot cache correctness: the frame that becomes the top again
         // (the caller this return/unwind exposes) is about to RE-EXECUTE and may
@@ -9250,7 +9306,11 @@ fn execute_frame_from_index(
                             .push(Value::Object(Some(exc_ref)))
                             .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
                         thread.frames[frame_idx].pc = handler_pc;
-                        fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                        fire_jvmti_exception_catch(
+                            shared.vm_identity,
+                            &thread.frames[frame_idx],
+                            handler_pc,
+                        );
                         thread.native_pin_roots.truncate(pin_base);
                         break;
                     }
@@ -9350,7 +9410,11 @@ fn execute_frame_from_index(
                                         MethodCallFailed::InternalError(VmError::Runtime(e))
                                     })?;
                                 thread.frames[frame_idx].pc = handler_pc;
-                                fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                                fire_jvmti_exception_catch(
+                                    shared.vm_identity,
+                                    &thread.frames[frame_idx],
+                                    handler_pc,
+                                );
                                 thread.native_pin_roots.truncate(pin_base);
                                 break;
                             }
@@ -9417,7 +9481,12 @@ fn execute_frame_from_index(
             // which exposes the whole frame stack, so hoist rule 1 forbids
             // routing it through `hot_fp`. Cold and listener-gated — it costs
             // nothing in the universal no-agent case.
-            fire_jvmti_single_step(thread, &thread.frames[frame_idx], saved_pc);
+            fire_jvmti_single_step(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                saved_pc,
+            );
         }
 
         // --- Fast path: handle hot bytecodes directly from raw bytes ---
@@ -10310,7 +10379,12 @@ fn execute_frame_from_index(
                     // JDK/Spring frames.
                     let return_value = Some(value);
                     let _ = frame;
-                    fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &return_value);
+                    fire_jvmti_method_exit_normal(
+                        shared.vm_identity,
+                        thread,
+                        &thread.frames[frame_idx],
+                        &return_value,
+                    );
                     if frame_idx > initial_frame_idx {
                         // Stackless return: pop child frame, push value to parent.
                         pop_and_recycle_frame(shared, thread);
@@ -10346,7 +10420,12 @@ fn execute_frame_from_index(
                 // return (void)
                 0xb1 => {
                     let _ = frame;
-                    fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &None);
+                    fire_jvmti_method_exit_normal(
+                        shared.vm_identity,
+                        thread,
+                        &thread.frames[frame_idx],
+                        &None,
+                    );
                     if frame_idx > initial_frame_idx {
                         pop_and_recycle_frame(shared, thread);
                         frame_idx -= 1;
@@ -12077,6 +12156,7 @@ fn execute_frame_from_index(
                                         })?;
                                     thread.frames[frame_idx].pc = handler_pc;
                                     fire_jvmti_exception_catch(
+                                        shared.vm_identity,
                                         &thread.frames[frame_idx],
                                         handler_pc,
                                     );
@@ -12187,7 +12267,11 @@ fn execute_frame_from_index(
                                     MethodCallFailed::InternalError(VmError::Runtime(e))
                                 })?;
                             thread.frames[frame_idx].pc = handler_pc;
-                            fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                            fire_jvmti_exception_catch(
+                                shared.vm_identity,
+                                &thread.frames[frame_idx],
+                                handler_pc,
+                            );
                             thread.native_pin_roots.truncate(pin_base);
                             break;
                         }
@@ -12238,15 +12322,21 @@ fn execute_frame_from_index(
 /// The `MethodId` is synthesized from the frame's class id and the first 32
 /// bits of an FNV hash of the method name. This matches the scheme used by
 /// the `VmClassMethodProvider` in `vm/src/jvmti/mod.rs`.
+///
+/// `vm` is the raising VM's `SharedVm::vm_identity`. It is a parameter rather
+/// than something read off `frame`/`thread` because neither `Frame` nor
+/// `JvmThread` carries a VM identity — see the module note on
+/// `push_frame_and_fire_entry`. Every caller has `shared: &SharedVm` in
+/// scope, so the value is always exact and never the unattributed seam.
 #[inline]
-fn fire_jvmti_exception_catch(frame: &Frame, handler_pc: usize) {
+fn fire_jvmti_exception_catch(vm: usize, frame: &Frame, handler_pc: usize) {
     let method_id = synth_method_id(frame);
     // Thread id is implicit in JVMTI's ExceptionCatch callback signature;
     // we pass 0 here (the interpreter does not track a JVMTI thread id on
     // the per-frame path). Agents that need the id consult `GetCurrentThread`
     // from within the callback.
     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
-    crate::runtime::jvmti::fire_exception_catch(0, method_id, handler_pc as i64);
+    crate::runtime::jvmti::fire_exception_catch_for_vm(vm, 0, method_id, handler_pc as i64);
 }
 
 /// Synthesize a stable JVMTI `MethodId` for `frame`.
@@ -12278,27 +12368,57 @@ pub(crate) fn synth_method_id(frame: &Frame) -> u64 {
 // the interpreter hot path stays compact. Every helper returns early on a
 // single `AtomicBool::Acquire` load when no agent is subscribed to the
 // corresponding event, adding < 2 ns per opcode in the no-agent case.
+//
+// **VM scoping.** Each helper takes `vm: usize` — the raising VM's
+// `SharedVm::vm_identity` — as its first parameter, and delivers through the
+// `runtime::jvmti::fire_*_for_vm` family, which resolves that VM's JVMTI
+// environment and re-checks *that environment's* enable set before invoking a
+// callback. The `any_*_listener_active()` calls immediately below are the
+// deliberate process-wide **union** pre-filter: with two VMs the union can be
+// true because the *other* VM has an agent, which costs this VM one predicted
+// branch plus one registry lookup and never delivers it another VM's event.
+// Guards may over-approximate; delivery may not.
+//
+// `vm` is a parameter and not a field read off `thread`/`frame` because
+// neither `JvmThread` (`vm/src/threading/jvm_thread.rs:336`) nor `Frame`
+// (`vm/src/runtime/frame.rs:249`) carries a VM identity, and the only
+// process-level `SharedVm` registry (`set_global_shared_vm_for_hooks`,
+// `vm/src/vm/vm_init.rs:3498`) is a fan-out list of *every* live VM — it can
+// answer "which VMs exist", never "which VM is running this frame". Guessing
+// there would be exactly the wrong-VM delivery bug this scoping exists to
+// close. Every caller of every helper below has `shared: &SharedVm` in scope,
+// so the identity is always exact.
 
 /// Fire `MethodEntry` for the frame at `frames_depth - 1` (the one just
 /// pushed). Costs a single Acquire load when no agent is attached.
+///
+/// Currently unused — `push_frame_and_fire_entry` inlines the equivalent
+/// logic so that the frame push and the event are a single chokepoint.
+/// Retained for callers that already hold the pushed frame.
+#[allow(dead_code)]
 #[inline]
-fn fire_jvmti_method_entry(thread: &JvmThread, frame: &Frame) {
+fn fire_jvmti_method_entry(vm: usize, thread: &JvmThread, frame: &Frame) {
     if !crate::runtime::jvmti::any_method_entry_listener_active() {
         return;
     }
     let method_id = synth_method_id(frame);
-    crate::runtime::jvmti::fire_method_entry(thread.thread_id.0, method_id);
+    crate::runtime::jvmti::fire_method_entry_for_vm(vm, thread.thread_id.0, method_id);
 }
 
 /// Fire `MethodExit` for a normal return with the given return value.
 #[inline]
-fn fire_jvmti_method_exit_normal(thread: &JvmThread, frame: &Frame, return_value: &Option<Value>) {
+fn fire_jvmti_method_exit_normal(
+    vm: usize,
+    thread: &JvmThread,
+    frame: &Frame,
+    return_value: &Option<Value>,
+) {
     if !crate::runtime::jvmti::any_method_exit_listener_active() {
         return;
     }
     let method_id = synth_method_id(frame);
     let lv = to_local_value(return_value.as_ref());
-    crate::runtime::jvmti::fire_method_exit(thread.thread_id.0, method_id, false, lv);
+    crate::runtime::jvmti::fire_method_exit_for_vm(vm, thread.thread_id.0, method_id, false, lv);
 }
 
 /// Fire `MethodExit` for an exception-unwind exit.  The return value is
@@ -12311,12 +12431,13 @@ fn fire_jvmti_method_exit_normal(thread: &JvmThread, frame: &Frame, return_value
 /// directly without duplicating the fast-path gate.
 #[allow(dead_code)]
 #[inline]
-fn fire_jvmti_method_exit_exception(thread: &JvmThread, frame: &Frame) {
+fn fire_jvmti_method_exit_exception(vm: usize, thread: &JvmThread, frame: &Frame) {
     if !crate::runtime::jvmti::any_method_exit_listener_active() {
         return;
     }
     let method_id = synth_method_id(frame);
-    crate::runtime::jvmti::fire_method_exit(
+    crate::runtime::jvmti::fire_method_exit_for_vm(
+        vm,
         thread.thread_id.0,
         method_id,
         /*was_popped_by_exception=*/ true,
@@ -12328,7 +12449,11 @@ fn fire_jvmti_method_exit_exception(thread: &JvmThread, frame: &Frame) {
 /// entry in `thread.frame_pop_requests`.  The matching entry is consumed
 /// so that a single `NotifyFramePop` call yields exactly one event.
 #[inline]
-fn fire_jvmti_frame_pop_if_requested(thread: &mut JvmThread, was_popped_by_exception: bool) {
+fn fire_jvmti_frame_pop_if_requested(
+    vm: usize,
+    thread: &mut JvmThread,
+    was_popped_by_exception: bool,
+) {
     if !crate::runtime::jvmti::any_frame_pop_listener_active() {
         return;
     }
@@ -12346,7 +12471,7 @@ fn fire_jvmti_frame_pop_if_requested(thread: &mut JvmThread, was_popped_by_excep
         let method_id = synth_method_id(frame);
         let tid = thread.thread_id.0;
         thread.frame_pop_requests.swap_remove(pos);
-        crate::runtime::jvmti::fire_frame_pop(tid, method_id, was_popped_by_exception);
+        crate::runtime::jvmti::fire_frame_pop_for_vm(vm, tid, method_id, was_popped_by_exception);
     }
 }
 
@@ -12354,7 +12479,7 @@ fn fire_jvmti_frame_pop_if_requested(thread: &mut JvmThread, was_popped_by_excep
 /// Cost when no agent is subscribed: a single `AtomicBool::Acquire` load
 /// (the per-event flag) plus one predicted branch.  No work otherwise.
 #[inline]
-fn fire_jvmti_single_step(thread: &JvmThread, frame: &Frame, saved_pc: usize) {
+fn fire_jvmti_single_step(vm: usize, thread: &JvmThread, frame: &Frame, saved_pc: usize) {
     if !crate::runtime::jvmti::any_single_step_listener_active() {
         return;
     }
@@ -12368,7 +12493,12 @@ fn fire_jvmti_single_step(thread: &JvmThread, frame: &Frame, saved_pc: usize) {
     }
     let method_id = synth_method_id(frame);
     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
-    crate::runtime::jvmti::fire_single_step(thread.thread_id.0, method_id, saved_pc as i64);
+    crate::runtime::jvmti::fire_single_step_for_vm(
+        vm,
+        thread.thread_id.0,
+        method_id,
+        saved_pc as i64,
+    );
 }
 
 /// Push `frame` onto the thread and fire `MethodEntry`.  The MethodEntry
@@ -12378,8 +12508,12 @@ fn fire_jvmti_single_step(thread: &JvmThread, frame: &Frame, saved_pc: usize) {
 /// This is the single chokepoint for every interpreter frame push. If a
 /// push site skips it (e.g. to call `thread.frames.push` directly for
 /// setup reasons), MethodEntry will NOT fire for that frame.
+///
+/// `vm` is `shared.vm_identity` at every one of the ten call sites. It cannot
+/// be derived from `thread` or `frame` — see the VM-scoping note at the top of
+/// this helper block.
 #[inline]
-pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
+pub(crate) fn push_frame_and_fire_entry(vm: usize, thread: &mut JvmThread, frame: Frame) {
     thread.frames.push(frame);
     if crate::runtime::jvmti::any_method_entry_listener_active() {
         // Safe: we just pushed.
@@ -12387,7 +12521,7 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
         let frame_ref = &thread.frames[last];
         let method_id = synth_method_id(frame_ref);
         let tid = thread.thread_id.0;
-        crate::runtime::jvmti::fire_method_entry(tid, method_id);
+        crate::runtime::jvmti::fire_method_entry_for_vm(vm, tid, method_id);
     }
     if crate::runtime::env_cache::trace_sb_filter() {
         let last = thread.frames.len() - 1;
@@ -12515,6 +12649,418 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
                 thread.thread_id.0,
             );
         }
+    }
+}
+
+/// Delivery-side VM scoping for the interpreter's JVMTI event helpers.
+///
+/// The registry half of this (`runtime::jvmti::ENVIRONMENTS`) is pinned by
+/// `runtime::jvmti`'s own tests. What is pinned *here* is the half those
+/// cannot reach: that the interpreter helpers pass a real, exact
+/// `vm_identity` down to the `fire_*_for_vm` family, rather than the
+/// `UNATTRIBUTED_VM` migration seam they used before this change. A
+/// regression that reverts any one helper to the VM-less `fire_*` free
+/// function delivers VM A's MethodEntry to VM B's `-agentpath:` agent, which
+/// a debugging interface people trust to be authoritative must never do.
+///
+/// Parallel safety: every test takes its own `scoped_vm()` identity from a
+/// base no real `SharedVm` can reach (`NEXT_VM_IDENTITY` counts from 1), and
+/// takes `jvmti_registry_test_lock()` because registering a listener moves
+/// the process-wide **union** mirrors that `runtime::jvmti`'s tests assert
+/// are false. Each test drops its rows again on the way out.
+#[cfg(test)]
+mod jvmti_delivery_scoping_tests {
+    use super::*;
+    use crate::runtime::jvmti::{
+        self, EventCallbacks, EventMode, JvmtiEventKind, JvmtiEventManager, MethodId,
+    };
+    use crate::threading::jvm_thread::ThreadId;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    use std::sync::{Arc, Mutex};
+
+    /// A `vm_identity` no other test and no real VM can collide with. Real
+    /// identities come from `NEXT_VM_IDENTITY` (`vm/src/vm/vm_init.rs:9`), a
+    /// counter starting at 1, so small integers are NOT safe to fake with in a
+    /// binary that also builds real `SharedVm`s. The base is distinct from
+    /// `runtime::jvmti`'s own `scoped_test_vm()` base (`0x7000_0000`) so the
+    /// two modules cannot hand out the same row even by accident.
+    fn scoped_vm() -> usize {
+        use std::sync::atomic::AtomicUsize;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        0x7100_0000 + NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+    }
+
+    /// Install an empty manager owned by `vm` and return it.
+    fn manager_for(vm: usize) -> Arc<JvmtiEventManager> {
+        jvmti::install_manager_for_vm(vm, Arc::new(JvmtiEventManager::new_for_vm(vm)));
+        let mgr = jvmti::manager_for_vm(vm).expect("row was just installed");
+        assert_eq!(
+            mgr.vm_identity(),
+            vm,
+            "manager_for_vm must not resolve through the unattributed seam for an installed row"
+        );
+        mgr
+    }
+
+    /// Subscribe `mgr`'s VM to `kinds` and install `callbacks`.
+    ///
+    /// `set_event_callbacks` replaces the whole struct, so it is called once
+    /// with every callback the test needs — calling it per kind would silently
+    /// drop all but the last, which is exactly the shape of bug that makes a
+    /// scoping test pass for the wrong reason.
+    fn watch(mgr: &Arc<JvmtiEventManager>, kinds: &[JvmtiEventKind], callbacks: EventCallbacks) {
+        for kind in kinds {
+            mgr.set_event_notification_mode(EventMode::Enable, *kind, None)
+                .expect("enabling an event on a fresh manager cannot fail");
+        }
+        mgr.set_event_callbacks(callbacks)
+            .expect("installing callbacks on a fresh manager cannot fail");
+    }
+
+    type Seen = Arc<Mutex<Vec<(u64, MethodId)>>>;
+
+    fn seen() -> Seen {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn method_entry_cb(sink: &Seen) -> EventCallbacks {
+        let s = sink.clone();
+        EventCallbacks {
+            method_entry: Some(Box::new(move |t, m| s.lock().unwrap().push((t, m)))),
+            ..Default::default()
+        }
+    }
+
+    fn method_exit_cb(sink: &Seen) -> EventCallbacks {
+        let s = sink.clone();
+        EventCallbacks {
+            method_exit: Some(Box::new(move |t, m, _exc, _rv| {
+                s.lock().unwrap().push((t, m))
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn test_frame(method_name: &str) -> Frame {
+        Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            method_name.to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            8,
+            4,
+            &[],
+        )
+    }
+
+    fn test_thread(name: &str) -> JvmThread {
+        JvmThread::new(ThreadId(1234), name)
+    }
+
+    /// MethodExit raised with VM A's identity reaches A's agent and never B's.
+    #[test]
+    fn method_exit_reaches_only_the_raising_vms_agent() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        watch(&ma, &[JvmtiEventKind::MethodExit], method_exit_cb(&sa));
+        watch(&mb, &[JvmtiEventKind::MethodExit], method_exit_cb(&sb));
+
+        let thread = test_thread("method-exit-scoping");
+        let frame = test_frame("m");
+        let expected = synth_method_id(&frame);
+        fire_jvmti_method_exit_normal(a, &thread, &frame, &Some(Value::Int(7)));
+
+        assert_eq!(
+            *sa.lock().unwrap(),
+            vec![(thread.thread_id.0, expected)],
+            "the raising VM's agent must see exactly one MethodExit"
+        );
+        assert!(
+            sb.lock().unwrap().is_empty(),
+            "a second VM's agent must never see another VM's MethodExit"
+        );
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
+    }
+
+    /// `push_frame_and_fire_entry` is the single frame-push chokepoint, so a
+    /// missed identity there mis-attributes *every* MethodEntry in the VM.
+    #[test]
+    fn push_frame_and_fire_entry_attributes_method_entry_to_its_vm() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        watch(&ma, &[JvmtiEventKind::MethodEntry], method_entry_cb(&sa));
+        watch(&mb, &[JvmtiEventKind::MethodEntry], method_entry_cb(&sb));
+
+        let mut thread = test_thread("method-entry-scoping");
+        let frame = test_frame("entered");
+        let expected = synth_method_id(&frame);
+        push_frame_and_fire_entry(b, &mut thread, frame);
+
+        assert_eq!(thread.frames.len(), 1, "the frame must still be pushed");
+        assert_eq!(
+            *sb.lock().unwrap(),
+            vec![(thread.thread_id.0, expected)],
+            "the pushing VM's agent must see the MethodEntry"
+        );
+        assert!(
+            sa.lock().unwrap().is_empty(),
+            "the other VM's agent must not see it"
+        );
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
+    }
+
+    /// FramePop consumes the request on the raising VM's thread and delivers
+    /// to that VM only.
+    #[test]
+    fn frame_pop_reaches_only_the_raising_vms_agent() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        let ca = sa.clone();
+        let cb = sb.clone();
+        watch(
+            &ma,
+            &[JvmtiEventKind::FramePop],
+            EventCallbacks {
+                frame_pop: Some(Box::new(move |t, m, _exc| ca.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+        watch(
+            &mb,
+            &[JvmtiEventKind::FramePop],
+            EventCallbacks {
+                frame_pop: Some(Box::new(move |t, m, _exc| cb.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+
+        let mut thread = test_thread("frame-pop-scoping");
+        thread.frames.push(test_frame("popping"));
+        let expected = synth_method_id(&thread.frames[0]);
+        thread.frame_pop_requests.push(0);
+        fire_jvmti_frame_pop_if_requested(a, &mut thread, false);
+
+        assert_eq!(*sa.lock().unwrap(), vec![(thread.thread_id.0, expected)]);
+        assert!(sb.lock().unwrap().is_empty());
+        assert!(
+            thread.frame_pop_requests.is_empty(),
+            "NotifyFramePop is one-shot: the matching request must be consumed"
+        );
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
+    }
+
+    /// SingleStep keeps its per-thread gate *and* gains the per-VM one.
+    #[test]
+    fn single_step_reaches_only_the_raising_vms_agent() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        let ca = sa.clone();
+        let cb = sb.clone();
+        watch(
+            &ma,
+            &[JvmtiEventKind::SingleStep],
+            EventCallbacks {
+                single_step: Some(Box::new(move |t, m, _loc| ca.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+        watch(
+            &mb,
+            &[JvmtiEventKind::SingleStep],
+            EventCallbacks {
+                single_step: Some(Box::new(move |t, m, _loc| cb.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+
+        let thread = test_thread("single-step-scoping");
+        let frame = test_frame("stepped");
+        let expected = synth_method_id(&frame);
+
+        // Per-thread gate closed: nobody hears it, whatever the VM.
+        fire_jvmti_single_step(a, &thread, &frame, 3);
+        assert!(
+            sa.lock().unwrap().is_empty(),
+            "the per-thread single-step gate must still be honoured"
+        );
+
+        thread
+            .single_step_enabled
+            .store(true, AtomicOrdering::Relaxed);
+        fire_jvmti_single_step(a, &thread, &frame, 3);
+        assert_eq!(*sa.lock().unwrap(), vec![(thread.thread_id.0, expected)]);
+        assert!(sb.lock().unwrap().is_empty());
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
+    }
+
+    /// ExceptionCatch is the one helper that has only a `&Frame` — no thread,
+    /// no VM — so it is the likeliest to be reverted to the VM-less fire.
+    #[test]
+    fn exception_catch_reaches_only_the_raising_vms_agent() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        let ca = sa.clone();
+        let cb = sb.clone();
+        watch(
+            &ma,
+            &[JvmtiEventKind::ExceptionCatch],
+            EventCallbacks {
+                exception_catch: Some(Box::new(move |t, m, _loc| ca.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+        watch(
+            &mb,
+            &[JvmtiEventKind::ExceptionCatch],
+            EventCallbacks {
+                exception_catch: Some(Box::new(move |t, m, _loc| cb.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+
+        let frame = test_frame("catcher");
+        let expected = synth_method_id(&frame);
+        fire_jvmti_exception_catch(b, &frame, 17);
+
+        assert_eq!(
+            *sb.lock().unwrap(),
+            vec![(0u64, expected)],
+            "ExceptionCatch carries thread id 0 by design; the VM must still be exact"
+        );
+        assert!(sa.lock().unwrap().is_empty());
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
+    }
+
+    /// The load-bearing asymmetry: the `any_*_listener_active()` guards are a
+    /// process-wide **union**, so a VM with no agent at all still enters the
+    /// helper body when some *other* VM is listening. Delivery must then find
+    /// nothing. If a helper trusted the union flag instead of re-resolving the
+    /// row, this is the test that fails — and the bug it would be hiding is an
+    /// event delivered to an agent that never asked for it.
+    #[test]
+    fn a_union_guard_never_delivers_another_vms_event() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (quiet, loud) = (scoped_vm(), scoped_vm());
+        let _quiet_mgr = manager_for(quiet); // installed, but subscribes to nothing
+        let loud_mgr = manager_for(loud);
+        let heard = seen();
+        let (entry_sink, exit_sink) = (heard.clone(), heard.clone());
+        watch(
+            &loud_mgr,
+            &[JvmtiEventKind::MethodEntry, JvmtiEventKind::MethodExit],
+            EventCallbacks {
+                method_entry: Some(Box::new(move |t, m| {
+                    entry_sink.lock().unwrap().push((t, m))
+                })),
+                method_exit: Some(Box::new(move |t, m, _exc, _rv| {
+                    exit_sink.lock().unwrap().push((t, m))
+                })),
+                ..Default::default()
+            },
+        );
+
+        // The union is true because `loud` is listening — that is the whole
+        // point of the guard, and it is what puts `quiet`'s interpreter on the
+        // slow path.
+        assert!(
+            jvmti::any_method_entry_listener_active(),
+            "the union guard must be set while any VM listens"
+        );
+        assert!(
+            !jvmti::any_method_entry_listener_active_for_vm(quiet),
+            "the exact per-VM query must disagree with the union here"
+        );
+
+        let mut thread = test_thread("union-guard");
+        fire_jvmti_method_exit_normal(quiet, &thread, &test_frame("m"), &None);
+        push_frame_and_fire_entry(quiet, &mut thread, test_frame("m"));
+
+        assert!(
+            heard.lock().unwrap().is_empty(),
+            "an over-approximating guard must not turn into an over-approximating delivery"
+        );
+
+        jvmti::forget_vm_jvmti_state(quiet);
+        jvmti::forget_vm_jvmti_state(loud);
+    }
+
+    /// Field watchpoints: the four getfield/getstatic/putfield/putstatic sites
+    /// pass `shared.vm_identity`, so a watch armed in one VM must not fire on
+    /// the same `(class_id, field_index)` in another. `class_id` is only
+    /// unique *within* a VM, so this pair genuinely aliases.
+    #[test]
+    fn field_watchpoints_do_not_alias_across_vms() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        let ca = sa.clone();
+        let cb = sb.clone();
+        watch(
+            &ma,
+            &[JvmtiEventKind::FieldAccess],
+            EventCallbacks {
+                field_access: Some(Box::new(move |t, m, _f| ca.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+        watch(
+            &mb,
+            &[JvmtiEventKind::FieldAccess],
+            EventCallbacks {
+                field_access: Some(Box::new(move |t, m, _f| cb.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+
+        let (class_id, field_index) = (0xDEAD_BEEF_u64, 3usize);
+        jvmti::set_field_watchpoint_for_vm(a, class_id, field_index, true, false)
+            .expect("arming a watchpoint on a fresh row cannot fail");
+
+        // Exactly the call the getstatic/getfield sites now make.
+        jvmti::fire_field_access_if_watched_for_vm(b, 1234, 0x99, class_id, field_index);
+        assert!(
+            sb.lock().unwrap().is_empty(),
+            "VM B has no watch on this (class_id, field_index) — B's ids mean different classes"
+        );
+        assert!(
+            sa.lock().unwrap().is_empty(),
+            "and B's access must certainly not be reported to A, which does watch it"
+        );
+
+        jvmti::fire_field_access_if_watched_for_vm(a, 1234, 0x99, class_id, field_index);
+        assert_eq!(
+            sa.lock().unwrap().len(),
+            1,
+            "A's own access must reach A's agent"
+        );
+        assert!(sb.lock().unwrap().is_empty());
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
     }
 }
 
@@ -13134,6 +13680,85 @@ pub(crate) fn find_jit_exception_handler(
     handler_pc
 }
 
+/// Claim the stashed reason-9 exceptional frame if it names `cached`, mapping
+/// it to `(throw bci, locals)`.
+///
+/// A frame naming a DIFFERENT method is re-stashed, not dropped: unlike
+/// `route_jit_signal_exception` (the outermost drain, where a foreign frame's
+/// owner is provably gone), this sink runs while the compiled CALLER is still
+/// on the stack and will drain later — a frame belonging to it is still in
+/// flight. An unmappable frame is consumed and reported as absent, so the
+/// caller fails closed rather than resuming on values it could not rebuild.
+///
+/// `incoming_args` repairs slot 0 of an instance method. The snapshot records
+/// `this` as `Undefined` whenever the bytecode has no further *read* of it —
+/// which is the common case, and is exactly what the real
+/// `BindConverter.convert` frame does (`getfield delegates` at bci 3 is its last
+/// use, so local 0 is dropped from bci 4 on). Liveness is the right answer for a
+/// bytecode read; it is the wrong answer for the receiver, which the VM itself
+/// still needs for a `synchronized` method's monitor and for stack traces. The
+/// caller passed the genuine receiver in, so put it back.
+fn precise_handler_frame_for(
+    cached: &Arc<CachedBytecodeMethod>,
+    incoming_args: &[Value],
+) -> Option<(usize, Vec<Value>)> {
+    if params_only_callee_handler_frames() {
+        return None;
+    }
+    let rframe = cratonvm_jit::deopt::take_exceptional_frame()?;
+    if !deopt_frame_matches_method(
+        &rframe,
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+    ) {
+        cratonvm_jit::deopt::restash_exceptional_frame(rframe);
+        return None;
+    }
+    let bci = rframe.bci as usize;
+    let mut locals = ir_deopt_locals(&rframe.locals)?;
+    if !cached.is_static {
+        if let (Some(slot0), Some(receiver)) = (locals.first_mut(), incoming_args.first()) {
+            *slot0 = *receiver;
+        }
+    }
+    Some((bci, locals))
+}
+
+/// A/B opt-out (`CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME=1`): restore the
+/// pre-2026-08-01 `run_jit_callee_handler`, which resumed a compiled callee's
+/// handler on `this`-plus-parameters and left every other local zeroed.
+///
+/// It exists so one binary can demonstrate the defect and its fix:
+/// `JitPreciseHandlerFrame.loopMismatches` reports 19497 of 20000 with this set
+/// and 0 without it. It restores the old behaviour in full, fail-closed
+/// branch included, because a decline is not what the old code did and an A/B
+/// that silently substitutes a third behaviour proves nothing. This is a
+/// wrong-answer switch, not a tuning knob — nothing but a differential run
+/// should ever set it.
+fn params_only_callee_handler_frames() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME")
+            .is_some()
+    })
+}
+
+/// Would resuming one of `cached`'s handlers on `this`-plus-parameters alone
+/// invent values? See `cratonvm_jit::handler_resume_requires_precise_locals`.
+fn handler_resume_needs_precise_locals(cached: &Arc<CachedBytecodeMethod>) -> bool {
+    // `cached.code` carries 2 bytes of speculative-read padding.
+    let code_len = cached.code.len().saturating_sub(2);
+    cratonvm_jit::handler_resume_requires_precise_locals(
+        &cached.code,
+        code_len,
+        &cached.exception_table,
+        &cached.method_descriptor,
+        cached.is_static,
+    )
+}
+
 /// Run a compiled callee's own exception handler in the interpreter, resuming
 /// AT the handler rather than re-executing the method from its entry.
 ///
@@ -13147,14 +13772,38 @@ pub(crate) fn find_jit_exception_handler(
 /// (`docs/known-issues/repros/jitban-remaining-20260726/`).
 ///
 /// Resuming at the handler keeps the compiled prefix's single execution and
-/// runs only the cleanup the compiled body skipped. Locals are the callee's
-/// incoming arguments, which is the same verifier-consistent state
-/// `route_jit_exception_through_method` uses and is sound for exactly the same
-/// reason: a compiled method whose handler reads a local first assigned inside
-/// the try never passes the `local_handler_reads_unsafe_local` compile gate.
+/// runs only the cleanup the compiled body skipped.
+///
+/// Locals come from the reason-9 exceptional frame the compiled body published
+/// at its throw site when one is stashed for THIS method, and otherwise from
+/// the callee's incoming arguments — the same two-tier choice
+/// `route_jit_signal_exception` makes, and for the same reason.
+///
+/// **The params-only tier was the whole story here until 2026-08-01, and that
+/// was a silent miscompile.** Its stated justification was that "a compiled
+/// method whose handler reads a local first assigned inside the try never
+/// passes the `local_handler_reads_unsafe_local` compile gate" — true when it
+/// was written, false since `precise_handler_frames_enabled` began admitting
+/// exactly that population on the promise that every throwing site publishes a
+/// precise frame. `route_jit_signal_exception` kept that promise; this sink did
+/// not, so a compiled callee that threw inside its own protected range resumed
+/// its handler with every non-parameter local zeroed.
+///
+/// The witness is Spring Boot's `BindConverter.convert(Object, TypeDescriptor,
+/// TypeDescriptor)`: `for (ConversionService d : this.delegates)` keeps the
+/// `Iterator` in local 5, a `canConvert` inside the loop's `try` throws
+/// `ConversionException`, and the handler falls through to the loop head. With
+/// params-only locals the iterator resumed as null and the next `hasNext()`
+/// threw "Cannot invoke java.util.Iterator.hasNext() because <local5> is null"
+/// — 27 of 43 `LiquibaseAutoConfigurationTests` methods, deterministically, and
+/// clean under `--nojit`. `JitPreciseHandlerFrame.loopStep`
+/// (`test_compiled_callee_handler_resume_keeps_the_loop_iterator`) pins the
+/// shape.
 ///
 /// Returns `None` when no handler in `cached` covers `throw_pc`, leaving the
-/// caller to propagate the exception unchanged.
+/// caller to propagate the exception unchanged — and also when this method
+/// needs precise locals but no frame is stashed for it, where resuming would
+/// mean inventing them.
 pub(crate) fn run_jit_callee_handler(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -13163,7 +13812,36 @@ pub(crate) fn run_jit_callee_handler(
     exc: ObjectRef,
     incoming_args: &[Value],
 ) -> Option<MethodCallResult> {
+    let precise = precise_handler_frame_for(cached, incoming_args);
+    // A precise frame's bci is the compiled body's own throw site, recorded by
+    // the reason-9 stub. It is strictly better than the `athrow_bci` stamp
+    // `throw_pc` comes from (which carries no method identity), so prefer it
+    // for the handler's `[start_pc, end_pc)` range test.
+    let (throw_pc, precise_locals) = match precise.as_ref() {
+        Some((bci, locals)) => (*bci, Some(locals.as_slice())),
+        None => (throw_pc, None),
+    };
     let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
+    if precise_locals.is_none()
+        && !params_only_callee_handler_frames()
+        && handler_resume_needs_precise_locals(cached)
+    {
+        // Fail closed. Every throwing opcode inside a protected range of such a
+        // method is supposed to publish (`precise_exception_frame_sites_supported`),
+        // so arriving here means the promise was broken somewhere; resuming the
+        // handler now would hand it zeroed locals, which is a wrong answer with
+        // no crash to trace it back from. Declining leaves the caller's existing
+        // conservative behaviour (propagate, or the whole-method re-run) intact.
+        if crate::jit::helpers::rbc6_dbg() {
+            eprintln!(
+                "[rbc6-dbg] run_jit_callee_handler DECLINED {}.{}{} throw_pc={} \
+                 — handler needs precise locals and no frame was published",
+                cached.class_name, cached.method_name, cached.method_descriptor, throw_pc as i64,
+            );
+        }
+        return None;
+    }
+    let incoming_args = precise_locals.unwrap_or(incoming_args);
     let mut synchronized_args = cached.is_synchronized.then(|| incoming_args.to_vec());
     let synchronized_monitor = match synchronized_args.as_mut() {
         Some(args) => match JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args) {
@@ -13345,7 +14023,7 @@ fn route_jit_exception_through_method(
             frame.method_descriptor()
         );
     }
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
     let new_idx = thread.frames.len() - 1;
     // Exception is already on the operand stack (rooted before the fire above);
     // just position the PC at the handler.
@@ -13533,7 +14211,7 @@ fn resume_from_ir_deopt(
             cached.class_name, cached.method_name, cached.method_descriptor, rframe.bci, locals,
         );
     }
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
     // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
     // the `Deoptimizing -> JavaRunning` edge. The reconstructed values now live
     // in a GC-scanned interpreter frame, which is precisely the property the
@@ -13979,7 +14657,7 @@ fn resume_real_ir_deopt(
             // Push FIRST, pins STILL installed: during the push the oops are
             // rooted by the pins, and once pushed also by the frame. Only THEN
             // release the pins — the frame roots them from here on.
-            push_frame_and_fire_entry(thread, frame);
+            push_frame_and_fire_entry(shared.vm_identity, thread, frame);
             thread.native_pin_roots.truncate(pin_base);
             Some(CachedCallResult::FramePushed)
         }
@@ -14008,7 +14686,22 @@ fn resume_real_ir_deopt(
 ///
 /// Returns `Some(())` on a clean transfer (the caller then returns `None` from
 /// `try_osr`, so the interpreter resumes THIS mutated frame), or `None` for an
-/// out-of-scope / unmappable frame so the caller falls back to the safe reject.
+/// out-of-scope / unmappable frame.
+///
+/// **A `None` here is NOT a safe reject.** By the time this runs the OSR'd body
+/// has committed iterations, so "continue interpreting THIS frame from where it
+/// was" re-executes every one of them. `artifact` + `plan` are the validated
+/// entry (`CompiledMethod::validate_osr_entry`, spent by `osr_enter_planned`);
+/// its `osr_exit_policy` walked every deopt point of the artifact at ADMISSION
+/// and refused the entry outright (`osr-entry-unresumable-exit`) when any of
+/// them could reconstruct a frame this transfer would reject. That is what makes
+/// the refusal path unreachable after a committed body rather than merely rare —
+/// discovering it here would be useless, because the only remaining options are
+/// to replay the committed iterations or to lose them. See
+/// `docs/jit/on-stack-replacement.md` §4.
+///
+/// `plan.resume_after_exit` — not `rframe.bci` — names the pc the live frame is
+/// parked at; see the call site below for what it re-checks.
 ///
 /// GC-safety. The reconstructed oops were read in-stub (`x64_deopt_entry`) as raw
 /// heap words. The OSR-exit snapshot's provenance is Register / StackSlot /
@@ -14026,28 +14719,66 @@ fn transfer_osr_exit_into_live_frame(
     thread: &mut JvmThread,
     frame_idx: usize,
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    artifact: &cratonvm_jit::CompiledMethod,
+    plan: &cratonvm_jit::OsrEntryPlan,
 ) -> Option<()> {
+    match transfer_osr_exit_into_live_frame_checked(
+        shared, thread, frame_idx, rframe, artifact, plan,
+    ) {
+        Ok(()) => Some(()),
+        Err(why) => {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] OSR-exit transfer reject ({why}) at bci={}",
+                    rframe.bci
+                );
+            }
+            None
+        }
+    }
+}
+
+/// The body of [`transfer_osr_exit_into_live_frame`], returning the refusal
+/// *reason* instead of a bare `None`.
+///
+/// Split out so every refusal has a name a test can assert on. The bare
+/// `Option` the caller sees discards the reason (and traces it under
+/// `CRATONVM_DBG_DEOPT`), which is exactly how a `MaterializationRequired`
+/// slot used to be reported as the generic "unmappable local" — see the guard
+/// below.
+///
+/// **Fail-closed contract.** Every check that can refuse runs BEFORE the first
+/// write to the live frame, so a refusal can never half-write it. That includes
+/// the resume-bci decision: [`cratonvm_jit::OsrEntryPlan::resume_after_exit`]
+/// is consulted before the locals/stack are overwritten, not after.
+fn transfer_osr_exit_into_live_frame_checked(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    artifact: &cratonvm_jit::CompiledMethod,
+    plan: &cratonvm_jit::OsrEntryPlan,
+) -> Result<(), String> {
     use cratonvm_jit::deopt::FrameValue;
     let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some();
-    let bail = |why: &str| -> Option<()> {
-        if trace {
-            eprintln!(
-                "[cratonvm-deopt] OSR-exit transfer reject ({why}) at bci={}",
-                rframe.bci
-            );
-        }
-        None
-    };
 
     // Phase-A scope (mirror `build_deopt_frame_inner`): a single non-inlined frame,
     // no held monitors, no virtual (scalar-replaced) slots. The OSR-exit snapshot
     // never emits virtuals; if a future emitter does, reject until the elided-
     // monitor handling that gates `build_deopt_frame_inner` is wired here too.
+    //
+    // The `caller_frames` refusal is deliberate and unchanged: the in-place
+    // transfer is single-frame, so even a *described* caller chain cannot be
+    // resumed here (`docs/jit/deopt-frame-state-interning.md`, and the sibling
+    // sinks at `resume_from_ir_deopt` / `build_deopt_frame_inner`). The
+    // `MaterializationRequired` guard added below is orthogonal to it — it is a
+    // per-SLOT verdict and says nothing about scope depth, so the caller-chain
+    // rule keeps exactly the meaning it had.
     if !rframe.caller_frames.is_empty() {
-        return bail("inlined caller chain");
+        return Err("inlined caller chain".to_string());
     }
     if !rframe.monitors.is_empty() {
-        return bail("held monitors");
+        return Err("held monitors".to_string());
     }
     if rframe.locals.iter().chain(rframe.stack.iter()).any(|v| {
         matches!(
@@ -14055,7 +14786,40 @@ fn transfer_osr_exit_into_live_frame(
             FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
         )
     }) {
-        return bail("virtual-object slot");
+        return Err("virtual-object slot".to_string());
+    }
+    // `MaterializationRequired` is NOT `Unsupported`, and the difference is the
+    // whole reason `jit/src/deopt.rs` split the variant out: `Unsupported` means
+    // "the coarse whole-method classifier cannot name this slot's kind" (tolerated
+    // below — the live frame's current value is provably safe to leave in place),
+    // whereas `MaterializationRequired` means an optimization DELETED a value that
+    // *was* live and left no rebuild recipe. The live frame's stale pre-entry word
+    // is then genuinely WRONG, not merely unread, and reconstructing it as a silent
+    // null/zero is precisely what the variant exists to make impossible.
+    //
+    // Without this arm the refusal still happened — the variant falls through
+    // `fv_to_value`'s catch-all `None` — but it was reported as "unmappable local",
+    // naming the wrong cause, and only for LOCALS (a stack slot went to
+    // "unmappable stack slot"). Naming it here also makes it a *scope* verdict,
+    // decided before any mapping, alongside the other Phase-A refusals.
+    //
+    // Belt and braces: `deopt::frame_state_is_resumable` makes the same call on the
+    // jit side, so `validate_osr_entry` refuses such an artifact at ENTRY
+    // (`osr-entry-unresumable-exit`) and this transfer should never see one.
+    if let Some(what) = rframe
+        .locals
+        .iter()
+        .enumerate()
+        .map(|(i, v)| ("local", i, v))
+        .chain(rframe.stack.iter().enumerate().map(|(i, v)| ("stack", i, v)))
+        .find_map(|(region, i, v)| match v {
+            FrameValue::MaterializationRequired(ev) => {
+                Some(format!("materialization required ({region} {i}: {ev})"))
+            }
+            _ => None,
+        })
+    {
+        return Err(what);
     }
 
     // CRATONVM_DEOPT_VERIFY: structural + oop-plausibility checks before mutating
@@ -14077,7 +14841,7 @@ fn transfer_osr_exit_into_live_frame(
                  — forcing safe reject",
                 rframe.bci
             );
-            return None;
+            return Err(format!("deopt-verify: {why}"));
         }
     }
 
@@ -14087,7 +14851,7 @@ fn transfer_osr_exit_into_live_frame(
         let frame = &thread.frames[frame_idx];
         if rframe.locals.len() > frame.locals_len() || rframe.stack.len() > frame.max_stack as usize
         {
-            return bail("slot overflow");
+            return Err("slot overflow".to_string());
         }
     }
 
@@ -14128,20 +14892,45 @@ fn transfer_osr_exit_into_live_frame(
     // re-committing) every iteration since OSR entry. See
     // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md.
     let mut locals: Vec<Option<Value>> = Vec::with_capacity(rframe.locals.len());
-    for v in &rframe.locals {
+    for (i, v) in rframe.locals.iter().enumerate() {
         if matches!(v, cratonvm_jit::deopt::FrameValue::Unsupported) {
             locals.push(None);
         } else {
             match fv_to_value(v) {
                 Some(val) => locals.push(Some(val)),
-                None => return bail("unmappable local"),
+                // Reachable only for a variant `fv_to_value` cannot type. The
+                // `MaterializationRequired` case — historically the confusing
+                // occupant of this arm — is named by its own guard above, so this
+                // label no longer stands in for it.
+                None => return Err(format!("unmappable local ({i}: {v:?})")),
             }
         }
     }
     let stack_vals = match ir_deopt_frame_values(&rframe.stack) {
         Some(s) => s,
-        None => return bail("unmappable stack slot"),
+        None => return Err("unmappable stack slot".to_string()),
     };
+
+    // The exact bci to park the live frame at. This is the ONLY sanctioned resume
+    // point once compiled code has run: `resume_after_exit` re-checks that
+    // `rframe.bci` is a deopt point THIS artifact recorded and that its
+    // `ResumeSemantics` is `REEXECUTE` (i.e. the bytecode there has not taken
+    // effect), and returns the reconstructed frame's own bci — never the OSR entry
+    // bci. The bare `frame.pc = rframe.bci` it replaces trusted a bci that could be
+    // a mis-routed stash, or a `RESUME`/`RETHROW` point that must not be re-executed
+    // (the same double-execution defect this whole path exists to prevent, one
+    // bytecode instead of one loop iteration).
+    //
+    // Decided BEFORE the writes below so a refusal leaves the frame untouched. A
+    // refusal here means the OSR'd body committed work the interpreter cannot be
+    // resumed after — the caller must NOT safe-reject; see the exit sink in
+    // `try_osr`. `validate_osr_entry`'s `osr_exit_policy` walks every deopt point
+    // of the artifact at admission and refuses the entry outright
+    // (`osr-entry-unresumable-exit`) when one of them could land here, which is
+    // what makes this branch unreachable rather than merely rare.
+    let resume_bci = plan
+        .resume_after_exit(artifact, rframe)
+        .map_err(|b| format!("unresumable exit: {b}"))?;
 
     // Overwrite the live frame IN PLACE. No Java allocation here, so the
     // reconstructed oops remain valid and are rooted by the frame's slots the moment
@@ -14159,18 +14948,19 @@ fn transfer_osr_exit_into_live_frame(
     for v in &stack_vals {
         frame.stack.push_unchecked(*v);
     }
-    // Cast: bytecode index (non-negative, fits) → usize pc.
-    frame.pc = rframe.bci as usize;
+    // The plan-validated resume point (see above), not the raw `rframe.bci`.
+    frame.pc = resume_bci;
 
     if trace {
         eprintln!(
-            "[cratonvm-deopt] OSR-exit TRANSFER into live frame: resume bci={} ({} locals, {} stack)",
-            rframe.bci,
+            "[cratonvm-deopt] OSR-exit TRANSFER into live frame: resume bci={resume_bci} \
+             ({} locals, {} stack, entry_pc={})",
             locals.len(),
             stack_vals.len(),
+            plan.entry_pc,
         );
     }
-    Some(())
+    Ok(())
 }
 
 /// deopt-osr Step 9 — stamp a freshly compiled artifact with the method's
@@ -14915,6 +15705,7 @@ mod deopt_step3_tests {
                 bci,
                 reason: cratonvm_jit::deopt::DeoptReason::BoundsCheck,
                 action: cratonvm_jit::deopt::DeoptAction::Reinterpret,
+                semantics: cratonvm_jit::deopt::ResumeSemantics::REEXECUTE,
                 speculation_id: 0,
                 frame_state: cratonvm_jit::deopt::FrameState {
                     method_key: String::new(),
@@ -15276,6 +16067,32 @@ mod deopt_step3_tests {
         assert_eq!(thread.frames.len(), 1);
     }
 
+    /// A validated OSR-entry plan plus the artifact it was validated against —
+    /// the two arguments the in-place transfer now needs.
+    ///
+    /// The artifact records ONE `REEXECUTE` deopt point at `exit_bci`, which is
+    /// what `OsrEntryPlan::resume_after_exit` requires before it will name that
+    /// bci as an exact resume point; `entry_pc` is the loop header the entry was
+    /// taken at. The plan is built by hand rather than through
+    /// `validate_osr_entry` so these tests stay about the transfer — the
+    /// validator has its own coverage in `jit/src/lib.rs`.
+    fn osr_plan_for(
+        entry_pc: usize,
+        exit_bci: u32,
+    ) -> (cratonvm_jit::CompiledMethod, cratonvm_jit::OsrEntryPlan) {
+        let cm = cm_with_deopt_point(0, exit_bci);
+        let plan = cratonvm_jit::OsrEntryPlan {
+            entry_pc,
+            resume_bci: entry_pc,
+            native_offset: 0,
+            dead_mask: 0,
+            contract: cratonvm_jit::OsrContractSource::RegisterHomes,
+            exit_policy: cratonvm_jit::OsrExitPolicy::ExactTransfer,
+            expected_locals: Vec::new(),
+        };
+        (cm, plan)
+    }
+
     /// The core P4 invariant: the JIT-advanced loop state OVERWRITES the live
     /// frame's locals + operand stack IN PLACE and re-points pc, WITHOUT pushing a
     /// new frame — so the interpreter resumes the loop body from where the OSR'd
@@ -15300,8 +16117,10 @@ mod deopt_step3_tests {
         // The OSR'd code advanced 5 iterations (i=105, acc=5460) and left the
         // operand stack empty at the loop header.
         let advanced = rframe(vec![FrameValue::Int(105), FrameValue::Int(5460)], vec![], 7);
+        let (cm, plan) = osr_plan_for(7, 7);
         assert!(
-            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some(),
             "clean int frame must transfer"
         );
 
@@ -15344,8 +16163,10 @@ mod deopt_step3_tests {
             vec![FrameValue::Double(std::f64::consts::PI.to_bits())],
             3,
         );
+        let (cm, plan) = osr_plan_for(0, 3);
         assert!(
-            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some(),
             "cat-2/FP frame must transfer (no longer rejected)"
         );
         let frame = &thread.frames[0];
@@ -15393,7 +16214,11 @@ mod deopt_step3_tests {
             vec![FrameValue::Int(3), FrameValue::Int(4)],
             2,
         );
-        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some());
+        let (cm, plan) = osr_plan_for(0, 2);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some()
+        );
         let frame = &thread.frames[0];
         assert_eq!(frame.pc, 2);
         assert_eq!(frame.stack.len(), 2);
@@ -15431,7 +16256,11 @@ mod deopt_step3_tests {
             vec![],
             3,
         );
-        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some());
+        let (cm, plan) = osr_plan_for(0, 3);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some()
+        );
 
         // No Java allocation between in-stub capture and the in-place write, so the
         // raw address was valid; the frame slot now roots it. Force a GC — it must
@@ -15483,8 +16312,10 @@ mod deopt_step3_tests {
             vec![],
             8,
         );
+        let (cm, plan) = osr_plan_for(5, 8);
         assert!(
-            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some(),
             "an Unsupported LOCAL must not block the transfer"
         );
 
@@ -15528,7 +16359,10 @@ mod deopt_step3_tests {
             vec![FrameValue::Unsupported],
             8,
         );
-        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
+        let (cm, plan) = osr_plan_for(5, 8);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad, &cm, &plan).is_none()
+        );
 
         // Frame fully intact.
         let frame = &thread.frames[0];
@@ -15557,7 +16391,10 @@ mod deopt_step3_tests {
         );
 
         let bad = rframe(vec![vobj(0, 5, vec![FrameValue::Int(1)])], vec![], 0);
-        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
+        let (cm, plan) = osr_plan_for(0, 0);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad, &cm, &plan).is_none()
+        );
         assert_eq!(thread.frames[0].get_local(0), Value::Int(1));
     }
 
@@ -15578,8 +16415,236 @@ mod deopt_step3_tests {
 
         let mut inlined = rframe(vec![FrameValue::Int(2)], vec![], 0);
         inlined.caller_frames.push(rframe(vec![], vec![], 0));
-        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &inlined).is_none());
+        let (cm, plan) = osr_plan_for(0, 0);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &inlined, &cm, &plan)
+                .is_none()
+        );
         assert_eq!(thread.frames[0].get_local(0), Value::Int(1));
+    }
+
+    // ---------------------------------------------------------------------
+    // C2-review — the `MaterializationRequired` refusal, and the validated
+    // resume point that replaced the bare `frame.pc = rframe.bci`.
+    // ---------------------------------------------------------------------
+
+    /// The refusal reason for `rframe` against a plan whose artifact records a
+    /// `REEXECUTE` deopt point at the frame's own bci — i.e. everything except
+    /// the slot in question is in order.
+    fn transfer_refusal(
+        shared: &SharedVm,
+        thread: &mut JvmThread,
+        rframe: &ReconstructedFrame,
+    ) -> String {
+        // Cast: bci (u16-range in these fixtures) → usize entry pc.
+        let (cm, plan) = osr_plan_for(rframe.bci as usize, rframe.bci);
+        transfer_osr_exit_into_live_frame_checked(shared, thread, 0, rframe, &cm, &plan)
+            .expect_err("this fixture must refuse")
+    }
+
+    /// A `MaterializationRequired` local names ITS OWN cause. Before the guard it
+    /// fell through `fv_to_value`'s catch-all `None` and was reported as the
+    /// generic "unmappable local" — which is what the variant was split out of
+    /// `Unsupported` to stop happening. The refusal itself is not new; the name is.
+    #[test]
+    fn osr_exit_transfer_names_materialization_required_local() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(11), FrameValue::Int(22)],
+            vec![],
+            7,
+        );
+
+        let deleted = rframe(
+            vec![
+                FrameValue::Int(99),
+                FrameValue::MaterializationRequired(cratonvm_jit::deopt::EliminatedValue::new(
+                    7,
+                    cratonvm_jit::deopt::EliminationCause::EliminatedStore,
+                )),
+            ],
+            vec![],
+            7,
+        );
+        let why = transfer_refusal(&shared, &mut thread, &deleted);
+        assert!(
+            why.starts_with("materialization required"),
+            "must name the real cause, got {why:?}"
+        );
+        assert!(
+            !why.contains("unmappable local"),
+            "must NOT be reported as the generic unmappable-local bail, got {why:?}"
+        );
+        assert!(
+            why.contains("local 1"),
+            "must name the offending slot, got {why:?}"
+        );
+
+        // Fail closed: the live frame is untouched, exactly as for every other
+        // pre-mutation refusal.
+        let frame = &thread.frames[0];
+        assert_eq!(frame.get_local(0), Value::Int(11));
+        assert_eq!(frame.get_local(1), Value::Int(22));
+        assert_eq!(frame.pc, 7);
+    }
+
+    /// The same marker on the operand STACK is named too — it used to reach the
+    /// unrelated "unmappable stack slot" label.
+    #[test]
+    fn osr_exit_transfer_names_materialization_required_stack_slot() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 3);
+
+        let deleted = rframe(
+            vec![FrameValue::Int(2)],
+            vec![FrameValue::MaterializationRequired(
+                cratonvm_jit::deopt::EliminatedValue::unknown(
+                    cratonvm_jit::deopt::EliminationCause::Unclassified,
+                ),
+            )],
+            3,
+        );
+        let why = transfer_refusal(&shared, &mut thread, &deleted);
+        assert!(
+            why.starts_with("materialization required") && why.contains("stack 0"),
+            "must name the stack slot, got {why:?}"
+        );
+    }
+
+    /// `Unsupported` and `MaterializationRequired` are NOT the same verdict: the
+    /// first is tolerated (coarse-classifier noise, the live value stays), the
+    /// second refuses. That asymmetry is the entire reason for the split variant.
+    #[test]
+    fn unsupported_is_tolerated_where_materialization_required_refuses() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 4);
+
+        let (cm, plan) = osr_plan_for(4, 4);
+        let tolerated = rframe(vec![FrameValue::Int(2), FrameValue::Unsupported], vec![], 4);
+        assert!(
+            transfer_osr_exit_into_live_frame_checked(
+                &shared,
+                &mut thread,
+                0,
+                &tolerated,
+                &cm,
+                &plan
+            )
+            .is_ok(),
+            "an Unsupported local is coarse-classifier noise, not a deleted value"
+        );
+
+        let refused = rframe(
+            vec![
+                FrameValue::Int(3),
+                FrameValue::MaterializationRequired(
+                    cratonvm_jit::deopt::EliminatedValue::unknown(
+                        cratonvm_jit::deopt::EliminationCause::EliminatedStore,
+                    ),
+                ),
+            ],
+            vec![],
+            4,
+        );
+        assert!(transfer_refusal(&shared, &mut thread, &refused)
+            .starts_with("materialization required"));
+    }
+
+    /// The resume point comes from `OsrEntryPlan::resume_after_exit`, not from the
+    /// raw `rframe.bci`: a bci the artifact never recorded a deopt point for is a
+    /// mis-routed stash, and parking the interpreter there is a guess. It refuses,
+    /// and the frame is left untouched — the entry gate is what makes this
+    /// unreachable after a committed body.
+    #[test]
+    fn osr_exit_transfer_refuses_a_bci_the_artifact_never_recorded() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 2);
+
+        // The artifact's only deopt point is at bci 2; the stash names bci 9.
+        let (cm, plan) = osr_plan_for(2, 2);
+        let stray = rframe(vec![FrameValue::Int(7)], vec![], 9);
+        let why = transfer_osr_exit_into_live_frame_checked(
+            &shared, &mut thread, 0, &stray, &cm, &plan,
+        )
+        .expect_err("a bci from nowhere is not a resume point");
+        assert!(why.contains("unresumable exit"), "got {why:?}");
+
+        let frame = &thread.frames[0];
+        assert_eq!(frame.pc, 2, "a refused transfer must not move the pc");
+        assert_eq!(frame.get_local(0), Value::Int(1), "nor write a local");
+    }
+
+    /// A validated transfer parks the frame at the RECONSTRUCTED frame's own bci —
+    /// where the OSR'd body actually stopped — and never at the entry pc. Resuming
+    /// at the entry pc is the `jit-osr-bail-reruns-loop-iterations` defect: every
+    /// iteration the compiled body committed would run a second time.
+    #[test]
+    fn validated_resume_lands_where_the_body_stopped_not_at_the_entry_pc() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        // Entered at the loop header (bci 2) with i=0; the body committed 50
+        // iterations and bailed at bci 9.
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(0)], vec![], 2);
+
+        let cm = cm_with_deopt_point(0, 9);
+        let plan = cratonvm_jit::OsrEntryPlan {
+            entry_pc: 2,
+            resume_bci: 2,
+            native_offset: 0,
+            dead_mask: 0,
+            contract: cratonvm_jit::OsrContractSource::RegisterHomes,
+            exit_policy: cratonvm_jit::OsrExitPolicy::ExactTransfer,
+            expected_locals: Vec::new(),
+        };
+        let advanced = rframe(vec![FrameValue::Int(50)], vec![], 9);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some()
+        );
+
+        let frame = &thread.frames[0];
+        assert_eq!(
+            frame.pc, 9,
+            "resume at the bail's own bci, so the committed iterations are not replayed"
+        );
+        assert_ne!(frame.pc, plan.entry_pc, "never fall back to the entry pc");
+        assert_eq!(
+            frame.get_local(0),
+            Value::Int(50),
+            "the JIT-advanced induction variable must survive"
+        );
+    }
+
+    /// The `caller_frames` rule is unchanged by the new variant: a
+    /// `MaterializationRequired` slot is a per-SLOT verdict and says nothing about
+    /// scope depth, so an inlined chain still refuses on its own (older) reason
+    /// even when every slot is describable. (`docs/jit/deopt-frame-state-interning.md`
+    /// records that all three resume sinks refuse a non-empty `caller_frames`.)
+    #[test]
+    fn materialization_guard_does_not_disturb_the_caller_chain_rule() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 0);
+
+        let mut inlined = rframe(vec![FrameValue::Int(2)], vec![], 0);
+        inlined.caller_frames.push(rframe(vec![], vec![], 0));
+        assert_eq!(
+            transfer_refusal(&shared, &mut thread, &inlined),
+            "inlined caller chain"
+        );
     }
 }
 
@@ -16642,31 +17707,56 @@ fn execute_instruction(
         Instruction::Return => {
             // T17.Δ.2 — MethodExit fires on every normal return. No-op fast
             // path when no agent listens.
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &None);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &None,
+            );
             return Ok(InstructionResult::Return(None));
         }
         Instruction::Ireturn => {
             let v = thread.frames[frame_idx].stack.pop_int()?;
             let rv = Some(Value::Int(v));
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &rv,
+            );
             return Ok(InstructionResult::Return(rv));
         }
         Instruction::Lreturn => {
             let v = thread.frames[frame_idx].stack.pop_long()?;
             let rv = Some(Value::Long(v));
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &rv,
+            );
             return Ok(InstructionResult::Return(rv));
         }
         Instruction::Freturn => {
             let v = thread.frames[frame_idx].stack.pop_float()?;
             let rv = Some(Value::Float(v));
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &rv,
+            );
             return Ok(InstructionResult::Return(rv));
         }
         Instruction::Dreturn => {
             let v = thread.frames[frame_idx].stack.pop_double()?;
             let rv = Some(Value::Double(v));
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &rv,
+            );
             return Ok(InstructionResult::Return(rv));
         }
         Instruction::Areturn => {
@@ -16674,7 +17764,12 @@ fn execute_instruction(
             let ret = crate::jit::return_type(thread.frames[frame_idx].method_descriptor());
             let v = coerce_value_for_return_validated(shared, v, ret);
             let rv = Some(v);
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &rv,
+            );
             return Ok(InstructionResult::Return(rv));
         }
 
@@ -16692,11 +17787,16 @@ fn execute_instruction(
                     }
                 }
             };
-            // T17.Δ.4 — JVMTI FieldAccess watchpoint.  Consults the global
-            // registry; a single HashMap read + branch on the no-watch path.
+            // T17.Δ.4 — JVMTI FieldAccess watchpoint.  Consults *this VM's*
+            // watchpoint row; a single HashMap read + branch on the no-watch
+            // path. The process-wide `any_field_watchpoint_active()` union
+            // gate inside the callee stays as the cheap pre-filter — it may
+            // say "yes" because another VM is watching, and the per-VM lookup
+            // then answers exactly.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
-                crate::runtime::jvmti::fire_field_access_if_watched(
+                crate::runtime::jvmti::fire_field_access_if_watched_for_vm(
+                    shared.vm_identity,
                     thread.thread_id.0,
                     method_id,
                     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
@@ -16850,10 +17950,11 @@ fn execute_instruction(
                     }
                 }
             };
-            // T17.Δ.4 — JVMTI FieldModification watchpoint.
+            // T17.Δ.4 — JVMTI FieldModification watchpoint, scoped to this VM.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
-                crate::runtime::jvmti::fire_field_modification_if_watched(
+                crate::runtime::jvmti::fire_field_modification_if_watched_for_vm(
+                    shared.vm_identity,
                     thread.thread_id.0,
                     method_id,
                     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
@@ -17196,11 +18297,14 @@ fn execute_instruction(
             // direct CompactValue push path for J/D.  Two field loads — no
             // hashmap work on the fast path.
             let desc_byte = Some(field.desc_byte);
-            // T17.Δ.4 — JVMTI FieldAccess watchpoint.  Fast path: no
-            // watchpoint registered ⇒ one HashMap read returning None.
+            // T17.Δ.4 — JVMTI FieldAccess watchpoint, scoped to this VM.
+            // Fast path: no watchpoint registered ⇒ one atomic load; when the
+            // process-wide union says some VM is watching, one HashMap read
+            // against *this* VM's row returning None.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
-                crate::runtime::jvmti::fire_field_access_if_watched(
+                crate::runtime::jvmti::fire_field_access_if_watched_for_vm(
+                    shared.vm_identity,
                     thread.thread_id.0,
                     method_id,
                     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
@@ -17688,10 +18792,11 @@ fn execute_instruction(
                     }
                 }
             } // end `if any_field_diag()` — consolidated putfield diagnostics
-              // T17.Δ.4 — JVMTI FieldModification watchpoint.
+              // T17.Δ.4 — JVMTI FieldModification watchpoint, scoped to this VM.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
-                crate::runtime::jvmti::fire_field_modification_if_watched(
+                crate::runtime::jvmti::fire_field_modification_if_watched_for_vm(
+                    shared.vm_identity,
                     thread.thread_id.0,
                     method_id,
                     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
@@ -17797,6 +18902,7 @@ fn execute_instruction(
                     let recv_cid = shared.mem.heap.class_id_of(obj_ref);
                     if ec_is_watched_class(shared, recv_cid) {
                         crate::runtime::ec_watch::record(
+                            shared.vm_identity,
                             obj_ref,
                             field.field_index,
                             // Cast: object/code pointer to integer address
@@ -18297,9 +19403,22 @@ fn execute_instruction(
                 let comp_brackets = total_array_depth - d - 1;
                 let cid = if comp_brackets > 0 {
                     // Component is itself an array class — resolve `[…`.
+                    //
+                    // JVMS §5.3.3: that inner array class is defined by the
+                    // defining loader of ITS component, so it must be resolved
+                    // loader-faithfully. This `ClassId` is stamped into the
+                    // allocated array object's header and is what a later
+                    // `getClass()` / `getComponentType()` reads back, so
+                    // collapsing two loaders' `[Lp/X;` here would make
+                    // `new p.X[2][2]` report the wrong loader's element type.
                     let comp_desc = format!("{}{}", "[".repeat(comp_brackets), leaf_desc);
-                    resolve_class_loader_aware(shared, thread, referencing_class_id, &comp_desc)
-                        .unwrap_or(ClassId::new(0))
+                    resolve_class_or_array_loader_aware(
+                        shared,
+                        thread,
+                        referencing_class_id,
+                        &comp_desc,
+                    )
+                    .unwrap_or(ClassId::new(0))
                 } else if leaf_desc.starts_with('L') && leaf_desc.ends_with(';') {
                     // Reference leaf — component is the element class itself.
                     let comp_name = &leaf_desc[1..leaf_desc.len() - 1];
@@ -19302,7 +20421,14 @@ pub use constants::*;
 // Moved to `interpreter/field_access.rs`. The `pub use` keeps every
 // existing path resolving; a glob re-export caps each item at its own
 // declared visibility, so nothing here became more public than it was.
-mod field_access;
+//
+// C2 P0 — the module declaration itself is `pub(crate)` (it was private) so
+// that `crate::runtime::resolve::MemberResolver` can name the field-resolution
+// core it delegates to. Nothing inside became more visible: the glob re-export
+// still caps each item at its own declared visibility, and only the one item
+// `resolve` calls was widened. Call `runtime::resolve`, not this module —
+// `runtime::resolve::guard` enforces it.
+pub(crate) mod field_access;
 pub use field_access::*;
 // ---------------------------------------------------------------------------
 // Helper: Method invocation
@@ -19311,8 +20437,137 @@ pub use field_access::*;
 // Moved to `interpreter/invoke.rs`. The `pub use` keeps every
 // existing path resolving; a glob re-export caps each item at its own
 // declared visibility, so nothing here became more public than it was.
-mod invoke;
+//
+// C2 P0 — `pub(crate)` for the same reason as `field_access` above: it is the
+// method-resolution core that `crate::runtime::resolve::MemberResolver`
+// delegates to. Only `resolve_method_metadata` was widened.
+pub(crate) mod invoke;
 pub use invoke::*;
+
+// ---------------------------------------------------------------------------
+// Helper: loader-faithful ARRAY class resolution (JVMS §5.3.3)
+// ---------------------------------------------------------------------------
+
+/// Resolve the array class `name` the way JVMS §5.3.3 requires, from the
+/// perspective of `referencing_class_id`'s defining loader.
+///
+/// > If the component type is a `reference` type, the Java Virtual Machine
+/// > marks C to have the defining loader of the component type as its defining
+/// > loader. Otherwise, the Java Virtual Machine marks C to have the bootstrap
+/// > class loader as its defining loader.
+/// >
+/// > — JVMS SE 21 §5.3.3, step 2
+///
+/// So `[Lp/X;` referenced from a class defined by loader A is a *different*
+/// runtime class from `[Lp/X;` referenced from loader B whenever A and B each
+/// define their own `p/X`. Collapsing the two is type confusion: array class
+/// identity is what `checkcast`/`instanceof` on an array type, the verifier's
+/// array-assignability rules and `Class.getComponentType()` all read.
+///
+/// Returns `None` — meaning "no loader-faithful answer, use the ordinary global
+/// resolution" — for a non-array name, for a referencing class whose defining
+/// loader is built-in, or when the class manager cannot synthesise the array.
+/// It can therefore only ever return a *more* precise answer, never fail a
+/// resolution that the global path would have answered.
+///
+/// Locking: the O(1) exact-key probe runs under the class-manager **read**
+/// lock, and the write lock is taken only on the cold "this loader has never
+/// resolved this array descriptor" path — at most once per
+/// `(loader, array descriptor)` pair. Same discipline as
+/// `SharedVm::load_class_concurrent`; each guard is bound to a `let` so it is
+/// dropped at the semicolon rather than being held across the next acquisition
+/// (`parking_lot::RwLock` is not reentrant — see the note in
+/// `typecheck::array_is_assignable_to_impl`).
+pub(crate) fn resolve_array_class_loader_aware(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+    name: &str,
+) -> Option<ClassId> {
+    if !name.starts_with('[') {
+        return None;
+    }
+    let requesting_loader = {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_loader_id(referencing_class_id)
+    }?;
+    // Only a user-defined component loader can produce a non-bootstrap array
+    // class (see `ClassManager::array_defining_loader` for why the three
+    // built-in loaders are deliberately collapsed onto `Bootstrap`), so for a
+    // built-in referencing class this path has nothing to add and must not pay
+    // for the probe.
+    if !matches!(
+        requesting_loader,
+        cratonvm_types::ClassLoaderId::UserDefined(_)
+    ) {
+        return None;
+    }
+    // Fast path. Exact key only: a delegating probe would hand back another
+    // loader's array class, which is the whole bug.
+    //
+    // Probing under `requesting_loader` is sound even though the array's key is
+    // its *component's* loader — a hit means an array class named `name` is
+    // filed under this loader, which by construction (the key is derived from
+    // the component) means its component was defined by this loader.
+    let cached = {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .loaded_class_under_exact_key(name, requesting_loader)
+    };
+    if let Some(id) = cached {
+        return Some(id);
+    }
+    // §5.3.3 step 1: "the algorithm of this section is applied recursively
+    // **using L** in order to load and thereby create the component type".
+    // `ClassManager` cannot invoke a Java `loadClass`, so drive the component
+    // through this loader here, before deriving the array's defining loader
+    // from it. Without this the component would fall back to the flat global
+    // store and the array would come out bootstrap-keyed again.
+    if let Some(component) = array_component_class_name(name) {
+        let known = {
+            shared
+                .classes
+                .class_manager
+                .read()
+                .find_class_by_name_for_loader(component, requesting_loader)
+        };
+        if known.is_none() {
+            let _ = drive_defining_loader_load(shared, thread, referencing_class_id, component);
+        }
+    }
+    shared
+        .classes
+        .class_manager
+        .write()
+        .load_array_class_for_loader(name, requesting_loader)
+        .ok()
+}
+
+/// [`resolve_array_class_loader_aware`] with the ordinary
+/// [`resolve_class_loader_aware`] as its fallback — the drop-in replacement for
+/// a `CONSTANT_Class` resolution site that may be handed either an array
+/// descriptor or a plain class name.
+pub(crate) fn resolve_class_or_array_loader_aware(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+    name: &str,
+) -> Result<ClassId, MethodCallFailed> {
+    if name.starts_with('[') {
+        let loader_faithful =
+            resolve_array_class_loader_aware(shared, thread, referencing_class_id, name);
+        if let Some(id) = loader_faithful {
+            return Ok(id);
+        }
+    }
+    resolve_class_loader_aware(shared, thread, referencing_class_id, name)
+}
+
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
@@ -21155,6 +22410,58 @@ mod tests {
             fci,
             "tryLock",
             "(JJZ)Ljava/nio/channels/FileLock;"
+        ));
+    }
+
+    #[test]
+    fn file_system_provider_link_ops_force_native_over_the_base_class_throw() {
+        // The base class gives all three a concrete
+        // `throw new UnsupportedOperationException()` body, and CratonVM's
+        // default provider IS that base class — so both dispatch gates have to
+        // admit the registered natives or `Files.createSymbolicLink` dies at
+        // `FileSystemProvider.createSymbolicLink`.
+        let providers = [
+            "java/nio/file/spi/FileSystemProvider",
+            "sun/nio/fs/WindowsFileSystemProvider",
+            "sun/nio/fs/UnixFileSystemProvider",
+        ];
+        let ops = [
+            (
+                "createSymbolicLink",
+                "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)V",
+            ),
+            ("createLink", "(Ljava/nio/file/Path;Ljava/nio/file/Path;)V"),
+            (
+                "readSymbolicLink",
+                "(Ljava/nio/file/Path;)Ljava/nio/file/Path;",
+            ),
+        ];
+        for provider in providers {
+            for (name, descriptor) in ops {
+                assert!(
+                    is_file_system_provider_link_native_override(provider, name, descriptor),
+                    "{provider}.{name}{descriptor} must route to the registered native"
+                );
+                assert!(
+                    force_native_over_real_jdk_bytecode(provider, name, descriptor),
+                    "real-JDK bytecode dispatch must force the {name} native"
+                );
+            }
+        }
+        // The `Files` static wrapper is NOT the receiver these run on: a
+        // registration there loses to `Files`' own bytecode, which is what made
+        // the original three stubs dead code. The exemption must not pretend
+        // otherwise.
+        assert!(!is_file_system_provider_link_native_override(
+            "java/nio/file/Files",
+            "createSymbolicLink",
+            "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/file/Path;"
+        ));
+        // A neighbouring provider method must not be swept in.
+        assert!(!is_file_system_provider_link_native_override(
+            "java/nio/file/spi/FileSystemProvider",
+            "delete",
+            "(Ljava/nio/file/Path;)V"
         ));
     }
 

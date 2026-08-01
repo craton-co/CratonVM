@@ -4570,16 +4570,18 @@ mod checkexec_security_tests {
     fn no_security_manager_allows_check_exec() {
         let _guard = security_state_test_lock();
         // Ensure no SM is installed (defensive вЂ” other tests may have set one).
-        let prev = set_security_manager_for_test(None);
-
+        // The slot is per-VM now, so the reset needs the ctx whose identity
+        // owns it. `mock_ctx()` reports the default identity 0.
         let mut ctx = mock_ctx();
+        let prev = set_security_manager_for_test(&ctx, None);
+
         let result = check_exec_or_throw(&mut ctx, "/usr/bin/ls");
         assert!(
             result.is_ok(),
             "check_exec_or_throw must be a no-op with no SecurityManager, got {result:?}",
         );
 
-        let _ = set_security_manager_for_test(prev);
+        let _ = set_security_manager_for_test(&ctx, prev);
     }
 
     // -----------------------------------------------------------------------
@@ -4592,7 +4594,7 @@ mod checkexec_security_tests {
         let _guard = security_state_test_lock();
         let mut ctx = mock_ctx();
         let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
-        let prev = set_security_manager_for_test(Some(sm));
+        let prev = set_security_manager_for_test(&ctx, Some(sm));
 
         // Pre-arm the mock so the next invoke_virtual returns a SecurityException.
         // This simulates a SecurityManager whose checkExec(String) denies.
@@ -4608,7 +4610,7 @@ mod checkexec_security_tests {
         let err = result.expect_err("denying SM must surface SecurityException");
         assert_security_exception(&err);
 
-        let _ = set_security_manager_for_test(prev);
+        let _ = set_security_manager_for_test(&ctx, prev);
     }
 
     #[test]
@@ -4622,7 +4624,7 @@ mod checkexec_security_tests {
         // surface IOException, not SecurityException.
         let mut ctx = mock_ctx();
         let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
-        let prev = set_security_manager_for_test(Some(sm));
+        let prev = set_security_manager_for_test(&ctx, Some(sm));
         unsafe {
             *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
                 VmError::Runtime(RuntimeError::SecurityException {
@@ -4645,7 +4647,7 @@ mod checkexec_security_tests {
         let err = result.expect_err("deny-all SM must block Runtime.exec spawn");
         assert_security_exception(&err);
 
-        let _ = set_security_manager_for_test(prev);
+        let _ = set_security_manager_for_test(&ctx, prev);
     }
 
     #[test]
@@ -4657,7 +4659,7 @@ mod checkexec_security_tests {
         // not silently bypass policy.
         let mut ctx = mock_ctx();
         let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
-        let prev = set_security_manager_for_test(Some(sm));
+        let prev = set_security_manager_for_test(&ctx, Some(sm));
         unsafe {
             *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
                 VmError::Runtime(RuntimeError::SecurityException {
@@ -4679,7 +4681,7 @@ mod checkexec_security_tests {
         let err = result.expect_err("deny-all SM must block ProcessBuilder.start");
         assert_security_exception(&err);
 
-        let _ = set_security_manager_for_test(prev);
+        let _ = set_security_manager_for_test(&ctx, prev);
     }
 
     // -----------------------------------------------------------------------
@@ -4698,7 +4700,7 @@ mod checkexec_security_tests {
         let _guard = security_state_test_lock();
         let mut ctx = mock_ctx();
         let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
-        let prev = set_security_manager_for_test(Some(sm));
+        let prev = set_security_manager_for_test(&ctx, Some(sm));
 
         // First call: simulate a denial for the disallowed binary.
         unsafe {
@@ -4721,7 +4723,7 @@ mod checkexec_security_tests {
             "allow-listed path must pass the gate, got {allowed:?}",
         );
 
-        let _ = set_security_manager_for_test(prev);
+        let _ = set_security_manager_for_test(&ctx, prev);
     }
 }
 

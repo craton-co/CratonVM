@@ -825,6 +825,25 @@ pub(crate) fn resolve_class_loader_aware(
             let _ = drive_defining_loader_load(shared, thread, referencing_class_id, component);
         }
     }
+    // (0b) JVMS §5.3.3: an array class is defined by its COMPONENT's defining
+    //      loader, not the bootstrap loader. Every loader-faithful branch below
+    //      excludes `[` names, so without this an `X[]` resolved from one user
+    //      loader was handed to the next loader that asked — type confusion,
+    //      since array-class identity is what `checkcast` and the verifier
+    //      consult.
+    //
+    //      Strictly additive: the helper answers `None` for a non-array name
+    //      and for a built-in referencing loader.
+    if name.starts_with('[') {
+        if let Some(id) = crate::runtime::interpreter::resolve_array_class_loader_aware(
+            shared,
+            thread,
+            referencing_class_id,
+            name,
+        ) {
+            return Ok(id);
+        }
+    }
     // (1) Gate / built-in / JDK-name fast paths + already-known loader-local
     //     answer — none of which need a re-entrant call.
     let direct_loader = shared

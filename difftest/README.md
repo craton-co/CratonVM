@@ -38,6 +38,8 @@ difftest/
     crossmode.rs CratonVM path-vs-path comparison (needs no reference JDK)
     matrix.rs    opcode / execution-path coverage matrix, derived from the
                  corpus class files themselves
+    opcorpus.rs  the generated opcode corpus: one deterministic, checksum-
+                 declaring Java program per JVMS opcode (197 of 202)
     harness.rs   compile + run the matrix + diff + gate (§3.5)
     generate.rs  corpus generator (§3.1)
     minimize.rs  reproducer shrinker (§3.4)
@@ -49,6 +51,7 @@ difftest/
                  expected to diverge until §5 enforcement lands
   ledger.json    committed known-divergence ledger (the gate's baseline)
   corpus/        live corpus (generated / promoted inputs)   [grows at runtime]
+  corpus-opcodes/ generated opcode corpus  [build product, .gitignore'd]
   regression/    minimized, committed repros of confirmed divergences
 ```
 
@@ -88,7 +91,32 @@ cratonvm-difftest run --corpus difftest/seeds \
 
 # Generate the opcode / execution-path coverage matrix (C2 review P0).
 cratonvm-difftest matrix --corpus difftest/seeds --show-gaps
+
+# ...but a matrix over the 3-program seed corpus measures almost nothing, so
+# generate one program per opcode first and point the matrix at that.
+cratonvm-difftest gen-opcodes --out target/difftest-opcodes
+cratonvm-difftest matrix --corpus target/difftest-opcodes --show-gaps
 ```
+
+### The generated opcode corpus
+
+`gen-opcodes` emits **one Java program per JVMS opcode** — 197 of 202, with the
+five `javac` cannot produce (`nop`, `swap`, `jsr`, `ret`, `jsr_w`) reported as
+`unreachable-by-construction` with the reason rather than as gaps anybody could
+close. Each program is deterministic, declares a `##DIFFTEST-CHECKSUM##` line
+(before this, *no* seed did, so the fifth comparison dimension was never
+exercised), and wraps its focus opcode in a loop **and** a handler so the `osr`
+and `exception` axes have code sites at all — those facts are per method, so
+helper methods carry their own pair.
+
+Three recipes exist only because generation makes them practical: `ldc_w` needs a
+constant pool deeper than 255 entries, `wide` needs more than 255 locals, and
+`goto_w` needs a method body over 32 KiB. Nobody writes those by hand.
+
+The corpus is a **build product** (`.gitignore`d): `gen-opcodes` reproduces it
+byte-identically, and committing it would let the programs drift from the
+recipes that describe them. Full write-up, including what the matrix still does
+not claim: [`docs/testing/opcode-coverage.md`](../docs/testing/opcode-coverage.md).
 
 ### Execution-path modes
 

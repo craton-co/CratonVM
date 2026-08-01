@@ -538,6 +538,19 @@ impl<'a> ClassMethodProvider for VmClassMethodProvider<'a> {
 pub struct VmLocalVariableProvider<'a> {
     pub thread: &'a mut crate::threading::jvm_thread::JvmThread,
     pub thread_id: u64,
+    /// The heap the returned raw addresses belong to.
+    ///
+    /// `get_local` on an object local hands an agent that object's raw
+    /// address as an `i64` — a long-smuggle mint, which must be registered
+    /// in `memory::smuggled_longs` against the heap that owns it (a mint
+    /// table is per-heap; see that module). `JvmThread` carries no route to
+    /// its `SharedVm`, so the constructor supplies it.
+    ///
+    /// `None` disables the mint registration, and a provider built that way
+    /// will leave a smuggled JVMTI local un-rewritable across a moving
+    /// collection. Only the unit tests below construct one; any production
+    /// wiring MUST pass `Some(&shared.mem.heap)`.
+    pub heap: Option<&'a crate::memory::VmHeap>,
 }
 
 impl<'a> LocalVariableProvider for VmLocalVariableProvider<'a> {
@@ -561,8 +574,11 @@ impl<'a> LocalVariableProvider for VmLocalVariableProvider<'a> {
                 // local receives its raw address as i64 and may re-inject it
                 // (set_local) or hold it in Java-visible longs. Register the
                 // exact value (definitionally an object start) so the GC
-                // rewrite arm treats it as a genuine handle.
-                crate::memory::smuggled_longs::record_minted_long(r.as_ptr() as u64);
+                // rewrite arm treats it as a genuine handle. The mint table
+                // is per-heap, so this needs the owning heap (see `heap`).
+                if let Some(heap) = self.heap {
+                    crate::memory::smuggled_longs::record_minted_long(heap, r.as_ptr() as u64);
+                }
                 r.as_ptr() as i64
             }
             crate::types::Value::Object(None) => 0,
@@ -975,6 +991,7 @@ mod tests {
         let provider = VmLocalVariableProvider {
             thread: &mut thread,
             thread_id: 1,
+            heap: None,
         };
 
         // Read int local at slot 0
@@ -1011,6 +1028,7 @@ mod tests {
         let mut provider = VmLocalVariableProvider {
             thread: &mut thread,
             thread_id: 1,
+            heap: None,
         };
 
         // Set int local
