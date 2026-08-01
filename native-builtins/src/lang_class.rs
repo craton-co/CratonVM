@@ -5018,7 +5018,7 @@ pub(crate) fn write_field_accessible_external(
 // reads by resolved index (descriptor-decoded) and degrades any non-reference
 // tag to null. `getModifiers` below is `()I` and stays on the by-name read —
 // there `Int(0)` is the correct answer for an unwritten slot.
-// See `docs/known-issues/by-name-field-reads.md`.
+// See `docs/known-issues/c2/by-name-field-reads.md`.
 pub(crate) fn native_field_get_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],

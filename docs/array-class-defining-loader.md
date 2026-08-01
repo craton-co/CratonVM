@@ -4,7 +4,7 @@
 points this lane owns, with seven regression tests. One interpreter call site
 and four `native-builtins` consumers remain — each with a recipe below.
 
-This closes *Open 3* of `docs/known-issues/classloading-identity-audit.md`.
+This closes *Open 3* of `docs/known-issues/c2/classloading-identity-audit.md`.
 
 ## 1. What the specification actually says
 
@@ -319,7 +319,7 @@ answer each time rather than hitting a recorded alias.
 
 ## Related
 
-* `docs/known-issues/classloading-identity-audit.md` — *Open 3* is this
+* `docs/known-issues/c2/classloading-identity-audit.md` — *Open 3* is this
   document; *Fixed 1* (`upgrade_synthetic_class` re-key) is the template the
   migration branch follows; *Open 5* is *Remaining 4* above.
 * `docs/internal/loader-identity.md` — per-file tally of remaining

@@ -10742,7 +10742,7 @@ fn virtual_object_info_for(
 /// optimizing tier is an optimization, never a requirement.
 ///
 /// This is the adapter the P0 "JIT correctness" lane of
-/// `docs/known-issues/deep-research-vm-c2.md` asks for: `verify_graph` returns
+/// `docs/known-issues/c2/deep-research-vm-c2.md` asks for: `verify_graph` returns
 /// `Result`, the compile path returns `Option`, and rather than change the
 /// signature of anything already in the pipeline the conversion happens here,
 /// at the call site. The bailout is *counted* (`bailout::bailout_counts`) so
@@ -11916,6 +11916,12 @@ thread_local! {
 /// own code reads a local (`a`) last assigned by the FIRST try's successful
 /// (non-exceptional) path. Without SOME such check, that method compiled
 /// and silently produced a wrong checksum.
+///
+/// (Everything above documents [`local_handler_reads_unsafe_local`], the
+/// private compile-time gate at the bottom of this block — not the public
+/// wrapper immediately below, which inherited the paragraphs when it was
+/// added.)
+
 /// VM-side view of [`local_handler_reads_unsafe_local`]: does resuming one of
 /// this method's handlers require the locals a PRECISE exceptional frame
 /// carries, rather than the `this`-plus-declared-parameters reconstruction the
@@ -11977,6 +11983,7 @@ fn local_handler_reads_unsafe_local(
     }
     false
 }
+
 
 /// Whether the precise-handler-frame relaxation of the RBC.6 gate is enabled.
 ///
@@ -13257,7 +13264,7 @@ fn try_compile_inner(
                 // Branchy-IR explicitly disabled (CRATONVM_NO_IR_BRANCHY) and
                 // reassoc off → fall through to the single-pass backend below.
             } else {
-                // P0 "JIT correctness" (docs/known-issues/deep-research-vm-c2.md):
+                // P0 "JIT correctness" (docs/known-issues/c2/deep-research-vm-c2.md):
                 // the IR verifier runs after every mutating pass when
                 // `ir_verify::verify_enabled()` (debug builds, or
                 // `CRATONVM_JIT_VERIFY_IR=1`), and unconditionally immediately

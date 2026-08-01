@@ -10410,7 +10410,7 @@ pub(crate) fn bc_pkcs12_read_state(
     // unwritten slot answers `Value::Int(0)`, which the first arm ACCEPTED, so
     // the `_ => 0` fallback was not even the path that produced the zero. A
     // PKCS#12 KDF run with zero iterations degenerates the derived key. Read by
-    // resolved index and refuse. See `docs/known-issues/by-name-field-reads.md`.
+    // resolved index and refuse. See `docs/known-issues/c2/by-name-field-reads.md`.
     let iteration_count = match crate::field_read::int_field_strict(ctx, this, "iterationCount") {
         Some(v) if v > 0 => v,
         _ => {

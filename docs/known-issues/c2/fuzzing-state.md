@@ -390,9 +390,9 @@ campaign that does not. It does not replace one that does.
 
 ## Cross-file corrections needed (not this lane's files)
 
-1. **`docs/known-issues/class-file-parser-hardening.md:151`** says "18
+1. **`docs/known-issues/c2/class-file-parser-hardening.md:151`** says "18
    `libfuzzer` targets". There are 17.
-2. **`docs/known-issues/class-file-parser-hardening.md:154`** says they
+2. **`docs/known-issues/c2/class-file-parser-hardening.md:154`** says they
    "are not wired into CI". They are — `ci.yml:926-942`, blocking. The
    accurate statement is that CI builds them and never runs them.
 3. **`reader/tests/mutation_harness.rs:11-13`** repeats the same claim in

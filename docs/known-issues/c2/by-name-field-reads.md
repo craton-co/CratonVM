@@ -369,7 +369,7 @@ write per reference field per native-allocated object.
 
 ## Related
 
-* `docs/known-issues/crypto-failure-mode-audit.md` — the crypto-side guards
+* `docs/known-issues/c2/crypto-failure-mode-audit.md` — the crypto-side guards
   (`check_rounds`, `demand_rounds`) that instance (a) was upstream of.
 * `native-api/src/registry.rs:2173-2180` — the trait doc for both accessors.
   It documents the "not found" case but not the descriptor asymmetry; worth

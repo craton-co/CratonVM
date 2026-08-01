@@ -100,7 +100,7 @@ pub use class_manager::{
     // "nobody has this name" apart from "several loaders each have their own
     // class under it". Every `Option`-returning lookup collapses the two, and a
     // caller that reads the collapse as "absent" loads a second copy — see
-    // `docs/known-issues/classloading-identity-audit.md`.
+    // `docs/known-issues/c2/classloading-identity-audit.md`.
     NameResolution,
     RedefineOptions,
     ResolutionInvalidateHook,

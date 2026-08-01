@@ -136,13 +136,15 @@ public class EnumLookup {{
         ])
         .output()
         .ok()?;
-    if !out.status.success() {
-        eprintln!(
-            "javac EnumLookup.java failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return None;
-    }
+    // javac RAN and rejected the source: the probe is broken, and returning
+    // None here reads to the caller as "javac unavailable, skip", which makes
+    // this test a permanent vacuous pass.
+    assert!(
+        out.status.success(),
+        "[rslf4j1_get_resources] the embedded probe failed to compile — fix the probe source. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let jar_path = dir.path().join("rslf4j1-resources.jar");
     let f = std::fs::File::create(&jar_path).ok()?;

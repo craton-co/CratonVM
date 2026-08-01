@@ -12785,7 +12785,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // ensure_synthetic_class` hands back a distinctly-named, correctly
         // sized `cratonvm/synthetic/AmbiguousName$…` stand-in instead of a
         // stub filed under the ambiguous name — see its doc comment, and
-        // `docs/known-issues/synthetic-class-fallibility.md` for the migration
+        // `docs/known-issues/c2/synthetic-class-fallibility.md` for the migration
         // that removes this method's callers.
         self.shared
             .classes

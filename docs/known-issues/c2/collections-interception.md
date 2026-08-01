@@ -8,7 +8,7 @@ receiver-agnostic fallback the other five claimed in their own comments. The
 same trap was then found on the argument side of four bulk operations. Fixed
 with nine regression tests. Four residuals are left with a recipe each.
 
-Companion to `docs/known-issues/native-builtins-shim-audit.md`, which handed
+Companion to `docs/known-issues/c2/native-builtins-shim-audit.md`, which handed
 over *Cross-crate 1* and *Cross-crate 2* to this crate. **Do not re-derive the
 dispatch mechanism** — it is established there and only summarised below.
 
@@ -324,7 +324,7 @@ reason. The equivalent assertion for this crate now lives in
 
 ## Related
 
-* `docs/known-issues/native-builtins-shim-audit.md` — the mechanism, and the
+* `docs/known-issues/c2/native-builtins-shim-audit.md` — the mechanism, and the
   hand-over of *Cross-crate 1* / *Cross-crate 2* that this document answers.
 * `docs/synthetic-vs-real-explained.md` — why a synthetic stub can win over a
   real JDK class.

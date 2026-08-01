@@ -64,18 +64,30 @@ fn compile_probe(javac: &Path) -> Option<PathBuf> {
     let dir = std::env::temp_dir().join("cratonvm-instant-real-jdk-factory-probe");
     std::fs::create_dir_all(&dir).ok()?;
     let source = dir.join("InstantRealJdkFactoryProbe.java");
-    std::fs::write(&source, PROBE_SRC).ok()?;
-    let status = Command::new(javac)
+    // Never let a stale .class from an earlier revision stand in for a source
+    // that no longer compiles.
+    let _ = std::fs::remove_file(dir.join("InstantRealJdkFactoryProbe.class"));
+    std::fs::write(&source, PROBE_SRC).expect("write probe source");
+    let out = match Command::new(javac)
         .args(["--release", "21", "-d"])
         .arg(&dir)
         .arg(&source)
-        .status()
-        .ok()?;
-    if status.success() && dir.join("InstantRealJdkFactoryProbe.class").exists() {
-        Some(dir)
-    } else {
-        None
-    }
+        .output()
+    {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[instant_real_jdk_factory] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    assert!(
+        out.status.success() && dir.join("InstantRealJdkFactoryProbe.class").exists(),
+        "[instant_real_jdk_factory] the embedded probe failed to compile — fix the probe source. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(dir)
 }
 
 fn run_probe(binary: &Path, jdk: &Path, classes: &Path, no_jit: bool) {

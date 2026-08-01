@@ -113,14 +113,25 @@ fn arraylist_list_iterator_previous_uses_live_snapshot() {
         .and_then(|mut f| f.write_all(PROBE_SRC.trim_start().as_bytes()))
         .expect("write probe source");
 
-    let status = Command::new(&javac)
+    let compile = Command::new(&javac)
         .arg("-d")
         .arg(temp.path())
         .arg(&source)
-        .status();
-    if !matches!(status, Ok(s) if s.success()) {
-        eprintln!("javac failed; skipping ArrayListReverseListIteratorProbe");
-        return;
+        .output();
+    match compile {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[arraylist_reverse_list_iterator] javac could not be executed: {e}; skipping");
+            return;
+        }
+        // javac RAN and rejected the source: the probe is broken, and skipping
+        // here would make this test a permanent vacuous pass.
+        Ok(o) => assert!(
+            o.status.success(),
+            "[arraylist_reverse_list_iterator] the embedded probe failed to compile — fix the probe source. \
+             javac stderr:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
     }
 
     let child = Command::new(&bin)

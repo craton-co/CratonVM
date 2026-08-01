@@ -43,13 +43,28 @@ fn compile_probe() -> Option<PathBuf> {
     ));
     let _ = fs::remove_dir_all(&output_dir);
     fs::create_dir_all(&output_dir).ok()?;
-    let status = Command::new("javac")
+    let out = match Command::new("javac")
         .args(["--release", "21", "-d"])
         .arg(&output_dir)
         .arg(probe_source())
-        .status()
-        .ok()?;
-    status.success().then_some(output_dir)
+        .output()
+    {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[threadpoolexecutor_prestart] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    // javac RAN and rejected the fixture: skipping here would make this test a
+    // permanent vacuous pass.
+    assert!(
+        out.status.success(),
+        "[threadpoolexecutor_prestart] the checked-in probe fixture failed to compile \
+         — fix the .java source. javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(output_dir)
 }
 
 #[test]
