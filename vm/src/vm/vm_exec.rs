@@ -2038,6 +2038,22 @@ fn safe_native_call_impl(
         }
     };
 
+    // `CRATONVM_DBG_LINKAGE=1` — a native that returns a `VmError::Linkage`
+    // hands its caller something that is only catchable if the caller's
+    // dispatch arm converts it. Name the native and the Java call site here,
+    // at the boundary, so the routing can be followed from its origin.
+    if crate::runtime::interpreter::dbg_linkage() {
+        if let Err(MethodCallFailed::InternalError(VmError::Linkage(l))) = &out {
+            let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+            crate::runtime::interpreter::dbg_linkage_dump(
+                thread,
+                "native return",
+                &format!("{callee} -> {l:?}"),
+            );
+        }
+    }
+
     thread.native_pending_return = None;
     match &mut out {
         Ok(Some(v)) => {
@@ -5451,6 +5467,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         impl_ref_kind: u8,
         instantiated_descriptor: &str,
         capture_types: &str,
+        serializable: bool,
     ) -> u32 {
         use crate::classloading::resolution::{LambdaCallSite, MethodHandle};
         use std::sync::Arc;
@@ -5476,6 +5493,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             instantiated_descriptor: Arc::from(instantiated_descriptor),
             capture_types: capture_types.chars().collect(),
             proxy_class_id,
+            serializable_flag: serializable,
         };
         let mut proxies = self.shared.classes.lambda_proxies.write();
         if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
@@ -5559,6 +5577,13 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 instantiated_descriptor: cs.instantiated_descriptor.to_string(),
                 capture_types: cs.capture_types.iter().collect(),
             })
+    }
+
+    fn lambda_proxy_serializability(
+        &self,
+        class_id: ClassId,
+    ) -> cratonvm_native_api::LambdaSerializability {
+        self.shared.lambda_proxy_serializability(class_id)
     }
 
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
@@ -12760,7 +12785,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // ensure_synthetic_class` hands back a distinctly-named, correctly
         // sized `cratonvm/synthetic/AmbiguousName$…` stand-in instead of a
         // stub filed under the ambiguous name — see its doc comment, and
-        // `docs/known-issues/synthetic-class-fallibility.md` for the migration
+        // `docs/known-issues/c2/synthetic-class-fallibility.md` for the migration
         // that removes this method's callers.
         self.shared
             .classes

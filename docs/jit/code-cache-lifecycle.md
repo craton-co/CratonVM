@@ -3,7 +3,7 @@
 Installation and invalidation protocol, epoch retirement, and the counters that
 make both auditable.
 
-**Why this exists.** The C2 review (`docs/known-issues/deep-research-vm-c2.md`)
+**Why this exists.** The C2 review (`docs/known-issues/c2/deep-research-vm-c2.md`)
 has two adjacent P1 lanes:
 
 > **Add code-cache lifecycle metrics and reclamation** — Installed/reclaimed
@@ -433,5 +433,5 @@ shows no execution of partial or reclaimed code"* — needs, in addition:
 * `gc/src/gc_metrics.rs` — the counter/report idiom this mirrors.
 * `docs/jit/compiler-metrics.md` — per-compilation reports, including
   `code_cache_bytes_at_install`.
-* `docs/known-issues/deep-research-vm-c2.md` — the review this closes two P1
+* `docs/known-issues/c2/deep-research-vm-c2.md` — the review this closes two P1
   items of.

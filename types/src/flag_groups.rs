@@ -336,7 +336,6 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jetty2", on_key: Some("CRATONVM_DBG_JETTY2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-alloc", on_key: Some("CRATONVM_DBG_JIT_ALLOC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-bisect-only", on_key: Some("CRATONVM_JIT_BISECT_ONLY"), off_key: None, off_word: None },
-    E { group: Group::DBG, token: "jit-bisect-skip", on_key: Some("CRATONVM_JIT_BISECT_SKIP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-code", on_key: Some("CRATONVM_DBG_JIT_CODE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-code-free", on_key: Some("CRATONVM_DBG_JIT_CODE_FREE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-compiled", on_key: Some("CRATONVM_DBG_JIT_COMPILED"), off_key: None, off_word: None },
@@ -577,7 +576,6 @@ pub const INVENTORY: &[E] = &[
     // so `=0` still enables it and `off_word` must stay `None`.
     E { group: Group::JIT, token: "activation-global-mutex", on_key: Some("CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "alloc-class-cache", on_key: None, off_key: Some("CRATONVM_NO_JIT_ALLOC_CLASS_CACHE"), off_word: None },
-    E { group: Group::JIT, token: "allow-packages", on_key: Some("CRATONVM_JIT_ALLOW_PACKAGES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "arith-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_ARITH_LICM"), off_word: None },
     E { group: Group::JIT, token: "bce", on_key: None, off_key: Some("CRATONVM_JIT_NO_BCE"), off_word: None },
     E { group: Group::JIT, token: "bg-compile", on_key: Some("CRATONVM_BG_COMPILE"), off_key: None, off_word: None },
@@ -681,14 +679,15 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "poison-free", on_key: Some("CRATONVM_JIT_POISON_FREE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "precise-coverage-pin", on_key: Some("CRATONVM_PRECISE_COVERAGE_PIN"), off_key: None, off_word: None },
+    // Wrong-answer A/B lever, not a tuning knob: OFF restores the params-only
+    // `run_jit_callee_handler` resume that zeroed a compiled callee's
+    // non-parameter locals. See `params_only_callee_handler_frames`.
+    E { group: Group::JIT, token: "callee-handler-precise-frame", on_key: None, off_key: Some("CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME"), off_word: None },
     E { group: Group::JIT, token: "precise-handler-frames", on_key: None, off_key: Some("CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES"), off_word: None },
     E { group: Group::JIT, token: "precise-inline-frame-record", on_key: None, off_key: Some("CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD"), off_word: None },
     E { group: Group::JIT, token: "precise-jit-maps", on_key: None, off_key: Some("CRATONVM_NO_PRECISE_JIT_MAPS"), off_word: None },
     E { group: Group::JIT, token: "precise-reg-spill", on_key: None, off_key: Some("CRATONVM_NO_PRECISE_REG_SPILL"), off_word: None },
     E { group: Group::JIT, token: "precise-virtual-invokes", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES"), off_word: None },
-    // Default-ON: `vm::jit::skip_list::allow_putfield_init` reads
-    // `0`/`off`/`false`/`no` (trimmed, lower-cased) as the kill switch.
-    E { group: Group::JIT, token: "putfield-init", on_key: Some("CRATONVM_JIT_PUTFIELD_INIT"), off_key: None, off_word: Some("0") },
     // Guard-dominated bounds-check elimination (`x64::bce::range_bce_enabled`).
     // Default-**OFF** and presence-parsed: the gate is `.is_some()`, so
     // `CRATONVM_JIT_RANGE_BCE=0` *enables* it. `off_word` must therefore stay

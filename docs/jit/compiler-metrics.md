@@ -2,7 +2,7 @@
 
 Structured, per-method compiler reports for the CratonVM JIT.
 
-**Why this exists.** The C2 review (`docs/known-issues/deep-research-vm-c2.md`)
+**Why this exists.** The C2 review (`docs/known-issues/c2/deep-research-vm-c2.md`)
 has a P0 lane *"Measure compilation quality"*, whose acceptance criterion is:
 
 > Per-method compiler report is available without parsing debug logs.
@@ -315,4 +315,4 @@ enabled.
 * `jit/src/bailout.rs` — `BailoutReason`, the category table, `bailout_counts()`.
 * `jit/src/ir_verify.rs` — the verifier whose rejections show up as
   `ir_verification` bailouts.
-* `docs/known-issues/deep-research-vm-c2.md` — the review this closes a P0 item of.
+* `docs/known-issues/c2/deep-research-vm-c2.md` — the review this closes a P0 item of.

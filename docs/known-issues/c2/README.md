@@ -1,6 +1,6 @@
 # C2 review — the lanes that were NOT implemented
 
-`docs/known-issues/deep-research-vm-c2.md` was worked through by two waves of
+`docs/known-issues/c2/deep-research-vm-c2.md` was worked through by two waves of
 parallel agent lanes. Its decomposed, file-level items landed. Five lanes did
 not, and this directory is those five, decomposed into work that can run in
 parallel.

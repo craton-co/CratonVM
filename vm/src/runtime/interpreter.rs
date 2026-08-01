@@ -313,6 +313,31 @@ fn aioobe2_dbg() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_AIOOBE2").is_some())
 }
 
+/// `CRATONVM_DBG_LINKAGE=1` — trace VM-raised `LinkageError`s through the
+/// interpreter's error routing. A linkage error that never reaches
+/// `throw_linkage_error` stays a `VmError` and unwinds past every Java handler,
+/// which looks identical to a VM crash; this names the routing arm it took and
+/// the Java frames it took it from.
+pub(crate) fn dbg_linkage() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LINKAGE").is_some())
+}
+
+/// Dump `where` plus the live Java frames, deepest first. `CRATONVM_DBG_LINKAGE` only.
+pub(crate) fn dbg_linkage_dump(thread: &JvmThread, where_: &str, detail: &str) {
+    eprintln!("[DBG_LINKAGE] {where_}: {detail}");
+    for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
+        eprintln!(
+            "[DBG_LINKAGE-STK {i}] {}.{}{} pc={}",
+            f.class_name(),
+            f.method_name(),
+            f.method_descriptor(),
+            f.pc
+        );
+    }
+}
+
 /// Validate a primitive-array-store receiver header; dump receiver + Java
 /// stack when it is not a plausible array (the stale-ref smear signature).
 /// Reads raw header BYTES (not enum fields) — a garbage `kind`/`element_type`
@@ -6674,11 +6699,11 @@ pub fn execute(
                 let cm = shared.classes.class_manager.read();
                 cm.get_class(class_id).map_or(false, |c| c.is_interface())
             };
-            let policy = if shared.config.jit_aggressive_compilation {
-                crate::jit::skip_list::SkipPolicy::Aggressive
-            } else {
-                crate::jit::skip_list::SkipPolicy::Conservative
-            };
+            // The static JIT ban list was deleted 2026-07-31 (see
+            // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
+            // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
+            // remaining force-interpret lever, applied in `jit::try_compile`.
+            let policy = ();
             // T1.1.f — classify init complexity so trivial `<init>`/`<clinit>`
             // methods (just `aload_0; invokespecial; return`) become
             // JIT-eligible. The classifier walks the bytecode and returns
@@ -6686,20 +6711,8 @@ pub fn execute(
             // and no invokedynamic. For any other method name, the
             // classifier result is `Unknown` (the classifier is only
             // consulted for `<init>`/`<clinit>`).
-            let init_complexity = if method_name == "<init>" || method_name == "<clinit>" {
-                crate::jit::skip_list::classify_init_complexity(&code_attr.code)
-            } else {
-                crate::jit::skip_list::InitComplexity::Unknown
-            };
-            let static_skip_reason = crate::jit::skip_list::should_skip_jit_with_init(
-                &*class_name_str,
-                method_name,
-                is_interface_default,
-                std::thread::current().name().is_some(),
-                policy,
-                crate::jit::skip_list::allow_packages_from_env(),
-                init_complexity,
-            );
+            let _ = policy;
+            let static_skip_reason: Option<()> = None;
             // RFJP.1 — see is_fjp_subclass_blocklisted: methods on classes that
             // transitively extend `java/util/concurrent/ForkJoinTask` miscompile
             // under deep recursion and must run in the interpreter pending a
@@ -9217,6 +9230,60 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
     execute_frame_from_index(shared, thread, initial_frame_idx)
 }
 
+/// How a fast-path invoke dispatch failure should re-enter the main loop.
+enum FastPathInvokeError {
+    /// Convert through `throw_runtime_error` at the top of the loop.
+    Runtime(RuntimeError),
+    /// Already a Java throwable — route it through the exception table.
+    Java(ObjectRef),
+    /// Not expressible as a Java throwable; unwind the whole invocation.
+    Fatal(MethodCallFailed),
+}
+
+/// Classify an error returned by one of the stackless invoke fast paths
+/// (`0xb6`/`0xb7`/`0xb8`/`0xb9`).
+///
+/// Those arms handle their own errors and `continue`, so they never reach the
+/// per-opcode conversion that guards the slow path at the bottom of the loop —
+/// they have to perform the same conversions themselves. `VmError::Linkage`
+/// was the one they did not: every `java.lang.LinkageError` subclass is an
+/// ordinary throwable (JVMS §5.4), but the fast paths returned it raw, which
+/// skipped every exception handler in every frame and killed the process at
+/// `main-vm run()`.
+///
+/// Concretely: `ClassLoader.defineClass1` rejecting a bad-magic class file is
+/// reached by `invokestatic` from `ClassLoader.defineClass`, so
+/// `assertThatExceptionOfType(ClassFormatError.class)` in
+/// `RestartClassLoaderTests.getUpdatedClass` aborted the VM instead of
+/// passing, and a `catch (Throwable)` wrapped directly around `defineClass`
+/// never ran. `probes/DefineClassFormatErrorProbe.java` and
+/// `probes/DefineClassWhereLostProbe.java` cover both shapes.
+#[cold]
+fn classify_fastpath_invoke_error(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    err: MethodCallFailed,
+) -> FastPathInvokeError {
+    if dbg_linkage() {
+        if let MethodCallFailed::InternalError(VmError::Linkage(l)) = &err {
+            dbg_linkage_dump(thread, "fast-path invoke", &format!("{l:?}"));
+        }
+    }
+    match err {
+        MethodCallFailed::InternalError(VmError::Runtime(re)) => FastPathInvokeError::Runtime(re),
+        MethodCallFailed::ExceptionThrown(exc) => FastPathInvokeError::Java(exc),
+        MethodCallFailed::InternalError(VmError::Linkage(linkage_err)) => {
+            match crate::runtime::exceptions::throw_linkage_error(shared, thread, linkage_err) {
+                MethodCallFailed::ExceptionThrown(exc) => FastPathInvokeError::Java(exc),
+                // The throwable could not be built (`throw_linkage_error` logs
+                // why). Preserve the old behaviour rather than losing the error.
+                other => FastPathInvokeError::Fatal(other),
+            }
+        }
+        other => FastPathInvokeError::Fatal(other),
+    }
+}
+
 /// Execute a previously frozen stack. `initial_frame_idx` is the oldest frame
 /// owned by this invocation, while dispatch resumes at the current top frame.
 fn execute_frame_from_index(
@@ -11566,15 +11633,17 @@ fn execute_frame_from_index(
                             continue;
                         }
                         Ok(CachedCallResult::CacheMiss) => {}
-                        Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
-                            pending_runtime_error = Some((re, saved_pc));
-                            continue;
-                        }
-                        Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                            pending_java_exception = Some((exc, saved_pc));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        Err(e) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        },
                     }
                     // Miss path — VtableManager lock-free dispatch; a hit here
                     // populates invoke_cache for the next call.
@@ -11589,15 +11658,17 @@ fn execute_frame_from_index(
                             continue;
                         }
                         Ok(CachedCallResult::CacheMiss) => {}
-                        Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
-                            pending_runtime_error = Some((re, saved_pc));
-                            continue;
-                        }
-                        Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                            pending_java_exception = Some((exc, saved_pc));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        Err(e) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        },
                     }
                     match execute_invoke(shared, thread, frame_idx, cp_index, false) {
                         Ok(CachedCallResult::FramePushed) => {
@@ -11607,15 +11678,17 @@ fn execute_frame_from_index(
                         Ok(_) => {
                             continue;
                         }
-                        Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
-                            pending_runtime_error = Some((re, saved_pc));
-                            continue;
-                        }
-                        Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                            pending_java_exception = Some((exc, saved_pc));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        Err(e) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        },
                     }
                 }
                 // invokespecial — stackless dispatch with cache
@@ -11635,15 +11708,17 @@ fn execute_frame_from_index(
                             continue;
                         }
                         Ok(CachedCallResult::CacheMiss) => {}
-                        Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
-                            pending_runtime_error = Some((re, saved_pc));
-                            continue;
-                        }
-                        Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                            pending_java_exception = Some((exc, saved_pc));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        Err(e) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        },
                     }
                     match execute_invoke(shared, thread, frame_idx, cp_index, true) {
                         Ok(CachedCallResult::FramePushed) => {
@@ -11653,15 +11728,17 @@ fn execute_frame_from_index(
                         Ok(_) => {
                             continue;
                         }
-                        Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
-                            pending_runtime_error = Some((re, saved_pc));
-                            continue;
-                        }
-                        Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                            pending_java_exception = Some((exc, saved_pc));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        Err(e) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        },
                     }
                 }
                 // invokestatic — stackless dispatch with cache
@@ -11711,15 +11788,17 @@ fn execute_frame_from_index(
                             continue;
                         }
                         Ok(CachedCallResult::CacheMiss) => {}
-                        Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
-                            pending_runtime_error = Some((re, saved_pc));
-                            continue;
-                        }
-                        Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                            pending_java_exception = Some((exc, saved_pc));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        Err(e) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        },
                     }
                     match execute_invokestatic(shared, thread, frame_idx, cp_index) {
                         Ok(CachedCallResult::FramePushed) => {
@@ -11729,15 +11808,17 @@ fn execute_frame_from_index(
                         Ok(_) => {
                             continue;
                         }
-                        Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
-                            pending_runtime_error = Some((re, saved_pc));
-                            continue;
-                        }
-                        Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                            pending_java_exception = Some((exc, saved_pc));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        Err(e) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        },
                     }
                 }
                 // invokeinterface — stackless dispatch with monomorphic inline cache
@@ -11758,15 +11839,17 @@ fn execute_frame_from_index(
                             continue;
                         }
                         Ok(CachedCallResult::CacheMiss) => {}
-                        Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
-                            pending_runtime_error = Some((re, saved_pc));
-                            continue;
-                        }
-                        Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                            pending_java_exception = Some((exc, saved_pc));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        Err(e) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        },
                     }
                     // Miss path: interface dispatch shares the same vtable fast-path
                     // because the receiver's vtable already carries the
@@ -11784,15 +11867,17 @@ fn execute_frame_from_index(
                             continue;
                         }
                         Ok(CachedCallResult::CacheMiss) => {}
-                        Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
-                            pending_runtime_error = Some((re, saved_pc));
-                            continue;
-                        }
-                        Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                            pending_java_exception = Some((exc, saved_pc));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        Err(e) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        },
                     }
                     // invokeinterface: thread is_interface=true so γ's stash
                     // arms the default-method rescue.
@@ -11804,15 +11889,17 @@ fn execute_frame_from_index(
                         Ok(_) => {
                             continue;
                         }
-                        Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
-                            pending_runtime_error = Some((re, saved_pc));
-                            continue;
-                        }
-                        Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                            pending_java_exception = Some((exc, saved_pc));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                        Err(e) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                                continue;
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        },
                     }
                 }
                 _ => { /* fall through to slow path */ }
@@ -12055,6 +12142,9 @@ fn execute_frame_from_index(
                 Err(mcf)
             }
             Err(MethodCallFailed::InternalError(VmError::Linkage(linkage_err))) => {
+                if dbg_linkage() {
+                    dbg_linkage_dump(thread, "slow-path opcode", &format!("{linkage_err:?}"));
+                }
                 let mcf =
                     crate::runtime::exceptions::throw_linkage_error(shared, thread, linkage_err);
                 Err(mcf)
@@ -12196,6 +12286,9 @@ fn execute_frame_from_index(
             }
             Err(MethodCallFailed::InternalError(e)) => {
                 // Non-Runtime internal errors (linkage, classfile, etc.) — unwind.
+                if dbg_linkage() {
+                    dbg_linkage_dump(thread, "unwind (uncatchable)", &format!("{e:?}"));
+                }
                 while frame_idx > initial_frame_idx {
                     pop_and_recycle_frame_with_reason(shared, thread, true);
                     frame_idx -= 1;
@@ -13452,7 +13545,29 @@ fn route_jit_signal_exception(
     };
     let (throw_pc, locals) = match precise.as_ref() {
         Some((bci, locals)) => (*bci, locals.as_slice()),
-        None => (fallback_throw_pc, fallback_locals),
+        None => {
+            // The sibling of `run_jit_callee_handler`'s refusal, for the sink
+            // that was ALREADY consuming precise frames. Consuming them is not
+            // the whole contract: when none is stashed, `fallback_locals` is
+            // this method's `this`-plus-parameters, which describes a handler
+            // that reads nothing else. `precise_handler_frames_enabled` retired
+            // the compile gate that used to guarantee that, so a method whose
+            // handler DOES read further locals reaches here too — and with the
+            // throw pc unknown, `find_jit_exception_handler` will still match
+            // one of its typed handlers by exception class. Entering it would
+            // zero those locals silently. Propagate instead, exactly as this
+            // function already does for a frame it cannot map.
+            if handler_resume_needs_precise_locals(cached) {
+                if crate::jit::helpers::rbc6_dbg() {
+                    eprintln!(
+                        "[rbc6-dbg] route_jit_signal_exception DECLINED {}.{}{}                          — handler needs precise locals and no frame was published",
+                        cached.class_name, cached.method_name, cached.method_descriptor,
+                    );
+                }
+                return Err(MethodCallFailed::ExceptionThrown(exc));
+            }
+            (fallback_throw_pc, fallback_locals)
+        }
     };
     if crate::jit::helpers::rbc6_dbg() {
         eprintln!(
@@ -13680,6 +13795,85 @@ pub(crate) fn find_jit_exception_handler(
     handler_pc
 }
 
+/// Claim the stashed reason-9 exceptional frame if it names `cached`, mapping
+/// it to `(throw bci, locals)`.
+///
+/// A frame naming a DIFFERENT method is re-stashed, not dropped: unlike
+/// `route_jit_signal_exception` (the outermost drain, where a foreign frame's
+/// owner is provably gone), this sink runs while the compiled CALLER is still
+/// on the stack and will drain later — a frame belonging to it is still in
+/// flight. An unmappable frame is consumed and reported as absent, so the
+/// caller fails closed rather than resuming on values it could not rebuild.
+///
+/// `incoming_args` repairs slot 0 of an instance method. The snapshot records
+/// `this` as `Undefined` whenever the bytecode has no further *read* of it —
+/// which is the common case, and is exactly what the real
+/// `BindConverter.convert` frame does (`getfield delegates` at bci 3 is its last
+/// use, so local 0 is dropped from bci 4 on). Liveness is the right answer for a
+/// bytecode read; it is the wrong answer for the receiver, which the VM itself
+/// still needs for a `synchronized` method's monitor and for stack traces. The
+/// caller passed the genuine receiver in, so put it back.
+fn precise_handler_frame_for(
+    cached: &Arc<CachedBytecodeMethod>,
+    incoming_args: &[Value],
+) -> Option<(usize, Vec<Value>)> {
+    if params_only_callee_handler_frames() {
+        return None;
+    }
+    let rframe = cratonvm_jit::deopt::take_exceptional_frame()?;
+    if !deopt_frame_matches_method(
+        &rframe,
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+    ) {
+        cratonvm_jit::deopt::restash_exceptional_frame(rframe);
+        return None;
+    }
+    let bci = rframe.bci as usize;
+    let mut locals = ir_deopt_locals(&rframe.locals)?;
+    if !cached.is_static {
+        if let (Some(slot0), Some(receiver)) = (locals.first_mut(), incoming_args.first()) {
+            *slot0 = *receiver;
+        }
+    }
+    Some((bci, locals))
+}
+
+/// A/B opt-out (`CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME=1`): restore the
+/// pre-2026-08-01 `run_jit_callee_handler`, which resumed a compiled callee's
+/// handler on `this`-plus-parameters and left every other local zeroed.
+///
+/// It exists so one binary can demonstrate the defect and its fix:
+/// `JitPreciseHandlerFrame.loopMismatches` reports 19497 of 20000 with this set
+/// and 0 without it. It restores the old behaviour in full, fail-closed
+/// branch included, because a decline is not what the old code did and an A/B
+/// that silently substitutes a third behaviour proves nothing. This is a
+/// wrong-answer switch, not a tuning knob — nothing but a differential run
+/// should ever set it.
+fn params_only_callee_handler_frames() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME")
+            .is_some()
+    })
+}
+
+/// Would resuming one of `cached`'s handlers on `this`-plus-parameters alone
+/// invent values? See `cratonvm_jit::handler_resume_requires_precise_locals`.
+fn handler_resume_needs_precise_locals(cached: &Arc<CachedBytecodeMethod>) -> bool {
+    // `cached.code` carries 2 bytes of speculative-read padding.
+    let code_len = cached.code.len().saturating_sub(2);
+    cratonvm_jit::handler_resume_requires_precise_locals(
+        &cached.code,
+        code_len,
+        &cached.exception_table,
+        &cached.method_descriptor,
+        cached.is_static,
+    )
+}
+
 /// Run a compiled callee's own exception handler in the interpreter, resuming
 /// AT the handler rather than re-executing the method from its entry.
 ///
@@ -13693,14 +13887,45 @@ pub(crate) fn find_jit_exception_handler(
 /// (`docs/known-issues/repros/jitban-remaining-20260726/`).
 ///
 /// Resuming at the handler keeps the compiled prefix's single execution and
-/// runs only the cleanup the compiled body skipped. Locals are the callee's
-/// incoming arguments, which is the same verifier-consistent state
-/// `route_jit_exception_through_method` uses and is sound for exactly the same
-/// reason: a compiled method whose handler reads a local first assigned inside
-/// the try never passes the `local_handler_reads_unsafe_local` compile gate.
+/// runs only the cleanup the compiled body skipped.
+///
+/// Locals come from the reason-9 exceptional frame the compiled body published
+/// at its throw site when one is stashed for THIS method, and otherwise from
+/// the callee's incoming arguments — the same two-tier choice
+/// `route_jit_signal_exception` makes, and for the same reason.
+///
+/// **The params-only tier was the whole story here until 2026-08-01, and that
+/// was a silent miscompile.** Its stated justification was that "a compiled
+/// method whose handler reads a local first assigned inside the try never
+/// passes the `local_handler_reads_unsafe_local` compile gate" — true when it
+/// was written, false since `precise_handler_frames_enabled` began admitting
+/// exactly that population on the promise that every throwing site publishes a
+/// precise frame. `route_jit_signal_exception` kept that promise; this sink did
+/// not, so a compiled callee that threw inside its own protected range resumed
+/// its handler with every non-parameter local zeroed.
+///
+/// The witness is Spring Boot's `BindConverter.convert(Object, TypeDescriptor,
+/// TypeDescriptor)`: `for (ConversionService d : this.delegates)` keeps the
+/// `Iterator` in local 5, a `canConvert` inside the loop's `try` throws
+/// `ConversionException`, and the handler falls through to the loop head. With
+/// params-only locals the iterator resumed as null and the next `hasNext()`
+/// threw "Cannot invoke java.util.Iterator.hasNext() because <local5> is null"
+/// — 27 of 43 `LiquibaseAutoConfigurationTests` methods, deterministically, and
+/// clean under `--nojit`. `JitPreciseHandlerFrame.loopStep`
+/// (`test_compiled_callee_handler_resume_keeps_the_loop_iterator`) pins the
+/// shape.
 ///
 /// Returns `None` when no handler in `cached` covers `throw_pc`, leaving the
-/// caller to propagate the exception unchanged.
+/// caller to propagate the exception unchanged — and also when this method
+/// needs precise locals but no frame is stashed for it, where resuming would
+/// mean inventing them.
+///
+/// `probes/BindConverterJitProbe.java` is a second, independent witness for the
+/// same defect, arrived at from `DevToolsPooledDataSourceAutoConfigurationTests
+/// .inMemoryDerbyIsShutdown`: it drives the real `BindConverter.convert` and
+/// counts 199,491 wrong results in 200,000 calls before this fix, 0 after. Its
+/// `refuse` mode takes the handler out of the picture and passes, which is what
+/// identifies the handler resume as the mechanism.
 pub(crate) fn run_jit_callee_handler(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -13709,7 +13934,36 @@ pub(crate) fn run_jit_callee_handler(
     exc: ObjectRef,
     incoming_args: &[Value],
 ) -> Option<MethodCallResult> {
+    let precise = precise_handler_frame_for(cached, incoming_args);
+    // A precise frame's bci is the compiled body's own throw site, recorded by
+    // the reason-9 stub. It is strictly better than the `athrow_bci` stamp
+    // `throw_pc` comes from (which carries no method identity), so prefer it
+    // for the handler's `[start_pc, end_pc)` range test.
+    let (throw_pc, precise_locals) = match precise.as_ref() {
+        Some((bci, locals)) => (*bci, Some(locals.as_slice())),
+        None => (throw_pc, None),
+    };
     let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
+    if precise_locals.is_none()
+        && !params_only_callee_handler_frames()
+        && handler_resume_needs_precise_locals(cached)
+    {
+        // Fail closed. Every throwing opcode inside a protected range of such a
+        // method is supposed to publish (`precise_exception_frame_sites_supported`),
+        // so arriving here means the promise was broken somewhere; resuming the
+        // handler now would hand it zeroed locals, which is a wrong answer with
+        // no crash to trace it back from. Declining leaves the caller's existing
+        // conservative behaviour (propagate, or the whole-method re-run) intact.
+        if crate::jit::helpers::rbc6_dbg() {
+            eprintln!(
+                "[rbc6-dbg] run_jit_callee_handler DECLINED {}.{}{} throw_pc={} \
+                 — handler needs precise locals and no frame was published",
+                cached.class_name, cached.method_name, cached.method_descriptor, throw_pc as i64,
+            );
+        }
+        return None;
+    }
+    let incoming_args = precise_locals.unwrap_or(incoming_args);
     let mut synchronized_args = cached.is_synchronized.then(|| incoming_args.to_vec());
     let synchronized_monitor = match synchronized_args.as_mut() {
         Some(args) => match JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args) {
@@ -13751,8 +14005,13 @@ pub(crate) fn run_jit_callee_handler(
     }
     if crate::jit::helpers::rbc6_dbg() {
         eprintln!(
-            "[rbc6-dbg] run_jit_callee_handler {}.{}{} throw_pc={} handler_pc={}",
-            cached.class_name, cached.method_name, cached.method_descriptor, throw_pc, handler_pc,
+            "[rbc6-dbg] run_jit_callee_handler {}.{}{} throw_pc={} handler_pc={} precise={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            throw_pc,
+            handler_pc,
+            precise.is_some(),
         );
     }
     Some(execute_prebuilt_frame(shared, thread, frame))
@@ -24278,6 +24537,7 @@ mod tests {
             instantiated_descriptor: Arc::from("()V"),
             capture_types: vec!['I', 'I', 'J'],
             proxy_class_id,
+            serializable_flag: false,
         };
         shared
             .classes

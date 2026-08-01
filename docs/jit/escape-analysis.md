@@ -1,7 +1,7 @@
 # Escape analysis and scalar replacement: what is proved, what is refused
 
 Scope: the P1 item *"Escape analysis and scalar replacement"* of
-`docs/known-issues/deep-research-vm-c2.md` — identity/hash, synchronization,
+`docs/known-issues/c2/deep-research-vm-c2.md` — identity/hash, synchronization,
 exceptions, arrays, partial escape, deopt reconstruction.
 
 Subject: `jit/src/escape_analysis.rs`, the **sea-of-nodes** escape analysis

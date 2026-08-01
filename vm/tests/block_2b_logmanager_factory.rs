@@ -61,14 +61,28 @@ fn ensure_probe_compiled() -> bool {
     if !src.exists() {
         return false;
     }
-    let status = Command::new("javac")
+    let compile = Command::new("javac")
         .arg("--release")
         .arg("21")
         .arg("-d")
         .arg(&dir)
         .arg(&src)
-        .status();
-    matches!(status, Ok(s) if s.success()) && cls.exists() && inner.exists()
+        .output();
+    match compile {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(_) => false,
+        // javac RAN and rejected the fixture: skipping here would make this
+        // test a permanent vacuous pass.
+        Ok(o) => {
+            assert!(
+                o.status.success(),
+                "[block_2b_logmanager] the checked-in probe fixture failed to compile — fix the .java source. \
+             javac stderr:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            cls.exists() && inner.exists()
+        }
+    }
 }
 
 fn jdk_home() -> Option<PathBuf> {

@@ -4959,13 +4959,13 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
     // `gc_scan_tls_ctx_trust_manager_roots`. Both getters read them back and
     // only fall back to the synthetic default when nothing was installed.
     //
-    // RESIDUAL, deliberately not papered over: the stored verifier is NOT yet
-    // consulted during a request. This VM's HTTPS path
-    // (`http_url_connection::perform`) owns its rustls connection end to end
-    // and rustls performs RFC 6125 endpoint identification itself, so the
-    // DEFAULT verifier's job is already done — but a stricter app-supplied
-    // verifier is still not additionally applied. Making it run means calling
-    // it from `http_url_connection::perform`, which is outside this file.
+    // The stored verifier IS consulted during a request, by
+    // `http_url_connection::huc_verify_hostname` — but only where real JSSE
+    // consults it: as a fallback after the built-in RFC 2818 endpoint
+    // identification has already FAILED, never as an additional gate every
+    // connection must pass. Read that function's doc before changing anything
+    // here; the real JDK's own default verifier is a hardcoded `return false`,
+    // so "just call whatever is installed" rejects every https request.
     fn hurl_default_verifier_field(
         ctx: &dyn NativeContext,
     ) -> Option<(cratonvm_types::ClassId, usize)> {

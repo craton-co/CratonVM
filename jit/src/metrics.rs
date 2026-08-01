@@ -5,7 +5,7 @@
 //!
 //! ## Why this exists
 //!
-//! The C2 review (`docs/known-issues/deep-research-vm-c2.md`) has a P0 lane
+//! The C2 review (`docs/known-issues/c2/deep-research-vm-c2.md`) has a P0 lane
 //! "Measure compilation quality", whose acceptance criterion is: *"Per-method
 //! compiler report is available without parsing debug logs."* Before this
 //! module the only way to learn what the compiler did to a method was to set

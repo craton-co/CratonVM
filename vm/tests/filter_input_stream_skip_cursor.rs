@@ -61,7 +61,7 @@ fn compile_probe(java_home: Option<&str>) -> Option<PathBuf> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
     let source = dir.join(format!("{CLASS_NAME}.java"));
-    std::fs::write(&source, SOURCE).ok()?;
+    std::fs::write(&source, SOURCE).expect("write probe source");
     let javac = java_home
         .map(|home| {
             Path::new(home)
@@ -69,16 +69,30 @@ fn compile_probe(java_home: Option<&str>) -> Option<PathBuf> {
                 .join(if cfg!(windows) { "javac.exe" } else { "javac" })
         })
         .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "javac.exe" } else { "javac" }));
-    Command::new(javac)
+    let out = match Command::new(javac)
         .arg("--release")
         .arg("21")
         .arg("-d")
         .arg(&dir)
         .arg(&source)
-        .status()
-        .ok()?
-        .success()
-        .then_some(dir)
+        .output()
+    {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[filter_input_stream_skip_cursor] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    // javac RAN and rejected the source: the probe is broken, and skipping here
+    // would make this test a permanent vacuous pass.
+    assert!(
+        out.status.success(),
+        "[filter_input_stream_skip_cursor] the embedded probe failed to compile — fix \
+         the probe source. javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(dir)
 }
 
 #[test]

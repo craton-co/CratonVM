@@ -3224,7 +3224,7 @@ pub(super) fn try_lambda_default_method_dispatch(
 /// guards against redefinition, not against identity collision; only the key
 /// can do the latter.
 ///
-/// See `docs/known-issues/vm-process-global-state-round-2.md`.
+/// See `docs/known-issues/c2/vm-process-global-state-round-2.md`.
 type VmScopedClassPairKey = (usize, u32, u32);
 
 thread_local! {
@@ -14265,53 +14265,13 @@ pub(super) fn compile_osr_artifact(
     // normal JIT compilation must also be skipped from OSR to avoid
     // re-executing loop bodies with buggy compiled code. Use the canonical
     // predicate so OSR and the first-call compile path agree exactly.
-    let policy = if shared.config.jit_aggressive_compilation {
-        crate::jit::skip_list::SkipPolicy::Aggressive
-    } else {
-        crate::jit::skip_list::SkipPolicy::Conservative
-    };
+    // The static JIT ban list was deleted 2026-07-31 (see
+    // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
+    // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
+    // remaining force-interpret lever, applied in `jit::try_compile`.
     let class_name_check = class_name.as_str();
     let method_name_check = method_name.as_str();
-    // T1.1.f — OSR of `<init>`/`<clinit>` methods follows the same
-    // InitComplexity classification as the first-call compile path.
-    // Trivial constructors (which never appear as OSR targets in
-    // practice because they're too short) are allowed through the
-    // check; complex ones keep the ban.
-    let init_complexity = if method_name_check == "<init>" || method_name_check == "<clinit>" {
-        // OSR needs the raw bytecode; read it from the frame's code
-        // attribute via the class manager. If we can't get it, fall
-        // back to `Unknown` which preserves the historical ban.
-        match shared.classes.class_manager.read().get_class(class_id) {
-            Some(class) => class
-                .methods
-                .iter()
-                .find(|m| &*m.name == method_name_check)
-                .and_then(|m| {
-                    m.attributes.iter().find_map(|a| match a.as_decoded() {
-                        Some(cratonvm_reader::attribute::Attribute::Code(ca)) => Some(&ca.code),
-                        _ => None,
-                    })
-                })
-                .map(|bc| crate::jit::skip_list::classify_init_complexity(bc))
-                .unwrap_or(crate::jit::skip_list::InitComplexity::Unknown),
-            None => crate::jit::skip_list::InitComplexity::Unknown,
-        }
-    } else {
-        crate::jit::skip_list::InitComplexity::Unknown
-    };
-    if crate::jit::skip_list::should_skip_jit_with_init(
-        class_name_check,
-        method_name_check,
-        false, // OSR is never invoked for interface defaults (caller filters)
-        std::thread::current().name().is_some(),
-        policy,
-        crate::jit::skip_list::allow_packages_from_env(),
-        init_complexity,
-    )
-    .is_some()
-    {
-        return None;
-    }
+    let _ = (class_name_check, method_name_check);
     // GPU-offload JIT admission gate — the OSR path is the exact case
     // the gate exists for: OSR-compiling a hot loop that contains an
     // offload-eligible invokestatic would silently end GPU dispatch at
@@ -16757,38 +16717,10 @@ pub(super) fn try_jit_upgrade_with_gate(
     // invocation threshold (2000) and re-promoted `Integer.valueOf`
     // here.
     {
-        let policy = if shared.config.jit_aggressive_compilation {
-            crate::jit::skip_list::SkipPolicy::Aggressive
-        } else {
-            crate::jit::skip_list::SkipPolicy::Conservative
-        };
-        let init_complexity =
-            if &*cached.method_name == "<init>" || &*cached.method_name == "<clinit>" {
-                // Re-classify the constructor body so trivial `<init>` /
-                // `<clinit>` chains stay JIT-eligible (matches the
-                // first-call compile path's gate at line ~1107).
-                crate::jit::skip_list::classify_init_complexity(&cached.code)
-            } else {
-                crate::jit::skip_list::InitComplexity::Unknown
-            };
-        let is_interface_default = {
-            let cm = shared.classes.class_manager.read();
-            cm.get_class(cached.declaring_class_id)
-                .map_or(false, |c| c.is_interface())
-        };
-        if crate::jit::skip_list::should_skip_jit_with_init(
-            &cached.class_name,
-            &cached.method_name,
-            is_interface_default,
-            std::thread::current().name().is_some(),
-            policy,
-            crate::jit::skip_list::allow_packages_from_env(),
-            init_complexity,
-        )
-        .is_some()
-        {
-            return None;
-        }
+        // The static JIT ban list was deleted 2026-07-31 (see
+        // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
+        // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
+        // remaining force-interpret lever, applied in `jit::try_compile`.
         // GPU-offload JIT admission gate — see offload_jit_gate: a
         // promoted caller containing an offload-eligible invokestatic
         // would bypass the interpreter offload hook.
@@ -17247,34 +17179,10 @@ pub(super) fn try_jit_upgrade_with_gate(
             // skip-based bisection silently unsound for any method reachable
             // as a direct callee. Mirrors `try_jit_compile_callee`.
             {
-                let policy = if shared.config.jit_aggressive_compilation {
-                    crate::jit::skip_list::SkipPolicy::Aggressive
-                } else {
-                    crate::jit::skip_list::SkipPolicy::Conservative
-                };
-                let init_complexity = if callee_method == "<init>" || callee_method == "<clinit>" {
-                    crate::jit::skip_list::classify_init_complexity(&callee_cached.code)
-                } else {
-                    crate::jit::skip_list::InitComplexity::Unknown
-                };
-                let is_iface_default = {
-                    let cm2 = shared.classes.class_manager.read();
-                    cm2.get_class(callee_cached.declaring_class_id)
-                        .map_or(false, |c| c.is_interface())
-                };
-                if crate::jit::skip_list::should_skip_jit_with_init(
-                    &callee_cached.class_name,
-                    callee_method,
-                    is_iface_default,
-                    std::thread::current().name().is_some(),
-                    policy,
-                    crate::jit::skip_list::allow_packages_from_env(),
-                    init_complexity,
-                )
-                .is_some()
-                {
-                    return None;
-                }
+                // The static JIT ban list was deleted 2026-07-31 (see
+                // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
+                // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
+                // remaining force-interpret lever, applied in `jit::try_compile`.
                 // GPU-offload JIT admission gate — see offload_jit_gate.
                 #[cfg(feature = "gpu-offload")]
                 if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
@@ -18284,34 +18192,10 @@ pub(super) fn try_jit_compile_callee_slow(
     // could be compiled via this path, leading to JIT codegen bugs like the
     // `JoinedList.<init>` checkcast-on-primitive crash.
     {
-        let policy = if shared.config.jit_aggressive_compilation {
-            crate::jit::skip_list::SkipPolicy::Aggressive
-        } else {
-            crate::jit::skip_list::SkipPolicy::Conservative
-        };
-        let init_complexity = if method_name == "<init>" || method_name == "<clinit>" {
-            crate::jit::skip_list::classify_init_complexity(&cached.code)
-        } else {
-            crate::jit::skip_list::InitComplexity::Unknown
-        };
-        let is_iface_default = {
-            let cm2 = shared.classes.class_manager.read();
-            cm2.get_class(cached.declaring_class_id)
-                .map_or(false, |c| c.is_interface())
-        };
-        if crate::jit::skip_list::should_skip_jit_with_init(
-            &cached.class_name,
-            method_name,
-            is_iface_default,
-            std::thread::current().name().is_some(),
-            policy,
-            crate::jit::skip_list::allow_packages_from_env(),
-            init_complexity,
-        )
-        .is_some()
-        {
-            return None;
-        }
+        // The static JIT ban list was deleted 2026-07-31 (see
+        // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
+        // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
+        // remaining force-interpret lever, applied in `jit::try_compile`.
         // GPU-offload JIT admission gate — see offload_jit_gate.
         #[cfg(feature = "gpu-offload")]
         if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
@@ -19069,30 +18953,10 @@ pub(super) fn background_compile_task(
     // failed background attempts. Hibernate's package-level fail-closed
     // policy made that retry loop large enough to turn ordinary suite classes
     // into timeout candidates.
-    let policy = if shared.config.jit_aggressive_compilation {
-        crate::jit::skip_list::SkipPolicy::Aggressive
-    } else {
-        crate::jit::skip_list::SkipPolicy::Conservative
-    };
-    let is_interface_default = {
-        let cm = shared.classes.class_manager.read();
-        cm.get_loaded_class_id(&task.method_key.class_name)
-            .and_then(|id| cm.get_class(id))
-            .map_or(false, |class| class.is_interface())
-    };
-    if crate::jit::skip_list::should_skip_jit_with_init(
-        &task.method_key.class_name,
-        &task.method_key.method_name,
-        is_interface_default,
-        std::thread::current().name().is_some(),
-        policy,
-        crate::jit::skip_list::allow_packages_from_env(),
-        crate::jit::skip_list::InitComplexity::Unknown,
-    )
-    .is_some()
-    {
-        return declined(0);
-    }
+    // The static JIT ban list was deleted 2026-07-31 (see
+    // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
+    // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
+    // remaining force-interpret lever, applied in `jit::try_compile`.
     if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
         return declined(0);
     }
@@ -23256,6 +23120,42 @@ pub(super) fn execute_invokevirtual_cached(
         }
         // Static cache entries: invokespecial uses Bytecode/Native
         CachedInvokeTarget::Bytecode { cached, gate: _ } => {
+            // NULL-RECEIVER-CACHED-20260801: JVMS §6.5 — invokevirtual /
+            // invokespecial / invokeinterface must raise NullPointerException
+            // when `objectref` is null, BEFORE the callee frame exists. This
+            // arm popped the receiver straight into `args_slice[0]` and pushed
+            // the frame regardless, so a warmed call site silently RAN the
+            // callee body with `this == null`; the sibling `VirtualBytecode`
+            // arm has always deferred `Value::Object(None)` to the slow path
+            // (which owns both the canonical NPE and the deliberate
+            // null-tolerant shims), and this arm — which serves invokespecial,
+            // i.e. every private/super call — simply never got the same guard.
+            //
+            // Measured on `probes/NullReceiverInvokeProbe.java`: the FIRST
+            // `Impl.callPrivateOn(null)` throws NPE correctly (slow path),
+            // and after 50k warming calls the SAME site returns `3` — the
+            // private method's body, executed with a null `this`.
+            //
+            // That divergence is what turned a null element in
+            // `getPermittedSubclasses0()` into
+            // `NullPointerException: Cannot read field "interfaces" because
+            // "rd" is null` at `Class.java:1217` instead of a plain NPE at
+            // `Class.isDirectSubType`: `c.getInterfaces(false)` is an
+            // invokespecial, the callee frame was pushed with `this == null`,
+            // and `Class.reflectionData()`'s registered native answers a null
+            // receiver with a null RETURN. Deferring to the slow path here
+            // makes the warmed and cold answers identical, whichever the slow
+            // path decides.
+            if !cached.is_static
+                && matches!(
+                    thread.frames[frame_idx]
+                        .stack
+                        .peek_at(cached.num_params as usize),
+                    Value::Object(None)
+                )
+            {
+                return Ok(CachedCallResult::CacheMiss);
+            }
             if is_special && crate::runtime::env_cache::loader_aware_resolution() {
                 if let Some(owner_cid) =
                     lookup_loader_initiated(shared, caller_class_id, cached.class_name.as_ref())
@@ -23527,6 +23427,22 @@ pub(super) fn execute_invokevirtual_cached(
             num_params,
             gate: _,
         } => {
+            // NULL-RECEIVER-CACHED-20260801: same guard as the `Bytecode` arm
+            // above — this function only ever serves instance invokes
+            // (invokestatic goes to `execute_invokestatic_cached`), so
+            // `pop_coerced_invoke_args_virtual` always lays the receiver down
+            // as `args[0]`. Handing a registered native a null `args[0]` is
+            // how `Class.reflectionData()` came to return null instead of
+            // throwing: its body answers a non-object receiver with
+            // `Value::Object(None)`, and dozens of sibling natives do the
+            // same. Defer to the slow path, which raises the NPE (or applies
+            // the deliberate null-tolerant shim) exactly as the cold call did.
+            if matches!(
+                thread.frames[frame_idx].stack.peek_at(num_params as usize),
+                Value::Object(None)
+            ) {
+                return Ok(CachedCallResult::CacheMiss);
+            }
             let Some(callback) =
                 revalidate_cached_native(shared, native_id, callback, native_kind)
             else {

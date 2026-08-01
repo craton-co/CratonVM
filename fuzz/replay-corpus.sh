@@ -30,7 +30,7 @@
 #   CARGO_FUZZ        the cargo-fuzz invocation      (default "cargo +nightly fuzz")
 #   ALLOW_EMPTY_CORPUS  space-separated targets exempt from the seed
 #                       requirement. Every exemption needs a comment in
-#                       `docs/known-issues/fuzzing-state.md` saying why.
+#                       `docs/known-issues/c2/fuzzing-state.md` saying why.
 
 set -u -o pipefail
 

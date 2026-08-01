@@ -1192,6 +1192,30 @@ fn bootstrap_lambda(
             current_class_id, host_loader, functional_interface, functional_interface_id
         );
     }
+    // `altMetafactory` carries extra bootstrap static arguments beyond
+    // `metafactory`'s three; the fourth is an int bitmask whose
+    // `FLAG_SERIALIZABLE` (0x1) bit is set when the source target type was
+    // `Serializable`-intersected. Real HotSpot spins a `writeReplace()` on the
+    // proxy -- and adds `java.io.Serializable` to its interface list -- only
+    // for those lambdas; an ordinary `Supplier<String> s = () -> "x"` gets
+    // neither, and `(Serializable) s` throws ClassCastException. Record the bit
+    // so the reflective surfaces can tell the two apart. A plain `metafactory`
+    // site has no flags word and is never serializable BY FLAG (it can still be
+    // serializable by inheritance -- see `SharedVm::lambda_proxy_serializability`).
+    let serializable_flag = info.bsm_method == ALT_METAFACTORY
+        && info
+            .bootstrap_arg_indices
+            .get(3)
+            .and_then(|idx| {
+                let cm = shared.classes.class_manager.read();
+                let class = cm.get_class(current_class_id)?;
+                match class.constant_pool.get(*idx) {
+                    Some(ConstantPoolEntry::Integer(flags)) => Some((flags & 0x1) != 0),
+                    _ => None,
+                }
+            })
+            .unwrap_or(false);
+
     // Allocate a synthetic proxy ClassId
     let proxy_class_id = shared.alloc_lambda_proxy_id();
 
@@ -1205,6 +1229,7 @@ fn bootstrap_lambda(
         instantiated_descriptor: Arc::from(instantiated_desc),
         capture_types: capture_types.clone(),
         proxy_class_id,
+        serializable_flag,
     };
 
     // Register the lambda proxy and cache the call site
@@ -2962,6 +2987,7 @@ mod tests {
             instantiated_descriptor: Arc::from("(Ljava/lang/Object;)Ljava/lang/Object;"),
             capture_types: vec![],
             proxy_class_id: ClassId::new(9001),
+            serializable_flag: false,
         })
     }
 
