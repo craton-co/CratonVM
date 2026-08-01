@@ -863,6 +863,12 @@ pub mod vector_gate {
     //! has to treat the whole plan as refused — a partially-emitted guard set
     //! proves nothing, exactly as in [`crate::scev`].
     //!
+    //! `super::vec_emit` is that consumer. It obeys the rule literally: it takes
+    //! one binding per `guards` entry and refuses the whole request when even one
+    //! is missing. It is off by default and no call site invokes it yet; see
+    //! `docs/jit/vectorization-emitter.md` for what it emits and what remains
+    //! unvalidated.
+    //!
     //! # Where the facts come from
     //!
     //! Nothing here re-derives a fact another pass already proves:
@@ -1584,9 +1590,17 @@ pub mod vector_gate {
         },
         /// [`CountedLoop::trip_count`] could not bound the iteration count.
         UnknownTripCount,
-        /// The loop may execute fewer times than one vector pass covers, and
-        /// there is no guard shape that can say otherwise (see the module doc's
-        /// note on `PreheaderGuard`).
+        /// The loop may execute fewer times than one vector pass covers.
+        ///
+        /// This is a refusal rather than a guard because the gate does not ask
+        /// [`CountedLoop::prove_trip_count_at_least`] for a witness. The guard
+        /// shape itself *does* exist —
+        /// [`PreheaderGuard::TripCountAtLeast`] was added for exactly this
+        /// family and names vectorization in its own doc — so admitting these
+        /// loops behind a runtime `trip >= lanes` check is a live extension,
+        /// not an impossible one. It is deliberately not taken here: it
+        /// broadens admission, and the emitter that would consume it
+        /// (`super::vec_emit`) has never executed a byte.
         TripCountTooSmall {
             /// The fewest iterations the loop may run.
             min_trips: u64,
@@ -1987,10 +2001,11 @@ pub mod vector_gate {
             }
             Some(t) => {
                 if lanes >= 2 && t.min < lanes as u64 {
-                    // A runtime `trip >= lanes` check would rescue this, but
-                    // `scev::PreheaderGuard` has no variant that expresses one,
-                    // so the honest answer is a refusal rather than an
-                    // undischargeable obligation.
+                    // A runtime `trip >= lanes` check would rescue this, and
+                    // `PreheaderGuard::TripCountAtLeast` is the shape that
+                    // expresses it. The gate does not ask for that witness
+                    // today — see `VecRefusal::TripCountTooSmall` for why the
+                    // extension is deliberately not taken yet.
                     refusals.push(VecRefusal::TripCountTooSmall {
                         min_trips: t.min,
                         lanes,
