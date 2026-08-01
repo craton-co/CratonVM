@@ -149,6 +149,23 @@ commits of `dev` forward, on
 (SHA-256 `ED1186871C1A755AEE308205945B085C6193A670866FD35A70CDEFB89E39AB1F`):
 same 45/45 in both modes, all probes still pass.
 
+Verified once more on the **merged** result — `dev` `b65fbd1ee`, binary
+`cratonvm-devtools-cluster-20260801-r8.exe`
+(SHA-256 `8EC4151C67D9F24569D68E63DE3B4B638889A32A4692CEC7CA330EEB2C4FA624`) —
+because the merge resolved `run_jit_callee_handler` in favour of `dev`'s
+implementation rather than this branch's. 45/45 in both modes, all three
+probes pass.
+
+`dev` had reached the same handler-resume defect independently and in
+parallel, from `LiquibaseAutoConfigurationTests` rather than
+`DevToolsPooledDataSourceAutoConfigurationTests`. Its version is the one that
+landed: it adds a fail-closed refusal for a method that needs precise locals
+when no frame was published, plus a `params_only_callee_handler_frames`
+opt-out, neither of which this branch had. `probes/BindConverterJitProbe.java`
+is carried across as a second, independent witness — it drives the real method
+rather than a source-shape replica, and its `refuse` mode is what isolates the
+handler resume as the mechanism.
+
 | Class | JIT | `--nojit` |
 |---|---|---|
 | `RemoteUrlPropertyExtractorTests` | 5/5 | 5/5 |

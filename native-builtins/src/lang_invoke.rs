@@ -4904,7 +4904,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             // `cs.getTarget().bindTo(..).invoke()` yields a working SAM instance
             // whose abstract method runs the impl method.
             if let Some(ccs) = build_reflective_lambda_callsite(
-                ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type,
+                ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, false,
             ) {
                 if key.impl_ != 0 {
                     lambda_callsite_cache().lock().insert(key, ccs);
@@ -4940,16 +4940,32 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             // instantiatedMethodType, flags, markerInterfaces, ...) into
             // args[3]: Object[]. invokedType is args[2] (factory signature).
             let invoked_type = match args.get(2) { Some(Value::Object(o)) => *o, _ => None };
-            let (sam_type, impl_method, inst_type) = match args.get(3) {
+            let (sam_type, impl_method, inst_type, ser_flag) = match args.get(3) {
                 Some(Value::Object(Some(arr))) => {
                     let arr = *arr;
                     let len = ctx.array_length(arr);
                     let e = |ctx: &dyn NativeContext, i: usize| if i < len {
                         match ctx.get_array_element(arr, i) { Value::Object(o) => o, _ => None }
                     } else { None };
-                    (e(ctx, 0), e(ctx, 1), e(ctx, 2))
+                    // args[3] of the packed array is the flags bitmask (a boxed
+                    // Integer); FLAG_SERIALIZABLE is 0x1. Without it the spun proxy
+                    // would claim a `writeReplace()` and `Serializable` that the real
+                    // JDK only grants to Serializable-intersected call sites.
+                    let flags = if 3 < len {
+                        match ctx.get_array_element(arr, 3) {
+                            Value::Int(i) => i,
+                            Value::Object(Some(b)) => match ctx.get_field_by_name(b, "value") {
+                                Value::Int(i) => i,
+                                _ => 0,
+                            },
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    };
+                    (e(ctx, 0), e(ctx, 1), e(ctx, 2), (flags & 0x1) != 0)
                 }
-                _ => (None, None, None),
+                _ => (None, None, None, false),
             };
             let key = LambdaKey {
                 invoked: lambda_key_of(invoked_type),
@@ -4967,7 +4983,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             if let Some(ccs) = build_reflective_lambda_callsite(
-                ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type,
+                ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, ser_flag,
             ) {
                 if key.impl_ != 0 {
                     lambda_callsite_cache().lock().insert(key, ccs);
@@ -5805,6 +5821,9 @@ fn build_reflective_lambda_callsite(
     sam_type: Option<cratonvm_types::ObjectRef>,
     impl_method: Option<cratonvm_types::ObjectRef>,
     instantiated_type: Option<cratonvm_types::ObjectRef>,
+    // `LambdaMetafactory.FLAG_SERIALIZABLE`, as passed by a reflective
+    // `altMetafactory`. Plain `metafactory` has no flags word: `false`.
+    serializable: bool,
 ) -> Option<cratonvm_types::ObjectRef> {
     let invoked_mt = invoked_type?;
     let impl_mh = impl_method?;
@@ -5848,8 +5867,9 @@ fn build_reflective_lambda_callsite(
         impl_ref_kind,
         &inst_desc,
         &capture_types,
-    );
-    if proxy_cid == 0 {
+        serializable,
+        );
+        if proxy_cid == 0 {
         return None;
     }
 
