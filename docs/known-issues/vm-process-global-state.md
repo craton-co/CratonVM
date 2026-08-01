@@ -1,11 +1,20 @@
 # Process-global mutable state in `vm/src/` — census, fixes, and what remains
 
-**Status: 🟡 PARTIALLY FIXED 2026-08-01.** Two dangerous heap-pointer-holding
-globals are fixed and tested; one dangerous ObjectRef-holding global and one
-dangerous address-keyed table remain open with a recipe each. This is the
-`vm/src/` half of the C2 review's P0 "remove remaining process-global runtime
-state"; the `native-builtins/` half is the `SECURITY_STATE` fix in
-`native-builtins/src/security_manager.rs`, which is the template followed here.
+**Status: 🟡 SUPERSEDED 2026-08-01 — read
+[`vm-process-global-state-round-2.md`](vm-process-global-state-round-2.md)
+first.** Round 2 closed both items this document leaves "open — dangerous"
+(the `ClassFileTransformer` chain and `DIRECT_BUFFERS`) plus two of the per-VM
+leaks, and deleted the VM-agnostic `register_native_root_source` registry
+entirely. It also **corrects** two recommendations made below: the
+`DIRECT_BUFFERS` recipe ("the object-field read is correct on its own") is wrong
+in real-JDK mode, and the `FIELD_WATCHPOINTS` recipe should not be applied in
+isolation. Everything here that is still accurate: the census, the three-category
+taxonomy, and the two fixes described under "Fixed in this change".
+
+This is the `vm/src/` half of the C2 review's P0 "remove remaining
+process-global runtime state"; the `native-builtins/` half is the
+`SECURITY_STATE` fix in `native-builtins/src/security_manager.rs`, which is the
+template followed here.
 
 ## The three categories
 

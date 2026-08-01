@@ -1082,12 +1082,11 @@ pub fn update_all_roots(
         .update_thread_objs_after_gc(pointer_map);
 
     // 22. Uniform native-root registry — the post-move companion to
-    //     `roots.rs` step 21 (`scan_all_native_roots`). Fans out to every
-    //     subsystem that registered via `crate::memory::native_roots`,
-    //     repointing each held ObjectRef through `pointer_map`. Each registered
-    //     remap self-guards the empty (non-moving) map; the whole fan-out is a
-    //     no-op until a subsystem registers, so behaviour is byte-identical to
-    //     baseline on the default path.
+    //     `roots.rs` step 21, driven above via `native_roots::remap_all_roots`.
+    //     Fans out over `native_roots::VM_ROOT_SOURCES`, repointing each held
+    //     ObjectRef through `pointer_map`. Each remap self-guards the empty
+    //     (non-moving) map, and each receives the OWNING `SharedVm` so one VM's
+    //     fixup cannot rewrite another VM's entries.
 
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);

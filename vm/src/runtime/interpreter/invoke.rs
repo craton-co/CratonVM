@@ -3207,9 +3207,29 @@ pub(super) fn try_lambda_default_method_dispatch(
     .map(Some)
 }
 
+/// Key for the two thread-local dispatch caches below:
+/// `(vm_identity, proxy ClassId, receiver ClassId)`.
+///
+/// The `vm_identity` component is load-bearing, not decoration. A `ClassId` is
+/// unique only *within* one VM, and one OS thread can run bytecode in two VMs
+/// (the inline test modules build a `SharedVm` per test on one thread; a host
+/// thread can be attached to two `Vm`s). Keyed on the two `ClassId`s alone, a
+/// lookup in VM B hit VM A's entry for the numerically-equal ids and dispatched
+/// VM A's cached method body — or VM A's cached field index — against VM B's
+/// classes.
+///
+/// The `RedefineGate` does NOT catch that. Its staleness handle comes from the
+/// class manager of whichever VM populated the entry, so consulted from VM B it
+/// reports VM A's (unchanged) redefine generation and answers "fresh". The gate
+/// guards against redefinition, not against identity collision; only the key
+/// can do the latter.
+///
+/// See `docs/known-issues/vm-process-global-state-round-2.md`.
+type VmScopedClassPairKey = (usize, u32, u32);
+
 thread_local! {
     pub(super) static LAMBDA_IMPL_BYTECODE_CACHE: std::cell::RefCell<
-        rustc_hash::FxHashMap<(u32, u32), (Arc<CachedBytecodeMethod>, RedefineGate)>
+        rustc_hash::FxHashMap<VmScopedClassPairKey, (Arc<CachedBytecodeMethod>, RedefineGate)>
     > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
@@ -3220,7 +3240,7 @@ thread_local! {
 // lambda/accessor continues through the normal dispatch path.
 thread_local! {
     pub(super) static TDIGEST_DOUBLE_GET_FIELD_CACHE: std::cell::RefCell<
-        rustc_hash::FxHashMap<(u32, u32), (usize, RedefineGate)>
+        rustc_hash::FxHashMap<VmScopedClassPairKey, (usize, RedefineGate)>
     > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
@@ -3250,7 +3270,11 @@ pub(super) fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef,
         _ => return None,
     };
     let receiver_class_id = shared.mem.heap.class_id_of(receiver);
-    let key = (proxy_class_id.as_u32(), receiver_class_id.as_u32());
+    let key = (
+        shared.vm_identity,
+        proxy_class_id.as_u32(),
+        receiver_class_id.as_u32(),
+    );
     let field_index = TDIGEST_DOUBLE_GET_FIELD_CACHE
         .with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -3324,7 +3348,11 @@ pub(super) fn try_invoke_cached_lambda_impl(
     descriptor: &str,
     args: &[Value],
 ) -> Result<Option<Option<Value>>, MethodCallFailed> {
-    let key = (proxy_class_id.as_u32(), receiver_class_id.as_u32());
+    let key = (
+        shared.vm_identity,
+        proxy_class_id.as_u32(),
+        receiver_class_id.as_u32(),
+    );
     let cached = LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         match cache.get(&key) {

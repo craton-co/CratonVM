@@ -886,13 +886,14 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     results live in no heap slot, so a GC between `submit` and `get` must
     //     root them here. Remap companion in `gc.rs`.
 
-    // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
-    //     in a process-global side-table can register a scan callback here
-    //     instead of hand-wiring a new `gc_scan_*` call into this function (see
-    //     `crate::memory::native_roots`). Fans out to every registered source;
-    //     a no-op (byte-identical to baseline) until a subsystem registers, so
-    //     it is safe to land ahead of any adopter. The matching post-move remap
-    //     is `native_roots::remap_all_native_roots` in `gc.rs`.
+    // 21. Uniform native-root registry (driven above, via
+    //     `native_roots::scan_all_roots`). A native subsystem holding
+    //     ObjectRefs in a side-table belongs in `native_roots::VM_ROOT_SOURCES`
+    //     rather than hand-wired as another `gc_scan_*` call here — the table
+    //     row cannot compile without both the scan and the remap half. Every
+    //     source receives the OWNING `SharedVm`, so one backed by a static must
+    //     key that static on `shared.vm_identity`. The matching post-move remap
+    //     is `native_roots::remap_all_roots` in `gc.rs`.
 
     if let Some(w) = crate::memory::gc::watch_addr() {
         let rooted = roots.iter().any(|o| o.as_ptr() as usize == w);

@@ -7262,7 +7262,7 @@ impl std::fmt::Debug for Vm {
 /// Release every piece of process-global state this VM filed under
 /// `vm_identity`.
 ///
-/// Two rows today, both keyed on the identity and both of which would otherwise
+/// Three rows today, all keyed on the identity and all of which would otherwise
 /// outlive the heap that produced them:
 ///
 /// * the [`CapabilitySet`](cratonvm_native_api::CapabilitySet) installed by
@@ -7273,15 +7273,22 @@ impl std::fmt::Debug for Vm {
 ///   `ObjectRef`s (the installed manager, the policy object, the shared
 ///   permission collection). `forget_vm_security_state` had **no call site at
 ///   all** before this, so those addresses survived the heap they pointed into
-///   and a later VM that reused the identity would have inherited them.
+///   and a later VM that reused the identity would have inherited them;
+/// * the `java.lang.instrument` `ClassFileTransformer` chain
+///   ([`crate::runtime::instrument`]), which likewise holds raw heap
+///   `ObjectRef`s — the live transformer mirrors registered by Mockito's
+///   MockMaker / JaCoCo's agent — and is a registered GC root source, so a
+///   surviving row would report addresses into a dead heap on a later VM's
+///   collection.
 ///
-/// **Idempotent by construction** — `uninstall_capabilities` returns `None` and
-/// `forget_vm_security_state` removes nothing on a second call — because it is
-/// deliberately invoked from two places (see below), and either may run first
-/// or alone.
+/// **Idempotent by construction** — `uninstall_capabilities` returns `None`,
+/// and `forget_vm_security_state` / `forget_vm_transformers` remove nothing on
+/// a second call — because it is deliberately invoked from two places (see
+/// below), and either may run first or alone.
 pub fn release_vm_native_state(vm_identity: usize) {
     cratonvm_native_api::uninstall_capabilities(cratonvm_native_api::VmId::from_raw(vm_identity));
     cratonvm_native_builtins::security_manager::forget_vm_security_state(vm_identity);
+    crate::runtime::instrument::forget_vm_transformers(vm_identity);
 }
 
 /// The precise hook: the last `Arc<SharedVm>` is gone, so no thread can still
@@ -14358,6 +14365,24 @@ mod tests {
             let vm = SharedVm::new(VmConfig::default());
             id = cratonvm_native_api::VmId::from_raw(vm.vm_identity);
             assert!(cratonvm_native_api::capabilities_for(id).is_some());
+            // Seed the third row so its teardown is covered too. The ref is a
+            // synthetic non-heap address; it is only ever compared by pointer
+            // value, never dereferenced.
+            crate::runtime::instrument::add_transformer_entry(
+                vm.vm_identity,
+                crate::runtime::instrument::TransformerEntry {
+                    // SAFETY: non-null, 8-byte aligned, never dereferenced.
+                    transformer_ref: unsafe {
+                        cratonvm_types::ObjectRef::from_raw(0x5000usize as *mut u8)
+                    },
+                    can_retransform: true,
+                    native_method_prefix: None,
+                },
+            );
+            assert_eq!(
+                crate::runtime::instrument::transformer_count(vm.vm_identity),
+                1
+            );
         }
         assert!(
             cratonvm_native_api::capabilities_for(id).is_none(),
@@ -14373,6 +14398,15 @@ mod tests {
             &mut roots,
         );
         assert!(roots.is_empty(), "security state outlived the VM");
+
+        // The instrument half: the transformer chain holds raw `ObjectRef`s
+        // into the dropped heap and is a registered GC root source, so a
+        // surviving row would be reported to a later VM's collector.
+        assert_eq!(
+            crate::runtime::instrument::transformer_count(id.as_usize()),
+            0,
+            "the transformer chain outlived the VM"
+        );
     }
 
     /// Both teardown hooks call it and either may run first (or alone — a

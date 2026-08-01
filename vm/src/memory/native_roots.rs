@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Uniform GC-root registry for process-global native side-tables.
+//! Uniform, **VM-scoped** GC-root registry for native side-tables.
 //!
 //! # Why this exists
 //!
-//! A number of native subsystems hold `ObjectRef`s in **process-global Rust
-//! side-tables** that are invisible to the field-tracing root scan in
+//! A number of native subsystems hold `ObjectRef`s in Rust side-tables that are
+//! invisible to the field-tracing root scan in
 //! [`crate::memory::roots::collect_roots`]. Historically each such subsystem
 //! had to be wired in by hand in TWO places:
 //!
@@ -26,33 +26,38 @@
 //!
 //! # What this provides
 //!
-//! A single global registry. A subsystem calls
-//! [`register_native_root_source`] **once** (typically from its lazy
-//! initialization), supplying two top-level function pointers:
+//! [`VM_ROOT_SOURCES`] — a single compile-time inventory of named
+//! `(scan, remap)` pairs. Adding a source means adding one `root_source!` row,
+//! which cannot compile without supplying **both** halves; that is the whole
+//! point of the table, since a half-wired source is exactly the use-after-free
+//! described above. [`scan_all_roots`] and [`remap_all_roots`] fan out over it
+//! from `collect_roots` and the post-move fixup respectively.
 //!
-//!   * a **scan** callback — `fn(&mut Vec<ObjectRef>)` — that pushes each live
-//!     `ObjectRef` it currently holds (identical shape to the existing
-//!     `gc_scan_*_roots` helpers, so a subsystem can register its existing
-//!     function verbatim), and
-//!   * a **remap** callback — `fn(&HashMap<usize, usize>)` — that rewrites each
-//!     held `ObjectRef` using the collector's old→new relocation map (identical
-//!     shape to the existing `gc_update_*_refs` helpers).
+//! # Every source is VM-scoped
 //!
-//! [`scan_all_native_roots`] (driven from `collect_roots`) fans out to every
-//! registered scan callback; [`remap_all_native_roots`] (driven from the
-//! post-move fixup in `gc::update_all_roots`) fans out to every registered remap
-//! callback. With an empty registry both are no-ops, so this is a **zero
-//! behaviour-change** addition that is safe to merge before any subsystem
-//! adopts it.
+//! Both callbacks receive the **owning** [`crate::vm::SharedVm`]. That is not a
+//! convenience: a process can own several heaps at once (the inline test
+//! modules build a `SharedVm` per test, and `libcratonvm` can create more than
+//! one VM), so a source that answers from process-global state hands VM B's
+//! collector addresses belonging to VM A's heap, and lets VM B's post-move
+//! fixup rewrite VM A's entries through VM B's relocation map.
+//!
+//! A source whose backing store is genuinely process-global therefore either
+//! keys that store on `shared.vm_identity` (the logmanager, security-manager,
+//! boxed-value and `java.lang.instrument` rows all do) or is a documented,
+//! deliberate exception that ignores the `SharedVm` argument (`_:`).
+//!
+//! There used to be a second, **VM-agnostic** registry here —
+//! `register_native_root_source(scan: fn(&mut Vec<ObjectRef>), remap:
+//! fn(&HashMap<usize, usize>))`, a `LazyLock<RwLock<Vec<..>>>` that subsystems
+//! joined lazily on first use. It is gone. Its callbacks had no way to know
+//! which VM was collecting, so every subsystem that joined it was an isolation
+//! bug by construction; its last two members (the `ObjectStreamClass` cache and
+//! the `ClassFileTransformer` chain) have been re-keyed per VM and moved into
+//! the table below. Do not reintroduce it: a new side table belongs in
+//! `VM_ROOT_SOURCES`, keyed on `vm_identity` if it must live in a static.
 //!
 //! # Thread / lifecycle safety
-//!
-//! Registration is safe from any thread, before or after the GC has started —
-//! the registry is a `LazyLock<RwLock<…>>` (mirroring the JNI-native-method
-//! table in `native::jni`). Registration is **idempotent**: re-registering the
-//! same `(scan, remap)` function-pointer pair is silently ignored, so a
-//! subsystem that registers lazily on first use cannot double-scan (which would
-//! merely over-retain) or double-remap.
 //!
 //! The callbacks run while the world is stopped (root collection / post-move
 //! fixup), exactly like every other entry in `collect_roots` /
@@ -60,106 +65,6 @@
 
 use crate::types::ObjectRef;
 use std::collections::HashMap;
-use std::sync::LazyLock;
-
-use parking_lot::RwLock;
-
-/// A scan callback: append every live `ObjectRef` the subsystem currently holds
-/// to `roots`. Shape-compatible with the existing `gc_scan_*_roots` helpers so
-/// a subsystem can register one of those directly.
-pub type ScanFn = fn(&mut Vec<ObjectRef>);
-
-/// A remap callback: for each `ObjectRef` the subsystem holds, look its current
-/// address up in `pointer_map` (the collector's old→new relocation map) and, if
-/// present, rewrite it to the new address. Shape-compatible with the existing
-/// `gc_update_*_refs` helpers. A well-behaved implementation early-returns on an
-/// empty map (nothing moved — the non-moving sweep).
-pub type RemapFn = fn(&HashMap<usize, usize>);
-
-/// One registered native root source: a paired scan + remap callback. The two
-/// halves describe the same set of held `ObjectRef`s — scanning keeps them live,
-/// remapping keeps them valid across a move.
-#[derive(Clone, Copy)]
-struct NativeRootSource {
-    scan: ScanFn,
-    remap: RemapFn,
-}
-
-/// Process-global registry of native root sources.
-///
-/// Modelled on `native::jni::JNI_NATIVE_METHODS` (`LazyLock<RwLock<…>>`): cheap
-/// to read (the GC pause path takes a read lock and iterates), rare to write
-/// (subsystems register once at init). `parking_lot::RwLock` matches the rest of
-/// the VM and is poison-free, so a panicking callback cannot brick the registry.
-static REGISTRY: LazyLock<RwLock<Vec<NativeRootSource>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
-
-/// Register a native root source: a `scan` callback that yields every live
-/// `ObjectRef` the subsystem holds, and a `remap` callback that repoints each
-/// held `ObjectRef` after a moving collection.
-///
-/// Call this **once** per subsystem, typically from its lazy initialization.
-/// Registration is idempotent: registering the same `(scan, remap)` pair more
-/// than once is a no-op, so a subsystem that initializes lazily (and might race
-/// to register from multiple threads) never ends up double-scanned.
-///
-/// Safe to call from any thread, before or after GC has started. The callbacks
-/// are invoked only at a GC safepoint (root collection / post-move fixup) with
-/// the world stopped, so they observe a quiescent heap — exactly the contract
-/// the existing hand-wired `gc_scan_*` / `gc_update_*` helpers rely on.
-///
-/// # Function-pointer requirement
-///
-/// `scan` and `remap` are `fn` pointers (not `Box<dyn Fn>`): every subsystem
-/// registers a top-level `fn`, which sidesteps lifetime/`'static`-closure
-/// concerns and keeps the registry `Copy`-cheap to iterate. The matched pair is
-/// deduplicated by comparing the raw code addresses of the two pointers.
-pub fn register_native_root_source(scan: ScanFn, remap: RemapFn) {
-    let mut reg = REGISTRY.write();
-    // Idempotent: dedupe by the raw code addresses of BOTH pointers. Two
-    // distinct `fn` items have distinct addresses; the same `fn` item compares
-    // equal, so a subsystem that registers lazily on first use (possibly racing
-    // across threads) registers exactly once.
-    let scan_addr = scan as usize;
-    let remap_addr = remap as usize;
-    let already = reg
-        .iter()
-        .any(|s| s.scan as usize == scan_addr && s.remap as usize == remap_addr);
-    if !already {
-        reg.push(NativeRootSource { scan, remap });
-    }
-}
-
-/// Run every registered scan callback, appending each subsystem's live
-/// `ObjectRef`s to `roots`. Called from
-/// [`crate::memory::roots::collect_roots`] alongside the hand-wired root
-/// sources. No-op (zero behaviour change) when the registry is empty.
-///
-/// A read lock is held for the duration so registration cannot race the fan-out;
-/// since callbacks only *read* their side-tables and *push* into `roots`, this
-/// can never deadlock against another `scan_all` / `remap_all`.
-pub fn scan_all_native_roots(roots: &mut Vec<ObjectRef>) {
-    let reg = REGISTRY.read();
-    for source in reg.iter() {
-        (source.scan)(roots);
-    }
-}
-
-/// Run every registered remap callback, repointing each subsystem's held
-/// `ObjectRef`s through `pointer_map`. Called from
-/// [`crate::memory::gc::update_all_roots`] alongside the hand-wired
-/// `*_update_after_gc` hooks, on the post-move fixup path. No-op when the
-/// registry is empty.
-///
-/// `pointer_map` is the collector's old-address → new-address relocation map (an
-/// empty map means nothing moved — the non-moving sweep); each callback is
-/// expected to honour that and early-return.
-pub fn remap_all_native_roots(pointer_map: &HashMap<usize, usize>) {
-    let reg = REGISTRY.read();
-    for source in reg.iter() {
-        (source.remap)(pointer_map);
-    }
-}
 
 type VmScanFn = fn(&crate::vm::SharedVm, &mut Vec<ObjectRef>);
 type VmRemapFn = fn(&crate::vm::SharedVm, &HashMap<usize, usize>);
@@ -372,6 +277,25 @@ fn scan_upcalls(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
 fn remap_upcalls(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
     shared.natives.upcall_table.lock().update_after_gc(map);
 }
+// The `java.lang.instrument` `ClassFileTransformer` chain. Entries hold the
+// live `ClassFileTransformer` mirrors registered by Mockito's MockMaker /
+// JaCoCo's coverage agent, which are typically reachable from nowhere else.
+//
+// VM-scoped for the same reason as the logmanager and `ObjectStreamClass`
+// caches: the chain used to be ONE process-global `Vec<TransformerEntry>`
+// hooked in through the VM-agnostic `register_native_root_source` fan-out, so
+// every VM's collection walked every VM's transformers — reporting one heap's
+// addresses to another heap's collector and rewriting one VM's entries through
+// another VM's relocation map. See `runtime::instrument`.
+//
+// It was the last `register_native_root_source` caller, and the VM-agnostic
+// registry is gone with it.
+fn scan_instrument_transformers(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    crate::runtime::instrument::scan_transformer_roots(shared.vm_identity, roots);
+}
+fn remap_instrument_transformers(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    crate::runtime::instrument::remap_transformer_refs(shared.vm_identity, map);
+}
 
 /// Compile-time inventory of every VM/native side table that owns movable
 /// references. Adding a source requires supplying scan and remap together.
@@ -420,6 +344,11 @@ static VM_ROOT_SOURCES: &[VmRootSource] = &[
     root_source!("tls", scan_tls, remap_tls),
     root_source!("forkjoin", scan_forkjoin, remap_forkjoin),
     root_source!("vm-upcalls", scan_upcalls, remap_upcalls),
+    root_source!(
+        "instrument-transformers",
+        scan_instrument_transformers,
+        remap_instrument_transformers
+    ),
 ];
 
 pub fn scan_all_roots(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
@@ -427,7 +356,6 @@ pub fn scan_all_roots(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) 
         debug_assert!(!source.name.is_empty());
         (source.scan)(shared, roots);
     }
-    scan_all_native_roots(roots);
 }
 
 pub fn remap_all_roots(shared: &crate::vm::SharedVm, pointer_map: &HashMap<usize, usize>) {
@@ -435,7 +363,6 @@ pub fn remap_all_roots(shared: &crate::vm::SharedVm, pointer_map: &HashMap<usize
         debug_assert!(!source.name.is_empty());
         (source.remap)(shared, pointer_map);
     }
-    remap_all_native_roots(pointer_map);
 }
 
 // ---------------------------------------------------------------------------
@@ -446,124 +373,6 @@ pub fn remap_all_roots(shared: &crate::vm::SharedVm, pointer_map: &HashMap<usize
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    // The registry is process-global, so these tests register their OWN unique
-    // top-level callbacks (each test uses a distinct `fn` so the dedupe key is
-    // unique) and only assert on the refs THEY contribute — never on the total
-    // count, which other registrations (real or test) may inflate. All test
-    // refs use synthetic, 8-byte-aligned non-heap addresses; they are never
-    // dereferenced, only compared by pointer value.
-
-    /// Fabricate a never-dereferenced `ObjectRef` from a fixed aligned address.
-    fn fake_ref(addr: usize) -> ObjectRef {
-        debug_assert!(addr != 0 && addr % 8 == 0);
-        // SAFETY: the address is non-null and 8-byte aligned; the ref is only
-        // ever compared by pointer value in these tests, never dereferenced.
-        unsafe { ObjectRef::from_raw(addr as *mut u8) }
-    }
-
-    // ----- source #1: a fixed pair of refs, remapped via the pointer map -----
-    const REF_A: usize = 0xAAAA_0000;
-    const REF_B: usize = 0xBBBB_0000;
-
-    fn scan_src1(roots: &mut Vec<ObjectRef>) {
-        roots.push(fake_ref(REF_A));
-        roots.push(fake_ref(REF_B));
-    }
-    fn remap_src1(pointer_map: &HashMap<usize, usize>) {
-        // Record into a side-channel that the remap ran and with what mapping,
-        // so the test can verify the relocation function was applied.
-        if let Some(&new_a) = pointer_map.get(&REF_A) {
-            SRC1_REMAP_A.store(new_a, Ordering::SeqCst);
-        }
-    }
-    static SRC1_REMAP_A: AtomicUsize = AtomicUsize::new(0);
-
-    #[test]
-    fn scan_all_visits_registered_refs() {
-        register_native_root_source(scan_src1, remap_src1);
-
-        let mut roots = Vec::new();
-        scan_all_native_roots(&mut roots);
-
-        assert!(
-            roots.contains(&fake_ref(REF_A)),
-            "scan_all must surface the source's first ref"
-        );
-        assert!(
-            roots.contains(&fake_ref(REF_B)),
-            "scan_all must surface the source's second ref"
-        );
-    }
-
-    #[test]
-    fn remap_all_applies_relocation() {
-        register_native_root_source(scan_src1, remap_src1);
-
-        let mut pointer_map = HashMap::new();
-        let relocated_a = 0xCCCC_0000usize;
-        pointer_map.insert(REF_A, relocated_a);
-
-        SRC1_REMAP_A.store(0, Ordering::SeqCst);
-        remap_all_native_roots(&pointer_map);
-
-        assert_eq!(
-            SRC1_REMAP_A.load(Ordering::SeqCst),
-            relocated_a,
-            "remap_all must invoke the source's remap with the relocation map"
-        );
-    }
-
-    // ----- source #2: counts how many times its scan callback fired ----------
-    static SRC2_SCANS: AtomicUsize = AtomicUsize::new(0);
-
-    fn scan_src2(_roots: &mut Vec<ObjectRef>) {
-        SRC2_SCANS.fetch_add(1, Ordering::SeqCst);
-    }
-    fn remap_src2(_pointer_map: &HashMap<usize, usize>) {}
-
-    #[test]
-    fn registration_is_idempotent() {
-        // Register the SAME pair three times; the dedupe must keep exactly one.
-        register_native_root_source(scan_src2, remap_src2);
-        register_native_root_source(scan_src2, remap_src2);
-        register_native_root_source(scan_src2, remap_src2);
-
-        SRC2_SCANS.store(0, Ordering::SeqCst);
-        let mut roots = Vec::new();
-        scan_all_native_roots(&mut roots);
-
-        assert_eq!(
-            SRC2_SCANS.load(Ordering::SeqCst),
-            1,
-            "an idempotently-registered source must scan exactly once per fan-out"
-        );
-    }
-
-    // ----- source #3: proves an empty pointer-map is handled gracefully ------
-    fn scan_src3(_roots: &mut Vec<ObjectRef>) {}
-    fn remap_src3(pointer_map: &HashMap<usize, usize>) {
-        // A well-behaved remap early-returns on the non-moving sweep.
-        if pointer_map.is_empty() {
-            SRC3_SAW_EMPTY.store(true, Ordering::SeqCst);
-        }
-    }
-    static SRC3_SAW_EMPTY: AtomicBool = AtomicBool::new(false);
-
-    #[test]
-    fn remap_all_with_empty_map_is_safe() {
-        register_native_root_source(scan_src3, remap_src3);
-
-        SRC3_SAW_EMPTY.store(false, Ordering::SeqCst);
-        let empty: HashMap<usize, usize> = HashMap::new();
-        remap_all_native_roots(&empty);
-
-        assert!(
-            SRC3_SAW_EMPTY.load(Ordering::SeqCst),
-            "remap_all must still fan out (callbacks self-guard the empty map)"
-        );
-    }
 
     #[test]
     fn built_in_inventory_has_unique_named_scan_remap_pairs() {
@@ -578,5 +387,35 @@ mod tests {
             assert_ne!(source.scan as usize, 0);
             assert_ne!(source.remap as usize, 0);
         }
+    }
+
+    /// Every root source must supply BOTH halves as *distinct* functions. A row
+    /// that accidentally names the same function twice would either scan on the
+    /// remap path or remap on the scan path; the type system cannot catch it
+    /// (both halves are `fn(&SharedVm, ..)`-shaped once coerced), so assert it.
+    #[test]
+    fn every_root_source_pairs_two_distinct_halves() {
+        for source in VM_ROOT_SOURCES {
+            assert_ne!(
+                source.scan as usize, source.remap as usize,
+                "root source {} names the same function as both scan and remap",
+                source.name
+            );
+        }
+    }
+
+    /// The `ClassFileTransformer` chain must be in the inventory. It was the
+    /// last subsystem hooked in through the deleted VM-agnostic
+    /// `register_native_root_source` fan-out; if this row is ever dropped, a
+    /// moving collection reclaims or staleness-poisons every registered
+    /// transformer with no compile error to show for it.
+    #[test]
+    fn instrument_transformer_chain_is_a_registered_root_source() {
+        assert!(
+            VM_ROOT_SOURCES
+                .iter()
+                .any(|s| s.name == "instrument-transformers"),
+            "the java.lang.instrument transformer chain must be a VM root source"
+        );
     }
 }
