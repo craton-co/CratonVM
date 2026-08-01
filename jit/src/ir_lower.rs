@@ -7088,11 +7088,30 @@ pub(crate) fn lower_inner_with_scopes(
     // the materializer each bail to a safe whole-method re-run on any slot they
     // cannot reconstruct. Only reachable with `sr_map` set (i.e.
     // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`), so production is unaffected.
+    //
+    // ...unless the graph holds a monitor. Every `FrameState` this lowerer
+    // builds hard-codes `monitors: Vec::new()`, so a precise resume would
+    // rebuild an interpreter frame that believes it holds no lock. The
+    // interpreter's own sink refuses a frame that holds monitors — but it
+    // cannot fire on information that was never recorded, so the omission
+    // defeats the guard rather than tripping it, and the method exits without
+    // the `monitorexit` the lock is waiting for.
+    //
+    // The guard above (`monitor helper absent`) does not cover this: the
+    // helpers ARE wired in production, so that refusal is inert. Until the
+    // frame states carry real monitor state, a monitor-bearing method may be
+    // compiled and may deoptimize — it just may not resume PRECISELY. The
+    // whole-method re-run it falls back to re-enters a re-entrant lock and
+    // stays balanced.
     if sr_map.is_some()
         && cm
             ._deopt_point_boxes
             .iter()
             .any(|p| crate::deopt::count_virtual_objects(&p.frame_state) > 0)
+        && !graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::MonitorEnter | Op::MonitorExit))
     {
         cm.can_deopt_resume = true;
     }
