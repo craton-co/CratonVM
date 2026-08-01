@@ -95,6 +95,12 @@ pub use class_manager::{
     DefineClassOptions,
     JitInvalidateHook,
     JvmtiClassHook,
+    // C2 review P1 (classloading identity): the three-way answer that keeps
+    // "nobody has this name" apart from "several loaders each have their own
+    // class under it". Every `Option`-returning lookup collapses the two, and a
+    // caller that reads the collapse as "absent" loads a second copy — see
+    // `docs/known-issues/classloading-identity-audit.md`.
+    NameResolution,
     RedefineOptions,
     ResolutionInvalidateHook,
     UnloadedClass,

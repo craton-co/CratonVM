@@ -2069,6 +2069,52 @@ pub struct ClassManager {
     metadata_realm: MetadataRealm,
 }
 
+/// What the class-name index knows about a name, with the three "no single
+/// answer" outcomes kept apart.
+///
+/// See [`ClassManager::classify_loaded_name`] for why the distinction is
+/// load-bearing: `Absent` and `Ambiguous` both surface as `None` from every
+/// `Option`-returning lookup in this file, and they demand opposite actions
+/// from the caller (load it vs. definitely do not load it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameResolution {
+    /// No loader has a class registered under this name, and none is hidden
+    /// behind it. Loading one is safe.
+    Absent,
+    /// Exactly one class carries this name. Several loaders may name it (a
+    /// delegation alias), which is still one class and still unique.
+    Unique(ClassId),
+    /// Two or more **distinct** classes carry this name. There is no correct
+    /// context-free answer. Re-ask with an initiating loader
+    /// ([`ClassManager::find_class_by_name_for_loader`] /
+    /// [`ClassManager::find_class_by_name_for_class`]) or fail — treating this
+    /// as `Absent` and loading a fresh copy makes it a three-way collision.
+    Ambiguous {
+        /// How many distinct `ClassId`s carry the name.
+        definitions: usize,
+    },
+}
+
+impl NameResolution {
+    /// The class id when the name resolves uniquely, `None` for both `Absent`
+    /// and `Ambiguous`. Provided for call sites that genuinely do not care why
+    /// there is no answer; anything that would *load* on a miss must match on
+    /// the variants instead.
+    #[inline]
+    pub fn unique(self) -> Option<ClassId> {
+        match self {
+            NameResolution::Unique(id) => Some(id),
+            NameResolution::Absent | NameResolution::Ambiguous { .. } => None,
+        }
+    }
+
+    /// True when more than one distinct class carries the name.
+    #[inline]
+    pub fn is_ambiguous(self) -> bool {
+        matches!(self, NameResolution::Ambiguous { .. })
+    }
+}
+
 /// Metadata released when a user-defined class loader is unloaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnloadedClass {
@@ -7438,6 +7484,76 @@ impl ClassManager {
         None
     }
 
+    /// Classify a class name against the definition index, keeping the three
+    /// "no answer" outcomes apart.
+    ///
+    /// C2 review P1 (classloading identity): every context-free lookup in this
+    /// file collapses *absent* and *ambiguous* onto `None`
+    /// ([`Self::find_unique_class_by_name`], [`Self::get_loaded_class_id`],
+    /// [`Self::find_class_by_name`]). Returning `None` for ambiguity is the
+    /// correct **fail-closed** answer — picking one of several same-named
+    /// classes is type confusion — but it is only half the contract: a caller
+    /// that reads `None` as "nobody has this class" goes on to *load a second
+    /// copy*, which is precisely how the Spring AOT `argument type mismatch`
+    /// family and the Groovy `$_run_closureN` collapse were produced. The
+    /// collapse is unrecoverable at the call site because the two cases demand
+    /// opposite actions:
+    ///
+    ///   * `Absent`    — go and load it (there is nothing to conflict with).
+    ///   * `Ambiguous` — do NOT load; re-ask with an initiating loader via
+    ///     [`Self::find_class_by_name_for_loader`] /
+    ///     [`Self::find_class_by_name_for_class`], or fail.
+    ///   * `Unique`    — use it.
+    ///
+    /// O(1) against [`Self::name_definitions`]. Accepts either separator form
+    /// (`p/X` or `p.X`), matching [`Self::find_unique_class_by_name`].
+    pub fn classify_loaded_name(&self, name: &str) -> NameResolution {
+        // An already-internal name with no separator to translate is the
+        // overwhelmingly common case and both probe keys collapse onto it, so
+        // take it without allocating either `String`.
+        if !name.contains('.') && !name.contains('/') {
+            return self.classify_exact_name(name);
+        }
+        let slash = if name.contains('/') {
+            name.to_string()
+        } else {
+            name.replace('.', "/")
+        };
+        let dot = slash.replace('/', ".");
+        let slash_answer = self.classify_exact_name(&slash);
+        if !matches!(slash_answer, NameResolution::Absent) {
+            return slash_answer;
+        }
+        self.classify_exact_name(&dot)
+    }
+
+    /// [`Self::classify_loaded_name`] without separator normalisation.
+    fn classify_exact_name(&self, name: &str) -> NameResolution {
+        let Some(ids) = self.name_definitions.get(name) else {
+            return NameResolution::Absent;
+        };
+        let mut distinct = ids.keys();
+        let Some(&id) = distinct.next() else {
+            // An empty id set is retired by `release_name_definition`, so this
+            // is unreachable in practice; treat it as absent rather than
+            // asserting on a shape the index promises not to produce.
+            return NameResolution::Absent;
+        };
+        if distinct.next().is_some() {
+            return NameResolution::Ambiguous {
+                definitions: ids.len(),
+            };
+        }
+        // A hidden class is not reachable by name at all (JVMS §5.4.3.1 — a
+        // hidden class is never recorded in the loader's name table), so a lone
+        // hidden definition reads as absent, not as a usable unique answer.
+        if self.get_class(id).is_some_and(|class| !class.hidden) {
+            NameResolution::Unique(id)
+        } else {
+            NameResolution::Absent
+        }
+    }
+
     /// The one `ClassId` defined under `name`, or `None` when zero or more
     /// than one distinct class carries it (ambiguity is information loss, not
     /// permission to pick the first entry) or when the single match is hidden.
@@ -7445,15 +7561,10 @@ impl ClassManager {
     /// O(1) against [`Self::name_definitions`]; see that field for why the
     /// linear scan this replaced mattered so much.
     fn unique_visible_definition(&self, name: &str) -> Option<ClassId> {
-        let ids = self.name_definitions.get(name)?;
-        let mut distinct = ids.keys();
-        let id = *distinct.next()?;
-        if distinct.next().is_some() {
-            return None;
+        match self.classify_exact_name(name) {
+            NameResolution::Unique(id) => Some(id),
+            NameResolution::Absent | NameResolution::Ambiguous { .. } => None,
         }
-        self.get_class(id)
-            .is_some_and(|class| !class.hidden)
-            .then_some(id)
     }
 
     /// Sole writer of `loaded_classes` inserts -- keeps `name_definitions` in
@@ -8216,6 +8327,17 @@ impl ClassManager {
             .unwrap_or((0, 0));
         let final_num_total = num_total_fields.max(old_num_total);
 
+        // C2 review P1 (classloading identity): the defining loader recorded on
+        // the `Class` is about to change (see `class.loader_id = loader_id`
+        // below), and `loaded_classes` is keyed on `(defining loader, name)`.
+        // Capture the key this class is currently filed under so the map can be
+        // re-keyed in the same transaction — without that, the two disagree and
+        // a `(built-in loader, name)` entry keeps naming a class whose defining
+        // loader is a user-defined one.
+        let previous_loader_id = self.class_store.get(id).map(|c| c.loader_id);
+        let registered_name: Option<Arc<str>> =
+            self.class_store.get(id).map(|c| Arc::clone(&c.name));
+
         // Contract §5: "The in-place 'upgrade a stub to real' path must call
         // `set_origin`." Real bytes have just replaced the fabricated skeleton,
         // so the class stops being a compatibility stub and becomes whatever
@@ -8307,6 +8429,70 @@ impl ClassManager {
             // Compute has_finalizer
             class.has_finalizer = class.declares_finalize();
         }
+        // C2 review P1 (classloading identity): re-key `loaded_classes` to match
+        // the defining loader just installed above.
+        //
+        // A synthetic stub is always minted under `ClassLoaderId::Bootstrap`
+        // (`create_synthetic_stub` / `synthesize_array_class` both assert it),
+        // so it is filed in `loaded_classes` under `(Bootstrap, name)`. This
+        // path then re-homes the `Class` to whichever loader actually supplied
+        // the real bytes — including, via `define_class_with_options`'s
+        // "upgrade the stub instead of minting a shadowed second ClassId" arm,
+        // a `ClassLoaderId::UserDefined`. Every other field was refreshed; the
+        // map key was not, leaving two defects:
+        //
+        //   * `loaded_classes` and `ClassStore` disagreed about the defining
+        //     loader, so `class_defined_by_loader_exact(name, user_loader)`
+        //     missed its O(1) index and only answered through the cold
+        //     linear-scan fallback.
+        //   * far worse, `(Bootstrap, name) -> id` kept resolving for
+        //     bootstrap/extension/application-initiated lookups
+        //     (`get_loaded_class_id`, `find_class_by_name_for_loader`,
+        //     `find_bootstrap_class_by_name`), i.e. a built-in loader
+        //     delegating DOWN into a user-defined loader's namespace. That is
+        //     the isolation break every other lookup in this file is written to
+        //     prevent (`built_in_lookup_is_parent_first_and_never_delegates_down`):
+        //     JDK code and an unrelated loader would share one `ClassId` for a
+        //     class only one of them defined, and a second user loader defining
+        //     the same name would then be silently outranked by the stale
+        //     built-in alias instead of reading as ambiguous.
+        //
+        // Deliberately narrow: only a re-home INTO a user-defined loader is
+        // corrected here. Built-in -> built-in re-homing (the ordinary "stub
+        // for a JDK class, real bytes later found on the application
+        // classpath" case) is left exactly as it was. The built-in chain is
+        // walked parent-first at lookup time, so `(Bootstrap, name)` there is a
+        // legitimate initiating-loader record for a name the bootstrap loader
+        // really did initiate; and *adding* the `(Application, name)` defining
+        // key would start making a subsequent `define_class` for that pair
+        // report a duplicate-define `LinkageError` where it currently mints a
+        // second copy. That is arguably the JVMS-correct outcome, but it is a
+        // behaviour change on the hottest path in the VM and is out of scope
+        // here — see `docs/known-issues/classloading-identity-audit.md`.
+        if let (Some(previous_loader_id), Some(registered_name)) =
+            (previous_loader_id, registered_name)
+        {
+            let rehomed_to_user_loader = previous_loader_id != loader_id
+                && matches!(loader_id, ClassLoaderId::UserDefined(_));
+            if rehomed_to_user_loader {
+                // Only retire the old key when it still names THIS class: a
+                // concurrent define may already have reassigned it, and
+                // removing someone else's entry would be a second, worse bug.
+                let stale_alias_is_ours = loaded_classes_probe(
+                    &self.loaded_classes,
+                    previous_loader_id,
+                    &registered_name,
+                ) == Some(id);
+                let stale_alias_is_builtin =
+                    !matches!(previous_loader_id, ClassLoaderId::UserDefined(_));
+                self.loaded_classes_insert((loader_id, Arc::clone(&registered_name)), id);
+                self.user_loaders.insert(loader_id);
+                if stale_alias_is_ours && stale_alias_is_builtin {
+                    self.loaded_classes_remove(&(previous_loader_id, registered_name));
+                }
+            }
+        }
+
         // Check parent's has_finalizer (needs separate borrow)
         let parent_has = superclass_id
             .and_then(|sid| self.class_store.get(sid))
@@ -15053,6 +15239,192 @@ mod tests {
             class.init_state.load(std::sync::atomic::Ordering::Acquire),
             CLASS_INIT_UNINITIALIZED,
             "a real class upgraded from an initialized stub must not skip its real <clinit>"
+        );
+    }
+
+    /// C2 review P1 (classloading identity) — a synthetic stub is always
+    /// filed under `(Bootstrap, name)`, and `upgrade_synthetic_class` re-homes
+    /// the `Class` to whichever loader supplied the real bytes. When that
+    /// loader is user-defined the map key MUST follow, or a built-in loader
+    /// goes on resolving a class it does not define — a built-in delegating
+    /// DOWN into a user namespace, which is the shape every other lookup in
+    /// this file refuses (see
+    /// `built_in_lookup_is_parent_first_and_never_delegates_down`).
+    #[test]
+    fn a_user_loader_upgrading_a_bootstrap_stub_takes_the_map_key_with_it() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let id = mgr.ensure_synthetic_class("Foo", 0);
+
+        // Precondition: the stub really is bootstrap-keyed.
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "Foo"),
+            Some(id),
+            "a fresh synthetic stub is filed under the bootstrap loader",
+        );
+
+        let user = ClassLoaderId::UserDefined(0x5EED_0001);
+        mgr.upgrade_synthetic_class(
+            id,
+            "Foo",
+            include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class")
+                .to_vec()
+                .into(),
+            user,
+        )
+        .expect("upgrade the synthetic Foo stub with the real fixture bytes");
+
+        // The `ClassStore` records the new defining loader ...
+        assert_eq!(
+            mgr.get_class(id).expect("class survives the upgrade").loader_id,
+            user,
+        );
+        // ... and so must `loaded_classes`, which is keyed on it.
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, user, "Foo"),
+            Some(id),
+            "the name index must agree with the ClassStore about the defining loader",
+        );
+        assert!(
+            mgr.user_loaders.contains(&user),
+            "the re-homed loader has to join the user-loader probe set, or a \
+             context-free lookup can no longer see this class at all",
+        );
+
+        // The stale built-in alias is gone: no built-in loader delegates down.
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "Foo"),
+            None,
+        );
+        assert_eq!(mgr.find_bootstrap_class_by_name("Foo"), None);
+        assert_eq!(
+            mgr.find_class_by_name_for_loader("Foo", ClassLoaderId::Bootstrap),
+            None,
+        );
+        assert_eq!(
+            mgr.find_class_by_name_for_loader("Foo", ClassLoaderId::Application),
+            None,
+        );
+
+        // The owning loader still resolves it, exactly and by delegation.
+        assert_eq!(mgr.class_defined_by_loader_exact("Foo", user), Some(id));
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", user), Some(id));
+    }
+
+    /// The natural two-loader shape: loader A takes ownership of `Foo` by
+    /// upgrading the bootstrap stub, loader B then defines its own `Foo`. The
+    /// two must stay distinct classes, each resolvable from its own loader,
+    /// and the context-free lookups must report the name as ambiguous rather
+    /// than handing back whichever copy a stale built-in alias named.
+    #[test]
+    fn two_user_loaders_defining_the_same_name_stay_distinct_and_read_as_ambiguous() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let first = ClassLoaderId::UserDefined(0x5EED_0002);
+        let second = ClassLoaderId::UserDefined(0x5EED_0003);
+
+        let id_a = mgr.ensure_synthetic_class("Foo", 0);
+        mgr.upgrade_synthetic_class(id_a, "Foo", v1.clone().into(), first)
+            .expect("first loader upgrades the stub");
+
+        let id_b = mgr
+            .define_class("Foo", &v1, second)
+            .expect("the second loader defines its own copy");
+
+        assert_ne!(
+            id_a, id_b,
+            "two loaders defining the same name are two classes, not one",
+        );
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", first), Some(id_a));
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", second), Some(id_b));
+
+        // Ambiguity is information loss, not permission to pick one.
+        assert_eq!(
+            mgr.find_unique_class_by_name("Foo"),
+            None,
+            "the unique-definition index must refuse an ambiguous name",
+        );
+        assert_eq!(
+            mgr.get_loaded_class_id("Foo"),
+            None,
+            "with no requester to disambiguate, a name two user loaders own is \
+             a miss; a stale bootstrap alias made it silently answer the first \
+             loader's copy",
+        );
+    }
+
+    /// C2 review P1 — `Absent` and `Ambiguous` must not both look like `None`.
+    /// A caller that loads on a miss has to be able to tell "nobody has this
+    /// name" from "two loaders each have their own class under it"; collapsing
+    /// them is how a second (then a third) copy of a class gets minted.
+    #[test]
+    fn name_classification_separates_absent_from_ambiguous() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        assert_eq!(mgr.classify_loaded_name("Foo"), NameResolution::Absent);
+        assert!(!mgr.classify_loaded_name("Foo").is_ambiguous());
+        assert_eq!(mgr.classify_loaded_name("Foo").unique(), None);
+
+        let first = ClassLoaderId::UserDefined(0x5EED_0004);
+        let second = ClassLoaderId::UserDefined(0x5EED_0005);
+
+        let id_a = mgr
+            .define_class("Foo", &v1, first)
+            .expect("first loader defines Foo");
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Unique(id_a)
+        );
+
+        let id_b = mgr
+            .define_class("Foo", &v1, second)
+            .expect("second loader defines its own Foo");
+        assert_ne!(id_a, id_b);
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Ambiguous { definitions: 2 },
+            "two distinct classes under one name is ambiguous, not absent",
+        );
+        assert!(mgr.classify_loaded_name("Foo").is_ambiguous());
+        assert_eq!(mgr.classify_loaded_name("Foo").unique(), None);
+        // The `Option`-returning lookups keep failing closed, as before.
+        assert_eq!(mgr.find_unique_class_by_name("Foo"), None);
+
+        // Retiring one copy restores a single correct answer.
+        let unloaded = mgr.unload_user_classes(&[id_b]);
+        assert_eq!(unloaded.len(), 1);
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Unique(id_a)
+        );
+        assert_eq!(mgr.find_unique_class_by_name("Foo"), Some(id_a));
+
+        // A name nobody ever defined stays `Absent`, in either separator form.
+        assert_eq!(
+            mgr.classify_loaded_name("never/Defined"),
+            NameResolution::Absent
+        );
+        assert_eq!(
+            mgr.classify_loaded_name("never.Defined"),
+            NameResolution::Absent
+        );
+    }
+
+    /// Both separator spellings reach the same index entry.
+    #[test]
+    fn name_classification_normalises_the_separator() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let object = mgr
+            .load_class("java/lang/Object")
+            .expect("Object resolves (as a synthetic stub on an empty classpath)");
+        assert_eq!(
+            mgr.classify_loaded_name("java/lang/Object"),
+            NameResolution::Unique(object)
+        );
+        assert_eq!(
+            mgr.classify_loaded_name("java.lang.Object"),
+            NameResolution::Unique(object)
         );
     }
 
