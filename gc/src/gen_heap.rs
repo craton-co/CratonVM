@@ -4013,6 +4013,47 @@ impl GenerationalHeap {
         // function returns remains intentionally idempotent and still covers
         // every non-provider root owner.
         crate::external_roots::remap_external_roots(&result.0.pointer_map);
+        // ...and publish it to the ROOT SLICE, for the same reason and at the
+        // same boundary.
+        //
+        // `sweep_young_non_moving` above commits selective promotions
+        // (young→old), recording each in `result.0.pointer_map`, but leaves
+        // every root still holding the PRE-promotion young address. The
+        // in-place old sweep below marks from exactly this slice, and its seed
+        // loop rejects anything `old_gen.contains()` says is not old-gen — so a
+        // stale young address seeds NOTHING, the object at its new old-gen home
+        // is never marked, and `sweep_old_gen_non_moving` returns a LIVE
+        // object's block to the free list.
+        //
+        // The gate's own comment predicted this exactly: "the young sweep
+        // survives an imperfect root set via conservative over-marking and
+        // side-mark containment, but this old sweep frees purely on
+        // GC_FLAG_MARKED, so any root-set gap frees a LIVE promoted object."
+        // The gap was self-inflicted, one statement earlier in this function.
+        //
+        // Measured with `ROverlaySystemGcStress` (JIT on, real JDK,
+        // `System.gc()` per round): the sweep frees the five collection objects
+        // of each of the two oldest bundles — `[oldsweep] FREEING overlay owner
+        // 0x… class_id=121 num_slots=23` — while Java still holds them in a
+        // live `ArrayList`. They then read back as empty (their side-table
+        // state is dropped once `is_allocated_addr` reports the block free) and
+        // eventually as `ClassCastException: class java.lang.Object cannot be
+        // cast to Bundle` once the block is handed to another allocation.
+        // `CRATONVM_OLD_SWEEP_JIT=0` — which skips that sweep entirely — makes
+        // the probe pass, which is what localised it here.
+        //
+        // The moving path performs the equivalent root fixup after `major_gc`
+        // (through `compact_map`); this is that fixup for the non-moving path.
+        if !result.0.pointer_map.is_empty() {
+            for root in roots.iter_mut() {
+                if let Some(&new_addr) = result.0.pointer_map.get(&(root.as_ptr() as usize)) {
+                    debug_assert!(new_addr != 0, "promotion map contains a null destination");
+                    // SAFETY: `new_addr` is a destination recorded by selective
+                    // promotion, i.e. a live old-gen object this cycle wrote.
+                    *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
         // OOM-INVESTIGATE (dohead-oom, 2026-07-19): track young-arena usage
         // across cycles to find where reclaimed bytes stop coming back as
         // usable free space. Gated so normal runs pay nothing.
