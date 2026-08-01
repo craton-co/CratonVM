@@ -1027,7 +1027,7 @@ fn cache_get_configuration_property_names(
     // `Value::Int(0)` for an unwritten reference slot, which fails that match
     // and so reports the field as non-null. `ref_field_is_null` reads by
     // resolved index and covers null, unwritten and absent alike.
-    // See `docs/known-issues/by-name-field-reads.md`.
+    // See `docs/known-issues/c2/by-name-field-reads.md`.
     let data_is_null = match this {
         Some(t) => crate::field_read::ref_field_is_null(ctx, t, "data"),
         None => true,

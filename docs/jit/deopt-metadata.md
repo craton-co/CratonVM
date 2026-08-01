@@ -1,7 +1,7 @@
 # Deoptimization metadata: what is emitted, what is proved, what is missing
 
 Scope: the P0 items *"Complete deoptimization metadata"* and *"Emit precise oop
-maps at every safepoint"* of `docs/known-issues/deep-research-vm-c2.md`.
+maps at every safepoint"* of `docs/known-issues/c2/deep-research-vm-c2.md`.
 
 Acceptance criteria under audit:
 

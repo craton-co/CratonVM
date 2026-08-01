@@ -1024,7 +1024,7 @@ struct JitScanCache {
     /// `(filled_gen, chain_len, collection_count)` happen to match on the
     /// other side, hands VM A's object addresses to VM B's collector as
     /// roots — the `oscache` failure mode from
-    /// `docs/known-issues/vm-process-global-state.md`, but pointed at the mark
+    /// `docs/known-issues/c2/vm-process-global-state.md`, but pointed at the mark
     /// phase. `collection_count` cannot stand in for this: it is
     /// `heap.collection_count()`, a *different* counter per heap, so two young
     /// heaps trivially agree on it.
@@ -3382,7 +3382,7 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // JIT-scan cache keying (docs/known-issues/vm-jit-cache-keying.md)
+    // JIT-scan cache keying (docs/vm-jit-cache-keying.md)
     // -----------------------------------------------------------------------
 
     fn filled_scan_cache(heap_id: usize) -> JitScanCache {

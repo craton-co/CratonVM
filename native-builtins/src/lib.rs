@@ -2792,7 +2792,7 @@ fn native_randomness_get_random(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = obj_arg(args, 0)?;
     // Registered `()Ljava/util/Random;` — reference-typed, so the by-name read
     // must not be returned raw: it answers `Value::Int(0)` for an unwritten
-    // slot. See `docs/known-issues/by-name-field-reads.md`.
+    // slot. See `docs/known-issues/c2/by-name-field-reads.md`.
     Ok(Some(field_read::ref_field(ctx, this, "random")))
 }
 
@@ -4096,7 +4096,7 @@ pub mod case_map;
 /// `Value::Object(None)` through the indexed `get_field`. Natives that test a
 /// by-name read for null, or return one straight out of a reference-typed
 /// method, are asking the wrong question and get a plausible answer. See
-/// `docs/known-issues/by-name-field-reads.md`.
+/// `docs/known-issues/c2/by-name-field-reads.md`.
 pub(crate) mod field_read;
 pub mod lang_class;
 pub mod lang_string;
@@ -16978,7 +16978,7 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/util/logging/Level;",
         // Reference-typed return: an unwritten `level` slot reads back as
         // `Value::Int(0)` through the by-name accessor, not `Object(None)`.
-        // See `docs/known-issues/by-name-field-reads.md`.
+        // See `docs/known-issues/c2/by-name-field-reads.md`.
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             Ok(Some(field_read::ref_field(ctx, this, "level")))

@@ -19549,7 +19549,7 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     // not consulted yet. Validation does happen, but one call later and only
     // partially: the SAM natives (`native_collfn_supplier_get` and friends)
     // check `collector_tag_of` and degrade to an empty list/map rather than
-    // failing. See `docs/known-issues/collections-interception.md`, Residual 1.
+    // failing. See `docs/known-issues/c2/collections-interception.md`, Residual 1.
     // Left as-is deliberately: there is no way for a native to decline a call
     // (`MethodCallResult` has no "not handled" arm), so the only fail-closed
     // options are to throw — which would break any legitimate default-method

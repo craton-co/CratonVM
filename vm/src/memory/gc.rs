@@ -384,7 +384,7 @@ pub(crate) fn remap_handle_slots(
 /// spent its life as a `Cell<Option<ObjectRef>>` inside the `JIT_SIGNALS`
 /// `thread_local!` in `jit/helpers.rs`, where neither half could reach it — TLS
 /// belongs to the mutator, and every `VM_ROOT_SOURCES` callback runs on the
-/// collector. See `docs/known-issues/jit-signals-root-gap.md`.
+/// collector. See `docs/jit-signals-root-gap.md`.
 pub(crate) fn remap_thread_object_slots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &HashMap<usize, usize>,
