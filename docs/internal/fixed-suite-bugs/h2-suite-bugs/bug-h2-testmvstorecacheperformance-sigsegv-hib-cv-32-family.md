@@ -311,7 +311,7 @@ failure on the pre-merge build).
   heap-corruption family before dumping the cell's HOLDER
   (`CRATONVM_DBG_CELLCORRUPT=1`): here the heap really was corrupt, there it
   never was, and the diagnostic text is identical.
-- `../../../known-issues/h2/bug-h2-testdiskfull-classid0-corruption-segv-cce.md`
+- `bug-h2-testdiskfull-classid0-corruption-segv-cce.md` (retired into this directory 2026-08-01)
   — the `TestDiskFull` `AbstractMethodError` the original write-up flagged as
   "possibly related, not confirmed" now has its own doc. It is **not** closed
   by this fix and was not investigated here.
