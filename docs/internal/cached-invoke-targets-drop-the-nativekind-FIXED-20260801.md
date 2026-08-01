@@ -18,12 +18,12 @@ uncounted virtual path, and removes the virtual hit path's
 `real_protected_stub_class` pre-filter.
 
 Validation used the final release binary
-`cratonvm-tomcat-charsetcache-r11-20260801-019fb049` (SHA-256
-`12aa822f5c0f5d8ba3712900ad14a71b01b550ccdbff51f58e2aac95c700012f`):
+`cratonvm-tomcat-charsetcache-r13-20260801-019fb049` (SHA-256
+`65e66e82ff44a3e27f51fc70dcfac10ccf19a208b4b34591b50f47f5460d7900`):
 
 * `cratonvm-vm --test jdk_only_dispatch`: 12/12 passed.
 * A warm-cache JDK-only probe passed in both JIT and `--nojit` modes and
-  produced identical non-vacuous schema-2 census totals: 300,047 bridge
+  produced identical non-vacuous schema-2 census totals: 300,053 bridge
   invocations, one intrinsic invocation, and zero synthetic-stub invocations.
 * Each report attributed exactly 100,000 calls to virtual
   `Runtime.freeMemory`, virtual `Thread.isAlive`, and static `System.nanoTime`,

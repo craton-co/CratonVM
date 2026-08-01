@@ -6,15 +6,15 @@
 
 The direct JIT-call gate repair in `7f1b1f263` removed the last performance
 floor. A fresh release binary built from this record's final source
-(`cratonvm-tomcat-charsetcache-r11-20260801-019fb049`, SHA-256
-`12aa822f5c0f5d8ba3712900ad14a71b01b550ccdbff51f58e2aac95c700012f`)
+(`cratonvm-tomcat-charsetcache-r13-20260801-019fb049`, SHA-256
+`65e66e82ff44a3e27f51fc70dcfac10ccf19a208b4b34591b50f47f5460d7900`)
 passes the exact upstream class:
 
 ```text
-NoCsCache:   17,685,915,015 ns
-FullCsCache:  9,834,529,612 ns (0.556x uncached)
-LazyCsCache:  9,610,033,767 ns (0.543x uncached)
-Time: 37.313
+NoCsCache:   22,101,614,381 ns
+FullCsCache:  8,526,813,937 ns (0.386x uncached)
+LazyCsCache: 14,185,229,042 ns (0.642x uncached)
+Time: 45.027
 OK (1 test)
 ```
 
@@ -26,6 +26,14 @@ without the former constant-pool/name re-resolution or triple hash. The
 redefinition generation gate still evicts stale targets before policy
 revalidation.
 
+The current-dev merge exposed one final charset bootstrap residual before the
+benchmark body: `Collections.unmodifiableSortedMap` and
+`unmodifiableNavigableMap` were registered to the plain `UnmodifiableMap`
+callback, whose synthetic result deliberately implements only `Map`. That
+made `Charset.availableCharsets()` fail its required `SortedMap` checkcast.
+Those two overrides, including the early duplicate, are removed. The
+authoritative JDK bytecode now creates correctly typed, read-only wrappers.
+
 The exact performance assertion is a JIT gate: the interpreter intentionally
 does not provide compiled-call elimination, so its arm ratios are not a useful
 `--nojit` acceptance criterion. Semantic coverage was nevertheless exercised
@@ -34,7 +42,7 @@ Tomcat `CharsetCache` lookups with identical canonical charset names. Both runs
 reported `DOC23_CORRECTNESS_OK`. A JDK-only warm-cache census in both JIT and
 `--nojit` modes recorded 100,000 calls each to a virtual `Runtime.freeMemory`,
 virtual `Thread.isAlive`, and static `System.nanoTime`; each report contained
-300,047 bridge invocations, one intrinsic invocation, and zero synthetic-stub
+300,053 bridge invocations, one intrinsic invocation, and zero synthetic-stub
 invocations. This is non-vacuous evidence that both cached native arms are
 policy-checked and counted.
 
