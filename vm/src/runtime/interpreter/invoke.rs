@@ -15136,7 +15136,7 @@ pub(super) fn compile_osr_artifact(
                 + if osr_method_is_static { 0 } else { 1 };
             let (param_jvm_slots, param_slot_span) =
                 crate::jit::compute_param_jvm_slots(&method_descriptor, osr_method_is_static);
-            let helpers = crate::jit::helpers::build_helpers();
+            let helpers = crate::jit::helpers::build_helpers_for(shared);
             // HIB-CV-20 — seed the local-oop dataflow with this method's reference
             // PARAMETERS, exactly as the hot-path `jit::try_compile` does. The
             // legacy `x64::compile` wrapper hardcodes `param_oop_mask = 0`, so an
@@ -17336,7 +17336,7 @@ pub(super) fn try_jit_upgrade_with_gate(
                 };
                 shared.jit.profile_store.get_profile(&profile_key)
             };
-            let c_helpers = crate::jit::helpers::build_helpers();
+            let c_helpers = crate::jit::helpers::build_helpers_for(shared);
             let c_string_layout_resolver = || resolve_string_field_layout(shared);
             crate::jit::set_self_call_identity_stable(self_call_identity_stable(
                 shared,
@@ -17458,7 +17458,7 @@ pub(super) fn try_jit_upgrade_with_gate(
         };
         shared.jit.profile_store.get_profile(&profile_key)
     };
-    let helpers = crate::jit::helpers::build_helpers();
+    let helpers = crate::jit::helpers::build_helpers_for(shared);
     // Small-method inlining for the main tier-up compile. Without it, even a
     // trivial leaf like `static int add(int,int){return a+b;}` compiled to a
     // CALL per use, so call-heavy JDK-internal code (xalan/xerces DTM walks:
@@ -18375,7 +18375,7 @@ pub(super) fn try_jit_compile_callee_slow(
         };
         shared.jit.profile_store.get_profile(&profile_key)
     };
-    let helpers = crate::jit::helpers::build_helpers();
+    let helpers = crate::jit::helpers::build_helpers_for(shared);
 
     // Build inline resolver for method inlining (Session 31)
     let inline_resolver = |callee_class: &str,

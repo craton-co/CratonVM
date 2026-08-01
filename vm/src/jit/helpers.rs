@@ -13168,7 +13168,32 @@ pub unsafe extern "C" fn jit_arm_savebase_watch(_addr: i64) {}
 pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 
 /// Build the JIT runtime helpers table with real function pointer addresses.
+/// Build the helper table for a SPECIFIC VM.
+///
+/// Three of the fields below are VM-specific addresses: the STW flag the
+/// JIT polls, and the card-table triple its inline reference store marks
+/// into. They used to be resolved through `process_vm()` — the FIRST VM
+/// published in the process — so in a second VM the compiled code would poll
+/// another VM's safepoint flag and write card marks into another VM's
+/// table. A missed card mark is a missed remembered-set update, which is a
+/// use-after-free, not a slowdown. See
+/// `docs/known-issues/vm-process-global-state.md`.
+///
+/// Every production caller has its own `SharedVm` in scope and should use
+/// this. [`build_helpers`] remains for VM-less unit tests.
+pub fn build_helpers_for(shared: &crate::vm::SharedVm) -> JitRuntimeHelpers {
+    build_helpers_opt(Some(shared))
+}
+
+/// Build the helper table from the process-global VM, if one is published.
+///
+/// Prefer [`build_helpers_for`] wherever a `SharedVm` is in scope: this
+/// spelling silently picks the FIRST VM in the process.
 pub fn build_helpers() -> JitRuntimeHelpers {
+    build_helpers_opt(crate::native::jni::process_vm().as_deref())
+}
+
+fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntimeHelpers {
     // Compute the inline-TLAB offset triple once at startup so the JIT
     // can bake them as immediates. The runtime tests
     // `Tlab::test_tlab_offsets` and `JvmThread::tlab_offset_matches_field_address`
@@ -13210,7 +13235,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     //
     // The latch itself only ever moves toward strict, so this call can never
     // relax a policy another VM in the same process already installed.
-    let jdk_only = match crate::native::jni::process_vm() {
+    let jdk_only = match vm_for_helpers {
         Some(shared) => {
             let policy = shared.config.execution_policy();
             cratonvm_jit::set_jit_execution_policy(policy);
@@ -13272,7 +13297,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     }
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
-        crate::native::jni::process_vm()
+        vm_for_helpers
             .and_then(|shared| shared.mem.heap.jit_card_table_info())
             .unwrap_or((0, 0, 0));
 
@@ -13403,7 +13428,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // field) treats as "not wired" and emits no poll code at all — the
         // same optional-helper contract as `region_bounds_addr`/
         // `frame_record` above.
-        safepoint_flag_addr: crate::native::jni::process_vm()
+        safepoint_flag_addr: vm_for_helpers
             .map(|shared| shared.mem.gc_barrier.stw_requested_flag_addr() as usize)
             .unwrap_or(0),
         // Slow-path helper for a poll hit. Unconditionally wired (the

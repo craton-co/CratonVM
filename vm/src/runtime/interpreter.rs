@@ -7592,7 +7592,7 @@ pub fn execute(
 
                     // Try to compile
                     let param_slots = args.len();
-                    let helpers = crate::jit::helpers::build_helpers();
+                    let helpers = crate::jit::helpers::build_helpers_for(shared);
                     // HIB-CV-20 — like the OSR path (and unlike the legacy
                     // `x64::compile` wrapper, which hardcodes `param_oop_mask = 0`),
                     // seed the local-oop dataflow with this method's reference
