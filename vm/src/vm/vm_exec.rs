@@ -18091,6 +18091,17 @@ fn invoke_on_class_shared_inner(
                             && method_name == "newFileChannel"
                             && descriptor
                                 == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;")
+                        // The same story for the three link operations:
+                        // concrete `throw new UnsupportedOperationException()`
+                        // bodies on the base class, and no concrete subclass to
+                        // override them because the default provider IS the
+                        // base class here. Shared with the interpreter gate so
+                        // both paths agree.
+                        || crate::runtime::interpreter::is_file_system_provider_link_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || matches!(
                             (class_name, method_name, descriptor),
                             ("java/nio/charset/Charset", "contains", "(Ljava/nio/charset/Charset;)Z")

@@ -4423,19 +4423,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         files,
         "readSymbolicLink",
         "(Ljava/nio/file/Path;)Ljava/nio/file/Path;",
+        // Host symlinks and jrt package links both live in
+        // `p57_read_symbolic_link`; this used to handle only the jrt case and
+        // answered `NoSuchFileException` for every real symbolic link.
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            if let Some((java_home, entry)) = jrtfs_decode(&p) {
-                if let Some(target) = entry.strip_prefix("packages/").and_then(|rest| {
-                    jrt_image(&java_home).and_then(|image| jrt_package_link_target(&image, rest))
-                }) {
-                    let path =
-                        p57_alloc_path(ctx, &jrtfs_encode(&java_home, &format!("/{target}")));
-                    return Ok(Some(Value::Object(Some(path))));
-                }
-            }
-            Err(p57_no_such_file(ctx, &p))
+            p57_read_symbolic_link(ctx, &p)
         },
     );
 
@@ -5439,6 +5433,65 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_field(spl, 2, Value::Int(len));
             ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Object(Some(spl))))
+        },
+    );
+
+    // createSymbolicLink / createLink / readSymbolicLink.
+    //
+    // `Files.createSymbolicLink(link, target, attrs)` is ordinary (non-native)
+    // JDK bytecode: `provider(link).createSymbolicLink(link, target, attrs);
+    // return link;`. The default provider this VM hands back is the synthetic
+    // instance stamped as the literal `java/nio/file/spi/FileSystemProvider`
+    // class (see the `getFileStore` note above), so the invokevirtual lands on
+    // `FileSystemProvider`'s OWN concrete body — which, on the abstract base,
+    // is an unconditional `throw new UnsupportedOperationException()`. That is
+    // exactly what
+    // docs/known-issues/springboot/files-createsymboliclink-unsupported-20260731.md
+    // reported: every `Files.createSymbolicLink` call in the VM died with a
+    // bare `UnsupportedOperationException` at `FileSystemProvider.java:626`,
+    // taking out `ConfigTreePropertySourceTests` (Kubernetes ConfigMap
+    // `..data`-symlink shapes) and `FileWatcherTests` (symlink-following
+    // watch registration).
+    //
+    // Registering the three link methods HERE, on `fsp`, is what makes them
+    // reachable: a registration on `java/nio/file/Files` (there were three,
+    // now real, further down this file) never runs for these calls because
+    // `Files.createSymbolicLink` has real bytecode of its own and this VM
+    // prefers concrete bytecode over a bridge registration.
+    r.register(
+        fsp,
+        "createSymbolicLink",
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)V",
+        |ctx, args| {
+            let link = obj_arg(args, 1)?;
+            let target = obj_arg(args, 2)?;
+            let link = p57_read_path(ctx, link);
+            let target = p57_read_path(ctx, target);
+            p57_create_symbolic_link(ctx, &link, &target)?;
+            Ok(None)
+        },
+    );
+    r.register(
+        fsp,
+        "createLink",
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;)V",
+        |ctx, args| {
+            let link = obj_arg(args, 1)?;
+            let existing = obj_arg(args, 2)?;
+            let link = p57_read_path(ctx, link);
+            let existing = p57_read_path(ctx, existing);
+            p57_create_hard_link(ctx, &link, &existing)?;
+            Ok(None)
+        },
+    );
+    r.register(
+        fsp,
+        "readSymbolicLink",
+        "(Ljava/nio/file/Path;)Ljava/nio/file/Path;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 1)?;
+            let p = p57_read_path(ctx, path_obj);
+            p57_read_symbolic_link(ctx, &p)
         },
     );
 
@@ -7796,6 +7849,199 @@ pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> Meth
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     ctx.unpin_native_roots(exc_pin);
     MethodCallFailed::ExceptionThrown(exc)
+}
+
+/// Build a *typed* `java.nio.file.NotLinkException` for `path` (mirrors
+/// [`p57_no_such_file`]). Thrown by `readSymbolicLink` when the path exists but
+/// is not a symbolic link — the JDK's contract, and what
+/// `Files.readSymbolicLink`'s callers catch.
+pub(crate) fn p57_not_link(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
+    let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/NotLinkException", 4);
+    let exc_pin = ctx.pin_native_root(exc);
+    let file_str = ctx.create_string(path);
+    let exc = ctx.read_native_pin(exc_pin, exc);
+    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    ctx.unpin_native_roots(exc_pin);
+    MethodCallFailed::ExceptionThrown(exc)
+}
+
+/// Build a *typed* `java.nio.file.FileSystemException` carrying the JDK's
+/// three-part `(file, other, reason)` shape. `getMessage()` on the real class
+/// assembles `"<file> -> <other>: <reason>"` from exactly these fields, so we
+/// leave `Throwable.detailMessage` null (same reasoning as
+/// [`p57_no_such_file`]).
+///
+/// This is the type the JDK raises for an OS-level link failure that is not one
+/// of the specific subclasses — most visibly Windows' `ERROR_PRIVILEGE_NOT_HELD`
+/// ("A required privilege is not held by the client"), which is what a symlink
+/// creation gets on any Windows host without Developer Mode or an elevated
+/// token. Reporting it as `UnsupportedOperationException` (the old behaviour)
+/// made a *host* limitation look like a missing JDK feature.
+pub(crate) fn p57_filesystem_exception(
+    ctx: &mut dyn NativeContext,
+    file: &str,
+    other: Option<&str>,
+    reason: &str,
+) -> MethodCallFailed {
+    let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystemException", 4);
+    let exc_pin = ctx.pin_native_root(exc);
+    let file_str = ctx.create_string(file);
+    let exc = ctx.read_native_pin(exc_pin, exc);
+    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    if let Some(other) = other {
+        let other_str = ctx.create_string(other);
+        let exc = ctx.read_native_pin(exc_pin, exc);
+        ctx.set_field_by_name(exc, "other", Value::Object(Some(other_str)));
+    }
+    let reason_str = ctx.create_string(reason);
+    let exc = ctx.read_native_pin(exc_pin, exc);
+    ctx.set_field_by_name(exc, "reason", Value::Object(Some(reason_str)));
+    ctx.unpin_native_roots(exc_pin);
+    MethodCallFailed::ExceptionThrown(exc)
+}
+
+/// Windows error code for "a required privilege is not held by the client",
+/// which `CreateSymbolicLinkW` returns unless the process token holds
+/// `SeCreateSymbolicLinkPrivilege` (administrator) or the machine is in
+/// Developer Mode. Rust surfaces it as an uncategorised `io::Error`, so the
+/// raw OS code is the only reliable discriminator.
+#[cfg(windows)]
+const WIN_ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+/// Map an `io::Error` from a link syscall onto the exception type the JDK
+/// raises for it. `link` is the path being created/read (the `file` slot);
+/// `other` is the second path a two-path operation names, if any.
+fn p57_link_io_error(
+    ctx: &mut dyn NativeContext,
+    e: &std::io::Error,
+    link: &str,
+    other: Option<&str>,
+) -> MethodCallFailed {
+    match e.kind() {
+        std::io::ErrorKind::AlreadyExists => p57_file_already_exists(ctx, link),
+        std::io::ErrorKind::NotFound => p57_no_such_file(ctx, link),
+        std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, link),
+        _ => {
+            #[cfg(windows)]
+            if e.raw_os_error() == Some(WIN_ERROR_PRIVILEGE_NOT_HELD) {
+                return p57_filesystem_exception(
+                    ctx,
+                    link,
+                    other,
+                    "A required privilege is not held by the client",
+                );
+            }
+            // Strip Rust's trailing " (os error N)" so the reason reads like
+            // the JDK's, which carries only the system message text.
+            let text = e.to_string();
+            let reason = text.split(" (os error ").next().unwrap_or(&text).to_string();
+            p57_filesystem_exception(ctx, link, other, &reason)
+        }
+    }
+}
+
+/// Create a real symbolic link at `link` pointing at `target`.
+///
+/// `target` is stored verbatim — a relative target must stay relative, because
+/// that is what `readSymbolicLink` has to hand back and what makes a Kubernetes
+/// ConfigMap tree (`..data/<key>` plus one relative link per key) resolve.
+pub(crate) fn p57_create_symbolic_link(
+    ctx: &mut dyn NativeContext,
+    link: &str,
+    target: &str,
+) -> Result<(), MethodCallFailed> {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = {
+        // Windows needs to know at creation time whether the link is a file or
+        // a directory link — there is no "don't care" flag. The JDK decides the
+        // same way: it reads the target's attributes (resolving a relative
+        // target against the link's own parent) and sets
+        // SYMBOLIC_LINK_FLAG_DIRECTORY when it is a directory. A dangling
+        // target is unknowable, so it falls back to a file link, as the JDK's
+        // `WindowsLinkSupport` does.
+        let resolved = if std::path::Path::new(target).is_absolute() {
+            std::path::PathBuf::from(target)
+        } else {
+            std::path::Path::new(link)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(target)
+        };
+        let target_is_dir = std::fs::metadata(&resolved)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        // `symlink_file`/`symlink_dir` do NOT report an existing link as
+        // AlreadyExists on every Windows build, so pre-check to keep the
+        // `FileAlreadyExistsException` contract identical on both platforms.
+        if std::fs::symlink_metadata(link).is_ok() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "link already exists",
+            ))
+        } else if target_is_dir {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => Err(p57_link_io_error(ctx, &e, link, Some(target))),
+    }
+}
+
+/// Create a hard link at `link` referring to the same file as `existing`.
+pub(crate) fn p57_create_hard_link(
+    ctx: &mut dyn NativeContext,
+    link: &str,
+    existing: &str,
+) -> Result<(), MethodCallFailed> {
+    match std::fs::hard_link(existing, link) {
+        Ok(()) => Ok(()),
+        // `hard_link` reports a missing SOURCE as NotFound too, but the JDK
+        // names the link being created in either case, so the generic mapping
+        // is right.
+        Err(e) => Err(p57_link_io_error(ctx, &e, link, Some(existing))),
+    }
+}
+
+/// Read the target of the symbolic link at `path`, as a fresh `Path`.
+///
+/// Handles the runtime-image (jrt) package links first — those are synthesised
+/// out of the jimage, not the host filesystem — then falls through to a real
+/// `readlink(2)`/`DeviceIoControl` read.
+pub(crate) fn p57_read_symbolic_link(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+) -> MethodCallResult {
+    if let Some((java_home, entry)) = jrtfs_decode(path) {
+        if let Some(target) = entry.strip_prefix("packages/").and_then(|rest| {
+            jrt_image(&java_home).and_then(|image| jrt_package_link_target(&image, rest))
+        }) {
+            let p = p57_alloc_path(ctx, &jrtfs_encode(&java_home, &format!("/{target}")));
+            return Ok(Some(Value::Object(Some(p))));
+        }
+        return Err(p57_no_such_file(ctx, path));
+    }
+    // Distinguish "missing" from "present but not a link" before reading, so
+    // both map to the JDK's types (NoSuchFileException vs NotLinkException)
+    // rather than to whatever errno `readlink` happens to produce for each.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_symlink() => return Err(p57_not_link(ctx, path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(p57_no_such_file(ctx, path))
+        }
+        _ => {}
+    }
+    match std::fs::read_link(path) {
+        Ok(target) => {
+            let target = target.to_string_lossy().into_owned();
+            Ok(Some(Value::Object(Some(p57_alloc_path(ctx, &target)))))
+        }
+        Err(e) => Err(p57_link_io_error(ctx, &e, path, None)),
+    }
 }
 
 // --- jar-filesystem path encoding ---------------------------------------
@@ -16302,20 +16548,57 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(hash)))
         });
     }
+    // These three used to return `args[0]` — the link path — without creating
+    // or reading anything, i.e. they claimed success for a link that was never
+    // made. `Files.createSymbolicLink`/`createLink`/`readSymbolicLink` all have
+    // real bytecode that delegates to the provider, so these registrations lose
+    // to it and the lie was never observed; the provider natives registered on
+    // `java/nio/file/spi/FileSystemProvider` are what actually run. They are
+    // kept, and made real, so that any dispatch path that DOES prefer a
+    // registration over bytecode gets the same answer as the provider.
     r.register(
         f,
         "createLink",
         "(Ljava/nio/file/Path;Ljava/nio/file/Path;)Ljava/nio/file/Path;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        |ctx, args| {
+            let link_obj = obj_arg(args, 0)?;
+            let existing = obj_arg(args, 1)?;
+            // `p57_read_path` can call back into `Path.toString()` bytecode for
+            // a foreign Path implementation, so it is a GC point: pin the link
+            // we hand back across both reads (native stale-local family).
+            let link_pin = ctx.pin_native_root(link_obj);
+            let link = p57_read_path(ctx, link_obj);
+            let existing = p57_read_path(ctx, existing);
+            let result = p57_create_hard_link(ctx, &link, &existing);
+            let link_obj = ctx.read_native_pin(link_pin, link_obj);
+            ctx.unpin_native_roots(link_pin);
+            result?;
+            Ok(Some(Value::Object(Some(link_obj))))
+        },
     );
     r.register(f, "createSymbolicLink",
         "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/file/Path;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))));
+        |ctx, args| {
+            let link_obj = obj_arg(args, 0)?;
+            let target = obj_arg(args, 1)?;
+            let link_pin = ctx.pin_native_root(link_obj);
+            let link = p57_read_path(ctx, link_obj);
+            let target = p57_read_path(ctx, target);
+            let result = p57_create_symbolic_link(ctx, &link, &target);
+            let link_obj = ctx.read_native_pin(link_pin, link_obj);
+            ctx.unpin_native_roots(link_pin);
+            result?;
+            Ok(Some(Value::Object(Some(link_obj))))
+        });
     r.register(
         f,
         "readSymbolicLink",
         "(Ljava/nio/file/Path;)Ljava/nio/file/Path;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let p = p57_read_path(ctx, path_obj);
+            p57_read_symbolic_link(ctx, &p)
+        },
     );
     r.set_category(__prev_cat);
 }

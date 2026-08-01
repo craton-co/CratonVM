@@ -6470,6 +6470,48 @@ pub(crate) fn is_file_channel_impl_open_native_override(
         )
 }
 
+/// `FileSystemProvider`'s three link operations —
+/// `createSymbolicLink`/`createLink`/`readSymbolicLink`.
+///
+/// Same shape as the `newFileChannel` exemption further down this file: the
+/// real-JDK base class gives each of these a CONCRETE body that unconditionally
+/// throws `UnsupportedOperationException` (a concrete subclass is expected to
+/// override it). CratonVM's default provider is the synthetic instance stamped
+/// as the literal `java/nio/file/spi/FileSystemProvider` class, so there is no
+/// subclass to override anything and "real class bytes are authoritative" runs
+/// the throw. Without this exemption the natives registered in
+/// `native-builtins/src/phases_late/nio_file.rs` are unreachable and every
+/// `Files.createSymbolicLink` in the VM dies with a bare
+/// `UnsupportedOperationException` — see
+/// `docs/internal/fixed-suite-bugs/springboot/files-createsymboliclink-unsupported-FIXED.md`.
+///
+/// The real `sun.nio.fs.*` provider names are listed alongside the base for the
+/// same reason `newFileChannel` lists them: a cached dispatch site can carry a
+/// concrete receiver class name while the callback lives under the base name.
+///
+/// This is the single source of truth for the exemption: it is consulted by
+/// BOTH dispatch gates — [`force_native_over_real_jdk_bytecode`] and the
+/// `check_override` predicate in `vm_exec.rs::invoke_on_class_shared_inner`.
+pub(crate) fn is_file_system_provider_link_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "java/nio/file/spi/FileSystemProvider"
+            | "sun/nio/fs/WindowsFileSystemProvider"
+            | "sun/nio/fs/UnixFileSystemProvider"
+    ) && matches!(
+        (method_name, descriptor),
+        (
+            "createSymbolicLink",
+            "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)V"
+        ) | ("createLink", "(Ljava/nio/file/Path;Ljava/nio/file/Path;)V")
+            | ("readSymbolicLink", "(Ljava/nio/file/Path;)Ljava/nio/file/Path;")
+    )
+}
+
 pub(crate) fn is_input_stream_transfer_to_native_override(
     class_name: &str,
     method_name: &str,
@@ -8897,6 +8939,9 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     if is_file_channel_impl_open_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    if is_file_system_provider_link_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     if is_input_stream_transfer_to_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -9896,7 +9941,10 @@ pub(super) fn intercept_force_registered_native(
     // the forced call to that base registration explicitly so a cached
     // runtime receiver name cannot bypass it and run the JDK's deliberate
     // UnsupportedOperationException stub.
-    if method_name == "newFileChannel"
+    //
+    // `createSymbolicLink`/`createLink`/`readSymbolicLink` ride the same route
+    // for the same reason — see `is_file_system_provider_link_native_override`.
+    if (method_name == "newFileChannel"
         && method_descriptor
             == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;"
         && matches!(
@@ -9904,6 +9952,11 @@ pub(super) fn intercept_force_registered_native(
             "java/nio/file/spi/FileSystemProvider"
                 | "sun/nio/fs/WindowsFileSystemProvider"
                 | "sun/nio/fs/UnixFileSystemProvider"
+        ))
+        || is_file_system_provider_link_native_override(
+            class_name,
+            method_name,
+            method_descriptor,
         )
     {
         let cb = shared.natives.native_methods.find(
