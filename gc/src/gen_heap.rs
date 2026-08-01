@@ -8904,6 +8904,16 @@ impl GenerationalHeap {
             }
         }
 
+        // Snapshot for the free-loop diagnostic below; taken once, outside the
+        // per-object loop, and only when the gate is on.
+        let sweep_owner_dbg =
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OLDSWEEP_OWNERS").is_some();
+        let sweep_owner_addrs = if sweep_owner_dbg {
+            crate::external_roots::external_owner_addrs()
+        } else {
+            None
+        };
+
         if !compact {
             // Watched addresses (every address the reference processor holds —
             // see `ReferenceProcessor::all_tracked_addrs`) need an explicit
@@ -8942,6 +8952,29 @@ impl GenerationalHeap {
                             header.num_slots(),
                             total_size,
                         );
+                    }
+                    // DIAGNOSTIC (`CRATONVM_DBG_OLDSWEEP_OWNERS=1`): name every
+                    // freed object that is a REGISTERED OVERLAY OWNER — i.e. a
+                    // collection whose backing state lives in a native side
+                    // table. Freeing one is normal when the collection is
+                    // genuinely dead, but it is also the exact event behind a
+                    // live collection reading back as empty (the prune then
+                    // observes `is_allocated_addr == false` and correctly drops
+                    // its state), so this is the site that has to be watched to
+                    // tell those two apart.
+                    if sweep_owner_dbg {
+                        if let Some(owners) = sweep_owner_addrs.as_ref() {
+                            if owners.contains(&(obj_ptr as usize)) {
+                                eprintln!(
+                                    "[oldsweep] FREEING overlay owner 0x{:x} class_id={} \
+                                     num_slots={} size={}",
+                                    obj_ptr as usize,
+                                    header.class_id.as_u32(),
+                                    header.num_slots(),
+                                    total_size,
+                                );
+                            }
+                        }
                     }
                     // SAFETY: `obj_ptr`/`total_size` are exactly the (base, size) pair `walk_objects` yielded for this
                     // now-unmarked old-gen object, so returning that span to the free list is sound.
