@@ -317,10 +317,17 @@ pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
 /// discriminant — i.e. the mark BFS was handed an address that is not an object
 /// base and decoded whatever bytes were there as an `ObjectHeader`.
 ///
-/// See `docs/known-issues/gc/gc-old-gen-mark-accepts-unvalidated-addresses.md`.
+/// See `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
 /// A non-zero value here means a side table is holding a dangling old-gen
 /// address, or a reference slot holds a non-base word.
 pub static OLDMARK_BAD_KIND_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Old-gen mark-worklist candidates rejected by
+/// [`old_gen_mark_candidate_plausible`]. Non-zero means a reference slot or a
+/// side table held an in-range address that is not an old-gen object base —
+/// before the screen existed, each of these was a blind `gc_flags` write into
+/// whatever occupied that address.
+pub static OLDMARK_REJECTED_CANDIDATES: AtomicU64 = AtomicU64::new(0);
 
 /// Conservative root candidates may be interior heap addresses.  Only the
 /// opt-in A2 forensic mode reports rejected candidates; normal collection
@@ -3488,6 +3495,24 @@ impl GenerationalHeap {
     /// so `ResourceBundle.getBundle(.., null, ..)` threw `MissingResourceException`.
     pub fn is_old_gen_addr(&self, addr: usize) -> bool {
         self.old_gen.lock().contains(addr as *const u8)
+    }
+
+    /// True when `addr` is inside an **allocated** old-gen span.
+    ///
+    /// The strict counterpart of [`Self::is_old_gen_addr`], which is a bare
+    /// range check. That range check is the right answer to "which generation
+    /// is this address in?" (`metadata_pin_deferrable` / `mirror_pin_deferrable`
+    /// ask exactly that) but the WRONG answer to "is the object still there?".
+    ///
+    /// `is_old_gen_addr`'s comment justifies the permissive form with "a minor
+    /// collection never touches the old generation". That premise does not hold:
+    /// [`Self::sweep_old_gen_non_moving`] runs a full old-gen mark-sweep that
+    /// reclaims dead blocks IN PLACE, during a YOUNG collection, whenever a live
+    /// JIT frame blocks the moving young collector — and it does not zero what
+    /// it frees. Use this predicate for liveness; see
+    /// `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    pub fn is_live_old_gen_addr(&self, addr: usize) -> bool {
+        self.old_gen.lock().is_allocated_addr(addr as *const u8)
     }
 
     /// True when `addr` is the start of a young from-space object that
@@ -8475,14 +8500,19 @@ impl GenerationalHeap {
         // alignment, no header validation), so before this fix ANY garbage
         // address landing inside old gen's byte range got `gc_flags` blindly
         // RMW'd — the exact same corruption family, on the OTHER generation.
-        // Reject implausible candidates instead of marking them: mirrors the
-        // already-established pattern in `scan_object_for_old_refs`'s extent
-        // check (skip-on-implausible, never corrupt) — old-gen compaction
-        // decides liveness purely from `gc_flags & GC_FLAG_MARKED`, so unlike
-        // the young sweep there is no side-mark-set escape hatch; the safe
-        // choice for an address that fails these checks is to not mark it
-        // (over-retention is not even at stake here — a failing candidate
-        // was never a valid object to begin with).
+        // Reject implausible candidates instead of marking them
+        // (skip-on-implausible, never corrupt) — old-gen compaction decides
+        // liveness purely from `gc_flags & GC_FLAG_MARKED`, so unlike the young
+        // sweep there is no side-mark-set escape hatch; the safe choice for an
+        // address that fails these checks is to not mark it (over-retention is
+        // not even at stake here — a failing candidate was never a valid object
+        // to begin with).
+        //
+        // 2026-07-31: this screen is no longer local to the root seed. It lives
+        // in `old_gen_mark_candidate_plausible` and EVERY push site into the
+        // mark worklist goes through it, because the seven that did not were
+        // still doing exactly what the paragraph above describes — see
+        // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
         //
         // NOTE this predicate deliberately does NOT require a non-zero first
         // header word (unlike `mark_young`'s zero-word0 side-mark split):
@@ -8511,29 +8541,17 @@ impl GenerationalHeap {
         // pre-xt-activation background DoHead crash face.
         for root in roots.iter() {
             let ptr = root.as_ptr();
-            if (ptr as usize) & 0x7 == 0 && old_gen.contains(ptr) {
-                // SAFETY: `ptr` is 8-aligned and inside old gen (verified by
-                // `contains` above); reading its header is in-bounds.
+            // `conservative = true`: these are register/stack-scanned GUESSES,
+            // so they also need the zero-word0 neighbour disambiguation. The
+            // rest of the screen is the same one every other push site now
+            // uses — see `old_gen_mark_candidate_plausible`.
+            if old_gen_mark_candidate_plausible(ptr, old_gen, true) {
+                // SAFETY: the screen verified 8-alignment, old-gen containment
+                // and a header whose claimed extent fits inside old gen.
                 let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-                let kind_byte = header.kind as u8;
-                let is_array = header.kind == ObjectKind::Array;
-                let word0 = unsafe { *(ptr as *const u64) };
-                let plausible = kind_byte <= 1
-                    && (is_array || header.num_slots() <= (1 << 24))
-                    && (!is_array || header.array_length() <= i32::MAX as u32)
-                    && header_reserved_fields_plausible(header)
-                    && (word0 != 0 || !victim8_neighbor_explains_zero_prefix(ptr, old_gen));
-                if plausible {
-                    let total = gen_object_total_size(header);
-                    let fits = total >= HEADER_SIZE
-                        // SAFETY: total >= HEADER_SIZE was just checked; the
-                        // addition stays within a sane pointer range for a
-                        // plausibility probe (no dereference here).
-                        && old_gen.contains(unsafe { ptr.add(total - 1) });
-                    if fits && header.gc_flags & GC_FLAG_MARKED == 0 {
-                        header.gc_flags |= GC_FLAG_MARKED;
-                        worklist.push(ptr);
-                    }
+                if header.gc_flags & GC_FLAG_MARKED == 0 {
+                    header.gc_flags |= GC_FLAG_MARKED;
+                    worklist.push(ptr);
                 }
             }
         }
@@ -8550,15 +8568,12 @@ impl GenerationalHeap {
                 young_from.contains(owner_addr as *mut u8)
             })
         {
-            let overlay_ptr = overlay_ref.as_ptr();
-            if old_gen.contains(overlay_ptr) {
-                // SAFETY: `overlay_ptr` lies in old gen, verified above.
-                let h = unsafe { &mut *(overlay_ptr as *mut ObjectHeader) };
-                if h.gc_flags & GC_FLAG_MARKED == 0 {
-                    h.gc_flags |= GC_FLAG_MARKED;
-                    worklist.push(overlay_ptr);
-                }
-            }
+            mark_and_push_old_gen(
+                overlay_ref.as_ptr(),
+                old_gen,
+                &mut worklist,
+                "external-overlay(young owner)",
+            );
         }
 
         // BFS: transitively mark all reachable old-gen objects
@@ -8576,16 +8591,12 @@ impl GenerationalHeap {
             for overlay_ref in
                 crate::external_roots::external_roots_for_owner(obj_ptr as usize)
             {
-                let overlay_ptr = overlay_ref.as_ptr();
-                if old_gen.contains(overlay_ptr) {
-                    // SAFETY: `overlay_ptr` is in old gen; this is the same
-                    // marking transition used by the defining-loader pin below.
-                    let h = unsafe { &mut *(overlay_ptr as *mut ObjectHeader) };
-                    if h.gc_flags & GC_FLAG_MARKED == 0 {
-                        h.gc_flags |= GC_FLAG_MARKED;
-                        worklist.push(overlay_ptr);
-                    }
-                }
+                mark_and_push_old_gen(
+                    overlay_ref.as_ptr(),
+                    old_gen,
+                    &mut worklist,
+                    "external-overlay(BFS owner)",
+                );
             }
             if loader_pin_on {
                 // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
@@ -8593,15 +8604,12 @@ impl GenerationalHeap {
                 if let Some(loader_addr) =
                     cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
                 {
-                    let lp = loader_addr as *mut u8;
-                    if old_gen.contains(lp) {
-                        // SAFETY: `lp` is within old gen (verified by `contains`).
-                        let h = unsafe { &mut *(lp as *mut ObjectHeader) };
-                        if h.gc_flags & GC_FLAG_MARKED == 0 {
-                            h.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(lp);
-                        }
-                    }
+                    mark_and_push_old_gen(
+                        loader_addr as *mut u8,
+                        old_gen,
+                        &mut worklist,
+                        "loader_pin",
+                    );
                 }
             }
             // Class-mirror liveness pin (mirror_pin, companion to loader_pin
@@ -8618,31 +8626,24 @@ impl GenerationalHeap {
                 cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize)
             {
                 for mirror_addr in mirror_addrs {
-                    let mp = mirror_addr as *mut u8;
-                    if old_gen.contains(mp) {
-                        // SAFETY: `mp` is within old gen (verified by `contains`).
-                        let h = unsafe { &mut *(mp as *mut ObjectHeader) };
-                        if h.gc_flags & GC_FLAG_MARKED == 0 {
-                            h.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(mp);
-                        }
-                    }
+                    mark_and_push_old_gen(
+                        mirror_addr as *mut u8,
+                        old_gen,
+                        &mut worklist,
+                        "mirror_pin",
+                    );
                 }
             }
             if let Some(metadata_addrs) =
                 cratonvm_types::metadata_pin::roots_for_loader(obj_ptr as usize)
             {
                 for metadata_addr in metadata_addrs {
-                    let mp = metadata_addr as *mut u8;
-                    if old_gen.contains(mp) {
-                        // SAFETY: `mp` is within old gen and is a registered
-                        // loader-owned heap root.
-                        let h = unsafe { &mut *(mp as *mut ObjectHeader) };
-                        if h.gc_flags & GC_FLAG_MARKED == 0 {
-                            h.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(mp);
-                        }
-                    }
+                    mark_and_push_old_gen(
+                        metadata_addr as *mut u8,
+                        old_gen,
+                        &mut worklist,
+                        "metadata_pin",
+                    );
                 }
             }
         }
@@ -8828,15 +8829,7 @@ impl GenerationalHeap {
             // SAFETY: `obj_ptr`/`header` are a valid live young-from object.
             unsafe {
                 for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                    if old_gen.contains(ref_ptr) {
-                        // SAFETY: `ref_ptr` is in old gen (verified by `contains`);
-                        // its header is valid and mutable for marking.
-                        let ref_header = &mut *(ref_ptr as *mut ObjectHeader);
-                        if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                            ref_header.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(ref_ptr);
-                        }
-                    }
+                    mark_and_push_old_gen(ref_ptr, old_gen, worklist, "young->old ref slot");
                 });
             }
 
@@ -8850,7 +8843,7 @@ impl GenerationalHeap {
         // never an object base: some push site handed us a dangling or interior
         // address. Counted (not rejected) here — rejecting is the FIX, which is
         // deliberately not part of this diagnostic commit. See
-        // `docs/known-issues/gc/gc-old-gen-mark-accepts-unvalidated-addresses.md`.
+        // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
         // SAFETY: every push site range-checked `obj_ptr` against old gen, so
         // offset 4 is mapped.
         if unsafe { *obj_ptr.add(OBJECT_KIND_OFFSET) } > 2 {
@@ -8886,15 +8879,7 @@ impl GenerationalHeap {
         // SAFETY: `obj_ptr`/`header` are a valid live object.
         unsafe {
             for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                if old_gen.contains(ref_ptr) {
-                    // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its
-                    // header is valid and mutable for marking.
-                    let ref_header = &mut *(ref_ptr as *mut ObjectHeader);
-                    if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                        ref_header.gc_flags |= GC_FLAG_MARKED;
-                        worklist.push(ref_ptr);
-                    }
-                }
+                mark_and_push_old_gen(ref_ptr, old_gen, worklist, "old-gen ref slot");
             });
         }
     }
@@ -10707,6 +10692,120 @@ fn seedhunt_scan_young(
 /// Four bytes of near-uniform-random garbage failing this check is a ~1/2^29
 /// false-negative-on-garbage rate (2 padding bytes + 2 reserved bytes + 5
 /// undefined gc_flags bits); real objects always pass.
+/// The screen every old-gen mark-worklist push must pass.
+///
+/// [`OldGen::contains`] is a bare bounds check — no alignment, no header
+/// validation — so without this any word that happens to land inside old gen's
+/// byte range gets its `gc_flags` blindly read-modify-written and is then fed to
+/// `scan_object_for_old_refs` as an `ObjectHeader`. Two consequences, both
+/// reproduced by the tests named below: the mark bit lands in an unrelated LIVE
+/// object's PAYLOAD (an `int` field `0x41414141` becomes `0x43414141`), and
+/// those payload bytes are decoded as a header, which is how a byte that is not
+/// a valid `ObjectKind` discriminant reaches `gen_object_total_size`. See
+/// `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+///
+/// The root seed and the young->old conservative word scan already defended
+/// themselves (and their comments name this hazard as the reason); this is that
+/// same screen, factored out so the other seven push sites get it too.
+///
+/// `conservative` adds the zero-word0 neighbour disambiguation that only
+/// register/stack-scanned GUESSES need. It is deliberately NOT applied to
+/// precise references: a `ClassId(0)` ad-hoc container legitimately has an
+/// all-zero word0, and rejecting one that a real reference slot points at would
+/// free a live object. Every other clause is a property real objects always
+/// have, so precise sites can take them all with no risk of a false reject —
+/// which matters, because at a precise site a false reject IS a premature free.
+fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative: bool) -> bool {
+    if (ptr as usize) & 0x7 != 0 || !old_gen.contains(ptr) {
+        return false;
+    }
+    // SAFETY: `ptr` is 8-aligned and inside old gen, so the header read is
+    // in-bounds.
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    // Compare `kind` as a RAW BYTE: an out-of-range discriminant is exactly the
+    // case this screen exists to catch, and the optimiser is entitled to assume
+    // the enum is in 0..=2 — which would fold the check away.
+    // SAFETY: as above; `OBJECT_KIND_OFFSET` is inside the header.
+    let kind_byte = unsafe { *ptr.add(OBJECT_KIND_OFFSET) };
+    if kind_byte > ObjectKind::Array as u8 {
+        return false;
+    }
+    if kind_byte == ObjectKind::Array as u8 {
+        if header.array_length() > i32::MAX as u32 {
+            return false;
+        }
+    } else if header.num_slots() > (1 << 24) {
+        return false;
+    }
+    if !header_reserved_fields_plausible(header) {
+        return false;
+    }
+    if conservative {
+        // SAFETY: reads the first header word at an 8-aligned in-bounds ptr.
+        let word0 = unsafe { *(ptr as *const u64) };
+        if word0 == 0 && victim8_neighbor_explains_zero_prefix(ptr, old_gen) {
+            return false;
+        }
+    }
+    let total = gen_object_total_size(header);
+    // SAFETY: `total >= HEADER_SIZE` is checked first, so `ptr.add(total - 1)`
+    // is the object's last byte; `contains` only range-checks it.
+    total >= HEADER_SIZE && old_gen.contains(unsafe { ptr.add(total - 1) })
+}
+
+/// Mark `ptr` and push it onto the old-gen mark worklist — but only if it is a
+/// plausible old-gen object BASE. See [`old_gen_mark_candidate_plausible`].
+///
+/// An address outside old gen is silently ignored (it is simply not this
+/// generation's business). An address INSIDE old gen that fails the screen is
+/// counted and reported: it means a reference slot or a side table is holding
+/// something that is not an object base.
+fn mark_and_push_old_gen(
+    ptr: *mut u8,
+    old_gen: &OldGen,
+    worklist: &mut Vec<*mut u8>,
+    site: &'static str,
+) {
+    if !old_gen.contains(ptr) {
+        return;
+    }
+    if !old_gen_mark_candidate_plausible(ptr, old_gen, false) {
+        note_rejected_old_mark_candidate(ptr, site);
+        return;
+    }
+    // SAFETY: the screen verified 8-alignment, old-gen containment and a
+    // header whose claimed extent fits inside old gen.
+    let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
+    if header.gc_flags & GC_FLAG_MARKED == 0 {
+        header.gc_flags |= GC_FLAG_MARKED;
+        worklist.push(ptr);
+    }
+}
+
+/// Cold reporter for a rejected old-gen mark candidate.
+#[cold]
+#[inline(never)]
+fn note_rejected_old_mark_candidate(ptr: *mut u8, site: &'static str) {
+    let n = OLDMARK_REJECTED_CANDIDATES.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        // SAFETY: the caller verified `ptr` is inside old gen, so the 24 bytes
+        // a header occupies are mapped.
+        let w = unsafe { std::ptr::read_unaligned(ptr as *const [u64; 3]) };
+        tracing::warn!(
+            "old-gen mark: rejecting {} candidate {:p} — not a plausible object \
+             base (aligned={}, w0=0x{:016x} w1=0x{:016x} w2=0x{:016x}). A side \
+             table or reference slot is holding a stale old-gen address; see \
+             docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md",
+            site,
+            ptr,
+            (ptr as usize) & 7 == 0,
+            w[0],
+            w[1],
+            w[2],
+        );
+    }
+}
+
 #[inline]
 fn header_reserved_fields_plausible(header: &ObjectHeader) -> bool {
     header.gc_flags & !(GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT) == 0
@@ -13710,8 +13809,8 @@ mod tests {
         assert_ne!(heap.identity_hash_code(obj1), heap.identity_hash_code(obj2),);
     }
 
-    /// Half 1 of the open defect: after the NON-MOVING old-gen sweep,
-    /// `is_addr_live` still reports a freed block as live.
+    /// After the NON-MOVING old-gen sweep, `is_addr_live` must NOT report a
+    /// freed block as live. (Half 1 of the fix; was an open defect.)
     ///
     /// `VmHeap::is_addr_live` answers `is_old_gen_addr(addr) ||
     /// is_live_young_survivor(addr)`, and `is_old_gen_addr` is a bare range
@@ -13734,10 +13833,14 @@ mod tests {
     /// `gc_reconcile_defining_loaders` — RETAINS the entry for a just-freed
     /// object, leaving a dangling old-gen address for a later mark to decode.
     ///
-    /// See `docs/known-issues/gc/gc-old-gen-mark-accepts-unvalidated-addresses.md`.
+    /// See `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    /// Fixed by giving `is_addr_live` a free-list-aware old-gen predicate
+    /// (`GenerationalHeap::is_live_old_gen_addr` -> `OldGen::is_allocated_addr`).
+    /// `is_old_gen_addr` itself is deliberately UNCHANGED: it answers "which
+    /// generation is this address in?", which `metadata_pin_deferrable` /
+    /// `mirror_pin_deferrable` legitimately ask.
     #[test]
-    #[ignore = "documents an OPEN defect: is_addr_live lies after the non-moving old-gen sweep"]
-    fn non_moving_old_sweep_leaves_is_addr_live_reporting_a_freed_block_as_live() {
+    fn non_moving_old_sweep_frees_in_place_and_is_addr_live_says_so() {
         let heap = GenerationalHeap::with_sizes(2 * 1024, 8 * 1024);
         let monitors = NoOpMonitors;
 
@@ -13773,16 +13876,17 @@ mod tests {
         );
     }
 
-    /// Half 2 of the open defect: the old-gen mark BFS accepts ANY in-range
-    /// word as an object base — no alignment test, no header plausibility test.
+    /// The old-gen mark BFS must not accept an in-range word that is not an
+    /// object base. (Half 2 of the fix; was an open defect.)
     ///
-    /// `scan_object_for_old_refs` marks referents with
+    /// `scan_object_for_old_refs` used to mark referents with
     /// `if old_gen.contains(ref_ptr) { (*ref_ptr).gc_flags |= GC_FLAG_MARKED }`.
-    /// The ROOT seed in `old_gen_gc` documents this exact hazard and defends
+    /// The ROOT seed in `old_gen_gc` documented this exact hazard and defended
     /// against it ("ANY garbage address landing inside old gen's byte range got
     /// `gc_flags` blindly RMW'd — the exact same corruption family, on the
-    /// OTHER generation"), but that screen was never carried to the BFS, to the
-    /// young->old ref-slot seed, or to the four pin/overlay seeds.
+    /// OTHER generation"), but that screen had never been carried to the BFS,
+    /// to the young->old ref-slot seed, or to the four pin/overlay seeds. It now
+    /// lives in `old_gen_mark_candidate_plausible` and every push site uses it.
     ///
     /// Two consequences, both asserted here:
     ///   * the mark bit is written into an unrelated LIVE object's payload,
@@ -13796,8 +13900,7 @@ mod tests {
     /// a dangling old-gen address because the prune predicate lies, and nothing
     /// downstream re-checks it.
     #[test]
-    #[ignore = "documents an OPEN defect: the old-gen mark BFS marks unvalidated addresses"]
-    fn old_gen_mark_accepts_an_interior_address_as_an_object_header() {
+    fn old_gen_mark_rejects_an_interior_address_instead_of_decoding_it() {
         let heap = GenerationalHeap::with_sizes(2 * 1024, 16 * 1024);
         let monitors = NoOpMonitors;
 
@@ -13856,6 +13959,37 @@ mod tests {
             "the old-gen mark decoded an INTERIOR address as an ObjectHeader \
              instead of rejecting it (bad-kind hits {before} -> {after})",
         );
+    }
+
+    /// `OldGen::is_allocated_addr` is the discriminator `contains` cannot be:
+    /// a freed block stays inside the backing store (and keeps its bytes, since
+    /// only `alloc` zeroes), so only the free list can tell the two apart.
+    #[test]
+    fn old_gen_is_allocated_addr_distinguishes_freed_blocks_from_live_ones() {
+        let mut og = OldGen::new(64 * 1024);
+        let a = og.alloc(256, 8).expect("alloc a");
+        let b = og.alloc(256, 8).expect("alloc b");
+        assert!(og.is_allocated_addr(a) && og.is_allocated_addr(b));
+        // Interior addresses of a live object are still allocated storage.
+        assert!(og.is_allocated_addr(unsafe { a.add(128) }));
+
+        // SAFETY: `b` is exactly the (base, size) pair `alloc` just returned.
+        unsafe { og.free(b, 256) };
+        assert!(
+            og.contains(b),
+            "precondition: the freed block is still inside the backing store, \
+             which is why `contains` cannot answer a liveness question",
+        );
+        assert!(
+            !og.is_allocated_addr(b),
+            "a block returned to the free list must not read as allocated",
+        );
+        assert!(
+            og.is_allocated_addr(a),
+            "freeing a neighbour must not affect a live block",
+        );
+        // Outside the arena entirely.
+        assert!(!og.is_allocated_addr(std::ptr::null()));
     }
 
     #[test]

@@ -1872,12 +1872,20 @@ impl VmHeap {
     /// live objects in non-collected regions from dead objects.
     pub fn is_addr_live(&self, addr: usize) -> bool {
         match self {
-            // A minor (young) GC never collects the old generation, so any
-            // old-gen address is live. Reference processing uses this to avoid
-            // clearing weak/soft refs whose referent was tenured in an earlier
-            // cycle (see `GenerationalHeap::is_old_gen_addr`). Returning `false`
-            // here unconditionally — the prior behavior — cleared every weak
+            // An old-gen address is live if it is inside an ALLOCATED span.
+            // Reference processing uses this to avoid clearing weak/soft refs
+            // whose referent was tenured in an earlier cycle; returning `false`
+            // here unconditionally — the original behavior — cleared every weak
             // reference to a promoted object on the next young GC.
+            //
+            // This used to be the bare range check `is_old_gen_addr`, on the
+            // premise that "a minor GC never collects the old generation". That
+            // premise is false: `sweep_old_gen_non_moving` reclaims dead old-gen
+            // blocks IN PLACE, during a young collection, whenever a live JIT
+            // frame blocks the moving young collector — so a freed block kept
+            // answering "live" and no consumer of this predicate ever pruned a
+            // dangling old-gen entry. See
+            // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
             //
             // Young-GC live-reclaim ROOT FIX (2026-07-07): also recognize
             // kept-in-place young survivors of the NON-MOVING sweep (which
@@ -1888,7 +1896,9 @@ impl VmHeap {
             // `GenerationalHeap::is_live_young_survivor` for the soundness
             // argument (STW-window-only, zeroed-span discriminator,
             // moving-collection compatibility).
-            VmHeap::Generational(h) => h.is_old_gen_addr(addr) || h.is_live_young_survivor(addr),
+            VmHeap::Generational(h) => {
+                h.is_live_old_gen_addr(addr) || h.is_live_young_survivor(addr)
+            }
             VmHeap::G1(h) => h.is_addr_in_live_region(addr),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.is_heap_addr(addr).is_some(),
