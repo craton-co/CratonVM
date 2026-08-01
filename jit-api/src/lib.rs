@@ -15,11 +15,16 @@
 //!
 //! # SAFETY: the `JitRuntimeHelpers` ABI is frozen
 //!
-//! [`JitRuntimeHelpers`] is a `#[repr(C)]` table of bare `usize` words whose
-//! **byte offsets are compiled into RWX machine code**. Never reorder, remove,
-//! retype, or insert a field; append only, and bump
-//! [`JIT_HELPERS_ABI_VERSION`] when you do. The full contract, the per-field
-//! signatures, and the per-field nullability rules live in [`helpers_abi`].
+//! [`JitRuntimeHelpers`] is a `#[repr(C)]` table of bare `usize` words. The
+//! backend bakes each slot's **absolute address** into RWX machine code and
+//! hand-writes the argument-register setup at every call site; the byte offsets
+//! are what `as_words`/`word_at` and any non-Rust producer depend on. Never
+//! reorder, remove, retype, or insert a field; append only, and bump
+//! [`JIT_HELPERS_ABI_VERSION`] when you do — [`helpers_abi::ABI_REVISIONS`]
+//! makes that a compile error to forget. The full contract, the per-field
+//! signatures, and the per-field nullability rules live in [`helpers_abi`];
+//! `docs/jit/helper-abi-audit.md` lists which invariants have tripwires, which
+//! do not, and the procedure for adding a slot.
 //!
 //! ## `gpu-lowering` feature status
 //!
@@ -39,9 +44,12 @@ pub mod gpu_lowering;
 pub mod helpers_abi;
 
 pub use helpers_abi::{
-    helper_field, helper_field_offset, HelperAbiError, HelperFieldDesc, HelperKind,
-    HELPER_FIELDS, HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_ALIGN, JIT_HELPERS_ABI_SIZE,
-    JIT_HELPERS_ABI_VERSION, MAX_PLAUSIBLE_OFFSET, NUM_HELPER_FIELDS,
+    accessor_name_matches_field, helper_field, helper_field_offset, str_eq, HelperAbiError,
+    HelperAbiRevision, HelperArgAbi, HelperFieldDesc, HelperFnSig, HelperKind, HelperRetAbi,
+    ABI_REVISIONS, GOLDEN_HELPER_OFFSETS, HELPERS_NEEDING_WIN64_STACK_ARGS, HELPER_FIELDS,
+    HELPER_FIELD_STRIDE, HELPER_FN_SIGS, JIT_HELPERS_ABI_ALIGN, JIT_HELPERS_ABI_SIZE,
+    JIT_HELPERS_ABI_VERSION, MAX_PLAUSIBLE_OFFSET, NUM_HELPER_FIELDS, SYSV_INT_ARG_REGS,
+    WIN64_INT_ARG_REGS,
 };
 
 use std::sync::Arc;
