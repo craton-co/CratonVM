@@ -4078,6 +4078,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     if let Some(r) = thread.native_pending_return {
         snapshot.push(r);
     }
+    crate::memory::roots::push_off_frame_thread_roots(thread, &mut snapshot);
     // Direct JIT HashMap node cache: unlike the ordinary current-thread root
     // scan, a cross-thread collector can see this parked thread only through
     // `root_snapshot`.  Keep both cache handles in that snapshot so a
@@ -4321,6 +4322,45 @@ mod root_snapshot_cache_tests {
         assert!(
             snapshot.iter().any(|root| root.as_ptr() == handled_addr),
             "peer collectors must see objects owned only by a native handle scope"
+        );
+    }
+
+    /// `thread.printed` and `thread.scoped_values` are rewritten by all three
+    /// post-GC remaps but used to be published by NEITHER snapshot path, so a
+    /// peer thread's only reference to such an object was invisible to a
+    /// collection running on another thread. Both live in `JvmThread` fields
+    /// rather than on a frame, so the frame walk cannot cover them.
+    #[test]
+    fn root_snapshot_includes_off_frame_thread_roots() {
+        let shared = SharedVm::new(VmConfig::default());
+        let mut thread = JvmThread::new(ThreadId(0), "off-frame-roots-test");
+
+        let printed = shared.mem.heap.alloc_object(ClassId::new(9), 0);
+        thread.printed.push(Value::Object(Some(printed)));
+
+        let sv_key = shared.mem.heap.alloc_object(ClassId::new(9), 0);
+        let sv_value = shared.mem.heap.alloc_object(ClassId::new(9), 0);
+        thread
+            .scoped_values
+            .push((1, Some(sv_key), Value::Object(Some(sv_value))));
+
+        update_root_snapshot(&shared, &mut thread);
+
+        let snapshot = thread.root_snapshot.lock();
+        let published = |o: cratonvm_types::ObjectRef| {
+            snapshot.iter().any(|root| root.as_ptr() == o.as_ptr())
+        };
+        assert!(
+            published(printed),
+            "a peer's print-buffer object must be published to cross-thread collectors"
+        );
+        assert!(
+            published(sv_key),
+            "a peer's ScopedValue KEY must be published — Carrier.get reaches it"
+        );
+        assert!(
+            published(sv_value),
+            "a peer's ScopedValue binding must be published to cross-thread collectors"
         );
     }
 }

@@ -15731,17 +15731,25 @@ const WS_FIELD_COUNT: usize = 1;
 const WS_FIELD_OPEN: usize = 2;
 const WS_NUM_FIELDS: usize = 3;
 
-/// WatchKey layout: 4 fields
+/// WatchKey layout: 5 fields
 /// [0] = path (Object — String path being watched)
 /// [1] = events (Int — bitmask: 1=CREATE, 2=DELETE, 4=MODIFY)
 /// [2] = valid (Int — 1=valid, 0=cancelled)
 /// [3] = pending_events (Object — array of WatchEvent objects)
+/// [4] = watchable (Object — the `Path` object the caller registered)
+///
+/// Slot 4 exists because `WatchKey.watchable()` is not decoration: a watch
+/// loop is written as `Path dir = (Path) key.watchable(); dir.resolve(
+/// (Path) event.context())` (Spring Boot's `FileWatcher$WatcherThread.
+/// accumulate` is exactly this). Reconstructing the `Path` from slot 0's
+/// canonical string would hand back a *different* object than the one the
+/// caller registered; keeping the original reference matches the JDK, which
+/// documents `watchable()` as "the object for which this watch key was
+/// created".
 const WK_FIELD_PATH: usize = 0;
 const WK_FIELD_EVENTS: usize = 1;
 const WK_FIELD_VALID: usize = 2;
 const WK_FIELD_PENDING: usize = 3;
-/// The caller's own `Path` object, as handed to `Path.register`. `watchable()`
-/// must return exactly that — see the note in `native_ws_register`.
 const WK_FIELD_WATCHABLE: usize = 4;
 const WK_NUM_FIELDS: usize = 5;
 
@@ -16762,24 +16770,10 @@ fn classify_event_kind(kind: &EventKind) -> Option<i32> {
 
 /// Pull every currently-available event out of the notify receiver and
 /// partition it into the per-path queues. Called lazily on `poll`/`take`.
-/// `CRATONVM_DBG_WATCH=1` traces the WatchService pipeline end to end:
-/// registration (path + decoded event mask), every event the platform watcher
-/// delivers and how it is attributed, and each poll's verdict. The pipeline has
-/// four independent places an event can silently vanish (unmatched kind,
-/// unmatched watched path, zero event mask, closed/unknown service), and
-/// "nothing happened" looks identical from Java at all four.
-fn watch_dbg() -> bool {
-    static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DBG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_WATCH").is_some())
-}
-
 fn drain_into_queues(state: &mut WatchServiceState) {
     loop {
         match state.rx.try_recv() {
             Ok(Ok(event)) => {
-                if watch_dbg() {
-                    eprintln!("[watch] raw event {:?} paths={:?}", event.kind, event.paths);
-                }
                 let kind = match classify_event_kind(&event.kind) {
                     Some(k) => k,
                     None => continue,
@@ -16805,15 +16799,7 @@ fn drain_into_queues(state: &mut WatchServiceState) {
                             .file_name()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        if watch_dbg() {
-                            eprintln!("[watch]   queued kind={kind} under {t:?} name={name}");
-                        }
                         state.queued.entry(t).or_default().push((kind, name));
-                    } else if watch_dbg() {
-                        eprintln!(
-                            "[watch]   DROPPED (no registration matches) path={path:?} registered={:?}",
-                            state.registered
-                        );
                     }
                 }
             }
@@ -16844,18 +16830,30 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/WatchService;[Ljava/nio/file/WatchEvent$Kind;)Ljava/nio/file/WatchKey;",
         native_ws_register,
     );
+    // `Watchable.register(WatchService, Kind[], Modifier[])` is the interface's
+    // primitive; the 2-arg form above is a default that delegates to it. Code
+    // that calls the 3-arg form directly (or reaches it through a `Watchable`-
+    // typed reference) must land on the same implementation instead of the
+    // interface's abstract body. The modifiers array is accepted and ignored —
+    // the only standard modifiers are `com.sun.nio.file.*` extensions.
+    r.register(
+        "java/nio/file/Path",
+        "register",
+        "(Ljava/nio/file/WatchService;[Ljava/nio/file/WatchEvent$Kind;[Ljava/nio/file/WatchEvent$Modifier;)Ljava/nio/file/WatchKey;",
+        native_ws_register,
+    );
 
     // WatchService.poll() → WatchKey (or null)
     r.register(ws, "poll", "()Ljava/nio/file/WatchKey;", native_ws_poll);
 
-    // WatchService.poll(long, TimeUnit) → WatchKey (or null after the timeout)
+    // WatchService.poll(long, TimeUnit) → WatchKey (or null after timeout).
     //
-    // `WatchService` is an interface, so an unregistered overload has no `Code`
-    // attribute and calling it raises `AbstractMethodError` — it does not
-    // silently do nothing. Spring Boot's `FileWatcher$WatcherThread.run` polls
-    // with exactly this overload, so its watcher thread died on the very first
-    // iteration and every later `Path.register` then reported "service is
-    // closed or unknown".
+    // This overload used to be missing entirely. `java.nio.file.WatchService`
+    // is an interface, so a call to it fell through to the abstract
+    // declaration and threw `AbstractMethodError: ... has no Code attribute`
+    // — fatal for the canonical watch loop, which is written as
+    // `watchService.poll(quietPeriod, MILLISECONDS)` precisely so it can do
+    // periodic work while idle (Spring Boot's SSL bundle `FileWatcher`).
     r.register(
         ws,
         "poll",
@@ -16877,22 +16875,6 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
         native_wk_poll_events,
     );
 
-    // WatchKey.watchable() → the registered directory, as a Path.
-    //
-    // `WatchKey` is an interface, so leaving this unregistered is not a silent
-    // no-op: the call raises `AbstractMethodError`. Spring Boot's
-    // `FileWatcher.accumulate` opens with
-    // `Path directory = (Path) key.watchable();` and its watcher thread catches
-    // only InterruptedException/ClosedWatchServiceException, so the error killed
-    // the thread through the uncaught handler and every watch test then timed
-    // out waiting for a change that could no longer be reported.
-    r.register(
-        "java/nio/file/WatchKey",
-        "watchable",
-        "()Ljava/nio/file/Watchable;",
-        native_wk_watchable,
-    );
-
     // WatchKey.reset() → boolean
     r.register("java/nio/file/WatchKey", "reset", "()Z", native_wk_reset);
 
@@ -16905,6 +16887,14 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
         "isValid",
         "()Z",
         native_wk_is_valid,
+    );
+
+    // WatchKey.watchable() → Watchable (the Path that was registered)
+    r.register(
+        "java/nio/file/WatchKey",
+        "watchable",
+        "()Ljava/nio/file/Watchable;",
+        native_wk_watchable,
     );
 
     // WatchEvent.kind() → WatchEvent.Kind
@@ -16923,39 +16913,200 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
         native_we_context,
     );
 
-    // StandardWatchEventKinds constants
+    // WatchEvent.count() → int. Every event we surface is reported once; we
+    // never coalesce repeats into a single event with count > 1.
+    r.register("java/nio/file/WatchEvent", "count", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+
+    // StandardWatchEventKinds constants. `watch_event_kind_object` prefers the
+    // REAL static constant when the class is present, so `event.kind() ==
+    // StandardWatchEventKinds.ENTRY_CREATE` (an identity comparison — these are
+    // singletons) holds instead of silently failing against a fresh synthetic
+    // stand-in.
     let kinds = "java/nio/file/StandardWatchEventKinds";
     r.register(
         kinds,
         "ENTRY_CREATE",
         "()Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _| {
-            let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
-            ctx.set_field(k, 0, Value::Int(EVENT_CREATE));
-            Ok(Some(Value::Object(Some(k))))
-        },
+        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_CREATE))),
     );
     r.register(
         kinds,
         "ENTRY_DELETE",
         "()Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _| {
-            let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
-            ctx.set_field(k, 0, Value::Int(EVENT_DELETE));
-            Ok(Some(Value::Object(Some(k))))
-        },
+        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_DELETE))),
     );
     r.register(
         kinds,
         "ENTRY_MODIFY",
         "()Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _| {
-            let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
-            ctx.set_field(k, 0, Value::Int(EVENT_MODIFY));
-            Ok(Some(Value::Object(Some(k))))
-        },
+        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_MODIFY))),
     );
     r.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// WatchEvent.Kind <-> EVENT_* bit translation.
+//
+// Two representations reach these natives:
+//
+//   * the REAL JDK `java.nio.file.StandardWatchEventKinds$StdWatchEventKind`
+//     singletons (real-JDK mode — the overwhelmingly common case), whose
+//     identity is what user code compares against and whose only useful
+//     accessor is `name()`;
+//   * the synthetic one-field `java/nio/file/WatchEvent$Kind` this file
+//     allocates when the real class is unavailable, which carries the bit
+//     directly in slot 0.
+//
+// `Path.register`'s kinds array used to be decoded by reading slot 0 as an
+// `Int` unconditionally. On a real `StdWatchEventKind` slot 0 is the `name`
+// String, so the decode yielded mask 0 and EVERY event was then filtered out
+// by `detect_events` — a watch that registered successfully and reported
+// nothing, forever.
+// ---------------------------------------------------------------------------
+
+/// Translate one `WatchEvent.Kind` object to an `EVENT_*` bit, or 0 if it is
+/// not one of the three entry kinds we surface.
+fn watch_event_kind_bit(ctx: &mut dyn NativeContext, kind: ObjectRef) -> i32 {
+    // Synthetic kind: the bit lives in slot 0.
+    if ctx.object_num_fields(kind) > 0 {
+        if let Value::Int(k) = ctx.get_field(kind, 0) {
+            if k & (EVENT_CREATE | EVENT_DELETE | EVENT_MODIFY) != 0 {
+                return k;
+            }
+        }
+    }
+    // Real kind (or anything else implementing the interface): ask for the
+    // name. Fall back to reading the receiver as a String for the legacy
+    // synthetic surface that handed out bare name Strings.
+    let name = match ctx.invoke_virtual(kind, "name", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    }
+    .or_else(|| ctx.read_string(kind));
+    match name.as_deref() {
+        Some("ENTRY_CREATE") => EVENT_CREATE,
+        Some("ENTRY_DELETE") => EVENT_DELETE,
+        Some("ENTRY_MODIFY") => EVENT_MODIFY,
+        _ => 0,
+    }
+}
+
+/// The `WatchEvent.Kind` object for `bit` — the real JDK singleton when the
+/// class is loadable, else a synthetic one-field stand-in.
+fn watch_event_kind_object(ctx: &mut dyn NativeContext, bit: i32) -> Value {
+    let field = match bit {
+        EVENT_CREATE => "ENTRY_CREATE",
+        EVENT_DELETE => "ENTRY_DELETE",
+        EVENT_MODIFY => "ENTRY_MODIFY",
+        _ => "OVERFLOW",
+    };
+    if let Ok(cid) = ctx.ensure_class_initialized("java/nio/file/StandardWatchEventKinds") {
+        if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
+            let v = ctx.get_static_field(cid, idx);
+            if matches!(v, Value::Object(Some(_))) {
+                return v;
+            }
+        }
+    }
+    let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
+    ctx.set_field(k, 0, Value::Int(bit));
+    Value::Object(Some(k))
+}
+
+/// Build the `WatchEvent.context()` value for `name` (a basename) relative to
+/// the directory `watchable` that the key was registered for.
+///
+/// The JDK's context is a *relative* `Path` naming the entry inside the
+/// watched directory, and the canonical consumer does
+/// `directory.resolve((Path) event.context())`. Deriving it from the caller's
+/// own `Path` object (`dir.resolve(name).getFileName()`) keeps it the same
+/// `Path` implementation the caller already holds — a synthetic stand-in
+/// would blow up in that `resolve` with a `ClassCastException`.
+fn watch_context_path(
+    ctx: &mut dyn NativeContext,
+    watchable: Option<ObjectRef>,
+    name: &str,
+) -> Value {
+    if let Some(dir) = watchable {
+        // `create_string` allocates, so `dir` must be re-read afterwards.
+        let dir_pin = ctx.pin_native_root(dir);
+        let name_str = ctx.create_string(name);
+        let name_pin = ctx.pin_native_root(name_str);
+        let dir_now = ctx.read_native_pin(dir_pin, dir);
+        let name_now = ctx.read_native_pin(name_pin, name_str);
+        let resolved = ctx.invoke_virtual(
+            dir_now,
+            "resolve",
+            "(Ljava/lang/String;)Ljava/nio/file/Path;",
+            &[Value::Object(Some(name_now))],
+        );
+        let out = match resolved {
+            Ok(Some(Value::Object(Some(abs)))) => {
+                let abs_pin = ctx.pin_native_root(abs);
+                let file_name =
+                    ctx.invoke_virtual(abs, "getFileName", "()Ljava/nio/file/Path;", &[]);
+                match file_name {
+                    Ok(Some(v @ Value::Object(Some(_)))) => Some(v),
+                    // `getFileName()` unavailable: hand back the absolute
+                    // path. `Path.resolve(absolute)` returns the argument,
+                    // so the consumer still computes the right file.
+                    _ => Some(Value::Object(Some(ctx.read_native_pin(abs_pin, abs)))),
+                }
+            }
+            _ => None,
+        };
+        ctx.unpin_native_roots(dir_pin);
+        if let Some(v) = out {
+            return v;
+        }
+    }
+    // No watchable (or the real Path surface refused): fall back to the
+    // historical 2-field synthetic Path — [0] = name String, [1] = FileSystem.
+    let path_s = ctx.create_string(name);
+    let path_pin = ctx.pin_native_root(path_s);
+    let path_obj = alloc_synthetic(ctx, "java/nio/file/Path", 2);
+    let path_s = ctx.read_native_pin(path_pin, path_s);
+    ctx.set_field(path_obj, 0, Value::Object(Some(path_s)));
+    ctx.unpin_native_roots(path_pin);
+    Value::Object(Some(path_obj))
+}
+
+/// `java.nio.file.ClosedWatchServiceException` — what the JDK throws from
+/// `poll`/`take` on a closed service. A watch loop is written as
+/// `catch (ClosedWatchServiceException ex) { running = false; }`, so throwing
+/// anything else (this used to be an `IOException`) escapes the loop's own
+/// shutdown handling and kills the thread with an uncaught exception instead.
+fn closed_watch_service_exception(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object("java/nio/file/ClosedWatchServiceException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let _ = ctx.invoke(
+                "java/nio/file/ClosedWatchServiceException",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(exc))],
+            );
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => RuntimeError::IllegalStateException {
+            message: "WatchService is closed".into(),
+        }
+        .into(),
+    }
+}
+
+/// `Ok(())` while the service is open; the JDK's `ClosedWatchServiceException`
+/// once `close()` has run.
+fn ws_require_open(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if matches!(ctx.get_field(this, WS_FIELD_OPEN), Value::Int(1)) {
+        Ok(())
+    } else {
+        Err(closed_watch_service_exception(ctx))
+    }
 }
 
 /// Create a real `notify::RecommendedWatcher` + sender→receiver pair and
@@ -16995,52 +17146,6 @@ fn native_ws_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(Some(ws))))
 }
 
-/// Map one `WatchEvent.Kind` argument onto the `EVENT_*` bit it selects.
-///
-/// `StandardWatchEventKinds.ENTRY_CREATE` and friends are static **fields**, so
-/// under real-JDK bytecode a caller hands us a genuine `StdWatchEventKind`
-/// object whose slot 0 is its `name` String — not the `Int` tag the synthetic
-/// `WatchEvent$Kind` carries. Reading slot 0 as an `Int` therefore contributed
-/// nothing, every registration ended up with an event mask of 0, and
-/// `detect_events`' `k & event_mask != 0` filter dropped every event the
-/// platform watcher delivered: `Path.register` succeeded, the watcher ran, and
-/// the caller waited forever ("Timeout while waiting for changes" across
-/// `FileWatcherTests`).
-///
-/// Ask the kind for its name — which both the real class and any synthetic
-/// stand-in can answer — and fall back to the legacy `Int`-in-slot-0 form.
-fn watch_event_kind_mask(ctx: &mut dyn NativeContext, kind: ObjectRef) -> i32 {
-    let name = ctx
-        .invoke_virtual(kind, "name", "()Ljava/lang/String;", &[])
-        .ok()
-        .flatten()
-        .and_then(|v| match v {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
-        .or_else(|| {
-            ctx.invoke_virtual(kind, "toString", "()Ljava/lang/String;", &[])
-                .ok()
-                .flatten()
-                .and_then(|v| match v {
-                    Value::Object(Some(s)) => ctx.read_string(s),
-                    _ => None,
-                })
-        });
-    match name.as_deref() {
-        Some("ENTRY_CREATE") => return EVENT_CREATE,
-        Some("ENTRY_DELETE") => return EVENT_DELETE,
-        Some("ENTRY_MODIFY") => return EVENT_MODIFY,
-        // OVERFLOW selects no filesystem event.
-        Some("OVERFLOW") => return 0,
-        _ => {}
-    }
-    match ctx.get_field(kind, 0) {
-        Value::Int(k) => k,
-        _ => 0,
-    }
-}
-
 fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path_obj = obj_arg92(args, 0)?;
     let watcher = obj_arg92(args, 1)?;
@@ -17075,22 +17180,27 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         .into());
     }
 
-    // Read event kind bitmask. `watch_event_kind_mask` calls back into
-    // `Kind.name()` bytecode, which can allocate, so both the array being
-    // iterated and the `watcher` used after the loop are pinned across it
-    // (native stale-local family).
-    let watcher_pin = ctx.pin_native_root(watcher);
-    let kinds_pin = ctx.pin_native_root(kinds_arr);
+    // Read the event kind bitmask. `watch_event_kind_bit` handles both the
+    // real `StandardWatchEventKinds` singletons and the synthetic stand-ins.
     let kinds_len = ctx.array_length(kinds_arr);
     let mut event_mask = 0i32;
     for i in 0..kinds_len {
-        let kinds_now = ctx.read_native_pin(kinds_pin, kinds_arr);
-        if let Value::Object(Some(kind)) = ctx.get_array_element(kinds_now, i) {
-            event_mask |= watch_event_kind_mask(ctx, kind);
+        if let Value::Object(Some(kind)) = ctx.get_array_element(kinds_arr, i) {
+            event_mask |= watch_event_kind_bit(ctx, kind);
         }
     }
-    let watcher = ctx.read_native_pin(watcher_pin, watcher);
-    ctx.unpin_native_roots(watcher_pin);
+    if kinds_len > 0 && event_mask == 0 {
+        // Every kind failed to decode. Registering with mask 0 is a watch
+        // that can never fire, which is indistinguishable from "the OS never
+        // reported anything" — surface it and watch everything instead.
+        tracing::warn!(
+            target: "cratonvm::native::watch",
+            kinds_len,
+            "WatchService.register: none of the requested WatchEvent.Kind values \
+             could be decoded; watching CREATE|DELETE|MODIFY instead",
+        );
+        event_mask = EVENT_CREATE | EVENT_DELETE | EVENT_MODIFY;
+    }
 
     // Install the OS-level watch on the real path. Non-recursive matches
     // java.nio.file.Path.register's documented semantics (the JDK's
@@ -17116,47 +17226,68 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
 
-    if watch_dbg() {
-        eprintln!("[watch] register path={canonical:?} mask={event_mask}");
+    let canonical_str = canonical.to_string_lossy().into_owned();
+
+    // Re-registering a directory that already has a key on this service
+    // REPLACES that key's event set and returns the SAME key — the JDK is
+    // explicit about this ("If this path is already registered ... the event
+    // set is replaced"). Minting a second key instead split one directory's
+    // events across two keys: `detect_events` drains the shared per-path
+    // queue, so whichever key was scanned first consumed everything and the
+    // other never fired. Spring Boot's `FileWatcher` keys its
+    // registration map on the WatchKey, so the duplicate key's callbacks
+    // simply never ran (`shouldNotFailIfDirectoryIsRegisteredMultipleTimes`).
+    let count = match ctx.get_field(watcher, WS_FIELD_COUNT) {
+        Value::Int(n) => n.max(0) as usize,
+        _ => 0,
+    };
+    if let Value::Object(Some(regs)) = ctx.get_field(watcher, WS_FIELD_REGS) {
+        for i in 0..count.min(ctx.array_length(regs)) {
+            let Value::Object(Some(existing)) = ctx.get_array_element(regs, i) else {
+                continue;
+            };
+            let same_path = match ctx.get_field(existing, WK_FIELD_PATH) {
+                Value::Object(Some(s)) => {
+                    ctx.read_string(s).as_deref() == Some(canonical_str.as_str())
+                }
+                _ => false,
+            };
+            if same_path {
+                ctx.set_field(existing, WK_FIELD_EVENTS, Value::Int(event_mask));
+                ctx.set_field(existing, WK_FIELD_VALID, Value::Int(1));
+                ctx.set_field(existing, WK_FIELD_WATCHABLE, Value::Object(Some(path_obj)));
+                return Ok(Some(Value::Object(Some(existing))));
+            }
+        }
     }
 
-    // Create WatchKey. `WK_FIELD_PATH` holds the *canonicalized* path so
-    // lookups in the poll path find the matching entry irrespective of how the
-    // caller wrote it; `WK_FIELD_WATCHABLE` holds the caller's own `Path`
-    // OBJECT, which is what `watchable()` must hand back.
+    // Create the WatchKey. We store the *canonicalized* path so lookups in
+    // the poll path find the matching entry irrespective of how the caller
+    // wrote the path, and the caller's own `Path` object so `watchable()`
+    // hands back exactly what was registered.
     //
-    // The distinction is load-bearing, not cosmetic. Spring Boot's FileWatcher
-    // registers a letsencrypt-style path verbatim —
-    // `live/certname/../../archive/certname` — and then matches events with
-    // `key.watchable().resolve(event.context())` against that same unnormalised
-    // string. Returning the canonical directory made every such match fail
-    // (`FileWatcherTests.shouldFollowRelativePathSymlinks`). The JDK returns the
-    // exact Path that was registered, so we do too.
-    let wk = alloc_synthetic(ctx, "java/nio/file/WatchKey", WK_NUM_FIELDS);
-    // `wk`, the caller's Path and the service all have to survive the string
-    // and array allocations below (native stale-local family).
-    let wk_pin = ctx.pin_native_root(wk);
+    // `create_string`/`alloc_synthetic` are GC points, so `path_obj` and
+    // `watcher` are pinned and re-read: a moving young collection between the
+    // allocations relocates them and a raw native local would then write the
+    // key into freed memory (the Family-1 stale-ObjectRef defect).
     let path_obj_pin = ctx.pin_native_root(path_obj);
-    let watcher_pin2 = ctx.pin_native_root(watcher);
-    let canonical_str = canonical.to_string_lossy().into_owned();
+    let watcher_pin = ctx.pin_native_root(watcher);
+    let wk = alloc_synthetic(ctx, "java/nio/file/WatchKey", WK_NUM_FIELDS);
+    let wk_pin = ctx.pin_native_root(wk);
     let path_s = ctx.create_string(&canonical_str);
     let wk = ctx.read_native_pin(wk_pin, wk);
     ctx.set_field(wk, WK_FIELD_PATH, Value::Object(Some(path_s)));
     ctx.set_field(wk, WK_FIELD_EVENTS, Value::Int(event_mask));
     ctx.set_field(wk, WK_FIELD_VALID, Value::Int(1));
-    let path_obj = ctx.read_native_pin(path_obj_pin, path_obj);
-    ctx.set_field(wk, WK_FIELD_WATCHABLE, Value::Object(Some(path_obj)));
-    // Length 0, not 64: the array's length IS the event count.
-    let pending = ctx.new_array(ArrayElementType::Reference, 0);
-    let wk = ctx.read_native_pin(wk_pin, wk);
-    ctx.set_field(wk, WK_FIELD_PENDING, Value::Object(Some(pending)));
+    ctx.set_field(wk, WK_FIELD_PENDING, Value::Object(None));
+    ctx.set_field(
+        wk,
+        WK_FIELD_WATCHABLE,
+        Value::Object(Some(ctx.read_native_pin(path_obj_pin, path_obj))),
+    );
 
     // Attach to the service's Java-side registration array.
-    let watcher = ctx.read_native_pin(watcher_pin2, watcher);
-    let count = match ctx.get_field(watcher, WS_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
+    let watcher = ctx.read_native_pin(watcher_pin, watcher);
     if let Value::Object(Some(regs)) = ctx.get_field(watcher, WS_FIELD_REGS) {
         if count < ctx.array_length(regs) {
             ctx.set_array_element(regs, count, Value::Object(Some(wk)));
@@ -17164,7 +17295,7 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
     let wk = ctx.read_native_pin(wk_pin, wk);
-    ctx.unpin_native_roots(wk_pin);
+    ctx.unpin_native_roots(path_obj_pin);
 
     Ok(Some(Value::Object(Some(wk))))
 }
@@ -17197,72 +17328,147 @@ fn detect_events(
     };
     drain_into_queues(state);
     let raw = state.queued.remove(&canonical).unwrap_or_default();
-    if watch_dbg() {
-        eprintln!(
-            "[watch] detect_events key={canonical:?} mask={event_mask} raw={raw:?} queuedKeys={:?}",
-            state.queued.keys().collect::<Vec<_>>()
-        );
-    }
     raw.into_iter()
         .filter(|(k, _)| k & event_mask != 0)
         .collect()
 }
 
-fn native_ws_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    if !matches!(ctx.get_field(this, WS_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "WatchService is closed".into(),
-        }
-        .into());
-    }
-
+/// Scan every registered key for pending OS events, materialize them into the
+/// key's `pending` array, and return the first signalled key (`None` when the
+/// service is idle).
+///
+/// Every allocation below (`new_array`, `alloc_synthetic`, `create_string`,
+/// and the `invoke_virtual` inside `watch_context_path`) is a GC point, so the
+/// service, its registration array, and the key under construction are pinned
+/// and re-read across them rather than carried in raw native locals.
+fn ws_signalled_key(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let count = match ctx.get_field(this, WS_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
+        Value::Int(n) => n.max(0) as usize,
         _ => 0,
     };
     let regs = match ctx.get_field(this, WS_FIELD_REGS) {
         Value::Object(Some(a)) => a,
-        _ => {
-            if watch_dbg() {
-                eprintln!("[watch] poll: no regs array on the service");
-            }
-            return Ok(Some(Value::Object(None)));
-        }
+        _ => return Ok(None),
     };
-    if watch_dbg() {
-        eprintln!("[watch] poll: {count} registration(s)");
+
+    let this_pin = ctx.pin_native_root(this);
+    let regs_pin = ctx.pin_native_root(regs);
+    let mut signalled: Option<ObjectRef> = None;
+
+    for i in 0..count {
+        let regs_now = ctx.read_native_pin(regs_pin, regs);
+        if i >= ctx.array_length(regs_now) {
+            break;
+        }
+        let Value::Object(Some(wk)) = ctx.get_array_element(regs_now, i) else {
+            continue;
+        };
+        if !matches!(ctx.get_field(wk, WK_FIELD_VALID), Value::Int(1)) {
+            continue;
+        }
+        let this_now = ctx.read_native_pin(this_pin, this);
+        let events = detect_events(ctx, this_now, wk);
+        if events.is_empty() {
+            continue;
+        }
+
+        let wk_pin = ctx.pin_native_root(wk);
+        let pending = ctx.new_array(ArrayElementType::Reference, events.len());
+        let pending_pin = ctx.pin_native_root(pending);
+        for (j, (kind, name)) in events.iter().enumerate() {
+            let we = alloc_synthetic(ctx, "java/nio/file/WatchEvent", WE_NUM_FIELDS);
+            let we_pin = ctx.pin_native_root(we);
+            let watchable = match ctx.get_field(ctx.read_native_pin(wk_pin, wk), WK_FIELD_WATCHABLE)
+            {
+                Value::Object(Some(p)) => Some(p),
+                _ => None,
+            };
+            let context = watch_context_path(ctx, watchable, name);
+            let we_now = ctx.read_native_pin(we_pin, we);
+            ctx.set_field(we_now, WE_FIELD_KIND, Value::Int(*kind));
+            ctx.set_field(we_now, WE_FIELD_CONTEXT, context);
+            let pending_now = ctx.read_native_pin(pending_pin, pending);
+            ctx.set_array_element(pending_now, j, Value::Object(Some(we_now)));
+        }
+        let wk_now = ctx.read_native_pin(wk_pin, wk);
+        let pending_now = ctx.read_native_pin(pending_pin, pending);
+        ctx.set_field(wk_now, WK_FIELD_PENDING, Value::Object(Some(pending_now)));
+        signalled = Some(wk_now);
+        break;
     }
 
-    // Check each registered key for events
-    for i in 0..count {
-        if let Value::Object(Some(wk)) = ctx.get_array_element(regs, i) {
-            if !matches!(ctx.get_field(wk, WK_FIELD_VALID), Value::Int(1)) {
-                continue;
-            }
-            let events = detect_events(ctx, this, wk);
-            if !events.is_empty() {
-                // Store events in the watch key's pending array
-                let pending = ctx.new_array(ArrayElementType::Reference, events.len());
-                for (j, (kind, name)) in events.iter().enumerate() {
-                    let we = alloc_synthetic(ctx, "java/nio/file/WatchEvent", WE_NUM_FIELDS);
-                    ctx.set_field(we, WE_FIELD_KIND, Value::Int(*kind));
-                    let path_s = ctx.create_string(name);
-                    // 2 fields: [0] = path String, [1] = owning FileSystem
-                    // (left null here — a WatchEvent context path has no
-                    // originating FileSystem; `Path.getFileSystem()` falls
-                    // back to the default).
-                    let path_obj = alloc_synthetic(ctx, "java/nio/file/Path", 2);
-                    ctx.set_field(path_obj, 0, Value::Object(Some(path_s)));
-                    ctx.set_field(we, WE_FIELD_CONTEXT, Value::Object(Some(path_obj)));
-                    ctx.set_array_element(pending, j, Value::Object(Some(we)));
-                }
-                ctx.set_field(wk, WK_FIELD_PENDING, Value::Object(Some(pending)));
-                return Ok(Some(Value::Object(Some(wk))));
-            }
-        }
+    let signalled = signalled.map(|wk| {
+        // Nothing allocates between here and the unpin, but read the key back
+        // through its own pin anyway so the returned reference can never be a
+        // pre-GC address.
+        let pin = ctx.pin_native_root(wk);
+        ctx.read_native_pin(pin, wk)
+    });
+    ctx.unpin_native_roots(this_pin);
+    Ok(signalled)
+}
+
+fn native_ws_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    ws_require_open(ctx, this)?;
+    match ws_signalled_key(ctx, this)? {
+        Some(wk) => Ok(Some(Value::Object(Some(wk)))),
+        None => Ok(Some(Value::Object(None))),
     }
-    Ok(Some(Value::Object(None))) // no events
+}
+
+/// `WatchService.poll(long, TimeUnit)` — wait up to the given duration for a
+/// key to be signalled, then return it (or `null` on timeout).
+///
+/// This overload had no native at all before, so the call fell through to the
+/// interface's abstract declaration and threw `AbstractMethodError`. It is the
+/// overload a watch loop actually uses (`poll(quietPeriod, MILLISECONDS)`) —
+/// `poll()` returns immediately and `take()` blocks forever, neither of which
+/// lets a loop do periodic work.
+fn native_ws_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let timeout = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    let unit = args.get(2).copied();
+
+    let this_pin = ctx.pin_native_root(this);
+    let millis = watch_timeout_millis(ctx, timeout, unit);
+    let mut this = ctx.read_native_pin(this_pin, this);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+
+    let result = loop {
+        if let Err(e) = ws_require_open(ctx, this) {
+            break Err(e);
+        }
+        match ws_signalled_key(ctx, this) {
+            Err(e) => break Err(e),
+            Ok(Some(wk)) => break Ok(Some(Value::Object(Some(wk)))),
+            Ok(None) => {}
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break Ok(Some(Value::Object(None)));
+        }
+        // Sleep in short slices inside a timed blocking region: the thread is
+        // GC-safe while parked (a stop-the-world collector must not wait on
+        // it) and `close()` becomes visible within one slice.
+        let slice = (deadline - now).min(std::time::Duration::from_millis(20));
+        let mut blocked = [Value::Object(Some(this))];
+        ctx.begin_timed_blocking_region();
+        std::thread::sleep(slice);
+        ctx.end_blocking_region_refs(&mut blocked);
+        if let Value::Object(Some(cur)) = blocked[0] {
+            this = cur;
+        }
+    };
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 /// Blocking `WatchService.take()`. Polls the underlying `notify` channel in
@@ -17271,12 +17477,11 @@ fn native_ws_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// deadlock every other native entering the table).
 fn native_ws_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    loop {
-        if !matches!(ctx.get_field(this, WS_FIELD_OPEN), Value::Int(1)) {
-            return Err(RuntimeError::IOException {
-                message: "WatchService is closed".into(),
-            }
-            .into());
+    let this_pin = ctx.pin_native_root(this);
+    let mut this = this;
+    let result = loop {
+        if let Err(e) = ws_require_open(ctx, this) {
+            break Err(e);
         }
         // Drain whatever the OS has delivered so far, then try to return a key.
         {
@@ -17287,83 +17492,86 @@ fn native_ws_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 drain_into_queues(state);
             }
         }
-        if let Some(Value::Object(Some(wk))) = native_ws_poll(ctx, args)?.as_ref() {
-            return Ok(Some(Value::Object(Some(*wk))));
+        match ws_signalled_key(ctx, this) {
+            Err(e) => break Err(e),
+            Ok(Some(wk)) => break Ok(Some(Value::Object(Some(wk)))),
+            Ok(None) => {}
         }
+        this = ctx.read_native_pin(this_pin, this);
         // Nothing pending — wait a short slice for the next OS event.
         // Using recv_timeout here would require holding the services lock;
         // instead we sleep briefly and re-drain. 50ms is small enough that
-        // close() / interrupt become visible promptly.
+        // close() / interrupt become visible promptly. The sleep runs inside a
+        // blocking region so a concurrent stop-the-world GC is not held off
+        // for the whole slice.
+        let mut blocked = [Value::Object(Some(this))];
+        ctx.begin_timed_blocking_region();
         std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
-
-/// `WatchService.poll(long timeout, TimeUnit unit)` — the same drain-and-check
-/// loop as [`native_ws_take`], bounded by the caller's deadline and returning
-/// `null` (not an exception) when it expires.
-///
-/// A closed service is the one case that still throws: `take()` and `poll()`
-/// both report `ClosedWatchServiceException`/IOException there, and Spring
-/// Boot's watcher loop relies on the throw to end the thread when the
-/// `FileWatcher` is stopped.
-fn native_ws_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    // Ask the unit itself rather than decode an ordinal, so any TimeUnit
-    // constant works (mirrors `stamped_timeout_nanos` in native-builtins).
-    let nanos = match (args.get(1), args.get(2)) {
-        (Some(Value::Long(t)), Some(Value::Object(Some(unit)))) => {
-            match ctx.invoke_virtual(*unit, "toNanos", "(J)J", &[Value::Long(*t)]) {
-                Ok(Some(Value::Long(n))) => n.max(0),
-                // An unreadable unit: fall back to treating the value as
-                // milliseconds, the overwhelmingly common caller unit. Better a
-                // slightly-wrong bound than an unbounded block.
-                _ => t.saturating_mul(1_000_000).max(0),
-            }
+        ctx.end_blocking_region_refs(&mut blocked);
+        if let Value::Object(Some(cur)) = blocked[0] {
+            this = cur;
         }
-        _ => 0,
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(nanos as u64);
-    // `this` is re-read from a pin on every iteration: the loop spans
-    // `native_ws_poll`, which allocates (WatchEvent/Path/array), so a moving
-    // young GC can relocate the receiver mid-wait (native stale-local family).
-    let this_pin = ctx.pin_native_root(this);
-    let result = (|| loop {
-        let this = ctx.read_native_pin(this_pin, this);
-        if !matches!(ctx.get_field(this, WS_FIELD_OPEN), Value::Int(1)) {
-            return Err(RuntimeError::IOException {
-                message: "WatchService is closed".into(),
-            }
-            .into());
-        }
-        {
-            let this_key = ctx.identity_hash_code(this);
-            let mut services = watch_services().lock();
-            if let Some(state) = services.get_mut(&this_key) {
-                drain_into_queues(state);
-            }
-        }
-        let this = ctx.read_native_pin(this_pin, this);
-        if let Some(Value::Object(Some(wk))) =
-            native_ws_poll(ctx, &[Value::Object(Some(this))])?.as_ref()
-        {
-            return Ok(Some(Value::Object(Some(*wk))));
-        }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return Ok(Some(Value::Object(None)));
-        }
-        // Same 50ms slice as `take()`, clipped so we never overshoot the
-        // caller's deadline.
-        let slice = (deadline - now).min(std::time::Duration::from_millis(50));
-        std::thread::sleep(slice);
-    })();
     ctx.unpin_native_roots(this_pin);
     result
 }
 
+/// Convert a `(timeout, TimeUnit)` pair to whole milliseconds.
+///
+/// `TimeUnit.toMillis` is real JDK bytecode, so ask the unit itself; the name
+/// table is the fallback for a synthetic `TimeUnit` surface. A null unit means
+/// the caller already passed milliseconds.
+fn watch_timeout_millis(ctx: &mut dyn NativeContext, timeout: i64, unit: Option<Value>) -> u64 {
+    if timeout <= 0 {
+        return 0;
+    }
+    let Some(Value::Object(Some(u))) = unit else {
+        return timeout as u64;
+    };
+    if let Ok(Some(Value::Long(ms))) =
+        ctx.invoke_virtual(u, "toMillis", "(J)J", &[Value::Long(timeout)])
+    {
+        return ms.max(0) as u64;
+    }
+    let name = match ctx.invoke_virtual(u, "name", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    };
+    let ms = match name.as_deref() {
+        Some("NANOSECONDS") => timeout / 1_000_000,
+        Some("MICROSECONDS") => timeout / 1_000,
+        Some("SECONDS") => timeout.saturating_mul(1_000),
+        Some("MINUTES") => timeout.saturating_mul(60_000),
+        Some("HOURS") => timeout.saturating_mul(3_600_000),
+        Some("DAYS") => timeout.saturating_mul(86_400_000),
+        // MILLISECONDS, or an unrecognized unit: treat the value as millis.
+        _ => timeout,
+    };
+    ms.max(0) as u64
+}
+
 fn native_ws_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    ctx.set_field(this, WS_FIELD_OPEN, Value::Int(0));
+    // A `WatchService` that did not come from `native_ws_new` has none of our
+    // slots (the real `java.nio.file.WatchService` is an interface, so its
+    // class layout declares zero fields). Writing slot 2 on such a receiver is
+    // an out-of-bounds field write the heap guard drops with a warning; skip
+    // it instead of relying on the guard.
+    if ctx.object_num_fields(this) > WS_FIELD_OPEN {
+        ctx.set_field(this, WS_FIELD_OPEN, Value::Int(0));
+        // Closing a service cancels every key it created (JDK contract).
+        let count = match ctx.get_field(this, WS_FIELD_COUNT) {
+            Value::Int(n) => n.max(0) as usize,
+            _ => 0,
+        };
+        if let Value::Object(Some(regs)) = ctx.get_field(this, WS_FIELD_REGS) {
+            for i in 0..count.min(ctx.array_length(regs)) {
+                if let Value::Object(Some(wk)) = ctx.get_array_element(regs, i) {
+                    ctx.set_field(wk, WK_FIELD_VALID, Value::Int(0));
+                }
+            }
+        }
+    }
     // Dropping the WatchServiceState releases the platform watcher and its
     // background thread, which in turn hangs up the mpsc sender so any
     // concurrent `take()` observes the OPEN=0 flag and returns.
@@ -17375,55 +17583,53 @@ fn native_ws_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn native_wk_poll_events(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let pending = ctx.get_field(this, WK_FIELD_PENDING);
-    // Build the List through `ArrayList.add`, not by writing slots 0/1 of a
-    // hand-allocated "ArrayList".
-    //
-    // `java.util.ArrayList` is a REAL class here, so its instances carry the
-    // real JDK layout (an inherited `modCount` among them) — index 0 and index
-    // 1 are NOT `elementData`/`size`. The old code wrote the event array and
-    // its length into whichever two slots those happened to be, and the
-    // resulting List iterated as EMPTY: `detect_events` produced the right
-    // events, `poll()` returned a valid WatchKey, and `key.pollEvents()` then
-    // handed back nothing. That is what every "Timeout while waiting for
-    // changes" in FileWatcherTests actually was, downstream of the mask and
-    // receiver-layout bugs that masked it.
-    let list = match ctx.new_object("java/util/ArrayList")? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "WatchKey.pollEvents: cannot allocate ArrayList".into(),
-            }
-            .into())
+    let pending = match ctx.get_field(this, WK_FIELD_PENDING) {
+        Value::Object(Some(a)) => Some(a),
+        _ => None,
+    };
+    // "Retrieves and removes all pending events for this watch key" — the
+    // events must not be handed out twice.
+    ctx.set_field(this, WK_FIELD_PENDING, Value::Object(None));
+
+    let this_pin = ctx.pin_native_root(this);
+    let pending_pin = pending.map(|p| (ctx.pin_native_root(p), p));
+    let len = pending.map(|p| ctx.array_length(p)).unwrap_or(0);
+
+    // A REAL `java.util.ArrayList`, not a synthetic 2-slot stand-in: the
+    // caller iterates the result with a for-each loop, which runs the real
+    // `ArrayList$Itr` bytecode against the real `elementData`/`size`/`modCount`
+    // layout. The synthetic object had neither the right slot count nor the
+    // right slot meanings for that.
+    let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+        Ok(Some(Value::Object(Some(l)))) => Some(l),
+        _ => None,
+    };
+    if let Some(list) = list {
+        let list_pin = ctx.pin_native_root(list);
+        for i in 0..len {
+            let Some((pin, fallback)) = pending_pin else {
+                break;
+            };
+            let arr = ctx.read_native_pin(pin, fallback);
+            let elem = ctx.get_array_element(arr, i);
+            let list_now = ctx.read_native_pin(list_pin, list);
+            let _ = ctx.invoke_virtual(list_now, "add", "(Ljava/lang/Object;)Z", &[elem]);
         }
-    };
-    let Value::Object(Some(arr)) = pending else {
+        let list = ctx.read_native_pin(list_pin, list);
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(Some(list))));
-    };
-    // `add` runs real bytecode (allocating), so both the list being filled and
-    // the array being read are pinned across the loop.
-    let list_pin = ctx.pin_native_root(list);
-    let arr_pin = ctx.pin_native_root(arr);
-    let len = ctx.array_length(arr);
-    for i in 0..len {
-        let arr_now = ctx.read_native_pin(arr_pin, arr);
-        let event = match ctx.get_array_element(arr_now, i) {
-            Value::Object(Some(e)) => e,
-            // The pending array is allocated at its exact event count, but a
-            // reset-then-poll race can leave trailing nulls; skip them rather
-            // than surfacing null elements to the caller.
-            _ => continue,
-        };
-        let list_now = ctx.read_native_pin(list_pin, list);
-        ctx.invoke_virtual(
-            list_now,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(event))],
-        )?;
     }
-    let list = ctx.read_native_pin(list_pin, list);
-    ctx.unpin_native_roots(list_pin);
+
+    // Fallback for a VM configuration without a usable real ArrayList: the
+    // historical 2-field synthetic list.
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = match pending_pin {
+        Some((pin, fallback)) => ctx.read_native_pin(pin, fallback),
+        None => ctx.new_array(ArrayElementType::Reference, 0),
+    };
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(len as i32));
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -17431,34 +17637,32 @@ fn native_wk_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let this = obj_arg92(args, 0)?;
     let valid = matches!(ctx.get_field(this, WK_FIELD_VALID), Value::Int(1));
     if valid {
-        // Clear pending events. Length 0, not 64: the array's length IS the
-        // event count (`poll` allocates it at exactly `events.len()`), so a
-        // 64-slot reset array made a `pollEvents()` before the next `poll()`
-        // report 64 events, all null.
-        let pending = ctx.new_array(ArrayElementType::Reference, 0);
-        ctx.set_field(this, WK_FIELD_PENDING, Value::Object(Some(pending)));
+        // Re-arm: drop whatever `pollEvents()` did not consume. The previous
+        // body installed a fresh 64-element array here, which `pollEvents()`
+        // then reported as 64 pending (null) events.
+        ctx.set_field(this, WK_FIELD_PENDING, Value::Object(None));
     }
     Ok(Some(Value::Int(if valid { 1 } else { 0 })))
 }
 
+/// `WatchKey.watchable()` — the object the key was created for, i.e. the
+/// `Path` handed to `Path.register`.
 fn native_wk_watchable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    // The registered Path object itself, when we have it.
     if let Value::Object(Some(p)) = ctx.get_field(this, WK_FIELD_WATCHABLE) {
         return Ok(Some(Value::Object(Some(p))));
     }
-    let path_str = match ctx.get_field(this, WK_FIELD_PATH) {
+    // No stored watchable (a key from an older layout): rebuild a synthetic
+    // Path from the canonical path string.
+    let name = match ctx.get_field(this, WK_FIELD_PATH) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    // 2 fields: [0] = path String, [1] = owning FileSystem (left null; the
-    // default filesystem is what `Path.getFileSystem()` falls back to). Same
-    // layout `native_ws_poll` builds an event's context path with.
+    let path_s = ctx.create_string(&name);
+    let path_pin = ctx.pin_native_root(path_s);
     let path_obj = alloc_synthetic(ctx, "java/nio/file/Path", 2);
-    let path_pin = ctx.pin_native_root(path_obj);
-    let s = ctx.create_string(&path_str);
-    let path_obj = ctx.read_native_pin(path_pin, path_obj);
-    ctx.set_field(path_obj, 0, Value::Object(Some(s)));
+    let path_s = ctx.read_native_pin(path_pin, path_s);
+    ctx.set_field(path_obj, 0, Value::Object(Some(path_s)));
     ctx.unpin_native_roots(path_pin);
     Ok(Some(Value::Object(Some(path_obj))))
 }
@@ -17477,29 +17681,14 @@ fn native_wk_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn native_we_kind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let kind_val = ctx.get_field(this, WE_FIELD_KIND);
-    // Hand back the REAL `StandardWatchEventKinds.ENTRY_*` constant when it can
-    // be resolved: callers compare kinds by identity
-    // (`if (event.kind() == ENTRY_CREATE)`), and a freshly allocated synthetic
-    // never matches. Fall back to the synthetic carrier otherwise.
-    let field = match kind_val {
-        Value::Int(EVENT_CREATE) => Some("ENTRY_CREATE"),
-        Value::Int(EVENT_DELETE) => Some("ENTRY_DELETE"),
-        Value::Int(EVENT_MODIFY) => Some("ENTRY_MODIFY"),
-        _ => None,
+    let bit = match ctx.get_field(this, WE_FIELD_KIND) {
+        Value::Int(k) => k,
+        _ => 0,
     };
-    if let Some(field) = field {
-        if let Ok(cid) = ctx.ensure_class_initialized("java/nio/file/StandardWatchEventKinds") {
-            if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
-                if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
-                    return Ok(Some(v));
-                }
-            }
-        }
-    }
-    let kind_obj = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
-    ctx.set_field(kind_obj, 0, kind_val);
-    Ok(Some(Value::Object(Some(kind_obj))))
+    // The real `StandardWatchEventKinds` constants are singletons that callers
+    // compare by identity (`event.kind() == ENTRY_CREATE`); a freshly minted
+    // synthetic Kind would never match one.
+    Ok(Some(watch_event_kind_object(ctx, bit)))
 }
 
 fn native_we_context(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

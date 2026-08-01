@@ -1060,16 +1060,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(list))))
         },
     );
-    // NOTE: `FileSystem.newWatchService()` is registered ONCE, in
-    // `native-io`'s `register_watch_service` (`native_ws_new`) — the only
-    // implementation that allocates the 3-field receiver the WatchService
-    // natives read (regs / count / open) AND starts a platform watcher. Two
-    // stubs used to be registered here as well, one handing back a 1-field and
-    // one a 0-field bare object; whichever registered last won, so the live
-    // receiver had no `open` slot at all. Every `poll`/`register` on it then
-    // read out of bounds (the GC guard dropped the read) and reported
-    // "WatchService is closed" — the cascade behind the whole
-    // `FileWatcherTests` failure set. Do not re-add a stub here.
+    // `FileSystem.newWatchService()` deliberately has NO registration here.
+    // It used to hand out a bare 1-field placeholder with no platform watcher
+    // behind it; `cratonvm-native-io`'s `native_ws_new` is the real
+    // implementation (a `notify::RecommendedWatcher` plus the 3-field layout
+    // the rest of the WatchService natives read). Registration is
+    // last-write-wins, so this placeholder silently displaced it and every
+    // later native then operated on an object with none of the expected
+    // slots — `Path.register` reported "service is closed or unknown" and
+    // `WatchService.close` wrote past the receiver's layout. See
+    // `docs/internal/springboot/filewatcher-watchservice-surface-FIXED-20260801.md`.
 
     r.register(
         fs_class,
@@ -6551,9 +6551,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     // --- FileSystem additional methods ---
     let fsys = "java/nio/file/FileSystem";
-    // `newWatchService` deliberately NOT registered here — see the note at the
-    // other `fs_class` registration block above; `native_ws_new` in native-io
-    // is the single implementation.
+    // `newWatchService` is NOT registered here either — see the matching note
+    // on the `fs_class` block above. This copy allocated a ZERO-field
+    // WatchService, which is the object the heap guard reported as
+    // "out-of-bounds field write dropped ... class_name=java/nio/file/
+    // WatchService real_field_count=Some(0)".
 
     r.register(
         fsys,
@@ -15602,41 +15604,26 @@ pub(crate) fn p98_walk_dir(
 pub(crate) fn register_p66_watch_service(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // WatchService = 2-field synthetic (dir_path=0 String, last_scan_time=1 Long)
-    let ws = "java/nio/file/WatchService";
-    r.register(ws, "close", "()V", |ctx, args| {
-        // Mark as closed by clearing the dir_path field. Subsequent poll/take returns null.
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Object(None));
-        Ok(None)
-    });
 
-    // poll() — non-blocking: scan directory for changes since last poll
-    r.register(ws, "poll", "()Ljava/nio/file/WatchKey;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        watch_service_poll(ctx, this, None)
-    });
-
-    // poll(timeout, unit) — blocking with timeout
-    r.register(
-        ws,
-        "poll",
-        "(JLjava/util/concurrent/TimeUnit;)Ljava/nio/file/WatchKey;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let timeout_ms = match args.get(1) {
-                Some(Value::Long(t)) => Some(*t as u64),
-                _ => Some(1000),
-            };
-            watch_service_poll(ctx, this, timeout_ms)
-        },
-    );
-
-    // take() — blocking: wait for a change event (poll with 5s timeout)
-    r.register(ws, "take", "()Ljava/nio/file/WatchKey;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        watch_service_poll(ctx, this, Some(5000))
-    });
+    // NOTE — this function no longer registers `WatchService.close/poll/take`,
+    // `Path.register`, or the `WatchKey` methods.
+    //
+    // It used to carry a second, competing WatchService implementation built
+    // on a 2-field layout (dir_path=0, last_scan_time=1) that answered `poll`
+    // by re-`stat`ing the directory and comparing mtimes. The owner of the
+    // WatchService surface is `cratonvm-native-io`'s `register_watch_service`,
+    // which is backed by a real platform watcher (`notify` → inotify /
+    // ReadDirectoryChangesW / FSEvents), reports the actual changed entry
+    // through `WatchEvent.context()`, and uses an incompatible 3-field
+    // WatchService / 5-field WatchKey layout.
+    //
+    // Two implementations of the same triples resolved by last-write-wins, so
+    // which one ran depended purely on registration order between arms — and
+    // the two layouts are not interchangeable, so the losing side's objects
+    // are garbage to the winning side's natives. That is exactly how the
+    // Spring Boot `FileWatcher` failure arose (a placeholder `newWatchService`
+    // displacing the real one). Only the `StandardWatchEventKinds` constants
+    // stay here: they are plain named singletons, not a second implementation.
 
     // StandardWatchEventKinds
     let swek = "java/nio/file/StandardWatchEventKinds";
@@ -15677,130 +15664,7 @@ pub(crate) fn register_p66_watch_service(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // Path.register for WatchService — store directory path in the WatchService
-    r.register(
-        "java/nio/file/Path",
-        "register",
-        "(Ljava/nio/file/WatchService;[Ljava/nio/file/WatchEvent$Kind;)Ljava/nio/file/WatchKey;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let ws = obj_arg(args, 1)?;
-            // Store the directory path in the WatchService's field 0
-            let path_str = match ctx.get_field(path_obj, 0) {
-                Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(None),
-            };
-            ctx.set_field(ws, 0, path_str);
-            // Set last scan time to now
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            ctx.set_field(ws, 1, Value::Long(now));
-            // Return a synthetic WatchKey
-            let key = alloc_concurrent_synthetic(ctx, "java/nio/file/WatchKey", 2);
-            ctx.set_field(key, 0, Value::Int(1)); // valid
-            Ok(Some(Value::Object(Some(key))))
-        },
-    );
-
-    // WatchKey methods
-    let wk = "java/nio/file/WatchKey";
-    r.register(wk, "isValid", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(wk, "pollEvents", "()Ljava/util/List;", |ctx, _args| {
-        // Return empty list (events are detected via poll)
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        ctx.set_field(list, 0, Value::Object(Some(empty)));
-        ctx.set_field(list, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(list))))
-    });
-    // Was a hardcoded `true`. The JDK contract is "false if the key is no
-    // longer valid" — a watch loop is written as
-    // `if (!key.reset()) break;`, so an always-true answer turned a cancelled
-    // key into an endless spin over a directory nobody is watching any more.
-    // Slot 0 is the validity flag `cancel()` clears.
-    r.register(wk, "reset", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let valid = matches!(ctx.get_field(this, 0), Value::Int(1));
-        Ok(Some(Value::Int(i32::from(valid))))
-    });
-    r.register(wk, "cancel", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Int(0));
-        Ok(None)
-    });
     r.set_category(__prev_cat);
-}
-
-/// Poll a WatchService's registered directory for changes.
-/// Returns a WatchKey if changes detected, None otherwise.
-pub(crate) fn watch_service_poll(
-    ctx: &mut dyn NativeContext,
-    ws: cratonvm_types::ObjectRef,
-    timeout_ms: Option<u64>,
-) -> MethodCallResult {
-    let mut ws = ws;
-    let dir_path = match ctx.get_field(ws, 0) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let last_scan = match ctx.get_field(ws, 1) {
-        Value::Long(t) => t,
-        _ => 0,
-    };
-
-    if dir_path.is_empty() {
-        return Ok(Some(Value::Object(None)));
-    }
-
-    // Check if any file in the directory was modified since last_scan
-    let scan_time = std::time::UNIX_EPOCH + std::time::Duration::from_millis(last_scan as u64);
-    let mut changed = false;
-
-    if let Ok(entries) = std::fs::read_dir(&dir_path) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if modified > scan_time {
-                        changed = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // If timeout specified and no change, sleep briefly and retry once
-    if !changed && timeout_ms.is_some() {
-        let wait = timeout_ms.unwrap().min(100);
-        let mut blocked_refs = [Value::Object(Some(ws))];
-        ctx.begin_blocking_region();
-        std::thread::sleep(std::time::Duration::from_millis(wait));
-        ctx.end_blocking_region_refs(&mut blocked_refs);
-        if let Value::Object(Some(cur)) = blocked_refs[0] {
-            ws = cur;
-        }
-        // Don't loop — return null after single poll attempt
-    }
-
-    // Update scan time
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    ctx.set_field(ws, 1, Value::Long(now));
-
-    if changed {
-        let key = alloc_concurrent_synthetic(ctx, "java/nio/file/WatchKey", 2);
-        ctx.set_field(key, 0, Value::Int(1)); // valid
-        Ok(Some(Value::Object(Some(key))))
-    } else {
-        Ok(Some(Value::Object(None)))
-    }
 }
 
 // =============================================================================

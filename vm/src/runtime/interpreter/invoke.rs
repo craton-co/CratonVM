@@ -9926,6 +9926,103 @@ pub(super) fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Val
     )
 }
 
+/// CratonVM's own HTTP carrier classes — the concrete classes its
+/// `URL.openConnection()` hands back, and the ones
+/// `register_http_url_connection_real` registers natives on. Matched EXACTLY
+/// (not by subtype): a user subclass such as
+/// `SimpleClientHttpRequestFactoryTests$TestHttpURLConnection` has real
+/// bytecode of its own and must keep running it.
+const CRATONVM_HTTP_CARRIER_CLASSES: [&str; 4] = [
+    "java/net/HttpURLConnection",
+    "sun/net/www/protocol/http/HttpURLConnection",
+    "sun/net/www/protocol/https/HttpsURLConnectionImpl",
+    "javax/net/ssl/HttpsURLConnection",
+];
+
+/// Resolve the registered native for a call landing on a genuinely real,
+/// `URL.openConnection()`-constructed CratonVM HTTP carrier — the one case
+/// where the native must fire even though the class counts as "redefined"
+/// somewhere in the process.
+///
+/// Why the exemption exists: Mockito's mock makers trip the class-wide
+/// `class_redefine_generation` counter for EVERY instance of
+/// `java/net/HttpURLConnection`, mock or not, for the rest of the process.
+/// Without this, `should_force_registered_native_over_bytecode` cedes to the
+/// real-JDK bytecode for a real, non-mock connection too — observed as
+/// `getResponseCode()` returning 0 and `addRequestProperty`/`getHeaderField`
+/// silently no-op'ing, because CratonVM's carrier keeps its request/response
+/// state in native side tables the real JDK bytecode never touches. That is
+/// `SimpleClientHttpRequestFactoryTests.interceptor()` losing the
+/// interceptor's added header.
+///
+/// Keyed on the RECEIVER, not on `class_name`, and that is load-bearing twice:
+///
+///  * `class_name` is the resolved method's declaring class, so the very same
+///    `connection.addRequestProperty(...)` call site in
+///    `SimpleClientHttpRequest.addHeaders` reports `java/net/HttpURLConnection`
+///    at first and `java/net/URLConnection` once an unrelated
+///    `Mockito.mock(HttpURLConnection.class)` has re-resolved it. The old
+///    `class_name == "java/net/HttpURLConnection"` test silently stopped
+///    matching at that point — and it was missing from the cached/hot twin
+///    entirely, so it also stopped applying as soon as a call site warmed up.
+///  * a Mockito mock is Objenesis-constructed (no constructor ever runs), so
+///    its inherited `URLConnection.url` field 0 stays unset, while a real
+///    carrier's is always populated. The field-0 test therefore never fires
+///    for a mock, and mocking `HttpURLConnection` still routes through
+///    Mockito's advice for stubbing and verification.
+///
+/// Returns the callback to force, or `None` to let normal dispatch decide.
+pub(super) fn real_http_url_connection_native(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    args: &[Value],
+) -> Option<cratonvm_native_api::registry::NativeCallback> {
+    // Cheap gate first: only the connection hierarchy can reach the exemption.
+    if !matches!(
+        class_name,
+        "java/net/URLConnection"
+            | "java/net/HttpURLConnection"
+            | "javax/net/ssl/HttpsURLConnection"
+            | "sun/net/www/protocol/http/HttpURLConnection"
+            | "sun/net/www/protocol/https/HttpsURLConnectionImpl"
+    ) {
+        return None;
+    }
+    let Some(Value::Object(Some(receiver))) = args.first() else {
+        return None;
+    };
+    // Objenesis-constructed mock => field 0 unset => not a real carrier.
+    if !matches!(
+        shared.mem.heap.get_field(*receiver, 0),
+        Value::Object(Some(_))
+    ) {
+        return None;
+    }
+    let receiver_cid = shared.mem.heap.class_id_of(*receiver);
+    let receiver_name = shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(receiver_cid)
+        .map(|class| class.name.to_string())?;
+    if !CRATONVM_HTTP_CARRIER_CLASSES.contains(&receiver_name.as_str()) {
+        return None;
+    }
+    shared
+        .natives
+        .native_methods
+        .find(&receiver_name, method_name, method_descriptor)
+        .or_else(|| {
+            shared.natives.native_methods.find(
+                "java/net/HttpURLConnection",
+                method_name,
+                method_descriptor,
+            )
+        })
+}
+
 pub(super) fn intercept_force_registered_native(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -10131,30 +10228,20 @@ pub(super) fn intercept_force_registered_native(
     // stubbing/verification. Deliberately not narrowed to a specific method
     // allowlist: any native registered on this class for a real carrier is
     // safe to force, since the receiver check alone already gates out mocks.
-    if class_name == "java/net/HttpURLConnection"
-        && matches!(
-            args.first(),
-            Some(Value::Object(Some(receiver)))
-                if matches!(shared.mem.heap.get_field(*receiver, 0), Value::Object(Some(_)))
-        )
+    if let Some(callback) =
+        real_http_url_connection_native(shared, class_name, method_name, method_descriptor, args)
     {
-        if let Some(callback) = shared.natives.native_methods.find(
-            "java/net/HttpURLConnection",
-            method_name,
-            method_descriptor,
-        ) {
-            return Some((|| {
-                let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
-                if let Some(value) = result {
-                    push_invoke_return_value(
-                        &mut thread.frames[frame_idx].stack,
-                        coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
-                    )?;
-                    crate::vm::native_return_pushed_to_stack(shared, thread);
-                }
-                Ok(CachedCallResult::Handled)
-            })());
-        }
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
     }
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
@@ -10301,6 +10388,28 @@ pub(super) fn intercept_force_registered_native_cached(
             let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
                 push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
+    // Same real-carrier exemption the uncached twin applies (see
+    // `real_http_url_connection_native`). This path used to omit it entirely,
+    // so the exemption held only until a call site warmed into the invoke
+    // cache and then silently stopped applying — one
+    // `Mockito.mock(HttpURLConnection.class)` anywhere in the process then
+    // permanently broke every genuinely real connection's
+    // `addRequestProperty`/`getResponseCode`/`getHeaderField`.
+    if let Some(callback) =
+        real_http_url_connection_native(shared, class_name, method_name, method_descriptor, args)
+    {
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                )?;
                 crate::vm::native_return_pushed_to_stack(shared, thread);
             }
             Ok(CachedCallResult::Handled)

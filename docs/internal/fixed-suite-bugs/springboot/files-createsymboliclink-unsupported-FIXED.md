@@ -86,10 +86,16 @@ Symbolic links could not previously exist under CratonVM, so every link-blind co
 - **`Files.find` passed no `LinkOption` to `readAttributes`**, so a `BiPredicate` could never see
   `attrs.isSymbolicLink()` on a non-following walk.
 
-The whole `WatchService` implementation was also repaired — a *different* filed bug
-(`filewatcher-watchservice-timed-poll-missing-native-20260731.md`), but its dead watcher thread
-made the five symlink-dependent `FileWatcherTests` cases unverifiable, so it is fixed in the same
-branch. See `filewatcher-watchservice-timed-poll-missing-native-FIXED.md`.
+The whole `WatchService` surface also had to be repaired before any of this was verifiable — its
+dead watcher thread made the five symlink-dependent `FileWatcherTests` cases unreachable. That work
+was done twice, concurrently: this branch reached the same five defects independently, and a
+parallel session landed the better implementation on `dev` first (`25c40d8ef`, adding
+`ClosedWatchServiceException` parity, a timed blocking region so a wait cannot hold off a
+stop-the-world GC, per-directory key dedup, and a `registry_contracts` test asserting a single
+owner for the surface). **`dev`'s implementation was taken wholesale at the merge and this
+branch's was dropped** — see `docs/internal/springboot/filewatcher-watchservice-surface-FIXED-20260801.md`.
+The `FileWatcherTests` 15/15 below is against that merged implementation plus the symlink work
+here; neither reaches 15/15 alone (`dev`'s own run of it stopped at 5 failures, all symlink).
 
 ## Verification
 
