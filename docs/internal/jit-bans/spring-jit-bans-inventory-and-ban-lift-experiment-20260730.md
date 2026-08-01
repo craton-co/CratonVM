@@ -335,7 +335,7 @@ and a per-method ban hides that instead of surfacing it.
   ("known-issues holds only UNFIXED bugs").
 * `docs/known-issues/stackwalker-getdeclaringclass-null-regression-20260730.md`
   and
-  `docs/known-issues/springboot-basicerrorcontroller-checkcast-abort-20260731.md`
+  `docs/internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md` (retired 2026-08-01)
   — the two ban-independent regressions found while doing this, filed so
   retiring this doc does not drop them.
 
@@ -371,7 +371,7 @@ The pristine-dev control was built from a detached worktree at
 `376114f635` with no changes of any kind, and fails at the same rate. So the
 regression arrived on `dev` between `9ac1feffe` and `376114f635`; this branch
 neither causes nor worsens it. Written up separately as
-`docs/known-issues/springboot-basicerrorcontroller-checkcast-abort-20260731.md`.
+`docs/internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md` (retired 2026-08-01).
 
 ## Part 5 — the bans were NOT stale after all: the real root cause, and the fix
 
@@ -515,4 +515,4 @@ The other Part 4 residual — `BasicErrorControllerIntegrationTests` aborting
 with `checkcast: not an object reference` — is **not** fixed by this and is
 confirmed independent (it reproduces on pristine `dev` with every ban still
 in place). It stays filed at
-`docs/known-issues/springboot-basicerrorcontroller-checkcast-abort-20260731.md`.
+`docs/internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md` (retired 2026-08-01).

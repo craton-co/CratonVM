@@ -11916,6 +11916,12 @@ thread_local! {
 /// own code reads a local (`a`) last assigned by the FIRST try's successful
 /// (non-exceptional) path. Without SOME such check, that method compiled
 /// and silently produced a wrong checksum.
+///
+/// (Everything above documents [`local_handler_reads_unsafe_local`], the
+/// private compile-time gate at the bottom of this block — not the public
+/// wrapper immediately below, which inherited the paragraphs when it was
+/// added.)
+
 /// VM-side view of [`local_handler_reads_unsafe_local`]: does resuming one of
 /// this method's handlers require the locals a PRECISE exceptional frame
 /// carries, rather than the `this`-plus-declared-parameters reconstruction the
@@ -11977,6 +11983,7 @@ fn local_handler_reads_unsafe_local(
     }
     false
 }
+
 
 /// Whether the precise-handler-frame relaxation of the RBC.6 gate is enabled.
 ///

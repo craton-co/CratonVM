@@ -976,6 +976,23 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // `language`, `language_COUNTRY`, `language_COUNTRY_variant`, and the
     // `_COUNTRY` form when the language is empty — `Locale.toString`'s
     // documented layout, which is NOT the same as `toLanguageTag`.
+    //
+    // The subtags are read through the ACCESSORS, not through
+    // `locale_data_get` alone. Each accessor carries a three-shape fallback —
+    // the `locale_populate` side table that `<init>`/`forLanguageTag`/the
+    // constants fill, `synthetic_locale_data` for our own default Locale, and
+    // finally the real JDK object's `baseLocale` field (see `locale_language`)
+    // — and this method consulted only the first. Every `Locale` built by real
+    // JDK bytecode without running our `<init>` therefore stringified to the
+    // EMPTY STRING, `Locale.GERMAN` and `Locale.ITALIAN` included.
+    //
+    // That is not a cosmetic defect: `toString()` is a map KEY in real code.
+    // Jetty's `ContextHandler.setLocaleEncoding`/`getLocaleEncoding` key their
+    // encoding map on it, so every locale collapsed onto the one `""` key and a
+    // mapping registered for GERMAN answered a lookup for ITALIAN —
+    // `JettyServletWebServerFactoryTests.localeCharsetMappingsAreConfigured`,
+    // "expected: null but was: UTF-8", against 113/113 on HotSpot.
+    // `probes/LocaleToStringProbe.java` is the witness.
     registry.register(
         "java/util/Locale",
         "toString",
@@ -985,15 +1002,40 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let (lang, country, variant) = crate::locale_data_get(this);
+            let subtag = |ctx: &mut dyn NativeContext, name: &str| -> MethodCallResult {
+                ctx.invoke_virtual(this, name, "()Ljava/lang/String;", &[])
+            };
+            let read = |ctx: &mut dyn NativeContext, v: Option<Value>| match v {
+                Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let v = subtag(ctx, "getLanguage")?;
+            let lang = read(ctx, v);
+            let v = subtag(ctx, "getCountry")?;
+            let country = read(ctx, v);
+            let v = subtag(ctx, "getVariant")?;
+            let variant = read(ctx, v);
+            let v = subtag(ctx, "getScript")?;
+            let script = read(ctx, v);
+
+            // Same condition set as `java.util.Locale.toString`: the region
+            // separator appears when there IS a region, or when a language is
+            // followed by a variant/script that needs the empty region slot to
+            // keep its position.
             let mut s = lang.clone();
-            if !country.is_empty() || (!variant.is_empty() && !lang.is_empty()) {
+            if !country.is_empty()
+                || (!lang.is_empty() && (!variant.is_empty() || !script.is_empty()))
+            {
                 s.push('_');
                 s.push_str(&country);
             }
-            if !variant.is_empty() {
+            if !variant.is_empty() && (!lang.is_empty() || !country.is_empty()) {
                 s.push('_');
                 s.push_str(&variant);
+            }
+            if !script.is_empty() && (!lang.is_empty() || !country.is_empty()) {
+                s.push_str("_#");
+                s.push_str(&script);
             }
             Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
         },
