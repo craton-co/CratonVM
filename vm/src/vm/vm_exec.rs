@@ -697,13 +697,13 @@ std::thread_local! {
 #[inline]
 fn permissive_dispatch_already_recorded(
     vm_identity: usize,
-    caps: &Arc<cratonvm_native_api::CapabilitySet>,
+    caps: &std::sync::Arc<cratonvm_native_api::CapabilitySet>,
     kind: cratonvm_native_api::CapabilityKind,
 ) -> bool {
     // `CapabilityKind` is `#[repr(u8)]` with 9 fieldless variants, so the
     // discriminant is a shift amount in 0..9 and the mask fits a `u16`.
     let bit = 1u16 << (kind as u8);
-    let policy = Arc::as_ptr(caps) as usize;
+    let policy = std::sync::Arc::as_ptr(caps) as usize;
     PERMISSIVE_DISPATCH_MEMO.with(|memo| {
         let (memo_vm, memo_policy, mask) = memo.get();
         if memo_vm == vm_identity && memo_policy == policy {
@@ -24735,6 +24735,11 @@ mod tests {
             .native_methods
             .set_capabilities(Arc::clone(&caps));
         install_capabilities(Arc::clone(&caps));
+        // Boot ran under its own policy and may already have marked kinds in
+        // this thread's `Permissive` memo. Swapping the policy invalidates it by
+        // construction (the memo is keyed on the policy address), but clear it
+        // anyway so a test asserting on counts is reading its own traffic only.
+        reset_permissive_dispatch_memo();
         (shared, caps)
     }
 
@@ -24793,6 +24798,32 @@ mod tests {
         );
     }
 
+    /// The `Permissive` memo, both halves of the trade in one test: the
+    /// capability IS recorded (so the audit report names it and can derive a
+    /// grant for it), and it is recorded ONCE per kind per thread rather than
+    /// once per dispatch — which is what keeps the VM-wide audit mutex off the
+    /// `Unsafe` dispatch path, where `classify_native` maps every method to
+    /// `RawMemory`.
+    #[test]
+    fn permissive_records_a_kind_once_per_thread_then_goes_transparent() {
+        let (shared, caps) = vm_in_mode(CapabilityMode::Permissive);
+        for _ in 0..64 {
+            assert!(gate(&shared, SENSITIVE).is_ok());
+        }
+        let report = caps.audit_report();
+        assert_eq!(
+            report.total_checks(),
+            1,
+            "64 dispatches must cost ONE audit-mutex acquisition:\n{report}"
+        );
+
+        // Clearing the memo makes the next one record again — i.e. the
+        // suppression is a memo, not a latch that loses the capability.
+        reset_permissive_dispatch_memo();
+        assert!(gate(&shared, SENSITIVE).is_ok());
+        assert_eq!(caps.audit_report().total_checks(), 2);
+    }
+
     /// `Audit` is the mode a deployment runs its suite in before flipping:
     /// everything is still allowed, and the ungranted uses are tallied so the
     /// cost of `Enforce` is a number rather than a guess.
@@ -24836,6 +24867,12 @@ mod tests {
             text.contains("process-spawn"),
             "the refusal must name the capability so it is actionable: {text}"
         );
+
+        // The `Permissive` memo must not reach `Enforce`: a refusal is a
+        // decision, not a counter, and it has to be taken every time.
+        for _ in 0..8 {
+            assert!(gate(&shared, SENSITIVE).is_err());
+        }
 
         // A native that exercises no capability is untouched even under
         // Enforce — the gate is not a global switch.

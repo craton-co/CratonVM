@@ -738,7 +738,7 @@ pub(super) fn find_induction_variable(code: &[u8], header: usize, back_edge_end:
 ///
 /// Returns LoopBoundsInfo if the pattern is recognized.
 ///
-/// SUPERSEDED by [`locate_exit_test`] + [`crate::loop_analysis::decode_bound_expr`],
+/// SUPERSEDED by `locate_exit_test` + [`crate::loop_analysis::decode_bound_expr`],
 /// which accept a constant / `arraylength` / field / `Math.min`-`max` limit as
 /// well as a bare local, and — unlike this function — *verify* that the branch
 /// they decode is really the loop's exit or back edge. Retained because the
@@ -1337,7 +1337,7 @@ fn negate_exit_cmp(cmp: ExitCmp) -> ExitCmp {
 /// Every `(source, target)` branch edge in the method, or `None` when the
 /// method contains control flow this scan does not model (`tableswitch`,
 /// `lookupswitch`, `jsr`/`ret`, `goto_w`/`jsr_w`). Sibling of
-/// [`collect_i16_branch_targets`], which keeps only the targets; the entry-edge
+/// `collect_i16_branch_targets`, which keeps only the targets; the entry-edge
 /// question below needs to know where an edge came *from*.
 fn branch_edges(code: &[u8], code_len: usize) -> Option<Vec<(usize, usize)>> {
     let mut edges = Vec::new();
@@ -1463,7 +1463,7 @@ fn pattern_b_loop_form(
 ///   body, which admitted a loop whose accesses run before its test.)
 /// * **Pattern B** — the back edge itself is the comparison, branching back
 ///   into the loop to continue. The comparison is negated into exit polarity
-///   and the loop form is settled by [`pattern_b_loop_form`].
+///   and the loop form is settled by `pattern_b_loop_form`.
 ///
 /// The limit is decoded by [`crate::loop_analysis::decode_bound_expr`], which
 /// accepts a constant, a local, an inline `a.length`, a field, or a
@@ -1600,7 +1600,7 @@ fn recognise_loop(code: &[u8], code_len: usize, header: usize, back_edge: usize)
 /// | `TEST step,step; JS` + `CMP step, MAX-bound; JG` | `0 <= step <= MAX - bound` |
 /// | `CMP a.length, bound; JB`/`JBE` (per array) | `a.length >= bound + addend + 1` |
 ///
-/// [`Self::covers`] is the statement of which [`PreheaderGuard`] each of those
+/// `Self::covers` is the statement of which [`PreheaderGuard`] each of those
 /// discharges. A guard that is not covered means the whole proof is refused:
 /// a partially-emitted guard set proves nothing, and an elision resting on an
 /// obligation nobody discharged is a silent out-of-bounds access.
@@ -1705,13 +1705,13 @@ fn innermost_enclosing(code: &[u8], loops: &[(usize, usize)]) -> Vec<Option<usiz
 /// Returns a set of bytecode PCs where bounds checks can be safely skipped,
 /// and a list of speculative BCE guards to emit at loop headers.
 ///
-/// Each loop is recognised once ([`recognise_loop`]) and each array access
+/// Each loop is recognised once (`recognise_loop`) and each array access
 /// proved once ([`CountedLoop::prove_index_in_bounds_of`]). The verdicts map
 /// onto the existing output exactly as they did before:
 ///
 /// * [`BoundsProof::Static`] → the PC joins `safe_pcs` with no guard;
 /// * [`BoundsProof::Guarded`] → **every** guard must be covered by
-///   [`GuardShape::covers`], and the PC then joins `safe_pcs` and its array's
+///   `GuardShape::covers`, and the PC then joins `safe_pcs` and its array's
 ///   `covered_pcs`;
 /// * [`BoundsProof::Refused`] → the per-element check stays.
 ///

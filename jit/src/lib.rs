@@ -9256,8 +9256,14 @@ impl std::fmt::Debug for JitCache {
 /// recovered from its `Const(field_index)` offset operand (input[3]). Returns
 /// `None` for a compact / malformed node (no constant offset), letting the
 /// caller fall back to the `MemKind`-derived index. This is the single place
-/// the EA bridge interprets a production field access's index, so the EA
-/// graph's field edges and `apply_ea_to_ir`'s `field_values` lookup agree.
+/// the EA bridge interprets a production field access's index.
+///
+/// `plan_scalar_replacement` no longer *forwards* through this index — it asks
+/// `escape_analysis::ScalarReplacementInfo::load_value`, which is keyed by node
+/// rather than by field — but it still calls this as an agreement check, and
+/// `virtual_object_info_for` still indexes `field_values` by it. So the rule
+/// stands: the field index the EA graph keyed its edges by and the one the
+/// consumers recover here must be the same index.
 fn ir_load_store_field_index(ir_graph: &ir::Graph, node_id: ir::NodeId) -> Option<usize> {
     let node = ir_graph.nodes.get(node_id as usize)?;
     let offset_node = *node.inputs.get(3)?;
