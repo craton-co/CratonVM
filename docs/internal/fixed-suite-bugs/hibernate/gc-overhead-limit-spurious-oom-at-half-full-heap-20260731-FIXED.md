@@ -126,74 +126,50 @@ promotion is no longer zero. Old-gen headroom keeps working.
   wedged (>300 s, no progress past 20 MB) → **3.4 s**, `promoted` 2–4.6 MB per
   cycle. HotSpot control: 0.14 s.
 - **`DefaultCatalogAndSchemaTest`**, `--Xmx 1500m`, JIT on, real JDK — the
-  original repro, run to completion:
+  original repro:
 
   ```
-  @@RESULT ...DefaultCatalogAndSchemaTest found=121 started=121 ok=121
-           failed=0 aborted=0 skipped=0 ms=6328807
+  @@TOTALS tests=132 containers=16      failed=0      (3 runs for 3)
   ```
 
-  **No OOM, no failure, 105 min.** The decisive number is not the wall time: it
-  is that `CRATONVM_DBG_GC_OVERHEAD=1` printed **not one line** across the whole
-  run — *zero* forced GCs, where the failing run took thirty and latched the
-  streak on eight of them. The heap never came under pressure at all, because
-  young now drains.
+  **132 of 132, zero failures, matching the HotSpot control exactly.**
 
-  Progress stayed linear throughout (30 tests at 21 min, 60 at 44, 90 at 73, 120
-  at 103). The failing run's signature collapse — 104 tests in the first 41 min,
-  then only 7 more in the next 44 — is gone.
+  The decisive number is not the test count: it is that
+  `CRATONVM_DBG_GC_OVERHEAD=1` printed **not one line** across a whole run —
+  *zero* forced GCs, where the failing run took thirty and latched the streak on
+  eight of them. The heap never comes under pressure at all now, because young
+  drains.
 
-  `found=121` versus HotSpot's `found=132` is a **separate, newly-visible
-  defect**, described below. It is not this defect and not a regression from
-  this fix — it simply could not be seen before, because the class had never
-  once run to completion on CratonVM.
+  Progress is linear throughout. The failing run's signature collapse — 104
+  tests in the first 41 min, then only 7 more in the next 44 — is gone.
 
-### The residual, stated exactly
+  Getting to that clean result took a **second** fix, on a hazard this one
+  exposed: restoring the drain also re-enabled evacuation of roots published as
+  "movable" precise-JIT roots, on cycles whose coverage proof had failed. See
+  [`invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md`](invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md).
+  Both fixes are load-bearing.
 
-Two full CratonVM runs of the class disagree with each other, so the residual is
-**non-deterministic** and is recorded here as two observations rather than one
-mechanism:
+  Wall time is ~35–50 min against HotSpot's 120 s, on a shared box with other
+  work running. That gap is the
+  [moving-young-inert-under-JIT](../../../known-issues/hibernate/moving-young-inert-under-jit-throughput-tax-20260730.md)
+  throughput tax and stays with it. (An earlier "105 min" figure recorded here
+  was measured while three full workspace builds were running concurrently —
+  discount it.)
 
-| run | runner | result |
-|---|---|---|
-| A | `CratonRunner` (`-Dcraton.batch=1`) | `found=121 ok=121 failed=0` — 121 `HHH000490` lines |
-| B | `ListingRunner` (per-test listener) | **132 tests**, all 12 invocations × 11 methods present, 131 `SUCCESSFUL`, **1 `FAILED`** |
-| — | HotSpot, either runner | `132`, all successful |
+### What that took: a second fix
 
-So run B contradicts the obvious reading of run A: the invocations are *not*
-systematically missing — run B enumerated all twelve, each with its full eleven
-methods. What run B found instead is a genuine VM defect on the very last
-invocation:
+The first clean run did not come for free. Restoring the drain also re-enabled
+evacuation of roots published as **movable** precise-JIT roots — on cycles whose
+coverage proof had just failed. Three runs with the drain restored but that
+hazard unbounded produced three different outcomes (`found=121`; a
+`AbstractMethodError` on an interface's abstract declaration; a SIGSEGV in a JIT
+frame), all inside `[class-template-invocation:#12]`.
 
-```
-[class-template-invocation:#12]/[method:updateSchema_fromSessionFactory(DomainModelScope)]
-java.lang.AbstractMethodError: method java/lang/reflect/AnnotatedElement
-    .getDeclaredAnnotations()[Ljava/lang/annotation/Annotation;
-    has no Code attribute
-```
-
-`AnnotatedElement` is an interface and `getDeclaredAnnotations()` is abstract
-there, so this is a call that reached the interface declaration instead of the
-receiver's concrete override.
-
-It is **in-class pollution, not a property of that test**: selecting that exact
-unique id and running it alone passes on CratonVM 3 times out of 3 (and on
-HotSpot). It only fails behind the other 131 tests in the same JVM — the shape
-`reference_junit_request_method_defeats_inclass_repro` describes, and the reason
-each iteration on it costs a ~2-hour run.
-
-What is *not* in question: `options()` returns a byte-identical 12-row list on
-both VMs, so the parameter matrix itself is sound.
-
-Tracked separately as
-[`../../../known-issues/hibernate/annotatedelement-getdeclaredannotations-abstractmethoderror-20260731.md`](../../../known-issues/hibernate/annotatedelement-getdeclaredannotations-abstractmethoderror-20260731.md).
-- `cargo test -p cratonvm-gc --lib` — **881 passed, 0 failed**.
-- `cargo test -p cratonvm-vm --lib` — 2318 passed, 4 failed; all four
-  (`jni_function_table_extended_to_234`, `jni_nio_slots_not_stub`,
-  `no_presence_predicate_shadows_a_compound_flag_default`,
-  `obsaudit_attach_listener_creates_a_real_socket`) **verified pre-existing on
-  the base commit** `32f9db9a2` by reverting the change and re-running: same
-  four, 0 passed / 4 failed.
+It is not a regression from this fix — running the same class with
+`CRATONVM_NO_SELECTIVE_PROMOTE=1`, i.e. the collector's pre-fix behaviour, fails
+invocation #12 *worse* (4 and 5 tests, twice). This fix made it reachable, not
+real. Root cause, verification and the differential that found it:
+[`invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md`](invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md).
 
 ### Regression tests
 
@@ -212,6 +188,8 @@ enough to hide it.
   not under `XT_TAKEOVER`. **Verified to fail against the old gate** before
   being accepted, so it is a genuine differential rather than a test that
   happens to pass.
+- `gen_heap::tests::a_movable_jit_root_is_pinned_when_the_coverage_proof_failed`
+  — the bound from the second fix, asserted in both directions.
 
 ## What this does NOT fix
 
