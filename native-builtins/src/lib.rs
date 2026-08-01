@@ -2790,7 +2790,10 @@ struct RandomizedRandomCacheKey {
 
 fn native_randomness_get_random(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field_by_name(this, "random")))
+    // Registered `()Ljava/util/Random;` — reference-typed, so the by-name read
+    // must not be returned raw: it answers `Value::Int(0)` for an unwritten
+    // slot. See `docs/known-issues/by-name-field-reads.md`.
+    Ok(Some(field_read::ref_field(ctx, this, "random")))
 }
 
 #[inline]
@@ -4086,6 +4089,15 @@ fn native_wildfly_security_manager_get_property_privileged(
 /// rows in `docs/security/native-capabilities.md` they close.
 pub mod capability_gate;
 pub mod case_map;
+/// Descriptor-safe instance-field readers.
+///
+/// `NativeContext::get_field_by_name` is NOT descriptor-aware: an unwritten
+/// reference slot reads back as `Value::Int(0)` through it and as
+/// `Value::Object(None)` through the indexed `get_field`. Natives that test a
+/// by-name read for null, or return one straight out of a reference-typed
+/// method, are asking the wrong question and get a plausible answer. See
+/// `docs/known-issues/by-name-field-reads.md`.
+pub(crate) mod field_read;
 pub mod lang_class;
 pub mod lang_string;
 // WP2.1: java.lang.reflect full coverage — supplements lang_class.rs with
@@ -15531,10 +15543,15 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "name") {
-                return Ok(Some(ctx.get_field(this, slot)));
-            }
-            Ok(Some(ctx.get_field_by_name(this, "name")))
+            // `()Ljava/lang/String;` — must not surface a primitive tag. The
+            // old tail was `Ok(Some(ctx.get_field_by_name(this, "name")))`,
+            // which answers `Value::Int(0)` for an unwritten `name` slot
+            // because the by-name read is not descriptor-aware. `ref_field`
+            // resolves on the RECEIVER's class id (the `java/lang/Enum`
+            // name-keyed resolve above collapses under loader splits — see
+            // `resolve_field_index_by_class_id`'s doc) and degrades any
+            // non-reference tag to null.
+            Ok(Some(field_read::ref_field(ctx, this, "name")))
         },
     );
     registry.register(
@@ -15546,10 +15563,8 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "name") {
-                return Ok(Some(ctx.get_field(this, slot)));
-            }
-            Ok(Some(ctx.get_field_by_name(this, "name")))
+            // See `Enum.name` immediately above: same descriptor, same hazard.
+            Ok(Some(field_read::ref_field(ctx, this, "name")))
         },
     );
     registry.register(
@@ -16961,13 +16976,23 @@ pub fn register_essential_natives_with_shims(
         "java/util/logging/LogRecord",
         "getLevel",
         "()Ljava/util/logging/Level;",
-        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "level"))),
+        // Reference-typed return: an unwritten `level` slot reads back as
+        // `Value::Int(0)` through the by-name accessor, not `Object(None)`.
+        // See `docs/known-issues/by-name-field-reads.md`.
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(field_read::ref_field(ctx, this, "level")))
+        },
     );
     registry.register(
         "java/util/logging/LogRecord",
         "getMessage",
         "()Ljava/lang/String;",
-        |ctx, args| Ok(Some(ctx.get_field_by_name(obj_arg(args, 0)?, "message"))),
+        // `()Ljava/lang/String;` — see `getLevel` above.
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(field_read::ref_field(ctx, this, "message")))
+        },
     );
     // JULI's concrete bounded executor must retain its shutdown state. The
     // inherited ThreadPoolExecutor bridge is not selected for this concrete

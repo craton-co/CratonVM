@@ -43,8 +43,32 @@
 //! |---|---|---|
 //! | `scalar_replaceable` | IR scalar replacement | live |
 //! | `elide_locks` | IR lock elision | live |
+//! | `lock_elisions` | — | the *correct* granularity of `elide_locks` |
+//! | `lock_coarsening` | — | offered, no consumer yet |
+//! | `lock_refusals` | tests + diagnostics | informational |
 //! | `stack_allocatable` | — | **computed, never read** |
 //! | `escape_states` / `stats` | tests + diagnostics | informational |
+//!
+//! # Lock elimination and coarsening
+//!
+//! Two transforms, both fenced on `EscapeState::NoEscape`, both with their JMM
+//! argument written out at the "Phase 4" section comment below and in
+//! `docs/jit/lock-elimination.md`:
+//!
+//! * **elision** removes every monitor operation on a confined object. It is
+//!   offered per object ([`LockElisionPlan`]) because removing a strict subset
+//!   of a balanced monitor sequence is wrong code, and the consumer that reads
+//!   the flat [`EscapeAnalysisResult::elide_locks`] list can refuse individual
+//!   nodes.
+//! * **coarsening** merges two adjacent lock regions on a confined object by
+//!   deleting the inner `monitorexit`/`monitorenter` pair
+//!   ([`LockCoarseningPlan`]). It depends on no elision having landed, so it is
+//!   safe under that partial application.
+//!
+//! Both refuse an object whose monitor is `wait`ed on, both refuse an object
+//! whose monitors cannot be attributed, and coarsening additionally refuses any
+//! gap that can throw, can deopt, or can observe the unlocked state. Every
+//! refusal is recorded in [`EscapeAnalysisResult::lock_refusals`].
 //!
 //! `stack_allocatable` collects every `ArgEscape` allocation, but no caller
 //! looks at it: **stack allocation is not implemented**. The field is not a
@@ -53,10 +77,49 @@
 //!
 //! # Soundness direction
 //!
-//! The lattice joins upward (`NoEscape < ArgEscape < GlobalEscape`), so every
-//! partial result *under*-estimates escape, and both live consumers act on
-//! `== NoEscape`. Anything that can terminate the fixed point early therefore
-//! has to fail closed — see [`escalate_all_to_global`].
+//! The lattice joins upward (`NoEscape < PartialEscape < ArgEscape <
+//! GlobalEscape`), so every partial result *under*-estimates escape, and both
+//! live consumers act on `== NoEscape`. Anything that can terminate the fixed
+//! point early therefore has to fail closed — see [`escalate_all_to_global`].
+//!
+//! # The three things this module proves before an object may be replaced
+//!
+//! Scalar replacement deletes a *heap object*. Three separate facts have to
+//! hold, and each is checked by its own machinery here:
+//!
+//! 1. **Reachability** — nobody outside this frame can reach the object.
+//!    That is [`EscapeState`], computed by [`propagate_escape_states`].
+//! 2. **Value** — every surviving read of a field must be answerable with the
+//!    value the object actually held *at that point*. That is the positional
+//!    store record ([`ScalarReplacementInfo::field_stores`]) and the per-load
+//!    answer ([`LoadResolution`]). A last-write-wins field map is **not**
+//!    enough: `Foo o = new Foo(); int a = o.x; o.x = 42;` must fold `a` to the
+//!    zero default, never to `42`. See [`ScalarReplacementInfo::load_values`].
+//! 3. **Identity** — nothing may observe the object's *address*. `==` on
+//!    references, an identity hash, and `monitorenter`/`monitorexit` all do.
+//!    An object with a live identity observation is refused outright; see
+//!    [`Op::RefCompare`], [`Op::IdentityHash`] and
+//!    [`EscapeAnalysisResult::identity_observations`].
+//!
+//! Facts 2 and 3 are *independent* of fact 1. An object can be perfectly
+//! `NoEscape` and still be unreplaceable because a load cannot be answered or
+//! its identity is observed. Conflating them is how the last miscompilation on
+//! this branch happened.
+//!
+//! # Why `dominance_proved` exists
+//!
+//! Answering "which store does this load see?" is a dominance question, and the
+//! EA graph cannot ask it: the bridge in `jit/src/lib.rs`
+//! (`escape_analysis_from_ir`) rewrites the production `Op::Load` / `Op::Store`
+//! into the compact `[holder, value]` layout, **dropping the control and memory
+//! edges**. Without them there is no CFG here to build a dominator tree from.
+//!
+//! So the analysis uses program order — ascending [`NodeId`], which is creation
+//! order — as a stand-in, and gates that stand-in on
+//! [`program_order_proves_dominance`]: it is only sound in a graph with no
+//! branch, no join and no multi-input φ. Everything else resolves to
+//! [`LoadResolution::Unknown`] and the object is refused. Recovering precision
+//! means giving the EA graph real control edges — see `docs/jit/escape-analysis.md`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -95,7 +158,75 @@ pub enum Op {
     Call,
     MonitorEnter,
     MonitorExit,
+    /// `Object.wait` / `wait(long)`. Input `[obj]`.
+    ///
+    /// Semantically a *monitor* operation, not a call: it requires the monitor
+    /// to be held (else `IllegalMonitorStateException`), releases it to the
+    /// recorded depth, blocks, and reacquires it at that same depth. Every one
+    /// of those three facts is destroyed by eliding the monitor, so an object
+    /// with a live `MonitorWait` is refused both lock transforms outright — see
+    /// `find_lock_elision_plans`.
+    ///
+    /// NOTE: no producer yet. `ir_op_to_ea_op` maps the underlying
+    /// `invokevirtual` to [`Op::Call`], which arg-escapes the receiver and
+    /// therefore already refuses the elision. This variant makes that refusal
+    /// *intentional and reportable* rather than a side effect of the call rule,
+    /// and it keeps the refusal alive if `Op::Call` ever gains an
+    /// "inlined intrinsic, does not escape" arm.
+    MonitorWait,
+    /// `Object.notify` / `notifyAll`. Input `[obj]`.
+    ///
+    /// Same status and same treatment as [`Op::MonitorWait`]: it requires the
+    /// monitor to be held, and the thread it wakes is a thread that must have
+    /// been able to reach the object — so a `notify` on an object the analysis
+    /// believes is confined is a contradiction the analysis fails closed on
+    /// rather than resolves.
+    MonitorNotify,
+    /// A safepoint / deoptimization point. Inputs: the references the frame
+    /// state names (may be empty).
+    ///
+    /// Present so lock **coarsening** can ask "does a deopt land between these
+    /// two regions?". A deopt in a coarsened gap would reconstruct an
+    /// interpreter frame whose monitor set says the object is *unlocked* while
+    /// the compiled frame holds it — see `find_lock_coarsening_plans`.
+    ///
+    /// NOTE: no producer yet. `ir::Graph` carries safepoints in a side table
+    /// (`ir_graph.safepoints`), not as nodes, and `escape_analysis_from_ir`
+    /// does not bridge them. Until it does, [`LockRefusal::SafepointInGap`] is
+    /// unreachable from production IR and coarsening relies on the gap
+    /// allowlist alone — which admits no node that can be a safepoint.
+    Safepoint,
+    /// `athrow`. Inputs: the thrown reference.
+    ///
+    /// Throwing publishes the reference out of the frame (same rule as
+    /// [`Op::Return`]) and unwinds every monitor the frame holds.
+    ///
+    /// NOTE: no producer yet — `ir_op_to_ea_op` has no `athrow` arm.
+    Throw,
     ArrayLength,
+    /// Reference **identity comparison** (`if_acmpeq` / `if_acmpne`, and the
+    /// `Objects.isNull`-style folds that lower to one).  Inputs: the compared
+    /// references, in any order.
+    ///
+    /// This is an *identity observation*, not an escape: the compared object
+    /// stays unreachable from outside the frame, but its address becomes
+    /// observable, so it may not be scalar-replaced while the comparison is
+    /// live.  See [`find_identity_observations`].
+    ///
+    /// NOTE: no producer emits this yet — `ir_op_to_ea_op` in `jit/src/lib.rs`
+    /// maps `ir::Op::Cmp(_)` to [`Op::Other`].  Until it is taught to emit
+    /// `RefCompare` for a `Cmp` on two `IrType::Ref` operands, an `acmp` on a
+    /// scalar-replacement candidate is invisible here.  It is *currently*
+    /// harmless only because `Op::Other` hits `find_scalar_replacements`'
+    /// catch-all and refuses the object anyway; this variant makes the refusal
+    /// intentional and reportable rather than incidental.
+    RefCompare,
+    /// Identity-hash observation (`System.identityHashCode`, or an
+    /// `Object.hashCode` that is not overridden).  Input `[obj]`.
+    ///
+    /// Same status as [`Op::RefCompare`]: an identity observation that blocks
+    /// scalar replacement, with no producer in the bridge yet.
+    IdentityHash,
     Dead,
     Other,
 }
@@ -112,6 +243,22 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     pub entry: NodeId,
     pub exit: NodeId,
+    /// Nodes the *producer* knows execute on a cold path — an exceptional or
+    /// profiled-never-taken branch, a slow-path helper call, a bail.
+    ///
+    /// This is the only cold-path input the analysis has, and it is **empty by
+    /// default**: with no producer filling it, no allocation is ever classified
+    /// [`EscapeState::PartialEscape`] and behaviour is exactly what it was
+    /// before partial escape existed. That is deliberate — a wrong guess about
+    /// coldness would report an object as "escapes only rarely" when it escapes
+    /// on every call, so the fail-closed default is "nothing is cold".
+    ///
+    /// A partial-escape *classification* is informational: it never enables an
+    /// optimisation on its own (see [`EscapeState::PartialEscape`]). It names
+    /// the objects a future partial-escape applier could sink past their cold
+    /// escape point, together with the materialization sites it would need
+    /// ([`PartialEscapeInfo::escape_sites`]).
+    pub cold_nodes: HashSet<NodeId>,
 }
 
 impl Graph {
@@ -131,7 +278,17 @@ impl Graph {
             nodes: vec![start, ret],
             entry: 0,
             exit: 1,
+            cold_nodes: HashSet::new(),
         }
+    }
+
+    /// Record that `node` executes only on a cold path.
+    ///
+    /// Additive and monotone: marking more nodes cold can only ever move an
+    /// allocation from `ArgEscape`/`GlobalEscape` to the *reported*
+    /// `PartialEscape`, which no consumer acts on.
+    pub fn mark_cold(&mut self, node: NodeId) {
+        self.cold_nodes.insert(node);
     }
 
     pub fn add_node(&mut self, op: Op, inputs: Vec<NodeId>) -> NodeId {
@@ -228,13 +385,128 @@ fn field_in_range(graph: &Graph, holder_allocs: &HashSet<NodeId>, field: usize) 
         })
 }
 
+// ── Program order as a dominance stand-in ───────────────────────────────
+
+/// Whether ascending [`NodeId`] is a sound stand-in for *dominance* in this
+/// graph — i.e. whether "store id < load id" really means "the store executed
+/// before the load, on every path that reaches the load".
+///
+/// # Why this is needed at all
+///
+/// The value-forwarding question ("which store does this load see?") is a
+/// dominance question. The EA graph cannot answer it directly: the bridge
+/// (`escape_analysis_from_ir` in `jit/src/lib.rs`) rewrites `Op::Load` /
+/// `Op::Store` into the compact `[holder, value]` / `[holder]` layout and drops
+/// input 0 (control) and input 1 (memory). There is therefore no CFG in this
+/// graph to dominate over.
+///
+/// Node ids are assigned by `Graph::add_node` in creation order, which the
+/// bridge derives from `ir::Graph` node order, which the builder derives from
+/// bytecode order. In a graph with **no control flow at all** that ordering is
+/// exactly execution order, so it *is* dominance. Add one branch and it is not:
+///
+/// ```text
+///   Foo o = new Foo();
+///   if (c) o.x = 1; else o.x = 2;   // ids 10 and 12
+///   int a = o.x;                    // id 15 — sees 1 or 2, unknowably
+/// ```
+///
+/// Both stores precede the load in id order and neither dominates it. A
+/// last-write-wins field map answers `2` and miscompiles the `c` path.
+///
+/// # The test
+///
+/// Refuse the moment any of these appears on a live node:
+///
+/// * [`Op::If`] — the only way control can diverge, and therefore also the only
+///   way a loop can be built (a loop with no exit branch does not terminate).
+///   Catching `If` is what closes the back-edge case, where a *higher*-id store
+///   in the loop body runs before a *lower*-id load on the second iteration.
+/// * [`Op::Merge`] — a forward join. Implied by `If` in a well-formed graph,
+///   checked separately because the bridge maps `ir::Op::Region` (the loop
+///   header) to [`Op::Other`], so `Merge` is the only join op that survives
+///   translation and a graph could in principle carry one without an `If`.
+/// * A [`Op::Phi`] with more than one input. A φ merging two or more values can
+///   only exist at a join. A *single*-input φ is a degenerate copy (the
+///   transparent-alias shape `find_scalar_replacements` accepts) and does not
+///   imply divergence.
+///
+/// # What is deliberately *not* on the list
+///
+/// **Exception edges.** A `catch`/`finally` handler body is never built into
+/// the IR at all: `ir::IrBuilder::build` skips handler bytecode outright
+/// (the "STUB-S8" skip in `ir::IrBuilder::build`), because a JIT frame never
+/// takes an exception edge —
+/// an exception makes the compiled body return the `i64::MIN` sentinel and the
+/// runtime re-runs or resumes the method in the interpreter. So a throw inside
+/// a compiled body *leaves the frame*; it cannot branch to a lower-id load.
+/// If that ever changes, this predicate must gain a `may_throw` term.
+///
+/// # Failure mode
+///
+/// `false` is not a bug, it is the fail-closed answer: every field that has at
+/// least one store then resolves to [`LoadResolution::Unknown`] and the object
+/// is refused. Fields with *no* store still resolve (to the zero default,
+/// which no control flow can change), and an object with stores but no loads is
+/// still replaceable — nothing has to be answered.
+pub fn program_order_proves_dominance(graph: &Graph) -> bool {
+    !graph.nodes.iter().any(|n| match &n.op {
+        Op::If | Op::Merge => true,
+        Op::Phi => n.inputs.len() > 1,
+        _ => false,
+    })
+}
+
 // ── Escape state ────────────────────────────────────────────────────────
 
 /// How far an allocated object escapes from its allocation site.
+///
+/// The order of the variants **is** the lattice order, and [`join`] is `max`:
+///
+/// ```text
+///   NoEscape  <  PartialEscape  <  ArgEscape  <  GlobalEscape
+///   ▲                                                       ▲
+///   bottom (optimisable)                       top (fail-closed answer)
+/// ```
+///
+/// # `PartialEscape` is not produced by the fixed point
+///
+/// The other three states are computed by [`propagate_escape_states`], which
+/// only ever joins *upward*, so every intermediate value is an under-estimate
+/// and the final value is a sound over-approximation of reality.
+///
+/// `PartialEscape` is different: it is a **path-sensitive refinement applied
+/// after the fixed point**, in [`analyze_escapes`], and it *lowers* an
+/// allocation's reported state from `ArgEscape`/`GlobalEscape` when every site
+/// at which the object escapes is in [`Graph::cold_nodes`]. Lowering a state is
+/// unsound in general, which is why it is fenced three ways:
+///
+/// * it is never written into the [`ConnectionGraph`], so it can never feed
+///   back into the join and weaken another node's state;
+/// * it only ever appears in [`EscapeAnalysisResult::escape_states`] and
+///   [`EscapeAnalysisStats`], both of which are informational;
+/// * every consumer that *acts* (scalar replacement, lock elision) tests
+///   `== NoEscape` against the connection graph, so a `PartialEscape` object is
+///   treated exactly like the `ArgEscape`/`GlobalEscape` object it really is
+///   until somebody writes a partial-escape applier that sinks the allocation
+///   past its cold escape point.
+///
+/// It sits *below* `ArgEscape` in the order because that is the direction a
+/// future applier would move it in, and because a consumer that (wrongly) tests
+/// `>= ArgEscape` for "escapes" is then the one that has to be fixed — a
+/// consumer that tests `!= NoEscape`, which is the documented predicate
+/// ([`EscapeState::may_escape`]), stays correct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EscapeState {
     /// Object does not escape the current method -- can be scalar-replaced.
     NoEscape,
+    /// Object escapes on *some* path only, and every such path is cold.
+    ///
+    /// Reported, never propagated — see the type-level documentation. Today it
+    /// enables nothing; it identifies the objects a partial-escape applier
+    /// would target, and it is *not* stack-allocatable (the hot path would pay
+    /// for a frame slot the cold path then has to copy to the heap anyway).
+    PartialEscape,
     /// Object escapes to a callee but not globally -- can be stack-allocated.
     ArgEscape,
     /// Object escapes globally -- must be heap-allocated.
@@ -245,6 +517,22 @@ impl EscapeState {
     /// Join two escape states (lattice meet = max).
     fn join(self, other: EscapeState) -> EscapeState {
         std::cmp::max(self, other)
+    }
+
+    /// True when the object may be observed outside the allocating frame on at
+    /// least one path.
+    ///
+    /// **This, not `>= ArgEscape`, is the predicate to test for "escapes".**
+    /// `PartialEscape` escapes — rarely, but it escapes — and it orders below
+    /// `ArgEscape`.
+    pub fn may_escape(self) -> bool {
+        self != EscapeState::NoEscape
+    }
+
+    /// True when the object is provably confined to this frame on **every**
+    /// path, which is the precondition for scalar replacement and lock elision.
+    pub fn is_confined(self) -> bool {
+        self == EscapeState::NoEscape
     }
 }
 
@@ -335,6 +623,38 @@ impl ConnectionGraph {
 
 // ── Scalar replacement info ─────────────────────────────────────────────
 
+/// One store into a scalar-replaced object's field, kept **positionally**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldStore {
+    /// The `Op::Store` node. Its id is its position in program order.
+    pub store: NodeId,
+    /// The value node written by this store.
+    pub value: NodeId,
+}
+
+/// What a replaced field load reads.
+///
+/// The whole point of this type is that it distinguishes *"reads the zero
+/// default"* from *"cannot be answered"*. Collapsing those two into one
+/// `Option<NodeId>` is how a load-before-store gets a value from its own
+/// future.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadResolution {
+    /// The load reads the value produced by this node.
+    Value(NodeId),
+    /// No store to this field dominates the load, so it reads the freshly
+    /// allocated object's zero default.
+    ///
+    /// Sound because the object is genuinely zero-initialised at allocation:
+    /// `Op::New` names a class whose instance fields start at `0`/`null`, and
+    /// the front end only admits allocations whose constructor sets no non-zero
+    /// field before the analysis sees it.
+    ZeroDefault,
+    /// Not provable. The caller **must** keep the load (and, since the object
+    /// it reads must then still exist, must not elide the allocation either).
+    Unknown,
+}
+
 /// Information for replacing an allocation with scalar values.
 pub struct ScalarReplacementInfo {
     /// The allocation node being replaced.
@@ -343,26 +663,146 @@ pub struct ScalarReplacementInfo {
     pub class_id: u32,
     /// Number of fields.
     pub num_fields: usize,
-    /// For each field: the node representing its value (or None if uninitialized).
+    /// For each field: the value of the **last** store to it in program order
+    /// (or `None` if the field is never stored).
+    ///
+    /// # This field alone is not a correct forwarding source
+    ///
+    /// It answers "what does the object hold when the method ends?", which is
+    /// the right question for a deopt recipe at the *end* of the object's live
+    /// range and the wrong question for a load in the middle of it. Forwarding
+    /// every replaced load to `field_values[f]` folded
+    /// `Foo o = new Foo(); int a = o.x; o.x = 42;` to `a == 42` — the
+    /// miscompilation this branch already paid for once.
+    ///
+    /// It is kept because it is the shape `ir_lower::VirtualObjectInfo` is built
+    /// from today (via `jit/src/lib.rs::virtual_object_info_for`). **For load
+    /// forwarding use [`Self::load_values`] / [`Self::load_value`].**
     pub field_values: Vec<Option<NodeId>>,
+    /// Per field, **every** store to it, ascending by node id = program order.
+    ///
+    /// This is the positional record that makes per-load resolution possible,
+    /// and it is also what a deopt producer needs to pick the store that
+    /// dominates a *particular* safepoint rather than bailing on "unproven
+    /// dominance" — see `docs/jit/escape-analysis.md`.
+    pub field_stores: Vec<Vec<FieldStore>>,
     /// Loads that were replaced with direct field value access.
     pub replaced_loads: Vec<NodeId>,
+    /// For each entry of [`Self::replaced_loads`], in the same order, the value
+    /// that load actually reads.
+    ///
+    /// **Invariant:** a candidate that reaches [`EscapeAnalysisResult`] never
+    /// contains [`LoadResolution::Unknown`] here —
+    /// [`find_scalar_replacements`] refuses the whole object instead. A
+    /// consumer may therefore treat `Unknown` as unreachable, but should still
+    /// fail closed on it rather than assume.
+    pub load_values: Vec<(NodeId, LoadResolution)>,
     /// Stores that were eliminated.
     pub eliminated_stores: Vec<NodeId>,
+    /// Whether program order was a sound dominance stand-in for this graph —
+    /// [`program_order_proves_dominance`]. Recorded per candidate so a consumer
+    /// can see *why* a field with stores resolved to `Unknown`.
+    pub dominance_proved: bool,
+}
+
+impl ScalarReplacementInfo {
+    /// The value `load` reads, or [`LoadResolution::Unknown`] if this candidate
+    /// does not describe that load at all.
+    ///
+    /// Fails closed on an unknown node: a caller that asks about a load this
+    /// object never owned gets `Unknown`, not a plausible-looking wrong value.
+    pub fn load_value(&self, load: NodeId) -> LoadResolution {
+        self.load_values
+            .iter()
+            .find(|&&(l, _)| l == load)
+            .map(|&(_, r)| r)
+            .unwrap_or(LoadResolution::Unknown)
+    }
 }
 
 // ── Analysis result ─────────────────────────────────────────────────────
 
+/// An allocation that escapes, but only on cold paths.
+#[derive(Debug, Clone)]
+pub struct PartialEscapeInfo {
+    /// The allocation node.
+    pub alloc_node: NodeId,
+    /// The state the fixed point computed, before the cold-path refinement.
+    /// This is the state every *acting* consumer still sees, because the
+    /// refinement never enters the connection graph.
+    pub without_refinement: EscapeState,
+    /// The cold nodes at which the object becomes visible outside the frame.
+    /// A partial-escape applier must materialize the object on the heap before
+    /// each of these, with the field values that hold at that point.
+    pub escape_sites: Vec<NodeId>,
+}
+
 /// Full result of escape analysis on a graph.
 pub struct EscapeAnalysisResult {
     /// Escape states for all allocation sites.
+    ///
+    /// May contain [`EscapeState::PartialEscape`], which the connection graph
+    /// never does — see that variant's documentation.
     pub escape_states: HashMap<NodeId, EscapeState>,
     /// Allocations that can be scalar-replaced (NoEscape).
     pub scalar_replaceable: Vec<ScalarReplacementInfo>,
     /// Allocations that can be stack-allocated (ArgEscape).
     pub stack_allocatable: Vec<NodeId>,
-    /// Synchronized blocks on non-escaping objects (lock elision candidates).
+    /// Synchronized blocks on non-escaping objects (lock elision candidates),
+    /// as a flat, ascending node list.
+    ///
+    /// **This is the flattened union of [`Self::lock_elisions`] and it is only
+    /// sound applied a whole plan at a time.** Kept in this shape because it is
+    /// what `apply_ea_to_ir` reads.
     pub elide_locks: Vec<NodeId>,
+    /// The same offers, grouped per object, which is the granularity at which
+    /// they are correct.
+    ///
+    /// # The partial-application hazard
+    ///
+    /// This module *offers* elisions; `apply_ea_to_ir` in `jit/src/lib.rs`
+    /// independently refuses individual ones — for a monitor a safepoint slot
+    /// names, one whose memory-token chain cannot be spliced, or one whose value
+    /// is still read. Each refusal drops **one node** out of a balanced monitor
+    /// sequence, and a `monitorexit` whose `monitorenter` was elided throws
+    /// `IllegalMonitorStateException`; the reverse leaks a monitor past the end
+    /// of the frame.
+    ///
+    /// A per-node list cannot express "these four go together", so this field
+    /// does. [`apply_lock_elision_plan`] applies one plan atomically, and
+    /// [`apply_lock_elision`] refuses any request that is not balance-preserving.
+    /// The consumer in `jit/src/lib.rs` still reads the flat list; the required
+    /// edit is recorded in `docs/jit/lock-elimination.md` §6.
+    pub lock_elisions: Vec<LockElisionPlan>,
+    /// Adjacent lock regions on the same confined object that may be merged.
+    ///
+    /// Independent of [`Self::lock_elisions`]: a plan deletes only its own two
+    /// monitor nodes and leaves a balanced structure whether or not any elision
+    /// landed. Apply with [`apply_lock_coarsening`], which re-verifies.
+    pub lock_coarsening: Vec<LockCoarseningPlan>,
+    /// Every lock transform this analysis refused, with the reason.
+    ///
+    /// The `NodeId` is the object, except for
+    /// [`LockRefusal::AmbiguousMonitorOperand`] where it is the monitor node
+    /// that could not be attributed. Sorted and deduplicated. Purely
+    /// informational — it exists so a fail-closed answer is *reportable* rather
+    /// than invisible.
+    pub lock_refusals: Vec<(NodeId, LockRefusal)>,
+    /// Allocations whose every escape site is cold, with those sites.
+    /// Informational: nothing acts on it yet.
+    pub partial_escapes: Vec<PartialEscapeInfo>,
+    /// `(allocation, observing node)` pairs for every **live** observation of an
+    /// object's identity: `Op::RefCompare`, `Op::IdentityHash`,
+    /// `Op::MonitorEnter`, `Op::MonitorExit`, `Op::MonitorWait`,
+    /// `Op::MonitorNotify`. Sorted and deduplicated.
+    ///
+    /// Every allocation named here is excluded from
+    /// [`Self::scalar_replaceable`], whatever its escape state. Removing the
+    /// observation (marking the node `Op::Dead` — e.g. by applying lock elision)
+    /// and re-running the analysis makes the object eligible again; that
+    /// two-phase story is the *only* supported way to scalar-replace an object
+    /// whose identity is observed.
+    pub identity_observations: Vec<(NodeId, NodeId)>,
     /// Statistics.
     pub stats: EscapeAnalysisStats,
 }
@@ -372,11 +812,29 @@ pub struct EscapeAnalysisResult {
 pub struct EscapeAnalysisStats {
     pub total_allocations: usize,
     pub no_escape: usize,
+    /// Allocations reported [`EscapeState::PartialEscape`]. These are *not*
+    /// counted in `arg_escape`/`global_escape`, so the four state counters still
+    /// sum to `total_allocations`.
+    pub partial_escape: usize,
     pub arg_escape: usize,
     pub global_escape: usize,
     pub scalar_replaced: usize,
     pub stack_allocated: usize,
+    /// Monitor nodes offered for elision (the length of `elide_locks`).
     pub locks_elided: usize,
+    /// Objects with at least one complete elision plan.
+    pub lock_objects_elided: usize,
+    /// Adjacent region pairs offered for coarsening. Each plan removes two
+    /// monitor nodes.
+    pub locks_coarsened: usize,
+    /// Lock transforms refused, for any reason. The counterpart of
+    /// `identity_blocked`: it says what failing closed on locks costs.
+    pub locks_refused: usize,
+    /// `NoEscape` allocations refused scalar replacement *only* because their
+    /// identity is observed. The measurement that says how much an
+    /// identity-observation folder (acmp on a fresh object, elided monitors)
+    /// would be worth.
+    pub identity_blocked: usize,
 }
 
 // ── Materialization (partial escape analysis) ───────────────────────────
@@ -469,8 +927,11 @@ fn build_connection_graph(graph: &Graph) -> ConnectionGraph {
                 }
             }
 
-            // Return: any ref input escapes globally.
-            Op::Return => {
+            // Return / Throw: any ref input escapes globally.  A thrown
+            // reference leaves the frame exactly as a returned one does — the
+            // handler that catches it is, from this method's point of view,
+            // outside.
+            Op::Return | Op::Throw => {
                 for &inp in &node.inputs {
                     if is_ref_producer(graph, inp) {
                         cg.set_escape(inp, EscapeState::GlobalEscape);
@@ -483,6 +944,44 @@ fn build_connection_graph(graph: &Graph) -> ConnectionGraph {
                 for &inp in &node.inputs {
                     if is_ref_producer(graph, inp) {
                         cg.set_escape(inp, EscapeState::ArgEscape);
+                    }
+                }
+            }
+
+            // UNMODELLED NODE ⇒ its reference operands escape globally.
+            //
+            // `Op::Other` is not "a node that does nothing"; it is the bridge's
+            // catch-all. `jit/src/lib.rs::ir_op_to_ea_op` funnels every
+            // `ir::Op` this module has no variant for into it, and two of those
+            // publish or republish a reference:
+            //
+            //   * `ir::Op::LambdaIntToDouble` — `MemAccess::Opaque`,
+            //     `MemEffect::OPAQUE`, a safepoint, and it *invokes the lambda
+            //     it is handed*. It is a call in everything but name.
+            //   * `ir::Op::Guard` — a deoptimization point. Taking it rebuilds
+            //     an interpreter frame from the references the frame state
+            //     names, which republishes them outside the compiled frame.
+            //
+            // Leaving these contributing nothing was fail-OPEN, and the two
+            // consumers disagreed about it. `find_scalar_replacements` walks
+            // the allocation's uses and refuses an `Op::Other` use at its
+            // catch-all arm, so scalar replacement was already safe. **Lock
+            // elision walks no uses at all** — `find_lock_elision_plans`' E2 is
+            // `cg.get_escape(object).is_confined()` — so an object handed to an
+            // unmodelled node still looked confined and had its monitors
+            // deleted, dropping a `hb` edge the JMM argument in §4 assumes
+            // cannot exist.
+            //
+            // `GlobalEscape` rather than `ArgEscape`: we do not know that the
+            // destination is a callee, and `stack_allocatable` (which collects
+            // `ArgEscape`) should not fill up with objects whose fate is simply
+            // unknown. This costs scalar replacement nothing — the use walk
+            // refused these objects already — and costs lock elision only where
+            // it was unsound.
+            Op::Other => {
+                for &inp in &node.inputs {
+                    if is_ref_producer(graph, inp) {
+                        cg.set_escape(inp, EscapeState::GlobalEscape);
                     }
                 }
             }
@@ -647,6 +1146,28 @@ fn propagate_escape_states(cg: &mut ConnectionGraph, graph: &Graph) {
                         for &a in &obj_pts {
                             holder_escape = holder_escape.join(cg.get_escape(a));
                         }
+                        // UNKNOWN DESTINATION ⇒ GLOBAL ESCAPE.
+                        //
+                        // A holder that resolves to no allocation at all is a
+                        // write to somewhere this analysis cannot name: the
+                        // classic case is `putstatic`, whose base is a class /
+                        // static-area node, but it also covers a bridge gap
+                        // (a holder that mapped to `usize::MAX`) and any
+                        // opaque reference with no points-to entry.
+                        //
+                        // `get_escape` reports an unseen node as `NoEscape`, so
+                        // before this the rule below simply did not fire and a
+                        // value written into a *static field* stayed `NoEscape`
+                        // — scalar-replaceable, lock-elidable, and reachable by
+                        // every other thread in the VM. `Op::Param` holders were
+                        // already covered (the build phase marks them
+                        // `GlobalEscape`); nothing covered the rest.
+                        //
+                        // Fail closed: an unnameable destination is the global
+                        // heap until proven otherwise.
+                        if obj_pts.is_empty() {
+                            holder_escape = holder_escape.join(EscapeState::GlobalEscape);
+                        }
 
                         if holder_escape > EscapeState::NoEscape {
                             let val_escape = cg.get_escape(val);
@@ -703,11 +1224,112 @@ fn propagate_escape_states(cg: &mut ConnectionGraph, graph: &Graph) {
     }
 }
 
-// ── Phase 3: Find scalar replacement candidates ─────────────────────────
+// ── Phase 3a: Identity observations ─────────────────────────────────────
+
+/// Every **live** observation of an object's *identity*, as
+/// `(allocation, observing node)` pairs, sorted and deduplicated.
+///
+/// # Why identity is a separate question from escape
+///
+/// Scalar replacement deletes the object's address. Three JVM operations can
+/// see that address without the object escaping anywhere:
+///
+/// * `if_acmpeq` / `if_acmpne` — reference `==`. Two scalar-replaced objects
+///   with equal fields are indistinguishable; two heap objects are not.
+/// * `System.identityHashCode` (and a non-overridden `Object.hashCode`) — a
+///   stable per-object value derived from the header, which a bag of scalars
+///   does not have.
+/// * `monitorenter` / `monitorexit` — the monitor *is* the object header.
+///
+/// An object with any of these live cannot be scalar-replaced. The
+/// qualification in the review item — *"unless the observation is itself
+/// eliminated"* — is taken literally here: the observing node must be
+/// `Op::Dead`, i.e. some pass has already removed it. Anything weaker requires
+/// this module and its consumer to agree about a *future* elimination, and the
+/// consumer (`apply_ea_to_ir` in `jit/src/lib.rs`) can and does refuse elisions
+/// this module offers — for a lock naming a safepoint slot, for one whose
+/// memory chain cannot be spliced, for one whose value is still read. A monitor
+/// that survives on a scalar-replaced object is a `monitorenter` on a deleted
+/// reference.
+///
+/// So the supported way to scalar-replace a synchronized object is two-phase:
+/// run the analysis, [`apply_lock_elision`] the monitors it offers (they become
+/// `Op::Dead`), then run the analysis **again** on the mutated graph. The
+/// second run sees no live observation and replaces the object. This costs one
+/// extra pass and, unlike the coupled version, cannot desynchronise.
+///
+/// # Producer status
+///
+/// [`Op::RefCompare`] and [`Op::IdentityHash`] have no producer yet: the bridge
+/// maps `ir::Op::Cmp` to [`Op::Other`], and an identity-hash call to
+/// [`Op::Call`]. Both currently reach [`find_scalar_replacements`]' catch-all
+/// (`Other`) or escape the object (`Call`), so the *outcome* is already
+/// fail-closed — but it is incidental, unmeasurable and would silently become
+/// wrong if `Op::Other` were ever relaxed. Wiring the two variants is the
+/// out-of-scope edit recorded in `docs/jit/escape-analysis.md`.
+pub fn find_identity_observations(cg: &ConnectionGraph, graph: &Graph) -> Vec<(NodeId, NodeId)> {
+    let mut pairs: Vec<(NodeId, NodeId)> = Vec::new();
+
+    for (id, node) in graph.nodes.iter().enumerate() {
+        // The operands whose identity this node observes. `None` = not an
+        // identity observation at all.
+        let observed: &[NodeId] = match &node.op {
+            // The monitor is the object header of input 0 — the same operand
+            // `find_lock_elisions` reads, so the two agree about which object a
+            // monitor names.  `wait`/`notify` are monitor operations too: they
+            // read the header AND require the monitor to be held.
+            Op::MonitorEnter
+            | Op::MonitorExit
+            | Op::MonitorWait
+            | Op::MonitorNotify
+            | Op::IdentityHash => match node.inputs.first() {
+                Some(first) => std::slice::from_ref(first),
+                None => continue,
+            },
+            // Both sides of an `acmp` have their addresses compared.
+            Op::RefCompare => node.inputs.as_slice(),
+            _ => continue,
+        };
+        for &operand in observed {
+            // The operand itself may be the allocation (direct use), or a copy
+            // (φ / field load) that resolves to it.
+            let mut allocs = cg.resolve_points_to(operand);
+            if matches!(
+                graph.nodes.get(operand).map(|n| &n.op),
+                Some(Op::New { .. }) | Some(Op::NewArray { .. })
+            ) {
+                allocs.insert(operand);
+            }
+            for alloc in allocs {
+                pairs.push((alloc, id));
+            }
+        }
+    }
+
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
+}
+
+// ── Phase 3b: Find scalar replacement candidates ────────────────────────
 
 /// Identify allocations that can be decomposed into scalar field values.
 fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarReplacementInfo> {
     let mut results = Vec::new();
+
+    // Program order is only dominance in a branch-free graph; see
+    // `program_order_proves_dominance`. Computed once — it is a property of the
+    // graph, not of an object.
+    let dominance_proved = program_order_proves_dominance(graph);
+    // An allocation whose address is observed by a LIVE node may not be
+    // replaced, whatever its escape state.
+    let identity_observed: HashSet<NodeId> = find_identity_observations(cg, graph)
+        .into_iter()
+        .filter(|&(_, observer)| {
+            !matches!(graph.nodes.get(observer).map(|n| &n.op), Some(Op::Dead))
+        })
+        .map(|(alloc, _)| alloc)
+        .collect();
 
     for (id, node) in graph.nodes.iter().enumerate() {
         if let Op::New {
@@ -716,6 +1338,13 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
         } = &node.op
         {
             if cg.get_escape(id) != EscapeState::NoEscape {
+                continue;
+            }
+            // IDENTITY GATE. Checked before anything else so a `synchronized`
+            // or `==`-compared object is refused whole, not per-use — an
+            // observation reached through an alias this loop does not classify
+            // as transparent would otherwise slip past the use walk below.
+            if identity_observed.contains(&id) {
                 continue;
             }
 
@@ -727,7 +1356,13 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
             // order). `add_node` assigns ids in creation = program order, so a
             // larger store-node id is a later store.
             let mut field_value_store: Vec<Option<NodeId>> = vec![None; *num_fields];
+            // POSITIONAL RECORD: every store to each field, not just the last.
+            // Sorted by node id after the walk, because the worklist pops LIFO.
+            let mut field_stores: Vec<Vec<FieldStore>> = vec![Vec::new(); *num_fields];
             let mut replaced_loads = Vec::new();
+            // Parallel to `replaced_loads`: the field each one reads, kept so
+            // the per-load resolution below does not have to re-derive it.
+            let mut load_fields: Vec<usize> = Vec::new();
             let mut eliminated_stores = Vec::new();
             let mut can_replace = true;
 
@@ -816,6 +1451,14 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                                     field_values[*field_idx] = Some(stored_val);
                                     field_value_store[*field_idx] = Some(use_id);
                                 }
+                                // …and the POSITIONAL record keeps every store,
+                                // which is what lets a load see the store that
+                                // precedes *it* rather than the last one in the
+                                // method.
+                                field_stores[*field_idx].push(FieldStore {
+                                    store: use_id,
+                                    value: stored_val,
+                                });
                             }
                             // Both stores are eliminated regardless of which
                             // value wins — the heap object is gone, so every
@@ -839,6 +1482,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                         let is_holder = holder.is_some_and(|h| transparent.contains(&h));
                         if is_holder && *field_idx < *num_fields {
                             replaced_loads.push(use_id);
+                            load_fields.push(*field_idx);
                         } else {
                             can_replace = false;
                             break;
@@ -894,9 +1538,34 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                             break;
                         }
                     }
-                    // MonitorEnter/Exit on non-escaping objects are handled
-                    // separately by lock elision -- not a problem for SR.
-                    Op::MonitorEnter | Op::MonitorExit => {}
+                    // IDENTITY OBSERVATIONS.
+                    //
+                    // Previously `MonitorEnter`/`MonitorExit` were accepted
+                    // unconditionally, on the reasoning that lock elision would
+                    // remove them anyway. That coupling does not hold: this
+                    // module *offers* an elision, and `apply_ea_to_ir`
+                    // independently REFUSES it when a safepoint slot names the
+                    // monitor, when its memory chain cannot be spliced, or when
+                    // its value is still read (the `elide_locks` loop in
+                    // `jit/src/lib.rs::apply_ea_to_ir`). Each
+                    // refusal leaves a live `monitorenter` on an object this
+                    // pass just deleted.
+                    //
+                    // The identity gate above has already rejected the object,
+                    // so reaching here means the observation is `Op::Dead`
+                    // (handled by the `Op::Dead` arm) or the gate and this walk
+                    // disagree. Refuse either way — see
+                    // `find_identity_observations` for the two-phase story that
+                    // makes a synchronized object replaceable.
+                    Op::MonitorEnter
+                    | Op::MonitorExit
+                    | Op::MonitorWait
+                    | Op::MonitorNotify
+                    | Op::RefCompare
+                    | Op::IdentityHash => {
+                        can_replace = false;
+                        break;
+                    }
                     // ArrayLength on a non-escaping object is fine -- the
                     // length is known statically. Other uses prevent SR.
                     Op::ArrayLength => {}
@@ -907,14 +1576,75 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                 }
             }
 
+            // ── SELF-REFERENCE GATE ──────────────────────────────────
+            //
+            // The use walk above only ever visits uses of the allocation itself
+            // and of the transparent φ copies it accepted. A reference to the
+            // object that is recovered by **loading it back out of its own
+            // field** is reachable through neither, so every use made through
+            // that recovered reference is invisible to this loop:
+            //
+            //     o.next = o;          // recorded as a field store, fine
+            //     Foo p = o.next;      // `p` IS `o`, but `p` is a Load node
+            //     p.x = 5;             // holder is the LOAD — never visited
+            //
+            // `can_replace` stays true, `apply_scalar_replacement` deletes the
+            // allocation, and `p.x = 5` is left writing through an `Op::Dead`
+            // reference. That is the same *class* of defect as forwarding a
+            // load to a later store: an alias the analysis never proved absent.
+            //
+            // Refuse whenever a value written into one of our fields may BE
+            // this allocation. Asking `resolve_points_to` rather than testing
+            // `value == id` also catches the φ-aliased spelling
+            // (`o.next = (c ? o : o)`), and it is order-independent — unlike
+            // the `is_value` role test in the walk above, which the `is_holder`
+            // arm wins in exactly the self-store case.
+            if can_replace {
+                'self_ref: for stores in field_stores.iter() {
+                    for fs in stores {
+                        if fs.value == id || cg.resolve_points_to(fs.value).contains(&id) {
+                            can_replace = false;
+                            break 'self_ref;
+                        }
+                    }
+                }
+            }
+
+            // ── Positional load resolution ───────────────────────────
+            //
+            // Now that every store is recorded with its position, answer each
+            // replaced load with the store that actually dominates it. A load we
+            // cannot answer refuses the WHOLE object: leaving it in the graph
+            // while eliding the allocation would make it read a deleted object,
+            // and leaving both means there was nothing to gain.
+            for stores in field_stores.iter_mut() {
+                stores.sort_unstable_by_key(|s| s.store);
+            }
+            let mut load_values: Vec<(NodeId, LoadResolution)> =
+                Vec::with_capacity(replaced_loads.len());
+            if can_replace {
+                for (&load, &field) in replaced_loads.iter().zip(load_fields.iter()) {
+                    let resolution =
+                        resolve_field_load(&field_stores[field], load, dominance_proved);
+                    if resolution == LoadResolution::Unknown {
+                        can_replace = false;
+                        break;
+                    }
+                    load_values.push((load, resolution));
+                }
+            }
+
             if can_replace {
                 results.push(ScalarReplacementInfo {
                     alloc_node: id,
                     class_id: *class_id,
                     num_fields: *num_fields,
                     field_values,
+                    field_stores,
                     replaced_loads,
+                    load_values,
                     eliminated_stores,
+                    dominance_proved,
                 });
             }
         }
@@ -923,35 +1653,797 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
     results
 }
 
-// ── Phase 4: Find lock elision candidates ───────────────────────────────
+/// Resolve one field load against the field's positional store record.
+///
+/// `stores` must be sorted ascending by [`FieldStore::store`].
+/// `dominance_proved` is [`program_order_proves_dominance`] for the graph.
+///
+/// The three answers, and why each is sound:
+///
+/// * **no store to this field anywhere** ⇒ [`LoadResolution::ZeroDefault`].
+///   Sound *regardless of control flow*: if nothing in the method writes the
+///   field, every read of it sees the allocation's zero-initialised value on
+///   every path. This is the one case that survives a branchy graph.
+/// * **program order is dominance, and some store precedes the load** ⇒ the
+///   value of the latest such store. In a branch-free graph "precedes" is
+///   "executed before", and the latest one is the one still in the field.
+/// * **program order is dominance, and no store precedes the load** ⇒
+///   `ZeroDefault`. This is the load-before-store case
+///   (`Foo o = new Foo(); int a = o.x; o.x = 42;`): the later store is in the
+///   load's *future* and must not be forwarded to it. Answering `42` here was
+///   the miscompilation.
+///
+/// Everything else — a field with stores in a graph whose control flow we
+/// cannot see — is [`LoadResolution::Unknown`].
+fn resolve_field_load(
+    stores: &[FieldStore],
+    load: NodeId,
+    dominance_proved: bool,
+) -> LoadResolution {
+    if stores.is_empty() {
+        return LoadResolution::ZeroDefault;
+    }
+    if !dominance_proved {
+        return LoadResolution::Unknown;
+    }
+    match stores.iter().rev().find(|s| s.store < load) {
+        Some(s) => LoadResolution::Value(s.value),
+        None => LoadResolution::ZeroDefault,
+    }
+}
 
-/// Identify MonitorEnter/MonitorExit nodes on non-escaping objects.
-fn find_lock_elisions(cg: &ConnectionGraph, graph: &Graph) -> Vec<NodeId> {
-    let mut elide = Vec::new();
+// ── Phase 4: Lock elimination and coarsening ────────────────────────────
+//
+// Two transforms live here. They are independent: neither reads the other's
+// result, and applying one does not make the other unsound.
+//
+// ════════════════════════════════════════════════════════════════════════
+// (a) LOCK ELISION — delete every monitor operation on a confined object
+// ════════════════════════════════════════════════════════════════════════
+//
+// Preconditions, all of which must hold (`find_lock_elision_plans`):
+//
+//   E1. Every live monitor-family node in the WHOLE graph is attributable —
+//       `monitor_object` resolves its operand to exactly one allocation
+//       through φ copies only. One unattributable monitor refuses every lock
+//       plan in the method; see the note on [`LockRefusal::AmbiguousMonitorOperand`].
+//   E2. The object is [`EscapeState::NoEscape`] (`is_confined`).
+//   E3. No live `Object.wait`/`notify`/`notifyAll` names the object.
+//   E4. The offer names EVERY monitor on the object, and it is ALL-OR-NOTHING.
+//
+// # JMM argument
+//
+// JLS 17.4.4 gives a *lock action* on monitor m a synchronizes-with edge to
+// the *unlock action* on m that immediately precedes it in the synchronization
+// order. The edge is only observable when the two actions belong to different
+// threads: two synchronization actions of the *same* thread are already
+// ordered by program order, and `hb` is transitively closed over program
+// order, so an intra-thread lock/unlock pair on m contributes no `hb` edge
+// that program order did not already contribute.
+//
+// E2 proves no reference to the object is reachable from any other thread for
+// the object's whole lifetime, so no other thread can ever execute a
+// synchronization action on m. Every action on m is therefore this thread's,
+// and deleting all of them deletes no `hb` edge that constrains any legal
+// execution. This is the JSR-133 "synchronization on a thread-local object is
+// a no-op" argument; it is why the transform removes the implied fences too.
+//
+// E4 is what keeps the *lock state* consistent rather than the memory model:
+// removing a strict subset of a balanced monitor sequence leaves a
+// `monitorexit` with no matching `monitorenter` (immediate
+// `IllegalMonitorStateException`) or the reverse (a monitor held past the end
+// of the frame). This is exactly the hazard the partial-application note
+// below is about.
+//
+// E3 is separate from the memory model: `wait` is the one monitor operation
+// whose *semantics* — not just its ordering — depend on the monitor being
+// held. It throws `IllegalMonitorStateException` when it is not, releases the
+// monitor to its recorded reentry depth, and reacquires at that depth on
+// wake. None of that survives elision, and none of it is expressible once the
+// monitor is gone.
+//
+// ════════════════════════════════════════════════════════════════════════
+// (b) LOCK COARSENING — merge two adjacent regions on the same object
+// ════════════════════════════════════════════════════════════════════════
+//
+//     monitorenter o;  A  monitorexit o;   B   monitorenter o;  C  monitorexit o
+//  ⇒  monitorenter o;  A                   B                    C  monitorexit o
+//
+// It deletes exactly two nodes — the inner `monitorexit`/`monitorenter` pair —
+// and moves the gap `B` inside the critical section.
+//
+// Preconditions (`find_lock_coarsening_plans`):
+//
+//   C1. E1 (attributability) and E2 (confined) and E3 (no wait/notify).
+//   C2. [`program_order_proves_dominance`] — without it "adjacent" and
+//       "between" have no meaning in this graph, which has no CFG.
+//   C3. The object's monitor sequence is balanced and properly nested, and the
+//       two regions are both OUTERMOST (`depth == 0`).
+//   C4. Every node strictly between `first.exit` and `second.enter` is on the
+//       gap allowlist (`gap_node_refusal`): pure arithmetic, constants,
+//       single-input φ copies, and field accesses on confined allocations of
+//       this graph. Nothing else.
+//
+// # JMM argument
+//
+// Coarsening only ever *adds* synchronization: the gap `B` acquires an
+// enclosing lock region it did not have. Adding a lock region can only add
+// `hb` edges, and adding `hb` edges can only *remove* legal executions — every
+// execution of the coarsened program is an execution of the original. So no
+// new observable behaviour is introduced by the memory model itself.
+//
+// The two things adding synchronization *can* break are not memory-model
+// facts, and each is closed by a precondition:
+//
+//   * **Liveness.** Extending a critical section can starve or deadlock a
+//     thread that wanted the monitor during the gap. C1/E2 make that
+//     impossible: no other thread can reach the object, so no thread can ever
+//     block on m.
+//   * **Observing the unlocked state.** The JVM offers exactly three ways to
+//     see that m is free: `wait`/`notify` on m (refused by E3),
+//     `Thread.holdsLock(m)` (an `Op::Call` — not on the C4 allowlist), and
+//     another lock/unlock of m (a monitor op — not on the C4 allowlist).
+//
+// The removed `monitorexit; monitorenter` pair is itself a release/acquire
+// pair on m, and by the elision argument above it pairs with nothing.
+//
+// ## Exceptions
+//
+// The requirement is *exact* unlock-on-throw behaviour, and the proof is by
+// exclusion rather than by reasoning about unwinding: C4's allowlist admits no
+// node that can raise a throwable. `Op::Call`, `Op::New`, `Op::NewArray`,
+// `Op::ArrayLength`, `Op::Throw` and `Op::Other` are all refused, and the only
+// memory accesses admitted are on allocations of this graph, which are
+// non-null by construction and so cannot raise `NullPointerException`. A gap
+// that cannot throw cannot unwind a monitor, so the unwind behaviour of the
+// coarsened program is trivially identical to the original's.
+//
+// This is deliberately stronger than the reasoning a `finally`-based argument
+// would need. It has to be: `ir::IrBuilder::build` does not compile handler
+// bodies at all (the "STUB-S8" skip), an exception makes the compiled body
+// return the `i64::MIN` sentinel, and whether the sentinel path unwinds a
+// monitor the *compiled* frame holds is a runtime property this module cannot
+// prove. Refusing to coarsen across anything that can throw means we never
+// have to.
+//
+// ## Deopt relocking
+//
+// If a deopt lands in the gap, the interpreter frame must be reconstructed
+// with the monitor set the *original* program held there — which does NOT
+// include m, because the original had already run `first.exit`. The coarsened
+// compiled frame DOES hold m. `deopt::MonitorInfo { object, lock_depth }` can
+// describe holding m, but the reconstruction would still be wrong: the
+// interpreter resumes at a gap bci and goes on to execute the original
+// `second.enter`, reaching depth 2 with only one `monitorexit` left to run, so
+// m is never fully released.
+//
+// That reconstruction is not merely unproven, it is provably wrong, so
+// coarsening **refuses** rather than tries to repair it: `Op::Safepoint` is not
+// on the C4 allowlist ([`LockRefusal::SafepointInGap`]). Safepoints *inside*
+// either region are unaffected — the monitor set there is identical before and
+// after, because coarsening changes the held-monitor set only in the gap.
+
+/// One properly-nested `monitorenter`/`monitorexit` pair on a single object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockRegion {
+    /// The `Op::MonitorEnter` node.
+    pub enter: NodeId,
+    /// The `Op::MonitorExit` node that matches it.
+    pub exit: NodeId,
+    /// Reentry depth of `enter`: `0` for an outermost region on this object,
+    /// `1` for the first recursive re-entry inside it, and so on.
+    pub depth: u32,
+}
+
+/// Why a lock transform was refused.
+///
+/// Recorded rather than dropped so a refusal is *reportable*: the whole point
+/// of this module's identity machinery is that a fail-closed answer should be
+/// intentional and measurable rather than incidental.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LockRefusal {
+    /// A live monitor-family node's operand is `OperandOrigin::Unknown` — it
+    /// neither provably names one allocation of this graph nor provably names
+    /// something outside it.
+    ///
+    /// This refuses **every** lock plan in the graph, not just one object's.
+    /// An unattributable monitor locks *something* at run time; if that
+    /// something is an object whose other monitors we did elide, the elision
+    /// leaves an unbalanced sequence. There is no way to tell which object it
+    /// is, so no object is safe. The accompanying `NodeId` is the offending
+    /// **monitor node**, not an object — the one case where it is not an
+    /// allocation.
+    ///
+    /// A monitor on a *caller-supplied* reference (`Op::Param`, or a φ of
+    /// them) is NOT this: it provably locks something no allocation of this
+    /// frame can be, so `synchronized (local) {} … this.wait();` still
+    /// optimises the local.
+    AmbiguousMonitorOperand,
+    /// The object may be reachable from another thread (`may_escape`).
+    ObjectEscapes,
+    /// `Object.wait`/`notify`/`notifyAll` is performed on this monitor. The
+    /// monitor must actually be held for those to work at all.
+    WaitOrNotify,
+    /// The object's monitor operations are not a balanced, properly-nested
+    /// sequence in program order.
+    UnbalancedMonitors,
+    /// Program order is not a sound stand-in for execution order in this graph
+    /// ([`program_order_proves_dominance`]), so "adjacent regions" and
+    /// "between two regions" are not answerable.
+    NoDominanceProof,
+    /// A node between two regions can raise a throwable, so coarsening cannot
+    /// be shown to preserve unlock-on-throw behaviour.
+    MayThrowInGap,
+    /// A safepoint / deopt point lies between two regions. The reconstructed
+    /// interpreter frame would disagree with the compiled frame about whether
+    /// the monitor is held.
+    SafepointInGap,
+    /// A node between two regions can observe the unlocked state, or is an
+    /// access this analysis cannot prove is confined and non-faulting.
+    ObservableGap,
+}
+
+/// A complete, **all-or-nothing** lock-elision offer for one object.
+///
+/// [`EscapeAnalysisResult::elide_locks`] is the flattened union of these
+/// plans, kept for the existing consumer. **The flat list is only sound when
+/// applied a whole plan at a time** — see the partial-application note on
+/// [`EscapeAnalysisResult::lock_elisions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockElisionPlan {
+    /// The allocation whose monitor is elided.
+    pub object: NodeId,
+    /// EVERY live `Op::MonitorEnter`/`Op::MonitorExit` naming `object`,
+    /// ascending by node id. Applying a strict subset is unsound.
+    pub monitors: Vec<NodeId>,
+}
+
+/// Merging two adjacent outermost lock regions on one object.
+///
+/// Applying it deletes [`Self::removed_exit`] and [`Self::removed_enter`] and
+/// nothing else, which is why it is safe under partial application of *lock
+/// elision*: the surviving structure is a single balanced region either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockCoarseningPlan {
+    /// The allocation being locked.
+    pub object: NodeId,
+    /// The earlier region. Its `enter` survives.
+    pub first: LockRegion,
+    /// The later region. Its `exit` survives.
+    pub second: LockRegion,
+}
+
+impl LockCoarseningPlan {
+    /// The `monitorexit` this plan deletes.
+    pub fn removed_exit(&self) -> NodeId {
+        self.first.exit
+    }
+
+    /// The `monitorenter` this plan deletes.
+    pub fn removed_enter(&self) -> NodeId {
+        self.second.enter
+    }
+
+    /// The `monitorenter` that becomes the merged region's entry.
+    pub fn surviving_enter(&self) -> NodeId {
+        self.first.enter
+    }
+
+    /// The `monitorexit` that becomes the merged region's exit.
+    pub fn surviving_exit(&self) -> NodeId {
+        self.second.exit
+    }
+}
+
+/// True for the four monitor operations. `wait`/`notify` are monitor
+/// operations: they read the header and require the monitor to be held.
+fn is_monitor_family(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::MonitorEnter | Op::MonitorExit | Op::MonitorWait | Op::MonitorNotify
+    )
+}
+
+/// True when `op` provably produces no reference value at all, so a φ input of
+/// this shape cannot carry an object.
+///
+/// The complement — `New`, `NewArray`, `Phi`, `Load`, `Param`, `Call` and
+/// **`Other`** — is what `ref_operand_origin` has to account for. `Op::Other`
+/// is deliberately on the *may be a reference* side even though
+/// [`is_ref_producer`] excludes it: that heuristic is allowed to be optimistic
+/// because its consumers only ever *add* escape, whereas here an unexamined φ
+/// input is the difference between eliding this object's monitor and eliding a
+/// monitor some other thread contends on.
+fn produces_no_reference(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Start
+            | Op::Return
+            | Op::If
+            | Op::Merge
+            | Op::Const(_)
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Store(_)
+            | Op::MonitorEnter
+            | Op::MonitorExit
+            | Op::MonitorWait
+            | Op::MonitorNotify
+            | Op::Safepoint
+            | Op::Throw
+            | Op::ArrayLength
+            | Op::RefCompare
+            | Op::IdentityHash
+            | Op::Dead
+    )
+}
+
+/// What a reference operand provably names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperandOrigin {
+    /// Provably this allocation of this graph, on every path.
+    Allocation(NodeId),
+    /// Provably **not** any allocation of this graph: every path supplies a
+    /// caller-provided reference (`Op::Param`), and an allocation this frame
+    /// never published is by definition unreachable from the caller.
+    ///
+    /// This distinction is what keeps `synchronized (local) {} … this.wait();`
+    /// optimisable: the `wait` names a reference that cannot be `local`.
+    Foreign,
+    /// Anything else. Not "some other object" — *unknown*.
+    Unknown,
+}
+
+/// What a *reference operand* provably names.
+///
+/// "Provably" is deliberately narrow: the walk follows [`Op::Phi`] copies and
+/// stops at an allocation or a parameter. A `Call` result, a field `Load`, an
+/// `Op::Other` or a φ mixing the two leaf kinds all answer
+/// `OperandOrigin::Unknown`.
+///
+/// # Why not `ConnectionGraph::resolve_points_to`
+///
+/// Because a singleton points-to set is *not* a proof of provenance, and this
+/// is the same trap `find_scalar_replacements` documents at its φ arm: a
+/// reference input with unknown provenance (a `Param`, a `Call` result, a
+/// field `Load`) contributes **no** entry to the points-to set, so a φ merging
+/// this allocation with such an input still resolves to the singleton
+/// `{alloc}` while genuinely carrying the other object on one path.
+///
+/// For a lock that is a fatal difference. `monitorenter` on such a φ would be
+/// attributed to the confined allocation and elided, while at run time it
+/// locks the *other* — escaping — object, and its matching `monitorexit`
+/// disappears with it. This walk cannot make that mistake: an input it cannot
+/// name is an immediate `Unknown`.
+fn ref_operand_origin(graph: &Graph, operand: NodeId) -> OperandOrigin {
+    let mut work = vec![operand];
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    let mut alloc: Option<NodeId> = None;
+    let mut saw_param = false;
+
+    while let Some(n) = work.pop() {
+        if !seen.insert(n) {
+            continue;
+        }
+        let node = match graph.nodes.get(n) {
+            Some(node) => node,
+            None => return OperandOrigin::Unknown,
+        };
+        match &node.op {
+            Op::New { .. } | Op::NewArray { .. } => match alloc {
+                None => alloc = Some(n),
+                // Two *different* allocations reach this operand: it does not
+                // name one object, so it names none we can act on.
+                Some(l) if l != n => return OperandOrigin::Unknown,
+                Some(_) => {}
+            },
+            Op::Param(_) => saw_param = true,
+            Op::Phi => {
+                let mut any_ref = false;
+                for &inp in &node.inputs {
+                    let inp_op = match graph.nodes.get(inp) {
+                        Some(x) => &x.op,
+                        None => return OperandOrigin::Unknown,
+                    };
+                    // Only a *provably* value-less input may be skipped — the
+                    // Merge control edge, a primitive. Everything else is
+                    // walked, and the walk answers `Unknown` for anything it
+                    // cannot name.
+                    if produces_no_reference(inp_op) {
+                        continue;
+                    }
+                    any_ref = true;
+                    work.push(inp);
+                }
+                // A φ with no reference input cannot be a reference at all;
+                // treat the operand as unnameable rather than assume.
+                if !any_ref {
+                    return OperandOrigin::Unknown;
+                }
+            }
+            _ => return OperandOrigin::Unknown,
+        }
+    }
+
+    match (alloc, saw_param) {
+        // A φ that merges a local allocation with a parameter is neither: on
+        // one path it IS the allocation, so it cannot be dismissed as foreign,
+        // and on the other it is not, so it cannot be attributed.
+        (Some(_), true) => OperandOrigin::Unknown,
+        (Some(a), false) => OperandOrigin::Allocation(a),
+        (None, true) => OperandOrigin::Foreign,
+        (None, false) => OperandOrigin::Unknown,
+    }
+}
+
+/// The allocation a reference operand provably names, or `None`.
+fn ref_operand_allocation(graph: &Graph, operand: NodeId) -> Option<NodeId> {
+    match ref_operand_origin(graph, operand) {
+        OperandOrigin::Allocation(a) => Some(a),
+        _ => None,
+    }
+}
+
+/// The allocation whose monitor `monitor` operates on, or `None` when the
+/// operand is foreign or its provenance cannot be proved.
+///
+/// A `None` on an *unknown* operand is not a local refusal — see
+/// [`LockRefusal::AmbiguousMonitorOperand`]. A `None` on a *foreign* operand
+/// is simply "not one of ours", and is harmless.
+pub fn monitor_object(graph: &Graph, monitor: NodeId) -> Option<NodeId> {
+    let node = graph.nodes.get(monitor)?;
+    if !is_monitor_family(&node.op) {
+        return None;
+    }
+    ref_operand_allocation(graph, *node.inputs.first()?)
+}
+
+/// Every live monitor-family node in the graph, ascending.
+fn live_monitor_nodes(graph: &Graph) -> Vec<NodeId> {
+    graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| is_monitor_family(&n.op))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// The monitor nodes whose object is `OperandOrigin::Unknown`.
+///
+/// Non-empty means **no** lock transform may be applied anywhere in the
+/// method; see [`LockRefusal::AmbiguousMonitorOperand`]. A monitor on a
+/// *foreign* reference is not listed — it provably locks something no
+/// transform here touches.
+fn unattributable_monitors(graph: &Graph) -> Vec<NodeId> {
+    live_monitor_nodes(graph)
+        .into_iter()
+        .filter(|&m| {
+            graph.nodes[m]
+                .inputs
+                .first()
+                .map_or(true, |&operand| {
+                    ref_operand_origin(graph, operand) == OperandOrigin::Unknown
+                })
+        })
+        .collect()
+}
+
+/// True when a live `Object.wait`/`notify`/`notifyAll` names `object`.
+///
+/// Exact rather than conservative, because it is only ever called after the
+/// `unattributable_monitors` guard has already rejected the graph if any
+/// monitor-family operand was `OperandOrigin::Unknown`. What is left is
+/// provably this allocation or provably foreign.
+fn waits_or_notifies_on(graph: &Graph, object: NodeId) -> bool {
+    graph.nodes.iter().enumerate().any(|(id, n)| {
+        matches!(n.op, Op::MonitorWait | Op::MonitorNotify)
+            && monitor_object(graph, id) == Some(object)
+    })
+}
+
+/// The `monitorenter`/`monitorexit` regions of `object`, in program order.
+///
+/// `Err` is the fail-closed answer and carries the reason. Pairing enters with
+/// exits is only meaningful when program order is execution order, so this
+/// requires [`program_order_proves_dominance`] — unlike *elision*, which
+/// removes every monitor on the object and therefore needs no ordering at all.
+pub fn lock_regions(graph: &Graph, object: NodeId) -> Result<Vec<LockRegion>, LockRefusal> {
+    if !program_order_proves_dominance(graph) {
+        return Err(LockRefusal::NoDominanceProof);
+    }
+
+    let mut open: Vec<(NodeId, u32)> = Vec::new();
+    let mut regions: Vec<LockRegion> = Vec::new();
 
     for (id, node) in graph.nodes.iter().enumerate() {
-        if matches!(node.op, Op::MonitorEnter | Op::MonitorExit) {
-            if let Some(&obj) = node.inputs.first() {
-                let pts = cg.resolve_points_to(obj);
-                let all_no_escape = if pts.is_empty() {
-                    cg.get_escape(obj) == EscapeState::NoEscape
-                } else {
-                    pts.iter()
-                        .all(|&a| cg.get_escape(a) == EscapeState::NoEscape)
-                };
-                if all_no_escape {
-                    elide.push(id);
+        if !matches!(node.op, Op::MonitorEnter | Op::MonitorExit) {
+            continue;
+        }
+        if monitor_object(graph, id) != Some(object) {
+            continue;
+        }
+        match node.op {
+            Op::MonitorEnter => {
+                let depth = open.len() as u32;
+                open.push((id, depth));
+            }
+            Op::MonitorExit => match open.pop() {
+                Some((enter, depth)) => regions.push(LockRegion {
+                    enter,
+                    exit: id,
+                    depth,
+                }),
+                // An exit with no matching enter: the sequence is not a
+                // sequence we understand.
+                None => return Err(LockRefusal::UnbalancedMonitors),
+            },
+            _ => unreachable!("filtered above"),
+        }
+    }
+
+    if !open.is_empty() {
+        return Err(LockRefusal::UnbalancedMonitors);
+    }
+
+    regions.sort_unstable_by_key(|r| r.enter);
+    Ok(regions)
+}
+
+/// Whether `id` may appear in a coarsening gap, and why not if it may not.
+///
+/// The allowlist is the whole safety argument for (b); see the section comment
+/// above. It is an **allowlist**, not a denylist: an op nobody has thought
+/// about is refused, and adding an `Op` variant without an arm here is a
+/// compile error rather than a silent admission.
+fn gap_node_refusal(cg: &ConnectionGraph, graph: &Graph, id: NodeId) -> Option<LockRefusal> {
+    let node = match graph.nodes.get(id) {
+        Some(n) => n,
+        None => return Some(LockRefusal::ObservableGap),
+    };
+    match &node.op {
+        // Removed by an earlier pass: observes nothing, runs nothing.
+        Op::Dead => None,
+        // Pure, total, no safepoint, no throw.
+        Op::Start | Op::Const(_) | Op::Param(_) | Op::Add | Op::Sub | Op::Mul => None,
+        // A single-input φ is a degenerate copy. A multi-input φ cannot occur
+        // (C2 already required `program_order_proves_dominance`), but if one
+        // does, it is a join and the gap is not a straight line.
+        Op::Phi => {
+            if node.inputs.len() <= 1 {
+                None
+            } else {
+                Some(LockRefusal::ObservableGap)
+            }
+        }
+        // Field access. Admitted only when the holder is provably an
+        // allocation of THIS graph that does not escape:
+        //   * non-null by construction, so it cannot raise NPE — which is what
+        //     makes the "the gap cannot throw" claim hold;
+        //   * confined, so no other thread can observe the access and no
+        //     other thread's view of the gap changes.
+        // A holder that is a Param, a call result or an unresolvable reference
+        // fails both halves and is refused.
+        Op::Load(_) | Op::Store(_) => {
+            let holder = match node.op {
+                Op::Load(_) => load_holder(node),
+                _ => store_holder(node),
+            };
+            match holder.and_then(|h| ref_operand_allocation(graph, h)) {
+                Some(a)
+                    if matches!(graph.nodes.get(a).map(|n| &n.op), Some(Op::New { .. }))
+                        && cg.get_escape(a).is_confined() =>
+                {
+                    None
                 }
+                _ => Some(LockRefusal::ObservableGap),
+            }
+        }
+        // A deopt point whose recorded monitor set would be wrong.
+        Op::Safepoint => Some(LockRefusal::SafepointInGap),
+        // Can raise a throwable, and (for Call/New/NewArray) is a safepoint.
+        Op::Call | Op::New { .. } | Op::NewArray { .. } | Op::ArrayLength | Op::Throw => {
+            Some(LockRefusal::MayThrowInGap)
+        }
+        // Observes the lock state or the object's identity.
+        Op::MonitorEnter
+        | Op::MonitorExit
+        | Op::MonitorWait
+        | Op::MonitorNotify
+        | Op::RefCompare
+        | Op::IdentityHash => Some(LockRefusal::ObservableGap),
+        // Control flow inside the gap contradicts the dominance proof, and
+        // `Op::Other` is by definition unmodelled.
+        Op::If | Op::Merge | Op::Return | Op::Other => Some(LockRefusal::ObservableGap),
+    }
+}
+
+/// Lock-elision offers, one per object, plus the refusals.
+///
+/// Sound on its own terms: no other thread can reach a `NoEscape` object, so
+/// every action on its monitor is this thread's and the whole balanced set is
+/// a no-op. See the section comment above for the JMM argument.
+///
+/// **This offer does not license scalar replacement of the locked object.** A
+/// live monitor is an identity observation, and the consumer may refuse the
+/// elision for reasons this module cannot see (`apply_ea_to_ir` refuses one
+/// whose safepoint slot or memory chain it cannot repair). The object is
+/// therefore excluded from `scalar_replaceable` while the monitor is live —
+/// see [`find_identity_observations`].
+fn find_lock_elision_plans(
+    cg: &ConnectionGraph,
+    graph: &Graph,
+) -> (Vec<LockElisionPlan>, Vec<(NodeId, LockRefusal)>) {
+    let mut refusals: Vec<(NodeId, LockRefusal)> = Vec::new();
+
+    // E1, and it is global. One monitor we cannot attribute poisons the whole
+    // method: eliding any object's monitors could leave that one unbalanced,
+    // and we cannot tell which object it locks.
+    let unattributable = unattributable_monitors(graph);
+    if !unattributable.is_empty() {
+        for m in unattributable {
+            refusals.push((m, LockRefusal::AmbiguousMonitorOperand));
+        }
+        return (Vec::new(), refusals);
+    }
+
+    // Group the attributable enter/exit nodes by object, ascending.
+    let mut by_object: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for m in live_monitor_nodes(graph) {
+        if !matches!(graph.nodes[m].op, Op::MonitorEnter | Op::MonitorExit) {
+            continue;
+        }
+        if let Some(obj) = monitor_object(graph, m) {
+            by_object.entry(obj).or_default().push(m);
+        }
+    }
+
+    let mut objects: Vec<NodeId> = by_object.keys().copied().collect();
+    objects.sort_unstable();
+
+    let mut plans = Vec::new();
+    for object in objects {
+        let mut monitors = by_object.remove(&object).unwrap_or_default();
+        monitors.sort_unstable();
+
+        // E2.
+        if cg.get_escape(object).may_escape() {
+            refusals.push((object, LockRefusal::ObjectEscapes));
+            continue;
+        }
+        // E3.
+        if waits_or_notifies_on(graph, object) {
+            refusals.push((object, LockRefusal::WaitOrNotify));
+            continue;
+        }
+        // E4 is structural: `monitors` is every enter/exit on the object, and
+        // `LockElisionPlan` is documented all-or-nothing. Removing *all* of a
+        // balanced sequence is balance-preserving on every path, which is why
+        // elision — unlike coarsening — needs no ordering proof.
+        plans.push(LockElisionPlan { object, monitors });
+    }
+
+    (plans, refusals)
+}
+
+/// Backwards-compatible flat view of `find_lock_elision_plans`: every monitor
+/// node of every complete plan, ascending.
+///
+/// Kept because it is the shape [`EscapeAnalysisResult::elide_locks`] has and
+/// the shape `apply_ea_to_ir` reads. It loses the grouping, and the grouping is
+/// load-bearing — see [`EscapeAnalysisResult::lock_elisions`].
+pub fn find_lock_elisions(cg: &ConnectionGraph, graph: &Graph) -> Vec<NodeId> {
+    let (plans, _) = find_lock_elision_plans(cg, graph);
+    let mut nodes: Vec<NodeId> = plans.into_iter().flat_map(|p| p.monitors).collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    nodes
+}
+
+/// Lock-coarsening offers, plus the refusals.
+///
+/// Each plan merges two *adjacent outermost* regions on the same object by
+/// deleting the inner `monitorexit`/`monitorenter` pair. See the section
+/// comment above for the JMM, exception and deopt arguments.
+///
+/// # Independence from lock elision
+///
+/// A plan names only its own two victims and is correct whether or not any
+/// elision was applied — which is the answer to the partial-application
+/// hazard: coarsening depends on no elision landing.
+///
+/// [`apply_lock_coarsening`] re-verifies its four nodes before mutating, so
+/// applying any subset of the offered plans, in any order, leaves a balanced
+/// monitor structure. Chained plans (three adjacent regions ⇒ two plans) share
+/// a region, so the second one applied is *refused* rather than compounded;
+/// re-running the analysis on the mutated graph offers the now-adjacent pair,
+/// the same iterate-to-fixpoint story `find_identity_observations` documents
+/// for synchronized objects.
+fn find_lock_coarsening_plans(
+    cg: &ConnectionGraph,
+    graph: &Graph,
+) -> (Vec<LockCoarseningPlan>, Vec<(NodeId, LockRefusal)>) {
+    let mut refusals: Vec<(NodeId, LockRefusal)> = Vec::new();
+
+    // C1 (attributability), global for the same reason as in elision: an
+    // unattributable monitor could be an inner region on the object we are
+    // about to coarsen, and then "adjacent" is a lie.
+    let unattributable = unattributable_monitors(graph);
+    if !unattributable.is_empty() {
+        for m in unattributable {
+            refusals.push((m, LockRefusal::AmbiguousMonitorOperand));
+        }
+        return (Vec::new(), refusals);
+    }
+
+    let mut objects: Vec<NodeId> = live_monitor_nodes(graph)
+        .into_iter()
+        .filter_map(|m| monitor_object(graph, m))
+        .collect();
+    objects.sort_unstable();
+    objects.dedup();
+
+    let mut plans = Vec::new();
+    for object in objects {
+        // C1: confined.
+        if cg.get_escape(object).may_escape() {
+            refusals.push((object, LockRefusal::ObjectEscapes));
+            continue;
+        }
+        // C1: no wait/notify.
+        if waits_or_notifies_on(graph, object) {
+            refusals.push((object, LockRefusal::WaitOrNotify));
+            continue;
+        }
+        // C2 + C3.
+        let regions = match lock_regions(graph, object) {
+            Ok(r) => r,
+            Err(reason) => {
+                refusals.push((object, reason));
+                continue;
+            }
+        };
+        let outer: Vec<LockRegion> = regions.into_iter().filter(|r| r.depth == 0).collect();
+
+        // C4, pairwise over adjacent outermost regions.
+        for pair in outer.windows(2) {
+            let (first, second) = (pair[0], pair[1]);
+            let mut refusal = None;
+            for id in (first.exit + 1)..second.enter {
+                if let Some(r) = gap_node_refusal(cg, graph, id) {
+                    refusal = Some(r);
+                    break;
+                }
+            }
+            match refusal {
+                Some(r) => refusals.push((object, r)),
+                None => plans.push(LockCoarseningPlan {
+                    object,
+                    first,
+                    second,
+                }),
             }
         }
     }
 
-    elide
+    (plans, refusals)
 }
 
 // ── Partial escape analysis helpers ─────────────────────────────────────
 
 /// Check if an object escapes on only some control flow paths.
+///
+/// This is the *structural* heuristic — "some direct use escapes, some does
+/// not" — and it says nothing about how often the escaping path runs. It is
+/// kept because [`find_materialization_points`] is written against it.
+///
+/// The lattice-level answer is [`EscapeState::PartialEscape`], produced by
+/// [`analyze_escapes`] from [`Graph::cold_nodes`]. The two differ deliberately:
+/// this one is true for `new Foo(); o.x = 1; f(o);` (a local use and an
+/// escaping use) even though the object escapes on *every* execution, whereas
+/// the lattice classification requires the escape site itself to be cold. Only
+/// the latter is a basis for sinking an allocation.
 pub fn is_partial_escape(cg: &ConnectionGraph, graph: &Graph, alloc: NodeId) -> bool {
     let state = cg.get_escape(alloc);
     if state == EscapeState::NoEscape {
@@ -1052,6 +2544,75 @@ pub fn find_materialization_points(
     points
 }
 
+/// Every live node at which `alloc` becomes visible outside the allocating
+/// frame.
+///
+/// This is the *attribution* half of partial escape: [`EscapeState`] says an
+/// object escapes, this says **where**. An empty result for an escaping object
+/// means the escape could not be attributed to a site (it came from the
+/// fail-closed [`escalate_all_to_global`] path, or through an edge shape this
+/// walk does not model), and the caller must then keep the unrefined state.
+fn escape_sites_for(cg: &ConnectionGraph, graph: &Graph, alloc: NodeId) -> Vec<NodeId> {
+    let mut sites = Vec::new();
+    // Does `r` (a node used as a reference) carry `alloc`?
+    let carries = |cg: &ConnectionGraph, r: NodeId| -> bool {
+        r == alloc || cg.resolve_points_to(r).contains(&alloc)
+    };
+
+    for (id, node) in graph.nodes.iter().enumerate() {
+        match &node.op {
+            Op::Dead => {}
+            // Returning, throwing or passing the reference publishes it. So
+            // does handing it to a node this module cannot model: `Op::Other`
+            // is the bridge's catch-all, and `build_connection_graph` escapes
+            // its reference operands for the reasons recorded there. Naming the
+            // site here keeps the attribution and the lattice agreeing — an
+            // unattributed escape would otherwise look like the fail-closed
+            // `escalate_all_to_global` path.
+            Op::Return | Op::Throw | Op::Call | Op::Other => {
+                if node
+                    .inputs
+                    .iter()
+                    .any(|&inp| is_ref_producer(graph, inp) && carries(cg, inp))
+                {
+                    sites.push(id);
+                }
+            }
+            // Writing the reference into a field publishes it exactly when the
+            // holder is itself reachable from outside — the same rule the
+            // propagation uses, including "an unnameable holder is the global
+            // heap".
+            Op::Store(_) => {
+                let (obj, val) = match (store_holder(node), store_value(node)) {
+                    (Some(o), Some(v)) => (o, v),
+                    // A malformed store is an unattributable publication of its
+                    // value; propagation escalates it to GlobalEscape, so name
+                    // it as a site rather than pretend it is not one.
+                    (None, Some(v)) if carries(cg, v) => {
+                        sites.push(id);
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if !carries(cg, val) {
+                    continue;
+                }
+                let obj_pts = cg.resolve_points_to(obj);
+                let mut holder_escape = cg.get_escape(obj);
+                for &a in &obj_pts {
+                    holder_escape = holder_escape.join(cg.get_escape(a));
+                }
+                if obj_pts.is_empty() || holder_escape.may_escape() {
+                    sites.push(id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    sites
+}
+
 // ── Main entry point ────────────────────────────────────────────────────
 
 /// Run escape analysis on the IR graph.
@@ -1060,21 +2621,67 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
     propagate_escape_states(&mut cg, graph);
 
     let scalar_replaceable = find_scalar_replacements(&cg, graph);
-    let lock_elisions = find_lock_elisions(&cg, graph);
+    let (lock_elisions, mut lock_refusals) = find_lock_elision_plans(&cg, graph);
+    let (lock_coarsening, coarsening_refusals) = find_lock_coarsening_plans(&cg, graph);
+    lock_refusals.extend(coarsening_refusals);
+    lock_refusals.sort_unstable();
+    lock_refusals.dedup();
+    // The flat view the existing consumer reads. Derived from the plans rather
+    // than recomputed, so the two can never disagree about which monitors are
+    // offered.
+    let mut elide_lock_nodes: Vec<NodeId> = lock_elisions
+        .iter()
+        .flat_map(|p| p.monitors.iter().copied())
+        .collect();
+    elide_lock_nodes.sort_unstable();
+    elide_lock_nodes.dedup();
+    let identity_observations = find_identity_observations(&cg, graph);
+    // Allocations whose identity a LIVE node observes. Used only to attribute
+    // the "would have been replaced but for its identity" statistic — the
+    // refusal itself already happened inside `find_scalar_replacements`.
+    let identity_live: HashSet<NodeId> = identity_observations
+        .iter()
+        .filter(|&&(_, observer)| {
+            !matches!(graph.nodes.get(observer).map(|n| &n.op), Some(Op::Dead))
+        })
+        .map(|&(alloc, _)| alloc)
+        .collect();
 
     // Classify allocations.
     let mut stats = EscapeAnalysisStats::default();
     let mut escape_states = HashMap::new();
     let mut stack_allocatable = Vec::new();
+    let mut partial_escapes = Vec::new();
 
     for (id, node) in graph.nodes.iter().enumerate() {
         if matches!(node.op, Op::New { .. } | Op::NewArray { .. }) {
             stats.total_allocations += 1;
-            let state = cg.get_escape(id);
+            let raw = cg.get_escape(id);
+            if raw.is_confined() && identity_live.contains(&id) {
+                stats.identity_blocked += 1;
+            }
+
+            // COLD-PATH REFINEMENT (reported only — see `EscapeState`).
+            // An escaping object whose every escape site is cold is reported
+            // `PartialEscape`. Both conditions fail closed: an unattributable
+            // escape (empty site list) and any hot site keep the raw state.
+            let mut state = raw;
+            if raw.may_escape() {
+                let sites = escape_sites_for(&cg, graph, id);
+                if !sites.is_empty() && sites.iter().all(|s| graph.cold_nodes.contains(s)) {
+                    partial_escapes.push(PartialEscapeInfo {
+                        alloc_node: id,
+                        without_refinement: raw,
+                        escape_sites: sites,
+                    });
+                    state = EscapeState::PartialEscape;
+                }
+            }
             escape_states.insert(id, state);
 
             match state {
                 EscapeState::NoEscape => stats.no_escape += 1,
+                EscapeState::PartialEscape => stats.partial_escape += 1,
                 EscapeState::ArgEscape => {
                     stats.arg_escape += 1;
                     stack_allocatable.push(id);
@@ -1086,13 +2693,21 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
 
     stats.scalar_replaced = scalar_replaceable.len();
     stats.stack_allocated = stack_allocatable.len();
-    stats.locks_elided = lock_elisions.len();
+    stats.locks_elided = elide_lock_nodes.len();
+    stats.lock_objects_elided = lock_elisions.len();
+    stats.locks_coarsened = lock_coarsening.len();
+    stats.locks_refused = lock_refusals.len();
 
     EscapeAnalysisResult {
         escape_states,
         scalar_replaceable,
         stack_allocatable,
-        elide_locks: lock_elisions,
+        elide_locks: elide_lock_nodes,
+        lock_elisions,
+        lock_coarsening,
+        lock_refusals,
+        partial_escapes,
+        identity_observations,
         stats,
     }
 }
@@ -1101,28 +2716,69 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
 
 /// Apply scalar replacement: replace allocation + load/store with direct
 /// value flow.  Marks eliminated nodes as `Op::Dead`.
+///
+/// # Which value each load gets
+///
+/// [`ScalarReplacementInfo::load_values`], **not** `field_values`. This
+/// function used to forward every load of field `f` to `field_values[f]`, the
+/// value of the *last* store to `f` anywhere in the method, which is a value
+/// from the load's future whenever a store to the same field follows it. That
+/// is the `Foo o = new Foo(); int a = o.x; o.x = 42;` ⇒ `a == 42`
+/// miscompilation, in this module rather than in `apply_ea_to_ir`.
+///
+/// # All-or-nothing
+///
+/// If any load cannot be resolved the graph is left **completely untouched**.
+/// A half-applied object — allocation killed, an unanswerable load still
+/// reading it — is worse than no optimisation.
 pub fn apply_scalar_replacement(graph: &mut Graph, info: &ScalarReplacementInfo) {
-    // Replace loads with the stored field value (or a zero constant).
+    // Refuse before mutating anything. `find_scalar_replacements` already
+    // guarantees no `Unknown` survives into a reported candidate, so this is the
+    // belt-and-braces check for a hand-built or future-produced info.
+    if info
+        .replaced_loads
+        .iter()
+        .any(|&l| info.load_value(l) == LoadResolution::Unknown)
+    {
+        return;
+    }
+
+    // Replace loads with the value that load actually reads.
+    let mut zero_default: Option<NodeId> = None;
     for &load_id in &info.replaced_loads {
         if load_id >= graph.nodes.len() {
             continue;
         }
-        if let Op::Load(field_idx) = graph.nodes[load_id].op {
-            if field_idx < info.num_fields {
-                if let Some(val) = info.field_values[field_idx] {
-                    // Redirect all uses of this load to the stored value.
-                    let load_uses: Vec<NodeId> = graph.nodes[load_id].uses.clone();
-                    for &u in &load_uses {
-                        if u < graph.nodes.len() {
-                            for inp in graph.nodes[u].inputs.iter_mut() {
-                                if *inp == load_id {
-                                    *inp = val;
-                                }
-                            }
-                            graph.nodes[val].uses.push(u);
-                        }
+        // A never-written field reads the allocation's zero value; materialise
+        // ONE shared `Const(0)` for all of them.
+        let val = match info.load_value(load_id) {
+            LoadResolution::Value(v) => Some(v),
+            LoadResolution::ZeroDefault => Some(match zero_default {
+                Some(z) => z,
+                None => {
+                    let z = graph.add_node(Op::Const(0), vec![]);
+                    zero_default = Some(z);
+                    z
+                }
+            }),
+            // Unreachable: the guard above returned. Keep the load alive rather
+            // than kill it with no replacement.
+            LoadResolution::Unknown => None,
+        };
+        let val = match val {
+            Some(v) if v < graph.nodes.len() => v,
+            _ => continue,
+        };
+        // Redirect all uses of this load to that value.
+        let load_uses: Vec<NodeId> = graph.nodes[load_id].uses.clone();
+        for &u in &load_uses {
+            if u < graph.nodes.len() {
+                for inp in graph.nodes[u].inputs.iter_mut() {
+                    if *inp == load_id {
+                        *inp = val;
                     }
                 }
+                graph.nodes[val].uses.push(u);
             }
         }
         graph.nodes[load_id].op = Op::Dead;
@@ -1147,16 +2803,178 @@ pub fn apply_scalar_replacement(graph: &mut Graph, info: &ScalarReplacementInfo)
     }
 }
 
-/// Eliminate locks on non-escaping objects by marking MonitorEnter/Exit
-/// as dead.
-pub fn apply_lock_elision(graph: &mut Graph, lock_nodes: &[NodeId]) {
-    for &id in lock_nodes {
-        if id < graph.nodes.len() {
-            graph.nodes[id].op = Op::Dead;
-            graph.nodes[id].inputs.clear();
-            graph.nodes[id].uses.clear();
+/// True when `id` is a live `Op::MonitorEnter` (`want_enter`) or a live
+/// `Op::MonitorExit` (`!want_enter`).
+fn is_monitor_kind(graph: &Graph, id: NodeId, want_enter: bool) -> bool {
+    match graph.nodes.get(id).map(|n| &n.op) {
+        Some(Op::MonitorEnter) => want_enter,
+        Some(Op::MonitorExit) => !want_enter,
+        _ => false,
+    }
+}
+
+/// Kill one monitor node outright. Callers must have proved the *set* they are
+/// killing is balance-preserving; this does no checking of its own.
+fn kill_node(graph: &mut Graph, id: NodeId) {
+    if id < graph.nodes.len() {
+        graph.nodes[id].op = Op::Dead;
+        graph.nodes[id].inputs.clear();
+        graph.nodes[id].uses.clear();
+    }
+}
+
+/// Eliminate locks on non-escaping objects by marking MonitorEnter/Exit as
+/// dead — **all or nothing**.
+///
+/// # Why this validates instead of just killing
+///
+/// It used to kill whatever it was handed. A monitor sequence is only correct
+/// as a whole: dropping one `monitorenter` out of a balanced pair leaves a
+/// `monitorexit` on a monitor that was never entered
+/// (`IllegalMonitorStateException`), and dropping one `monitorexit` leaks the
+/// monitor past the end of the frame. Since the caller of record —
+/// `apply_ea_to_ir` — filters [`EscapeAnalysisResult::elide_locks`] node by
+/// node and can hand back a strict subset, "kill whatever I am given" is one
+/// consumer-side refusal away from wrong code.
+///
+/// Accepted when, **per object**, either
+///
+/// * the request removes *every* live `monitorenter`/`monitorexit` on that
+///   object — balance-preserving on every path, no ordering needed; or
+/// * [`lock_regions`] can pair the object's monitors, and every region is
+///   *wholly* in or *wholly* out of the request. This is the nested-region
+///   case: removing the inner pair of `enter o; enter o; exit o; exit o` is
+///   legal and useful. Removing `e2` and `x2` from that sequence is not — the
+///   two are not a pair, and the result would silently *narrow* the outer
+///   region rather than eliminate a level of reentry.
+///
+/// Anything else — including a monitor whose object cannot be attributed, or a
+/// request that names a node that is not a monitor — leaves the graph
+/// **completely untouched**. Returns whether the request was applied.
+///
+/// # What this does NOT check
+///
+/// Confinement. This function sees no [`ConnectionGraph`], so it validates the
+/// monitor *structure* and trusts the caller for the escape state. Its caller
+/// of record is [`apply_lock_elision_plan`], whose plans come from
+/// `find_lock_elision_plans` and are confined by construction.
+pub fn apply_lock_elision(graph: &mut Graph, lock_nodes: &[NodeId]) -> bool {
+    let mut requested: Vec<NodeId> = lock_nodes
+        .iter()
+        .copied()
+        .filter(|&id| {
+            graph
+                .nodes
+                .get(id)
+                .is_some_and(|n| matches!(n.op, Op::MonitorEnter | Op::MonitorExit))
+        })
+        .collect();
+    requested.sort_unstable();
+    requested.dedup();
+    if requested.is_empty() {
+        // Nothing live to do (a request of only dead/absent nodes is vacuous,
+        // not a violation).
+        return true;
+    }
+
+    // Group both the request and the graph's monitors by object.
+    let mut requested_by_object: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for &id in &requested {
+        match monitor_object(graph, id) {
+            Some(obj) => requested_by_object.entry(obj).or_default().push(id),
+            // Unattributable: we cannot prove anything about the sequence it
+            // belongs to. Fail closed for the whole request.
+            None => return false,
         }
     }
+
+    for (&object, removed) in requested_by_object.iter() {
+        let all: Vec<NodeId> = (0..graph.nodes.len())
+            .filter(|&id| matches!(graph.nodes[id].op, Op::MonitorEnter | Op::MonitorExit))
+            .filter(|&id| monitor_object(graph, id) == Some(object))
+            .collect();
+        let removed_set: HashSet<NodeId> = removed.iter().copied().collect();
+        if removed_set.len() == all.len() {
+            // Whole-object elision: correct without any ordering proof.
+            continue;
+        }
+        // Partial removal. Every region must go whole or stay whole.
+        let regions = match lock_regions(graph, object) {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        for region in &regions {
+            if removed_set.contains(&region.enter) != removed_set.contains(&region.exit) {
+                return false;
+            }
+        }
+    }
+
+    for id in requested {
+        kill_node(graph, id);
+    }
+    true
+}
+
+/// Apply one complete [`LockElisionPlan`] atomically.
+///
+/// The plan already names every monitor on its object, so this is the
+/// whole-object case of [`apply_lock_elision`] and cannot be partially applied
+/// by construction. Returns whether it was applied — `false` when the graph has
+/// drifted from the plan (a monitor is no longer live, or the object grew one
+/// the plan does not name).
+pub fn apply_lock_elision_plan(graph: &mut Graph, plan: &LockElisionPlan) -> bool {
+    let still_complete = (0..graph.nodes.len())
+        .filter(|&id| matches!(graph.nodes[id].op, Op::MonitorEnter | Op::MonitorExit))
+        .filter(|&id| monitor_object(graph, id) == Some(plan.object))
+        .all(|id| plan.monitors.contains(&id));
+    if !still_complete {
+        return false;
+    }
+    apply_lock_elision(graph, &plan.monitors)
+}
+
+/// Apply one [`LockCoarseningPlan`]: delete the inner `monitorexit` and
+/// `monitorenter`, merging the two regions into one.
+///
+/// # Re-verification, and why it is not paranoia
+///
+/// The plan was computed on a graph that may since have been mutated — by lock
+/// elision, by scalar replacement, or by a partially-applied version of either.
+/// Node ids are stable and killing a node clears its inputs, so "all four
+/// monitors are still live and still the right kind" is exactly the statement
+/// that the structure this plan proved still exists. If it does not, the plan
+/// is dropped whole:
+///
+/// * an elision that already removed the pair ⇒ no-op, not a double kill;
+/// * an elision that removed the *outer* enter or exit ⇒ refused, so
+///   coarsening never compounds an unbalanced sequence it did not create.
+///
+/// Returns whether it was applied.
+pub fn apply_lock_coarsening(graph: &mut Graph, plan: &LockCoarseningPlan) -> bool {
+    if !is_monitor_kind(graph, plan.surviving_enter(), true)
+        || !is_monitor_kind(graph, plan.removed_exit(), false)
+        || !is_monitor_kind(graph, plan.removed_enter(), true)
+        || !is_monitor_kind(graph, plan.surviving_exit(), false)
+    {
+        return false;
+    }
+    // All four must still name the same object, or the "same monitor" premise
+    // is gone.
+    for id in [
+        plan.surviving_enter(),
+        plan.removed_exit(),
+        plan.removed_enter(),
+        plan.surviving_exit(),
+    ] {
+        if monitor_object(graph, id) != Some(plan.object) {
+            return false;
+        }
+    }
+
+    kill_node(graph, plan.removed_exit());
+    kill_node(graph, plan.removed_enter());
+    true
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -1684,8 +3502,11 @@ mod tests {
             class_id: 1,
             num_fields: 1,
             field_values: vec![Some(c10)],
+            field_stores: vec![vec![FieldStore { store, value: c10 }]],
             replaced_loads: vec![load],
+            load_values: vec![(load, LoadResolution::Value(c10))],
             eliminated_stores: vec![store],
+            dominance_proved: true,
         };
 
         apply_scalar_replacement(&mut g, &info);
@@ -1857,8 +3678,11 @@ mod tests {
             class_id: 1,
             num_fields: 1,
             field_values: vec![Some(c42)],
+            field_stores: vec![vec![FieldStore { store, value: c42 }]],
             replaced_loads: vec![load],
+            load_values: vec![(load, LoadResolution::Value(c42))],
             eliminated_stores: vec![store],
+            dominance_proved: true,
         };
 
         apply_scalar_replacement(&mut g, &info);
@@ -2482,5 +4306,1653 @@ mod tests {
                 .all(|sr| sr.alloc_node != obj),
             "an ArgEscape allocation is not scalar-replaceable"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Positional (dominance-aware) store tracking
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // The defect these fence: `field_values` records only the LAST store per
+    // field, and forwarding every load to it hands a load a value from its own
+    // future. `apply_ea_to_ir` currently *refuses* such an object; the analysis
+    // now answers it instead.
+
+    /// THE REGRESSION TEST. `Foo o = new Foo(); int a = o.x; o.x = 42;` must
+    /// fold `a` to the zero default. Folding it to `42` was the miscompilation.
+    #[test]
+    fn load_before_store_reads_the_zero_default_not_the_later_store() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        // `int a = o.x;` — BEFORE any store.
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+        let c42 = g.add_node(Op::Const(42), vec![]);
+        // `o.x = 42;` — after the read.
+        let store = g.add_node(Op::Store(0), vec![alloc, c42]);
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("a purely local object is still replaceable");
+
+        assert_eq!(
+            sr.load_value(load),
+            LoadResolution::ZeroDefault,
+            "a load that precedes every store to its field reads the freshly \
+             allocated object's zero value"
+        );
+        assert_ne!(
+            sr.load_value(load),
+            LoadResolution::Value(c42),
+            "forwarding the load to a store in its own future is THE \
+             miscompilation this test exists for"
+        );
+        // The last-write-wins map still says 42 — which is precisely why it is
+        // the wrong forwarding source and `load_values` exists.
+        assert_eq!(sr.field_values[0], Some(c42));
+        assert_eq!(sr.field_stores[0], vec![FieldStore { store, value: c42 }]);
+    }
+
+    /// The paired POSITIVE: a load after the store reads that store.
+    #[test]
+    fn load_after_store_reads_that_store() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c42 = g.add_node(Op::Const(42), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c42]);
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("must replace");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c42));
+        assert!(sr.dominance_proved);
+    }
+
+    /// Two stores straddling two loads: each load keeps the value that was in
+    /// the field when *it* ran. A single last-write-wins slot cannot express
+    /// this at all.
+    #[test]
+    fn interleaved_stores_and_loads_each_resolve_positionally() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let s1 = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let load_a = g.add_node(Op::Load(0), vec![alloc]);
+        let c2 = g.add_node(Op::Const(2), vec![]);
+        let s2 = g.add_node(Op::Store(0), vec![alloc, c2]);
+        let load_b = g.add_node(Op::Load(0), vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("must replace");
+        assert_eq!(sr.load_value(load_a), LoadResolution::Value(c1));
+        assert_eq!(sr.load_value(load_b), LoadResolution::Value(c2));
+        assert_eq!(
+            sr.field_stores[0],
+            vec![
+                FieldStore {
+                    store: s1,
+                    value: c1
+                },
+                FieldStore {
+                    store: s2,
+                    value: c2
+                }
+            ],
+            "the positional record keeps BOTH stores, in program order"
+        );
+        assert_eq!(
+            sr.field_values[0],
+            Some(c2),
+            "the legacy last-write-wins map is unchanged for its remaining \
+             consumer (the deopt recipe builder)"
+        );
+    }
+
+    /// End-to-end through the in-module applier: the rewritten graph must give
+    /// each consumer the value its own load read.
+    #[test]
+    fn apply_scalar_replacement_forwards_each_load_to_its_own_store() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _s1 = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let load_a = g.add_node(Op::Load(0), vec![alloc]);
+        let c2 = g.add_node(Op::Const(2), vec![]);
+        let _s2 = g.add_node(Op::Store(0), vec![alloc, c2]);
+        let load_b = g.add_node(Op::Load(0), vec![alloc]);
+        // `a + b` — the consumer that would observe the wrong fold.
+        let add = g.add_node(Op::Add, vec![load_a, load_b]);
+
+        let result = analyze_escapes(&g);
+        let info = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("must replace");
+        apply_scalar_replacement(&mut g, info);
+
+        assert_eq!(
+            g.nodes[add].inputs,
+            vec![c1, c2],
+            "forwarding both loads to `field_values[0]` would make this \
+             `[c2, c2]` — i.e. `a` folded to 2"
+        );
+    }
+
+    /// An unresolvable load must leave the graph completely untouched — no
+    /// half-applied object.
+    #[test]
+    fn apply_scalar_replacement_refuses_an_unresolvable_load() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+
+        let info = ScalarReplacementInfo {
+            alloc_node: alloc,
+            class_id: 1,
+            num_fields: 1,
+            field_values: vec![Some(c1)],
+            field_stores: vec![vec![FieldStore { store, value: c1 }]],
+            replaced_loads: vec![load],
+            load_values: vec![(load, LoadResolution::Unknown)],
+            eliminated_stores: vec![store],
+            dominance_proved: false,
+        };
+        apply_scalar_replacement(&mut g, &info);
+
+        assert!(
+            matches!(g.nodes[alloc].op, Op::New { .. }),
+            "the allocation must survive an unresolvable load"
+        );
+        assert!(matches!(g.nodes[load].op, Op::Load(_)));
+        assert!(matches!(g.nodes[store].op, Op::Store(_)));
+    }
+
+    // ── The dominance gate ────────────────────────────────────────────
+
+    /// `if (c) o.x = 1; else o.x = 2; int a = o.x;` — both stores precede the
+    /// load in program order and NEITHER dominates it. Program order is not
+    /// dominance here, so the object must be refused rather than folded to the
+    /// textually-last store.
+    #[test]
+    fn a_branch_makes_program_order_stop_proving_dominance() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let cond = g.add_node(Op::Const(0), vec![]);
+        let _iff = g.add_node(Op::If, vec![cond]);
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let c2 = g.add_node(Op::Const(2), vec![]);
+        let _s1 = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let _s2 = g.add_node(Op::Store(0), vec![alloc, c2]);
+        let _load = g.add_node(Op::Load(0), vec![alloc]);
+
+        assert!(!program_order_proves_dominance(&g));
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::NoEscape),
+            "the object still does not escape — this is a VALUE question, not \
+             a reachability one"
+        );
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "a load that could read either of two conditional stores must not \
+             be folded to one of them"
+        );
+    }
+
+    /// The paired POSITIVE for the gate: a field with **no** store anywhere
+    /// resolves even in a branchy graph — no control flow can change what a
+    /// never-written field holds.
+    #[test]
+    fn a_never_stored_field_resolves_even_without_dominance() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 2,
+            },
+            vec![],
+        );
+        let cond = g.add_node(Op::Const(0), vec![]);
+        let _iff = g.add_node(Op::If, vec![cond]);
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _s0 = g.add_node(Op::Store(0), vec![alloc, c1]);
+        // Field 1 is never stored, anywhere.
+        let load = g.add_node(Op::Load(1), vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("a never-stored field is answerable with or without a CFG");
+        assert!(!sr.dominance_proved);
+        assert_eq!(sr.load_value(load), LoadResolution::ZeroDefault);
+    }
+
+    /// The three shapes that retract the dominance stand-in, and the one that
+    /// does not (a single-input φ is a copy, not a join).
+    #[test]
+    fn program_order_dominance_predicate_shapes() {
+        let mut branch = Graph::new();
+        let c = branch.add_node(Op::Const(0), vec![]);
+        branch.add_node(Op::If, vec![c]);
+        assert!(!program_order_proves_dominance(&branch));
+
+        let mut join = Graph::new();
+        join.add_node(Op::Merge, vec![]);
+        assert!(!program_order_proves_dominance(&join));
+
+        let mut merge_phi = Graph::new();
+        let a = merge_phi.add_node(Op::Const(1), vec![]);
+        let b = merge_phi.add_node(Op::Const(2), vec![]);
+        merge_phi.add_node(Op::Phi, vec![a, b]);
+        assert!(!program_order_proves_dominance(&merge_phi));
+
+        let mut copy_phi = Graph::new();
+        let a = copy_phi.add_node(Op::Const(1), vec![]);
+        copy_phi.add_node(Op::Phi, vec![a]);
+        assert!(
+            program_order_proves_dominance(&copy_phi),
+            "a single-input φ is a degenerate copy and implies no divergence"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Identity sensitivity
+    // ══════════════════════════════════════════════════════════════════
+
+    /// An object whose reference is compared with `==` has its ADDRESS
+    /// observed. It does not escape, and it still may not be replaced.
+    #[test]
+    fn object_compared_by_identity_is_not_scalar_replaced() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let other = g.add_node(Op::Param(0), vec![]);
+        let cmp = g.add_node(Op::RefCompare, vec![alloc, other]);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::NoEscape),
+            "an acmp does not publish the object — escape and identity are \
+             different questions"
+        );
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "an object with a live identity comparison must not be replaced: \
+             a bag of scalars has no address to compare"
+        );
+        assert!(result.identity_observations.contains(&(alloc, cmp)));
+        assert_eq!(result.stats.identity_blocked, 1);
+    }
+
+    /// The paired POSITIVE: the same object without the comparison replaces.
+    #[test]
+    fn object_not_compared_by_identity_is_scalar_replaced() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("must replace");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c1));
+        assert!(result.identity_observations.is_empty());
+        assert_eq!(result.stats.identity_blocked, 0);
+    }
+
+    /// An identity hash is a header read: same rule as `==`.
+    #[test]
+    fn identity_hash_blocks_scalar_replacement() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let ihash = g.add_node(Op::IdentityHash, vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::NoEscape)
+        );
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "a scalar-replaced object has no header to hash"
+        );
+        assert!(result.identity_observations.contains(&(alloc, ihash)));
+    }
+
+    /// An identity observation reached through a transparent φ still counts —
+    /// the alias is the same address.
+    #[test]
+    fn identity_observed_through_a_phi_alias_blocks_replacement() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let phi = g.add_node(Op::Phi, vec![alloc]);
+        let _cmp = g.add_node(Op::RefCompare, vec![phi]);
+
+        let result = analyze_escapes(&g);
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "the φ resolves to this allocation, so comparing the φ compares \
+             this object's address"
+        );
+    }
+
+    /// SYNCHRONIZATION is an identity observation: the monitor *is* the object
+    /// header. A live `monitorenter` blocks replacement even though the lock is
+    /// simultaneously offered for elision — because the consumer may refuse
+    /// that elision (`apply_ea_to_ir` does, for a monitor a safepoint names).
+    ///
+    /// The paired POSITIVE is in the same test: once the monitors are actually
+    /// eliminated, a second run replaces the object. That two-phase order is
+    /// the supported way to get both.
+    #[test]
+    fn synchronized_object_is_not_replaced_until_the_monitor_is_eliminated() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c7 = g.add_node(Op::Const(7), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c7]);
+        let _enter = g.add_node(Op::MonitorEnter, vec![alloc]);
+        let _exit = g.add_node(Op::MonitorExit, vec![alloc]);
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+
+        let first = analyze_escapes(&g);
+        assert_eq!(
+            first.escape_states.get(&alloc),
+            Some(&EscapeState::NoEscape),
+            "locking a local object does not make it escape"
+        );
+        assert!(
+            first
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "MUST NOT: a live monitor observes the object's identity"
+        );
+        assert_eq!(
+            first.elide_locks.len(),
+            2,
+            "the elision is still OFFERED — it is sound on its own terms"
+        );
+        assert_eq!(first.stats.identity_blocked, 1);
+
+        // Phase two: actually eliminate the observation, then re-analyse.
+        apply_lock_elision(&mut g, &first.elide_locks);
+        let second = analyze_escapes(&g);
+        let sr = second
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("MUST: with the monitors dead, nothing observes the identity");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c7));
+        assert_eq!(second.stats.identity_blocked, 0);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // The lattice: partial escape and the global-escape rules
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn lattice_order_places_partial_between_no_escape_and_arg_escape() {
+        assert!(EscapeState::NoEscape < EscapeState::PartialEscape);
+        assert!(EscapeState::PartialEscape < EscapeState::ArgEscape);
+        assert!(EscapeState::ArgEscape < EscapeState::GlobalEscape);
+        // `may_escape`, not `>= ArgEscape`, is the "escapes" predicate.
+        assert!(!EscapeState::NoEscape.may_escape());
+        assert!(EscapeState::PartialEscape.may_escape());
+        assert!(EscapeState::NoEscape.is_confined());
+        assert!(!EscapeState::PartialEscape.is_confined());
+    }
+
+    /// An object that escapes only through a node the producer marked cold is
+    /// classified `PartialEscape` — and that classification licenses nothing.
+    #[test]
+    fn object_escaping_only_on_a_cold_path_is_classified_partial() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        // The only escape: a slow-path helper the producer knows is cold.
+        let cold_call = g.add_node(Op::Call, vec![alloc]);
+        g.mark_cold(cold_call);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::PartialEscape)
+        );
+        let pe = result
+            .partial_escapes
+            .iter()
+            .find(|p| p.alloc_node == alloc)
+            .expect("the refinement records what it refined");
+        assert_eq!(pe.without_refinement, EscapeState::ArgEscape);
+        assert_eq!(pe.escape_sites, vec![cold_call]);
+        assert_eq!(result.stats.partial_escape, 1);
+        assert_eq!(result.stats.arg_escape, 0);
+
+        // A refinement is NOT a licence. Nothing may act on it.
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "a partially-escaping object is still not scalar-replaceable"
+        );
+        assert!(
+            !result.stack_allocatable.contains(&alloc),
+            "nor stack-allocatable — the cold path would have to copy it out"
+        );
+    }
+
+    /// The paired NEGATIVE control: the same escape on a HOT path stays
+    /// `ArgEscape`, and one hot site among cold ones is enough to keep it.
+    #[test]
+    fn a_single_hot_escape_site_defeats_the_partial_classification() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let cold_call = g.add_node(Op::Call, vec![alloc]);
+        let _hot_call = g.add_node(Op::Call, vec![alloc]);
+        g.mark_cold(cold_call);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::ArgEscape),
+            "one escape site that is not cold means the object escapes on the \
+             hot path"
+        );
+        assert!(result.partial_escapes.is_empty());
+        assert_eq!(result.stats.partial_escape, 0);
+        assert_eq!(result.stats.arg_escape, 1);
+    }
+
+    /// With no cold information at all — the default — the classification is
+    /// exactly what it was before partial escape existed.
+    #[test]
+    fn no_cold_information_means_no_partial_classification() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _call = g.add_node(Op::Call, vec![alloc]);
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::ArgEscape)
+        );
+        assert!(result.partial_escapes.is_empty());
+    }
+
+    /// A value written into a holder this analysis cannot NAME — a `putstatic`
+    /// base, or any opaque reference with no points-to entry — must escape
+    /// globally.
+    ///
+    /// Before this rule the store-escape check read the holder's state with
+    /// `get_escape`, which reports an unseen node as `NoEscape`, so the rule
+    /// simply did not fire: an object published into a **static field** stayed
+    /// `NoEscape`, hence scalar-replaceable and lock-elidable, while being
+    /// reachable from every thread in the VM.
+    #[test]
+    fn object_stored_into_an_unnameable_holder_is_global_escape() {
+        let mut g = Graph::new();
+        // The static-area base: not an allocation, not a Param — opaque.
+        let statics = g.add_node(Op::Other, vec![]);
+        let obj = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _putstatic = g.add_node(Op::Store(0), vec![statics, obj]);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&obj),
+            Some(&EscapeState::GlobalEscape),
+            "a write to an unnameable destination is a write to the global heap"
+        );
+        assert!(result.scalar_replaceable.is_empty());
+        assert!(result.elide_locks.is_empty());
+    }
+
+    /// An object passed to an unknown call escapes. It is `ArgEscape`, not
+    /// `GlobalEscape` — that is what the middle lattice element is FOR (the
+    /// callee can reach it; the global heap cannot, unless the callee publishes
+    /// it, which is the callee's own analysis). Either way it is not
+    /// replaceable.
+    #[test]
+    fn object_passed_to_an_unknown_call_escapes_and_is_not_replaced() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let _call = g.add_node(Op::Call, vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        let state = *result.escape_states.get(&alloc).expect("classified");
+        assert!(state.may_escape());
+        assert_eq!(state, EscapeState::ArgEscape);
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc)
+        );
+    }
+
+    /// The paired POSITIVE for both escape rules: an object that is neither
+    /// published nor passed anywhere stays confined and IS replaced.
+    #[test]
+    fn a_purely_local_object_stays_confined_and_is_replaced() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        assert!(result.escape_states[&alloc].is_confined());
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("MUST replace");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c1));
+    }
+
+    /// The four state counters partition the allocations — a `PartialEscape`
+    /// object is counted once, in its own bucket.
+    #[test]
+    fn state_counters_partition_the_allocations() {
+        let mut g = Graph::new();
+        let local = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let arg = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let cold = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let global = g.add_node(
+            Op::New {
+                class_id: 4,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _ = local;
+        let _arg_call = g.add_node(Op::Call, vec![arg]);
+        let cold_call = g.add_node(Op::Call, vec![cold]);
+        g.mark_cold(cold_call);
+        g.nodes[1].inputs.push(global); // Return
+        g.nodes[global].uses.push(1);
+
+        let s = analyze_escapes(&g).stats;
+        assert_eq!(s.total_allocations, 4);
+        assert_eq!(s.no_escape, 1);
+        assert_eq!(s.partial_escape, 1);
+        assert_eq!(s.arg_escape, 1);
+        assert_eq!(s.global_escape, 1);
+        assert_eq!(
+            s.no_escape + s.partial_escape + s.arg_escape + s.global_escape,
+            s.total_allocations
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Lock elimination and coarsening
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // Every "MUST NOT" below is paired with the "MUST" that proves the refusal
+    // is a refusal and not an inability.
+
+    /// A fresh confined object with `num_fields` fields.
+    fn alloc(g: &mut Graph, class_id: u32, num_fields: usize) -> NodeId {
+        g.add_node(
+            Op::New {
+                class_id,
+                num_fields,
+            },
+            vec![],
+        )
+    }
+
+    /// The monitor nodes of `object`, ascending — what the graph *still* holds
+    /// after a transform, independent of any plan.
+    fn live_monitors_of(g: &Graph, object: NodeId) -> Vec<NodeId> {
+        (0..g.nodes.len())
+            .filter(|&id| matches!(g.nodes[id].op, Op::MonitorEnter | Op::MonitorExit))
+            .filter(|&id| monitor_object(g, id) == Some(object))
+            .collect()
+    }
+
+    // ── (a) Lock elision ──────────────────────────────────────────────
+
+    /// MUST: a confined object's monitor is elided, and it is offered as ONE
+    /// all-or-nothing plan naming every monitor on the object.
+    #[test]
+    fn confined_object_lock_is_elided_as_one_complete_plan() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let c = g.add_node(Op::Const(1), vec![]);
+        let enter = g.add_node(Op::MonitorEnter, vec![o]);
+        let _st = g.add_node(Op::Store(0), vec![o, c]);
+        let exit = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.escape_states.get(&o), Some(&EscapeState::NoEscape));
+        assert_eq!(r.lock_elisions.len(), 1);
+        assert_eq!(r.lock_elisions[0].object, o);
+        assert_eq!(
+            r.lock_elisions[0].monitors,
+            vec![enter, exit],
+            "the plan names EVERY monitor on the object — that is what makes \
+             it all-or-nothing"
+        );
+        assert_eq!(r.elide_locks, vec![enter, exit]);
+        assert_eq!(r.stats.locks_elided, 2);
+        assert_eq!(r.stats.lock_objects_elided, 1);
+        assert!(r.lock_refusals.is_empty());
+    }
+
+    /// MUST NOT: `wait()` requires the monitor to actually be held. Eliding it
+    /// turns a legal wait into `IllegalMonitorStateException`, and there is no
+    /// depth left to release to or reacquire at.
+    ///
+    /// Paired MUST: the identical graph without the `wait` elides.
+    #[test]
+    fn object_with_wait_is_never_elided() {
+        let build = |with_wait: bool| {
+            let mut g = Graph::new();
+            let o = alloc(&mut g, 1, 0);
+            let _enter = g.add_node(Op::MonitorEnter, vec![o]);
+            if with_wait {
+                g.add_node(Op::MonitorWait, vec![o]);
+            }
+            let _exit = g.add_node(Op::MonitorExit, vec![o]);
+            (g, o)
+        };
+
+        let (g, o) = build(true);
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.escape_states.get(&o),
+            Some(&EscapeState::NoEscape),
+            "waiting on a local object does not publish it — this is not an \
+             escape question"
+        );
+        assert!(r.elide_locks.is_empty(), "MUST NOT elide a waited-on monitor");
+        assert!(r.lock_elisions.is_empty());
+        assert!(r.lock_coarsening.is_empty());
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::WaitOrNotify)));
+
+        let (g, o) = build(false);
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.lock_elisions.len(),
+            1,
+            "MUST elide once nothing waits on the monitor"
+        );
+        assert_eq!(r.lock_elisions[0].object, o);
+    }
+
+    /// `notify`/`notifyAll` are the same rule: they too throw when the monitor
+    /// is not held, and a thread they could wake is a thread that reached the
+    /// object.
+    #[test]
+    fn object_with_notify_is_never_elided() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _enter = g.add_node(Op::MonitorEnter, vec![o]);
+        let _notify = g.add_node(Op::MonitorNotify, vec![o]);
+        let _exit = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(r.elide_locks.is_empty());
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::WaitOrNotify)));
+    }
+
+    /// A `wait` on a **caller-supplied** reference cannot be a wait on an
+    /// object this frame allocated and never published, so it must not block
+    /// that object's elision. The `Foreign` half of `OperandOrigin` is what
+    /// keeps `synchronized (local) {} … this.wait();` optimisable.
+    #[test]
+    fn a_wait_on_a_foreign_reference_does_not_block_a_local_object() {
+        let mut g = Graph::new();
+        let this = g.add_node(Op::Param(0), vec![]);
+        let o = alloc(&mut g, 1, 0);
+        let enter = g.add_node(Op::MonitorEnter, vec![o]);
+        let exit = g.add_node(Op::MonitorExit, vec![o]);
+        let _wait = g.add_node(Op::MonitorWait, vec![this]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.elide_locks, vec![enter, exit]);
+        assert!(!r
+            .lock_refusals
+            .iter()
+            .any(|&(_, why)| why == LockRefusal::WaitOrNotify));
+    }
+
+    /// MUST NOT: a monitor whose operand may be either a local allocation or a
+    /// caller-supplied reference is attributable to neither, and it poisons
+    /// **every** lock plan in the method — including the unrelated object's,
+    /// whose monitors would otherwise be elided.
+    ///
+    /// A singleton points-to set would have said "this is `a`" and elided a
+    /// lock that, on the parameter path, guards an object other threads share.
+    ///
+    /// Paired MUST: replace the parameter input with the allocation itself and
+    /// both objects elide.
+    #[test]
+    fn an_unattributable_monitor_operand_poisons_every_lock_plan() {
+        let build = |mix_in_param: bool| {
+            let mut g = Graph::new();
+            let p = g.add_node(Op::Param(0), vec![]);
+            let a = alloc(&mut g, 1, 0);
+            let b = alloc(&mut g, 2, 0);
+            let other = if mix_in_param { p } else { a };
+            let phi = g.add_node(Op::Phi, vec![a, other]);
+            let amb = g.add_node(Op::MonitorEnter, vec![phi]);
+            let _ambx = g.add_node(Op::MonitorExit, vec![phi]);
+            let _be = g.add_node(Op::MonitorEnter, vec![b]);
+            let _bx = g.add_node(Op::MonitorExit, vec![b]);
+            (g, a, b, amb)
+        };
+
+        let (g, _a, b, amb) = build(true);
+        let r = analyze_escapes(&g);
+        assert!(
+            r.elide_locks.is_empty(),
+            "MUST NOT elide anything while one monitor is unattributable — \
+             including object {b}'s own, perfectly confined, lock"
+        );
+        assert!(r.lock_coarsening.is_empty());
+        assert!(r
+            .lock_refusals
+            .contains(&(amb, LockRefusal::AmbiguousMonitorOperand)));
+
+        let (g, a, b, _) = build(false);
+        let r = analyze_escapes(&g);
+        let objects: Vec<NodeId> = r.lock_elisions.iter().map(|p| p.object).collect();
+        assert!(
+            objects.contains(&a) && objects.contains(&b),
+            "MUST elide both once every operand names exactly one allocation"
+        );
+    }
+
+    /// MUST NOT: an escaping object's monitor is real. Another thread can
+    /// contend on it, so both transforms are refused.
+    #[test]
+    fn escaping_object_lock_is_neither_elided_nor_coarsened() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        g.nodes[1].inputs.push(o); // Return
+        g.nodes[o].uses.push(1);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _c = g.add_node(Op::Const(0), vec![]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.escape_states.get(&o), Some(&EscapeState::GlobalEscape));
+        assert!(r.elide_locks.is_empty());
+        assert!(
+            r.lock_coarsening.is_empty(),
+            "MUST NOT coarsen an escaping object: extending its critical \
+             section can block a thread that wanted the monitor in the gap"
+        );
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::ObjectEscapes)));
+    }
+
+    // ── Recursive locking ─────────────────────────────────────────────
+
+    /// A reentrant `synchronized (o) { synchronized (o) { … } }` round-trips:
+    /// the regions pair at the right depths, the elision offer names all four
+    /// monitors, and applying it leaves an object with no monitors at all.
+    #[test]
+    fn recursive_locking_round_trips() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let regions = lock_regions(&g, o).expect("a balanced nest pairs up");
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            regions[0],
+            LockRegion {
+                enter: e1,
+                exit: x2,
+                depth: 0
+            },
+            "the OUTER region is e1..x2"
+        );
+        assert_eq!(
+            regions[1],
+            LockRegion {
+                enter: e2,
+                exit: x1,
+                depth: 1
+            },
+            "the INNER region is e2..x1 — pairing by nesting, not by order"
+        );
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.lock_elisions.len(), 1);
+        assert_eq!(r.lock_elisions[0].monitors, vec![e1, e2, x1, x2]);
+
+        let plan = r.lock_elisions[0].clone();
+        assert!(apply_lock_elision_plan(&mut g, &plan));
+        assert!(
+            live_monitors_of(&g, o).is_empty(),
+            "the whole nest goes, so the depth is 0 before and after"
+        );
+        assert!(lock_regions(&g, o).expect("still balanced").is_empty());
+    }
+
+    /// Removing the INNER pair of a reentrant nest is legal (one level of
+    /// reentry disappears, the outer region is untouched). Removing `e2` and
+    /// `x2` — which are not a pair — is not: it would silently narrow the outer
+    /// region. Both requests are "balanced" by a naive depth count; only the
+    /// region-pairing check tells them apart.
+    #[test]
+    fn partial_elision_is_accepted_only_when_whole_regions_go() {
+        let build = || {
+            let mut g = Graph::new();
+            let o = alloc(&mut g, 1, 0);
+            let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+            let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+            let x1 = g.add_node(Op::MonitorExit, vec![o]);
+            let x2 = g.add_node(Op::MonitorExit, vec![o]);
+            (g, o, e1, e2, x1, x2)
+        };
+
+        let (mut g, o, e1, e2, x1, x2) = build();
+        assert!(
+            apply_lock_elision(&mut g, &[e2, x1]),
+            "MUST: the inner region is a whole region"
+        );
+        assert_eq!(live_monitors_of(&g, o), vec![e1, x2]);
+
+        let (mut g, o, e1, e2, x1, x2) = build();
+        assert!(
+            !apply_lock_elision(&mut g, &[e2, x2]),
+            "MUST NOT: e2 pairs with x1, not x2"
+        );
+        assert_eq!(
+            live_monitors_of(&g, o),
+            vec![e1, e2, x1, x2],
+            "a refused request leaves the graph completely untouched"
+        );
+    }
+
+    /// THE PARTIAL-APPLICATION GUARD. `apply_ea_to_ir` filters `elide_locks`
+    /// node by node and can hand back a strict subset; a lone `monitorexit`
+    /// throws `IllegalMonitorStateException` and a lone `monitorenter` leaks the
+    /// monitor. The applier refuses rather than obeys.
+    #[test]
+    fn a_half_applied_elision_request_is_refused_whole() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let enter = g.add_node(Op::MonitorEnter, vec![o]);
+        let exit = g.add_node(Op::MonitorExit, vec![o]);
+
+        assert!(
+            !apply_lock_elision(&mut g, &[enter]),
+            "MUST NOT drop the enter and keep the exit"
+        );
+        assert!(!apply_lock_elision(&mut g, &[exit]));
+        assert_eq!(g.nodes[enter].op, Op::MonitorEnter);
+        assert_eq!(g.nodes[exit].op, Op::MonitorExit);
+
+        assert!(
+            apply_lock_elision(&mut g, &[enter, exit]),
+            "MUST apply the complete pair"
+        );
+        assert_eq!(g.nodes[enter].op, Op::Dead);
+        assert_eq!(g.nodes[exit].op, Op::Dead);
+    }
+
+    /// An unbalanced monitor sequence is not a sequence this analysis
+    /// understands, and `lock_regions` says so rather than guessing.
+    #[test]
+    fn an_unbalanced_monitor_sequence_is_refused() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _e = g.add_node(Op::MonitorEnter, vec![o]);
+        assert_eq!(lock_regions(&g, o), Err(LockRefusal::UnbalancedMonitors));
+
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _x = g.add_node(Op::MonitorExit, vec![o]);
+        assert_eq!(lock_regions(&g, o), Err(LockRefusal::UnbalancedMonitors));
+    }
+
+    // ── (b) Lock coarsening ───────────────────────────────────────────
+
+    /// MUST: two adjacent regions on a confined object, separated by pure
+    /// arithmetic, merge — and applying the plan leaves exactly one balanced
+    /// region.
+    #[test]
+    fn two_adjacent_regions_on_a_confined_object_are_coarsened() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _s1 = g.add_node(Op::Store(0), vec![o, c1]);
+        let x1 = g.add_node(Op::MonitorExit, vec![o]);
+        // The gap: pure, total, no safepoint, no throw.
+        let c2 = g.add_node(Op::Const(2), vec![]);
+        let sum = g.add_node(Op::Add, vec![c1, c2]);
+        let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _s2 = g.add_node(Op::Store(0), vec![o, sum]);
+        let x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.lock_coarsening.len(), 1);
+        assert_eq!(r.stats.locks_coarsened, 1);
+        let plan = r.lock_coarsening[0];
+        assert_eq!(plan.object, o);
+        assert_eq!(plan.surviving_enter(), e1);
+        assert_eq!(plan.removed_exit(), x1);
+        assert_eq!(plan.removed_enter(), e2);
+        assert_eq!(plan.surviving_exit(), x2);
+
+        assert!(apply_lock_coarsening(&mut g, &plan));
+        assert_eq!(g.nodes[x1].op, Op::Dead);
+        assert_eq!(g.nodes[e2].op, Op::Dead);
+        assert_eq!(
+            lock_regions(&g, o).expect("still balanced"),
+            vec![LockRegion {
+                enter: e1,
+                exit: x2,
+                depth: 0
+            }],
+            "one region, entered once and exited once"
+        );
+    }
+
+    /// MUST NOT: a throw between the two regions. In the source program the
+    /// monitor is NOT held at the throw, so unwinding releases nothing;
+    /// coarsening would make the compiled frame hold it there.
+    ///
+    /// The preservation argument is by exclusion, and this test states it as
+    /// such: the plan is refused, the two regions survive untouched, and the
+    /// throw still lies in the unlocked window between them.
+    ///
+    /// Paired MUST: replace the throw with an `Add` and the merge happens.
+    #[test]
+    fn a_throw_between_two_regions_refuses_the_merge_and_still_unlocks() {
+        let build = |throwing: bool| {
+            let mut g = Graph::new();
+            let p = g.add_node(Op::Param(0), vec![]);
+            let o = alloc(&mut g, 1, 0);
+            let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+            let x1 = g.add_node(Op::MonitorExit, vec![o]);
+            let gap = if throwing {
+                g.add_node(Op::Throw, vec![p])
+            } else {
+                g.add_node(Op::Add, vec![p, p])
+            };
+            let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+            let x2 = g.add_node(Op::MonitorExit, vec![o]);
+            (g, o, e1, x1, gap, e2, x2)
+        };
+
+        let (mut g, o, e1, x1, throw, e2, x2) = build(true);
+        let r = analyze_escapes(&g);
+        assert!(
+            r.lock_coarsening.is_empty(),
+            "MUST NOT coarsen across a node that can unwind monitors"
+        );
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::MayThrowInGap)));
+
+        // Nothing to apply, so unlock-on-throw is bit-for-bit the original's:
+        // the throw sits strictly inside the window where `o` is unlocked.
+        for plan in &r.lock_coarsening {
+            apply_lock_coarsening(&mut g, plan);
+        }
+        let regions = lock_regions(&g, o).expect("balanced");
+        assert_eq!(
+            regions,
+            vec![
+                LockRegion {
+                    enter: e1,
+                    exit: x1,
+                    depth: 0
+                },
+                LockRegion {
+                    enter: e2,
+                    exit: x2,
+                    depth: 0
+                }
+            ]
+        );
+        assert!(
+            throw > regions[0].exit && throw < regions[1].enter,
+            "the throw is in the unlocked gap, exactly where the source put it"
+        );
+
+        let (g, _o, _e1, _x1, _gap, _e2, _x2) = build(false);
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.lock_coarsening.len(),
+            1,
+            "MUST coarsen once the gap cannot throw"
+        );
+    }
+
+    /// MUST NOT: a deopt point in the gap. The interpreter frame rebuilt there
+    /// must NOT hold the monitor (the original had already run the first
+    /// `monitorexit`), while the coarsened compiled frame does. That
+    /// reconstruction is provably wrong, not merely unproven, so the merge is
+    /// refused outright rather than repaired.
+    ///
+    /// Paired MUST: safepoints *inside* either region are fine — coarsening
+    /// changes the held-monitor set only in the gap, so those frames
+    /// reconstruct exactly the monitor set they always did.
+    #[test]
+    fn a_deopt_point_in_the_gap_refuses_the_merge_but_one_inside_a_region_does_not() {
+        // Safepoint in the GAP.
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _sp = g.add_node(Op::Safepoint, vec![]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(
+            r.lock_coarsening.is_empty(),
+            "MUST NOT coarsen across a deopt point whose monitor set would be \
+             wrong after the merge"
+        );
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::SafepointInGap)));
+
+        // Safepoints INSIDE both regions, gap clean.
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _sp1 = g.add_node(Op::Safepoint, vec![]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _c = g.add_node(Op::Const(0), vec![]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _sp2 = g.add_node(Op::Safepoint, vec![]);
+        let x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.lock_coarsening.len(),
+            1,
+            "MUST coarsen: a deopt inside a region holds the same monitor set \
+             before and after the merge"
+        );
+        assert_eq!(r.lock_coarsening[0].surviving_enter(), e1);
+        assert_eq!(r.lock_coarsening[0].surviving_exit(), x2);
+    }
+
+    /// MUST NOT: a call in the gap. It is a safepoint, it can throw, and it is
+    /// how `Thread.holdsLock` and every blocking operation reach the gap — the
+    /// three ways the unlocked state is observable.
+    #[test]
+    fn a_call_in_the_gap_refuses_the_merge() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _call = g.add_node(Op::Call, vec![]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(r.lock_coarsening.is_empty());
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::MayThrowInGap)));
+    }
+
+    /// A `monitorexit`/`monitorenter` on a DIFFERENT object in the gap is an
+    /// observation of the lock state, and it is also the shape where a naive
+    /// merge could invert two lock orders. Refused.
+    #[test]
+    fn a_foreign_monitor_in_the_gap_refuses_the_merge() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let p = alloc(&mut g, 2, 0);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _pe = g.add_node(Op::MonitorEnter, vec![p]);
+        let _px = g.add_node(Op::MonitorExit, vec![p]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(r
+            .lock_coarsening
+            .iter()
+            .all(|plan| plan.object != o));
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::ObservableGap)));
+    }
+
+    /// Without a dominance proof "adjacent" and "between" are not answerable,
+    /// so coarsening is refused wholesale — while elision, which removes every
+    /// monitor and therefore needs no ordering, still fires.
+    #[test]
+    fn a_branch_refuses_coarsening_but_not_elision() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let cond = g.add_node(Op::Const(0), vec![]);
+        let _iff = g.add_node(Op::If, vec![cond]);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        assert!(!program_order_proves_dominance(&g));
+        let r = analyze_escapes(&g);
+        assert!(r.lock_coarsening.is_empty());
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::NoDominanceProof)));
+        assert_eq!(
+            r.elide_locks,
+            vec![e1, x1, e2, x2],
+            "removing EVERY monitor is balance-preserving on every path, so \
+             elision needs no ordering proof"
+        );
+    }
+
+    /// Coarsening merges only *outermost* regions. An inner recursive region is
+    /// not adjacent to anything: merging across it would change the reentry
+    /// depth the interpreter has to rebuild.
+    #[test]
+    fn coarsening_pairs_only_outermost_regions() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]); // depth 1
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let xo = g.add_node(Op::MonitorExit, vec![o]);
+        let _c = g.add_node(Op::Const(0), vec![]);
+        let e3 = g.add_node(Op::MonitorEnter, vec![o]);
+        let x3 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.lock_coarsening.len(), 1);
+        let plan = r.lock_coarsening[0];
+        assert_eq!(plan.surviving_enter(), e1);
+        assert_eq!(plan.removed_exit(), xo, "the OUTER exit, not the inner one");
+        assert_eq!(plan.removed_enter(), e3);
+        assert_eq!(plan.surviving_exit(), x3);
+    }
+
+    /// Three adjacent regions produce two chained plans that SHARE a region.
+    /// Each plan is individually balance-preserving, and the re-verification in
+    /// [`apply_lock_coarsening`] makes overlapping plans mutually exclusive
+    /// rather than compounding: whichever runs first wins, the other is dropped.
+    /// The graph is balanced after every subset, in every order.
+    ///
+    /// Merging all three is reached the same way a synchronized object reaches
+    /// scalar replacement — by re-running the analysis on the mutated graph.
+    #[test]
+    fn chained_coarsening_plans_are_safe_in_any_subset() {
+        let build = || {
+            let mut g = Graph::new();
+            let o = alloc(&mut g, 1, 0);
+            for _ in 0..3 {
+                g.add_node(Op::MonitorEnter, vec![o]);
+                g.add_node(Op::MonitorExit, vec![o]);
+                g.add_node(Op::Const(0), vec![]);
+            }
+            (g, o)
+        };
+
+        let (g, _o) = build();
+        let plans = analyze_escapes(&g).lock_coarsening;
+        assert_eq!(plans.len(), 2, "three regions ⇒ two adjacent pairs");
+
+        // Either plan alone: three regions become two.
+        for which in 0..2 {
+            let (mut g, o) = build();
+            assert!(apply_lock_coarsening(&mut g, &plans[which]));
+            assert_eq!(
+                lock_regions(&g, o).expect("balanced").len(),
+                2,
+                "applying one of two plans leaves two balanced regions"
+            );
+        }
+
+        // Both, in either order: the second overlaps the first and is dropped.
+        for order in [[0usize, 1usize], [1, 0]] {
+            let (mut g, o) = build();
+            assert!(apply_lock_coarsening(&mut g, &plans[order[0]]));
+            assert!(
+                !apply_lock_coarsening(&mut g, &plans[order[1]]),
+                "the two plans share a region; the second no longer describes \
+                 the graph and is refused rather than half-applied"
+            );
+            let regions = lock_regions(&g, o).expect("balanced");
+            assert_eq!(regions.len(), 2);
+
+            // Re-analysing the mutated graph offers the now-adjacent pair.
+            let again = analyze_escapes(&g).lock_coarsening;
+            assert_eq!(again.len(), 1);
+            assert!(apply_lock_coarsening(&mut g, &again[0]));
+            assert_eq!(
+                lock_regions(&g, o).expect("balanced").len(),
+                1,
+                "one region, entered once and exited once"
+            );
+        }
+    }
+
+    /// Coarsening depends on NO elision having landed, and re-verifies before
+    /// mutating. A plan whose pair an elision already removed is a no-op; a
+    /// plan whose *outer* monitor a partial elision removed is refused, so
+    /// coarsening never compounds an imbalance it did not create.
+    #[test]
+    fn coarsening_is_safe_under_partial_application_of_elision() {
+        let build = || {
+            let mut g = Graph::new();
+            let o = alloc(&mut g, 1, 0);
+            let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+            let x1 = g.add_node(Op::MonitorExit, vec![o]);
+            let _c = g.add_node(Op::Const(0), vec![]);
+            let e2 = g.add_node(Op::MonitorEnter, vec![o]);
+            let x2 = g.add_node(Op::MonitorExit, vec![o]);
+            (g, o, e1, x1, e2, x2)
+        };
+
+        let (g, _o, _e1, _x1, _e2, _x2) = build();
+        let plan = analyze_escapes(&g).lock_coarsening[0];
+
+        // The elision landed in full: the pair is already gone.
+        let (mut g, o, _e1, _x1, _e2, _x2) = build();
+        let r = analyze_escapes(&g);
+        assert!(apply_lock_elision_plan(&mut g, &r.lock_elisions[0]));
+        assert!(
+            !apply_lock_coarsening(&mut g, &plan),
+            "no monitors left: the plan is dropped, not applied twice"
+        );
+        assert!(live_monitors_of(&g, o).is_empty());
+
+        // A partial elision took the OUTER enter only — the hazard case.
+        let (mut g, _o, e1, x1, e2, x2) = build();
+        g.nodes[e1].op = Op::Dead;
+        g.nodes[e1].inputs.clear();
+        assert!(
+            !apply_lock_coarsening(&mut g, &plan),
+            "MUST NOT merge onto an enter that is no longer there"
+        );
+        assert_eq!(g.nodes[x1].op, Op::MonitorExit);
+        assert_eq!(g.nodes[e2].op, Op::MonitorEnter);
+        assert_eq!(g.nodes[x2].op, Op::MonitorExit);
+    }
+
+    /// Field accesses on confined allocations of this graph ARE admitted in a
+    /// gap: they cannot fault (the holder is a `New` of this frame, so never
+    /// null) and no other thread can observe them.
+    #[test]
+    fn a_gap_of_confined_field_accesses_is_transparent() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let other = alloc(&mut g, 2, 1);
+        let c = g.add_node(Op::Const(7), vec![]);
+        let e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _st = g.add_node(Op::Store(0), vec![other, c]);
+        let _ld = g.add_node(Op::Load(0), vec![other]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        let plan = r
+            .lock_coarsening
+            .iter()
+            .find(|p| p.object == o)
+            .expect("a confined-only gap is transparent");
+        assert_eq!(plan.surviving_enter(), e1);
+        assert_eq!(plan.surviving_exit(), x2);
+    }
+
+    /// …but a field access on a **caller-supplied** holder is not: it can raise
+    /// `NullPointerException`, which is a monitor-unwinding event, and other
+    /// threads can see the write.
+    #[test]
+    fn a_gap_touching_a_foreign_holder_is_not_transparent() {
+        let mut g = Graph::new();
+        let this = g.add_node(Op::Param(0), vec![]);
+        let o = alloc(&mut g, 1, 0);
+        let c = g.add_node(Op::Const(7), vec![]);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _st = g.add_node(Op::Store(0), vec![this, c]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(r.lock_coarsening.is_empty());
+        assert!(r.lock_refusals.contains(&(o, LockRefusal::ObservableGap)));
+    }
+
+    /// Coarsening does not disturb the identity rule: a live monitor is still
+    /// an identity observation, so the object is not scalar-replaced until the
+    /// monitors are actually gone. The documented two-phase route still works
+    /// through the coarsened graph.
+    #[test]
+    fn coarsening_then_elision_still_unlocks_scalar_replacement() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let c = g.add_node(Op::Const(9), vec![]);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _st = g.add_node(Op::Store(0), vec![o, c]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+        let _k = g.add_node(Op::Const(0), vec![]);
+        let _e2 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x2 = g.add_node(Op::MonitorExit, vec![o]);
+        let load = g.add_node(Op::Load(0), vec![o]);
+
+        let first = analyze_escapes(&g);
+        assert!(
+            first.scalar_replaceable.iter().all(|s| s.alloc_node != o),
+            "MUST NOT replace while a monitor observes the identity"
+        );
+        assert_eq!(first.stats.identity_blocked, 1);
+
+        let plan = first.lock_coarsening[0];
+        assert!(apply_lock_coarsening(&mut g, &plan));
+        let second = analyze_escapes(&g);
+        assert!(
+            second.scalar_replaceable.iter().all(|s| s.alloc_node != o),
+            "two monitors survive the merge — still observed"
+        );
+
+        assert!(apply_lock_elision_plan(&mut g, &second.lock_elisions[0]));
+        let third = analyze_escapes(&g);
+        let sr = third
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == o)
+            .expect("MUST replace once every monitor is dead");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c));
+    }
+
+    /// The refusal counters are the measurement that says what failing closed
+    /// costs, exactly as `identity_blocked` does for scalar replacement.
+    #[test]
+    fn lock_refusals_are_counted_and_deduplicated() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        g.nodes[1].inputs.push(o); // Return: escapes
+        g.nodes[o].uses.push(1);
+        let _e1 = g.add_node(Op::MonitorEnter, vec![o]);
+        let _x1 = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.lock_refusals,
+            vec![(o, LockRefusal::ObjectEscapes)],
+            "the elision and coarsening finders both refuse it; the record is \
+             deduplicated"
+        );
+        assert_eq!(r.stats.locks_refused, 1);
+        assert_eq!(r.stats.locks_elided, 0);
+        assert_eq!(r.stats.locks_coarsened, 0);
+    }
+
+    // ── Alias-analysis audit (wave: alias soundness) ──────────────────
+
+    /// SELF-REFERENCE. `o.f0 = o;` makes the allocation recoverable by loading
+    /// its own field, and the use walk in `find_scalar_replacements` never
+    /// visits uses made through that recovered reference — it only walks the
+    /// allocation's own uses and the transparent φ copies it accepts.
+    ///
+    /// Before the self-reference gate this object was reported replaceable:
+    /// `apply_scalar_replacement` would delete the allocation and leave
+    /// `p.f1 = 7` writing through an `Op::Dead` holder.
+    #[test]
+    fn an_object_stored_into_its_own_field_is_not_scalar_replaced() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 2);
+        let c7 = g.add_node(Op::Const(7), vec![]);
+        // o.f0 = o
+        let _self_store = g.add_node(Op::Store(0), vec![o, o]);
+        // p = o.f0   — `p` is `o`, but it is a Load node, not a use of `o`
+        let p = g.add_node(Op::Load(0), vec![o]);
+        // p.f1 = 7   — a real store into the object, invisible to the walk
+        let _via_p = g.add_node(Op::Store(1), vec![p, c7]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.escape_states.get(&o),
+            Some(&EscapeState::NoEscape),
+            "the object genuinely does not escape — this is an ALIAS question, \
+             not a reachability one, which is why the escape lattice alone \
+             cannot refuse it"
+        );
+        assert!(
+            r.scalar_replaceable.iter().all(|s| s.alloc_node != o),
+            "a reference to the object is recoverable from its own field, so \
+             there are uses of it this analysis never saw"
+        );
+    }
+
+    /// The paired NEGATIVE control: an allocation stored into a *different*
+    /// object's field is still refused (it is published), and an allocation
+    /// whose fields hold only non-references is still replaced. The gate must
+    /// not have swallowed the ordinary case.
+    #[test]
+    fn the_self_reference_gate_does_not_refuse_an_ordinary_object() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let c9 = g.add_node(Op::Const(9), vec![]);
+        let _st = g.add_node(Op::Store(0), vec![o, c9]);
+        let load = g.add_node(Op::Load(0), vec![o]);
+
+        let r = analyze_escapes(&g);
+        let sr = r
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == o)
+            .expect("a field holding a constant is not a self-reference");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c9));
+    }
+
+    /// UNMODELLED USE. `Op::Other` is the bridge's catch-all, and two of the
+    /// `ir::Op`s that land in it — `LambdaIntToDouble` and `Guard` — publish or
+    /// republish the reference they are handed.
+    ///
+    /// `find_scalar_replacements` refuses such an object at its use-walk
+    /// catch-all, but `find_lock_elision_plans` walks no uses: its E2 test is
+    /// `get_escape(object).is_confined()`. Before this rule the object looked
+    /// confined and both monitors were elided.
+    #[test]
+    fn an_unmodelled_use_blocks_lock_elision() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _opaque = g.add_node(Op::Other, vec![o]);
+        let _enter = g.add_node(Op::MonitorEnter, vec![o]);
+        let _exit = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(
+            r.escape_states
+                .get(&o)
+                .copied()
+                .unwrap_or(EscapeState::NoEscape)
+                .may_escape(),
+            "a reference handed to a node this module cannot model must not be \
+             reported confined"
+        );
+        assert!(
+            r.elide_locks.is_empty(),
+            "eliding every monitor on an object an unmodelled node may have \
+             published drops a happens-before edge the JMM argument assumes \
+             cannot exist"
+        );
+        assert!(r.scalar_replaceable.iter().all(|s| s.alloc_node != o));
+    }
+
+    /// The `Op::Other` rule must key off the *reference* operands only: an
+    /// unmodelled node with no reference input (the static-area base shape) is
+    /// unchanged, and a node an earlier pass already killed observes nothing.
+    #[test]
+    fn the_unmodelled_use_rule_ignores_dead_and_referenceless_nodes() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let c = g.add_node(Op::Const(3), vec![]);
+        let _st = g.add_node(Op::Store(0), vec![o, c]);
+        // A referenceless unmodelled node, and a stale dead use-edge.
+        let _bare = g.add_node(Op::Other, vec![c]);
+        let stale = g.add_node(Op::Other, vec![o]);
+        g.nodes[stale].op = Op::Dead;
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.escape_states.get(&o), Some(&EscapeState::NoEscape));
+        assert!(r.scalar_replaceable.iter().any(|s| s.alloc_node == o));
     }
 }

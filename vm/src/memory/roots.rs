@@ -55,6 +55,49 @@ fn conditional_loader_metadata(shared: &SharedVm) -> bool {
     }
 }
 
+/// Per-thread roots that live in `JvmThread` FIELDS rather than on any frame,
+/// and are therefore invisible to the frame walk both peer-publish paths are
+/// built around.
+///
+/// This exists as one function called from all THREE per-thread root paths —
+/// [`collect_roots`] (the collection initiator's own scan),
+/// `interpreter::update_root_snapshot` (a peer parked at a cooperative
+/// safepoint) and `NativeContextImpl::deposit_root_snapshot_inner` (a peer
+/// blocked in a native) — because those paths had drifted apart. Both fields
+/// below were rewritten by all three post-GC remaps (`gc::update_all_roots`,
+/// `interpreter::apply_pointer_map_to_thread`, and
+/// `NativeContextImpl::check_post_block_gc_refs`) yet published as roots by
+/// NEITHER snapshot path, so they were remapped-but-never-marked.
+///
+/// That asymmetry is the use-after-free `memory::native_roots`' module doc
+/// describes from the other side: nothing claims the object, the collector
+/// frees it, and the wake path then "relocates" the dangling address through a
+/// `pointer_map` that has no entry for it — leaving the owner to read a zeroed
+/// header. A peer's own frames are safe because the frame walk covers them;
+/// these two categories live outside it.
+///
+/// A new `ObjectRef`-bearing `JvmThread` field belongs HERE, so it cannot be
+/// published on one path and silently dropped on the other two.
+pub(crate) fn push_off_frame_thread_roots(thread: &JvmThread, roots: &mut Vec<ObjectRef>) {
+    // Test-harness print buffer (`native_temp_print_int` / `_print_string`).
+    for val in &thread.printed {
+        if let Value::Object(Some(obj_ref)) = val {
+            roots.push(*obj_ref);
+        }
+    }
+    // Scoped-value bindings (JEP 446) — the KEY as well as the value. Pushing
+    // only values would let the key object be reclaimed while its binding is
+    // still live, which JDK-internal code reaches via `Carrier.get(ScopedValue)`.
+    for (_key_id, key_ref, val) in &thread.scoped_values {
+        if let Some(obj_ref) = key_ref {
+            roots.push(*obj_ref);
+        }
+        if let Value::Object(Some(obj_ref)) = val {
+            roots.push(*obj_ref);
+        }
+    }
+}
+
 /// Collect all GC root ObjectRefs from the shared VM state and the current thread.
 ///
 /// Returns a vector of all live non-null ObjectRefs reachable from:
@@ -217,12 +260,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    // 4. Thread printed values — test harness output buffer
-    for val in &thread.printed {
-        if let Value::Object(Some(obj_ref)) = val {
-            roots.push(*obj_ref);
-        }
-    }
+    // 4. Off-frame per-thread roots — the test-harness print buffer and the
+    //    scoped-value bindings. Shared with both peer-publish paths; see
+    //    `push_off_frame_thread_roots`.
+    push_off_frame_thread_roots(thread, &mut roots);
 
     // 4b. Native invoke pins — object args popped off the operand stack for
     //     `safe_native_call` (see `JvmThread::native_pin_roots`).
@@ -531,13 +572,38 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
+    // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception,
+    //     jit_pending_exception
     if let Some(ref obj_ref) = thread.java_thread_obj {
         roots.push(*obj_ref);
     }
     if let Some(ref obj_ref) = thread.pending_async_exception {
         roots.push(*obj_ref);
     }
+    // The JIT's pending throwable. It used to live in a thread-local `Cell`,
+    // where the collector could not reach it at all — TLS is invisible from a
+    // collecting thread, which is precisely why the two slots above are fields.
+    // Without this push the remap half is half-wired: the reference would be
+    // relocated but never kept alive.
+    if let Some(ref obj_ref) = thread.jit_pending_exception {
+        roots.push(*obj_ref);
+    }
+    // The JIT's stashed deopt / exceptional frames. Those live in `jit/`
+    // thread-locals — that crate cannot depend on `vm/`, so they cannot become
+    // `JvmThread` fields the way the slot above did — and are reached through
+    // an on-thread visitor instead. That works for the same reason the slots
+    // above do: this scan already runs ON the owning thread. Paired with the
+    // remap in `gc.rs`; wiring one without the other is refused by a debug
+    // assertion in the visitor. See `docs/jit/deopt-thread-local-roots.md`.
+    //
+    // `is_object_address` rather than a bare `ObjectRef`, matching the
+    // `pinned_addrs` block above: the stash can name an address the heap no
+    // longer owns, if an earlier collection already ran while it was unrooted.
+    cratonvm_jit::deopt::for_each_stashed_deopt_object(|addr| {
+        if let Some(obj) = shared.mem.heap.is_object_address(addr as usize) {
+            roots.push(obj);
+        }
+    });
 
     // 10b. Registry-held java.lang.Thread mirrors of every ALIVE thread.
     //      HotSpot semantics: a thread's mirror is a strong root while the
@@ -564,21 +630,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    // 12. Scoped value bindings (JEP 446)
-    //
-    // Round-9 GC fix: also push the ScopedValue KEY ObjectRef when present.
-    // The previous version only pushed VALUEs, so the key object itself
-    // (which JDK-internal code reaches via Carrier.get(ScopedValue)) could
-    // be reclaimed while the binding was still live — a use-after-free on
-    // the next reflective `Carrier.get` traversal.
-    for (_key_id, key_ref, val) in &thread.scoped_values {
-        if let Some(obj_ref) = key_ref {
-            roots.push(*obj_ref);
-        }
-        if let Value::Object(Some(obj_ref)) = val {
-            roots.push(*obj_ref);
-        }
-    }
+    // 12. Scoped value bindings (JEP 446) are published by
+    //     `push_off_frame_thread_roots` at step 4, together with the print
+    //     buffer — the two off-frame categories every per-thread root path
+    //     must agree on.
 
     // 13. Resolution cache — CONSTANT_Dynamic values may hold ObjectRefs
     {
@@ -886,13 +941,14 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     results live in no heap slot, so a GC between `submit` and `get` must
     //     root them here. Remap companion in `gc.rs`.
 
-    // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
-    //     in a process-global side-table can register a scan callback here
-    //     instead of hand-wiring a new `gc_scan_*` call into this function (see
-    //     `crate::memory::native_roots`). Fans out to every registered source;
-    //     a no-op (byte-identical to baseline) until a subsystem registers, so
-    //     it is safe to land ahead of any adopter. The matching post-move remap
-    //     is `native_roots::remap_all_native_roots` in `gc.rs`.
+    // 21. Uniform native-root registry (driven above, via
+    //     `native_roots::scan_all_roots`). A native subsystem holding
+    //     ObjectRefs in a side-table belongs in `native_roots::VM_ROOT_SOURCES`
+    //     rather than hand-wired as another `gc_scan_*` call here — the table
+    //     row cannot compile without both the scan and the remap half. Every
+    //     source receives the OWNING `SharedVm`, so one backed by a static must
+    //     key that static on `shared.vm_identity`. The matching post-move remap
+    //     is `native_roots::remap_all_roots` in `gc.rs`.
 
     if let Some(w) = crate::memory::gc::watch_addr() {
         let rooted = roots.iter().any(|o| o.as_ptr() as usize == w);

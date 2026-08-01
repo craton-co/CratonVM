@@ -40,182 +40,48 @@
 //! should treat entries as permanent — removing one and then reading it
 //! back would produce two `ObjectStreamClass` instances for the same
 //! class, violating the identity contract.
+//!
+//! # GC rooting (per-VM, NOT process-global)
+//!
+//! The cache holds `ObjectRef`s that may be the *only* reference to a
+//! descriptor, so it must be both scanned (else the descriptor is
+//! reclaimed) and remapped (else the entry points into vacated
+//! from-space). Both halves live on [`OscCache::scan_roots`] /
+//! [`OscCache::remap_roots`] and are driven from
+//! `memory::native_roots::VM_ROOT_SOURCES` with the **owning**
+//! `SharedVm`, so a collection in VM B never reports or rewrites VM A's
+//! descriptors.
+//!
+//! This replaces a process-global `Mutex<Vec<*const OscMap>>` registry
+//! that every `OscCache` published a raw pointer into, hooked into the
+//! VM-agnostic `register_native_root_source` fan-out. That was wrong
+//! twice over:
+//!
+//!   * **Isolation / memory safety.** The fan-out has no VM parameter,
+//!     so *every* VM's collection walked *every* live cache: VM B's root
+//!     scan handed its collector addresses belonging to VM A's heap, and
+//!     VM B's post-move fixup rewrote VM A's entries through VM B's
+//!     relocation map. Both are the "pointer into a heap this collector
+//!     does not own" hazard that scoped the logmanager and
+//!     security-manager tables.
+//!   * **Lifetime.** Keeping the registry sound required a `SendPtr`
+//!     raw-pointer wrapper, a `Drop` impl to deregister, and holding the
+//!     registry lock across every walk — machinery that had already
+//!     produced SIGSEGVs and permanent hangs in this module's own tests.
+//!     Owning the scan through `SharedVm` removes the raw pointer, the
+//!     `unsafe`, and the teardown ordering problem outright.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
 use cratonvm_types::{ClassId, ObjectRef};
 
-/// Process-global registry of every live [`OscCache`]'s backing map.
-///
-/// The GC-root registry (`crate::memory::native_roots`) drives scanning
-/// and remapping through bare `fn` pointers, which cannot capture a
-/// specific `OscCache` instance. To bridge that, each cache publishes a
-/// raw pointer to its `inner` map here on first insert; the global
-/// [`scan_osc_cache_roots`] / [`remap_osc_cache_refs`] functions walk
-/// this list.
-///
-/// # Safety / lifetime
-///
-/// Entries are raw pointers into `OscCache::inner`, which lives as long
-/// as the owning `SharedVm` (see module docs — `OscCache` is a permanent
-/// per-VM field, never moved or dropped during normal execution). The
-/// VM does not tear down `SharedVm` mid-run, so these pointers stay
-/// valid for the process lifetime. We never form a `&` reference that
-/// outlives a lock acquisition: each scan/remap re-locks the target map
-/// freshly through its `RwLock`, so there is no aliasing with the
-/// owning cache's own `read()`/`write()` guards.
-///
-/// Lifetime is enforced by the registry lock itself, not by the "caches
-/// outlive the process" assumption above (which the unit tests break, and
-/// which any teardown path would break): [`scan_osc_cache_roots`] and
-/// [`remap_osc_cache_refs`] hold the registry guard for the whole walk, and
-/// [`OscCache::drop`] must take that same guard to deregister, so a
-/// registered map cannot be freed while a walk is dereferencing it.
+/// The backing map of one VM's cache. Reachable only through the owning
+/// [`OscCache`], which is a field of that VM's `ClassRealm` — there is no
+/// process-global handle on it, by design (see the module docs).
 type OscMap = RwLock<FxHashMap<ClassId, ObjectRef>>;
-
-/// Lazily-initialised list of live cache backing maps. `Mutex` (not
-/// `RwLock`) because registration is rare (once per VM) and the GC scan
-/// only needs a short read of the pointer list before re-locking each
-/// map individually.
-fn cache_registry() -> &'static Mutex<Vec<SendPtr>> {
-    static REGISTRY: OnceLock<Mutex<Vec<SendPtr>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-// SAFETY: the registry stores raw `*const OscMap` pointers that are only
-// ever dereferenced under the target map's own `RwLock`. `OscMap`
-// (`RwLock<FxHashMap<ClassId, ObjectRef>>`) is itself `Send + Sync`
-// (`ObjectRef` is `Send + Sync`), so sharing these pointers across
-// threads for GC scanning is sound under the VM's safepoint model — the
-// GC observes them only at a stop-the-world safepoint, when no other
-// thread mutates the maps.
-#[derive(Clone, Copy)]
-struct SendPtr(*const OscMap);
-// SAFETY: see the comment above `SendPtr`.
-unsafe impl Send for SendPtr {}
-
-/// Push every cached descriptor `ObjectRef` from every live cache onto
-/// `roots`, so the GC marks them as live. Null/dangling refs are never
-/// stored (the cache only holds descriptors returned from a successful
-/// build), but we still skip the null bit-pattern defensively.
-///
-/// Registered with the native-root registry via
-/// [`register_with_gc`]; must be a bare `fn` for that API.
-pub fn scan_osc_cache_roots(roots: &mut Vec<ObjectRef>) {
-    // The registry lock is held for the WHOLE walk, not just long enough to
-    // clone the pointer list.
-    //
-    // It used to snapshot-then-release, "to keep lock ordering simple (registry
-    // -> map, never the reverse)" — but holding the registry across `map.read()`
-    // *is* registry -> map, the same order, so the early release bought nothing
-    // and opened a use-after-free: `OscCache::drop` deregisters under this very
-    // lock and then frees the map, so a cache dropped between the snapshot and
-    // the `&*ptr` below left a dangling pointer in the snapshot. Reading freed
-    // memory either faults outright or, if the freed bytes happen to look like a
-    // locked `RwLock`, parks `map.read()` forever.
-    //
-    // That is not theoretical: `runtime::serialization::oscache`'s own tests
-    // create and drop short-lived stack `OscCache`s while other threads run GC,
-    // and 1500 filtered runs of that module produced 5 SIGSEGVs and 2 permanent
-    // hangs. Holding the guard closes the window — `drop` cannot make progress
-    // while we walk, and no path takes the registry while holding a map lock
-    // (`register_with_gc` releases the registry before its caller touches
-    // `inner`), so the order stays total.
-    let guard = cache_registry().lock();
-    for &SendPtr(ptr) in guard.iter() {
-        // SAFETY: `ptr` names a map whose owning `OscCache` is still registered,
-        // and `OscCache::drop` must take the registry lock we are holding in
-        // order to deregister and be freed — so the map cannot go away while
-        // this reference lives. We re-lock through its own `RwLock`, so there is
-        // no aliasing with the owner's guards either.
-        let map = unsafe { &*ptr };
-        for (&class_id, desc) in map.read().iter() {
-            // `ObjectRef` is non-null by construction; the guard is
-            // belt-and-suspenders against a future nullable value type.
-            if !desc.as_ptr().is_null() {
-                if cratonvm_types::metadata_pin::metadata_weak_mode() {
-                    if let Some(loader) =
-                        cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
-                    {
-                        cratonvm_types::metadata_pin::add_metadata_pin(
-                            loader,
-                            desc.as_ptr() as usize,
-                        );
-                        continue;
-                    }
-                }
-                roots.push(*desc);
-            }
-        }
-    }
-}
-
-/// Rewrite every cached descriptor `ObjectRef` through `map`
-/// (old_addr -> new_addr) after a moving GC relocates the heap. Entries
-/// whose address is absent from `map` are left untouched (a non-moved
-/// object, or one already updated).
-///
-/// Registered with the native-root registry via [`register_with_gc`];
-/// must be a bare `fn` for that API.
-pub fn remap_osc_cache_refs(map: &HashMap<usize, usize>) {
-    // Registry guard held across the walk — see `scan_osc_cache_roots` for why
-    // the snapshot-then-release this replaces was a use-after-free.
-    let guard = cache_registry().lock();
-    for &SendPtr(ptr) in guard.iter() {
-        // SAFETY: see `scan_osc_cache_roots`. We take the *write* lock
-        // because we mutate the stored refs in place.
-        let osc_map = unsafe { &*ptr };
-        let mut guard = osc_map.write();
-        for desc in guard.values_mut() {
-            if desc.as_ptr().is_null() {
-                continue;
-            }
-            let old = desc.as_ptr() as usize;
-            if let Some(&new) = map.get(&old) {
-                // SAFETY: `new` is a live, 8-byte-aligned heap address
-                // produced by the moving collector's forwarding table
-                // (the same invariant every other root-remapper relies
-                // on). `from_raw` only debug-asserts non-null/alignment.
-                *desc = unsafe { ObjectRef::from_raw(new as *mut u8) };
-            }
-        }
-    }
-}
-
-/// Register this cache's backing map with the process-global registry
-/// **and** (once per process) hook [`scan_osc_cache_roots`] /
-/// [`remap_osc_cache_refs`] into the GC's native-root registry.
-///
-/// Idempotent per cache: the same `inner` pointer is added at most once.
-/// The GC-registry hook is guarded by a `OnceLock` so it fires exactly
-/// once for the whole process even though every `OscCache` calls this on
-/// its first insert.
-fn register_with_gc(inner: &OscMap) {
-    let ptr = inner as *const OscMap;
-    {
-        let mut guard = cache_registry().lock();
-        if guard.iter().any(|s| s.0 == ptr) {
-            return;
-        }
-        guard.push(SendPtr(ptr));
-    }
-
-    // Wire the scan/remap pair into the VM-wide native-root registry
-    // exactly once. `register_native_root_source` is idempotent, but we
-    // still gate on a `OnceLock` to avoid taking its lock on every cache
-    // creation.
-    static GC_HOOK: OnceLock<()> = OnceLock::new();
-    GC_HOOK.get_or_init(|| {
-        crate::memory::native_roots::register_native_root_source(
-            scan_osc_cache_roots,
-            remap_osc_cache_refs,
-        );
-    });
-}
 
 /// A per-VM cache of `ObjectStreamClass` mirror objects keyed by
 /// `ClassId`.
@@ -226,7 +92,7 @@ fn register_with_gc(inner: &OscMap) {
 /// very first lookup of a class.
 #[derive(Default)]
 pub struct OscCache {
-    inner: RwLock<FxHashMap<ClassId, ObjectRef>>,
+    inner: OscMap,
 }
 
 impl OscCache {
@@ -264,10 +130,10 @@ impl OscCache {
             return existing;
         }
         let fresh = build();
-        // Ensure this cache's descriptors are GC-rooted/remapped before
-        // the first ref is parked in the map (the only reference to a
-        // descriptor may now be the cache entry).
-        register_with_gc(&self.inner);
+        // No registration step: this cache is a field of the owning VM's
+        // `ClassRealm`, and `memory::native_roots` scans it through that
+        // `SharedVm` on every collection — so a descriptor is rooted from
+        // the moment the VM exists, not from the first insert.
         let mut guard = self.inner.write();
         *guard.entry(class_id).or_insert(fresh)
     }
@@ -276,9 +142,6 @@ impl OscCache {
     /// descriptor that ends up in the cache (either `desc` or the
     /// pre-existing entry if one was present).
     pub fn insert_if_absent(&self, class_id: ClassId, desc: ObjectRef) -> ObjectRef {
-        // See `get_or_insert_with`: register for GC root-scanning before
-        // we become the sole holder of this descriptor.
-        register_with_gc(&self.inner);
         let mut guard = self.inner.write();
         *guard.entry(class_id).or_insert(desc)
     }
@@ -293,12 +156,13 @@ impl OscCache {
         self.inner.read().is_empty()
     }
 
-    /// Scan this VM's descriptor cache directly from its owning `SharedVm`.
+    /// Scan this VM's descriptor cache from its owning `SharedVm`.
     ///
-    /// The process-global callback remains as a compatibility backstop, but a
-    /// VM-owned cache must not depend on lazy raw-pointer registration for
-    /// correctness or unloading. Direct ownership also lets loader metadata
-    /// remain a conditional edge during a full class-unloading mark.
+    /// This is the ONLY scan path (`memory::native_roots`' `"osc-cache"`
+    /// source drives it); there is no process-global backstop, so a
+    /// collection in another VM can neither see nor mark these refs.
+    /// Direct ownership also lets loader metadata remain a conditional
+    /// edge during a full class-unloading mark.
     pub fn scan_roots(&self, roots: &mut Vec<ObjectRef>) {
         for (&class_id, desc) in self.inner.read().iter() {
             if cratonvm_types::metadata_pin::metadata_weak_mode() {
@@ -346,23 +210,11 @@ impl OscCache {
     }
 }
 
-impl Drop for OscCache {
-    /// Remove this cache's backing map from the process-global registry on
-    /// teardown, so the GC never dereferences a pointer to a freed `OscMap`.
-    ///
-    /// `insert_if_absent` / `get_or_insert_with` register `&self.inner` via
-    /// [`register_with_gc`] on first use, but nothing un-registered it: a
-    /// production cache outlives the VM, so this never bit real code, but it
-    /// is a latent use-after-free for any teardown path. It *did* bite the
-    /// unit tests, which create and drop many short-lived caches sharing the
-    /// one global registry — a dropped cache left a dangling pointer that a
-    /// later `scan_osc_cache_roots` / `remap_osc_cache_refs` would read.
-    /// Deregistering on `Drop` keeps the registry tracking only live maps.
-    fn drop(&mut self) {
-        let ptr = &self.inner as *const OscMap;
-        cache_registry().lock().retain(|s| s.0 != ptr);
-    }
-}
+// NOTE: there is deliberately no `Drop` impl. The previous one existed only
+// to deregister this cache's raw backing-map pointer from a process-global
+// registry before the map was freed — a use-after-free the registry itself
+// created. With the cache owned by its `SharedVm` and scanned through it,
+// dropping the cache drops its refs and nothing outside can still name them.
 
 /// A borrow handle into the cache. Currently an alias, but exposed
 /// separately so future work can narrow the API surface (e.g. restrict
@@ -458,35 +310,43 @@ mod tests {
         assert!(cache.get(ClassId::new(1)).is_none());
     }
 
-    /// Register a cache's backing map with the global registry *without*
-    /// going through `register_with_gc` — the latter also hooks the VM's
-    /// native-root registry, which we don't want to touch from a unit
-    /// test. This exercises the scan/remap logic in isolation.
-    fn register_for_test(cache: &OscCache) {
-        let ptr = &cache.inner as *const OscMap;
-        let mut guard = cache_registry().lock();
-        // `SendPtr` is `Copy + Send` but deliberately not `PartialEq`, so
-        // dedup by comparing the wrapped raw pointer, mirroring the production
-        // `register_with_gc` idiom above.
-        if !guard.iter().any(|s| s.0 == ptr) {
-            guard.push(SendPtr(ptr));
-        }
-    }
-
     #[test]
     fn scan_yields_cached_descriptor() {
-        // Use a high, distinctive pointer value to avoid colliding with
-        // other tests sharing the process-global registry.
         let seeded = fake_ref(0x5_0001);
         let cache = OscCache::new();
         cache.insert_if_absent(ClassId::new(5001), seeded);
-        register_for_test(&cache);
 
         let mut roots = Vec::new();
-        scan_osc_cache_roots(&mut roots);
+        cache.scan_roots(&mut roots);
         assert!(
             roots.contains(&seeded),
             "scan must surface the cached descriptor as a GC root"
+        );
+    }
+
+    /// The isolation property the process-global registry did not have:
+    /// scanning ONE cache must not report another cache's descriptors.
+    ///
+    /// Under the old `Mutex<Vec<*const OscMap>>` fan-out, every live
+    /// cache in the process contributed to every root scan, so a second
+    /// VM's collector received addresses belonging to a heap it does not
+    /// own. This asserts the scan is bounded by the receiver.
+    #[test]
+    fn scan_does_not_leak_another_caches_descriptors() {
+        let mine = fake_ref(0x5_1001);
+        let theirs = fake_ref(0x5_1002);
+        let vm_a = OscCache::new();
+        let vm_b = OscCache::new();
+        vm_a.insert_if_absent(ClassId::new(5101), mine);
+        vm_b.insert_if_absent(ClassId::new(5101), theirs);
+
+        let mut roots = Vec::new();
+        vm_a.scan_roots(&mut roots);
+        assert!(roots.contains(&mine), "own descriptor must be rooted");
+        assert!(
+            !roots.contains(&theirs),
+            "scanning VM A's cache must not surface VM B's descriptor \
+             (that is a pointer into a heap A's collector does not own)"
         );
     }
 
@@ -497,16 +357,42 @@ mod tests {
         let cache = OscCache::new();
         let cid = ClassId::new(6001);
         cache.insert_if_absent(cid, old_ref);
-        register_for_test(&cache);
 
         let mut map = HashMap::new();
         map.insert(old_ref.as_ptr() as usize, new_ref.as_ptr() as usize);
-        remap_osc_cache_refs(&map);
+        cache.remap_roots(&map);
 
         assert_eq!(
             cache.get(cid),
             Some(new_ref),
             "remap must rewrite the cached ref to its relocated address"
+        );
+    }
+
+    /// The remap counterpart of the scan-isolation test above: VM B's
+    /// relocation map must not rewrite VM A's entries. Two heaps can
+    /// hand out the same address, so a shared fan-out silently repointed
+    /// the other VM's descriptor at an unrelated object.
+    #[test]
+    fn remap_does_not_rewrite_another_caches_descriptors() {
+        let shared_addr = fake_ref(0x6_1001);
+        let relocated = fake_ref(0x6_1002);
+        let vm_a = OscCache::new();
+        let vm_b = OscCache::new();
+        let cid = ClassId::new(6101);
+        vm_a.insert_if_absent(cid, shared_addr);
+        vm_b.insert_if_absent(cid, shared_addr);
+
+        // VM B collects and moves the object at `shared_addr`.
+        let mut map = HashMap::new();
+        map.insert(shared_addr.as_ptr() as usize, relocated.as_ptr() as usize);
+        vm_b.remap_roots(&map);
+
+        assert_eq!(vm_b.get(cid), Some(relocated), "B's own entry moves");
+        assert_eq!(
+            vm_a.get(cid),
+            Some(shared_addr),
+            "B's relocation map must not rewrite A's entry"
         );
     }
 
@@ -516,13 +402,12 @@ mod tests {
         let cache = OscCache::new();
         let cid = ClassId::new(7001);
         cache.insert_if_absent(cid, kept);
-        register_for_test(&cache);
 
         // A remap table that mentions a *different* address must not
         // disturb our entry.
         let mut map = HashMap::new();
         map.insert(0xDEAD_0000usize, 0xBEEF_0000usize);
-        remap_osc_cache_refs(&map);
+        cache.remap_roots(&map);
 
         assert_eq!(cache.get(cid), Some(kept));
     }
