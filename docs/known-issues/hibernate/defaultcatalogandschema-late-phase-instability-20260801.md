@@ -90,6 +90,50 @@ Cheap next steps, in order — the top one is a specific, testable hypothesis:
    per cycle, so whatever this is needs the class's shape.
 3. Bisect `32f9db9a2..cc8167f94` with promotion forced ON, 3 runs per point.
 
+## 2026-08-01 — the corruption is IN OLD GEN, and dev's own validators see it
+
+Running the class on the promotion-ON binary with `CRATONVM_DBG_SWEEP_LIVENESS=1`
++ `CRATONVM_GC_STATS=1` (2 runs: one clean `132/132`, one exiting `rc=3` at 129
+tests) produced the first direct evidence rather than a symptom:
+
+```
+old-gen mark: rejecting object at 0x207908e5610 with implausible extent 0
+    (kind=0, array_len=0, num_slots=33554433) — corrupt header        [x2]
+
+old-gen mark: rejecting external-overlay(BFS owner) candidate 0x2078a1b8b00
+    — not a plausible object base (aligned=true, w0=0x00...)          [x8]
+```
+
+Both come from `c3dbb011a`'s new `old_gen_mark_candidate_plausible` screen, and
+both point the same way:
+
+* `num_slots=33554433` is `0x0200_0001` — not a plausible slot count, and the
+  shape of a header word read at the **wrong base** (or of live old-gen bytes
+  overwritten by something that thinks it owns them). Selective promotion is the
+  only thing writing object headers into old gen at volume on this branch.
+* Eight external-overlay entries resolve to old-gen addresses that are not object
+  bases. `run_non_moving_young_cycle` calls
+  `external_roots::remap_external_roots(&pointer_map)` right after the young
+  sweep precisely so promoted objects' overlay owners follow the young→old move,
+  so these are entries that either missed that remap or now point at memory that
+  has been reused underneath them.
+
+The `CRATONVM_DBG_SWEEP_LIVENESS` assertion itself did **not** fire in either
+run — so whatever frees or overwrites this memory is not the old-gen sweep
+freeing a block something still points at. Combined with the
+`CRATONVM_NO_OLDGEN_COALESCE=1` result above (0 crashes in 2 runs), the surviving
+shape of the hypothesis is: **a free block that does not correspond to a real
+dead object gets merged and handed back out over live promoted data.** The next
+question is what puts such a block on the list — an over-sized `OldGen::free`,
+or an alloc that leaves an inconsistent remainder — not whether the coalescer's
+own strict-adjacency merge is sound (it is).
+
+Instrument `OldGen::free` and `alloc_from_buckets` to assert the freed extent
+matches the object's real extent and that remainders never overlap, and re-run.
+That is a cheap, targeted next step and it does not need the 27-minute class:
+`probes/GcPromoteProbe.java` promotes megabytes per cycle and can be pushed into
+old-gen sweeping with a smaller `--Xmx`.
+
 ## Cost
 
 ~27 minutes per run on a quiet box, and no arm fails reliably — the worst arm is
