@@ -6446,6 +6446,34 @@ impl JitCache {
         }
     }
 
+    /// DIAG: every `declaring_class_id` under which this (class, method,
+    /// descriptor) triple is published, ignoring the id entirely.
+    ///
+    /// [`get`](Self::get) requires an EXACT `declaring_class_id` match, so a
+    /// caller that probes with the wrong id (notably
+    /// `get_loaded_class_id(..).unwrap_or(0)`) misses a body that is sitting
+    /// right there. This says so instead of leaving it to inference.
+    pub fn debug_ids_for(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        for shard in self.shards.iter() {
+            let methods = shard.methods.load();
+            for (key, _) in methods.values() {
+                if &*key.class_name == class_name
+                    && &*key.method_name == method_name
+                    && &*key.descriptor == descriptor
+                {
+                    out.push(key.declaring_class_id.as_u32());
+                }
+            }
+        }
+        out
+    }
+
     /// Look up the independently published OSR body for a method.
     pub fn get_osr(
         &self,

@@ -1965,6 +1965,72 @@ fn read_pinned_elem(ctx: &dyn NativeContext, handle: usize, orig: Value) -> Valu
     }
 }
 
+/// GC-SAFETY idiom: run `body` — which may allocate, dispatch Java, or block
+/// in a GC-safe wait, and can therefore complete a moving young collection —
+/// while `roots` stay rooted, then rewrite each one in place to its post-move
+/// address.
+///
+/// This is the "Family 1" stale-`ObjectRef` bug in one place. A native that
+/// captures a heap reference in a bare Rust local, calls something GC-capable,
+/// and then reuses the local is writing through a pre-move address: the object
+/// itself survives (the caller's `safe_native_call` pin keeps it alive and the
+/// collector remaps *that* pin), but this function's private copy is never
+/// rewritten. Worse, a reference reachable ONLY from such a local — a bucket
+/// chain the walk has already unlinked, a table not yet published — is not a
+/// root at all, and the collection reclaims it outright, leaving a zeroed
+/// receiver behind (`num_slots=0 class_id=ClassId(0)`, the
+/// `gen_heap::set_field: out-of-bounds field write dropped` guard).
+///
+/// Fixing that per site is what produced the long tail of one-off
+/// `pin_native_root`/`read_native_pin` pairs elsewhere in this file, and each
+/// pass missed some. Prefer this helper for new code:
+///
+/// ```ignore
+/// let mut this = this;
+/// let new_table = rooted_across(ctx, &mut [&mut this], |ctx| {
+///     alloc_ref_array(ctx, new_cap)
+/// });
+/// // `this` is now the CURRENT address; `new_table` is post-GC by construction.
+/// ```
+///
+/// The pin frame is taken above whatever the caller already holds and torn
+/// down before returning, so this composes with an enclosing pin base.
+fn rooted_across<T>(
+    ctx: &mut dyn NativeContext,
+    roots: &mut [&mut ObjectRef],
+    body: impl FnOnce(&mut dyn NativeContext) -> T,
+) -> T {
+    if roots.is_empty() {
+        return body(ctx);
+    }
+    // Pin in order; `handles[0]` is the frame base, and
+    // `unpin_native_roots(base)` releases the base and everything above it.
+    let mut handles: Vec<usize> = Vec::with_capacity(roots.len());
+    for r in roots.iter() {
+        handles.push(ctx.pin_native_root(**r));
+    }
+    let base = handles[0];
+    let out = body(ctx);
+    for (r, &h) in roots.iter_mut().zip(handles.iter()) {
+        **r = ctx.read_native_pin(h, **r);
+    }
+    ctx.unpin_native_roots(base);
+    out
+}
+
+/// [`rooted_across`] for the overwhelmingly common single-root case: keep
+/// `this` rooted across `body` and return `(this_now, body_result)`.
+#[inline]
+fn rooted_across1<T>(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    body: impl FnOnce(&mut dyn NativeContext) -> T,
+) -> (ObjectRef, T) {
+    let mut this = this;
+    let out = rooted_across(ctx, &mut [&mut this], body);
+    (this, out)
+}
+
 /// Allocate a hash-map bucket table of `cap` entries, **capping the eager
 /// allocation to what the heap can hold**, and return `(table, actual_cap)`.
 ///
@@ -3217,7 +3283,9 @@ pub fn native_al_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
+    // GC-safety: `alloc_ref_array` can complete a moving young GC and `this` is
+    // a bare Rust local — see `rooted_across`.
+    let (this, buf) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, AL_DEFAULT_CAPACITY));
     al_set_data(ctx, this, buf);
     al_set_size(ctx, this, 0);
     Ok(None)
@@ -3720,9 +3788,16 @@ pub fn native_al_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     // Live `values()` view: clearing the view clears the source map.
-    if let Some(source) = values_view_source(ctx, this) {
-        ctx.invoke_virtual(source, "clear", "()V", &[])?;
-    }
+    // GC-safety: that `clear()` is arbitrary Java and can complete a moving
+    // young GC, leaving `this` a pre-move address for everything below.
+    let this_pin = ctx.pin_native_root(this);
+    let cleared = match values_view_source(ctx, this) {
+        Some(source) => ctx.invoke_virtual(source, "clear", "()V", &[]).map(|_| ()),
+        None => Ok(()),
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    cleared?;
     let (data, size) = al_state(ctx, this);
     if let Some(d) = data {
         for i in 0..(size as usize) {
@@ -4292,7 +4367,14 @@ fn native_al_trim_to_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let size = size as usize;
     let old_cap = data.map_or(0, |d| ctx.array_length(d));
     if size < old_cap {
-        let new_buf = alloc_ref_array(ctx, size);
+        // GC-safety: the allocation can move both `this` and the old buffer;
+        // both are used afterwards. See `rooted_across`.
+        let mut this = this;
+        let mut old = data.unwrap_or(this);
+        let new_buf = rooted_across(ctx, &mut [&mut this, &mut old], |ctx| {
+            alloc_ref_array(ctx, size)
+        });
+        let data = data.map(|_| old);
         if let Some(old_buf) = data {
             if !ctx.bulk_array_copy(old_buf, 0, new_buf, 0, size) {
                 for i in 0..size {
@@ -6759,7 +6841,9 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let this = ctx.read_native_pin(this_pin, this);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
         ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-        // The store above is a GC point (write barrier); refresh before reusing.
+        // Refresh before reusing. (The store above is NOT itself a GC point —
+        // see the `map_resize_inner` note; the refresh is kept as cheap
+        // store-boundary discipline, not because the barrier can collect.)
         let this = ctx.read_native_pin(this_pin, this);
         ctx.unpin_native_roots(this_pin);
         set_map_size(ctx, this, 0);
@@ -6816,10 +6900,14 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // Legacy synthetic layout — what every other native HashMap op expects.
     // GC-safety: same hazard as the Hashtable branch above — `alloc_ref_array`
     // can collect, and every field store from here on uses `this`.
-    // A reference-typed store is itself a GC point: its write barrier can
-    // allocate a remembered-set entry and complete a young collection (see
-    // the `map_resize` chain-cursor fix). Keep both pins live and re-read
-    // across every such store, not just across the allocation.
+    // NOTE (HIB-MAPRESIZE-STALE.1): the pins below stay live across the whole
+    // store sequence, but NOT for the reason originally given here. A
+    // reference-typed store is not a GC point: `gen_heap::write_barrier`
+    // bails out on a non-cross-generational store and otherwise pushes an
+    // offset into a per-mutator Rust buffer — it never allocates from the
+    // Java heap. The real hazard is the ALLOCATION above; holding the pins
+    // through the stores is harmless and keeps every store using a re-read
+    // reference.
     let this_pin = ctx.pin_native_root(this);
     let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
     let buckets_pin = ctx.pin_native_root(buckets);
@@ -6910,10 +6998,14 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // which is what `new HashSet<>(...)`'s backing map goes through — never
     // got the same treatment, so the bucket-array store below could land on a
     // stale receiver and leave the fresh map with no table at all.
-    // A reference-typed store is itself a GC point: its write barrier can
-    // allocate a remembered-set entry and complete a young collection (see
-    // the `map_resize` chain-cursor fix). Keep both pins live and re-read
-    // across every such store, not just across the allocation.
+    // NOTE (HIB-MAPRESIZE-STALE.1): the pins below stay live across the whole
+    // store sequence, but NOT for the reason originally given here. A
+    // reference-typed store is not a GC point: `gen_heap::write_barrier`
+    // bails out on a non-cross-generational store and otherwise pushes an
+    // offset into a per-mutator Rust buffer — it never allocates from the
+    // Java heap. The real hazard is the ALLOCATION above; holding the pins
+    // through the stores is harmless and keeps every store using a re-read
+    // reference.
     let this_pin = ctx.pin_native_root(this);
     let (buckets, cap) = alloc_bucket_table(ctx, cap);
     let buckets_pin = ctx.pin_native_root(buckets);
@@ -9186,7 +9278,13 @@ fn alloc_view_backing(
     kind: i32,
     cap: usize,
 ) -> ObjectRef {
-    let buckets = alloc_ref_array(ctx, cap);
+    // GC-safety: `source` outlives the bucket allocation, the
+    // `ensure_class_initialized` below (which can run a `<clinit>`) and the
+    // backing allocation, and `buckets` outlives the last two — all as bare
+    // Rust locals. A freshly allocated bucket array that nothing references yet
+    // is reclaimed outright by a collection here. See `rooted_across`.
+    let mut source = source;
+    let mut buckets = rooted_across(ctx, &mut [&mut source], |ctx| alloc_ref_array(ctx, cap));
 
     // Build the view backing with the REAL `java/util/HashMap` field layout
     // (buckets at the resolved `table` slot), NOT the legacy synthetic
@@ -9207,7 +9305,9 @@ fn alloc_view_backing(
     // resolved `size`), so the view's own population/iterator/remove natives are
     // unaffected. Falls back to the legacy synthetic `MapViewBacking` layout if
     // the real HashMap class is not yet resolvable (early bootstrap).
-    let _ = ctx.ensure_class_initialized("java/util/HashMap");
+    rooted_across(ctx, &mut [&mut source, &mut buckets], |ctx| {
+        let _ = ctx.ensure_class_initialized("java/util/HashMap");
+    });
     let f_table = ctx.resolve_field_index("java/util/HashMap", "table");
     let f_size = ctx.resolve_field_index("java/util/HashMap", "size");
     if let (Some(f_table), Some(f_size)) = (f_table, f_size) {
@@ -9232,7 +9332,9 @@ fn alloc_view_backing(
         .max()
         .unwrap_or(0);
         let n_fields = std::cmp::max(real_max + 1, VIEW_BACKING_FIELDS);
-        let backing = ctx.alloc_object(hashmap_cid, n_fields);
+        let backing = rooted_across(ctx, &mut [&mut source, &mut buckets], |ctx| {
+            ctx.alloc_object(hashmap_cid, n_fields)
+        });
         ctx.set_field(backing, f_table, Value::Object(Some(buckets)));
         // Dual-storage: also keep the bucket array at the synthetic slot 0 so the
         // legacy slot-0 readers (`map_state`'s fast path, the `collect_view_
@@ -9261,7 +9363,9 @@ fn alloc_view_backing(
 
     // Fallback: legacy synthetic `(buckets, size, capacity)` MapViewBacking
     // layout, used before the real `java/util/HashMap` class is resolvable.
-    let backing = alloc_synthetic(ctx, "cratonvm/util/MapViewBacking", VIEW_BACKING_FIELDS);
+    let backing = rooted_across(ctx, &mut [&mut source, &mut buckets], |ctx| {
+        alloc_synthetic(ctx, "cratonvm/util/MapViewBacking", VIEW_BACKING_FIELDS)
+    });
     ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, backing, 0);
     ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
@@ -10442,13 +10546,14 @@ fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // returns. Use only their count for sizing, then RE-collect from the live
     // backing after the alloc and store immediately (no alloc in between).
     let len = keys.len();
-    let arr = match target {
+    // `backing` is read again after the allocation, so root it across it.
+    let (backing, arr) = rooted_across1(ctx, backing, |ctx| match target {
         Some(t) => {
             let comp = ctx.class_id_of_object(t);
             ctx.new_ref_array(comp, len)
         }
         None => alloc_ref_array(ctx, len),
-    };
+    });
     let keys = collect_view_snapshot_ordered(ctx, backing);
     for (i, k) in keys.iter().enumerate().take(len) {
         ctx.set_array_element(arr, i, *k);
@@ -10580,14 +10685,37 @@ fn native_hs_contains_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // GC-safety: `collect_collection_elements_or_real` dispatches Java and the
+    // per-element `native_hs_contains` below dispatches more (the source map's
+    // `containsKey`/`get`, the elements' `hashCode`/`equals`). `this` and every
+    // element sit in bare Rust locals across those calls — the `Vec` is not a
+    // GC root, so its contents would be pre-move addresses.
+    let this_pin = ctx.pin_native_root(this);
     let elems = collect_collection_elements_or_real(ctx, coll);
-    for e in &elems {
-        let r = native_hs_contains(ctx, &[Value::Object(Some(this)), *e])?;
-        if !matches!(r, Some(Value::Int(1))) {
-            return Ok(Some(Value::Int(0)));
+    let (_elem_base, elem_pins) = pin_value_slice(ctx, &elems);
+    let mut answer = 1;
+    let mut failure = None;
+    for (i, e) in elems.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, elem_pins[i], *e);
+        match native_hs_contains(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(r) => {
+                if !matches!(r, Some(Value::Int(1))) {
+                    answer = 0;
+                    break;
+                }
+            }
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
         }
     }
-    Ok(Some(Value::Int(1)))
+    ctx.unpin_native_roots(this_pin);
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    Ok(Some(Value::Int(answer)))
 }
 
 /// S111r28: Allocate the backing HashMap with enough field slots to cover
@@ -10938,6 +11066,26 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
+    // GC-safety: the view branches below dispatch the SOURCE map's real
+    // `containsKey`/`get` (arbitrary Java) and `map_keys_equal`, each of which
+    // can complete a moving young GC. `backing`, `elem` and the entry's
+    // key/value are bare Rust locals used after those calls. Root them for the
+    // whole native and re-read at each use.
+    let hs_pin = ctx.pin_native_root(backing);
+    let elem_pin = pin_value(ctx, elem);
+    let elem = read_pinned_elem(ctx, elem_pin, elem);
+    let result = native_hs_contains_pinned(ctx, backing, hs_pin, elem, elem_pin);
+    ctx.unpin_native_roots(hs_pin);
+    result
+}
+
+fn native_hs_contains_pinned(
+    ctx: &mut dyn NativeContext,
+    backing: ObjectRef,
+    hs_pin: usize,
+    elem: Value,
+    elem_pin: usize,
+) -> MethodCallResult {
     // entrySet() view: `contains(e)` must follow `AbstractMap`'s contract —
     // `getNode(e.getKey()) != null && node.value.equals(e.getValue())` — i.e.
     // compare by Map.Entry equality against the SOURCE map. Looking the entry
@@ -10959,11 +11107,17 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             // Resolve via the source map's own `containsKey`/`get` so this works
             // for every backing map type (HashMap / LinkedHashMap / TreeMap).
             // `containsKey` distinguishes "absent" from "present with null value".
+            // Both dispatches are arbitrary Java and can move every local here.
+            let source_pin = ctx.pin_native_root(source);
+            let key_pin = pin_value(ctx, key);
+            let want_pin = pin_value(ctx, want_val);
             let has_key =
                 ctx.invoke_virtual(source, "containsKey", "(Ljava/lang/Object;)Z", &[key])?;
             if !matches!(has_key, Some(Value::Int(1))) {
                 return Ok(Some(Value::Int(0)));
             }
+            let source = ctx.read_native_pin(source_pin, source);
+            let key = read_pinned_elem(ctx, key_pin, key);
             let got = ctx
                 .invoke_virtual(
                     source,
@@ -10972,8 +11126,10 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                     &[key],
                 )?
                 .unwrap_or(Value::Object(None));
+            let got_pin = pin_value(ctx, got);
+            let want_val = read_pinned_elem(ctx, want_pin, want_val);
             let eq = values_equal(ctx, &got, &want_val)
-                || match (got, want_val) {
+                || match (read_pinned_elem(ctx, got_pin, got), want_val) {
                     (Value::Object(Some(a)), Value::Object(Some(b))) => map_keys_equal(ctx, a, b)?,
                     _ => false,
                 };
@@ -10988,6 +11144,7 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // returned false (LinkedCaseInsensitiveMapTests putAndGet /
         // putWithOverlappingKeys).
         if view_backing_kind(ctx, backing) == VIEW_KIND_KEYSET {
+            let elem = read_pinned_elem(ctx, elem_pin, elem);
             let has =
                 ctx.invoke_virtual(source, "containsKey", "(Ljava/lang/Object;)Z", &[elem])?;
             return Ok(Some(Value::Int(if matches!(has, Some(Value::Int(1))) {
@@ -10997,6 +11154,8 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             })));
         }
     }
+    let backing = ctx.read_native_pin(hs_pin, backing);
+    let elem = read_pinned_elem(ctx, elem_pin, elem);
     let ck_args = [Value::Object(Some(backing)), elem];
     native_map_contains_key(ctx, &ck_args)
 }
@@ -11011,9 +11170,18 @@ fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         None => return Ok(None),
     };
     // Live keySet/entrySet view: clearing the view clears the source map.
-    if let Some(source) = view_backing_source(ctx, backing) {
-        ctx.invoke_virtual(source, "clear", "()V", &[])?;
-    }
+    // GC-safety: that `clear()` is arbitrary Java and can complete a moving
+    // young GC, after which both `this` and `backing` are pre-move addresses.
+    let this_pin = ctx.pin_native_root(this);
+    let backing_h = ctx.pin_native_root(backing);
+    let cleared = match view_backing_source(ctx, backing) {
+        Some(source) => ctx.invoke_virtual(source, "clear", "()V", &[]).map(|_| ()),
+        None => Ok(()),
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    let backing = ctx.read_native_pin(backing_h, backing);
+    ctx.unpin_native_roots(this_pin);
+    cleared?;
     let clear_args = [Value::Object(Some(backing))];
     // LinkedHashSet / CopyOnWriteArraySet back onto a LinkedHashMap, whose state
     // (size/head/tail + bucket table) lives in the LHM overlay, NOT the plain
@@ -11187,7 +11355,9 @@ fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // live (and now post-GC) backing and store each ref immediately, with no
     // allocation between the read and the store.
     let len = collect_view_snapshot_ordered(ctx, backing).len();
-    let arr = alloc_ref_array(ctx, len);
+    // ...and root `backing` itself across that allocation: the re-collect below
+    // reads through it, so a pre-move copy would walk freed memory.
+    let (backing, arr) = rooted_across1(ctx, backing, |ctx| alloc_ref_array(ctx, len));
     let keys = collect_view_snapshot_ordered(ctx, backing);
     for (i, k) in keys.iter().enumerate().take(len) {
         ctx.set_array_element(arr, i, *k);
@@ -13727,7 +13897,16 @@ fn native_entry_set_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if ctx.object_num_fields(this) >= 3 {
         if let Value::Object(Some(src_map)) = ctx.get_field(this, 2) {
             let key = ctx.get_field(this, 0);
-            if is_hashtable_receiver(ctx, src_map) {
+            // GC-safety: the write-through below dispatches arbitrary Java
+            // (`put`, the key's `hashCode`/`equals`, a possible resize). Root the
+            // source map and both values so the call receives current addresses.
+            let src_pin = ctx.pin_native_root(src_map);
+            let key_pin = pin_value(ctx, key);
+            let val_pin = pin_value(ctx, new_val);
+            let src_map = ctx.read_native_pin(src_pin, src_map);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let new_val = read_pinned_elem(ctx, val_pin, new_val);
+            let wrote = if is_hashtable_receiver(ctx, src_map) {
                 // Hashtable/Properties store their entries outside the HashMap
                 // bucket array `native_map_put` writes to (Properties keeps them
                 // in a Rust side-table). Dispatch through the receiver's virtual
@@ -13739,10 +13918,13 @@ fn native_entry_set_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                     "put",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                     &[key, new_val],
-                )?;
+                )
+                .map(|_| ())
             } else {
-                native_map_put(ctx, &[Value::Object(Some(src_map)), key, new_val])?;
-            }
+                native_map_put(ctx, &[Value::Object(Some(src_map)), key, new_val]).map(|_| ())
+            };
+            ctx.unpin_native_roots(src_pin);
+            wrote?;
         }
     }
     Ok(Some(old_val))
@@ -13753,15 +13935,26 @@ fn native_entry_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let key = ctx
-        .invoke_virtual(this, "getKey", "()Ljava/lang/Object;", &[])?
-        .unwrap_or(Value::Object(None));
-    let value = ctx
-        .invoke_virtual(this, "getValue", "()Ljava/lang/Object;", &[])?
-        .unwrap_or(Value::Object(None));
-    Ok(Some(Value::Int(
-        element_hash_code(ctx, &key) ^ element_hash_code(ctx, &value),
-    )))
+    // GC-safety: every dispatch here runs arbitrary Java. `this` and the two
+    // extracted values are bare Rust locals reused after the next call.
+    let this_pin = ctx.pin_native_root(this);
+    let hashes = (|| -> Result<i32, MethodCallFailed> {
+        let key = ctx
+            .invoke_virtual(this, "getKey", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        let key_pin = pin_value(ctx, key);
+        let this = ctx.read_native_pin(this_pin, this);
+        let value = ctx
+            .invoke_virtual(this, "getValue", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        let value_pin = pin_value(ctx, value);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let kh = element_hash_code(ctx, &key);
+        let value = read_pinned_elem(ctx, value_pin, value);
+        Ok(kh ^ element_hash_code(ctx, &value))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Int(hashes?)))
 }
 
 fn native_entry_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13780,23 +13973,42 @@ fn native_entry_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         return Ok(Some(Value::Int(0)));
     }
 
-    let this_key = ctx
-        .invoke_virtual(this, "getKey", "()Ljava/lang/Object;", &[])?
-        .unwrap_or(Value::Object(None));
-    let this_value = ctx
-        .invoke_virtual(this, "getValue", "()Ljava/lang/Object;", &[])?
-        .unwrap_or(Value::Object(None));
-    let other_key = ctx
-        .invoke_virtual(other, "getKey", "()Ljava/lang/Object;", &[])?
-        .unwrap_or(Value::Object(None));
-    if !values_equal_deep(ctx, &this_key, &other_key)? {
-        return Ok(Some(Value::Int(0)));
-    }
-    let other_value = ctx
-        .invoke_virtual(other, "getValue", "()Ljava/lang/Object;", &[])?
-        .unwrap_or(Value::Object(None));
-    let eq = values_equal_deep(ctx, &this_value, &other_value)?;
-    Ok(Some(Value::Int(if eq { 1 } else { 0 })))
+    // GC-safety: four Java dispatches plus two `equals` comparisons, with the
+    // receivers and every extracted value living in bare Rust locals across
+    // them. Root the two receivers and each value as it is produced.
+    let eq_base = ctx.pin_native_root(this);
+    let other_pin = ctx.pin_native_root(other);
+    let verdict = (|| -> Result<bool, MethodCallFailed> {
+        let this_key = ctx
+            .invoke_virtual(this, "getKey", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        let this_key_pin = pin_value(ctx, this_key);
+        let this = ctx.read_native_pin(eq_base, this);
+        let this_value = ctx
+            .invoke_virtual(this, "getValue", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        let this_value_pin = pin_value(ctx, this_value);
+        let other = ctx.read_native_pin(other_pin, other);
+        let other_key = ctx
+            .invoke_virtual(other, "getKey", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        let other_key_pin = pin_value(ctx, other_key);
+        let this_key = read_pinned_elem(ctx, this_key_pin, this_key);
+        let other_key = read_pinned_elem(ctx, other_key_pin, other_key);
+        if !values_equal_deep(ctx, &this_key, &other_key)? {
+            return Ok(false);
+        }
+        let other = ctx.read_native_pin(other_pin, other);
+        let other_value = ctx
+            .invoke_virtual(other, "getValue", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        let other_value_pin = pin_value(ctx, other_value);
+        let this_value = read_pinned_elem(ctx, this_value_pin, this_value);
+        let other_value = read_pinned_elem(ctx, other_value_pin, other_value);
+        values_equal_deep(ctx, &this_value, &other_value)
+    })();
+    ctx.unpin_native_roots(eq_base);
+    Ok(Some(Value::Int(if verdict? { 1 } else { 0 })))
 }
 
 /// True when `this`'s runtime class is `java/util/Hashtable` or a subclass
@@ -14745,7 +14957,20 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn native_map_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let key = args.first().copied().unwrap_or(Value::Object(None));
     let value = args.get(1).copied().unwrap_or(Value::Object(None));
+    // GC-safety: `alloc_synthetic` can complete a moving young GC, so the bare
+    // `key`/`value` copies would be pre-move addresses by the time they are
+    // stored — publishing dangling references into a live object. Pin both
+    // across the allocation and re-read them at the stores.
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
     let entry = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
+    let key = read_pinned_elem(ctx, key_pin, key);
+    let value = read_pinned_elem(ctx, value_pin, value);
+    if key_pin != usize::MAX {
+        ctx.unpin_native_roots(key_pin);
+    } else if value_pin != usize::MAX {
+        ctx.unpin_native_roots(value_pin);
+    }
     ctx.set_field(entry, 0, key);
     ctx.set_field(entry, 1, value);
     Ok(Some(Value::Object(Some(entry))))
@@ -27750,7 +27975,9 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
 
 fn ll_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
     let size = ll_size(ctx, this) as usize;
-    let arr = alloc_ref_array(ctx, size);
+    // GC-safety: the allocation can complete a moving young GC and the node
+    // walk below reads `head` out of `this`. See `rooted_across`.
+    let (this, arr) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, size));
     let mut cur = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
@@ -27776,8 +28003,16 @@ fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let arr = ll_snapshot_array(ctx, this);
-    let it = alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3);
+    // GC-safety: the snapshot and the iterator shell each allocate; `this`
+    // and the snapshot are both stored afterwards. See `rooted_across`.
+    let mut this = this;
+    let this_at_call = this;
+    let mut arr = rooted_across(ctx, &mut [&mut this], |ctx| {
+        ll_snapshot_array(ctx, this_at_call)
+    });
+    let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
+        alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3)
+    });
     ctx.set_field(it, 0, Value::Object(Some(arr)));
     ctx.set_field(it, 1, Value::Int(0));
     ctx.set_field(it, 2, Value::Object(Some(this)));
@@ -27793,8 +28028,16 @@ fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let arr = ll_snapshot_array(ctx, this);
-    let it = alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3);
+    // GC-safety: the snapshot and the iterator shell each allocate; `this`
+    // and the snapshot are both stored afterwards. See `rooted_across`.
+    let mut this = this;
+    let this_at_call = this;
+    let mut arr = rooted_across(ctx, &mut [&mut this], |ctx| {
+        ll_snapshot_array(ctx, this_at_call)
+    });
+    let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
+        alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3)
+    });
     ctx.set_field(it, 0, Value::Object(Some(arr)));
     ctx.set_field(it, 1, Value::Int(idx.max(0)));
     ctx.set_field(it, 2, Value::Object(Some(this)));
@@ -28071,11 +28314,20 @@ fn native_ll_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     };
     let elements = ll_overlay_elements(ctx, this);
-    let arr = alloc_ref_array(ctx, elements.len());
+    // GC-safety: the collected elements live in a bare `Vec`, which is not a
+    // GC root, and both allocations below can collect. Pin the slice and
+    // re-read each element at its store; root the array across the shell.
+    let (elem_base, elem_pins) = pin_value_slice(ctx, &elements);
+    let mut arr = alloc_ref_array(ctx, elements.len());
     for (i, v) in elements.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
+        ctx.set_array_element(arr, i, read_pinned_elem(ctx, elem_pins[i], *v));
     }
-    let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+    if elem_base != usize::MAX {
+        ctx.unpin_native_roots(elem_base);
+    }
+    let spl = rooted_across(ctx, &mut [&mut arr], |ctx| {
+        alloc_synthetic(ctx, "java/util/Spliterator", 3)
+    });
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
     ctx.set_field(spl, 2, Value::Int(elements.len() as i32));
@@ -28709,7 +28961,8 @@ fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     };
     let size = ll_size(ctx, this) as usize;
-    let arr = alloc_ref_array(ctx, size);
+    // GC-safety: see `ll_snapshot_array`.
+    let (this, arr) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, size));
     let mut cur_opt = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
@@ -28746,9 +28999,20 @@ fn native_ll_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
     let size = ll_size(ctx, this) as usize;
     // Reuse the supplied array when it is large enough; otherwise allocate.
-    let target = match template {
-        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
-        _ => alloc_ref_array(ctx, size),
+    // GC-safety: the fallback allocation can move `this` (walked below) and
+    // the caller-supplied template. See `rooted_across`.
+    let mut this = this;
+    let mut template_ref = match template {
+        Value::Object(Some(a)) => a,
+        _ => this,
+    };
+    let reuse = matches!(template, Value::Object(Some(a)) if ctx.array_length(a) >= size);
+    let target = if reuse {
+        template_ref
+    } else {
+        rooted_across(ctx, &mut [&mut this, &mut template_ref], |ctx| {
+            alloc_ref_array(ctx, size)
+        })
     };
     let mut cur_opt = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
@@ -28810,7 +29074,16 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let head = ll_get(ctx, this, "head");
-    let itr = alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3);
+    // GC-safety: `alloc_synthetic` can collect; `this` and the head node are
+    // both stored into the iterator afterwards. See `rooted_across`.
+    let head_pin = pin_value(ctx, head);
+    let (this, itr) = rooted_across1(ctx, this, |ctx| {
+        alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3)
+    });
+    let head = read_pinned_elem(ctx, head_pin, head);
+    if head_pin != usize::MAX {
+        ctx.unpin_native_roots(head_pin);
+    }
     ctx.set_field(itr, 0, head); // current node
     ctx.set_field(itr, 1, Value::Object(Some(this))); // list ref
     ctx.set_field(itr, 2, Value::Object(None)); // last returned node
@@ -29189,9 +29462,20 @@ fn lhm_unlink(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) {
 fn lhm_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let (_, size, cap) = lhm_state(ctx, this);
     let new_cap = (cap as usize) * 2;
-    let new_buckets = alloc_ref_array(ctx, new_cap);
+    // HIB-MAPRESIZE-STALE.1: `alloc_ref_array` can complete a moving young GC,
+    // and `this` is a bare Rust local — the caller's `safe_native_call` pin
+    // keeps the map ALIVE but does not rewrite this copy of its address. The
+    // sibling `lhm_init_with_cap` and `map_resize_inner` were both given this
+    // treatment; `lhm_resize` and `native_lhm_clear` were missed. Reading
+    // `head` through the stale address then walks a freed object's slot as a
+    // node chain and writes `LHM_NODE_NEXT` (slot 3) through every "node" it
+    // finds — the `index=3 num_slots=0 class_id=ClassId(0)` dropped write in
+    // the Hibernate `--nojit` SIGSEGV — and finally publishes those addresses
+    // into `new_buckets`, corrupting the map for good.
+    let (this, new_buckets) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, new_cap));
 
-    // Walk insertion-order list and rehash
+    // Walk insertion-order list and rehash. No allocation and no Java dispatch
+    // happens below, so one refresh of `this` covers the whole walk.
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let hash = match ctx.get_field(node, LHM_NODE_HASH) {
@@ -29453,7 +29737,31 @@ fn native_lhm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Object(None))),
     };
 
+    // GC-safety: `native_lhm_get`, the mapper's `apply` and `native_lhm_put`
+    // below each dispatch arbitrary Java and can complete a moving young GC.
+    // `this`, `key` and `function` are bare Rust locals — the caller's
+    // `safe_native_call` pins keep the OBJECTS alive but do not rewrite these
+    // copies, so every later use addressed a pre-move location.
+    let cia_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let fn_pin = ctx.pin_native_root(function);
+    let out =
+        native_lhm_compute_if_absent_pinned(ctx, this, cia_pin, key, key_pin, function, fn_pin);
+    ctx.unpin_native_roots(cia_pin);
+    out
+}
+
+fn native_lhm_compute_if_absent_pinned(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    cia_pin: usize,
+    key: Value,
+    key_pin: usize,
+    function: ObjectRef,
+    fn_pin: usize,
+) -> MethodCallResult {
     // If the key is already present, return the existing value unchanged.
+    let key = read_pinned_elem(ctx, key_pin, key);
     let existing = native_lhm_get(ctx, &[Value::Object(Some(this)), key])?;
     if let Some(Value::Object(Some(_))) = existing {
         return Ok(existing);
@@ -29465,6 +29773,8 @@ fn native_lhm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // `key` remain in the surrounding safe-native argument root set. A short
     // global root avoids the per-frame snapshot work of three transient pins
     // while preserving the result through a moving collection.
+    let function = ctx.read_native_pin(fn_pin, function);
+    let key = read_pinned_elem(ctx, key_pin, key);
     let result = ctx.invoke_virtual(
         function,
         "apply",
@@ -29479,6 +29789,8 @@ fn native_lhm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Value::Object(Some(obj)) => Some(ctx.add_global_root(obj)),
         _ => None,
     };
+    let this = ctx.read_native_pin(cia_pin, this);
+    let key = read_pinned_elem(ctx, key_pin, key);
     let put_result = native_lhm_put(ctx, &[Value::Object(Some(this)), key, new_val]);
     let new_val = match result_root.and_then(|root| ctx.resolve_global_root(root)) {
         Some(obj) => Value::Object(Some(obj)),
@@ -30121,7 +30433,12 @@ fn native_lhm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     let (_, _, cap) = lhm_state(ctx, this);
-    let new_buckets = alloc_ref_array(ctx, cap as usize);
+    // HIB-MAPRESIZE-STALE.1: same missed pin as `lhm_resize` — `alloc_ref_array`
+    // can complete a moving young GC, and every `lhm_set` below (including the
+    // overlay key, which is `this`'s identity hash) would then address a
+    // pre-move copy of the map, leaving the real map uncleared and scribbling
+    // on whatever now occupies the old address.
+    let (this, new_buckets) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, cap as usize));
     lhm_set(
         ctx,
         this,
@@ -30202,14 +30519,39 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // another batch load -> `StackOverflowError` (HotSpot never hashes entries
     // while building/iterating `entrySet()`). Live removal/`setValue` still work
     // via the entrySet view-backing (`VIEW_KIND_ENTRYSET` + 3-field entries).
-    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    // GC-safety: this builds the view with N+2 allocations in a loop while
+    // holding `this`, `set`, `backing_map` and every collected key/value in
+    // bare Rust locals — none of which is a GC root, so each allocation could
+    // leave the next store writing through a pre-move address (and could
+    // reclaim the freshly built `set`/`backing_map` outright, since nothing on
+    // the heap references them yet). Root them all for the whole build.
+    let mut this = this;
+    let flat: Vec<Value> = pairs.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (flat_base, flat_pins) = pin_value_slice(ctx, &flat);
+    let mut set = rooted_across(ctx, &mut [&mut this], |ctx| {
+        alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)
+    });
     let cap = std::cmp::max(pairs.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
-    let backing_map = alloc_view_backing(ctx, this, VIEW_KIND_ENTRYSET, cap);
+    let this_at_call = this;
+    let mut backing_map = rooted_across(ctx, &mut [&mut this, &mut set], |ctx| {
+        alloc_view_backing(ctx, this_at_call, VIEW_KIND_ENTRYSET, cap)
+    });
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
-    for (key, val) in &pairs {
-        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 3);
-        ctx.set_field(entry_obj, 0, *key);
-        ctx.set_field(entry_obj, 1, *val);
+    for i in 0..pairs.len() {
+        let mut entry_obj =
+            rooted_across(ctx, &mut [&mut this, &mut set, &mut backing_map], |ctx| {
+                alloc_synthetic(ctx, "java/util/Map$Entry", 3)
+            });
+        ctx.set_field(
+            entry_obj,
+            0,
+            read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]),
+        );
+        ctx.set_field(
+            entry_obj,
+            1,
+            read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]),
+        );
         ctx.set_field(entry_obj, 2, Value::Object(Some(this)));
         let hash = ctx.identity_hash_code(entry_obj);
         let (b, size, c) = map_state(ctx, backing_map);
@@ -30221,9 +30563,27 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             _ => None,
         };
         let sentinel = Value::Int(1);
-        let node = map_alloc_node(ctx, entry_obj, sentinel, hash, head);
-        ctx.set_array_element(b, idx, Value::Object(Some(node)));
+        // `map_alloc_node` allocates: the bucket array and the map itself must
+        // survive it, and the entry has to come back at its post-move address.
+        let mut bucket_arr = b;
+        let entry_at_call = entry_obj;
+        let head_at_call = head;
+        let node = rooted_across(
+            ctx,
+            &mut [
+                &mut this,
+                &mut set,
+                &mut backing_map,
+                &mut bucket_arr,
+                &mut entry_obj,
+            ],
+            |ctx| map_alloc_node(ctx, entry_at_call, sentinel, hash, head_at_call),
+        );
+        ctx.set_array_element(bucket_arr, idx, Value::Object(Some(node)));
         set_map_size(ctx, backing_map, size + 1);
+    }
+    if flat_base != usize::MAX {
+        ctx.unpin_native_roots(flat_base);
     }
     Ok(Some(Value::Object(Some(set))))
 }
@@ -30418,7 +30778,14 @@ fn ad_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
         return;
     }
     let new_cap = std::cmp::max(old_cap * 2, min_cap);
-    let new_buf = alloc_ref_array(ctx, new_cap);
+    // GC-safety: the allocation can complete a moving young GC; `this` and the
+    // old buffer are both bare Rust locals used below. See `rooted_across`.
+    let mut this = this;
+    let mut old = data.unwrap_or(this);
+    let new_buf = rooted_across(ctx, &mut [&mut this, &mut old], |ctx| {
+        alloc_ref_array(ctx, new_cap)
+    });
+    let data = data.map(|_| old);
     // Copy elements in order: head..end, then 0..wrap
     if let Some(old_buf) = data {
         let s = size as usize;
@@ -30524,7 +30891,8 @@ fn native_ad_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let buf = alloc_ref_array(ctx, AD_DEFAULT_CAPACITY);
+    // GC-safety: see `rooted_across` — `this` must survive the allocation.
+    let (this, buf) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, AD_DEFAULT_CAPACITY));
     ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
@@ -30990,7 +31358,12 @@ fn native_ad_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, head, _, size) = ad_state(ctx, this);
-    let arr = alloc_ref_array(ctx, size as usize);
+    // GC-safety: the allocation can move the ring buffer we copy out of.
+    let mut buf_ref = data.unwrap_or(this);
+    let arr = rooted_across(ctx, &mut [&mut buf_ref], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
+    let data = data.map(|_| buf_ref);
     if let Some(buf) = data {
         let cap = ctx.array_length(buf);
         for i in 0..(size as usize) {
@@ -31154,7 +31527,13 @@ fn pq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
         return;
     }
     let new_cap = std::cmp::max(old_cap + old_cap / 2 + 1, min_cap);
-    let new_buf = alloc_ref_array(ctx, new_cap);
+    // GC-safety: see `rooted_across`.
+    let mut this = this;
+    let mut old = data.unwrap_or(this);
+    let new_buf = rooted_across(ctx, &mut [&mut this, &mut old], |ctx| {
+        alloc_ref_array(ctx, new_cap)
+    });
+    let data = data.map(|_| old);
     if let Some(old_buf) = data {
         for i in 0..old_cap {
             let val = ctx.get_array_element(old_buf, i);
@@ -31349,7 +31728,8 @@ fn native_pq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let buf = alloc_ref_array(ctx, PQ_DEFAULT_CAPACITY);
+    // GC-safety: see `rooted_across`.
+    let (this, buf) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, PQ_DEFAULT_CAPACITY));
     ctx.set_field(this, PQ_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(0));
     ctx.set_field(this, PQ_FIELD_COMPARATOR, Value::Object(None));
@@ -31388,7 +31768,14 @@ fn native_pq_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(None),
     };
     let comp = args.get(1).copied().unwrap_or(Value::Object(None));
-    let buf = alloc_ref_array(ctx, PQ_DEFAULT_CAPACITY);
+    // GC-safety: `this` and the comparator argument must both survive the
+    // allocation below — see `rooted_across`.
+    let comp_pin = pin_value(ctx, comp);
+    let (this, buf) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, PQ_DEFAULT_CAPACITY));
+    let comp = read_pinned_elem(ctx, comp_pin, comp);
+    if comp_pin != usize::MAX {
+        ctx.unpin_native_roots(comp_pin);
+    }
     ctx.set_field(this, PQ_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(0));
     ctx.set_field(this, PQ_FIELD_COMPARATOR, comp);
@@ -31564,7 +31951,12 @@ fn native_pq_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, size) = pq_state(ctx, this);
-    let arr = alloc_ref_array(ctx, size as usize);
+    // GC-safety: the allocation can move the heap buffer we copy out of.
+    let mut buf_ref = data.unwrap_or(this);
+    let arr = rooted_across(ctx, &mut [&mut buf_ref], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
+    let data = data.map(|_| buf_ref);
     if let Some(buf) = data {
         for i in 0..(size as usize) {
             let elem = ctx.get_array_element(buf, i);
@@ -31580,7 +31972,12 @@ fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, size) = pq_state(ctx, this);
-    let arr = alloc_ref_array(ctx, size as usize);
+    // GC-safety: the allocation can move the heap buffer we copy out of.
+    let mut buf_ref = data.unwrap_or(this);
+    let arr = rooted_across(ctx, &mut [&mut buf_ref], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
+    let data = data.map(|_| buf_ref);
     if let Some(buf) = data {
         for i in 0..(size as usize) {
             let elem = ctx.get_array_element(buf, i);
@@ -35624,7 +36021,18 @@ fn tm_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> Objec
     // (Class.getMethods) and reflective property access see getKey/getValue.
     // The old fabricated "HashMap$Entry" does not implement Map.Entry — see
     // native_tm_entry_set for the SpEL EL1008E that motivated this.
+    // GC-safety: same hazard as `native_map_entry` — pin `key`/`value` across
+    // the allocation so the entry is populated with post-move addresses.
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
     let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
+    let key = read_pinned_elem(ctx, key_pin, key);
+    let value = read_pinned_elem(ctx, value_pin, value);
+    if key_pin != usize::MAX {
+        ctx.unpin_native_roots(key_pin);
+    } else if value_pin != usize::MAX {
+        ctx.unpin_native_roots(value_pin);
+    }
     ctx.set_field(entry, 0, key);
     ctx.set_field(entry, 1, value);
     entry
@@ -37278,10 +37686,17 @@ fn native_ts_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(None),
     };
     // Live TreeMap keySet view: clearing the view clears the source TreeMap.
-    if let Some(source) = ts_view_source(ctx, this) {
-        ctx.invoke_virtual(source, "clear", "()V", &[])?;
-    }
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    // GC-safety: the view's `clear()` is arbitrary Java and the allocation
+    // below collects too; `this` is used after both. See `rooted_across`.
+    let this_pin = ctx.pin_native_root(this);
+    let cleared = match ts_view_source(ctx, this) {
+        Some(source) => ctx.invoke_virtual(source, "clear", "()V", &[]).map(|_| ()),
+        None => Ok(()),
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    cleared?;
+    let (this, buf) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, TS_DEFAULT_CAPACITY));
     ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     Ok(None)
@@ -37470,7 +37885,14 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data_opt, size, _) = ts_state(ctx, this);
-    let snap = alloc_ref_array(ctx, size as usize);
+    // GC-safety: both allocations below collect; `this`, the backing data array
+    // and the snapshot are bare Rust locals used afterwards. See `rooted_across`.
+    let mut this = this;
+    let mut data_ref = data_opt.unwrap_or(this);
+    let mut snap = rooted_across(ctx, &mut [&mut this, &mut data_ref], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
+    let data_opt = data_opt.map(|_| data_ref);
     if let Some(data) = data_opt {
         for i in 0..(size as usize) {
             let v = ctx.get_array_element(data, i);
@@ -37481,7 +37903,9 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // The back-reference to the owning set lets `TreeSet$Itr.remove()` delete
     // the last-returned element from the live set (real-JDK `Iterator.remove`
     // contract) rather than throwing UnsupportedOperationException.
-    let itr = alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3);
+    let itr = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
+        alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
+    });
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     ctx.set_field(itr, 2, Value::Object(Some(this)));
@@ -38031,7 +38455,13 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let (data_opt, size, _) = ts_state(ctx, this);
     let n = size as usize;
-    let snap = alloc_ref_array(ctx, n);
+    // GC-safety: see `native_ts_iterator`.
+    let mut this = this;
+    let mut data_ref = data_opt.unwrap_or(this);
+    let mut snap = rooted_across(ctx, &mut [&mut this, &mut data_ref], |ctx| {
+        alloc_ref_array(ctx, n)
+    });
+    let data_opt = data_opt.map(|_| data_ref);
     if let Some(data) = data_opt {
         for i in 0..n {
             // Reverse: snap[i] = data[size-1-i] (the data array is kept sorted
@@ -38040,7 +38470,9 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
             ctx.set_array_element(snap, i, v);
         }
     }
-    let itr = alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3);
+    let itr = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
+        alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
+    });
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     ctx.set_field(itr, 2, Value::Object(Some(this)));
@@ -40044,20 +40476,38 @@ fn native_chm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     chm_reject_null_key(&key)?;
-    let hash = chm_key_hash(ctx, &key)?;
-    match chm_segment_for(ctx, this, hash) {
-        Some(seg) => {
-            // Volatile-read path: a present mapping is detected by a
-            // non-null Value::Object payload OR by walking the chain
-            // and finding a key match (which `chm_seg_get` does). A
-            // miss returns None here.
-            match chm_seg_get(ctx, seg, key)? {
-                Some(_) => Ok(Some(Value::Int(1))),
-                None => Ok(Some(Value::Int(0))),
+    // GC-safety: `chm_key_hash` dispatches the key's real `hashCode()`
+    // (arbitrary Java), so it can complete a moving young GC — every sibling
+    // CHM entry point pins across it and this one did not. The stale `this`
+    // then made `chm_segment_for` read the segments array out of a
+    // freed-and-reused address, so `containsKey` reported ABSENT for a key the
+    // map demonstrably held. Caught deterministically by
+    // `regression-suite/src/RMapGcStress.java` under `CRATONVM_DBG_GC_STRESS`
+    // ("ConcurrentHashMap/filled: containsKey false for 0", with the
+    // `CRATONVM_DBG_STALE_OBJREF` canary firing in the same native).
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let key = read_pinned_elem(ctx, key_pin, key);
+    let result = (|| -> MethodCallResult {
+        let hash = chm_key_hash(ctx, &key)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        match chm_segment_for(ctx, this, hash) {
+            Some(seg) => {
+                // Volatile-read path: a present mapping is detected by a
+                // non-null Value::Object payload OR by walking the chain
+                // and finding a key match (which `chm_seg_get` does). A
+                // miss returns None here.
+                match chm_seg_get(ctx, seg, key)? {
+                    Some(_) => Ok(Some(Value::Int(1))),
+                    None => Ok(Some(Value::Int(0))),
+                }
             }
+            None => Ok(Some(Value::Int(0))),
         }
-        None => Ok(Some(Value::Int(0))),
-    }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_chm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -40977,7 +41427,30 @@ fn native_chm_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if !object_is_map(ctx, other) {
         return Ok(Some(Value::Int(0)));
     }
+    // GC-safety: every `invoke_virtual` below runs arbitrary Java (`size`,
+    // `get`, and the values' `equals`) and can complete a moving young GC.
+    // `other` and every key/value in `our_entries` are bare Rust locals — the
+    // Vec is not a GC root at all, so its contents would be pre-move addresses
+    // (and an entry reachable only from it can be reclaimed outright). Root
+    // them for the whole comparison and re-read each element at its use.
+    let this_pin = ctx.pin_native_root(this);
+    let other_h = ctx.pin_native_root(other);
     let our_entries = chm_collect_all_entries(ctx, this);
+    let flat: Vec<Value> = our_entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_flat_base, flat_pins) = pin_value_slice(ctx, &flat);
+    let result = native_chm_equals_pinned(ctx, other, other_h, &flat, &flat_pins);
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+fn native_chm_equals_pinned(
+    ctx: &mut dyn NativeContext,
+    other: ObjectRef,
+    other_h: usize,
+    flat: &[Value],
+    flat_pins: &[usize],
+) -> MethodCallResult {
+    let other = ctx.read_native_pin(other_h, other);
     // `other` may be ANY `Map`, not just a (segmented) ConcurrentHashMap —
     // HotSpot's `CHM.equals` does `m.get(p.key)` / iterates `m.entrySet()` via
     // the `Map` interface. Reading `other` through the CHM-specific
@@ -40997,7 +41470,7 @@ fn native_chm_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             }
         }
     };
-    if other_size != our_entries.len() as i32 {
+    if other_size != (flat.len() / 2) as i32 {
         return Ok(Some(Value::Int(0)));
     }
     // Compare each value with the `Map.equals` contract: `v.equals(otherVal)`.
@@ -41012,19 +41485,29 @@ fn native_chm_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // `catch (ClassCastException | NullPointerException) { return false; }` — it
     // dispatches `v.equals(val)` directly and lets such an exception propagate.
     // So we propagate here too (the `?`), matching HotSpot.
-    for (key, value) in &our_entries {
+    for i in 0..(flat.len() / 2) {
+        let other = ctx.read_native_pin(other_h, other);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
         let other_val = ctx
             .invoke_virtual(
                 other,
                 "get",
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
-                &[*key],
+                &[key],
             )?
             .unwrap_or(Value::Object(None));
-        let eq = match (value, &other_val) {
-            (Value::Object(Some(va)), Value::Object(Some(vb))) => map_keys_equal(ctx, *va, *vb)?,
-            _ => values_equal(ctx, value, &other_val),
+        // `get` above ran arbitrary Java; refresh our value before comparing,
+        // and root `other_val` across `map_keys_equal` (which dispatches the
+        // value's own `equals`).
+        let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        let other_val_pin = pin_value(ctx, other_val);
+        let eq = match (value, other_val) {
+            (Value::Object(Some(va)), Value::Object(Some(vb))) => map_keys_equal(ctx, va, vb)?,
+            _ => values_equal(ctx, &value, &other_val),
         };
+        if other_val_pin != usize::MAX {
+            ctx.unpin_native_roots(other_val_pin);
+        }
         if !eq {
             return Ok(Some(Value::Int(0)));
         }
@@ -41233,9 +41716,16 @@ fn native_chm_mapping_count(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_chm_new_key_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let set = alloc_synthetic(ctx, "java/util/HashSet", 1);
-    let backing = alloc_backing_map(ctx);
-    let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+    // GC-safety: three allocations in a row, each a potential moving young GC,
+    // with the previous results held in bare Rust locals that nothing roots —
+    // a freshly allocated object no bucket/field yet points at is reclaimed
+    // outright by a collection here. Root each result across the next
+    // allocation.
+    let mut set = alloc_synthetic(ctx, "java/util/HashSet", 1);
+    let mut backing = rooted_across(ctx, &mut [&mut set], |ctx| alloc_backing_map(ctx));
+    let buckets = rooted_across(ctx, &mut [&mut set, &mut backing], |ctx| {
+        alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY)
+    });
     ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, backing, 0);
     ctx.set_field(
@@ -44204,13 +44694,21 @@ fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn native_map_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = args.first().copied().unwrap_or(Value::Object(None));
-    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
-    native_map_init_from_map(ctx, &[Value::Object(Some(backing)), src])?;
-    Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
-        ctx,
-        UNMOD_MAP_CLASS,
-        backing,
-    )))))
+    // GC-safety: the allocation and the copy-in below both collect; `src` and
+    // `backing` are bare locals used after each. See `rooted_across`.
+    let src_pin = pin_value(ctx, src);
+    let mut backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    let src = read_pinned_elem(ctx, src_pin, src);
+    let backing_at_call = backing;
+    let copied = rooted_across(ctx, &mut [&mut backing], |ctx| {
+        native_map_init_from_map(ctx, &[Value::Object(Some(backing_at_call)), src])
+    });
+    if src_pin != usize::MAX {
+        ctx.unpin_native_roots(src_pin);
+    }
+    copied?;
+    let wrapper = alloc_immutable_wrapper(ctx, UNMOD_MAP_CLASS, backing);
+    Ok(Some(Value::Object(Some(wrapper))))
 }
 
 /// `Collections.unmodifiableMap` — wrap the source map in a live read-only view.
@@ -45019,7 +45517,8 @@ fn native_lbq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let arr = alloc_ref_array(ctx, 16);
+    // GC-safety: see `rooted_across`.
+    let (this, arr) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, 16));
     ctx.set_field(this, LBQ_FIELD_HEAD, Value::Object(Some(arr)));
     ctx.set_field(this, LBQ_FIELD_TAIL, Value::Int(0)); // head index = 0
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(0));
@@ -45036,7 +45535,8 @@ fn native_lbq_init_cap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Int(v)) => *v,
         _ => i32::MAX,
     };
-    let arr = alloc_ref_array(ctx, cap.max(1) as usize);
+    // GC-safety: see `rooted_across`.
+    let (this, arr) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, cap.max(1) as usize));
     ctx.set_field(this, LBQ_FIELD_HEAD, Value::Object(Some(arr)));
     ctx.set_field(this, LBQ_FIELD_TAIL, Value::Int(0));
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(0));
@@ -45090,7 +45590,13 @@ fn lbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
     }
     // Grow: allocate a larger buffer and copy the live window to index 0.
     let new_len = (old_len * 2).max(needed).max(16);
-    let new_arr = alloc_ref_array(ctx, new_len);
+    // GC-safety: the allocation can complete a moving young GC; `this` and the
+    // old buffer are both bare Rust locals used below. See `rooted_across`.
+    let mut this = this;
+    let mut arr = arr;
+    let new_arr = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
+        alloc_ref_array(ctx, new_len)
+    });
     for i in 0..size {
         ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, head + i));
     }
@@ -45545,7 +46051,13 @@ fn native_lbq_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     let head = lbq_head(ctx, this);
-    let result = alloc_ref_array(ctx, size as usize);
+    // GC-safety: the allocation can move `this` (the monitor we still have to
+    // exit) and the backing buffer we copy out of. See `rooted_across`.
+    let mut this = this;
+    let mut arr = arr;
+    let result = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
     for i in 0..size as usize {
         ctx.set_array_element(result, i, ctx.get_array_element(arr, head + i));
     }
@@ -45571,12 +46083,20 @@ fn native_lbq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     let head = lbq_head(ctx, this);
-    let snap = alloc_ref_array(ctx, size as usize);
+    // GC-safety: see `native_lbq_to_array`; the iterator shell allocates too,
+    // and the snapshot is stored into it afterwards.
+    let mut this = this;
+    let mut arr = arr;
+    let mut snap = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
+        alloc_ref_array(ctx, size as usize)
+    });
     for i in 0..size as usize {
         ctx.set_array_element(snap, i, ctx.get_array_element(arr, head + i));
     }
     ctx.monitor_exit(this);
-    let itr = alloc_synthetic(ctx, "java/util/concurrent/LinkedBlockingQueue$Itr", 2);
+    let itr = rooted_across(ctx, &mut [&mut snap], |ctx| {
+        alloc_synthetic(ctx, "java/util/concurrent/LinkedBlockingQueue$Itr", 2)
+    });
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(itr))))
@@ -46322,7 +46842,8 @@ fn native_stpe_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Int(v)) => *v,
         _ => 1,
     };
-    let task_arr = alloc_ref_array(ctx, 16);
+    // GC-safety: see `rooted_across`.
+    let (this, task_arr) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, 16));
     ctx.set_field(this, STPE_FIELD_POOL_SIZE, Value::Int(pool_size));
     ctx.set_field(this, STPE_FIELD_SHUTDOWN, Value::Int(0));
     ctx.set_field(this, STPE_FIELD_TASK_LIST, Value::Object(Some(task_arr)));
@@ -46658,8 +47179,20 @@ fn cslm_ensure_capacity(
         return (keys, values);
     }
     let new_cap = (arr_len * 2).max(needed).max(CSLM_DEFAULT_CAPACITY);
-    let new_keys = alloc_ref_array(ctx, new_cap);
-    let new_values = alloc_ref_array(ctx, new_cap);
+    // GC-safety: two allocations in a row with `this` and both source arrays
+    // live across them (and `new_keys` live across the second). See
+    // `rooted_across`.
+    let mut this = this;
+    let mut keys = keys;
+    let mut values = values;
+    let mut new_keys = rooted_across(ctx, &mut [&mut this, &mut keys, &mut values], |ctx| {
+        alloc_ref_array(ctx, new_cap)
+    });
+    let new_values = rooted_across(
+        ctx,
+        &mut [&mut this, &mut keys, &mut values, &mut new_keys],
+        |ctx| alloc_ref_array(ctx, new_cap),
+    );
     for i in 0..(size as usize) {
         ctx.set_array_element(new_keys, i, ctx.get_array_element(keys, i));
         ctx.set_array_element(new_values, i, ctx.get_array_element(values, i));
@@ -46693,8 +47226,12 @@ fn native_cslm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let keys = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
-    let values = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
+    // GC-safety: see `rooted_across`.
+    let (mut this, mut keys) =
+        rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY));
+    let values = rooted_across(ctx, &mut [&mut this, &mut keys], |ctx| {
+        alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY)
+    });
     ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(keys)));
     ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(values)));
     ctx.set_field(this, CSLM_FIELD_SIZE, Value::Int(0));
@@ -46711,8 +47248,13 @@ fn native_cslm_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let keys = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
-    let values = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
+    // GC-safety: see `rooted_across`. The comparator argument is read AFTER the
+    // allocations below, so it is rooted with everything else.
+    let (mut this, mut keys) =
+        rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY));
+    let values = rooted_across(ctx, &mut [&mut this, &mut keys], |ctx| {
+        alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY)
+    });
     ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(keys)));
     ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(values)));
     ctx.set_field(this, CSLM_FIELD_SIZE, Value::Int(0));
@@ -48194,7 +48736,6 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     // constant here would overwrite that stateful implementation.
 
     // --- ThreadPoolExecutor stat methods ---
-    let pool = "java/util/concurrent/ForkJoinPool";
     let tp = "java/util/concurrent/ThreadPoolExecutor";
     r.register(tp, "getPoolSize", "()I", |ctx, args| {
         let this = tp_arg0(args);
@@ -48296,25 +48837,37 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         native_tp_shutdown_now,
     );
 
-    // --- ForkJoinPool.invoke that actually calls compute ---
-    r.register(
-        pool,
-        "invoke",
-        "(Ljava/util/concurrent/ForkJoinTask;)Ljava/lang/Object;",
-        native_fjp_invoke,
-    );
-
-    // --- ForkJoinTask.invoke that calls compute ---
-    let fjt = "java/util/concurrent/ForkJoinTask";
-    r.register(fjt, "invoke", "()Ljava/lang/Object;", native_fjt_invoke);
-
-    // --- RecursiveTask.invoke that calls compute ---
-    let rt = "java/util/concurrent/RecursiveTask";
-    r.register(rt, "invoke", "()Ljava/lang/Object;", native_rt_invoke);
-
-    // --- RecursiveAction.invoke that calls compute ---
-    let ra = "java/util/concurrent/RecursiveAction";
-    r.register(ra, "invoke", "()Ljava/lang/Object;", native_ra_invoke);
+    // DELIBERATELY NOT REGISTERED HERE: `ForkJoinPool.invoke(ForkJoinTask)`,
+    // `ForkJoinTask.invoke()`, `RecursiveTask.invoke()`,
+    // `RecursiveAction.invoke()`.
+    //
+    // This module used to register all four. Because the registry is
+    // last-write-wins and this registrar runs after
+    // `phases_early::register_real_jdk_forkjoin_essentials`, those four
+    // registrations OVERWROTE the correct implementations (confirmed via
+    // `--dump-native-registry`: `registered_by
+    // native-collections/src/lib.rs`, `overwrote bridge`, in BOTH
+    // `compatible` and `jdk-only` mode). The copies here were wrong in two
+    // independent ways:
+    //
+    //  1. TYPE-CONFUSED HEAP WRITE. They memoised the task result with
+    //     `ctx.set_field(task, 0, val)`. Instance field 0 of a real
+    //     `java.util.concurrent.ForkJoinTask` is `volatile int status`
+    //     (`javap -p -s`), so every `pool.invoke(task)` stored an object
+    //     reference into an int slot. Observable on JDK 25: after
+    //     `pool.invoke()` of a `RecursiveTask`, HotSpot reads
+    //     `status == -2147483648` (the DONE bit) while CratonVM read back a
+    //     raw heap-pointer word.
+    //  2. NO `()V` SHAPE. `native_fjp_invoke` invoked
+    //     `compute()Ljava/lang/Object;` unconditionally and swallowed the
+    //     resulting `NoSuchMethodError`, so every `RecursiveAction` passed
+    //     to `pool.invoke()` silently never ran.
+    //
+    // The `phases_early` implementations dispatch through `fjt_entry_point`,
+    // which picks `compute()Ljava/lang/Object;` / `compute()V` / `exec()Z`
+    // from the receiver's runtime class, pin the task across the call, and
+    // memoise into a GC-remapped side table instead of a guessed field index.
+    // Do not re-add invoke natives here.
     r.set_category(__prev_cat);
 }
 
@@ -48324,26 +48877,45 @@ const COWAL_CLASS: &str = "java/util/concurrent/CopyOnWriteArrayList";
 /// synthetic stubs mirrored `ArrayList` with slot 0 = backing `Object[]`,
 /// slot 1 = `int` size.
 fn cowal_ensure_lock_and_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    // GC-safety: `new_object`, `invoke_special` and `new_array` can each
+    // complete a moving young GC, and every `set_field` below targets `this` —
+    // a bare Rust local that nothing rewrites. The freshly created lock object
+    // is likewise reachable only from a Rust local until it is stored, so a
+    // collection there reclaims it outright. See `rooted_across`.
+    let mut this = this;
     if let Some(ls) = ctx.resolve_field_index(COWAL_CLASS, "lock") {
         if matches!(ctx.get_field(this, ls), Value::Object(None)) {
-            if let Ok(Some(Value::Object(Some(lo)))) = ctx.new_object("java/lang/Object") {
-                let _ = ctx.invoke_special(
-                    "java/lang/Object",
-                    "<init>",
-                    "()V",
-                    &[Value::Object(Some(lo))],
-                );
+            let made = rooted_across(ctx, &mut [&mut this], |ctx| {
+                ctx.new_object("java/lang/Object")
+            });
+            if let Ok(Some(Value::Object(Some(lo)))) = made {
+                let mut lo = lo;
+                // The receiver passed to `<init>` is the address that is
+                // current *at the call*; `lo` itself is rewritten on return.
+                let lo_at_call = lo;
+                rooted_across(ctx, &mut [&mut this, &mut lo], |ctx| {
+                    let _ = ctx.invoke_special(
+                        "java/lang/Object",
+                        "<init>",
+                        "()V",
+                        &[Value::Object(Some(lo_at_call))],
+                    );
+                });
                 ctx.set_field(this, ls, Value::Object(Some(lo)));
             }
         }
     }
     if let Some(slot) = ctx.resolve_field_index(COWAL_CLASS, "array") {
         if matches!(ctx.get_field(this, slot), Value::Object(None)) {
-            let a = ctx.new_array(ArrayElementType::Reference, 0);
+            let a = rooted_across(ctx, &mut [&mut this], |ctx| {
+                ctx.new_array(ArrayElementType::Reference, 0)
+            });
             ctx.set_field(this, slot, Value::Object(Some(a)));
         }
     } else if matches!(ctx.get_field(this, 0), Value::Object(None)) {
-        let a = ctx.new_array(ArrayElementType::Reference, 0);
+        let a = rooted_across(ctx, &mut [&mut this], |ctx| {
+            ctx.new_array(ArrayElementType::Reference, 0)
+        });
         ctx.set_field(this, 0, Value::Object(Some(a)));
         ctx.set_field(this, 1, Value::Int(0));
     }
@@ -49791,63 +50363,13 @@ fn native_tp_shutdown_now(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Object(Some(list))))
 }
 
-// --- ForkJoinPool / ForkJoinTask invoke that calls compute ---
-
-fn native_fjp_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // pool.invoke(task) — call task.compute() and return result
-    let task = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let result = ctx.invoke_virtual(task, "compute", "()Ljava/lang/Object;", &[]);
-    match result {
-        Ok(Some(val)) => {
-            // Store result in task field 0 for subsequent join/get calls
-            ctx.set_field(task, 0, val.clone());
-            Ok(Some(val))
-        }
-        Ok(None) => {
-            ctx.set_field(task, 0, Value::Object(None));
-            Ok(Some(Value::Object(None)))
-        }
-        Err(_) => {
-            // If compute is not found, fall back to reading field 0
-            Ok(Some(ctx.get_field(task, 0)))
-        }
-    }
-}
-
-fn native_fjt_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let result = ctx.invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[]);
-    match result {
-        Ok(Some(val)) => {
-            ctx.set_field(this, 0, val.clone());
-            Ok(Some(val))
-        }
-        Ok(None) => {
-            ctx.set_field(this, 0, Value::Object(None));
-            Ok(Some(Value::Object(None)))
-        }
-        Err(_) => Ok(Some(ctx.get_field(this, 0))),
-    }
-}
-
-fn native_rt_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_fjt_invoke(ctx, args)
-}
-
-fn native_ra_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let _ = ctx.invoke_virtual(this, "compute", "()V", &[]);
-    Ok(Some(Value::Object(None)))
-}
+// ForkJoinPool / ForkJoinTask / RecursiveTask / RecursiveAction `invoke`
+// natives used to live here. They are gone: they wrote an object reference
+// into `ForkJoinTask.status` (an `int`) and had no `compute()V` shape. The
+// live implementations are in
+// `native-builtins/src/phases_early.rs::register_real_jdk_forkjoin_essentials`.
+// See the note at the deleted registration site in
+// `register_concurrent_completeness_natives`.
 
 // ===========================================================================
 // Test hooks — exposed so the GC-relocation integration harness in
@@ -50401,7 +50923,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_join_pool_invoke_registered_and_quiescence_left_to_native_builtins() {
+    fn fork_join_pool_invoke_and_quiescence_left_to_native_builtins() {
         let r = build_registry();
         let pool = "java/util/concurrent/ForkJoinPool";
         // `awaitQuiescence` deliberately does NOT live here: `native-builtins`
@@ -50418,37 +50940,42 @@ mod tests {
             .is_none(),
             "FJP awaitQuiescence must stay owned by native-builtins"
         );
+        // `invoke` deliberately does NOT live here either, for the same
+        // last-write-wins reason: this registrar runs after
+        // `phases_early::register_real_jdk_forkjoin_essentials`, so a local
+        // copy would overwrite the shape-aware implementation. See the note
+        // at the registration site.
         assert!(
             r.find(
                 pool,
                 "invoke",
                 "(Ljava/util/concurrent/ForkJoinTask;)Ljava/lang/Object;"
             )
-            .is_some(),
-            "FJP invoke"
+            .is_none(),
+            "FJP invoke must stay owned by native-builtins"
         );
     }
 
+    /// The `invoke` natives for the ForkJoinTask family must NOT be registered
+    /// by this crate. The copies that used to live here wrote an object
+    /// reference into `ForkJoinTask.status` (field 0, an `int`) and dispatched
+    /// `compute()Ljava/lang/Object;` unconditionally, so every
+    /// `RecursiveAction` handed to `pool.invoke()` silently never ran. Because
+    /// this registrar runs last, they overwrote the correct
+    /// `phases_early` implementations. Keep this crate out of the family.
     #[test]
-    fn fork_join_task_methods_registered() {
+    fn fork_join_task_invoke_left_to_native_builtins() {
         let r = build_registry();
-        let fjt = "java/util/concurrent/ForkJoinTask";
-        assert!(
-            r.find(fjt, "invoke", "()Ljava/lang/Object;").is_some(),
-            "FJT invoke"
-        );
-
-        let rt = "java/util/concurrent/RecursiveTask";
-        assert!(
-            r.find(rt, "invoke", "()Ljava/lang/Object;").is_some(),
-            "RT invoke"
-        );
-
-        let ra = "java/util/concurrent/RecursiveAction";
-        assert!(
-            r.find(ra, "invoke", "()Ljava/lang/Object;").is_some(),
-            "RA invoke"
-        );
+        for cls in [
+            "java/util/concurrent/ForkJoinTask",
+            "java/util/concurrent/RecursiveTask",
+            "java/util/concurrent/RecursiveAction",
+        ] {
+            assert!(
+                r.find(cls, "invoke", "()Ljava/lang/Object;").is_none(),
+                "{cls}.invoke must stay owned by native-builtins"
+            );
+        }
     }
 
     #[test]

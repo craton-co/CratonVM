@@ -1516,6 +1516,15 @@ impl GenerationalHeap {
                 }
                 // Both generations exhausted: report OOM to the caller instead
                 // of aborting (the divergence from `alloc_array`).
+                //
+                // Say WHY, once per run: "full" and "too fragmented to serve
+                // this request" are very different bugs and the caller only
+                // ever saw `OutOfMemoryError`. The old generation's free list
+                // is size-segregated and only coalesces on demand or after an
+                // in-place sweep (see `OldGen::coalesce_free_blocks`), so a
+                // large `free_bytes` next to a small `largest_free_block` is
+                // the fragmentation face.
+                self.report_fallible_alloc_exhaustion(total_size);
                 return None;
             }
         };
@@ -1536,6 +1545,41 @@ impl GenerationalHeap {
             );
             Some(ObjectRef::from_raw(ptr))
         }
+    }
+
+    /// One-shot breadcrumb for a fallible allocation that neither generation
+    /// could satisfy. Rate-limited to the first few occurrences: the
+    /// user-visible signal is the `OutOfMemoryError` the native boundary is
+    /// about to throw, this just makes it diagnosable.
+    fn report_fallible_alloc_exhaustion(&self, total_size: usize) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) >= 4 {
+            return;
+        }
+        let (young_used, young_free, young_cap) = {
+            let from = self.young_from.lock();
+            (from.used(), from.free_list_bytes(), from.capacity())
+        };
+        let (old_used, old_cap, old_free, old_largest, old_blocks) = {
+            let og = self.old_gen.lock();
+            let (free, largest) = og.free_bytes_and_largest();
+            (og.used(), og.capacity(), free, largest, og.free_block_count())
+        };
+        tracing::warn!(
+            target: "cratonvm::gc::guard",
+            request_bytes = total_size,
+            young_used,
+            young_free_list = young_free,
+            young_capacity = young_cap,
+            old_used,
+            old_capacity = old_cap,
+            old_free_bytes = old_free,
+            old_largest_free_block = old_largest,
+            old_free_blocks = old_blocks,
+            "fallible allocation could not be satisfied by either generation — \
+             compare old_free_bytes against old_largest_free_block: a large \
+             gap means FRAGMENTATION, not exhaustion",
+        );
     }
 
     /// Try to allocate a Java object. Returns `None` if young gen is exhausted.
@@ -8871,6 +8915,26 @@ impl GenerationalHeap {
                     unsafe { old_gen.free(obj_ptr, total_size) };
                 }
             }
+            // FRAGMENTATION FIX (xt-helper-window OOM, 2026-07-31): this arm
+            // is the ONLY old-gen reclamation that runs while a live JIT
+            // frame's roots are conservative, and it never compacts. Without
+            // this, every object it frees becomes a permanently isolated
+            // free block (`OldGen::free` defers coalescing to `compact`,
+            // which this path never reaches), so a workload that keeps the
+            // moving-young coverage proof unprovable — e.g. 10-100 threads
+            // blocked in a native read under a JIT frame, the
+            // `xt-helper-window-conservative-scan` fallback — fragments old
+            // gen monotonically until a modest array allocation OOMs on a
+            // mostly-free generation. Amortised: one O(n log n) merge per
+            // sweep, not per freed object.
+            let merged = old_gen.coalesce_free_blocks();
+            if merged > 0 {
+                tracing::debug!(
+                    merged_blocks = merged,
+                    free_blocks_now = old_gen.free_block_count(),
+                    "in-place old-gen sweep: coalesced adjacent free blocks"
+                );
+            }
             return watched_survivors;
         }
 
@@ -13447,6 +13511,64 @@ mod tests {
             freed_by_live > 0,
             "live_bytes_estimate must report the reclaimed bytes \
              (before={live_before}, after={live_after})"
+        );
+    }
+
+    /// xt-helper-window fragmentation regression, at the level the defect
+    /// actually bites: the IN-PLACE old-gen sweep is the only old-gen
+    /// reclamation that runs while a live JIT frame's roots are conservative,
+    /// and it never compacts. `OldGen::free` alone leaves one isolated free
+    /// block per reclaimed object (coalescing was deferred to `compact`, which
+    /// this path never reaches), so the generation fragments monotonically:
+    /// free BYTES stay high while the largest single block collapses to one
+    /// object, and a modest array request then fails on mostly-free storage.
+    ///
+    /// After the sweep, a contiguous run of reclaimed objects must present as
+    /// (close to) one block, not N.
+    #[test]
+    fn in_place_old_sweep_coalesces_the_run_it_reclaims() {
+        let heap = GenerationalHeap::with_sizes(64 * 1024, 512 * 1024);
+        let monitors = NoOpMonitors;
+
+        const N: usize = 32;
+        const ELEMS: usize = 256;
+        let mut roots: Vec<ObjectRef> = (0..N)
+            .map(|_| heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, ELEMS))
+            .collect();
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        assert!(
+            roots.iter().all(|r| heap.is_in_old(r.as_ptr())),
+            "precondition: every array must have been promoted to old gen"
+        );
+
+        // Keep the first half; the second half's storage is one adjacent run.
+        let live: Vec<ObjectRef> = roots[..N / 2].to_vec();
+        let blocks_before = heap.old_gen_lock().free_block_count();
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live);
+        assert!(reclaimed > 0, "the dropped half must be reclaimed");
+
+        let og = heap.old_gen_lock();
+        let (free_bytes, largest) = og.free_bytes_and_largest();
+        let blocks_after = og.free_block_count();
+        drop(og);
+
+        // The sweep freed N/2 objects. Without coalescing that is N/2 new
+        // isolated blocks; with it, the adjacent run collapses.
+        assert!(
+            blocks_after < blocks_before + N / 2,
+            "the sweep must merge the run it reclaimed (before={blocks_before}, \
+             after={blocks_after}, freed {} objects)",
+            N / 2
+        );
+        // And the largest single block must be able to serve much more than
+        // one reclaimed object — that is the property the allocator needs.
+        assert!(
+            largest > ELEMS * 2,
+            "largest free block ({largest}B) must exceed a single reclaimed \
+             array; free_bytes={free_bytes}B. A large free_bytes next to a \
+             small largest block IS the fragmentation OOM."
         );
     }
 
