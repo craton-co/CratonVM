@@ -125,22 +125,38 @@ fn jdk_home() -> Option<PathBuf> {
     None
 }
 
+/// `None` means "no usable `javac` on this machine" — a legitimate skip. A
+/// javac that RUNS and rejects the source is a broken probe, not a skip; see
+/// the matching comment in `sealed_bootstrap_permitted_subclasses.rs`.
 fn compile_probe(javac: &Path) -> Option<PathBuf> {
+    if !javac.exists() {
+        return None;
+    }
     let dir = std::env::temp_dir().join("cratonvm-null-receiver-cached-probe");
     let _ = std::fs::create_dir_all(&dir);
     let src = dir.join("NullReceiverCachedProbe.java");
-    std::fs::write(&src, PROBE_SRC).ok()?;
-    let status = Command::new(javac)
+    let class_file = dir.join("NullReceiverCachedProbe.class");
+    let _ = std::fs::remove_file(&class_file);
+    std::fs::write(&src, PROBE_SRC).expect("write probe source");
+    let out = match Command::new(javac)
         .args(["--release", "21", "-d"])
         .arg(&dir)
         .arg(&src)
-        .status()
-        .ok()?;
-    if status.success() && dir.join("NullReceiverCachedProbe.class").exists() {
-        Some(dir)
-    } else {
-        None
-    }
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[null_receiver_cached] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    assert!(
+        out.status.success() && class_file.exists(),
+        "[null_receiver_cached] the embedded probe failed to compile — fix PROBE_SRC. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(dir)
 }
 
 /// `jit` selects `--nojit` (false) or the default JIT pipeline (true): the

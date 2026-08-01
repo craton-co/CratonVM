@@ -82,10 +82,10 @@ public class SealedBootstrapProbe {
         "java.lang.ProcessBuilder",
         "java.util.concurrent.ConcurrentHashMap",
     }) {
-      Class<?>[] m = Class.forName(host).getNestMembers();
-      int nulls = 0;
-      for (Class<?> x : m) if (x == null) nulls++;
-      System.out.println("NEST " + host + " n=" + m.length + " nulls=" + nulls);
+      Class<?>[] members = Class.forName(host).getNestMembers();
+      int memberNulls = 0;
+      for (Class<?> x : members) if (x == null) memberNulls++;
+      System.out.println("NEST " + host + " n=" + members.length + " nulls=" + memberNulls);
     }
     System.out.println("OK");
   }
@@ -138,22 +138,46 @@ fn jdk_home() -> Option<PathBuf> {
     None
 }
 
+/// `None` means "no usable `javac` on this machine" — a legitimate skip.
+///
+/// A javac that RUNS and rejects the source is NOT a skip: it means this file's
+/// embedded probe no longer compiles, and silently returning `None` there turns
+/// the whole test into a vacuous pass. That is not hypothetical — the first
+/// draft of the nest-member assertions below shadowed two locals, javac
+/// errored, and the test reported `ok` in 0.8 s against a binary that
+/// reproduces the bug perfectly. Panic instead.
 fn compile_probe(javac: &Path) -> Option<PathBuf> {
+    if !javac.exists() {
+        return None;
+    }
     let dir = std::env::temp_dir().join("cratonvm-sealed-bootstrap-probe");
     let _ = std::fs::create_dir_all(&dir);
     let src = dir.join("SealedBootstrapProbe.java");
-    std::fs::write(&src, PROBE_SRC).ok()?;
-    let status = Command::new(javac)
+    let class_file = dir.join("SealedBootstrapProbe.class");
+    // Never let a stale .class from an earlier revision stand in for a source
+    // that no longer compiles.
+    let _ = std::fs::remove_file(&class_file);
+    std::fs::write(&src, PROBE_SRC).expect("write probe source");
+    let out = match Command::new(javac)
         .args(["--release", "21", "-d"])
         .arg(&dir)
         .arg(&src)
-        .status()
-        .ok()?;
-    if status.success() && dir.join("SealedBootstrapProbe.class").exists() {
-        Some(dir)
-    } else {
-        None
-    }
+        .output()
+    {
+        Ok(o) => o,
+        // javac present but unrunnable (permissions, broken install) — skip.
+        Err(e) => {
+            eprintln!("[sealed_bootstrap] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    assert!(
+        out.status.success() && class_file.exists(),
+        "[sealed_bootstrap] the embedded probe failed to compile — fix PROBE_SRC. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(dir)
 }
 
 #[test]
