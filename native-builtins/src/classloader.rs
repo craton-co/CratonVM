@@ -6857,13 +6857,32 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(result)
 }
 
+/// `URLClassLoader.getURLs()` — the URLs this loader was constructed with,
+/// plus anything `addURL` appended. Nothing else.
+///
+/// It must NOT expand a jar's manifest `Class-Path`. The real JDK resolves
+/// `Class-Path` lazily inside `URLClassPath`, never through this public
+/// accessor, and the expansion is observable: it drops the referring jar
+/// itself, invents entries for `Class-Path` names that do not exist on disk,
+/// and re-percent-encodes an already-encoded entry (`project%20space` came
+/// back as `project%2520space`). Spring Boot's `ChangeableUrls.fromClassLoader`
+/// walks `getURLs()` and then expands each jar's manifest itself, so a
+/// pre-expanded list made it report six directories where five were expected
+/// — `ChangeableUrlsTests.urlsFromJarClassPathAreConsidered`.
+///
+/// The expansion was added for Spring Boot's `ModifiedClassPathClassLoader`
+/// (`@ClassPathExclusions`), which is handed the suite runner's manifest-only
+/// pathing JAR and would otherwise filter a class path different from the one
+/// the loader searches. That never applied here: the application loader is
+/// `jdk.internal.loader.ClassLoaders$AppClassLoader`, which is not a
+/// `URLClassLoader`, so `ModifiedClassPathClassLoader.doExtractUrls` reads
+/// `ManagementFactory.getRuntimeMXBean().getClassPath()` and never reaches
+/// this native. `probes/DevtoolsChangeableUrlsProbe.java` covers the contract;
+/// `probes/RuntimeClassPathProbe.java` shows the app-loader shape.
 pub(crate) fn ucl_get_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
         if let Some(result) = ucp_path_urls(ctx, ucp) {
-            if let Some(expanded) = expanded_manifest_urls(ctx, result) {
-                return Ok(Some(Value::Object(Some(expanded))));
-            }
             return Ok(Some(Value::Object(Some(result))));
         }
     }
