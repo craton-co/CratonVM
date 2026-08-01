@@ -34226,17 +34226,65 @@ fn tm_fast_with<R>(
 /// "Sticky" flag side-table — once a TreeMap is forced to array mode
 /// (e.g. by a non-extractable key) it stays there for its lifetime so
 /// we never split state across both stores.
+///
+/// Keyed by `widened_obj_key`, exactly like `tm_array_table`/`tm_fast_table`,
+/// and therefore subject to the same recycle hazard those two document: the
+/// packed key embeds a 32-bit identity hash, so a leftover entry under a
+/// reclaimed map's key can be inherited by a later map that mints the same
+/// hash. It holds no `ObjectRef`, so a stale entry is not a use-after-free —
+/// but the newcomer silently starts life pinned to array mode, and the table
+/// grows without bound for the life of the process. It was the one
+/// `widened_obj_key`-keyed table `gc_prune_dead_collection_overlays` did not
+/// sweep; it does now. Poison-recovered on read/write for the same reason the
+/// GC funnel is: an `unwrap()` that panics here would poison the lock and make
+/// every later `tm_force_array_mode` call abort the VM.
 fn tm_force_array_set() -> &'static Mutex<StdHashMap<usize, ()>> {
     static T: std::sync::OnceLock<Mutex<StdHashMap<usize, ()>>> = std::sync::OnceLock::new();
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 fn tm_force_array_mode(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     let key = tm_obj_key(ctx, this);
-    tm_force_array_set().lock().unwrap().contains_key(&key)
+    tm_force_array_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&key)
 }
 fn tm_set_force_array(ctx: &dyn NativeContext, this: ObjectRef) {
     let key = tm_obj_key(ctx, this);
-    tm_force_array_set().lock().unwrap().insert(key, ());
+    tm_force_array_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, ());
+}
+
+/// Test hook: report whether `this`'s sticky array-mode flag is present.
+/// Exists so the prune regression test can observe the table directly
+/// rather than inferring it from downstream mode selection.
+#[doc(hidden)]
+pub fn __test_tm_force_array_mode(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    tm_force_array_mode(ctx, this)
+}
+
+/// Test hook: set `this`'s sticky array-mode flag.
+#[doc(hidden)]
+pub fn __test_tm_set_force_array(ctx: &dyn NativeContext, this: ObjectRef) {
+    tm_set_force_array(ctx, this)
+}
+
+/// Test hook: number of entries in the sticky array-mode table.
+///
+/// The prune regression test asserts on this rather than on
+/// `tm_force_array_mode(dead)`: pruning also drops the dead object's slot from
+/// `obj_key_registry`, so a post-prune `widened_obj_key` on the same address
+/// mints a FRESH generation and therefore a different packed key. A
+/// presence-check would then read `false` whether or not the table was swept.
+/// Counting entries distinguishes "swept" from "re-keyed".
+#[doc(hidden)]
+pub fn __test_tm_force_array_len() -> usize {
+    tm_force_array_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
 }
 
 /// Migrate any fast-mode entries to the array store, then remove the
@@ -34983,6 +35031,19 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
         let mut tmf = tm_fast_table().lock().unwrap_or_else(|e| e.into_inner());
         for (k, _) in &dead_keys {
             tmf.remove(k);
+        }
+    }
+    // The sticky "this TreeMap is pinned to array mode" flag is keyed by the
+    // same packed `widened_obj_key` as the two tables above and was the one
+    // such table this sweep missed: it grew for every TreeMap that ever hit a
+    // non-extractable key and, once a dead map's 32-bit identity hash was
+    // recycled, silently forced the NEW map into array mode from its first put.
+    {
+        let mut forced = tm_force_array_set()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (k, _) in &dead_keys {
+            forced.remove(k);
         }
     }
     {
@@ -47218,28 +47279,113 @@ fn register_concurrent_skip_list_map_natives(r: &mut NativeMethodRegistry) {
 /// `compareTo`, which raises (NoSuchMethodError / AbstractMethodError /
 /// ClassCastException) and propagates here via `?` instead of silently
 /// collapsing the ordering and dropping the entry.
+///
+/// Family-1 stale-`ObjectRef` fix (2026-08-01): this was the last binary
+/// search in the file still holding raw `ObjectRef`s across `tree_compare`.
+/// `tm_binary_search`, `ts_binary_search` and `pbq_offer_locked` all pin and
+/// re-read; CSLM never did. `tree_compare` dispatches either a user
+/// `Comparator.compare` or the key's own `Comparable.compareTo` — a full
+/// re-entry into the interpreter that can allocate and complete a moving young
+/// collection. Everything the search or its CALLERS touch afterwards is at
+/// risk, so all of it is pinned here and written back through `&mut`:
+///
+/// * `keys`  — re-read by `get_array_element` on the next iteration, and by the
+///   caller's shift/insert. A stale array ref reads `Object(None)` (or, on the
+///   real heap, whatever now occupies the address) and silently drops writes.
+/// * `values` — never touched by the search itself, but every caller stores
+///   into it immediately afterwards, so it must ride the same pins. `None` for
+///   `containsKey`, which has no value array to keep.
+/// * `owner` — the caller writes `CSLM_FIELD_SIZE` through it after the search.
+/// * `comparator` and `key` — dereferenced again on the *next* iteration.
+///
+/// Parameters are `&mut` rather than returned in a tuple deliberately: a caller
+/// physically cannot keep using a pre-search copy, because there isn't one.
 fn cslm_binary_search(
     ctx: &mut dyn NativeContext,
-    comparator: &Value,
-    keys: ObjectRef,
+    owner: &mut ObjectRef,
+    keys: &mut ObjectRef,
+    values: &mut Option<ObjectRef>,
     size: i32,
-    key: &Value,
+    comparator: &mut Value,
+    key: &mut Value,
 ) -> Result<Result<usize, usize>, MethodCallFailed> {
+    // `owner_pin` is taken FIRST so `unpin_native_roots(owner_pin)` releases
+    // this whole batch (the API unwinds from the base handle onward).
+    let owner_pin = ctx.pin_native_root(*owner);
+    let keys_pin = ctx.pin_native_root(*keys);
+    let values_pin = opt_pin(ctx, *values);
+    let comparator_pin = pin_value(ctx, *comparator);
+    let key_pin = pin_value(ctx, *key);
     let mut low: usize = 0;
     let mut high = size as usize;
     while low < high {
         let mid = low + (high - low) / 2;
-        let mid_key = ctx.get_array_element(keys, mid);
-        let cmp = tree_compare(ctx, comparator, mid_key, *key)?;
+        let mid_key = ctx.get_array_element(*keys, mid);
+        // Orientation is compare(existing, searched) — the inverse of
+        // `tm_binary_search` — so the branch signs below differ from TreeMap's.
+        // Preserved exactly: a non-antisymmetric comparator distinguishes them.
+        let cmp = match tree_compare(ctx, comparator, mid_key, *key) {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.unpin_native_roots(owner_pin);
+                return Err(e);
+            }
+        };
+        // The comparison ran real bytecode — refresh everything reused below
+        // and everything the caller reuses after we return.
+        *owner = ctx.read_native_pin(owner_pin, *owner);
+        *keys = ctx.read_native_pin(keys_pin, *keys);
+        *values = opt_read(ctx, values_pin, *values);
+        *comparator = read_pinned_elem(ctx, comparator_pin, *comparator);
+        *key = read_pinned_elem(ctx, key_pin, *key);
         if cmp < 0 {
             low = mid + 1;
         } else if cmp > 0 {
             high = mid;
         } else {
+            ctx.unpin_native_roots(owner_pin);
             return Ok(Ok(mid));
         }
     }
+    ctx.unpin_native_roots(owner_pin);
     Ok(Err(low))
+}
+
+/// Read a CSLM's backing key/value arrays, creating them if the receiver was
+/// built without running our `<init>` (a deserialized or subclassed map).
+///
+/// Returns the (possibly relocated) receiver alongside: the lazy
+/// `alloc_ref_array` calls below are Java-heap allocations and can move `this`,
+/// so a caller that kept its own copy would write `CSLM_FIELD_SIZE` into a
+/// dead address. Callers MUST use the returned receiver.
+fn cslm_arrays(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> (ObjectRef, ObjectRef, ObjectRef, i32) {
+    let (keys_opt, values_opt, size) = cslm_state(ctx, this);
+    let mut this = this;
+    let mut keys = match keys_opt {
+        Some(k) => k,
+        None => {
+            let (moved, k) = rooted_across1(ctx, this, |ctx| {
+                alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY)
+            });
+            this = moved;
+            ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(k)));
+            k
+        }
+    };
+    let values = match values_opt {
+        Some(v) => v,
+        None => {
+            let v = rooted_across(ctx, &mut [&mut this, &mut keys], |ctx| {
+                alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY)
+            });
+            ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(v)));
+            v
+        }
+    };
+    (this, keys, values, size)
 }
 
 fn cslm_ensure_capacity(
@@ -47297,6 +47443,46 @@ fn cslm_state(
     (keys, values, size)
 }
 
+// ---------------------------------------------------------------------------
+// CSLM test hooks
+// ---------------------------------------------------------------------------
+//
+// `register_concurrent_skip_list_map_natives` is deliberately NOT called (see
+// the `let _ = register_concurrent_skip_list_map_natives;` no-op in
+// `register_collections_natives`, and the `concurrent_skip_list_map_not_
+// intercepted` unit test that guards it): the real
+// `java.util.concurrent.ConcurrentSkipListMap` bytecode runs instead. The
+// implementation below is kept "for reference" so it can be re-enabled.
+//
+// That is exactly why these hooks exist. The GC-safety fixes applied to this
+// family on 2026-08-01 are otherwise untestable — the natives cannot be reached
+// through the registry — and an untested fix in code someone may re-enable is
+// how the defect comes back. The hooks call the natives directly, so the
+// registry stays clean and the pin discipline is still covered.
+
+#[doc(hidden)]
+pub fn __test_cslm_init_comparator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_cslm_init_comparator(ctx, args)
+}
+
+#[doc(hidden)]
+pub fn __test_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_cslm_put(ctx, args)
+}
+
+#[doc(hidden)]
+pub fn __test_cslm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_cslm_get(ctx, args)
+}
+
+#[doc(hidden)]
+pub fn __test_cslm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_cslm_size(ctx, args)
+}
+
 fn native_cslm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -47349,31 +47535,36 @@ fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     // Fix item 5: honor the map's custom comparator (natural ordering if none).
-    let comparator = cslm_comparator(ctx, this);
+    let mut comparator = cslm_comparator(ctx, this);
     // Bug 1: serialise mutating ops on this map's lock stripe.
     let _guard = cslm_stripe_for(ctx, this).write();
-    let (keys_opt, values_opt, size) = cslm_state(ctx, this);
-    let keys = match keys_opt {
-        Some(k) => k,
-        None => {
-            let k = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
-            ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(k)));
-            k
-        }
-    };
-    let values_arr = match values_opt {
-        Some(v) => v,
-        None => {
-            let v = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
-            ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(v)));
-            v
-        }
-    };
-    let search = cslm_binary_search(ctx, &comparator, keys, size, &key)?;
-    match search {
+    let (mut this, mut keys, values_arr, size) = cslm_arrays(ctx, this);
+    let mut values_opt = Some(values_arr);
+    // Family-1 stale-ObjectRef fix: the search dispatches the comparator and
+    // refreshes everything it is handed. The inserted VALUE is not part of the
+    // search, yet it is stored into the backing array afterwards, so it needs
+    // its own pin. Taken BEFORE the search's own pins, so the search's
+    // `unpin_native_roots(owner_pin)` — which truncates from its own base
+    // onward — cannot release it.
+    let value_pin = pin_value(ctx, value);
+    let search = cslm_binary_search(
+        ctx,
+        &mut this,
+        &mut keys,
+        &mut values_opt,
+        size,
+        &mut comparator,
+        &mut key,
+    );
+    let value = read_pinned_elem(ctx, value_pin, value);
+    if value_pin != usize::MAX {
+        ctx.unpin_native_roots(value_pin);
+    }
+    let values_arr = values_opt.unwrap_or(keys);
+    match search? {
         Ok(idx) => {
             // Key exists — replace value, return old
             let old = ctx.get_array_element(values_arr, idx);
@@ -47381,8 +47572,23 @@ fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             Ok(Some(old))
         }
         Err(pos) => {
-            // Insert at pos, shifting elements right
+            // Insert at pos, shifting elements right.
+            //
+            // GC-safety: `cslm_ensure_capacity` performs TWO Java-heap
+            // allocations. It roots the arrays it returns, but not the
+            // caller's `this`/`key`/`value` — and all three are dereferenced
+            // below (the size write, and the two inserting stores). Without
+            // these pins a growth-triggered young collection made the `size`
+            // write land in a dead address (the map silently kept its old
+            // count) and stored dangling key/value refs into the array.
+            let this_pin = ctx.pin_native_root(this);
+            let key_pin = pin_value(ctx, key);
+            let value_pin = pin_value(ctx, value);
             let (keys, values_arr) = cslm_ensure_capacity(ctx, this, size, keys, values_arr);
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let value = read_pinned_elem(ctx, value_pin, value);
+            ctx.unpin_native_roots(this_pin);
             let s = size as usize;
             for i in (pos..s).rev() {
                 let k = ctx.get_array_element(keys, i);
@@ -47403,23 +47609,35 @@ fn native_cslm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Fix item 5: honor the map's custom comparator.
-    let comparator = cslm_comparator(ctx, this);
+    let mut comparator = cslm_comparator(ctx, this);
     // Bug 1: shared read lock — concurrent reads OK, blocks during writes.
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
-    let keys = match keys_opt {
+    let mut keys = match keys_opt {
         Some(k) => k,
         None => return Ok(Some(Value::Object(None))),
     };
-    let values_arr = match values_opt {
-        Some(v) => v,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    match cslm_binary_search(ctx, &comparator, keys, size, &key)? {
-        Ok(idx) => Ok(Some(ctx.get_array_element(values_arr, idx))),
-        Err(_) => Ok(Some(Value::Object(None))),
+    if values_opt.is_none() {
+        return Ok(Some(Value::Object(None)));
+    }
+    // Family-1 stale-ObjectRef fix: even a pure READ dispatches the comparator,
+    // so `values_opt` — read AFTER the search — must ride the search's pins.
+    let mut this = this;
+    let mut values_opt = values_opt;
+    let found = cslm_binary_search(
+        ctx,
+        &mut this,
+        &mut keys,
+        &mut values_opt,
+        size,
+        &mut comparator,
+        &mut key,
+    )?;
+    match (found, values_opt) {
+        (Ok(idx), Some(values_arr)) => Ok(Some(ctx.get_array_element(values_arr, idx))),
+        _ => Ok(Some(Value::Object(None))),
     }
 }
 
@@ -47428,21 +47646,37 @@ fn native_cslm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Fix item 5: honor the map's custom comparator.
-    let comparator = cslm_comparator(ctx, this);
+    let mut comparator = cslm_comparator(ctx, this);
     // Bug 1: serialise mutating ops on this map's lock stripe.
     let _guard = cslm_stripe_for(ctx, this).write();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
-    let keys = match keys_opt {
+    let mut keys = match keys_opt {
         Some(k) => k,
         None => return Ok(Some(Value::Object(None))),
     };
-    let values_arr = match values_opt {
-        Some(v) => v,
-        None => return Ok(Some(Value::Object(None))),
+    if values_opt.is_none() {
+        return Ok(Some(Value::Object(None)));
+    }
+    // Family-1 stale-ObjectRef fix: the comparator dispatch inside the search
+    // can move `this`, both arrays and the searched key; all four are used by
+    // the compaction loop and the size write below.
+    let mut this = this;
+    let mut values_opt = values_opt;
+    let found = cslm_binary_search(
+        ctx,
+        &mut this,
+        &mut keys,
+        &mut values_opt,
+        size,
+        &mut comparator,
+        &mut key,
+    )?;
+    let Some(values_arr) = values_opt else {
+        return Ok(Some(Value::Object(None)));
     };
-    match cslm_binary_search(ctx, &comparator, keys, size, &key)? {
+    match found {
         Ok(idx) => {
             let old_val = ctx.get_array_element(values_arr, idx);
             let s = size as usize;
@@ -47494,17 +47728,30 @@ fn native_cslm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Fix item 5: honor the map's custom comparator.
-    let comparator = cslm_comparator(ctx, this);
+    let mut comparator = cslm_comparator(ctx, this);
     // Bug 1: shared read lock.
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
-    let keys = match keys_opt {
+    let mut keys = match keys_opt {
         Some(k) => k,
         None => return Ok(Some(Value::Int(0))),
     };
-    let found = cslm_binary_search(ctx, &comparator, keys, size, &key)?.is_ok();
+    // `containsKey` never touches the value array, so it hands the search a
+    // `None` slot — nothing to keep rooted on its behalf.
+    let mut this = this;
+    let mut values_opt: Option<ObjectRef> = None;
+    let found = cslm_binary_search(
+        ctx,
+        &mut this,
+        &mut keys,
+        &mut values_opt,
+        size,
+        &mut comparator,
+        &mut key,
+    )?
+    .is_ok();
     Ok(Some(Value::Int(i32::from(found))))
 }
 
