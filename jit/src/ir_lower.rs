@@ -7174,7 +7174,7 @@ fn lower_inner_sized(
         crate::metrics::note_current_reloads(lowerer.ls_reloads);
     }
 
-    let buf = lowerer.buf;
+    let mut buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
     // non-panicking: on capacity exhaustion it sets a sticky `overflowed` flag
     // and DROPS the write, so an under-estimated buffer yields a silently
@@ -7189,8 +7189,13 @@ fn lower_inner_sized(
         // emission got, not how much room the body needs — measured
         // understatements of more than 2x. `wanted()` counts every byte codegen
         // asked for, dropped writes included, which is both the honest figure
-        // for the bailout record and the exact size [`lower_inner`] retries at.
+        // for the bailout record and the exact size the retry uses.
         IR_CODE_BUFFER_WANTED.with(|c| c.set(buf.wanted()));
+        // Nothing points into this buffer — it is discarded here, before any
+        // `CompiledMethod` could carry it to the cache — so keep its unmap out
+        // of the recent-frees ring, whose non-zero-active-count invariant is a
+        // use-after-free detector and not a counter.
+        buf.mark_never_published();
         return refuse(Bailout::new(BailoutReason::CodeBufferExhausted {
             needed: buf.wanted(),
             capacity,

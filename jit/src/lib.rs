@@ -352,6 +352,19 @@ pub struct ExecutableBuffer {
     /// bail is indistinguishable from a method the JIT declined for any other
     /// reason. See [`wanted`](Self::wanted).
     wanted: usize,
+    /// This buffer was abandoned before anything could point at it, so its
+    /// unmap must not be recorded in the recent-frees ring.
+    ///
+    /// The ring pairs every unmap with `ACTIVE_JIT_EXECUTIONS`, and a non-zero
+    /// count there means "released while a thread was inside compiled code" —
+    /// the signature of a release path bypassing the `defer_jit_owner`
+    /// retirement queue, and how the 2026-07-28 retirement-unmaps-executing-code
+    /// defect was caught. A discarded compile attempt is freed on a compiler
+    /// thread while mutators are running, so it would record a non-zero count
+    /// while being perfectly safe — no cache entry, no baked direct call, no
+    /// trampoline points into it. Recording it would make the invariant read
+    /// false and put a bogus range in front of the next crash report.
+    never_published: bool,
     /// Suppress the per-patch overflow warnings on this buffer.
     ///
     /// An overflow is only newsworthy where it ENDS a compile. The optimizing
@@ -399,8 +412,18 @@ impl ExecutableBuffer {
             overflowed: false,
             wanted: 0,
             quiet_overflow: false,
+            never_published: false,
             tag: "untagged",
         })
+    }
+
+    /// Mark this buffer as abandoned before publication, so its unmap stays out
+    /// of the recent-frees ring. See [`never_published`].
+    ///
+    /// [`never_published`]: Self::never_published
+    #[inline]
+    pub fn mark_never_published(&mut self) {
+        self.never_published = true;
     }
 
     /// Suppress this buffer's overflow warnings. See [`quiet_overflow`].
@@ -807,11 +830,13 @@ impl Drop for ExecutableBuffer {
         // thread was inside compiled code — which is precisely the bug the
         // `defer_jit_owner` retirement queue above exists to prevent, so a
         // non-zero value here means some release path is still bypassing it.
-        record_code_free(
-            self.ptr as usize,
-            self.capacity,
-            ACTIVE_JIT_EXECUTIONS.get(),
-        );
+        if !self.never_published {
+            record_code_free(
+                self.ptr as usize,
+                self.capacity,
+                ACTIVE_JIT_EXECUTIONS.get(),
+            );
+        }
         if never_free_code_enabled() {
             return;
         }
