@@ -20176,10 +20176,42 @@ fn execute_instruction(
                                         "checkcast receiver points into RECLAIMED memory — a \
                                          still-referenced object was collected. `java.lang.Object` \
                                          here is the all-zero header the collector left behind, \
-                                         not a real Object. Re-run with CRATONVM_DBG_SWEEP_ZERO=1 \
-                                         and CRATONVM_DBG_ZERO_RANGES=1 to name the class and the \
-                                         cycle.",
+                                         not a real Object.",
                                     );
+                                    // H2-CID0: and WHAT was reclaimed. The
+                                    // old-gen ring is unconditional, so unlike
+                                    // the young sweep ring this answers on the
+                                    // FIRST occurrence rather than only on a
+                                    // re-run with the right flag pre-set.
+                                    if let Some((cid, kind, site, seq)) =
+                                        cratonvm_gc::gen_heap::old_freed_lookup(addr)
+                                    {
+                                        let orig = shared
+                                            .classes
+                                            .class_manager
+                                            .try_read()
+                                            .and_then(|cm| {
+                                                cm.class_store
+                                                    .get(cratonvm_types::ClassId::new(cid))
+                                                    .map(|c| c.name.to_string())
+                                            })
+                                            .unwrap_or_else(|| format!("class_id={cid}"));
+                                        tracing::error!(
+                                            target: "cratonvm::gc::guard",
+                                            obj = format!("{addr:#x}"),
+                                            original_class = %orig,
+                                            original_kind = kind,
+                                            freed_by = if site == 1 {
+                                                "in-place old-gen sweep"
+                                            } else {
+                                                "old-gen mark-compact"
+                                            },
+                                            free_seq = seq,
+                                            "…and the old-gen reclamation ring knows what that \
+                                             block held. The original class names the mark-phase \
+                                             gap that freed it while it was still referenced.",
+                                        );
+                                    }
                                 }
                             }
                             if let Some((cid, kind, cycle, reason, initiator, blocked)) =

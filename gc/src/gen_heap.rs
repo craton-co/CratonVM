@@ -401,6 +401,96 @@ pub static DOUBLE_FREE_SPANS: AtomicU64 = AtomicU64::new(0);
 /// H2-CID0 — bounded report counter for [`DOUBLE_FREE_SPANS`].
 static DOUBLE_FREE_REPORTS: AtomicU64 = AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// Old-generation reclamation ring (H2-CID0, 2026-08-01)
+//
+// `OldGen::free` returns a block to the free list and leaves the bytes in
+// place, so a still-live reference into it keeps reading the old object —
+// until the allocator reuses the block, and reuse ZEROES it before writing the
+// new header. That is how a prematurely reclaimed old-gen object comes back as
+// an all-zero `ClassId(0)` header, which renders as `java.lang.Object` and
+// fails a `checkcast` minutes later on another thread. By then the class is
+// gone, and the sweep-ring that would have known it
+// (`CRATONVM_DBG_SWEEP_ZERO`) only records the YOUNG sweep AND has to have
+// been enabled before the run.
+//
+// This ring is the old-gen answer, and it is ALWAYS ON: an in-place old sweep
+// only runs past 75 % occupancy, and a record is one relaxed `fetch_add` plus
+// four relaxed stores. Lock-free, so it cannot serialise a sweep the way the
+// young sweep-zero ring's mutex does.
+// ---------------------------------------------------------------------------
+
+/// [`record_old_freed`] site: the in-place old-gen sweep's free loop.
+pub const OLD_FREED_SITE_INPLACE_SWEEP: u8 = 1;
+/// [`record_old_freed`] site: mark-compact dropped the object (its storage
+/// became part of the zeroed tail, or was slid over).
+pub const OLD_FREED_SITE_COMPACT: u8 = 2;
+
+const OLD_FREED_RING_BITS: usize = 14; // 16K entries, ~256 KB
+const OLD_FREED_RING_LEN: usize = 1 << OLD_FREED_RING_BITS;
+
+struct OldFreedRec {
+    addr: AtomicU64,
+    class_id: std::sync::atomic::AtomicU32,
+    kind: std::sync::atomic::AtomicU8,
+    site: std::sync::atomic::AtomicU8,
+    seq: AtomicU64,
+}
+
+impl OldFreedRec {
+    const fn new() -> Self {
+        Self {
+            addr: AtomicU64::new(0),
+            class_id: std::sync::atomic::AtomicU32::new(0),
+            kind: std::sync::atomic::AtomicU8::new(0),
+            site: std::sync::atomic::AtomicU8::new(0),
+            seq: AtomicU64::new(0),
+        }
+    }
+}
+
+static OLD_FREED_RING: [OldFreedRec; OLD_FREED_RING_LEN] =
+    [const { OldFreedRec::new() }; OLD_FREED_RING_LEN];
+static OLD_FREED_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Record that an old-generation block is being reclaimed. See the module note
+/// above for why this is unconditional.
+#[inline]
+pub fn record_old_freed(addr: usize, class_id: u32, kind: u8, site: u8) {
+    let seq = OLD_FREED_NEXT.fetch_add(1, Ordering::Relaxed);
+    let r = &OLD_FREED_RING[(seq as usize) & (OLD_FREED_RING_LEN - 1)];
+    // Publish `addr` LAST: a reader that sees the address has already seen the
+    // rest of this record (the slot may still be torn against a wrapping
+    // writer, which is why `old_freed_lookup` is a diagnostic and not a proof).
+    r.class_id.store(class_id, Ordering::Relaxed);
+    r.kind.store(kind, Ordering::Relaxed);
+    r.site.store(site, Ordering::Relaxed);
+    r.seq.store(seq, Ordering::Relaxed);
+    r.addr.store(addr as u64, Ordering::Release);
+}
+
+/// Did an old-gen reclamation free a block at `addr`, and what did it hold?
+/// Returns `(class_id, kind, site, seq)` for the most recent matching record.
+pub fn old_freed_lookup(addr: usize) -> Option<(u32, u8, u8, u64)> {
+    let a = addr as u64;
+    let mut best: Option<(u32, u8, u8, u64)> = None;
+    for r in OLD_FREED_RING.iter() {
+        if r.addr.load(Ordering::Acquire) != a {
+            continue;
+        }
+        let seq = r.seq.load(Ordering::Relaxed);
+        if best.is_none_or(|(_, _, _, b)| seq > b) {
+            best = Some((
+                r.class_id.load(Ordering::Relaxed),
+                r.kind.load(Ordering::Relaxed),
+                r.site.load(Ordering::Relaxed),
+                seq,
+            ));
+        }
+    }
+    best
+}
+
 /// Old-gen mark-worklist entries whose `kind` byte is not a valid `ObjectKind`
 /// discriminant — i.e. the mark BFS was handed an address that is not an object
 /// base and decoded whatever bytes were there as an `ObjectHeader`.
@@ -10002,6 +10092,22 @@ impl GenerationalHeap {
                             }
                         }
                     }
+                    // H2-CID0 (2026-08-01): remember WHAT was here. `OldGen::free`
+                    // leaves the bytes in place, so a dangling read of this block
+                    // returns the stale object until the allocator reuses it —
+                    // and reuse zeroes the block before writing the new header,
+                    // which is how a still-referenced old-gen object comes back as
+                    // an all-zero `ClassId(0)` header, i.e. `java.lang.Object`.
+                    // Always on, and cheap: an in-place old sweep only runs past
+                    // 75 % occupancy, and the record is one relaxed `fetch_add`
+                    // plus four relaxed stores. See
+                    // `docs/known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`.
+                    record_old_freed(
+                        obj_ptr as usize,
+                        header.class_id.as_u32(),
+                        header.kind as u8,
+                        OLD_FREED_SITE_INPLACE_SWEEP,
+                    );
                     // SAFETY: `obj_ptr`/`total_size` are exactly the (base, size) pair `walk_objects` yielded for this
                     // now-unmarked old-gen object, so returning that span to the free list is sound.
                     unsafe { old_gen.free(obj_ptr, total_size) };
