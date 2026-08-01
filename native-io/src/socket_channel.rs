@@ -269,34 +269,76 @@ fn tcp_replace_connect_state(id: i32, stream: TcpStream, connected: bool, blocki
 const ACCEPT_CLOSE_POLL: Duration = Duration::from_millis(10);
 const LINGERING_CHANNEL_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn tcp_listener_still_registered(id: i32) -> bool {
+fn tcp_listener_is_registered(id: i32) -> bool {
     matches!(tcp_registry().read().get(&id), Some(TcpHandle::Listener(_)))
 }
 
+/// Accept from the registry's own listener, never from a private duplicate.
+///
+/// `ServerSocketChannel.close()` must make the port stop listening **by the
+/// time it returns** — that is the whole contract a graceful shutdown rests
+/// on. `sc_close` implements it by dropping the registry entry, which drops
+/// the `TcpListener` and closes the OS socket. That only works if the registry
+/// holds the *last* handle.
+///
+/// This used to `try_clone()` the listener before looping, so an acceptor
+/// thread parked here kept a duplicate OS handle alive across the close. Two
+/// things went wrong, both of them silent:
+///
+///   * The port stayed open until the acceptor happened to poll again, so a
+///     client connecting in that window completed its TCP handshake instead of
+///     being refused.
+///   * Worse, the deregistration check sat only in the `WouldBlock` arm — a
+///     connection that arrived after the close was returned by `accept()` and
+///     SERVED, with no check at all.
+///
+/// Spring Boot's `JettyServletWebServerFactoryTests
+/// .whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade` is
+/// exactly that race: it calls `shutDownGracefully` (which closes the
+/// connector synchronously) and then connects, expecting
+/// `HttpHostConnectException`. It got `404 Not Found` — a real response from
+/// the server that was supposed to be closed. It reproduces only under load,
+/// because the window is one `ACCEPT_CLOSE_POLL` wide, which is why the test
+/// passes standalone and fails inside the full 113-test class.
+///
+/// Taking the registry read lock per poll instead costs one uncontended lock
+/// every 10 ms and makes the close atomic against the accept: `tcp_remove`
+/// takes the write lock, so it either runs before an iteration (which then
+/// finds no listener and gives up) or after it (which has already returned).
+/// The lock is never held across a blocking syscall — the listener is put in
+/// non-blocking mode first, so `accept()` here always returns immediately.
 fn accept_close_aware(
-    listener: &TcpListener,
     id: i32,
     blocking: bool,
 ) -> std::io::Result<Option<(TcpStream, SocketAddr)>> {
-    listener.set_nonblocking(true)?;
-
-    if !blocking {
-        return match listener.accept() {
-            Ok(pair) => Ok(Some(pair)),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(e),
-        };
-    }
-
+    let mut nonblocking_set = false;
     loop {
-        match listener.accept() {
+        // Scoped so the guard is dropped before the sleep below — otherwise a
+        // parked acceptor would hold the registry read lock process-wide.
+        let attempt = {
+            let map = tcp_registry().read();
+            match map.get(&id) {
+                Some(TcpHandle::Listener(l)) => {
+                    if !nonblocking_set {
+                        l.set_nonblocking(true)?;
+                        nonblocking_set = true;
+                    }
+                    Some(l.accept())
+                }
+                _ => None,
+            }
+        };
+        let Some(result) = attempt else {
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "server channel closed",
+            ));
+        };
+        match result {
             Ok(pair) => return Ok(Some(pair)),
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                if !tcp_listener_still_registered(id) {
-                    return Err(std::io::Error::new(
-                        ErrorKind::Interrupted,
-                        "server channel closed",
-                    ));
+                if !blocking {
+                    return Ok(None);
                 }
                 std::thread::sleep(ACCEPT_CLOSE_POLL);
             }
@@ -3267,16 +3309,9 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let preaccepted = crate::nio_selector::take_any_pending_accepted(id);
     let preaccepted_used = preaccepted.is_some();
 
-    // Clone listener out so the registry lock isn't held across blocking accept.
-    let listener_clone = {
-        let map = tcp_registry().read();
-        match map.get(&id) {
-            Some(TcpHandle::Listener(l)) => {
-                l.try_clone().map_err(|e| map_err("accept clone", e))?
-            }
-            _ => return Err(ioex("accept: id is not a listener")),
-        }
-    };
+    if !tcp_listener_is_registered(id) {
+        return Err(ioex("accept: id is not a listener"));
+    }
     let accepted = if let Some(stream) = preaccepted {
         let peer = stream
             .peer_addr()
@@ -3293,16 +3328,16 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // (e.g. HTTP/2), leaving the acceptor idle in accept() for the whole
         // exchange. `end_blocking_region` waits out any active pause before we
         // resume touching the heap below. The actual wait is a close-aware
-        // nonblocking poll loop: close() drops the registry entry, which wakes
-        // this path promptly even if the OS would leave our duplicate listener
-        // blocked in accept().
+        // nonblocking poll loop over the REGISTRY's listener (never a private
+        // duplicate — see `accept_close_aware`), so `close()` both wakes this
+        // path and closes the OS socket in the same instant.
         let res = if blocking {
             ctx.begin_blocking_region();
-            let res = accept_close_aware(&listener_clone, id, true);
+            let res = accept_close_aware(id, true);
             ctx.end_blocking_region();
             res
         } else {
-            accept_close_aware(&listener_clone, id, false)
+            accept_close_aware(id, false)
         };
         match res {
             Ok(pair) => pair,
@@ -3367,11 +3402,15 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 ///
 /// The socket is flipped non-blocking and polled, exactly like
 /// `accept_close_aware` does for TCP: a blocking `accept()` would have to be
-/// issued while holding the registry lock (an `UdsListener` cannot be
-/// `try_clone`d out of the map the way a `TcpListener` can), which would
-/// deadlock against the `close()` that is supposed to wake it. Polling keeps
-/// each lock acquisition to a single non-blocking syscall and lets `close()`
-/// — which removes the registry entry — end the wait promptly.
+/// issued while holding the registry lock, which would deadlock against the
+/// `close()` that is supposed to wake it. Polling keeps each lock acquisition
+/// to a single non-blocking syscall and lets `close()` — which removes the
+/// registry entry — end the wait promptly.
+///
+/// This path was always registry-borrowed because an `UdsListener` cannot be
+/// `try_clone`d out of the map. The TCP twin *could* be, and was, which is
+/// how it ended up keeping the listening socket open across a `close()` — see
+/// `accept_close_aware`. The two now have the same shape.
 fn uds_accept_close_aware(
     id: i32,
     blocking: bool,
@@ -4453,17 +4492,10 @@ mod tests {
     fn blocking_accept_observes_channel_close_promptly() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let id = tcp_register(TcpHandle::Listener(listener));
-        let accept_listener = {
-            let regs = tcp_registry().read();
-            match regs.get(&id) {
-                Some(TcpHandle::Listener(l)) => l.try_clone().unwrap(),
-                _ => panic!("listener must be registered"),
-            }
-        };
 
         let waiter = std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            let err = accept_close_aware(&accept_listener, id, true).unwrap_err();
+            let err = accept_close_aware(id, true).unwrap_err();
             (err.kind(), start.elapsed())
         });
 
@@ -4474,6 +4506,48 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "close-aware accept should wake promptly, got {elapsed:?}"
+        );
+    }
+
+    /// Dropping the registry entry must close the OS socket, even with an
+    /// acceptor thread parked in `accept_close_aware`.
+    ///
+    /// The registry is the sole owner of the listening socket, so
+    /// `tcp_remove` — which is what `ServerSocketChannel.close()` ends in —
+    /// closes the port. An acceptor that kept its own `try_clone()`d duplicate
+    /// silently defeated that: the port stayed open for up to one
+    /// `ACCEPT_CLOSE_POLL`, and a connection arriving in that window was
+    /// accepted and served. Spring Boot's `JettyServletWebServerFactoryTests
+    /// .whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade` saw
+    /// that as `404 Not Found` where it expected a refused connection.
+    ///
+    /// Assert the OS-visible property directly — a connect to the port has to
+    /// fail — rather than the internal one, because the internal state was
+    /// already correct while the socket stayed open.
+    #[test]
+    fn closing_the_registry_entry_closes_the_listening_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let id = tcp_register(TcpHandle::Listener(listener));
+
+        let acceptor = std::thread::spawn(move || accept_close_aware(id, true).map(|_| ()));
+        // Let the acceptor reach its first poll, so the close lands with a
+        // thread actively accepting.
+        std::thread::sleep(Duration::from_millis(50));
+
+        tcp_remove(id);
+        assert_eq!(
+            acceptor.join().unwrap().unwrap_err().kind(),
+            ErrorKind::Interrupted
+        );
+
+        let target: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let connected =
+            std::net::TcpStream::connect_timeout(&target, Duration::from_millis(250)).is_ok();
+        assert!(
+            !connected,
+            "port {port} still accepted a connection after its registry entry \
+             was dropped — something outlived the close"
         );
     }
 
