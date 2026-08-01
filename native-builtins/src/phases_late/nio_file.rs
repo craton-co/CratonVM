@@ -4394,6 +4394,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let p = p57_read_path(ctx, path_obj);
             let is_file = match vfs_classify(&p) {
                 Some(kind) => matches!(kind, JarFsKind::File),
+                None if p57_link_options_nofollow(ctx, args.get(1)) => {
+                    std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file())
+                }
                 None => std::path::Path::new(&p).is_file(),
             };
             Ok(Some(Value::Int(if is_file { 1 } else { 0 })))
@@ -4503,10 +4506,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         ctx: &mut dyn NativeContext,
         path_obj: ObjectRef,
         max_depth: usize,
+        follow_links: bool,
     ) -> MethodCallResult {
         let p = p57_read_path(ctx, path_obj);
         let mut paths = Vec::new();
-        vfs_or_host_walk(&p, 0, max_depth, &mut paths);
+        vfs_or_host_walk(&p, 0, max_depth, follow_links, &mut paths);
         let mut vals = Vec::with_capacity(paths.len());
         for e in &paths {
             let ep = p57_alloc_path(ctx, e);
@@ -4520,7 +4524,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;[Ljava/nio/file/FileVisitOption;)Ljava/util/stream/Stream;",
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
-            files_walk_stream(ctx, path_obj, usize::MAX)
+            let follow = p57_visit_options_follow_links(ctx, args.get(1));
+            files_walk_stream(ctx, path_obj, usize::MAX, follow)
         },
     );
     r.register(
@@ -4533,7 +4538,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(n)) if *n >= 0 => *n as usize,
                 _ => usize::MAX,
             };
-            files_walk_stream(ctx, path_obj, max_depth)
+            let follow = p57_visit_options_follow_links(ctx, args.get(2));
+            files_walk_stream(ctx, path_obj, max_depth, follow)
         },
     );
     r.register(
@@ -4551,19 +4557,41 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(o)) => Some(o),
                 _ => None,
             };
+            let follow = p57_visit_options_follow_links(ctx, args.get(3));
             let mut paths = Vec::new();
-            vfs_or_host_walk(&p, 0, max_depth, &mut paths);
+            vfs_or_host_walk(&p, 0, max_depth, follow, &mut paths);
+            // Without FOLLOW_LINKS the JDK's walker reads each entry's
+            // attributes with NOFOLLOW_LINKS, which is what lets a `BiPredicate`
+            // see `attrs.isSymbolicLink()`. `p59_files_read_attributes` reads
+            // that request off a non-empty `LinkOption[]` (the enum has one
+            // constant), so hand it a 1-element array when not following.
+            let nofollow_opts = if follow {
+                Value::Object(None)
+            } else {
+                Value::Object(Some(
+                    ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1),
+                ))
+            };
+            let nofollow_pin = match nofollow_opts {
+                Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+                _ => None,
+            };
             let mut vals = Vec::with_capacity(paths.len());
             for e in &paths {
                 let ep = p57_alloc_path(ctx, e);
                 let ep_pin = ctx.pin_native_root(ep);
-                let attrs = match p59_files_read_attributes(ctx, &[Value::Object(Some(ep))])? {
-                    Some(Value::Object(Some(attrs))) => attrs,
-                    _ => {
-                        ctx.unpin_native_roots(ep_pin);
-                        continue;
-                    }
+                let opts = match nofollow_pin {
+                    Some((pin, orig)) => Value::Object(Some(ctx.read_native_pin(pin, orig))),
+                    None => Value::Object(None),
                 };
+                let attrs =
+                    match p59_files_read_attributes(ctx, &[Value::Object(Some(ep)), opts])? {
+                        Some(Value::Object(Some(attrs))) => attrs,
+                        _ => {
+                            ctx.unpin_native_roots(ep_pin);
+                            continue;
+                        }
+                    };
                 let attrs_pin = ctx.pin_native_root(attrs);
                 let attrs = ctx.read_native_pin(attrs_pin, attrs);
                 let ep_current = ctx.read_native_pin(ep_pin, ep);
@@ -4586,6 +4614,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 if keep {
                     vals.push(Value::Object(Some(ep)));
                 }
+            }
+            if let Some((pin, _)) = nofollow_pin {
+                ctx.unpin_native_roots(pin);
             }
             cratonvm_native_collections::make_stream_from_elements(ctx, &vals)
         },
@@ -4790,12 +4821,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(files, "delete", "(Ljava/nio/file/Path;)V", |ctx, args| {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
-        let pb = std::path::Path::new(&p);
-        if pb.is_dir() {
-            let _ = std::fs::remove_dir(&p);
-        } else {
-            let _ = std::fs::remove_file(&p);
-        }
+        p57_delete_path(&p);
         Ok(None)
     });
 
@@ -4806,15 +4832,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            if !std::path::Path::new(&p).exists() {
+            // `Path::exists()` follows links, so a DANGLING symlink read as
+            // "does not exist" and was left on disk. The link itself is what
+            // `deleteIfExists` is being asked about.
+            if std::fs::symlink_metadata(&p).is_err() {
                 return Ok(Some(Value::Int(0)));
             }
-            let pb = std::path::Path::new(&p);
-            if pb.is_dir() {
-                let _ = std::fs::remove_dir(&p);
-            } else {
-                let _ = std::fs::remove_file(&p);
-            }
+            p57_delete_path(&p);
             Ok(Some(Value::Int(1)))
         },
     );
@@ -7851,6 +7875,23 @@ pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> Meth
     MethodCallFailed::ExceptionThrown(exc)
 }
 
+/// Remove a single filesystem entry, choosing `remove_dir` vs `remove_file` the
+/// way the JDK's `Files.delete` does: on the entry's OWN type.
+///
+/// This used to branch on `Path::is_dir()`, which resolves symbolic links — so
+/// deleting a link to a directory called `remove_dir` on the link, which fails
+/// with ENOTDIR and (because the error was discarded) left the link on disk.
+/// `FileSystemUtils.deleteRecursively` on such a link therefore silently did
+/// nothing, stranding it for every later caller.
+pub(crate) fn p57_delete_path(path: &str) {
+    let is_real_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    if is_real_dir {
+        let _ = std::fs::remove_dir(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Build a *typed* `java.nio.file.NotLinkException` for `path` (mirrors
 /// [`p57_no_such_file`]). Thrown by `readSymbolicLink` when the path exists but
 /// is not a symbolic link — the JDK's contract, and what
@@ -8920,16 +8961,86 @@ pub(crate) fn vfs_or_host_is_dir(p: &str) -> bool {
     }
 }
 
+/// "Is this a directory the walker should descend into?", honouring
+/// `FileVisitOption.FOLLOW_LINKS`.
+///
+/// Without FOLLOW_LINKS the JDK's `FileTreeWalker` reads each entry's
+/// attributes with `NOFOLLOW_LINKS`, so a symbolic link — even one pointing at
+/// a directory — is a *file* to the walk and is never descended into. The
+/// walkers here used to ask `Path::is_dir()`, which resolves the link, so every
+/// tree walk in the VM silently followed every symlink. Two consequences, both
+/// observed: a `FileSystemUtils.deleteRecursively(symlink)` recursed into and
+/// emptied the link's TARGET instead of unlinking the link
+/// (`ApplicationTempTests`), and a symlink cycle was bounded only by
+/// `max_depth`.
+pub(crate) fn vfs_or_host_is_walkable_dir(p: &str, follow_links: bool) -> bool {
+    match vfs_classify(p) {
+        // jar/jrt namespaces have no symbolic links of their own.
+        Some(kind) => matches!(kind, JarFsKind::Dir),
+        None if follow_links => std::path::Path::new(p).is_dir(),
+        None => std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()),
+    }
+}
+
 /// Depth-first pre-order walk: pushes `p` then every descendant (encoded path
 /// strings). Bounded by `depth`/`max_depth` to guard against pathological host
 /// symlink cycles (jar/jrt namespaces are acyclic).
-pub(crate) fn vfs_or_host_walk(p: &str, depth: usize, max_depth: usize, out: &mut Vec<String>) {
+pub(crate) fn vfs_or_host_walk(
+    p: &str,
+    depth: usize,
+    max_depth: usize,
+    follow_links: bool,
+    out: &mut Vec<String>,
+) {
     out.push(p.to_string());
-    if depth >= max_depth || !vfs_or_host_is_dir(p) {
+    if depth >= max_depth || !vfs_or_host_is_walkable_dir(p, follow_links) {
         return;
     }
     for child in vfs_or_host_list(p) {
-        vfs_or_host_walk(&child, depth + 1, max_depth, out);
+        vfs_or_host_walk(&child, depth + 1, max_depth, follow_links, out);
+    }
+}
+
+/// Whether a `LinkOption[]` argument asks for `NOFOLLOW_LINKS`.
+///
+/// `java.nio.file.LinkOption` is a single-constant enum, so a non-empty array
+/// unambiguously means NOFOLLOW_LINKS — the same shortcut
+/// `p59_files_read_attributes` already takes, lifted here so the
+/// `exists`/`isDirectory`/`isRegularFile` predicates stop ignoring the option
+/// entirely. They all resolved links, so a dangling link "did not exist" and a
+/// link to a directory "was a directory" even under NOFOLLOW_LINKS.
+pub(crate) fn p57_link_options_nofollow(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> bool {
+    matches!(arg, Some(Value::Object(Some(a))) if ctx.array_length(*a) > 0)
+}
+
+/// Whether a `FileVisitOption[]`/`Set<FileVisitOption>` argument asks for
+/// `FOLLOW_LINKS`.
+///
+/// `java.nio.file.FileVisitOption` is a single-constant enum, so — exactly like
+/// the `LinkOption`/NOFOLLOW_LINKS check in `p59_files_read_attributes` — a
+/// non-empty container unambiguously means FOLLOW_LINKS and needs no
+/// re-entrant `toString()` probe. An absent or empty argument means "do not
+/// follow", which is the JDK's default.
+pub(crate) fn p57_visit_options_follow_links(
+    ctx: &mut dyn NativeContext,
+    arg: Option<&Value>,
+) -> bool {
+    let Some(Value::Object(Some(o))) = arg else {
+        return false;
+    };
+    let o = *o;
+    let class_id = ctx.class_id_of_object(o);
+    let is_array = ctx
+        .class_name_of_id(class_id)
+        .is_some_and(|n| n.starts_with('['));
+    if is_array {
+        // Array form (`Files.walk(path, opts...)` varargs).
+        return ctx.array_length(o) > 0;
+    }
+    // Set form (`Files.walkFileTree(path, Set<FileVisitOption>, ...)`).
+    match ctx.invoke_virtual(o, "isEmpty", "()Z", &[]) {
+        Ok(Some(Value::Int(v))) => v == 0,
+        _ => false,
     }
 }
 
@@ -14238,6 +14349,12 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 };
                 let exists = match vfs_classify(&path_str) {
                     Some(kind) => !matches!(kind, JarFsKind::Absent),
+                    // NOFOLLOW_LINKS asks about the LINK, so a dangling
+                    // symbolic link exists. `Path::exists()` resolves the link
+                    // and answered false for one.
+                    None if p57_link_options_nofollow(ctx, args.get(1)) => {
+                        std::fs::symlink_metadata(&path_str).is_ok()
+                    }
                     None => std::path::Path::new(&path_str).exists(),
                 };
                 Ok(Some(Value::Int(if exists { 1 } else { 0 })))
@@ -14258,6 +14375,9 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 };
                 let exists = match vfs_classify(&path_str) {
                     Some(kind) => !matches!(kind, JarFsKind::Absent),
+                    None if p57_link_options_nofollow(ctx, args.get(1)) => {
+                        std::fs::symlink_metadata(&path_str).is_ok()
+                    }
                     None => std::path::Path::new(&path_str).exists(),
                 };
                 Ok(Some(Value::Int(if !exists { 1 } else { 0 })))
@@ -14278,6 +14398,11 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 };
                 let is_dir = match vfs_classify(&path_str) {
                     Some(kind) => matches!(kind, JarFsKind::Dir),
+                    // Under NOFOLLOW_LINKS a link to a directory is a LINK,
+                    // not a directory.
+                    None if p57_link_options_nofollow(ctx, args.get(1)) => {
+                        std::fs::symlink_metadata(&path_str).is_ok_and(|m| m.is_dir())
+                    }
                     None => std::path::Path::new(&path_str).is_dir(),
                 };
                 Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
@@ -14298,6 +14423,9 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 };
                 let is_file = match vfs_classify(&path_str) {
                     Some(kind) => matches!(kind, JarFsKind::File),
+                    None if p57_link_options_nofollow(ctx, args.get(1)) => {
+                        std::fs::symlink_metadata(&path_str).is_ok_and(|m| m.is_file())
+                    }
                     None => std::path::Path::new(&path_str).is_file(),
                 };
                 Ok(Some(Value::Int(if is_file { 1 } else { 0 })))
@@ -14934,7 +15062,8 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "java/nio/file/Files",
         "walkFileTree",
         "(Ljava/nio/file/Path;Ljava/nio/file/FileVisitor;)Ljava/nio/file/Path;",
-        |ctx, args| p98_walk_file_tree(ctx, args, usize::MAX),
+        // The 2-arg overload is specified as "does not follow symbolic links".
+        |ctx, args| p98_walk_file_tree(ctx, args, usize::MAX, false),
     );
     r.register(
         "java/nio/file/Files",
@@ -14948,8 +15077,9 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
             } else {
                 requested_depth.max(0) as usize
             };
+            let follow = p57_visit_options_follow_links(ctx, args.get(1));
             let visitor = args.get(3).copied().unwrap_or(Value::Object(None));
-            p98_walk_file_tree(ctx, &[path_obj, visitor], max_depth)
+            p98_walk_file_tree(ctx, &[path_obj, visitor], max_depth, follow)
         },
     );
     r.set_category(__prev_cat);
@@ -14959,6 +15089,7 @@ pub(crate) fn p98_walk_file_tree(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     max_depth: usize,
+    follow_links: bool,
 ) -> MethodCallResult {
     let path_val = args.first().copied().unwrap_or(Value::Object(None));
     let visitor = if let Some(Value::Object(Some(v))) = args.get(1) {
@@ -15021,17 +15152,62 @@ pub(crate) fn p98_walk_file_tree(
         ctx.unpin_native_roots(visitor_pin.0);
         return Ok(Some(path_val));
     }
-    let result = p98_walk_dir(
-        ctx,
-        &root_str,
-        visitor_pin,
-        path_pin,
-        skip_file_callbacks,
-        max_depth,
-    );
+    // A root that is not a directory (a plain file, or — without FOLLOW_LINKS —
+    // a symbolic link, even one pointing at a directory) gets a single
+    // `visitFile` callback, not the preVisitDirectory/postVisitDirectory pair.
+    // Treating a symlink root as a directory is what made
+    // `FileSystemUtils.deleteRecursively(symlink)` recurse into the link's
+    // TARGET and then fail to unlink the link itself (`ApplicationTempTests`,
+    // whose leftover symlink then poisoned every later test in the class).
+    let result = if vfs_or_host_is_walkable_dir(&root_str, follow_links) {
+        p98_walk_dir(
+            ctx,
+            &root_str,
+            visitor_pin,
+            path_pin,
+            skip_file_callbacks,
+            max_depth,
+            follow_links,
+        )
+        .map(|_| ())
+    } else {
+        p98_visit_single_file(ctx, &root_str, visitor_pin, path_pin, skip_file_callbacks)
+    };
     ctx.unpin_native_roots(visitor_pin.0);
     result?;
     Ok(Some(path_val))
+}
+
+/// `visitFile` for a walk root that is not a directory. `Files.walkFileTree`
+/// accepts any path; the JDK reports a non-directory root through exactly one
+/// `visitFile` callback and never touches the directory callbacks.
+fn p98_visit_single_file(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+    visitor_pin: P98Pin,
+    path_pin: P98Pin,
+    skip_file_callbacks: bool,
+) -> Result<(), MethodCallFailed> {
+    if skip_file_callbacks {
+        return Ok(());
+    }
+    // A symlink's own size, not its target's — the walk did not follow it.
+    let size = std::fs::symlink_metadata(path)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    let fa = p98_alloc_basic_file_attributes(ctx, false, size);
+    let visitor_now = p98_read_pin(ctx, visitor_pin);
+    let path_now = p98_read_pin(ctx, path_pin);
+    p98_invoke_file_visitor(
+        ctx,
+        visitor_now,
+        "visitFile",
+        "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
+        "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
+        path_now,
+        Value::Object(Some(fa)),
+    )?;
+    Ok(())
 }
 
 pub(crate) fn p98_is_missing_visitor_method(
@@ -15240,6 +15416,7 @@ pub(crate) fn p98_walk_dir(
     dir_path_pin: P98Pin,
     skip_file_callbacks: bool,
     remaining_depth: usize,
+    follow_links: bool,
 ) -> Result<bool, MethodCallFailed> {
     let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
@@ -15286,6 +15463,7 @@ pub(crate) fn p98_walk_dir(
                         epo_pin,
                         skip_file_callbacks,
                         remaining_depth - 1,
+                        follow_links,
                     )? {
                         return Ok(false);
                     }
@@ -15335,6 +15513,7 @@ pub(crate) fn p98_walk_dir(
                         epo_pin,
                         skip_file_callbacks,
                         remaining_depth - 1,
+                        follow_links,
                     )? {
                         return Ok(false);
                     }
@@ -15371,7 +15550,16 @@ pub(crate) fn p98_walk_dir(
             for entry in entries.flatten() {
                 let ep = entry.path();
                 let es = ep.to_string_lossy().to_string();
-                if ep.is_dir() {
+                // `entry.file_type()` is the NOFOLLOW answer (it comes straight
+                // off the readdir record), so a symbolic link is a link here
+                // whatever it points at. `Path::is_dir()` resolves it — which is
+                // exactly the "descend unless FOLLOW_LINKS" decision the walk
+                // has to make, so only ask it when following.
+                let is_dir = entry
+                    .file_type()
+                    .map(|t| t.is_dir() || (follow_links && t.is_symlink() && ep.is_dir()))
+                    .unwrap_or(false);
+                if is_dir {
                     let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
                     let epo_pin = p98_pin(ctx, epo);
                     let s = ctx.create_string(&es);
@@ -15384,6 +15572,7 @@ pub(crate) fn p98_walk_dir(
                         epo_pin,
                         skip_file_callbacks,
                         remaining_depth - 1,
+                        follow_links,
                     )? {
                         return Ok(false);
                     }
