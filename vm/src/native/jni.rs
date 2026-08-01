@@ -3004,7 +3004,7 @@ extern "C" fn jni_set_long_field(_env: JNIEnv, obj: JObject, field_id: JFieldID,
             && bits & 0x7 == 0
             && shared.mem.heap.is_object_address(bits as usize).is_some()
         {
-            crate::memory::smuggled_longs::record_minted_long(bits);
+            crate::memory::smuggled_longs::record_minted_long(&shared.mem.heap, bits);
         }
         shared
             .mem
@@ -3892,7 +3892,7 @@ extern "C" fn jni_set_long_array_region(
                 && bits & 0x7 == 0
                 && shared.mem.heap.is_object_address(bits as usize).is_some()
             {
-                crate::memory::smuggled_longs::record_minted_long(bits);
+                crate::memory::smuggled_longs::record_minted_long(&shared.mem.heap, bits);
             }
             let _ = shared
                 .mem
@@ -4958,7 +4958,7 @@ pub unsafe fn dispatch_jni_native(
             if bits != 0 && bits & 0x7 == 0 {
                 with_shared_vm(|shared| {
                     if shared.mem.heap.is_object_address(bits as usize).is_some() {
-                        crate::memory::smuggled_longs::record_minted_long(bits);
+                        crate::memory::smuggled_longs::record_minted_long(&shared.mem.heap, bits);
                     }
                     Some(())
                 });

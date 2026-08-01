@@ -284,6 +284,20 @@ fn remap_security_manager(shared: &crate::vm::SharedVm, map: &HashMap<usize, usi
         map,
     );
 }
+// The `ObjectStreamClass` descriptor cache. VM-scoped because the cache is a
+// field of THIS VM's `ClassRealm`: `scan_roots` walks only the receiver's map.
+//
+// It used to register a process-global `Mutex<Vec<*const OscMap>>` of raw
+// backing-map pointers through `register_native_root_source`, which has no VM
+// parameter — so every VM's collection walked every live cache, reporting one
+// heap's addresses to another heap's collector and rewriting one VM's entries
+// through another VM's relocation map. See `runtime::serialization::oscache`.
+fn scan_osc_cache(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    shared.classes.osc_cache.scan_roots(roots);
+}
+fn remap_osc_cache(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    shared.classes.osc_cache.remap_roots(map);
+}
 fn scan_annotations(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(roots);
 }
@@ -394,6 +408,7 @@ static VM_ROOT_SOURCES: &[VmRootSource] = &[
     root_source!("class-values", scan_class_values, remap_class_values),
     root_source!("jboss-msc", scan_msc, remap_msc),
     root_source!("logmanager", scan_logmanager, remap_logmanager),
+    root_source!("osc-cache", scan_osc_cache, remap_osc_cache),
     root_source!("annotation-proxies", scan_annotations, remap_annotations),
     root_source!("http-handlers", scan_http_handlers, remap_http_handlers),
     root_source!("inet-addresses", scan_inet_addresses, remap_inet_addresses),
