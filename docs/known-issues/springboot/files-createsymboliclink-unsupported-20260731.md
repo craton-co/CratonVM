@@ -61,6 +61,8 @@ symlink is unimplemented.
   `UnsupportedOperationException` at `FileSystemProvider.createSymbolicLink(FileSystemProvider.java:626)`
   → `Files.createSymbolicLink(Files.java:976)`, from `shouldTriggerOnConfigMapUpdates`,
   `shouldFollowSymlinkRecursively`, `shouldFollowRelativePathSymlinks`,
-  `shouldTriggerOnConfigMapAtomicMoveUpdates`, `shouldFollowSymlink`. The remaining 9 failures in
-  this class are a separate, unrelated bug — see
-  `filewatcher-watchservice-timed-poll-missing-native-20260731.md`.
+  `shouldTriggerOnConfigMapAtomicMoveUpdates`, `shouldFollowSymlink`. The other 9 failures were a
+  separate, unrelated bug in the `WatchService` surface, FIXED 2026-08-01 —
+  `docs/internal/springboot/filewatcher-watchservice-surface-FIXED-20260801.md`. Since that fix
+  these 5 are the **only** remaining failures in the class (10/15 pass, stable over 4 runs), and
+  they abort at test *setup* — the watch loop itself is never reached.
