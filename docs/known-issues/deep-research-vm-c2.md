@@ -111,7 +111,28 @@
 > deopt/oop-map bci must also translate through `bci_at`. A missed table fails
 > silently.
 >
-> **3. Linear-scan RA.** Complete with `verify_allocation` (7 proofs) and
+> **2b. The atomic step, verified.** All three primitives now exist and are
+> tested: `LoopXform::outputs_for_bci` (one-to-many inverse of `bci_at`),
+> `replicate_pc_keyed` (one table into output-PC space, payload cloned so
+> pointer-carrying tables share one target across copies — correct, since an
+> inline cache keyed on a call site sees the same receiver distribution in
+> every copy), and `rebuild_pc_to_native` (original-bci space, inheriting
+> `osr_entry_pc`'s image choice and leaving the unrolled back-edge gap at the
+> `-1` sentinel).
+>
+> **The interception is ONE function.** `compile_with_param_slots` receives all
+> 21 pc-keyed tables by value at the top of its body, so the whole change is:
+> (i) plan the transform there, (ii) shadow `code`/`code_len` with the rewritten
+> bytes, (iii) call `replicate_pc_keyed` on each of the 21 tables, (iv) compile,
+> (v) on exit translate every recorded bci through `bci_at` and swap in
+> `rebuild_pc_to_native`. Step (v) is a single post-pass over `CompiledMethod`,
+> NOT ~24 edits at the `deopt_stubs.push` sites.
+>
+> **It must land atomically.** Replicating some tables and not others compiles
+> fine and silently produces a copy that lost a field resolution or an inline
+> cache — which is exactly why the primitives were built and tested separately
+> first. Do not split step (iii).
+>> **3. Linear-scan RA.** Complete with `verify_allocation` (7 proofs) and
 > parallel-copy resolution; refs pinned to memory across safepoints because
 > `emit_safepoint_map` publishes frame slots only. **Remaining:** no production
 > call site — `ir_lower` still uses the slot colourer. Wiring it means replacing
