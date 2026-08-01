@@ -86,8 +86,23 @@ fn ensure_probe_compiled(name: &str) -> bool {
     if !src.exists() {
         return false;
     }
-    let status = Command::new("javac").arg("-d").arg(&dir).arg(&src).status();
-    matches!(status, Ok(s) if s.success()) && cls.exists()
+    let compile = Command::new("javac").arg("-d").arg(&dir).arg(&src)
+        .output();
+    match compile {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(_) => false,
+        // javac RAN and rejected the fixture: skipping here would make this
+        // test a permanent vacuous pass.
+        Ok(o) => {
+            assert!(
+                o.status.success(),
+                "[wave2_string_decode] the checked-in probe fixture failed to compile — fix the .java source. \
+             javac stderr:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            cls.exists()
+        }
+    }
 }
 
 fn run_probe(name: &str) -> Option<(String, String, std::process::ExitStatus)> {

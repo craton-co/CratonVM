@@ -100,9 +100,19 @@ fn ensure_probe_compiled() -> bool {
         .arg(dir.join("stubs/org/jboss/modules/ModuleClassLoader.java"))
         .arg(dir.join("stubs/org/jboss/modules/LocalModuleLoader.java"))
         .arg(dir.join("stubs/org/jboss/modules/DefaultBootModuleLoaderHolder.java"))
-        .status();
-    if !matches!(stub_status, Ok(s) if s.success()) {
-        return false;
+        .output();
+    match stub_status {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(_) => return false,
+        // javac RAN and rejected the stubs: answering `false` here reads to the
+        // caller as "javac unavailable, skip", which makes this test a permanent
+        // vacuous pass.
+        Ok(o) => assert!(
+            o.status.success(),
+            "[wildfly_jboss_module_service_leak] the jboss-modules stubs failed to compile \
+             — fix the stub sources. javac stderr:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
     }
     let probe_status = Command::new("javac")
         .arg("-cp")
@@ -110,8 +120,20 @@ fn ensure_probe_compiled() -> bool {
         .arg("-d")
         .arg(&dir)
         .arg(dir.join("JBossModuleServiceLeakProbe.java"))
-        .status();
-    matches!(probe_status, Ok(s) if s.success()) && probe_class.exists()
+        .output();
+    match probe_status {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(_) => false,
+        Ok(o) => {
+            assert!(
+                o.status.success(),
+                "[wildfly_jboss_module_service_leak] the embedded probe failed to compile \
+                 — fix the probe source. javac stderr:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            probe_class.exists()
+        }
+    }
 }
 
 /// Runs the probe for one module, returning the comma-joined provider

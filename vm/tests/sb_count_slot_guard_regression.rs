@@ -77,14 +77,29 @@ fn ensure_probe_compiled() -> bool {
         return false;
     }
     let _ = std::fs::create_dir_all(&dir);
-    let status = Command::new("javac")
+    let compile = Command::new("javac")
         .arg("--release")
         .arg("21")
         .arg("-d")
         .arg(&dir)
         .arg(&source)
-        .status();
-    matches!(status, Ok(s) if s.success()) && class_file.exists()
+        .output();
+    match compile {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(_) => false,
+        // javac RAN and rejected the fixture: answering `false` here reads to
+        // the caller as "javac unavailable, skip", which makes this test a
+        // permanent vacuous pass.
+        Ok(o) => {
+            assert!(
+                o.status.success(),
+                "[sb_count_slot_guard] the checked-in probe fixture failed to compile — fix the \
+                 .java source. javac stderr:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            class_file.exists()
+        }
+    }
 }
 
 /// Runs `SbCountProbe` under a hard timeout, killing (not just failing)

@@ -128,13 +128,15 @@ fn stage_probe() -> Option<PathBuf> {
         ])
         .output()
         .ok()?;
-    if !out.status.success() {
-        eprintln!(
-            "javac SubListProbe.java failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return None;
-    }
+    // javac RAN and rejected the source: the probe is broken, and returning
+    // None here reads to the caller as "javac unavailable, skip", which makes
+    // this test a permanent vacuous pass.
+    assert!(
+        out.status.success(),
+        "[sublist_view_regression] the embedded probe failed to compile — fix the probe source. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     std::mem::forget(dir);
     Some(classes)
 }

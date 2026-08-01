@@ -199,7 +199,7 @@ fn compile_probe(jh: &Path, out_dir: &Path, name: &str, src: &str) -> bool {
             .arg("-d")
             .arg(out_dir)
             .arg(&java_file)
-            .status()
+            .output()
     } else {
         // Fall back to invoking the `jdk.compiler` module's main class
         // directly through `java` (JRE-headless images without a standalone
@@ -213,10 +213,20 @@ fn compile_probe(jh: &Path, out_dir: &Path, name: &str, src: &str) -> bool {
             .arg("-d")
             .arg(out_dir)
             .arg(&java_file)
-            .status()
+            .output()
     };
-    if !matches!(compiled, Ok(s) if s.success()) {
-        return false;
+    match compiled {
+        // Neither compiler could be launched — the one legitimate skip.
+        Err(_) => return false,
+        // The compiler RAN and rejected the source: answering `false` here reads
+        // to the caller as "no javac, skip", which makes this test a permanent
+        // vacuous pass.
+        Ok(o) => assert!(
+            o.status.success(),
+            "[es_segalloc_arena_dispatch] the embedded probe failed to compile — fix \
+             the probe source. compiler stderr:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
     }
     let class_file = out_dir.join(format!("{name}.class"));
     if !class_file.exists() {
