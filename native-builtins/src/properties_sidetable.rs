@@ -110,8 +110,11 @@ macro_rules! props_diag_eprintln {
 /// `entrySet` / `keys` / `elements` / `propertyNames` / `forEach` / `store` —
 /// derives its iteration order from it, and a hash-bucket order is both
 /// arbitrary and unlike anything the real JDK produces. Insertion order is the
-/// deterministic floor; [`ordered_snapshot_kv`] layers real-JDK order on top
-/// whenever the object has a populated `map` `ConcurrentHashMap` backing.
+/// deterministic floor for a `Properties` with no real `map`
+/// `ConcurrentHashMap` backing (the synthetic `System.getProperties()`
+/// singleton, surefire's `store_property_in_sidetable` path);
+/// [`ordered_snapshot_kv`] layers the JDK's actual order on top whenever there
+/// IS such a backing.
 type PropsMap = indexmap::IndexMap<String, String, BuildHasherDefault<FxHasher>>;
 
 fn table() -> &'static Mutex<FxHashMap<usize, PropsMap>> {
@@ -1094,13 +1097,28 @@ fn snapshot_kv(ctx: &dyn NativeContext, obj: ObjectRef) -> Vec<(String, String)>
 /// the CHM holds but the side-table does not are the callers' business — they
 /// append them via [`chm_extra_entries`] with the side-table keys as the skip
 /// set, exactly as before.
-fn ordered_snapshot_kv(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<(String, String)> {
-    let side = snapshot_kv(ctx, obj);
+fn ordered_snapshot_kv(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) -> Vec<(String, String)> {
+    let side = snapshot_kv(ctx, *obj);
     if side.len() < 2 {
         return side;
     }
-    let order = chm_key_order(ctx, obj);
+    // `chm_key_order` re-enters Java (`entrySet`/`iterator`/`next`/`getKey`),
+    // so it allocates, so it is a GC point — unlike `snapshot_kv`, which is a
+    // pure side-table read and is why none of these callers used to need a pin
+    // here. Taking `obj` by `&mut` is the point: it forces every caller's own
+    // receiver to be refreshed across the walk instead of silently carrying a
+    // pre-GC address into the pins and virtual dispatches that follow. That
+    // stranding is what a Family-1 stale-`ObjectRef` failure looks like from
+    // Java: `NullPointerException: Cannot invoke "java.util.Iterator.hasNext()"
+    // because "<local5>" is null`, several frames away and nowhere near here.
+    let pin = ctx.pin_native_root(*obj);
+    let order = chm_key_order(ctx, *obj);
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.unpin_native_roots(pin);
     if order.is_empty() {
+        // No real CHM backing (the synthetic `System.getProperties()`
+        // singleton, surefire's `store_property_in_sidetable` path). The
+        // side-table's own insertion order stands.
         return side;
     }
     reorder_by(&side, &order)
@@ -2351,7 +2369,7 @@ fn build_string_collection(
 /// Build a real `HashSet<String>` populated with the side-table keys for the
 /// given Properties object.  Returns an empty HashSet if the object isn't
 /// tracked.
-fn build_key_set(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+fn build_key_set(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> ObjectRef {
     let keys: Vec<String> = ordered_snapshot_kv(ctx, this)
         .into_iter()
         .map(|(k, _v)| k)
@@ -2612,7 +2630,8 @@ fn native_properties_string_property_names(
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
-    let set = build_key_set(ctx, this);
+    let mut this = this;
+    let set = build_key_set(ctx, &mut this);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -2628,7 +2647,8 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
-    let mut set = build_key_set(ctx, this);
+    let mut this = this;
+    let mut set = build_key_set(ctx, &mut this);
     let set_pin = ctx.pin_native_root(set);
     // Add keys for CHM-exclusive (non-String-valued) entries so the key view
     // matches the real map; `stringPropertyNames()` deliberately does NOT do
@@ -2704,7 +2724,8 @@ fn native_properties_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Ok(Some(Value::Object(Some(list))));
         }
     };
-    let snapshot = ordered_snapshot_kv(ctx, this);
+    let mut this = this;
+    let snapshot = ordered_snapshot_kv(ctx, &mut this);
     // cceres5-style GC safety (mirrors `native_properties_entry_set`): every
     // `create_string` below can trigger a moving GC that relocates `this` and
     // strings already accumulated in `vals`. Pin everything and refresh
@@ -2770,7 +2791,8 @@ fn native_properties_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
-    let snapshot = ordered_snapshot_kv(ctx, this);
+    let mut this = this;
+    let snapshot = ordered_snapshot_kv(ctx, &mut this);
     props_diag_eprintln!(
         "[PROPS-DBG] native_properties_entry_set: {} entries for obj {:?}",
         snapshot.len(),
@@ -2877,7 +2899,8 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             )))))
         }
     };
-    let mut keys: Vec<String> = ordered_snapshot_kv(ctx, this)
+    let mut this = this;
+    let mut keys: Vec<String> = ordered_snapshot_kv(ctx, &mut this)
         .into_iter()
         .map(|(k, _v)| k)
         .collect();
@@ -2900,7 +2923,8 @@ fn collect_own_property_names(
     seen: &mut std::collections::HashSet<String>,
     out: &mut Vec<String>,
 ) {
-    for (k, _v) in ordered_snapshot_kv(ctx, this) {
+    let mut this = this;
+    for (k, _v) in ordered_snapshot_kv(ctx, &mut this) {
         if seen.insert(k.clone()) {
             out.push(k);
         }
@@ -2960,7 +2984,7 @@ fn native_properties_property_names(
 /// `keys()`, enumerating the side-table values.
 fn native_properties_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let vals: Vec<String> = match args.first() {
-        Some(Value::Object(Some(o))) => ordered_snapshot_kv(ctx, *o)
+        Some(Value::Object(Some(o))) => ordered_snapshot_kv(ctx, &mut { *o })
             .into_iter()
             .map(|(_k, v)| v)
             .collect(),
@@ -3032,7 +3056,8 @@ fn native_properties_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
     };
-    let snapshot = ordered_snapshot_kv(ctx, this);
+    let mut this = this;
+    let snapshot = ordered_snapshot_kv(ctx, &mut this);
     for (k, v) in &snapshot {
         let ks = ctx.create_string(k);
         let vs = ctx.create_string(v);
@@ -3315,18 +3340,19 @@ fn collect_via_virtual_entryset(
 /// same data). For a subclass, iterate the virtual `entrySet()` so overrides
 /// (e.g. `SortedProperties`' sorted view) are honored.
 fn collect_store_entries(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(String, String)> {
+    let mut this = this;
     let cid = ctx.class_id_of_object(this);
     let is_exact = ctx
         .class_name_of_id(cid)
         .is_none_or(|n| n == "java/util/Properties");
     if is_exact {
-        return ordered_snapshot_kv(ctx, this);
+        return ordered_snapshot_kv(ctx, &mut this);
     }
     let entries = collect_via_virtual_entryset(ctx, this);
     // Fallback: if the virtual walk produced nothing (unexpected dispatch
     // failure) but the side-table has data, don't silently drop it.
     if entries.is_empty() {
-        return ordered_snapshot_kv(ctx, this);
+        return ordered_snapshot_kv(ctx, &mut this);
     }
     entries
 }
@@ -3808,7 +3834,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let other_pin = ctx.pin_native_root(other);
     let mut this = this;
     let mut other = other;
-    let snapshot = ordered_snapshot_kv(ctx, other);
+    let snapshot = ordered_snapshot_kv(ctx, &mut other);
     this = ctx.read_native_pin(this_pin, this);
     other = ctx.read_native_pin(other_pin, other);
     let other_side_keys = side_key_set(ctx, other);
@@ -4017,7 +4043,7 @@ mod tests {
     #[test]
     fn reorder_preserves_every_entry() {
         let side = kv(&[("a", "1"), ("b", "2"), ("c", "3")]);
-        // `z` is in the CHM but not the side-table; `b` is in neither position.
+        // `z` is in the CHM but not the side-table; `b` is not named by `order`.
         let order: Vec<String> = ["z", "c", "a"].iter().map(|s| s.to_string()).collect();
         let got = reorder_by(&side, &order);
         assert_eq!(got, kv(&[("c", "3"), ("a", "1"), ("b", "2")]));
@@ -4031,17 +4057,16 @@ mod tests {
         assert_eq!(reorder_by(&side, &order), kv(&[("b", "2"), ("a", "1")]));
     }
 
+    /// No CHM backing: the side-table's own order passes through untouched.
     #[test]
-    fn reorder_with_no_chm_order_keeps_insertion_order() {
+    fn reorder_with_no_chm_order_is_a_passthrough() {
         let side = kv(&[("a", "1"), ("b", "2")]);
         assert_eq!(reorder_by(&side, &[]), side);
     }
 
-    /// The side-table itself must be insertion-ordered — it is the floor every
-    /// enumeration native falls back to when the receiver has no CHM backing
-    /// (the synthetic `System.getProperties()` singleton, surefire's
-    /// `store_property_in_sidetable` path). A `FxHashMap` here is what produced
-    /// the gh-11892 failure in the first place.
+    /// The side-table is the order every enumeration native falls back to when
+    /// the receiver has no CHM backing, so it must be insertion-ordered rather
+    /// than hash-bucket-ordered, and a removal must not disturb the survivors.
     #[test]
     fn props_map_is_insertion_ordered_across_removal() {
         let mut m = PropsMap::default();
@@ -4061,6 +4086,41 @@ mod tests {
         // Re-inserting an existing key must NOT move it to the back.
         m.insert("branch".to_string(), "other".to_string());
         assert_eq!(m.keys().next().map(|k| k.as_str()), Some("branch"));
+    }
+
+    /// `reorder_by` must not depend on the side-table's own iteration order for
+    /// any key the CHM names — that is the whole point of deferring to the CHM,
+    /// and it is what makes the JDK-order guarantee independent of however the
+    /// side-table happens to be stored. Feed the same entries in two different
+    /// orders and require the same answer.
+    #[test]
+    fn reorder_is_independent_of_side_table_order_for_chm_named_keys() {
+        let order: Vec<String> = ["commit.id.full", "branch", "commit.id.abbrev", "commit.id"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = kv(&[
+            ("branch", "b"),
+            ("commit.id", "i"),
+            ("commit.id.abbrev", "a"),
+            ("commit.id.full", "f"),
+        ]);
+        let b = kv(&[
+            ("commit.id", "i"),
+            ("commit.id.full", "f"),
+            ("branch", "b"),
+            ("commit.id.abbrev", "a"),
+        ]);
+        assert_eq!(reorder_by(&a, &order), reorder_by(&b, &order));
+        assert_eq!(
+            reorder_by(&a, &order),
+            kv(&[
+                ("commit.id.full", "f"),
+                ("branch", "b"),
+                ("commit.id.abbrev", "a"),
+                ("commit.id", "i"),
+            ])
+        );
     }
 
     /// Source-level guard. Every native that hands an *enumeration order* to

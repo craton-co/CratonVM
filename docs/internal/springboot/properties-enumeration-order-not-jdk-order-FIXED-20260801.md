@@ -154,6 +154,18 @@ duplicating it would duplicate the hazard.
 `snapshot_kv` is unchanged and still used where order is irrelevant
 (`Properties.contains`, the surefire `snapshot_sidetable` export).
 
+### The GC point this introduced
+
+`snapshot_kv` is a pure side-table read. `ordered_snapshot_kv` is not: reaching
+the CHM means `entrySet`/`iterator`/`next`/`getKey` in Java, which allocates,
+which is a GC point. Several callers took their `this` pin *after* the snapshot
+— safe when the snapshot could not move anything, a stale `ObjectRef` once it
+can. `ordered_snapshot_kv` therefore takes `obj: &mut ObjectRef`, pins across the
+walk and writes the refreshed reference back, so no caller can silently carry a
+pre-GC address into the pins and virtual dispatches that follow. This was found
+by inspection while chasing an unrelated (and, see below, phantom) regression;
+it is a genuine latent Family-1 hazard, not a speculative one.
+
 ## Guard
 
 `only_order_insensitive_functions_read_the_unordered_snapshot` scans this
@@ -164,27 +176,55 @@ produces a *plausible* order, and nothing breaks until some binder somewhere
 silently picks the wrong branch. Confirmed non-inert — reverting `build_key_set`
 to `snapshot_kv` makes it fail, naming that function.
 
-Four `reorder_by` unit tests pin the ordering rule itself (including the exact
-gh-11892 key order), and `props_map_is_insertion_ordered_across_removal` pins the
+`reorder_is_independent_of_side_table_order_for_chm_named_keys` pins the property
+that makes the JDK-order guarantee robust: for any key the CHM names, the answer
+does not depend on how the side-table happens to be stored. Four more
+`reorder_by` tests pin the ordering rule itself (including the exact gh-11892 key
+order), and `props_map_is_insertion_ordered_across_removal` pins the
 `shift_remove` choice.
 
 ## Verification
 
+All A/B runs below use a control binary built from **the exact same dev commit**
+(`b82153d5c5`) the fix branch merged — see the warning at the end for why that
+qualifier is load-bearing.
+
 | check | result |
 | ----- | ------ |
-| `GitInfoContributorTests` | **4/4 pass** (was 3/4). HotSpot control 4/4. |
+| `GitInfoContributorTests` | **4/4 pass** (control: 3/4). HotSpot control 4/4. |
 | `PropsOrderProbe` | enumeration identical to HotSpot 25 across `keySet` / `stringPropertyNames` / `entrySet` / `keys` |
 | `BinderShapeProbe` | (a) and (b) identical on all three arms; (c) restored to HotSpot's order |
-| `cargo test -p cratonvm-native-builtins --lib properties_sidetable` | 30/30 |
-| Spring Boot `core/spring-boot`, **all 351 test classes**, A/B vs the pre-fix binary | **zero diff** |
-| Spring Boot `module/spring-boot-actuator`, **all 82 test classes**, A/B | `GitInfoContributorTests` 1 failure → 0; **no other real change** |
+| `cargo test -p cratonvm-native-builtins --lib properties_sidetable` | 31/31 |
+| `module/spring-boot-actuator`, **all 82 test classes**, same-base A/B | one line differs: `GitInfoContributorTests` 1 failure → 0 |
+| `core/spring-boot`, **96 `context.properties` / `env` / `info` / `*Properties*` classes**, same-base A/B | **zero diff** |
+| `core/spring-boot`, **all 351 test classes**, A/B on the pre-merge base | **zero diff** |
 
-Three further lines differed in the actuator A/B and one in an earlier
-96-class core run, all of them 300 s harness timeouts (`rc=124`) flipping in both
-directions while the shared host sat at load 40–70 on 16 cores.
-`JacksonJmxOperationResponseMapperTests` — the only one that flipped *against*
-the fix — was re-run twice on each binary at lower load and passes 11/11 on both.
-Treat every `rc=124` line in those summaries as host contention, not signal.
+Two `cratonvm-native-builtins` lib tests fail on this branch —
+`panama::tests::test_85_4_upcall_handle_and_invoke` and
+`tls_deny::tests::every_plaintext_base_overload_is_accounted_for`. Both fail
+identically with the fix reverted, so both are pre-existing and unrelated.
+
+### A warning worth keeping: the phantom regression
+
+An intermediate A/B appeared to show `ConfigurationPropertiesTests` going from 4
+failures to 8 — deterministically, 3/3 runs. Localisation was thoroughly
+misleading: an env-gated three-way split (`off` / `walk` / `full`) showed all
+three modes failing 8, reverting the `IndexMap` still failed 8, and excluding the
+`System.getProperties()` singleton still failed 8. The conclusion drawn from that
+— *"any order perturbation trips a latent order-fragile defect"* — was wrong, and
+a `PropsMap` doc comment justifying a revert on those grounds was written and
+then deleted.
+
+The control binary had been built from a **newer `origin/dev`** than the fix
+branch had merged (`063be4f18` vs `72da6c55f`); dev had fixed those four tests in
+between. Rebuilding both arms from one pinned commit put the control at 4 and the
+fix at 4. Nothing about the fix was ever involved.
+
+The lesson is the standing one, and it survived three rounds of plausible
+counter-evidence: **when two arms are two separately-built binaries, verify they
+share a base before believing any difference between them.** Every localisation
+step above was internally consistent and every one of them was measuring dev's
+own churn.
 
 ## Affected classes
 
