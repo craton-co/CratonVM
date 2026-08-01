@@ -28,6 +28,19 @@
 //! Opt out with `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1` (presence check, like
 //! `CRATONVM_NO_PRECISE_JIT_MAPS`): the helpers then fall back to the legacy
 //! per-allocation class-manager lookups.
+//!
+//! # Per-VM state audit: BENIGN — already correct, do not re-litigate
+//!
+//! The 2026-08-01 `vm/src/jit/` cache-keying sweep
+//! (`docs/vm-jit-cache-keying.md`) checked this module and found
+//! nothing to fix. The table is `ClassId`-keyed, which is per-VM state, but it
+//! is NOT a process global: it is a by-value field of `JitRealm` inside
+//! `Arc<SharedVm>` (`vm/src/vm/realms/jit_realm.rs` `jit_alloc_class_cache`,
+//! constructed at `vm/src/vm/vm_init.rs`), so each VM has its own and the
+//! `ClassId` index is unambiguous within it. The paragraph above says as much;
+//! this note records that the claim was verified rather than assumed. It also
+//! holds no `ObjectRef` and no heap address — only field indices, a `PrimKind`
+//! and a `bool` — so it is not a GC-root concern either.
 
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;

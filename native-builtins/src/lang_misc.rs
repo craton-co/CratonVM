@@ -1674,13 +1674,34 @@ pub(crate) fn native_enum_ordinal(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(Some(ctx.get_field(this, 1)))
 }
 
-/// Enum.name() and Enum.toString() — return field 0 (String ref)
+/// Enum.name() and Enum.toString() — return the `name` String ref.
+///
+/// Both are registered as `()Ljava/lang/String;`, so this must never return a
+/// primitive `Value`. Two ways it could:
+///
+/// * the hardcoded slot-0 read is descriptor-decoded only when the receiver's
+///   class metadata resolves the descriptor for slot 0 (`vm_exec.rs:8605`); for
+///   a synthetic stand-in with no resolvable layout it degrades to the raw
+///   read, and a zeroed slot decodes as `Value::Int(0)` — not `Object(None)`
+///   (`gc/src/heap.rs:398-411`);
+/// * an `Enum` allocated but never `<init>`-ed has an unwritten `name`.
+///
+/// Handing `Int(0)` to bytecode that is about to `areturn`/`checkcast` a
+/// `String` is unsound, so resolve `name` on the receiver's own class and read
+/// by index, degrading any non-reference tag to null. Slot 0 stays as the
+/// fallback for the fieldless synthetic layout this native was written for.
 pub(crate) fn native_enum_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, 0)))
+    if crate::field_read::declares_field(ctx, this, "name") {
+        return Ok(Some(crate::field_read::ref_field(ctx, this, "name")));
+    }
+    Ok(Some(match ctx.get_field(this, 0) {
+        v @ Value::Object(_) => v,
+        _ => Value::Object(None),
+    }))
 }
 
 /// Enum.compareTo(Enum other) — this.ordinal - other.ordinal

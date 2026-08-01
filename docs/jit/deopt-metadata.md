@@ -1,7 +1,7 @@
 # Deoptimization metadata: what is emitted, what is proved, what is missing
 
 Scope: the P0 items *"Complete deoptimization metadata"* and *"Emit precise oop
-maps at every safepoint"* of `docs/known-issues/deep-research-vm-c2.md`.
+maps at every safepoint"* of `docs/known-issues/c2/deep-research-vm-c2.md`.
 
 Acceptance criteria under audit:
 
@@ -26,7 +26,7 @@ a column. "IR" is the optimizing sea-of-nodes tier (`jit/src/ir_lower.rs`);
 | Metadata element | IR | 1-pass | Where | Test |
 | --- | --- | --- | --- | --- |
 | Native PC → deopt point | **emitted** | **emitted** | `jit/src/ir_lower.rs:3942-3964` (`build_deopt_points`, keyed by `bci_native`); `jit/src/x64.rs:2315-2585` (`build_and_record_deopt_point`, keyed by `buf.pos()`) | `deopt.rs::unsorted_points_break_the_binary_search_and_are_rejected` |
-| Inlined scope chain | **absent** | **absent** | `FrameState::caller` is hard-coded `None` at `jit/src/ir_lower.rs:3459,3783,3792` and `jit/src/x64.rs:2577`. The *type* supports arbitrary depth (`FrameState::caller`, walked by `reconstruct_frame`) and the inliner does inline — so every inlined callee's frame is attributed to the caller's method key with the callee's bci | `deopt.rs::inlined_caller_scopes_are_checked_too` (proves the verifier walks the chain, not that a producer builds one) |
+| Inlined scope chain | **buildable, not produced** | **absent** | IR: `Lowerer::resolve_frame_state` now fills `caller` from `Lowerer::caller_chain_for` (`jit/src/ir_lower.rs`), driven by an `InlineScopeTable` (`jit/src/ir.rs`) that maps a safepoint index to its scope; `lower_inner_with_scopes` takes the table. **But the production compile path calls `lower_inner` (`jit/src/lib.rs`), which passes `InlineScopeTable::new()` — `push_scope` has no non-test caller, so every compiled method today still has `caller: None` at every point.** 1-pass: `caller: None` is still hard-coded in `build_and_record_deopt_point`; there is no scope stack pushed at the splice. So the inliner still attributes every inlined callee's frame to the caller's method key with the callee's bci. See `docs/jit/deopt-inline-scopes.md` for the producer side | `deopt.rs::inlined_caller_scopes_are_checked_too` (the verifier walks the chain); `ir_lower.rs`'s `resolve_with_scopes` tests (the lowerer builds one *when handed a table*) — neither proves a producer populates it |
 | BCI | **emitted** | **emitted** | `DeoptimizationPoint::bci` + `FrameState::bci`, both set from the snapshot bci | `deopt.rs::bci_past_the_end_of_the_method_is_rejected`, `point_bci_must_match_its_frame_state_bci` |
 | Locals | **emitted, typed from IR node type** | **emitted, typed from a whole-method classifier** | IR: `jit/src/ir_lower.rs:3369-3444` (`frame_value_for` / `typed_stack_slot`, driven by `IrType`); 1-pass: `jit/src/x64.rs:2347-2447` (oop mask ∪ `local_kinds`, with a per-bci refinement for `Ambiguous`) | `deopt.rs::reconstruct_resolves_typed_slots`, `more_locals_than_max_locals_is_rejected` |
 | Operand stack | **emitted** | **approximated** | IR: same mapper as locals. 1-pass: `jit/src/x64.rs:2449-2525` — the abstract operand stack has **no per-entry width source**, so a non-oop slot in a method that touches any `long`/`float`/`double` is recorded `Unsupported` (refuse) unless an `invokedynamic` descriptor types it | `deopt.rs::deeper_stack_than_max_stack_is_rejected` |
@@ -35,7 +35,7 @@ a column. "IR" is the optimizing sea-of-nodes tier (`jit/src/ir_lower.rs`);
 | Register locations | **unused by design** | **emitted** | `FrameValue::Register/RegisterLong/RegisterRef/XmmFloat/XmmDouble`, resolved against the stub-spilled `SavedRegisters`. The IR lowerer spills every value, so it never emits one | `deopt.rs::register_homed_locals_ignore_a_stale_canonical_frame_slot`, `out_of_range_register_descriptors_are_rejected` |
 | Stack-slot locations | **emitted** | **emitted** | `FrameValue::StackSlot{,Ref,Long,Float,Double}(off)`, read as `*(rbp + off)` with `off < 0` | `deopt.rs::reconstruct_resolves_typed_slots` |
 | Virtual (scalar-replaced) objects | **gated, partial** | **gated, partial** | IR: `jit/src/ir_lower.rs:3826-3936` (`frame_value_for_object`), only when `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`; bails to `Undefined` on nested virtuals, unproven dominance, or any unresolvable field. 1-pass: `jit/src/x64.rs:2302-2313` (`sr_virtual_object_state`) | `deopt.rs::virtual_object_graph_integrity_is_checked`, `slot_naming_a_removed_node_is_rejected` |
-| Reexecute flag | **absent** | **absent** | No field exists. Re-execute-vs-resume is encoded *implicitly* in `DeoptReason`: div/rem and array guards document "the interpreter re-executes this bytecode" (`jit/src/ir_lower.rs:3464-3471`, `:2870`, `:2923`), while `PendingException` documents the opposite ("its `bci` names the throwing instruction … not a resume point", `deopt.rs`). A consumer that gets the convention wrong executes the instruction after a call that never returned | — (no test can pin an absent field) |
+| Reexecute flag | **emitted, unread** | **emitted, unread** | `DeoptimizationPoint::semantics: ResumeSemantics` now exists (`jit/src/deopt.rs`, next to `frame_state`) and **every** producer stamps it — `ir_lower.rs` at all three construction sites and `x64.rs::build_and_record_deopt_point`, all with `ResumeSemantics::for_reason(reason)`, which is exactly the prose convention written down once instead of re-derived per consumer. Two flags (`reexecute`, `rethrow_exception`) give the three states `RESUME` / `REEXECUTE` / `RETHROW`. **The VM resume sink does not read it yet** — `vm/src/runtime/interpreter.rs` still infers re-execute-vs-resume from `DeoptReason`, so the field is recorded and round-tripped but changes no behaviour. See `docs/jit/deopt-frame-state-interning.md` §2 and §5.2 | `deopt.rs::frame_state_interning_tests` (semantics are part of a state's identity; `for_reason` / `for_caller_scope`) |
 | Pending-exception state | **emitted as a reason + a separate stash** | same | `DeoptReason::PendingException`; the frame is published to `LAST_EXCEPTIONAL`, never `LAST_DEOPT`, precisely because it is not resumable (`deopt.rs`, `take_exceptional_frame`) | `x64_deopt_entry_tests` (stash routing) |
 | Oop map per safepoint | **emitted, fail-closed** | see note | `jit/src/ir_lower.rs:803-896` (`emit_safepoint_map`) → `crate::OopMapEntry` (`jit/src/lib.rs:864-916`). Coverage is claimed only when every live `Ref` slot could be named **and** the shadow-stack push was emitted; otherwise `moving_young_coverage_complete: false`, which routes the cycle to the non-moving sweep | `deopt.rs::reference_slot_absent_from_the_oop_map_is_rejected`, `incomplete_coverage_does_not_flag_uncovered_references` |
 
@@ -228,14 +228,21 @@ other. Today they overlap only on the slot-count check.
    `ir_lower::frame_value_for` maps to `FrameValue::Undefined` — and a
    reference-typed local reconstructs as `Int(0)`/null. **A scalar-replaced
    object can currently reconstruct incorrectly for exactly this reason.**
-2. **Inlined scope chains are never built.** `FrameState::caller` is always
-   `None` in both backends, so a deopt inside an inlined callee cannot rebuild
-   the caller frames. Until this lands, "byte-for-byte equivalent interpreter
-   state" is unreachable for any method the inliner touched.
-3. **No reexecute flag.** The re-execute-vs-resume decision is carried by
-   convention through `DeoptReason` and prose. It needs to be a field on
-   `DeoptimizationPoint` that the resume sink reads, not a per-reason
-   convention each new consumer must re-learn.
+2. **Inlined scope chains are never *populated*.** The IR lowerer can now build
+   one (`caller_chain_for` + `InlineScopeTable`), and the verifier and
+   `reconstruct_frame` have always walked one — but no producer pushes a scope,
+   and the single-pass backend has no scope stack at all, so `FrameState::caller`
+   is `None` in every artifact this VM installs. Until a producer lands,
+   "byte-for-byte equivalent interpreter state" is still unreachable for any
+   method the inliner touched. *Half-closed: the consumer side is done, the
+   producer side is not.*
+3. **The reexecute flag is recorded but not read.**
+   `DeoptimizationPoint::semantics` exists and every producer stamps
+   `ResumeSemantics::for_reason(reason)`, so the convention is written down in
+   one place. The remaining gap is the consumer: the VM resume sink
+   (`vm/src/runtime/interpreter.rs`) still re-derives the decision from
+   `DeoptReason`, so a producer that knows better — a caller scope, a genuine
+   post-call resume point — cannot yet change what the interpreter does.
 4. **Monitor state is only recorded for elided locks** (1-pass) or not at all
    (IR). An ordinary open `synchronized` region at a deopt bci contributes no
    `MonitorInfo`, so a resume would not re-acquire it. Currently masked by
@@ -255,22 +262,27 @@ other. Today they overlap only on the slot-count check.
 
 ## 6. Wiring the verifier (edits outside `jit/src/deopt.rs`)
 
-The verifier is additive and currently has no caller. Two install sites should
-run it:
+**One of the two install sites is wired.**
 
-* `jit/src/ir_lower.rs:4630` — after `cm.deopt_points = deopt_points;` and
-  `cm.oop_maps = oop_maps;` (line 4655), build a `DeoptVerifier` from the
-  method's `MethodFrameLimits`, one `OopCoverage` per `OopMapEntry` (mapping
-  `native_pc_offset` → offsets and `moving_young_coverage_complete`), the
-  scalar-replacement map's keys as materializable nodes, and the `Op::Dead` node
-  ids as removed nodes; on `Err`, `record_bailout(&b)` and return `None` (the
-  same `refuse(..)` shape already used at `jit/src/ir_lower.rs:4621-4626`).
-* `jit/src/x64.rs:24180` — before `cm.can_deopt_resume = …`, run the same check
-  and clear `can_deopt_resume` (rather than failing the compile) on `Err`, since
-  the single-pass backend is the fallback tier and must always produce code.
+* **DONE — `jit/src/ir_lower.rs`**, in `lower_inner_with_scopes`'s
+  "Install-time deopt-metadata verification" block, before the artifact becomes
+  a `CompiledMethod`. It builds a `DeoptVerifier` from `MethodFrameLimits` under
+  the empty method key the lowerer records, the `Op::Dead` node ids as removed
+  nodes, the scalar-replacement map's keys as materializable nodes, and one
+  `OopCoverage` per **anchored** `OopMapEntry`. Entries with
+  `native_pc_offset == 0` are deliberately not registered — `emit_safepoint_map`
+  matches them by safepoint id, not pc, so registering them all under key `0`
+  would compare deopt points against an arbitrary map. Both `deopt_points` and
+  the baked `deopt_boxes` are checked.
+* **STILL OPEN — `jit/src/x64.rs`**, before
+  `cm.can_deopt_resume = !cm.deopt_points.is_empty() && !compiler.has_elided_monitor;`.
+  The single-pass backend installs its deopt metadata unverified. The edit is to
+  run the same check and **clear `can_deopt_resume`** rather than fail the
+  compile, since this is the fallback tier and must always produce code.
 
-A dedicated `BailoutReason::DeoptMetadata(String)` with category
-`"deopt_metadata"` should be added to `jit/src/bailout.rs` (`BailoutReason`
-around line 88, `CATEGORIES` at line 256, and the `all_reasons()` tripwire at
-line 331). Until then `deopt_metadata_bailout` reuses
-`BailoutReason::IrVerification` with a `phase=deopt-metadata` context.
+`BailoutReason::DeoptMetadata(String)` **exists** (`jit/src/bailout.rs:131`,
+category `"deopt_metadata"` at `:154`, rendered at `:190`, and covered by the
+`all_reasons()` tripwire at `:376`), and `deopt_metadata_bailout`
+(`jit/src/deopt.rs:4046`) uses it with the context string **`phase=install`**.
+The earlier claim in this section — that it reuses `BailoutReason::IrVerification`
+with `phase=deopt-metadata` — was wrong on both halves and has been removed.

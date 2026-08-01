@@ -5009,6 +5009,16 @@ pub(crate) fn write_field_accessible_external(
 
 // --- Field getters (simple field reads) ---
 
+// `Field.getName` is registered `()Ljava/lang/String;`, `Field.getType`
+// `()Ljava/lang/Class;` and `Field.getDeclaringClass` `()Ljava/lang/Class;`,
+// so none of them may return a primitive `Value`. A plain `get_field_by_name`
+// can: it is not descriptor-aware, so an unwritten reference slot on a Field
+// mirror answers `Value::Int(0)` rather than `Object(None)`, and that tag then
+// reaches bytecode about to `areturn`/`checkcast` a reference. `ref_field`
+// reads by resolved index (descriptor-decoded) and degrades any non-reference
+// tag to null. `getModifiers` below is `()I` and stays on the by-name read —
+// there `Int(0)` is the correct answer for an unwritten slot.
+// See `docs/known-issues/c2/by-name-field-reads.md`.
 pub(crate) fn native_field_get_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5017,7 +5027,7 @@ pub(crate) fn native_field_get_name(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "name")))
+    Ok(Some(crate::field_read::ref_field(ctx, this, "name")))
 }
 
 pub(crate) fn native_field_get_type(
@@ -5028,7 +5038,7 @@ pub(crate) fn native_field_get_type(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "type")))
+    Ok(Some(crate::field_read::ref_field(ctx, this, "type")))
 }
 
 pub(crate) fn native_field_get_modifiers(
@@ -5050,7 +5060,7 @@ pub(crate) fn native_field_get_declaring_class(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "clazz")))
+    Ok(Some(crate::field_read::ref_field(ctx, this, "clazz")))
 }
 
 fn ensure_static_field_declaring_class_initialized(
@@ -6687,6 +6697,9 @@ pub(crate) fn method_modifiers_value(
     method_int_field_value_or_legacy(ctx, method_obj, "modifiers", METHOD_LEGACY_SLOT_MODIFIERS)
 }
 
+/// `Method.getName` — `()Ljava/lang/String;`. See `native_field_get_name`:
+/// a by-name read cannot return a reference-typed answer for an unwritten
+/// slot, so resolve and read by index instead.
 pub(crate) fn native_method_get_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -6695,7 +6708,7 @@ pub(crate) fn native_method_get_name(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "name")))
+    Ok(Some(crate::field_read::ref_field(ctx, this, "name")))
 }
 
 pub(crate) fn native_method_get_return_type(
@@ -8031,13 +8044,22 @@ fn declared_methods_with_synthetic(
                 });
             }
         }
-        if ctx.lambda_proxy_host(class_id).is_some()
+        // ...but ONLY for a lambda the JDK would actually have spun a
+        // `writeReplace()` onto. Real HotSpot generates one solely for
+        // serializable lambdas; an ordinary `Supplier<String> s = () -> "x"`
+        // declares just its SAM method, and `getDeclaredMethod("writeReplace")`
+        // throws NoSuchMethodException. Reporting it unconditionally made every
+        // CratonVM lambda look serializable to a reflective method scan.
+        if ctx.lambda_proxy_serializability(class_id)
+            != cratonvm_native_api::LambdaSerializability::NotSerializable
+            && ctx.lambda_proxy_host(class_id).is_some()
             && !methods.iter().any(|m| m.name == "writeReplace")
         {
             methods.push(MethodMetadata {
                 name: "writeReplace".to_string(),
                 descriptor: "()Ljava/lang/Object;".to_string(),
-                access_flags: 0x0002, // ACC_PRIVATE
+                // ACC_PRIVATE | ACC_FINAL, matching the real spun method.
+                access_flags: 0x0012,
                 declaring_class_id: class_id,
                 exceptions: Vec::new(),
             });
@@ -9107,7 +9129,14 @@ pub(crate) fn native_constructor_get_parameter_types(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "parameterTypes")))
+    // `()[Ljava/lang/Class;` — an array-typed return. `get_field_by_name`
+    // answers `Int(0)` for an unwritten `[…`-descriptor slot, which then
+    // reaches an `arraylength`/`aaload` as a non-reference.
+    Ok(Some(crate::field_read::ref_field(
+        ctx,
+        this,
+        "parameterTypes",
+    )))
 }
 
 pub(crate) fn native_constructor_get_modifiers(
@@ -9129,7 +9158,7 @@ pub(crate) fn native_constructor_get_declaring_class(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "clazz")))
+    Ok(Some(crate::field_read::ref_field(ctx, this, "clazz")))
 }
 
 pub(crate) fn native_constructor_get_parameter_count(
@@ -10390,18 +10419,32 @@ pub(crate) fn native_class_get_interfaces(
         if let Some(iface_id) =
             lambda_functional_interface_id_loader_aware(ctx, class_id, &iface_name)
         {
-            let mirror = ctx.get_class_mirror(iface_id);
-            let elem = ctx
-                .class_id_by_name("java/lang/Class")
-                .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
-            let arr = ctx.new_ref_array(elem, 1);
-            ctx.set_array_element(arr, 0, Value::Object(Some(mirror)));
+            // A lambda whose call site passed FLAG_SERIALIZABLE gets
+            // `java.io.Serializable` APPENDED to the spun class's interfaces by the
+            // real metafactory (`isSerializable && !foundSerializableSupertype`).
+            // One that is serializable only because its functional interface already
+            // extends Serializable does NOT -- it is reachable transitively.
+            let mut iface_ids = vec![iface_id];
+            if ctx.lambda_proxy_serializability(class_id)
+                == cratonvm_native_api::LambdaSerializability::ByFlag
+            {
+                if let Some(ser_id) = ctx.class_id_by_name("java/io/Serializable") {
+                    iface_ids.push(ser_id);
+                }
+            }
             if dbg_bb {
                 eprintln!(
-                    "[bb-dbg] getInterfaces({}) -> [{}] [lambda]",
-                    this_name, iface_name
+                    "[bb-dbg] getInterfaces({}) -> [{}] [lambda, {} iface(s)]",
+                    this_name,
+                    iface_name,
+                    iface_ids.len()
                 );
             }
+            // GC-safe mirror materialisation, as in the non-lambda path below.
+            let class_comp = class_component_id(ctx);
+            let arr = build_mirror_array_comp(ctx, class_comp, iface_ids.len(), |ctx, i| {
+                ctx.get_class_mirror(iface_ids[i])
+            });
             return Ok(Some(Value::Object(Some(arr))));
         }
     }
@@ -14148,12 +14191,21 @@ pub(crate) fn native_class_get_generic_interfaces(
             // `LambdaSafe.GenericTypeFilter` (which must NOT pre-filter a
             // lambda callback, so the deliberate erasure-driven
             // `ClassCastException` its javadoc exists to catch still happens).
-            let mirror = ctx.get_class_mirror(iface_id);
-            let elem = ctx
-                .class_id_by_name("java/lang/Class")
-                .unwrap_or_else(|| ClassId::new(0));
-            let arr = ctx.new_ref_array(elem, 1);
-            ctx.set_array_element(arr, 0, Value::Object(Some(mirror)));
+            // Same marker rule as `getInterfaces()` above: HotSpot returns the raw
+            // `Class` for each, plus `java.io.Serializable` when the call site set
+            // FLAG_SERIALIZABLE.
+            let mut iface_ids = vec![iface_id];
+            if ctx.lambda_proxy_serializability(class_id)
+                == cratonvm_native_api::LambdaSerializability::ByFlag
+            {
+                if let Some(ser_id) = ctx.class_id_by_name("java/io/Serializable") {
+                    iface_ids.push(ser_id);
+                }
+            }
+            let class_comp = class_component_id(ctx);
+            let arr = build_mirror_array_comp(ctx, class_comp, iface_ids.len(), |ctx, i| {
+                ctx.get_class_mirror(iface_ids[i])
+            });
             return Ok(Some(Value::Object(Some(arr))));
         }
     }
@@ -14395,7 +14447,9 @@ pub(crate) fn native_field_get_generic_type(
     }
     // Fallback: when no Signature attribute, getGenericType() в‰Ў getType().
     // The `type` field is the Class<?> mirror at the JDK-native layout slot.
-    Ok(Some(ctx.get_field_by_name(this, "type")))
+    // `()Ljava/lang/reflect/Type;` — read by resolved index so an unwritten
+    // slot answers null rather than `Int(0)`.
+    Ok(Some(crate::field_read::ref_field(ctx, this, "type")))
 }
 
 /// RecordComponent.getGenericType() вЂ” returns Type from the component's
@@ -14440,8 +14494,9 @@ pub(crate) fn native_record_component_get_generic_type(
             }
         }
     }
-    // Fallback: getGenericType() в‰Ў getType().
-    Ok(Some(ctx.get_field_by_name(this, "type")))
+    // Fallback: getGenericType() в‰Ў getType(). `()Ljava/lang/reflect/Type;` —
+    // see `native_field_get_generic_type` above.
+    Ok(Some(crate::field_read::ref_field(ctx, this, "type")))
 }
 
 // --- java.lang.reflect.Modifier ---
@@ -17360,7 +17415,42 @@ fn resolve_nestmate_via_defining_loader(
     // invocation failed/threw — global lookup is the best available
     // fallback, and is safe here since a null loader means isolation
     // cannot be in play to begin with.
-    ctx.class_id_by_name(name)
+    if let Some(id) = ctx.class_id_by_name(name) {
+        return Some(id);
+    }
+    // DERENCODABLE-SEALED-20260801: `class_id_by_name` is a PASSIVE cache
+    // lookup that never triggers classloading, so the branch above only ever
+    // answers for a nestmate/permitted subclass that some earlier code
+    // happened to load already. That is precisely the hole the
+    // WEBCLIENTEXT-SEALED-20260717 fix closed for app classes — but it closed
+    // it only inside the `loader_obj` arm above, and a class defined by the
+    // BOOTSTRAP loader has no Java-level `ClassLoader` object at all
+    // (`native_class_get_class_loader` returns null for every `java/`,
+    // `javax/`, `jdk/`, `sun/`, `com/sun/` name), so every JDK-owned sealed
+    // interface fell straight through to the passive lookup and reported
+    // whichever subset of its permitted subclasses was incidentally loaded.
+    //
+    // Live measurement on JDK 25's `java.security.DEREncodable` (sealed, 8
+    // permitted subclasses, the PEM-encoding JEP): `getPermittedSubclasses0()`
+    // returned `[null, null, null, null, null, X509Certificate, null, null]`
+    // — one entry, purely because `X509Certificate` was already loaded — where
+    // real HotSpot returns all 8. Re-running the same probe *after* touching
+    // all 8 classes returned all 8, which is the passive-lookup signature.
+    //
+    // `load_class` is the same active resolution the loader arm gets from
+    // `ClassLoader.loadClass`, and it is equally re-entrancy-safe here (an
+    // ordinary native-method call boundary, exactly like `Class.forName`'s
+    // native). Guard it with `would_fabricate_synthetic_stub` so a name that
+    // has no real class file behind it keeps answering `None` instead of
+    // minting a stub and handing back a `Class` that HotSpot would never
+    // produce.
+    if ctx.would_fabricate_synthetic_stub(name) {
+        return None;
+    }
+    match ctx.load_class(name) {
+        Ok(Some(Value::Object(Some(mirror)))) => ctx.class_id_from_mirror(mirror),
+        _ => None,
+    }
 }
 
 pub(crate) fn native_class_get_nest_members(
@@ -17403,9 +17493,15 @@ pub(crate) fn native_class_get_nest_members(
         ctx.set_array_element(arr, 0, Value::Object(Some(this)));
         Ok(Some(Value::Object(Some(arr))))
     } else {
-        // Nest host вЂ” return [host] + resolved members
-        let host_mirror = ctx.get_class_mirror(host_class_id);
-        let mut mirrors: Vec<ObjectRef> = vec![host_mirror];
+        // Nest host вЂ” return [host] + resolved members.
+        //
+        // DERENCODABLE-SEALED-20260801: accumulate `ClassId`s, not
+        // `ObjectRef`s — see the matching comment in
+        // `native_class_get_permitted_subclasses`. Resolution now runs an
+        // active `load_class` for bootstrap-loaded nest hosts, so the loop
+        // body can allocate and collect; a `Vec<ObjectRef>` carried across it
+        // is the Family-1 stale-native-local shape.
+        let mut member_ids: Vec<ClassId> = vec![host_class_id];
         for member_name in &members {
             let resolved = resolve_nestmate_via_defining_loader(
                 ctx,
@@ -17416,14 +17512,19 @@ pub(crate) fn native_class_get_nest_members(
             );
             if let Some(member_id) = resolved {
                 if member_id != host_class_id {
-                    mirrors.push(ctx.get_class_mirror(member_id));
+                    member_ids.push(member_id);
                 }
             }
         }
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, mirrors.len());
-        for (i, mirror) in mirrors.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*mirror)));
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, member_ids.len());
+        let arr_pin = ctx.pin_native_root(arr);
+        for (i, member_id) in member_ids.iter().enumerate() {
+            let mirror = ctx.get_class_mirror(*member_id);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
         }
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.unpin_native_roots(arr_pin);
         Ok(Some(Value::Object(Some(arr))))
     }
 }
@@ -17583,7 +17684,6 @@ pub(crate) fn native_class_get_permitted_subclasses(
     }
 
     let subs = ctx.permitted_subclasses(class_id);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, subs.len());
     // The same ClassLoader that defines `this` sealed class is authoritative
     // for resolving its own permitted subclasses (they are compiled
     // together, always visible to that loader) — see
@@ -17591,7 +17691,36 @@ pub(crate) fn native_class_get_permitted_subclasses(
     // be tried BEFORE any loader-blind global lookup, not after.
     let mut loader_obj: Option<ObjectRef> = None;
     let mut loader_resolved = false;
-    for (i, sub_name) in subs.iter().enumerate() {
+    // DERENCODABLE-SEALED-20260801: COMPACT, never leave holes. The array this
+    // native returns is handed straight to real JDK bytecode
+    // (`Class.getPermittedSubclasses()` → `isDirectSubType(c)` →
+    // `c.getInterfaces(false)`), which dereferences every element without a
+    // null guard because HotSpot's own `getPermittedSubclasses0` cannot
+    // produce a null element. A hole here therefore becomes a null-receiver
+    // instance call inside `java.lang.Class` — and the two ways CratonVM
+    // answers that call (a null-tolerant slow-path shim that returns an empty
+    // `Class[]`, vs. a warmed inline cache that pushes the callee frame with
+    // `this == null`) produce, respectively, a silently EMPTY permitted set
+    // and `NullPointerException: Cannot read field "interfaces" because "rd"
+    // is null` at `Class.java:1217`. Both were observed on the same JDK 25
+    // `DEREncodable` hierarchy — the second one is what aborts every Mockito
+    // `mock(X509Certificate.class)`.
+    //
+    // The active resolution above should now leave no holes at all; compacting
+    // is the belt to that braces, and it keeps the JDK contract ("every
+    // element is a real `Class`") true by construction for any future name
+    // that genuinely cannot be resolved.
+    //
+    // Accumulate `ClassId`s, not `ObjectRef`s: resolution now runs
+    // `ClassLoader.loadClass` / `load_class` per name, either of which can
+    // allocate and therefore collect. A `Vec<ObjectRef>` held across that loop
+    // is the Family-1 stale-native-local shape; a `ClassId` is a plain index
+    // the GC never rewrites. Mirrors are materialised afterwards, one at a
+    // time, with the destination array pinned (`get_class_mirror` allocates on
+    // first use for a class whose mirror the active resolution above just
+    // brought in — precisely the new case this fix creates).
+    let mut sub_ids: Vec<ClassId> = Vec::with_capacity(subs.len());
+    for sub_name in subs.iter() {
         let resolved = resolve_nestmate_via_defining_loader(
             ctx,
             args,
@@ -17600,10 +17729,18 @@ pub(crate) fn native_class_get_permitted_subclasses(
             &mut loader_resolved,
         );
         if let Some(sub_id) = resolved {
-            let mirror = ctx.get_class_mirror(sub_id);
-            ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+            sub_ids.push(sub_id);
         }
     }
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, sub_ids.len());
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, sub_id) in sub_ids.iter().enumerate() {
+        let mirror = ctx.get_class_mirror(*sub_id);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+    }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(arr))))
 }
 

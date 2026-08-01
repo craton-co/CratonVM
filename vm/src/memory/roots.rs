@@ -572,13 +572,38 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
+    // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception,
+    //     jit_pending_exception
     if let Some(ref obj_ref) = thread.java_thread_obj {
         roots.push(*obj_ref);
     }
     if let Some(ref obj_ref) = thread.pending_async_exception {
         roots.push(*obj_ref);
     }
+    // The JIT's pending throwable. It used to live in a thread-local `Cell`,
+    // where the collector could not reach it at all — TLS is invisible from a
+    // collecting thread, which is precisely why the two slots above are fields.
+    // Without this push the remap half is half-wired: the reference would be
+    // relocated but never kept alive.
+    if let Some(ref obj_ref) = thread.jit_pending_exception {
+        roots.push(*obj_ref);
+    }
+    // The JIT's stashed deopt / exceptional frames. Those live in `jit/`
+    // thread-locals — that crate cannot depend on `vm/`, so they cannot become
+    // `JvmThread` fields the way the slot above did — and are reached through
+    // an on-thread visitor instead. That works for the same reason the slots
+    // above do: this scan already runs ON the owning thread. Paired with the
+    // remap in `gc.rs`; wiring one without the other is refused by a debug
+    // assertion in the visitor. See `docs/jit/deopt-thread-local-roots.md`.
+    //
+    // `is_object_address` rather than a bare `ObjectRef`, matching the
+    // `pinned_addrs` block above: the stash can name an address the heap no
+    // longer owns, if an earlier collection already ran while it was unrooted.
+    cratonvm_jit::deopt::for_each_stashed_deopt_object(|addr| {
+        if let Some(obj) = shared.mem.heap.is_object_address(addr as usize) {
+            roots.push(obj);
+        }
+    });
 
     // 10b. Registry-held java.lang.Thread mirrors of every ALIVE thread.
     //      HotSpot semantics: a thread's mirror is a strong root while the
@@ -916,13 +941,14 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     results live in no heap slot, so a GC between `submit` and `get` must
     //     root them here. Remap companion in `gc.rs`.
 
-    // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
-    //     in a process-global side-table can register a scan callback here
-    //     instead of hand-wiring a new `gc_scan_*` call into this function (see
-    //     `crate::memory::native_roots`). Fans out to every registered source;
-    //     a no-op (byte-identical to baseline) until a subsystem registers, so
-    //     it is safe to land ahead of any adopter. The matching post-move remap
-    //     is `native_roots::remap_all_native_roots` in `gc.rs`.
+    // 21. Uniform native-root registry (driven above, via
+    //     `native_roots::scan_all_roots`). A native subsystem holding
+    //     ObjectRefs in a side-table belongs in `native_roots::VM_ROOT_SOURCES`
+    //     rather than hand-wired as another `gc_scan_*` call here — the table
+    //     row cannot compile without both the scan and the remap half. Every
+    //     source receives the OWNING `SharedVm`, so one backed by a static must
+    //     key that static on `shared.vm_identity`. The matching post-move remap
+    //     is `native_roots::remap_all_roots` in `gc.rs`.
 
     if let Some(w) = crate::memory::gc::watch_addr() {
         let rooted = roots.iter().any(|o| o.as_ptr() as usize == w);

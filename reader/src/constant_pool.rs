@@ -409,7 +409,36 @@ impl ConstantPool {
                         ));
                     }
                 }
-                _ => {} // Tombstone, Utf8, Integer, Float, Long, Double, Module, Package
+                // C2 hardening: `Module` / `Package` were the last two
+                // reference-bearing tags still falling into the catch-all
+                // arm, so their `name_index` was the only cross-reference
+                // in the pool that `validate` never looked at. JVMS §4.4.11
+                // (`CONSTANT_Module_info`) and §4.4.12
+                // (`CONSTANT_Package_info`) both require `name_index` to be
+                // a valid index to a `CONSTANT_Utf8_info`.
+                ConstantPoolEntry::Module { name_index }
+                | ConstantPoolEntry::Package { name_index } => {
+                    let kind = if matches!(entry, ConstantPoolEntry::Module { .. }) {
+                        "Module"
+                    } else {
+                        "Package"
+                    };
+                    if *name_index == 0 || *name_index >= len {
+                        errors.push(format!(
+                            "cp#{i}: {kind} name_index {} out of bounds",
+                            name_index
+                        ));
+                    } else if !matches!(
+                        self.entries.get(*name_index as usize),
+                        Some(ConstantPoolEntry::Utf8(_))
+                    ) {
+                        errors.push(format!(
+                            "cp#{i}: {kind} name_index {} does not point to Utf8",
+                            name_index
+                        ));
+                    }
+                }
+                _ => {} // Tombstone, Utf8, Integer, Float, Long, Double
             }
         }
         errors
@@ -691,6 +720,72 @@ mod tests {
         let pool = ConstantPool::new(entries);
         let errors = pool.validate();
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    // ---------------------------------------------------------------------
+    // C2 hardening: Module / Package name_index (JVMS §4.4.11, §4.4.12).
+    // These were the last reference-bearing tags in the `_ => {}` arm.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn validate_module_and_package_well_formed() {
+        let entries = vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("java.base".into()),
+            ConstantPoolEntry::Module { name_index: 1 },
+            ConstantPoolEntry::Package { name_index: 1 },
+        ];
+        let pool = ConstantPool::new(entries);
+        assert!(pool.validate().is_empty());
+    }
+
+    #[test]
+    fn validate_module_name_index_not_utf8() {
+        let entries = vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Integer(7),
+            ConstantPoolEntry::Module { name_index: 1 },
+        ];
+        let pool = ConstantPool::new(entries);
+        let errors = pool.validate();
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(
+            errors[0].contains("Module name_index 1 does not point to Utf8"),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_package_name_index_zero_and_out_of_bounds() {
+        let entries = vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Package { name_index: 0 },
+            ConstantPoolEntry::Package { name_index: 999 },
+        ];
+        let pool = ConstantPool::new(entries);
+        let errors = pool.validate();
+        assert_eq!(errors.len(), 2, "got: {errors:?}");
+        assert!(errors.iter().all(|e| e.contains("Package name_index")));
+        assert!(errors.iter().all(|e| e.contains("out of bounds")));
+    }
+
+    /// A `Module` whose `name_index` lands on the *second slot* of a
+    /// `CONSTANT_Long` must be rejected. That slot is a `Tombstone`, which
+    /// is neither `Utf8` nor out of bounds — it is the distinct
+    /// "unusable second half of a category-2 entry" hazard from JVMS §4.4.5.
+    #[test]
+    fn validate_rejects_index_into_the_second_slot_of_a_long() {
+        let entries = vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Long(1),
+            ConstantPoolEntry::Tombstone, // the unusable second slot
+            ConstantPoolEntry::Module { name_index: 2 },
+            ConstantPoolEntry::ClassReference { name_index: 2 },
+        ];
+        let pool = ConstantPool::new(entries);
+        let errors = pool.validate();
+        assert_eq!(errors.len(), 2, "got: {errors:?}");
+        assert!(errors.iter().all(|e| e.contains("does not point to Utf8")));
     }
 
     #[test]

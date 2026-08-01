@@ -6149,14 +6149,51 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int((na as i32) - (nb as i32))))
     });
+    // SHIM-AUDIT (native-builtins-shim-audit.md, row `java/nio/ByteBuffer`):
+    // `ByteBuffer` is an ABSTRACT class and never declares its own instance —
+    // every receiver is a `HeapByteBuffer`, `DirectByteBuffer`,
+    // `MappedByteBuffer`, one of their read-only siblings, or a third-party
+    // subclass. `Buffer.toString()` has real bytecode
+    // (`getClass().getName() + "[pos=" ...`), and the native-override
+    // hierarchy walk in `vm/src/runtime/interpreter/invoke.rs` looks for a
+    // native on each ANCESTOR *before* it checks whether that ancestor has
+    // bytecode — so this registration wins for every one of those receivers.
+    // It used to hard-code the literal string `java.nio.HeapByteBuffer`, i.e.
+    // it answered a question it could not know: a `DirectByteBuffer` — or a
+    // real-JDK `MappedByteBuffer`, or a third-party subclass — rendered as a
+    // heap buffer, which is exactly the shape a "which buffer kind is this?"
+    // diagnostic reads.
+    //
+    // Three-step, fail-closed: never invent a concrete class name.
+    //   1. If the receiver has a CONCRETE class (anything other than the
+    //      abstract `java/nio/ByteBuffer` itself), that class IS the answer —
+    //      this is the real-JDK receiver case and the only one `Buffer
+    //      .toString()`'s `getClass().getName()` would ever see.
+    //   2. CratonVM's own `ByteBuffer.allocate` / `allocateDirect` mint a
+    //      synthetic stand-in whose class name is the abstract
+    //      `java/nio/ByteBuffer`, so step 1 cannot name it. Derive the kind
+    //      from the storage the buffer actually has, which is the same source
+    //      `equals`/`hashCode`/`compareTo` read: a heap array means
+    //      `HeapByteBuffer`, a native window means `DirectByteBuffer`.
+    //   3. Storage-less (a bare stub): render the abstract class's own name.
+    //      Unhelpful, but true — better than a concrete lie.
     r.register(bb, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this);
         let lim = s2_bb_limit(ctx, this);
         let cap = s2_bb_cap(ctx, this);
-        let s = ctx.create_string(&format!(
-            "java.nio.HeapByteBuffer[pos={pos} lim={lim} cap={cap}]"
-        ));
+        let cid = ctx.class_id_of_object(this);
+        let own = ctx.class_name_of_id(cid).unwrap_or_default();
+        let name = if !own.is_empty() && own != "java/nio/ByteBuffer" {
+            own.replace('/', ".")
+        } else {
+            match s2_bb_storage(ctx, this) {
+                Some(S2BbStorage::Heap { .. }) => "java.nio.HeapByteBuffer".to_string(),
+                Some(S2BbStorage::Direct { .. }) => "java.nio.DirectByteBuffer".to_string(),
+                None => "java.nio.ByteBuffer".to_string(),
+            }
+        };
+        let s = ctx.create_string(&format!("{name}[pos={pos} lim={lim} cap={cap}]"));
         Ok(Some(Value::Object(Some(s))))
     });
 
@@ -7199,6 +7236,55 @@ mod tests {
     use super::*;
     use cratonvm_native_api::NativeContext as _;
     use cratonvm_types::ClassId;
+
+    /// SHIM-AUDIT regression (fails before the 2026-08-01 fix).
+    ///
+    /// `java.nio.ByteBuffer` is an ABSTRACT class, so this native is inherited
+    /// by every buffer in the VM through the interpreter's superclass walk —
+    /// and it wins over the real `Buffer.toString()` bytecode, whose whole body
+    /// is `getClass().getName() + "[pos=" …`. The shim used to answer with the
+    /// hard-coded literal `java.nio.HeapByteBuffer`, so a direct, mapped,
+    /// read-only or third-party buffer all claimed to be heap buffers.
+    ///
+    /// Each case here has a CONCRETE receiver class, which is the real-JDK
+    /// shape and the only branch `getClass().getName()` would ever take. The
+    /// storage-derived fallback (for CratonVM's own synthetic stand-ins, whose
+    /// class name IS the abstract `java/nio/ByteBuffer`) is exercised by
+    /// `vm/src/vm.rs::byte_buffer_to_string`, which allocates through
+    /// `ByteBuffer.allocate` and still expects `java.nio.HeapByteBuffer`.
+    #[test]
+    fn byte_buffer_to_string_names_the_receivers_own_class() {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        register_s2_bytebuffer(&mut registry);
+        let cb = registry
+            .find("java/nio/ByteBuffer", "toString", "()Ljava/lang/String;")
+            .expect("ByteBuffer.toString native");
+
+        for class_name in [
+            "java/nio/DirectByteBuffer",
+            "java/nio/MappedByteBuffer",
+            "java/nio/HeapByteBufferR",
+            "com/example/VendorByteBuffer",
+        ] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let buf = match ctx.new_object(class_name).expect("alloc") {
+                Some(Value::Object(Some(o))) => o,
+                other => panic!("expected {class_name} object, got {other:?}"),
+            };
+            let rendered = match cb(&mut ctx, &[Value::Object(Some(buf))]) {
+                Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                _ => panic!("expected a String from ByteBuffer.toString for {class_name}"),
+            };
+            let expected_prefix = format!("{}[", class_name.replace('/', "."));
+            assert!(
+                rendered.starts_with(&expected_prefix),
+                "ByteBuffer.toString must render the RECEIVER's class: expected a \
+                 `{expected_prefix}…` prefix, got `{rendered}`. A hard-coded concrete \
+                 class name here is a claim the shim cannot know — see \
+                 docs/known-issues/c2/native-builtins-shim-audit.md."
+            );
+        }
+    }
 
     #[test]
     fn test_socket_registry_alloc_stream_wrapping_ids() {

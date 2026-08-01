@@ -148,14 +148,25 @@ fn private_invokevirtual_does_not_dispatch_to_subclass_static_shadow() {
         .and_then(|mut f| f.write_all(PROBE_SRC.trim_start().as_bytes()))
         .expect("write probe source");
 
-    let status = Command::new(javac_bin())
+    let compile = Command::new(javac_bin())
         .arg("-d")
         .arg(temp.path())
         .arg(&source)
-        .status();
-    if !matches!(status, Ok(s) if s.success()) {
-        eprintln!("javac failed; skipping PrivateInvokevirtualShadowProbe");
-        return;
+        .output();
+    match compile {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[private_invokevirtual_shadow] javac could not be executed: {e}; skipping");
+            return;
+        }
+        // javac RAN and rejected the source: the probe is broken, and skipping
+        // here would make this test a permanent vacuous pass.
+        Ok(o) => assert!(
+            o.status.success(),
+            "[private_invokevirtual_shadow] the embedded probe failed to compile — fix the probe source. \
+             javac stderr:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
     }
 
     let mut cmd = Command::new(&bin);

@@ -168,6 +168,15 @@ pub fn unload_dead_class_metadata(
             .jit
             .tiered_manager
             .invalidate_class(class.name.as_ref());
+        // And purge the broker: an unloaded class must lose its tracked
+        // requests as well as its epoch, so `purge_class` rather than
+        // `invalidate`. In-flight records are deliberately KEPT by that
+        // call so their pre-unload epoch refuses the body coming back.
+        let _ = shared
+            .jit
+            .compilation_broker
+            .lock()
+            .purge_class(class.name.as_ref());
         shared.jit.deopt_log.lock().clear_class(class.name.as_ref());
         jit_entries_retired += shared
             .jit
@@ -356,6 +365,55 @@ pub(crate) fn remap_handle_slots(
             rewritten += 1;
         }
     }
+    rewritten
+}
+
+/// Post-move half of root section §10: the per-thread **single-slot** object
+/// references. Returns how many were relocated.
+///
+/// Each of these is one `Option<ObjectRef>` field on `JvmThread` in which some
+/// subsystem parks a live reference between two bytecodes, with nothing else in
+/// the heap keeping it reachable. Every slot listed here MUST also be pushed by
+/// the matching scan in `memory/roots.rs` §10 — a slot with only one of the two
+/// halves is either a collected object (scan missing) or a from-space address
+/// handed back to running code (remap missing), and both surface far away from
+/// here. Factored out of [`update_all_roots`] so the pairing is unit-testable
+/// without standing up a VM, exactly like [`remap_handle_slots`].
+///
+/// `jit_pending_exception` is the newest member and the reason this exists: it
+/// spent its life as a `Cell<Option<ObjectRef>>` inside the `JIT_SIGNALS`
+/// `thread_local!` in `jit/helpers.rs`, where neither half could reach it — TLS
+/// belongs to the mutator, and every `VM_ROOT_SOURCES` callback runs on the
+/// collector. See `docs/jit-signals-root-gap.md`.
+pub(crate) fn remap_thread_object_slots(
+    thread: &mut crate::threading::jvm_thread::JvmThread,
+    pointer_map: &HashMap<usize, usize>,
+) -> usize {
+    let mut rewritten = 0;
+    for slot in [
+        &mut thread.java_thread_obj,
+        &mut thread.pending_async_exception,
+        &mut thread.jit_pending_exception,
+    ] {
+        let Some(obj_ref) = slot.as_mut() else {
+            continue;
+        };
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            // SAFETY: relocation maps contain live, aligned object addresses.
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            rewritten += 1;
+        }
+    }
+    // The remap half for the JIT's stashed deopt / exceptional frames. The scan
+    // half is in `roots.rs` §10 and the two must land together — the visitor
+    // carries a debug assertion that this thread scanned at least once whenever
+    // there is anything to remap, precisely so the half-wiring that shipped
+    // once already trips instead of going quiet.
+    cratonvm_jit::deopt::remap_stashed_deopt_objects(|addr| {
+        pointer_map.get(&(addr as usize)).map(|&to| to as u64)
+    });
     rewritten
 }
 
@@ -894,21 +952,12 @@ pub fn update_all_roots(
     // reactor worker dies (ES testManyAsyncRequests under burst load). The helper
     // early-returns when nothing moved (non-moving GC).
 
-    // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
-    if let Some(ref mut obj_ref) = thread.java_thread_obj {
-        let old_addr = obj_ref.as_ptr() as usize;
-        if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            debug_assert!(new_addr != 0, "GC pointer map contains null address");
-            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-        }
-    }
-    if let Some(ref mut obj_ref) = thread.pending_async_exception {
-        let old_addr = obj_ref.as_ptr() as usize;
-        if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            debug_assert!(new_addr != 0, "GC pointer map contains null address");
-            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-        }
-    }
+    // 10. Per-thread ObjectRef slots — java_thread_obj, pending_async_exception,
+    //     jit_pending_exception. Paired with the scan in `roots.rs` §10; each of
+    //     these is a single `Option<ObjectRef>` field that some subsystem parks a
+    //     live reference in between two bytecodes, so it must be BOTH pushed as a
+    //     root there and rewritten here.
+    remap_thread_object_slots(thread, pointer_map);
 
     // 11. Root snapshot
     {
@@ -1082,12 +1131,11 @@ pub fn update_all_roots(
         .update_thread_objs_after_gc(pointer_map);
 
     // 22. Uniform native-root registry — the post-move companion to
-    //     `roots.rs` step 21 (`scan_all_native_roots`). Fans out to every
-    //     subsystem that registered via `crate::memory::native_roots`,
-    //     repointing each held ObjectRef through `pointer_map`. Each registered
-    //     remap self-guards the empty (non-moving) map; the whole fan-out is a
-    //     no-op until a subsystem registers, so behaviour is byte-identical to
-    //     baseline on the default path.
+    //     `roots.rs` step 21, driven above via `native_roots::remap_all_roots`.
+    //     Fans out over `native_roots::VM_ROOT_SOURCES`, repointing each held
+    //     ObjectRef through `pointer_map`. Each remap self-guards the empty
+    //     (non-moving) map, and each receives the OWNING `SharedVm` so one VM's
+    //     fixup cannot rewrite another VM's entries.
 
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);
@@ -1576,6 +1624,127 @@ mod tests {
         assert_eq!(slots[0].unwrap().as_ptr() as usize, 0x2000);
         assert!(slots[1].is_none());
         assert_eq!(slots[2].unwrap().as_ptr() as usize, 0x3000);
+    }
+
+    /// §10 post-move fixup covers ALL three per-thread single-slot references,
+    /// `jit_pending_exception` included. Before it moved onto `JvmThread` the
+    /// JIT's pending throwable lived in a `thread_local!` that this function
+    /// could not name, so a moving collection left the interpreter's drain
+    /// reading a from-space address.
+    #[test]
+    fn moving_gc_rewrites_every_per_thread_object_slot() {
+        use crate::threading::jvm_thread::{JvmThread, ThreadId};
+
+        // SAFETY: these aligned non-null addresses are never dereferenced —
+        // the remap is pure address arithmetic against the pointer map.
+        let mirror = unsafe { ObjectRef::from_raw(0x1000usize as *mut u8) };
+        let async_exc = unsafe { ObjectRef::from_raw(0x2000usize as *mut u8) };
+        let jit_exc = unsafe { ObjectRef::from_raw(0x3000usize as *mut u8) };
+
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        thread.java_thread_obj = Some(mirror);
+        thread.pending_async_exception = Some(async_exc);
+        thread.jit_pending_exception = Some(jit_exc);
+
+        let pointer_map = HashMap::from([
+            (0x1000usize, 0x8000usize),
+            (0x2000usize, 0x9000usize),
+            (0x3000usize, 0xA000usize),
+        ]);
+
+        assert_eq!(remap_thread_object_slots(&mut thread, &pointer_map), 3);
+        assert_eq!(
+            thread.java_thread_obj.unwrap().as_ptr() as usize,
+            0x8000,
+            "java_thread_obj must follow the move"
+        );
+        assert_eq!(
+            thread.pending_async_exception.unwrap().as_ptr() as usize,
+            0x9000,
+            "pending_async_exception must follow the move"
+        );
+        assert_eq!(
+            thread.jit_pending_exception.unwrap().as_ptr() as usize,
+            0xA000,
+            "the JIT's pending throwable must follow the move — a stale address \
+             here is handed straight to the interpreter's post-JIT drain"
+        );
+    }
+
+    /// A slot whose object did not move, and an empty slot, must both come
+    /// through untouched — the remap must not invent or drop references.
+    #[test]
+    fn per_thread_object_slot_remap_leaves_unmoved_and_empty_slots_alone() {
+        use crate::threading::jvm_thread::{JvmThread, ThreadId};
+
+        // SAFETY: never dereferenced; see the sibling test.
+        let unmoved = unsafe { ObjectRef::from_raw(0x5000usize as *mut u8) };
+
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        thread.jit_pending_exception = Some(unmoved);
+
+        // A non-empty map that simply does not mention our object.
+        let pointer_map = HashMap::from([(0x1000usize, 0x8000usize)]);
+
+        assert_eq!(remap_thread_object_slots(&mut thread, &pointer_map), 0);
+        assert_eq!(thread.jit_pending_exception.unwrap().as_ptr() as usize, 0x5000);
+        assert!(thread.java_thread_obj.is_none());
+        assert!(thread.pending_async_exception.is_none());
+    }
+
+    /// End-to-end: stash a JIT pending exception on the thread, run a *real*
+    /// moving collection with that object as the only root, and check the
+    /// thread's slot now names the object's post-copy address — and that the
+    /// object is genuinely still there (its field survives the copy).
+    ///
+    /// This is the shape the bug had: the reference is parked in a slot while a
+    /// collection relocates the object, and the drain that follows must not see
+    /// the pre-move address.
+    #[test]
+    fn jit_pending_exception_survives_and_follows_a_moving_collection() {
+        use crate::threading::jvm_thread::{JvmThread, ThreadId};
+
+        let heap = small_heap();
+        let monitor_table = crate::threading::monitor::MonitorTable::new();
+
+        // Stand in for the throwable the JIT helper would have constructed.
+        let exc = heap.alloc_object(ClassId::new(7), 1);
+        heap.set_field(exc, 0, Value::Int(0x5EED));
+
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        thread.jit_pending_exception = Some(exc);
+
+        // The scan half: §10 of `roots.rs` pushes this slot. Model it directly
+        // (that file is the collector's root list, not this module's) so the
+        // object is reachable for the copy.
+        let mut roots = vec![exc];
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitor_table);
+
+        let moved_to = roots[0];
+        assert_ne!(
+            moved_to.as_ptr(),
+            exc.as_ptr(),
+            "the collection must actually relocate the object, or this test \
+             proves nothing about the remap"
+        );
+
+        // The remap half: what this module owns.
+        remap_thread_object_slots(&mut thread, &result.pointer_map);
+
+        let drained = thread
+            .jit_pending_exception
+            .take()
+            .expect("the pending exception must survive the collection");
+        assert_eq!(
+            drained.as_ptr(),
+            moved_to.as_ptr(),
+            "the drain must see the post-move address"
+        );
+        assert_eq!(
+            heap.get_field(drained, 0).as_int(),
+            Some(0x5EED),
+            "the relocated throwable must still be a live, readable object"
+        );
     }
 
     #[test]

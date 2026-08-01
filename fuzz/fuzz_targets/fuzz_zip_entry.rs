@@ -22,13 +22,13 @@
 //! `classloading/src/class_path.rs`):
 //!   * `add_path` (`:2147`) — archive sniffing, `ZipArchive::new`, fat-JAR
 //!     expansion.
-//!   * `list_class_names` (`:4297`) — walks the central directory and
+//!   * `list_class_names` (`:4363`) — walks the central directory and
 //!     surfaces every `*.class` entry name verbatim.
-//!   * `find_class` (`:2394`) / `find_resource` (`:3170`) /
-//!     `contains_resource` (`:3179`) — the lookup paths that must refuse a
+//!   * `find_class` (`:2394`) / `find_resource` (`:3236`) /
+//!     `contains_resource` (`:3245`) — the lookup paths that must refuse a
 //!     traversal-shaped name.
 //!   * `read_jar_manifest` (`:2113`) — inflates `META-INF/MANIFEST.MF`.
-//!   * `entry_count` (`:2103`), `list_jmod_modules` (`:4347`).
+//!   * `entry_count` (`:2103`), `list_jmod_modules` (`:4413`).
 //!
 //! # The traversal oracle
 //!
@@ -126,6 +126,14 @@ const TRAVERSAL_PROBES: [&str; 11] = [
 /// Exactly the negation of `is_safe_class_name`
 /// (`classloading/src/class_path.rs:1035`). `find_class` applies no
 /// normalisation, so this predicate is applied to the raw name.
+///
+/// This is a **hand-maintained mirror**, because the real predicate is
+/// private to that module. That is a silent-drift hazard in one direction:
+/// tightening `is_safe_class_name` without updating this copy makes the
+/// assertions below quietly weaker rather than failing. Loosening it
+/// produces a visible false failure. Making the real predicate `pub` and
+/// calling it directly is the fix — see
+/// `docs/known-issues/c2/fuzzing-state.md`.
 fn class_name_is_hostile(name: &str) -> bool {
     name.contains("..")
         || name.starts_with('/')
@@ -159,13 +167,25 @@ fn staging_path() -> &'static PathBuf {
     })
 }
 
-/// Force the `read()` archive path instead of `mmap`. `loader_flags()`
-/// latches on first read, so this must run before the first `ClassPath` is
-/// built — hence the `Once` rather than a per-iteration `set_var`.
+/// Force the `read()` archive path instead of `mmap`.
+///
+/// This used to `set_var`, which does not work for a DECLARED flag: the
+/// snapshot latches on first read, so an environment write only takes effect
+/// if it wins the race to initialise it. `flag_env_mutation_guard` fails over
+/// exactly that. Installing the snapshot is the supported way to say "for the
+/// rest of this process", and the `Once` still matters, because `install`
+/// refuses a second attempt and this must land before the first `ClassPath`.
 fn disable_jar_mmap_once() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        std::env::set_var("CRATONVM_DISABLE_JAR_MMAP", "1");
+        let cfg = cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+            "CRATONVM_DISABLE_JAR_MMAP",
+            Some("1"),
+        )]);
+        // An error here only means something already latched the snapshot, in
+        // which case there is nothing to do and the mmap path is what gets
+        // fuzzed — which is worth fuzzing too.
+        let _ = cratonvm_types::flags::install(cfg);
     });
 }
 

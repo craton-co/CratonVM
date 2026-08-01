@@ -83,9 +83,14 @@ fn compile_probe(jdk: &Path, classes: &Path) {
         .args(["--release", "21", "-d"])
         .arg(classes)
         .arg(&source)
-        .status()
+        .output()
         .expect("run javac");
-    assert!(status.success(), "javac failed");
+    assert!(
+        status.status.success(),
+        "[lambda_invokespecial_no_retarget] the embedded probe failed to compile — fix the probe source. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
 }
 
 fn run_probe(binary: &Path, jdk: &Path, classes: &Path, nojit: bool) -> String {

@@ -84,20 +84,29 @@ fn compile_enumtest(workdir: &Path) -> Option<PathBuf> {
     std::fs::write(&src, ENUMTEST_JAVA).ok()?;
     let classes = workdir.join("classes");
     std::fs::create_dir_all(&classes).ok()?;
-    let status = Command::new("javac")
+    let out = match Command::new("javac")
         .arg("--release")
         .arg("21")
         .arg("-d")
         .arg(&classes)
         .arg(&src)
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    if !classes.join("EnumTest.class").exists() {
-        return None;
-    }
+        .output()
+    {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[wave1_b2_bootloader_resources] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    // javac RAN and rejected the source: the probe is broken, and skipping here
+    // would make this test a permanent vacuous pass.
+    assert!(
+        out.status.success() && classes.join("EnumTest.class").exists(),
+        "[wave1_b2_bootloader_resources] the embedded probe failed to compile — fix \
+         the probe source. javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     Some(classes)
 }
 

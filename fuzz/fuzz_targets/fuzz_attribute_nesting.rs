@@ -10,11 +10,12 @@
 //!     `decode_code_body` — a `Code` attribute's body carries its own
 //!     attribute table, so `Code`-in-`Code` (and `Record`-in-`Record`)
 //!     nests without limit on the wire. Bounded by the private
-//!     `MAX_ATTRIBUTE_DEPTH` (`reader/src/attribute.rs:964`).
+//!     `MAX_ATTRIBUTE_DEPTH` (`reader/src/attribute.rs:1106`, whose
+//!     canonical value lives in `reader/src/limits.rs`).
 //!   * `decode_annotation_depth` ⇄ `decode_element_value_depth` — an
 //!     `element_value` with tag `@` holds a whole nested annotation, and
 //!     tag `[` holds an array of element values. Bounded by the private
-//!     `MAX_ANNOTATION_DEPTH` (`reader/src/attribute.rs:1699`).
+//!     `MAX_ANNOTATION_DEPTH` (`reader/src/attribute.rs:1892`).
 //!   * `decode_type_annotation` → `decode_type_path` → `decode_annotation`
 //!     — `RuntimeVisible/InvisibleTypeAnnotations` wrap the same annotation
 //!     recursion behind a `u8`-counted `type_path`.
@@ -27,9 +28,9 @@
 //! vacuously if the generator ever emitted malformed bodies.
 //!
 //! Surface under test:
-//!   * `cratonvm_reader::decode_attribute` (`reader/src/attribute.rs:873`)
+//!   * `cratonvm_reader::decode_attribute` (`reader/src/attribute.rs:1015`)
 //!   * `cratonvm_reader::attribute::validate_attribute_shape`
-//!     (`reader/src/attribute.rs:751`)
+//!     (`reader/src/attribute.rs:874`)
 //!
 //! Per-input layout:
 //!   * byte 0 — selects which attribute name the raw-bytes phase feeds to

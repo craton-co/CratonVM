@@ -6,7 +6,7 @@
 //! ## Why this exists
 //!
 //! The P0 "JIT correctness" lane of the C2 review
-//! (`docs/known-issues/deep-research-vm-c2.md`) asks for *"a universal IR
+//! (`docs/known-issues/c2/deep-research-vm-c2.md`) asks for *"a universal IR
 //! verifier … run after parsing and every mutating pass in stress builds; run
 //! before lowering in all builds"*, with the exit criterion that *"invalid IR
 //! or ABI state causes a deterministic compilation bailout, never silent wrong
@@ -550,21 +550,13 @@ fn is_memory_token_input(node: &Node, input_index: usize) -> bool {
     if matches!(node.op, Op::Phi) {
         return node.ty == IrType::Memory && input_index >= 1;
     }
-    // Minimum input count of the documented full `[ctrl, mem, …]` form. Kept
-    // numerically identical to `ir_optimize::memory_token_slot`.
-    let min_full_arity = match node.op {
-        Op::Load(_) => 3,           // [ctrl, mem, base]
-        Op::Store(_) => 4,          // [ctrl, mem, base, value]
-        Op::ArrayLoad(_) => 4,      // [ctrl, mem, array, index]
-        Op::ArrayStore(_) => 5,     // [ctrl, mem, array, index, value]
-        Op::ArrayLength => 3,       // [ctrl, mem, array_ref]
-        Op::New { .. } => 2,        // [ctrl, mem]
-        Op::NewArray { .. } => 3,   // [ctrl, mem, length]
-        Op::Call { .. } => 2,       // [ctrl, mem, args…]
-        Op::LambdaIntToDouble => 4, // [ctrl, mem, lambda, index]
-        _ => return false,
-    };
-    input_index == 1 && node.inputs.len() >= min_full_arity
+    // Delegates to the single table in `ir.rs` (`Op::memory_shape`), which is
+    // what `ir_optimize::memory_token_slot` and `lib.rs::ea_memory_token_slot`
+    // also read. Three hand-maintained copies of this arity table existed and
+    // were only *numerically* identical; a fourth op gaining a memory edge
+    // would have had to be added to all three, and a verifier that disagrees
+    // with the optimizer about what a token slot is proves nothing.
+    crate::ir::memory_token_slot(node) == Some(input_index)
 }
 
 // ── Lane: edges ──────────────────────────────────────────────────────
@@ -683,6 +675,8 @@ fn expected_arity(op: &Op) -> (usize, usize) {
         Op::LambdaIntToDouble => (4, 4),
         // [ctrl, cond]
         Op::Guard { .. } => (2, 2),
+        // [ctrl, mem, obj]
+        Op::MonitorEnter | Op::MonitorExit => (3, 3),
         Op::Dead => (0, 0),
     }
 }
@@ -1114,7 +1108,43 @@ fn check_types(graph: &Graph, v: &mut Violations) {
 /// deliberately leaves an eliminated `Op::New`'s snapshot slot naming the dead
 /// node as the virtual-object descriptor — see [`APPLY_EA_ROUTES_ALL_SAFEPOINTS`]
 /// for why that needs a model change rather than a fix.
+///
+/// Three things are checked: that snapshot bcis are **unique** (both consumers
+/// key on the bci and break ties by position, so a duplicate silently discards
+/// one frame state), that slot counts are `u16`-plausible, and that every named
+/// node is in range and live. See `docs/jit/deopt-metadata-audit.md` §5.
 fn check_frame_states(graph: &Graph, v: &mut Violations) {
+    // Snapshot bcis must be unique, because both consumers key on the bci and
+    // resolve ties by *position*:
+    //
+    //   * `ir_lower::resolve_frame_state_for_bci` does
+    //     `safepoints.iter().position(|s| s.bci == bci)` — first match wins, and
+    //     that index is also what binds the frame to its inlined scope
+    //     (`InlineScopeTable::snapshot_scope`), so a duplicate binds the frame
+    //     to another snapshot's scope;
+    //   * `ir_lower::build_deopt_points` maps every snapshot through
+    //     `bci_native[sp.bci]`, so duplicates collide on one native offset and
+    //     `dedup_by_key` drops all but the first.
+    //
+    // Either way one of the two frame states is silently discarded and the
+    // other is used at a program point it does not describe — a *plausible*
+    // deopt frame rather than the correct one, which is the failure mode with
+    // no visible symptom. The front end's linear bytecode walk visits each `pc`
+    // once, so this holds today; the check is what keeps it holding.
+    let mut first_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (si, sp) in graph.safepoints.iter().enumerate() {
+        if let Some(&prev) = first_at.get(&sp.bci) {
+            v.add(format!(
+                "safepoint[{si}] and safepoint[{prev}] both describe bci {} — the bci-keyed \
+                 consumers take the first match, so one of the two frame states is silently \
+                 discarded and the other resumes a program point it does not describe",
+                sp.bci
+            ));
+        } else {
+            first_at.insert(sp.bci, si);
+        }
+    }
+
     for (si, sp) in graph.safepoints.iter().enumerate() {
         if sp.locals.len() > MAX_JVM_FRAME_SLOTS {
             v.add(format!(
@@ -1700,6 +1730,69 @@ mod tests {
         let m = message(&err);
         assert!(m.contains("local[0]"), "{m}");
         assert!(m.contains("removed (Dead)"), "{m}");
+    }
+
+    /// Both snapshot consumers key on the bci and resolve ties by position, so
+    /// two snapshots at one bci silently discard one of the two frame states.
+    /// The survivor then describes a program point that is not the one it
+    /// resumes at — a wrong frame with no symptom at the point of the defect.
+    #[test]
+    fn two_snapshots_at_one_bci_are_rejected() {
+        let mut g = linear_graph();
+        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = g.add(Op::Const(2), IrType::Int, vec![], None);
+        g.safepoints.push(crate::ir::SafepointSnapshot {
+            bci: 4,
+            locals: vec![a],
+            stack: vec![],
+        });
+        // A second, DIFFERENT frame state at the same bci.
+        g.safepoints.push(crate::ir::SafepointSnapshot {
+            bci: 4,
+            locals: vec![b],
+            stack: vec![],
+        });
+        let err = verify_graph(&g, "test", VerifyOptions::default()).unwrap_err();
+        let m = message(&err);
+        assert!(m.contains("both describe bci 4"), "{m}");
+        assert!(m.contains("silently discarded"), "{m}");
+    }
+
+    /// Distinct bcis are the normal case and must stay clean, including when
+    /// they name the same node.
+    #[test]
+    fn distinct_snapshot_bcis_are_accepted() {
+        let mut g = linear_graph();
+        let k = g.add(Op::Const(1), IrType::Int, vec![], None);
+        for bci in [2usize, 4, 7] {
+            g.safepoints.push(crate::ir::SafepointSnapshot {
+                bci,
+                locals: vec![k],
+                stack: vec![],
+            });
+        }
+        assert!(verify_graph(&g, "test", VerifyOptions::default()).is_ok());
+    }
+
+    /// The duplicate-bci check lives in the frame-state lane, so it follows
+    /// that lane's opt-in rules rather than silently becoming an always-on
+    /// structural check.
+    #[test]
+    fn the_duplicate_bci_check_is_part_of_the_frame_state_lane() {
+        let mut g = linear_graph();
+        let k = g.add(Op::Const(1), IrType::Int, vec![], None);
+        g.safepoints.push(crate::ir::SafepointSnapshot {
+            bci: 4,
+            locals: vec![k],
+            stack: vec![],
+        });
+        g.safepoints.push(crate::ir::SafepointSnapshot {
+            bci: 4,
+            locals: vec![k],
+            stack: vec![],
+        });
+        assert!(verify_graph(&g, "test", VerifyOptions::structural()).is_ok());
+        assert!(verify_graph(&g, "test", VerifyOptions::default()).is_err());
     }
 
     #[test]

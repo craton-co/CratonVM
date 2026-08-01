@@ -1568,8 +1568,11 @@ impl ValueStack {
                         // restores the old rewrite-on-any-map-hit behavior
                         // (escape hatch for an unregistered mint path; such a
                         // block is logged under CRATONVM_DBG_LONGROOT).
-                        let minted = crate::memory::smuggled_longs::is_minted(bits)
-                            || crate::memory::smuggled_longs::is_minted(new_addr as u64);
+                        // Asked of THIS heap's mint table only: a handle
+                        // minted against another VM's heap says nothing
+                        // about this slot (see `smuggled_longs`).
+                        let minted = crate::memory::smuggled_longs::is_minted(heap, bits)
+                            || crate::memory::smuggled_longs::is_minted(heap, new_addr as u64);
                         if !minted && !longrewrite_loose() {
                             if longroot_dbg() {
                                 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1994,7 +1997,7 @@ mod tests {
         // exactly the shape `scan_object_refs`'s hybrid branch roots.
         // Mint-provenance (2026-07-03): the rewrite arm only remaps values
         // registered at a mint chokepoint — model the JNI mint explicitly.
-        crate::memory::smuggled_longs::record_minted_long(old_addr);
+        crate::memory::smuggled_longs::record_minted_long(&heap, old_addr);
         let mut stack = ValueStack::new(4);
         stack.push_long(old_addr as i64).unwrap();
 
@@ -2056,7 +2059,7 @@ mod tests {
         // the same process happened to record provenance in that granule).
         // SAFETY: the pointer is only used for its bits (never dereferenced).
         let _ = unsafe { cratonvm_types::ObjectRef::from_raw(old_addr as *mut u8) };
-        crate::memory::smuggled_longs::record_minted_long(old_addr);
+        crate::memory::smuggled_longs::record_minted_long(&heap, old_addr);
         let mut stack = ValueStack::new(4);
         stack.push_long(old_addr as i64).unwrap();
         let mut map = HashMap::new();
@@ -2089,12 +2092,18 @@ mod tests {
         let new_addr = b.as_ptr() as u64;
 
         // The primitive's value equals A's address, but it was NEVER minted
-        // as a handle (no record_minted_long). Guard against cross-test
-        // registry pollution (the registry is process-global and another
-        // test's heap could have handed out an identical address).
-        if crate::memory::smuggled_longs::is_minted(old_addr) {
-            return;
-        }
+        // as a handle (no record_minted_long).
+        //
+        // This used to `return` early when the address was already minted,
+        // because the registry was one process-global set and another test's
+        // heap could have handed out an identical address — i.e. the test
+        // silently skipped itself. The registry is now keyed on the heap, so
+        // this freshly-created heap has an empty table by construction and
+        // the guard can be an assertion.
+        assert!(
+            !crate::memory::smuggled_longs::is_minted(&heap, old_addr),
+            "a fresh heap must start with no mints registered against it"
+        );
         let mut stack = ValueStack::new(4);
         stack.push_long(old_addr as i64).unwrap();
 
@@ -2864,7 +2873,7 @@ mod tests {
         // Mint-provenance (2026-07-03): raw pointer-shaped slots are only
         // rewritten when the value was registered at a mint chokepoint —
         // model the JNI mint this test's smuggle represents.
-        crate::memory::smuggled_longs::record_minted_long(old_ptr as u64);
+        crate::memory::smuggled_longs::record_minted_long(&heap, old_ptr as u64);
         let mut stack = ValueStack::new(4);
         stack.push_compact(CompactValue::from_bits(old_ptr as u64));
 

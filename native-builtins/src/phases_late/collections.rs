@@ -320,18 +320,50 @@ pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(&format!("{{size={size}}}"));
         Ok(Some(Value::Object(Some(s))))
     });
-    r.register(am, "hashCode", "()I", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(this.as_ptr() as i32)))
-    });
-    r.register(am, "equals", "(Ljava/lang/Object;)Z", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if let Some(Value::Object(Some(other))) = args.get(1) {
-            Ok(Some(Value::Int(if this == *other { 1 } else { 0 })))
-        } else {
-            Ok(Some(Value::Int(0)))
-        }
-    });
+    // SHIM-AUDIT (docs/known-issues/c2/native-builtins-shim-audit.md, row
+    // `java/util/AbstractMap`) — `equals`/`hashCode` are DELIBERATELY NOT
+    // registered here. They used to be, as:
+    //
+    //     hashCode -> Value::Int(this.as_ptr() as i32)
+    //     equals   -> this.as_ptr() == other.as_ptr()
+    //
+    // Three things were wrong with that, and `AbstractMap` being an ABSTRACT
+    // CLASS is what made all three reachable. The native-override hierarchy
+    // walk (`vm/src/runtime/interpreter/invoke.rs`, the `walk_native_hierarchy`
+    // loop) climbs a receiver's SUPERCLASS chain and, at each ancestor, looks
+    // for a native BEFORE it asks whether that ancestor has bytecode. Neither
+    // `java.util.HashMap` nor `TreeMap`, `LinkedHashMap`, `EnumMap`,
+    // `Collections$UnmodifiableMap` nor any user `class X extends AbstractMap`
+    // declares `equals`/`hashCode` — they all inherit them — so this pair
+    // intercepted *every map in the VM*:
+    //
+    //  1. WRONG ANSWER. The real `AbstractMap.equals` is entry-wise and
+    //     `AbstractMap.hashCode` is the sum of entry hashes. Identity made two
+    //     maps with identical contents unequal and gave them different hashes
+    //     — the JDK's map-in-a-set / map-as-a-key contract, inverted.
+    //  2. UNSTABLE HASH. `this.as_ptr() as i32` is a RAW HEAP ADDRESS, not the
+    //     VM's identity hash. Under a moving young collection the object
+    //     relocates and its `hashCode()` silently changes, so a map used as a
+    //     key is lost from its own bucket across a GC. `Object.hashCode`'s
+    //     native (`native_object_hash_code`) uses `ctx.identity_hash_code`,
+    //     which is stable across relocation — the two natives disagreed about
+    //     what "identity hash" even means.
+    //  3. IT WON OVER CORRECT BYTECODE. In a mixed run where the real
+    //     `java.util.AbstractMap` is loaded, its correct entry-wise bytecode
+    //     was shadowed by (1).
+    //
+    // Refusing is strictly better than reimplementing, in BOTH modes, which is
+    // why nothing replaces them:
+    //   * real `AbstractMap` bytecode present -> the walk finds no native on
+    //     `AbstractMap`, sees `has_bytecode`, and stops; the real entry-wise
+    //     implementation runs. Correct.
+    //   * bare synthetic `AbstractMap` stub (no bytecode) -> the walk continues
+    //     to `java/lang/Object` and lands on the `Object.equals`/
+    //     `Object.hashCode` natives, i.e. identity — the same answer the
+    //     deleted shims gave, minus the moving-GC instability of (2).
+    //
+    // Do not "restore" these without a receiver-driven entry walk; an identity
+    // answer on an abstract collection base class is never right.
     r.set_category(__prev_cat);
 }
 

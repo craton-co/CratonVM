@@ -9,7 +9,8 @@ package cratonvm;
  * loop) re-checks instead of corrupting the expected value; only a genuine
  * routing defect can make these non-zero.
  *
- * Three shapes, each of which was silently wrong before the 2026-07-28 fixes:
+ * Four shapes, each of which was silently wrong before the 2026-07-28 fixes
+ * (the first three) or the 2026-08-01 one (`loopStep`):
  *
  * <ul>
  *   <li>{@code plainStep} — the handler reads only parameters, so this shape
@@ -30,6 +31,17 @@ package cratonvm;
  *       handler, so the handler-blind liveness behind register allocation
  *       considered it dead across the whole try and let it share a register
  *       with `other`, which IS live there.</li>
+ *   <li>{@code loopStep} — the non-parameter local at risk is the LOOP's
+ *       iterator, which the handler itself never touches: it is read by the
+ *       loop head the handler falls through to. `run_jit_callee_handler` (the
+ *       sink that resumes a compiled CALLEE at its own handler) rebuilt the
+ *       frame from the incoming arguments alone and ignored the precise
+ *       reason-9 frame, so the iterator came back null and the next
+ *       `hasNext()` NPE'd. Spring Boot's
+ *       `BindConverter.convert(Object, TypeDescriptor, TypeDescriptor)` is the
+ *       real-world instance (27 of 43 `LiquibaseAutoConfigurationTests`
+ *       methods). `CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME=1` restores the
+ *       defect on the same binary.</li>
  * </ul>
  */
 public class JitPreciseHandlerFrame {
@@ -150,6 +162,114 @@ public class JitPreciseHandlerFrame {
                 continue;
             }
             if (got != (fail ? v * 3 + (v + 1) : v + 1)) {
+                bad++;
+            }
+        }
+        return bad;
+    }
+
+    // ---- loopStep: the iterator is the local at risk ----------------------
+
+    interface Step {
+        int apply(int i);
+    }
+
+    static final class Adder implements Step {
+        private final int add;
+
+        Adder(int add) {
+            this.add = add;
+        }
+
+        @Override
+        public int apply(int i) {
+            return i + this.add;
+        }
+    }
+
+    static final class Thrower implements Step {
+        @Override
+        public int apply(int i) {
+            throw new Boom("step");
+        }
+    }
+
+    // A plain `ArrayList`, populated by `add`. `Arrays.asList(...)` iterated
+    // zero elements under the synthetic JDK the in-process test VM boots with,
+    // which made every iteration mismatch for a reason that had nothing to do
+    // with the defect under test.
+    static final java.util.List<Step> STEPS = new java.util.ArrayList<Step>();
+
+    static {
+        STEPS.add(new Adder(1));
+        STEPS.add(new Thrower());
+        STEPS.add(new Adder(2));
+        STEPS.add(new Thrower());
+        STEPS.add(new Adder(4));
+    }
+
+    /**
+     * The `BindConverter.convert` shape. `sum` and the loop's `Iterator` are
+     * both non-parameter locals assigned BEFORE the protected range; the
+     * handler reads `sum` (so this method needs precise frames at all), and the
+     * ITERATOR is read only by the loop head the handler falls through to.
+     * Resuming on `this`-plus-parameters zeroes both.
+     */
+    static int loopStep(int i, boolean doubleIt) {
+        int sum = 0;
+        for (Step step : STEPS) {
+            try {
+                // ONLY an `invokeinterface` inside the protected range. An
+                // `instanceof` here (the first draft had one) is opcode 0xc1,
+                // which `precise_frame_publishing_opcode` does not admit, so
+                // the whole method was refused compilation and the test was a
+                // false pass in both A/B arms.
+                sum += step.apply(i);
+            } catch (Boom b) {
+                sum -= 1;
+            }
+        }
+        return doubleIt ? sum * 2 : sum;
+    }
+
+    /**
+     * A HOT caller, and the reason this shape reaches the sink under test at
+     * all. `run_jit_callee_handler` is only entered from
+     * `route_implicit_exc_through_callee`, i.e. when a COMPILED caller
+     * dispatched the throwing callee. `loopMismatches` itself runs its loop
+     * once and is OSR-denied, so calling `loopStep` directly from it leaves the
+     * exception on the ordinary interpreter drain and the test is a false pass
+     * (measured: 0 mismatches in both A/B arms). This wrapper is invoked 20,000
+     * times, compiles on the invocation counter, and puts a compiled frame
+     * between the two.
+     */
+    static int loopCall(int i, boolean doubleIt) {
+        int r = loopStep(i, doubleIt);
+        if (r == Integer.MIN_VALUE) {
+            // Never taken; keeps this from being a trivial forwarder the
+            // compiler can fold the callee into.
+            throw new Boom("unreachable");
+        }
+        return r;
+    }
+
+    public static int loopMismatches() {
+        int bad = 0;
+        for (int i = 0; i < 20000; i++) {
+            int v = i % 97;
+            boolean doubleIt = (i % 4) == 0;
+            int got;
+            try {
+                got = loopCall(v, doubleIt);
+            } catch (RuntimeException escaped) {
+                // Either loopStep's own catch did not run, or the resumed frame
+                // handed the loop a null iterator.
+                bad++;
+                continue;
+            }
+            // three adders (+1, +2, +4) and two throwers (-1 each)
+            int sum = (v + 1) + (v + 2) + (v + 4) - 2;
+            if (got != (doubleIt ? sum * 2 : sum)) {
                 bad++;
             }
         }

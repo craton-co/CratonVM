@@ -200,6 +200,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "bufunder", on_key: Some("CRATONVM_DBG_BUFUNDER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "bug03", on_key: Some("CRATONVM_DBG_BUG03"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "bytecode-dump", on_key: Some("CRATONVM_DBG_BYTECODE_DUMP"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "callee-probe", on_key: Some("CRATONVM_DBG_CALLEE_PROBE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "caller", on_key: Some("CRATONVM_DBG_CALLER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "capval", on_key: Some("CRATONVM_DBG_CAPVAL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "catalina", on_key: Some("CRATONVM_DBG_CATALINA"), off_key: None, off_word: None },
@@ -287,6 +288,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gcphase", on_key: Some("CRATONVM_DBG_GCPHASE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcwrite", on_key: Some("CRATONVM_DBG_GCWRITE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "getresources", on_key: Some("CRATONVM_DBG_GETRESOURCES"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "getstatic-prof", on_key: Some("CRATONVM_DBG_GETSTATIC_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gocbf", on_key: Some("CRATONVM_DBG_GOCBF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-trace-bytes", on_key: Some("CRATONVM_GPU_TRACE_BYTES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gse", on_key: Some("CRATONVM_DBG_GSE"), off_key: None, off_word: None },
@@ -299,6 +301,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "heapcopy", on_key: Some("CRATONVM_DBG_HEAPCOPY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "heartbeat", on_key: Some("CRATONVM_DBG_HEARTBEAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "hm-trace", on_key: Some("CRATONVM_HM_TRACE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "hminit-purge", on_key: Some("CRATONVM_DBG_HMINIT_PURGE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "hmput", on_key: Some("CRATONVM_DBG_HMPUT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "hotpath-counts", on_key: Some("CRATONVM_DBG_HOTPATH_COUNTS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "hs-itr-dbg", on_key: Some("CRATONVM_HS_ITR_DBG"), off_key: None, off_word: None },
@@ -320,6 +323,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "ir-bailout", on_key: Some("CRATONVM_DBG_IR_BAILOUT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-call", on_key: Some("CRATONVM_DBG_IR_CALL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-compiles", on_key: Some("CRATONVM_DBG_IR_COMPILES"), off_key: None, off_word: None },
+    // The trace half of `jit/ir-linear-scan`; same token name in the group that
+    // owns tracing, exactly like `ir-long` and `xt-jit-root-scan` below.
+    E { group: Group::DBG, token: "ir-linear-scan", on_key: Some("CRATONVM_DBG_IR_LINEAR_SCAN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-long", on_key: Some("CRATONVM_DBG_IR_LONG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-reloc", on_key: Some("CRATONVM_DBG_IR_RELOC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-slots", on_key: Some("CRATONVM_DBG_IR_SLOTS"), off_key: None, off_word: None },
@@ -330,7 +336,6 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jetty2", on_key: Some("CRATONVM_DBG_JETTY2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-alloc", on_key: Some("CRATONVM_DBG_JIT_ALLOC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-bisect-only", on_key: Some("CRATONVM_JIT_BISECT_ONLY"), off_key: None, off_word: None },
-    E { group: Group::DBG, token: "jit-bisect-skip", on_key: Some("CRATONVM_JIT_BISECT_SKIP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-code", on_key: Some("CRATONVM_DBG_JIT_CODE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-code-free", on_key: Some("CRATONVM_DBG_JIT_CODE_FREE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-compiled", on_key: Some("CRATONVM_DBG_JIT_COMPILED"), off_key: None, off_word: None },
@@ -367,6 +372,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "logprov", on_key: Some("CRATONVM_DBG_LOGPROV"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "longroot", on_key: Some("CRATONVM_DBG_LONGROOT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lookup", on_key: Some("CRATONVM_DBG_LOOKUP"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "map-miss-audit", on_key: Some("CRATONVM_DBG_MAP_MISS_AUDIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mapper", on_key: Some("CRATONVM_DBG_MAPPER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mcl", on_key: Some("CRATONVM_DBG_MCL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "memwatch", on_key: Some("CRATONVM_DBG_MEMWATCH"), off_key: None, off_word: None },
@@ -406,7 +412,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "nullthis", on_key: Some("CRATONVM_DBG_NULLTHIS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "obj-equals", on_key: Some("CRATONVM_DBG_OBJ_EQUALS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "objects", on_key: Some("CRATONVM_DBG_OBJECTS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "objkey", on_key: Some("CRATONVM_DBG_OBJKEY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "obsreg", on_key: Some("CRATONVM_DBG_OBSREG"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "oldsweep-owners", on_key: Some("CRATONVM_DBG_OLDSWEEP_OWNERS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "oobfield", on_key: Some("CRATONVM_DBG_OOBFIELD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "oom-bt", on_key: Some("CRATONVM_DBG_OOM_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "oop-span-probe", on_key: Some("CRATONVM_OOP_SPAN_PROBE"), off_key: None, off_word: None },
@@ -416,6 +424,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "osr-meta", on_key: Some("CRATONVM_DBG_OSR_META"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-all", on_key: Some("CRATONVM_DBG_OVERLAY_ALL"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "overlay-prune", on_key: Some("CRATONVM_DBG_OVERLAY_PRUNE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "parklat", on_key: Some("CRATONVM_DBG_PARKLAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pb", on_key: Some("CRATONVM_DBG_PB"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pbe", on_key: Some("CRATONVM_DBG_PBE"), off_key: None, off_word: None },
@@ -562,8 +571,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "youngstate", on_key: Some("CRATONVM_DBG_YOUNGSTATE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zero-ranges", on_key: Some("CRATONVM_DBG_ZERO_RANGES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "aaload-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_AALOAD_LICM"), off_word: None },
+    // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
+    // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
+    // so `=0` still enables it and `off_word` must stay `None`.
+    E { group: Group::JIT, token: "activation-global-mutex", on_key: Some("CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "alloc-class-cache", on_key: None, off_key: Some("CRATONVM_NO_JIT_ALLOC_CLASS_CACHE"), off_word: None },
-    E { group: Group::JIT, token: "allow-packages", on_key: Some("CRATONVM_JIT_ALLOW_PACKAGES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "arith-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_ARITH_LICM"), off_word: None },
     E { group: Group::JIT, token: "bce", on_key: None, off_key: Some("CRATONVM_JIT_NO_BCE"), off_word: None },
     E { group: Group::JIT, token: "bg-compile", on_key: Some("CRATONVM_BG_COMPILE"), off_key: None, off_word: None },
@@ -609,10 +621,23 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-deopt-resume", on_key: Some("CRATONVM_IR_DEOPT_RESUME"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-direct-call", on_key: Some("CRATONVM_JIT_IR_DIRECT_CALL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-fp", on_key: Some("CRATONVM_JIT_IR_FP"), off_key: None, off_word: None },
+    // Default-**OFF**, unlike its neighbour `ir-reloc-emit`. `ir_lower::
+    // linear_scan_enabled` answers `false` for `Err(_)`, so unsetting the key is
+    // already the off state and `off_word` stays `None`; writing `"0"` here
+    // would work too but would mislabel the row as a default-ON knob, which is
+    // the one thing this table is supposed to state unambiguously.
+    E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
     E { group: Group::JIT, token: "ir-reloc-emit", on_key: Some("CRATONVM_JIT_IR_RELOC_EMIT"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "ir-selfrec-direct", on_key: Some("CRATONVM_JIT_IR_SELFREC_DIRECT"), off_key: None, off_word: None },
+    // Default-ON, `"0"` turns it off — same polarity as `ir-reloc-emit`, and
+    // the row must spell it that way round. The consumer refuses to install a
+    // compilation stamped older than the last cache flush; setting this to `0`
+    // restores publish-anyway for bisection, which is an unsafe-on-purpose
+    // lever. Added a wave after the declaration sweep closed at zero
+    // offenders, which is exactly how the count creeps back up.
+    E { group: Group::JIT, token: "strict-install-epoch", on_key: Some("CRATONVM_JIT_STRICT_INSTALL_EPOCH"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "kernel-reg-locals", on_key: Some("CRATONVM_JIT_KERNEL_REG_LOCALS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "kernel-reg-osr", on_key: Some("CRATONVM_JIT_KERNEL_REG_OSR"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "leak-code", on_key: Some("CRATONVM_JIT_LEAK_CODE"), off_key: None, off_word: None },
@@ -628,6 +653,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "metrics", on_key: Some("CRATONVM_JIT_METRICS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "metrics-out", on_key: Some("CRATONVM_JIT_METRICS_OUT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "metrics-ring", on_key: Some("CRATONVM_JIT_METRICS_RING"), off_key: None, off_word: None },
+    // The two virtual-MIC levers in `vm::jit::helpers`. `mic-exc-table-publish`
+    // is default-OFF (an expired ban the next person may lift on evidence);
+    // `mic-rust-entry-cache` is default-ON with only an opt-out spelling.
+    E { group: Group::JIT, token: "mic-exc-table-publish", on_key: Some("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "mic-rust-entry-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE"), off_word: None },
     // The three moving-young ("my-") bisect levers. All default-ON, all read
     // `0`/`false` as off, and `my-shadow-emission` is read identically by
     // `jit::x64::licm` and `vm::jit::conservative_roots` — two halves of one
@@ -642,17 +672,30 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "never-free-code", on_key: Some("CRATONVM_JIT_NEVER_FREE_CODE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "old-sweep-jit", on_key: Some("CRATONVM_OLD_SWEEP_JIT"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "osr", on_key: Some("CRATONVM_JIT_OSR"), off_key: None, off_word: None },
+    // Default-ON: `jit::osr_dead_local_entry_allowed` answers `true` for
+    // `Err(_)` and reads `0`/`off`/`false`/`no` as the kill switch.
+    E { group: Group::JIT, token: "osr-dead-locals", on_key: Some("CRATONVM_JIT_OSR_DEAD_LOCALS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "poison-free", on_key: Some("CRATONVM_JIT_POISON_FREE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "precise-coverage-pin", on_key: Some("CRATONVM_PRECISE_COVERAGE_PIN"), off_key: None, off_word: None },
+    // Wrong-answer A/B lever, not a tuning knob: OFF restores the params-only
+    // `run_jit_callee_handler` resume that zeroed a compiled callee's
+    // non-parameter locals. See `params_only_callee_handler_frames`.
+    E { group: Group::JIT, token: "callee-handler-precise-frame", on_key: None, off_key: Some("CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME"), off_word: None },
     E { group: Group::JIT, token: "precise-handler-frames", on_key: None, off_key: Some("CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES"), off_word: None },
     E { group: Group::JIT, token: "precise-inline-frame-record", on_key: None, off_key: Some("CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD"), off_word: None },
     E { group: Group::JIT, token: "precise-jit-maps", on_key: None, off_key: Some("CRATONVM_NO_PRECISE_JIT_MAPS"), off_word: None },
     E { group: Group::JIT, token: "precise-reg-spill", on_key: None, off_key: Some("CRATONVM_NO_PRECISE_REG_SPILL"), off_word: None },
-    // Default-ON: `vm::jit::skip_list::allow_putfield_init` reads
-    // `0`/`off`/`false`/`no` (trimmed, lower-cased) as the kill switch.
-    E { group: Group::JIT, token: "putfield-init", on_key: Some("CRATONVM_JIT_PUTFIELD_INIT"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "precise-virtual-invokes", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES"), off_word: None },
+    // Guard-dominated bounds-check elimination (`x64::bce::range_bce_enabled`).
+    // Default-**OFF** and presence-parsed: the gate is `.is_some()`, so
+    // `CRATONVM_JIT_RANGE_BCE=0` *enables* it. `off_word` must therefore stay
+    // `None` — `Some("0")` would make `CRATONVM_JIT=-range-bce` write `"0"` and
+    // switch the pass **on**, and a wrong elision here is an out-of-bounds heap
+    // write. `-bce` (`CRATONVM_JIT_NO_BCE`) still kills every reason including
+    // this one.
+    E { group: Group::JIT, token: "range-bce", on_key: Some("CRATONVM_JIT_RANGE_BCE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "range-scan-legacy", on_key: Some("CRATONVM_JIT_RANGE_SCAN_LEGACY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "reassoc", on_key: Some("CRATONVM_JIT_REASSOC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "rootsnap-cache", on_key: Some("CRATONVM_ROOTSNAP_CACHE"), off_key: None, off_word: None },
@@ -668,12 +711,28 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "shadow-noreload", on_key: Some("CRATONVM_SHADOW_NORELOAD"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "shadow-pin", on_key: Some("CRATONVM_SHADOW_PIN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "shadow-raw-reload", on_key: Some("CRATONVM_SHADOW_RAW_RELOAD"), off_key: None, off_word: None },
+    // Default-ON overflow bound on the shadow-stack push both backends emit.
+    // `-shadow-end-guard` restores the pre-guard behaviour in which an
+    // overrunning push stores straight on through the allocator arena — an
+    // out-of-bounds write, so this is a bisection-only switch. It was read by a
+    // live `getenv` until this row existed, which is precisely how a stale
+    // export in a parent shell disarms a memory-safety bound with no way for
+    // the launcher, `-XX:`, or a test override to see it or say otherwise.
+    E { group: Group::JIT, token: "shadow-end-guard", on_key: None, off_key: Some("CRATONVM_SHADOW_NO_END_GUARD"), off_word: None },
+    E { group: Group::JIT, token: "shadow-overflow-diag", on_key: Some("CRATONVM_SHADOW_OVERFLOW_DIAG"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "shadow-savebase", on_key: None, off_key: Some("CRATONVM_SHADOW_NO_SAVEBASE"), off_word: None },
     E { group: Group::JIT, token: "shadow-stack", on_key: Some("CRATONVM_SHADOW_STACK"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "slot-mirror", on_key: None, off_key: Some("CRATONVM_JIT_NO_SLOT_MIRROR"), off_word: None },
     E { group: Group::JIT, token: "sp-coalesce", on_key: None, off_key: Some("CRATONVM_SP_NO_COALESCE"), off_word: None },
+    // Both default-ON and both parsed by an exact `Ok("0")` match — no other
+    // word turns them off, so `off_word` must be exactly `"0"`.
+    E { group: Group::JIT, token: "sp-inline-ic", on_key: Some("CRATONVM_JIT_SP_INLINE_IC"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "sp-tailcall", on_key: Some("CRATONVM_JIT_SP_TAILCALL"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "spec-bce", on_key: None, off_key: Some("CRATONVM_JIT_NO_SPEC_BCE"), off_word: None },
     E { group: Group::JIT, token: "stack-bang", on_key: Some("CRATONVM_JIT_STACK_BANG"), off_key: Some("CRATONVM_JIT_NO_STACK_BANG"), off_word: None },
+    // Interpreter-side like `trivial-getter`: the lock-free static-field read
+    // path in `vm::vm_object`, default-ON with an opt-out-only spelling.
+    E { group: Group::JIT, token: "statics-index", on_key: None, off_key: Some("CRATONVM_NO_STATICS_INDEX"), off_word: None },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
     // despite the prose on that function calling it an opt-in.
     E { group: Group::JIT, token: "strict-callee-roots", on_key: Some("CRATONVM_JIT_STRICT_CALLEE_ROOTS"), off_key: None, off_word: Some("0") },
@@ -692,6 +751,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "trivial-getter", on_key: Some("CRATONVM_TRIVIAL_GETTER"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "unban-junitcore", on_key: Some("CRATONVM_JIT_UNBAN_JUNITCORE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unroll", on_key: Some("CRATONVM_JIT_UNROLL"), off_key: Some("CRATONVM_DISABLE_UNROLL"), off_word: None },
+    // Vectorized emission (`x64::vec_emit::VecEmitPolicy::from_flags`).
+    // Default-**OFF**: unset answers `Disabled`, so unsetting the key is the off
+    // state and `off_word` stays `None`. The parser does also read
+    // `0`/`false`/`off`/`no`/empty as off, so `Some("0")` would behave
+    // identically — it is left out because `off_word` is how a reader tells a
+    // default-ON knob from a default-OFF one.
+    E { group: Group::JIT, token: "vectorize", on_key: Some("CRATONVM_JIT_VECTORIZE"), off_key: None, off_word: None },
     // IR verifier lanes. `verify-ir` is the only *tri-state* knob in the table:
     // unset means "follow the build profile" (on under `debug_assertions`), an
     // explicit `1` forces it on in a release build, and an explicit `0` is also
@@ -709,12 +775,22 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "virtual-tierup", on_key: Some("CRATONVM_JIT_VIRTUAL_TIERUP"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "xt-helper-window-scan", on_key: Some("CRATONVM_XT_HELPER_WINDOW_SCAN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "xt-jit-root-scan", on_key: Some("CRATONVM_XT_JIT_ROOT_SCAN"), off_key: None, off_word: None },
+    // Value token, milliseconds: `CRATONVM_JIT=xt-peer-deadline-ms=50`. Unset
+    // means the built-in 20 ms, and `0` is rejected by the parser's own filter,
+    // so there is no off state to spell.
+    E { group: Group::JIT, token: "xt-peer-deadline-ms", on_key: Some("CRATONVM_XT_PEER_DEADLINE_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "card-table-only", on_key: Some("CRATONVM_CARD_TABLE_ONLY"), off_key: None, off_word: None },
     E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "default-heap-ergonomics", on_key: Some("CRATONVM_DEFAULT_HEAP_ERGONOMICS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "default-heap-max-mb", on_key: Some("CRATONVM_DEFAULT_HEAP_MAX_MB"), off_key: None, off_word: None },
+    // Bisection escape hatches for two GC fixes, both opt-out-only. Enabling
+    // either *reinstates a known defect* (stale-address writes in post-GC
+    // reference processing; monotonic old-gen fragmentation) — they exist for
+    // A/B isolation, which is exactly why they belong inside the declared
+    // surface rather than behind a live `getenv` nobody can enumerate.
+    E { group: Group::GC, token: "exact-refproc-survival", on_key: None, off_key: Some("CRATONVM_NO_EXACT_REFPROC_SURVIVAL"), off_word: None },
     E { group: Group::GC, token: "g1-evac-retry", on_key: None, off_key: Some("CRATONVM_G1_NO_EVAC_RETRY"), off_word: None },
     E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-workers", on_key: Some("CRATONVM_G1_WORKERS"), off_key: None, off_word: None },
@@ -724,10 +800,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "gpu-critical-lease-ms", on_key: Some("CRATONVM_GPU_CRITICAL_LEASE_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "gpu-critical-wait-ms", on_key: Some("CRATONVM_GPU_CRITICAL_WAIT_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None },
+    // Measurement lever: root every heap-backed LinkedHashMap overlay entry
+    // again, restoring the unbounded young-gen pinning the skip-set removed.
+    E { group: Group::GC, token: "lhm-root-all", on_key: Some("CRATONVM_LHM_ROOT_ALL"), off_key: None, off_word: None },
     E { group: Group::GC, token: "max-inflated-bytes", on_key: Some("CRATONVM_MAX_INFLATED_BYTES"), off_key: None, off_word: None },
     E { group: Group::GC, token: "mirror-pin-young-defer", on_key: None, off_key: Some("CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER"), off_word: None },
     E { group: Group::GC, token: "moving-young", on_key: Some("CRATONVM_MOVING_YOUNG"), off_key: Some("CRATONVM_NO_MOVING_YOUNG"), off_word: None },
     E { group: Group::GC, token: "moving-young-jit-frames", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_JIT"), off_word: None },
+    E { group: Group::GC, token: "oldgen-coalesce", on_key: None, off_key: Some("CRATONVM_NO_OLDGEN_COALESCE"), off_word: None },
     E { group: Group::GC, token: "overhead-limit", on_key: Some("CRATONVM_GC_OVERHEAD_LIMIT"), off_key: None, off_word: None },
     E { group: Group::GC, token: "par-min-bytes", on_key: Some("CRATONVM_GC_PAR_MIN_BYTES"), off_key: None, off_word: None },
     E { group: Group::GC, token: "par-threads", on_key: Some("CRATONVM_GC_PAR_THREADS"), off_key: None, off_word: None },
@@ -812,6 +892,13 @@ pub const INVENTORY: &[E] = &[
     // under `debug_assertions`), any other value arms it, and `0`/`false`/`off`
     // stands it down even in a debug build.
     E { group: Group::THREADS, token: "stress-thread-states", on_key: Some("CRATONVM_STRESS_THREAD_STATES"), off_key: None, off_word: Some("0") },
+    // `types::striped_counter` — per-thread stripes instead of one shared
+    // counter, the sibling A/B of `jit/activation-global-mutex`. THREADS rather
+    // than GC or JIT because the knob is about contention, not about what the
+    // counters mean; its three users are in `jit`, `vm` and `gc`. Presence-
+    // parsed opt-out, so the token is stated positively and `-striped-counters`
+    // is what sets `CRATONVM_STRIPED_COUNTERS_OFF`.
+    E { group: Group::THREADS, token: "striped-counters", on_key: None, off_key: Some("CRATONVM_STRIPED_COUNTERS_OFF"), off_word: None },
     E { group: Group::THREADS, token: "thread-start-grace-ms", on_key: Some("CRATONVM_THREAD_START_GRACE_MS"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "aot-hmac-key", on_key: Some("CRATONVM_AOT_HMAC_KEY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "block-private-nets", on_key: Some("CRATONVM_BLOCK_PRIVATE_NETS"), off_key: None, off_word: None },
@@ -1715,6 +1802,231 @@ mod tests {
         // about the image and differs only about substitutions.
         assert!(!JDK_ONLY_CONFLICTS_WITH.contains(&"--real-jdk"));
         assert!(!JDK_ONLY_CONFLICTS_WITH.contains(&"--jdk-only"));
+    }
+
+    // ── The 2026-08-01 declaration audit ───────────────────────────────────
+    //
+    // Four JIT capabilities landed in this wave with their consumers committed
+    // and their declarations impossible, because this file was owned by another
+    // lane. The tests below pin what was verified at each consumer, not merely
+    // that a row exists — a row with the wrong polarity is worse than no row,
+    // since it reads as coverage while doing the opposite of what it says.
+
+    /// The four default-OFF JIT capability rows are switched off by **removing**
+    /// their key, never by writing a value into it.
+    ///
+    /// Two distinct reasons converge on the same requirement, and the assertion
+    /// messages keep them apart because only one of them is a correctness bug:
+    ///
+    /// * `range-bce` and `activation-global-mutex` are **presence-parsed**
+    ///   (`runtime_var_os(..).is_some()`). Writing `"0"` leaves `is_some()`
+    ///   answering `true`, so an `off_word` here makes `CRATONVM_JIT=-token`
+    ///   turn the feature **on**. For `range-bce` that is not cosmetic: the gate
+    ///   admits a new reason for *deleting* a bounds check, and a wrong elision
+    ///   is an out-of-bounds heap write — which would then be reachable from the
+    ///   documented surface by the very spelling that means "off".
+    /// * `vectorize` and `ir-linear-scan` do read `"0"` as false, so either
+    ///   spelling would work. `off_word` stays `None` because it is the field a
+    ///   reader uses to tell a default-ON knob from a default-OFF one; see
+    ///   `every_entry_can_be_switched_both_ways`.
+    #[test]
+    fn default_off_capabilities_are_switched_off_by_unsetting_them() {
+        // (token, the consumer tests presence only)
+        let rows = [
+            ("range-bce", true),
+            ("activation-global-mutex", true),
+            ("vectorize", false),
+            ("ir-linear-scan", false),
+        ];
+        for (token, presence_parsed) in rows {
+            let e = lookup(Group::JIT, token)
+                .unwrap_or_else(|| panic!("CRATONVM_JIT={token} is not declared"));
+            let key = e
+                .on_key
+                .unwrap_or_else(|| panic!("{token} has no positive key"));
+            assert!(e.off_key.is_none(), "{token} grew an opt-out spelling");
+            if presence_parsed {
+                assert!(
+                    e.off_word.is_none(),
+                    "{token} carries off_word {:?}, but its consumer only tests \
+                     the key's *presence* — that value would switch the knob ON",
+                    e.off_word
+                );
+            } else {
+                assert!(
+                    e.off_word.is_none(),
+                    "{token} is default-OFF; off_word is how a reader spots a \
+                     default-ON knob, so it must stay None even though {:?} \
+                     would behave the same",
+                    e.off_word
+                );
+            }
+
+            // Off, even against a stale export from a parent shell.
+            let spec = format!("-{token}");
+            let c = case(&[("CRATONVM_JIT", spec.as_str()), (key, "1")]);
+            assert_eq!(
+                c.resolve().get(key),
+                None,
+                "CRATONVM_JIT=-{token} must clear {key}, not give it a value"
+            );
+
+            // On.
+            let c = case(&[("CRATONVM_JIT", token)]);
+            assert_eq!(c.resolve().get(key), Some(OsString::from("1")));
+        }
+    }
+
+    /// The whole bounds-check-elimination family, in one place.
+    ///
+    /// `range-bce` arrived alongside three existing switches and the question
+    /// asked was whether *any* of them were declared. Three already were; a gap
+    /// in this family is how a bisection ends up unable to express the state it
+    /// needs, so the set is asserted rather than assumed.
+    #[test]
+    fn the_bounds_check_family_is_declared_in_full() {
+        let family = [
+            ("bce", "CRATONVM_JIT_NO_BCE", false),
+            ("spec-bce", "CRATONVM_JIT_NO_SPEC_BCE", false),
+            ("inclusive-bce", "CRATONVM_JIT_INCLUSIVE_BCE", true),
+            ("range-bce", "CRATONVM_JIT_RANGE_BCE", true),
+        ];
+        for (token, key, opt_in) in family {
+            let e = lookup(Group::JIT, token).unwrap_or_else(|| panic!("{token} is undeclared"));
+            if opt_in {
+                assert_eq!(e.on_key, Some(key), "{token} should enable via {key}");
+            } else {
+                assert_eq!(e.off_key, Some(key), "{token} should disable via {key}");
+            }
+        }
+        // `-bce` still kills every reason including the new one, which is what
+        // lets `range-bce` stay a narrow opt-in without losing the wide switch.
+        let c = case(&[("CRATONVM_JIT", "-bce,range-bce")]);
+        let r = c.resolve();
+        assert_eq!(r.get("CRATONVM_JIT_NO_BCE"), Some(OsString::from("1")));
+        assert_eq!(r.get("CRATONVM_JIT_RANGE_BCE"), Some(OsString::from("1")));
+    }
+
+    /// Two knobs that were asked for and are deliberately **not** here.
+    ///
+    /// `CRATONVM_TIER_BROKER`: `jit/src/tiered.rs` reads no such key — the
+    /// broker is additive and still unwired, and the row exists only as a
+    /// proposal in `docs/jit/compilation-broker.md`.
+    /// `CRATONVM_JIT_BYTECODE_UNROLL`: the loop rewriter is armed by a
+    /// thread-local (`x64::set_bytecode_loop_rewriter_armed`) and reads no
+    /// environment at all.
+    ///
+    /// A declared flag with no read site is worse than an absent one: it reads
+    /// as coverage, `CRATONVM_JIT=<token>` reports no unknown token, and
+    /// `docs/CONFIG.md` gains a knob that does nothing. That is exactly the
+    /// defect `the_documented_no_ops_now_work` above exists to have fixed once.
+    ///
+    /// The two names are spelled with `concat!` on purpose. Written whole they
+    /// would be exact `"CRATONVM_…"` literals in a scanned source file, and
+    /// both `types/tests/flag_declaration_guard.rs` and
+    /// `tools/flag-census/check-surface.sh` would report them as undeclared
+    /// read sites — which is the correct behaviour for a *read* site and the
+    /// wrong answer for an assertion that the name does not exist. Splitting
+    /// before the underscore is enough: both scanners key on `"CRATONVM_`.
+    #[test]
+    fn knobs_without_a_consumer_are_not_declared() {
+        for key in [
+            concat!("CRATONVM", "_TIER_BROKER"),
+            concat!("CRATONVM", "_JIT_BYTECODE_UNROLL"),
+        ] {
+            assert!(
+                canonical_spelling(key).is_none(),
+                "{key} is declared, but nothing reads it. Delete the row, or \
+                 land the consumer in the same commit."
+            );
+        }
+        for token in ["compilation-broker", "bytecode-unroll"] {
+            assert!(lookup(Group::JIT, token).is_none(), "{token} is declared");
+        }
+        // And the tokens that *do* exist are reported as unknown, so a runbook
+        // exporting one is told rather than silently ignored.
+        let c = case(&[("CRATONVM_JIT", "compilation-broker")]);
+        assert_eq!(
+            c.resolve().unknown_tokens,
+            vec!["CRATONVM_JIT=compilation-broker"]
+        );
+    }
+
+    /// The rest of the audit: knobs that were read by a live `getenv` because
+    /// no row named them. Polarity is asserted per row, since these were
+    /// classified by reading each consumer.
+    #[test]
+    fn the_previously_undeclared_knobs_expand_the_way_their_consumers_parse() {
+        // Default-ON, killed only by an exact `"0"`.
+        for (group, token, key) in [
+            (Group::JIT, "sp-inline-ic", "CRATONVM_JIT_SP_INLINE_IC"),
+            (Group::JIT, "sp-tailcall", "CRATONVM_JIT_SP_TAILCALL"),
+            (Group::JIT, "osr-dead-locals", "CRATONVM_JIT_OSR_DEAD_LOCALS"),
+        ] {
+            let e = lookup(group, token).unwrap_or_else(|| panic!("{token} is undeclared"));
+            assert_eq!(e.on_key, Some(key));
+            assert_eq!(e.off_word, Some("0"), "{token} needs a falsey word");
+            let spec = format!("-{token}");
+            let c = case(&[(group.var(), spec.as_str())]);
+            assert_eq!(c.resolve().get(key), Some(OsString::from("0")));
+        }
+
+        // Default-ON with a dedicated opt-out name: `-token` sets it.
+        for (group, token, off_key) in [
+            (Group::JIT, "shadow-end-guard", "CRATONVM_SHADOW_NO_END_GUARD"),
+            (Group::JIT, "statics-index", "CRATONVM_NO_STATICS_INDEX"),
+            (
+                Group::JIT,
+                "mic-rust-entry-cache",
+                "CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE",
+            ),
+            (
+                Group::JIT,
+                "precise-virtual-invokes",
+                "CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES",
+            ),
+            (
+                Group::GC,
+                "exact-refproc-survival",
+                "CRATONVM_NO_EXACT_REFPROC_SURVIVAL",
+            ),
+            (Group::GC, "oldgen-coalesce", "CRATONVM_NO_OLDGEN_COALESCE"),
+            (
+                Group::THREADS,
+                "striped-counters",
+                "CRATONVM_STRIPED_COUNTERS_OFF",
+            ),
+        ] {
+            let e = lookup(group, token).unwrap_or_else(|| panic!("{token} is undeclared"));
+            assert_eq!(e.off_key, Some(off_key));
+            assert!(e.on_key.is_none(), "{token} gained an unread positive key");
+            let spec = format!("-{token}");
+            let c = case(&[(group.var(), spec.as_str())]);
+            assert_eq!(c.resolve().get(off_key), Some(OsString::from("1")));
+            // ...and the positive token clears a stale export.
+            let c = case(&[(group.var(), token), (off_key, "1")]);
+            assert_eq!(c.resolve().get(off_key), None);
+        }
+    }
+
+    /// `ir-linear-scan` is one token name in two groups — the capability in
+    /// `JIT`, its trace in `DBG` — like `ir-long` and `xt-jit-root-scan` before
+    /// it. They must stay two distinct keys, or `CRATONVM_DBG=all` would arm a
+    /// register allocator.
+    #[test]
+    fn a_token_shared_between_groups_stays_two_keys() {
+        for token in ["ir-linear-scan", "ir-long", "xt-jit-root-scan"] {
+            let jit = lookup(Group::JIT, token).unwrap_or_else(|| panic!("JIT/{token}"));
+            let dbg = lookup(Group::DBG, token).unwrap_or_else(|| panic!("DBG/{token}"));
+            assert_ne!(jit.on_key, dbg.on_key, "{token} collapsed into one key");
+        }
+        let c = case(&[("CRATONVM_DBG", "all")]);
+        let r = c.resolve();
+        assert_eq!(
+            r.get("CRATONVM_DBG_IR_LINEAR_SCAN"),
+            Some(OsString::from("1"))
+        );
+        assert_eq!(r.get("CRATONVM_JIT_IR_LINEAR_SCAN"), None);
     }
 
     #[test]

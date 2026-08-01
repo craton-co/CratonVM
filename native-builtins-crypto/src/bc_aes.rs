@@ -223,6 +223,28 @@ pub fn try_decrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) -> Crypto
     Ok(())
 }
 
+/// The guard applied by the **infallible** pair, which cannot return a failure.
+///
+/// A `-> ()` block cipher has no safe way to decline: writing zeros, or leaving
+/// the output buffer at whatever it held, both hand the caller sixteen bytes it
+/// will treat as ciphertext (or plaintext). Only an abort is a refusal.
+///
+/// This is not a new failure — a malformed schedule already aborted, via an
+/// `kw.len() - 1` underflow or an out-of-bounds `kw[rounds]` index. What
+/// changes is that the abort now happens **before** any table lookup, is
+/// deterministic rather than dependent on which index happens to run off the
+/// end first, and names the defect. All six in-tree call sites validate the
+/// schedule first, but only with a `kw.len() >= 2` *lower bound*
+/// (`native-builtins/src/phases_late/bouncycastle.rs:6081`, `:6199`, `:6565`,
+/// `:7578`, `:8886`, `:9091`), which still admits a 2- or 4-entry schedule that
+/// the round structure indexes past the end of.
+#[inline]
+fn demand_block_args(kw: &[[u32; 4]], inb: &[u8], outb: &[u8], kernel: &str) {
+    if let Err(e) = check_block_args(kw, inb, outb) {
+        panic!("{kernel}: {e}");
+    }
+}
+
 /// Port of `AESEngine.encryptBlock`. `kw` is the expanded key schedule
 /// (`KW[round][col]`); `inb`/`outb` are 16-byte blocks. `ROUNDS == kw.len()-1`.
 ///
@@ -234,8 +256,11 @@ pub fn try_decrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) -> Crypto
 /// same conditions as a failure the facade can throw. The signature is kept
 /// as-is for the existing `native-builtins` registrations, all of which
 /// validate the schedule first (though only with a `>= 2` lower bound — see
-/// [`check_block_args`]).
+/// [`check_block_args`]). The abort is now raised explicitly and up front by
+/// [`demand_block_args`], rather than emerging from whichever index runs off
+/// the end first.
 pub fn encrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
+    demand_block_args(kw, inb, outb, "AESEngine.encryptBlock");
     let rounds = kw.len() - 1;
     let c0 = le_to_u32(inb, 0);
     let c1 = le_to_u32(inb, 4);
@@ -307,6 +332,7 @@ pub fn encrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
 ///
 /// Same conditions as [`encrypt_block`]; prefer [`try_decrypt_block`].
 pub fn decrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
+    demand_block_args(kw, inb, outb, "AESEngine.decryptBlock");
     let rounds = kw.len() - 1;
     let c0 = le_to_u32(inb, 0);
     let c1 = le_to_u32(inb, 4);
@@ -720,6 +746,34 @@ mod tests {
         let mut out15 = [0u8; 15];
         let err = try_encrypt_block(&kw, &[0u8; 16], &mut out15).expect_err("short output");
         assert_eq!(err.java_class(), "java/lang/IllegalArgumentException");
+    }
+
+    /// The infallible pair cannot report a refusal, so it aborts — but it now
+    /// aborts *deterministically and by name*, before any table lookup, rather
+    /// than through whichever index happens to run off the end of `kw` first.
+    /// A 2-entry schedule is the interesting case: it passes the `kw.len() >= 2`
+    /// lower bound every in-tree caller uses, and the round structure then
+    /// reads `kw[rounds]` past the end.
+    #[test]
+    #[should_panic(expected = "AES engine not initialised")]
+    fn infallible_encrypt_block_aborts_on_a_two_entry_schedule() {
+        let mut outb = [0u8; 16];
+        encrypt_block(&vec![[0u32; 4]; 2], &[0u8; 16], &mut outb);
+    }
+
+    #[test]
+    #[should_panic(expected = "AES engine not initialised")]
+    fn infallible_decrypt_block_aborts_on_an_empty_schedule() {
+        let mut outb = [0u8; 16];
+        decrypt_block(&[], &[0u8; 16], &mut outb);
+    }
+
+    #[test]
+    #[should_panic(expected = "AES block must be 16 bytes")]
+    fn infallible_encrypt_block_aborts_on_a_short_block() {
+        let kw = generate_working_key(&[0u8; 16], true).unwrap();
+        let mut outb = [0u8; 16];
+        encrypt_block(&kw, &[0u8; 15], &mut outb);
     }
 
     /// The fail-loud wrappers must be byte-identical to the infallible pair on

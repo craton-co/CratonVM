@@ -8,6 +8,9 @@
 
 pub mod capability;
 pub mod charset;
+/// Class-identity answers a native can act on: the ambiguous-vs-absent
+/// distinction, and the refusal a by-name lookup is allowed to return.
+pub mod class_identity;
 pub mod fd_table;
 pub mod ffi;
 pub mod init_level;
@@ -39,6 +42,7 @@ pub use capability::{
     CapabilityAuditReport, CapabilityCheck, CapabilityDenied, CapabilityKind, CapabilityMode,
     CapabilitySet, CapabilityUse, PortSpec, Scope, VmId,
 };
+pub use class_identity::{ClassIdentityError, NameLookup};
 pub use intrinsic::InterpIntrinsic;
 /// Native-dispatch call-site memoization: resolve once, then index.
 ///
@@ -50,6 +54,7 @@ pub use native_id::{NativeCallSite, NativeMethodId, NativeMethodKey};
 pub use registry::{
     dispatch_baos_event, install_baos_event_hook, AnnotationData, AnnotationElementValue,
     BaosEvent, BaosEventHook, DefineClassFull, FieldMetadata, LambdaSerialMetadata, MethodMetadata,
+    LambdaSerializability,
     NativeCallback, NativeCensusEntry, NativeClassAccess, NativeContext, NativeExceptionAccess,
     NativeGpuAccess, NativeHandle, NativeHandleScope, NativeHeapAccess, NativeInvokeAccess,
     NativeKind, NativeMethodRegistry, NativeSystemAccess, NativeThreadAccess, NativeThreadBlocker,

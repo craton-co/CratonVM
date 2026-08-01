@@ -36,7 +36,13 @@
 //! Producers must never spell the second case as the first. See
 //! `docs/jit/deopt-metadata.md` for the producer-by-producer status.
 
-use std::{fmt, mem};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fmt,
+    hash::{Hash, Hasher},
+    mem,
+    sync::Arc,
+};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -376,11 +382,58 @@ pub struct VirtualObjectState {
 /// it can never resume from fails on its first compiled call with
 /// `InternalError: precise deoptimization unavailable ... refusing
 /// side-effecting replay`, which is strictly worse than staying interpreted.
+///
+/// ## The whole chain, not just the innermost scope
+///
+/// The scan follows `caller`. It has to: a deopt inside an inlined callee
+/// rebuilds *every* frame in the chain, so a caller scope holding a value no
+/// one can describe is exactly as unresumable as the trapping scope holding
+/// one — and it is the caller's locals that a resume would silently fill with
+/// `Value::Int(0)`.
+///
+/// It used to stop at the innermost scope, which was correct only because no
+/// producer built a chain. The callers are the two **compile-time** admission
+/// gates — `jit/src/x64.rs`'s unresumable-`invokedynamic`-trap bail and
+/// `CompiledMethod::osr_exit_policy` — and both are deciding "may this artifact
+/// ever be entered". An artifact whose only trap sits under an undescribable
+/// caller scope must fail that question, not pass it because the innermost
+/// frame happens to be clean.
+///
+/// (The VM's *resume* sinks are a separate, stricter gate: they refuse any
+/// `ReconstructedFrame` with a non-empty `caller_frames` outright —
+/// `vm/src/runtime/interpreter.rs:13393`, `:13616`, `:13959` — so an inlined
+/// chain currently never resumes at all. This predicate is what decides
+/// whether such a chain gets compiled in the first place.)
+///
+/// Behaviour-preserving today: every producer sets `caller: None`, and a
+/// one-scope chain is exactly the old predicate. The interned counterparts are
+/// [`FrameStateInterner::is_resumable`] (deliberately scope-local — it answers
+/// "is *this* scope clean") and [`FrameStateInterner::chain_is_resumable`],
+/// which is the handle-side equivalent of this function.
+///
+/// The walk is bounded by [`MAX_SCOPE_CHAIN`]: a chain longer than that is
+/// treated as unresumable rather than walked further, because a chain that deep
+/// is a metadata defect and refusing costs only a whole-method re-run.
 pub fn frame_state_is_resumable(fs: &FrameState) -> bool {
-    !fs.locals
-        .iter()
-        .chain(fs.stack.iter())
-        .any(value_blocks_resume)
+    let mut scope = Some(fs);
+    let mut seen = 0usize;
+    while let Some(f) = scope {
+        if f.locals
+            .iter()
+            .chain(f.stack.iter())
+            .any(value_blocks_resume)
+        {
+            return false;
+        }
+        seen += 1;
+        if seen >= MAX_SCOPE_CHAIN {
+            // Deeper than any real inliner produces: refuse rather than keep
+            // walking a chain that is already known to be malformed.
+            return f.caller.is_none();
+        }
+        scope = f.caller.as_deref();
+    }
+    true
 }
 
 /// `true` when `v` cannot be turned into an interpreter value: either it is
@@ -641,6 +694,22 @@ pub struct DeoptimizationPoint {
     pub speculation_id: u32,
     /// How to reconstruct the interpreter frame.
     pub frame_state: FrameState,
+    /// What the interpreter must do with the bytecode at `frame_state.bci`:
+    /// re-execute it, continue after it, or route a pending exception through
+    /// the method's exception table.
+    ///
+    /// This used to be a **prose convention** derived from `reason` by each
+    /// consumer independently — `docs/jit/deopt-metadata.md` records the
+    /// missing field as an outright gap, and "a consumer that gets the
+    /// convention wrong executes the instruction after a call that never
+    /// returned". Every producer stamps [`ResumeSemantics::for_reason`], which
+    /// *is* that convention, so recording it changes no behaviour; what changes
+    /// is that a producer which knows better — an inlined caller scope
+    /// ([`ResumeSemantics::for_caller_scope`]), a resume point after a call
+    /// that did return — can now say so, and that
+    /// [`FrameStateInterner::materialize_point`] can round-trip it instead of
+    /// dropping it.
+    pub semantics: ResumeSemantics,
 }
 
 // ---------------------------------------------------------------------------
@@ -1649,6 +1718,514 @@ pub fn restash_last_deopt(frame: ReconstructedFrame) {
     LAST_DEOPT.with(|c| *c.borrow_mut() = Some(frame));
 }
 
+// ---------------------------------------------------------------------------
+// GC visibility of the two stashes — see `docs/jit/deopt-thread-local-roots.md`
+// ---------------------------------------------------------------------------
+//
+// [`LAST_DEOPT`] and [`LAST_EXCEPTIONAL`] hold [`ReconstructedFrame`]s whose
+// slots carry **raw Java heap addresses**: [`FrameValue::Object`], produced at
+// trap time by `resolve_value` from a `StackSlotRef` / `RegisterRef`. The read
+// itself is current ("no GC has run since the guard captured it"), but nothing
+// keeps it current afterwards.
+//
+// A collection CAN run inside the window, on this very thread. The shortest
+// named one: a compiled method's post-invoke check
+// (`jit/src/x64.rs::emit_post_invoke_exception_check`) routes **every**
+// `i64::MIN` return at a protected bci into the reason-9 deopt stub, which
+// publishes a `PendingException` frame here. The pending signal at that moment
+// may be a bare NPE / AIOOBE / arithmetic flag rather than a throwable, and the
+// VM sink then *allocates* the throwable — `throw_runtime_error` /
+// `create_exception_object` in `vm/src/runtime/interpreter/invoke.rs` — BEFORE
+// `route_jit_signal_exception` drains this stash and reads its locals. An
+// allocation is a safepoint: threads stop "at their next safepoint (allocation
+// site or backward branch)" (`vm/src/threading/gc_barrier.rs`). The same three
+// arms sit *between* a stashed `LAST_DEOPT` frame and the `result == i64::MIN`
+// drain, and they early-return without draining it at all.
+//
+// `jit/` cannot depend on `vm/`, so the storage cannot move onto `JvmThread` the
+// way `jit_pending_exception` did. These two visitors are the alternative: they
+// let the VM reach the stashes **from the owning thread**, which is the only
+// place a thread-local is reachable at all — and is exactly where this VM
+// already enumerates and rewrites per-thread roots
+// (`memory/roots.rs::collect_roots`, `memory/gc.rs::update_all_roots`,
+// `NativeContext::deposit_root_snapshot` / `check_post_block_gc`; all four run
+// on the thread that owns the state, never on a peer's behalf).
+//
+// **Both halves must be wired, in the same change.** A remap without a scan
+// faithfully rewrites a reference to a reclaimed slot, which is worse than
+// either failure alone. The debug assertion in [`remap_stashed_deopt_objects`]
+// exists to catch exactly that half-wiring.
+
+thread_local! {
+    /// How many times this thread has offered its stashed frames to a root
+    /// scan via [`for_each_stashed_deopt_object`]. Debug-only wiring check —
+    /// see [`remap_stashed_deopt_objects`].
+    static STASH_ROOT_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Visit every raw heap address in `values`, descending into scalar-replaced
+/// object recipes.
+///
+/// A `VirtualObject`'s `field_values` are resolved to concrete values by
+/// `resolve_value` at trap time (see its `FrameValue::VirtualObject` arm), so a
+/// field can be an `Object` address exactly like a local or stack slot; missing
+/// them would leave a scalar-replaced object's referents unrooted. A
+/// `VirtualObjectRef` is an intra-frame id edge, not an address, and is also the
+/// cycle terminator — not following it is what bounds this walk.
+///
+/// Address `0` is `null` and is never offered: callers are entitled to treat
+/// every value they receive as a live heap reference.
+fn visit_object_addrs(values: &[FrameValue], f: &mut dyn FnMut(u64)) {
+    for v in values {
+        match v {
+            FrameValue::Object(addr) if *addr != 0 => f(*addr),
+            FrameValue::VirtualObject(state) => visit_object_addrs(&state.field_values, f),
+            _ => {}
+        }
+    }
+}
+
+/// Mutable twin of [`visit_object_addrs`]: `f` returns the object's new address
+/// when the collection moved it, `None` to leave the slot alone.
+fn visit_object_addrs_mut(values: &mut [FrameValue], f: &mut dyn FnMut(u64) -> Option<u64>) {
+    for v in values {
+        match v {
+            FrameValue::Object(addr) if *addr != 0 => {
+                if let Some(moved) = f(*addr) {
+                    *addr = moved;
+                }
+            }
+            FrameValue::VirtualObject(state) => visit_object_addrs_mut(&mut state.field_values, f),
+            _ => {}
+        }
+    }
+}
+
+impl ReconstructedFrame {
+    /// Offer every raw heap address this frame holds to `f`, for a root scan.
+    ///
+    /// Covers all four containers that can hold one — `locals`, `stack`,
+    /// `monitors[].object` and the inlined `caller_frames` chain — plus the
+    /// field recipes of any scalar-replaced object nested in them. A slot family
+    /// missed here is an unrooted reference, i.e. a use-after-free that surfaces
+    /// days later somewhere else.
+    pub fn for_each_object_address(&self, f: &mut dyn FnMut(u64)) {
+        visit_object_addrs(&self.locals, f);
+        visit_object_addrs(&self.stack, f);
+        for m in &self.monitors {
+            visit_object_addrs(std::slice::from_ref(&m.object), f);
+        }
+        for c in &self.caller_frames {
+            c.for_each_object_address(f);
+        }
+    }
+
+    /// Rewrite every raw heap address this frame holds through `f` (the GC
+    /// pointer map). Same coverage as [`Self::for_each_object_address`] — the
+    /// two must always agree, or a scanned slot goes un-remapped.
+    pub fn for_each_object_address_mut(&mut self, f: &mut dyn FnMut(u64) -> Option<u64>) {
+        visit_object_addrs_mut(&mut self.locals, f);
+        visit_object_addrs_mut(&mut self.stack, f);
+        for m in &mut self.monitors {
+            visit_object_addrs_mut(std::slice::from_mut(&mut m.object), f);
+        }
+        for c in &mut self.caller_frames {
+            c.for_each_object_address_mut(f);
+        }
+    }
+}
+
+/// Run `visit` against both stashes, tolerating a thread whose TLS is already
+/// being torn down (such a thread cannot be mid-window).
+fn with_both_stashes(mut visit: impl FnMut(&std::cell::RefCell<Option<ReconstructedFrame>>)) {
+    let _ = LAST_DEOPT.try_with(&mut visit);
+    let _ = LAST_EXCEPTIONAL.try_with(&mut visit);
+}
+
+/// **Scan half.** Offer every raw heap address currently stashed in
+/// [`LAST_DEOPT`] and [`LAST_EXCEPTIONAL`] to `f`, so the collector keeps those
+/// objects alive.
+///
+/// Must be called from the thread that owns the stashes — a thread-local is
+/// unreachable from anywhere else. In this VM that is not a restriction: root
+/// enumeration is already per-thread and on-thread
+/// (`memory/roots.rs::collect_roots(shared, thread)` for the collecting thread,
+/// `NativeContext::deposit_root_snapshot` for a thread about to park).
+///
+/// Null (`0`) slots are skipped; every address handed to `f` is a live heap
+/// reference.
+pub fn for_each_stashed_deopt_object(mut f: impl FnMut(u64)) {
+    let f: &mut dyn FnMut(u64) = &mut f;
+    with_both_stashes(|cell| match cell.try_borrow() {
+        Ok(slot) => {
+            if let Some(frame) = slot.as_ref() {
+                frame.for_each_object_address(&mut *f);
+            }
+        }
+        Err(_) => debug_assert!(
+            false,
+            "deopt stash borrowed during a root scan: a stash accessor re-entered \
+             the collector (see docs/jit/deopt-thread-local-roots.md)"
+        ),
+    });
+    let _ = STASH_ROOT_SCANS.try_with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// **Remap half.** Rewrite every raw heap address stashed in [`LAST_DEOPT`] and
+/// [`LAST_EXCEPTIONAL`] through the collection's pointer map: `f` returns the
+/// new address for an object that moved, `None` for one that did not.
+///
+/// Same thread rule as [`for_each_stashed_deopt_object`], and the same pairing
+/// rule: this is only sound when that scan ran for the same collection. Without
+/// it the rewrite is applied to a reference the collector was free to reclaim —
+/// a faithfully-updated pointer to a dead slot, which is worse than either
+/// failure alone. Debug builds assert on that half-wiring rather than let it
+/// ship quietly.
+pub fn remap_stashed_deopt_objects(mut f: impl FnMut(u64) -> Option<u64>) {
+    debug_assert!(
+        STASH_ROOT_SCANS.try_with(|c| c.get()).unwrap_or(0) > 0
+            || stashed_deopt_object_count() == 0,
+        "remap_stashed_deopt_objects ran on a thread that never offered its deopt \
+         stashes to a root scan — the fix is half-wired; see \
+         docs/jit/deopt-thread-local-roots.md"
+    );
+    let f: &mut dyn FnMut(u64) -> Option<u64> = &mut f;
+    with_both_stashes(|cell| match cell.try_borrow_mut() {
+        Ok(mut slot) => {
+            if let Some(frame) = slot.as_mut() {
+                frame.for_each_object_address_mut(&mut *f);
+            }
+        }
+        Err(_) => debug_assert!(
+            false,
+            "deopt stash borrowed during a GC remap: a stash accessor re-entered \
+             the collector (see docs/jit/deopt-thread-local-roots.md)"
+        ),
+    });
+}
+
+/// How many live heap references the two stashes currently hold on this thread.
+///
+/// Diagnostic / wiring check only — it is NOT a root provider. Does not count
+/// as a scan.
+pub fn stashed_deopt_object_count() -> usize {
+    let mut n = 0usize;
+    with_both_stashes(|cell| {
+        if let Ok(slot) = cell.try_borrow() {
+            if let Some(frame) = slot.as_ref() {
+                frame.for_each_object_address(&mut |_addr: u64| n += 1);
+            }
+        }
+    });
+    n
+}
+
+#[cfg(test)]
+mod deopt_stash_root_tests {
+    use super::*;
+
+    /// Both stashes empty, whatever a previous test on this thread did.
+    fn clear_stashes() {
+        let _ = take_last_deopt();
+        let _ = take_exceptional_frame();
+    }
+
+    fn scanned_addresses() -> Vec<u64> {
+        let mut out = Vec::new();
+        for_each_stashed_deopt_object(|a| out.push(a));
+        out.sort_unstable();
+        out
+    }
+
+    /// A frame that puts a distinct object address in EVERY container that can
+    /// hold one, so a walk that forgets a family fails loudly rather than
+    /// silently under-rooting:
+    ///
+    /// * `locals`                                    → `0x1000`
+    /// * `stack`                                     → `0x2000`
+    /// * `monitors[].object`                         → `0x3000`
+    /// * a scalar-replaced object's `field_values`   → `0x4000`
+    /// * the inlined `caller_frames` chain (locals)  → `0x5000`
+    /// * a nested virtual object inside that field   → `0x6000`
+    ///
+    /// Interleaved with non-reference slots of every width, and with a null
+    /// (`Object(0)`) slot, both of which must be left strictly alone.
+    fn frame_with_one_object_per_container(base: u64) -> ReconstructedFrame {
+        let nested = FrameValue::VirtualObject(VirtualObjectState {
+            id: 2,
+            class_id: 9,
+            num_fields: 1,
+            field_values: vec![FrameValue::Object(base + 0x6000)],
+        });
+        ReconstructedFrame {
+            method_key: "craton/probe/Stash.m:()V".to_string(),
+            bci: 4,
+            locals: vec![
+                FrameValue::Object(base + 0x1000),
+                FrameValue::Int(-7),
+                FrameValue::Object(0),                  // null — never a root
+                FrameValue::Long(base as i64 + 0x1000), // an int-typed lookalike
+                FrameValue::Undefined,
+            ],
+            stack: vec![
+                FrameValue::Double(0x4059_0000_0000_0000),
+                FrameValue::Object(base + 0x2000),
+                FrameValue::VirtualObject(VirtualObjectState {
+                    id: 1,
+                    class_id: 8,
+                    num_fields: 2,
+                    field_values: vec![FrameValue::Object(base + 0x4000), nested],
+                }),
+                FrameValue::VirtualObjectRef(1),
+            ],
+            monitors: vec![MonitorInfo {
+                object: FrameValue::Object(base + 0x3000),
+                lock_depth: 1,
+            }],
+            caller_frames: vec![ReconstructedFrame {
+                method_key: "craton/probe/Stash.caller:()V".to_string(),
+                bci: 0,
+                locals: vec![FrameValue::Object(base + 0x5000)],
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller_frames: Vec::new(),
+            }],
+        }
+    }
+
+    fn expected_addresses(base: u64) -> Vec<u64> {
+        let mut v = vec![
+            base + 0x1000,
+            base + 0x2000,
+            base + 0x3000,
+            base + 0x4000,
+            base + 0x5000,
+            base + 0x6000,
+        ];
+        v.sort_unstable();
+        v
+    }
+
+    /// Every container that can hold a raw heap address is reachable from the
+    /// scan half. This is the test that fails if a new `FrameValue` variant or
+    /// a new frame field starts carrying an address.
+    #[test]
+    fn every_object_slot_family_is_offered_to_a_root_scan() {
+        clear_stashes();
+        restash_last_deopt(frame_with_one_object_per_container(0));
+        assert_eq!(scanned_addresses(), expected_addresses(0));
+        clear_stashes();
+    }
+
+    /// The exceptional stash is a second, independent thread-local. It is the
+    /// one with the shortest proven window (an allocating `sig.npe` /
+    /// `sig.aioobe` / `sig.arithmetic` arm sits between its publication and its
+    /// drain), so a scan that covered only `LAST_DEOPT` would close the wrong
+    /// half.
+    #[test]
+    fn the_exceptional_stash_is_scanned_too() {
+        clear_stashes();
+        restash_exceptional_frame(frame_with_one_object_per_container(0));
+        assert_eq!(scanned_addresses(), expected_addresses(0));
+        clear_stashes();
+    }
+
+    /// Both stashes can be occupied at once — a deopt frame belonging to a
+    /// callee standing while this method publishes an exceptional frame. The
+    /// scan must yield the union, not whichever it happens to look at first.
+    #[test]
+    fn both_stashes_are_scanned_when_both_are_occupied() {
+        clear_stashes();
+        restash_last_deopt(frame_with_one_object_per_container(0));
+        restash_exceptional_frame(frame_with_one_object_per_container(0x10_0000));
+        let mut expected = expected_addresses(0);
+        expected.extend(expected_addresses(0x10_0000));
+        expected.sort_unstable();
+        assert_eq!(scanned_addresses(), expected);
+        assert_eq!(stashed_deopt_object_count(), 12);
+        clear_stashes();
+    }
+
+    /// `Object(0)` is `null`. Offering it as a root would hand the collector a
+    /// zero address to resolve; callers are entitled to assume every value they
+    /// receive is a live reference.
+    #[test]
+    fn null_object_slots_are_not_offered_as_roots() {
+        clear_stashes();
+        restash_last_deopt(ReconstructedFrame {
+            method_key: String::new(),
+            bci: 0,
+            locals: vec![FrameValue::Object(0), FrameValue::Object(0)],
+            stack: vec![FrameValue::Object(0)],
+            monitors: vec![MonitorInfo {
+                object: FrameValue::Object(0),
+                lock_depth: 1,
+            }],
+            caller_frames: Vec::new(),
+        });
+        assert!(scanned_addresses().is_empty());
+        assert_eq!(stashed_deopt_object_count(), 0);
+        clear_stashes();
+    }
+
+    #[test]
+    fn nothing_is_offered_when_no_frame_is_stashed() {
+        clear_stashes();
+        assert!(scanned_addresses().is_empty());
+        assert_eq!(stashed_deopt_object_count(), 0);
+    }
+
+    /// The real shape: a moving collection relocates every object the frame
+    /// names, and the drained frame must read the POST-move addresses. A frame
+    /// that kept its pre-move addresses hands the interpreter from-space
+    /// pointers — the failure this whole mechanism exists to prevent.
+    #[test]
+    fn a_moving_collection_rewrites_every_stashed_object_slot() {
+        clear_stashes();
+        restash_last_deopt(frame_with_one_object_per_container(0));
+        restash_exceptional_frame(frame_with_one_object_per_container(0x10_0000));
+
+        // The scan half runs first, exactly as it does in a real collection.
+        let scanned = scanned_addresses();
+        assert_eq!(scanned.len(), 12);
+
+        // Every scanned object moved by +0x8000_0000.
+        const DELTA: u64 = 0x8000_0000;
+        remap_stashed_deopt_objects(|a| Some(a + DELTA));
+
+        let deopt = take_last_deopt().expect("still stashed");
+        let exceptional = take_exceptional_frame().expect("still stashed");
+
+        let mut after: Vec<u64> = Vec::new();
+        deopt.for_each_object_address(&mut |a: u64| after.push(a));
+        exceptional.for_each_object_address(&mut |a: u64| after.push(a));
+        after.sort_unstable();
+        let expected: Vec<u64> = scanned.iter().map(|a| a + DELTA).collect();
+        assert_eq!(after, expected, "every slot family must follow the move");
+
+        // Spot-check the two hardest containers by hand, so a walk that
+        // "visits" them without writing back cannot pass.
+        assert_eq!(deopt.monitors[0].object, FrameValue::Object(0x3000 + DELTA));
+        assert_eq!(
+            deopt.caller_frames[0].locals[0],
+            FrameValue::Object(0x5000 + DELTA)
+        );
+        clear_stashes();
+    }
+
+    /// A pointer map that does not mention an object means it did not move.
+    /// Perturbing such a slot would be a corruption of its own.
+    #[test]
+    fn remap_leaves_addresses_the_map_does_not_mention_alone() {
+        clear_stashes();
+        restash_last_deopt(frame_with_one_object_per_container(0));
+        let _ = scanned_addresses();
+        // Only the local at 0x1000 moved.
+        remap_stashed_deopt_objects(|a| if a == 0x1000 { Some(0xABCD) } else { None });
+        let frame = take_last_deopt().expect("still stashed");
+        assert_eq!(frame.locals[0], FrameValue::Object(0xABCD));
+        assert_eq!(frame.stack[1], FrameValue::Object(0x2000));
+        assert_eq!(frame.monitors[0].object, FrameValue::Object(0x3000));
+        assert_eq!(frame.caller_frames[0].locals[0], FrameValue::Object(0x5000));
+        clear_stashes();
+    }
+
+    /// Nothing but an `Object` slot is an address. An `Int`/`Long`/`Float`/
+    /// `Double` whose bits happen to look like a pointer, an unresolved
+    /// `StackSlotRef` (a frame OFFSET, not an address), a `VirtualObjectRef` (an
+    /// intra-frame id) and `Undefined` must all survive a remap untouched — a
+    /// visitor that widened to "anything 64-bit" would silently rewrite live
+    /// primitive data.
+    #[test]
+    fn non_reference_slots_are_never_offered_or_rewritten() {
+        clear_stashes();
+        let originals = vec![
+            FrameValue::Int(0x1000),
+            FrameValue::Long(0x1000),
+            FrameValue::Float(0x1000),
+            FrameValue::Double(0x1000),
+            FrameValue::StackSlotRef(-16),
+            FrameValue::RegisterRef(3),
+            FrameValue::StackSlot(-8),
+            FrameValue::VirtualObjectRef(1),
+            FrameValue::Undefined,
+            FrameValue::Unsupported,
+            FrameValue::MaterializationRequired(EliminatedValue::unknown(
+                EliminationCause::Unclassified,
+            )),
+        ];
+        restash_last_deopt(ReconstructedFrame {
+            method_key: String::new(),
+            bci: 0,
+            locals: originals.clone(),
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        });
+        assert!(scanned_addresses().is_empty());
+        remap_stashed_deopt_objects(|_| Some(0xDEAD_BEEF));
+        let frame = take_last_deopt().expect("still stashed");
+        assert_eq!(frame.locals, originals);
+        clear_stashes();
+    }
+
+    /// The visitors must not disturb the stash itself: a scan is a peek, and a
+    /// remap rewrites in place. A consumer that runs after a collection must
+    /// still find its frame, with its identity intact.
+    #[test]
+    fn scanning_and_remapping_leave_the_stash_in_place() {
+        clear_stashes();
+        restash_last_deopt(frame_with_one_object_per_container(0));
+        assert!(has_last_deopt());
+        let _ = scanned_addresses();
+        assert!(has_last_deopt(), "a root scan must not consume the stash");
+        remap_stashed_deopt_objects(|_| None);
+        assert!(has_last_deopt(), "a remap must not consume the stash");
+        assert_eq!(
+            peek_last_deopt_identity(),
+            Some(("craton/probe/Stash.m:()V".to_string(), 4))
+        );
+        clear_stashes();
+    }
+
+    /// A remap on a thread that never offered its stashes to a root scan is the
+    /// half-wired state: the reference gets faithfully rewritten to a slot the
+    /// collector was free to reclaim. Debug builds must refuse it. (An EMPTY
+    /// stash is not half-wiring — there is nothing to keep alive — so the
+    /// unscanned no-op below must stay quiet.)
+    #[test]
+    fn remapping_an_empty_stash_without_a_scan_is_not_an_error() {
+        clear_stashes();
+        remap_stashed_deopt_objects(|a| Some(a));
+        assert_eq!(stashed_deopt_object_count(), 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn remapping_a_populated_stash_without_a_scan_trips_the_wiring_check() {
+        // Deliberately on a FRESH thread rather than via `#[should_panic]`:
+        // both the stashes and the scan counter are thread-local, and
+        // `--test-threads=1` runs every test on one thread, where an earlier
+        // test's scan would satisfy the check and make this one vacuous.
+        let outcome = std::thread::spawn(|| {
+            restash_last_deopt(frame_with_one_object_per_container(0));
+            // No `for_each_stashed_deopt_object` — this is the half-wiring.
+            remap_stashed_deopt_objects(|a| Some(a + 1));
+        })
+        .join();
+        let payload = outcome.expect_err("a remap without a scan must be refused");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("half-wired"),
+            "the panic must name the half-wiring, got: {msg}"
+        );
+    }
+}
+
 /// Deopt trampoline entry — called from JIT code when a guard fails.
 ///
 /// The trampoline loads a pointer to the guard's `DeoptimizationPoint` into
@@ -1832,6 +2409,7 @@ mod x64_deopt_entry_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let _ = take_last_deopt(); // clear any prior stash
                                    // Null guard ⇒ no staleness check (the production / unstamped path).
@@ -1895,6 +2473,7 @@ mod x64_deopt_entry_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let _ = take_last_deopt();
         let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters, &guard);
@@ -1937,6 +2516,7 @@ mod x64_deopt_entry_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let _ = take_last_deopt();
         let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters, &guard);
@@ -1958,6 +2538,1158 @@ pub fn count_virtual_objects(frame: &FrameState) -> usize {
     }
 
     count_in(&frame.locals) + count_in(&frame.stack)
+}
+
+// ---------------------------------------------------------------------------
+// Interned, immutable frame states (structural sharing)
+// ---------------------------------------------------------------------------
+//
+// The P0 acceptance criterion this section serves:
+//
+//   "Safepoint metadata structurally shares states and supports inlining."
+//
+// A [`FrameState`] owns its slots: `Vec<FrameValue>` locals, `Vec<FrameValue>`
+// stack, `Vec<MonitorInfo>` monitors, a `String` method key and a
+// `Box<FrameState>` caller. One snapshot per safepoint is therefore one full
+// copy per safepoint, and a hot method has a safepoint at every call, poll and
+// guard. Consecutive safepoints differ in *one or two* slots — the JVM operand
+// stack pushes one value per bytecode — so the copies are almost entirely
+// identical, and the cost is paid again for every inlined caller scope once
+// producers start building them. That is why interning has to land *before*
+// inlined scope chains do: a depth-8 chain that re-copies the caller's locals
+// at every callee safepoint multiplies the metadata by the inline depth.
+//
+// The representation here is persistent and parent-linked:
+//
+//   * a scope is a [`SharedFrameState`] — seven `Copy` handles, no owned heap;
+//   * `locals`/`stack` are [`ValuesId`] handles to an interned *spine* of
+//     interned fixed-size chunks ([`FRAME_VALUE_CHUNK`] slots each), so two
+//     snapshots differing in one slot share every chunk but one;
+//   * `caller` is an `Option<FrameStateId>`, i.e. the inlined caller scope is
+//     shared by every deopt point inside the same inlined callee rather than
+//     deep-copied into each;
+//   * the resume semantics that used to be a per-[`DeoptReason`] prose
+//     convention are an explicit [`ResumeSemantics`] field.
+//
+// Everything is content-addressed: interning the same state twice returns the
+// same [`FrameStateId`], so `==` on handles is structural equality and a
+// `FxHashMap` keyed by handle is a map keyed by frame state.
+//
+// **Compatibility.** No producer is edited by this change (`ir_lower.rs` and
+// `x64.rs` are owned elsewhere), so the owned [`FrameState`] stays exactly as
+// it is and the two directions are explicit:
+// [`FrameStateInterner::intern`] takes what producers already build, and
+// [`FrameStateInterner::materialize`] hands consumers (the resume sinks,
+// [`reconstruct_frame`], [`DeoptVerifier`]) the owned form they already
+// consume. See `docs/jit/deopt-frame-state-interning.md` for the producer
+// edits that would let the interned form be the *only* form.
+
+/// How many [`FrameValue`]s one interned chunk holds.
+///
+/// The unit of structural sharing: two value arrays that differ in one slot
+/// share every chunk except the one containing it, so the storage cost of a
+/// derived snapshot is one chunk rather than one array. Smaller chunks share
+/// more and cost more spine entries (`u32` each); 8 is the point where the
+/// spine is ~5% of the slot bytes it indexes for the array lengths real
+/// methods produce (`max_locals` + `max_stack` in the tens).
+pub const FRAME_VALUE_CHUNK: usize = 8;
+
+/// Hard cap on how many scopes a caller chain may be walked for.
+///
+/// Chains are acyclic by construction (a scope can only name a caller that was
+/// interned *before* it, so caller handles are strictly smaller), but every
+/// walk in this module is bounded anyway: a metadata defect must not turn into
+/// an unbounded loop inside a deopt path.
+const MAX_SCOPE_CHAIN: usize = 256;
+
+/// Handle to an interned scope in a [`FrameStateInterner`].
+///
+/// Handles are only meaningful in the interner that issued them. Two handles
+/// from the same interner are equal exactly when the states they name are
+/// structurally equal, including their whole caller chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FrameStateId(u32);
+
+/// Handle to an interned array of [`FrameValue`]s (a scope's locals or stack).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ValuesId(u32);
+
+/// Handle to an interned array of [`MonitorInfo`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MonitorsId(u32);
+
+/// Handle to an interned method key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MethodKeyId(u32);
+
+/// Handle to one interned chunk of [`FRAME_VALUE_CHUNK`] (or fewer, for the
+/// last chunk of an array) values. Private: chunking is an implementation
+/// detail of the sharing, not part of the frame-state model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ChunkId(u32);
+
+impl FrameStateId {
+    /// Raw index, for diagnostics and stable ordering only.
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
+impl ValuesId {
+    /// Raw index, for diagnostics and stable ordering only.
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
+impl MonitorsId {
+    /// Raw index, for diagnostics and stable ordering only.
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
+impl MethodKeyId {
+    /// Raw index, for diagnostics and stable ordering only.
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
+/// What the interpreter must do with the bytecode at a scope's `bci` — the
+/// explicit form of what is otherwise a per-[`DeoptReason`] prose convention.
+///
+/// `docs/jit/deopt-metadata.md` records the convention as an outright gap:
+///
+/// > **Reexecute flag** — absent / absent. No field exists. Re-execute-vs-resume
+/// > is encoded *implicitly* in `DeoptReason` […] A consumer that gets the
+/// > convention wrong executes the instruction after a call that never returned.
+///
+/// The two flags are independent, exactly as in a real scope descriptor:
+///
+/// * `reexecute` — the bytecode at `bci` has **not** taken effect. The
+///   interpreter must run it from the top. Every guard the backends emit is
+///   like this: a bounds check fires *before* the `aaload` it protects, so the
+///   snapshot's operand stack still holds the array and the index.
+/// * `rethrow_exception` — the scope is not a resume point at all. A Java
+///   exception is pending and `bci` names the *throwing* instruction, to be
+///   routed through this method's own exception table
+///   ([`DeoptReason::PendingException`]).
+///
+/// The distinction is load-bearing for inlining, which is why it lands with
+/// the interning: the innermost (trapping) scope of an inlined chain
+/// re-executes its bytecode, but every **caller** scope is parked mid-`invoke`
+/// — its `bci` names a call that is already in progress, and re-executing it
+/// would call the callee a second time. [`Self::for_caller_scope`] is that
+/// answer, and [`FrameStateInterner::intern`] applies it automatically to
+/// every scope it links as a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResumeSemantics {
+    /// Re-run the bytecode at `bci` instead of continuing after it.
+    pub reexecute: bool,
+    /// `bci` names a throwing instruction with a pending exception; route it
+    /// through the exception table rather than resuming.
+    pub rethrow_exception: bool,
+}
+
+impl ResumeSemantics {
+    /// Continue *after* the bytecode at `bci`; it has already taken effect.
+    pub const RESUME: Self = Self {
+        reexecute: false,
+        rethrow_exception: false,
+    };
+
+    /// Re-run the bytecode at `bci` from the top — the guard fired before it.
+    pub const REEXECUTE: Self = Self {
+        reexecute: true,
+        rethrow_exception: false,
+    };
+
+    /// Not a resume point: route the pending exception through the method's
+    /// exception table, starting at the throwing `bci`.
+    pub const RETHROW: Self = Self {
+        reexecute: false,
+        rethrow_exception: true,
+    };
+
+    /// The semantics a [`DeoptReason`] implies today, written down once.
+    ///
+    /// Every reason the two backends emit stamps a guard that fires *before*
+    /// the bytecode it protects — a null check before the field access, a
+    /// bounds check before the array access, a div-by-zero test before the
+    /// `idiv` (`ir_lower.rs`: "deopt to the interpreter at this bci, which
+    /// re-executes the `idiv`/`irem` and throws"), an uncommon trap on a
+    /// branch that was never taken, an OSR-exit at a loop bci that has not run
+    /// — so they all re-execute. The single exception is
+    /// [`DeoptReason::PendingException`], whose own documentation states it "is
+    /// **not** a resume point".
+    ///
+    /// This is a *derivation* from the current convention, not a licence to
+    /// keep it: a producer that knows better (a caller scope, a resume point
+    /// after a returning call) must pass explicit semantics instead.
+    pub fn for_reason(reason: DeoptReason) -> Self {
+        match reason {
+            DeoptReason::PendingException => Self::RETHROW,
+            _ => Self::REEXECUTE,
+        }
+    }
+
+    /// The semantics of an inlined **caller** scope: the `invoke` at its `bci`
+    /// is in progress, so the interpreter must neither re-execute it (that
+    /// would call the callee twice) nor treat it as throwing.
+    pub fn for_caller_scope() -> Self {
+        Self::RESUME
+    }
+}
+
+impl Default for ResumeSemantics {
+    /// [`Self::REEXECUTE`] — the safe default for a guard-shaped deopt point,
+    /// and what every point the backends emit today needs.
+    fn default() -> Self {
+        Self::REEXECUTE
+    }
+}
+
+impl fmt::Display for ResumeSemantics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.reexecute, self.rethrow_exception) {
+            (_, true) => f.write_str("rethrow"),
+            (true, false) => f.write_str("reexecute"),
+            (false, false) => f.write_str("resume"),
+        }
+    }
+}
+
+/// One interned scope: a [`FrameState`] with every owned field replaced by a
+/// handle, plus the explicit [`ResumeSemantics`] the owned form has no room
+/// for.
+///
+/// `Copy` and 32 bytes, so a snapshot sequence is a `Vec` of these rather than
+/// a `Vec` of nested heap graphs. Handles are only valid in the
+/// [`FrameStateInterner`] that issued them; read them through that interner's
+/// accessors rather than indexing anything yourself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SharedFrameState {
+    /// Interned `"<class>.<method>:<descriptor>"` key.
+    pub method_key: MethodKeyId,
+    /// Bytecode index this scope names (resume point, re-execution point or
+    /// throwing instruction — see `semantics`).
+    pub bci: u32,
+    /// Interned local-variable array.
+    pub locals: ValuesId,
+    /// Interned operand-stack array.
+    pub stack: ValuesId,
+    /// Interned held-monitor array.
+    pub monitors: MonitorsId,
+    /// The inlined caller scope, shared with every other deopt point inside
+    /// the same inlined callee.
+    pub caller: Option<FrameStateId>,
+    /// Re-execute / rethrow, explicitly.
+    pub semantics: ResumeSemantics,
+}
+
+/// A [`DeoptimizationPoint`] whose frame state is an interned handle.
+///
+/// `Copy` and pointer-free, so — unlike `DeoptimizationPoint`, which owns a
+/// whole `FrameState` graph — it is cheap to clone into a sorted table: every
+/// point at the same bci with the same live values names the *same*
+/// `frame_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InternedDeoptPoint {
+    /// Offset in native code where this deopt point lives.
+    pub native_offset: u32,
+    /// Corresponding bytecode index in the original method.
+    pub bci: u32,
+    /// Reason this deopt point exists.
+    pub reason: DeoptReason,
+    /// What to do when deopt is triggered.
+    pub action: DeoptAction,
+    /// Speculation ID (tracks which speculation failed).
+    pub speculation_id: u32,
+    /// Handle to the interned frame state.
+    pub frame_state: FrameStateId,
+}
+
+/// What one interner is holding, and how much of it is shared.
+///
+/// The measurement that makes the sharing claim checkable rather than
+/// asserted: `logical_slots` is what today's owned `Vec<FrameValue>`s would
+/// store (one full copy per snapshot), `stored_slots` is what the interner
+/// actually holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InterningStats {
+    /// How many times a scope was offered for interning (hits included).
+    pub intern_requests: u64,
+    /// Distinct scopes held.
+    pub states: usize,
+    /// Distinct value arrays (locals/stack) held.
+    pub value_arrays: usize,
+    /// Distinct value chunks held.
+    pub chunks: usize,
+    /// Slots actually stored, i.e. the sum of every distinct chunk's length.
+    pub stored_slots: usize,
+    /// Slots the owned representation would store: the sum over distinct
+    /// scopes of `locals.len() + stack.len()`.
+    pub logical_slots: u64,
+    /// Chunk-handle entries across every distinct spine (the sharing overhead).
+    pub spine_entries: usize,
+    /// Distinct monitor arrays held.
+    pub monitor_arrays: usize,
+    /// Monitor entries actually stored.
+    pub stored_monitors: usize,
+    /// Monitor entries the owned representation would store.
+    pub logical_monitors: u64,
+    /// Distinct method keys held.
+    pub method_keys: usize,
+}
+
+impl InterningStats {
+    /// Fraction of logical slots that cost no storage because an identical
+    /// chunk was already held. `0.0` when nothing has been interned.
+    pub fn slot_sharing_ratio(&self) -> f64 {
+        if self.logical_slots == 0 {
+            return 0.0;
+        }
+        1.0 - (self.stored_slots as f64 / self.logical_slots as f64)
+    }
+
+    /// Bytes of slot storage the owned `Vec<FrameValue>` representation would
+    /// need (excluding the `Vec` headers, which favour the owned form).
+    pub fn owned_slot_bytes(&self) -> usize {
+        (self.logical_slots as usize).saturating_mul(mem::size_of::<FrameValue>())
+    }
+
+    /// Bytes of slot storage the interned representation needs: the distinct
+    /// chunks plus the spines that index them.
+    pub fn interned_slot_bytes(&self) -> usize {
+        self.stored_slots
+            .saturating_mul(mem::size_of::<FrameValue>())
+            .saturating_add(self.spine_entries.saturating_mul(mem::size_of::<ChunkId>()))
+    }
+
+    /// Fraction of slot *bytes* saved against the owned representation,
+    /// counting the spine overhead against the interned side.
+    pub fn slot_byte_saving(&self) -> f64 {
+        let owned = self.owned_slot_bytes();
+        if owned == 0 {
+            return 0.0;
+        }
+        1.0 - (self.interned_slot_bytes() as f64 / owned as f64)
+    }
+
+    /// Fraction of intern requests answered by an existing scope.
+    pub fn state_dedup_ratio(&self) -> f64 {
+        if self.intern_requests == 0 {
+            return 0.0;
+        }
+        1.0 - (self.states as f64 / self.intern_requests as f64)
+    }
+}
+
+/// Hash one [`FrameValue`] structurally, consistently with its `PartialEq`.
+///
+/// Written by hand rather than derived because [`FrameValue`] carries only
+/// `PartialEq` today and widening its derives would change a type four other
+/// files construct. Every field `PartialEq` compares is hashed, and nothing
+/// else, which is the property the interner's hash buckets need.
+fn hash_frame_value<H: Hasher>(v: &FrameValue, state: &mut H) {
+    mem::discriminant(v).hash(state);
+    match v {
+        FrameValue::Int(i) | FrameValue::Long(i) => i.hash(state),
+        FrameValue::Float(b) | FrameValue::Double(b) | FrameValue::Object(b) => b.hash(state),
+        FrameValue::Register(r)
+        | FrameValue::RegisterLong(r)
+        | FrameValue::RegisterRef(r)
+        | FrameValue::XmmFloat(r)
+        | FrameValue::XmmDouble(r) => r.hash(state),
+        FrameValue::StackSlot(o)
+        | FrameValue::StackSlotRef(o)
+        | FrameValue::StackSlotLong(o)
+        | FrameValue::StackSlotFloat(o)
+        | FrameValue::StackSlotDouble(o) => o.hash(state),
+        FrameValue::VirtualObject(vo) => {
+            vo.id.hash(state);
+            vo.class_id.hash(state);
+            vo.num_fields.hash(state);
+            for f in &vo.field_values {
+                hash_frame_value(f, state);
+            }
+        }
+        FrameValue::VirtualObjectRef(id) => id.hash(state),
+        FrameValue::MaterializationRequired(ev) => {
+            ev.producer.hash(state);
+            ev.class_id.hash(state);
+            mem::discriminant(&ev.cause).hash(state);
+        }
+        FrameValue::Undefined | FrameValue::Unsupported => {}
+    }
+}
+
+/// Structural hash of a value slice (its length included, so `[a]` and `[a, a]`
+/// do not collide by construction).
+fn hash_frame_values(values: &[FrameValue]) -> u64 {
+    let mut h = DefaultHasher::new();
+    values.len().hash(&mut h);
+    for v in values {
+        hash_frame_value(v, &mut h);
+    }
+    h.finish()
+}
+
+/// Structural hash of a monitor slice. [`MonitorInfo`] carries no `PartialEq`,
+/// so both the hash and the equality used against it are spelled out here.
+fn hash_monitors(monitors: &[MonitorInfo]) -> u64 {
+    let mut h = DefaultHasher::new();
+    monitors.len().hash(&mut h);
+    for m in monitors {
+        hash_frame_value(&m.object, &mut h);
+        m.lock_depth.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// How many [`FrameValue::MaterializationRequired`] markers `v` is or
+/// transitively contains as a virtual-object field.
+///
+/// Identical to the counting arm inside [`count_materialization_required`],
+/// factored out so the interned predicate cannot drift from the owned one.
+fn count_materialization_required_in(v: &FrameValue) -> usize {
+    match v {
+        FrameValue::MaterializationRequired(_) => 1,
+        FrameValue::VirtualObject(state) => state
+            .field_values
+            .iter()
+            .map(count_materialization_required_in)
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// Structural equality of two monitor slices — the counterpart of
+/// [`hash_monitors`].
+fn monitors_eq(a: &[MonitorInfo], b: &[MonitorInfo]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.lock_depth == y.lock_depth && x.object == y.object)
+}
+
+/// Content-addressed store for immutable frame states.
+///
+/// One interner per compilation. Nothing is ever removed: an artifact's
+/// metadata is built once and the interner is dropped with it, so there is no
+/// reclamation policy to get wrong, and handles can never dangle.
+///
+/// Every accessor tolerates a handle it did not issue (returning `None`, an
+/// empty slice or a conservative `false`) rather than panicking — this type is
+/// reachable from deopt paths, where a panic is strictly worse than a refusal.
+#[derive(Debug)]
+pub struct FrameStateInterner {
+    /// Distinct value chunks, indexed by [`ChunkId`].
+    chunks: Vec<Arc<[FrameValue]>>,
+    /// Structural hash → chunks with that hash (equality decides).
+    chunk_index: FxHashMap<u64, Vec<ChunkId>>,
+    /// Distinct spines (chunk-handle arrays), indexed by [`ValuesId`].
+    arrays: Vec<Arc<[ChunkId]>>,
+    /// Spine → its handle. `ChunkId` is `Hash + Eq`, so this needs no custom
+    /// hashing and no allocation to probe.
+    array_index: FxHashMap<Arc<[ChunkId]>, ValuesId>,
+    /// Distinct monitor arrays, indexed by [`MonitorsId`].
+    monitors: Vec<Arc<[MonitorInfo]>>,
+    /// Structural hash → monitor arrays with that hash.
+    monitor_index: FxHashMap<u64, Vec<MonitorsId>>,
+    /// Distinct method keys, indexed by [`MethodKeyId`].
+    keys: Vec<Arc<str>>,
+    /// Method key → its handle.
+    key_index: FxHashMap<Arc<str>, MethodKeyId>,
+    /// Distinct scopes, indexed by [`FrameStateId`].
+    states: Vec<SharedFrameState>,
+    /// Scope → its handle. This is what makes identical states share one id.
+    state_index: FxHashMap<SharedFrameState, FrameStateId>,
+    /// Scopes offered for interning, hits included.
+    intern_requests: u64,
+    /// Slots the owned representation would have stored for the distinct
+    /// scopes held (the denominator of the sharing ratio).
+    logical_slots: u64,
+    /// Monitor entries the owned representation would have stored.
+    logical_monitors: u64,
+}
+
+impl Default for FrameStateInterner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameStateInterner {
+    /// An empty interner.
+    pub fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            chunk_index: FxHashMap::default(),
+            arrays: Vec::new(),
+            array_index: FxHashMap::default(),
+            monitors: Vec::new(),
+            monitor_index: FxHashMap::default(),
+            keys: Vec::new(),
+            key_index: FxHashMap::default(),
+            states: Vec::new(),
+            state_index: FxHashMap::default(),
+            intern_requests: 0,
+            logical_slots: 0,
+            logical_monitors: 0,
+        }
+    }
+
+    // ── interning ────────────────────────────────────────────────────
+
+    /// Intern an owned [`FrameState`] and its whole caller chain.
+    ///
+    /// The compatibility direction producers use unchanged: they keep building
+    /// the owned form, and this turns it into the shared one. The innermost
+    /// scope gets [`ResumeSemantics::default`] (re-execute — what every guard
+    /// the backends emit needs); every scope reached through `caller` gets
+    /// [`ResumeSemantics::for_caller_scope`], because an inlined caller is
+    /// parked mid-`invoke`.
+    pub fn intern(&mut self, fs: &FrameState) -> FrameStateId {
+        self.intern_with(fs, ResumeSemantics::default())
+    }
+
+    /// [`Self::intern`] with the innermost scope's semantics taken from the
+    /// deopt reason (see [`ResumeSemantics::for_reason`]).
+    pub fn intern_for_reason(&mut self, fs: &FrameState, reason: DeoptReason) -> FrameStateId {
+        self.intern_with(fs, ResumeSemantics::for_reason(reason))
+    }
+
+    /// [`Self::intern`] with explicit semantics for the innermost scope.
+    ///
+    /// Iterative, not recursive: a caller chain is walked into a small vector
+    /// and interned outermost-first, so a chain long enough to overflow a
+    /// stack cannot — and it is capped at [`MAX_SCOPE_CHAIN`] regardless.
+    pub fn intern_with(&mut self, fs: &FrameState, semantics: ResumeSemantics) -> FrameStateId {
+        let mut chain: Vec<&FrameState> = Vec::new();
+        let mut cursor = Some(fs);
+        // Was the walk cut short with frames still above it?
+        let mut truncated = false;
+        while let Some(scope) = cursor {
+            chain.push(scope);
+            if chain.len() >= MAX_SCOPE_CHAIN {
+                truncated = scope.caller.is_some();
+                break;
+            }
+            cursor = scope.caller.as_deref();
+        }
+
+        // A cut chain must not be interned as if the last scope we kept were
+        // the bottom of the stack. That is the silent-truncation shape: every
+        // scope below the cut is well-formed, `chain_is_resumable` says clean,
+        // and the resume rebuilds a call stack the program never had — a
+        // *plausible* frame instead of the correct one, which is strictly worse
+        // than a refusal. Terminating the chain with an explicitly
+        // unreconstructable scope makes the cut visible to every consumer that
+        // already knows how to refuse one: `chain_is_resumable`,
+        // `frame_state_is_resumable` after materialization, and the
+        // `DeoptVerifier` scope lane (an out-of-range bci under a method key it
+        // has no limits for).
+        let mut caller: Option<FrameStateId> = if truncated {
+            Some(self.intern_scope(
+                "",
+                u32::MAX,
+                &[FrameValue::Unsupported],
+                &[],
+                &[],
+                None,
+                ResumeSemantics::for_caller_scope(),
+            ))
+        } else {
+            None
+        };
+        for (depth, scope) in chain.iter().enumerate().rev() {
+            let sem = if depth == 0 {
+                semantics
+            } else {
+                ResumeSemantics::for_caller_scope()
+            };
+            caller = Some(self.intern_scope(
+                &scope.method_key,
+                scope.bci,
+                &scope.locals,
+                &scope.stack,
+                &scope.monitors,
+                caller,
+                sem,
+            ));
+        }
+        // `chain` always holds at least `fs`, so this is `Some`; the fallback
+        // keeps the function total rather than relying on that.
+        caller.unwrap_or_else(|| {
+            self.intern_scope(&fs.method_key, fs.bci, &[], &[], &[], None, semantics)
+        })
+    }
+
+    /// Intern one scope from its parts. The building block the producers would
+    /// call directly once they are allowed to change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn intern_scope(
+        &mut self,
+        method_key: &str,
+        bci: u32,
+        locals: &[FrameValue],
+        stack: &[FrameValue],
+        monitors: &[MonitorInfo],
+        caller: Option<FrameStateId>,
+        semantics: ResumeSemantics,
+    ) -> FrameStateId {
+        let node = SharedFrameState {
+            method_key: self.intern_key(method_key),
+            bci,
+            locals: self.intern_values(locals),
+            stack: self.intern_values(stack),
+            monitors: self.intern_monitors(monitors),
+            caller,
+            semantics,
+        };
+        self.intern_node(node)
+    }
+
+    /// Intern a [`DeoptimizationPoint`], taking the innermost scope's semantics
+    /// from the point itself.
+    ///
+    /// It used to re-derive them with [`ResumeSemantics::for_reason`], because
+    /// the owned point had no field to read. It does now, and every producer
+    /// fills that field with `for_reason(reason)` — so this is the same answer
+    /// today, and the *producer's* answer once one of them knows better.
+    pub fn intern_point(&mut self, point: &DeoptimizationPoint) -> InternedDeoptPoint {
+        InternedDeoptPoint {
+            native_offset: point.native_offset,
+            bci: point.bci,
+            reason: point.reason,
+            action: point.action,
+            speculation_id: point.speculation_id,
+            frame_state: self.intern_with(&point.frame_state, point.semantics),
+        }
+    }
+
+    /// Intern an already-assembled scope node, deduplicating against every
+    /// scope held.
+    fn intern_node(&mut self, node: SharedFrameState) -> FrameStateId {
+        self.intern_requests = self.intern_requests.saturating_add(1);
+        if let Some(&id) = self.state_index.get(&node) {
+            return id;
+        }
+        let id = FrameStateId(self.states.len() as u32);
+        let slots = (self.values_len(node.locals) + self.values_len(node.stack)) as u64;
+        let mons = self.monitor_slice(node.monitors).len() as u64;
+        self.states.push(node);
+        self.state_index.insert(node, id);
+        self.logical_slots = self.logical_slots.saturating_add(slots);
+        self.logical_monitors = self.logical_monitors.saturating_add(mons);
+        id
+    }
+
+    fn intern_key(&mut self, key: &str) -> MethodKeyId {
+        if let Some(&id) = self.key_index.get(key) {
+            return id;
+        }
+        let id = MethodKeyId(self.keys.len() as u32);
+        let arc: Arc<str> = Arc::from(key);
+        self.keys.push(Arc::clone(&arc));
+        self.key_index.insert(arc, id);
+        id
+    }
+
+    /// Intern one chunk (at most [`FRAME_VALUE_CHUNK`] values).
+    fn intern_chunk(&mut self, slice: &[FrameValue]) -> ChunkId {
+        let h = hash_frame_values(slice);
+        if let Some(bucket) = self.chunk_index.get(&h) {
+            for &cid in bucket {
+                if self
+                    .chunks
+                    .get(cid.0 as usize)
+                    .is_some_and(|held| &held[..] == slice)
+                {
+                    return cid;
+                }
+            }
+        }
+        let cid = ChunkId(self.chunks.len() as u32);
+        let arc: Arc<[FrameValue]> = Arc::from(slice.to_vec());
+        self.chunks.push(arc);
+        self.chunk_index.entry(h).or_default().push(cid);
+        cid
+    }
+
+    /// Intern a spine of chunk handles.
+    fn intern_spine(&mut self, spine: Vec<ChunkId>) -> ValuesId {
+        if let Some(&id) = self.array_index.get(spine.as_slice()) {
+            return id;
+        }
+        let id = ValuesId(self.arrays.len() as u32);
+        let arc: Arc<[ChunkId]> = Arc::from(spine);
+        self.arrays.push(Arc::clone(&arc));
+        self.array_index.insert(arc, id);
+        id
+    }
+
+    /// Intern a value array by chunking it. Chunk `i` always covers slots
+    /// `[i * FRAME_VALUE_CHUNK, …)`, so only the last chunk may be short and a
+    /// slot index maps to a chunk by division — the invariant
+    /// [`Self::replace_slot`] depends on.
+    fn intern_values(&mut self, values: &[FrameValue]) -> ValuesId {
+        let mut spine: Vec<ChunkId> = Vec::with_capacity(values.len().div_ceil(FRAME_VALUE_CHUNK));
+        for chunk in values.chunks(FRAME_VALUE_CHUNK) {
+            let cid = self.intern_chunk(chunk);
+            spine.push(cid);
+        }
+        self.intern_spine(spine)
+    }
+
+    fn intern_monitors(&mut self, monitors: &[MonitorInfo]) -> MonitorsId {
+        let h = hash_monitors(monitors);
+        if let Some(bucket) = self.monitor_index.get(&h) {
+            for &mid in bucket {
+                if self
+                    .monitors
+                    .get(mid.0 as usize)
+                    .is_some_and(|held| monitors_eq(held, monitors))
+                {
+                    return mid;
+                }
+            }
+        }
+        let mid = MonitorsId(self.monitors.len() as u32);
+        let arc: Arc<[MonitorInfo]> = Arc::from(monitors.to_vec());
+        self.monitors.push(arc);
+        self.monitor_index.entry(h).or_default().push(mid);
+        mid
+    }
+
+    // ── reading ──────────────────────────────────────────────────────
+
+    /// The scope a handle names, or `None` for a handle this interner never
+    /// issued.
+    pub fn scope(&self, id: FrameStateId) -> Option<&SharedFrameState> {
+        self.states.get(id.0 as usize)
+    }
+
+    /// The method key of a scope (`""` for an unknown handle).
+    pub fn method_key(&self, id: FrameStateId) -> &str {
+        match self
+            .scope(id)
+            .and_then(|s| self.keys.get(s.method_key.0 as usize))
+        {
+            Some(key) => key,
+            None => "",
+        }
+    }
+
+    /// The bci of a scope, or `None` for an unknown handle.
+    pub fn bci(&self, id: FrameStateId) -> Option<u32> {
+        self.scope(id).map(|s| s.bci)
+    }
+
+    /// The resume semantics of a scope, or `None` for an unknown handle.
+    pub fn semantics(&self, id: FrameStateId) -> Option<ResumeSemantics> {
+        self.scope(id).map(|s| s.semantics)
+    }
+
+    /// The inlined caller of a scope, if any.
+    pub fn caller(&self, id: FrameStateId) -> Option<FrameStateId> {
+        self.scope(id).and_then(|s| s.caller)
+    }
+
+    /// How many inlined caller scopes sit above `id` (`0` for a scope that was
+    /// not inlined into anything).
+    pub fn depth(&self, id: FrameStateId) -> usize {
+        let mut n = 0;
+        let mut cursor = self.caller(id);
+        while let Some(c) = cursor {
+            n += 1;
+            if n >= MAX_SCOPE_CHAIN {
+                break;
+            }
+            cursor = self.caller(c);
+        }
+        n
+    }
+
+    /// Number of local slots in a scope.
+    pub fn locals_len(&self, id: FrameStateId) -> usize {
+        self.scope(id).map_or(0, |s| self.values_len(s.locals))
+    }
+
+    /// Number of operand-stack slots in a scope.
+    pub fn stack_len(&self, id: FrameStateId) -> usize {
+        self.scope(id).map_or(0, |s| self.values_len(s.stack))
+    }
+
+    /// One local slot, without materializing the array.
+    pub fn local(&self, id: FrameStateId, index: usize) -> Option<&FrameValue> {
+        self.slot(self.scope(id)?.locals, index)
+    }
+
+    /// One operand-stack slot, without materializing the array.
+    pub fn stack_slot(&self, id: FrameStateId, index: usize) -> Option<&FrameValue> {
+        self.slot(self.scope(id)?.stack, index)
+    }
+
+    /// The held monitors of a scope (empty for an unknown handle).
+    pub fn monitors(&self, id: FrameStateId) -> &[MonitorInfo] {
+        match self.scope(id) {
+            Some(node) => self.monitor_slice(node.monitors),
+            None => &[],
+        }
+    }
+
+    /// Logical length of an interned value array.
+    fn values_len(&self, id: ValuesId) -> usize {
+        let Some(spine) = self.arrays.get(id.0 as usize) else {
+            return 0;
+        };
+        match spine.last() {
+            None => 0,
+            Some(last) => {
+                let tail = self
+                    .chunks
+                    .get(last.0 as usize)
+                    .map_or(0, |chunk| chunk.len());
+                (spine.len() - 1) * FRAME_VALUE_CHUNK + tail
+            }
+        }
+    }
+
+    /// One slot of an interned value array.
+    fn slot(&self, id: ValuesId, index: usize) -> Option<&FrameValue> {
+        let spine = self.arrays.get(id.0 as usize)?;
+        let cid = spine.get(index / FRAME_VALUE_CHUNK)?;
+        self.chunks
+            .get(cid.0 as usize)?
+            .get(index % FRAME_VALUE_CHUNK)
+    }
+
+    /// Every value of an interned array, in order.
+    fn values_iter(&self, id: ValuesId) -> impl Iterator<Item = &FrameValue> + '_ {
+        let spine: &[ChunkId] = match self.arrays.get(id.0 as usize) {
+            Some(held) => held,
+            None => &[],
+        };
+        spine.iter().flat_map(move |cid| {
+            let chunk: &[FrameValue] = match self.chunks.get(cid.0 as usize) {
+                Some(held) => held,
+                None => &[],
+            };
+            chunk.iter()
+        })
+    }
+
+    fn values_vec(&self, id: ValuesId) -> Vec<FrameValue> {
+        let mut out = Vec::with_capacity(self.values_len(id));
+        out.extend(self.values_iter(id).cloned());
+        out
+    }
+
+    fn monitor_slice(&self, id: MonitorsId) -> &[MonitorInfo] {
+        match self.monitors.get(id.0 as usize) {
+            Some(held) => held,
+            None => &[],
+        }
+    }
+
+    // ── persistent derivation ────────────────────────────────────────
+
+    /// The scope `id` with local `index` replaced — the persistent update.
+    ///
+    /// Costs one chunk and one spine, not one copy of the locals array. An
+    /// out-of-range index or an unknown handle returns `id` unchanged (there
+    /// is nothing to derive and nothing worth panicking over), and so does a
+    /// write of the value already there.
+    pub fn with_local(
+        &mut self,
+        id: FrameStateId,
+        index: usize,
+        value: FrameValue,
+    ) -> FrameStateId {
+        let Some(node) = self.scope(id).copied() else {
+            return id;
+        };
+        let Some(locals) = self.replace_slot(node.locals, index, value) else {
+            return id;
+        };
+        if locals == node.locals {
+            return id;
+        }
+        self.intern_node(SharedFrameState { locals, ..node })
+    }
+
+    /// The scope `id` with operand-stack slot `index` replaced. See
+    /// [`Self::with_local`].
+    pub fn with_stack_slot(
+        &mut self,
+        id: FrameStateId,
+        index: usize,
+        value: FrameValue,
+    ) -> FrameStateId {
+        let Some(node) = self.scope(id).copied() else {
+            return id;
+        };
+        let Some(stack) = self.replace_slot(node.stack, index, value) else {
+            return id;
+        };
+        if stack == node.stack {
+            return id;
+        }
+        self.intern_node(SharedFrameState { stack, ..node })
+    }
+
+    /// The scope `id` resuming at a different bci — every slot shared.
+    pub fn with_bci(&mut self, id: FrameStateId, bci: u32) -> FrameStateId {
+        let Some(node) = self.scope(id).copied() else {
+            return id;
+        };
+        if node.bci == bci {
+            return id;
+        }
+        self.intern_node(SharedFrameState { bci, ..node })
+    }
+
+    /// The scope `id` linked under an inlined caller — every slot of both
+    /// scopes shared.
+    ///
+    /// This is the operation inlined scope chains need: one interned caller
+    /// scope is linked from every deopt point the inlined callee emits, so a
+    /// callee with 20 safepoints costs 20 handles, not 20 copies of the
+    /// caller's frame.
+    pub fn with_caller(&mut self, id: FrameStateId, caller: Option<FrameStateId>) -> FrameStateId {
+        let Some(node) = self.scope(id).copied() else {
+            return id;
+        };
+        if node.caller == caller {
+            return id;
+        }
+        self.intern_node(SharedFrameState { caller, ..node })
+    }
+
+    /// The scope `id` with different resume semantics — every slot shared.
+    pub fn with_semantics(&mut self, id: FrameStateId, semantics: ResumeSemantics) -> FrameStateId {
+        let Some(node) = self.scope(id).copied() else {
+            return id;
+        };
+        if node.semantics == semantics {
+            return id;
+        }
+        self.intern_node(SharedFrameState { semantics, ..node })
+    }
+
+    /// Replace one slot of an interned array, re-interning only the chunk that
+    /// contains it. `None` when the array or the index does not exist;
+    /// `Some(values)` unchanged when the slot already holds `value`.
+    fn replace_slot(
+        &mut self,
+        values: ValuesId,
+        index: usize,
+        value: FrameValue,
+    ) -> Option<ValuesId> {
+        let spine = Arc::clone(self.arrays.get(values.0 as usize)?);
+        let chunk_index = index / FRAME_VALUE_CHUNK;
+        let cid = *spine.get(chunk_index)?;
+        let mut chunk = self.chunks.get(cid.0 as usize)?.to_vec();
+        let pos = index % FRAME_VALUE_CHUNK;
+        if pos >= chunk.len() {
+            return None;
+        }
+        if chunk[pos] == value {
+            return Some(values);
+        }
+        chunk[pos] = value;
+        let new_cid = self.intern_chunk(&chunk);
+        let mut new_spine = spine.to_vec();
+        new_spine[chunk_index] = new_cid;
+        Some(self.intern_spine(new_spine))
+    }
+
+    // ── materialization (the other half of the compatibility layer) ──
+
+    /// Rebuild the owned [`FrameState`] a handle names, caller chain included.
+    ///
+    /// `None` for a handle this interner never issued. The owned form has no
+    /// room for [`ResumeSemantics`], so materializing **drops** it — which is
+    /// exactly the producer/consumer gap `docs/jit/deopt-metadata.md` §5.3
+    /// records, and why the flag has to reach `DeoptimizationPoint` before the
+    /// owned form can be retired.
+    pub fn materialize(&self, id: FrameStateId) -> Option<FrameState> {
+        let mut chain: Vec<&SharedFrameState> = Vec::new();
+        let mut cursor = Some(id);
+        while let Some(handle) = cursor {
+            let node = self.scope(handle)?;
+            chain.push(node);
+            if chain.len() >= MAX_SCOPE_CHAIN {
+                // Refuse, do not truncate. Returning the first
+                // `MAX_SCOPE_CHAIN` scopes with the last one's `caller` set to
+                // `None` would hand the caller a well-formed `FrameState` that
+                // describes a *different* call stack from the one that
+                // trapped, with nothing anywhere marking it short. `None`
+                // routes to the safe whole-method re-run instead; the
+                // `DeoptVerifier` turns it into
+                // `DeoptMetadataError::ScopeChainTooDeep`.
+                if node.caller.is_some() {
+                    return None;
+                }
+                break;
+            }
+            cursor = node.caller;
+        }
+
+        let mut built: Option<Box<FrameState>> = None;
+        for node in chain.iter().rev() {
+            built = Some(Box::new(FrameState {
+                method_key: self
+                    .keys
+                    .get(node.method_key.0 as usize)
+                    .map_or_else(String::new, |k| k.to_string()),
+                bci: node.bci,
+                locals: self.values_vec(node.locals),
+                stack: self.values_vec(node.stack),
+                monitors: self.monitor_slice(node.monitors).to_vec(),
+                caller: built.take(),
+            }));
+        }
+        built.map(|boxed| *boxed)
+    }
+
+    /// Rebuild the owned [`DeoptimizationPoint`] an interned point names.
+    ///
+    /// The semantics survive the round trip: they are read back from the
+    /// interned innermost scope rather than re-derived from `reason`. (The
+    /// caller *scopes'* semantics are still dropped — the owned `FrameState`
+    /// has no field for them — which is the remaining half of the gap
+    /// `docs/jit/deopt-frame-state-interning.md` records.)
+    pub fn materialize_point(&self, point: &InternedDeoptPoint) -> Option<DeoptimizationPoint> {
+        Some(DeoptimizationPoint {
+            native_offset: point.native_offset,
+            bci: point.bci,
+            reason: point.reason,
+            action: point.action,
+            speculation_id: point.speculation_id,
+            frame_state: self.materialize(point.frame_state)?,
+            semantics: self
+                .semantics(point.frame_state)
+                .unwrap_or_else(|| ResumeSemantics::for_reason(point.reason)),
+        })
+    }
+
+    // ── predicates over the interned form ────────────────────────────
+
+    /// Is *this* scope's own frame reconstructable?
+    ///
+    /// Scope-local by design: only this scope's locals and stack are
+    /// inspected, so it answers "is this one frame clean" for a caller walking
+    /// a chain itself. [`Self::chain_is_resumable`] is the whole-chain answer,
+    /// and it is the one that corresponds to the owned
+    /// [`frame_state_is_resumable`] — which follows `caller` for exactly the
+    /// reason spelled out there. The two agree on a one-scope chain, which is
+    /// every chain a producer builds today.
+    ///
+    /// An unknown handle is *not* resumable: refusing costs a whole-method
+    /// re-run, accepting would resume a frame nobody can describe.
+    pub fn is_resumable(&self, id: FrameStateId) -> bool {
+        let Some(node) = self.scope(id) else {
+            return false;
+        };
+        !self
+            .values_iter(node.locals)
+            .chain(self.values_iter(node.stack))
+            .any(value_blocks_resume)
+    }
+
+    /// [`Self::is_resumable`] for a scope **and** every inlined caller above
+    /// it: a caller scope holding a value no one can rebuild is exactly as
+    /// unresumable as the trapping scope holding one.
+    ///
+    /// Bounded by [`MAX_SCOPE_CHAIN`], and — like the owned
+    /// [`frame_state_is_resumable`] this mirrors — a chain that is still going
+    /// at the cap answers **`false`**, not `true`. Both callers are compile-time
+    /// admission gates deciding "may this artifact ever be entered", so
+    /// stopping the walk early and reporting `true` would admit an artifact on
+    /// the strength of scopes nobody looked at. Refusing costs a whole-method
+    /// re-run; admitting costs a wrong frame.
+    pub fn chain_is_resumable(&self, id: FrameStateId) -> bool {
+        let mut cursor = Some(id);
+        let mut seen = 0;
+        while let Some(handle) = cursor {
+            if !self.is_resumable(handle) {
+                return false;
+            }
+            seen += 1;
+            if seen >= MAX_SCOPE_CHAIN {
+                return self.caller(handle).is_none();
+            }
+            cursor = self.caller(handle);
+        }
+        true
+    }
+
+    /// [`count_materialization_required`] without materializing (scope-local,
+    /// same as the owned function, down to the recursion into virtual-object
+    /// field graphs).
+    pub fn count_materialization_required(&self, id: FrameStateId) -> usize {
+        let Some(node) = self.scope(id) else {
+            return 0;
+        };
+        self.values_iter(node.locals)
+            .chain(self.values_iter(node.stack))
+            .map(count_materialization_required_in)
+            .sum()
+    }
+
+    // ── measurement ──────────────────────────────────────────────────
+
+    /// Slots the **owned** representation would store for `roots`: every scope
+    /// of every root's caller chain, counted once per root.
+    ///
+    /// This is the honest denominator once inlining lands.
+    /// [`InterningStats::logical_slots`] counts each distinct *scope* once,
+    /// which is right for a flat snapshot sequence but understates what
+    /// `DeoptimizationPoint` actually costs today: its caller is a
+    /// `Box<FrameState>`, so an inlined caller's locals are re-copied into
+    /// *every* deopt point of the inlined callee.
+    pub fn owned_chain_slots(&self, roots: &[FrameStateId]) -> u64 {
+        let mut total: u64 = 0;
+        for &root in roots {
+            let mut cursor = Some(root);
+            let mut seen = 0;
+            while let Some(handle) = cursor {
+                let Some(node) = self.scope(handle) else {
+                    break;
+                };
+                total = total.saturating_add(
+                    (self.values_len(node.locals) + self.values_len(node.stack)) as u64,
+                );
+                seen += 1;
+                if seen >= MAX_SCOPE_CHAIN {
+                    break;
+                }
+                cursor = node.caller;
+            }
+        }
+        total
+    }
+
+    /// What is held and how much of it is shared. See [`InterningStats`].
+    pub fn stats(&self) -> InterningStats {
+        InterningStats {
+            intern_requests: self.intern_requests,
+            states: self.states.len(),
+            value_arrays: self.arrays.len(),
+            chunks: self.chunks.len(),
+            stored_slots: self.chunks.iter().map(|c| c.len()).sum(),
+            logical_slots: self.logical_slots,
+            spine_entries: self.arrays.iter().map(|a| a.len()).sum(),
+            monitor_arrays: self.monitors.len(),
+            stored_monitors: self.monitors.iter().map(|m| m.len()).sum(),
+            logical_monitors: self.logical_monitors,
+            method_keys: self.keys.len(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2162,6 +3894,67 @@ pub enum DeoptMetadataError {
     /// `CompiledMethod::find_deopt_point`'s binary search can miss an entry —
     /// which reads as "no deopt metadata here" and forces the imprecise path.
     DeoptPointsUnsorted { first: u32, second: u32 },
+    /// An [`InternedDeoptPoint`] names a [`FrameStateId`] the interner it was
+    /// checked against never issued — a handle from a different interner, or
+    /// from one that has since been rebuilt. Its scope chain cannot be read at
+    /// all, so nothing about the point is verifiable.
+    UnknownFrameStateHandle { native_offset: u32, handle: u32 },
+    /// The inlined caller chain is longer than [`MAX_SCOPE_CHAIN`], so it
+    /// cannot be described in full. Reported rather than truncated: a chain
+    /// silently cut at the cap reconstructs a *plausible* stack (the frames
+    /// below the cut, with the outermost one claiming to be the bottom) instead
+    /// of the correct one.
+    ScopeChainTooDeep { native_offset: u32, cap: usize },
+    /// A frame-slot descriptor's offset does not address a word inside the
+    /// trapping frame. Every producer encodes a positive `[rbp - spill]` offset
+    /// as its negation, so a non-negative offset is either `[rbp]` (the saved
+    /// caller frame pointer) or a word in the *caller's* frame.
+    FrameSlotOutsideFrame { at: SlotRef, offset: i32 },
+    /// One frame word is described twice in the same scope with two different
+    /// JVM value categories. A machine word holds one value at one program
+    /// point, so at most one of the two descriptions can be right, and the
+    /// resume has no way to tell which.
+    SlotTypeConflict {
+        /// The second (conflicting) description.
+        at: SlotRef,
+        /// The first description of the same word.
+        first: SlotRef,
+        /// The `*(rbp + off)` offset both descriptions name.
+        offset: i32,
+        /// Category the first description claims.
+        first_kind: &'static str,
+        /// Category this description claims.
+        second_kind: &'static str,
+    },
+    /// The deopt map describes a location as a **primitive** that the oop map
+    /// for the same safepoint lists as holding a **live reference**. The two
+    /// disagree about the type of one word, so one of them is wrong: either the
+    /// resume hands the interpreter an `int` where a reference belongs, or the
+    /// collector relocates against a word that is not an object pointer.
+    PrimitiveSlotCoveredByOopMap {
+        at: SlotRef,
+        /// `"gpr"` for a register location, `"frame"` for a frame slot.
+        bank: &'static str,
+        /// The GPR number, or the positive `[rbp - off]` frame offset.
+        location: i32,
+        /// What the deopt map claims the location holds.
+        kind: &'static str,
+    },
+    /// A held monitor names an object the resume cannot lock: a value that is
+    /// not reference-shaped at all (an `int` cannot be a monitor), or an
+    /// explicit null. Either way the unwinding `monitorexit` count is wrong,
+    /// which deadlocks the next acquirer rather than failing visibly.
+    MonitorObjectNotAReference { at: SlotRef, detail: String },
+    /// The point's [`ResumeSemantics`] and its [`DeoptReason`] disagree about
+    /// whether a Java exception is pending. The two are read by *different*
+    /// consumers — `x64_deopt_entry` routes on `reason`, a resume sink reads
+    /// `semantics` — so a disagreement means one of them resumes a frame the
+    /// other one knows is exceptional.
+    ResumeSemanticsMismatch {
+        native_offset: u32,
+        reason: DeoptReason,
+        rethrow: bool,
+    },
 }
 
 impl fmt::Display for DeoptMetadataError {
@@ -2282,6 +4075,59 @@ impl fmt::Display for DeoptMetadataError {
                 f,
                 "deopt points are not sorted by native offset (0x{first:x} precedes 0x{second:x}) \
                  — find_deopt_point's binary search can miss an entry"
+            ),
+            Self::UnknownFrameStateHandle {
+                native_offset,
+                handle,
+            } => write!(
+                f,
+                "pc+0x{native_offset:x}: frame-state handle #{handle} was not issued by this \
+                 interner — the deopt point's scope chain is unreadable"
+            ),
+            Self::ScopeChainTooDeep { native_offset, cap } => write!(
+                f,
+                "pc+0x{native_offset:x}: inlined caller chain is deeper than the {cap}-scope cap — \
+                 the frames above the cut cannot be described, and a truncated chain resumes a \
+                 stack that never existed"
+            ),
+            Self::FrameSlotOutsideFrame { at, offset } => write!(
+                f,
+                "{at}: frame-slot offset {offset} does not address this frame — *(rbp{offset:+}) \
+                 is the saved frame pointer or the caller's frame, not a spill slot"
+            ),
+            Self::SlotTypeConflict {
+                at,
+                first,
+                offset,
+                first_kind,
+                second_kind,
+            } => write!(
+                f,
+                "{at}: describes *(rbp{offset:+}) as {second_kind}, but {first} already describes \
+                 the same word as {first_kind} — one machine word holds one value"
+            ),
+            Self::PrimitiveSlotCoveredByOopMap {
+                at,
+                bank,
+                location,
+                kind,
+            } => write!(
+                f,
+                "{at}: deopt map reads {bank}[{location}] as {kind}, but the oop map lists it as a \
+                 live reference — the resume and the collector disagree about the type of one word"
+            ),
+            Self::MonitorObjectNotAReference { at, detail } => {
+                write!(f, "{at}: monitor object is not lockable — {detail}")
+            }
+            Self::ResumeSemanticsMismatch {
+                native_offset,
+                reason,
+                rethrow,
+            } => write!(
+                f,
+                "pc+0x{native_offset:x}: reason {reason:?} and rethrow_exception={rethrow} \
+                 disagree about whether an exception is pending — the stash routing and the \
+                 resume sink would take opposite branches"
             ),
         }
     }
@@ -2497,13 +4343,63 @@ impl DeoptVerifier {
             });
         }
 
+        // ── exception-state agreement ────────────────────────────────
+        //
+        // `reason` and `semantics.rethrow_exception` answer the same question
+        // for two different consumers: `x64_deopt_entry` routes the frame to
+        // `LAST_EXCEPTIONAL` on `reason == PendingException`, while a resume
+        // sink that has learned to read `semantics` decides re-execute /
+        // resume / rethrow from the flag. If they disagree, one of them treats
+        // an exceptional frame as a resume point and executes past a call that
+        // never returned — which is the `finally`-not-run / leaked-`athrow`-bci
+        // defect shape, restated in metadata. Both directions are checked: a
+        // `PendingException` point that forgot the flag, and a flagged point
+        // whose reason will route it into `LAST_DEOPT`.
+        let pending = point.reason == DeoptReason::PendingException;
+        if pending != point.semantics.rethrow_exception {
+            out.push(DeoptMetadataError::ResumeSemanticsMismatch {
+                native_offset: point.native_offset,
+                reason: point.reason,
+                rethrow: point.semantics.rethrow_exception,
+            });
+        }
+
         let coverage = self.oop_coverage.get(&point.native_offset);
         let mut scope: Option<&FrameState> = Some(&point.frame_state);
         let mut depth = 0usize;
         while let Some(state) = scope {
+            // Bounded exactly like every other walk in this module
+            // (`frame_state_is_resumable`, `FrameStateInterner::materialize`):
+            // a chain this deep is a metadata defect, and checking only its
+            // first `MAX_SCOPE_CHAIN` scopes would report "clean" for a frame
+            // whose outer scopes were never looked at.
+            if depth >= MAX_SCOPE_CHAIN {
+                out.push(DeoptMetadataError::ScopeChainTooDeep {
+                    native_offset: point.native_offset,
+                    cap: MAX_SCOPE_CHAIN,
+                });
+                break;
+            }
             self.check_scope(point, state, depth, coverage, out);
             scope = state.caller.as_deref();
             depth += 1;
+        }
+    }
+
+    /// The JVM value category a machine-location descriptor claims for the word
+    /// it names, or `None` for a descriptor that names no machine word.
+    ///
+    /// Two descriptors of the *same* word must agree on this, which is what
+    /// [`DeoptMetadataError::SlotTypeConflict`] enforces. `"ref"` is also what
+    /// the oop-map agreement lanes join on.
+    fn slot_category(v: &FrameValue) -> Option<(i32, &'static str)> {
+        match v {
+            FrameValue::StackSlot(off) => Some((*off, "int")),
+            FrameValue::StackSlotRef(off) => Some((*off, "ref")),
+            FrameValue::StackSlotLong(off) => Some((*off, "long")),
+            FrameValue::StackSlotFloat(off) => Some((*off, "float")),
+            FrameValue::StackSlotDouble(off) => Some((*off, "double")),
+            _ => None,
         }
     }
 
@@ -2565,9 +4461,7 @@ impl DeoptVerifier {
         // per scope. References are validated at the end because a
         // `VirtualObjectRef` may legally precede its definition — the
         // materializer allocates all shells before wiring any field.
-        let mut defined: FxHashSet<usize> = FxHashSet::default();
-        let mut referenced: Vec<(SlotRef, usize)> = Vec::new();
-        let mut needs_oop_map = false;
+        let mut ctx = ScopeCheck::default();
 
         let base = |kind: SlotKind, index: usize| SlotRef {
             native_offset: point.native_offset,
@@ -2579,26 +4473,10 @@ impl DeoptVerifier {
         };
 
         for (i, v) in state.locals.iter().enumerate() {
-            self.check_value(
-                v,
-                &base(SlotKind::Local, i),
-                coverage,
-                &mut defined,
-                &mut referenced,
-                &mut needs_oop_map,
-                out,
-            );
+            self.check_value(v, &base(SlotKind::Local, i), coverage, &mut ctx, out);
         }
         for (i, v) in state.stack.iter().enumerate() {
-            self.check_value(
-                v,
-                &base(SlotKind::Stack, i),
-                coverage,
-                &mut defined,
-                &mut referenced,
-                &mut needs_oop_map,
-                out,
-            );
+            self.check_value(v, &base(SlotKind::Stack, i), coverage, &mut ctx, out);
         }
 
         // ── monitor lane ─────────────────────────────────────────────
@@ -2638,24 +4516,30 @@ impl DeoptVerifier {
                     ),
                 });
             }
-            self.check_value(
-                &m.object,
-                &at,
-                coverage,
-                &mut defined,
-                &mut referenced,
-                &mut needs_oop_map,
-                out,
-            );
+            // A monitor entry replays as `monitorenter` on the object it names,
+            // and the interpreter's method-exit path emits one `monitorexit`
+            // per entry. So the entry has to name something lockable. A
+            // primitive descriptor here is not a near-miss: the resume would
+            // build a `Value::Int`, the exit would try to unlock it, and the
+            // real monitor stays held — a hang in whatever thread asks for it
+            // next, arbitrarily far from the deopt that caused it. An explicit
+            // null is the same story with an NPE at the enter instead.
+            if let Some(detail) = monitor_object_defect(&m.object) {
+                out.push(DeoptMetadataError::MonitorObjectNotAReference {
+                    at: at.clone(),
+                    detail,
+                });
+            }
+            self.check_value(&m.object, &at, coverage, &mut ctx, out);
         }
 
-        for (at, id) in referenced {
-            if !defined.contains(&id) {
+        for (at, id) in std::mem::take(&mut ctx.referenced) {
+            if !ctx.defined.contains(&id) {
                 out.push(DeoptMetadataError::UndefinedVirtualObjectRef { at, id });
             }
         }
 
-        if needs_oop_map && coverage.is_none() && self.require_oop_map {
+        if ctx.needs_oop_map && coverage.is_none() && self.require_oop_map {
             out.push(DeoptMetadataError::MissingOopMap {
                 native_offset: point.native_offset,
                 bci: state.bci,
@@ -2664,21 +4548,79 @@ impl DeoptVerifier {
     }
 
     /// Check one `FrameValue`, recursing through virtual-object fields.
-    #[allow(clippy::too_many_arguments)]
     fn check_value(
         &self,
         v: &FrameValue,
         at: &SlotRef,
         coverage: Option<&OopCoverage>,
-        defined: &mut FxHashSet<usize>,
-        referenced: &mut Vec<(SlotRef, usize)>,
-        needs_oop_map: &mut bool,
+        ctx: &mut ScopeCheck,
         out: &mut Vec<DeoptMetadataError>,
     ) {
+        // ── frame-slot well-formedness, for every `StackSlot*` variant ──
+        //
+        // Two properties that hold for *all five* typed frame-slot variants
+        // and that nothing checked before, so they are done once here rather
+        // than five times in the match below.
+        if let Some((off, kind)) = Self::slot_category(v) {
+            // (1) The offset must address this frame. Every producer builds
+            // these as `-spill_off` from a strictly positive `[rbp - spill]`
+            // offset (`x64::frame_value_for_slot`, `x64::sr_field_values`,
+            // `ir_lower::typed_stack_slot`), so `off >= 0` cannot come from a
+            // correct emitter: `0` is `[rbp]`, the saved caller frame pointer
+            // — the one word `ir_lower::poison_slot` exists to keep the
+            // compiler from ever naming — and anything above it is the
+            // caller's frame or the return address. Reconstructing a local
+            // from there is a plausible-looking wrong value, which is worse
+            // than a refusal.
+            if off >= 0 {
+                out.push(DeoptMetadataError::FrameSlotOutsideFrame {
+                    at: at.clone(),
+                    offset: off,
+                });
+            }
+            // (2) One machine word, one value. Two slots may legitimately
+            // *share* a word (`aload_0` leaves local 0 and stack[0] naming the
+            // same spill), but then they agree on its type. Disagreeing is an
+            // internal contradiction that needs no external data to spot, and
+            // it is precisely how an `int` ends up reconstructed into a slot
+            // the interpreter reads as a reference.
+            // Cloned out of the map before the match so the lookup borrow ends
+            // here rather than spanning the `insert` in the `None` arm.
+            let prior = ctx.word_types.get(&off).cloned();
+            match prior {
+                Some((first, first_kind)) if first_kind != kind => {
+                    out.push(DeoptMetadataError::SlotTypeConflict {
+                        at: at.clone(),
+                        first,
+                        offset: off,
+                        first_kind,
+                        second_kind: kind,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    ctx.word_types.insert(off, (at.clone(), kind));
+                }
+            }
+        }
+
         match v {
             // ── register-file bounds ─────────────────────────────────
             FrameValue::Register(r) | FrameValue::RegisterLong(r) => {
                 self.check_gpr_index(*r, out);
+                self.check_primitive_not_in_oop_map(
+                    at,
+                    coverage,
+                    "gpr",
+                    *r as i32,
+                    if matches!(v, FrameValue::Register(_)) {
+                        "int"
+                    } else {
+                        "long"
+                    },
+                    |cov| cov.covers_register(*r),
+                    out,
+                );
             }
             FrameValue::XmmFloat(n) | FrameValue::XmmDouble(n) => {
                 if *n as usize >= 16 {
@@ -2691,7 +4633,7 @@ impl DeoptVerifier {
 
             // ── oop-map agreement ────────────────────────────────────
             FrameValue::RegisterRef(r) => {
-                *needs_oop_map = true;
+                ctx.needs_oop_map = true;
                 self.check_gpr_index(*r, out);
                 if let Some(cov) = coverage {
                     if cov.moving_young_coverage_complete && !cov.covers_register(*r) {
@@ -2703,7 +4645,7 @@ impl DeoptVerifier {
                 }
             }
             FrameValue::StackSlotRef(off) => {
-                *needs_oop_map = true;
+                ctx.needs_oop_map = true;
                 // Deopt spells the word as `*(rbp + off)` with `off < 0`; the
                 // oop map spells the same word as the positive `[rbp - off]`.
                 let positive = -*off;
@@ -2721,6 +4663,24 @@ impl DeoptVerifier {
                     }
                 }
             }
+            // The converse oop-map direction, for the four *primitive* frame
+            // slots. See `check_primitive_not_in_oop_map`.
+            FrameValue::StackSlot(off)
+            | FrameValue::StackSlotLong(off)
+            | FrameValue::StackSlotFloat(off)
+            | FrameValue::StackSlotDouble(off) => {
+                let positive = -*off;
+                let kind = Self::slot_category(v).map_or("primitive", |(_, k)| k);
+                self.check_primitive_not_in_oop_map(
+                    at,
+                    coverage,
+                    "frame",
+                    positive,
+                    kind,
+                    |cov| cov.covers_frame_slot(positive),
+                    out,
+                );
+            }
             FrameValue::Object(addr) if *addr != 0 => {
                 out.push(DeoptMetadataError::BakedObjectAddress {
                     at: at.clone(),
@@ -2730,7 +4690,7 @@ impl DeoptVerifier {
 
             // ── virtual objects ──────────────────────────────────────
             FrameValue::VirtualObject(state) => {
-                if !defined.insert(state.id) {
+                if !ctx.defined.insert(state.id) {
                     out.push(DeoptMetadataError::DuplicateVirtualObjectDefinition {
                         at: at.clone(),
                         id: state.id,
@@ -2758,18 +4718,10 @@ impl DeoptVerifier {
                 }
                 for (i, fv) in state.field_values.iter().enumerate() {
                     let field_at = at.field(state.id, i);
-                    self.check_value(
-                        fv,
-                        &field_at,
-                        coverage,
-                        defined,
-                        referenced,
-                        needs_oop_map,
-                        out,
-                    );
+                    self.check_value(fv, &field_at, coverage, ctx, out);
                 }
             }
-            FrameValue::VirtualObjectRef(id) => referenced.push((at.clone(), *id)),
+            FrameValue::VirtualObjectRef(id) => ctx.referenced.push((at.clone(), *id)),
 
             // ── eliminated vs. undefined ─────────────────────────────
             //
@@ -2794,15 +4746,186 @@ impl DeoptVerifier {
             });
         }
     }
+
+    /// The **converse** of the oop-map agreement rule: a location the deopt map
+    /// reads as a primitive must not be one the oop map lists as holding a live
+    /// reference.
+    ///
+    /// `docs/jit/deopt-metadata.md` §3 states the forward direction (a
+    /// reference the deopt map names must be one the GC updates) and then says
+    /// the converse — an oop-map slot the deopt map does not name — is *not* an
+    /// error, because the GC may legitimately track a spilled temporary the
+    /// interpreter frame does not resume from. That remains true, and this is
+    /// not that case: here the deopt map **does** name the word, and names it
+    /// as an `int`/`long`/`float`/`double`. One machine word at one safepoint
+    /// holds one value, so the two maps cannot both be right, and either
+    /// reading is unsound — the resume hands the interpreter a truncated `int`
+    /// where a live reference belongs (and drops the oop from the frame's root
+    /// set), or the collector relocates against a word that is not a pointer.
+    ///
+    /// Sound on the IR backend by construction rather than by luck: `plan_slots`
+    /// keeps disjoint `Ref` and `Prim` free lists, so "a colour is `Ref` or
+    /// `Prim` from its first assignment and never changes class"
+    /// (`jit/src/ir_lower.rs`, *Reference / primitive separation*). This lane is
+    /// the tripwire on that invariant, and a real check for any backend wired in
+    /// later whose deopt map and oop map are built from different sources — which
+    /// `jit/src/x64.rs` is (`local_oop_masks`/`stack_oop_marks` vs. the register
+    /// allocator's live sets).
+    ///
+    /// Gated on `moving_young_coverage_complete` for the same reason the forward
+    /// lane is: a map that does not claim completeness is a conservative
+    /// over-approximation the collector already refuses to move against, so a
+    /// disagreement there is not evidence of a defect.
+    #[allow(clippy::too_many_arguments)]
+    fn check_primitive_not_in_oop_map(
+        &self,
+        at: &SlotRef,
+        coverage: Option<&OopCoverage>,
+        bank: &'static str,
+        location: i32,
+        kind: &'static str,
+        covered: impl Fn(&OopCoverage) -> bool,
+        out: &mut Vec<DeoptMetadataError>,
+    ) {
+        let Some(cov) = coverage else { return };
+        if !cov.moving_young_coverage_complete {
+            return;
+        }
+        if covered(cov) {
+            out.push(DeoptMetadataError::PrimitiveSlotCoveredByOopMap {
+                at: at.clone(),
+                bank,
+                location,
+                kind,
+            });
+        }
+    }
+}
+
+/// Per-scope accumulators shared by every [`DeoptVerifier::check_value`] call
+/// for one scope.
+///
+/// Grouped into a struct rather than passed as five `&mut` parameters because
+/// the set grew past what a reader can keep straight at a call site, and every
+/// member has the same lifetime: one scope of one deopt point.
+#[derive(Default)]
+struct ScopeCheck {
+    /// Virtual-object ids *defined* (by a `VirtualObject`) in this scope.
+    defined: FxHashSet<usize>,
+    /// `VirtualObjectRef` edges, validated after the whole scope is walked (a
+    /// reference may legally precede its definition).
+    referenced: Vec<(SlotRef, usize)>,
+    /// Any reference-typed slot was seen, so this scope needs an oop map.
+    needs_oop_map: bool,
+    /// Frame word (`*(rbp + off)`) → the first descriptor that named it and the
+    /// JVM category that descriptor claimed. Drives
+    /// [`DeoptMetadataError::SlotTypeConflict`].
+    word_types: FxHashMap<i32, (SlotRef, &'static str)>,
+}
+
+/// Why `object` cannot serve as a held monitor, or `None` if it can.
+///
+/// A monitor entry is replayed as a `monitorenter` on resume and balanced by
+/// one `monitorexit` at method exit, so the recorded value has to be something
+/// the interpreter can lock. Two shapes cannot be:
+///
+/// * a **primitive** descriptor — the resume builds a `Value::Int`/`Long`/…,
+///   the exit tries to unlock it, and the real monitor is never released. The
+///   symptom is a hang in an unrelated thread, arbitrarily later.
+/// * an **explicit null** (`Object(0)`) — `monitorenter` on null throws, so no
+///   correct emitter records one; a null here means the emitter lost the
+///   object, not that the program locked nothing.
+///
+/// `Undefined`, `Unsupported` and `MaterializationRequired` are already
+/// reported by the surrounding [`DeoptMetadataError::UnbalancedMonitor`] arm,
+/// so they are deliberately not repeated here.
+fn monitor_object_defect(object: &FrameValue) -> Option<String> {
+    match object {
+        FrameValue::Object(0) => Some(
+            "the recorded object is null, and `monitorenter` on null throws rather than locking"
+                .to_string(),
+        ),
+        FrameValue::Object(_)
+        | FrameValue::StackSlotRef(_)
+        | FrameValue::RegisterRef(_)
+        | FrameValue::VirtualObject(_)
+        | FrameValue::VirtualObjectRef(_)
+        | FrameValue::Undefined
+        | FrameValue::Unsupported
+        | FrameValue::MaterializationRequired(_) => None,
+        other => Some(format!(
+            "{other:?} is a primitive descriptor, so the resume would `monitorenter` a \
+             non-reference and the matching `monitorexit` would never release the real lock"
+        )),
+    }
+}
+
+/// The verifier over the interned representation.
+///
+/// Deliberately *not* a second implementation of the rules: each interned
+/// point is materialized through the compatibility layer and handed to the
+/// exact same [`DeoptVerifier::violations`]. Two checkers that were supposed
+/// to agree and drifted would be a worse defect than the materialization
+/// these methods pay for — this runs once per compile, on the install path.
+impl DeoptVerifier {
+    /// [`Self::violations`] for interned points.
+    ///
+    /// A handle the interner never issued is itself a violation
+    /// ([`DeoptMetadataError::UnknownFrameStateHandle`]) rather than a silently
+    /// skipped point: an unreadable scope chain means nothing about that deopt
+    /// point was checked, which must not read as "clean".
+    pub fn violations_interned(
+        &self,
+        interner: &FrameStateInterner,
+        points: &[InternedDeoptPoint],
+    ) -> Vec<DeoptMetadataError> {
+        let mut owned = Vec::with_capacity(points.len());
+        let mut out = Vec::new();
+        for point in points {
+            match interner.materialize_point(point) {
+                Some(p) => owned.push(p),
+                // `materialize` refuses for two different reasons and they are
+                // different findings. A handle the interner never issued means
+                // nothing about the point is readable; a chain past the cap
+                // means the point is readable but *undescribable*, and saying
+                // "unknown handle" would send a reader looking for the wrong
+                // bug. Distinguished by whether the root scope resolves.
+                None if interner.scope(point.frame_state).is_some() => {
+                    out.push(DeoptMetadataError::ScopeChainTooDeep {
+                        native_offset: point.native_offset,
+                        cap: MAX_SCOPE_CHAIN,
+                    })
+                }
+                None => out.push(DeoptMetadataError::UnknownFrameStateHandle {
+                    native_offset: point.native_offset,
+                    handle: point.frame_state.index(),
+                }),
+            }
+        }
+        out.extend(self.violations(&owned));
+        out
+    }
+
+    /// [`Self::verify`] for interned points: `Ok(())` or a [`Bailout`].
+    pub fn verify_interned(
+        &self,
+        interner: &FrameStateInterner,
+        points: &[InternedDeoptPoint],
+    ) -> CompileResult<()> {
+        let errors = self.violations_interned(interner, points);
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(deopt_metadata_bailout(&errors))
+    }
 }
 
 /// Render a violation list as a compilation [`Bailout`].
 ///
-/// Uses [`BailoutReason::IrVerification`] with a `phase=deopt-metadata`
-/// context: the reason set in `bailout.rs` has no deopt-specific category yet
-/// (adding one is a change to a file this module does not own — see
-/// `docs/jit/deopt-metadata.md`), and `ir_verification` is the closest existing
-/// bucket, since this *is* a verifier rejecting emitted compiler output.
+/// Uses [`BailoutReason::DeoptMetadata`] (its own category in `bailout.rs`,
+/// so these are countable separately from IR-verification rejections) with the
+/// context `phase=install`, because that is the only point at which this runs:
+/// over emitted metadata, before the artifact becomes a `CompiledMethod`.
 fn deopt_metadata_bailout(errors: &[DeoptMetadataError]) -> Bailout {
     let shown = errors.len().min(MAX_REPORTED_DEOPT_VIOLATIONS);
     let mut msg = format!("{} deopt-metadata violation(s): ", errors.len());
@@ -2865,6 +4988,7 @@ mod deopt_metadata_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         }
     }
 
@@ -3372,6 +5496,7 @@ mod deopt_metadata_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let regs = SavedRegisters::default();
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, 0);
@@ -3417,6 +5542,7 @@ mod deopt_metadata_tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         }])
         .is_empty());
     }
@@ -3466,6 +5592,554 @@ mod deopt_metadata_tests {
                 index: 99,
             })
         );
+    }
+}
+
+/// The soundness lanes added by the deopt-metadata audit
+/// (`docs/jit/deopt-metadata-audit.md`). Each test fails against the verifier
+/// as it stood before that audit: every construct below passed verification.
+#[cfg(test)]
+mod deopt_metadata_soundness_tests {
+    use super::*;
+
+    const M: &str = "T.m:(I)I";
+
+    fn limits() -> MethodFrameLimits {
+        MethodFrameLimits::new(M, 32, 3, 2)
+    }
+
+    /// A point with no reference slots and no oop-map dependency, so each test
+    /// below introduces exactly one defect.
+    fn plain_point() -> DeoptimizationPoint {
+        DeoptimizationPoint {
+            native_offset: 0x40,
+            bci: 12,
+            reason: DeoptReason::BoundsCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: M.to_string(),
+                bci: 12,
+                locals: vec![FrameValue::Int(7)],
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            },
+            semantics: ResumeSemantics::REEXECUTE,
+        }
+    }
+
+    fn scoped() -> DeoptVerifier {
+        DeoptVerifier::new().with_method(limits())
+    }
+
+    fn rendered(errors: &[DeoptMetadataError]) -> String {
+        errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    // ── frame-slot addressing ────────────────────────────────────────
+
+    /// Every producer encodes a frame slot as the negation of a strictly
+    /// positive `[rbp - spill]` offset, so a non-negative offset addresses the
+    /// saved frame pointer (`0`) or the caller's frame. Reading a local from
+    /// there reconstructs a value that looks entirely plausible and is not the
+    /// program's.
+    #[test]
+    fn a_frame_slot_at_or_above_rbp_is_rejected() {
+        for bad in [
+            FrameValue::StackSlot(0),
+            FrameValue::StackSlot(16),
+            FrameValue::StackSlotLong(8),
+            FrameValue::StackSlotFloat(0),
+            FrameValue::StackSlotDouble(24),
+            FrameValue::StackSlotRef(0),
+        ] {
+            let mut p = plain_point();
+            p.frame_state.locals[0] = bad.clone();
+            let errs = scoped().violations(&[p]);
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, DeoptMetadataError::FrameSlotOutsideFrame { .. })),
+                "{bad:?} must be refused: {}",
+                rendered(&errs)
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_negative_frame_slot_is_accepted() {
+        let mut p = plain_point();
+        p.frame_state.locals[0] = FrameValue::StackSlot(-40);
+        assert!(scoped().violations(&[p]).is_empty());
+    }
+
+    /// The message names the word, not just "some slot is wrong".
+    #[test]
+    fn the_outside_frame_message_names_the_slot_and_the_offset() {
+        let mut p = plain_point();
+        p.frame_state.stack = vec![FrameValue::StackSlotRef(8)];
+        let msg = rendered(&scoped().violations(&[p]));
+        assert!(msg.contains("stack[0]"), "{msg}");
+        assert!(msg.contains("rbp+8"), "{msg}");
+    }
+
+    // ── one word, one type ───────────────────────────────────────────
+
+    /// A machine word holds one value at one program point. Describing it as a
+    /// reference in one slot and an `int` in another is an internal
+    /// contradiction, and it is exactly the shape that reconstructs an `int`
+    /// into a slot the interpreter reads as a reference.
+    #[test]
+    fn one_word_described_as_two_types_is_rejected() {
+        let mut p = plain_point();
+        p.frame_state.locals = vec![FrameValue::StackSlotRef(-40)];
+        p.frame_state.stack = vec![FrameValue::StackSlot(-40)];
+        let errs = DeoptVerifier::new().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::SlotTypeConflict {
+                    offset: -40,
+                    first_kind: "ref",
+                    second_kind: "int",
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        let msg = rendered(&errs);
+        assert!(msg.contains("local[0]"), "must name the first slot: {msg}");
+        assert!(msg.contains("stack[0]"), "must name the second slot: {msg}");
+    }
+
+    /// Sharing a word is legal — `aload_0` leaves local 0 and stack[0] naming
+    /// the same spill — as long as the two agree on its type.
+    #[test]
+    fn the_same_word_named_twice_with_the_same_type_is_fine() {
+        let mut p = plain_point();
+        p.frame_state.locals = vec![FrameValue::StackSlotRef(-40)];
+        p.frame_state.stack = vec![FrameValue::StackSlotRef(-40)];
+        assert!(DeoptVerifier::new().violations(&[p]).is_empty());
+    }
+
+    /// Cat-1 and cat-2 are different types even though both are "not a
+    /// reference": a `long` read as an `int` loses the upper 32 bits and the
+    /// second local slot.
+    #[test]
+    fn an_int_and_a_long_at_one_word_are_a_conflict() {
+        let mut p = plain_point();
+        p.frame_state.locals = vec![FrameValue::StackSlot(-40)];
+        p.frame_state.stack = vec![FrameValue::StackSlotLong(-40)];
+        let errs = DeoptVerifier::new().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::SlotTypeConflict {
+                    first_kind: "int",
+                    second_kind: "long",
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    // ── the converse oop-map direction ───────────────────────────────
+
+    /// The forward rule (a reference the deopt map names must be one the GC
+    /// updates) had a hole in the other direction: the deopt map could read a
+    /// word as an `int` that the oop map lists as a live reference. One of the
+    /// two is wrong and both readings are unsound.
+    #[test]
+    fn a_primitive_frame_slot_the_oop_map_calls_a_reference_is_rejected() {
+        let mut p = plain_point();
+        p.frame_state.locals[0] = FrameValue::StackSlot(-40);
+        let v = scoped().with_oop_map(0x40, OopCoverage::complete([40]));
+        let errs = v.violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::PrimitiveSlotCoveredByOopMap {
+                    bank: "frame",
+                    location: 40,
+                    kind: "int",
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("disagree about the type of one word"));
+    }
+
+    #[test]
+    fn a_primitive_register_the_oop_map_calls_a_reference_is_rejected() {
+        let mut p = plain_point();
+        p.frame_state.locals[0] = FrameValue::Register(3);
+        let v = scoped().with_oop_map(
+            0x40,
+            OopCoverage {
+                frame_slot_offsets: Vec::new(),
+                registers: vec![3],
+                moving_young_coverage_complete: true,
+            },
+        );
+        let errs = v.violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::PrimitiveSlotCoveredByOopMap {
+                    bank: "gpr",
+                    location: 3,
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    /// Same exemption as the forward lane: a map that does not claim
+    /// moving-young completeness is a conservative over-approximation the
+    /// collector already refuses to relocate against, so a disagreement there
+    /// is not evidence of a defect.
+    #[test]
+    fn an_incomplete_oop_map_does_not_flag_a_primitive_slot() {
+        let mut p = plain_point();
+        p.frame_state.locals[0] = FrameValue::StackSlot(-40);
+        let v = scoped().with_oop_map(
+            0x40,
+            OopCoverage {
+                frame_slot_offsets: vec![40],
+                registers: Vec::new(),
+                moving_young_coverage_complete: false,
+            },
+        );
+        assert!(v.violations(&[p]).is_empty());
+    }
+
+    /// The direction that is *not* an error, restated as a test so it stays
+    /// that way: the GC may track a spilled temporary the interpreter frame
+    /// does not resume from.
+    #[test]
+    fn an_oop_map_slot_the_deopt_map_never_names_is_not_an_error() {
+        let p = plain_point();
+        let v = scoped().with_oop_map(0x40, OopCoverage::complete([40, 48, 56]));
+        assert!(v.violations(&[p]).is_empty());
+    }
+
+    // ── monitors ─────────────────────────────────────────────────────
+
+    /// A monitor entry replays as `monitorenter` and is balanced by one
+    /// `monitorexit` at method exit. An entry naming a primitive descriptor
+    /// leaves the real lock held: a hang in an unrelated thread, arbitrarily
+    /// later, with nothing pointing back at the deopt.
+    #[test]
+    fn a_monitor_on_a_primitive_is_rejected() {
+        for bad in [
+            FrameValue::Int(5),
+            FrameValue::Long(5),
+            FrameValue::StackSlot(-40),
+            FrameValue::StackSlotLong(-40),
+            FrameValue::Register(2),
+            FrameValue::XmmDouble(1),
+        ] {
+            let mut p = plain_point();
+            p.frame_state.monitors = vec![MonitorInfo {
+                object: bad.clone(),
+                lock_depth: 1,
+            }];
+            let errs = scoped().violations(&[p]);
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    DeoptMetadataError::MonitorObjectNotAReference { .. }
+                )),
+                "monitor on {bad:?} must be refused: {}",
+                rendered(&errs)
+            );
+        }
+    }
+
+    /// `monitorenter` on null throws rather than locking, so a null monitor
+    /// object means the emitter lost the object — not that the program locked
+    /// nothing.
+    #[test]
+    fn a_monitor_on_null_is_rejected() {
+        let mut p = plain_point();
+        p.frame_state.monitors = vec![MonitorInfo {
+            object: FrameValue::Object(0),
+            lock_depth: 1,
+        }];
+        let errs = scoped().violations(&[p]);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                DeoptMetadataError::MonitorObjectNotAReference { .. }
+            )),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("null"));
+    }
+
+    /// The reference-shaped forms stay accepted, including a monitor on a
+    /// scalar-replaced object that will be materialized before the re-lock.
+    #[test]
+    fn reference_shaped_monitor_objects_are_accepted() {
+        for good in [
+            FrameValue::StackSlotRef(-40),
+            FrameValue::RegisterRef(4),
+            FrameValue::VirtualObjectRef(9),
+        ] {
+            let mut p = plain_point();
+            // A defining occurrence for the `VirtualObjectRef` case.
+            p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState {
+                id: 9,
+                class_id: 3,
+                num_fields: 0,
+                field_values: Vec::new(),
+            });
+            p.frame_state.monitors = vec![MonitorInfo {
+                object: good.clone(),
+                lock_depth: 2,
+            }];
+            let errs = scoped().violations(&[p]);
+            assert!(
+                !errs.iter().any(|e| matches!(
+                    e,
+                    DeoptMetadataError::MonitorObjectNotAReference { .. }
+                )),
+                "monitor on {good:?} must be accepted: {}",
+                rendered(&errs)
+            );
+        }
+    }
+
+    /// The monitor object goes through the same oop-map agreement lane as a
+    /// local: a lock the collector cannot see is re-acquired on a stale address
+    /// after a relocating young collection.
+    #[test]
+    fn a_monitor_object_is_checked_against_the_oop_map() {
+        let mut p = plain_point();
+        p.frame_state.monitors = vec![MonitorInfo {
+            object: FrameValue::StackSlotRef(-64),
+            lock_depth: 1,
+        }];
+        let v = scoped().with_oop_map(0x40, OopCoverage::complete([40]));
+        let errs = v.violations(&[p]);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                DeoptMetadataError::ReferenceNotInOopMap { frame_offset: 64, .. }
+            )),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("monitor[0]"));
+    }
+
+    // ── exception state ──────────────────────────────────────────────
+
+    /// `x64_deopt_entry` routes on `reason`; a resume sink reads `semantics`.
+    /// If the two disagree, one of them resumes a frame the other knows is
+    /// exceptional — the metadata restatement of "the `finally` block was not
+    /// run" and "the `athrow` bci leaked".
+    #[test]
+    fn a_pending_exception_point_without_rethrow_semantics_is_rejected() {
+        let mut p = plain_point();
+        p.reason = DeoptReason::PendingException;
+        p.semantics = ResumeSemantics::REEXECUTE;
+        let errs = scoped().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::ResumeSemanticsMismatch {
+                    reason: DeoptReason::PendingException,
+                    rethrow: false,
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    #[test]
+    fn a_rethrow_point_whose_reason_routes_it_to_the_resume_stash_is_rejected() {
+        let mut p = plain_point();
+        p.reason = DeoptReason::NullCheck;
+        p.semantics = ResumeSemantics::RETHROW;
+        let errs = scoped().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::ResumeSemanticsMismatch { rethrow: true, .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    /// What every producer stamps today (`ResumeSemantics::for_reason`) passes
+    /// for every reason, so the lane is a tripwire on a future producer rather
+    /// than a tax on the current ones.
+    #[test]
+    fn for_reason_agrees_with_the_lane_for_every_reason() {
+        for reason in [
+            DeoptReason::NullCheck,
+            DeoptReason::ClassCheck,
+            DeoptReason::BoundsCheck,
+            DeoptReason::DivByZero,
+            DeoptReason::ReceiverTypeChanged,
+            DeoptReason::ClassLoading,
+            DeoptReason::UninitializedAccess,
+            DeoptReason::TransferToInterpreter,
+            DeoptReason::UncommonTrap,
+            DeoptReason::SpeculationFailed,
+            DeoptReason::NotCompiled,
+            DeoptReason::UnreachedCode,
+            DeoptReason::OsrExit,
+            DeoptReason::PendingException,
+        ] {
+            let mut p = plain_point();
+            p.reason = reason;
+            p.semantics = ResumeSemantics::for_reason(reason);
+            let errs = scoped().violations(&[p]);
+            assert!(
+                !errs.iter().any(|e| matches!(
+                    e,
+                    DeoptMetadataError::ResumeSemanticsMismatch { .. }
+                )),
+                "{reason:?}: {}",
+                rendered(&errs)
+            );
+        }
+    }
+
+    // ── caller-chain depth ───────────────────────────────────────────
+
+    fn owned_chain(depth: usize) -> FrameState {
+        let mut fs = FrameState {
+            method_key: String::new(),
+            bci: 0,
+            locals: Vec::new(),
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        for i in 0..depth {
+            fs = FrameState {
+                method_key: String::new(),
+                bci: i as u32 + 1,
+                locals: Vec::new(),
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: Some(Box::new(fs)),
+            };
+        }
+        fs
+    }
+
+    /// The verifier used to walk a caller chain to its end with no bound and
+    /// report nothing about the fact that it was absurdly deep. Now the cap is
+    /// a finding: stopping at it and saying "clean" would report a verdict for
+    /// scopes nobody looked at.
+    #[test]
+    fn an_over_deep_owned_chain_is_reported_not_silently_accepted() {
+        let mut p = plain_point();
+        p.frame_state = owned_chain(MAX_SCOPE_CHAIN + 2);
+        p.frame_state.bci = p.bci;
+        let errs = DeoptVerifier::new().violations(&[p]);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, DeoptMetadataError::ScopeChainTooDeep { .. })),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    #[test]
+    fn a_chain_within_the_cap_is_walked_without_complaint() {
+        let mut p = plain_point();
+        p.frame_state = owned_chain(4);
+        p.frame_state.bci = p.bci;
+        assert!(DeoptVerifier::new().violations(&[p]).is_empty());
+    }
+
+    /// Interning used to cut a chain at the cap and hand back a state whose
+    /// outermost kept scope claimed to be the bottom of the stack: every scope
+    /// well-formed, `chain_is_resumable` true, and a resume that rebuilds a
+    /// call stack the program never had. The cut is now represented.
+    #[test]
+    fn interning_an_over_deep_chain_marks_the_cut_instead_of_dropping_the_outer_frames() {
+        let mut it = FrameStateInterner::new();
+        let id = it.intern(&owned_chain(MAX_SCOPE_CHAIN + 3));
+        assert!(
+            !it.chain_is_resumable(id),
+            "a chain that was cut must not read as resumable"
+        );
+        assert!(
+            it.materialize(id).is_none(),
+            "materializing a cut chain must refuse rather than return a short stack"
+        );
+    }
+
+    /// …and a chain that fits is unaffected: it round-trips whole.
+    #[test]
+    fn a_chain_within_the_cap_still_round_trips_through_interning() {
+        let mut it = FrameStateInterner::new();
+        let id = it.intern(&owned_chain(6));
+        assert!(it.chain_is_resumable(id));
+        let back = it.materialize(id).expect("a chain within the cap materializes");
+        let mut depth = 0;
+        let mut cursor = Some(&back);
+        while let Some(fs) = cursor {
+            depth += 1;
+            cursor = fs.caller.as_deref();
+        }
+        assert_eq!(depth, 7, "6 callers above the innermost scope");
+    }
+
+    /// A cut chain reaching the interned verifier is reported as what it is,
+    /// not as an unknown handle — the two send a reader looking for different
+    /// bugs.
+    #[test]
+    fn the_interned_verifier_names_an_over_deep_chain_rather_than_an_unknown_handle() {
+        let mut it = FrameStateInterner::new();
+        let mut p = plain_point();
+        p.frame_state = owned_chain(MAX_SCOPE_CHAIN + 3);
+        p.frame_state.bci = p.bci;
+        let interned = it.intern_point(&p);
+        let errs = DeoptVerifier::new().violations_interned(&it, &[interned]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::ScopeChainTooDeep { .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("truncated chain"));
+    }
+
+    /// The owned and handle-side resumability predicates must agree at the cap.
+    /// `frame_state_is_resumable` has always refused there; its handle-side
+    /// twin used to stop walking and answer `true`, which is a fail-open in a
+    /// compile-time admission gate.
+    #[test]
+    fn the_two_resumability_predicates_agree_at_the_cap() {
+        let deep = owned_chain(MAX_SCOPE_CHAIN + 1);
+        assert!(!frame_state_is_resumable(&deep));
+        let mut it = FrameStateInterner::new();
+        let id = it.intern(&deep);
+        assert_eq!(frame_state_is_resumable(&deep), it.chain_is_resumable(id));
     }
 }
 
@@ -3519,6 +6193,69 @@ mod tests {
             "an Unsupported STACK slot under an indy argument -- the javac \
              ClassReader.readInnerClasses shape -- must make the frame unresumable"
         );
+    }
+
+    /// The predicate follows `caller`.
+    ///
+    /// The predicate used to inspect the innermost scope alone, which was
+    /// correct only because no producer built a chain. Its callers are the two
+    /// compile-time admission gates (`x64.rs`'s unresumable-indy-trap bail and
+    /// `CompiledMethod::osr_exit_policy`), and both must answer "no" for an
+    /// artifact whose trap sits under a caller frame nobody can describe —
+    /// otherwise a clean innermost scope admits it. `chain_is_resumable`
+    /// already existed on the interned side; this is its owned counterpart.
+    #[test]
+    fn resumability_follows_the_whole_caller_chain() {
+        let clean = || fs(vec![FrameValue::Int(1)], vec![]);
+        let mut chain = clean();
+        chain.caller = Some(Box::new(clean()));
+        assert!(
+            frame_state_is_resumable(&chain),
+            "a clean chain stays resumable"
+        );
+
+        for dirty in [
+            FrameValue::Unsupported,
+            FrameValue::MaterializationRequired(EliminatedValue::unknown(
+                EliminationCause::ElidedLock,
+            )),
+        ] {
+            let mut bad_caller = fs(vec![dirty.clone()], vec![]);
+            bad_caller.caller = None;
+            let mut inner = clean();
+            inner.caller = Some(Box::new(bad_caller));
+            assert!(
+                frame_state_is_resumable(&clean()),
+                "precondition: the innermost scope alone is clean"
+            );
+            assert!(
+                !frame_state_is_resumable(&inner),
+                "an unrebuildable CALLER slot ({dirty:?}) must sink the whole chain"
+            );
+
+            // …at depth 3 as well, not just as an immediate caller.
+            let mut deep = fs(vec![dirty.clone()], vec![]);
+            for _ in 0..3 {
+                let mut next = clean();
+                next.caller = Some(Box::new(deep));
+                deep = next;
+            }
+            assert!(!frame_state_is_resumable(&deep));
+        }
+    }
+
+    /// A caller chain deeper than `MAX_SCOPE_CHAIN` is refused rather than
+    /// walked further: that deep is a metadata defect, and refusing costs only
+    /// a whole-method re-run.
+    #[test]
+    fn an_absurdly_deep_chain_is_refused_not_walked() {
+        let mut deep = fs(vec![FrameValue::Int(0)], vec![]);
+        for _ in 0..(MAX_SCOPE_CHAIN + 4) {
+            let mut next = fs(vec![FrameValue::Int(0)], vec![]);
+            next.caller = Some(Box::new(deep));
+            deep = next;
+        }
+        assert!(!frame_state_is_resumable(&deep));
     }
 
     // -- per-bci de-spec registry (Step 9 follow-up c) ---------------------
@@ -3576,6 +6313,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: simple_frame_state(),
+            semantics: ResumeSemantics::REEXECUTE,
         }
     }
 
@@ -3621,6 +6359,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, rbp);
         assert_eq!(rf.locals[0], FrameValue::Object(0x1111_2222_3333_4444));
@@ -3677,6 +6416,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, rbp);
         assert_eq!(rf.locals[0], FrameValue::Float(float_bits as u64));
@@ -3743,6 +6483,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, rbp);
         assert_eq!(
@@ -3831,6 +6572,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: callee,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, 0);
         assert_eq!(rf.locals[0], FrameValue::Int(9));
@@ -3865,6 +6607,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, 0);
         assert_eq!(rf.monitors.len(), 1);
@@ -4434,6 +7177,7 @@ mod tests {
             action: DeoptAction::RecompileAndReinterpret,
             speculation_id: 1,
             frame_state: inner,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame(&dp);
         assert_eq!(rf.method_key, "Inner.go:()V");
@@ -4580,9 +7324,877 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame(&dp);
         assert_eq!(rf.monitors.len(), 1);
         assert_eq!(rf.monitors[0].lock_depth, 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: interned, immutable frame states
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod frame_state_interning_tests {
+    use super::*;
+
+    const M: &str = "T.m:(I)I";
+
+    fn ints(n: usize) -> Vec<FrameValue> {
+        (0..n).map(|i| FrameValue::Int(i as i64)).collect()
+    }
+
+    fn owned(bci: u32, locals: Vec<FrameValue>, stack: Vec<FrameValue>) -> FrameState {
+        FrameState {
+            method_key: M.to_string(),
+            bci,
+            locals,
+            stack,
+            monitors: Vec::new(),
+            caller: None,
+        }
+    }
+
+    /// An owned caller chain `depth` levels deep above the innermost scope.
+    /// Level 0 is the trapping scope; level `depth` is the outermost caller.
+    fn owned_chain(depth: usize) -> FrameState {
+        let mut built: Option<Box<FrameState>> = None;
+        for level in (0..=depth).rev() {
+            built = Some(Box::new(FrameState {
+                method_key: format!("T.level{level}:()V"),
+                bci: level as u32 + 1,
+                locals: vec![FrameValue::Int(level as i64), FrameValue::Undefined],
+                stack: vec![FrameValue::Int(100 + level as i64)],
+                monitors: vec![MonitorInfo {
+                    object: FrameValue::StackSlotRef(-8 * (level as i32 + 1)),
+                    lock_depth: 1,
+                }],
+                caller: built.take(),
+            }));
+        }
+        *built.expect("at least the innermost scope")
+    }
+
+    // ── identity ─────────────────────────────────────────────────────
+
+    /// The interning contract: structurally identical states are one state.
+    /// Everything else in this module rests on it — `==` on handles is only a
+    /// stand-in for structural equality if this holds.
+    #[test]
+    fn identical_states_intern_to_the_same_handle() {
+        let mut it = FrameStateInterner::new();
+        let a = owned(7, ints(20), vec![FrameValue::StackSlot(-8)]);
+        let b = a.clone();
+        let ia = it.intern(&a);
+        let ib = it.intern(&b);
+        assert_eq!(ia, ib, "identical states must share one handle");
+
+        let st = it.stats();
+        assert_eq!(st.states, 1, "the second intern allocated nothing");
+        assert_eq!(st.intern_requests, 2);
+        assert!(st.state_dedup_ratio() > 0.0);
+
+        // Different in ONE field ⇒ a different state, but the untouched value
+        // arrays are still the same handles.
+        let ic = it.with_bci(ia, 8);
+        assert_ne!(ia, ic);
+        let sa = *it.scope(ia).expect("interned");
+        let sc = *it.scope(ic).expect("interned");
+        assert_eq!(sa.locals, sc.locals, "a bci change copies no slots");
+        assert_eq!(sa.stack, sc.stack);
+        assert_eq!(sa.method_key, sc.method_key);
+    }
+
+    /// The sharing claim at its smallest: two 32-slot snapshots differing in
+    /// one slot store 40 slots, not 64.
+    #[test]
+    fn states_differing_in_one_slot_share_every_other_chunk() {
+        let mut it = FrameStateInterner::new();
+        let base = owned(0, ints(32), Vec::new());
+        let mut changed = base.clone();
+        changed.locals[5] = FrameValue::Int(999);
+
+        let ia = it.intern(&base);
+        let ib = it.intern(&changed);
+        assert_ne!(ia, ib);
+
+        let sa = *it.scope(ia).expect("interned");
+        let sb = *it.scope(ib).expect("interned");
+        assert_ne!(sa.locals, sb.locals);
+        assert_eq!(sa.stack, sb.stack, "the empty stack is one shared array");
+        assert_eq!(sa.method_key, sb.method_key, "the key is interned once");
+
+        // 32 slots = 4 chunks; only the chunk holding slot 5 is re-interned.
+        let st = it.stats();
+        assert_eq!(st.chunks, 5, "4 shared + 1 re-interned");
+        assert_eq!(st.stored_slots, 32 + FRAME_VALUE_CHUNK);
+        assert_eq!(st.logical_slots, 64, "the owned form would store 2 x 32");
+        assert!(
+            (st.slot_sharing_ratio() - 0.375).abs() < 1e-9,
+            "sharing {}",
+            st.slot_sharing_ratio()
+        );
+
+        // Reading a shared slot needs no materialization.
+        assert_eq!(it.local(ia, 5), Some(&FrameValue::Int(5)));
+        assert_eq!(it.local(ib, 5), Some(&FrameValue::Int(999)));
+        assert_eq!(it.local(ib, 6), Some(&FrameValue::Int(6)));
+        assert_eq!(it.locals_len(ib), 32);
+        assert_eq!(it.stack_len(ib), 0);
+    }
+
+    /// The persistent update and the compatibility path must land on the same
+    /// state — otherwise a producer that switches from rebuilding owned
+    /// snapshots to deriving them changes the metadata.
+    #[test]
+    fn persistent_derivation_agrees_with_interning_the_owned_state() {
+        let mut it = FrameStateInterner::new();
+        let base = owned(0, ints(24), vec![FrameValue::Int(7)]);
+        let id = it.intern(&base);
+
+        let mut expected = base.clone();
+        expected.locals[9] = FrameValue::Object(0);
+        expected.stack[0] = FrameValue::Undefined;
+        expected.bci = 42;
+
+        let derived = it.with_local(id, 9, FrameValue::Object(0));
+        let derived = it.with_stack_slot(derived, 0, FrameValue::Undefined);
+        let derived = it.with_bci(derived, 42);
+
+        assert_eq!(
+            derived,
+            it.intern(&expected),
+            "derivation and re-interning must agree"
+        );
+
+        // Writing the value already there derives nothing.
+        assert_eq!(it.with_local(id, 9, FrameValue::Int(9)), id);
+        // An out-of-range index is inert, not a panic.
+        assert_eq!(it.with_local(id, 99, FrameValue::Int(1)), id);
+        assert_eq!(it.with_stack_slot(id, 5, FrameValue::Int(1)), id);
+    }
+
+    // ── inlining ─────────────────────────────────────────────────────
+
+    /// A caller chain of every depth 0..=8 survives interning byte-for-byte:
+    /// method keys, bcis, locals, stack and monitors of every scope.
+    #[test]
+    fn caller_chains_of_depth_zero_to_eight_round_trip() {
+        for depth in 0..=8usize {
+            let before = owned_chain(depth);
+            let mut it = FrameStateInterner::new();
+            let id = it.intern(&before);
+
+            assert_eq!(it.depth(id), depth, "depth {depth}");
+            assert_eq!(it.method_key(id), "T.level0:()V");
+            assert_eq!(it.bci(id), Some(1));
+
+            let after = it.materialize(id).expect("round-trip");
+            assert_eq!(
+                format!("{after:?}"),
+                format!("{before:?}"),
+                "chain of depth {depth} must round-trip unchanged"
+            );
+
+            // Only the innermost scope re-executes; every inlined caller is
+            // parked mid-invoke.
+            assert_eq!(it.semantics(id), Some(ResumeSemantics::REEXECUTE));
+            let mut cursor = it.caller(id);
+            let mut seen = 0;
+            while let Some(c) = cursor {
+                assert_eq!(
+                    it.semantics(c),
+                    Some(ResumeSemantics::RESUME),
+                    "caller scope at depth {seen} must not re-execute its invoke"
+                );
+                seen += 1;
+                cursor = it.caller(c);
+            }
+            assert_eq!(seen, depth);
+        }
+    }
+
+    /// What makes inlined scopes affordable: every deopt point inside one
+    /// inlined callee names the *same* caller scope handle, so the caller's
+    /// frame is stored once regardless of how many safepoints the callee has.
+    #[test]
+    fn one_inlined_caller_scope_is_shared_by_every_point_in_the_callee() {
+        const POINTS: usize = 40;
+        let mut it = FrameStateInterner::new();
+
+        let caller = it.intern_scope(
+            "T.outer:()V",
+            17,
+            &ints(16),
+            &[FrameValue::Int(3)],
+            &[],
+            None,
+            ResumeSemantics::for_caller_scope(),
+        );
+
+        let mut callee_locals = ints(8);
+        let mut ids = Vec::with_capacity(POINTS);
+        for bci in 0..POINTS {
+            callee_locals[bci % 8] = FrameValue::Int(500 + bci as i64);
+            let id = it.intern_scope(
+                "T.inner:()V",
+                bci as u32,
+                &callee_locals,
+                &[],
+                &[],
+                Some(caller),
+                ResumeSemantics::REEXECUTE,
+            );
+            ids.push(id);
+        }
+
+        for id in &ids {
+            assert_eq!(it.caller(*id), Some(caller));
+            assert_eq!(it.depth(*id), 1);
+        }
+
+        // The caller's 17 slots are stored once, not 40 times: the owned form
+        // boxes a full copy of the caller frame into every deopt point.
+        let st = it.stats();
+        assert_eq!(st.states, POINTS + 1);
+        let owned_slots = it.owned_chain_slots(&ids);
+        assert_eq!(
+            owned_slots,
+            (POINTS * (8 + 16 + 1)) as u64,
+            "the owned form re-copies the caller into every point"
+        );
+        assert_eq!(
+            st.stored_slots,
+            16 + 1 + POINTS * FRAME_VALUE_CHUNK,
+            "the caller's chunks are stored once for all {POINTS} points"
+        );
+        let chain_sharing = 1.0 - (st.stored_slots as f64 / owned_slots as f64);
+        assert!(
+            chain_sharing > 0.60,
+            "expected >60% of chain slots shared at inline depth 1, got {chain_sharing:.4}"
+        );
+        eprintln!(
+            "[frame-state interning] depth-1 inline, {POINTS} points: \
+             chain slots {owned_slots} -> {} ({:.1}% shared)",
+            st.stored_slots,
+            chain_sharing * 100.0
+        );
+
+        // Relinking a callee scope under a *different* caller shares the
+        // callee's slots too.
+        let other_caller = it.with_bci(caller, 21);
+        let relinked = it.with_caller(ids[0], Some(other_caller));
+        assert_ne!(relinked, ids[0]);
+        assert_eq!(
+            it.scope(relinked).expect("interned").locals,
+            it.scope(ids[0]).expect("interned").locals
+        );
+        assert_eq!(it.with_caller(ids[0], Some(caller)), ids[0]);
+    }
+
+    // ── the reexecute flag ───────────────────────────────────────────
+
+    /// The flag that replaces the per-`DeoptReason` prose convention: it is
+    /// part of a state's identity, it survives interning and derivation, and
+    /// it is derived from the reason in exactly one place.
+    #[test]
+    fn the_reexecute_flag_survives_interning() {
+        let mut it = FrameStateInterner::new();
+        let fs = owned(4, ints(12), vec![FrameValue::Int(1)]);
+
+        let re = it.intern_with(&fs, ResumeSemantics::REEXECUTE);
+        let resume = it.intern_with(&fs, ResumeSemantics::RESUME);
+        let rethrow = it.intern_with(&fs, ResumeSemantics::RETHROW);
+
+        assert_ne!(re, resume, "semantics are part of the state's identity");
+        assert_ne!(re, rethrow);
+        assert!(it.semantics(re).expect("interned").reexecute);
+        assert!(!it.semantics(resume).expect("interned").reexecute);
+        assert!(it.semantics(rethrow).expect("interned").rethrow_exception);
+        assert!(!it.semantics(rethrow).expect("interned").reexecute);
+
+        // Three semantics, one copy of the slots.
+        let (a, b, c) = (
+            *it.scope(re).expect("interned"),
+            *it.scope(resume).expect("interned"),
+            *it.scope(rethrow).expect("interned"),
+        );
+        assert_eq!(a.locals, b.locals);
+        assert_eq!(b.locals, c.locals);
+        assert_eq!(it.stats().logical_slots, 3 * 13);
+        assert_eq!(it.stats().stored_slots, 12 + 1);
+
+        // The convention, written down once.
+        assert_eq!(
+            ResumeSemantics::for_reason(DeoptReason::BoundsCheck),
+            ResumeSemantics::REEXECUTE
+        );
+        assert_eq!(
+            ResumeSemantics::for_reason(DeoptReason::DivByZero),
+            ResumeSemantics::REEXECUTE
+        );
+        assert_eq!(
+            ResumeSemantics::for_reason(DeoptReason::OsrExit),
+            ResumeSemantics::REEXECUTE
+        );
+        assert_eq!(
+            ResumeSemantics::for_reason(DeoptReason::PendingException),
+            ResumeSemantics::RETHROW
+        );
+        assert_eq!(ResumeSemantics::for_caller_scope(), ResumeSemantics::RESUME);
+        assert_eq!(ResumeSemantics::default(), ResumeSemantics::REEXECUTE);
+        assert_eq!(ResumeSemantics::REEXECUTE.to_string(), "reexecute");
+        assert_eq!(ResumeSemantics::RESUME.to_string(), "resume");
+        assert_eq!(ResumeSemantics::RETHROW.to_string(), "rethrow");
+
+        // …and it reaches a state interned from a whole deopt point.
+        let point = DeoptimizationPoint {
+            native_offset: 0x10,
+            bci: 4,
+            reason: DeoptReason::PendingException,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: fs.clone(),
+            semantics: ResumeSemantics::for_reason(DeoptReason::PendingException),
+        };
+        let interned = it.intern_point(&point);
+        assert_eq!(
+            it.semantics(interned.frame_state),
+            Some(ResumeSemantics::RETHROW)
+        );
+        assert_eq!(interned.frame_state, rethrow, "same state, same handle");
+
+        let flipped = it.with_semantics(interned.frame_state, ResumeSemantics::REEXECUTE);
+        assert_eq!(flipped, re);
+        assert_eq!(
+            it.with_semantics(re, ResumeSemantics::REEXECUTE),
+            re,
+            "a no-op derivation allocates nothing"
+        );
+    }
+
+    // ── the existing verifier over interned states ───────────────────
+
+    fn limits() -> MethodFrameLimits {
+        MethodFrameLimits::new(M, 32, 3, 2)
+    }
+
+    fn good_point() -> DeoptimizationPoint {
+        DeoptimizationPoint {
+            native_offset: 0x40,
+            bci: 12,
+            reason: DeoptReason::BoundsCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: M.to_string(),
+                bci: 12,
+                locals: vec![FrameValue::StackSlotRef(-40), FrameValue::Int(7)],
+                stack: vec![FrameValue::StackSlot(-48)],
+                monitors: Vec::new(),
+                caller: None,
+            },
+            semantics: ResumeSemantics::REEXECUTE,
+        }
+    }
+
+    fn verifier() -> DeoptVerifier {
+        DeoptVerifier::new()
+            .with_method(limits())
+            .with_oop_map(0x40, OopCoverage::complete([40]))
+    }
+
+    fn rendered(errors: &[DeoptMetadataError]) -> String {
+        errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// The interned form must not weaken the install-time check: a well-formed
+    /// point still passes, and every violation the owned lane rejects today is
+    /// still rejected through the interned lane, with the same error.
+    #[test]
+    fn the_verifier_accepts_interned_states_and_rejects_the_same_violations() {
+        let mut it = FrameStateInterner::new();
+
+        let ok = it.intern_point(&good_point());
+        assert!(
+            verifier().violations_interned(&it, &[ok]).is_empty(),
+            "{}",
+            rendered(&verifier().violations_interned(&it, &[ok]))
+        );
+        assert!(verifier().verify_interned(&it, &[ok]).is_ok());
+
+        // bci past the end of the method
+        let mut p = good_point();
+        p.bci = 99;
+        p.frame_state.bci = 99;
+        let bad_bci = it.intern_point(&p);
+        assert!(
+            matches!(
+                verifier().violations_interned(&it, &[bad_bci]).first(),
+                Some(DeoptMetadataError::BciOutOfRange { bci: 99, code_len: 32, .. })
+            ),
+            "{}",
+            rendered(&verifier().violations_interned(&it, &[bad_bci]))
+        );
+
+        // more locals than max_locals
+        let mut p = good_point();
+        p.frame_state.locals = vec![FrameValue::Int(0); 4];
+        let too_many = it.intern_point(&p);
+        assert!(matches!(
+            verifier().violations_interned(&it, &[too_many]).first(),
+            Some(DeoptMetadataError::LocalCountMismatch {
+                found: 4,
+                max_locals: 3,
+                ..
+            })
+        ));
+
+        // the moving-GC agreement rule
+        let mut p = good_point();
+        p.frame_state.locals[0] = FrameValue::StackSlotRef(-56);
+        let uncovered = it.intern_point(&p);
+        let errs = verifier().violations_interned(&it, &[uncovered]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::ReferenceNotInOopMap { frame_offset: 56, .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("local[0]"), "{}", rendered(&errs));
+
+        // a baked heap address
+        let mut p = good_point();
+        p.frame_state.locals[1] = FrameValue::Object(0x7f00_1234);
+        let baked = it.intern_point(&p);
+        assert!(matches!(
+            verifier().violations_interned(&it, &[baked]).first(),
+            Some(DeoptMetadataError::BakedObjectAddress { .. })
+        ));
+
+        // a duplicate virtual-object definition
+        let mut p = good_point();
+        let vo = FrameValue::VirtualObject(VirtualObjectState {
+            id: 4,
+            class_id: 1,
+            num_fields: 0,
+            field_values: Vec::new(),
+        });
+        p.frame_state.locals[0] = vo.clone();
+        p.frame_state.stack[0] = vo;
+        let dup = it.intern_point(&p);
+        assert!(matches!(
+            verifier().violations_interned(&it, &[dup]).first(),
+            Some(DeoptMetadataError::DuplicateVirtualObjectDefinition { id: 4, .. })
+        ));
+
+        // an inlined caller scope is still checked at depth 1
+        let mut p = good_point();
+        p.frame_state.caller = Some(Box::new(FrameState {
+            method_key: "T.outer:()V".to_string(),
+            bci: 500,
+            locals: Vec::new(),
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        }));
+        let inlined = it.intern_point(&p);
+        let v = verifier().with_method(MethodFrameLimits::new("T.outer:()V", 20, 1, 1));
+        assert!(
+            matches!(
+                v.violations_interned(&it, &[inlined]).first(),
+                Some(DeoptMetadataError::BciOutOfRange { scope_depth: 1, .. })
+            ),
+            "{}",
+            rendered(&v.violations_interned(&it, &[inlined]))
+        );
+
+        // sortedness still guards find_deopt_point's binary search
+        let mut a = good_point();
+        a.native_offset = 0x80;
+        let mut b = good_point();
+        b.native_offset = 0x40;
+        let (ia, ib) = (it.intern_point(&a), it.intern_point(&b));
+        assert!(matches!(
+            DeoptVerifier::new()
+                .violations_interned(&it, &[ia, ib])
+                .first(),
+            Some(DeoptMetadataError::DeoptPointsUnsorted {
+                first: 0x80,
+                second: 0x40
+            })
+        ));
+
+        // the bailout is the same shape as the owned lane's
+        let err = verifier()
+            .verify_interned(&it, &[bad_bci])
+            .expect_err("a bad bci must bail");
+        assert_eq!(err.category(), "deopt_metadata");
+        assert!(err.to_string().contains("resume bci 99"), "{err}");
+    }
+
+    /// Parity, point by point: the interned lane reports exactly what the
+    /// owned lane reports. Two checkers that drift apart would be worse than
+    /// the materialization this parity costs.
+    #[test]
+    fn interned_and_owned_verification_agree() {
+        let mut it = FrameStateInterner::new();
+        let mut points = Vec::new();
+
+        points.push(good_point());
+        let mut p = good_point();
+        p.frame_state.locals[0] = FrameValue::RegisterRef(9);
+        points.push(p);
+        let mut p = good_point();
+        p.bci = 13; // disagrees with frame_state.bci
+        points.push(p);
+
+        for p in &points {
+            let interned = it.intern_point(p);
+            let owned_errs = verifier().violations(std::slice::from_ref(p));
+            let interned_errs = verifier().violations_interned(&it, &[interned]);
+            assert_eq!(
+                rendered(&owned_errs),
+                rendered(&interned_errs),
+                "lane disagreement on pc+0x{:x}",
+                p.native_offset
+            );
+        }
+    }
+
+    /// A handle from a different interner is a violation, not a silently
+    /// skipped point: an unreadable scope chain must never read as "clean".
+    #[test]
+    fn a_foreign_frame_state_handle_is_reported_not_skipped() {
+        let mut it = FrameStateInterner::new();
+        let point = it.intern_point(&good_point());
+        let empty = FrameStateInterner::new();
+        let errs = verifier().violations_interned(&empty, &[point]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::UnknownFrameStateHandle { native_offset: 0x40, .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("unreadable"), "{}", rendered(&errs));
+        assert!(verifier().verify_interned(&empty, &[point]).is_err());
+    }
+
+    /// `semantics` survives the interning round trip.
+    ///
+    /// It used to be re-derived from `DeoptReason` on the way *in* and dropped
+    /// on the way *out* (`materialize` has nowhere to put it), so a producer
+    /// that knew better than the reason-based convention could not say so.
+    /// Now `intern_point` reads the field and `materialize_point` restores it —
+    /// including the case where they disagree, which is the only case that
+    /// proves the value is carried rather than recomputed.
+    #[test]
+    fn point_semantics_survive_the_interning_round_trip() {
+        let mut it = FrameStateInterner::new();
+
+        // The convention case: what every producer stamps today.
+        let p = good_point();
+        assert_eq!(p.semantics, ResumeSemantics::for_reason(p.reason));
+        let conventional = it.intern_point(&p);
+        let back = it.materialize_point(&conventional).expect("round-trip");
+        assert_eq!(back.semantics, p.semantics);
+
+        // The case the field exists for: semantics that the reason does NOT
+        // imply. A resume point after a call that returned is `RESUME`, while
+        // `for_reason` would say `REEXECUTE` and call the callee twice.
+        let mut explicit = good_point();
+        explicit.semantics = ResumeSemantics::RESUME;
+        assert_ne!(
+            explicit.semantics,
+            ResumeSemantics::for_reason(explicit.reason),
+            "precondition: the reason must not already imply these semantics"
+        );
+        let interned = it.intern_point(&explicit);
+        assert_eq!(
+            it.semantics(interned.frame_state),
+            Some(ResumeSemantics::RESUME)
+        );
+        let back = it.materialize_point(&interned).expect("round-trip");
+        assert_eq!(
+            back.semantics,
+            ResumeSemantics::RESUME,
+            "materialize_point must read the interned semantics, not re-derive them"
+        );
+        // …and the rest of the point is untouched.
+        assert_eq!(back.native_offset, explicit.native_offset);
+        assert_eq!(back.bci, explicit.bci);
+        assert_eq!(back.reason, explicit.reason);
+    }
+
+    // ── unresumable states stay unresumable ──────────────────────────
+
+    /// The eliminated-vs-undefined distinction must survive the new
+    /// representation intact. Interning a `MaterializationRequired` slot that
+    /// softened it to `Undefined` (or dropped it in a shared chunk) would
+    /// restore the silent-null reconstruction the variant exists to stop.
+    #[test]
+    fn materialization_required_remains_unresumable_through_interning() {
+        let eliminated = FrameValue::MaterializationRequired(EliminatedValue::allocation(
+            12,
+            77,
+            EliminationCause::ScalarReplacedObject,
+        ));
+        let mut it = FrameStateInterner::new();
+
+        let fs = owned(
+            3,
+            vec![
+                FrameValue::Int(1),
+                eliminated.clone(),
+                FrameValue::Undefined,
+            ],
+            Vec::new(),
+        );
+        let id = it.intern(&fs);
+        assert!(!it.is_resumable(id), "an eliminated slot must refuse");
+        assert!(!it.chain_is_resumable(id));
+        assert_eq!(it.count_materialization_required(id), 1);
+        assert_eq!(it.local(id, 1), Some(&eliminated));
+
+        // …and it is still there after a round-trip through the owned form.
+        let back = it.materialize(id).expect("round-trip");
+        assert_eq!(back.locals[1], eliminated);
+        assert!(!frame_state_is_resumable(&back));
+        assert_eq!(count_materialization_required(&back), 1);
+
+        // Parity with the owned predicates on a resumable frame too.
+        let plain = owned(3, vec![FrameValue::Int(1), FrameValue::Undefined], Vec::new());
+        let plain_id = it.intern(&plain);
+        assert!(it.is_resumable(plain_id));
+        assert_eq!(
+            it.is_resumable(plain_id),
+            frame_state_is_resumable(&it.materialize(plain_id).expect("round-trip"))
+        );
+        assert_eq!(it.count_materialization_required(plain_id), 0);
+
+        // A poisoned virtual-object field poisons the slot, chunked or not.
+        let poisoned = owned(
+            0,
+            vec![FrameValue::VirtualObject(VirtualObjectState {
+                id: 1,
+                class_id: 2,
+                num_fields: 2,
+                field_values: vec![
+                    FrameValue::Int(4),
+                    FrameValue::MaterializationRequired(EliminatedValue::unknown(
+                        EliminationCause::EliminatedStore,
+                    )),
+                ],
+            })],
+            Vec::new(),
+        );
+        let poisoned_id = it.intern(&poisoned);
+        assert!(!it.is_resumable(poisoned_id));
+        assert_eq!(it.count_materialization_required(poisoned_id), 1);
+
+        // `is_resumable` is scope-local — it answers "is *this* frame clean".
+        // `chain_is_resumable` is the whole-chain answer an inlined deopt
+        // needs, and it is the one the owned `frame_state_is_resumable` now
+        // matches: the owned predicate used to stop at the innermost scope, so
+        // this exact state round-tripped back as "resumable" while holding a
+        // caller slot nobody can rebuild.
+        let mut inner = owned(1, vec![FrameValue::Int(0)], Vec::new());
+        inner.caller = Some(Box::new(owned(2, vec![eliminated.clone()], Vec::new())));
+        let inner_id = it.intern(&inner);
+        assert!(
+            it.is_resumable(inner_id),
+            "the trapping scope itself is clean"
+        );
+        assert!(
+            !it.chain_is_resumable(inner_id),
+            "an unrebuildable caller slot makes the whole chain unresumable"
+        );
+        assert!(
+            !frame_state_is_resumable(&it.materialize(inner_id).expect("round-trip")),
+            "the owned predicate must agree with `chain_is_resumable`, not with \
+             `is_resumable` — this is the resume sinks' only guard"
+        );
+    }
+
+    // ── measurement ──────────────────────────────────────────────────
+
+    /// The headline number: 100 consecutive safepoint snapshots of a 72-slot
+    /// frame that differ by one slot each. The owned representation stores
+    /// 7 200 slots; the interned one stores 864.
+    #[test]
+    fn sharing_ratio_on_a_hundred_snapshots_differing_by_one_slot() {
+        const POINTS: usize = 100;
+        const LOCALS: usize = 64;
+        const STACK: usize = 8;
+
+        let mut it = FrameStateInterner::new();
+        let mut locals = ints(LOCALS);
+        let stack: Vec<FrameValue> = (0..STACK)
+            .map(|i| FrameValue::StackSlot(-8 * (i as i32 + 1)))
+            .collect();
+
+        let mut ids = Vec::with_capacity(POINTS);
+        for bci in 0..POINTS {
+            if bci > 0 {
+                // Exactly one slot differs from the previous snapshot.
+                locals[bci % LOCALS] = FrameValue::Int(1000 + bci as i64);
+            }
+            let fs = FrameState {
+                method_key: "T.hot:()V".to_string(),
+                bci: bci as u32,
+                locals: locals.clone(),
+                stack: stack.clone(),
+                monitors: Vec::new(),
+                caller: None,
+            };
+            ids.push(it.intern(&fs));
+        }
+
+        let distinct: FxHashSet<FrameStateId> = ids.iter().copied().collect();
+        assert_eq!(distinct.len(), POINTS, "every bci is its own state");
+
+        let st = it.stats();
+        assert_eq!(st.states, POINTS);
+        assert_eq!(st.method_keys, 1, "one key for the whole sequence");
+        assert_eq!(st.logical_slots, (POINTS * (LOCALS + STACK)) as u64);
+        // First snapshot: 8 local chunks + 1 stack chunk. Every later one
+        // re-interns exactly the one local chunk it touched.
+        assert_eq!(st.chunks, 9 + (POINTS - 1));
+        assert_eq!(
+            st.stored_slots,
+            LOCALS + STACK + (POINTS - 1) * FRAME_VALUE_CHUNK
+        );
+        assert_eq!(st.value_arrays, POINTS + 1, "one shared stack array");
+
+        let ratio = st.slot_sharing_ratio();
+        assert!(
+            ratio > 0.85,
+            "expected >85% of slots shared, got {:.4}",
+            ratio
+        );
+        assert!(
+            st.slot_byte_saving() > 0.80,
+            "expected >80% of slot bytes saved, got {:.4}",
+            st.slot_byte_saving()
+        );
+
+        eprintln!(
+            "[frame-state interning] {POINTS} snapshots x {} slots: \
+             slots {} -> {} ({:.1}% shared); bytes {} -> {} ({:.1}% saved); \
+             states {} value-arrays {} chunks {} spine-entries {}",
+            LOCALS + STACK,
+            st.logical_slots,
+            st.stored_slots,
+            ratio * 100.0,
+            st.owned_slot_bytes(),
+            st.interned_slot_bytes(),
+            st.slot_byte_saving() * 100.0,
+            st.states,
+            st.value_arrays,
+            st.chunks,
+            st.spine_entries,
+        );
+
+        // Every snapshot still reads back exactly, shared chunks and all.
+        let last = *ids.last().expect("100 points");
+        assert_eq!(it.bci(last), Some((POINTS - 1) as u32));
+        assert_eq!(it.locals_len(last), LOCALS);
+        assert_eq!(it.stack_len(last), STACK);
+        assert_eq!(
+            it.local(last, (POINTS - 1) % LOCALS),
+            Some(&FrameValue::Int(1000 + (POINTS - 1) as i64))
+        );
+        let materialized = it.materialize(last).expect("round-trip");
+        assert_eq!(materialized.locals, locals);
+        assert_eq!(materialized.stack, stack);
+    }
+
+    /// Monitors and method keys are interned too: a synchronized region open
+    /// across many safepoints stores its monitor list once.
+    #[test]
+    fn monitor_lists_and_method_keys_are_shared() {
+        let mut it = FrameStateInterner::new();
+        let monitors = vec![MonitorInfo {
+            object: FrameValue::StackSlotRef(-40),
+            lock_depth: 2,
+        }];
+        let mut ids = Vec::new();
+        for bci in 0..16u32 {
+            let fs = FrameState {
+                method_key: "T.sync:()V".to_string(),
+                bci,
+                locals: vec![FrameValue::Int(bci as i64)],
+                stack: Vec::new(),
+                monitors: monitors.clone(),
+                caller: None,
+            };
+            ids.push(it.intern(&fs));
+        }
+        let st = it.stats();
+        assert_eq!(st.method_keys, 1);
+        assert_eq!(st.monitor_arrays, 1, "one shared monitor list");
+        assert_eq!(st.stored_monitors, 1);
+        assert_eq!(st.logical_monitors, 16);
+        for id in &ids {
+            assert_eq!(it.monitors(*id).len(), 1);
+            assert_eq!(it.monitors(*id)[0].lock_depth, 2);
+        }
+        // An empty monitor list is also interned once, and is a different one.
+        let bare = it.intern(&owned(0, Vec::new(), Vec::new()));
+        assert!(it.monitors(bare).is_empty());
+        assert_eq!(it.stats().monitor_arrays, 2);
+    }
+
+    /// Nothing in this module panics on a handle it did not issue — these
+    /// accessors are reachable from deopt paths, where a panic is strictly
+    /// worse than a refusal.
+    #[test]
+    fn foreign_handles_are_inert() {
+        let mut it = FrameStateInterner::new();
+        let real = it.intern(&owned(1, ints(4), Vec::new()));
+        let foreign = FrameStateId(9_999);
+
+        assert!(it.scope(foreign).is_none());
+        assert!(it.materialize(foreign).is_none());
+        assert_eq!(it.method_key(foreign), "");
+        assert_eq!(it.bci(foreign), None);
+        assert_eq!(it.semantics(foreign), None);
+        assert_eq!(it.caller(foreign), None);
+        assert_eq!(it.depth(foreign), 0);
+        assert_eq!(it.locals_len(foreign), 0);
+        assert_eq!(it.stack_len(foreign), 0);
+        assert_eq!(it.local(foreign, 0), None);
+        assert_eq!(it.stack_slot(foreign, 0), None);
+        assert!(it.monitors(foreign).is_empty());
+        assert_eq!(it.count_materialization_required(foreign), 0);
+        assert!(
+            !it.is_resumable(foreign),
+            "an undescribable frame must refuse, not resume"
+        );
+        assert!(!it.chain_is_resumable(foreign));
+
+        // Derivations on a foreign handle return it unchanged.
+        assert_eq!(it.with_local(foreign, 0, FrameValue::Int(1)), foreign);
+        assert_eq!(it.with_stack_slot(foreign, 0, FrameValue::Int(1)), foreign);
+        assert_eq!(it.with_bci(foreign, 3), foreign);
+        assert_eq!(it.with_caller(foreign, Some(real)), foreign);
+        assert_eq!(
+            it.with_semantics(foreign, ResumeSemantics::RESUME),
+            foreign
+        );
+
+        // …and the real handle is untouched by any of it.
+        assert_eq!(it.locals_len(real), 4);
+        assert_eq!(it.stats().states, 1);
     }
 }

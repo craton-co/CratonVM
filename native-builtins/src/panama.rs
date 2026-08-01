@@ -5288,76 +5288,86 @@ mod tests {
 
     #[test]
     fn test_85_4_upcall_handle_and_invoke() {
-        // Create an upcall handle through pe_upcall_handle and dispatch through pe_upcall_invoke
-        let mut ctx = mock_ctx();
+        // Native access is DENIED by default, and `pe_upcall_handle` gates on
+        // it — so without this the test asserts against a refusal and fails on
+        // a correct build. The two panama tests that pass unguarded do so only
+        // because the policy is a process global that another test may have
+        // granted first; `with_policy_isolated` takes the shared lock and
+        // restores the previous value, so this neither depends on nor leaks
+        // that ordering.
+        with_policy_isolated(|| {
+            set_native_access_enabled(true);
+            // Create an upcall handle through pe_upcall_handle and dispatch through pe_upcall_invoke
+            let mut ctx = mock_ctx();
 
-        // Create target, descriptor
-        let target = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2);
+            // Create target, descriptor
+            let target = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2);
 
-        let ret_layout = make_layout(&mut ctx, LAYOUT_INT);
-        let param_layout = make_layout(&mut ctx, LAYOUT_INT);
-        let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-        ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
+            let ret_layout = make_layout(&mut ctx, LAYOUT_INT);
+            let param_layout = make_layout(&mut ctx, LAYOUT_INT);
+            let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+            ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
-        let descriptor =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
-        ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
-        ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
+            let descriptor =
+                alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
+            ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let linker = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1);
-        let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
+            let linker = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1);
+            let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
 
-        // Register upcall handle
-        let handle_result = pe_upcall_handle(
-            &mut ctx,
-            &[
-                Value::Object(Some(linker)),
-                Value::Object(Some(target)),
-                Value::Object(Some(descriptor)),
-                Value::Object(Some(arena)),
-            ],
-        );
-        assert!(handle_result.is_ok());
-        let seg = match handle_result.unwrap() {
-            Some(Value::Object(Some(s))) => s,
-            _ => panic!("Expected segment from upcall handle"),
-        };
+            // Register upcall handle
+            let handle_result = pe_upcall_handle(
+                &mut ctx,
+                &[
+                    Value::Object(Some(linker)),
+                    Value::Object(Some(target)),
+                    Value::Object(Some(descriptor)),
+                    Value::Object(Some(arena)),
+                ],
+            );
+            assert!(handle_result.is_ok());
+            let seg = match handle_result.unwrap() {
+                Some(Value::Object(Some(s))) => s,
+                _ => panic!("Expected segment from upcall handle"),
+            };
 
-        // The segment's address (field 0) should be a real trampoline function pointer
-        let tramp_addr = match ctx.get_field(seg, 0) {
-            Value::Long(n) => n,
-            _ => -1,
-        };
-        assert!(tramp_addr != 0, "Trampoline address should be non-null");
-        // Verify it's a real callable function pointer by calling it
-        let tramp_fn: unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-            unsafe { std::mem::transmute(tramp_addr as usize) };
-        let tramp_result = unsafe { tramp_fn(42, 0, 0, 0, 0, 0, 0, 0) };
-        // Trampoline dispatch returns 0 (no thread-local context in tests)
-        assert_eq!(tramp_result, 0);
+            // The segment's address (field 0) should be a real trampoline function pointer
+            let tramp_addr = match ctx.get_field(seg, 0) {
+                Value::Long(n) => n,
+                _ => -1,
+            };
+            assert!(tramp_addr != 0, "Trampoline address should be non-null");
+            // Verify it's a real callable function pointer by calling it
+            let tramp_fn: unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                unsafe { std::mem::transmute(tramp_addr as usize) };
+            let tramp_result = unsafe { tramp_fn(42, 0, 0, 0, 0, 0, 0, 0) };
+            // Trampoline dispatch returns 0 (no thread-local context in tests)
+            assert_eq!(tramp_result, 0);
 
-        // Set up invoke_virtual to return a value when the upcall dispatches
-        // via pe_upcall_invoke (the Java-side dispatch path)
-        unsafe {
-            *ctx.invoke_virtual_result.get() = Some(Ok(Some(Value::Int(99))));
-        }
+            // Set up invoke_virtual to return a value when the upcall dispatches
+            // via pe_upcall_invoke (the Java-side dispatch path)
+            unsafe {
+                *ctx.invoke_virtual_result.get() = Some(Ok(Some(Value::Int(99))));
+            }
 
-        // Create an UpcallStub handle object for pe_upcall_invoke
-        // (uses the VM upcall slot 0, not the trampoline address)
-        let stub = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2);
-        ctx.set_field(stub, 0, Value::Long(0)); // slot 0 in the VM's upcall table
+            // Create an UpcallStub handle object for pe_upcall_invoke
+            // (uses the VM upcall slot 0, not the trampoline address)
+            let stub = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2);
+            ctx.set_field(stub, 0, Value::Long(0)); // slot 0 in the VM's upcall table
 
-        // Create args array
-        let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-        ctx.set_array_element(call_args, 0, Value::Int(42));
+            // Create args array
+            let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+            ctx.set_array_element(call_args, 0, Value::Int(42));
 
-        let result = pe_upcall_invoke(
-            &mut ctx,
-            &[Value::Object(Some(stub)), Value::Object(Some(call_args))],
-        );
-        assert!(result.is_ok());
-        let val = result.unwrap();
-        assert_eq!(val, Some(Value::Int(99)));
+            let result = pe_upcall_invoke(
+                &mut ctx,
+                &[Value::Object(Some(stub)), Value::Object(Some(call_args))],
+            );
+            assert!(result.is_ok());
+            let val = result.unwrap();
+            assert_eq!(val, Some(Value::Int(99)));
+        });
     }
 
     #[test]
