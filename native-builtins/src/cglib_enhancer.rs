@@ -4796,7 +4796,7 @@ fn fb_handler_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => None,
     };
     let method_name = match method_obj {
-        Some(m) => match ctx.get_field_by_name(m, "name") {
+        Some(m) => match crate::lang_class::method_name_value(ctx, m) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         },
@@ -4828,13 +4828,24 @@ fn fb_handler_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // custom methods, equals/hashCode/toString) delegates straight to the
     // raw factory's own real dispatch — mirrors real Spring's CGLIB
     // callback / interface-proxy handler, which intercept getObject alone.
+    // The descriptor MUST come from the mirror's `parameterTypes`/`returnType`
+    // (via `method_descriptor_for_invoke`), never from the `signature` field:
+    // `Method.signature` holds the *generic* signature and is null for every
+    // non-generic method, so the old read fell through to a hardcoded
+    // `()Ljava/lang/Object;` default and made `isSingleton()Z` /
+    // `getObjectType()Ljava/lang/Class;` dispatch as `()Ljava/lang/Object;` —
+    // `NoSuchMethodError: <rawFactory>.isSingleton()Ljava/lang/Object;` out of
+    // the proxy body (Spr15275 `withAbstractFactoryBean`,
+    // `withAbstractFactoryBeanForInterface`, `withFinalFactoryBean`).
     let descriptor = match method_obj {
-        Some(m) => match ctx.get_field_by_name(m, "signature") {
-            Value::Object(Some(s)) => {
-                ctx.read_string(s).unwrap_or_else(|| "()Ljava/lang/Object;".to_string())
+        Some(m) => {
+            let d = crate::lang_class::method_descriptor_for_invoke(&*ctx, m);
+            if d.is_empty() {
+                "()Ljava/lang/Object;".to_string()
+            } else {
+                d
             }
-            _ => "()Ljava/lang/Object;".to_string(),
-        },
+        }
         None => "()Ljava/lang/Object;".to_string(),
     };
     let call_args: Vec<Value> = match args.get(3) {
@@ -4844,7 +4855,31 @@ fn fb_handler_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         }
         _ => Vec::new(),
     };
-    ctx.invoke_virtual(raw_factory, &method_name, &descriptor, &call_args)
+    let result = ctx.invoke_virtual(raw_factory, &method_name, &descriptor, &call_args)?;
+
+    // `InvocationHandler.invoke` is declared to return `Object`, and the JDK's
+    // generated proxy body immediately `checkcast`s that result to the boxed
+    // wrapper before unboxing it (`checkcast java/lang/Boolean; invokevirtual
+    // booleanValue()Z` for an `isSingleton()Z` proxy method). Handing back the
+    // raw primitive `Value` the delegated call produced aborted the VM with
+    // "checkcast: not an object reference (got Int(1)) at
+    // jdk/proxy2/$Proxy23.isSingleton()Z" — box it to match the contract, and
+    // map a `void` delegate to `null`.
+    let ret_desc = descriptor
+        .rfind(')')
+        .map(|i| descriptor[i + 1..].to_string())
+        .unwrap_or_default();
+    let boxed = match ret_desc.as_str() {
+        "V" => Some(Value::Object(None)),
+        "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D" => match result {
+            Some(v @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_))) => {
+                Some(crate::lang_class::box_value(ctx, v, &ret_desc))
+            }
+            other => other,
+        },
+        _ => result,
+    };
+    Ok(boxed)
 }
 
 /// `cratonvm/internal/ConfigEnhancerSupport.enhanceFactoryBeanReference`
