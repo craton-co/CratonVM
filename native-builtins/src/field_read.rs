@@ -166,6 +166,10 @@ pub(crate) fn int_field_strict(
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
+    // The heap accessors these tests drive (`new_object`, `create_string`,
+    // `get_field_by_name`, `set_field_by_name`) are trait methods, and the
+    // trait has to be in scope to call them on the mock.
+    use cratonvm_native_api::NativeHeapAccess;
 
     /// The mock's `get_field_by_name` mirrors the production hazard for an
     /// unresolvable name: it answers `Value::Int(0)`, not `Object(None)`
