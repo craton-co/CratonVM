@@ -22,6 +22,19 @@
 //! cost — the alternative (a JIT-compiled caller that silently never
 //! offloads again) is strictly worse.
 //!
+//! # Second reason to refuse: inline array stores
+//!
+//! The same gate also blocks a method that stores into an
+//! `int[]`/`long[]`/`float[]`/`double[]`. That has nothing to do with
+//! where the kernel is called from: it keeps the GPU input-residency
+//! cache honest. `offload::input_cache` mirrors a Java array in device
+//! memory across submissions, so a host write must evict the entry. The
+//! interpreter's `*astore` arms and the `jit_iastore`/`jit_bastore`
+//! helpers all call `input_cache::invalidate`, but the JIT's IR
+//! pipeline lowers `Op::ArrayStore` to a raw inline `MOVSS`/`MOVSD`
+//! with no helper call to hook. Blocking admission is the same trade as
+//! above — see [`method_writes_primitive_array`].
+//!
 //! # Entirely `gpu-offload`-gated
 //!
 //! Like [`crate::runtime::offload`], this whole module only exists when
@@ -226,6 +239,17 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         return false;
     };
 
+    // Phase 10 #2, JIT half: a method that writes an int/long/float/
+    // double array cannot be compiled while offload is live, because the
+    // IR pipeline's inline `MOVSS`/`MOVSD` store has no hook to
+    // invalidate the input-residency cache from. Checked before the
+    // invokestatic scan — this reason is independent of whether the
+    // method calls an eligible kernel at all, and it is the common case
+    // for the *producer* method (`init(a)`) rather than the caller.
+    if method_writes_primitive_array(&code_attr.code) {
+        return true;
+    }
+
     let cp_indices = scan_invokestatic_cp_indices(&code_attr.code);
     if cp_indices.is_empty() {
         return false;
@@ -289,7 +313,21 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
 /// switch table): stops the walk and returns whatever was already
 /// collected rather than panicking or misinterpreting subsequent bytes.
 fn scan_invokestatic_cp_indices(code: &[u8]) -> Vec<u16> {
+    scan_code(code).0
+}
+
+/// Walk `code` once, collecting both facts the gate needs:
+///
+/// * the constant-pool index of every `invokestatic`, and
+/// * whether the method stores into a primitive array of a type the GPU
+///   input cache can hold — `iastore` (0x4f), `lastore` (0x50),
+///   `fastore` (0x51), `dastore` (0x52).
+///
+/// The second is what closes the JIT half of Phase 10 #2. See
+/// [`method_writes_primitive_array`].
+fn scan_code(code: &[u8]) -> (Vec<u16>, bool) {
     let mut out = Vec::new();
+    let mut writes_array = false;
     let mut pc = 0usize;
     while pc < code.len() {
         let op = code[pc];
@@ -299,6 +337,12 @@ fn scan_invokestatic_cp_indices(code: &[u8]) -> Vec<u16> {
             } else {
                 break;
             }
+        }
+        // iastore / lastore / fastore / dastore. Reached only on a real
+        // instruction boundary, so an operand byte that happens to equal
+        // one of these cannot false-positive.
+        if (0x4f..=0x52).contains(&op) {
+            writes_array = true;
         }
         let len = match op {
             0x00..=0x0f => 1,
@@ -390,7 +434,33 @@ fn scan_invokestatic_cp_indices(code: &[u8]) -> Vec<u16> {
         }
         pc += len;
     }
-    out
+    (out, writes_array)
+}
+
+/// Does `code` store into an `int[]`/`long[]`/`float[]`/`double[]`?
+///
+/// # Why the gate cares
+///
+/// The GPU input-residency cache (`offload::input_cache`) must be
+/// dropped whenever the host writes an array the device is mirroring.
+/// The interpreter's `*astore` arms and the `jit_iastore` / `jit_bastore`
+/// helpers all call `input_cache::invalidate`, but the JIT's IR pipeline
+/// lowers `Op::ArrayStore` to a **raw inline `MOVSS`/`MOVSD`**
+/// (`jit/src/ir_lower.rs`) with no helper call at all. There is no
+/// callback to hook, and emitting one per element store would put a
+/// branch and a potential call in the middle of every compiled array
+/// write.
+///
+/// So while offload is active, such a method is simply not admitted to
+/// the JIT — the same conservative trade this module already makes for
+/// eligible callers (see the module comment): a correct interpreted loop
+/// beats a compiled one that silently feeds the kernel stale data.
+///
+/// This costs nothing on a CPU-only build (module not compiled), and
+/// nothing on a `gpu-offload` build running without a usable `--gpu`
+/// device, because [`caller_blocks_jit`] checks that first.
+fn method_writes_primitive_array(code: &[u8]) -> bool {
+    scan_code(code).1
 }
 
 /// Resolve a `MethodReference` / `InterfaceMethodReference` constant-pool
@@ -438,6 +508,68 @@ mod tests {
     #[test]
     fn scan_empty_code_finds_nothing() {
         assert!(scan_invokestatic_cp_indices(&[]).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // `method_writes_primitive_array` — the JIT half of Phase 10 #2.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn array_store_scan_finds_each_cached_element_type() {
+        for (op, name) in [
+            (0x4fu8, "iastore"),
+            (0x50, "lastore"),
+            (0x51, "fastore"),
+            (0x52, "dastore"),
+        ] {
+            // aload_0; iconst_0; iconst_1; <astore>; return
+            let code = [0x2a, 0x03, 0x04, op, 0xb1];
+            assert!(
+                method_writes_primitive_array(&code),
+                "{name} must block JIT admission while offload is live"
+            );
+        }
+    }
+
+    #[test]
+    fn array_store_scan_ignores_reference_and_subword_stores() {
+        // aastore/bastore/castore/sastore never reach the input cache,
+        // which only holds int/long/float/double buffers. bastore has a
+        // helper hook anyway.
+        for op in [0x53u8, 0x54, 0x55, 0x56] {
+            let code = [0x2a, 0x03, 0x04, op, 0xb1];
+            assert!(!method_writes_primitive_array(&code), "opcode {op:#x}");
+        }
+    }
+
+    #[test]
+    fn array_store_scan_is_not_fooled_by_an_operand_byte() {
+        // `bipush 0x4f` — the 0x4f is an immediate, not an iastore. A
+        // naive byte scan would block every method containing the
+        // constant 79, so this is the property that keeps the gate from
+        // disabling the JIT across the whole program.
+        let code = [0x10, 0x4f, 0xb1];
+        assert!(!method_writes_primitive_array(&code));
+    }
+
+    #[test]
+    fn array_store_scan_sees_a_store_after_a_switch_table() {
+        // A lookupswitch body full of arbitrary bytes, then a real
+        // iastore: the walk must resync on the instruction boundary.
+        let mut code = vec![0x2a, 0xab, 0x00, 0x00]; // aload_0; lookupswitch; pad to 4
+        code.extend_from_slice(&[0, 0, 0, 8]); // default
+        code.extend_from_slice(&[0, 0, 0, 0]); // npairs = 0
+        code.push(0x4f); // iastore
+        assert!(method_writes_primitive_array(&code));
+    }
+
+    #[test]
+    fn scan_code_reports_both_facts_from_one_walk() {
+        // aload_0; iconst_0; iconst_1; iastore; invokestatic #7; return
+        let code = [0x2a, 0x03, 0x04, 0x4f, 0xb8, 0x00, 0x07, 0xb1];
+        let (indices, writes) = scan_code(&code);
+        assert_eq!(indices, vec![7]);
+        assert!(writes);
     }
 
     #[test]

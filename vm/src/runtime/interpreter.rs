@@ -15780,6 +15780,10 @@ fn execute_instruction(
                     }
                     RuntimeError::ArrayIndexOutOfBoundsException { index: i }
                 })?;
+            // Phase 10 #2: the host just wrote this array, so any device
+            // buffer mirroring it is stale.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
         // WP4.3 fix: long[] / double[] store must use typed pop so that the
         // CompactValue type-erasure (raw long bits decoding as Value::Double via
@@ -15835,6 +15839,9 @@ fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Long(v))
                 .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
+            // Phase 10 #2 — see the `Iastore` arm.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
         Instruction::Dastore => {
             let d = thread.frames[frame_idx].stack.pop_double()?;
@@ -15874,6 +15881,9 @@ fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Double(d))
                 .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
+            // Phase 10 #2 — see the `Iastore` arm.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
 
         // -- Stack manipulation (T10.9.D direct CompactValue path) --
@@ -22601,6 +22611,27 @@ mod tests {
             );
         }
 
+        // Per-FILE exceptions inside the strict-zero submodule dirs. Kept
+        // separate from the directory budget above on purpose: raising that
+        // budget would hand the same allowance to every file in the
+        // directory, which is exactly what the comment above refuses to do.
+        //
+        // `disp.rs` earns one because `disp8_const` is a `const fn` whose
+        // `panic!` IS the const-evaluation failure mechanism — const context
+        // has no `Result`, so this is how a layout constant that would not fit
+        // a signed disp8 becomes a BUILD failure instead of an instruction
+        // that addresses memory backwards from the base register. It already
+        // carries `#[allow(clippy::panic)]` and documents that it must only be
+        // called in const context. Note this is a per-file allowance, not a
+        // blanket "const fn panics are fine" rule: a `const fn` called at run
+        // time panics like any other function, which is why the scanner is not
+        // taught to skip them wholesale.
+        for (path, max_allowed) in targets.iter_mut() {
+            if path.replace('\\', "/").ends_with("jit/src/x64/disp.rs") {
+                *max_allowed = 1;
+            }
+        }
+
         for (path, max_allowed) in &targets {
             let (hits, scanned) = scan_production_section(path, &needles);
 
@@ -22609,19 +22640,37 @@ mod tests {
             // logic ever regresses to the old `find("#[cfg(test)]")`
             // doc-comment anchor, `scanned` collapses to the header and this
             // trips before the (now-vacuous) panic assertion can pass
-            // silently. Expressed as a fraction of the file rather than a flat
-            // line count, so it stays meaningful for a 49-line split-out
-            // module as well as a 24,000-line parent.
-            let total = std::fs::read_to_string(path)
-                .unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+            // silently.
+            //
+            // Anchored on the FIRST real `#[cfg(test)]` attribute rather than
+            // on a fraction of the file. Every line above that attribute is
+            // unambiguously production, so the scan must have covered at
+            // least that many — a property that holds whatever the
+            // production/test ratio is. The previous form asserted
+            // `scanned * 2 >= total`, i.e. "production is at least half the
+            // file", which is not the property being tested and which a small
+            // utility with thorough tests legitimately fails:
+            // `jit/src/x64/disp.rs` is 327 production lines and 406 test
+            // lines, so the scan was exactly right and the gate still fired.
+            let src = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+            let total = src.lines().count();
+            // Same "is this a real attribute, not a comment mentioning one"
+            // test `scan_production_section` applies.
+            let production_prefix = src
                 .lines()
-                .count();
+                .position(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with('*')) && t.starts_with("#[cfg(test)]")
+                })
+                .unwrap_or(total);
             assert!(
-                scanned * 2 >= total,
-                "B3 regression: scan of {path} covered only {scanned} of \
-                 {total} lines — the production body was not scanned. The \
-                 `#[cfg(test)]` boundary detection in \
-                 scan_production_section is broken.",
+                scanned >= production_prefix,
+                "B3 regression: scan of {path} covered only {scanned} lines, \
+                 but {production_prefix} lines precede the first \
+                 `#[cfg(test)]` attribute (file is {total} lines) — the \
+                 production body was not scanned. The `#[cfg(test)]` boundary \
+                 detection in scan_production_section is broken.",
             );
 
             assert!(
