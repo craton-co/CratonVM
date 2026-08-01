@@ -4241,13 +4241,10 @@ fn ss_wrapper_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         // Plain ServerSocket (no ServerSocketChannel back-ref). This native is
         // the last-registered — and therefore winning — `bind`, but the real
         // binding logic (TcpListener + the `s2` listener table that `accept()`
-        // reads + port recording) lives in native-builtins, which we cannot
-        // call directly. Delegate through the cross-crate hook it installs
+        // reads + the per-socket state) lives in native-builtins, which we
+        // cannot call directly. Delegate through the handler set it installs
         // (BUG-04); previously this no-opped, leaving `getLocalPort()` = 0.
-        if let Some(cb) = cratonvm_native_api::plain_server_socket_bind::get() {
-            return cb(ctx, args);
-        }
-        return Ok(None);
+        return plain_server_socket_delegate(ctx, args, |ops| ops.bind, |_| Ok(None));
     };
     // Delegate to ssc_bind with backlog=0 (TcpListener picks its own).
     let sa = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -4262,17 +4259,35 @@ fn ss_wrapper_bind_backlog(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         None => return Err(ioex("bind: null this")),
     };
     let Some(ssc) = ss_back_ref(ctx, this) else {
-        // Plain ServerSocket — delegate to the native-builtins plain-bind hook
-        // (BUG-04); see ss_wrapper_bind above.
-        if let Some(cb) = cratonvm_native_api::plain_server_socket_bind::get() {
-            return cb(ctx, args);
-        }
-        return Ok(None);
+        // Plain ServerSocket — delegate to the native-builtins plain-bind
+        // handler (BUG-04); see ss_wrapper_bind above.
+        return plain_server_socket_delegate(ctx, args, |ops| ops.bind, |_| Ok(None));
     };
     let sa = args.get(1).copied().unwrap_or(Value::Object(None));
     let backlog = args.get(2).copied().unwrap_or(Value::Int(50));
     let _ = ssc_bind(ctx, &[Value::Object(Some(ssc)), sa, backlog])?;
     Ok(None)
+}
+
+/// Route one plain-`ServerSocket` call to the handler `cratonvm-native-builtins`
+/// installed, or answer `fallback` when there is none.
+///
+/// A missing handler set means the synthetic `java/net/ServerSocket` surface was
+/// never registered — i.e. `CRATONVM_REAL=net-sockets` (the default), where the
+/// registry drops every native on that class and real JDK bytecode runs, so
+/// these wrappers are not reachable at all.
+fn plain_server_socket_delegate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    pick: fn(
+        &cratonvm_native_api::plain_server_socket::PlainServerSocketOps,
+    ) -> cratonvm_native_api::registry::NativeCallback,
+    fallback: impl FnOnce(&mut dyn NativeContext) -> MethodCallResult,
+) -> MethodCallResult {
+    match cratonvm_native_api::plain_server_socket::get() {
+        Some(ops) => pick(&ops)(ctx, args),
+        None => fallback(ctx),
+    }
 }
 
 fn ss_wrapper_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4285,17 +4300,19 @@ fn ss_wrapper_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(Value::Int(port)));
     }
     // No ServerSocketChannel back-ref: this is a PLAIN synthetic `java.net.ServerSocket`
-    // (bound by the net_phase_e re2 / phases_early phase53 path), not a channel adapter.
-    // This native is the last-registered `getLocalPort` and therefore shadows the plain
-    // ServerSocket too, so returning 0 here breaks every plain-socket caller that reads
-    // its bound port (e.g. Narayana's TransactionStatusManager advertises getLocalPort()
-    // and its recovery connector then connects to it → the Hibernate JTA cluster hang).
-    // The binding native records the actual OS-assigned port in the shared native-api
-    // registry keyed by identity hash (object fields can't carry it — the real layout's
-    // low slots are reference-typed, so an int does not round-trip). Read it back.
-    let p = cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this), this)
-        .unwrap_or(0);
-    Ok(Some(Value::Int(p)))
+    // (bound by the net_phase_e re2 path), not a channel adapter. This native is the
+    // last-registered `getLocalPort` and therefore shadows the plain ServerSocket too,
+    // so answering here breaks every plain-socket caller that reads its bound port
+    // (e.g. Narayana's TransactionStatusManager advertises getLocalPort() and its
+    // recovery connector then connects to it → the Hibernate JTA cluster hang).
+    // Only the owner knows whether the socket was ever bound (-1) versus bound and
+    // since closed (still the port), so ask it rather than reconstructing an answer
+    // from the port side table.
+    plain_server_socket_delegate(ctx, args, |ops| ops.local_port, |ctx| {
+        let p = cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this), this)
+            .unwrap_or(0);
+        Ok(Some(Value::Int(p)))
+    })
 }
 
 fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4303,7 +4320,20 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
-    let (port, host) = if let Some(ssc) = ss_back_ref(ctx, this) {
+    let Some(ssc) = ss_back_ref(ctx, this) else {
+        // Plain ServerSocket — only the owning crate knows whether this socket
+        // was ever bound (null) versus bound and since closed (still its
+        // address); see `ss_wrapper_local_port`. The `server_socket_ports`
+        // side table is the fallback for a VM with no handler set installed.
+        let identity = ctx.identity_hash_code(this);
+        return plain_server_socket_delegate(ctx, args, |ops| ops.local_socket_address, |ctx| {
+            match cratonvm_native_api::server_socket_ports::get_addr(identity, this) {
+                Some((host, port)) if port > 0 => new_resolved_inet_socket_address(ctx, &host, port),
+                _ => Ok(Some(Value::Object(None))),
+            }
+        });
+    };
+    let (port, host) = {
         let port = cf_get(ctx, ssc, F_LOCAL_PORT).as_int().unwrap_or(0);
         let id = cf_get(ctx, ssc, F_REG_ID).as_int().unwrap_or(-1);
         // Real bound address, not the historical "0.0.0.0" placeholder —
@@ -4324,19 +4354,6 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             _ => "0.0.0.0".to_string(),
         };
         (port, host)
-    } else {
-        // Plain ServerSocket — read the address recorded by the binder (BUG-04),
-        // same channel ss_wrapper_local_port uses. The binder lives in
-        // native-builtins, while this last-registered wrapper lives in native-io,
-        // so the native-api side table is the cross-crate handoff.
-        let identity = ctx.identity_hash_code(this);
-        match cratonvm_native_api::server_socket_ports::get_addr(identity, this) {
-            Some((host, port)) => (port, host),
-            None => (
-                cratonvm_native_api::server_socket_ports::get(identity, this).unwrap_or(0),
-                "0.0.0.0".to_string(),
-            ),
-        }
     };
     if port <= 0 {
         return Ok(Some(Value::Object(None)));
@@ -4359,11 +4376,18 @@ fn ss_wrapper_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         None => return Ok(Some(Value::Int(0))),
     };
     let Some(ssc) = ss_back_ref(ctx, this) else {
-        // Plain ServerSocket — bound iff the binder recorded a port (BUG-04).
+        // Plain ServerSocket — `isBound()` stays true after close(), which the
+        // bound-port side table cannot express (close() removes the entry), so
+        // ask the owner.
         let bound =
             cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this), this)
                 .is_some();
-        return Ok(Some(Value::Int(if bound { 1 } else { 0 })));
+        return plain_server_socket_delegate(
+            ctx,
+            args,
+            |ops| ops.is_bound,
+            |_| Ok(Some(Value::Int(i32::from(bound)))),
+        );
     };
     let id = cf_get(ctx, ssc, F_REG_ID).as_int().unwrap_or(-1);
     Ok(Some(Value::Int(if id >= 0 { 1 } else { 0 })))
@@ -4378,7 +4402,10 @@ fn ss_wrapper_is_closed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let open = cf_get(ctx, ssc, F_OPEN).as_int().unwrap_or(0);
         return Ok(Some(Value::Int(if open == 0 { 1 } else { 0 })));
     }
-    Ok(Some(Value::Int(0)))
+    // Plain ServerSocket. This used to answer a hardcoded `false`: nothing in
+    // native-io tracks the closed state, so `isClosed()` was permanently false
+    // even right after `close()` — a lifecycle check every server loop makes.
+    plain_server_socket_delegate(ctx, args, |ops| ops.is_closed, |_| Ok(Some(Value::Int(0))))
 }
 
 fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4395,15 +4422,12 @@ fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Plain ServerSocket (no ServerSocketChannel back-ref). This native is the
     // last-registered — and therefore winning — `close`, but the listener it
     // must drop lives in native-builtins' `s2` registry (the binding went
-    // through the plain-bind hook). Delegate through the cross-crate close hook
-    // it installs; previously this no-opped, so the listener stayed registered
-    // and a thread blocked in ServerSocket.accept() never woke — okhttp's
+    // through the plain-bind handler). Delegate to the matching close handler;
+    // previously this no-opped, so the listener stayed registered and a thread
+    // blocked in ServerSocket.accept() never woke — okhttp's
     // MockWebServer.close() then threw `AssertionError: Gave up waiting for
     // queue to shut down` on teardown.
-    if let Some(cb) = cratonvm_native_api::plain_server_socket_close::get() {
-        return cb(ctx, args);
-    }
-    Ok(None)
+    plain_server_socket_delegate(ctx, args, |ops| ops.close, |_| Ok(None))
 }
 
 // ---------------------------------------------------------------------------
