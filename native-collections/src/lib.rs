@@ -867,6 +867,21 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     //    the first object seen for this hash: allocate a fresh, never-recycled
     //    generation (NOT `slots.len()`, which could re-issue a generation a live
     //    or just-pruned slot still owns) so the newcomer never aliases an entry.
+    //
+    // DIAGNOSTIC (`CRATONVM_DBG_OBJKEY=1`): reaching here for an object that is
+    // NOT new hands it a fresh, EMPTY overlay — a populated collection silently
+    // reads back as size 0, with no dangling pointer and nothing for the
+    // heap/overlay verifiers to find. Distinguishing that from a premature free
+    // is the first fork in diagnosing any "collection lost its contents"
+    // report, so log the inputs that decide it.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OBJKEY").is_some() && !slots.is_empty() {
+        eprintln!(
+            "[objkey] FRESH generation for hash=0x{hash:x} ptr=0x{ptr:x} class_id={class_id} \
+             — {} existing slot(s), none matched (mine={mine_count}); \
+             any overlay state under the old key is now unreachable",
+            slots.len(),
+        );
+    }
     let generation = next_generation(slots);
     slots.push(ObjKeyEntry {
         last_ptr: ptr,
@@ -29227,6 +29242,15 @@ fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>>
 /// collection churn (e.g. `WebXml.orderWebFragments` over 720 input
 /// permutations). `gc_scan_collection_overlay_roots` consults this set and
 /// skips rooting heap-backed entries; the remap path still repoints them.
+/// `CRATONVM_LHM_ROOT_ALL=1` — measurement lever; see the call site in
+/// [`for_each_overlay_ref`]. Cached, because the root scan runs on every GC.
+fn lhm_root_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_LHM_ROOT_ALL").is_some()
+    })
+}
+
 fn lhm_heap_backed() -> &'static Mutex<std::collections::HashSet<usize>> {
     static HB: std::sync::OnceLock<Mutex<std::collections::HashSet<usize>>> =
         std::sync::OnceLock::new();
@@ -34390,7 +34414,7 @@ fn ts_array_table() -> &'static Mutex<StdHashMap<usize, TsArrayState>> {
 ///   - `false` (post-GC remap): visit ALL entries — the cached refs of *live*
 ///     LHMs that relocated must still be repointed; dead entries are not in the
 ///     `pointer_map` so their stale refs are left untouched (never read again).
-fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
+fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&'static str, &mut ObjectRef)) {
     // PERF (overlay-empty-skip): this runs on EVERY GC. Pruning keeps each
     // overlay table bounded to live collections, but an app that uses none of a
     // given collection type leaves that table empty — yet we still locked it and
@@ -34432,9 +34456,9 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         }
         for state in maps.values_mut() {
             for (key, value) in state.entries.values_mut() {
-                f(key);
+                f("hm-int-fast/key", key);
                 if let Value::Object(Some(object)) = value {
-                    f(object);
+                    f("hm-int-fast/value", object);
                 }
             }
         }
@@ -34446,7 +34470,7 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         for inner in ll.values_mut() {
             for v in inner.values_mut() {
                 if let Value::Object(Some(r)) = v {
-                    f(r);
+                    f("ll-overlay", r);
                 }
             }
         }
@@ -34460,7 +34484,21 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
             // never taken while lhm_overlay is held elsewhere — `lhm_set` locks them
             // sequentially, not nested — so this order can't deadlock). Recover the
             // guard on poison too, for the same reason as the outer tables.
-            let hb = if for_rooting {
+            // A/B LEVER (`CRATONVM_LHM_ROOT_ALL=1`): root EVERY LinkedHashMap
+            // overlay ref, i.e. ignore `lhm_heap_backed`.
+            //
+            // `lhm-overlay` is the only table the post-GC audit reports
+            // dangling refs from (600 `ZEROED(reclaimed)` reports over 68
+            // distinct addresses in one `DefaultCatalogAndSchemaTest` run), and
+            // it is also the only table whose refs the ROOT scan conditionally
+            // SKIPS. The skip's premise is that a heap-backed LHM's
+            // `head`/`tail`/`table` are mirrored into real heap fields and so
+            // stay alive by ordinary field tracing. This flag tests that
+            // premise directly instead of arguing about it: with the skip off,
+            // the audit count must go to zero. It is a measurement lever, not a
+            // fix — removing the skip outright reintroduces the unbounded
+            // pinning of dead LHMs/LHSs it was added to stop.
+            let hb = if for_rooting && !lhm_root_all() {
                 Some(lhm_heap_backed().lock().unwrap_or_else(|e| e.into_inner()))
             } else {
                 None
@@ -34471,9 +34509,20 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
                         continue;
                     }
                 }
-                for v in inner.values_mut() {
+                for (name, v) in inner.iter_mut() {
                     if let Value::Object(Some(r)) = v {
-                        f(r);
+                        // Name the slot, not just the table: which of
+                        // `head`/`tail`/`table` dangles says whether the mirror
+                        // is missing or merely stale.
+                        f(
+                            match name.as_str() {
+                                "head" => "lhm-overlay/head",
+                                "tail" => "lhm-overlay/tail",
+                                "table" => "lhm-overlay/table",
+                                _ => "lhm-overlay/other",
+                            },
+                            r,
+                        );
                     }
                 }
             }
@@ -34484,10 +34533,10 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         let mut tm = tm_array_table().lock().unwrap_or_else(|e| e.into_inner());
         for st in tm.values_mut() {
             if let Some(r) = &mut st.data {
-                f(r);
+                f("tm-array/data", r);
             }
             if let Value::Object(Some(r)) = &mut st.comparator {
-                f(r);
+                f("tm-array/comparator", r);
             }
         }
     }
@@ -34499,7 +34548,7 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         for bt in tmf.values_mut() {
             for v in bt.values_mut() {
                 if let Value::Object(Some(r)) = v {
-                    f(r);
+                    f("tm-fast/value", r);
                 }
             }
         }
@@ -34509,10 +34558,10 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         let mut ts = ts_array_table().lock().unwrap_or_else(|e| e.into_inner());
         for st in ts.values_mut() {
             if let Some(r) = &mut st.data {
-                f(r);
+                f("ts-array/data", r);
             }
             if let Value::Object(Some(r)) = &mut st.comparator {
-                f(r);
+                f("ts-array/comparator", r);
             }
         }
     }
@@ -34525,7 +34574,7 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for r in cmps.values_mut() {
-            f(r);
+            f("cslm/comparator", r);
         }
     }
 }
@@ -34533,7 +34582,40 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
 /// Push every top-level ObjectRef held by the overlay-backed collections onto
 /// `roots` so a moving GC keeps the backing storage live and relocates it.
 pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
-    for_each_overlay_ref(true, |r| roots.push(*r));
+    for_each_overlay_ref(true, |_table, r| roots.push(*r));
+}
+
+/// Post-GC audit: hand every overlay-held `ObjectRef` to `classify` and report
+/// the ones it calls dangling.
+///
+/// The heap-side verifiers (`verify_heap_object_fields`, `verify_no_stale_refs`)
+/// walk Java objects and thread frames, so an overlay that lost its backing is
+/// invisible to both — the side table is neither on the heap nor in a frame.
+/// That blind spot is where the `LinkedHashMap$Node` reclaimed-receiver family
+/// lives, and inferring it from downstream symptoms has repeatedly gone wrong.
+///
+/// `classify` returns `Some(reason)` for a dangling target (off-heap, zeroed
+/// header, un-forwarded) and `None` for a healthy one; only the collector can
+/// answer that, so it supplies the predicate. Call with POST-remap addresses,
+/// so a report means the ref is genuinely bad rather than merely not-yet-fixed.
+/// Diagnostic-only: opt-in and capped at the call site.
+///
+/// Walks with `for_rooting = false`, so it audits the `lhm_heap_backed` entries
+/// the ROOT scan deliberately skips as well. Those are the interesting ones:
+/// their survival rests on the mirrored `head`/`tail`/`table` heap fields still
+/// being current, and nothing else checks that.
+pub fn gc_audit_overlay_refs(
+    classify: &dyn Fn(usize) -> Option<&'static str>,
+    report: &mut dyn FnMut(&'static str, &'static str, usize),
+) {
+    for_each_overlay_ref(false, |table, r| {
+        let addr = r.as_ptr() as usize;
+        if addr != 0 {
+            if let Some(reason) = classify(addr) {
+                report(reason, table, addr);
+            }
+        }
+    });
 }
 
 /// Publish the collection-overlay root contract to the collector abstraction.
@@ -34710,7 +34792,7 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
     if pointer_map.is_empty() {
         return;
     }
-    for_each_overlay_ref(false, |r| {
+    for_each_overlay_ref(false, |_table, r| {
         if let Some(&new_addr) = pointer_map.get(&(r.as_ptr() as usize)) {
             debug_assert!(new_addr != 0, "GC pointer map contains null address");
             *r = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
@@ -44428,23 +44510,17 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Set;)Ljava/util/Set;",
         native_collections_unmodifiable_set,
     );
-    r.register(
-        c,
-        "unmodifiableSortedMap",
-        "(Ljava/util/SortedMap;)Ljava/util/SortedMap;",
-        native_collections_unmodifiable_map,
-    );
+    // Keep the real-JDK bytecode authoritative for the sorted/navigable map
+    // factories. The plain synthetic UnmodifiableMap stamp implements Map,
+    // not SortedMap/NavigableMap; routing these factories to the plain-map
+    // callback therefore violates their declared return type and makes
+    // Charset.availableCharsets() fail its checkcast. The JDK implementations
+    // create the correctly typed, read-only wrapper classes.
     r.register(
         c,
         "unmodifiableSortedSet",
         "(Ljava/util/SortedSet;)Ljava/util/SortedSet;",
         native_collections_unmodifiable_sorted_set,
-    );
-    r.register(
-        c,
-        "unmodifiableNavigableMap",
-        "(Ljava/util/NavigableMap;)Ljava/util/NavigableMap;",
-        native_collections_unmodifiable_map,
     );
     r.register(
         c,
@@ -53176,7 +53252,7 @@ mod tests {
             let mine: std::collections::HashSet<usize> =
                 planted.iter().map(|(_, ptr)| *ptr).collect();
             let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            for_each_overlay_ref(true, |r| {
+            for_each_overlay_ref(true, |_table, r| {
                 let ptr = r.as_ptr() as usize;
                 if mine.contains(&ptr) {
                     visited.insert(ptr);

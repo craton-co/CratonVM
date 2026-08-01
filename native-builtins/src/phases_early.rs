@@ -128,12 +128,6 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
     );
     r.register(
         cu,
-        "unmodifiableSortedMap",
-        "(Ljava/util/SortedMap;)Ljava/util/SortedMap;",
-        native_return_first_arg,
-    );
-    r.register(
-        cu,
         "unmodifiableSortedSet",
         "(Ljava/util/SortedSet;)Ljava/util/SortedSet;",
         native_return_first_arg,

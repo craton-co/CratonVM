@@ -105,7 +105,7 @@ The class list has two copies. The *predicate* built on it has more:
   holding the class-manager read lock"*).
 * The `VirtualNative` cache-hit path (`invoke.rs` ~22250) — calls Copy B as a
   cheap pre-filter, then the full helper. See
-  [cached invoke targets drop the `NativeKind`](cached-invoke-targets-drop-the-nativekind.md).
+  [cached invoke targets retain and revalidate the `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md).
 
 Both class lists are additionally OR-ed with
 `env_cache::real_bytecode_selector().prefers_real(class)`, i.e. the

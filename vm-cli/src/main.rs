@@ -3931,7 +3931,27 @@ fn run() -> Result<()> {
     // collector and when no G1 collection ran.
     if args.verbose_gc || std::env::var_os("CRATONVM_GC_STATS").is_some() {
         vm.shared.mem.heap.print_gc_summary();
+        {
+            // Cross-thread STW peer-scan coverage. A non-zero count means the
+            // collector swept while a peer it could not classify was still
+            // running JIT code, i.e. that cycle marked from an INCOMPLETE root
+            // set. See docs/known-issues/h2/
+            // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+            use std::sync::atomic::Ordering as O;
+            let peers = cratonvm_vm::jit::xt_root_scan::XT_PEERS_UNCLASSIFIED.load(O::Relaxed);
+            let cycles =
+                cratonvm_vm::jit::xt_root_scan::XT_CYCLES_WITH_UNCLASSIFIED.load(O::Relaxed);
+            if peers > 0 {
+                eprintln!(
+                    "[GC] xt_peer_scan: unclassified_peers={peers} cycles_with_unclassified={cycles}"
+                );
+            }
+        }
     }
+
+    // Per-segment `getstatic` cost, plus whether the lock-free statics index is
+    // actually being hit (`CRATONVM_DBG_GETSTATIC_PROF=1`).
+    cratonvm_vm::jit::helpers::gs_prof::dump();
 
     // T19.K1 — wait for non-daemon threads before exiting.
     //

@@ -71,9 +71,13 @@ behaviour** — no exception, no log line, no failing test.
 | 3 | [The forced-native `String` policy exists in three places, in disagreeing forms](forced-native-string-policy-two-lists-that-disagree.md) | A 21-name positive list (cold path) versus a 7-pair exclusion (warm path), plus a JIT direct-call ladder. The disagreement has already made a landed, measured h2-bnf performance fix into **statically unreachable code**. |
 | 4 | [`ensure_synthetic_class` cannot enforce policy, only record it](ensure-synthetic-class-cannot-enforce-only-record.md) | Returns a bare `ClassId`, so under `--jdk-only` it records the violation and fabricates anyway, across 52 live non-test call sites in 27 files. The fallible siblings now exist but have **zero callers**, so nothing changed operationally. Strict boot *silently loses* `Enumeration$Impl` / `Comparator$Native` instead of failing. |
 | 5 | [VM-internal classes are mislabelled `CompatibilityStub`](vm-internal-classes-mislabelled-compatibility-stub.md) | `AnonymousObject$N` and `Proxy$Instance` are stamped `CompatibilityStub` to avoid flipping the derived `is_synthetic_stub` bool that 181 read sites across 20 files depend on. Correct deferral — but it makes contract §11's zero-stub criterion unachievable by construction, and two of those read sites gate native-vs-bytecode dispatch. |
-| 6 | [Cached invoke targets drop the `NativeKind`](cached-invoke-targets-drop-the-nativekind.md) | `CachedInvokeTarget::{Native,VirtualNative}` store a callback and no kind, so a cache *hit* cannot re-apply the policy. The hit path re-derives it by name — but only for classes on a hard-coded allow-list; everything else is served unchecked. The re-land closed the counting half for the **static** cached path only; the virtual one, which is the high-volume one, is still uncounted by design. |
 | 7 | [The `ThreadPoolExecutor.execute` receiver-shape case is copied eight times](threadpoolexecutor-execute-receiver-shape-special-case-copies.md) | Wave 1's markers name four. There are **eight** dispatch sites in the `vm` crate plus one unconditional `force_native` arm they all exist to override. A mechanical "delete every marked site" sweep leaves half the duplication enforcing a policy the other half no longer applies. The marker undercount is unchanged by the re-land. |
 | 8 | [The real-protected-stub allow-lists diverge](real-protected-stub-allowlists-diverge.md) | Two copies, 11 classes vs 10: one includes `java/util/StringJoiner`, the other deliberately omits it with a documented heap-corruption reason. Wave 2 must **reconcile**, not merge; both naive directions reintroduce a known defect. *Demoted from 7 to 8:* the re-land added the missing cross-reference to the including copy, so the "a reader who finds one has no way to know the other exists" trap is retired. The divergence itself is untouched. |
+
+Retired item 6: [cached invoke targets retain and revalidate `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md)
+was fixed on 2026-08-01. The interpreter invoke cache now carries the id and
+kind, re-applies central policy, and counts both static and virtual warm hits.
+The JIT MIC/PIC-slot half remains independently tracked by item 11 §1.
 
 ### Tier 2 — the instruments the tier-1 items must be measured with
 
@@ -104,13 +108,13 @@ The items are not independent. The order that avoids doing work twice:
 3. **Item 1** — make every native's kind an explicit, per-registration fact.
    `registered_by` provenance is already captured (`#[track_caller]` landed), so
    "chosen" and "inherited" can now be told apart in the census. Nothing else in
-   tier 1 can be done safely before this: items 3, 6, 7, 8 and item 11 §4/§11
+   tier 1 can be done safely before this: items 3, 7, 8 and item 11 §4/§11
    all end with "let `resolve_dispatch` decide from `NativeKind` +
    `Method::code()`", which requires the kinds to be true.
-4. **Items 6 and 11 §1 together** — store the kind (and a `NativeMethodId`) in
-   both the interpreter's invoke cache and the JIT's MIC/PIC slots. Doing one
-   alone buys nothing, and the JIT side is currently paying for the gap with a
-   blanket refusal that costs `JdkOnly` runs every inline-cached native call.
+4. **Item 11 §1** — item 6 is retired: the interpreter's invoke cache now
+   stores the kind and `NativeMethodId`. The JIT's MIC/PIC slots remain open
+   and currently pay for the gap with a blanket refusal that costs `JdkOnly`
+   runs every inline-cached native call.
 5. **Items 3, 7, 8, and item 11 §4/§8/§9/§11** — delete the hard-coded lists,
    each with its own regression corpus.
 6. **Items 4 and 5** — migrate the `ensure_synthetic_class` callers to the

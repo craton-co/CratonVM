@@ -573,6 +573,35 @@ impl VmHeap {
         }
     }
 
+    /// Diagnostic decomposition of [`Self::is_addr_live`] into its two arms,
+    /// plus where the address actually sits.
+    ///
+    /// `is_addr_live` ORs an old-gen allocation test with a young-survivor
+    /// test, so a `false` is indistinguishable between "the old-gen block is on
+    /// the free list", "the address is in the wrong semispace" and "it is in
+    /// neither generation". Those have completely different causes, and the one
+    /// consumer that DESTROYS state on a `false` — the collection-overlay prune
+    /// — has to be debugged against the specific arm.
+    ///
+    /// Returns `(old_gen_allocated, young_survivor, region)`.
+    pub fn liveness_arms(&self, addr: usize) -> (bool, bool, &'static str) {
+        match self {
+            VmHeap::Generational(h) => {
+                let old = h.is_live_old_gen_addr(addr);
+                let young = h.is_live_young_survivor(addr);
+                let region = if h.is_in_old(addr as *const u8) {
+                    "old-gen"
+                } else if h.is_heap_addr(addr).is_some() {
+                    "young"
+                } else {
+                    "off-heap"
+                };
+                (old, young, region)
+            }
+            _ => (false, false, "n/a"),
+        }
+    }
+
     /// T1.7.1 — Brooks-pointer read barrier.
     ///
     /// Consults the object's compact header: if the `LockState` is

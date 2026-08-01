@@ -57,7 +57,55 @@ cost is; reproduce with `probes/VirtOnlyProbe.java`.
    bootstrap intercept — for every class, on every read;
 4. `get_static_shared(..)` — a `statics.read()` acquisition plus a hashmap probe.
 
-## What was fixed (halved)
+## Round 2 (2026-08-01) — profile first, then fix
+
+Round 1 guessed at the remaining cost and was wrong. `CRATONVM_DBG_GETSTATIC_PROF=1`
+now times each segment of the helper with `rdtsc` and reports whether the
+lock-free statics index is actually hit, so the next person does not have to
+guess either. Two results:
+
+* **The `RwLock` + hash probe were NOT the bottleneck.** A lock-free
+  `ClassId -> base pointer` index was built for them (`StaticsIndex`,
+  `StaticsBlock`) and measured **no wall-clock change** across 4 interleaved
+  pairs — while showing 4 803 264 index hits against 11 misses, so it was
+  working, just not on the critical path. Kept anyway: it is the prerequisite
+  for baking the address into generated code, and `CRATONVM_NO_STATICS_INDEX=1`
+  turns it off.
+* **The `System.out` intercept was still the dominant segment**, at 98 cyc/call
+  — the very thing round 1 believed it had fixed. Resolving `java/lang/System`'s
+  ClassId by NAME only helps if that lookup resolves; when it does not, every
+  call still takes the `class_manager` lock and looks exactly like working code.
+  Replaced with a per-`ClassId` memo (`system_class_memo`): asked at most once
+  per class, then two bit tests. Segment cost 98.2 -> 20.8 cyc, which is the
+  instrumentation floor (`boundary` 18.5 and `init` 19.8 measure near-trivial
+  work).
+
+> A guard whose cost is invisible from outside will be "fixed" twice. Measure
+> the segment, not the function.
+
+Wall clock, interleaved, `static mutable int` marginal: **25.4 -> 16.0 ns**
+(median of 4 pairs; every pair favoured the memo).
+
+Current state against HotSpot, 2M iterations:
+
+| rung | CratonVM | HotSpot |
+|---|---|---|
+| `static` mutable int | +15.78 | +0.09 |
+| `static final` REF | +26.06 | +0.04 |
+| `static` mutable REF | +27.40 | +0.04 |
+| `static final` REF, hoisted | −0.56 | +0.08 |
+| instance field | +0.24 | +0.08 |
+
+Primitive statics are down from ~52 ns marginal at the start of this work to
+~16. Reference statics remain dearer than primitives (the `Value::Object` arm
+adds a `plausible_heap_pointer` check) and are the next thing to look at.
+
+**A hard floor worth knowing**: a bare direct call costs ~5 ns on this VM
+(`probes/VirtOnlyProbe.java`, `invokestatic` marginal). No amount of trimming
+inside the helper can beat that. HotSpot's ~1 ns is only reachable by emitting
+the load inline, with no call at all.
+
+## What was fixed in round 1 (halved)
 
 * **(3) resolved once.** `java/lang/System`'s `ClassId` is cached in an atomic
   and compared as an integer, so every other class touches no lock and does no
