@@ -2493,8 +2493,10 @@ impl Compiler {
                     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXCFRAME").is_some() {
                         eprintln!(
                             "[excframe] DROP local={i} at bci={bci} live_mask={live_here:#x} \
-                             precise={} handler_ranges={}",
-                            self.precise_exception_frames, self.exception_ranges_dbg_len,
+                             precise={} handler_ranges={} method={}",
+                            self.precise_exception_frames,
+                            self.exception_ranges_dbg_len,
+                            self.method_key,
                         );
                     }
                     locals.push(FrameValue::Undefined);
@@ -2566,6 +2568,22 @@ impl Compiler {
                 frame_value_for_slot(reg, xmm, off, false)
             };
             locals.push(fv);
+        }
+
+        // `CRATONVM_DBG_EXCFRAME=1` also dumps the WHOLE published locals vector,
+        // not just the slots the liveness mask dropped. A slot that survives
+        // liveness can still be published with the wrong *type source* — a
+        // ref-typed local that the oop mask does not claim comes out as
+        // `Register`/`StackSlot`, which the resume sink turns into a
+        // `Value::Int`, and reading it back with `aload` then behaves as null.
+        // That failure is invisible in the DROP lines alone, so print the
+        // provenance the snapshot actually chose for every slot.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXCFRAME").is_some() {
+            eprintln!(
+                "[excframe] FRAME method={} bci={bci} reason={reason:?} oop_reached={oop_reached} \
+                 oop_mask={oop_mask:#x} locals={:?}",
+                self.method_key, locals,
+            );
         }
 
         // Operand stack (empty at a BCE loop header; non-empty at OSR-exit loop
