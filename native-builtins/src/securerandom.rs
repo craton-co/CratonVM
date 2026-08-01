@@ -217,6 +217,21 @@ fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<i32, u64>) -> R) -> R {
     f(g.as_mut().expect("table just initialized"))
 }
 
+/// `java.util.Random.nextNextGaussian` — the second variate of the polar
+/// pair, held until the next `nextGaussian()` call consumes it. Keyed exactly
+/// like [`SEED_TABLE`] (identity hash, GC-stable) because it is part of the
+/// same per-instance generator state: an entry's presence is the spec's
+/// `haveNextNextGaussian` flag.
+static GAUSSIAN_TABLE: RwLock<Option<FxHashMap<i32, f64>>> = RwLock::new(None);
+
+fn with_gaussian_table_write<R>(f: impl FnOnce(&mut FxHashMap<i32, f64>) -> R) -> R {
+    let mut g = GAUSSIAN_TABLE.write();
+    if g.is_none() {
+        *g = Some(FxHashMap::default());
+    }
+    f(g.as_mut().expect("table just initialized"))
+}
+
 /// GC-stable key for a `Random` instance.  Round-9 C12 fix: was
 /// `obj.as_ptr() as usize`, which broke after the GC relocated the
 /// `Random`.  `identity_hash_code` is preserved across compaction by
@@ -237,6 +252,11 @@ fn set_seed(ctx: &mut dyn NativeContext, obj: ObjectRef, user_seed: i64) {
     let key = obj_key(ctx, obj);
     with_table_write(|t| {
         t.insert(key, scrambled);
+    });
+    // `java.util.Random.setSeed` also clears `haveNextNextGaussian`, so a
+    // re-seeded generator must not hand back a variate drawn from the old seed.
+    with_gaussian_table_write(|t| {
+        t.remove(&key);
     });
 }
 
@@ -511,12 +531,25 @@ pub(crate) fn native_random_next_gaussian(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Double(0.0))),
     };
-    // Marsaglia polar method — same as JDK Random.nextGaussian.  We
-    // generate one and discard the partner; the JDK caches it but
-    // making `nextNextGaussian` durable through field 1 is more
-    // trouble than it's worth (the partner-cache only saves one LCG
-    // pair every other call).
+    // Marsaglia polar method, as `java.util.Random.nextGaussian()` specifies
+    // it — INCLUDING the cached partner.
     //
+    // This used to compute the pair and discard the second value, with a
+    // comment calling the cache a micro-optimisation "not worth the trouble".
+    // That reasoning was wrong: the cache is not an optimisation, it is part of
+    // the specified output. Discarding the partner both advanced the LCG at
+    // twice the specified rate — so every SEEDED sequence diverged from a
+    // conforming VM — and made successive results i.i.d. rather than sharing a
+    // `mult`, which is a property real code depends on. H2's `MemoryEstimator`
+    // sizes a skip counter from how close consecutive values are, so
+    // `TestMemoryEstimator` saw a sampling percentage of 8 against its `<= 7`
+    // bound; that failure was recorded in `vm/src/jit/skip_list.rs` as the sole
+    // blocker on lifting the `org/h2/` JIT ban and was believed to be a JIT
+    // miscompile. It is neither JIT-related nor H2-specific.
+    let key = obj_key(ctx, this);
+    if let Some(cached) = with_gaussian_table_write(|t| t.remove(&key)) {
+        return Ok(Some(Value::Double(cached)));
+    }
     // Cap the retry loop so a pathological seed cannot hang us:
     // P(reject) per pair ≈ 1 - π/4 ≈ 0.215, so 64 retries is well
     // under 2^-32 failure probability.
@@ -530,6 +563,9 @@ pub(crate) fn native_random_next_gaussian(
         let s = v1 * v1 + v2 * v2;
         if s < 1.0 && s != 0.0 {
             let mult = (-2.0 * s.ln() / s).sqrt();
+            with_gaussian_table_write(|t| {
+                t.insert(key, v2 * mult);
+            });
             return Ok(Some(Value::Double(v1 * mult)));
         }
     }

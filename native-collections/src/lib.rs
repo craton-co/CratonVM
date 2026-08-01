@@ -27322,8 +27322,14 @@ fn native_sj_set_empty_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 // Phase 14 Step 1: java.util.Random
 // ===========================================================================
 
-// Random = 2-field synthetic (field 0 = Long seed, field 1 = unused/reserved)
+// Random = 2-field synthetic (field 0 = Long seed, field 1 = cached second
+// gaussian variate). Field 1 is what classloading's
+// `"java/util/Random" => instance_fields(2)` calls "has-next-gaussian".
 const RND_FIELD_SEED: usize = 0;
+/// `java.util.Random.nextNextGaussian` + `haveNextNextGaussian`, folded into
+/// one slot: `Value::Double(x)` means "cached", anything else (an unwritten
+/// slot reads back `Object(None)` by index) means "empty".
+const RND_FIELD_NEXT_GAUSSIAN: usize = 1;
 
 fn register_random_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
@@ -27496,28 +27502,65 @@ fn native_random_set_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => 0,
     };
     ctx.set_field(this, RND_FIELD_SEED, Value::Long(rnd_scramble_seed(seed)));
+    // `java.util.Random.setSeed` also does `haveNextNextGaussian = false`, so a
+    // re-seeded generator must not hand out a variate drawn from the old seed.
+    ctx.set_field(this, RND_FIELD_NEXT_GAUSSIAN, Value::Object(None));
     Ok(None)
 }
 
+/// One `nextDouble()` draw: `(next(26) << 27 + next(27)) * 2^-53`.
+fn rnd_uniform_double(next: &mut impl FnMut(u32) -> i32) -> f64 {
+    let hi = (next(26) as i64) << 27;
+    let lo = next(27) as i64;
+    (hi + lo) as f64 / ((1i64 << 53) as f64)
+}
+
+/// The polar (Marsaglia) method exactly as `java.util.Random.nextGaussian()`
+/// specifies it, returning BOTH variates of the accepted pair.
+///
+/// Factored out of the native so the specified sequence is testable without a
+/// VM — `next` is `Random.next(bits)`.
+fn rnd_gaussian_pair(mut next: impl FnMut(u32) -> i32) -> (f64, f64) {
+    loop {
+        let v1 = 2.0 * rnd_uniform_double(&mut next) - 1.0;
+        let v2 = 2.0 * rnd_uniform_double(&mut next) - 1.0;
+        let s = v1 * v1 + v2 * v2;
+        if s < 1.0 && s != 0.0 {
+            let multiplier = (-2.0 * s.ln() / s).sqrt();
+            return (v1 * multiplier, v2 * multiplier);
+        }
+    }
+}
+
+/// `java.util.Random.nextGaussian()`.
+///
+/// The polar method yields TWO standard normals per accepted pair; the JDK
+/// returns the first and caches the second for the following call. This used to
+/// discard the second and draw a fresh pair every time, which was wrong twice
+/// over: the LCG then advanced at twice the specified rate, so every SEEDED
+/// sequence diverged from a conforming VM, and consecutive results came out
+/// i.i.d. instead of sharing a `multiplier` the way the spec's pairs do.
+///
+/// That correlation is observable, not academic: H2's `MemoryEstimator` sizes a
+/// skip counter from how close consecutive values are, so `TestMemoryEstimator`
+/// measured a sampling percentage of 8 against its own `<= 7` bound. It was
+/// recorded in `vm/src/jit/skip_list.rs` as the sole blocker on lifting the
+/// `org/h2/` JIT ban and read as a JIT miscompile; it is neither JIT-related
+/// nor H2-specific.
 fn native_random_next_gaussian(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Double(0.0))),
     };
-    // Box-Muller transform (simplified: generate a pair, return one)
-    loop {
-        let hi1 = (rnd_next(ctx, this, 26) as i64) << 27;
-        let lo1 = rnd_next(ctx, this, 27) as i64;
-        let v1 = 2.0 * ((hi1 + lo1) as f64 / ((1i64 << 53) as f64)) - 1.0;
-        let hi2 = (rnd_next(ctx, this, 26) as i64) << 27;
-        let lo2 = rnd_next(ctx, this, 27) as i64;
-        let v2 = 2.0 * ((hi2 + lo2) as f64 / ((1i64 << 53) as f64)) - 1.0;
-        let s = v1 * v1 + v2 * v2;
-        if s < 1.0 && s != 0.0 {
-            let multiplier = (-2.0 * s.ln() / s).sqrt();
-            return Ok(Some(Value::Double(v1 * multiplier)));
-        }
+    // A cached second variate is consumed before any new draw, so the stream
+    // advances once per PAIR of calls.
+    if let Value::Double(cached) = ctx.get_field(this, RND_FIELD_NEXT_GAUSSIAN) {
+        ctx.set_field(this, RND_FIELD_NEXT_GAUSSIAN, Value::Object(None));
+        return Ok(Some(Value::Double(cached)));
     }
+    let (first, second) = rnd_gaussian_pair(|bits| rnd_next(ctx, this, bits));
+    ctx.set_field(this, RND_FIELD_NEXT_GAUSSIAN, Value::Double(second));
+    Ok(Some(Value::Double(first)))
 }
 
 // ===========================================================================
@@ -51072,6 +51115,59 @@ mod tests {
 
     // Unit tests for helper functions only.
     // Integration tests are in vm.rs since they need the full VM.
+
+    /// `java.util.Random.nextGaussian()` must reproduce the JDK's documented
+    /// sequence for a given seed. The expected bit patterns are the first six
+    /// values of `new Random(42)` on Temurin jdk-25.0.3+9.
+    ///
+    /// Regression for the discarded second variate: returning only the first
+    /// variate of each pair advances the LCG at twice the specified rate, and
+    /// this asserts the exact stream rather than a distribution, so it fails on
+    /// the old behaviour at the very first value.
+    #[test]
+    fn next_gaussian_matches_jdk_seeded_sequence() {
+        use super::{rnd_gaussian_pair, LCG_INCREMENT, LCG_MASK, LCG_MULTIPLIER};
+
+        // `new Random(42)` — seed scrambling plus `next(bits)`, verbatim.
+        let mut seed = (42i64 ^ LCG_MULTIPLIER) & LCG_MASK;
+        let mut next = move |bits: u32| -> i32 {
+            seed = seed
+                .wrapping_mul(LCG_MULTIPLIER)
+                .wrapping_add(LCG_INCREMENT)
+                & LCG_MASK;
+            (seed >> (48 - bits)) as i32
+        };
+
+        // Drain the pairs the way the native does: first, then the cached second.
+        let mut got = Vec::new();
+        while got.len() < 6 {
+            let (a, b) = rnd_gaussian_pair(&mut next);
+            got.push(a);
+            got.push(b);
+        }
+
+        // Compared with a relative tolerance rather than by bit pattern: the
+        // JDK's multiplier goes through `StrictMath.log` (fdlibm) while this
+        // uses the platform libm, and those may differ in the last ulp. A
+        // DIFFERENT sequence cannot come within 1e-12 of this one, so the
+        // tolerance costs the assertion nothing.
+        let expected: [i64; 6] = [
+            4607821503525903750,
+            4606456510138157127,
+            -4616641179245592382,
+            -4615707776640798080,
+            4598733263062401967,
+            4604341753479877564,
+        ];
+        for (i, want_bits) in expected.iter().enumerate() {
+            let want = f64::from_bits(*want_bits as u64);
+            let have = got[i];
+            assert!(
+                (have - want).abs() <= 1e-12 * want.abs().max(1.0),
+                "nextGaussian[{i}] diverged from the JDK's seeded sequence:                  got {have:?}, want {want:?}"
+            );
+        }
+    }
 
     #[test]
     fn dbg_hmput_matches_env_presence() {
