@@ -279,9 +279,20 @@ thread_local! {
     /// overhead on short-callee shapes. One struct = one TLS address
     /// computation for the whole drain (`take_all_jit_signals`).
     ///
+    /// **This block holds NO heap references.** The one signal that did —
+    /// `exception`, the pending Java throwable — now lives on
+    /// [`JvmThread::jit_pending_exception`], because a `thread_local!` is
+    /// unreachable from a collecting thread and the throwable was therefore
+    /// neither scanned nor remapped for the whole stash→drain window (see
+    /// `docs/known-issues/jit-signals-root-gap.md`). Every remaining field is a
+    /// plain scalar the collector has no interest in, which is why they may
+    /// stay here and keep the one-TLS-access drain. **Do not add an
+    /// `ObjectRef`, a `Value`, or a raw heap address to this struct** — put it
+    /// on `JvmThread` and root it in `memory/roots.rs` + `memory/gc.rs`.
+    ///
     /// Field semantics (formerly the individual statics):
-    /// * `exception` — pending Java exception from JIT dispatch; the
-    ///   interpreter routes it through exception tables after JIT returns.
+    /// * `athrow_bci` — see the field; the bci of the `athrow` that produced
+    ///   the (thread-resident) pending exception.
     /// * `aioobe` — pending AIOOBE `(index, length)` from a JIT bounds
     ///   check (`jit_throw_aioobe`), consumed on the `i64::MIN` sentinel.
     /// * `arithmetic` — pending `ArithmeticException` ("/ by zero") from
@@ -302,7 +313,6 @@ thread_local! {
     ///   would spuriously re-run it, double-executing side effects).
     static JIT_SIGNALS: JitSignals = const {
         JitSignals {
-            exception: Cell::new(None),
             athrow_bci: Cell::new(-1),
             aioobe: Cell::new(None),
             arithmetic: Cell::new(false),
@@ -651,13 +661,17 @@ pub fn clear_jit_thread() {
 
 /// The consolidated out-of-band JIT→interpreter signal block — see the
 /// [`JIT_SIGNALS`] thread-local for field semantics.
+///
+/// Scalars only — the pending throwable lives on
+/// [`JvmThread::jit_pending_exception`] so the collector can see and relocate
+/// it (`docs/known-issues/jit-signals-root-gap.md`).
 struct JitSignals {
-    exception: Cell<Option<ObjectRef>>,
     /// RBC.6 correctness fix — the bytecode pc of the `athrow` that produced
-    /// `exception`, when statically known at JIT-compile time (`-1` = unknown,
+    /// the thread's `jit_pending_exception`, when statically known at
+    /// JIT-compile time (`-1` = unknown,
     /// e.g. an exception propagated up from a dispatched callee, which this
-    /// method has no bci for). Set ONLY by `jit_throw_exception` alongside
-    /// `exception`; every other site that stashes a general exception (no
+    /// method has no bci for). Set ONLY by `jit_throw_exception` alongside the
+    /// throwable itself; every other site that stashes a general exception (no
     /// known local throw site) leaves/resets this to `-1`. Consumed by
     /// `execute_jit_call` to give `route_jit_exception_through_method` a real
     /// `throw_pc` instead of the `usize::MAX`-means-unknown fallback, which
@@ -700,14 +714,22 @@ pub(crate) struct DrainedJitSignals {
     pub deopt: bool,
 }
 
-/// Snapshot-and-clear ALL JIT signals in ONE thread-local access. Draining
-/// everything unconditionally is deliberate: a signal surviving into the
-/// next unrelated JIT call was the recurring Round-8..11 leak-bug class, and
-/// clearing a flag nobody set is free.
+/// Snapshot-and-clear ALL JIT signals: one thread-local access for the six
+/// scalars, plus one field read on `thread` for the pending throwable.
+/// Draining everything unconditionally is deliberate: a signal surviving into
+/// the next unrelated JIT call was the recurring Round-8..11 leak-bug class,
+/// and clearing a flag nobody set is free.
+///
+/// `thread` must be the thread whose JIT call just returned — the same one
+/// that was installed via `set_jit_thread`. It is the drain's *only* way to
+/// reach the throwable now that the reference is GC-rooted on the thread
+/// rather than parked in TLS; passing a different thread silently drains an
+/// empty slot and strands the exception on the real one.
 #[inline]
-pub(crate) fn take_all_jit_signals() -> DrainedJitSignals {
+pub(crate) fn take_all_jit_signals(thread: &mut JvmThread) -> DrainedJitSignals {
+    let exception = thread.jit_pending_exception.take();
     JIT_SIGNALS.with(|s| DrainedJitSignals {
-        exception: s.exception.take(),
+        exception,
         athrow_bci: s.athrow_bci.replace(-1),
         aioobe: s.aioobe.take(),
         arithmetic: s.arithmetic.take(),
@@ -725,11 +747,12 @@ pub(crate) fn take_all_jit_signals() -> DrainedJitSignals {
 /// the direct-local-athrow path. Only `jit_throw_exception`'s dedicated
 /// `set_jit_pending_exception_with_bci` may set a real bci, and only for the
 /// exception it is stashing in that same call.
-fn set_jit_pending_exception(exc: ObjectRef) {
-    JIT_SIGNALS.with(|s| {
-        s.exception.set(Some(exc));
-        s.athrow_bci.set(-1);
-    });
+/// The throwable is stored on `thread` (not in `JIT_SIGNALS`) so that a
+/// collection occurring between this stash and the interpreter's drain both
+/// keeps it alive and rewrites it — see [`JvmThread::jit_pending_exception`].
+fn set_jit_pending_exception(thread: &mut JvmThread, exc: ObjectRef) {
+    thread.jit_pending_exception = Some(exc);
+    JIT_SIGNALS.with(|s| s.athrow_bci.set(-1));
 }
 
 /// RBC.6 correctness fix — sibling of `set_jit_pending_exception` for the ONE
@@ -738,11 +761,9 @@ fn set_jit_pending_exception(exc: ObjectRef) {
 /// `JitSignals::athrow_bci` for why this matters (typed-handler routing
 /// correctness with 2+ exception-table entries when `throw_pc` would
 /// otherwise be `usize::MAX`).
-fn set_jit_pending_exception_with_bci(exc: ObjectRef, bci: i64) {
-    JIT_SIGNALS.with(|s| {
-        s.exception.set(Some(exc));
-        s.athrow_bci.set(bci);
-    });
+fn set_jit_pending_exception_with_bci(thread: &mut JvmThread, exc: ObjectRef, bci: i64) {
+    thread.jit_pending_exception = Some(exc);
+    JIT_SIGNALS.with(|s| s.athrow_bci.set(bci));
 }
 
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
@@ -758,8 +779,8 @@ fn set_jit_pending_exception_with_bci(exc: ObjectRef, bci: i64) {
 /// one) — always falls back to the pre-existing `usize::MAX`-means-unknown
 /// behavior for the re-stashed exception, never a regression, just not the
 /// newly-precise case.
-pub(crate) fn stash_jit_pending_exception(exc: ObjectRef) {
-    set_jit_pending_exception(exc);
+pub(crate) fn stash_jit_pending_exception(thread: &mut JvmThread, exc: ObjectRef) {
+    set_jit_pending_exception(thread, exc);
 }
 
 /// Forget the `athrow` bci carried by the pending exception, keeping the
@@ -800,8 +821,13 @@ pub(crate) fn stash_jit_pending_aioobe(index: i64, length: i64) {
 
 /// Take (consume) any pending Java exception set by JIT dispatch.
 /// Returns `Some(ObjectRef)` if an exception was pending, `None` otherwise.
-pub fn take_jit_pending_exception() -> Option<ObjectRef> {
-    JIT_SIGNALS.with(|s| s.exception.take())
+///
+/// `thread` must be the thread whose JIT call stashed it — see
+/// [`take_all_jit_signals`]. The returned `ObjectRef` is the *post-move*
+/// address if a collection intervened, because the slot it comes out of is
+/// rooted and remapped (`memory/roots.rs` §10, `memory/gc.rs` §10).
+pub fn take_jit_pending_exception(thread: &mut JvmThread) -> Option<ObjectRef> {
+    thread.jit_pending_exception.take()
 }
 
 /// Non-consuming peek: returns `true` if a pending Java exception is set.
@@ -811,13 +837,24 @@ pub fn take_jit_pending_exception() -> Option<ObjectRef> {
 /// post-invoke exception guard fires and the interpreter routes the
 /// stashed exception through the method's exception table — instead of
 /// returning a bogus `0` that the JIT would keep computing with.
+/// Resolves the thread through [`current_jit_thread_ptr`] rather than taking a
+/// `&mut JvmThread`, because three of its four call sites sit *before* the
+/// `jit_thread_mut()` acquisition in their function and cannot name one. That
+/// is sound here and only here: this is a **read**, so it creates no aliasing
+/// `&mut`, and every call site runs inside a JIT helper on the thread that
+/// installed the pointer. A null pointer (no JIT thread installed — the only
+/// way to reach that is from outside JIT dispatch, where nothing can have
+/// stashed an exception) reads as "nothing pending", which is the same answer
+/// the empty TLS cell used to give.
 pub(crate) fn jit_pending_exception_is_set() -> bool {
-    JIT_SIGNALS.with(|s| {
-        let v = s.exception.take();
-        let present = v.is_some();
-        s.exception.set(v);
-        present
-    })
+    let t = current_jit_thread_ptr();
+    if t.is_null() {
+        return false;
+    }
+    // SAFETY: `t` is this OS thread's own `JvmThread`, installed by
+    // `set_jit_thread` and alive for the whole JIT call; the read is a
+    // shared-reference-shaped `Option` load with no aliasing `&mut` created.
+    unsafe { (*t).jit_pending_exception.is_some() }
 }
 
 /// Take (consume) a pending AIOOBE from JIT bounds check.
@@ -977,17 +1014,18 @@ pub extern "C" fn jit_set_deopt_pending() {
 /// `i64::MIN` is a real `Long.MIN_VALUE` return — the caller keeps it). The peek
 /// is non-destructive so the outer interpreter drain still observes the flag.
 ///
-/// SAFETY: no pointer arguments; only reads thread-locals. Safe to call from
-/// JIT-compiled code immediately after a dispatch returns `i64::MIN`.
+/// SAFETY: no pointer arguments; only reads this thread's own signal block and
+/// `JvmThread`. Safe to call from JIT-compiled code immediately after a
+/// dispatch returns `i64::MIN`.
 pub extern "C" fn jit_dispatch_threw() -> i64 {
-    let pending = JIT_SIGNALS.with(|s| {
-        // Non-destructive peek across the whole signal block in ONE
-        // thread-local access (the former per-flag statics cost four).
-        let exc = s.exception.take();
-        let exc_set = exc.is_some();
-        s.exception.set(exc);
-        exc_set || s.npe.get() || s.aioobe.get().is_some() || s.deopt.get()
-    }) || cratonvm_jit::deopt::has_last_deopt();
+    // The throwable half lives on the `JvmThread` (GC-rooted); the scalar
+    // flags stay in TLS. Both are this OS thread's own state, so the peek is
+    // still allocation-free and lock-free — it just reads two places instead
+    // of one. See `jit_pending_exception_is_set` for why resolving the thread
+    // through the raw pointer is sound in a read-only peek.
+    let pending = (jit_pending_exception_is_set()
+        || JIT_SIGNALS.with(|s| s.npe.get() || s.aioobe.get().is_some() || s.deopt.get()))
+        || cratonvm_jit::deopt::has_last_deopt();
     if pending {
         1
     } else {
@@ -1659,14 +1697,50 @@ struct CachedDispatchTarget {
 /// bounded-cache posture as `ClassManager::note_synthetic_upgrade_absent`.
 const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
 
+/// Identity of one JIT call site, for every per-thread dispatch memo in this
+/// module: `(SharedVm::vm_identity, JitInvokeInfo pointer)`.
+///
+/// **The `vm_identity` half is load-bearing — do not drop it.** A
+/// `JitInvokeInfo` pointer alone does NOT identify a call site across VMs:
+///
+///  * several call sites pass the address of a process-global `static
+///    JitInvokeInfo` (`INTEGER_VALUE_OF_INFO`, `INTEGER_INT_VALUE_INFO`,
+///    `HASHMAP_PUT_DIRECT_INFO`, `HASHMAP_GET_DIRECT_INFO`,
+///    `CONCURRENT_HASHMAP_GET_DIRECT_INFO`, `STRING_LATIN1_LOWER_DIRECT_INFO`),
+///    which is literally the SAME address in every VM in the process;
+///  * every other info lives in `JitCache::invoke_info_arena`, a per-VM arena
+///    freed when that VM's `JitCache` drops, so a later VM's arena can hand
+///    out the same address.
+///
+/// What these memos hold is per-VM to the word: raw compiled entry pointers
+/// into one VM's code cache, receiver `ClassId`s, `NativeMethodId` census
+/// handles from one VM's registry, and resolved callee class names. A
+/// cross-VM hit therefore does not degrade to a slow path — it CALLs another
+/// VM's compiled body, or runs `java/util/HashMap`'s native against whatever
+/// class happens to hold that id in this VM. See
+/// `docs/known-issues/vm-jit-cache-keying.md`.
+///
+/// `vm_identity` is a monotonically issued counter (`vm_init.rs`
+/// `NEXT_VM_IDENTITY`), never an address, so it is never recycled — unlike a
+/// `&SharedVm` cast to `usize`, which a sequentially-created second VM can
+/// plausibly inherit from a dropped one.
+pub(crate) type JitSiteKey = (usize, usize);
+
+/// Build a [`JitSiteKey`]. Free function (not a method on `SharedVm`) so the
+/// keying can be unit-tested without constructing a VM.
+#[inline]
+pub(crate) fn jit_site_key(vm_identity: usize, info_ptr: usize) -> JitSiteKey {
+    (vm_identity, info_ptr)
+}
+
 thread_local! {
-    /// `(JitInvokeInfo ptr, receiver ClassId) -> CachedDispatchTarget`.
+    /// `(JitSiteKey, receiver ClassId) -> CachedDispatchTarget`.
     ///
     /// Keyed exactly like `VIRTUAL_DISPATCH_CACHE`. Array receivers and
     /// `ClassId(0)` never reach it — an array header carries its COMPONENT
     /// class id, so `(site, class id)` does not identify one.
     static VIRTUAL_TARGET_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<(usize, u32), CachedDispatchTarget>> =
+        std::cell::RefCell<rustc_hash::FxHashMap<(JitSiteKey, u32), CachedDispatchTarget>> =
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 
     /// `(class_definition_epoch, any_class_redefined)` this thread last
@@ -1839,11 +1913,9 @@ unsafe fn try_mic_rust_cached_entry(
     if !mic_rust_entry_cache_enabled() || !direct_virtual_compiled_callee_entry_enabled() {
         return None;
     }
-    let (entry, needs_ctx) = VIRTUAL_DISPATCH_CACHE.with(|dc| {
-        dc.borrow()
-            .get(&(info_ptr as usize, receiver_cid))
-            .map(|c| (c.entry, c.needs_context))
-    })?;
+    let key = (jit_site_key(vm.vm_identity, info_ptr as usize), receiver_cid);
+    let (entry, needs_ctx) =
+        VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow().get(&key).map(|c| (c.entry, c.needs_context)))?;
     let rc = try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice)?;
     if rc == i64::MIN {
         if let Some(v) = handle_compiled_callee_deopt_sentinel(
@@ -1865,6 +1937,7 @@ unsafe fn try_mic_rust_cached_entry(
 /// a failure to pin simply means the entry is not cached — never a dangling
 /// one.
 fn publish_mic_rust_cached_entry(
+    vm_identity: usize,
     info_ptr: i64,
     receiver_cid: u32,
     entry_ptr: usize,
@@ -1878,7 +1951,7 @@ fn publish_mic_rust_cached_entry(
     };
     VIRTUAL_DISPATCH_CACHE.with(|dc| {
         dc.borrow_mut().insert(
-            (info_ptr as usize, receiver_cid),
+            (jit_site_key(vm_identity, info_ptr as usize), receiver_cid),
             DispatchCache {
                 entry: entry_ptr,
                 needs_context: needs_ctx,
@@ -1910,7 +1983,7 @@ unsafe fn virtual_dispatch_target_cached(
     vm: &SharedVm,
     receiver: ObjectRef,
     info: &JitInvokeInfo,
-    info_key: usize,
+    info_key: JitSiteKey,
 ) -> CachedDispatchTarget {
     // KC26: array receivers store their COMPONENT class id in the header, so
     // the `(site, class id)` key cannot tell `X[]` from `X`. Resolve them
@@ -2095,11 +2168,31 @@ unsafe fn try_run_callee_handler(
     exc: cratonvm_types::ObjectRef,
     throw_pc: usize,
 ) -> Option<i64> {
-    let cached = resolve_callee_cached(vm, info, receiver_class_id)?;
+    // `exc` arrives here having already been DRAINED out of
+    // `thread.jit_pending_exception` by the caller, so for the length of this
+    // function it is a bare Rust local — the one heap reference to a live
+    // throwable that no root provider knows about. `resolve_callee_cached` can
+    // load the callee's class (a user `ClassLoader.loadClass`, hence
+    // allocation, hence a collection), and `run_jit_callee_handler` runs
+    // arbitrary Java before it pushes `exc` onto the resumed frame's operand
+    // stack. Pin it across both. `native_pin_roots` is the right home: it is
+    // both scanned (`memory/roots.rs`) and remapped (`memory/gc.rs`), so we
+    // re-read the slot afterwards to pick up a relocation instead of handing
+    // the interpreter a from-space address.
+    let pin_base = thread.native_pin_roots.len();
+    thread.native_pin_roots.push(exc);
+    let resolved = resolve_callee_cached(vm, info, receiver_class_id);
+    let Some(cached) = resolved else {
+        thread.native_pin_roots.truncate(pin_base);
+        return None;
+    };
     let args = decode_dispatch_values(vm, info, args_slice);
+    let exc = thread.native_pin_roots[pin_base];
     let res = crate::runtime::interpreter::run_jit_callee_handler(
         vm, thread, &cached, throw_pc, exc, &args,
-    )?;
+    );
+    thread.native_pin_roots.truncate(pin_base);
+    let res = res?;
     Some(match res {
         Ok(Some(Value::Int(v))) => v as i64,
         Ok(Some(Value::Long(v))) => v,
@@ -2316,7 +2409,7 @@ unsafe fn route_implicit_exc_through_callee(
                 // re-run then adds its own balanced pass. Witnessed by
                 // `CallPathProbe`/`FinallyShapeProbe`
                 // (docs/known-issues/repros/jitban-remaining-20260726/).
-                let signals = take_all_jit_signals();
+                let signals = take_all_jit_signals(thread);
                 if let Some(exc) = signals.exception {
                     // `signals.athrow_bci` is always -1 here: the entry clear
                     // above ran before this drain. Fall back to the value
@@ -2335,17 +2428,25 @@ unsafe fn route_implicit_exc_through_callee(
                     if let Some(v) =
                         try_run_callee_handler(vm, thread, info, receiver_class_id, args_slice, exc, throw_pc)
                     {
+                        // The handler ran and the call is complete, so any
+                        // exceptional frame the callee's compiled body
+                        // published describes a FINISHED attempt. Drop it here
+                        // as well as on the fall-through below. Leaving it
+                        // stashed keeps a heap reference alive for an unbounded
+                        // time, and lets a later drain for the same method
+                        // claim it — the match compares method names only.
+                        cratonvm_jit::deopt::clear_exceptional_frame();
                         return v;
                     }
                     // No handler covers this throw site -- restore the signal
                     // exactly as it was found and fall through.
                     if throw_pc == usize::MAX {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     } else {
-                        set_jit_pending_exception_with_bci(exc, throw_pc as i64);
+                        set_jit_pending_exception_with_bci(thread, exc, throw_pc as i64);
                     }
                 }
-                let _ = take_jit_pending_exception();
+                let _ = take_jit_pending_exception(thread);
                 // The callee is about to be re-executed from its entry in the
                 // interpreter, which regenerates and routes the exception
                 // itself. Any exceptional frame its compiled body published
@@ -2610,7 +2711,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     // outgoing arguments still identify that callee, and run its handler at
     // the recorded throw bci.  Re-entering the callee from bytecode 0 used to
     // duplicate all side effects before a caught bounds/null/divide exception.
-    let signals = take_all_jit_signals();
+    let signals = take_all_jit_signals(thread);
     let throw_pc = if signals.athrow_bci >= 0 {
         signals.athrow_bci as usize
     } else {
@@ -2678,7 +2779,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     // original signal shape so the existing caller-side drain remains the
     // fallback; this preserves behaviour for a miss or a non-covering catch.
     if let Some(exc) = signals.exception {
-        set_jit_pending_exception(exc);
+        set_jit_pending_exception(thread, exc);
     }
     if let Some((index, length)) = signals.aioobe {
         stash_jit_pending_aioobe(index, length);
@@ -3199,6 +3300,10 @@ fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
 fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
     // SAFETY: called only from a JIT alloc helper on the thread that installed the
     // JIT thread pointer; no other `&mut JvmThread` borrow is live here.
+    // SAFETY (both acquisitions): see the comment above — this runs on the JIT
+    // thread and no other `&mut JvmThread` borrow is live. The two are separate
+    // because the first `_guard` must drop before the singleton fallback can
+    // re-borrow.
     if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
         if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
             vm,
@@ -3206,13 +3311,20 @@ fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
             "java/lang/OutOfMemoryError",
             Some(msg),
         ) {
-            set_jit_pending_exception(exc);
+            set_jit_pending_exception(thread, exc);
             return 0;
         }
     }
-    // Fresh creation failed (or no JIT thread) — use the pre-allocated singleton.
+    // Fresh creation failed (or no JIT thread) — use the pre-allocated
+    // singleton. This needs the thread too now that the stash is a GC-rooted
+    // `JvmThread` field: the singleton OOME is exactly the reference most
+    // likely to be live across a collection (we are here *because* the heap is
+    // full), so parking it anywhere the collector cannot see would be the
+    // worst possible place for it.
     if let Some(oom) = *vm.mem.singleton_oom.read() {
-        set_jit_pending_exception(oom);
+        if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
+            set_jit_pending_exception(thread, oom);
+        }
     }
     0
 }
@@ -3238,7 +3350,7 @@ fn jit_negative_array_size(vm: &SharedVm, length: i64) -> i64 {
             "java/lang/NegativeArraySizeException",
             Some(&length.to_string()),
         ) {
-            set_jit_pending_exception(exc);
+            set_jit_pending_exception(thread, exc);
         }
     }
     0
@@ -3490,7 +3602,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
             use crate::error::MethodCallFailed;
             match err {
                 MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                 }
                 MethodCallFailed::InternalError(vm_err) => {
                     let msg =
@@ -3501,7 +3613,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
                         "java/lang/InternalError",
                         Some(&msg),
                     ) {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     }
                 }
             }
@@ -3662,7 +3774,7 @@ unsafe fn jit_cp_alloc_internal_error(vm: &SharedVm, msg: &str) -> i64 {
             "java/lang/InternalError",
             Some(msg),
         ) {
-            set_jit_pending_exception(exc);
+            set_jit_pending_exception(thread, exc);
         }
     }
     0
@@ -3680,7 +3792,7 @@ fn jit_cp_alloc_stash_failure(
 ) -> i64 {
     use crate::error::MethodCallFailed;
     match err {
-        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(exc),
+        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(thread, exc),
         MethodCallFailed::InternalError(vm_err) => {
             let msg = format!("{context}: {vm_err}");
             if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
@@ -3689,7 +3801,7 @@ fn jit_cp_alloc_stash_failure(
                 "java/lang/InternalError",
                 Some(&msg),
             ) {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
             }
         }
     }
@@ -3823,7 +3935,7 @@ unsafe fn jit_resolve_cp_class(
                     "java/lang/IllegalAccessError",
                     Some(&message),
                 ) {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                 }
             }
             return Err(0);
@@ -4073,12 +4185,12 @@ fn stash_jit_monitor_error(
 ) {
     use crate::error::{MethodCallFailed, VmError};
     match err {
-        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(exc),
+        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(thread, exc),
         MethodCallFailed::InternalError(VmError::Runtime(runtime)) => {
             if let MethodCallFailed::ExceptionThrown(exc) =
                 crate::runtime::exceptions::throw_runtime_error(vm, thread, runtime)
             {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
             }
         }
         MethodCallFailed::InternalError(other) => {
@@ -4088,7 +4200,7 @@ fn stash_jit_monitor_error(
                 "java/lang/InternalError",
                 Some(&format!("JIT monitor operation failed: {other}")),
             ) {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
             }
         }
     }
@@ -4516,7 +4628,7 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
                     "java/lang/ArrayStoreException",
                     Some(&elem_cls),
                 ) {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                     return;
                 }
             }
@@ -5212,22 +5324,70 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
 /// A dense bitmap indexed by `ClassId` makes the steady-state check one relaxed
 /// load plus a bit test. Ids outside the bitmap simply take the slow path, so
 /// the capacity bound is a performance choice, not a correctness one.
+///
+/// # VM scoping (2026-08-01)
+///
+/// `ClassId` is only unique *within* a VM. The bitmap used to be an unqualified
+/// process global, so VM A marking id 5000 initialized made
+/// [`jit_getstatic`]/[`jit_putstatic_object`] in VM B skip the JVMS §5.5
+/// initialization check for *its* class 5000 — a compiled `getstatic` that is
+/// the first-ever access to that class then reads the zero-initialized
+/// placeholder (`Value::Int(0)`, decoded as a null reference), which is exactly
+/// the `LineWrapper$FlushType` NPE this memo's own doc describes, resurrected
+/// by a second VM in the same process.
+///
+/// The table is therefore owned by exactly ONE VM: the first to touch it wins
+/// the `OWNER` latch, and every other VM answers `is_initialized == false` and
+/// takes the authoritative `ensure_class_initialized_shared` path forever. That
+/// is a correct-but-slower outcome for VM #2, and no shared mutable state can
+/// give a wrong answer. See `docs/known-issues/vm-jit-cache-keying.md`.
 mod class_init_memo {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     /// Covers class ids `[0, 1 << 20)` in 128 KiB, allocated on first use.
     const CAPACITY: usize = 1 << 20;
     const WORDS: usize = CAPACITY / 64;
+
+    /// `vm_identity` of the VM this table describes; `0` = unclaimed.
+    ///
+    /// `0` is a safe sentinel because `NEXT_VM_IDENTITY` (`vm/src/vm/vm_init.rs`)
+    /// is `AtomicUsize::new(1)` and only ever `fetch_add`s, so no `SharedVm`
+    /// can have identity 0.
+    static OWNER: AtomicUsize = AtomicUsize::new(0);
 
     fn bits() -> &'static [AtomicU64] {
         static BITS: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
         BITS.get_or_init(|| (0..WORDS).map(|_| AtomicU64::new(0)).collect())
     }
 
+    /// Does this table belong to `vm_identity`? Claims it if unowned.
+    /// One relaxed load in the steady state.
     #[inline]
-    pub fn is_initialized(class_id: u32) -> bool {
+    fn owned_by(vm_identity: usize) -> bool {
+        let owner = OWNER.load(Ordering::Relaxed);
+        if owner == vm_identity {
+            return true;
+        }
+        if owner != 0 {
+            return false;
+        }
+        OWNER
+            .compare_exchange(0, vm_identity, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Whether this table is currently claimed by `vm_identity` — read-only,
+    /// claims nothing.
+    #[cfg(test)]
+    #[inline]
+    pub fn owner() -> usize {
+        OWNER.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn is_initialized(vm_identity: usize, class_id: u32) -> bool {
         let idx = class_id as usize;
-        if idx >= CAPACITY {
+        if idx >= CAPACITY || !owned_by(vm_identity) {
             return false;
         }
         let w = bits()[idx / 64].load(Ordering::Relaxed);
@@ -5235,12 +5395,23 @@ mod class_init_memo {
     }
 
     #[inline]
-    pub fn mark_initialized(class_id: u32) {
+    pub fn mark_initialized(vm_identity: usize, class_id: u32) {
         let idx = class_id as usize;
-        if idx >= CAPACITY {
+        if idx >= CAPACITY || !owned_by(vm_identity) {
             return;
         }
         bits()[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Relaxed);
+    }
+
+    /// Drop the ownership claim and clear the table. Tests only — production
+    /// never un-claims (a VM's ids stay valid for its whole life, and the next
+    /// VM correctly falls through to the authoritative path).
+    #[cfg(test)]
+    pub fn reset_for_test() {
+        for w in bits() {
+            w.store(0, Ordering::Relaxed);
+        }
+        OWNER.store(0, Ordering::Relaxed);
     }
 }
 
@@ -5255,13 +5426,31 @@ mod class_init_memo {
 /// Keyed on the class id instead, the question is asked at most once per class
 /// and answered thereafter by two bit tests. Class ids are stable for the life
 /// of the VM, so the memo never needs invalidating.
+///
+/// # VM scoping (2026-08-01)
+///
+/// Same defect and same remedy as [`class_init_memo`]: `ClassId` is per-VM, and
+/// this table used to be an unqualified process global. Both directions were
+/// wrong across two VMs in one process — VM A recording "id 42 is not System"
+/// suppresses the `System.out`/`err` bootstrap intercept for VM B's *real*
+/// `java/lang/System` (so `println` silently no-ops on a null stream, the exact
+/// failure the intercept exists to prevent), and VM A recording "id 7 IS
+/// System" applies the intercept to an unrelated class's static reads in VM B.
+///
+/// The table is owned by exactly one VM via an `OWNER` latch; every other VM
+/// takes the authoritative `resolve` path (a `class_manager` read plus a name
+/// compare) on every call. Correct, and slower only for VM #2 onwards.
 mod system_class_memo {
     use crate::classloading::ClassId;
     use crate::vm::SharedVm;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     const CAPACITY: usize = 1 << 17;
     const WORDS: usize = CAPACITY / 64;
+
+    /// `vm_identity` of the VM this table describes; `0` = unclaimed. See
+    /// [`super::class_init_memo`] for why `0` cannot collide with a real VM.
+    static OWNER: AtomicUsize = AtomicUsize::new(0);
 
     fn table() -> &'static (Box<[AtomicU64]>, Box<[AtomicU64]>) {
         static T: std::sync::OnceLock<(Box<[AtomicU64]>, Box<[AtomicU64]>)> =
@@ -5272,6 +5461,27 @@ mod system_class_memo {
                 (0..WORDS).map(|_| AtomicU64::new(0)).collect(),
             )
         })
+    }
+
+    #[inline]
+    fn owned_by(vm_identity: usize) -> bool {
+        let owner = OWNER.load(Ordering::Relaxed);
+        if owner == vm_identity {
+            return true;
+        }
+        if owner != 0 {
+            return false;
+        }
+        OWNER
+            .compare_exchange(0, vm_identity, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Which VM currently owns the table (`0` = unclaimed).
+    #[cfg(test)]
+    #[inline]
+    pub fn owner() -> usize {
+        OWNER.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -5286,8 +5496,9 @@ mod system_class_memo {
 
     pub fn is_system(vm: &SharedVm, class_id: ClassId) -> bool {
         let idx = class_id.as_u32() as usize;
-        if idx >= CAPACITY {
-            // Unindexable id: fall back to the authoritative check.
+        if idx >= CAPACITY || !owned_by(vm.vm_identity) {
+            // Unindexable id, or a VM that does not own this table: fall back
+            // to the authoritative check.
             return resolve(vm, class_id);
         }
         let (resolved, is_sys) = table();
@@ -5309,34 +5520,26 @@ mod system_class_memo {
             .get_class(class_id)
             .is_some_and(|c| &*c.name == "java/lang/System")
     }
+
+    /// Drop the ownership claim and clear both bitmaps. Tests only.
+    #[cfg(test)]
+    pub fn reset_for_test() {
+        let (resolved, is_sys) = table();
+        for w in resolved.iter().chain(is_sys.iter()) {
+            w.store(0, Ordering::Relaxed);
+        }
+        OWNER.store(0, Ordering::Relaxed);
+    }
 }
 
-/// `java/lang/System`'s `ClassId`, resolved once.
-///
-/// `jit_getstatic` needs to know whether the field it is reading belongs to
-/// `java/lang/System` (the `out`/`err` bootstrap intercept). Asking that
-/// question by name meant a `class_manager` read lock plus a string compare on
-/// every static read from compiled code. The id is assigned during bootstrap
-/// and never changes, so it is cached after the first successful resolution.
-///
-/// Returns `None` until `java/lang/System` is loaded — before that there is no
-/// id that could match, so the caller's intercept correctly does not fire.
-fn system_class_id(vm: &SharedVm) -> Option<ClassId> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    /// `u32::MAX` = "not resolved yet"; any other value is the cached id.
-    static CACHED: AtomicU32 = AtomicU32::new(u32::MAX);
-    let cached = CACHED.load(Ordering::Relaxed);
-    if cached != u32::MAX {
-        return Some(ClassId::new(cached));
-    }
-    let id = vm
-        .classes
-        .class_manager
-        .read()
-        .get_loaded_class_id("java/lang/System")?;
-    CACHED.store(id.as_u32(), Ordering::Relaxed);
-    Some(id)
-}
+// `system_class_id` — a process-global `AtomicU32` holding `java/lang/System`'s
+// `ClassId`, "resolved once" — was DELETED on 2026-08-01. It had no callers
+// anywhere in the repository (`system_class_memo::is_system` superseded it),
+// and it was wrong for the same reason that memo was: the first VM in the
+// process to resolve System latched its id forever, so in a second VM the
+// `System.out`/`err` intercept would fire on whatever class happened to hold
+// that id and never on the real `java/lang/System`. Do not reintroduce it
+// without a `vm_identity` in the key.
 
 pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
     gs_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5383,13 +5586,13 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // `getstatic`'s ~35 ns. Initialization is monotonic, so the memo never
     // needs invalidating. See `class_init_memo`.
     let _gs_init = gs_prof::CycGuard::new(&gs_prof::CYC_INIT);
-    if !class_init_memo::is_initialized(class_id_raw as u32) {
+    if !class_init_memo::is_initialized(vm.vm_identity, class_id_raw as u32) {
         if let Some((thread, _guard)) = jit_thread_mut() {
             if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
                 use crate::error::MethodCallFailed;
                 match err {
                     MethodCallFailed::ExceptionThrown(exc) => {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     }
                     MethodCallFailed::InternalError(vm_err) => {
                         let msg = format!(
@@ -5401,7 +5604,7 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
                             "java/lang/InternalError",
                             Some(&msg),
                         ) {
-                            set_jit_pending_exception(exc);
+                            set_jit_pending_exception(thread, exc);
                         }
                     }
                 }
@@ -5411,7 +5614,7 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
             // re-attempted per JVMS (the class enters the erroneous state and
             // subsequent attempts throw NoClassDefFoundError from the real
             // check, not from a stale memo).
-            class_init_memo::mark_initialized(class_id_raw as u32);
+            class_init_memo::mark_initialized(vm.vm_identity, class_id_raw as u32);
         }
     }
 
@@ -5648,7 +5851,7 @@ unsafe fn jit_putstatic_class_init_guard(vm: &SharedVm, class_id_raw: i64) -> Op
             use crate::error::MethodCallFailed;
             match err {
                 MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                 }
                 MethodCallFailed::InternalError(vm_err) => {
                     let msg = format!(
@@ -5660,7 +5863,7 @@ unsafe fn jit_putstatic_class_init_guard(vm: &SharedVm, class_id_raw: i64) -> Op
                         "java/lang/InternalError",
                         Some(&msg),
                     ) {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     }
                 }
             }
@@ -5963,7 +6166,7 @@ unsafe fn jit_typecheck_memoized(
     class_name_len: usize,
     lenient: bool,
 ) -> Option<bool> {
-    let vm_key = vm as *const SharedVm as usize;
+    let vm_key = vm.vm_identity;
     let key = (
         vm_key,
         class_name_ptr as usize,
@@ -6021,7 +6224,7 @@ fn jit_typecheck_target_cache_put(cache_key: (usize, usize, usize), target: Clas
 /// `is_subclass_of` directly: a hit can only ever replace a call that would
 /// have returned `true` with `true`.
 fn jit_is_subclass_of_cached(vm: &SharedVm, child: ClassId, parent: ClassId) -> bool {
-    let vm_key = vm as *const SharedVm as usize;
+    let vm_key = vm.vm_identity;
     let key = (vm_key, child.as_u32(), parent.as_u32());
     // JVMTI class redefinition cannot change superclass or interface identity,
     // so a positive subtype result remains valid across method-body changes.
@@ -6153,7 +6356,7 @@ unsafe fn jit_typecheck_resolve(
     // `if let` block (including the `else` branch), deadlocking any path that
     // later calls `load_class_concurrent` (which needs a write lock).
     let cache_key = (
-        vm as *const SharedVm as usize,
+        vm.vm_identity,
         class_name.as_ptr() as usize,
         class_name.len(),
     );
@@ -6491,7 +6694,7 @@ pub unsafe extern "C" fn jit_checkcast(
                 "java/lang/ClassCastException",
                 Some(&msg),
             ) {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
                 return i64::MIN;
             }
         }
@@ -6746,8 +6949,31 @@ pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if exc_ptr == 0 {
         stash_jit_pending_npe();
+    } else if let Some((thread, _guard)) = jit_thread_mut() {
+        // The throwable is stashed on the `JvmThread` so the collector can
+        // both keep it alive and relocate it before the interpreter's drain
+        // reads it back (`docs/known-issues/jit-signals-root-gap.md`).
+        set_jit_pending_exception_with_bci(
+            thread,
+            ObjectRef::from_raw(exc_ptr as usize as *mut u8),
+            bci,
+        );
     } else {
-        set_jit_pending_exception_with_bci(ObjectRef::from_raw(exc_ptr as usize as *mut u8), bci);
+        // Unreachable in a compiled method: `emitted_athrow` forces
+        // `has_dispatch` (`jit/src/x64.rs`), and `has_dispatch` is exactly what
+        // makes `execute_jit_call` install `JIT_THREAD` before entering. If
+        // that ever stops holding, the throwable has nowhere GC-visible to go
+        // and the fast entry path would not drain it either — so say so loudly
+        // in debug rather than silently dropping an exception.
+        debug_assert!(
+            false,
+            "jit_throw_exception with no JIT thread installed: `emitted_athrow` \
+             must force has_dispatch (jit/src/x64.rs)"
+        );
+        // Still record the bci, and let the sentinel propagate exactly as
+        // before; the interpreter treats a sentinel with no signal as a plain
+        // deopt.
+        JIT_SIGNALS.with(|s| s.athrow_bci.set(bci));
     }
     i64::MIN // deopt sentinel — interpreter drains the pending exception
 }
@@ -7088,35 +7314,44 @@ struct IntegerNativeDispatchCache {
     native_id: Option<cratonvm_native_api::NativeMethodId>,
 }
 
-// Thread-local map from JitInvokeInfo pointer -> cached JIT entry.
+// Thread-local map from [`JitSiteKey`] -> cached JIT entry.
 // Using a thread-local avoids synchronization on the hot path.
 // T10.9.B: FxHashMap — pointer values are internal; this is touched on every
 // JIT-dispatched invoke.
+//
+// The key is `(vm_identity, JitInvokeInfo pointer)`, NOT the pointer alone —
+// see [`JitSiteKey`] for why the pointer alone aliases across VMs and what a
+// cross-VM hit would execute. A thread reaches two VMs via JNI
+// `AttachCurrentThread`, or by being reused across `SharedVm`s in one test
+// process; thread-local is not per-VM.
 thread_local! {
-    static DISPATCH_CACHE: std::cell::RefCell<rustc_hash::FxHashMap<usize, DispatchCache>>
+    static DISPATCH_CACHE: std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, DispatchCache>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-    static DISPATCH_COUNTER: std::cell::RefCell<rustc_hash::FxHashMap<usize, u32>>
+    static DISPATCH_COUNTER: std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, u32>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     static OBJECT_NATIVE_DISPATCH_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<usize, NativeDispatchCache>>
+        std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, NativeDispatchCache>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     static INTEGER_NATIVE_DISPATCH_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<usize, Option<IntegerNativeDispatchCache>>>
+        std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, Option<IntegerNativeDispatchCache>>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     /// Real `java/lang/Integer` class discovered from the first ordinary
-    /// `valueOf` result in each VM. A new VM pointer invalidates the entry.
+    /// `valueOf` result in each VM, as `(vm_identity, class id)`. A different
+    /// VM identity invalidates the entry.
     static INTEGER_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
         const { std::cell::Cell::new(None) };
     /// Exact real-JDK `java/util/regex/Matcher` class id, discovered once per
-    /// VM for the virtual-MIC native fast path.
+    /// VM for the virtual-MIC native fast path. `(vm_identity, class id)`.
     static MATCHER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
         const { std::cell::Cell::new(None) };
-    // Virtual/interface call sites are keyed by their JIT metadata pointer AND
-    // the receiver's actual class id. A static CP owner is not sound here:
+    // Virtual/interface call sites are keyed by their JIT site key AND the
+    // receiver's actual class id. A static CP owner is not sound here:
     // an interface method may resolve to a receiver override.
-    static VIRTUAL_DISPATCH_CACHE: std::cell::RefCell<rustc_hash::FxHashMap<(usize, u32), DispatchCache>>
+    static VIRTUAL_DISPATCH_CACHE:
+        std::cell::RefCell<rustc_hash::FxHashMap<(JitSiteKey, u32), DispatchCache>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-    static VIRTUAL_DISPATCH_COUNTER: std::cell::RefCell<rustc_hash::FxHashMap<(usize, u32), u32>>
+    static VIRTUAL_DISPATCH_COUNTER:
+        std::cell::RefCell<rustc_hash::FxHashMap<(JitSiteKey, u32), u32>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
@@ -7212,7 +7447,7 @@ fn raise_jit_stack_overflow(vm: &SharedVm) -> i64 {
             "java/lang/StackOverflowError",
             None,
         ) {
-            set_jit_pending_exception(exc);
+            set_jit_pending_exception(thread, exc);
         }
     }
     i64::MIN
@@ -7318,7 +7553,7 @@ fn handle_jit_dispatch_error(
     use crate::error::{ClassFileError, MethodCallFailed, RuntimeError, VmError};
     match err {
         MethodCallFailed::ExceptionThrown(exc) => {
-            set_jit_pending_exception(exc);
+            set_jit_pending_exception(thread, exc);
         }
         // A native callee that returns `Err(RuntimeError::X)` is, by the
         // exception model, asking the VM to throw the Java exception that
@@ -7352,7 +7587,7 @@ fn handle_jit_dispatch_error(
         {
             match crate::runtime::exceptions::throw_runtime_error(vm, thread, rt_err) {
                 MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                 }
                 MethodCallFailed::InternalError(vm_err2) => {
                     // Exception-object construction failed — fall back to
@@ -7368,7 +7603,7 @@ fn handle_jit_dispatch_error(
                         "java/lang/InternalError",
                         Some(&msg),
                     ) {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     }
                 }
             }
@@ -7394,7 +7629,7 @@ fn handle_jit_dispatch_error(
                 crate::runtime::exceptions::throw_linkage_error(vm, thread, linkage_err);
             match converted {
                 MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                 }
                 MethodCallFailed::InternalError(vm_err2) => {
                     let msg = format!(
@@ -7407,7 +7642,7 @@ fn handle_jit_dispatch_error(
                         "java/lang/InternalError",
                         Some(&msg),
                     ) {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     }
                 }
             }
@@ -7433,7 +7668,7 @@ fn handle_jit_dispatch_error(
                 "java/lang/NoClassDefFoundError",
                 Some(class_name),
             ) {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
             }
         }
         MethodCallFailed::InternalError(vm_err) => {
@@ -7454,14 +7689,19 @@ fn handle_jit_dispatch_error(
                 "java/lang/InternalError",
                 Some(&msg),
             ) {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
             }
         }
     }
     // Return the deopt sentinel iff a pending exception was actually
     // stashed; otherwise `0` (legacy silent-drop — exception construction
     // itself failed, nothing for the caller to route).
-    if jit_pending_exception_is_set() {
+    //
+    // Read the field through `thread` rather than `jit_pending_exception_is_set()`:
+    // that helper resolves the thread from the raw `JIT_THREAD` pointer, and we
+    // are holding a live `&mut JvmThread` for the same thread, so going through
+    // the pointer here would manufacture an aliasing reference for no reason.
+    if thread.jit_pending_exception.is_some() {
         i64::MIN
     } else {
         0
@@ -7607,7 +7847,10 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         return i64::MIN;
     }
 
-    let info_key = info_ptr as usize;
+    // `(vm_identity, info pointer)`. The VM half is not decoration: the direct
+    // helpers below pass the address of a process-global `static JitInvokeInfo`,
+    // which is identical in every VM. See [`JitSiteKey`].
+    let info_key = jit_site_key(vm.vm_identity, info_ptr as usize);
     // Cached exact-receiver native fast path — the FIRST per-callsite probe. The
     // resolution/insertion slow path stays further down (after the compile
     // probes); this early block only serves sites the cache has already
@@ -8484,7 +8727,7 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
     let vm = &*(vm_ptr as *const SharedVm);
     let value = value as i32;
     if !(-128..=127).contains(&value) {
-        let vm_key = vm as *const SharedVm as usize;
+        let vm_key = vm.vm_identity;
         let cached_class = INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
             cache
                 .get()
@@ -8603,7 +8846,7 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
         Some(Value::Object(Some(object))) => {
             INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
                 cache.set(Some((
-                    vm as *const SharedVm as usize,
+                    vm.vm_identity,
                     vm.mem.heap.class_id_of(object).as_u32(),
                 )))
             });
@@ -8736,7 +8979,7 @@ thread_local! {
 /// callers before the raw header read).
 unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
     let cid = std::ptr::read(receiver as usize as *const u32);
-    let vm_key = vm as *const SharedVm as usize;
+    let vm_key = vm.vm_identity;
     if HASHMAP_CLASS_CACHE.with(|c| c.get() == Some((vm_key, cid))) {
         return !class_was_redefined(vm, ClassId::new(cid));
     }
@@ -8761,7 +9004,7 @@ unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
 // receiver at the dispatch site.
 unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
     let cid = std::ptr::read(receiver as usize as *const u32);
-    let vm_key = vm as *const SharedVm as usize;
+    let vm_key = vm.vm_identity;
     if CONCURRENT_HASHMAP_CLASS_CACHE.with(|c| c.get() == Some((vm_key, cid))) {
         return !class_was_redefined(vm, ClassId::new(cid));
     }
@@ -9156,7 +9399,7 @@ fn call_integer_native_raw_inner(
     if matches!(entry.kind, IntegerNativeKind::ValueOf) {
         let value = args_slice[0] as i32;
         if !(-128..=127).contains(&value) {
-            let vm_key = vm as *const SharedVm as usize;
+            let vm_key = vm.vm_identity;
             let cached_class = INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
                 cache
                     .get()
@@ -9227,7 +9470,7 @@ fn call_integer_native_raw_inner(
         if let Some(Value::Object(Some(object))) = result {
             INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
                 cache.set(Some((
-                    vm as *const SharedVm as usize,
+                    vm.vm_identity,
                     vm.mem.heap.class_id_of(object).as_u32(),
                 )))
             });
@@ -9459,7 +9702,7 @@ fn call_stringbuilder_native_raw(
 
 #[inline]
 fn is_exact_matcher_class(vm: &SharedVm, class_id: ClassId) -> bool {
-    let vm_key = vm as *const SharedVm as usize;
+    let vm_key = vm.vm_identity;
     let raw_class_id = class_id.as_u32();
     if MATCHER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, raw_class_id))) {
         return true;
@@ -10424,8 +10667,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // `Enum.clone() → CloneNotSupportedException` for every array clone
         // of an enum type. Per JVMS §4.4.1, array classes inherit their
         // method table from `Object`; short-circuit accordingly.
-        let dispatch_target =
-            virtual_dispatch_target_cached(vm, receiver_ref, info, info_ptr as usize);
+        let dispatch_target = virtual_dispatch_target_cached(
+            vm,
+            receiver_ref,
+            info,
+            jit_site_key(vm.vm_identity, info_ptr as usize),
+        );
         let cacheable_receiver = dispatch_target.cacheable_receiver;
         let globally_named = dispatch_target.globally_named;
         // An entryless slot can be retargeted by another thread after the
@@ -10509,7 +10756,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 && cacheable_receiver
                 && globally_named
             {
-                publish_mic_rust_cached_entry(info_ptr, receiver_cid, entry_ptr, needs_ctx);
+                publish_mic_rust_cached_entry(
+                    vm.vm_identity,
+                    info_ptr,
+                    receiver_cid,
+                    entry_ptr,
+                    needs_ctx,
+                );
             }
             if callee_barred_by_table || callee_has_indy_trap {
                 mic_prof::bump(&mic_prof::PUB_BARRED);
@@ -10621,8 +10874,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // --- Cache miss: full resolution + update cache ---
     mic.record_miss();
 
-    let dispatch_target =
-        virtual_dispatch_target_cached(vm, receiver_ref, info, info_ptr as usize);
+    let dispatch_target = virtual_dispatch_target_cached(
+        vm,
+        receiver_ref,
+        info,
+        jit_site_key(vm.vm_identity, info_ptr as usize),
+    );
     let cacheable_receiver = dispatch_target.cacheable_receiver;
     let globally_named = dispatch_target.globally_named;
     let class_name = dispatch_target.class_name;
@@ -10683,7 +10940,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     let callee_has_indy_trap =
         compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor);
     if callee_barred_by_table && !callee_has_indy_trap && cacheable_receiver && globally_named {
-        publish_mic_rust_cached_entry(info_ptr, receiver_cid, entry_ptr as usize, needs_ctx);
+        publish_mic_rust_cached_entry(
+            vm.vm_identity,
+            info_ptr,
+            receiver_cid,
+            entry_ptr as usize,
+            needs_ctx,
+        );
     }
     if cacheable_receiver && !callee_barred_by_table && !callee_has_indy_trap {
         // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
@@ -11130,6 +11393,382 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Per-VM keying of the JIT dispatch memos
+    // (docs/known-issues/vm-jit-cache-keying.md)
+    // -----------------------------------------------------------------------
+
+    /// Serializes the tests that reset the two process-global, VM-owned
+    /// bitmaps (`class_init_memo`, `system_class_memo`). Nothing else in the
+    /// unit-test suite reaches them — only `jit_getstatic` does, and that
+    /// needs compiled code — but two of these tests running concurrently
+    /// would clear each other's claim.
+    static MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn memo_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        MEMO_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // -----------------------------------------------------------------------
+    // The pending JIT exception is thread-resident, not TLS-resident
+    // (docs/known-issues/jit-signals-root-gap.md)
+    // -----------------------------------------------------------------------
+
+    fn scratch_thread(id: u64) -> JvmThread {
+        use crate::threading::jvm_thread::ThreadId;
+        JvmThread::new(ThreadId(id), "jit-signals-test")
+    }
+
+    /// Clear this test thread's TLS signal block so a test never inherits the
+    /// scalar flags of whichever test ran before it on the same OS thread
+    /// (libtest may reuse one under `--test-threads=1`).
+    fn reset_tls_signals() {
+        let mut scratch = scratch_thread(u64::MAX);
+        let _ = take_all_jit_signals(&mut scratch);
+    }
+
+    /// A throwable stashed for thread A must be reachable **through A's
+    /// `JvmThread`** — that is the whole point of the move, because a
+    /// `thread_local!` is invisible to the collector's root scan and post-move
+    /// fixup. Draining a different thread must not see it.
+    #[test]
+    fn a_stashed_jit_exception_is_reachable_through_the_thread_it_belongs_to() {
+        reset_tls_signals();
+        // SAFETY: an aligned, non-null address that is never dereferenced —
+        // the signal plumbing only moves the `ObjectRef` around.
+        let exc = unsafe { ObjectRef::from_raw(0x4000usize as *mut u8) };
+        let mut a = scratch_thread(1);
+        let mut b = scratch_thread(2);
+
+        set_jit_pending_exception(&mut a, exc);
+
+        assert_eq!(
+            a.jit_pending_exception.map(|o| o.as_ptr() as usize),
+            Some(0x4000),
+            "the stash must land in the GC-rooted `JvmThread` slot; if this is \
+             None the reference has gone back into a thread-local and is \
+             unrooted again"
+        );
+        assert!(
+            b.jit_pending_exception.is_none(),
+            "another thread's slot must stay empty"
+        );
+
+        // The drain is per-thread and consuming.
+        assert!(
+            take_all_jit_signals(&mut b).exception.is_none(),
+            "draining B must not steal A's pending exception"
+        );
+        assert_eq!(
+            take_all_jit_signals(&mut a)
+                .exception
+                .map(|o| o.as_ptr() as usize),
+            Some(0x4000)
+        );
+        assert!(
+            a.jit_pending_exception.is_none(),
+            "the drain must consume the slot"
+        );
+    }
+
+    /// `take_jit_pending_exception` is the interpreter's other drain door; it
+    /// must consume the same slot.
+    #[test]
+    fn take_jit_pending_exception_consumes_the_thread_slot() {
+        reset_tls_signals();
+        // SAFETY: never dereferenced.
+        let exc = unsafe { ObjectRef::from_raw(0x4100usize as *mut u8) };
+        let mut t = scratch_thread(3);
+
+        stash_jit_pending_exception(&mut t, exc);
+        assert_eq!(
+            take_jit_pending_exception(&mut t).map(|o| o.as_ptr() as usize),
+            Some(0x4100)
+        );
+        assert!(take_jit_pending_exception(&mut t).is_none());
+    }
+
+    /// The RBC.6 `athrow_bci` stays in TLS (it is a scalar the collector has no
+    /// interest in) but must still travel with the thread-resident throwable
+    /// through one drain, and reset afterwards.
+    #[test]
+    fn the_athrow_bci_still_pairs_with_the_thread_resident_exception() {
+        reset_tls_signals();
+        // SAFETY: never dereferenced.
+        let exc = unsafe { ObjectRef::from_raw(0x4200usize as *mut u8) };
+        let mut t = scratch_thread(4);
+
+        set_jit_pending_exception_with_bci(&mut t, exc, 17);
+        assert_eq!(peek_jit_athrow_bci(), 17);
+
+        let drained = take_all_jit_signals(&mut t);
+        assert_eq!(
+            drained.exception.map(|o| o.as_ptr() as usize),
+            Some(0x4200)
+        );
+        assert_eq!(drained.athrow_bci, 17);
+        assert_eq!(
+            peek_jit_athrow_bci(),
+            -1,
+            "the drain must reset the bci so it cannot leak onto the next \
+             unrelated exception"
+        );
+
+        // The general setter always clears the bci back to "unknown".
+        set_jit_pending_exception(&mut t, exc);
+        assert_eq!(peek_jit_athrow_bci(), -1);
+        let _ = take_all_jit_signals(&mut t);
+    }
+
+    /// `jit_pending_exception_is_set` resolves the thread through the raw
+    /// `JIT_THREAD` pointer. With no JIT thread installed (this test thread
+    /// never enters compiled code) it must answer "nothing pending" rather
+    /// than dereference null.
+    #[test]
+    fn the_pending_exception_peek_is_null_safe_without_a_jit_thread() {
+        // Establish the premise rather than assuming it: another test may have
+        // run on this OS thread first.
+        clear_jit_thread();
+        assert!(current_jit_thread_ptr().is_null());
+        assert!(!jit_pending_exception_is_set());
+    }
+
+    #[test]
+    fn jit_site_key_separates_vm_identities() {
+        let info_ptr = &INTEGER_VALUE_OF_INFO as *const JitInvokeInfo as usize;
+        assert_eq!(jit_site_key(1, info_ptr), jit_site_key(1, info_ptr));
+        assert_ne!(
+            jit_site_key(1, info_ptr),
+            jit_site_key(2, info_ptr),
+            "the same JitInvokeInfo address in two VMs must not be one key"
+        );
+        assert_ne!(jit_site_key(1, info_ptr), jit_site_key(1, info_ptr + 8));
+    }
+
+    /// The concrete premise behind [`JitSiteKey`]: the direct helpers dispatch
+    /// through the address of a `static JitInvokeInfo`, which is literally the
+    /// same `usize` in every VM in the process. Before the fix that address
+    /// WAS the whole cache key.
+    #[test]
+    fn static_invoke_infos_share_one_address_across_vms() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let a = SharedVm::new(VmConfig::default());
+        let b = SharedVm::new(VmConfig::default());
+        assert_ne!(a.vm_identity, b.vm_identity);
+
+        for ptr in [
+            &INTEGER_VALUE_OF_INFO as *const JitInvokeInfo as usize,
+            &INTEGER_INT_VALUE_INFO as *const JitInvokeInfo as usize,
+            &HASHMAP_PUT_DIRECT_INFO as *const JitInvokeInfo as usize,
+            &HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize,
+            &CONCURRENT_HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize,
+            &STRING_LATIN1_LOWER_DIRECT_INFO as *const JitInvokeInfo as usize,
+        ] {
+            assert_ne!(
+                jit_site_key(a.vm_identity, ptr),
+                jit_site_key(b.vm_identity, ptr),
+                "process-global JitInvokeInfo at 0x{ptr:x} must key differently per VM"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_cache_does_not_serve_another_vms_compiled_entry() {
+        let info_ptr = &HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize;
+        let vm_a = jit_site_key(11, info_ptr);
+        let vm_b = jit_site_key(12, info_ptr);
+
+        DISPATCH_CACHE.with(|dc| {
+            dc.borrow_mut().insert(
+                vm_a,
+                DispatchCache {
+                    entry: 0xdead_beef,
+                    needs_context: false,
+                    _owner: None,
+                },
+            );
+        });
+
+        let from_a = DISPATCH_CACHE.with(|dc| dc.borrow().get(&vm_a).map(|c| c.entry));
+        let from_b = DISPATCH_CACHE.with(|dc| dc.borrow().get(&vm_b).map(|c| c.entry));
+        DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+
+        assert_eq!(from_a, Some(0xdead_beef), "the owning VM must still hit");
+        assert_eq!(
+            from_b, None,
+            "another VM must never be handed a raw entry pointer into VM A's code cache"
+        );
+    }
+
+    #[test]
+    fn virtual_dispatch_cache_does_not_serve_another_vms_compiled_entry() {
+        let info_ptr = &CONCURRENT_HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize;
+        // The SAME receiver class id in both VMs — the collision that makes
+        // this cache miscompile-grade rather than merely stale.
+        let cid = 4242u32;
+        let key_a = (jit_site_key(21, info_ptr), cid);
+        let key_b = (jit_site_key(22, info_ptr), cid);
+
+        VIRTUAL_DISPATCH_CACHE.with(|dc| {
+            dc.borrow_mut().insert(
+                key_a,
+                DispatchCache {
+                    entry: 0x1234_5678,
+                    needs_context: true,
+                    _owner: None,
+                },
+            );
+        });
+        let from_a = VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow().get(&key_a).map(|c| c.entry));
+        let from_b = VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow().get(&key_b).map(|c| c.entry));
+        VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+
+        assert_eq!(from_a, Some(0x1234_5678));
+        assert_eq!(
+            from_b, None,
+            "identical (site, class id) in a different VM must not hit"
+        );
+    }
+
+    #[test]
+    fn virtual_target_cache_does_not_serve_another_vms_class_name() {
+        let info_ptr = &HASHMAP_PUT_DIRECT_INFO as *const JitInvokeInfo as usize;
+        let cid = 77u32;
+        let key_a = (jit_site_key(31, info_ptr), cid);
+        let key_b = (jit_site_key(32, info_ptr), cid);
+
+        VIRTUAL_TARGET_CACHE.with(|c| {
+            c.borrow_mut().insert(
+                key_a,
+                CachedDispatchTarget {
+                    class_name: std::rc::Rc::from("com/example/OnlyInVmA"),
+                    cacheable_receiver: true,
+                    globally_named: true,
+                },
+            );
+        });
+        let a_name =
+            VIRTUAL_TARGET_CACHE.with(|c| c.borrow().get(&key_a).map(|t| t.class_name.to_string()));
+        let b_hit = VIRTUAL_TARGET_CACHE.with(|c| c.borrow().get(&key_b).is_some());
+        VIRTUAL_TARGET_CACHE.with(|c| c.borrow_mut().clear());
+
+        assert_eq!(a_name.as_deref(), Some("com/example/OnlyInVmA"));
+        assert!(
+            !b_hit,
+            "a callee class name resolved in VM A must not be reused in VM B"
+        );
+    }
+
+    #[test]
+    fn integer_native_dispatch_cache_is_vm_scoped() {
+        // The value is irrelevant — `None` means "policy declined this
+        // optimization at this site", which is itself a per-VM answer (the
+        // execution policy and the native registry are both per-VM).
+        let info_ptr = &INTEGER_VALUE_OF_INFO as *const JitInvokeInfo as usize;
+        let key_a = jit_site_key(41, info_ptr);
+        let key_b = jit_site_key(42, info_ptr);
+
+        INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow_mut().insert(key_a, None));
+        let a_present = INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow().contains_key(&key_a));
+        let b_present = INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow().contains_key(&key_b));
+        INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow_mut().clear());
+
+        assert!(a_present);
+        assert!(
+            !b_present,
+            "a per-VM native admission decision must not leak to another VM"
+        );
+    }
+
+    #[test]
+    fn dispatch_counter_is_vm_scoped() {
+        let info_ptr = &HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize;
+        let key_a = jit_site_key(51, info_ptr);
+        let key_b = jit_site_key(52, info_ptr);
+        DISPATCH_COUNTER.with(|dc| {
+            let mut m = dc.borrow_mut();
+            *m.entry(key_a).or_insert(0) += 5;
+        });
+        let (a, b) = DISPATCH_COUNTER
+            .with(|dc| (dc.borrow().get(&key_a).copied(), dc.borrow().get(&key_b).copied()));
+        DISPATCH_COUNTER.with(|dc| dc.borrow_mut().clear());
+        assert_eq!(a, Some(5));
+        assert_eq!(b, None, "hotness counted in VM A must not tier up VM B");
+    }
+
+    #[test]
+    fn class_init_memo_is_not_shared_between_vms() {
+        let _g = memo_test_guard();
+        class_init_memo::reset_for_test();
+
+        let vm_a = 101usize;
+        let vm_b = 202usize;
+        let class_id = 5000u32;
+
+        assert!(!class_init_memo::is_initialized(vm_a, class_id));
+        class_init_memo::mark_initialized(vm_a, class_id);
+        assert!(
+            class_init_memo::is_initialized(vm_a, class_id),
+            "the owning VM keeps its fast path"
+        );
+        assert_eq!(class_init_memo::owner(), vm_a);
+        assert!(
+            !class_init_memo::is_initialized(vm_b, class_id),
+            "VM B must run the authoritative JVMS 5.5 init check for its own class {class_id}"
+        );
+        // VM B must not be able to poison the table either.
+        class_init_memo::mark_initialized(vm_b, 6000);
+        assert!(!class_init_memo::is_initialized(vm_b, 6000));
+        assert!(
+            !class_init_memo::is_initialized(vm_a, 6000),
+            "a non-owning VM must not publish into the owner's table"
+        );
+
+        class_init_memo::reset_for_test();
+    }
+
+    #[test]
+    fn class_init_memo_owner_latch_is_claimed_once() {
+        let _g = memo_test_guard();
+        class_init_memo::reset_for_test();
+        assert_eq!(class_init_memo::owner(), 0, "starts unclaimed");
+        assert!(!class_init_memo::is_initialized(7, 1));
+        assert_eq!(class_init_memo::owner(), 7, "first toucher claims it");
+        assert!(!class_init_memo::is_initialized(8, 1));
+        assert_eq!(class_init_memo::owner(), 7, "a later VM cannot steal it");
+        class_init_memo::reset_for_test();
+    }
+
+    #[test]
+    fn system_class_memo_is_owned_by_one_vm() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let _g = memo_test_guard();
+        system_class_memo::reset_for_test();
+
+        let a = SharedVm::new(VmConfig::default());
+        let b = SharedVm::new(VmConfig::default());
+        assert_ne!(a.vm_identity, b.vm_identity);
+
+        // Any query claims the table for the first VM to ask.
+        let _ = system_class_memo::is_system(&a, ClassId::new(9));
+        assert_eq!(system_class_memo::owner(), a.vm_identity);
+
+        // B's answers must come from the authoritative resolver, not A's bits.
+        // Whatever the answer is, asking must not transfer ownership.
+        let _ = system_class_memo::is_system(&b, ClassId::new(9));
+        assert_eq!(
+            system_class_memo::owner(),
+            a.vm_identity,
+            "a second VM must not take over the System-class bitmap"
+        );
+
+        system_class_memo::reset_for_test();
+    }
 
     #[test]
     fn native_dispatch_scratch_stays_inline_through_register_envelope() {
@@ -12541,7 +13180,32 @@ pub unsafe extern "C" fn jit_arm_savebase_watch(_addr: i64) {}
 pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 
 /// Build the JIT runtime helpers table with real function pointer addresses.
+/// Build the helper table for a SPECIFIC VM.
+///
+/// Three of the fields below are VM-specific addresses: the STW flag the
+/// JIT polls, and the card-table triple its inline reference store marks
+/// into. They used to be resolved through `process_vm()` — the FIRST VM
+/// published in the process — so in a second VM the compiled code would poll
+/// another VM's safepoint flag and write card marks into another VM's
+/// table. A missed card mark is a missed remembered-set update, which is a
+/// use-after-free, not a slowdown. See
+/// `docs/known-issues/vm-process-global-state.md`.
+///
+/// Every production caller has its own `SharedVm` in scope and should use
+/// this. [`build_helpers`] remains for VM-less unit tests.
+pub fn build_helpers_for(shared: &crate::vm::SharedVm) -> JitRuntimeHelpers {
+    build_helpers_opt(Some(shared))
+}
+
+/// Build the helper table from the process-global VM, if one is published.
+///
+/// Prefer [`build_helpers_for`] wherever a `SharedVm` is in scope: this
+/// spelling silently picks the FIRST VM in the process.
 pub fn build_helpers() -> JitRuntimeHelpers {
+    build_helpers_opt(crate::native::jni::process_vm().as_deref())
+}
+
+fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntimeHelpers {
     // Compute the inline-TLAB offset triple once at startup so the JIT
     // can bake them as immediates. The runtime tests
     // `Tlab::test_tlab_offsets` and `JvmThread::tlab_offset_matches_field_address`
@@ -12583,7 +13247,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     //
     // The latch itself only ever moves toward strict, so this call can never
     // relax a policy another VM in the same process already installed.
-    let jdk_only = match crate::native::jni::process_vm() {
+    let jdk_only = match vm_for_helpers {
         Some(shared) => {
             let policy = shared.config.execution_policy();
             cratonvm_jit::set_jit_execution_policy(policy);
@@ -12645,11 +13309,11 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     }
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
-        crate::native::jni::process_vm()
+        vm_for_helpers
             .and_then(|shared| shared.mem.heap.jit_card_table_info())
             .unwrap_or((0, 0, 0));
 
-    JitRuntimeHelpers {
+    let helpers = JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,
         new_object: jit_new_object as *const () as usize,
         anewarray_object: jit_anewarray_object as *const () as usize,
@@ -12659,6 +13323,11 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // hand-built test tables can leave them 0.
         new_object_cp: jit_new_object_cp as *const () as usize,
         anewarray_object_cp: jit_anewarray_object_cp as *const () as usize,
+        // These two existed but were unreachable from the JIT: correct
+        // implementations with no table slot, so `ir_lower` had nothing to call
+        // and monitors could not be lowered at all.
+        monitor_enter: jit_monitor_enter as *const () as usize,
+        monitor_exit: jit_monitor_exit as *const () as usize,
         baload: jit_baload as *const () as usize,
         bastore: jit_bastore as *const () as usize,
         iaload: jit_iaload as *const () as usize,
@@ -12771,7 +13440,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // field) treats as "not wired" and emits no poll code at all — the
         // same optional-helper contract as `region_bounds_addr`/
         // `frame_record` above.
-        safepoint_flag_addr: crate::native::jni::process_vm()
+        safepoint_flag_addr: vm_for_helpers
             .map(|shared| shared.mem.gc_barrier.stw_requested_flag_addr() as usize)
             .unwrap_or(0),
         // Slow-path helper for a poll hit. Unconditionally wired (the
@@ -12783,8 +13452,148 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         jit_card_table_addr,
         jit_card_old_base,
         jit_card_old_end,
+    };
+
+    // Actually run the validator this table has always shipped with.
+    //
+    // `JitRuntimeHelpers::validate_abi` checks the ABI revision, the struct
+    // size, that every `required` slot is non-zero, and that every `Offset`
+    // slot is a plausible displacement — and until now it had **no callers
+    // outside `jit-api`'s own tests** (`docs/jit/helper-abi-audit.md` §4). A
+    // zeroed required slot therefore left the producer silently and surfaced
+    // as a `CALL 0` from RWX memory somewhere downstream, with the crash
+    // pointing at the JIT backend rather than at the one line here that failed
+    // to wire a helper.
+    //
+    // Panicking is the correct severity: every required slot is an
+    // unconditional `f as *const () as usize` of a function that exists in this
+    // binary, so a failure is a build-integrity problem, not a runtime
+    // condition — there is no degraded mode to fall back to, and continuing
+    // means compiling machine code around a null pointer. The optional slots
+    // (`safepoint_flag_addr`, `frame_record`, `region_bounds_addr`, the card
+    // table triple) are legitimately zero when their mechanism is off or when
+    // `process_vm()` is not yet published, and `validate_abi` does not require
+    // them, so a VM-less `build_helpers()` still passes.
+    //
+    // The hand-built tables in `jit/tests/*` and `jit/src/x64.rs`'s
+    // `test_helpers()` do NOT reach this: they construct `JitRuntimeHelpers`
+    // literals directly and never call `build_helpers`, which is defined only
+    // here.
+    if let Err(e) = helpers.validate_abi() {
+        panic!("JIT helper table is not usable: {e}");
     }
+    helpers
 }
+
+// ---------------------------------------------------------------------------
+// Helper-slot signature checks (`docs/jit/helper-abi-audit.md` §4)
+// ---------------------------------------------------------------------------
+//
+// `build_helpers` above stores every callable slot as
+// `jit_foo as *const () as usize`. That cast type-checks against **nothing**:
+// any `extern "C"` function of any arity, argument width or return type casts
+// to `*const ()` just as cleanly, so the signatures declared in `jit-api`'s
+// `helper_fn_slots!` — which are what the backends bake call sequences from —
+// were never compared against the functions actually installed. A helper that
+// grew a parameter, or whose return went from `i64` to `()`, would compile
+// fine on both sides and go wrong only in generated machine code.
+//
+// Each line below binds one helper to its declared alias. A fn item coerces to
+// a fn-pointer type only when its `extern`-ness, arity, argument types and
+// return type all match, so a divergence is a compile error naming the exact
+// slot. `const _` blocks emit no code and cost nothing at run time.
+//
+// Deliberately NOT in `build_helpers`: keeping the checks out of the function
+// leaves the (already long) table literal untouched and lets the list be read
+// as a census.
+//
+// NOTE — `get_current_thread` is absent, and cannot be added as-is. Its alias
+// is declared `() -> *mut c_void` while `jit_get_current_thread` returns
+// `*mut JvmThread`. The two are ABI-identical (both are thin pointers in RAX)
+// which is why the raw cast has always "worked", but fn-pointer types are
+// invariant in their return type, so the coercion below cannot express it and
+// no cast can either. Reconciling that needs a one-word change in `jit-api`'s
+// `helper_fn_slots!` row — see this lane's report.
+const _: () = {
+    use cratonvm_jit_api::helpers_abi::*;
+
+    // Allocation.
+    let _: HelperFnNewarray = jit_newarray;
+    let _: HelperFnNewObject = jit_new_object;
+    let _: HelperFnAnewarrayObject = jit_anewarray_object;
+    let _: HelperFnNewObjectCp = jit_new_object_cp;
+    let _: HelperFnAnewarrayObjectCp = jit_anewarray_object_cp;
+    let _: HelperFnMultianewarray2d = jit_multianewarray_2d;
+    let _: HelperFnTlabPostInit = jit_post_tlab_init;
+
+    // Monitors.
+    let _: HelperFnMonitorEnter = jit_monitor_enter;
+    let _: HelperFnMonitorExit = jit_monitor_exit;
+
+    // Array access.
+    let _: HelperFnBaload = jit_baload;
+    let _: HelperFnBastore = jit_bastore;
+    let _: HelperFnIaload = jit_iaload;
+    let _: HelperFnIastore = jit_iastore;
+    let _: HelperFnAaload = jit_aaload;
+    let _: HelperFnAastore = jit_aastore;
+    let _: HelperFnArraylength = jit_arraylength;
+
+    // Instance fields.
+    let _: HelperFnGetfield = jit_getfield;
+    let _: HelperFnPutfieldInt = jit_putfield_int;
+    let _: HelperFnPutfieldLong = jit_putfield_long;
+    let _: HelperFnPutfieldFloat = jit_putfield_float;
+    let _: HelperFnPutfieldDouble = jit_putfield_double;
+    let _: HelperFnPutfieldObject = jit_putfield_object;
+
+    // Statics.
+    let _: HelperFnGetstatic = jit_getstatic;
+    let _: HelperFnPutstaticInt = jit_putstatic_int;
+    let _: HelperFnPutstaticLong = jit_putstatic_long;
+    let _: HelperFnPutstaticFloat = jit_putstatic_float;
+    let _: HelperFnPutstaticDouble = jit_putstatic_double;
+    let _: HelperFnPutstaticObject = jit_putstatic_object;
+
+    // Type checks.
+    let _: HelperFnCheckcast = jit_checkcast;
+    let _: HelperFnInstanceofCheck = jit_instanceof;
+
+    // Implicit exceptions and the out-of-band signal plumbing.
+    let _: HelperFnThrowAioobe = jit_throw_aioobe;
+    let _: HelperFnThrowArithmetic = jit_throw_arithmetic;
+    let _: HelperFnThrowException = jit_throw_exception;
+    let _: HelperFnSetThrowBci = jit_set_throw_bci;
+    let _: HelperFnJitNpeWithAction = jit_npe_with_action;
+    let _: HelperFnDispatchThrew = jit_dispatch_threw;
+
+    // Invocation and deopt.
+    let _: HelperFnInvokeDispatch = jit_invoke_dispatch;
+    let _: HelperFnInvokeVirtualMic = jit_invoke_virtual_mic;
+    let _: HelperFnServiceCalleeDeopt = jit_service_callee_deopt;
+    let _: HelperFnUncommonTrap = jit_uncommon_trap;
+    let _: HelperFnLambdaIntToDouble = jit_lambda_int_to_double;
+
+    // GC barriers.
+    let _: HelperFnWriteBarrier = jit_write_barrier;
+    let _: HelperFnSatbPreWriteBarrier = jit_satb_pre_write_barrier;
+
+    // Floating point.
+    let _: HelperFnMathFmaDouble = jit_math_fma_double;
+    let _: HelperFnMathFmaFloat = jit_math_fma_float;
+    let _: HelperFnJitFrem = jit_frem;
+    let _: HelperFnJitDrem = jit_drem;
+
+    // Stack guards, precise maps, strings, safepoints.
+    let _: HelperFnSelfCallStackGuard = jit_self_call_stack_guard;
+    let _: HelperFnNativeStackFloor = jit_native_stack_floor;
+    // Both candidates for the one `frame_record` slot — `build_helpers`
+    // chooses between them at run time, so both must match the alias.
+    let _: HelperFnFrameRecord = jit_frame_record;
+    let _: HelperFnFrameRecord = jit_verify_inline_frame_record;
+    let _: HelperFnLdcString = jit_ldc_string;
+    let _: HelperFnSafepointSlowPath = jit_safepoint_slow_path;
+};
 
 /// GC-safe materialization for a compiled `ldc "..."` instruction.
 ///
@@ -12836,7 +13645,11 @@ pub extern "C" fn jit_ldc_string(vm_ptr: i64, bytes: *const u8, len: usize) -> i
 pub unsafe extern "C" fn jit_safepoint_slow_path() {
     static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     crate::jit::conservative_roots::note_jit_boundary();
-    let Some(vm) = crate::native::jni::process_vm() else {
+    // STRICT: parking against another VM's stop-the-world barrier is a hang
+    // or worse, while declining to park only leaves this one poll
+    // ineffective. With a single VM — every production configuration
+    // today — this resolves exactly as it always did.
+    let Some(vm) = crate::native::jni::process_vm_strict() else {
         return;
     };
     if let Some((thread, _guard)) = jit_thread_mut() {

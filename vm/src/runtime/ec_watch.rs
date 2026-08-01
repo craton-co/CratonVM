@@ -52,19 +52,19 @@ pub fn native_enabled() -> bool {
 /// `class_id` (header offset 0, `repr(C)`) lets [`detect`] re-validate the
 /// remapped holder's identity, ruling out a remap-false-positive (holder
 /// reclaimed + its address reused by a different object).
-fn table() -> &'static Mutex<Vec<(ObjectRef, u32, usize, u32)>> {
-    static T: OnceLock<Mutex<Vec<(ObjectRef, u32, usize, u32)>>> = OnceLock::new();
+fn table() -> &'static Mutex<Vec<(ObjectRef, u32, usize, u32, usize)>> {
+    static T: OnceLock<Mutex<Vec<(ObjectRef, u32, usize, u32, usize)>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 const CAP: usize = 1 << 15;
 
 /// Current number of live watches (diagnostic).
-pub fn size() -> usize {
+pub fn size(vm: usize) -> usize {
     if !enabled() {
         return 0;
     }
-    table().lock().len()
+    table().lock().iter().filter(|e| e.4 == vm).count()
 }
 
 /// Read the `class_id` (u32 at header offset 0) of the object at `addr`.
@@ -77,7 +77,7 @@ fn class_id_at(addr: usize) -> u32 {
 
 /// Record a watched reference field. De-duplicated by `(holder, field_idx)`
 /// (latest store wins). `class_id` is the holder's class for identity revalidation.
-pub fn record(holder: ObjectRef, field_idx: usize, expected: usize, class_id: u32) {
+pub fn record(vm: usize, holder: ObjectRef, field_idx: usize, expected: usize, class_id: u32) {
     if !enabled() || expected < 0x1000 {
         return;
     }
@@ -86,14 +86,14 @@ pub fn record(holder: ObjectRef, field_idx: usize, expected: usize, class_id: u3
     let mut t = table().lock();
     if let Some(e) = t
         .iter_mut()
-        .find(|(o, i, _, _)| o.as_ptr() as usize == key && *i == idx)
+        .find(|(o, i, _, _, v)| o.as_ptr() as usize == key && *i == idx && *v == vm)
     {
         e.2 = expected;
         e.3 = class_id;
         return;
     }
     if t.len() < CAP {
-        t.push((holder, idx, expected, class_id));
+        t.push((holder, idx, expected, class_id, vm));
     }
 }
 
@@ -138,13 +138,18 @@ const VALUE_DISC_OBJECT: u32 = 4;
 /// +8) is NOT a false positive. Entries that are no longer a non-null `Object`
 /// (null, reclaimed-zeroed, or re-typed) are pruned to keep the list bounded;
 /// reported entries are also dropped (once is enough).
-pub fn detect() -> Vec<(usize, u32, usize, usize)> {
+pub fn detect(vm: usize) -> Vec<(usize, u32, usize, usize)> {
     if !enabled() {
         return Vec::new();
     }
     let mut t = table().lock();
     let mut hits = Vec::new();
-    t.retain(|&(holder, idx, expected, class_id)| {
+    t.retain(|&(holder, idx, expected, class_id, entry_vm)| {
+        // Another VM's entry: not ours to validate, and its addresses belong
+        // to a different heap. Keep it, report nothing.
+        if entry_vm != vm {
+            return true;
+        }
         // IDENTITY RE-VALIDATION: if the holder's current class_id no longer
         // matches the watched one, the holder was reclaimed and its address
         // reused by a different object (or relocated without our remap seeing
@@ -199,12 +204,15 @@ pub fn detect() -> Vec<(usize, u32, usize, usize)> {
 /// Rewrite each watched holder through the collector's `pointer_map` after a
 /// GC. MUST be called on every GC instead of clearing — a moving collector
 /// relocates survivors, and the corruption frequently hits a survivor.
-pub fn remap(pointer_map: &HashMap<usize, usize>) {
+pub fn remap(vm: usize, pointer_map: &HashMap<usize, usize>) {
     if !enabled() || pointer_map.is_empty() {
         return;
     }
     let mut t = table().lock();
-    for (holder, _, _, _) in t.iter_mut() {
+    // Only THIS VM's entries: the table is process-global and a foreign VM's
+    // relocation map names addresses in a different heap, so applying it here
+    // would rewrite our holders to addresses that were never ours.
+    for (holder, _, _, _, v) in t.iter_mut().filter(|e| e.4 == vm) {
         if let Some(&new) = pointer_map.get(&(holder.as_ptr() as usize)) {
             // SAFETY: `new` is a live post-GC heap address from the collector's
             // relocation map.

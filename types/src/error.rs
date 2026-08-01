@@ -609,15 +609,24 @@ impl fmt::Display for JdkOnlyViolation {
 
 /// The JDK image location to name in the report's JDK block.
 ///
-/// Read straight from the environment rather than from
-/// [`crate::flags::flags`]: this is a diagnostic printed on a failure path, and
-/// the flags snapshot latches on first read — binding a *report* to that latch
-/// would make the rendered text depend on whether some other subsystem had
-/// already touched a flag. `CRATONVM_JAVA_HOME` is the VM's own override and
-/// wins over the ambient `JAVA_HOME`, matching the launcher's precedence.
+/// `CRATONVM_JAVA_HOME` is the VM's own override and wins over the ambient
+/// `JAVA_HOME`, matching the launcher's precedence. Both go through
+/// [`crate::flags::runtime_var_os`], which is what makes the reported path the
+/// one the VM was *configured* with: `CRATONVM_JAVA_HOME` is a declared scalar,
+/// so it is served from the immutable snapshot — including the case where a
+/// launcher supplied it via `flags::install` and never touched `environ` at
+/// all, which a raw `std::env` read would miss entirely. `JAVA_HOME` is not
+/// declared, so it keeps live `getenv` semantics through the same call.
+///
+/// This previously read `std::env` directly, on the grounds that binding a
+/// diagnostic to a latching snapshot would make its text depend on who read a
+/// flag first. That is the wrong way round: the snapshot is fixed for the life
+/// of the process, whereas `environ` is rewritten in place by
+/// [`crate::flag_groups::expand_process_env`], so the raw read is the one that
+/// can disagree with the running configuration.
 fn java_home() -> Option<String> {
     for key in ["CRATONVM_JAVA_HOME", "JAVA_HOME"] {
-        if let Some(value) = std::env::var_os(key) {
+        if let Some(value) = crate::flags::runtime_var_os(key) {
             if let Ok(text) = value.into_string() {
                 if !text.trim().is_empty() {
                     return Some(text);

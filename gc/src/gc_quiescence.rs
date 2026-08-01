@@ -248,12 +248,22 @@ static MOVING_YOUNG_COVERAGE_INCOMPLETE: AtomicBool = AtomicBool::new(false);
 #[cfg(not(test))]
 static MOVING_YOUNG_INCOMPLETE_REASON: AtomicUsize = AtomicUsize::new(0);
 
+// A STRICTLY NARROWER per-cycle verdict than the one above: this cycle scanned
+// state belonging to a peer thread that will never apply the collection's
+// pointer map to itself (an OS-suspended in-JIT peer, or a blocked peer's JIT
+// helper window). See `unrewritable_peer_state` for why the two must not be
+// conflated. Same production-global / `cfg(test)`-thread-local split, and for
+// the same reason.
+#[cfg(not(test))]
+static UNREWRITABLE_PEER_STATE: AtomicBool = AtomicBool::new(false);
+
 #[cfg(test)]
 thread_local! {
     static MOVING_YOUNG_COVERAGE_INCOMPLETE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static MOVING_YOUNG_INCOMPLETE_REASON: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static UNREWRITABLE_PEER_STATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(not(test))]
@@ -291,6 +301,18 @@ fn incomplete_reason_clear() {
     MOVING_YOUNG_INCOMPLETE_REASON.store(incomplete_reason::NONE, Ordering::Release);
 }
 
+#[cfg(not(test))]
+#[inline]
+fn unrewritable_peer_state_get() -> bool {
+    UNREWRITABLE_PEER_STATE.load(Ordering::Acquire)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn unrewritable_peer_state_set(v: bool) {
+    UNREWRITABLE_PEER_STATE.store(v, Ordering::Release);
+}
+
 #[cfg(test)]
 #[inline]
 fn coverage_incomplete_get() -> bool {
@@ -323,6 +345,18 @@ fn incomplete_reason_set_if_unset(reason: usize) {
 #[inline]
 fn incomplete_reason_clear() {
     MOVING_YOUNG_INCOMPLETE_REASON.with(|c| c.set(incomplete_reason::NONE));
+}
+
+#[cfg(test)]
+#[inline]
+fn unrewritable_peer_state_get() -> bool {
+    UNREWRITABLE_PEER_STATE.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[inline]
+fn unrewritable_peer_state_set(v: bool) {
+    UNREWRITABLE_PEER_STATE.with(|c| c.set(v));
 }
 
 // Diagnostic counters. Thread-local under `cfg(test)` for the same reason as
@@ -549,6 +583,84 @@ pub fn moving_young_fallback_reason_counts() -> [usize; incomplete_reason::COUNT
 pub fn begin_moving_young_coverage_cycle() {
     coverage_incomplete_set(false);
     incomplete_reason_clear();
+    unrewritable_peer_state_set(false);
+}
+
+/// Whether this cycle's root scan touched state belonging to a peer thread that
+/// will never apply the collection's pointer map to itself.
+///
+/// **This is NOT `moving_young_coverage_incomplete`, and the difference is a
+/// live-heap-correctness-vs-throughput fault line.** The two ask different
+/// questions:
+///
+/// * `moving_young_coverage_incomplete` — "can the COPYING young collector run
+///   this cycle?" It is false for the overwhelmingly common case of a compiled
+///   frame that did not publish a complete rewritable oop map
+///   (`UNPUBLISHED_FRAME_OOP`, `MISSING_EXACT_RBP`, …). Those frames are still
+///   scanned CONSERVATIVELY, and the non-moving sweep's selective promotion is
+///   safe under exactly that regime: it pins by raw slot VALUE, so a
+///   conservatively-discovered address — real oop or false positive — is never
+///   evacuated.
+/// * this predicate — "does some thread hold state that neither the pin-by-value
+///   set nor the post-GC remap can protect?" A forcibly OS-suspended in-JIT peer
+///   is excused from the safepoint barrier, so it never re-reads its own slots;
+///   worse, its registers can hold ONLY a DERIVED/interior pointer to an object
+///   whose base is reachable through precise heap edges. An interior address
+///   does not resolve to a root, so pin-by-value does not protect the base: the
+///   base gets evacuated, its young source zeroed and re-served, and the resumed
+///   peer keeps loading through the stale derived pointer. That — and only that
+///   — is the hazard the promotion gate was added for (xt-hardening 2026-07-03).
+///
+/// Conflating them was the `HIB-GCOVERHEAD-HALFFULL.1` defect. The gate was
+/// written when `mark_moving_young_coverage_incomplete` had exactly one caller,
+/// the cross-thread takeover path. The arch-2026-07-26 moving-young work then
+/// reused the same flag for the relocation-capability question, and once
+/// moving-young became the default the flag was set on essentially EVERY
+/// JIT-active collection — so selective promotion, the non-moving sweep's only
+/// way to drain young into old, silently switched off VM-wide. The young
+/// generation then filled with live objects that could never leave it: forced
+/// GCs freed slivers, the GC-overhead streak latched, and the process died with
+/// `OutOfMemoryError` on a heap that was **49 % full with 570 MB free**.
+/// Measured on `probes/GcPromoteProbe.java`: 3.9 s with promotion, permanently
+/// wedged (`promoted=0`) without it.
+#[inline]
+pub fn unrewritable_peer_state() -> bool {
+    unrewritable_peer_state_get()
+}
+
+/// Record that this cycle scanned un-rewritable peer state — see
+/// [`unrewritable_peer_state`]. Cleared by
+/// [`begin_moving_young_coverage_cycle`].
+pub fn mark_unrewritable_peer_state() {
+    unrewritable_peer_state_set(true);
+}
+
+/// Whether an [`incomplete_reason`] code, on its own, implies this cycle
+/// scanned un-rewritable peer state.
+///
+/// Exactly the two codes the 2026-07-03 promotion gate was scoped to: a peer
+/// **OS-suspended** in JIT code, and a **blocked** peer's JIT helper window.
+/// Both are excused from the STW barrier, so neither ever re-reads its own
+/// registers — that is what makes a derived/interior pointer in one of them
+/// unfixable.
+///
+/// [`incomplete_reason::CROSS_THREAD_JIT_PEER`] is deliberately NOT here. It
+/// means only "some peer is somewhere inside compiled code", which is true of
+/// nearly every multi-threaded cycle in a warmed-up server workload. Such a peer
+/// is parked *cooperatively*: it deposits a root snapshot (including its own
+/// conservative JIT-frame scan) that the collection folds into `roots`, so
+/// selective promotion's pin-by-value covers it, and it remaps its shadow stack
+/// on resume. Classifying it as un-rewritable would re-create
+/// `HIB-GCOVERHEAD-HALFFULL.1` for every multi-threaded application — the exact
+/// mistake this predicate exists to undo, one abstraction level up. The code is
+/// a moving-young-era relocation obligation and was never in the promotion
+/// gate's scope.
+#[inline]
+pub fn reason_implies_unrewritable_peer_state(reason: usize) -> bool {
+    matches!(
+        reason,
+        incomplete_reason::XT_TAKEOVER | incomplete_reason::XT_HELPER_WINDOW
+    )
 }
 
 /// Record that at least one live JIT frame in this collection lacks a complete
@@ -564,6 +676,12 @@ pub fn mark_moving_young_coverage_incomplete() {
 pub fn mark_moving_young_coverage_incomplete_because(reason: usize) {
     incomplete_reason_set_if_unset(reason);
     coverage_incomplete_set(true);
+    // Classify off the reason the CALLER passed, not the stored one: the stored
+    // reason is first-wins (it names what forced the decision), so a later
+    // cross-thread obligation would otherwise never arm the promotion gate.
+    if reason_implies_unrewritable_peer_state(reason) {
+        unrewritable_peer_state_set(true);
+    }
 }
 
 /// The first recorded reason this cycle's moving-young coverage was incomplete
@@ -1231,6 +1349,106 @@ mod tests {
         begin_moving_young_coverage_cycle();
         assert!(!moving_young_coverage_incomplete());
         assert_eq!(moving_young_incomplete_reason(), incomplete_reason::NONE);
+    }
+
+    /// HIB-GCOVERHEAD-HALFFULL.1 regression.
+    ///
+    /// `unrewritable_peer_state` must stay STRICTLY narrower than
+    /// `moving_young_coverage_incomplete`. The two were the same flag when the
+    /// promotion gate was written; once moving-young became the default, the
+    /// wide verdict was set on essentially every JIT-active cycle, and reading
+    /// it as "un-rewritable peer state" switched off selective promotion
+    /// VM-wide — the young generation lost its only drain and the VM raised
+    /// `OutOfMemoryError` on a 49%-full heap.
+    ///
+    /// Asserted as a DECISION, not a side effect: an end-to-end "does the heap
+    /// still OOM" test cannot distinguish this from any other allocation defect,
+    /// and would pass again the moment some unrelated change made young big
+    /// enough to hide it.
+    #[test]
+    fn unrewritable_peer_state_is_narrower_than_the_coverage_verdict() {
+        // The ordinary case, and the one that regressed: a compiled frame on
+        // THIS thread whose oop map is unproven. Relocation is off; promotion
+        // must not be, because the conservative scan still covers that frame and
+        // selective promotion pins its slot values.
+        for reason in [
+            incomplete_reason::UNPUBLISHED_FRAME_OOP,
+            incomplete_reason::MISSING_EXACT_RBP,
+            incomplete_reason::ACTIVE_FRAME_MAP,
+            incomplete_reason::PARENT_FRAME_MAP,
+            incomplete_reason::NO_PRECISE_MAP,
+            incomplete_reason::UNREGISTERED_JIT_FRAME,
+            incomplete_reason::OSR_SHADOW,
+            incomplete_reason::UNBOUNDED_FRAME_BAND,
+            incomplete_reason::FOREIGN_INNERMOST_RBP,
+            incomplete_reason::JIT_RELOCATION_UNSUPPORTED,
+            // "some peer is in compiled code" — a cooperatively parked peer,
+            // covered by its own deposited root snapshot.
+            incomplete_reason::CROSS_THREAD_JIT_PEER,
+        ] {
+            begin_moving_young_coverage_cycle();
+            mark_moving_young_coverage_incomplete_because(reason);
+            assert!(
+                moving_young_coverage_incomplete(),
+                "{} must still divert the COPYING collector",
+                incomplete_reason::label(reason),
+            );
+            assert!(
+                !unrewritable_peer_state(),
+                "{} must NOT disable selective promotion — it describes a frame \
+                 the conservative scan covers, not state no one can rewrite. \
+                 Widening this gate is HIB-GCOVERHEAD-HALFFULL.1: the young \
+                 generation loses its only drain and the VM OOMs on a half-empty \
+                 heap.",
+                incomplete_reason::label(reason),
+            );
+        }
+
+        // The two the 2026-07-03 gate was actually written for: a peer excused
+        // from the STW barrier, which therefore never re-reads its own
+        // registers.
+        for reason in [
+            incomplete_reason::XT_TAKEOVER,
+            incomplete_reason::XT_HELPER_WINDOW,
+        ] {
+            begin_moving_young_coverage_cycle();
+            mark_moving_young_coverage_incomplete_because(reason);
+            assert!(
+                unrewritable_peer_state(),
+                "{} MUST disable selective promotion: a frozen peer's register \
+                 can hold only a derived/interior pointer, which pin-by-value \
+                 does not protect",
+                incomplete_reason::label(reason),
+            );
+        }
+
+        // Set by a later reason even when an earlier one already claimed the
+        // first-wins reason slot.
+        begin_moving_young_coverage_cycle();
+        mark_moving_young_coverage_incomplete_because(incomplete_reason::UNPUBLISHED_FRAME_OOP);
+        assert!(!unrewritable_peer_state());
+        mark_moving_young_coverage_incomplete_because(incomplete_reason::XT_TAKEOVER);
+        assert_eq!(
+            moving_young_incomplete_reason(),
+            incomplete_reason::UNPUBLISHED_FRAME_OOP,
+            "the recorded reason stays first-wins",
+        );
+        assert!(
+            unrewritable_peer_state(),
+            "…but the peer-state verdict must not be first-wins: it is a safety \
+             gate, so any cross-thread obligation in the cycle arms it",
+        );
+
+        // And the standalone marker (the xt-takeover call site) plus the reset.
+        begin_moving_young_coverage_cycle();
+        assert!(!unrewritable_peer_state());
+        mark_unrewritable_peer_state();
+        assert!(unrewritable_peer_state());
+        begin_moving_young_coverage_cycle();
+        assert!(
+            !unrewritable_peer_state(),
+            "the verdict is per-cycle and must be cleared with the others",
+        );
     }
 
     #[test]

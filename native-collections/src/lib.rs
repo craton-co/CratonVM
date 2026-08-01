@@ -695,6 +695,78 @@ mod overlay_owner_liveness_tests {
         );
         clear_overlay_entries_for_key(key, new_addr);
     }
+
+    /// A `pointer_map` that contains both `A -> B` and `B -> C` must land A's
+    /// keys at B and B's at C — not sweep both to C.
+    ///
+    /// Old-gen sliding compaction routinely produces exactly that shape: it
+    /// hands one surviving object the address another surviving object just
+    /// vacated, so a single map legitimately holds a value that is also a key.
+    /// (The moving young phase alone cannot — its keys are from-space and its
+    /// values are to-space or old gen — which is why this only ever bites on a
+    /// compacting cycle.)
+    ///
+    /// The re-key used to relocate entries in place, one move at a time. Apply
+    /// `A -> B` first and A's keys sit at B; the later `B -> C` then carries
+    /// them onward with B's own, leaving the collection that really is at B
+    /// with no entry at its own address. `gc_overlay_roots_for_collection(B)`
+    /// answers "owns nothing", the non-moving young marker and `old_gen_gc`'s
+    /// mark BFS both skip its backing array, and it is freed while live.
+    /// Whether it fired depended on `HashMap` iteration order — applying the
+    /// moves in reverse happens to be harmless — so this uses a CHAIN of eight
+    /// hops rather than a single pair. In-place relocation survives that only
+    /// if every one of the eight lands in exactly reverse order, which the
+    /// randomly-seeded `HashMap` iteration will not do. A two-address version
+    /// of this test would pass half the time on the broken code.
+    #[test]
+    fn a_chained_pointer_map_does_not_sweep_one_owners_keys_onto_another() {
+        // A private address range, so the process-global index cannot make
+        // this pass or fail for a sibling test's reason.
+        const HOPS: usize = 8;
+        let addr = |i: usize| 0x5EAD_0A00_usize + i * 0x100;
+        let key = |i: usize| 0x5EAD_0A01_usize + i * 0x100;
+
+        // Owner i sits at addr(i) and moves to addr(i+1) — the address owner
+        // i+1 is simultaneously vacating. Old-gen sliding compaction produces
+        // exactly this: every live object slides down onto the space its
+        // neighbour just left. (The moving young phase alone cannot — its keys
+        // are from-space and its values are to-space or old gen — which is why
+        // this only ever bites on a compacting cycle.)
+        let mut pointer_map = StdHashMap::new();
+        for i in 0..HOPS {
+            register_overlay_owner_key(addr(i), key(i));
+            pointer_map.insert(addr(i), addr(i + 1));
+        }
+
+        gc_update_collection_overlay_refs(&pointer_map);
+
+        for i in 0..HOPS {
+            assert!(
+                overlay_owner_still_at(addr(i + 1), key(i)),
+                "owner {i} moved to 0x{:x} but its key is not recorded there — \
+                 a later hop in the same pointer_map carried it onward, so \
+                 every per-owner root walk now reports this collection as \
+                 owning nothing and frees its backing array while it is live",
+                addr(i + 1)
+            );
+            assert!(
+                !overlay_owner_still_at(addr(i), key(i)),
+                "owner {i}'s pre-move address must no longer name it"
+            );
+        }
+        // The tail address gained nothing but the last owner: keys must not
+        // have piled up at the end of the chain.
+        for i in 0..HOPS.saturating_sub(1) {
+            assert!(
+                !overlay_owner_still_at(addr(HOPS), key(i)),
+                "owner {i}'s key was swept to the end of the chain"
+            );
+        }
+
+        for i in 0..HOPS {
+            remove_overlay_owner_key(addr(i + 1), key(i));
+        }
+    }
 }
 
 /// Select the registry shard for an identity hash. Mixes with the 64-bit
@@ -3858,7 +3930,20 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // Family-1 fix (cce0079): pin the snapshot vector's elements — a GC
         // triggered by any iteration's `equals()` leaves the LATER raw
         // `Vec` slots stale.
-        let elems = collect_collection_elements(ctx, this);
+        //
+        // 2026-08-01 (collections-interception audit): use the wrapper, not the
+        // bare `collect_collection_elements`. This native is registered on
+        // `java/util/AbstractCollection.contains`, and `AbstractCollection` is
+        // the base whose *documented* minimal subclass contract is "implement
+        // `iterator()` and `size()`" — i.e. exactly the receivers whose layout
+        // no heuristic here models. The bare collector returns an empty `Vec`
+        // for those, so `contains` answered a flat `false` for every element of
+        // such a collection: not a crash, a plausible wrong answer. The wrapper
+        // asks the receiver's own `size()` and falls back to its real
+        // `iterator()`. No recursion risk: the `iterator()` native snapshots
+        // through `collect_collection_elements`, which never drives
+        // `iterator()`, and never calls `contains`.
+        let elems = al_or_collection_elements(ctx, this);
         let (pin_base, handles) = pin_value_slice(ctx, &elems);
         let th = pin_value(ctx, target);
         let mut target = target;
@@ -3944,36 +4029,18 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let mut elems = al_or_collection_elements(ctx, this);
-    if heuristic_snapshot_is_suspect(ctx, this, &elems) {
-        // Null holes from a foreign non-List backing array (see
-        // `heuristic_snapshot_is_suspect`). `toArray` is not on the iterator
-        // native's path, so the real `iterator()` is safe to drive here.
-        let real = collect_via_real_iterator_once(ctx, this);
-        if !real.is_empty() {
-            elems = real;
-        }
-    }
-    if elems.is_empty() {
-        // `collect_collection_elements` only knows fixed collection layouts and
-        // returns empty for any other Collection — but this native is also
-        // registered on `AbstractCollection.toArray()`, so it intercepts
-        // *every* Collection, including custom user/library subclasses (e.g.
-        // ByteBuddy's `TypeList$Generic$Explicit`, which backs the interface
-        // list of every generated class). For those, `toArray()` must honour
-        // the real `Collection` contract — drive the real `iterator()`. Unlike
-        // `collect_collection_elements` (called BY the iterator native, hence
-        // can't iterate without recursing), `toArray` is not on the iterator
-        // native's path, so this is safe. Guard on a non-zero real `size()` so
-        // genuinely-empty collections skip the extra invokes.
-        let real_size = match ctx.invoke_virtual(this, "size", "()I", &[]) {
-            Ok(Some(Value::Int(n))) => n,
-            _ => 0,
-        };
-        if real_size > 0 {
-            elems = collect_via_real_iterator(ctx, this);
-        }
-    }
+    // `collect_collection_elements` only knows fixed collection layouts and
+    // returns empty for any other Collection — but this native is also
+    // registered on `AbstractCollection.toArray()`, so it intercepts *every*
+    // Collection, including custom user/library subclasses (e.g. ByteBuddy's
+    // `TypeList$Generic$Explicit`, which backs the interface list of every
+    // generated class). For those, `toArray()` must honour the real
+    // `Collection` contract — drive the real `iterator()`. That fallback, and
+    // the null-hole guard that used to be inlined here, now live in
+    // `al_or_collection_elements` so the `toArray(T[])`, `toArray(IntFunction)`,
+    // `forEach` and `stream` natives — which are intercepting the very same
+    // receivers — get them too.
+    let elems = al_or_collection_elements(ctx, this);
     // GC-SAFETY: `elems` contains bare object refs collected before the
     // result array allocation. `alloc_ref_array` can trigger a moving GC;
     // pin and refresh every object element before storing it into the new
@@ -4077,16 +4144,71 @@ fn heuristic_snapshot_is_suspect(
     !obj_is_instance_of(ctx, coll, "java/util/List")
 }
 
-/// Read elements for the `toArray` / `forEach` natives. These are registered on
-/// `AbstractCollection`, so they also intercept non-ArrayList collections
-/// (EnumSet/TreeSet/...). `al_state` cannot be trusted to return `None` for
-/// those — for a `RegularEnumSet` it reports an empty ArrayList (size 0), which
-/// made `EnumSet.allOf(...).toArray()`/`forEach`/`new ArrayList<>(enumSet)` all
-/// see zero elements. Delegate to `collect_collection_elements`, whose
-/// ArrayList-layout heuristics handle the fast path and whose iterator fallback
-/// materialises everything else through the real `iterator()`.
+/// Read elements for the `toArray` / `forEach` / `stream` natives. These are
+/// registered on `java/util/AbstractCollection` (and on the `Collection` /
+/// `List` interfaces), so they intercept **every** Collection that does not
+/// declare its own override — JDK, third-party and user subclasses alike.
+/// `al_state` cannot be trusted to return `None` for those: for a
+/// `RegularEnumSet` it reports an empty ArrayList (size 0), which made
+/// `EnumSet.allOf(...).toArray()`/`forEach`/`new ArrayList<>(enumSet)` all see
+/// zero elements.
+///
+/// [`collect_collection_elements`] alone is NOT enough, and its own closing
+/// comment says so: it must never drive `iterator()`, because the
+/// `Iterable`/`Collection` `iterator()` native snapshots *through* it and would
+/// recurse — so a layout it does not hand-model materialises as an EMPTY `Vec`
+/// there, and "empty" is indistinguishable from "genuinely empty". Supplying
+/// the fallback is this wrapper's job. Every caller of this wrapper
+/// (`toArray()`, `toArray(T[])`, `toArray(IntFunction)`, `forEach`, `stream`)
+/// is off the iterator native's path, so driving the receiver's real
+/// `iterator()` from here is safe.
+///
+/// **2026-08-01 (collections-interception audit).** Until this change the
+/// fallback lived inside `native_al_to_array` only. The zero-arg `toArray()`
+/// therefore answered correctly for an unmodelled receiver while
+/// `toArray(T[])`, `toArray(IntFunction)`, `forEach` and `stream` silently
+/// answered EMPTY for the *same* receiver — e.g. `coll.toArray(new T[0])` over
+/// a user `class X extends AbstractCollection` (which only has to implement
+/// `iterator()` and `size()`) returned a zero-length array rather than the
+/// elements, and `x.forEach(...)` visited nothing. The doc comments on
+/// `native_al_to_array_typed`, `native_al_for_each` and `native_al_stream`
+/// already claimed this fallback existed; now it does.
+///
+/// Ordering mirrors what `native_al_to_array` did, so the zero-arg path keeps
+/// its exact behaviour:
+/// 1. heuristic snapshot; if it looks suspect (null holes in a non-`List`),
+///    prefer a re-entrancy-guarded real-iterator walk;
+/// 2. if the heuristics found nothing, ask the receiver's own `size()` — it is
+///    not shadowed on `AbstractCollection` (`size()` is abstract there, so the
+///    dispatch walk stops at the subclass's own bytecode) — and only pay for a
+///    real-iterator walk when it reports a non-empty collection.
 fn al_or_collection_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
-    collect_collection_elements(ctx, this)
+    // GC-safety: every step below can run arbitrary Java (`invoke_virtual`),
+    // which may complete a moving young collection and leave `this` stale.
+    let this_pin = ctx.pin_native_root(this);
+    let mut elems = collect_collection_elements(ctx, this);
+    let this = ctx.read_native_pin(this_pin, this);
+    if !elems.is_empty() {
+        if heuristic_snapshot_is_suspect(ctx, this, &elems) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let real = collect_via_real_iterator_once(ctx, this);
+            if !real.is_empty() {
+                elems = real;
+            }
+        }
+        ctx.unpin_native_roots(this_pin);
+        return elems;
+    }
+    let real_size = match ctx.invoke_virtual(this, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n,
+        _ => 0,
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    if real_size > 0 {
+        elems = collect_via_real_iterator(ctx, this);
+    }
+    ctx.unpin_native_roots(this_pin);
+    elems
 }
 
 /// `ArrayList.toArray(T[])` / `AbstractCollection.toArray(T[])` —
@@ -13262,6 +13384,9 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Use the generic helper so non-ArrayList collections (EnumSet/TreeSet/…)
     // routed here through the AbstractCollection/Iterable interface natives are
     // materialised via their real iterator instead of seeing an empty backing.
+    // (Before 2026-08-01 the helper had no such fallback — this comment
+    // described `native_al_to_array`'s inlined copy of it, not what `forEach`
+    // actually did, so an unmodelled receiver's `forEach` visited nothing.)
     let elems = al_or_collection_elements(ctx, this);
     // GC-safety: each `accept()` body runs arbitrary Java bytecode via
     // invoke_virtual and can allocate → moving young GC relocates `action` and
@@ -17472,7 +17597,9 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // non-ArrayList collection like RegularEnumSet, so the old `Some` branch
     // produced an empty stream for `enumSet.stream()`. Use the generic helper,
     // whose ArrayList heuristics keep the fast path and whose iterator fallback
-    // walks EnumSet/TreeSet/foreign collections.
+    // walks EnumSet/TreeSet/foreign collections. (That iterator fallback only
+    // became real on 2026-08-01 — see `al_or_collection_elements`; until then
+    // `stream()` over an unmodelled foreign collection was silently empty.)
     // As for HashSet.stream(), never carry an unrooted Rust snapshot across
     // stream/array allocation: a moving GC may forward every list element and
     // turn the stale refs into unrelated Objects. This is particularly visible
@@ -19409,7 +19536,25 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     // Some real-JDK interface dispatch paths can arrive with a tagged
     // synthetic Collector whose runtime class has collapsed to Object. Keep
     // the standard Collector contract methods available under Object as a
-    // defensive bridge; the callbacks still validate the receiver layout/tag.
+    // defensive bridge.
+    //
+    // CAVEAT (collections-interception audit, 2026-08-01) — this comment used
+    // to end "…; the callbacks still validate the receiver layout/tag", and
+    // that is NOT true of these four: `make_collector_fn` wraps whatever
+    // receiver it is handed, unconditionally. `java/lang/Object` is the
+    // universal base, so the dispatch walk reaches these for ANY receiver that
+    // is sent `supplier()`/`accumulator()`/`finisher()`/`combiner()` and whose
+    // own class and every superclass leave it undeclared — including a receiver
+    // whose implementation is an interface DEFAULT method, which the walk has
+    // not consulted yet. Validation does happen, but one call later and only
+    // partially: the SAM natives (`native_collfn_supplier_get` and friends)
+    // check `collector_tag_of` and degrade to an empty list/map rather than
+    // failing. See `docs/known-issues/collections-interception.md`, Residual 1.
+    // Left as-is deliberately: there is no way for a native to decline a call
+    // (`MethodCallResult` has no "not handled" arm), so the only fail-closed
+    // options are to throw — which would break any legitimate default-method
+    // receiver — or to drop these four registrations, which needs the
+    // collapsed-to-Object Collector path re-tested first.
     r.register(
         "java/lang/Object",
         "supplier",
@@ -32429,10 +32574,17 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
 /// methods), which the vintage engine relies on for discovery.
 ///
 /// Driving `toArray()` (not `iterator()`) keeps this recursion-safe: the only
-/// native `toArray()` can reach is `native_al_to_array`, which calls
-/// `collect_collection_elements` — NOT this wrapper — so there is no cycle.
-/// The `size() > 0` guard means a genuinely empty (or unrecognised-and-empty)
+/// native `toArray()` can reach is `native_al_to_array`, which since
+/// 2026-08-01 collects through the *other* wrapper, `al_or_collection_elements`
+/// — never through this one — so there is still no cycle, only one more
+/// virtual call on the deepest path (`toArray()` → `iterator()`). The
+/// `size() > 0` guard means a genuinely empty (or unrecognised-and-empty)
 /// collection never triggers the extra virtual calls.
+///
+/// Callers: the copy constructors, `addAll`, `removeAll`, `retainAll`,
+/// `containsAll` and `AbstractSet.hashCode`. All read a collection passed as an
+/// ARGUMENT, never the receiver of an element-reading native, which is why
+/// driving the argument's own `toArray()` from here cannot re-enter.
 fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
     let elems = collect_collection_elements(ctx, coll);
     if !elems.is_empty() {
@@ -33038,7 +33190,13 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let coll_elems = collect_collection_elements(ctx, coll);
+    // `_or_real`, not the bare heuristic reader: `coll` is an arbitrary
+    // caller-supplied Collection, and the bare reader answers EMPTY for any
+    // layout it does not hand-model — which made `removeAll(foreignCollection)`
+    // a silent no-op that still reported `false`. (The wrapper's own doc listed
+    // `removeAll`/`retainAll` as callers before they were; fixed 2026-08-01
+    // with the `AbstractCollection` interception audit.)
+    let coll_elems = collect_collection_elements_or_real(ctx, coll);
     let (data, size) = al_state(ctx, this);
     let buf = match data {
         Some(b) => b,
@@ -33128,7 +33286,10 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // ANY Map's values() view, not just Properties') found 2026-07-26 while
     // auditing Properties.values() liveness. See properties-keyset-view-not-live.md.
     let view_src = values_view_source(ctx, this);
-    let coll_elems = collect_collection_elements(ctx, coll);
+    // `_or_real` — see `native_al_remove_all`. A `retainAll` that reads the
+    // argument as empty is worse than a no-op: it retains nothing and clears
+    // the receiver.
+    let coll_elems = collect_collection_elements_or_real(ctx, coll);
     let (data, size) = al_state(ctx, this);
     let buf = match data {
         Some(b) => b,
@@ -33358,7 +33519,10 @@ fn native_ll_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elems = collect_collection_elements(ctx, coll);
+    // `_or_real` — see `native_al_remove_all`. `native_al_add_all` already used
+    // it; this sibling did not, so `linkedList.addAll(foreignCollection)` added
+    // nothing and reported `false`.
+    let elems = collect_collection_elements_or_real(ctx, coll);
     if elems.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
@@ -33386,7 +33550,9 @@ fn native_ad_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elems = collect_collection_elements(ctx, coll);
+    // `_or_real` — see `native_al_remove_all`. Same gap as `native_ll_add_all`:
+    // `arrayDeque.addAll(foreignCollection)` added nothing.
+    let elems = collect_collection_elements_or_real(ctx, coll);
     if elems.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
@@ -34226,17 +34392,65 @@ fn tm_fast_with<R>(
 /// "Sticky" flag side-table — once a TreeMap is forced to array mode
 /// (e.g. by a non-extractable key) it stays there for its lifetime so
 /// we never split state across both stores.
+///
+/// Keyed by `widened_obj_key`, exactly like `tm_array_table`/`tm_fast_table`,
+/// and therefore subject to the same recycle hazard those two document: the
+/// packed key embeds a 32-bit identity hash, so a leftover entry under a
+/// reclaimed map's key can be inherited by a later map that mints the same
+/// hash. It holds no `ObjectRef`, so a stale entry is not a use-after-free —
+/// but the newcomer silently starts life pinned to array mode, and the table
+/// grows without bound for the life of the process. It was the one
+/// `widened_obj_key`-keyed table `gc_prune_dead_collection_overlays` did not
+/// sweep; it does now. Poison-recovered on read/write for the same reason the
+/// GC funnel is: an `unwrap()` that panics here would poison the lock and make
+/// every later `tm_force_array_mode` call abort the VM.
 fn tm_force_array_set() -> &'static Mutex<StdHashMap<usize, ()>> {
     static T: std::sync::OnceLock<Mutex<StdHashMap<usize, ()>>> = std::sync::OnceLock::new();
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 fn tm_force_array_mode(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     let key = tm_obj_key(ctx, this);
-    tm_force_array_set().lock().unwrap().contains_key(&key)
+    tm_force_array_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&key)
 }
 fn tm_set_force_array(ctx: &dyn NativeContext, this: ObjectRef) {
     let key = tm_obj_key(ctx, this);
-    tm_force_array_set().lock().unwrap().insert(key, ());
+    tm_force_array_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, ());
+}
+
+/// Test hook: report whether `this`'s sticky array-mode flag is present.
+/// Exists so the prune regression test can observe the table directly
+/// rather than inferring it from downstream mode selection.
+#[doc(hidden)]
+pub fn __test_tm_force_array_mode(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    tm_force_array_mode(ctx, this)
+}
+
+/// Test hook: set `this`'s sticky array-mode flag.
+#[doc(hidden)]
+pub fn __test_tm_set_force_array(ctx: &dyn NativeContext, this: ObjectRef) {
+    tm_set_force_array(ctx, this)
+}
+
+/// Test hook: number of entries in the sticky array-mode table.
+///
+/// The prune regression test asserts on this rather than on
+/// `tm_force_array_mode(dead)`: pruning also drops the dead object's slot from
+/// `obj_key_registry`, so a post-prune `widened_obj_key` on the same address
+/// mints a FRESH generation and therefore a different packed key. A
+/// presence-check would then read `false` whether or not the table was swept.
+/// Counting entries distinguishes "swept" from "re-keyed".
+#[doc(hidden)]
+pub fn __test_tm_force_array_len() -> usize {
+    tm_force_array_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
 }
 
 /// Migrate any fast-mode entries to the array store, then remove the
@@ -34825,23 +35039,48 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
     // object-key registry. The marker uses this index on the next non-moving
     // cycle, so leaving even one pre-copy address here would silently drop a
     // live collection's overlay edge.
+    //
+    // Rebuild into a FRESH map rather than relocating entries in place. Every
+    // other remap in this file is a single-step lookup — each ref is rewritten
+    // exactly once, which is what `pointer_map` means (the collector has
+    // already composed young->promoted->compacted chains into one hop before
+    // handing it over). Relocating in place is not single-step: a `pointer_map`
+    // may legitimately contain both `A -> B` and `B -> C`, because old-gen
+    // sliding compaction hands one live object the address another live object
+    // just vacated. Applying `A -> B` first parks A's keys at B, and the later
+    // `B -> C` then sweeps them on to C along with B's own — so A's collection,
+    // which really is at B, ends up with NO entry at its own address.
+    //
+    // Nothing catches that afterwards. The side tables are keyed by the
+    // relocation-invariant identity hash, so the collection keeps reading its
+    // own state correctly; only the GC's "which refs does this collection own?"
+    // question breaks, and only on the paths that ask it per owner — the
+    // non-moving young marker and `old_gen_gc`'s mark BFS. Those then free a
+    // live backing array, which resurfaces as `checkcast: not an object
+    // reference` in whatever reads the collection next. The moving young path
+    // seeds from `external_roots_for_matching_owners(&|_| true)`, a union over
+    // every indexed address, so it survives a misplaced entry and cannot expose
+    // the bug — which is why this stayed invisible while the moving-young work
+    // was the thing under test.
+    //
+    // Iteration order of `moves` decided whether it fired, so it was silent,
+    // intermittent, and needed two overlay-backed collections in old gen plus a
+    // compacting cycle that slid one onto the other's address.
     let mut owners = overlay_owner_keys()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let moves: Vec<(usize, usize)> = owners
-        .keys()
-        .filter_map(|old| pointer_map.get(old).map(|new| (*old, *new)))
-        .collect();
-    for (old, new) in moves {
-        if let Some(keys) = owners.remove(&old) {
-            let target = owners.entry(new).or_default();
-            for key in keys {
-                if !target.contains(&key) {
-                    target.push(key);
-                }
+    let mut rebuilt: StdHashMap<usize, Vec<usize>> = StdHashMap::with_capacity(owners.len());
+    for (addr, keys) in owners.drain() {
+        // Absent from the map means "did not move" — keep the address as is.
+        let target_addr = pointer_map.get(&addr).copied().unwrap_or(addr);
+        let target = rebuilt.entry(target_addr).or_default();
+        for key in keys {
+            if !target.contains(&key) {
+                target.push(key);
             }
         }
     }
+    *owners = rebuilt;
 }
 
 /// Prune overlay/side-table entries whose backing collection object is no
@@ -34985,6 +35224,19 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
             tmf.remove(k);
         }
     }
+    // The sticky "this TreeMap is pinned to array mode" flag is keyed by the
+    // same packed `widened_obj_key` as the two tables above and was the one
+    // such table this sweep missed: it grew for every TreeMap that ever hit a
+    // non-extractable key and, once a dead map's 32-bit identity hash was
+    // recycled, silently forced the NEW map into array mode from its first put.
+    {
+        let mut forced = tm_force_array_set()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (k, _) in &dead_keys {
+            forced.remove(k);
+        }
+    }
     {
         let mut ts = ts_array_table().lock().unwrap_or_else(|e| e.into_inner());
         for (k, _) in &dead_keys {
@@ -35049,6 +35301,100 @@ fn ts_install_backing_array(
     let buf = ctx.read_native_pin(buf_pin, buf);
     ctx.unpin_native_roots(owner_pin);
     (owner, buf)
+}
+
+/// Owners already reported by [`report_short_overlay_backing`], so one
+/// corrupted collection logs once instead of once per read.
+fn reported_short_backings() -> &'static Mutex<std::collections::HashSet<(usize, usize)>> {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<(usize, usize)>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Name a TreeMap/TreeSet whose overlay `size` no longer fits its backing
+/// array, at the read that first observes it.
+///
+/// This is the invariant every indexed read of the array-mode backing store
+/// depends on and none of them check: `size` says N entries are live, so the
+/// array must be at least `N * slots_per_entry` long. When the collector
+/// reclaims the array out from under a still-live collection, what comes back
+/// is a zeroed header — `ClassId(0)`, `array_length == 0` — and the reads keep
+/// going, returning `Int(0)` where an element belongs. That `Int(0)` then
+/// travels: `TreeSet.contains` -> `ts_binary_search` -> `tree_compare` ->
+/// `comparator_compare` -> the real `String$CaseInsensitiveComparator.compare`,
+/// which dies on `checkcast: not an object reference` in a stack frame that
+/// names neither the collection nor the GC. Three separate investigations
+/// (2026-07-28, 07-31, 07-31 again) each had to re-derive that chain from the
+/// checkcast backwards, twice via a hand-added throwaway probe.
+///
+/// So this stays ON, unconditionally: it cannot fire unless the VM is already
+/// broken, and one line here replaces that whole derivation. It reports and
+/// returns — the caller's behaviour is unchanged, and the downstream failure
+/// still happens; the point is that the log now says what actually went wrong.
+/// De-duplicated per (owner address, side-table key) so a corrupted collection
+/// that is read in a loop does not drown the log.
+///
+/// Raw numbers only, never a `{:?}` of a decoded value: the whole premise is
+/// that these bytes are garbage, and formatting a `Value`/enum read out of a
+/// freed header is how a diagnostic turns a recoverable report into a SIGSEGV.
+fn report_short_overlay_backing(
+    ctx: &dyn NativeContext,
+    kind: &'static str,
+    owner: ObjectRef,
+    data: Option<ObjectRef>,
+    size: i32,
+    slots_per_entry: usize,
+) {
+    // Only an installed-but-too-short array is unambiguous. `data == None`
+    // with `size > 0` is a LEGITIMATE state: a fast-mode TreeMap keeps its
+    // entries in `tm_fast_table` and leaves the array slot empty, but still
+    // records the count in the array-state `size` slot so `native_tm_size` can
+    // read it (see `tm_materialize_deser_if_needed`). Reporting that shape
+    // would fire on every deserialized natural-order TreeMap in the process.
+    let data = match data {
+        Some(d) if size > 0 => d,
+        _ => return,
+    };
+    let needed = (size as usize).saturating_mul(slots_per_entry);
+    let arr_len = ctx.array_length(data);
+    if arr_len >= needed {
+        return;
+    }
+    let data_addr = data.as_ptr() as usize;
+    let owner_addr = owner.as_ptr() as usize;
+    let key = tm_obj_key(ctx, owner);
+    // A map that has BOTH an array and a fast-mode table is mid-conversion,
+    // not corrupt: the authoritative store is the table and the array slot is
+    // whatever the array path last left there.
+    if tm_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&key)
+    {
+        return;
+    }
+    {
+        let mut seen = reported_short_backings()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !seen.insert((owner_addr, key)) {
+            return;
+        }
+    }
+    // `class_id_of_object` on a zeroed header reports 0, which is also the real
+    // id of `java/lang/Object` — print the number and let the reader decide,
+    // rather than resolving it to a name that would read as a plausible class.
+    let data_cid = ctx.class_id_of_object(data).as_u32();
+    eprintln!(
+        "[overlay-backing] {kind} backing array is shorter than its size — the \
+         collector reclaimed or failed to remap it while the collection was \
+         still live. owner=0x{owner_addr:x} key=0x{key:x} size={size} \
+         needed={needed} array_length={arr_len} data=0x{data_addr:x} \
+         data_class_id={data_cid} (array_length=0 together with \
+         data_class_id=0 is a freed, zeroed object). Reads past the end \
+         return Int(0), which surfaces far away as \
+         'checkcast: not an object reference'."
+    );
 }
 
 /// TreeMap twin of [`ts_install_backing_array`] — same hazard, same contract.
@@ -35288,6 +35634,9 @@ fn tm_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
         Value::Int(v) => v,
         _ => 0,
     };
+    // TreeMap's array mode stores key/value pairs, so `size` entries occupy
+    // `2 * size` slots.
+    report_short_overlay_backing(ctx, "TreeMap", this, data, size, 2);
     let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
     (data, size, comparator)
 }
@@ -35414,6 +35763,7 @@ fn ts_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
         Value::Int(v) => v,
         _ => 0,
     };
+    report_short_overlay_backing(ctx, "TreeSet", this, data, size, 1);
     let comparator = ts_get_slot(ctx, this, TS_FIELD_COMPARATOR);
     (data, size, comparator)
 }
@@ -47218,28 +47568,113 @@ fn register_concurrent_skip_list_map_natives(r: &mut NativeMethodRegistry) {
 /// `compareTo`, which raises (NoSuchMethodError / AbstractMethodError /
 /// ClassCastException) and propagates here via `?` instead of silently
 /// collapsing the ordering and dropping the entry.
+///
+/// Family-1 stale-`ObjectRef` fix (2026-08-01): this was the last binary
+/// search in the file still holding raw `ObjectRef`s across `tree_compare`.
+/// `tm_binary_search`, `ts_binary_search` and `pbq_offer_locked` all pin and
+/// re-read; CSLM never did. `tree_compare` dispatches either a user
+/// `Comparator.compare` or the key's own `Comparable.compareTo` — a full
+/// re-entry into the interpreter that can allocate and complete a moving young
+/// collection. Everything the search or its CALLERS touch afterwards is at
+/// risk, so all of it is pinned here and written back through `&mut`:
+///
+/// * `keys`  — re-read by `get_array_element` on the next iteration, and by the
+///   caller's shift/insert. A stale array ref reads `Object(None)` (or, on the
+///   real heap, whatever now occupies the address) and silently drops writes.
+/// * `values` — never touched by the search itself, but every caller stores
+///   into it immediately afterwards, so it must ride the same pins. `None` for
+///   `containsKey`, which has no value array to keep.
+/// * `owner` — the caller writes `CSLM_FIELD_SIZE` through it after the search.
+/// * `comparator` and `key` — dereferenced again on the *next* iteration.
+///
+/// Parameters are `&mut` rather than returned in a tuple deliberately: a caller
+/// physically cannot keep using a pre-search copy, because there isn't one.
 fn cslm_binary_search(
     ctx: &mut dyn NativeContext,
-    comparator: &Value,
-    keys: ObjectRef,
+    owner: &mut ObjectRef,
+    keys: &mut ObjectRef,
+    values: &mut Option<ObjectRef>,
     size: i32,
-    key: &Value,
+    comparator: &mut Value,
+    key: &mut Value,
 ) -> Result<Result<usize, usize>, MethodCallFailed> {
+    // `owner_pin` is taken FIRST so `unpin_native_roots(owner_pin)` releases
+    // this whole batch (the API unwinds from the base handle onward).
+    let owner_pin = ctx.pin_native_root(*owner);
+    let keys_pin = ctx.pin_native_root(*keys);
+    let values_pin = opt_pin(ctx, *values);
+    let comparator_pin = pin_value(ctx, *comparator);
+    let key_pin = pin_value(ctx, *key);
     let mut low: usize = 0;
     let mut high = size as usize;
     while low < high {
         let mid = low + (high - low) / 2;
-        let mid_key = ctx.get_array_element(keys, mid);
-        let cmp = tree_compare(ctx, comparator, mid_key, *key)?;
+        let mid_key = ctx.get_array_element(*keys, mid);
+        // Orientation is compare(existing, searched) — the inverse of
+        // `tm_binary_search` — so the branch signs below differ from TreeMap's.
+        // Preserved exactly: a non-antisymmetric comparator distinguishes them.
+        let cmp = match tree_compare(ctx, comparator, mid_key, *key) {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.unpin_native_roots(owner_pin);
+                return Err(e);
+            }
+        };
+        // The comparison ran real bytecode — refresh everything reused below
+        // and everything the caller reuses after we return.
+        *owner = ctx.read_native_pin(owner_pin, *owner);
+        *keys = ctx.read_native_pin(keys_pin, *keys);
+        *values = opt_read(ctx, values_pin, *values);
+        *comparator = read_pinned_elem(ctx, comparator_pin, *comparator);
+        *key = read_pinned_elem(ctx, key_pin, *key);
         if cmp < 0 {
             low = mid + 1;
         } else if cmp > 0 {
             high = mid;
         } else {
+            ctx.unpin_native_roots(owner_pin);
             return Ok(Ok(mid));
         }
     }
+    ctx.unpin_native_roots(owner_pin);
     Ok(Err(low))
+}
+
+/// Read a CSLM's backing key/value arrays, creating them if the receiver was
+/// built without running our `<init>` (a deserialized or subclassed map).
+///
+/// Returns the (possibly relocated) receiver alongside: the lazy
+/// `alloc_ref_array` calls below are Java-heap allocations and can move `this`,
+/// so a caller that kept its own copy would write `CSLM_FIELD_SIZE` into a
+/// dead address. Callers MUST use the returned receiver.
+fn cslm_arrays(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> (ObjectRef, ObjectRef, ObjectRef, i32) {
+    let (keys_opt, values_opt, size) = cslm_state(ctx, this);
+    let mut this = this;
+    let mut keys = match keys_opt {
+        Some(k) => k,
+        None => {
+            let (moved, k) = rooted_across1(ctx, this, |ctx| {
+                alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY)
+            });
+            this = moved;
+            ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(k)));
+            k
+        }
+    };
+    let values = match values_opt {
+        Some(v) => v,
+        None => {
+            let v = rooted_across(ctx, &mut [&mut this, &mut keys], |ctx| {
+                alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY)
+            });
+            ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(v)));
+            v
+        }
+    };
+    (this, keys, values, size)
 }
 
 fn cslm_ensure_capacity(
@@ -47297,6 +47732,46 @@ fn cslm_state(
     (keys, values, size)
 }
 
+// ---------------------------------------------------------------------------
+// CSLM test hooks
+// ---------------------------------------------------------------------------
+//
+// `register_concurrent_skip_list_map_natives` is deliberately NOT called (see
+// the `let _ = register_concurrent_skip_list_map_natives;` no-op in
+// `register_collections_natives`, and the `concurrent_skip_list_map_not_
+// intercepted` unit test that guards it): the real
+// `java.util.concurrent.ConcurrentSkipListMap` bytecode runs instead. The
+// implementation below is kept "for reference" so it can be re-enabled.
+//
+// That is exactly why these hooks exist. The GC-safety fixes applied to this
+// family on 2026-08-01 are otherwise untestable — the natives cannot be reached
+// through the registry — and an untested fix in code someone may re-enable is
+// how the defect comes back. The hooks call the natives directly, so the
+// registry stays clean and the pin discipline is still covered.
+
+#[doc(hidden)]
+pub fn __test_cslm_init_comparator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_cslm_init_comparator(ctx, args)
+}
+
+#[doc(hidden)]
+pub fn __test_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_cslm_put(ctx, args)
+}
+
+#[doc(hidden)]
+pub fn __test_cslm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_cslm_get(ctx, args)
+}
+
+#[doc(hidden)]
+pub fn __test_cslm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_cslm_size(ctx, args)
+}
+
 fn native_cslm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -47349,31 +47824,36 @@ fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     // Fix item 5: honor the map's custom comparator (natural ordering if none).
-    let comparator = cslm_comparator(ctx, this);
+    let mut comparator = cslm_comparator(ctx, this);
     // Bug 1: serialise mutating ops on this map's lock stripe.
     let _guard = cslm_stripe_for(ctx, this).write();
-    let (keys_opt, values_opt, size) = cslm_state(ctx, this);
-    let keys = match keys_opt {
-        Some(k) => k,
-        None => {
-            let k = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
-            ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(k)));
-            k
-        }
-    };
-    let values_arr = match values_opt {
-        Some(v) => v,
-        None => {
-            let v = alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY);
-            ctx.set_field(this, CSLM_FIELD_VALUES, Value::Object(Some(v)));
-            v
-        }
-    };
-    let search = cslm_binary_search(ctx, &comparator, keys, size, &key)?;
-    match search {
+    let (mut this, mut keys, values_arr, size) = cslm_arrays(ctx, this);
+    let mut values_opt = Some(values_arr);
+    // Family-1 stale-ObjectRef fix: the search dispatches the comparator and
+    // refreshes everything it is handed. The inserted VALUE is not part of the
+    // search, yet it is stored into the backing array afterwards, so it needs
+    // its own pin. Taken BEFORE the search's own pins, so the search's
+    // `unpin_native_roots(owner_pin)` — which truncates from its own base
+    // onward — cannot release it.
+    let value_pin = pin_value(ctx, value);
+    let search = cslm_binary_search(
+        ctx,
+        &mut this,
+        &mut keys,
+        &mut values_opt,
+        size,
+        &mut comparator,
+        &mut key,
+    );
+    let value = read_pinned_elem(ctx, value_pin, value);
+    if value_pin != usize::MAX {
+        ctx.unpin_native_roots(value_pin);
+    }
+    let values_arr = values_opt.unwrap_or(keys);
+    match search? {
         Ok(idx) => {
             // Key exists — replace value, return old
             let old = ctx.get_array_element(values_arr, idx);
@@ -47381,8 +47861,23 @@ fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             Ok(Some(old))
         }
         Err(pos) => {
-            // Insert at pos, shifting elements right
+            // Insert at pos, shifting elements right.
+            //
+            // GC-safety: `cslm_ensure_capacity` performs TWO Java-heap
+            // allocations. It roots the arrays it returns, but not the
+            // caller's `this`/`key`/`value` — and all three are dereferenced
+            // below (the size write, and the two inserting stores). Without
+            // these pins a growth-triggered young collection made the `size`
+            // write land in a dead address (the map silently kept its old
+            // count) and stored dangling key/value refs into the array.
+            let this_pin = ctx.pin_native_root(this);
+            let key_pin = pin_value(ctx, key);
+            let value_pin = pin_value(ctx, value);
             let (keys, values_arr) = cslm_ensure_capacity(ctx, this, size, keys, values_arr);
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let value = read_pinned_elem(ctx, value_pin, value);
+            ctx.unpin_native_roots(this_pin);
             let s = size as usize;
             for i in (pos..s).rev() {
                 let k = ctx.get_array_element(keys, i);
@@ -47403,23 +47898,35 @@ fn native_cslm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Fix item 5: honor the map's custom comparator.
-    let comparator = cslm_comparator(ctx, this);
+    let mut comparator = cslm_comparator(ctx, this);
     // Bug 1: shared read lock — concurrent reads OK, blocks during writes.
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
-    let keys = match keys_opt {
+    let mut keys = match keys_opt {
         Some(k) => k,
         None => return Ok(Some(Value::Object(None))),
     };
-    let values_arr = match values_opt {
-        Some(v) => v,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    match cslm_binary_search(ctx, &comparator, keys, size, &key)? {
-        Ok(idx) => Ok(Some(ctx.get_array_element(values_arr, idx))),
-        Err(_) => Ok(Some(Value::Object(None))),
+    if values_opt.is_none() {
+        return Ok(Some(Value::Object(None)));
+    }
+    // Family-1 stale-ObjectRef fix: even a pure READ dispatches the comparator,
+    // so `values_opt` — read AFTER the search — must ride the search's pins.
+    let mut this = this;
+    let mut values_opt = values_opt;
+    let found = cslm_binary_search(
+        ctx,
+        &mut this,
+        &mut keys,
+        &mut values_opt,
+        size,
+        &mut comparator,
+        &mut key,
+    )?;
+    match (found, values_opt) {
+        (Ok(idx), Some(values_arr)) => Ok(Some(ctx.get_array_element(values_arr, idx))),
+        _ => Ok(Some(Value::Object(None))),
     }
 }
 
@@ -47428,21 +47935,37 @@ fn native_cslm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Fix item 5: honor the map's custom comparator.
-    let comparator = cslm_comparator(ctx, this);
+    let mut comparator = cslm_comparator(ctx, this);
     // Bug 1: serialise mutating ops on this map's lock stripe.
     let _guard = cslm_stripe_for(ctx, this).write();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
-    let keys = match keys_opt {
+    let mut keys = match keys_opt {
         Some(k) => k,
         None => return Ok(Some(Value::Object(None))),
     };
-    let values_arr = match values_opt {
-        Some(v) => v,
-        None => return Ok(Some(Value::Object(None))),
+    if values_opt.is_none() {
+        return Ok(Some(Value::Object(None)));
+    }
+    // Family-1 stale-ObjectRef fix: the comparator dispatch inside the search
+    // can move `this`, both arrays and the searched key; all four are used by
+    // the compaction loop and the size write below.
+    let mut this = this;
+    let mut values_opt = values_opt;
+    let found = cslm_binary_search(
+        ctx,
+        &mut this,
+        &mut keys,
+        &mut values_opt,
+        size,
+        &mut comparator,
+        &mut key,
+    )?;
+    let Some(values_arr) = values_opt else {
+        return Ok(Some(Value::Object(None)));
     };
-    match cslm_binary_search(ctx, &comparator, keys, size, &key)? {
+    match found {
         Ok(idx) => {
             let old_val = ctx.get_array_element(values_arr, idx);
             let s = size as usize;
@@ -47494,17 +48017,30 @@ fn native_cslm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Fix item 5: honor the map's custom comparator.
-    let comparator = cslm_comparator(ctx, this);
+    let mut comparator = cslm_comparator(ctx, this);
     // Bug 1: shared read lock.
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
-    let keys = match keys_opt {
+    let mut keys = match keys_opt {
         Some(k) => k,
         None => return Ok(Some(Value::Int(0))),
     };
-    let found = cslm_binary_search(ctx, &comparator, keys, size, &key)?.is_ok();
+    // `containsKey` never touches the value array, so it hands the search a
+    // `None` slot — nothing to keep rooted on its behalf.
+    let mut this = this;
+    let mut values_opt: Option<ObjectRef> = None;
+    let found = cslm_binary_search(
+        ctx,
+        &mut this,
+        &mut keys,
+        &mut values_opt,
+        size,
+        &mut comparator,
+        &mut key,
+    )?
+    .is_ok();
     Ok(Some(Value::Int(i32::from(found))))
 }
 

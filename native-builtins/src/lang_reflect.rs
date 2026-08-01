@@ -1742,7 +1742,11 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Class;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field_by_name(this, "rawType")))
+            // Reference-typed return: `get_field_by_name` is not
+            // descriptor-aware and answers `Int(0)` for an unwritten `rawType`
+            // slot, which then fails a `checkcast` to Class/Type. Read by
+            // resolved index. See `docs/known-issues/by-name-field-reads.md`.
+            Ok(Some(crate::field_read::ref_field(ctx, this, "rawType")))
         },
     );
     registry.register(
@@ -1751,7 +1755,11 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field_by_name(this, "rawType")))
+            // Reference-typed return: `get_field_by_name` is not
+            // descriptor-aware and answers `Int(0)` for an unwritten `rawType`
+            // slot, which then fails a `checkcast` to Class/Type. Read by
+            // resolved index. See `docs/known-issues/by-name-field-reads.md`.
+            Ok(Some(crate::field_read::ref_field(ctx, this, "rawType")))
         },
     );
     registry.register(
@@ -1800,7 +1808,8 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field_by_name(this, "ownerType")))
+            // `()Ljava/lang/reflect/Type;` — see `getRawType` above.
+            Ok(Some(crate::field_read::ref_field(ctx, this, "ownerType")))
         },
     );
     registry.register(pti_real, "toString", "()Ljava/lang/String;", |ctx, args| {
@@ -2286,7 +2295,8 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
     register_type_variable_annotation_natives(registry, tvi_real);
     registry.register(tvi_real, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field_by_name(this, "name")))
+        // `()Ljava/lang/String;` — see `getRawType` above.
+        Ok(Some(crate::field_read::ref_field(ctx, this, "name")))
     });
     // getBounds() reifies the `bounds` field (a volatile Object[] holding the
     // unreified sun.reflect…FieldTypeSignature nodes). The JDK bytecode does the
@@ -2355,7 +2365,12 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field_by_name(this, "genericComponentType")))
+            // `()Ljava/lang/reflect/Type;` — see `getRawType` above.
+            Ok(Some(crate::field_read::ref_field(
+                ctx,
+                this,
+                "genericComponentType",
+            )))
         },
     );
     register_type_variable_annotation_natives(registry, "java/lang/reflect/TypeVariable");

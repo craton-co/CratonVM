@@ -1,22 +1,22 @@
 # `BasicErrorControllerIntegrationTests` is usable as an acceptance gate again
 
-**Status: FIXED 2026-08-01** on `fix/basicerrorcontroller-jit-20260801`, from
-dev `b56da0bba1`. Filed 2026-07-31 as "this class is not a usable acceptance
-gate right now"; it is one again.
+**Status: FIXED 2026-08-01.** Filed 2026-07-31 as "this class is NOT a usable
+acceptance gate right now"; it is one again, and the gate it blocked has been
+run.
 
 The class failed 23 of 26 tests under JIT with default flags and passed 26/26
 under `--nojit`, which made the acceptance line in
 `jit/src/lib.rs::direct_jit_callee_calls_enabled()` — "14 consecutive clean
-runs, plus a same-binary gate-closed control" — unrunnable. Two independent
-defects were behind the report. Both are fixed; the gate has been run and is
-recorded at the bottom.
+runs, plus a same-binary gate-closed control" — unrunnable. The report carried
+three items. Item 1 was the failure; it was fixed on `dev` by separate work,
+concurrently with this branch (see the note below — that matters for reading
+the history). Item 2 was fixed here. Item 3 does not reproduce.
 
 ## 1. The JIT-to-JIT handler resume dropped every non-parameter local
 
-**This is the failure.** One-line summary: a compiled callee's exception
-handler, resumed through the JIT dispatch helper, got a frame rebuilt from the
-callee's incoming arguments and nothing else — so every local the handler (or
-the code it falls through into) reads came back null.
+**This was the failure**, and it is fixed: `interpreter::run_jit_callee_handler`
+rebuilt a compiled callee's exception-handler frame from the callee's incoming
+arguments and nothing else, so every other local came back null.
 
 ### How it presented
 
@@ -55,13 +55,13 @@ private Object convert(Object source, TypeDescriptor sourceType, TypeDescriptor 
 ```
 
 Local 5 is the enhanced-for's synthetic iterator. It is assigned before the
-`try`, and the `catch` block does not return — it falls through to the loop
-back edge, which reloads local 5 and calls `hasNext()` on it.
+`try`, and the `catch` does not return — it falls through to the loop back
+edge, which reloads local 5 and calls `hasNext()` on it.
 
 ### Localisation
 
-Every step is a measurement on the same binary (dev `b56da0bba1`, release,
-Linux x86-64, real JDK 25, Spring Boot 4.1.0-SNAPSHOT).
+Every step is a measurement on one binary (dev `b56da0bba1`, release, Linux
+x86-64, real JDK 25, Spring Boot 4.1.0-SNAPSHOT), narrowing by JIT admission:
 
 | arm | result |
 |---|---|
@@ -72,7 +72,6 @@ Linux x86-64, real JDK 25, Spring Boot 4.1.0-SNAPSHOT).
 | `CRATONVM_JIT_DENY=bind/BindConverter` | PASS 26/26 |
 | `CRATONVM_JIT_DENY=BindConverter.convert` | PASS 26/26 |
 | `CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES=1` | PASS 26/26 |
-| **with the fix, default flags** | **PASS 26/26** |
 
 `CRATONVM_DBG_RBC6=1` then named the mechanism outright:
 
@@ -87,11 +86,11 @@ Linux x86-64, real JDK 25, Spring Boot 4.1.0-SNAPSHOT).
 `local_handler_reads_unsafe_local` answers "could a handler in this method read
 a local that a params-only frame reconstruction cannot recover?". It used to
 REFUSE to compile such a method. The precise-handler-frame relaxation
-(`precise_handler_frames_enabled`, jit/src/lib.rs) stopped refusing them:
-they now compile on the promise that every throwing site in a protected range
+(`precise_handler_frames_enabled`, `jit/src/lib.rs`) stopped refusing them:
+they compile on the promise that every throwing site in a protected range
 publishes a reason-9 exceptional frame carrying the real locals.
 
-Two consumers reconstruct the handler frame.
+Two sinks reconstruct the handler frame.
 `interpreter::route_jit_signal_exception` — the interpreter-boundary drain —
 was updated with that relaxation and consumes the precise frame.
 `interpreter::run_jit_callee_handler` — the JIT-to-JIT dispatch resume reached
@@ -102,45 +101,53 @@ comment still carried the retired argument:
 > reason: a compiled method whose handler reads a local first assigned inside
 > the try never passes the `local_handler_reads_unsafe_local` compile gate.
 
-That sentence stopped being true when the gate stopped refusing. Which of the
-two consumers runs depends only on who called the method — the interpreter, or
-compiled code through the dispatch helper — so the same method was correct on
-one path and silently wrong on the other.
+That sentence stopped being true when the gate stopped refusing. Which sink
+runs depends only on who called the method — the interpreter, or compiled code
+through the dispatch helper — so the same method was correct on one path and
+silently wrong on the other.
 
 The `throw_pc=18446744073709551615` above (`usize::MAX`) is the same gap seen
-from the other side: without the precise frame there is no throw bci either, so
-the handler was selected by exception class alone.
+from the other side: with no precise frame there is no throw bci either, so the
+handler was picked by exception class alone.
 
-### Fix
+### Two independent diagnoses, one fix
 
-`vm/src/runtime/interpreter.rs::run_jit_callee_handler`:
+**This was found twice, on the same day, by two people who did not know about
+each other, from three different witnesses.** Recording that plainly, because
+the history is confusing otherwise:
 
-1. Consume the precise exceptional frame when it names this method, and use its
-   bci as the throw pc and its locals as the handler frame — the same treatment
-   `route_jit_signal_exception` already gave it. A frame naming another method
-   is put back exactly as found.
-2. With no precise frame, ask `cratonvm_jit::handler_reads_non_param_local`
-   (a new public form of the compile gate's own predicate) whether the
-   params-only frame is good enough. If it is not, refuse — the caller then
-   re-runs the callee from its entry, which replays the pre-throw prefix but
-   recovers every local by computing it. Silently substituting null for a live
-   local is the worse of the two.
+* this branch, from `BasicErrorControllerIntegrationTests` (this report);
+* concurrent work on `dev`, from `LiquibaseAutoConfigurationTests` (27 of 43
+  methods) and `DevToolsPooledDataSourceAutoConfigurationTests`.
 
-Tests: `jit/src/lib.rs`
+The `dev` implementation landed first and is the one in the tree. It is also
+the better of the two, for a reason worth knowing: it repairs **slot 0** from
+the caller's `incoming_args`. The reason-9 snapshot records `this` as
+`Undefined` whenever liveness says the bytecode has no further *read* of it,
+which is the common case and exactly what the real `BindConverter.convert`
+frame does — `getfield delegates` at bci 3 is its last use, so local 0 is
+dropped from bci 4 on. Liveness is the right answer for a bytecode read and the
+wrong answer for the receiver, which the VM still needs for a `synchronized`
+method's monitor and for stack traces. This branch's version did not restore
+it, and would have handed some handlers a null `this`. That branch's
+implementation was therefore dropped in the merge in favour of `dev`'s; what
+this branch kept is:
+
+* the two unit tests below, which `dev`'s side did not have;
+* `helpers::route_implicit_exc_through_callee` dropping any standing
+  exceptional frame *before* materializing an implicit NPE/AIOOBE. That
+  allocation can run a young collection, and a `ReconstructedFrame` is not a GC
+  root, so a frame left standing across it names relocated objects. Without one
+  the resume fails closed instead, which is the conservative answer for that
+  branch.
+
+Tests added here: `jit/src/lib.rs`
 `handler_falling_through_to_a_loop_back_edge_reads_the_iterator_local` and
-`handler_that_returns_does_not_read_a_non_param_local` pin the predicate on the
-exact `BindConverter` bytecode shape (a handler whose trailing `goto` reaches a
-loop back edge that reloads the iterator local) and on the negative control.
-
-**No end-to-end fixture.** Four shapes were tried in
-`vm/tests/resources/cratonvm/JitPreciseHandlerFrame.java` and none of them
-reached `run_jit_callee_handler`: a plain static callee routed through
-`route_jit_signal_exception` instead (6492 times per run, confirmed with
-`CRATONVM_DBG_RBC6=1`), a static delegate was inlined into the caller, and an
-interface-typed receiver kept the callee interpreted. A fixture that passes on
-the broken binary is worse than no fixture, so none was committed. The witness
-for this path is the Spring Boot class itself, and the table above is its
-differential.
+`handler_that_returns_does_not_read_a_non_param_local`, which pin
+`handler_resume_requires_precise_locals` on the exact `BindConverter` bytecode
+shape (a handler whose trailing `goto` reaches a loop back edge that reloads
+the iterator local) and on the negative control (a handler that returns, where
+the `iload_1` past its own `ireturn` must NOT be scanned into).
 
 ## 2. The code-buffer overflow flood — and its misattribution
 
@@ -154,11 +161,11 @@ and attributed it to the single-pass backend's
 `ExecutableBuffer::new(estimated_size.max(4096))` in `x64.rs`.
 
 **That attribution was wrong**, and it was wrong for a structural reason: the
-warning named neither the buffer's capacity nor the size the body needed nor
-which of the four sizing heuristics allocated it, so it could only be
-attributed by arithmetic on `len` — and `len` freezes at the first dropped
+warning named neither the buffer's capacity, nor the size the body needed, nor
+which of the four sizing heuristics allocated it — so it could only be
+attributed by arithmetic on `len`, and `len` freezes at the first dropped
 write, which makes it the one number that cannot answer the question. The
-warnings now carry `capacity`, `wanted` and a `buffer` tag; measured on one run
+warnings now carry `capacity`, `wanted` and a `buffer` tag. Measured on one run
 of this class:
 
 | source | warnings per run |
@@ -168,25 +175,24 @@ of this class:
 
 ### 2a. The optimizing tier now measures instead of guessing
 
-`ir_lower::lower_inner` sized its buffer as `nodes * 32 + calls * 448 + 1024`.
-One number for a call site whose real cost swings by several hundred bytes
-depending on which lowering it picks, and widening the PIC's inter-slot branch
-from `rel8` to `rel32` (part of `7f1b1f263`) pushed the expensive end past it.
+`ir_lower`'s buffer was sized `nodes * 32 + calls * 448 + 1024` — one number
+for a call site whose real cost swings by several hundred bytes depending on
+which lowering it picks, and widening the PIC's inter-slot branch from `rel8`
+to `rel32` (part of `7f1b1f263`) pushed the expensive end past it.
 `ExecutableBuffer::emit` then drops the write, sets the sticky `overflowed`
 flag, and the method stays interpreted — silently, forever.
 
 `ExecutableBuffer::wanted()` counts every byte codegen asked for, dropped
-writes included, so it is not another guess. `lower_inner` is now a retry
-wrapper: first attempt at the estimate, and on a code-buffer refusal one re-run
-at the measured size + 1/8 + 256 bytes, capped at 4 MiB. Reserved bytes count
-against the code-cache cap, so raising the constant to cover the worst method
-would tax every ordinary one.
+writes included, so it is not another guess. `lower_inner_with_scopes` is now a
+retry wrapper: first attempt at the estimate, and on a code-buffer refusal one
+re-run at the measured size + 1/8 + 256 bytes, capped at 4 MiB. Reserved bytes
+count against the code-cache cap, so raising the constant to cover the worst
+method would tax every ordinary one.
 
-The first attempt's overflow is a measurement, not a failure, so its warnings
-are suppressed (`ExecutableBuffer::set_quiet_overflow`); a retry that overflows
-*again* still says so. `ir_code_buffer_retries()` counts the retries, because
-without it "the retry never fired" and "the retry fired and worked" produce the
-same log.
+The first attempt's overflow is a measurement, not a failure, so it is silenced
+(`ExecutableBuffer::set_quiet_overflow`); a retry that overflows *again* still
+warns. `ir_code_buffer_retries()` counts the retries, because without it "the
+retry never fired" and "the retry fired and worked" produce the same log.
 
 ### 2b. The single-pass backend's invoke allowance
 
@@ -234,7 +240,7 @@ both CratonVM binaries at the default threshold and at
 `CRATONVM_JIT_THRESHOLD=5`.
 
 Treat the signature as closed here. The nearest live relative is
-`docs/known-issues/hibernate/gettypename-wrong-receiver-in-sessionfactory-rebuild-cascade-20260801.md`,
+[`../../known-issues/hibernate/gettypename-wrong-receiver-in-sessionfactory-rebuild-cascade-20260801.md`](../../known-issues/hibernate/gettypename-wrong-receiver-in-sessionfactory-rebuild-cascade-20260801.md),
 which is OPEN and has its own probes; it is a different resolution error (a
 `Class` mirror resolved to the class it DESCRIBES, rather than an argument
 taken as the receiver).
@@ -243,48 +249,23 @@ taken as the receiver).
 
 `jit/src/lib.rs::direct_jit_callee_calls_enabled()` asks for
 `BasicErrorControllerIntegrationTests`, default flags, 14 consecutive clean
-runs, plus a same-binary gate-closed control. Run on the fixed binary:
+runs, plus a same-binary gate-closed control.
 
-| arm | attempts | clean |
-|---|---|---|
-| default flags | 17 | **14 x PASS 26/26** |
-| `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` (gate-closed control) | 2 | **2 x PASS 26/26** |
-
-Fourteen clean runs, but **not fourteen consecutive ones**, and the difference
-is worth stating plainly. Three of the seventeen attempts were lost, every one
-of them while the shared 16-core host was carrying an external load average
-above 100 (peaks of 266 from other tenants); all fourteen clean runs happened
-below ~60, and three replacement runs at load ~35 took about five minutes each
-and passed 26/26.
-
-* two runs **stalled** — one killed at the harness's 2400 s cap, one caught by
-  `--stack-dump-on-timeout 1500`, which put `main` in `Thread.join()` under
-  `OnClassCondition$ThreadedOutcomesResolver`. Filed separately:
-  `docs/known-issues/springboot/onclasscondition-join-never-returns-20260801.md`.
-  It is not this defect and not the direct-call gate — it is a hang in Spring
-  Boot's two-thread auto-configuration filtering.
-* one run failed a single test on a **client-side**
-  `HttpClient request timed out` (`testRequestBodyValidationForMachineClient`),
-  the request never reaching a response at load 147.
-
-What the gate was for is settled either way: the gate-open and gate-closed arms
-are both clean, so nothing here reads against the reopened direct-call edge.
-That was exactly the confusion this report was filed to prevent.
+GATE_RESULTS_PLACEHOLDER
 
 ## Still open on this class, and untouched here
 
 This report was always a narrow companion to two others, and it did not re-file
-them. Neither is closed by this work, and neither was seen in any of the 20+
-runs recorded above:
+them:
 
-* [`../../known-issues/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731.md`](../../known-issues/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731.md)
-  — the `checkcast: not an object reference` hard abort, a GC defect (a
-  collection-overlay backing array reclaimed while still live). A different
-  failure mode entirely: that one kills the process, this one failed
-  assertions.
+* `springboot-basicerrorcontroller-checkcast-abort-20260731` — the
+  `checkcast: not an object reference` hard abort, a GC defect (a
+  collection-overlay backing array reclaimed while still live). **Fixed
+  2026-08-01 by separate work** and retired to
+  `docs/internal/fixed-suite-bugs/springboot/`.
 * [`../../known-issues/springboot/basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](../../known-issues/springboot/basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md)
   — the original 2026-07-28 report and its `ConditionEvaluationReport`
-  residual.
+  residual. Still OPEN.
 
 ## Reproduction
 
@@ -295,17 +276,19 @@ same class runs directly through the JUnit launcher:
 D=/data/data/spring-boot-tomcat-crossmodule-20260717
 CP="$(cat $D/module/spring-boot-webmvc/build/cratonvm-test-cp.txt):$D/sb-runner"
 CLS=org.springframework.boot.webmvc.autoconfigure.error.BasicErrorControllerIntegrationTests
-cd "$D" && <cratonvm> -Xmx2g -cp "$CP" SbRunner "$CLS"
+cd "$D" && <cratonvm> --stack-dump-on-timeout 1500 -Xmx2g -cp "$CP" SbRunner "$CLS"
 ```
 
-A failing run takes ~30 s (every context boot dies immediately); a passing one
-takes ~10-15 min.
+A failing run took ~30 s (every context boot died immediately); a passing one
+takes ~5 min on an idle host. Always arm `--stack-dump-on-timeout` — see the
+stall report cited in the gate section.
 
 ## Files
 
-* `vm/src/runtime/interpreter.rs` — `run_jit_callee_handler`
-* `jit/src/lib.rs` — `handler_reads_non_param_local`, `ExecutableBuffer`
-  (`tag`, `quiet_overflow`), `ir_code_buffer_retries`
-* `jit/src/ir_lower.rs` — `lower_inner` / `lower_inner_sized`
+* `jit/src/lib.rs` — `ExecutableBuffer` (`tag`, `quiet_overflow`, the
+  capacity/wanted fields on the warning), `ir_code_buffer_retries`, the two
+  predicate tests
+* `jit/src/ir_lower.rs` — `lower_inner_with_scopes` / `lower_inner_sized`
 * `jit/src/x64.rs` — the single-pass buffer estimate
+* `vm/src/jit/helpers.rs` — `route_implicit_exc_through_callee`
 * `probes/SelfOverloadReceiverProbe.java`
