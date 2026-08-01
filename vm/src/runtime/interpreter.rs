@@ -12866,7 +12866,20 @@ fn route_jit_signal_exception(
     };
     let (throw_pc, locals) = match precise.as_ref() {
         Some((bci, locals)) => (*bci, locals.as_slice()),
-        None => (fallback_throw_pc, fallback_locals),
+        None => {
+            // Same refusal as `run_jit_callee_handler`: without a precise frame
+            // the fallback locals are this method's incoming arguments, which
+            // only describe a handler that reads nothing else. Since
+            // `precise_handler_frames_enabled()` retired the compile-time
+            // refusal, a method whose handler DOES read further locals is
+            // compiled — entering its handler here would zero them silently.
+            // Propagating is the honest outcome and matches how this function
+            // already treats an unmappable frame.
+            if handler_frame_needs_more_than_arguments(cached) {
+                return Err(MethodCallFailed::ExceptionThrown(exc));
+            }
+            (fallback_throw_pc, fallback_locals)
+        }
     };
     if crate::jit::helpers::rbc6_dbg() {
         eprintln!(
@@ -13094,6 +13107,38 @@ pub(crate) fn find_jit_exception_handler(
     handler_pc
 }
 
+/// Could a handler of `cached` observe a local the incoming-arguments-only
+/// frame reconstruction cannot supply?
+///
+/// `true` means "do not enter a handler of this method without a precise
+/// exceptional frame". See `cratonvm_jit::handler_reads_unsafe_local` for why
+/// the answer stopped being a compile-time constant.
+///
+/// The pre-filter is deliberately conservative: `num_params` counts arguments,
+/// not JVM slots, and excludes `this`, so `max_locals <= num_params` implies
+/// there is no slot past the incoming arguments at all. Anything else pays for
+/// the real dataflow. That runs once per exception routed through this sink,
+/// on a path that already takes the class-manager lock and may resolve (or
+/// load) a catch class — a forward scan of one method's handler-reachable code
+/// is small beside it.
+fn handler_frame_needs_more_than_arguments(cached: &Arc<CachedBytecodeMethod>) -> bool {
+    // `cached.code` carries 2 bytes of speculative-read padding.
+    let code_len = cached.code.len().saturating_sub(2);
+    if cached.exception_table.is_empty() || code_len == 0 {
+        return false;
+    }
+    if (cached.max_locals as usize) <= cached.num_params as usize {
+        return false;
+    }
+    cratonvm_jit::handler_reads_unsafe_local(
+        &cached.code[..code_len],
+        code_len,
+        &cached.exception_table,
+        &cached.method_descriptor,
+        cached.is_static,
+    )
+}
+
 /// Run a compiled callee's own exception handler in the interpreter, resuming
 /// AT the handler rather than re-executing the method from its entry.
 ///
@@ -13107,14 +13152,42 @@ pub(crate) fn find_jit_exception_handler(
 /// (`docs/known-issues/repros/jitban-remaining-20260726/`).
 ///
 /// Resuming at the handler keeps the compiled prefix's single execution and
-/// runs only the cleanup the compiled body skipped. Locals are the callee's
-/// incoming arguments, which is the same verifier-consistent state
-/// `route_jit_exception_through_method` uses and is sound for exactly the same
-/// reason: a compiled method whose handler reads a local first assigned inside
-/// the try never passes the `local_handler_reads_unsafe_local` compile gate.
+/// runs only the cleanup the compiled body skipped.
 ///
-/// Returns `None` when no handler in `cached` covers `throw_pc`, leaving the
-/// caller to propagate the exception unchanged.
+/// # Where the handler frame's locals come from
+///
+/// First choice is the callee's own PRECISE exceptional frame — the reason-9
+/// snapshot `x64::emit_post_invoke_exception_check` records at every throwing
+/// invoke inside a protected range. It carries the full local array at the
+/// exact throw bci, and its bci is a better `throw_pc` than anything the
+/// signal plumbing can offer (`athrow_bci` carries no method identity, so it
+/// routinely arrives here as the `usize::MAX` "unknown" sentinel).
+///
+/// Failing that, the locals are the callee's incoming arguments — the same
+/// verifier-consistent state `route_jit_exception_through_method` uses. That
+/// used to be sound unconditionally, on this premise, which was true when this
+/// function was written and is NOT true any more:
+///
+/// > a compiled method whose handler reads a local first assigned inside the
+/// > try never passes the `local_handler_reads_unsafe_local` compile gate.
+///
+/// `precise_handler_frames_enabled()` (default on) retired that refusal in
+/// exchange for the precise frames above. So such a method is compiled now,
+/// and seeding its handler frame with params-only silently zeroes every other
+/// local. Observed as `BindConverter.convert`'s
+/// `for (ConversionService delegate : this.delegates)` — its iterator lives in
+/// local 5, assigned BEFORE the protected range — coming back null the moment
+/// a delegate threw a `ConversionException`:
+/// `NullPointerException: Cannot invoke "java.util.Iterator.hasNext()" because
+/// "<local5>" is null`, failing Spring Boot's whole property-binding path.
+/// `cratonvm_jit::handler_reads_unsafe_local` is the same gate asked from this
+/// side; when it says the handler may read past the arguments and no precise
+/// frame is available, refuse — the caller then falls back to the interpreter
+/// re-run, which reconstructs the state honestly.
+///
+/// Returns `None` when no handler in `cached` covers `throw_pc`, or when the
+/// handler cannot be entered with a state this function can justify, leaving
+/// the caller to propagate the exception (or re-run the callee) unchanged.
 pub(crate) fn run_jit_callee_handler(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -13123,6 +13196,39 @@ pub(crate) fn run_jit_callee_handler(
     exc: ObjectRef,
     incoming_args: &[Value],
 ) -> Option<MethodCallResult> {
+    let precise = match cratonvm_jit::deopt::take_exceptional_frame() {
+        Some(rframe)
+            if deopt_frame_matches_method(
+                &rframe,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            ) =>
+        {
+            // Names this method but carries a value we cannot map: fail closed
+            // rather than resume the handler with a partially zeroed frame.
+            let locals = ir_deopt_locals(&rframe.locals)?;
+            Some((rframe.bci as usize, locals))
+        }
+        // A frame naming a DIFFERENT method belongs to a callee still unwinding
+        // (or to a caller whose own drain has not run); leave it where it is.
+        // `route_jit_signal_exception` drops a foreign frame because by then its
+        // owner has provably left the stack — that reasoning does not hold here.
+        Some(foreign) => {
+            cratonvm_jit::deopt::restash_exceptional_frame(foreign);
+            None
+        }
+        None => None,
+    };
+    let (throw_pc, incoming_args) = match precise.as_ref() {
+        Some((bci, locals)) => (*bci, locals.as_slice()),
+        None => {
+            if handler_frame_needs_more_than_arguments(cached) {
+                return None;
+            }
+            (throw_pc, incoming_args)
+        }
+    };
     let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
     let mut synchronized_args = cached.is_synchronized.then(|| incoming_args.to_vec());
     let synchronized_monitor = match synchronized_args.as_mut() {

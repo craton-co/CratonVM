@@ -8985,6 +8985,32 @@ fn local_handler_reads_unsafe_local(
     false
 }
 
+/// The RBC.6 handler-safety question, asked from the RUNTIME side.
+///
+/// [`local_handler_reads_unsafe_local`] is the compile-time admission gate.
+/// The runtime sinks that resume a compiled method AT one of its handlers
+/// (`interpreter::run_jit_callee_handler`,
+/// `interpreter::route_jit_signal_exception`) need the same answer: when they
+/// have no precise exceptional frame to reconstruct from, they seed the
+/// handler frame with the method's INCOMING ARGUMENTS only, and that is sound
+/// exactly while this returns `false`.
+///
+/// It used to be sound unconditionally, because a `true` here meant the method
+/// was never compiled at all. [`precise_handler_frames_enabled`] (default on)
+/// retired that refusal in exchange for a precise frame at every throwing site
+/// in a protected range — so a `true` method IS compiled now, and a sink that
+/// reaches a handler without that frame must refuse rather than resume with
+/// zeroed non-parameter locals.
+pub fn handler_reads_unsafe_local(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+    method_descriptor: &str,
+    is_static: bool,
+) -> bool {
+    local_handler_reads_unsafe_local(code, code_len, exception_table, method_descriptor, is_static)
+}
+
 /// Whether the precise-handler-frame relaxation of the RBC.6 gate is enabled.
 ///
 /// The relaxation compiles a method whose exception handler (or code reachable
