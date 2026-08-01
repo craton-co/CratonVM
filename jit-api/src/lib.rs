@@ -15,11 +15,16 @@
 //!
 //! # SAFETY: the `JitRuntimeHelpers` ABI is frozen
 //!
-//! [`JitRuntimeHelpers`] is a `#[repr(C)]` table of bare `usize` words whose
-//! **byte offsets are compiled into RWX machine code**. Never reorder, remove,
-//! retype, or insert a field; append only, and bump
-//! [`JIT_HELPERS_ABI_VERSION`] when you do. The full contract, the per-field
-//! signatures, and the per-field nullability rules live in [`helpers_abi`].
+//! [`JitRuntimeHelpers`] is a `#[repr(C)]` table of bare `usize` words. The
+//! backend bakes each slot's **absolute address** into RWX machine code and
+//! hand-writes the argument-register setup at every call site; the byte offsets
+//! are what `as_words`/`word_at` and any non-Rust producer depend on. Never
+//! reorder, remove, retype, or insert a field; append only, and bump
+//! [`JIT_HELPERS_ABI_VERSION`] when you do — [`helpers_abi::ABI_REVISIONS`]
+//! makes that a compile error to forget. The full contract, the per-field
+//! signatures, and the per-field nullability rules live in [`helpers_abi`];
+//! `docs/jit/helper-abi-audit.md` lists which invariants have tripwires, which
+//! do not, and the procedure for adding a slot.
 //!
 //! ## `gpu-lowering` feature status
 //!
@@ -39,9 +44,12 @@ pub mod gpu_lowering;
 pub mod helpers_abi;
 
 pub use helpers_abi::{
-    helper_field, helper_field_offset, HelperAbiError, HelperFieldDesc, HelperKind,
-    HELPER_FIELDS, HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_ALIGN, JIT_HELPERS_ABI_SIZE,
-    JIT_HELPERS_ABI_VERSION, MAX_PLAUSIBLE_OFFSET, NUM_HELPER_FIELDS,
+    accessor_name_matches_field, helper_field, helper_field_offset, str_eq, HelperAbiError,
+    HelperAbiRevision, HelperArgAbi, HelperFieldDesc, HelperFnSig, HelperKind, HelperRetAbi,
+    ABI_REVISIONS, GOLDEN_HELPER_OFFSETS, HELPERS_NEEDING_WIN64_STACK_ARGS, HELPER_FIELDS,
+    HELPER_FIELD_STRIDE, HELPER_FN_SIGS, JIT_HELPERS_ABI_ALIGN, JIT_HELPERS_ABI_SIZE,
+    JIT_HELPERS_ABI_VERSION, MAX_PLAUSIBLE_OFFSET, NUM_HELPER_FIELDS, SYSV_INT_ARG_REGS,
+    WIN64_INT_ARG_REGS,
 };
 
 use std::sync::Arc;
@@ -1016,6 +1024,15 @@ pub struct JitRuntimeHelpers {
     /// wired → the deferred site bails the compile. Appended at the END of
     /// the struct so all prior golden offsets stay stable.
     pub anewarray_object_cp: usize,
+    /// `monitorenter` for compiled code. Returns the possibly-REMAPPED
+    /// object, which the caller must store back: a contended acquire parks
+    /// the thread and the object can move while it is parked.
+    ///
+    /// Optional - a table leaving this 0 makes `ir_lower` refuse a graph
+    /// containing monitor ops rather than emit nothing and drop the lock.
+    pub monitor_enter: usize,
+    /// `monitorexit`. See `monitor_enter`.
+    pub monitor_exit: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1183,6 +1200,9 @@ helper_fields! {
     // site and bails the compile — the pre-existing behaviour.
     (new_object_cp,                  FieldKind::OptionalPtr),
     (anewarray_object_cp,            FieldKind::OptionalPtr),
+    // Optional: 0 makes `ir_lower` refuse a graph containing monitor ops.
+    (monitor_enter,                  FieldKind::OptionalPtr),
+    (monitor_exit,                   FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1208,7 +1228,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 60,
+    JitRuntimeHelpers::NUM_FIELDS == 62,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1597,6 +1617,8 @@ mod tests {
             service_callee_deopt: 0x1190,
             new_object_cp: 0x1198,
             anewarray_object_cp: 0x11A0,
+            monitor_enter: 0x11A8,
+            monitor_exit: 0x11B0,
         }
     }
 
@@ -1829,6 +1851,8 @@ mod tests {
             service_callee_deopt: 0,
             new_object_cp: 0,
             anewarray_object_cp: 0,
+            monitor_enter: 0,
+            monitor_exit: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2004,8 +2028,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 60.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 60);
+        // And the macro-driven count is the canonical 62.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 62);
     }
 
     #[test]
@@ -2303,6 +2327,16 @@ mod tests {
                 "anewarray_object_cp",
                 std::mem::offset_of!(JitRuntimeHelpers, anewarray_object_cp),
             ),
+            (
+                60,
+                "monitor_enter",
+                std::mem::offset_of!(JitRuntimeHelpers, monitor_enter),
+            ),
+            (
+                61,
+                "monitor_exit",
+                std::mem::offset_of!(JitRuntimeHelpers, monitor_exit),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2357,7 +2391,7 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 42, "required-pointer count drifted");
-        assert_eq!(opt, 9, "optional-pointer count drifted");
+        assert_eq!(opt, 11, "optional-pointer count drifted");
         assert_eq!(off, 9, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }

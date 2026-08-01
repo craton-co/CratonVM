@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::heap::{
     array_data_size, ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
@@ -63,11 +63,25 @@ pub enum RegionType {
 // Remembered set
 // ---------------------------------------------------------------------------
 
+/// G1AUD-5 (defect G1-8) — the generation stamp that means "never prune this
+/// entry on age".
+///
+/// [`RememberedSet::add_reference`] — the generation-less entry point kept for
+/// callers that have no collector generation to hand (the deprecated
+/// [`RegionHeap`] prototype and the unit tests) — records this value. It is
+/// strictly greater than any real generation, so the staleness test in
+/// [`RememberedSet::retain_sources_in_generation`] never drops such an entry.
+/// That is the fail-safe direction: an un-stamped entry over-retains (the
+/// source is re-walked) instead of under-scanning (a live cross-region edge
+/// dropped, i.e. a use-after-free).
+pub const RSET_GENERATION_PINNED: u64 = u64::MAX;
+
 /// Per-region remembered set: tracks which other regions hold references into this one.
 ///
-/// Stored as a set of (source_region_index, card_offset) pairs. This is a
-/// simplified hash-set RSet — production G1 uses a multi-level structure
-/// (sparse → fine → coarse) for space efficiency.
+/// Stored as a map from source region index to the *generation* in which the
+/// most recent edge from that source was recorded. This is a simplified
+/// hash-map RSet — production G1 uses a multi-level structure (sparse → fine →
+/// coarse) for space efficiency.
 ///
 /// Round-9 gc CRIT-8 (post_write_barrier_rset hot path): `sources` lives
 /// behind a `parking_lot::Mutex` so that `add_reference` takes `&self`
@@ -77,10 +91,26 @@ pub enum RegionType {
 /// once with all entries and never reallocated, so a cached `*const
 /// G1Region` (and therefore `*const RememberedSet`) is stable for the
 /// lifetime of the mutator phase.
+///
+/// **G1AUD-5 (defect G1-8) — why the value is a generation, not a bool.**
+/// The set used to be a bare `FxHashSet<usize>` whose only pruning was
+/// `cleanup`'s "is the source Free *right now*" pass. A source that was
+/// recycled and then re-typed into a live region is not Free at cleanup time,
+/// so its entry survived — and every later pause re-walked that region
+/// *wholesale* on behalf of an edge whose holder no longer exists, resurrecting
+/// the referents of objects that died a cycle ago ("undead" entries). Stamping
+/// each entry with the collector's reclassification generation lets both the
+/// scan side and `cleanup` ask the sharper question — "was this source recycled
+/// *since* the edge was recorded?" — which is exactly the condition that makes
+/// the entry dead.
 #[derive(Debug, Default)]
 pub struct RememberedSet {
-    /// Set of (source_region_index) that have references into this region.
-    /// T10.9.B: FxHashSet — source region indices are internal.
+    /// `source_region_index -> generation in which the edge was recorded`.
+    ///
+    /// The generation is `G1Collector::rset_cache_epoch`, which is bumped
+    /// (Release, under the regions lock) at the start of every phase that can
+    /// recycle or re-type a region. Comparing it against the source region's
+    /// `recycled_in_generation` answers "has the source been reset since?".
     ///
     /// `parking_lot::Mutex` is uncontended-fast and lets the write
     /// barrier mutate via `&self`. The RSet for any given target
@@ -89,13 +119,32 @@ pub struct RememberedSet {
     /// land in that one region — a low-frequency case compared with
     /// per-thread same-region successive stores (handled by the
     /// caller's TLS pointer cache without touching this mutex at all).
-    sources: parking_lot::Mutex<FxHashSet<usize>>,
+    sources: parking_lot::Mutex<FxHashMap<usize, u64>>,
 }
 
 impl RememberedSet {
-    /// Record that `source_region` has a reference into this region.
+    /// Record that `source_region` has a reference into this region, without a
+    /// generation stamp.
+    ///
+    /// The entry is stamped [`RSET_GENERATION_PINNED`] and is therefore never
+    /// pruned on age. Collector paths should call
+    /// [`Self::add_reference_in_generation`] instead; this remains for the
+    /// deprecated [`RegionHeap`] prototype and for tests.
     pub fn add_reference(&self, source_region: usize) {
-        self.sources.lock().insert(source_region);
+        self.add_reference_in_generation(source_region, RSET_GENERATION_PINNED);
+    }
+
+    /// G1AUD-5 — record that `source_region` has a reference into this region,
+    /// stamped with the collector reclassification `generation` in which the
+    /// store happened.
+    ///
+    /// Re-recording an existing source keeps the NEWER stamp: an edge written
+    /// after the source was recycled is the live one, and the older stamp
+    /// describes a holder that no longer exists.
+    pub fn add_reference_in_generation(&self, source_region: usize, generation: u64) {
+        let mut guard = self.sources.lock();
+        let slot = guard.entry(source_region).or_insert(generation);
+        *slot = (*slot).max(generation);
     }
 
     /// Clear the remembered set.
@@ -125,7 +174,22 @@ impl RememberedSet {
     /// humongous filler, and a straddling object), and a dropped live entry
     /// there is a use-after-free.
     pub fn retain_sources<F: FnMut(usize) -> bool>(&self, mut keep: F) {
-        self.sources.lock().retain(|&s| keep(s));
+        self.sources.lock().retain(|&s, _| keep(s));
+    }
+
+    /// G1AUD-5 (defect G1-8) — generation-aware variant of
+    /// [`Self::retain_sources`]: `keep` receives the source region index AND
+    /// the generation the edge was recorded in, so the caller can drop entries
+    /// whose source has been recycled since.
+    ///
+    /// Dropping such an entry is sound for the same reason the Free-source
+    /// prune is: `G1Region::reset` zero-fills the region and clears its own
+    /// rset, so no object that could have held the edge survives. Any edge the
+    /// re-typed region stores afterwards is re-recorded by the mutator
+    /// post-write barrier (with the newer generation), and GC-internal edges
+    /// are re-derived by the Phase-4 rebuild.
+    pub fn retain_sources_in_generation<F: FnMut(usize, u64) -> bool>(&self, mut keep: F) {
+        self.sources.lock().retain(|&s, gen| keep(s, *gen));
     }
 
     /// Number of distinct source regions.
@@ -139,7 +203,26 @@ impl RememberedSet {
     /// internal mutex across iteration (and so the signature does not
     /// leak a `MutexGuard` lifetime).
     pub fn sources(&self) -> Vec<usize> {
-        self.sources.lock().iter().copied().collect()
+        self.sources.lock().keys().copied().collect()
+    }
+
+    /// G1AUD-5 — snapshot of `(source_region_index, recorded_generation)`.
+    ///
+    /// The scan side uses this instead of [`Self::sources`] so it can skip a
+    /// source that was recycled after the edge was recorded rather than walk it
+    /// wholesale (defect G1-8, the "undead" entry).
+    pub fn sources_with_generations(&self) -> Vec<(usize, u64)> {
+        self.sources
+            .lock()
+            .iter()
+            .map(|(&s, &gen)| (s, gen))
+            .collect()
+    }
+
+    /// G1AUD-5 — the generation in which the newest edge from `source_region`
+    /// was recorded, or `None` if this rset does not name that source.
+    pub fn recorded_generation(&self, source_region: usize) -> Option<u64> {
+        self.sources.lock().get(&source_region).copied()
     }
 }
 
@@ -1280,5 +1363,49 @@ mod tests {
         assert_eq!(rset.source_count(), 2);
         rset.clear();
         assert_eq!(rset.source_count(), 0);
+    }
+
+    /// G1AUD-5 (defect G1-8) — an entry carries the generation of the NEWEST
+    /// edge from that source.
+    ///
+    /// Keeping the newest is what makes the staleness test correct: a source
+    /// that was recycled and then wrote a fresh edge must not be pruned on the
+    /// strength of the older, dead edge's stamp. The generation-less entry point
+    /// records the never-prune stamp, which must dominate everything.
+    #[test]
+    fn remembered_set_entries_keep_the_newest_generation_stamp() {
+        let rset = RememberedSet::default();
+
+        rset.add_reference_in_generation(3, 7);
+        assert_eq!(rset.recorded_generation(3), Some(7));
+
+        // Older re-record: the live edge is still the newer one.
+        rset.add_reference_in_generation(3, 2);
+        assert_eq!(
+            rset.recorded_generation(3),
+            Some(7),
+            "an out-of-order add must not age an entry backwards — that would \
+             prune a live edge"
+        );
+
+        rset.add_reference_in_generation(3, 9);
+        assert_eq!(rset.recorded_generation(3), Some(9));
+        assert_eq!(rset.source_count(), 1, "still one source");
+
+        // The generation-less path pins the entry against age-based pruning.
+        rset.add_reference(3);
+        assert_eq!(rset.recorded_generation(3), Some(RSET_GENERATION_PINNED));
+        assert_eq!(rset.recorded_generation(4), None);
+
+        // The generation-aware retain sees both halves of every entry.
+        rset.add_reference_in_generation(4, 1);
+        let mut seen: Vec<(usize, u64)> = Vec::new();
+        rset.retain_sources_in_generation(|s, gen| {
+            seen.push((s, gen));
+            s == 4
+        });
+        seen.sort_unstable();
+        assert_eq!(seen, vec![(3, RSET_GENERATION_PINNED), (4, 1)]);
+        assert_eq!(rset.sources(), vec![4]);
     }
 }

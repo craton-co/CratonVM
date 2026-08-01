@@ -121,14 +121,17 @@ class.
 | `module/spring-boot-actuator`, 82 classes, pre-fix vs post-fix | identical: 81 PASS / 1 FAIL (`GitInfoContributorTests`, a separate open issue) |
 | `cargo test -p cratonvm-classloading` | 720 + 118 pass |
 
-## Adjacent gap NOT addressed here
+## Adjacent gap — investigated separately, NOT a bug
 
 `ClassManager::upgrade_synthetic_class` (synthetic JDK stub → real `.class`
 bytecode) fires the JIT and resolution invalidation hooks but never rebuilds
-any vtable descriptors at all — not even the upgraded class's own. Unlike JEP
-109 redefinition it may also change the method set, so the descendant-refresh
-above would not be sufficient there either. Untested and out of scope for this
-fix; recorded here because it is the same shape.
+any vtable descriptors at all — not even the upgraded class's own. That looked
+like the same shape and was chased down on 2026-08-01: it is sound, because a
+compatibility stub never has a vtable in the first place and its methods carry
+no Code, so there is nothing stale to serve. See
+[`synthetic-stub-upgrade-vtable-NOT-A-BUG-20260801.md`](synthetic-stub-upgrade-vtable-NOT-A-BUG-20260801.md);
+the invariant is now enforced by
+`class_manager::tests::synthetic_stub_has_no_vtable_and_no_dispatchable_body`.
 
 ## Diagnostic that settled it
 

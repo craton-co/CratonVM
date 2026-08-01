@@ -10,7 +10,10 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::num::NonZeroU32;
 
-use super::ir::{Graph, IrType, MemKind, NodeId, Op, SafepointSnapshot, NO_NODE};
+use super::ir::{
+    Graph, InlineScopeTable, IrType, MemKind, NodeId, Op, SafepointSnapshot, MAX_INLINE_SCOPE_DEPTH,
+    NO_NODE,
+};
 use super::ir_schedule::Schedule;
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo, JitRuntimeHelpers};
 use crate::bailout::{
@@ -19,8 +22,10 @@ use crate::bailout::{
 };
 use crate::deopt::{
     ir_deopt_entry, DeoptAction, DeoptReason, DeoptVerifier, DeoptimizationPoint, EliminatedValue,
-    EliminationCause, FrameState, FrameValue, MethodFrameLimits, OopCoverage, VirtualObjectState,
+    EliminationCause, FrameState, FrameValue, MethodFrameLimits, OopCoverage, ResumeSemantics,
+    VirtualObjectState,
 };
+use crate::regalloc::{resolve_parallel_copy, CopyOp, ValueLoc};
 use cratonvm_types::{ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
 
 // ── Header-offset emission sites (arch-2026-07-26 `layout-constant-hazards`) ──
@@ -170,6 +175,20 @@ const ENTRY_ABI_REGS: &[u8] = &[1, 2, 8, 9]; // RCX, RDX, R8, R9
 #[cfg(not(target_os = "windows"))]
 const ENTRY_ABI_REGS: &[u8] = &[7, 6, 2, 1, 8, 9]; // RDI, RSI, RDX, RCX, R8, R9
 
+/// How many incoming argument slots this backend's prologue can actually
+/// deposit — the context pointer (when present) plus the Java arguments,
+/// receiver included.
+///
+/// `emit_prologue` reads incoming arguments from `ENTRY_ABI_REGS` and nothing
+/// else, so this is a hard capacity, not a heuristic: an argument past it
+/// arrives on the caller's stack and is silently dropped. `lower()` refuses
+/// such a graph up front — see the Gap B bail there for what that cost the
+/// last time the two got out of step.
+#[inline]
+fn incoming_abi_reg_capacity() -> usize {
+    ENTRY_ABI_REGS.len()
+}
+
 // ── Lowering state ───────────────────────────────────────────────────
 
 struct Lowerer<'a> {
@@ -279,6 +298,8 @@ struct Lowerer<'a> {
     /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
     /// nodes use the same shared runtime-lowering stub as the baseline tier.
     new_object: usize,
+    monitor_enter: usize,
+    monitor_exit: usize,
     /// Cooperative GC poll flag and no-argument slow path. IR values are
     /// canonicalized in frame slots, so the slow-path call needs no spill.
     safepoint_flag_addr: usize,
@@ -303,6 +324,23 @@ struct Lowerer<'a> {
     /// Shadow `top` captured at method entry; restored by every exit. See the
     /// layout comment in `Lowerer::new`.
     shadow_savetop_slot_off: i32,
+    /// The one reserved frame word [`Lowerer::emit_phi_copies`] parks a value in
+    /// to break a cycle in an edge's parallel copy ([`CopyOp::Save`] /
+    /// [`CopyOp::Restore`]).
+    ///
+    /// RAX is already the *move* temporary — every `Move` reads through it — so
+    /// breaking a cycle needs a second location that survives the intervening
+    /// move, and a frame word is the one thing this backend always has. It is a
+    /// bookkeeping reservation like the four above it, so it sits BELOW
+    /// `first_spill` and can never collide with a colour [`plan_slots`] hands
+    /// out.
+    ///
+    /// Deliberately not zeroed in the prologue and never named by an oop map: a
+    /// `Save` always precedes its matching `Restore` within one straight-line
+    /// copy sequence (no safepoint, no branch, no call in between), so the word
+    /// is never read before it is written and never holds a live reference
+    /// across a point the collector can observe.
+    phi_copy_scratch_slot_off: i32,
     /// `get_current_thread` helper; `0` when unwired (the JIT unit tests' stub
     /// table). Every shadow site is gated on it — dereferencing a thread
     /// pointer that was never fetched would read stack garbage.
@@ -349,7 +387,8 @@ struct Lowerer<'a> {
     /// Byte size of the Java-locals region, for the published `FrameLayout`.
     locals_size: i32,
     /// First operand-spill offset, i.e. the exclusive top of the reserved
-    /// locals region (locals + context + sp-id).
+    /// locals region (locals + context + the five bookkeeping words: sp-id,
+    /// cached thread, shadow save-base, shadow save-top, phi-copy scratch).
     first_spill: i32,
     /// Per-safepoint oop maps published for the moving-young relocation
     /// contract. An empty vector means "no precise coverage", which
@@ -434,6 +473,42 @@ struct Lowerer<'a> {
     /// `Op::New` so a deopt snapshot slot holding it lowers to a
     /// `FrameValue::VirtualObject`. `None` ⇒ disabled (byte-identical default).
     sr_map: Option<&'a ScalarReplacementMap>,
+    /// Which inlined callee each safepoint snapshot belongs to, and the caller
+    /// scopes stacked above it. Consumed by [`Lowerer::caller_chain_for`] to
+    /// fill `FrameState::caller`, which was hard-coded `None` before this
+    /// existed.
+    ///
+    /// Empty on every compile today — `IrBuilder::build` does not inline — and
+    /// an empty table reproduces the historical flat frame states exactly.
+    inline_scopes: &'a InlineScopeTable,
+
+    // ── Linear-scan register read cache ──────────────────────────────
+    //
+    // All four are empty / zero unless `CRATONVM_JIT_IR_LINEAR_SCAN` is on, in
+    // which case `lower_inner_with_scopes` installs the plan after
+    // construction. See the section on [`plan_register_residency`].
+    /// `reg_of[id]` = the XMM number [`plan_register_residency`] gave node
+    /// `id`'s value for its whole life. Empty when the path is off.
+    reg_of: Vec<Option<u8>>,
+    /// `reg_live[id]` = the DEFINITION site for `id` has actually run and
+    /// copied the value into `reg_of[id]`.
+    ///
+    /// This is the safety interlock, not bookkeeping. A read consults
+    /// `reg_live`, never `reg_of` directly, so a definition arm this wave did
+    /// not convert can only cost an optimization — never produce a read of a
+    /// register that was never written. Adding a converted definition site is
+    /// therefore additive; forgetting one is not a correctness event.
+    reg_live: Vec<bool>,
+    /// Register → memory transitions this backend EMITTED for resident values
+    /// (one per resident definition, because the wiring is write-through).
+    /// Reported as `CompilationReport::spills`.
+    ls_spills: usize,
+    /// Memory → register transitions emitted for resident values: the
+    /// materialisation of a value whose definition arm computes into RAX
+    /// (`Op::ConstF`, `Op::Neg`, `Op::Param`) and therefore reaches its
+    /// register through its home word. Reported as
+    /// `CompilationReport::reloads`.
+    ls_reloads: usize,
 }
 
 impl<'a> Lowerer<'a> {
@@ -450,6 +525,7 @@ impl<'a> Lowerer<'a> {
         direct_calls: &'a HashMap<usize, (usize, bool)>,
         ic_slots: &'a HashMap<usize, (usize, usize)>,
         compact_fields: &HashMap<usize, (u32, bool, u8)>,
+        inline_scopes: &'a InlineScopeTable,
     ) -> Self {
         // Frame homes of the reference PARAMETERS, in `[rbp - off]` form. Every
         // safepoint map republishes these; see `emit_safepoint_map`.
@@ -481,18 +557,21 @@ impl<'a> Lowerer<'a> {
         let needs_context = needs.needs_context;
         let max_call_args = needs.max_call_args;
 
-        // Frame layout (rbp downward): locals, [context slot], spills, [args
-        // staging], 16-byte stack-arg reserve, 32-byte shadow. Reserve slots for
+        // Frame layout (rbp downward): locals, [context slot], five bookkeeping
+        // words, spills, [args staging], 16-byte stack-arg reserve, 32-byte
+        // shadow. Reserve slots for
         // locals + one per COLOUR + shadow. The 16-byte tail above the shadow
         // region holds in-frame stack args for any helper called without
         // `emit_stack_arg_setup`; see the matching comment in `x64.rs`
         // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
         let locals_size = (num_locals as i32) * 8;
         let context_size = if needs_context { 8 } else { 0 };
-        // Four extra reserved slots: the safepoint id, the cached
-        // `*mut JvmThread`, the shadow stack's base `top` for this push, and
-        // the shadow `top` watermark captured at method entry.
-        let sp_id_size = 8i32 * 4;
+        // Five extra reserved slots: the safepoint id, the cached
+        // `*mut JvmThread`, the shadow stack's base `top` for this push, the
+        // shadow `top` watermark captured at method entry, and the phi
+        // parallel-copy scratch word (`emit_phi_copies`, which needs a location
+        // other than RAX to park a value in while it unwinds a cycle).
+        let bookkeeping_size = 8i32 * 5;
         // Liveness-based slot reuse: one 8-byte slot per *colour*, not per
         // graph node. [`plan_slots`] has already packed every value whose live
         // range does not overlap another's into a shared slot, so this term is
@@ -516,7 +595,7 @@ impl<'a> Lowerer<'a> {
             frame_size,
             ((locals_size
                 + context_size
-                + sp_id_size
+                + bookkeeping_size
                 + spill_size
                 + args_stage_size
                 + shadow
@@ -581,7 +660,22 @@ impl<'a> Lowerer<'a> {
         // unguarded push stored past the mapping. See
         // `x64.rs::Compiler::emit_epilogue` for the mechanism this mirrors.
         let shadow_savetop_slot_off = (base + 3) * 8;
-        let first_spill = (base + 4) * 8;
+        // One word for the phi parallel copy's `Save`/`Restore` scratch. Every
+        // phi has its OWN frame word (`prealloc_phi_slots`), so an edge whose
+        // copies form a cycle — the swap loop, whose two loop-header phis are
+        // each other's back-edge value — cannot be sequentialised through RAX
+        // alone: RAX is the move temporary and is dead the instant the next
+        // `Move` loads through it. Parking one element of the cycle here frees
+        // its predecessor and the rest unwinds with plain moves
+        // (`regalloc::resolve_parallel_copy`). One word, once per method,
+        // whether or not any edge ever needs it — the alternative was refusing
+        // the compile and dropping a tier on every swap-shaped loop.
+        //
+        // It is a BOOKKEEPING word, below `first_spill`, so `plan_slots` can
+        // never colour a value onto it and `verify_slot_colouring` /
+        // `verify_data_locations` see an unchanged spill band.
+        let phi_copy_scratch_slot_off = (base + 4) * 8;
+        let first_spill = (base + 5) * 8;
         let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
         let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
 
@@ -611,6 +705,8 @@ impl<'a> Lowerer<'a> {
             getfield: helpers.getfield,
             putfield_int: helpers.putfield_int,
             new_object: helpers.new_object,
+            monitor_enter: helpers.monitor_enter,
+            monitor_exit: helpers.monitor_exit,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
@@ -620,6 +716,7 @@ impl<'a> Lowerer<'a> {
             ref_param_homes,
             shadow_savebase_slot_off,
             shadow_savetop_slot_off,
+            phi_copy_scratch_slot_off,
             get_current_thread: helpers.get_current_thread,
             shadow_off_in_thread: helpers.shadow_stack_offset_in_thread as i32,
             pending_shadow: Vec::new(),
@@ -645,6 +742,121 @@ impl<'a> Lowerer<'a> {
             service_callee_deopt: helpers.service_callee_deopt,
             branch_hints,
             sr_map,
+            inline_scopes,
+            // Off by default; `lower_inner_with_scopes` installs a plan when
+            // `CRATONVM_JIT_IR_LINEAR_SCAN` is on. Empty vectors, not
+            // node-sized ones: `resident_xmm` reads through `get`, so an
+            // absent plan costs one bounds check and no allocation.
+            reg_of: Vec::new(),
+            reg_live: Vec::new(),
+            ls_spills: 0,
+            ls_reloads: 0,
+        }
+    }
+
+    /// Install the linear-scan register plan. Called once, after construction
+    /// and before any emission, only when the path is enabled.
+    fn set_residency(&mut self, residency: RegResidency) {
+        self.reg_live = vec![false; residency.reg_of.len()];
+        self.reg_of = residency.reg_of;
+    }
+
+    /// The XMM register `id`'s value is CURRENTLY resident in, if any.
+    ///
+    /// Gated on `reg_live`, not on `reg_of`: a value is only readable from a
+    /// register once its definition site has published it there. See the field
+    /// comment for why that direction is the safe one.
+    fn resident_xmm(&self, id: NodeId) -> Option<u8> {
+        if !self.reg_live.get(id as usize).copied().unwrap_or(false) {
+            return None;
+        }
+        self.reg_of.get(id as usize).copied().flatten()
+    }
+
+    /// MOVAPS `dst`, `src` — a full 128-bit register copy.
+    ///
+    /// `MOVAPS` rather than `MOVSS`/`MOVSD` so the copy has no false
+    /// dependency on `dst`'s previous contents and one encoding serves both
+    /// widths: the low 32 or 64 bits are what every consumer reads, and a bit
+    /// copy preserves them exactly (NaN payloads included — this must never be
+    /// an arithmetic move).
+    fn fp_reg_move(&mut self, dst: u8, src: u8) {
+        if dst == src {
+            return;
+        }
+        // REX.R for dst >= 8, REX.B for src >= 8. `IR_LOWER_LS_XMMS` is
+        // XMM2–XMM5 and the value tier is XMM0/XMM1, so no REX is emitted
+        // today; encoding it anyway keeps the helper correct if the file grows.
+        let rex = 0x40u8 | (((dst >= 8) as u8) << 2) | ((src >= 8) as u8);
+        if rex != 0x40 {
+            self.buf.emit_byte(rex);
+        }
+        self.buf
+            .emit(&[0x0F, 0x28, 0xC0 | ((dst & 7) << 3) | (src & 7)]);
+    }
+
+    /// Load `id`'s value into `xmm`, from its resident register when it has
+    /// one and from its home word otherwise.
+    ///
+    /// The read half of the cache. Every FP operand read in `lower_data_node`
+    /// goes through here; a site left calling `fp_load(self.slot_of(id))`
+    /// directly is simply not accelerated.
+    fn fp_load_value(&mut self, xmm: u8, id: NodeId, is_double: bool) {
+        // Bound out of the scrutinee position: every read of `self` here must
+        // finish before the emitters take `&mut self`.
+        let resident = self.resident_xmm(id);
+        match resident {
+            Some(src) => self.fp_reg_move(xmm, src),
+            None => {
+                let off = self.slot_of(id);
+                self.fp_load(xmm, off, is_double);
+            }
+        }
+    }
+
+    /// The register `id`'s value has been ASSIGNED, whether or not its
+    /// definition has published it yet. Only the two publishing sites may use
+    /// this; every reader goes through [`Self::resident_xmm`].
+    fn assigned_xmm(&self, id: NodeId) -> Option<u8> {
+        self.reg_of.get(id as usize).copied().flatten()
+    }
+
+    /// Mark `id` readable from its assigned register.
+    fn mark_reg_live(&mut self, id: NodeId) {
+        if let Some(cell) = self.reg_live.get_mut(id as usize) {
+            *cell = true;
+        }
+    }
+
+    /// Write `id`'s result from `xmm`: ALWAYS to the home word, and
+    /// additionally into its resident register.
+    ///
+    /// The write-through invariant lives here. The home store is emitted
+    /// unconditionally and first, so the frame image is complete at every
+    /// instruction boundary — which is what lets `emit_safepoint_map`,
+    /// `build_deopt_points` and `emit_phi_copies` stay untouched.
+    fn fp_store_value(&mut self, id: NodeId, slot: i32, xmm: u8, is_double: bool) {
+        self.fp_store(slot, xmm, is_double);
+        let dst = self.assigned_xmm(id);
+        if let Some(dst) = dst {
+            self.fp_reg_move(dst, xmm);
+            self.ls_spills += 1;
+            self.mark_reg_live(id);
+        }
+    }
+
+    /// Publish a result that was computed in RAX and already stored to its home
+    /// word (`Op::ConstF`, FP `Op::Neg`, FP `Op::Param`) into its register.
+    ///
+    /// A memory → register transition, and counted as one: the value's only
+    /// materialisation is the home word this reads back. It is still a win in
+    /// a loop, where the alternative is that load once per use.
+    fn publish_fp_from_slot(&mut self, id: NodeId, slot: i32, is_double: bool) {
+        let dst = self.assigned_xmm(id);
+        if let Some(dst) = dst {
+            self.fp_load(dst, slot, is_double);
+            self.ls_reloads += 1;
+            self.mark_reg_live(id);
         }
     }
 
@@ -1028,10 +1240,13 @@ fn reloc_emit_enabled() -> bool {
     ///
     /// Each copy loads the incoming SSA value (already spilled by the
     /// predecessor block, which is lowered before its terminator) into RAX
-    /// and stores it into the phi's reserved slot. The phi value sources
-    /// are predecessor-side snapshots, never this merge's own phis, so the
-    /// copies have no read-after-write cycle and a single scratch register
-    /// is sufficient.
+    /// and stores it into the phi's reserved slot.
+    ///
+    /// The copies are a PARALLEL assignment: every source is read as it was
+    /// *before* any destination is written. They are therefore sequentialised
+    /// by [`resolve_parallel_copy`] rather than emitted in gather order, and a
+    /// cycle among them is broken through [`Lowerer::phi_copy_scratch_slot_off`].
+    /// See the doc comment on the emission loop below for what was wrong before.
     fn emit_phi_copies(&mut self, pred_block: usize, succ_block: usize) {
         let merge_ctrl = self.schedule.blocks[succ_block].ctrl;
         // Only Merge/Region blocks carry phis tied to incoming edges.
@@ -1073,10 +1288,76 @@ fn reloc_emit_enabled() -> bool {
             }
         }
 
-        for (dst_slot, src_slot) in copies {
-            self.load_to_rax(src_slot);
-            self.store_rax(dst_slot);
+        // Phi copies are a PARALLEL assignment, not a sequence.
+        //
+        // `prealloc_phi_slots` gives every phi its own frame word, so a loop
+        // that swaps two locals makes each phi the other's back-edge value and
+        // this list becomes a cycle (`a <- b, b <- a`). Emitted in gather order
+        // through RAX, the second copy reads the word the first just overwrote
+        // and both locals end up holding `b` — a wrong-code bug, not a missed
+        // optimisation.
+        //
+        // `resolve_parallel_copy` orders the copies so that every read still
+        // sees the pre-copy value: destinations nothing else reads go first,
+        // and when only cycles remain one element is parked in the scratch,
+        // which frees its predecessor and unwinds the rest of the cycle. The
+        // acyclic majority — every merge that is not a permutation — pays
+        // exactly the same one load + one store per copy it always did, and
+        // touches the scratch word not at all.
+        //
+        // An intermediate state of this fix REFUSED a residual cycle
+        // (`UnsupportedShape("cyclic phi parallel copy")`) because no scratch
+        // location was reserved. That was correct but dropped every swap-shaped
+        // loop to a lower tier; `phi_copy_scratch_slot_off` is the reserved word
+        // that makes the refusal unnecessary.
+        let ops = match phi_copy_sequence(&copies) {
+            Ok(ops) => ops,
+            Err(bailout) => {
+                let Bailout { reason, context } = bailout;
+                let edge = format!("phi parallel copy on block {pred_block} -> {succ_block}");
+                self.latch_bailout(Bailout::with_context(
+                    reason,
+                    match context {
+                        Some(c) => format!("{edge}: {c}"),
+                        None => edge,
+                    },
+                ));
+                return;
+            }
+        };
+        for op in ops {
+            if let Err(bailout) = self.emit_copy_op(op) {
+                self.latch_bailout(bailout);
+                return;
+            }
         }
+    }
+
+    /// Emit one sequentialised [`CopyOp`], routed through RAX (the move
+    /// temporary) and, for `Save`/`Restore`, the reserved scratch frame word.
+    ///
+    /// `Save` and `Restore` are *not* a push/pop pair: `resolve_parallel_copy`
+    /// emits at most one live save at a time and always consumes it before
+    /// starting another cycle, so a single word suffices no matter how many
+    /// disjoint cycles the edge contains.
+    fn emit_copy_op(&mut self, op: CopyOp) -> CompileResult<()> {
+        let scratch = self.phi_copy_scratch_slot_off;
+        let (src, dst) = match op {
+            CopyOp::Move { from, to } => (frame_word_off(from)?, frame_word_off(to)?),
+            CopyOp::Save { from } => (frame_word_off(from)?, scratch),
+            CopyOp::Restore { to } => (scratch, frame_word_off(to)?),
+        };
+        // The scratch is a reserved bookkeeping word placed by `Lowerer::new`;
+        // a zero here would encode `[rbp - 0]`, the saved caller RBP.
+        if src <= 0 || dst <= 0 {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal("ir_lower: a phi copy names frame offset 0"),
+                format!("[rbp - {dst}] <- [rbp - {src}]"),
+            ));
+        }
+        self.load_to_rax(src);
+        self.store_rax(dst);
+        Ok(())
     }
 
     // ── Code emission helpers ────────────────────────────────────────
@@ -1092,17 +1373,32 @@ fn reloc_emit_enabled() -> bool {
 
         // Store params from ABI registers to local frame slots.
         // Windows: RCX, RDX, R8, R9.  SysV: RDI, RSI, RDX, RCX, R8, R9.
-        #[cfg(target_os = "windows")]
-        let abi_regs: &[u8] = &[RCX, RDX, 8, 9]; // RCX, RDX, R8, R9
-        #[cfg(not(target_os = "windows"))]
-        let abi_regs: &[u8] = &[7, 6, RDX, RCX, 8, 9]; // RDI, RSI, RDX, RCX, R8, R9
+        // One list, shared with `incoming_abi_reg_capacity()` — the local copy
+        // this used to keep could (and did) disagree with the bail that is
+        // supposed to keep the `break` below unreachable.
+        let abi_regs: &[u8] = ENTRY_ABI_REGS;
 
         // Gap B: a `needs_context` method receives the VM context pointer in
         // ABI[0] (the `try_call_with_context` convention), with the Java params
         // shifted to ABI[1..]. Store the context to its slot, then the params to
-        // their local slots. `lower()` bails (single-pass) before reaching here
-        // if `1 + num_params` would exceed the register args, so every param
-        // below comes from a register.
+        // their local slots.
+        //
+        // `lower()` refuses the graph before reaching here when the context
+        // slot plus the Java arguments would exceed `incoming_abi_reg_capacity()`,
+        // so every param below comes from a register. The `break` is that
+        // guard's backstop, NOT a supported path: an argument past the register
+        // file arrives on the caller's stack, and dropping it leaves the local
+        // holding whatever the frame slot contained — a silent wrong value, no
+        // diagnostic. That is what shipped while the bail was scoped to
+        // `needs_context` only.
+        debug_assert!(
+            self.num_params + usize::from(self.needs_context) <= abi_regs.len(),
+            "lower() must refuse {} incoming slots (needs_context={}) — the prologue \
+             can only deposit {}",
+            self.num_params,
+            self.needs_context,
+            abi_regs.len(),
+        );
         let base = if self.needs_context {
             self.store_abi_reg(abi_regs[0], self.context_slot_off);
             1
@@ -2665,16 +2961,22 @@ fn reloc_emit_enabled() -> bool {
                 let param_offset = ((*idx as i32) + 1) * 8;
                 self.load_to_rax(param_offset);
                 self.store_rax(slot);
+                // An FP parameter is a loop invariant often enough to be worth
+                // a register; the copy comes from the home word this just
+                // wrote, because the prologue delivered it through a GPR.
+                if matches!(node.ty, IrType::Float | IrType::Double) {
+                    self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
+                }
             }
             Op::Add => {
                 let slot = self.alloc_slot(id);
                 if matches!(node.ty, IrType::Float | IrType::Double) {
                     // ADDSS/ADDSD XMM0, XMM1
                     let is_d = node.ty == IrType::Double;
-                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
-                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_load_value(XMM0, node.inputs[0], is_d);
+                    self.fp_load_value(XMM1, node.inputs[1], is_d);
                     self.fp_binop(0x58, XMM0, XMM1, is_d);
-                    self.fp_store(slot, XMM0, is_d);
+                    self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.load_to_rax(self.slot_of(node.inputs[0]));
                     self.load_to_rcx(self.slot_of(node.inputs[1]));
@@ -2693,10 +2995,10 @@ fn reloc_emit_enabled() -> bool {
                 if matches!(node.ty, IrType::Float | IrType::Double) {
                     // SUBSS/SUBSD XMM0, XMM1
                     let is_d = node.ty == IrType::Double;
-                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
-                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_load_value(XMM0, node.inputs[0], is_d);
+                    self.fp_load_value(XMM1, node.inputs[1], is_d);
                     self.fp_binop(0x5C, XMM0, XMM1, is_d);
-                    self.fp_store(slot, XMM0, is_d);
+                    self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.load_to_rax(self.slot_of(node.inputs[0]));
                     self.load_to_rcx(self.slot_of(node.inputs[1]));
@@ -2715,10 +3017,10 @@ fn reloc_emit_enabled() -> bool {
                 if matches!(node.ty, IrType::Float | IrType::Double) {
                     // MULSS/MULSD XMM0, XMM1
                     let is_d = node.ty == IrType::Double;
-                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
-                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_load_value(XMM0, node.inputs[0], is_d);
+                    self.fp_load_value(XMM1, node.inputs[1], is_d);
                     self.fp_binop(0x59, XMM0, XMM1, is_d);
-                    self.fp_store(slot, XMM0, is_d);
+                    self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.load_to_rax(self.slot_of(node.inputs[0]));
                     self.load_to_rcx(self.slot_of(node.inputs[1]));
@@ -2739,10 +3041,10 @@ fn reloc_emit_enabled() -> bool {
                 // and is never a deopt point.
                 if matches!(node.ty, IrType::Float | IrType::Double) {
                     let is_d = node.ty == IrType::Double;
-                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
-                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_load_value(XMM0, node.inputs[0], is_d);
+                    self.fp_load_value(XMM1, node.inputs[1], is_d);
                     self.fp_binop(0x5E, XMM0, XMM1, is_d);
-                    self.fp_store(slot, XMM0, is_d);
+                    self.fp_store_value(id, slot, XMM0, is_d);
                     return;
                 }
                 let ty = node.ty;
@@ -2783,12 +3085,12 @@ fn reloc_emit_enabled() -> bool {
                 // there is NO exception-sentinel check, unlike `Op::Call`.
                 if matches!(node.ty, IrType::Float | IrType::Double) {
                     let is_d = node.ty == IrType::Double;
-                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d); // a
-                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d); // b
+                    self.fp_load_value(XMM0, node.inputs[0], is_d); // a
+                    self.fp_load_value(XMM1, node.inputs[1], is_d); // b
                     let helper = if is_d { self.drem } else { self.frem };
                     self.emit_mov_reg_imm64(RAX, helper as u64);
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
-                    self.fp_store(slot, XMM0, is_d);
+                    self.fp_store_value(id, slot, XMM0, is_d);
                     return;
                 }
                 let ty = node.ty;
@@ -2811,6 +3113,49 @@ fn reloc_emit_enabled() -> bool {
                 self.buf.emit(&[0x48, 0x89, 0xD0]);
                 self.patch_div_overflow_after(ovf_after);
                 self.store_rax(slot);
+            }
+            Op::MonitorEnter | Op::MonitorExit => {
+                // `[ctrl, mem, obj]`.
+                let obj_id = node.inputs[2];
+                let obj_slot = self.slot_of(obj_id);
+                // Publish the map BEFORE the call, same contract as `Op::Call`:
+                // both monitor ops carry `safepoint: true`, and a contended
+                // acquire parks this thread for an entire collection.
+                let sp_live_hi = self.spill_high_water;
+                self.emit_safepoint_map(sp_live_hi);
+                let target = if matches!(node.op, Op::MonitorEnter) {
+                    self.monitor_enter
+                } else {
+                    self.monitor_exit
+                };
+                crate::runtime_lowering::emit_monitor_stub(
+                    &mut self.buf,
+                    self.context_slot_off,
+                    obj_slot,
+                    target,
+                    self.frame_record,
+                );
+                // `i64::MIN` means the helper published a pending Java
+                // exception (a null receiver takes the NPE path).
+                self.emit_mov_reg_imm64(RCX, i64::MIN as u64);
+                self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                self.buf.emit(&[0x0F, 0x85]); // JNE ok
+                let ok_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.buf.emit_byte(0xE9); // JMP shared exception epilogue
+                let exception_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.call_exc_patches.push(exception_patch);
+                let ok = self.buf.pos();
+                let rel = ok as i32 - (ok_patch as i32 + 4);
+                Self::patch_or_bail(&mut self.buf, ok_patch, rel);
+                // Store the possibly-REMAPPED reference back. A contended
+                // acquire can move the object while this thread is parked.
+                // Idempotent with the collector's own rewrite:
+                // `conservative_roots::remap_one_jit_frame` rewrites published
+                // slots keyed on their CURRENT value, so if it already wrote
+                // the new address, writing the same address again is a no-op.
+                self.store_rax(obj_slot);
             }
             Op::New {
                 class_id,
@@ -2875,6 +3220,11 @@ fn reloc_emit_enabled() -> bool {
                     }
                 }
                 self.store_rax(slot);
+                // The FP arms computed in RAX, so an XMM-resident result
+                // reaches its register through the home word it just wrote.
+                if matches!(node.ty, IrType::Float | IrType::Double) {
+                    self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
+                }
             }
             Op::And => {
                 let slot = self.alloc_slot(id);
@@ -3013,8 +3363,8 @@ fn reloc_emit_enabled() -> bool {
                 //         ⇒ AL-DL = {a>b:+1, a<b:-1, eq:0, NaN:+1}.
                 let is_d = *double;
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d); // a
-                self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d); // b
+                self.fp_load_value(XMM0, node.inputs[0], is_d); // a
+                self.fp_load_value(XMM1, node.inputs[1], is_d); // b
                 if *nan_greater {
                     // UCOMIS XMM1, XMM0 (compare b vs a) — ModRM C8.
                     if is_d {
@@ -3076,13 +3426,19 @@ fn reloc_emit_enabled() -> bool {
                 // baked below). The point's frame state comes from the safepoint
                 // snapshot recorded for `bci` during IR building.
                 let frame_state = self.resolve_frame_state_for_bci(bci);
+                let reason = DeoptReason::UncommonTrap;
                 let point = Box::new(DeoptimizationPoint {
                     native_offset: self.buf.pos() as u32,
                     bci: bci as u32,
-                    reason: DeoptReason::UncommonTrap,
+                    reason,
                     action: DeoptAction::Reinterpret,
                     speculation_id: 0,
                     frame_state,
+                    // The guard fires BEFORE the bytecode it protects, so the
+                    // interpreter re-runs that bytecode. `for_reason` is the
+                    // convention this file already documents, now written down
+                    // in the metadata instead of inferred by each consumer.
+                    semantics: ResumeSemantics::for_reason(reason),
                 });
                 let point_ptr = point.as_ref() as *const DeoptimizationPoint as u64;
                 self.deopt_boxes.push(point);
@@ -3285,7 +3641,7 @@ fn reloc_emit_enabled() -> bool {
                 let sib = if is_d { 0xC8 } else { 0x88 };
                 self.buf
                     .emit(&[prefix, 0x0F, 0x10, 0x44, sib, HEADER_SIZE as u8]);
-                self.fp_store(slot, XMM0, is_d);
+                self.fp_store_value(id, slot, XMM0, is_d);
             }
             // FP array element store (Slice B) — `fastore`/`dastore`. inputs =
             // [ctrl, mem, array, index, value]. Load the value into XMM0 first
@@ -3297,7 +3653,7 @@ fn reloc_emit_enabled() -> bool {
                 let _slot = self.alloc_slot(id);
                 let is_d = matches!(kind, MemKind::Double);
                 let bci = node.bytecode_pc.unwrap_or(0);
-                self.fp_load(XMM0, self.slot_of(node.inputs[4]), is_d); // value → XMM0
+                self.fp_load_value(XMM0, node.inputs[4], is_d); // value → XMM0
                 self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
                 self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
                 self.emit_array_null_bounds_guards(bci);
@@ -3465,6 +3821,11 @@ fn reloc_emit_enabled() -> bool {
                 let slot = self.alloc_slot(id);
                 self.emit_mov_rax_imm64(*bits as i64);
                 self.store_rax(slot);
+                // A float/double constant is materialised as an integer
+                // immediate, so its register copy comes from the home word.
+                // `regalloc` calls `Op::ConstF` rematerializable and evicts it
+                // first for exactly this reason; here it is simply cheap.
+                self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
             }
             // int → float / double. Load the int operand to EAX and convert.
             Op::I2F => {
@@ -3472,14 +3833,14 @@ fn reloc_emit_enabled() -> bool {
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 // CVTSI2SS XMM0, EAX
                 self.buf.emit(&[0xF3, 0x0F, 0x2A, 0xC0]);
-                self.fp_store(slot, XMM0, false);
+                self.fp_store_value(id, slot, XMM0, false);
             }
             Op::I2D => {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 // CVTSI2SD XMM0, EAX
                 self.buf.emit(&[0xF2, 0x0F, 0x2A, 0xC0]);
-                self.fp_store(slot, XMM0, true);
+                self.fp_store_value(id, slot, XMM0, true);
             }
             // long → float / double (64-bit source operand in RAX).
             Op::L2F => {
@@ -3487,21 +3848,21 @@ fn reloc_emit_enabled() -> bool {
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 // CVTSI2SS XMM0, RAX (REX.W)
                 self.buf.emit(&[0xF3, 0x48, 0x0F, 0x2A, 0xC0]);
-                self.fp_store(slot, XMM0, false);
+                self.fp_store_value(id, slot, XMM0, false);
             }
             Op::L2D => {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 // CVTSI2SD XMM0, RAX (REX.W)
                 self.buf.emit(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
-                self.fp_store(slot, XMM0, true);
+                self.fp_store_value(id, slot, XMM0, true);
             }
             // float → int / long (truncate toward zero, with the JVM
             // NaN→0 / overflow→MAX|MIN fixup). Source stays in XMM0 for the
             // fixup's sign/NaN test.
             Op::F2I => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), false);
+                self.fp_load_value(XMM0, node.inputs[0], false);
                 // CVTTSS2SI EAX, XMM0
                 self.buf.emit(&[0xF3, 0x0F, 0x2C, 0xC0]);
                 self.emit_fp_to_int_fixup(/* is_double */ false, /* is_long */ false);
@@ -3511,7 +3872,7 @@ fn reloc_emit_enabled() -> bool {
             }
             Op::F2L => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), false);
+                self.fp_load_value(XMM0, node.inputs[0], false);
                 // CVTTSS2SI RAX, XMM0 (REX.W)
                 self.buf.emit(&[0xF3, 0x48, 0x0F, 0x2C, 0xC0]);
                 self.emit_fp_to_int_fixup(/* is_double */ false, /* is_long */ true);
@@ -3520,15 +3881,15 @@ fn reloc_emit_enabled() -> bool {
             // float → double.
             Op::F2D => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), false);
+                self.fp_load_value(XMM0, node.inputs[0], false);
                 // CVTSS2SD XMM0, XMM0
                 self.buf.emit(&[0xF3, 0x0F, 0x5A, 0xC0]);
-                self.fp_store(slot, XMM0, true);
+                self.fp_store_value(id, slot, XMM0, true);
             }
             // double → int / long (truncate toward zero, with the JVM fixup).
             Op::D2I => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), true);
+                self.fp_load_value(XMM0, node.inputs[0], true);
                 // CVTTSD2SI EAX, XMM0
                 self.buf.emit(&[0xF2, 0x0F, 0x2C, 0xC0]);
                 self.emit_fp_to_int_fixup(/* is_double */ true, /* is_long */ false);
@@ -3537,7 +3898,7 @@ fn reloc_emit_enabled() -> bool {
             }
             Op::D2L => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), true);
+                self.fp_load_value(XMM0, node.inputs[0], true);
                 // CVTTSD2SI RAX, XMM0 (REX.W)
                 self.buf.emit(&[0xF2, 0x48, 0x0F, 0x2C, 0xC0]);
                 self.emit_fp_to_int_fixup(/* is_double */ true, /* is_long */ true);
@@ -3546,10 +3907,10 @@ fn reloc_emit_enabled() -> bool {
             // double → float.
             Op::D2F => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), true);
+                self.fp_load_value(XMM0, node.inputs[0], true);
                 // CVTSD2SS XMM0, XMM0
                 self.buf.emit(&[0xF2, 0x0F, 0x5A, 0xC0]);
-                self.fp_store(slot, XMM0, false);
+                self.fp_store_value(id, slot, XMM0, false);
             }
             // Control and meta nodes — skip
             Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {}
@@ -3828,9 +4189,14 @@ fn reloc_emit_enabled() -> bool {
     /// snapshot. Falls back to an empty frame if no snapshot exists (e.g. a
     /// hand-built graph that did not register one) — the resume bci is still
     /// carried so the deopt is well-formed.
+    ///
+    /// First match on `bci` wins, exactly as before. The *index* of that match
+    /// is what binds the snapshot to its inlined scope
+    /// ([`InlineScopeTable::snapshot_scope`]), so the search is a `position`
+    /// rather than a `find`.
     fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
-        match self.graph.safepoints.iter().find(|s| s.bci == bci) {
-            Some(sp) => self.resolve_frame_state(sp),
+        match self.graph.safepoints.iter().position(|s| s.bci == bci) {
+            Some(idx) => self.resolve_frame_state(&self.graph.safepoints[idx], idx),
             None => FrameState {
                 method_key: String::new(),
                 bci: bci as u32,
@@ -3974,6 +4340,10 @@ fn reloc_emit_enabled() -> bool {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state,
+            // Null / bounds / div-by-zero guards all fire before the bytecode
+            // they protect; `PendingException` (the one rethrow reason) never
+            // reaches here. See `ResumeSemantics::for_reason`.
+            semantics: ResumeSemantics::for_reason(reason),
         });
         let point_ptr = point.as_ref() as *const DeoptimizationPoint as u64;
         self.deopt_boxes.push(point);
@@ -4014,7 +4384,14 @@ fn reloc_emit_enabled() -> bool {
         // continues; otherwise (index >= length, OR a negative index whose
         // unsigned value is huge) deopt → AIOOBE.
         self.buf
-            .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV R10D,[RAX+12]
+            .emit(&[
+                0x44,
+                0x8B,
+                0x50,
+                // Compile-time checked: a layout constant past 127 would encode a
+                // NEGATIVE disp8 and read before the object.
+                crate::x64::disp::disp8_const(ARRAY_LENGTH_OFFSET as i64) as u8,
+            ]); // MOV R10D,[RAX+12]
         self.buf.emit(&[0x44, 0x39, 0xD1]); // CMP ECX, R10D
         self.emit_deopt_unless(0x82, bci, DeoptReason::BoundsCheck); // JB continue
     }
@@ -4111,7 +4488,35 @@ fn reloc_emit_enabled() -> bool {
     /// `method_key` is left to the VM caller to fill (the lowerer does not
     /// know it); deopt resume keys on the running `CompiledMethod`, not this
     /// string. It is recorded empty here.
-    fn resolve_frame_state(&self, sp: &SafepointSnapshot) -> FrameState {
+    ///
+    /// `index` is the snapshot's position in `Graph::safepoints`, which is what
+    /// binds it to its inlined scope: `caller` is the chain of frames parked
+    /// mid-`invoke` above this one ([`Self::caller_chain_for`]). With an empty
+    /// [`InlineScopeTable`] — every compile today — `caller` is `None` and this
+    /// produces exactly the frame state it always did.
+    fn resolve_frame_state(&self, sp: &SafepointSnapshot, index: usize) -> FrameState {
+        let (locals, stack) = self.resolve_frame_values(sp);
+        FrameState {
+            method_key: String::new(),
+            bci: sp.bci as u32,
+            locals,
+            stack,
+            monitors: Vec::new(),
+            caller: self.caller_chain_for(index),
+        }
+    }
+
+    /// The `(locals, stack)` halves of one snapshot's frame — everything
+    /// [`Self::resolve_frame_state`] builds except the identity and the caller
+    /// chain.
+    ///
+    /// Split out so [`Self::caller_chain_for`] can resolve a *caller's*
+    /// snapshot without re-entering `resolve_frame_state`. Chaining those two
+    /// would be mutually recursive, and a table that (wrongly) named a scope's
+    /// own snapshot as its `caller_snapshot` would recurse until the stack ran
+    /// out — inside a compile, for a metadata defect. There is no cycle to
+    /// defend against here because this function never looks at a scope.
+    fn resolve_frame_values(&self, sp: &SafepointSnapshot) -> (Vec<FrameValue>, Vec<FrameValue>) {
         // Guard-surviving scalar replacement (producer): when `sr_map` is set, a
         // snapshot slot holding a scalar-replaced (now-`Op::Dead`) `Op::New`
         // lowers to a `FrameValue::VirtualObject` (first occurrence) /
@@ -4155,23 +4560,80 @@ fn reloc_emit_enabled() -> bool {
                     self.frame_value_for(n)
                 });
             }
-            return FrameState {
-                method_key: String::new(),
-                bci: sp.bci as u32,
+            return (locals, stack);
+        }
+        (
+            sp.locals.iter().map(|&n| self.frame_value_for(n)).collect(),
+            sp.stack.iter().map(|&n| self.frame_value_for(n)).collect(),
+        )
+    }
+
+    /// The chain of inlined **caller** frames above the snapshot at `index`,
+    /// outermost last — i.e. exactly what `FrameState::caller` wants.
+    ///
+    /// `None` when the snapshot belongs to no inlined callee, which is every
+    /// snapshot on every compile today (`IrBuilder::build` does not inline, so
+    /// [`Lowerer::inline_scopes`] is empty). The early return keeps that path
+    /// allocation-free.
+    ///
+    /// ## Fail-closed on an undescribed caller
+    ///
+    /// A caller frame is not empty: its locals and operand stack are live, and
+    /// a resume has to rebuild them. When the scope names no
+    /// `caller_snapshot` — or names one that does not exist — this emits a
+    /// frame holding a single [`FrameValue::Unsupported`] rather than an empty
+    /// one. An empty caller frame is *silently wrong*: the resume sinks map a
+    /// missing slot to `Value::Int(0)`, so a future sink that learned to resume
+    /// chains would resume the caller with all-zero locals and no error
+    /// anywhere. `Unsupported` makes the whole chain fail
+    /// [`crate::deopt::frame_state_is_resumable`] — which walks the caller
+    /// chain precisely so this cannot pass as clean — and the artifact is
+    /// refused at admission instead.
+    ///
+    /// ## Known gap, unreachable today
+    ///
+    /// Each scope's values are resolved by its own [`Self::resolve_frame_values`]
+    /// call, so the `emitted` set that turns a repeated scalar-replaced object
+    /// into a `VirtualObjectRef` does not span scopes: an object live in BOTH a
+    /// callee and its caller would be *defined* twice, and the materializer
+    /// would rebuild two objects where the program had one. Unreachable while
+    /// the scope table is empty; a producer that starts building chains must
+    /// thread one `emitted` set through the whole chain first. See
+    /// `docs/jit/deopt-inline-scopes.md`.
+    fn caller_chain_for(&self, index: usize) -> Option<Box<FrameState>> {
+        if self.inline_scopes.is_empty() {
+            return None;
+        }
+        let scope = self.inline_scopes.snapshot_scope(index)?;
+        // Outermost-first, so each frame can be built with the one already
+        // built as its own caller. `chain` is capped at
+        // `MAX_INLINE_SCOPE_DEPTH`, so this cannot run away on a bad table.
+        let chain = self.inline_scopes.chain(scope);
+        debug_assert!(chain.len() <= MAX_INLINE_SCOPE_DEPTH);
+        let mut built: Option<Box<FrameState>> = None;
+        for &handle in chain.iter().rev() {
+            let Some(sc) = self.inline_scopes.scope(handle) else {
+                continue;
+            };
+            let described = sc
+                .caller_snapshot
+                .and_then(|si| self.graph.safepoints.get(si as usize))
+                .map(|sp| self.resolve_frame_values(sp));
+            let (locals, stack) = match described {
+                Some(parts) => parts,
+                // See "Fail-closed on an undescribed caller" above.
+                None => (vec![FrameValue::Unsupported], Vec::new()),
+            };
+            built = Some(Box::new(FrameState {
+                method_key: sc.method_key.clone(),
+                bci: sc.caller_bci,
                 locals,
                 stack,
                 monitors: Vec::new(),
-                caller: None,
-            };
+                caller: built.take(),
+            }));
         }
-        FrameState {
-            method_key: String::new(),
-            bci: sp.bci as u32,
-            locals: sp.locals.iter().map(|&n| self.frame_value_for(n)).collect(),
-            stack: sp.stack.iter().map(|&n| self.frame_value_for(n)).collect(),
-            monitors: Vec::new(),
-            caller: None,
-        }
+        built
     }
 
     /// Block where the deopt at `bci` fires — the program point all of a
@@ -4368,21 +4830,23 @@ fn reloc_emit_enabled() -> bool {
     /// search. Snapshots whose bci emitted no machine code are skipped.
     fn build_deopt_points(&self) -> Vec<DeoptimizationPoint> {
         let mut points: Vec<DeoptimizationPoint> = Vec::with_capacity(self.graph.safepoints.len());
-        for sp in &self.graph.safepoints {
+        for (index, sp) in self.graph.safepoints.iter().enumerate() {
             let native_offset = match self.bci_native.get(&sp.bci) {
                 Some(&off) => off as u32,
                 // bci produced no node / no machine code — nothing to anchor.
                 None => continue,
             };
+            // No speculation yet — these are plain resume points (step 2,
+            // emit-and-discard). A real guard (step 3) sets its own reason.
+            let reason = DeoptReason::TransferToInterpreter;
             points.push(DeoptimizationPoint {
                 native_offset,
                 bci: sp.bci as u32,
-                // No speculation yet — these are plain resume points (step 2,
-                // emit-and-discard). A real guard (step 3) sets its own reason.
-                reason: DeoptReason::TransferToInterpreter,
+                reason,
                 action: DeoptAction::Reinterpret,
                 speculation_id: 0,
-                frame_state: self.resolve_frame_state(sp),
+                frame_state: self.resolve_frame_state(sp, index),
+                semantics: ResumeSemantics::for_reason(reason),
             });
         }
         points.sort_by_key(|p| p.native_offset);
@@ -4444,7 +4908,7 @@ fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
 /// `needs`.
 ///
 /// Mirrors [`Lowerer::new`]'s layout exactly — locals, optional context slot,
-/// the four reserved bookkeeping slots, the spill reservation, the outgoing
+/// the five reserved bookkeeping slots, the spill reservation, the outgoing
 /// argument staging area, the 16-byte stack-argument reserve and the 32-byte
 /// ABI shadow space, rounded up to the 16-byte stack alignment — but in
 /// saturating `usize` arithmetic, so a graph big enough to overflow the
@@ -4463,8 +4927,10 @@ fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
 fn estimate_frame_bytes(num_locals: usize, spill_slots: usize, needs: &FrameNeeds) -> usize {
     let locals = num_locals.saturating_mul(8);
     let context = if needs.needs_context { 8 } else { 0 };
-    // safepoint id, cached thread pointer, shadow save-base, shadow save-top.
-    let bookkeeping = 8usize * 4;
+    // safepoint id, cached thread pointer, shadow save-base, shadow save-top,
+    // phi parallel-copy scratch. Mirrors `bookkeeping_size` in `Lowerer::new`;
+    // the `debug_assert_eq!` there is what keeps the two counts equal.
+    let bookkeeping = 8usize * 5;
     let spills = spill_slots.saturating_mul(8);
     let args_stage = needs.max_call_args.saturating_mul(8);
     let shadow = 32usize;
@@ -4510,6 +4976,77 @@ fn check_frame_size(frame_bytes: usize, limit: usize) -> CompileResult<()> {
         }));
     }
     Ok(())
+}
+
+// ── Phi parallel copy: the `ValueLoc` view of a frame word ───────────
+
+/// The [`ValueLoc`] this backend uses for the frame word at `[rbp - off]`.
+///
+/// [`resolve_parallel_copy`] only ever *compares* locations — it never
+/// dereferences one, and the scratch is deliberately unnamed in [`CopyOp`] — so
+/// the payload has to be an injective token for "this frame word" and nothing
+/// more. The rbp-relative byte offset is exactly that: it is what
+/// [`Lowerer::slot_of`] hands out, it is positive and bounded by
+/// [`DEFAULT_MAX_FRAME_BYTES`], and no arithmetic is done to it on the way in or
+/// out.
+///
+/// Deliberately NOT `off / 8`, even though every offset this file produces is on
+/// the 8-byte grid. A division would map two distinct offsets onto one location
+/// the moment that ever stopped being true, and `resolve_parallel_copy` DROPS a
+/// copy whose destination and source are the same location — so the aliasing
+/// would silently delete a real move, which is the same class of wrong-code bug
+/// as the sequential emission this replaces.
+fn frame_word_loc(off: i32) -> CompileResult<ValueLoc> {
+    u32::try_from(off)
+        .ok()
+        .filter(|&o| o != 0)
+        .map(ValueLoc::Slot)
+        .ok_or_else(|| {
+            Bailout::with_context(
+                BailoutReason::Internal("ir_lower: a phi copy names a non-frame location"),
+                format!("offset {off}"),
+            )
+        })
+}
+
+/// Inverse of [`frame_word_loc`].
+///
+/// A [`ValueLoc::Reg`] is unreachable from this backend — it keeps every value
+/// in its home frame word and has no register allocation to disagree with — but
+/// it is representable in the shared type, so it is refused rather than
+/// mis-emitted as an offset.
+fn frame_word_off(loc: ValueLoc) -> CompileResult<i32> {
+    match loc {
+        ValueLoc::Slot(off) => i32::try_from(off).map_err(|_| {
+            Bailout::with_context(
+                BailoutReason::Internal("ir_lower: a phi copy offset does not fit the frame"),
+                format!("{loc:?}"),
+            )
+        }),
+        ValueLoc::Reg(_) => Err(Bailout::with_context(
+            BailoutReason::Internal(
+                "ir_lower: a phi copy names a register; this backend keeps every value in a \
+                 frame word",
+            ),
+            format!("{loc:?}"),
+        )),
+    }
+}
+
+/// Sequentialise one edge's `(phi slot, source slot)` parallel copy.
+///
+/// The gathered pairs are simultaneous — every source is read as it was before
+/// any destination is written — so they go through
+/// [`resolve_parallel_copy`], which returns an order preserving that semantics
+/// and breaks any cycle with one [`CopyOp::Save`] / [`CopyOp::Restore`] pair.
+/// Self-copies are dropped by the resolver, so the acyclic majority emits
+/// exactly one load + one store per surviving pair, as it always did.
+fn phi_copy_sequence(copies: &[(i32, i32)]) -> CompileResult<Vec<CopyOp>> {
+    let mut pairs: Vec<(ValueLoc, ValueLoc)> = Vec::with_capacity(copies.len());
+    for &(dst, src) in copies {
+        pairs.push((frame_word_loc(dst)?, frame_word_loc(src)?));
+    }
+    resolve_parallel_copy(&pairs)
 }
 
 // ── Pre-emission location verification ───────────────────────────────
@@ -5455,6 +5992,433 @@ fn verify_slot_colouring(
     Ok(())
 }
 
+// ── Linear-scan register residency (`CRATONVM_JIT_IR_LINEAR_SCAN`) ───
+//
+// `regalloc::allocate_linear_scan` is a complete, self-verifying linear-scan
+// allocator that had no production consumer. This section is its first one.
+//
+// It is deliberately NOT a replacement for the frame-slot colouring. The
+// colourer still runs, still decides every value's home word, and every value
+// is still WRITTEN to that home. What the allocator adds is a *read cache*: a
+// value the allocation keeps in one register for its entire live range is also
+// copied into that register at its definition, and its later reads take the
+// register instead of the frame.
+//
+// ## Why write-through, and why that is the safe shape
+//
+// The frame image stays authoritative at every instruction boundary. That is
+// what makes this wiring cheap to reason about:
+//
+//   * `emit_safepoint_map` publishes frame slots. Every live value is still in
+//     its slot, so the oop map is exactly as complete as it was — there is no
+//     register a collector would have to know about, walk, or *update* on an
+//     evacuation. (The register file below is XMM-only, so a reference cannot
+//     be register-resident at all; see `IR_LOWER_LS_XMMS`. Two independent
+//     reasons, either one sufficient.)
+//   * `build_deopt_points` / `FrameState` name frame words. Unchanged.
+//   * `emit_phi_copies`, call-argument marshalling and the shadow push all read
+//     home slots. Unchanged.
+//   * A definition site this wave did not convert simply never publishes
+//     residency (see `Lowerer::reg_live`), so all of its reads stay memory
+//     reads. A missed *use* site is a missed optimization; there is no edit
+//     that turns into wrong code by omission.
+//
+// The cost is that the store side is not eliminated: this buys loads, not
+// stores. Eliminating the store requires the whole lowerer to stop treating the
+// frame as the value's identity, which is the large change this one is the
+// increment towards. See `docs/jit/linear-scan-wiring.md`.
+
+/// The registers this wiring may hand out.
+///
+/// XMM2–XMM5, and the choice is forced rather than tuned:
+///
+///   * **Caller-saved on both ABIs.** Win64 makes XMM0–XMM5 volatile and
+///     XMM6–XMM15 non-volatile; System V makes every XMM volatile. The IR
+///     prologue saves NO callee-saved register (`emit_prologue` pushes RBP and
+///     nothing else), so any register the caller expects preserved is unusable
+///     here until that prologue grows a save area — which rules out every
+///     register in `regalloc::RegFile::x86_64` (`LOCAL_REGS` = RBX/R12–R15,
+///     plus R8/R9 and XMM8–XMM15).
+///   * **Never touched by this emitter.** The FP value tier is XMM0/XMM1; the
+///     GP tier is RAX/RCX/RDX with R10/R11 as safepoint and shadow-stack
+///     scratch and R8/R9 as call-argument registers. XMM2–XMM5 appear nowhere.
+///   * **Encodable without REX**, which `fp_load` / `fp_store` / `fp_binop`
+///     require: they emit ModRM with `(xmm & 7) << 3` and no REX.R, so only
+///     XMM0–XMM7 are addressable by them at all.
+///
+/// The consequence worth stating plainly: this wiring is **FP-only**. An `int`
+/// loop counter gets nothing out of it. That is the price of not touching the
+/// prologue, and it is the first thing to revisit — see the doc.
+const IR_LOWER_LS_XMMS: [u8; 4] = [2, 3, 4, 5];
+
+/// `CRATONVM_JIT_IR_LINEAR_SCAN=1` — run the linear-scan allocator and use its
+/// result as a register read cache. Default OFF.
+///
+/// Declared-flag note: the name must also be listed in
+/// `types/src/flag_groups.rs` for `-XX:` options and `with_thread_overrides` to
+/// reach it. Until it is, `runtime_var` falls through to a live `std::env`
+/// read, which still honours the environment but is invisible to the flag
+/// snapshot. Tests do not depend on either — they drive [`LsForce`] — so a
+/// declaration change cannot silently make them vacuous.
+fn linear_scan_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = ls_forced() {
+            return forced;
+        }
+    }
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LINEAR_SCAN") {
+        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`linear_scan_enabled`], so a unit test never
+    /// depends on the process environment or on whether the flag has been
+    /// declared yet. Thread-local, so parallel tests cannot see each other's
+    /// setting.
+    static LS_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn ls_forced() -> Option<bool> {
+    LS_FORCE.with(|c| c.get())
+}
+
+/// Test-only RAII override of [`linear_scan_enabled`] on this thread.
+#[cfg(test)]
+struct LsForce;
+
+#[cfg(test)]
+impl LsForce {
+    fn on() -> LsForce {
+        LS_FORCE.with(|c| c.set(Some(true)));
+        LsForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for LsForce {
+    fn drop(&mut self) {
+        LS_FORCE.with(|c| c.set(None));
+    }
+}
+
+/// Which XMM register holds each value for its whole life, plus what the
+/// decision cost.
+#[derive(Clone, Debug, Default)]
+struct RegResidency {
+    /// `reg_of[id]` = the XMM number holding node `id`'s value from its
+    /// definition to its last use, with no split, no spill and no reload.
+    /// `None` for everything else, which is the majority.
+    reg_of: Vec<Option<u8>>,
+    /// How many values that is.
+    promoted: usize,
+    /// Values the allocator promoted that this file then refused, because the
+    /// allocator's liveness model and `plan_slots`' disagreed about them. A
+    /// non-zero count is a compiler bug worth chasing; it is not wrong code,
+    /// because a refusal only sends the value back to memory.
+    demoted: usize,
+    /// Copied out of the liveness model so the caller can report it.
+    #[allow(dead_code)]
+    peak_live: usize,
+}
+
+/// The machine model for `ir_lower`'s emission, over `regs`.
+///
+/// [`crate::regalloc::MachineModel::for_graph`] derives clobbers from ops. It
+/// is correct as far as it goes, and it cannot know about the calls a
+/// particular backend emits *between* ops. This adds the one `ir_lower` has:
+/// the cooperative safepoint poll, which on a loop back edge tests a byte and
+/// on a set flag calls its slow path (`emit_safepoint_poll`) — at the block's
+/// outgoing-edge position, which belongs to no node. `for_graph` already marks
+/// those positions safepoints; they must also be clobbers, because a value in
+/// a caller-saved register across a back edge would be destroyed by that call.
+///
+/// The entry poll (before block 0) needs nothing: no value is live yet.
+fn ir_lower_machine_model(
+    graph: &Graph,
+    schedule: &Schedule,
+    live: &crate::regalloc::LiveModel,
+    regs: crate::regalloc::RegFile,
+) -> crate::regalloc::MachineModel {
+    use std::collections::BTreeMap;
+    let all: Vec<crate::regalloc::PhysReg> = regs.specs().iter().map(|s| s.reg).collect();
+    let mut model = crate::regalloc::MachineModel::for_graph(graph, schedule, live, regs);
+
+    // `MachineModel::clobbered_at` binary-searches by position, so the list
+    // must stay sorted AND hold one entry per position. Merge through a map
+    // rather than push-and-sort.
+    let mut merged: BTreeMap<usize, Vec<crate::regalloc::PhysReg>> = BTreeMap::new();
+    for (pos, regs) in model.clobbers.drain(..) {
+        merged.entry(pos).or_default().extend(regs);
+    }
+    for (b, block) in schedule.blocks.iter().enumerate() {
+        if !block.successors.iter().any(|&s| s <= b) {
+            continue;
+        }
+        let Some(&(_, edge)) = live.span.get(b) else {
+            continue;
+        };
+        // `lower_terminator` and `lower_block`'s fall-through arm both emit the
+        // poll immediately before the edge's phi copies, i.e. between the
+        // terminator position and the edge position. Clobber both, for the same
+        // reason `MachineModel::for_graph` makes both safepoints.
+        for pos in [edge.saturating_sub(1), edge] {
+            merged.entry(pos).or_default().extend_from_slice(&all);
+        }
+    }
+    model.clobbers = merged
+        .into_iter()
+        .map(|(pos, mut regs)| {
+            regs.sort_unstable();
+            regs.dedup();
+            (pos, regs)
+        })
+        .collect();
+    model
+}
+
+/// Plan register residency for one scheduled graph, or `None` when nothing is
+/// promotable and the colourer's memory layout stands unchanged.
+///
+/// Every refusal here is a *demotion*, never a bailout: a value that does not
+/// take a register keeps the home slot the lowerer has always given it, which
+/// is correct by construction. The one hard failure is
+/// [`crate::regalloc::verify_allocation`] rejecting the allocation, which is a
+/// compiler bug — that returns `Err` and the caller refuses the compile rather
+/// than emitting against an allocation nothing proved.
+fn plan_register_residency(
+    graph: &Graph,
+    schedule: &Schedule,
+    plan: &SlotPlan,
+) -> CompileResult<Option<RegResidency>> {
+    use crate::regalloc::{
+        allocate_linear_scan, build_live_model, verify_allocation, PhysReg, RegClass, RegFile,
+        RegSpec,
+    };
+
+    let mut live = build_live_model(graph, schedule);
+    if !live.converged {
+        // Every range is the whole method; nothing is promotable and the scan
+        // would only burn compile time proving it.
+        return Ok(None);
+    }
+
+    // ── Release the deopt pins, and why that is legal HERE ───────────
+    //
+    // Without this the wiring is inert on every real method. `IrBuilder`
+    // records a `SafepointSnapshot` of the locals and the operand stack at
+    // EVERY bytecode boundary, so every temporary is named by some frame state
+    // and `build_live_model` pins the entire value set — `allocate_linear_scan`
+    // then promotes nothing at all, on any graph that came from bytecode.
+    //
+    // The pin's premise is "the home word must hold the value at any recorded
+    // bci, and an allocator cannot establish that". This consumer establishes
+    // it by construction rather than by analysis: `fp_store_value` emits the
+    // home store at EVERY definition, promoted or not, so a deopt frame read
+    // out of home words is bit-identical to the one the colourer-only path
+    // produces. `build_deopt_points` is not modified and does not need to be.
+    //
+    // The price, per `release_deopt_pins`' contract, is `Allocation::stack_slot`
+    // — which this file must not read, and does not: every home offset comes
+    // from `plan_slots`, which keeps every pin, through `alloc_slot_checked`.
+    let released = live.release_deopt_pins(graph);
+
+    // ── Agreement check: two liveness models, one program ────────────
+    //
+    // `build_live_model` re-implements `plan_slots`' position model rather than
+    // calling it (`SlotPlan` and `LiveRange` are private to this file). Two
+    // implementations of one model drifting apart is precisely how a register
+    // allocator comes to alias two live values, so the agreement is CHECKED
+    // before either is used, not documented and hoped for.
+    //
+    // A disagreement disables promotion entirely. It is not a bailout: the
+    // colourer's answer is still correct on its own terms, and it is the one
+    // the frame is built from.
+    let expected_positions: usize = schedule
+        .blocks
+        .iter()
+        .map(|b| b.nodes.len() + usize::from(b.terminator.is_some()) + 1)
+        .sum();
+    if live.total_positions != expected_positions {
+        return Ok(None);
+    }
+    if live.wants_loc.len() != plan.node_color.len()
+        || live
+            .wants_loc
+            .iter()
+            .zip(plan.node_color.iter())
+            .any(|(wants, color)| *wants != color.is_some())
+    {
+        return Ok(None);
+    }
+
+    // ── The register file ────────────────────────────────────────────
+    let regs = RegFile::from_specs(IR_LOWER_LS_XMMS.iter().map(|&n| RegSpec {
+        reg: PhysReg::xmm(n),
+        // Not "the ABI says so" but "this frame never saves them", which is the
+        // property that matters: a value may not stay in one across a call.
+        caller_saved: true,
+    }));
+    let model = ir_lower_machine_model(graph, schedule, &live, regs);
+
+    let alloc = match allocate_linear_scan(graph, &live, &model) {
+        Ok(alloc) => alloc,
+        // Register pressure, an unsatisfiable fixed constraint or an exhausted
+        // split budget is a property of the input program, not a compiler bug.
+        // Decline to promote and keep the frame layout the colourer already
+        // produced; there is no reason to lose the whole optimized body over
+        // an optimization that did not fit.
+        Err(_) => return Ok(None),
+    };
+    // `allocate_linear_scan` verifies its own result. Re-verify anyway: this
+    // call site's guarantee must not rest on an internal detail of another
+    // module, and the check is the only thing standing between a bug in the
+    // scan and machine code that reads a register two values are in.
+    //
+    // THIS one propagates. A verifier failure is a compiler bug, and emitting
+    // against an allocation nothing proved is exactly the trade that has
+    // produced silent heap corruption in this VM before.
+    verify_allocation(graph, &live, &model, &alloc)?;
+
+    let n = graph.nodes.len();
+    let mut reg_of: Vec<Option<u8>> = vec![None; n];
+    let mut demoted = 0usize;
+    for id in 0..n {
+        let Some(segs) = alloc.segments.get(id) else {
+            continue;
+        };
+        // ONE segment, and it holds a register. Anything else — a split, a
+        // spill, a reload, a home-slot stretch in the middle — is refused
+        // rather than emitted: this wiring has no reload machinery, so a value
+        // whose register goes away partway through must not be read from one.
+        let reg = match segs.as_slice() {
+            [seg] => match seg.reg {
+                Some(reg) => reg,
+                None => continue,
+            },
+            _ => continue,
+        };
+        // Defensive, all three: the file is XMM-only and FP-only by
+        // construction, so a `Ref` (or an `int`, or XMM8) arriving here means
+        // the file or `RegClass::of` changed under this code.
+        if reg.class != RegClass::Xmm || !IR_LOWER_LS_XMMS.contains(&reg.num) {
+            continue;
+        }
+        if !matches!(
+            graph.nodes.get(id).map(|node| node.ty),
+            Some(IrType::Float) | Some(IrType::Double)
+        ) {
+            continue;
+        }
+        // Write-through needs a home to write to.
+        if plan.node_color.get(id).copied().flatten().is_none() {
+            continue;
+        }
+        // A phi's home is written by `emit_phi_copies` at each incoming edge,
+        // not by a definition arm, so there is no site that could publish it
+        // into a register. `allocate_linear_scan` already refuses phis; this
+        // says so locally rather than relying on that.
+        //
+        // NOT `SlotClass::Pinned`. That class means "never shares a frame
+        // word", and after `release_deopt_pins` it covers exactly the
+        // deopt-named values — i.e., on a bytecode graph, nearly all of them.
+        // Testing it here would undo the release and make this wiring inert
+        // again. A dedicated home word is if anything the safer case for
+        // write-through.
+        let is_phi = graph
+            .nodes
+            .get(id)
+            .is_some_and(|node| matches!(node.op, Op::Phi));
+        if is_phi {
+            continue;
+        }
+        reg_of[id] = Some(reg.num);
+    }
+
+    // ── Second opinion on the aliasing property ──────────────────────
+    //
+    // `verify_allocation` proves "no two values hold one register at one
+    // position" against the ALLOCATOR's liveness model. Re-prove it against
+    // `plan_slots`' independently computed ranges. If the two models disagree
+    // about an overlap, both values lose the register — the disagreement
+    // itself is the reason not to trust either answer for that pair.
+    let mut holders: HashMap<u8, Vec<usize>> = HashMap::new();
+    for (id, reg) in reg_of.iter().enumerate() {
+        if let Some(reg) = reg {
+            holders.entry(*reg).or_default().push(id);
+        }
+    }
+    let mut drop_ids: Vec<usize> = Vec::new();
+    for ids in holders.values() {
+        for (i, &a) in ids.iter().enumerate() {
+            let Some(ra) = plan.range.get(a).copied().flatten() else {
+                drop_ids.push(a);
+                continue;
+            };
+            for &b in &ids[i + 1..] {
+                match plan.range.get(b).copied().flatten() {
+                    Some(rb) if !ra.overlaps(rb) => {}
+                    _ => {
+                        drop_ids.push(a);
+                        drop_ids.push(b);
+                    }
+                }
+            }
+        }
+    }
+    // ── Second opinion on the ABI property ───────────────────────────
+    //
+    // The same idea for `verify_allocation`'s clobber check: re-run it against
+    // `plan_slots`' range for the value rather than the allocator's.
+    for (id, reg) in reg_of.iter().enumerate() {
+        let Some(reg) = reg else { continue };
+        let Some(range) = plan.range.get(id).copied().flatten() else {
+            continue;
+        };
+        let me = PhysReg::xmm(*reg);
+        if model
+            .clobbers
+            .iter()
+            .any(|(pos, regs)| *pos >= range.lo && *pos <= range.hi && regs.contains(&me))
+        {
+            drop_ids.push(id);
+        }
+    }
+    for id in drop_ids {
+        if reg_of[id].take().is_some() {
+            demoted += 1;
+        }
+    }
+
+    let promoted = reg_of.iter().filter(|r| r.is_some()).count();
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+        eprintln!(
+            "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
+             scan_promoted={} resident={promoted} demoted={demoted} splits={} \
+             scan_spills={} scan_reloads={}",
+            live.total_positions,
+            live.peak_live,
+            alloc.promoted,
+            alloc.splits,
+            alloc.spills,
+            alloc.reloads,
+        );
+    }
+    if promoted == 0 {
+        return Ok(None);
+    }
+    Ok(Some(RegResidency {
+        reg_of,
+        promoted,
+        demoted,
+        peak_live: live.peak_live,
+    }))
+}
+
 /// Funnel every refusal in this file through one place: count it, then return
 /// the `None` the public entry points have always returned, which is the
 /// caller's signal to run the method in a lower tier. A compiler refusal must
@@ -5606,6 +6570,46 @@ pub(crate) fn lower_inner(
     helpers: &JitRuntimeHelpers,
     branch_hints: &HashMap<usize, bool>,
     sr_map: Option<&ScalarReplacementMap>,
+    direct_calls: &HashMap<usize, (usize, bool)>,
+    ic_slots: &HashMap<usize, (usize, usize)>,
+    compact_fields: &HashMap<usize, (u32, bool, u8)>,
+) -> Option<CompiledMethod> {
+    // No inlined callee scopes: every deopt point is a single flat frame, which
+    // is what this path has always produced.
+    let no_scopes = InlineScopeTable::new();
+    lower_inner_with_scopes(
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        branch_hints,
+        sr_map,
+        direct_calls,
+        ic_slots,
+        compact_fields,
+        &no_scopes,
+    )
+}
+
+/// [`lower_inner`] plus the inlined-scope table.
+///
+/// Split from `lower_inner` rather than folded into it so the existing
+/// ten-argument call in `lib.rs` keeps compiling: a producer that has inlined
+/// something calls this one, everything else keeps calling `lower_inner` and
+/// gets an empty table. An empty table is byte-identical to the previous
+/// behaviour — `FrameState::caller` stays `None` at every deopt point.
+///
+/// See `docs/jit/deopt-inline-scopes.md` for the producer side.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_inner_with_scopes(
+    graph: &Graph,
+    schedule: &Schedule,
+    num_params: usize,
+    num_locals: usize,
+    helpers: &JitRuntimeHelpers,
+    branch_hints: &HashMap<usize, bool>,
+    sr_map: Option<&ScalarReplacementMap>,
     // IR direct-call lowering: `pc → (callee_entry, callee_needs_context)` for
     // every statically-bound call site whose callee was eagerly compiled. Empty
     // ⇒ every `Op::Call` keeps the historical `jit_invoke_dispatch` lowering.
@@ -5618,7 +6622,36 @@ pub(crate) fn lower_inner(
     // descriptor tag)` for every resolved compact instance field. Empty ⇒ every
     // `Op::Load` takes the checked helper, as it always did.
     compact_fields: &HashMap<usize, (u32, bool, u8)>,
+    // Which inlined callee each `graph.safepoints` entry belongs to, and the
+    // caller scopes above it. Empty ⇒ flat, caller-less deopt frames.
+    inline_scopes: &InlineScopeTable,
 ) -> Option<CompiledMethod> {
+    // A monitor in the graph must REFUSE the compile, not fall through.
+    //
+    // `ir::Op::MonitorEnter`/`MonitorExit` exist (escape analysis needs them to
+    // reason about lock elision), but there is no lowering arm for them here
+    // and no monitor helper in `JitRuntimeHelpers` to call. `lower_data_node`'s
+    // catch-all is `_ => {}`, so an unguarded monitor would compile to *nothing*
+    // — the lock silently disappears, which is a data race and an unbalanced
+    // `monitorexit`, not a missed optimization.
+    //
+    // Unreachable today (`IrBuilder` has no `monitorenter` arm, so a
+    // synchronized method bails earlier), which is exactly why this guard has
+    // to exist before that arm is ever added: the failure it prevents is
+    // silent. Adding the helper is not a small change — the helper table's byte
+    // offsets are baked into emitted machine code.
+    if (helpers.monitor_enter == 0 || helpers.monitor_exit == 0)
+        && graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::MonitorEnter | Op::MonitorExit))
+    {
+        return refuse(Bailout::with_context(
+            BailoutReason::UnsupportedShape("monitor helper absent"),
+            "graph contains monitor ops but the helper table has no monitor \
+             entry; refusing rather than emitting nothing and dropping the lock",
+        ));
+    }
     // A live object allocation is now supported by the common allocation
     // stub. A zero helper pointer is only possible in synthetic unit-test
     // tables; reject it instead of emitting a call through address zero.
@@ -5746,21 +6779,38 @@ pub(crate) fn lower_inner(
         direct_calls,
         ic_slots,
         compact_fields,
+        inline_scopes,
     );
 
-    // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
-    // VM pointer as a hidden first arg, but only `abi_regs.len()` integer
-    // registers carry incoming args. If `1 + num_params` would spill a param to
-    // the stack, the prologue can't load it — bail to single-pass (the safety
-    // net) rather than mis-read the param. `abi_regs` is 4 on Win64, 6 on SysV.
-    if lowerer.needs_context {
-        #[cfg(target_os = "windows")]
-        let abi_len = 4usize;
-        #[cfg(not(target_os = "windows"))]
-        let abi_len = 6usize;
-        if 1 + num_params > abi_len {
-            return None;
-        }
+    // Gap B: only `abi_regs.len()` integer registers carry incoming args (4 on
+    // Win64, 6 on SysV), and a `needs_context` method (one containing an
+    // `Op::Call`) spends the first of them on the hidden VM pointer. Anything
+    // past that arrives on the caller's stack, and `emit_prologue` can only
+    // read registers — its deposit loop `break`s at `abi_regs.len()` and leaves
+    // the remaining locals holding whatever the frame slot happened to contain.
+    // Bail to the single-pass backend (which does load stack params, see
+    // `x64.rs`'s "ROUND-12 fix") rather than mis-read them.
+    //
+    // The check used to sit INSIDE `if lowerer.needs_context`, which left every
+    // LEAF method — no `Op::Call`, so `needs_context == false` — completely
+    // unguarded. Those are the ones the prologue drops from ABI index
+    // `abi_regs.len()` on, with no diagnostic: a method returning its own last
+    // parameter returned null instead. `probes/EntryAbiArgSlotProbe.java`
+    // measured the boundary exactly (the receiver is an incoming slot too, so
+    // an instance method with N parameters occupies N+1): `i3`/`s4` = 4 slots
+    // correct, `i4`/`s5` = 5 slots wrong, and `i6`/`s6` wrong 299_445 times in
+    // 300_000. Downstream it silently emptied Spring Boot's property binding,
+    // because `BindHandler.onSuccess(name, target, context, result)` is
+    // `aload 4; areturn` over five slots — see
+    // `docs/internal/fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
+    // for the trail from there to `BindResult.isBound() == false` for every
+    // property.
+    //
+    // `emit_prologue`'s `break` is what this guard exists to keep unreachable;
+    // `ir_lower_refuses_more_incoming_slots_than_abi_registers` pins the pair
+    // together so the two cannot drift apart again.
+    if num_params + usize::from(lowerer.needs_context) > incoming_abi_reg_capacity() {
+        return None;
     }
 
     // BUG FIX [jit-irlower #2]: reserve phi destination slots before any
@@ -5768,6 +6818,38 @@ pub(crate) fn lower_inner(
     // reference slots of phis in not-yet-lowered merge blocks.
     if let Err(bailout) = lowerer.prealloc_phi_slots() {
         return refuse(bailout);
+    }
+
+    // ── Linear-scan register residency (default OFF) ─────────────────
+    //
+    // The production call site for `regalloc::allocate_linear_scan`. Installed
+    // BEFORE the prologue and never touched again, so residency is a property
+    // of the whole emission rather than something that changes mid-body.
+    //
+    // A verifier failure is the one hard stop. `plan_register_residency`
+    // returns `Err` only when `verify_allocation` rejects the allocation — a
+    // compiler bug — and emitting against an allocation nothing proved is
+    // exactly the trade that has produced silent heap corruption here before.
+    // Refuse the body; the method runs in a lower tier, which is always valid.
+    // Everything else it can decline (register pressure, a liveness-model
+    // disagreement, a value it cannot prove) comes back as `Ok(None)` and
+    // leaves the colourer's memory layout in charge.
+    let mut ls_active = false;
+    if linear_scan_enabled() {
+        match plan_register_residency(graph, schedule, &slot_plan) {
+            Ok(Some(residency)) => {
+                if crate::ir_stage_reporting() {
+                    eprintln!(
+                        "[ir] linear scan: {} values resident, {} demoted",
+                        residency.promoted, residency.demoted
+                    );
+                }
+                lowerer.set_residency(residency);
+                ls_active = true;
+            }
+            Ok(None) => {}
+            Err(bailout) => return refuse(bailout),
+        }
     }
 
     lowerer.emit_prologue();
@@ -5938,6 +7020,22 @@ pub(crate) fn lower_inner(
     // `metrics::note_current_peak_live_values`); a no-op when metrics are off.
     crate::metrics::note_current_peak_live_values(slot_plan.peak_live);
 
+    // `CompilationReport::spills` / `::reloads` are reported ONLY when the
+    // linear-scan path actually ran, and they count what this backend EMITTED,
+    // not what `regalloc::Allocation` planned — the plan is a full
+    // spill/reload/split schedule, and this wiring executes only the subset it
+    // can prove (see `plan_register_residency`). Reporting the plan's numbers
+    // would describe machine code that was never generated.
+    //
+    // The colourer-only path leaves both `NotMeasured`, which is the truth: it
+    // allocates no registers, so it has no register↔memory transitions to
+    // count, and a reported `0` would be indistinguishable from "measured, and
+    // it spilled nothing".
+    if ls_active {
+        crate::metrics::note_current_spills(lowerer.ls_spills);
+        crate::metrics::note_current_reloads(lowerer.ls_reloads);
+    }
+
     let buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
     // non-panicking: on capacity exhaustion it sets a sticky `overflowed` flag
@@ -5971,8 +7069,13 @@ pub(crate) fn lower_inner(
     //
     // The frame the lowerer builds, from `rbp` downward:
     //
-    //     locals | [context] | sp-id | spills … | arg staging | argrsv | shadow
-    //     ^0       ^locals    ^       ^first_spill            ^spill_cap_off
+    //     locals | [context] | bookkeeping ×5 | spills … | arg staging | argrsv | shadow
+    //     ^0       ^locals    ^                 ^first_spill           ^spill_cap_off
+    //
+    // The five bookkeeping words are the safepoint id, the cached thread
+    // pointer, the shadow save-base, the shadow save-top and the phi
+    // parallel-copy scratch. They are all below `first_spill`, so the spill
+    // band the maps and the deopt verifier describe is unchanged by them.
     //
     // `callee_saved_lo` names the start of the region the verifier must NOT
     // inspect. The IR prologue saves no callee-saved registers (it uses only
@@ -6030,11 +7133,30 @@ pub(crate) fn lower_inner(
     // the materializer each bail to a safe whole-method re-run on any slot they
     // cannot reconstruct. Only reachable with `sr_map` set (i.e.
     // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`), so production is unaffected.
+    //
+    // ...unless the graph holds a monitor. Every `FrameState` this lowerer
+    // builds hard-codes `monitors: Vec::new()`, so a precise resume would
+    // rebuild an interpreter frame that believes it holds no lock. The
+    // interpreter's own sink refuses a frame that holds monitors — but it
+    // cannot fire on information that was never recorded, so the omission
+    // defeats the guard rather than tripping it, and the method exits without
+    // the `monitorexit` the lock is waiting for.
+    //
+    // The guard above (`monitor helper absent`) does not cover this: the
+    // helpers ARE wired in production, so that refusal is inert. Until the
+    // frame states carry real monitor state, a monitor-bearing method may be
+    // compiled and may deoptimize — it just may not resume PRECISELY. The
+    // whole-method re-run it falls back to re-enters a re-entrant lock and
+    // stays balanced.
     if sr_map.is_some()
         && cm
             ._deopt_point_boxes
             .iter()
             .any(|p| crate::deopt::count_virtual_objects(&p.frame_state) > 0)
+        && !graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::MonitorEnter | Op::MonitorExit))
     {
         cm.can_deopt_resume = true;
     }
@@ -6220,6 +7342,43 @@ mod tests {
         assert_eq!(HITS.load(Ordering::SeqCst), 1);
     }
 
+    /// `emit_prologue` deposits incoming arguments out of `ENTRY_ABI_REGS` and
+    /// nothing else, so a graph with more incoming slots than that must be
+    /// REFUSED — the single-pass backend is the one that loads stack-passed
+    /// params. A leaf method (no `Op::Call`, so `needs_context == false`) used
+    /// to skip the check entirely and be lowered anyway, which dropped every
+    /// argument past the register file and left its local null.
+    ///
+    /// Tested through the return value rather than the emitted bytes: the body
+    /// is `aload_<last>; areturn`, so a lowering that dropped the argument
+    /// would answer with the wrong slot. `num_params` counts the receiver, so
+    /// capacity+1 is the first refused shape.
+    #[test]
+    fn ir_lower_refuses_more_incoming_slots_than_abi_registers() {
+        let cap = incoming_abi_reg_capacity();
+
+        // At capacity: every slot is register-passed, so lowering is allowed.
+        // `aload_0; areturn` keeps the body legal for any slot count.
+        let code = [0x2a, 0xb0]; // aload_0; areturn
+        assert!(
+            compile_via_ir(&code, code.len(), cap, cap).is_some(),
+            "a graph with exactly {cap} incoming slots fits the entry ABI and must lower",
+        );
+
+        // One past capacity: the last argument arrives on the caller's stack,
+        // which `emit_prologue` cannot read. Refuse instead of dropping it.
+        for extra in 1..=3 {
+            let slots = cap + extra;
+            assert!(
+                compile_via_ir(&code, code.len(), slots, slots).is_none(),
+                "a graph with {slots} incoming slots exceeds the {cap}-register entry \
+                 ABI and must bail to the single-pass backend, not silently drop \
+                 argument {}",
+                slots - 1,
+            );
+        }
+    }
+
     fn compile_via_ir(
         code: &[u8],
         code_len: usize,
@@ -6236,6 +7395,52 @@ mod tests {
     /// Build → schedule → lower WITHOUT the optimizer, so safepoint NodeIds
     /// stay stable (DCE/GVN safepoint preservation is a later concern; the
     /// emit-and-discard points are validated on the un-optimized graph).
+    /// A synchronized region now reaches the IR tier instead of bailing.
+    ///
+    /// Two halves, and both matter. With NO monitor helper the compile must be
+    /// REFUSED — `lower_data_node`'s catch-all would otherwise emit nothing for
+    /// the monitor and the lock would silently disappear. With a helper present
+    /// it must compile, and the emitted code must actually CALL that helper
+    /// twice (enter + exit), not merely accept the graph.
+    #[test]
+    fn a_synchronized_region_lowers_through_the_monitor_helper() {
+        // aload_0; monitorenter; aload_0; monitorexit; return
+        let code = [0x2a, 0xc2, 0x2a, 0xc3, 0xb1, 0, 0];
+        let builder = IrBuilder::new(1, 1);
+        let graph = builder.build(&code, 5).expect("builder must accept monitors");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::MonitorEnter)),
+            "the builder must emit a MonitorEnter node"
+        );
+        let schedule = ir_schedule::schedule(&graph);
+
+        // No helper -> refuse, rather than drop the lock.
+        assert!(
+            lower(&graph, &schedule, 1, 1, &no_helpers()).is_none(),
+            "a monitor graph with no helper must be REFUSED, never lowered to \
+             nothing"
+        );
+
+        // Helper present -> compiles, and both monitor calls are emitted.
+        extern "C" fn fake_monitor(_vm: i64, obj: i64) -> i64 {
+            obj
+        }
+        let mut helpers = no_helpers();
+        helpers.monitor_enter = fake_monitor as *const () as usize;
+        helpers.monitor_exit = fake_monitor as *const () as usize;
+        let cm = lower(&graph, &schedule, 1, 1, &helpers)
+            .expect("a monitor graph with a helper must compile");
+        let target = (fake_monitor as *const () as usize).to_le_bytes();
+        let bytes = cm.code_bytes();
+        let calls = bytes
+            .windows(8)
+            .filter(|w| *w == target)
+            .count();
+        assert_eq!(calls, 2, "monitorenter and monitorexit must each call the helper");
+    }
     fn compile_via_ir_no_opt(
         code: &[u8],
         code_len: usize,
@@ -6543,7 +7748,12 @@ mod tests {
         ));
         assert!(contains_seq(
             &code,
-            &[0x4D, 0x8B, 0x5A, JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8]
+            &[
+                0x4D,
+                0x8B,
+                0x5A,
+                crate::x64::disp::disp8_const(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as i64) as u8,
+            ]
         ));
         assert!(
             contains_seq(
@@ -6586,7 +7796,13 @@ mod tests {
             assert!(
                 contains_seq(
                     &code,
-                    &[0x4D, 0x8B, 0x5A, JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8]
+                    &[
+                        0x4D,
+                        0x8B,
+                        0x5A,
+                        crate::x64::disp::disp8_const(JitPICSlot::ENTRY_PTR_OFFSETS[i] as i64)
+                            as u8,
+                    ]
                 ),
                 "PIC entry {i} cached-entry load must be emitted"
             );
@@ -7183,6 +8399,7 @@ mod tests {
                 monitors: vec![],
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         // The map covers [rbp-40]; deopt spells that word as StackSlotRef(-40).
         let verifier = DeoptVerifier::new().with_oop_map(0x40, OopCoverage::complete([40]));
@@ -7230,6 +8447,7 @@ mod tests {
                 monitors: vec![],
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         assert!(
             DeoptVerifier::new()
@@ -7815,6 +9033,7 @@ mod tests {
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
         let no_compact_fields: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_scopes = InlineScopeTable::new();
         let buf = ExecutableBuffer::new(4096).expect("executable buffer");
         let helpers = no_helpers();
         let plan = plan_slots(&graph, &schedule, None);
@@ -7831,6 +9050,7 @@ mod tests {
             &no_direct,
             &no_ic,
             &no_compact_fields,
+            &no_scopes,
         );
 
         // Unallocated is an error, not an offset.
@@ -8413,5 +9633,1115 @@ mod tests {
         let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a 5 000-node method lowers");
         assert_eq!(unsafe { cm.try_call(&[0]) }, Ok(5_000));
         assert_eq!(unsafe { cm.try_call(&[42]) }, Ok(5_042));
+    }
+
+    // ── Phi parallel copy (the swap-loop wrong-code fix) ─────────────────
+    //
+    // `prealloc_phi_slots` gives every phi its OWN frame word, so the copies on
+    // one CFG edge are a parallel assignment over distinct words. Emitted in
+    // gather order through RAX — which is what this file did — a loop that
+    // swaps two locals makes each phi the other's back-edge value, the second
+    // copy reads the word the first just overwrote, and both locals end up
+    // holding the same value. These tests execute the emitted bytes, because
+    // that bug is invisible to any assertion about the copy *list*.
+
+    /// Value seeded into the reserved scratch word before every harness run, so
+    /// a test can prove an acyclic copy never touched it.
+    const SCRATCH_SENTINEL: i64 = 0x0BAD_5C7A_0000_1234;
+
+    /// Emit `push rbp; mov rbp,rsp; sub rsp,frame`, seed the named frame words
+    /// (plus the scratch, with [`SCRATCH_SENTINEL`]), run `copies` through the
+    /// REAL sequencer and the REAL emitter, load one word into RAX and return.
+    /// Then execute it.
+    ///
+    /// `read_back == None` reads the reserved scratch word itself.
+    ///
+    /// The frame is a genuine `Lowerer` frame (so the offsets, the scratch
+    /// reservation and `frame_size` are the ones production uses); only the
+    /// prologue/epilogue are hand-rolled, because the real ones fetch a thread
+    /// and touch the shadow stack that this fixture has no helpers for.
+    fn parallel_copy_harness(
+        seed: &[(i32, i64)],
+        copies: &[(i32, i32)],
+        read_back: Option<i32>,
+    ) -> (i64, Vec<CopyOp>) {
+        // Eight locals so the harness has plenty of frame words BELOW the
+        // bookkeeping reservation to use as stand-in phi slots.
+        const HARNESS_LOCALS: usize = 8;
+
+        let (graph, schedule) = add_one_graph();
+        let plan = plan_slots(&graph, &schedule, None);
+        let empty: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_scopes = InlineScopeTable::new();
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let helpers = no_helpers();
+        let mut lowerer = Lowerer::new(
+            &graph,
+            &schedule,
+            buf,
+            0,
+            HARNESS_LOCALS,
+            &plan,
+            &helpers,
+            &empty,
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact,
+            &no_scopes,
+        );
+        let scratch = lowerer.phi_copy_scratch_slot_off;
+        let frame = lowerer.frame_size;
+        for &(off, _) in seed {
+            assert!(
+                off > 0 && off < frame && off != scratch,
+                "the fixture must name a real frame word other than the scratch: {off}",
+            );
+        }
+
+        // push rbp ; mov rbp, rsp ; sub rsp, frame_size
+        lowerer.buf.emit_byte(0x55);
+        lowerer.buf.emit(&[0x48, 0x89, 0xE5]);
+        lowerer.buf.emit(&[0x48, 0x81, 0xEC]);
+        lowerer.buf.emit(&frame.to_le_bytes());
+
+        let scratch_seed = [(scratch, SCRATCH_SENTINEL)];
+        for &(off, val) in seed.iter().chain(scratch_seed.iter()) {
+            lowerer.emit_mov_reg_imm64(RAX, val as u64);
+            lowerer.store_rax(off);
+        }
+
+        let ops = phi_copy_sequence(copies).expect("the fixture's copies sequentialise");
+        for op in ops.iter().copied() {
+            lowerer
+                .emit_copy_op(op)
+                .expect("every location in this backend is a frame word");
+        }
+
+        lowerer.load_to_rax(read_back.unwrap_or(scratch));
+        // add rsp, frame_size ; pop rbp ; ret
+        lowerer.buf.emit(&[0x48, 0x81, 0xC4]);
+        lowerer.buf.emit(&frame.to_le_bytes());
+        lowerer.buf.emit_byte(0x5D);
+        lowerer.buf.emit_byte(0xC3);
+        assert!(!lowerer.buf.overflowed(), "the harness body must fit");
+
+        let cm = CompiledMethod::new(lowerer.buf);
+        // SAFETY: the emitted body takes no arguments, reads only its own
+        // frame, calls nothing and returns an i64 in RAX.
+        let value = unsafe { cm.try_call(&[]) }.expect("the harness body runs");
+        (value, ops)
+    }
+
+    fn count_kind(ops: &[CopyOp], f: impl Fn(&CopyOp) -> bool) -> usize {
+        ops.iter().copied().filter(|o| f(o)).count()
+    }
+
+    /// The swap loop's back edge, at the machine level: `a <- b, b <- a`.
+    ///
+    /// Sequential emission through RAX put `b`'s value in BOTH words. This is
+    /// the wrong-code witness, asserted by running the bytes.
+    #[test]
+    fn a_two_element_phi_cycle_really_swaps_the_two_frame_words() {
+        let (a, b) = (8i32, 16i32);
+        let seed = [(a, 0x1111_1111i64), (b, 0x2222_2222i64)];
+        let copies = [(a, b), (b, a)];
+
+        let (got_a, ops) = parallel_copy_harness(&seed, &copies, Some(a));
+        let (got_b, _) = parallel_copy_harness(&seed, &copies, Some(b));
+        assert_eq!(got_a, 0x2222_2222, "a must receive b's PRE-copy value");
+        assert_eq!(
+            got_b, 0x1111_1111,
+            "b must receive a's PRE-copy value — 0x22222222 here is the old \
+             sequential-emission bug, in which both words ended up holding b",
+        );
+
+        // One save/restore pair breaks the cycle; the third op is the move.
+        assert_eq!(ops.len(), 3, "{ops:?}");
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Save { .. })), 1);
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Restore { .. })), 1);
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Move { .. })), 1);
+
+        // …and the scratch word really is where the parked value went.
+        let (scratch_after, _) = parallel_copy_harness(&seed, &copies, None);
+        assert_ne!(
+            scratch_after, SCRATCH_SENTINEL,
+            "a cycle must go through the reserved scratch word",
+        );
+    }
+
+    /// A three-element cycle rotates; the last move IS the restore, so it costs
+    /// one save, two moves and one restore.
+    #[test]
+    fn a_three_element_phi_cycle_rotates_the_frame_words() {
+        let (a, b, c) = (8i32, 16i32, 24i32);
+        let seed = [(a, 1i64), (b, 2i64), (c, 3i64)];
+        // a <- b, b <- c, c <- a
+        let copies = [(a, b), (b, c), (c, a)];
+
+        let (got_a, ops) = parallel_copy_harness(&seed, &copies, Some(a));
+        let (got_b, _) = parallel_copy_harness(&seed, &copies, Some(b));
+        let (got_c, _) = parallel_copy_harness(&seed, &copies, Some(c));
+        assert_eq!((got_a, got_b, got_c), (2, 3, 1), "{ops:?}");
+
+        assert_eq!(ops.len(), 4, "one save, two moves, one restore: {ops:?}");
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Save { .. })), 1);
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Restore { .. })), 1);
+    }
+
+    /// The acyclic majority — every merge that is not a permutation — must be
+    /// unchanged: one load + one store per copy, and the scratch word untouched.
+    #[test]
+    fn an_acyclic_phi_chain_emits_the_minimal_moves_and_no_scratch() {
+        let (a, b, c) = (8i32, 16i32, 24i32);
+        let seed = [(a, 1i64), (b, 2i64), (c, 3i64)];
+        // b <- a, c <- b. Gather order would overwrite b before c reads it.
+        let copies = [(b, a), (c, b)];
+
+        let (got_b, ops) = parallel_copy_harness(&seed, &copies, Some(b));
+        let (got_c, _) = parallel_copy_harness(&seed, &copies, Some(c));
+        assert_eq!(got_b, 1, "b <- a");
+        assert_eq!(got_c, 2, "c must read b's PRE-copy value: {ops:?}");
+
+        assert_eq!(
+            ops,
+            vec![
+                CopyOp::Move {
+                    from: frame_word_loc(b).expect("a frame word"),
+                    to: frame_word_loc(c).expect("a frame word"),
+                },
+                CopyOp::Move {
+                    from: frame_word_loc(a).expect("a frame word"),
+                    to: frame_word_loc(b).expect("a frame word"),
+                },
+            ],
+            "an acyclic web must cost exactly one move per copy",
+        );
+
+        let (scratch_after, _) = parallel_copy_harness(&seed, &copies, None);
+        assert_eq!(
+            scratch_after, SCRATCH_SENTINEL,
+            "an acyclic web must not touch the reserved scratch word",
+        );
+    }
+
+    /// A copy to itself is not a move: it must emit nothing at all, so a merge
+    /// whose phi already lives in its source's word costs zero instructions.
+    #[test]
+    fn a_self_copy_emits_nothing() {
+        let ops = phi_copy_sequence(&[(8, 8), (16, 16)]).expect("sequentialises");
+        assert!(ops.is_empty(), "{ops:?}");
+    }
+
+    /// ONE scratch word is enough however many cycles an edge contains: the
+    /// sequencer always consumes a save before it starts the next cycle. If
+    /// that ever stopped being true the saves would nest and the single
+    /// reserved word would be clobbered, so pin it here — this file's frame
+    /// reservation is what depends on it.
+    #[test]
+    fn disjoint_phi_cycles_never_nest_their_saves() {
+        let (a, b, c, d) = (8i32, 16i32, 24i32, 32i32);
+        let seed = [(a, 1i64), (b, 2i64), (c, 3i64), (d, 4i64)];
+        let copies = [(a, b), (b, a), (c, d), (d, c)];
+
+        let mut saved = false;
+        let (got_a, ops) = parallel_copy_harness(&seed, &copies, Some(a));
+        for op in &ops {
+            match op {
+                CopyOp::Save { .. } => {
+                    assert!(!saved, "a second save before the first restore: {ops:?}");
+                    saved = true;
+                }
+                CopyOp::Restore { .. } => {
+                    assert!(saved, "a restore with nothing saved: {ops:?}");
+                    saved = false;
+                }
+                CopyOp::Move { .. } => {}
+            }
+        }
+        assert!(!saved, "an unconsumed save: {ops:?}");
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Save { .. })), 2);
+
+        let (got_b, _) = parallel_copy_harness(&seed, &copies, Some(b));
+        let (got_c, _) = parallel_copy_harness(&seed, &copies, Some(c));
+        let (got_d, _) = parallel_copy_harness(&seed, &copies, Some(d));
+        assert_eq!((got_a, got_b, got_c, got_d), (2, 1, 4, 3));
+    }
+
+    /// A register is representable in the shared `ValueLoc` but unreachable
+    /// here — this backend keeps every value in its home frame word. Refused,
+    /// not mis-emitted as an offset.
+    #[test]
+    fn a_register_location_is_refused_rather_than_emitted_as_an_offset() {
+        let err = frame_word_off(ValueLoc::Reg(crate::regalloc::PhysReg::gp(3)))
+            .expect_err("a register is not a frame word");
+        assert!(
+            matches!(err.reason, BailoutReason::Internal(_)),
+            "{err:?}",
+        );
+        // …and offset 0 (`[rbp - 0]` is the saved caller RBP) is not a location.
+        assert!(frame_word_loc(0).is_err());
+        assert!(frame_word_loc(-8).is_err());
+    }
+
+    /// The scratch is a BOOKKEEPING word: it sits below `first_spill`, so no
+    /// colour `plan_slots` hands out can ever land on it, and the five reserved
+    /// words are contiguous with no gap for a coloured slot to hide in.
+    ///
+    /// Also the frame arithmetic: `estimate_frame_bytes` (which `lower_inner`
+    /// bounds against) must still equal the frame `Lowerer::new` lays out. The
+    /// constructor pins that with a `debug_assert_eq!`; this asserts it in a
+    /// release build too, and from the published offsets rather than from a
+    /// repetition of the same sum.
+    #[test]
+    fn the_phi_scratch_word_is_reserved_below_the_spill_band() {
+        for &num_locals in &[0usize, 1, 8] {
+            let (graph, schedule) = add_one_graph();
+            let plan = plan_slots(&graph, &schedule, None);
+            let empty: HashMap<usize, bool> = HashMap::new();
+            let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+            let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+            let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+            let no_scopes = InlineScopeTable::new();
+            let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+            let helpers = no_helpers();
+            let lowerer = Lowerer::new(
+                &graph,
+                &schedule,
+                buf,
+                0,
+                num_locals,
+                &plan,
+                &helpers,
+                &empty,
+                None,
+                &no_direct,
+                &no_ic,
+                &no_compact,
+                &no_scopes,
+            );
+
+            // The five bookkeeping words are contiguous and end at first_spill.
+            assert_eq!(lowerer.shadow_thread_slot_off, lowerer.sp_id_slot_off + 8);
+            assert_eq!(
+                lowerer.shadow_savebase_slot_off,
+                lowerer.shadow_thread_slot_off + 8
+            );
+            assert_eq!(
+                lowerer.shadow_savetop_slot_off,
+                lowerer.shadow_savebase_slot_off + 8
+            );
+            assert_eq!(
+                lowerer.phi_copy_scratch_slot_off,
+                lowerer.shadow_savetop_slot_off + 8,
+                "the scratch is the fifth reserved word",
+            );
+            assert_eq!(
+                lowerer.first_spill,
+                lowerer.phi_copy_scratch_slot_off + 8,
+                "the spill band starts one word above the scratch",
+            );
+
+            // No coloured slot can collide with it.
+            for color in 0..plan.slots as i32 {
+                assert_ne!(
+                    lowerer.first_spill + color * 8,
+                    lowerer.phi_copy_scratch_slot_off,
+                );
+            }
+            assert!(lowerer.first_spill <= lowerer.spill_cap_off);
+
+            // The estimate `lower_inner` bounds against is the frame that got
+            // built — including the fifth reserved word.
+            let needs = scan_frame_needs(&graph, &helpers);
+            assert_eq!(
+                lowerer.frame_size,
+                estimate_frame_bytes(num_locals, plan.slots, &needs) as i32,
+            );
+            // …and that number really does account for locals + 5 bookkeeping
+            // words + the spill band + the 16-byte stack-arg reserve + the
+            // 32-byte ABI shadow. `add_one_graph` needs no context slot and
+            // stages no call arguments.
+            let locals_size = (num_locals as i32) * 8;
+            let bookkeeping = 8 * 5;
+            let tail = 32 + 16;
+            assert_eq!(
+                lowerer.frame_size,
+                ((locals_size + bookkeeping + (plan.slots as i32) * 8 + tail) + 15) & !15,
+            );
+            assert_eq!(lowerer.spill_cap_off, lowerer.frame_size - tail);
+            // Offsets are 1-based — `[rbp - 0]` is the saved caller RBP — so the
+            // first spill word sits one word past the locals + bookkeeping bytes.
+            assert_eq!(lowerer.first_spill, locals_size + bookkeeping + 8);
+        }
+    }
+
+    /// End to end, on the shape the fix exists for.
+    ///
+    /// ```java
+    /// static int f(int a, int b, int n) {
+    ///     for (int i = 0; i < n; i++) { int t = a; a = b; b = t; }
+    ///     return a - b;
+    /// }
+    /// ```
+    ///
+    /// The two loop-header phis are each other's back-edge value, so the back
+    /// edge's parallel copy is a two-element cycle. Before the scratch word this
+    /// method REFUSED to compile (`UnsupportedShape("cyclic phi parallel
+    /// copy")`) and dropped to a lower tier; before that it compiled to wrong
+    /// code. `a - b` is the sharp readout: `0` is what both duplication bugs
+    /// (both words ending up with `a`, or both with `b`) produce.
+    #[test]
+    fn the_swap_loop_compiles_and_swaps() {
+        //  0: iconst_0     03
+        //  1: istore_3     3e          i = 0
+        //  2: iload_3      1d      ← loop header
+        //  3: iload_2      1c
+        //  4: if_icmpge 17 a2 00 0d
+        //  7: iload_1      1b          swap through the operand stack:
+        //  8: iload_0      1a          stack = [b, a]
+        //  9: istore_1     3c          b = a
+        // 10: istore_0     3b          a = b
+        // 11: iinc 3,1     84 03 01
+        // 14: goto 2       a7 ff f4
+        // 17: iload_0      1a
+        // 18: iload_1      1b
+        // 19: isub         64
+        // 20: ireturn      ac
+        let code = [
+            0x03, 0x3e, 0x1d, 0x1c, 0xa2, 0x00, 0x0d, 0x1b, 0x1a, 0x3c, 0x3b, 0x84, 0x03, 0x01,
+            0xa7, 0xff, 0xf4, 0x1a, 0x1b, 0x64, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 21, 3, 4).expect(
+            "the swap loop must COMPILE — a None here is the cyclic-parallel-copy \
+             refusal coming back, which drops the method a tier",
+        );
+        // `ireturn` leaves a 32-bit value in the return register, so the raw
+        // i64 readout carries an untouched upper half and a negative result
+        // reads as its u32 bit pattern (-4 as 0xFFFF_FFFC). Sign-extend before
+        // comparing, or a correct swap reports as a failure.
+        let f = |a: i64, b: i64, n: i64| {
+            let raw = unsafe { cm.try_call(&[a, b, n]).expect("call") };
+            raw as i32 as i64
+        };
+        assert_eq!(f(3, 7, 0), -4, "no iterations: 3 - 7");
+        assert_eq!(f(3, 7, 1), 4, "one swap: 7 - 3 (0 would mean a == b)");
+        assert_eq!(f(3, 7, 2), -4, "two swaps: back to 3 - 7");
+        assert_eq!(f(3, 7, 3), 4, "three swaps");
+        assert_eq!(f(-9, 5, 1), 14, "5 - (-9)");
+    }
+
+    // ── Inlined caller scopes → `FrameState::caller` ─────────────────────
+
+    /// A trivially lowerable graph (`Start → Proj ctrl/mem → Param(0) →
+    /// Const(7) → Return`) with no safepoints; the caller pushes whatever
+    /// snapshots the test needs. Returns the `Const` node id, which resolves to
+    /// `FrameValue::Int(7)` with no machine location — the simplest slot a
+    /// snapshot can name.
+    fn scope_fixture_graph() -> (Graph, NodeId) {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let p0 = g.add(Op::Param(0), IrType::Int, vec![start], None);
+        let k = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, p0], None);
+        g.exit = ret;
+        (g, k)
+    }
+
+    /// Resolve `graph.safepoints[index]` through a real `Lowerer` carrying
+    /// `scopes`, i.e. exactly the path `build_deopt_points` takes.
+    fn resolve_with_scopes(graph: &Graph, scopes: &InlineScopeTable, index: usize) -> FrameState {
+        let schedule = ir_schedule::schedule(graph);
+        let plan = plan_slots(graph, &schedule, None);
+        let empty: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let helpers = no_helpers();
+        let lowerer = Lowerer::new(
+            graph,
+            &schedule,
+            buf,
+            1,
+            1,
+            &plan,
+            &helpers,
+            &empty,
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact,
+            scopes,
+        );
+        lowerer.resolve_frame_state(&graph.safepoints[index], index)
+    }
+
+    /// The state of the world today: no scope table, so every deopt frame is
+    /// flat. This is the byte-identical-behaviour witness for the whole change.
+    #[test]
+    fn an_empty_scope_table_still_produces_a_flat_frame() {
+        let (mut g, _k) = scope_fixture_graph();
+        g.safepoints.push(SafepointSnapshot {
+            bci: 4,
+            locals: vec![NO_NODE],
+            stack: vec![],
+        });
+        let fs = resolve_with_scopes(&g, &InlineScopeTable::new(), 0);
+        assert_eq!(fs.bci, 4);
+        assert!(fs.caller.is_none(), "no scope table ⇒ no caller chain");
+        assert!(crate::deopt::frame_state_is_resumable(&fs));
+    }
+
+    /// A snapshot bound to a scope round-trips through lowering into a
+    /// `FrameState` whose caller carries the scope's method key and the bci of
+    /// the `invoke` that is in progress — and whose locals come from the
+    /// caller's own recorded snapshot, not from thin air.
+    #[test]
+    fn a_bound_snapshot_lowers_into_its_caller_scope() {
+        let (mut g, k) = scope_fixture_graph();
+        // snapshot 0 = the caller's state at the invoke; snapshot 1 = the
+        // inlined callee's state at the trapping bci.
+        g.safepoints.push(SafepointSnapshot {
+            bci: 12,
+            locals: vec![k],
+            stack: vec![],
+        });
+        g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![],
+        });
+
+        let mut scopes = InlineScopeTable::new();
+        let s = scopes
+            .push_scope("Outer.run:()V", 12, Some(0), None)
+            .expect("scope");
+        assert!(scopes.bind_snapshot(1, s));
+
+        let fs = resolve_with_scopes(&g, &scopes, 1);
+        assert_eq!(fs.bci, 3, "innermost scope is the trapping one");
+        let caller = fs.caller.as_ref().expect("caller scope present");
+        assert_eq!(caller.method_key, "Outer.run:()V");
+        assert_eq!(caller.bci, 12, "the invoke's bci, not the callee's");
+        assert_eq!(
+            caller.locals,
+            vec![FrameValue::Int(7)],
+            "the caller's locals come from its own snapshot"
+        );
+        assert!(caller.caller.is_none(), "depth 1 ⇒ nothing above");
+        assert!(crate::deopt::frame_state_is_resumable(&fs));
+
+        // The unbound snapshot in the same graph is unaffected.
+        assert!(resolve_with_scopes(&g, &scopes, 0).caller.is_none());
+    }
+
+    /// Depth 0..4: the chain length the lowerer produces is exactly the scope
+    /// depth, and the frames come out innermost-caller-first.
+    #[test]
+    fn caller_chains_of_depth_zero_through_four() {
+        for depth in 0..=4usize {
+            let (mut g, k) = scope_fixture_graph();
+            // One caller snapshot per scope, then the trapping snapshot last.
+            for d in 0..depth {
+                g.safepoints.push(SafepointSnapshot {
+                    bci: 100 + d,
+                    locals: vec![k],
+                    stack: vec![],
+                });
+            }
+            let trap_index = depth;
+            g.safepoints.push(SafepointSnapshot {
+                bci: 9,
+                locals: vec![NO_NODE],
+                stack: vec![],
+            });
+
+            let mut scopes = InlineScopeTable::new();
+            // Push outermost-first so each parent already exists.
+            let mut parent = None;
+            for d in (0..depth).rev() {
+                parent = scopes.push_scope(
+                    &format!("M{d}.m:()V"),
+                    (100 + d) as u32,
+                    Some(d as u32),
+                    parent,
+                );
+                assert!(parent.is_some(), "depth {depth}, scope {d}");
+            }
+            if let Some(innermost) = parent {
+                assert!(scopes.bind_snapshot(trap_index, innermost));
+            }
+
+            let fs = resolve_with_scopes(&g, &scopes, trap_index);
+            let mut walked = 0usize;
+            let mut cursor = fs.caller.as_deref();
+            while let Some(f) = cursor {
+                // Scope 0 is the immediate caller, scope `depth-1` the outermost.
+                assert_eq!(f.method_key, format!("M{walked}.m:()V"));
+                assert_eq!(f.bci, (100 + walked) as u32);
+                walked += 1;
+                cursor = f.caller.as_deref();
+            }
+            assert_eq!(walked, depth, "chain length matches the scope depth");
+            assert!(crate::deopt::frame_state_is_resumable(&fs));
+        }
+    }
+
+    /// A caller scope whose own snapshot holds an unreconstructable slot must
+    /// be REFUSED, not admitted. The innermost scope here is spotless, so a
+    /// scope-local predicate would wave it through — which is precisely the
+    /// hazard `frame_state_is_resumable`'s caller walk closes for the two
+    /// compile-time admission gates that consult it.
+    #[test]
+    fn a_caller_scope_holding_materialization_required_is_refused() {
+        let (mut g, _k) = scope_fixture_graph();
+        // A snapshot slot naming a node id past the end of the arena resolves
+        // to `MaterializationRequired` (see `frame_value_for`).
+        let dangling: NodeId = 9_999;
+        g.safepoints.push(SafepointSnapshot {
+            bci: 12,
+            locals: vec![dangling],
+            stack: vec![],
+        });
+        g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![],
+        });
+
+        let mut scopes = InlineScopeTable::new();
+        let s = scopes
+            .push_scope("Outer.run:()V", 12, Some(0), None)
+            .expect("scope");
+        assert!(scopes.bind_snapshot(1, s));
+
+        let fs = resolve_with_scopes(&g, &scopes, 1);
+        let caller = fs.caller.as_ref().expect("caller scope present");
+        assert!(
+            matches!(caller.locals[0], FrameValue::MaterializationRequired(_)),
+            "{:?}",
+            caller.locals[0]
+        );
+        // Innermost alone is clean …
+        let innermost_only = FrameState {
+            caller: None,
+            ..fs.clone()
+        };
+        assert!(
+            crate::deopt::frame_state_is_resumable(&innermost_only),
+            "precondition: a scope-local predicate would wave this through"
+        );
+        // … the chain is not.
+        assert!(
+            !crate::deopt::frame_state_is_resumable(&fs),
+            "an unresumable caller must sink the whole deopt point"
+        );
+    }
+
+    /// A scope with no recorded caller snapshot is rendered as an explicitly
+    /// UNRESUMABLE frame, never as an empty one — an empty caller frame
+    /// reconstructs as all-zero locals with no error anywhere.
+    #[test]
+    fn an_undescribed_caller_scope_is_unresumable_not_empty() {
+        let (mut g, _k) = scope_fixture_graph();
+        g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![],
+        });
+
+        let mut scopes = InlineScopeTable::new();
+        let s = scopes
+            .push_scope("Outer.run:()V", 12, None, None)
+            .expect("scope");
+        assert!(scopes.bind_snapshot(0, s));
+
+        let fs = resolve_with_scopes(&g, &scopes, 0);
+        let caller = fs.caller.as_ref().expect("caller scope present");
+        assert_eq!(caller.locals, vec![FrameValue::Unsupported]);
+        assert!(!crate::deopt::frame_state_is_resumable(&fs));
+    }
+
+    /// Every `DeoptimizationPoint` this file builds carries
+    /// `ResumeSemantics::for_reason(reason)` — the convention, written down
+    /// instead of re-derived by each consumer. `build_deopt_points` is the
+    /// site under test; the two guard sites (`Op::Guard`, `emit_deopt_unless`)
+    /// box their points into code and are covered by the source witness below.
+    #[test]
+    fn every_deopt_point_stamps_for_reason() {
+        // iconst_5; iconst_3; iadd; iconst_2; imul; ireturn — two deopt points
+        // (bci 2 and bci 4), the same fixture `test_deopt_points_resolve_*` uses.
+        let code = [0x08, 0x06, 0x60, 0x05, 0x68, 0xac, 0, 0];
+        let cm = compile_via_ir_no_opt(&code, 6, 0, 0);
+        assert!(!cm.deopt_points.is_empty(), "fixture must emit deopt points");
+        for p in &cm.deopt_points {
+            assert_eq!(
+                p.semantics,
+                ResumeSemantics::for_reason(p.reason),
+                "deopt point at +{:#x} (reason {:?})",
+                p.native_offset,
+                p.reason
+            );
+            assert_eq!(
+                p.semantics,
+                ResumeSemantics::REEXECUTE,
+                "a resume point before the bytecode re-executes it"
+            );
+        }
+    }
+
+    /// Source witness: no `DeoptimizationPoint` literal in this file may omit
+    /// `semantics`. The two guard sites bake their point's *address* into
+    /// emitted code and are never handed back to a test, so the field's
+    /// presence there cannot be asserted behaviourally.
+    #[test]
+    fn every_deopt_point_literal_names_its_semantics() {
+        let src = include_str!("ir_lower.rs");
+        let literals = src.matches("DeoptimizationPoint {").count();
+        let stamped = src.matches("semantics: ResumeSemantics::").count();
+        assert!(
+            stamped >= literals,
+            "{literals} `DeoptimizationPoint` literal(s) but only {stamped} \
+             `semantics:` initialiser(s) — a construction site is inferring \
+             the re-execute convention again instead of recording it"
+        );
+    }
+
+    // ── Linear-scan register residency ──────────────────────────────────
+
+    /// `double f(double a) { return a * a * 2.0 + a; }` as a hand-built graph.
+    ///
+    /// Hand-built rather than compiled from `dload_0; dmul; …`, because the
+    /// point of these tests is the ALLOCATION, and a bytecode-built graph
+    /// carries a `SafepointSnapshot` per bci whose interaction with pinning is
+    /// the subject of its own test below.
+    fn fp_chain_graph() -> (Graph, Schedule) {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Double, vec![start], Some(0));
+        let sq = graph.add(Op::Mul, IrType::Double, vec![a, a], Some(1));
+        let two = graph.add(Op::ConstF(2.0f64.to_bits()), IrType::Double, vec![], Some(2));
+        let scaled = graph.add(Op::Mul, IrType::Double, vec![sq, two], Some(3));
+        let sum = graph.add(Op::Add, IrType::Double, vec![scaled, a], Some(4));
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum], Some(5));
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
+    #[test]
+    fn linear_scan_promotes_fp_values_and_nothing_else() {
+        let (graph, schedule) = fp_chain_graph();
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("the colouring verifies");
+
+        let residency = plan_register_residency(&graph, &schedule, &plan)
+            .expect("the allocation verifies")
+            .expect("an FP arithmetic chain has something to promote");
+
+        assert!(residency.promoted > 0);
+        assert_eq!(
+            residency.demoted, 0,
+            "the two liveness models must agree on a straight-line graph"
+        );
+        for (id, reg) in residency.reg_of.iter().enumerate() {
+            let Some(reg) = reg else { continue };
+            assert!(
+                IR_LOWER_LS_XMMS.contains(reg),
+                "n{id} was given xmm{reg}, which is outside the file this \
+                 backend may clobber"
+            );
+            assert!(
+                matches!(graph.nodes[id].ty, IrType::Float | IrType::Double),
+                "n{id} is {:?} — only FP values may take a register here, which \
+                 is what makes a reference at a safepoint unrepresentable",
+                graph.nodes[id].ty
+            );
+        }
+    }
+
+    /// A value named by a deopt frame state must still be promotable, and its
+    /// home word must still be written.
+    ///
+    /// This is the regression witness for the check that nearly made the whole
+    /// wiring inert: `plan_slots` marks every deopt-named value
+    /// `SlotClass::Pinned` (= never shares a frame word), and refusing to
+    /// promote that class would have undone `release_deopt_pins` for exactly
+    /// the values it exists to release. `IrBuilder` names essentially every
+    /// value in some frame state, so this is not a corner case — it is the
+    /// common case on real bytecode.
+    #[test]
+    fn a_deopt_named_value_is_still_promotable() {
+        let (mut graph, _) = fp_chain_graph();
+        // Name every FP value in a frame state, as `IrBuilder` would.
+        let fp: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.ty, IrType::Float | IrType::Double))
+            .map(|(id, _)| id as NodeId)
+            .collect();
+        assert!(!fp.is_empty());
+        graph.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: fp.clone(),
+            stack: fp.clone(),
+        });
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        // Precondition: the colourer really does pin them, so this test is
+        // asserting against the state it means to.
+        assert!(
+            fp.iter()
+                .any(|&id| plan.class[id as usize] == Some(SlotClass::Pinned)),
+            "the colourer must pin a deopt-named value"
+        );
+
+        let residency = plan_register_residency(&graph, &schedule, &plan)
+            .expect("the allocation verifies")
+            .expect(
+                "a deopt-named FP value must still be promotable — write-through \
+                 keeps its home word correct at every bci",
+            );
+        assert!(residency.promoted > 0);
+    }
+
+    /// The GC cliff, stated as a property rather than a comment: no reference
+    /// can be register-resident, so `emit_safepoint_map`'s frame-slot-only
+    /// publication stays complete.
+    #[test]
+    fn a_reference_is_never_register_resident() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        // A live array reference and an int index, both genuinely read.
+        let arr = graph.add(Op::Param(0), IrType::Ref, vec![start], Some(0));
+        let idx = graph.add(Op::Param(1), IrType::Int, vec![start], Some(1));
+        let elem = graph.add(
+            Op::ArrayLoad(MemKind::Double),
+            IrType::Double,
+            vec![ctrl, mem, arr, idx],
+            Some(2),
+        );
+        let doubled = graph.add(Op::Add, IrType::Double, vec![elem, elem], Some(3));
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, doubled], Some(4));
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        let residency = plan_register_residency(&graph, &schedule, &plan)
+            .expect("the allocation verifies")
+            .expect("the FP values are promotable");
+        assert_eq!(
+            residency.reg_of[arr as usize], None,
+            "a reference took a register; `emit_safepoint_map` publishes frame \
+             slots only, so the collector could neither see nor relocate it"
+        );
+        assert_eq!(
+            residency.reg_of[idx as usize], None,
+            "an int took a register, but this file's register set is XMM-only"
+        );
+        assert!(
+            residency.reg_of[doubled as usize].is_some(),
+            "the FP value must be promoted, or the two assertions above are \
+             vacuous"
+        );
+    }
+
+    /// A value live across a helper call must not keep a caller-saved register.
+    ///
+    /// FP `Op::Rem` is the sharp case: it lowers to `CALL jit_drem`, and
+    /// `regalloc::ir_op_is_call` did not count it until this wiring landed.
+    #[test]
+    fn a_value_live_across_a_helper_call_keeps_no_register() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Double, vec![start], Some(0));
+        let m = graph.add(Op::ConstF(3.0f64.to_bits()), IrType::Double, vec![], Some(1));
+        // `jit_drem` — a call that returns into the body.
+        let r = graph.add(Op::Rem, IrType::Double, vec![a, m], Some(2));
+        // `a` is read again AFTER the call, so its range spans it.
+        let sum = graph.add(Op::Add, IrType::Double, vec![r, a], Some(3));
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum], Some(4));
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        let residency = plan_register_residency(&graph, &schedule, &plan)
+            .expect("the allocation verifies");
+        let reg_of_a = residency
+            .as_ref()
+            .and_then(|res| res.reg_of.get(a as usize).copied().flatten());
+        assert_eq!(
+            reg_of_a, None,
+            "n{a} spans a `CALL jit_drem`, which destroys every XMM this file \
+             allocates over"
+        );
+    }
+
+    /// `MachineModel::for_graph` cannot see the safepoint poll's slow-path
+    /// call, because it belongs to no node. `ir_lower_machine_model` adds it.
+    ///
+    /// Without this the first loop-carried FP value would be handed a register
+    /// the poll destroys on every back edge.
+    #[test]
+    fn the_machine_model_clobbers_the_back_edge_poll() {
+        use crate::regalloc::{build_live_model, MachineModel, PhysReg, RegFile, RegSpec};
+
+        // int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        // Unoptimized on purpose: the schedule's back edges are the subject,
+        // and the optimizer is free to reshape them.
+        let builder = IrBuilder::new(1, 3);
+        let graph = builder.build(&code, 21).expect("IR build");
+        let schedule = ir_schedule::schedule(&graph);
+        let live = build_live_model(&graph, &schedule);
+        assert!(live.converged);
+
+        let file = || {
+            RegFile::from_specs(IR_LOWER_LS_XMMS.iter().map(|&n| RegSpec {
+                reg: PhysReg::xmm(n),
+                caller_saved: true,
+            }))
+        };
+        let bare = MachineModel::for_graph(&graph, &schedule, &live, file());
+        let ours = ir_lower_machine_model(&graph, &schedule, &live, file());
+
+        let back_edges: Vec<usize> = schedule
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, block)| block.successors.iter().any(|&s| s <= *b))
+            .filter_map(|(b, _)| live.span.get(b).map(|&(_, edge)| edge))
+            .collect();
+        assert!(
+            !back_edges.is_empty(),
+            "a counted loop must have a back edge to poll on"
+        );
+
+        let xmm2 = PhysReg::xmm(2);
+        let holds = |model: &MachineModel, pos: usize| {
+            model
+                .clobbers
+                .iter()
+                .any(|(p, regs)| *p == pos && regs.contains(&xmm2))
+        };
+        for edge in back_edges {
+            assert!(
+                holds(&ours, edge),
+                "the poll at the outgoing edge of a back-edge block calls its \
+                 slow path; position {edge} must be a clobber"
+            );
+            assert!(
+                !holds(&bare, edge),
+                "this test is only meaningful while `for_graph` still misses \
+                 the poll — if it now models it, delete the augmentation"
+            );
+        }
+
+        // `MachineModel::clobbered_at` binary-searches this list.
+        assert!(
+            ours.clobbers.windows(2).all(|w| w[0].0 < w[1].0),
+            "the clobber list must stay sorted with one entry per position"
+        );
+    }
+
+    /// The finding that decides whether any of this does anything on real
+    /// code: `IrBuilder` snapshots the frame at every bci, so `build_live_model`
+    /// pins the whole value set and the allocator promotes nothing until the
+    /// deopt pins are released.
+    #[test]
+    fn a_bytecode_graph_pins_everything_until_the_deopt_pins_are_released() {
+        use crate::regalloc::{allocate_linear_scan, build_live_model, MachineModel, RegFile};
+
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        let builder = IrBuilder::new(1, 3);
+        let graph = builder.build(&code, 21).expect("IR build");
+        let schedule = ir_schedule::schedule(&graph);
+
+        let mut live = build_live_model(&graph, &schedule);
+        assert!(live.converged);
+        assert!(
+            !graph.safepoints.is_empty(),
+            "the IR builder records a frame state per bci"
+        );
+
+        let wants = live.wants_loc.iter().filter(|w| **w).count();
+        let pinned_before = live
+            .wants_loc
+            .iter()
+            .zip(live.pinned.iter())
+            .filter(|(w, p)| **w && **p)
+            .count();
+        assert!(
+            wants > 0 && pinned_before * 2 > wants,
+            "most values ({pinned_before} of {wants}) should be pinned by the \
+             per-bci frame states — that is the whole finding"
+        );
+
+        let model = MachineModel::for_graph(&graph, &schedule, &live, RegFile::x86_64());
+        let before = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+
+        let released = live.release_deopt_pins(&graph);
+        assert!(released > 0, "there were pins to release");
+        let after = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        crate::regalloc::verify_allocation(&graph, &live, &model, &after).expect("verifies");
+        assert!(
+            after.promoted > before.promoted,
+            "releasing the deopt pins is what makes the allocator do anything \
+             on a real method ({} → {})",
+            before.promoted,
+            after.promoted
+        );
+        // Phi pins are structural and must survive.
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if matches!(node.op, Op::Phi) && live.wants_loc[id] {
+                assert!(
+                    live.pinned[id],
+                    "phi n{id} lost its pin; its home is what the edge copies write"
+                );
+            }
+        }
+    }
+
+    /// Write-through, end to end: the same method must return the same bits
+    /// with the register cache on and off, and the "on" body must still emit
+    /// every home store the "off" body did.
+    #[test]
+    fn the_register_cache_changes_no_result_and_drops_no_home_store() {
+        let (graph, schedule) = fp_chain_graph();
+
+        let (off_code, off_bits) = {
+            let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("lowers");
+            // SAFETY: one incoming argument, delivered as the raw bits of a
+            // double in an integer ABI register, exactly as `Op::Param`
+            // expects; the body calls no helper.
+            let bits = unsafe { cm.try_call(&[3.0f64.to_bits() as i64]).expect("call") };
+            (cm.code_bytes().to_vec(), bits)
+        };
+        assert_eq!(
+            f64::from_bits(off_bits as u64),
+            3.0 * 3.0 * 2.0 + 3.0,
+            "the fixture itself must compute a*a*2+a"
+        );
+
+        let (on_code, on_bits, resident) = {
+            let _flag = LsForce::on();
+            let plan = plan_slots(&graph, &schedule, None);
+            let resident = plan_register_residency(&graph, &schedule, &plan)
+                .expect("verifies")
+                .map(|r| r.promoted)
+                .unwrap_or(0);
+            let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("lowers");
+            // SAFETY: as above.
+            let bits = unsafe { cm.try_call(&[3.0f64.to_bits() as i64]).expect("call") };
+            (cm.code_bytes().to_vec(), bits, resident)
+        };
+
+        assert!(resident > 0, "the fixture must actually promote something");
+        assert_eq!(
+            on_bits, off_bits,
+            "the register cache changed the computed value"
+        );
+
+        // MOVAPS xmm, xmm — the register copy, emitted only by the cache.
+        // Compared rather than counted absolutely: a two-byte needle can also
+        // fall inside some other instruction's encoding.
+        assert!(
+            count_seq(&on_code, &[0x0F, 0x28]) > count_seq(&off_code, &[0x0F, 0x28]),
+            "the enabled body emitted no register copy, so the wiring did \
+             nothing and the rest of this test is vacuous"
+        );
+
+        // MOVSD [rbp - disp32], xmm0 — the home store. Write-through means the
+        // cached body emits at least as many as the uncached one.
+        let home_store = [0xF2u8, 0x0F, 0x11, 0x85];
+        let off_stores = count_seq(&off_code, &home_store);
+        assert!(off_stores > 0, "the fixture must store FP results to memory");
+        assert!(
+            count_seq(&on_code, &home_store) >= off_stores,
+            "a home store disappeared: the frame image is no longer complete \
+             at every instruction boundary, which is what `emit_safepoint_map` \
+             and `build_deopt_points` rely on"
+        );
+    }
+
+    /// The publication interlock, asserted on the source because it is a
+    /// property of *which accessor* every read uses, and a behavioural test
+    /// cannot reach a lowering that forgot to convert a definition site.
+    ///
+    /// `reg_of` says which register a value was ASSIGNED; `reg_live` says the
+    /// definition has actually written it. Every read must go through
+    /// `resident_xmm` (which checks `reg_live`) or `assigned_xmm` (which is
+    /// only for the two publishing sites). A definition arm nobody converted
+    /// must therefore cost an optimization, never a read of a register that
+    /// was never written.
+    #[test]
+    fn the_register_read_path_is_gated_on_publication() {
+        // Only the emitter, not this module: the assertion below quotes the
+        // very strings it looks for.
+        let src = include_str!("ir_lower.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let reads: Vec<String> = body
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| l.contains("self.reg_of") && !l.starts_with("//"))
+            .collect();
+        let allowed = [
+            "self.reg_of = residency.reg_of;",
+            "self.reg_of.get(id as usize).copied().flatten()",
+        ];
+        for line in &reads {
+            assert!(
+                allowed.contains(&line.as_str()),
+                "new read of the register assignment outside `resident_xmm` / \
+                 `assigned_xmm`: {line}"
+            );
+        }
+        assert_eq!(
+            reads.len(),
+            3,
+            "expected exactly the install site and the two accessors"
+        );
     }
 }
