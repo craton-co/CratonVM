@@ -13452,7 +13452,29 @@ fn route_jit_signal_exception(
     };
     let (throw_pc, locals) = match precise.as_ref() {
         Some((bci, locals)) => (*bci, locals.as_slice()),
-        None => (fallback_throw_pc, fallback_locals),
+        None => {
+            // The sibling of `run_jit_callee_handler`'s refusal, for the sink
+            // that was ALREADY consuming precise frames. Consuming them is not
+            // the whole contract: when none is stashed, `fallback_locals` is
+            // this method's `this`-plus-parameters, which describes a handler
+            // that reads nothing else. `precise_handler_frames_enabled` retired
+            // the compile gate that used to guarantee that, so a method whose
+            // handler DOES read further locals reaches here too — and with the
+            // throw pc unknown, `find_jit_exception_handler` will still match
+            // one of its typed handlers by exception class. Entering it would
+            // zero those locals silently. Propagate instead, exactly as this
+            // function already does for a frame it cannot map.
+            if handler_resume_needs_precise_locals(cached) {
+                if crate::jit::helpers::rbc6_dbg() {
+                    eprintln!(
+                        "[rbc6-dbg] route_jit_signal_exception DECLINED {}.{}{}                          — handler needs precise locals and no frame was published",
+                        cached.class_name, cached.method_name, cached.method_descriptor,
+                    );
+                }
+                return Err(MethodCallFailed::ExceptionThrown(exc));
+            }
+            (fallback_throw_pc, fallback_locals)
+        }
     };
     if crate::jit::helpers::rbc6_dbg() {
         eprintln!(

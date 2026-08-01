@@ -111,7 +111,7 @@ this time landing somewhere dereferenced unsafely instead of hitting a
 re-diagnosed at the source level this session. The
 `compiled-frame-oop-not-published` GC annotation on the crashing frame is
 worth noting given this cluster's other members (see the
-`springboot-basicerrorcontroller-checkcast-abort-20260731.md` doc in this
+`../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md` doc (retired 2026-08-01) in this
 same directory) trace to moving-young-generation root-publication gaps; a
 future investigation should check whether they share a cause.
 

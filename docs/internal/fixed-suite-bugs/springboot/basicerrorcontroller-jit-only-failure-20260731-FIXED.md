@@ -1,5 +1,42 @@
 # `BasicErrorControllerIntegrationTests` is NOT a usable acceptance gate right now
 
+**Status: FIXED — 2026-08-01. The title is no longer true; the class IS a
+usable gate again.** Retired from `docs/known-issues/springboot/`.
+
+This document was right about the important thing: the failure it recorded was
+neither the direct-call gate nor the `checkcast` abort its two companions
+described, and anyone running
+`jit/src/lib.rs::direct_jit_callee_calls_enabled()`'s stated acceptance would
+have concluded the reopened JIT-to-JIT edge was unsafe when it was not.
+
+Its two signatures —
+
+```
+NullPointerException: Cannot invoke "java.util.Iterator.hasNext()" because "<local5>" is null
+BindException: Failed to bind properties under 'spring.main.allow-bean-definition-overriding' to boolean
+```
+
+— were one defect: the JIT-to-JIT handler-resume sink seeding a handler frame
+with the callee's incoming arguments only, for a method the precise-handler-frame
+relaxation now admits. Fixed in `843b780baa`; full write-up in
+[`basicerrorcontroller-class-cluster-20260728-FIXED.md`](basicerrorcontroller-class-cluster-20260728-FIXED.md).
+
+Two items from this document did NOT close with it:
+
+* The `DeferredLogFactory.getLog(Class)` receiver mix-up recorded under
+  "Signature observed here" was last seen on a binary at `351218f44` and has
+  not been observed since `7f1b1f263`. It was never root-caused. If it returns,
+  it is a separate defect — do not assume the handler-frame fix covers it.
+* The code-buffer overflow flood is re-filed, with a corrected attribution
+  (it is the optimizing IR tier's estimate, not `x64.rs`'s), as
+  `docs/known-issues/jit-ir-tier-code-buffer-overflow-flood-20260801.md`.
+
+---
+
+*(The original report follows in full. Its own `Status:` line records the 2026-07-31 state and is superseded by the header above.)*
+
+# `BasicErrorControllerIntegrationTests` is NOT a usable acceptance gate right now
+
 **Status:** OPEN, measured 2026-07-31 against dev `f14b64379`.
 
 This is a narrow companion to the two existing reports on this class —
