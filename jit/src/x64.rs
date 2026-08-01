@@ -184,6 +184,15 @@ pub use licm_int::*;
 mod bce;
 pub use bce::*;
 // ---------------------------------------------------------------------------
+// Vector (SIMD) emission
+// ---------------------------------------------------------------------------
+//
+// Lives in `x64/vec_emit.rs`. The `pub use` keeps every
+// existing path resolving; a glob re-export caps each item at its own
+// declared visibility, so nothing here became more public than it was.
+mod vec_emit;
+pub use vec_emit::*;
+// ---------------------------------------------------------------------------
 // Compile bytecode to x86-64
 // ---------------------------------------------------------------------------
 
@@ -338,6 +347,31 @@ struct Compiler {
     /// Empty when the method has no handlers. Consulted only by
     /// [`Compiler::pc_is_protected`]; see `PROTECTED_RANGES_REQUEST`.
     protected_ranges: Vec<(u32, u32)>,
+    /// `LoopXform::bci_of` when this compile is emitting REWRITTEN bytecode
+    /// (see `plan_bytecode_loop_xform`), `None` on every ordinary compile.
+    ///
+    /// When present, the `pc` the emitter walks is an output PC of the
+    /// rewritten method and is **not** an interpreter bci — output PCs run
+    /// past the end of the interpreter's method. Everything that leaves this
+    /// compile as a bci must therefore go through [`Compiler::orig_bci`].
+    /// There are exactly four such places, and all four bake the value as an
+    /// immediate into machine code, so none of them can be fixed by a
+    /// post-pass over the finished `CompiledMethod`:
+    ///
+    ///  * [`Compiler::emit_bounds_check_stubs`] — arg 4 of `jit_throw_aioobe`;
+    ///  * [`Compiler::emit_exception_check_stub`] — the arg of `set_throw_bci`,
+    ///    which `execute_jit_call` range-tests against this method's own
+    ///    exception table;
+    ///  * [`Compiler::emit_deopt_stubs`] — arg 3 of `jit_uncommon_trap`;
+    ///  * the `athrow` (`0xbf`) lowering — arg 2 of `jit_throw_exception`,
+    ///    range-tested by `route_jit_exception_through_method`.
+    ///
+    /// `OopMapEntry::bytecode_pc` is deliberately NOT translated: it is only
+    /// ever compared against the value this same codegen stores into the
+    /// frame's safepoint-id slot (`emit_pre_safepoint_spill`), so both sides
+    /// live in output-PC space and translating one of them would make
+    /// `find_oop_map_for_safepoint_id`'s `.find()` ambiguous across copies.
+    bci_provenance: Option<Vec<u32>>,
     /// An allocation OOM bail (`emit_post_alloc_oom_check`) was emitted in this
     /// method — by `newarray` (0xbc), `anewarray` (0xbd), or `new` (0xbb).
     /// Forces `has_dispatch` for the SAME thread-availability reason as
@@ -1901,6 +1935,9 @@ impl Compiler {
             emitted_monitor_call: false,
             precise_exception_frames,
             protected_ranges,
+            // Installed after construction by `compile_with_param_slots`, and
+            // only when it decided to compile rewritten bytecode.
+            bci_provenance: None,
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
             forward_patches: Vec::new(),
@@ -11945,6 +11982,11 @@ impl Compiler {
         // offsets; a separate pad for each remains unambiguous.
         let sites = self.bounds_check_stubs.clone();
         for (patch_off, bc_pc) in sites {
+            // `bc_pc` is an EMITTER pc. `jit_throw_aioobe`'s 4th argument is
+            // reported as this method's bytecode index, so it must be an
+            // interpreter bci — the identity unless this compile is emitting
+            // rewritten bytecode. See `Compiler::bci_provenance`.
+            let bc_pc = self.orig_bci(bc_pc);
             let stub_offset = self.buf.pos();
 
             // At this point RAX=array pointer, RCX=index, R10D=array length.
@@ -12118,6 +12160,24 @@ impl Compiler {
             .any(|(start, end)| pc >= *start && pc < *end)
     }
 
+    /// The interpreter bci an emitter PC belongs to.
+    ///
+    /// The identity on every ordinary compile (`bci_provenance == None`), so
+    /// the four call sites are byte-identical there. When this compile is
+    /// emitting rewritten bytecode it is `LoopXform::bci_at`, which is total
+    /// over the rewritten method — `plan_bytecode_loop_xform` refuses any
+    /// transform whose `provenance_is_total()` does not hold, so the `None`
+    /// arm of the lookup is unreachable for an in-range PC. It is still
+    /// written to fall back to `pc` rather than panic, because these callers
+    /// run inside the no-panic emit path.
+    fn orig_bci(&self, pc: usize) -> usize {
+        match &self.bci_provenance {
+            // Widening: u32 -> usize
+            Some(map) => map.get(pc).map(|&b| b as usize).unwrap_or(pc),
+            None => pc,
+        }
+    }
+
     fn emit_post_invoke_exception_check(&mut self, ret_type: u8) {
         // The simulated operand stack at this point is the state *after* the
         // instruction which made the fallible call: every invoke lowering has
@@ -12272,6 +12332,12 @@ impl Compiler {
         let sites = self.exception_check_stubs.clone();
         let mut stub_by_bci: FxHashMap<usize, usize> = FxHashMap::default();
         for (patch_off, bci) in sites {
+            // The stamped value is range-tested against THIS method's
+            // interpreter exception table, so it must be an interpreter bci.
+            // Identity on an ordinary compile; under a loop rewrite the copies
+            // of one bytecode collapse onto their shared original bci, which
+            // is exactly the grouping the comment above describes.
+            let bci = self.orig_bci(bci);
             let stub_offset = match stub_by_bci.get(&bci) {
                 Some(&off) => off,
                 None => {
@@ -12314,8 +12380,16 @@ impl Compiler {
         // Map from (bci, reason) to the emitted stub offset
         let mut stub_offsets: FxHashMap<(usize, i64), usize> = FxHashMap::default();
 
-        for &(patch_off, bci, reason) in &stubs {
-            let key = (bci, reason);
+        for &(patch_off, site_pc, reason) in &stubs {
+            // `site_pc` is the EMITTER pc the guard was recorded at, and every
+            // `*_box_ptr_by_bci` map below is keyed by that same emitter pc.
+            // Stub SHARING stays keyed on it too: under a loop rewrite two
+            // copies of one bytecode have the same original bci but may have
+            // recorded different frame snapshots, and sharing a stub would
+            // bake one copy's snapshot pointer into the other copy's exit.
+            // Identity — and therefore byte-identical — on an ordinary
+            // compile, where `site_pc` IS the bci.
+            let key = (site_pc, reason);
             if let Some(&stub_off) = stub_offsets.get(&key) {
                 // Reuse existing stub
                 let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
@@ -12429,25 +12503,30 @@ impl Compiler {
             // indy-trap artifact (no helper there could resolve it). Repro:
             // scratch-min/IndyReplay.java (nested shape: 30000/30000 calls
             // corrupted side effects before these fixes, 0 after).
+            // The value HANDED TO THE RUNTIME, as opposed to the emitter pc
+            // used for keying above: `jit_uncommon_trap`'s 3rd argument is an
+            // interpreter bci and the interpreter resumes at it. Identity
+            // unless this compile is emitting rewritten bytecode.
+            let bci = self.orig_bci(site_pc);
             let frame_box_ptr = if crate::deopt_real_enabled() || matches!(reason, 8 | 9 | 10) {
                 match reason {
-                    2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
+                    2 => self.deopt_box_ptr_by_bci.get(&site_pc).copied(),
                     // Step 6: String-intrinsic and call-site type-check guards
                     // (ReceiverTypeChanged). The same `deopt_box_ptr_by_bci` map
                     // is used; a snapshot was recorded by `snapshot_pre_intrinsic_call`
                     // immediately after the pre-call flush (before any arg pops).
-                    6 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
-                    7 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
+                    6 => self.deopt_box_ptr_by_bci.get(&site_pc).copied(),
+                    7 => self.osr_exit_box_ptr_by_bci.get(&site_pc).copied(),
                     // Reason 8 (UnreachedCode / invokedynamic trap): unconditional,
                     // NOT gated behind `deopt_real_enabled()` — see the doc above.
-                    8 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
+                    8 => self.osr_exit_box_ptr_by_bci.get(&site_pc).copied(),
                     // Reason 9 is a pending Java exception in a method whose
                     // handler reads non-parameter locals. Its snapshot is keyed
                     // on the THROWING invoke's own bci (not a resume point — see
                     // `emit_post_invoke_exception_check`) and lives in its own
                     // map, because it is consumed by the interpreter's exception
                     // route rather than by any resume sink.
-                    9 | 10 => self.exc_frame_box_ptr_by_bci.get(&bci).copied(),
+                    9 | 10 => self.exc_frame_box_ptr_by_bci.get(&site_pc).copied(),
                     _ => None,
                 }
             } else {
@@ -13077,18 +13156,19 @@ impl Compiler {
             //
             // Bytecode-loop-transform contract: `osr_entry_native` is published
             // as `CompiledMethod::osr_pc_to_native` and INDEXED BY INTERPRETER
-            // BCI by the runtime's OSR entry check. That is correct today only
-            // because `compile_with_param_slots` compiles the caller's original
-            // bytecode, so `pc` here IS an interpreter bci
-            // (`bytecode_loop_xform_rewrites_bytecode() == false`). If the
-            // bytecode rewriter is ever wired in, this vector must be rebuilt in
-            // ORIGINAL-bci space via `LoopXform::osr_entry_pc(bci)` — not by
-            // writing `self.buf.pos()` at the transformed pc. The reverse of
-            // `bci_of` is one-to-many inside a transformed region, and picking
-            // the wrong image is a wrong-code bug, not a missed optimisation:
-            // entering a PEELED copy re-runs the peeled iterations, so the loop
-            // executes `k` times too many. `osr_entry_pc` always answers with
-            // the steady-state copy. See `docs/jit/loop-transform-wiring.md`.
+            // BCI by the runtime's OSR entry check, but `pc` here is whatever
+            // the emitter is walking — an interpreter bci on an ordinary
+            // compile, an OUTPUT pc when the bytecode rewriter is armed. Keep
+            // writing `self.buf.pos()` at the emitted pc: the coordinate change
+            // is a single `LoopXform::rebuild_pc_to_native` at the end of
+            // `compile_with_param_slots`, NOT a translation here. It has to be
+            // there because the reverse of `bci_of` is one-to-many inside a
+            // transformed region and this loop only ever sees one image at a
+            // time; picking the wrong one is a wrong-code bug, not a missed
+            // optimisation (entering a PEELED copy re-runs the peeled
+            // iterations, so the loop executes `k` times too many).
+            // `rebuild_pc_to_native` applies `osr_entry_pc`'s steady-state
+            // choice pointwise. See `docs/jit/loop-rewriter-wiring.md`.
             if !dead && pc < self.osr_entry_native.len() {
                 let inside_aaload_hoisted = self
                     .hoist_info
@@ -16306,7 +16386,15 @@ impl Compiler {
                     // try-region actually threw. `pc` here is this
                     // instruction's own bci (loaded after ARG_REGS[0] so it
                     // does not disturb the exception-ref load above).
-                    self.emit_mov_imm32_sx(ARG_REGS[1], pc as i32);
+                    //
+                    // `route_jit_exception_through_method` range-tests this
+                    // against the INTERPRETER exception table, so it must be an
+                    // interpreter bci — hence `orig_bci`, which is the identity
+                    // unless this compile is emitting rewritten bytecode. This
+                    // is the fourth and last site in the backend that bakes a
+                    // bci as an immediate; see `Compiler::bci_provenance`.
+                    let throw_bci = self.orig_bci(pc);
+                    self.emit_mov_imm32_sx(ARG_REGS[1], throw_bci as i32); // Cast: bci fits i32
                     self.emit_call_absolute(self.helpers.throw_exception);
                     // Helper returned the i64::MIN sentinel in RAX —
                     // propagate it as the method's return value.
@@ -23131,34 +23219,66 @@ fn gc_inert_selfrec_candidate(
     pc == code_len && self_calls != 0 && saw_return
 }
 
+thread_local! {
+    /// Opt-in for the bytecode loop rewriter, per compiler thread.
+    ///
+    /// **Off by default, process-wide.** Nothing in the VM arms it; the only
+    /// way in is [`set_bytecode_loop_rewriter_armed`]. That makes the default
+    /// compile path byte-identical to before this wiring landed (one
+    /// thread-local `Cell<bool>` load per compile), and it keeps the opt-in
+    /// out of the declared-flag table, which lives in a crate this backend
+    /// does not own.
+    ///
+    /// Thread-local rather than a process-wide `AtomicBool` for two reasons:
+    /// the JIT compiles on worker threads, so arming is a per-worker decision
+    /// a validation harness can make one thread at a time; and the unit tests
+    /// in this file run concurrently in one process, where a global switch
+    /// would leak one test's transform into another's compile.
+    static BYTECODE_LOOP_REWRITER_ARMED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Arm (or disarm) the bytecode loop rewriter for every subsequent compile on
+/// THIS thread, returning the previous setting.
+///
+/// See [`bytecode_loop_xform_rewrites_bytecode`] for what it switches on and
+/// `docs/jit/loop-rewriter-wiring.md` for what is and is not validated.
+/// Callers that arm it must disarm it again (the tests below use a guard), or
+/// every later compile on the same thread inherits it.
+pub fn set_bytecode_loop_rewriter_armed(on: bool) -> bool {
+    BYTECODE_LOOP_REWRITER_ARMED.with(|c| c.replace(on))
+}
+
 /// Does the bytecode-level loop transform (`plan_loop_peel` /
 /// `plan_loop_unroll` in `x64::licm`) rewrite the bytecode the emitter
 /// compiles?
 ///
-/// `false` today. `compile_with_param_slots` compiles the caller's original
-/// bytecode verbatim, so every pc the emitter handles is an interpreter bci,
-/// every caller-supplied side table (`field_info`, `invoke_info`, `mic_slots`,
-/// `inline_sites`, …) is still keyed correctly, and every deopt bci, oop-map
-/// `bytecode_pc`, `pc_to_native` index and `osr_entry_native` index is already
-/// in interpreter-bci space with nothing to translate.
+/// `false` unless [`set_bytecode_loop_rewriter_armed`] armed this thread.
 ///
-/// The transform IS used, as the native unroller's admission oracle — see
-/// `plan_native_unroll` — but only its *verdict* is consumed; the rewritten
-/// bytes are dropped.
+/// When it is `false`, `compile_with_param_slots` compiles the caller's
+/// original bytecode verbatim, so every pc the emitter handles is an
+/// interpreter bci, every caller-supplied side table (`field_info`,
+/// `invoke_info`, `mic_slots`, `inline_sites`, …) is still keyed correctly,
+/// and every deopt bci, oop-map `bytecode_pc`, `pc_to_native` index and
+/// `osr_entry_native` index is already in interpreter-bci space with nothing
+/// to translate.
 ///
-/// Flipping this to `true` is the single switch that hands loop unrolling to
-/// the bytecode rewriter, and it is deliberately the same switch that turns
-/// the native byte-copy unroller off (see `native_unroller_enabled`): the
-/// two must never both fire on one loop, or `k+1` bytecode copies get
-/// machine-code-duplicated `k+1` more times behind one back edge, giving
-/// `(k+1)^2` bodies per poll — a time-to-safepoint neither unroller's budget
-/// check ever saw.
+/// When it is `true`, `compile_with_param_slots` asks
+/// `plan_bytecode_loop_xform` for a transform. If it gets one it compiles the
+/// REWRITTEN bytes, replicates every pc-keyed side table into output-PC space
+/// through `LoopXform::replicate_pc_keyed`, and translates the three
+/// bci-valued immediates the emitter bakes into machine code back through
+/// `Compiler::orig_bci`. If it does not get one — the common case, because
+/// the admission test is deliberately narrow — the compile is byte-identical
+/// to the unarmed one except that the native unroller is off.
 ///
-/// Do NOT flip it before every item in `docs/jit/loop-transform-wiring.md` is
-/// done. A half-wired rewrite records transformed PCs as interpreter bcis,
-/// which corrupts deopt and the GC's precise oop-map lookup silently.
+/// This is deliberately the same switch that turns the native byte-copy
+/// unroller off (see `native_unroller_enabled`): the two must never both fire
+/// on one loop, or `k+1` bytecode copies get machine-code-duplicated `k+1`
+/// more times behind one back edge, giving `(k+1)^2` bodies per poll — a
+/// time-to-safepoint neither unroller's budget check ever saw.
 fn bytecode_loop_xform_rewrites_bytecode() -> bool {
-    false
+    BYTECODE_LOOP_REWRITER_ARMED.with(|c| c.get())
 }
 
 /// Is the native byte-copy unroller (the `0xa7` arm of `compile_bytecode`)
@@ -23258,6 +23378,191 @@ fn plan_native_unroll(
             None
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bytecode loop rewriter: planning and side-table replication
+// ---------------------------------------------------------------------------
+
+/// Why `compile_with_param_slots` did not compile rewritten bytecode.
+///
+/// Every variant means "compile the caller's original bytecode", which is the
+/// pre-existing behaviour and always correct — the transform is an
+/// optimisation, so refusing it costs speed and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopRewriteRefusal {
+    /// The default. This thread never called
+    /// [`set_bytecode_loop_rewriter_armed`].
+    NotArmed,
+    /// `CRATONVM_DEOPT_REAL`. The precise-deopt snapshots record
+    /// `DeoptimizationPoint::bci`, which the VM *resumes at*, and they are
+    /// built deep inside the emitter from the emitter's own pc. Translating
+    /// them is a separate piece of work; until it lands, refuse.
+    DeoptRealEnabled,
+    /// Precise exceptional frames. Same reason: `emit_post_invoke_exception_check`
+    /// and `emit_precise_null_check_field_store` record a resume-bearing
+    /// snapshot keyed on the emitter pc.
+    PreciseExceptionFrames,
+    /// The method has an `invokedynamic`. Its lowering is an unconditional
+    /// trap that records an `UnreachedCode` snapshot through
+    /// `emit_osr_exit_map_at_reason` — and unlike the two above, that path is
+    /// NOT gated on `deopt_real_enabled()`, so it would fire in production.
+    InvokedynamicPresent,
+    /// The method has inline sites. An inlined callee contributes its own bci
+    /// space (`docs/jit/deopt-inline-scopes.md`) that this wiring's
+    /// caller-only provenance map does not describe.
+    InlineSitesPresent,
+    /// No loop in the method passed the profitability band and the structural
+    /// admission test.
+    NoCandidateLoop,
+    /// The planner produced a transform whose provenance is not total. Cannot
+    /// happen (`rewrite_loop_copies` builds `bci_of` byte by byte and checks
+    /// its length), and is re-checked here because `Compiler::orig_bci`'s
+    /// soundness rests on it.
+    ProvenanceNotTotal,
+    /// The rewriter itself refused the last candidate loop.
+    Planner(LoopXformRefusal),
+}
+
+/// The properties of a pending compile that decide whether the bytecode loop
+/// rewriter may run at all, independent of any particular loop.
+pub(crate) struct LoopRewriteShape {
+    pub(crate) deopt_real: bool,
+    pub(crate) precise_exception_frames: bool,
+    pub(crate) has_indy: bool,
+    pub(crate) has_inline_sites: bool,
+}
+
+/// Choose ONE loop to unroll at the bytecode level and rewrite the method.
+///
+/// The profitability band is deliberately character-for-character the native
+/// unroller's (see the `unroll_loops` construction in
+/// `compile_with_param_slots`), so arming the rewriter changes *which
+/// machinery* unrolls a loop, not *which loops* are considered. The
+/// legality question is `plan_loop_unroll`'s, exactly as it already is for
+/// the native unroller via `plan_native_unroll`.
+///
+/// Exactly one loop, because a `LoopXform` describes one rewrite: composing
+/// two would mean composing their provenance maps, which the primitives in
+/// `x64::licm` do not do. The first admitted loop in `detect_loops` order
+/// wins, and that order is innermost-first for a nest, which is the
+/// profitable choice. Every other loop in the method is left alone — the
+/// rewriter shifts it correctly, it just does not duplicate it.
+fn plan_bytecode_loop_xform(
+    code: &[u8],
+    code_len: usize,
+    exception_ranges: &[(usize, usize, usize)],
+    loop_unroll_hints: &HashMap<usize, usize>,
+    shape: LoopRewriteShape,
+) -> Result<LoopXform, LoopRewriteRefusal> {
+    use LoopRewriteRefusal as R;
+
+    if !bytecode_loop_xform_rewrites_bytecode() {
+        return Err(R::NotArmed);
+    }
+    // Whole-compile refusals, cheapest first. Each names a construct that
+    // publishes an emitter pc to the VM as a resume bci through a path this
+    // wiring does not translate; see the variant docs.
+    if shape.deopt_real {
+        return Err(R::DeoptRealEnabled);
+    }
+    if shape.precise_exception_frames {
+        return Err(R::PreciseExceptionFrames);
+    }
+    if shape.has_indy {
+        return Err(R::InvokedynamicPresent);
+    }
+    if shape.has_inline_sites {
+        return Err(R::InlineSitesPresent);
+    }
+
+    let loops = detect_loops(code, code_len);
+    let bypassable = find_bypassable_loop_headers(code, code_len, &loops, exception_ranges);
+    let mut last_refusal: Option<LoopXformRefusal> = None;
+    for &(header, back_edge) in &loops {
+        if back_edge >= code_len || code[back_edge] != 0xa7 {
+            continue;
+        }
+        // Same pre-header placement contract the native unroller, the LICM
+        // hoists, matrix-dot and the bulk-byte loops all apply.
+        if bypassable.contains(&header) {
+            continue;
+        }
+        let body_size = back_edge - header;
+        if body_size < 5 {
+            continue;
+        }
+        // PGO path: a profiled trip count extends eligibility to larger
+        // bodies. A refusal here does NOT fall through to the static
+        // heuristic — same as the native unroller's `return`.
+        if let Some(&pgo_factor) = loop_unroll_hints.get(&back_edge) {
+            if body_size <= 50 || (body_size <= 100 && pgo_factor <= 2) {
+                return match plan_loop_unroll(
+                    code,
+                    code_len,
+                    header,
+                    back_edge,
+                    pgo_factor.saturating_sub(1),
+                    exception_ranges,
+                ) {
+                    Ok(x) if !x.provenance_is_total() => Err(R::ProvenanceNotTotal),
+                    Ok(x) => Ok(x),
+                    Err(e) => Err(R::Planner(e)),
+                };
+            }
+        }
+        let extra_copies = if body_size <= 20 {
+            3 // 4x unroll
+        } else if body_size <= 50 {
+            1 // 2x unroll
+        } else {
+            continue;
+        };
+        match plan_loop_unroll(
+            code,
+            code_len,
+            header,
+            back_edge,
+            extra_copies,
+            exception_ranges,
+        ) {
+            Ok(x) if !x.provenance_is_total() => return Err(R::ProvenanceNotTotal),
+            Ok(x) => return Ok(x),
+            Err(e) => last_refusal = Some(e),
+        }
+    }
+    Err(last_refusal.map(R::Planner).unwrap_or(R::NoCandidateLoop))
+}
+
+/// [`LoopXform::replicate_pc_keyed`] for a table whose entry is a 3-tuple
+/// `(pc, a, b)`.
+///
+/// The primitive is defined over `(usize, T)`; these two adapters pack the
+/// payload into a tuple and unpack it again so that EVERY pc-keyed table goes
+/// through the one replication function. That is the point: replicating some
+/// tables and not others compiles fine and silently produces a loop copy
+/// missing a field resolution or an inline cache.
+fn replicate_pc3<A: Clone, B: Clone>(x: &LoopXform, t: Vec<(usize, A, B)>) -> Vec<(usize, A, B)> {
+    let packed: Vec<(usize, (A, B))> = t.into_iter().map(|(pc, a, b)| (pc, (a, b))).collect();
+    x.replicate_pc_keyed(&packed)
+        .into_iter()
+        .map(|(pc, (a, b))| (pc, a, b))
+        .collect()
+}
+
+/// [`replicate_pc3`] for a 5-tuple `(pc, a, b, c, d)`.
+fn replicate_pc5<A: Clone, B: Clone, C: Clone, D: Clone>(
+    x: &LoopXform,
+    t: Vec<(usize, A, B, C, D)>,
+) -> Vec<(usize, A, B, C, D)> {
+    let packed: Vec<(usize, (A, B, C, D))> = t
+        .into_iter()
+        .map(|(pc, a, b, c, d)| (pc, (a, b, c, d)))
+        .collect();
+    x.replicate_pc_keyed(&packed)
+        .into_iter()
+        .map(|(pc, (a, b, c, d))| (pc, a, b, c, d))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23374,6 +23679,201 @@ pub fn compile_with_param_slots(
     let kernel_reg_homes_osr_requested =
         KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.take()) && kernel_reg_osr_enabled();
 
+    // ── Bytecode loop rewriter (opt-in; see `set_bytecode_loop_rewriter_armed`)
+    //
+    // This is the whole interception. Below this point `code`/`code_len` are
+    // the REWRITTEN method and every pc-keyed side table has been lifted into
+    // its PC space, so the ~40 analyses and the emitter are unmodified: they
+    // simply see a different method. Three things make that sound, and all
+    // three are here rather than scattered:
+    //
+    //   (i)   the rewrite itself, refused for anything it cannot describe;
+    //   (ii)  ONE replication of ALL pc-keyed tables, in one expression, so a
+    //         table cannot be forgotten silently;
+    //   (iii) the coordinate change back to interpreter-bci space, which is
+    //         `Compiler::orig_bci` at the three sites that BAKE a bci into
+    //         machine code plus the `osr_pc_to_native` / `osr_dead_mask`
+    //         rebuild at the end of this function.
+    //
+    // `None` on every unarmed compile, at the cost of one thread-local
+    // `Cell<bool>` load, and the whole path below is then the identity.
+    let loop_xform: Option<LoopXform> = match plan_bytecode_loop_xform(
+        code,
+        code_len,
+        &exception_ranges,
+        &loop_unroll_hints,
+        LoopRewriteShape {
+            deopt_real: crate::deopt_real_enabled(),
+            precise_exception_frames,
+            has_indy: !indy_info.is_empty(),
+            has_inline_sites: !inline_sites.is_empty(),
+        },
+    ) {
+        Ok(x) => {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+                eprintln!(
+                    "[JIT_GEN] bytecode loop rewrite: header={} body_len={} copies={} \
+                     code_len {}->{} poll_free={}",
+                    x.header, x.body_len, x.copies, code_len, x.code_len, x.poll_free_bytes
+                );
+            }
+            Some(x)
+        }
+        Err(refusal) => {
+            if !matches!(refusal, LoopRewriteRefusal::NotArmed)
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+            {
+                eprintln!("[JIT_GEN] bytecode loop rewrite refused: {refusal:?}");
+            }
+            None
+        }
+    };
+    // Kept for the coordinate change at the end of this function; `code_len`
+    // is about to become the rewritten length.
+    let orig_code_len = code_len;
+    // A rewritten method has a backward branch, and `gc_inert_selfrec_candidate`
+    // (computed above, on the ORIGINAL bytes and tables) rejects every backward
+    // branch — so this conjunction is already true. Written out anyway so the
+    // one predicate computed before the rewrite cannot silently start
+    // describing a method that no longer exists.
+    let gc_inert_selfrec = gc_inert_selfrec && loop_xform.is_none();
+    let (code, code_len): (&[u8], usize) = match &loop_xform {
+        Some(x) => (&x.code[..], x.code_len),
+        None => (code, code_len),
+    };
+    // Handler ranges in output coordinates. A range enclosing the loop is
+    // WIDENED over the copies by the rewriter, which is what keeps a `try`
+    // that lexically encloses the loop covering every copy.
+    let exception_ranges: Vec<(usize, usize, usize)> = match &loop_xform {
+        Some(x) => x.exception_ranges.clone(),
+        None => exception_ranges,
+    };
+    // The per-bci de-spec registry (`crate::deopt::despec_contains`) is keyed
+    // by INTERPRETER bci, but every loop header below is an output pc. Consult
+    // it through the provenance map. Identity when unarmed.
+    let despec_bci = |pc: usize| -> u32 {
+        // Cast: bci fits u32 (checked against u32::MAX by the rewriter)
+        loop_xform.as_ref().and_then(|x| x.bci_at(pc)).unwrap_or(pc) as u32
+    };
+
+    // ── Side-table replication — ATOMIC BY CONSTRUCTION ────────────────
+    //
+    // All 21 pc-keyed tables `compile_with_param_slots` receives, rebound in
+    // ONE expression. Adding a 22nd parameter and forgetting it here is a
+    // compile error at the destructuring, not a silent miscompile: a copy that
+    // lost its `field_info` entry takes the helper-call fallback instead of the
+    // inline access and nothing fails.
+    //
+    // Payloads are CLONED, so the pointer-carrying tables (`typecheck_info`,
+    // `invoke_info`, `mic_slots`, `pic_slots`, `ldc_string_info`) share one
+    // target across the copies. For the read-only ones (a class name, a
+    // resolved-invoke descriptor, an interned string) that is trivially sound.
+    // For the two MUTABLE ones (`mic_slots`, `pic_slots`) it is sound because
+    // an inline cache keyed on a call site sees the same receiver distribution
+    // in every copy — exactly what happens today when a non-unrolled loop runs
+    // many times. It is also what makes them safe to share at all: the caller
+    // (`jit/src/lib.rs::try_compile`) owns and outlives these slots, and
+    // minting fresh ones per copy would need code outside this crate's file.
+    let (
+        multianewarray_info, field_info, typecheck_info, static_field_info,
+        new_info, new_deferred_info, anewarray_info, anewarray_deferred_info,
+        invoke_info, direct_calls, mic_slots, pic_slots,
+        ldc_info, ldc_string_info, ldc2w_info, branch_hints,
+        loop_unroll_hints, non_escaping_new, inline_sites, compact_field_info,
+        indy_info,
+    ) = match &loop_xform {
+        None => (
+            multianewarray_info, field_info, typecheck_info, static_field_info,
+            new_info, new_deferred_info, anewarray_info, anewarray_deferred_info,
+            invoke_info, direct_calls, mic_slots, pic_slots,
+            ldc_info, ldc_string_info, ldc2w_info, branch_hints,
+            loop_unroll_hints, non_escaping_new, inline_sites, compact_field_info,
+            indy_info,
+        ),
+        Some(x) => (
+            x.replicate_pc_keyed(&multianewarray_info),
+            replicate_pc3(x, field_info),
+            replicate_pc3(x, typecheck_info),
+            replicate_pc5(x, static_field_info),
+            replicate_pc5(x, new_info),
+            replicate_pc3(x, new_deferred_info),
+            x.replicate_pc_keyed(&anewarray_info),
+            replicate_pc3(x, anewarray_deferred_info),
+            x.replicate_pc_keyed(&invoke_info),
+            // `JitDirectCall` is not `Clone` (it lives in `jit/src/lib.rs`,
+            // which this agent does not own), so its payload is packed into a
+            // tuple of `Copy` fields, replicated by the same primitive, and
+            // rebuilt. Adding `#[derive(Clone)]` there would let this use
+            // `replicate_pc_keyed` directly.
+            {
+                let packed: Vec<(usize, (usize, bool, usize, u8, u32))> = direct_calls
+                    .into_iter()
+                    .map(|(pc, d)| {
+                        (
+                            pc,
+                            (
+                                d.entry,
+                                d.needs_context,
+                                d.num_params,
+                                d.return_type,
+                                d.guard_class_id,
+                            ),
+                        )
+                    })
+                    .collect();
+                x.replicate_pc_keyed(&packed)
+                    .into_iter()
+                    .map(
+                        |(pc, (entry, needs_context, num_params, return_type, guard_class_id))| {
+                            (
+                                pc,
+                                super::JitDirectCall {
+                                    entry,
+                                    needs_context,
+                                    num_params,
+                                    return_type,
+                                    guard_class_id,
+                                },
+                            )
+                        },
+                    )
+                    .collect::<Vec<(usize, super::JitDirectCall)>>()
+            },
+            x.replicate_pc_keyed(&mic_slots),
+            x.replicate_pc_keyed(&pic_slots),
+            x.replicate_pc_keyed(&ldc_info),
+            replicate_pc3(x, ldc_string_info),
+            x.replicate_pc_keyed(&ldc2w_info),
+            x.replicate_pc_keyed(&branch_hints.into_iter().collect::<Vec<_>>())
+                .into_iter()
+                .collect::<HashMap<usize, bool>>(),
+            // Keyed by BACK-EDGE pc. Under `Unroll` an original back-edge bci
+            // has exactly one image (the last copy carries the only back edge),
+            // so this stays single-valued.
+            x.replicate_pc_keyed(&loop_unroll_hints.into_iter().collect::<Vec<_>>())
+                .into_iter()
+                .collect::<HashMap<usize, usize>>(),
+            x.replicate_pc_keyed(
+                &non_escaping_new
+                    .into_iter()
+                    .map(|pc| (pc, ()))
+                    .collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .map(|(pc, ())| pc)
+            .collect::<std::collections::HashSet<usize>>(),
+            // Always empty here — `InlineSitesPresent` refuses the transform —
+            // but routed through the same primitive so the census has no
+            // "handled elsewhere" entry.
+            x.replicate_pc_keyed(&inline_sites.into_iter().collect::<Vec<_>>())
+                .into_iter()
+                .collect::<HashMap<usize, crate::InlineSite>>(),
+            replicate_pc3(x, compact_field_info),
+            // Always empty here — `InvokedynamicPresent` refuses the transform.
+            replicate_pc5(x, indy_info),
+        ),
+    };
+
     // Estimate buffer size. A bytecode invoke is not the old ~40-byte helper
     // call: the current lowering can emit a context bridge, exception/deopt
     // edge, and MIC/PIC dispatch machinery. Hibernate's concurrent query path
@@ -23464,7 +23964,7 @@ pub fn compile_with_param_slots(
     let hoist_info: Vec<LoopHoist> = hoist_info
         .into_iter()
         .filter(|h| {
-            let despec = crate::deopt::despec_contains(method_key, h.loop_header as u32);
+            let despec = crate::deopt::despec_contains(method_key, despec_bci(h.loop_header));
             if despec && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] de-spec: dropping aaload LICM hoist at loop_header \
@@ -23716,7 +24216,16 @@ pub fn compile_with_param_slots(
     // the emitter's `0xa7` arm treats membership as proof that duplicating
     // the body's machine code is sound. See its doc comment for what the old
     // `code[back_edge] == 0xa7` + body-size test was missing.
-    let unroll_loops: Vec<(usize, usize, usize)> = if !native_unroller_enabled() {
+    //
+    // `loop_xform.is_some()` is redundant with `!native_unroller_enabled()`
+    // (arming the rewriter is what turns the native unroller off, and a
+    // transform can only exist when armed), and is written anyway: this
+    // vector is the emitter's proof that duplicating machine code is sound,
+    // and "the bytecode was already duplicated" must be visible AT the vector
+    // rather than two functions away.
+    let unroll_loops: Vec<(usize, usize, usize)> = if loop_xform.is_some()
+        || !native_unroller_enabled()
+    {
         Vec::new()
     } else {
         loops
@@ -24070,6 +24579,12 @@ pub fn compile_with_param_slots(
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
     compiler.method_key = method_key.to_string();
+    // Coordinate change, emitter half: the three sites that BAKE a bci as an
+    // immediate into machine code consult this. It must be installed before
+    // `compile_bytecode` runs — those stubs are emitted at the end of that
+    // call, so no post-pass over the finished `CompiledMethod` could reach
+    // them. `None` (the identity) on every unarmed compile.
+    compiler.bci_provenance = loop_xform.as_ref().map(|x| x.bci_of.clone());
     // deopt-osr Step 9 follow-up (c): per-bci de-spec. Drop any speculative-BCE
     // guard whose loop header was recorded in the de-spec registry (a guard that
     // repeatedly deopted past the per-bci give-up threshold). Those headers fall
@@ -24087,7 +24602,7 @@ pub fn compile_with_param_slots(
     let speculative_bce_guards: Vec<SpeculativeBCEGuard> = speculative_bce_guards
         .into_iter()
         .filter(|g| {
-            let despec = crate::deopt::despec_contains(method_key, g.loop_header as u32);
+            let despec = crate::deopt::despec_contains(method_key, despec_bci(g.loop_header));
             if despec {
                 for covered_pc in &g.covered_pcs {
                     bounds_safe_pcs.remove(covered_pc);
@@ -24443,6 +24958,23 @@ pub fn compile_with_param_slots(
         return None;
     }
 
+    // Fail-closed backstop for the bytecode rewriter. `DeoptimizationPoint::bci`
+    // is what the VM RESUMES AT, and it is recorded from the emitter's own pc
+    // deep inside the emitter. `plan_bytecode_loop_xform` refuses every
+    // construct that records one (`DeoptRealEnabled`, `PreciseExceptionFrames`,
+    // `InvokedynamicPresent`), so this vector is provably empty here — but if a
+    // future emit path records one anyway, discard the method rather than
+    // publish an output PC as an interpreter resume point.
+    if loop_xform.is_some() && !compiler.deopt_points.is_empty() {
+        tracing::warn!(
+            method = method_key,
+            deopt_points = compiler.deopt_points.len(),
+            "JIT compile bailed: bytecode loop rewrite recorded a deopt point whose \
+             bci is an output PC; method stays interpreted"
+        );
+        return None;
+    }
+
     // Build the CompiledMethod with OSR metadata.
     //
     // `has_dispatch` gates the interpreter's compiled-entry fast path
@@ -24574,17 +25106,33 @@ pub fn compile_with_param_slots(
     // pipeline compiles its own separate, memory-homed artifact
     // (`compile_osr_artifact` never requests kernel homes), so loop-hot
     // methods still get OSR service.
+    //
+    // Coordinate change, artifact half. `osr_entry_native` is written by the
+    // emitter at the pc it is emitting, so under a bytecode rewrite it is
+    // indexed by OUTPUT pc while the runtime indexes the published vector by
+    // INTERPRETER bci. It cannot merely be translated on read: a bci inside a
+    // transformed region has SEVERAL native offsets and picking the wrong one
+    // re-runs iterations. `LoopXform::rebuild_pc_to_native` applies
+    // `osr_entry_pc`'s steady-state choice pointwise and leaves the `-1`
+    // sentinel wherever there is no valid image (the unrolled back-edge gap),
+    // where entering compiled code is not valid at all and `can_osr_enter`
+    // must refuse. The identity — the same vector, moved — when unarmed.
+    let osr_entry_native = compiler.osr_entry_native;
+    let osr_entry_native = match &loop_xform {
+        Some(x) => x.rebuild_pc_to_native(&osr_entry_native, orig_code_len),
+        None => osr_entry_native,
+    };
     cm.osr_pc_to_native = if kernel_reg_homes && !kernel_reg_homes_osr_requested {
         // Method-entry kernel homes: same length, every entry -1 —
         // `can_osr_enter` refuses every pc (the method-entry body was never
         // built for trampoline entry).
-        Some(vec![-1; compiler.osr_entry_native.len()])
+        Some(vec![-1; osr_entry_native.len()])
     } else {
         // Ordinary bodies AND OSR-tier kernel-homed bodies publish real
         // entries: the OSR trampoline seeds every local into its
         // `osr_local_assignments` register (or frame slot for `None`/ref
         // locals), which for a kernel-homed body is exactly its homes.
-        Some(compiler.osr_entry_native)
+        Some(osr_entry_native)
     };
     cm.osr_num_locals = compiler.num_locals;
     cm.osr_num_reg_locals = compiler.num_reg_locals;
@@ -24744,6 +25292,24 @@ pub fn compile_with_param_slots(
             );
         }
     }
+    // Indexed by the same interpreter bci as `osr_pc_to_native` above, so it
+    // needs the same coordinate change and the same image choice — a mask
+    // read for one copy while the entry jumps into another would skip loading
+    // a local that IS live at the entry it actually takes. A bci with no
+    // steady-state image keeps a zero mask, which is never read: the entry is
+    // already refused by the `-1` in `osr_pc_to_native`.
+    let osr_dead_mask = match &loop_xform {
+        Some(x) => {
+            let mut rebuilt = vec![0u64; orig_code_len + 1];
+            for (bci, slot) in rebuilt.iter_mut().enumerate() {
+                if let Some(image) = x.osr_entry_pc(bci) {
+                    *slot = osr_dead_mask.get(image).copied().unwrap_or(0);
+                }
+            }
+            rebuilt
+        }
+        None => osr_dead_mask,
+    };
     cm.osr_dead_mask = Some(osr_dead_mask);
     cm.osr_local_assignments = Some(osr_local_assignments);
     cm.osr_xmm_assignments = Some(osr_xmm_assignments);
@@ -24829,7 +25395,19 @@ pub fn compile_with_param_slots(
     // (the emit site is gated), so production artifacts are unchanged. Step 8
     // consults `can_osr_exit` + `osr_exit_points` (under `CRATONVM_DEOPT_REAL`)
     // to route a mid-loop bail through the deopt trampoline.
-    cm.osr_exit_points = compiler.osr_exit_points;
+    // Bcis, consumed by the VM's OSR-exit route. Provably empty under a
+    // bytecode rewrite (`emit_osr_exit_map_at` fires only when
+    // `deopt_real_enabled()`, and the indy site is refused), so the
+    // translation arm is a backstop rather than a live path. `filter_map`
+    // drops a pc with no provenance instead of publishing it raw.
+    cm.osr_exit_points = match &loop_xform {
+        Some(x) => compiler
+            .osr_exit_points
+            .iter()
+            .filter_map(|&pc| x.bci_at(pc))
+            .collect(),
+        None => compiler.osr_exit_points,
+    };
     // FIX: mirror `can_deopt_resume`'s elided-monitor exclusion above — an
     // OSR-exit transfer materializes the same kind of reconstructed frame, so
     // a scalar-replaced object held under an elided `synchronized` block is
@@ -39254,5 +39832,405 @@ mod loop_unroll_admission {
             assert_eq!(peel.osr_entry_pc(back_edge), Some(peel.back_edge_pc()));
             assert_eq!(peel.bci_at(peel.back_edge_pc()), Some(back_edge));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The rewriter WIRED: opt-in, planning, replication, coordinate change
+    // -----------------------------------------------------------------------
+
+    /// Arms the bytecode rewriter for this thread and disarms it on drop, so a
+    /// failing assertion cannot leave the thread armed for a later compile.
+    struct Armed(bool);
+    impl Armed {
+        fn new() -> Self {
+            Armed(set_bytecode_loop_rewriter_armed(true))
+        }
+    }
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            set_bytecode_loop_rewriter_armed(self.0);
+        }
+    }
+
+    /// `static int accum(int n) { int s = 0; for (int i = 0; i < n; i++) s += i;
+    /// return s; }`
+    ///
+    /// Deliberately helper-free — pure integer arithmetic, no array access, no
+    /// field, no call — so it compiles end to end against an all-zero
+    /// `JitRuntimeHelpers`. Header 4, back edge 16, body 12 bytes, length 21;
+    /// the static heuristic asks for 3 extra copies, giving a 57-byte rewrite.
+    fn shape_int_accum_loop() -> Vec<u8> {
+        vec![
+            0x03, // 0:  iconst_0
+            0x3c, // 1:  istore_1          s = 0
+            0x03, // 2:  iconst_0
+            0x3d, // 3:  istore_2          i = 0
+            0x1c, // 4:  iload_2           <- header
+            0x1a, // 5:  iload_0
+            0xa2, 0x00, 0x0d, // 6:  if_icmpge 19
+            0x1b, // 9:  iload_1
+            0x1c, // 10: iload_2
+            0x60, // 11: iadd
+            0x3c, // 12: istore_1
+            0x84, 0x02, 0x01, // 13: iinc 2, 1
+            0xa7, 0xff, 0xf4, // 16: goto 4            <- back edge
+            0x1b, // 19: iload_1
+            0xac, // 20: ireturn
+        ]
+    }
+
+    fn accum_shape_ok() -> LoopRewriteShape {
+        LoopRewriteShape {
+            deopt_real: false,
+            precise_exception_frames: false,
+            has_indy: false,
+            has_inline_sites: false,
+        }
+    }
+
+    /// Compile `shape_int_accum_loop` through the legacy wrapper with no
+    /// metadata and an all-zero helper table (the method calls none).
+    fn compile_accum_fixture() -> Option<CompiledMethod> {
+        let code = shape_int_accum_loop();
+        compile(
+            &code,
+            21,
+            1,     // num_params: (int n)
+            3,     // max_locals: n, s, i
+            false, // needs_heap
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &JitRuntimeHelpers::default(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn the_fixture_loop_is_what_the_planner_is_offered() {
+        let code = shape_int_accum_loop();
+        assert_eq!(code.len(), 21);
+        assert_eq!(detect_loops(&code, 21), vec![(4usize, 16usize)]);
+        assert!(
+            !find_bypassable_loop_headers(&code, 21, &[(4, 16)], &[]).contains(&4),
+            "the fixture header must be reachable only by fall-through and its \
+             own back edge, or the planner would refuse it for the wrong reason"
+        );
+        // The rewrite the planner should choose, stated independently of it.
+        let x = plan_loop_unroll(&code, 21, 4, 16, 3, &[]).expect("admitted");
+        assert_eq!(x.code_len, 21 + 3 * 12);
+        assert!(x.provenance_is_total());
+    }
+
+    /// The opt-in is off by default and is scoped to the arming thread, which
+    /// is what lets these tests run alongside every other compile in the
+    /// process without perturbing it.
+    #[test]
+    fn the_rewriter_is_off_by_default_and_armed_per_thread() {
+        assert!(
+            !bytecode_loop_xform_rewrites_bytecode(),
+            "the default compile path must not rewrite bytecode"
+        );
+        // The native unroller has its own kill switch; only claim it is live
+        // when that switch is not set, or this positive control would fail for
+        // an unrelated reason.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_UNROLL").is_none() {
+            assert!(
+                native_unroller_enabled(),
+                "unarmed, the native byte-copy unroller owns unrolling"
+            );
+        }
+        {
+            let _armed = Armed::new();
+            assert!(bytecode_loop_xform_rewrites_bytecode());
+            assert!(
+                !native_unroller_enabled(),
+                "arming the rewriter must turn the native unroller off in the \
+                 same motion, or one loop gets duplicated twice"
+            );
+            // A thread that did not arm is unaffected.
+            let elsewhere = std::thread::spawn(bytecode_loop_xform_rewrites_bytecode)
+                .join()
+                .expect("probe thread");
+            assert!(!elsewhere, "the opt-in leaked to another thread");
+        }
+        assert!(!bytecode_loop_xform_rewrites_bytecode(), "guard must disarm");
+    }
+
+    #[test]
+    fn planning_refuses_unless_armed() {
+        let code = shape_int_accum_loop();
+        assert_eq!(
+            plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
+            LoopRewriteRefusal::NotArmed
+        );
+        let _armed = Armed::new();
+        let x = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())
+            .expect("armed, the fixture is admitted");
+        assert_eq!((x.header, x.body_len, x.copies), (4, 12, 3));
+        assert_eq!(x.code_len, 57);
+    }
+
+    /// Every whole-compile refusal names a construct that publishes an emitter
+    /// pc to the VM as a resume bci through a path this wiring does not
+    /// translate. Each must refuse on its own, not merely in combination.
+    #[test]
+    fn planning_refuses_every_untranslated_construct() {
+        let _armed = Armed::new();
+        let code = shape_int_accum_loop();
+        for (shape, want) in [
+            (
+                LoopRewriteShape {
+                    deopt_real: true,
+                    ..accum_shape_ok()
+                },
+                LoopRewriteRefusal::DeoptRealEnabled,
+            ),
+            (
+                LoopRewriteShape {
+                    precise_exception_frames: true,
+                    ..accum_shape_ok()
+                },
+                LoopRewriteRefusal::PreciseExceptionFrames,
+            ),
+            (
+                LoopRewriteShape {
+                    has_indy: true,
+                    ..accum_shape_ok()
+                },
+                LoopRewriteRefusal::InvokedynamicPresent,
+            ),
+            (
+                LoopRewriteShape {
+                    has_inline_sites: true,
+                    ..accum_shape_ok()
+                },
+                LoopRewriteRefusal::InlineSitesPresent,
+            ),
+        ] {
+            assert_eq!(
+                plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), shape).unwrap_err(),
+                want
+            );
+        }
+        // Positive control: with none of them set, the same fixture IS admitted,
+        // so the four refusals above are not vacuous.
+        assert!(plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok()).is_ok());
+    }
+
+    /// A structurally-refused loop leaves the method un-rewritten rather than
+    /// half-rewritten, and reports the rewriter's own reason.
+    #[test]
+    fn planning_reports_the_structural_refusal() {
+        let _armed = Armed::new();
+        // Irreducible: the cycle is entered at both of its blocks. Header 7,
+        // back edge 17, body 10 — inside the profitability band, so the band
+        // is not what refuses it. Two filters can: `bypassable_headers` (the
+        // `goto 7` at pc 4 is an external edge into the header) skips the
+        // candidate, and the structural oracle refuses it as `ExternalEntry`.
+        // Which one fires first is not the property under test; that the
+        // method is never rewritten is.
+        let irr = shape_irreducible();
+        let err = plan_bytecode_loop_xform(&irr, 21, &[], &HashMap::new(), accum_shape_ok())
+            .expect_err("an irreducible loop must never be rewritten");
+        assert!(
+            matches!(
+                err,
+                LoopRewriteRefusal::NoCandidateLoop
+                    | LoopRewriteRefusal::Planner(LoopXformRefusal::ExternalEntry)
+            ),
+            "unexpected refusal for an irreducible loop: {err:?}"
+        );
+        // Pre-header bypass: the region itself is impeccable, so only the
+        // `bypassable_headers` filter can refuse it — and it does so by
+        // skipping the candidate, leaving no candidate at all.
+        let byp = shape_bypassable_header();
+        assert!(plan_loop_unroll(&byp, 30, 11, 25, 3, &[]).is_ok());
+        assert_eq!(
+            plan_bytecode_loop_xform(&byp, 30, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
+            LoopRewriteRefusal::NoCandidateLoop
+        );
+    }
+
+    /// The profitability band is the native unroller's, PGO arm included.
+    #[test]
+    fn the_pgo_hint_sets_the_factor_exactly_as_the_native_unroller_does() {
+        let _armed = Armed::new();
+        let code = shape_int_accum_loop();
+        // Factor 2 ⇒ 1 extra copy, overriding the static heuristic's 3.
+        let hints: HashMap<usize, usize> = [(16usize, 2usize)].into_iter().collect();
+        let x = plan_bytecode_loop_xform(&code, 21, &[], &hints, accum_shape_ok())
+            .expect("PGO factor 2 is admitted");
+        assert_eq!(x.copies, 1);
+        assert_eq!(x.code_len, 21 + 12);
+        // A degenerate factor is refused, not underflowed — and, matching the
+        // native unroller, does NOT fall back to the static heuristic.
+        for factor in [0usize, 1] {
+            let hints: HashMap<usize, usize> = [(16usize, factor)].into_iter().collect();
+            assert_eq!(
+                plan_bytecode_loop_xform(&code, 21, &[], &hints, accum_shape_ok()).unwrap_err(),
+                LoopRewriteRefusal::Planner(LoopXformRefusal::TooManyCopies)
+            );
+        }
+    }
+
+    /// Replication is the property the whole wiring rests on: a site inside
+    /// the duplicated body must appear once per copy with the SAME payload, a
+    /// site after the region must shift past every copy, and a site before it
+    /// must not move. Checked through the two tuple adapters as well as the
+    /// primitive, because those adapters are what the 21 tables actually use.
+    #[test]
+    fn replication_lifts_every_site_once_per_copy() {
+        let code = shape_int_accum_loop();
+        for k in 1..=3usize {
+            let x = plan_loop_unroll(&code, 21, 4, 16, k, &[]).expect("admitted");
+            let body_len = 12usize;
+
+            // pc 0 is before the header, pc 10 is inside the body, pc 19 is
+            // after the region.
+            let two: Vec<(usize, u8)> = vec![(0, 0xAA), (10, 0xBB), (19, 0xCC)];
+            let lifted = x.replicate_pc_keyed(&two);
+            assert_eq!(
+                lifted.len(),
+                1 + (k + 1) + 1,
+                "k={k}: the in-body site must appear once per copy"
+            );
+            assert_eq!(lifted[0], (0, 0xAA), "k={k}: a prefix site does not move");
+            for ci in 0..=k {
+                assert_eq!(
+                    lifted[1 + ci],
+                    (10 + ci * body_len, 0xBB),
+                    "k={k} copy={ci}: wrong image or payload"
+                );
+            }
+            assert_eq!(
+                *lifted.last().unwrap(),
+                (19 + k * body_len, 0xCC),
+                "k={k}: a suffix site shifts past every copy"
+            );
+            // Sorted by pc — every consumer of these tables assumes it.
+            assert!(lifted.windows(2).all(|w| w[0].0 <= w[1].0), "k={k}");
+            // Every image's provenance is the original pc, which is what makes
+            // the coordinate change back out of this exactly.
+            for &(pc, _) in &lifted {
+                assert!(x.bci_at(pc).is_some(), "k={k}: image {pc} has no bci");
+            }
+
+            // The 3- and 5-tuple adapters agree with the primitive.
+            let three = vec![(0usize, 1u8, 2u32), (10, 3, 4), (19, 5, 6)];
+            let l3 = replicate_pc3(&x, three);
+            assert_eq!(
+                l3.iter().map(|e| e.0).collect::<Vec<_>>(),
+                lifted.iter().map(|e| e.0).collect::<Vec<_>>(),
+                "k={k}: replicate_pc3 disagrees with the primitive on images"
+            );
+            assert!(
+                l3.iter().filter(|e| e.1 == 3).all(|e| e.2 == 4),
+                "k={k}: replicate_pc3 must clone the payload verbatim"
+            );
+            let five = vec![(0usize, 1u8, 2u32, 3u16, false), (10, 4, 5, 6, true)];
+            let l5 = replicate_pc5(&x, five);
+            assert_eq!(l5.len(), 1 + (k + 1), "k={k}");
+            assert!(
+                l5.iter().filter(|e| e.4).all(|e| (e.1, e.2, e.3) == (4, 5, 6)),
+                "k={k}: replicate_pc5 must clone the payload verbatim"
+            );
+        }
+    }
+
+    /// A raw-pointer payload is SHARED, not duplicated. That is the property
+    /// that makes `mic_slots` / `pic_slots` sound to replicate at all: one
+    /// inline-cache slot per call site, seen by every copy, exactly as a
+    /// non-unrolled loop's single slot is seen by every iteration.
+    #[test]
+    fn a_pointer_payload_is_shared_across_the_copies() {
+        let code = shape_int_accum_loop();
+        let x = plan_loop_unroll(&code, 21, 4, 16, 3, &[]).expect("admitted");
+        // Cast: a distinctive non-null sentinel address; never dereferenced.
+        let slot = 0xDEAD_BEEFusize as *const u8;
+        let lifted = x.replicate_pc_keyed(&[(10usize, slot)]);
+        assert_eq!(lifted.len(), 4);
+        assert!(
+            lifted.iter().all(|&(_, p)| p == slot),
+            "every copy must name the SAME slot"
+        );
+    }
+
+    /// End to end: with the rewriter armed the emitter really compiles the
+    /// rewritten bytes, and the OSR metadata the artifact publishes is back in
+    /// INTERPRETER-bci space.
+    ///
+    /// Two assertions carry this, and neither can pass by accident:
+    ///
+    ///  * the published vectors are `orig_code_len + 1` long. The compiled
+    ///    method is 57 bytes; without `rebuild_pc_to_native` they would be 58.
+    ///  * `osr_pc_to_native[16]` — the back-edge bci — is `-1` under the
+    ///    rewrite and a real offset without it. Unroll's steady state is copy
+    ///    0, which ends just before the back edge, so those bytes have no
+    ///    steady-state image and OSR there must be REFUSED; answering with an
+    ///    offset would resume a "back edge next" frame at the top of a fresh
+    ///    body and run an extra iteration.
+    #[test]
+    fn a_rewritten_compile_publishes_osr_metadata_in_interpreter_bci_space() {
+        let baseline = compile_accum_fixture()
+            .expect("the helper-free fixture must compile on the default path");
+        let base_osr = baseline
+            .osr_pc_to_native
+            .as_ref()
+            .expect("the fixture publishes OSR entries");
+        assert_eq!(base_osr.len(), 22, "baseline: one slot per bci, plus the end");
+        assert!(
+            base_osr[16] >= 0,
+            "baseline: the back-edge bci is an ordinary OSR entry — if it were \
+             already -1 the rewritten assertion below would prove nothing"
+        );
+
+        let rewritten = {
+            let _armed = Armed::new();
+            compile_accum_fixture().expect("the rewritten fixture must compile")
+        };
+        let osr = rewritten
+            .osr_pc_to_native
+            .as_ref()
+            .expect("the rewritten artifact still publishes OSR entries");
+        assert_eq!(
+            osr.len(),
+            22,
+            "the published vector must be indexed by INTERPRETER bci (22 slots), \
+             not by the 57-byte rewritten method's output pc"
+        );
+        assert_eq!(
+            rewritten.osr_dead_mask.as_ref().map(Vec::len),
+            Some(22),
+            "the dead-local mask is indexed by the same bci as osr_pc_to_native"
+        );
+        assert!(
+            osr[4] >= 0,
+            "the loop header must still be OSR-enterable after the rewrite"
+        );
+        for gap in 16..19 {
+            assert_eq!(
+                osr[gap], -1,
+                "bci {gap} is inside the unrolled back-edge gap: it has no \
+                 steady-state image, so OSR there must be refused"
+            );
+        }
+        assert!(
+            osr[19] >= 0 && osr[20] >= 0,
+            "the suffix keeps its OSR entries, shifted past the copies"
+        );
     }
 }
