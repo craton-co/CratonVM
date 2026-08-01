@@ -41,8 +41,24 @@
  * young addresses and the sweep's seed loop drops them as not-old-gen. Run it
  * by hand when working on that:
  *
- *   cratonvm --java-home <jdk> -cp build ROverlaySystemGcStress        # fails
- *   CRATONVM_OLD_SWEEP_JIT=0 cratonvm --java-home <jdk> -cp build ...  # passes
+ *   cratonvm --java-home <jdk> --Xmx 256m -cp build ROverlaySystemGcStress
+ *   CRATONVM_OLD_SWEEP_JIT=0 cratonvm --java-home <jdk> --Xmx 256m -cp build ...
+ *
+ * PIN `--Xmx`, and do not trust the default-heap form. Measured 2026-08-01: on
+ * the DEFAULT heap this probe is load-sensitive and is NOT a controlled
+ * experiment. Identical command, same binary, same class files: one run
+ * reported ZERO young->old promotion entries across all 40 collections and
+ * another reported 8670 (`CRATONVM_DBG_PROMO_SEED=1`) — the default heap size
+ * derives from system RAM, which decides how many collections run at all. The
+ * verdict tracks it: 4/4 FAIL in one window and 8/8 PASS an hour later, with
+ * the only intervening source change shown irrelevant by a bisect. A run that
+ * promotes nothing cannot express a promotion defect, so a green one proves
+ * nothing and a red one attributes to nothing.
+ *
+ * The `CRATONVM_OLD_SWEEP_JIT=0` A/B above carries the same caution — on the
+ * default heap that control flips on its own. Interleave the arms
+ * (`probes/overlay-paired-ab-20260801.sh`) instead of running one arm now and
+ * the other later.
  */
 import java.util.ArrayList;
 import java.util.LinkedHashMap;

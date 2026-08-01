@@ -55,6 +55,49 @@ fn conditional_loader_metadata(shared: &SharedVm) -> bool {
     }
 }
 
+/// Per-thread roots that live in `JvmThread` FIELDS rather than on any frame,
+/// and are therefore invisible to the frame walk both peer-publish paths are
+/// built around.
+///
+/// This exists as one function called from all THREE per-thread root paths —
+/// [`collect_roots`] (the collection initiator's own scan),
+/// `interpreter::update_root_snapshot` (a peer parked at a cooperative
+/// safepoint) and `NativeContextImpl::deposit_root_snapshot_inner` (a peer
+/// blocked in a native) — because those paths had drifted apart. Both fields
+/// below were rewritten by all three post-GC remaps (`gc::update_all_roots`,
+/// `interpreter::apply_pointer_map_to_thread`, and
+/// `NativeContextImpl::check_post_block_gc_refs`) yet published as roots by
+/// NEITHER snapshot path, so they were remapped-but-never-marked.
+///
+/// That asymmetry is the use-after-free `memory::native_roots`' module doc
+/// describes from the other side: nothing claims the object, the collector
+/// frees it, and the wake path then "relocates" the dangling address through a
+/// `pointer_map` that has no entry for it — leaving the owner to read a zeroed
+/// header. A peer's own frames are safe because the frame walk covers them;
+/// these two categories live outside it.
+///
+/// A new `ObjectRef`-bearing `JvmThread` field belongs HERE, so it cannot be
+/// published on one path and silently dropped on the other two.
+pub(crate) fn push_off_frame_thread_roots(thread: &JvmThread, roots: &mut Vec<ObjectRef>) {
+    // Test-harness print buffer (`native_temp_print_int` / `_print_string`).
+    for val in &thread.printed {
+        if let Value::Object(Some(obj_ref)) = val {
+            roots.push(*obj_ref);
+        }
+    }
+    // Scoped-value bindings (JEP 446) — the KEY as well as the value. Pushing
+    // only values would let the key object be reclaimed while its binding is
+    // still live, which JDK-internal code reaches via `Carrier.get(ScopedValue)`.
+    for (_key_id, key_ref, val) in &thread.scoped_values {
+        if let Some(obj_ref) = key_ref {
+            roots.push(*obj_ref);
+        }
+        if let Value::Object(Some(obj_ref)) = val {
+            roots.push(*obj_ref);
+        }
+    }
+}
+
 /// Collect all GC root ObjectRefs from the shared VM state and the current thread.
 ///
 /// Returns a vector of all live non-null ObjectRefs reachable from:
@@ -217,12 +260,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    // 4. Thread printed values — test harness output buffer
-    for val in &thread.printed {
-        if let Value::Object(Some(obj_ref)) = val {
-            roots.push(*obj_ref);
-        }
-    }
+    // 4. Off-frame per-thread roots — the test-harness print buffer and the
+    //    scoped-value bindings. Shared with both peer-publish paths; see
+    //    `push_off_frame_thread_roots`.
+    push_off_frame_thread_roots(thread, &mut roots);
 
     // 4b. Native invoke pins — object args popped off the operand stack for
     //     `safe_native_call` (see `JvmThread::native_pin_roots`).
@@ -564,21 +605,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    // 12. Scoped value bindings (JEP 446)
-    //
-    // Round-9 GC fix: also push the ScopedValue KEY ObjectRef when present.
-    // The previous version only pushed VALUEs, so the key object itself
-    // (which JDK-internal code reaches via Carrier.get(ScopedValue)) could
-    // be reclaimed while the binding was still live — a use-after-free on
-    // the next reflective `Carrier.get` traversal.
-    for (_key_id, key_ref, val) in &thread.scoped_values {
-        if let Some(obj_ref) = key_ref {
-            roots.push(*obj_ref);
-        }
-        if let Value::Object(Some(obj_ref)) = val {
-            roots.push(*obj_ref);
-        }
-    }
+    // 12. Scoped value bindings (JEP 446) are published by
+    //     `push_off_frame_thread_roots` at step 4, together with the print
+    //     buffer — the two off-frame categories every per-thread root path
+    //     must agree on.
 
     // 13. Resolution cache — CONSTANT_Dynamic values may hold ObjectRefs
     {
