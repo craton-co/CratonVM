@@ -37,7 +37,21 @@ internally rather than genuinely asserting false.
 | binary | result |
 |---|---|
 | pre-fix (`dev`-equivalent) | `Tests run: 21, Failures: 7` — 6 hostname + this one |
-| post-fix | `Tests run: 21, Failures: 1` — only this one |
+| post-fix, 3 of 4 runs | `Tests run: 21, Failures: 1` — only this one |
+| post-fix, 1 of 4 runs | `Failures: 2` — this one plus a `testPost` load flake |
+
+This test failed in **every** post-fix run (4/4), so unlike `testPost` it is
+not load-dependent.
+
+## Sibling flake, deliberately not filed as a defect
+
+`testPost[JSSE]` failed once in four post-fix runs, on the run that overlapped
+a concurrent cargo build on this shared host. Its thread-level errors are
+`java.io.IOException` (`os error 10053`, connection aborted) and
+`TLS connect: connection closed by peer during handshake` — accept-path
+saturation in a test that fans out many concurrent TLS POSTs, not a TLS
+correctness problem. Class runtime swung 270–445s across the same runs. Noted
+here so a future run that sees `Failures: 2` does not read it as a regression.
 
 ## Reproduction
 

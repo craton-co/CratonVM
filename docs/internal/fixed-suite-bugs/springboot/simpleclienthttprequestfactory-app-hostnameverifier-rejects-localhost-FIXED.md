@@ -208,6 +208,24 @@ that still fails. Pre-fix it has **7** failures; post-fix **1**:
 
 `Tests run: 21, Failures: 7` → `Tests run: 21, Failures: 1`.
 
+`testPost` is load-sensitive, not fixed-and-then-re-broken. Across the four
+post-fix `TestSsl` runs it failed exactly once — the run that overlapped a
+concurrent cargo build on this shared host — with thread-level
+`java.io.IOException` (`os error 10053`, connection aborted) and a rejected
+handshake, i.e. accept-path saturation in a test that fans out many concurrent
+TLS POSTs. It passed in the other three. Class runtime swung 270–445s across
+the same runs, which is the same load signal.
+
+## Post-merge reverification
+
+`dev` moved 113 commits between the fix and integration, so everything was
+rebuilt and rerun on the merged tree (none of those commits touched
+`http_url_connection.rs`, `t27_tls.rs` or `x509_manager.rs`):
+
+- `SimpleClientHttpRequestFactoryBuilderTests` — 19/19 PASS, unchanged.
+- All 6 other Tomcat classes — PASS, unchanged, still no verifier message.
+- `TestSsl` — `Failures: 1` in 2 of 3 runs (the `testPost` flake above).
+
 ## Not fixed here, and not caused here
 
 `TestSsl.testClientInitiatedRenegotiation[JSSE]` — a bare
