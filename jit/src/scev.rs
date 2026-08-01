@@ -969,16 +969,23 @@ impl SymBound {
 
     /// The endpoint's value when it is entirely compile-time known.
     pub fn as_const(&self) -> Option<i32> {
-        match self.base {
-            BoundTerm::Const(v) => {
-                let sum = v as i64 + self.addend as i64;
-                if (i32::MIN as i64..=i32::MAX as i64).contains(&sum) {
-                    Some(sum as i32)
-                } else {
-                    None
-                }
-            }
+        // `BoundTerm::Const(v)` and `BoundTerm::Bound(BoundSource::Const(v))`
+        // are two spellings of the same constant — the first is minted by
+        // arithmetic here, the second by `decode_bound_expr` reading an
+        // `sipush`/`ldc` limit out of the bytecode. Folding only the first made
+        // every proof over a literal loop bound answer "symbolic", which cost a
+        // preheader guard on `for (i = 0; i < 16; i++) a[i]` with a known-length
+        // array and, worse, silently skipped the always-fails refusal below.
+        let base = match self.base {
+            BoundTerm::Const(v) => Some(v),
+            BoundTerm::Bound(BoundSource::Const(v)) => Some(v),
             _ => None,
+        }?;
+        let sum = base as i64 + self.addend as i64;
+        if (i32::MIN as i64..=i32::MAX as i64).contains(&sum) {
+            Some(sum as i32)
+        } else {
+            None
         }
     }
 
@@ -1713,6 +1720,17 @@ impl CountedLoop {
                         }
                     }
                 }
+                // Normalise a constant demand to base-only. `Const(198) + 1`
+                // and `Const(199) + 0` are the same guard; leaving both spellings
+                // in circulation defeats the `dedup` below and makes two
+                // identical preheader compares look distinct to a consumer.
+                let needed = match needed.as_const() {
+                    Some(c) => SymBound {
+                        base: BoundTerm::Const(c),
+                        addend: 0,
+                    },
+                    None => needed,
+                };
                 guards.push(PreheaderGuard::LengthAtLeast(needed));
             }
         }

@@ -1087,9 +1087,44 @@ fn reloc_emit_enabled() -> bool {
             }
         }
 
-        for (dst_slot, src_slot) in copies {
-            self.load_to_rax(src_slot);
-            self.store_rax(dst_slot);
+        // Phi copies are a PARALLEL assignment, not a sequence.
+        //
+        // `prealloc_phi_slots` gives every phi its own frame word, so a loop
+        // that swaps two locals makes each phi the other's back-edge value and
+        // this list becomes a cycle (`a <- b, b <- a`). Emitted in order through
+        // RAX, the second copy reads the word the first just overwrote and both
+        // locals end up holding `b`.
+        //
+        // Emit any copy whose destination is not still needed as a source, and
+        // repeat. What can remain is exactly a set of cycles, which needs a
+        // scratch location to break; RAX is already the move temporary and no
+        // spare frame word is reserved here, so a residual cycle refuses the
+        // compile and the method runs in a lower tier — correct and rare rather
+        // than silently wrong. `regalloc::resolve_parallel_copy` implements the
+        // scratch-based break; wiring it needs a `ValueLoc` view of these slots
+        // plus one reserved word.
+        let mut pending: Vec<(i32, i32)> = copies.into_iter().filter(|(d, s)| d != s).collect();
+        while !pending.is_empty() {
+            let ready = pending
+                .iter()
+                .position(|(dst, _)| !pending.iter().any(|(_, src)| src == dst));
+            match ready {
+                Some(i) => {
+                    let (dst_slot, src_slot) = pending.remove(i);
+                    self.load_to_rax(src_slot);
+                    self.store_rax(dst_slot);
+                }
+                None => {
+                    self.latch_bailout(Bailout::with_context(
+                        BailoutReason::UnsupportedShape("cyclic phi parallel copy"),
+                        format!(
+                            "block {pred_block} -> {succ_block}: {} copies form a cycle",
+                            pending.len()
+                        ),
+                    ));
+                    return;
+                }
+            }
         }
     }
 
