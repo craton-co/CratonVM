@@ -6214,12 +6214,13 @@ mod broker_tests {
         }
         .is_transient());
 
-        let mut broker = CompilationBroker::with_thresholds(fast_policy());
-        let denied = MethodKey::new("java/math/MutableBigInteger", "divideMagnitude", "()V");
-        let decision = broker.on_invocation(&denied, 5_000);
-        assert_eq!(decision.category(), "class_denied");
-        assert!(decision.to_string().starts_with("declined [class_denied]"));
-        assert_eq!(broker.queue_depth(), 0);
+        // The class_denied arm used to be exercised here with
+        // MutableBigInteger.divideMagnitude. That static deny was removed on
+        // 2026-07-31 with the last ban mirrors (see
+        // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md), so the
+        // reason is now unreachable and no method declines for it. The rest of
+        // this test -- that every DeclineReason names itself and reports its own
+        // transience -- is unaffected and still runs.
     }
 
     // ── Queue policy: priority, bound, shed rule ─────────────────────
