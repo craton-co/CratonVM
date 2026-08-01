@@ -9384,6 +9384,13 @@ fn escape_analysis_from_ir(
                 vec![map_id(ir_node.inputs[2]), map_id(ir_node.inputs[4])]
             }
             ir::Op::Load(_) if ir_node.inputs.len() >= 3 => vec![map_id(ir_node.inputs[2])],
+            // EA layout contract: the locked reference is input 0. The IR node
+            // carries `[ctrl, mem, obj]`, exactly like `Load`/`Store`, so
+            // forwarding verbatim would attribute the monitor to the MEMORY
+            // TOKEN and every lock decision would be made about the wrong node.
+            ir::Op::MonitorEnter | ir::Op::MonitorExit if ir_node.inputs.len() >= 3 => {
+                vec![map_id(ir_node.inputs[2])]
+            }
             // `escape_analysis::Op::IdentityHash` reads the observed reference
             // at input 0 — the same slot `Op::MonitorEnter` uses, so the two
             // agree about which object a header read names. The IR call carries
@@ -9544,6 +9551,12 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         ir::Op::Mul => EaOp::Mul,
         ir::Op::Load(mk) => EaOp::Load(*mk as usize),
         ir::Op::Store(mk) => EaOp::Store(*mk as usize),
+        // Monitors: the variants now exist, so lock elision and coarsening can
+        // finally see the operations they were written for. Operand re-packing
+        // is in the second pass — forwarding `[ctrl, mem, obj]` verbatim would
+        // attribute the monitor to the memory token.
+        ir::Op::MonitorEnter => EaOp::MonitorEnter,
+        ir::Op::MonitorExit => EaOp::MonitorExit,
         ir::Op::New {
             class_id,
             num_fields,
