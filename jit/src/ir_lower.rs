@@ -5958,6 +5958,31 @@ pub(crate) fn lower_inner_with_scopes(
     // caller scopes above it. Empty ⇒ flat, caller-less deopt frames.
     inline_scopes: &InlineScopeTable,
 ) -> Option<CompiledMethod> {
+    // A monitor in the graph must REFUSE the compile, not fall through.
+    //
+    // `ir::Op::MonitorEnter`/`MonitorExit` exist (escape analysis needs them to
+    // reason about lock elision), but there is no lowering arm for them here
+    // and no monitor helper in `JitRuntimeHelpers` to call. `lower_data_node`'s
+    // catch-all is `_ => {}`, so an unguarded monitor would compile to *nothing*
+    // — the lock silently disappears, which is a data race and an unbalanced
+    // `monitorexit`, not a missed optimization.
+    //
+    // Unreachable today (`IrBuilder` has no `monitorenter` arm, so a
+    // synchronized method bails earlier), which is exactly why this guard has
+    // to exist before that arm is ever added: the failure it prevents is
+    // silent. Adding the helper is not a small change — the helper table's byte
+    // offsets are baked into emitted machine code.
+    if graph
+        .nodes
+        .iter()
+        .any(|n| matches!(n.op, Op::MonitorEnter | Op::MonitorExit))
+    {
+        return refuse(Bailout::with_context(
+            BailoutReason::UnsupportedShape("monitor op has no lowering"),
+            "ir_lower has no MonitorEnter/MonitorExit arm and JitRuntimeHelpers \
+             has no monitor helper; refusing rather than dropping the lock",
+        ));
+    }
     // A live object allocation is now supported by the common allocation
     // stub. A zero helper pointer is only possible in synthetic unit-test
     // tables; reject it instead of emitting a call through address zero.
