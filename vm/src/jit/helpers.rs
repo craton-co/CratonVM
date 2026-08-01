@@ -12360,6 +12360,11 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // hand-built test tables can leave them 0.
         new_object_cp: jit_new_object_cp as *const () as usize,
         anewarray_object_cp: jit_anewarray_object_cp as *const () as usize,
+        // These two existed but were unreachable from the JIT: correct
+        // implementations with no table slot, so `ir_lower` had nothing to call
+        // and monitors could not be lowered at all.
+        monitor_enter: jit_monitor_enter as *const () as usize,
+        monitor_exit: jit_monitor_exit as *const () as usize,
         baload: jit_baload as *const () as usize,
         bastore: jit_bastore as *const () as usize,
         iaload: jit_iaload as *const () as usize,

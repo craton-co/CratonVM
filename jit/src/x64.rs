@@ -25446,6 +25446,11 @@ mod tests {
             // than emit a null CALL, so the tests stay byte-identical.
             new_object_cp: 0,
             anewarray_object_cp: 0,
+            // 0 is meaningful here: `ir_lower` refuses a graph containing
+            // monitor ops when the helper is absent, rather than emitting
+            // nothing for them.
+            monitor_enter: 0,
+            monitor_exit: 0,
         }
     }
 
