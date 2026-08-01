@@ -1082,6 +1082,38 @@ pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
     (addr >= entry && addr < end).then_some(cm)
 }
 
+/// Resolve `addr` to a *retained* owner of the compiled body containing it.
+///
+/// [`lookup_jit_code_range`] returns a bare `usize` — the address of an
+/// `Arc<CompiledMethod>`'s inner value with no keep-alive. Between that call
+/// returning and the caller dereferencing it, the last strong reference can be
+/// dropped and the artifact (its oop maps, its deopt tables, its inline-cache
+/// slot boxes, and its executable buffer) freed. Today that window is closed
+/// only indirectly, by `defer_jit_owner` declining to reclaim while any thread
+/// is inside compiled code — which holds for a root scan of a *running* JIT
+/// frame but is not an invariant the signature states or a caller can check.
+///
+/// This is the same lookup with the keep-alive attached: the returned `Arc`
+/// makes the metadata and the code buffer valid for as long as it is held.
+/// `None` means "no live body covers this address", which is the safe answer.
+///
+/// Costs one mutex acquisition on `jit_entry_owners` over the lock-free range
+/// search, so it belongs on the per-frame paths (a root scan naming one frame),
+/// not on the per-stack-word conservative sweep — that one wants
+/// [`snapshot_code_ranges_into`], which hands out no owner pointer at all.
+pub fn pin_jit_code_range_owner(addr: usize) -> Option<Arc<CompiledMethod>> {
+    let entry = {
+        let ranges = jit_code_ranges().snapshot.load();
+        let candidate = ranges.partition_point(|&(entry, _, _)| entry <= addr);
+        let &(entry, end, _) = ranges.get(candidate.checked_sub(1)?)?;
+        if addr < entry || addr >= end {
+            return None;
+        }
+        entry
+    };
+    resolve_jit_entry_owner(entry)
+}
+
 /// Copy the registered code ranges into `buf` as `(start, end)` pairs sorted by
 /// `start`, taking the table lock exactly ONCE.
 ///
@@ -1247,11 +1279,48 @@ pub fn register_jit_method_name(entry: usize, len: usize, name: String) {
     }
 }
 
+/// Withdraw every name range starting at `entry`.
+///
+/// Called from [`CompiledMethod::drop`], BEFORE the buffer is unmapped, for the
+/// same reason [`unregister_jit_code_range`] is. Without it the table both grows
+/// without bound and, worse, keeps naming an address the OS is free to hand to
+/// the next `mmap`: a crash inside a *new* body at a recycled address would be
+/// reported under the *dead* body's name. A crash report that names the wrong
+/// method is worse than one that names none, because it is believed.
+pub fn unregister_jit_method_name(entry: usize) {
+    if entry == 0 {
+        return;
+    }
+    // Only when the registry was ever populated — `jit_names_enabled()` is the
+    // usual reason it was not, and `get()` avoids creating it on the drop path.
+    if let Some(lock) = JIT_NAME_RANGES.get() {
+        if let Ok(mut v) = lock.lock() {
+            v.retain(|(e, _, _)| *e != entry);
+        }
+    }
+}
+
+/// Number of registered JIT method-name ranges (diagnostic; also the assertion
+/// hook for "the registry does not grow without bound").
+pub fn jit_method_name_range_count() -> usize {
+    JIT_NAME_RANGES
+        .get()
+        .and_then(|lock| lock.try_lock().ok().map(|v| v.len()))
+        .unwrap_or(0)
+}
+
 /// Resolve the method name whose code range contains `addr`. Uses `try_lock` so
 /// it is safe to call from a crash handler (never blocks on a held lock).
+///
+/// Searches from the END: entries are appended in publication order, so the
+/// most recent registration for an address wins. That is the belt to
+/// [`unregister_jit_method_name`]'s braces — if a withdrawal is ever missed, a
+/// recycled address still symbolizes as the body currently mapped there rather
+/// than as the dead one that was mapped there first.
 pub fn lookup_jit_method_name(addr: usize) -> Option<String> {
     let v = jit_name_ranges().try_lock().ok()?;
     v.iter()
+        .rev()
         .find(|(e, end, _)| addr >= *e && addr < *end)
         .map(|(_, _, name)| name.clone())
 }
@@ -1279,6 +1348,7 @@ pub fn lookup_jit_method_name_detailed(addr: usize) -> JitNameLookup {
     };
     match v
         .iter()
+        .rev()
         .find(|(e, end, _)| addr >= *e && addr < *end)
         .map(|(_, _, name)| name.clone())
     {
@@ -1707,6 +1777,25 @@ pub struct CompiledMethod {
     /// lookup was pure overhead — and reading the owner off the live artifact
     /// cannot return a retired entry's stale answer.
     pub owner_class_id: u32,
+    /// Value of [`jit_install_epoch`] when this artifact's COMPILATION began.
+    ///
+    /// The install-side half of the redefinition hole. `redefineClass` bumps
+    /// the epoch and then flushes the cache
+    /// (`vm/src/vm/vm_exec.rs::redefine_class`), and a synthetic-stub layout
+    /// upgrade flushes it too (`vm/src/vm/vm_init.rs::jit_invalidate_adapter`).
+    /// Neither reaches a compilation that is ALREADY RUNNING: the broker has no
+    /// epoch on its queued or in-flight requests, so a compile that read the
+    /// pre-redefinition bytecode completes afterwards and — until this field
+    /// existed — was published unconditionally and called. The published body
+    /// then executes bytecode the agent replaced, or (for a layout upgrade)
+    /// reads field offsets that no longer describe the class.
+    ///
+    /// [`JitCache::put`] / [`put_osr`](JitCache::put_osr) compare this against
+    /// the owning cache's `flush_barrier` and refuse a stale artifact. Stamped
+    /// in both constructors from [`current_compile_install_epoch`], which reads
+    /// the compile-wide thread-local witness [`open_compile_epoch_witness`]
+    /// opens (so the stamp is the epoch at compile START, not at finalize).
+    pub install_epoch: u64,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -1719,6 +1808,10 @@ impl Drop for CompiledMethod {
             report_stale_ic_holders(entry);
         }
         unregister_jit_code_range(entry);
+        // Same withdrawal, same reason, and it must happen here too: the buffer
+        // this artifact owns is unmapped as soon as this function returns, and
+        // the address is then reusable by the next `alloc_executable`.
+        unregister_jit_method_name(entry);
         if let Some(owners) = JIT_ENTRY_OWNERS.get() {
             let mut owners = owners.lock();
             if owners
@@ -1847,6 +1940,7 @@ impl CompiledMethod {
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
+            install_epoch: current_compile_install_epoch(),
         }
     }
 
@@ -1914,6 +2008,7 @@ impl CompiledMethod {
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
+            install_epoch: current_compile_install_epoch(),
         }
     }
 
@@ -7739,6 +7834,17 @@ impl JitPICSlot {
         if class_id == 0 {
             return;
         }
+        // Read the OWNER FIRST, then the entry pointer.
+        //
+        // `JitMICSlot::clear_compiled_entry` zeroes `cached_entry_ptr` and only
+        // then takes `compiled_owner`. Reading in the other order — as this did
+        // — admits the interleaving that copies a live raw entry into the PIC
+        // together with an owner that has already been taken: the PIC then holds
+        // a callable address with no keep-alive, and the emitted 4-way cascade
+        // `CALL`s it after the body is unmapped. Owner-then-entry makes that
+        // interleaving impossible: if the owner read lands after the take, the
+        // entry read (which follows it) necessarily lands after the zeroing.
+        let owner = mic.compiled_owner.lock().clone();
         let entry_ptr = mic
             .cached_entry_ptr
             .load(std::sync::atomic::Ordering::Acquire);
@@ -7749,7 +7855,17 @@ impl JitPICSlot {
         // per-hit clones in the dispatch helper) — convert on this rare
         // promotion path.
         let class_name = mic.cached_class_name.lock().as_deref().map(String::from);
-        *self.compiled_owners[0].lock() = mic.compiled_owner.lock().clone();
+        // And re-run the same admission the two other install paths run: an
+        // owner-less address that is still a `jit_entry_owners` key, or that
+        // lies inside a live JIT region, is a body we failed to retain — not a
+        // native trampoline. Copying it forward would launder a refusal the MIC
+        // itself would make today.
+        let (entry_ptr, needs_ctx) = if jit_entry_publishable(entry_ptr, &owner) {
+            (entry_ptr, needs_ctx)
+        } else {
+            (0, false)
+        };
+        *self.compiled_owners[0].lock() = owner;
         // BUG-24: publish entry_ptr / needs_context / name BEFORE the class_id,
         // exactly as `write_entry` does. The inline PIC cascade
         // (`jit/src/x64.rs`) reads `class_ids[i]` first and, on a match, loads
@@ -8309,6 +8425,24 @@ pub struct JitCache {
     mutation: parking_lot::Mutex<()>,
     string_arena: parking_lot::Mutex<Vec<Pin<Box<str>>>>,
     invoke_info_arena: parking_lot::Mutex<Vec<Pin<Box<JitInvokeInfo>>>>,
+    /// Highest [`JIT_INSTALL_EPOCH`] value this cache has been flushed at.
+    ///
+    /// An artifact whose [`CompiledMethod::install_epoch`] is below this began
+    /// compiling before the flush, so it was compiled against bytecode (or a
+    /// field layout) the flush exists to retire. [`Self::put`] and
+    /// [`Self::put_osr`] refuse it.
+    ///
+    /// Raised only by [`Self::clear_all`], under `mutation` — the same lock the
+    /// two publication paths hold — so a publication either completes entirely
+    /// before the flush (and is then wiped by it) or observes the raised
+    /// barrier. There is no third outcome.
+    ///
+    /// Deliberately per-cache rather than a global watermark: `clear_all` is
+    /// fanned out across every live VM by
+    /// `vm/src/vm/vm_init.rs::jit_invalidate_adapter`, so a real flush still
+    /// arms every cache, while a *test* flushing its own `JitCache` cannot
+    /// refuse a concurrent test's publication into a different one.
+    flush_barrier: std::sync::atomic::AtomicU64,
 }
 
 static JIT_ENTRY_OWNERS: std::sync::OnceLock<
@@ -8685,9 +8819,122 @@ pub fn redefine_epoch() -> u32 {
 
 /// Record that a class was redefined. Invalidates every inline cache exactly
 /// once, lazily, as each slot is next dispatched through.
+///
+/// Also advances [`JIT_INSTALL_EPOCH`], so a compilation that is already in
+/// flight when this runs carries a strictly older stamp than any cache flush
+/// that follows. Arming is `JitCache::clear_all`'s job — see
+/// [`JitCache::flush_barrier`].
 #[inline]
 pub fn bump_redefine_epoch() {
     REDEFINE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    bump_jit_install_epoch();
+}
+
+/// Monotonic process-wide *compilation* epoch.
+///
+/// Read at the START of a compilation and stamped onto the resulting artifact
+/// ([`CompiledMethod::install_epoch`]); advanced by every event that makes an
+/// already-running compilation's input bytecode or class layout obsolete —
+/// [`bump_redefine_epoch`] and [`JitCache::clear_all`].
+///
+/// This is a *counter*, not a gate. The gate is per-cache
+/// ([`JitCache::flush_barrier`]) so that one VM's redefinition cannot refuse
+/// another VM's unrelated publication, and so a test flushing its own
+/// `JitCache` cannot refuse a concurrent test's `put`. Starts at 1 so `0` is
+/// never a legitimate stamp.
+pub static JIT_INSTALL_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Current compilation epoch (one acquire load).
+#[inline]
+pub fn jit_install_epoch() -> u64 {
+    JIT_INSTALL_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Advance the compilation epoch and return the NEW value.
+#[inline]
+pub fn bump_jit_install_epoch() -> u64 {
+    JIT_INSTALL_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+}
+
+thread_local! {
+    /// The install epoch the compilation running on this thread began at, or
+    /// `None` when no compilation is open.
+    static COMPILE_INSTALL_EPOCH: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII scope opened for the whole duration of one compilation.
+///
+/// Re-entrant and conservative: a nested compile (the `callee_compiler`
+/// recursion, or an inlined callee compiled on the same thread) keeps the
+/// OUTERMOST — i.e. oldest — epoch, because the inner artifact is only useful
+/// if the outer one is, and an outer stamp can only refuse more.
+#[must_use = "the witness must stay alive for the whole compilation"]
+pub struct CompileEpochWitness {
+    prev: Option<u64>,
+}
+
+impl Drop for CompileEpochWitness {
+    fn drop(&mut self) {
+        COMPILE_INSTALL_EPOCH.with(|c| c.set(self.prev));
+    }
+}
+
+/// Open a compilation scope, stamping every [`CompiledMethod`] built inside it
+/// with the epoch as of *now* rather than as of buffer finalize.
+///
+/// [`try_compile_with_invokespecial_resolver`] opens one around the whole
+/// pipeline. A backend entered directly (the OSR compile in
+/// `vm/src/runtime/interpreter/invoke.rs` calls `x64::compile_with_param_slots`
+/// without going through `try_compile`) simply gets the narrower
+/// finalize-to-publish window, which is still a real gate — see
+/// `docs/jit/code-cache-lifetime.md` for the one-line change that widens it.
+pub fn open_compile_epoch_witness() -> CompileEpochWitness {
+    COMPILE_INSTALL_EPOCH.with(|c| {
+        let prev = c.get();
+        if prev.is_none() {
+            c.set(Some(jit_install_epoch()));
+        }
+        CompileEpochWitness { prev }
+    })
+}
+
+/// The epoch a `CompiledMethod` built right now must be stamped with: the open
+/// compilation's start epoch, or (no compilation open) the live epoch.
+#[inline]
+fn current_compile_install_epoch() -> u64 {
+    COMPILE_INSTALL_EPOCH
+        .with(|c| c.get())
+        .unwrap_or_else(jit_install_epoch)
+}
+
+/// Publications refused because the compilation predated a cache flush.
+static STALE_INSTALL_EPOCH_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of artifacts refused publication for having been compiled against
+/// bytecode a later redefinition or layout upgrade replaced.
+pub fn stale_install_epoch_refusals() -> u64 {
+    STALE_INSTALL_EPOCH_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a compilation that predates a cache flush is refused publication.
+///
+/// DEFAULT-ON. Refusing costs one wasted compile: the method stays interpreted
+/// and recompiles on a later invocation, against the bytecode that is actually
+/// installed. Publishing anyway runs the code the redefinition replaced —
+/// silently, because nothing downstream can tell a stale body from a current
+/// one. `CRATONVM_JIT_STRICT_INSTALL_EPOCH=0` restores the historical
+/// publish-anyway behaviour for bisection; the refusal is still counted.
+fn strict_install_epoch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_STRICT_INSTALL_EPOCH")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 pub fn jit_cache_generation() -> u64 {
@@ -8705,6 +8952,8 @@ impl JitCache {
             mutation: parking_lot::Mutex::new(()),
             string_arena: parking_lot::Mutex::new(Vec::new()),
             invoke_info_arena: parking_lot::Mutex::new(Vec::new()),
+            // Never flushed: every artifact is at or above epoch 1.
+            flush_barrier: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -8826,6 +9075,27 @@ impl JitCache {
         }
     }
 
+    /// Returns `false` when this artifact was compiled against inputs a later
+    /// flush of THIS cache retired, in which case it must not be published.
+    ///
+    /// Callers must hold `mutation` — that is what makes the answer stable
+    /// against a concurrent [`Self::clear_all`].
+    fn publication_epoch_is_current(&self, compiled: &CompiledMethod) -> bool {
+        let barrier = self.flush_barrier.load(std::sync::atomic::Ordering::Acquire);
+        if compiled.install_epoch >= barrier {
+            return true;
+        }
+        STALE_INSTALL_EPOCH_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dbg_jit_pin_enabled() {
+            eprintln!(
+                "[jit-stale-install] refusing a body compiled at epoch {} into a cache \
+flushed at epoch {barrier}",
+                compiled.install_epoch,
+            );
+        }
+        !strict_install_epoch_enabled()
+    }
+
     /// Returns `false` when a baked direct-call target could not be pinned, in
     /// which case this body must NOT be published — its emitted code contains a
     /// `call` to an address nothing keeps alive.
@@ -8864,6 +9134,14 @@ impl JitCache {
         mut compiled: CompiledMethod,
     ) {
         let _mutation = self.mutation.lock();
+        if !self.publication_epoch_is_current(&compiled) {
+            // Compiled against bytecode a redefinition (or a synthetic-stub
+            // layout upgrade) has since replaced. Dropping it leaves the method
+            // interpreted; it recompiles on a later invocation, against the
+            // bytecode that is actually installed. See
+            // `CompiledMethod::install_epoch`.
+            return;
+        }
         let h = compute_jit_key_hash(&class_name, &method_name, &descriptor, declaring_class_id);
         let key = JitKey {
             class_name,
@@ -8954,6 +9232,11 @@ impl JitCache {
     ) {
         let _mutation = self.mutation.lock();
         debug_assert!(compiled.compiled_via_osr);
+        // Same gate as `put` — an OSR body compiled against retired bytecode is
+        // if anything worse, since it is entered into a loop already running.
+        if !self.publication_epoch_is_current(&compiled) {
+            return;
+        }
         let h = compute_jit_key_hash(&class_name, &method_name, &descriptor, declaring_class_id);
         let key = JitKey {
             class_name,
@@ -9221,8 +9504,21 @@ impl JitCache {
     /// not just methods declared by the redefined class. A full flush is rare
     /// but conservative; ownership pins any body still referenced by an
     /// already-loaded reader while new snapshots become empty atomically.
+    ///
+    /// Also **arms the install barrier**: emptying the maps retires every body
+    /// that is already here, but says nothing about the bodies still being
+    /// compiled from the same retired inputs. Raising `flush_barrier` under
+    /// `mutation` — the lock the two publication paths also hold — makes those
+    /// unpublishable, which is the half of the redefinition protocol the
+    /// compilation broker cannot supply (it stamps no epoch on a queued or
+    /// in-flight request, so a completion cannot notice its bytecode is gone).
     pub fn clear_all(&self) -> usize {
         let _mutation = self.mutation.lock();
+        // Advance first, then arm, so the barrier is strictly greater than the
+        // stamp of every compilation that had already started.
+        let barrier = bump_jit_install_epoch();
+        self.flush_barrier
+            .fetch_max(barrier, std::sync::atomic::Ordering::AcqRel);
         let mut count = 0;
         for shard in self.shards.iter() {
             for map in [shard.methods.load(), shard.osr_methods.load()] {
@@ -11382,6 +11678,13 @@ pub fn try_compile_with_invokespecial_resolver(
     // for a given site) bails the whole compile — see `try_compile_inner`.
     cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
 ) -> Option<CompiledMethod> {
+    // Open the compilation scope FIRST, before any constant-pool resolver runs.
+    // Every `CompiledMethod` built under it — including one built by a nested
+    // `callee_compiler` compile on this thread — is stamped with the install
+    // epoch as of right now, so a redefinition or layout upgrade that lands
+    // while this compile is reading bytecode makes the result unpublishable.
+    // See `CompiledMethod::install_epoch` and `JitCache::flush_barrier`.
+    let _compile_epoch = open_compile_epoch_witness();
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
     // scan/IR/lowering work per re-attempt (every 2000 invocations
@@ -13253,10 +13556,20 @@ fn try_compile_inner(
                             compiled._jit_pic_slots.extend(ir_pic_boxes);
                         }
                         if !ir_direct_callee_entries.is_empty() {
-                            ir_direct_callee_entries.sort_unstable();
-                            ir_direct_callee_entries.dedup();
-                            compiled._direct_callee_entries =
-                                std::mem::take(&mut ir_direct_callee_entries);
+                            // `append`, never assign — the same reasoning as the
+                            // `_jit_mic_slots` transfer three lines up. An
+                            // assignment silently DISCARDS any entry the lowerer
+                            // recorded on the artifact itself, and a discarded
+                            // entry is one `prepare_for_publication` will not
+                            // pin: the body would then be published with a baked
+                            // CALL to an address nothing keeps mapped. The
+                            // lowerer records none today, which is exactly why
+                            // the assignment looked safe.
+                            compiled
+                                ._direct_callee_entries
+                                .append(&mut ir_direct_callee_entries);
+                            compiled._direct_callee_entries.sort_unstable();
+                            compiled._direct_callee_entries.dedup();
                         }
                         // Backend-routing introspection (tests only): this body was
                         // produced by the optimizing IR pipeline. A method that
@@ -22228,5 +22541,356 @@ mod layout_constant_inventory {
                 .any(|(_, counts)| counts.iter().any(|c| *c > 0)),
             "an inventory of all zeros would pass without checking anything"
         );
+    }
+}
+
+/// Lifetime and ownership of compiled code and its side tables.
+///
+/// See `docs/jit/code-cache-lifetime.md`. Every test here is written to be
+/// robust against the other tests in this binary running concurrently: nothing
+/// asserts an absolute value of a process-global counter, and the install
+/// barrier these tests exercise is deliberately per-`JitCache` so that flushing
+/// one cache cannot refuse another's publication.
+#[cfg(test)]
+mod code_cache_lifetime_tests {
+    use super::*;
+
+    fn ret_body() -> CompiledMethod {
+        let mut buf = ExecutableBuffer::new(64).expect("alloc executable");
+        buf.emit(&[0xC3]); // RET
+        CompiledMethod::new(buf)
+    }
+
+    fn key() -> (Arc<str>, Arc<str>, Arc<str>, cratonvm_types::ClassId) {
+        (
+            Arc::from("cclt/Subject"),
+            Arc::from("m"),
+            Arc::from("()V"),
+            cratonvm_types::ClassId::new(1),
+        )
+    }
+
+    /// Read the name registry past a transient `Locked`.
+    ///
+    /// `lookup_jit_method_name*` is a `try_lock` accessor so it is safe from a
+    /// crash handler, which means "the registry was busy" and "no name covers
+    /// this address" are different answers that must not be conflated — the
+    /// distinction `JitNameLookup` exists for. Same convention as
+    /// `live_code_region_covers_a_buffer_the_name_registry_never_saw`.
+    fn name_of(addr: usize) -> Option<String> {
+        for _ in 0..200 {
+            match lookup_jit_method_name_detailed(addr) {
+                JitNameLookup::Found(n) => return Some(n),
+                JitNameLookup::NotFound => return None,
+                JitNameLookup::Locked => std::thread::yield_now(),
+            }
+        }
+        panic!("the name registry stayed locked for 200 attempts");
+    }
+
+    /// THE redefinition hole, from the install side.
+    ///
+    /// `redefineClass` bumps the epoch and flushes the cache, but the
+    /// compilation broker stamps nothing on a queued or in-flight request, so a
+    /// compile that already read the OLD bytecode completes afterwards. Before
+    /// the install barrier, `put` published it unconditionally and the VM then
+    /// executed the bytecode the agent had replaced.
+    #[test]
+    fn a_compilation_that_predates_a_cache_flush_is_not_installed() {
+        let cache = JitCache::new();
+        let (class, method, desc, cid) = key();
+
+        // A compilation opens, reads bytecode, and produces an artifact...
+        let witness = open_compile_epoch_witness();
+        let stale = ret_body();
+
+        // ...and a redefinition flushes the cache while it is still in flight.
+        cache.clear_all();
+        drop(witness);
+
+        cache.put(class.clone(), method.clone(), desc.clone(), cid, stale);
+        assert!(
+            cache.get(&class, &method, &desc, cid).is_none(),
+            "a body compiled against bytecode the flush retired must not be published"
+        );
+    }
+
+    /// The gate must refuse only what it is meant to: a compilation that STARTS
+    /// after the flush publishes normally. Without this the previous test would
+    /// also pass on a `put` that never publishes anything.
+    #[test]
+    fn a_compilation_that_starts_after_a_flush_installs_normally() {
+        let cache = JitCache::new();
+        let (class, method, desc, cid) = key();
+
+        cache.clear_all();
+        let witness = open_compile_epoch_witness();
+        let fresh = ret_body();
+        drop(witness);
+
+        cache.put(class.clone(), method.clone(), desc.clone(), cid, fresh);
+        assert!(
+            cache.get(&class, &method, &desc, cid).is_some(),
+            "a body compiled after the flush is current and must publish"
+        );
+    }
+
+    /// The stamp has to be the epoch at compile START, not at buffer finalize —
+    /// the whole window the broker cannot see is the one *before* codegen ends.
+    ///
+    /// Race-free by construction: both artifacts are compared against each
+    /// other rather than against a separately-read global, so a concurrent bump
+    /// from another test cannot change the outcome.
+    #[test]
+    fn the_compile_witness_stamps_the_start_epoch_not_the_finalize_epoch() {
+        let witness = open_compile_epoch_witness();
+        let at_start = ret_body().install_epoch;
+        bump_jit_install_epoch();
+        bump_jit_install_epoch();
+        let at_finalize = ret_body().install_epoch;
+        drop(witness);
+
+        assert_eq!(
+            at_start, at_finalize,
+            "an artifact finalized after a mid-compile epoch bump must still \
+             carry the epoch its compilation began at"
+        );
+
+        // And with no witness open, the live epoch is used — otherwise a
+        // backend entered directly would inherit a stale thread-local.
+        let unscoped = ret_body().install_epoch;
+        assert!(
+            unscoped > at_start,
+            "outside a compilation scope the stamp must track the live epoch \
+             (got {unscoped}, compile-scope stamp was {at_start})"
+        );
+    }
+
+    /// `callee_compiler` re-enters `try_compile` on the same thread. The nested
+    /// compile must keep the OUTER (older) epoch: it is only useful if the outer
+    /// artifact is, and an older stamp can only refuse more.
+    #[test]
+    fn a_nested_compile_keeps_the_outer_epoch() {
+        let outer = open_compile_epoch_witness();
+        let outer_stamp = ret_body().install_epoch;
+        {
+            let inner = open_compile_epoch_witness();
+            bump_jit_install_epoch();
+            assert_eq!(
+                ret_body().install_epoch,
+                outer_stamp,
+                "a nested compile must not adopt a newer epoch than its caller"
+            );
+            drop(inner);
+        }
+        assert_eq!(
+            ret_body().install_epoch,
+            outer_stamp,
+            "closing the nested scope must restore the outer compilation's epoch"
+        );
+        drop(outer);
+    }
+
+    /// The barrier is per-cache on purpose. A global watermark would make one
+    /// VM's redefinition refuse another VM's unrelated publication — and, in
+    /// this test binary, would make every `clear_all` test a random failure
+    /// generator for every concurrent `put` test.
+    #[test]
+    fn flushing_one_cache_does_not_refuse_another_caches_publication() {
+        let flushed = JitCache::new();
+        let untouched = JitCache::new();
+        let (class, method, desc, cid) = key();
+
+        let witness = open_compile_epoch_witness();
+        let body = ret_body();
+        flushed.clear_all();
+        drop(witness);
+
+        untouched.put(class.clone(), method.clone(), desc.clone(), cid, body);
+        assert!(
+            untouched.get(&class, &method, &desc, cid).is_some(),
+            "a cache that was never flushed must not inherit another cache's barrier"
+        );
+    }
+
+    /// `JitPICSlot::seed_from_mic` used to read the MIC's entry pointer BEFORE
+    /// its owner. `JitMICSlot::clear_compiled_entry` zeroes the entry and only
+    /// then takes the owner, so the old order could copy a live raw address into
+    /// the PIC together with an owner that had already been released — a
+    /// callable pointer with no keep-alive, which the emitted 4-way cascade
+    /// `CALL`s. This is that state, written directly.
+    #[test]
+    fn seeding_a_pic_refuses_a_mic_entry_that_lost_its_owner() {
+        use std::sync::atomic::Ordering;
+
+        // A live JIT code region: an unowned address inside one is a compiled
+        // body we failed to retain, never a native trampoline.
+        let buf = ExecutableBuffer::new(64).expect("alloc executable");
+        let orphan = buf.as_ptr() as u64;
+
+        let mic = JitMICSlot::new();
+        mic.cached_entry_ptr.store(orphan, Ordering::Release);
+        mic.cached_needs_context.store(true, Ordering::Relaxed);
+        mic.cached_class_id.store(7, Ordering::Release);
+        // `compiled_owner` deliberately left empty — the residue of the race.
+
+        let pic = JitPICSlot::new();
+        pic.seed_from_mic(&mic);
+
+        assert_eq!(
+            pic.class_ids[0].load(Ordering::Acquire),
+            7,
+            "the class guard is still worth carrying forward"
+        );
+        assert_eq!(
+            pic.entry_ptrs[0].load(Ordering::Acquire),
+            0,
+            "an entry with no live owner must be downgraded to unresolved, not \
+             copied into a slot generated code calls without validation"
+        );
+        assert!(
+            !pic.needs_context[0].load(Ordering::Relaxed),
+            "the ABI flag must be cleared alongside the refused entry"
+        );
+        drop(buf);
+    }
+
+    /// An admissible MIC entry still seeds through — the refusal above must not
+    /// be "seed_from_mic no longer copies anything".
+    #[test]
+    fn seeding_a_pic_carries_a_well_formed_mic_entry_forward() {
+        use std::sync::atomic::Ordering;
+
+        let mic = JitMICSlot::new();
+        // A synthetic non-JIT sentinel: unowned but outside every code region,
+        // which is the shape `jit_entry_publishable` admits (native/builtin
+        // targets, which nothing unmaps). Same value the sibling PIC tests in
+        // `mod tests` use, so it is empirically clear of every real mapping this
+        // suite makes.
+        let sentinel = 0x7000u64;
+        mic.cached_entry_ptr.store(sentinel, Ordering::Release);
+        mic.cached_class_id.store(9, Ordering::Release);
+
+        let pic = JitPICSlot::new();
+        pic.seed_from_mic(&mic);
+
+        assert_eq!(pic.class_ids[0].load(Ordering::Acquire), 9);
+        assert_eq!(pic.entry_ptrs[0].load(Ordering::Acquire), sentinel);
+    }
+
+    /// A retired body must stop naming its address. The OS is free to hand that
+    /// page to the next `alloc_executable`, and a crash report that names the
+    /// dead method is worse than one that names none — it is believed.
+    #[test]
+    fn a_retired_body_withdraws_its_crash_report_name() {
+        let cm = ret_body();
+        let entry = cm.entry_ptr() as usize;
+        let len = cm.code_len().max(1);
+        let name = "cclt/Retired.body()V".to_string();
+        register_jit_method_name(entry, len, name.clone());
+        assert_eq!(
+            name_of(entry).as_deref(),
+            Some(name.as_str()),
+            "the name must resolve while the body is live"
+        );
+
+        drop(cm);
+        // `!= our name` rather than `is_none`: the allocator may already have
+        // handed this page to a concurrently-running test, which would then
+        // legitimately own the address. What must never happen is the DEAD
+        // body still answering for it.
+        assert_ne!(
+            name_of(entry).as_deref(),
+            Some(name.as_str()),
+            "a dropped body must not keep symbolizing an address the allocator \
+             can hand to a different body"
+        );
+    }
+
+    /// Belt to the withdrawal's braces: if a registration is ever missed, the
+    /// newest range for an address must still win, so a recycled address
+    /// symbolizes as what is mapped there NOW.
+    #[test]
+    fn the_newest_registration_for_an_address_wins() {
+        let buf = ExecutableBuffer::new(64).expect("alloc executable");
+        let entry = buf.as_ptr() as usize;
+        register_jit_method_name(entry, 16, "cclt/First.old()V".to_string());
+        register_jit_method_name(entry, 16, "cclt/Second.new()V".to_string());
+        assert_eq!(
+            name_of(entry).as_deref(),
+            Some("cclt/Second.new()V"),
+            "the most recent publication for an address must be the one reported"
+        );
+        unregister_jit_method_name(entry);
+        assert_ne!(
+            name_of(entry).as_deref(),
+            Some("cclt/Second.new()V"),
+            "withdrawal must remove EVERY range starting at the entry, not just one"
+        );
+        assert_ne!(
+            name_of(entry).as_deref(),
+            Some("cclt/First.old()V"),
+            "and it must remove the older range for the same entry too"
+        );
+        drop(buf);
+    }
+
+    /// `lookup_jit_code_range` hands out a bare `Arc<CompiledMethod>` inner
+    /// address with no keep-alive; the pinning form must hand out a reference
+    /// that makes the metadata (and the code buffer) valid for as long as it is
+    /// held, even after the cache has released the body.
+    #[test]
+    fn pinning_a_code_range_owner_retains_the_artifact() {
+        let cache = JitCache::new();
+        let (class, method, desc, cid) = key();
+        cache.put(class.clone(), method.clone(), desc.clone(), cid, ret_body());
+        let published = cache.get(&class, &method, &desc, cid).expect("published");
+        let entry = published.entry_ptr() as usize;
+        register_jit_code_range(
+            entry,
+            published.code_len().max(1),
+            Arc::as_ptr(&published) as usize,
+        );
+
+        let pinned = pin_jit_code_range_owner(entry).expect("a live body must pin");
+        assert_eq!(pinned.entry_ptr() as usize, entry);
+        // A pin is a real strong reference: it survives every other holder
+        // releasing, which is exactly what the bare-address form cannot promise.
+        drop(published);
+        cache.clear_all();
+        assert_eq!(
+            pinned.entry_ptr() as usize,
+            entry,
+            "the pinned artifact must stay valid after the cache released it"
+        );
+        assert_eq!(
+            pinned.code_bytes().first().copied(),
+            Some(0xC3),
+            "and its code buffer must still be mapped and readable"
+        );
+        drop(pinned);
+        unregister_jit_code_range(entry);
+    }
+
+    /// A registered range whose body was never published — so nothing in
+    /// `jit_entry_owners` can retain it — must pin as `None`. `None` is the safe
+    /// answer; a raw address would not be.
+    #[test]
+    fn pinning_an_unowned_code_range_yields_none() {
+        let cm = ret_body();
+        let entry = cm.entry_ptr() as usize;
+        register_jit_code_range(entry, cm.code_len().max(1), &cm as *const _ as usize);
+        assert!(
+            pin_jit_code_range_owner(entry).is_none(),
+            "a body with no retainable owner must not be handed out as pinned"
+        );
+        drop(cm);
+    }
+
+    /// An address no body covers pins nothing.
+    #[test]
+    fn pinning_an_unmapped_address_yields_none() {
+        assert!(pin_jit_code_range_owner(0).is_none());
+        assert!(pin_jit_code_range_owner(0x10).is_none());
     }
 }

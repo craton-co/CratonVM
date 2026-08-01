@@ -28,6 +28,31 @@
 //!
 //! TODO(round-12+): wire hoisting consumer into `x64::compile_method`
 //! and the IR optimizer.
+//!
+//! ## Lifetime and ownership (code-cache audit, 2026-08-01)
+//!
+//! Audited alongside `lib.rs` and `runtime_lowering.rs` for the shapes that
+//! produce wild jumps, and it has none of them. Every value this module
+//! produces or consumes is a *bytecode* quantity — `usize` bcis, `u16`
+//! constant-pool indices, `u64` local-modification masks, `i32` constants —
+//! and not one of them is a machine address, a `Box`/arena pointer handed to a
+//! backend, or anything with a reclamation order. No function here takes or
+//! returns a raw pointer. `BoundSource` is a recursively *boxed* expression
+//! tree, which is the only pointer-shaped thing in the file — but every `Box`
+//! is owned by the value that contains it and freed with it, and no address of
+//! one is ever handed out, baked, or cached, so it carries none of the
+//! `_jit_invoke_infos`-style "must outlive the code" obligation.
+//!
+//! The one lifetime-adjacent fact worth stating so nobody has to re-derive it:
+//! this module's verdicts are consumed at COMPILE time, and what reaches the
+//! emitted code is a set of immediates (trip counts, strides, guard constants).
+//! Those are baked into the artifact's own buffer and are therefore exactly as
+//! long-lived as it is — they name nothing outside it, so no invalidation,
+//! redefinition or reclamation event can strand one. That is why this file
+//! needs no `_direct_callee_entries`-style keep-alive list and no install-epoch
+//! stamp, and why nothing here is reachable from `CompiledMethod::drop`.
+//!
+//! See `docs/jit/code-cache-lifetime.md`.
 
 /// A natural loop discovered by scanning backward branches.
 ///
