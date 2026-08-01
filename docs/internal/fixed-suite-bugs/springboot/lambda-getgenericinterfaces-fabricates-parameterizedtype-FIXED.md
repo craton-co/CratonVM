@@ -169,9 +169,10 @@ commit, so they are unrelated to this change.
   `ParameterizedType`, check whether the real JDK actually supplies one before synthesizing
   it — a differential probe against `jdk-25.0.3.9-hotspot` settles it in minutes and is far
   cheaper than the two-test regression this cost.
-- A separate, unrelated lambda-proxy parity gap surfaced while probing and is **not** fixed
-  here: CratonVM's lambda proxies expose a `writeReplace` method from `getDeclaredMethods()`,
-  which real HotSpot only synthesizes for *serializable* lambdas (those whose call site went
-  through `LambdaMetafactory.altMetafactory` with `FLAG_SERIALIZABLE`). It is the only
-  remaining difference in the `LambdaGenProbe2` output. Not known to break anything yet, but
-  it makes every CratonVM lambda look serializable to a reflective method scan.
+- A separate lambda-proxy parity gap surfaced while probing and was **fixed the same day** in
+  `fix/lambda-writereplace-serializable-20260801` — see
+  `../lambda-proxy-writereplace-serializable-parity-FIXED.md`. CratonVM's lambda proxies
+  exposed a `writeReplace` method from `getDeclaredMethods()` (and answered `true` to
+  `instanceof Serializable`) for *every* lambda, where real HotSpot does so only for
+  serializable ones. It was the only remaining difference in the `LambdaGenProbe2` output;
+  with it closed, that probe is now **byte-identical** to HotSpot.
