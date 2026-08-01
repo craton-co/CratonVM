@@ -573,6 +573,35 @@ impl VmHeap {
         }
     }
 
+    /// Diagnostic decomposition of [`Self::is_addr_live`] into its two arms,
+    /// plus where the address actually sits.
+    ///
+    /// `is_addr_live` ORs an old-gen allocation test with a young-survivor
+    /// test, so a `false` is indistinguishable between "the old-gen block is on
+    /// the free list", "the address is in the wrong semispace" and "it is in
+    /// neither generation". Those have completely different causes, and the one
+    /// consumer that DESTROYS state on a `false` — the collection-overlay prune
+    /// — has to be debugged against the specific arm.
+    ///
+    /// Returns `(old_gen_allocated, young_survivor, region)`.
+    pub fn liveness_arms(&self, addr: usize) -> (bool, bool, &'static str) {
+        match self {
+            VmHeap::Generational(h) => {
+                let old = h.is_live_old_gen_addr(addr);
+                let young = h.is_live_young_survivor(addr);
+                let region = if h.is_in_old(addr as *const u8) {
+                    "old-gen"
+                } else if h.is_heap_addr(addr).is_some() {
+                    "young"
+                } else {
+                    "off-heap"
+                };
+                (old, young, region)
+            }
+            _ => (false, false, "n/a"),
+        }
+    }
+
     /// T1.7.1 — Brooks-pointer read barrier.
     ///
     /// Consults the object's compact header: if the `LockState` is
@@ -1829,6 +1858,18 @@ impl VmHeap {
             // below divides by the CURRENT heap rather than by whatever the
             // last collection saw. Cheap: two arena locks at shutdown.
             h.publish_gc_metrics_occupancy();
+        }
+        // Old-gen free-list coalescing (the counterpart of the young sweep's
+        // post-sweep coalescer). A large `merged` with compaction never having
+        // run is the fragmentation regime this exists for; `calls>0 merged=0`
+        // says the free list was already maximally coalesced.
+        {
+            use std::sync::atomic::Ordering as O;
+            let calls = crate::old_gen::COALESCE_CALLS.load(O::Relaxed);
+            let merged = crate::old_gen::BLOCKS_MERGED.load(O::Relaxed);
+            if calls > 0 {
+                eprintln!("[GC] oldgen_coalesce: calls={calls} blocks_merged={merged}");
+            }
         }
         // What the collector actually did on the last cycle and why. This is
         // the line that settles the `docs/GC.md` ("young collections run

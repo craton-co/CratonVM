@@ -36366,6 +36366,15 @@ fn native_exception_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // this, a no-arg `new IllegalStateException()` thrown from bytecode had an
     // empty getStackTrace(). Same root cause as native_exception_init_msg.
     if let Some(Value::Object(Some(this))) = args.first() {
+        // Mirror the JDK field initializer `private Throwable cause = this;`,
+        // exactly as `lang_misc::native_exc_init_noargs` does. This native is
+        // registered LATER (see `register_exception_extras_natives`) and wins
+        // the registry slot for ~56 subclasses, so without the mirror those
+        // classes were the only ones whose `cause` slot stayed unwritten:
+        // real-JDK `initCause()` bytecode reads `cause != this` and refuses
+        // with "Can't overwrite cause", and serializing such a throwable emits
+        // a null `cause` where HotSpot emits the self back-reference.
+        crate::lang_misc::write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
         crate::lang_misc::capture_throwable_trace(ctx, *this);
     }
     Ok(None)
@@ -36402,6 +36411,14 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // `lang_misc::register_throwable_subclass_natives` and win the slot for
     // ~50 subclasses, so this path is the live one.
     crate::lang_misc::write_throwable_detail_message(ctx, this, msg);
+    // Mirror the JDK field initializer `private Throwable cause = this;`, as
+    // `lang_misc::native_exc_init_message` already does. Same omission story as
+    // `native_exception_init_empty` above: this native shadows `Throwable
+    // .<init>` for ~56 subclasses, so `new UnsupportedOperationException("x")`
+    // left `cause` unwritten while `new RuntimeException()` (not in that list)
+    // got the sentinel — a divergence visible through reflection, through
+    // real-JDK `initCause()` bytecode, and in the serialized form.
+    crate::lang_misc::write_throwable_cause(ctx, this, Value::Object(Some(this)));
     // Surefire bootstrap forensics: capture exact Java callsite for the
     // recurring `NullPointerException("Name is null")` blocker so we can
     // patch the true producer instead of masking symptoms.

@@ -1516,6 +1516,15 @@ impl GenerationalHeap {
                 }
                 // Both generations exhausted: report OOM to the caller instead
                 // of aborting (the divergence from `alloc_array`).
+                //
+                // Say WHY, once per run: "full" and "too fragmented to serve
+                // this request" are very different bugs and the caller only
+                // ever saw `OutOfMemoryError`. The old generation's free list
+                // is size-segregated and only coalesces on demand or after an
+                // in-place sweep (see `OldGen::coalesce_free_blocks`), so a
+                // large `free_bytes` next to a small `largest_free_block` is
+                // the fragmentation face.
+                self.report_fallible_alloc_exhaustion(total_size);
                 return None;
             }
         };
@@ -1536,6 +1545,41 @@ impl GenerationalHeap {
             );
             Some(ObjectRef::from_raw(ptr))
         }
+    }
+
+    /// One-shot breadcrumb for a fallible allocation that neither generation
+    /// could satisfy. Rate-limited to the first few occurrences: the
+    /// user-visible signal is the `OutOfMemoryError` the native boundary is
+    /// about to throw, this just makes it diagnosable.
+    fn report_fallible_alloc_exhaustion(&self, total_size: usize) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) >= 4 {
+            return;
+        }
+        let (young_used, young_free, young_cap) = {
+            let from = self.young_from.lock();
+            (from.used(), from.free_list_bytes(), from.capacity())
+        };
+        let (old_used, old_cap, old_free, old_largest, old_blocks) = {
+            let og = self.old_gen.lock();
+            let (free, largest) = og.free_bytes_and_largest();
+            (og.used(), og.capacity(), free, largest, og.free_block_count())
+        };
+        tracing::warn!(
+            target: "cratonvm::gc::guard",
+            request_bytes = total_size,
+            young_used,
+            young_free_list = young_free,
+            young_capacity = young_cap,
+            old_used,
+            old_capacity = old_cap,
+            old_free_bytes = old_free,
+            old_largest_free_block = old_largest,
+            old_free_blocks = old_blocks,
+            "fallible allocation could not be satisfied by either generation — \
+             compare old_free_bytes against old_largest_free_block: a large \
+             gap means FRAGMENTATION, not exhaustion",
+        );
     }
 
     /// Try to allocate a Java object. Returns `None` if young gen is exhausted.
@@ -4017,7 +4061,8 @@ impl GenerationalHeap {
             && old_capacity > 0
             && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
         {
-            let (old_freed, old_survivors) = self.sweep_old_gen_non_moving(roots);
+            let (old_freed, old_survivors) =
+                self.sweep_old_gen_non_moving(roots, &result.0.pointer_map);
             // This cycle DID reclaim old-gen storage: a freed block is back on
             // the free list, so an old-gen address is no longer self-evidently
             // live. `old_survivors` carries the identity entries that make
@@ -5668,6 +5713,39 @@ impl GenerationalHeap {
             // watched object that stayed put, so `compact_map` membership is
             // the exact replacement proof.
             crate::gc_quiescence::set_old_gen_reclaimed(true);
+            // Publish THIS cycle's young relocation to the external-root
+            // providers BEFORE the major GC consults them.
+            //
+            // Phase 1a above forwarded every overlay-held young object, but it
+            // deliberately left the side tables themselves pointing at the
+            // PRE-copy addresses — the VM's post-GC `remap_external_roots`
+            // repoints them once the collector returns. That is too late when a
+            // major GC runs in the SAME collector call, because `old_gen_gc`
+            // seeds its mark worklist from exactly those side tables:
+            //
+            //   * `external_roots_for_matching_owners(|o| young_from.contains(o))`
+            //     tests a pre-copy address against the POST-swap from-space, so
+            //     it matches nothing and that owner's refs are never seeded;
+            //   * `external_roots_for_owner(..)` in the BFS hands back pre-copy
+            //     addresses for an object this cycle just PROMOTED, so the
+            //     promoted copy is never marked and the compaction frees it
+            //     while the overlay still holds the only reference to it.
+            //
+            // The reclaimed collection then reads its own state back through
+            // the relocation-invariant identity-hash key and gets a zeroed
+            // header (`ClassId(0)`, `num_slots == 0`) — surfacing as an
+            // out-of-bounds field read on a `java/lang/Object` receiver, a
+            // "Stale pointer detected in invokevirtual receiver" fallback, or
+            // an `old-gen mark: rejecting external-overlay(BFS owner)` warning
+            // when the stale address happens to land inside old gen's range.
+            //
+            // `run_non_moving_young_cycle` already publishes at this same
+            // boundary for this same reason; this is that call on the moving
+            // path. Idempotent with the VM's later pass: `pointer_map` here
+            // holds only young→to-space / young→old-gen entries, whose keys and
+            // values live in disjoint arenas, so a ref this remaps can never be
+            // remapped a second time.
+            crate::external_roots::remap_external_roots(&pointer_map);
             let compact_map = Self::major_gc(roots, &young_from, &mut old_gen);
             // CRITICAL FIX (heavy binary-trees GC corruption):
             //
@@ -7652,6 +7730,13 @@ impl GenerationalHeap {
         let retain_dead_objects =
             sweep_zero_enabled() || crate::a2dbg::enabled() || gc_flags().dbg_sweep_census;
         let mut dead_regions: Vec<(usize, usize, u32, u8, usize)> = Vec::new();
+        // CRATONVM_DBG_SWEEP_LIVENESS: bases of the objects this walk decides to
+        // KEEP, so the assertion below can ask whether any of them still points
+        // into a span the walk decided to zero. Collected here rather than by a
+        // second walk because the walk is the only thing that knows the object
+        // grid — re-deriving it is exactly the desync hazard documented on
+        // `mark_young_to_old_refs`.
+        let mut young_survivors: Vec<usize> = Vec::new();
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
         // Index into `dead_regions` at the last trustworthy walk anchor
@@ -8235,6 +8320,9 @@ impl GenerationalHeap {
             } else if side_marked_survivor {
                 // Side-marked survivor: pure retention, no header writes.
                 objects_live += 1;
+                if gc_flags().dbg_sweep_liveness {
+                    young_survivors.push(obj_ptr as usize);
+                }
                 // Family-A fix follow-up: a side-marked survivor is kept in
                 // place exactly like a header-marked one (same "never moves"
                 // guarantee), so it needs the SAME watched-referent identity
@@ -8263,6 +8351,9 @@ impl GenerationalHeap {
                 header.gc_flags &= !GC_FLAG_MARKED;
                 header.gc_age = header.gc_age.saturating_add(1);
                 objects_live += 1;
+                if gc_flags().dbg_sweep_liveness {
+                    young_survivors.push(obj_ptr as usize);
+                }
                 // RandomizedContext WeakHashMap<Thread,...> fix (see
                 // gc_quiescence::is_watched_referent): this survivor is kept
                 // in place at its ORIGINAL address, so selective promotion
@@ -8373,6 +8464,106 @@ impl GenerationalHeap {
                 }
             }
         }
+        // ---- CRATONVM_DBG_SWEEP_LIVENESS, young side ----
+        //
+        // The old-gen half of this assertion (see `old_gen_gc`) came back CLEAN
+        // on the `--nojit` DefaultCatalogAndSchemaTest reproducer: SIGSEGV at
+        // 94/132 with zero hits, so no marked old-gen object still pointed at a
+        // block that sweep freed. But the corrupt receiver in that crash reads
+        // `class_id=0 num_slots=0` — *zeroed* memory — and zeroing is what the
+        // YOUNG sweep does to dead spans, not what `OldGen::free` does (it only
+        // returns the block to a free list, leaving the bytes in place). So the
+        // victim is a young object, and the question moves here.
+        //
+        // Checked from the OLD generation into the young dead spans, because
+        // that is exactly the edge in the failing workload: a promoted bucket
+        // array still pointing at a young chain node. A hit means the young mark
+        // missed an old->young root — the remembered-set/card path — and the
+        // sweep is about to zero a live node.
+        //
+        // Interior hits count: the spans are coalesced, so this asks "does a
+        // live old-gen ref point INTO a doomed span", which also catches a
+        // reference to a field cell rather than the object base.
+        if gc_flags().dbg_sweep_liveness && !dead_regions.is_empty() {
+            let base = from_base;
+            let mut spans: Vec<(usize, usize)> = dead_regions
+                .iter()
+                .map(|&(off, sz, _, _, _)| (base + off, sz))
+                .collect();
+            spans.sort_unstable();
+            let in_doomed = |addr: usize| -> bool {
+                match spans.binary_search_by(|&(s, _)| s.cmp(&addr)) {
+                    Ok(_) => true,
+                    Err(0) => false,
+                    Err(i) => {
+                        let (s, sz) = spans[i - 1];
+                        addr < s + sz
+                    }
+                }
+            };
+            let mut hits: Vec<(usize, u32, usize, usize)> = Vec::new();
+            {
+                // Use the guard this function already holds (taken at the top,
+                // alongside `young_from`). `parking_lot::Mutex` is NOT
+                // reentrant, so re-locking `self.old_gen` here would deadlock
+                // the collector at a safepoint — with every mutator thread
+                // already stopped, i.e. a silent whole-VM hang rather than a
+                // panic.
+                for (obj_ptr, _size) in old_gen.walk_objects() {
+                    // SAFETY: `walk_objects` yields valid old-gen object starts.
+                    let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                    // SAFETY: a walked old-gen object has a valid header and an
+                    // in-bounds body — `for_each_ref_slot`'s contract.
+                    unsafe {
+                        for_each_ref_slot(obj_ptr, h, |ref_ptr, slot| {
+                            let victim = ref_ptr as usize;
+                            if in_doomed(victim) && hits.len() < 64 {
+                                hits.push((victim, h.class_id.as_u32(), obj_ptr as usize, slot));
+                            }
+                        });
+                    }
+                }
+            }
+            // YOUNG->YOUNG. Three prior runs of this assertion came back clean
+            // (old->old, old->young, and the PIN-STALE canary), and the shape
+            // that remains is a young referrer holding a young victim — e.g. a
+            // bucket array and its chain nodes both allocated inside one test
+            // method, never promoted. `young_survivors` is collected by the
+            // walk itself, because the walk is the only thing that knows the
+            // object grid; re-deriving it by a second linear scan is the exact
+            // desync hazard `mark_young_to_old_refs` documents.
+            let young_referrers = std::mem::take(&mut young_survivors);
+            for &obj_ptr in &young_referrers {
+                // SAFETY: these bases came from the sweep walk itself, which
+                // only classifies spans it has parsed as valid object headers.
+                let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                // SAFETY: a survivor has a valid header and an in-bounds body —
+                // `for_each_ref_slot`'s contract.
+                unsafe {
+                    for_each_ref_slot(obj_ptr as *mut u8, h, |ref_ptr, slot| {
+                        let victim = ref_ptr as usize;
+                        if in_doomed(victim) && hits.len() < 64 {
+                            hits.push((victim, h.class_id.as_u32(), obj_ptr, slot));
+                        }
+                    });
+                }
+            }
+            if !hits.is_empty() {
+                eprintln!(
+                    "[SWEEP-LIVENESS young] {} live ref(s) point into {} young span(s) this sweep is about to zero ({} old-gen + {} young survivors scanned)",
+                    hits.len(),
+                    spans.len(),
+                    objects_live,
+                    young_referrers.len(),
+                );
+                for (victim, cid, referrer, slot) in hits.iter().take(12) {
+                    eprintln!(
+                        "[SWEEP-LIVENESS young]   victim=0x{victim:x} <- referrer=0x{referrer:x} class_id={cid} slot={slot}",
+                    );
+                }
+            }
+        }
+
         // Coalesce the newly-dead spans while they are still in walk order.
         // Publishing every object-sized hole first and sorting the arena free
         // list afterward made a bintrees18 collection allocate, sort, and merge
@@ -8674,11 +8865,43 @@ impl GenerationalHeap {
     fn sweep_old_gen_non_moving(
         &self,
         roots: &[ObjectRef],
+        promotions: &HashMap<usize, usize>,
     ) -> (usize, HashMap<usize, usize>) {
         let young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
         let mut root_shadow = roots.to_vec();
+        // NOT DONE HERE — and the reason is measured, not theoretical.
+        //
+        // `sweep_young_non_moving` commits selective promotions (young→old)
+        // into `promotions` but leaves the caller's roots on their PRE-
+        // promotion young addresses. This sweep marks from those roots, and
+        // `old_gen_gc`'s seed loop drops any address `old_gen.contains()`
+        // rejects — so a stale young address seeds NOTHING, the object at its
+        // new old-gen home is never marked, and this sweep hands a LIVE
+        // object's block back to the free list. That is defect 4 in
+        // `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`,
+        // it is real, and `ROverlaySystemGcStress` catches it in seconds.
+        //
+        // The obvious repair — rewrite the roots through `promotions` before
+        // marking — fixes that probe and the whole regression suite, and makes
+        // `DefaultCatalogAndSchemaTest` SIGSEGV. Measured on the same host and
+        // fixture, `rc=139` counts out of three runs each:
+        //
+        //     baseline (no fixup)              0/3
+        //     fixup applied to `root_shadow`   2/3
+        //     fixup applied to caller's roots  3/3
+        //
+        // So it is not merely that mutating the caller's snapshot was wrong
+        // (it was — that slice outlives this call); marking the extra
+        // destinations is itself destabilising, which means at least one
+        // address in `promotions` is not the valid old-gen object base this
+        // seed loop assumes. Until that is understood, seeding them trades a
+        // silent use-after-free for a crash, which is not an improvement.
+        //
+        // `promotions` is threaded in and deliberately unused so the next
+        // attempt starts from the measurement rather than rediscovering it.
+        let _ = promotions;
         let survivors = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
         (before.saturating_sub(old_gen.used()), survivors)
     }
@@ -8873,6 +9096,16 @@ impl GenerationalHeap {
             }
         }
 
+        // Snapshot for the free-loop diagnostic below; taken once, outside the
+        // per-object loop, and only when the gate is on.
+        let sweep_owner_dbg =
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OLDSWEEP_OWNERS").is_some();
+        let sweep_owner_addrs = if sweep_owner_dbg {
+            crate::external_roots::external_owner_addrs()
+        } else {
+            None
+        };
+
         if !compact {
             // Watched addresses (every address the reference processor holds —
             // see `ReferenceProcessor::all_tracked_addrs`) need an explicit
@@ -8884,6 +9117,86 @@ impl GenerationalHeap {
             let watched = crate::gc_quiescence::watched_referents_snapshot();
             let mut watched_survivors: HashMap<usize, usize> = HashMap::new();
             let objects = old_gen.walk_objects();
+
+            // ---- CRATONVM_DBG_SWEEP_LIVENESS: freed-while-referenced assertion ----
+            //
+            // This sweep decides liveness purely from `GC_FLAG_MARKED`, and the
+            // mark that set it has NINE worklist push sites of which only two
+            // validate their input (see
+            // docs/known-issues/gc-old-gen-mark-accepts-unvalidated-addresses.md).
+            // If the mark misses a root, this loop hands a still-referenced
+            // block back to the free list and the damage surfaces only much
+            // later, at whichever unlucky reader dereferences it next — exactly
+            // the shape of the `--nojit` map-node corruption (`tail_node`
+            // reading `num_slots=0 class_id=0` in `native_map_put_evict_pinned`,
+            // already dead before it was ever pinned).
+            //
+            // Catch it AT THE FREE, where victim and referrer are both still
+            // intact, instead of inferring it from the crash site. `=rescue`
+            // additionally retains the referenced block: if the workload then
+            // stops crashing, freed-while-live is proven causal, not correlated.
+            let sweep_liveness = gc_flags().dbg_sweep_liveness;
+            let sweep_rescue = sweep_liveness
+                && gc_flags()
+                    .dbg_sweep_liveness_value
+                    .as_deref()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("rescue"));
+            let mut doomed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            if sweep_liveness {
+                for (obj_ptr, _size) in &objects {
+                    // SAFETY: `walk_objects` yields valid old-gen object starts.
+                    let h = unsafe { &*(*obj_ptr as *const ObjectHeader) };
+                    if h.gc_flags & GC_FLAG_MARKED == 0 {
+                        doomed.insert(*obj_ptr as usize);
+                    }
+                }
+            }
+            // Keyed by victim, so a block referenced from many places is
+            // reported (and rescued) once. Value = (referrer, class_id, slot).
+            let mut referenced_doomed: HashMap<usize, (usize, u32, usize)> = HashMap::new();
+            if sweep_liveness && !doomed.is_empty() {
+                for (obj_ptr, _size) in &objects {
+                    // SAFETY: as above.
+                    let h = unsafe { &*(*obj_ptr as *const ObjectHeader) };
+                    if h.gc_flags & GC_FLAG_MARKED == 0 {
+                        continue; // itself doomed; its refs keep nothing alive
+                    }
+                    // SAFETY: a marked old-gen object has a valid header and an
+                    // in-bounds body — `for_each_ref_slot`'s contract.
+                    unsafe {
+                        for_each_ref_slot(*obj_ptr, h, |ref_ptr, slot| {
+                            let victim = ref_ptr as usize;
+                            if doomed.contains(&victim) {
+                                referenced_doomed.entry(victim).or_insert((
+                                    *obj_ptr as usize,
+                                    h.class_id.as_u32(),
+                                    slot,
+                                ));
+                            }
+                        });
+                    }
+                }
+                if !referenced_doomed.is_empty() {
+                    eprintln!(
+                        "[SWEEP-LIVENESS] {} of {} doomed old-gen blocks are STILL REFERENCED by a live old-gen object{}",
+                        referenced_doomed.len(),
+                        doomed.len(),
+                        if sweep_rescue { " (rescuing)" } else { "" },
+                    );
+                    for (victim, (referrer, referrer_cid, slot)) in referenced_doomed.iter().take(12)
+                    {
+                        // SAFETY: `victim` is a base `walk_objects` yielded.
+                        let vh = unsafe { &*(*victim as *const ObjectHeader) };
+                        eprintln!(
+                            "[SWEEP-LIVENESS]   victim=0x{victim:x} class_id={} num_slots={} \
+                             <- referrer=0x{referrer:x} class_id={referrer_cid} slot={slot}",
+                            vh.class_id.as_u32(),
+                            vh.num_slots(),
+                        );
+                    }
+                }
+            }
+
             for (obj_ptr, total_size) in objects {
                 // SAFETY: `walk_objects` returns valid old-gen object starts.
                 // Marked objects remain at their current address; every other
@@ -8898,6 +9211,15 @@ impl GenerationalHeap {
                     {
                         watched_survivors.insert(obj_ptr as usize, obj_ptr as usize);
                     }
+                } else if sweep_rescue && referenced_doomed.contains_key(&(obj_ptr as usize)) {
+                    // CRATONVM_DBG_SWEEP_LIVENESS=rescue: a live object still
+                    // points here, so keep the block. Diagnostic only — this
+                    // leaks whatever the mark genuinely missed, and exists to
+                    // answer "is freed-while-live the cause?" with a run, not
+                    // an argument. Clear the mark bit like the survivor arm so
+                    // the next cycle starts from a clean slate.
+                    let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
+                    header.gc_flags &= !GC_FLAG_MARKED;
                 } else {
                     // A2 forensic breadcrumb (CRATONVM_DBG_A2): preserve the
                     // victim's pre-free identity so a later zero-header /
@@ -8912,10 +9234,53 @@ impl GenerationalHeap {
                             total_size,
                         );
                     }
+                    // DIAGNOSTIC (`CRATONVM_DBG_OLDSWEEP_OWNERS=1`): name every
+                    // freed object that is a REGISTERED OVERLAY OWNER — i.e. a
+                    // collection whose backing state lives in a native side
+                    // table. Freeing one is normal when the collection is
+                    // genuinely dead, but it is also the exact event behind a
+                    // live collection reading back as empty (the prune then
+                    // observes `is_allocated_addr == false` and correctly drops
+                    // its state), so this is the site that has to be watched to
+                    // tell those two apart.
+                    if sweep_owner_dbg {
+                        if let Some(owners) = sweep_owner_addrs.as_ref() {
+                            if owners.contains(&(obj_ptr as usize)) {
+                                eprintln!(
+                                    "[oldsweep] FREEING overlay owner 0x{:x} class_id={} \
+                                     num_slots={} size={}",
+                                    obj_ptr as usize,
+                                    header.class_id.as_u32(),
+                                    header.num_slots(),
+                                    total_size,
+                                );
+                            }
+                        }
+                    }
                     // SAFETY: `obj_ptr`/`total_size` are exactly the (base, size) pair `walk_objects` yielded for this
                     // now-unmarked old-gen object, so returning that span to the free list is sound.
                     unsafe { old_gen.free(obj_ptr, total_size) };
                 }
+            }
+            // FRAGMENTATION FIX (xt-helper-window OOM, 2026-07-31): this arm
+            // is the ONLY old-gen reclamation that runs while a live JIT
+            // frame's roots are conservative, and it never compacts. Without
+            // this, every object it frees becomes a permanently isolated
+            // free block (`OldGen::free` defers coalescing to `compact`,
+            // which this path never reaches), so a workload that keeps the
+            // moving-young coverage proof unprovable — e.g. 10-100 threads
+            // blocked in a native read under a JIT frame, the
+            // `xt-helper-window-conservative-scan` fallback — fragments old
+            // gen monotonically until a modest array allocation OOMs on a
+            // mostly-free generation. Amortised: one O(n log n) merge per
+            // sweep, not per freed object.
+            let merged = old_gen.coalesce_free_blocks();
+            if merged > 0 {
+                tracing::debug!(
+                    merged_blocks = merged,
+                    free_blocks_now = old_gen.free_block_count(),
+                    "in-place old-gen sweep: coalesced adjacent free blocks"
+                );
             }
             return watched_survivors;
         }
@@ -13558,6 +13923,64 @@ mod tests {
         );
     }
 
+    /// xt-helper-window fragmentation regression, at the level the defect
+    /// actually bites: the IN-PLACE old-gen sweep is the only old-gen
+    /// reclamation that runs while a live JIT frame's roots are conservative,
+    /// and it never compacts. `OldGen::free` alone leaves one isolated free
+    /// block per reclaimed object (coalescing was deferred to `compact`, which
+    /// this path never reaches), so the generation fragments monotonically:
+    /// free BYTES stay high while the largest single block collapses to one
+    /// object, and a modest array request then fails on mostly-free storage.
+    ///
+    /// After the sweep, a contiguous run of reclaimed objects must present as
+    /// (close to) one block, not N.
+    #[test]
+    fn in_place_old_sweep_coalesces_the_run_it_reclaims() {
+        let heap = GenerationalHeap::with_sizes(64 * 1024, 512 * 1024);
+        let monitors = NoOpMonitors;
+
+        const N: usize = 32;
+        const ELEMS: usize = 256;
+        let mut roots: Vec<ObjectRef> = (0..N)
+            .map(|_| heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, ELEMS))
+            .collect();
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        assert!(
+            roots.iter().all(|r| heap.is_in_old(r.as_ptr())),
+            "precondition: every array must have been promoted to old gen"
+        );
+
+        // Keep the first half; the second half's storage is one adjacent run.
+        let live: Vec<ObjectRef> = roots[..N / 2].to_vec();
+        let blocks_before = heap.old_gen_lock().free_block_count();
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
+        assert!(reclaimed > 0, "the dropped half must be reclaimed");
+
+        let og = heap.old_gen_lock();
+        let (free_bytes, largest) = og.free_bytes_and_largest();
+        let blocks_after = og.free_block_count();
+        drop(og);
+
+        // The sweep freed N/2 objects. Without coalescing that is N/2 new
+        // isolated blocks; with it, the adjacent run collapses.
+        assert!(
+            blocks_after < blocks_before + N / 2,
+            "the sweep must merge the run it reclaimed (before={blocks_before}, \
+             after={blocks_after}, freed {} objects)",
+            N / 2
+        );
+        // And the largest single block must be able to serve much more than
+        // one reclaimed object — that is the property the allocator needs.
+        assert!(
+            largest > ELEMS * 2,
+            "largest free block ({largest}B) must exceed a single reclaimed \
+             array; free_bytes={free_bytes}B. A large free_bytes next to a \
+             small largest block IS the fragmentation OOM."
+        );
+    }
+
     #[test]
     fn non_moving_old_sweep_reclaims_dead_promotions_without_relocation() {
         let heap = GenerationalHeap::with_sizes(4 * 1024, 16 * 1024);
@@ -13578,7 +14001,7 @@ mod tests {
         assert!(heap.is_in_old(roots[1].as_ptr()));
 
         let old_used_before = heap.old_gen_used();
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old]);
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old], &HashMap::new());
 
         assert!(
             reclaimed > 0,
@@ -13624,7 +14047,7 @@ mod tests {
         // Both addresses are watched — exactly what the VM publishes for every
         // address the reference processor holds.
         crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
-        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]]);
+        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]], &HashMap::new());
         crate::gc_quiescence::set_watched_referents(&[]);
 
         assert!(reclaimed > 0, "the unreachable promotion must be reclaimed");
@@ -14347,7 +14770,7 @@ mod tests {
         let doomed_addr = roots[1].as_ptr() as usize;
 
         let live = vec![keep];
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live);
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
         assert!(
             reclaimed > 0,
             "the sweep must actually have reclaimed the dropped object in place",
@@ -14358,6 +14781,59 @@ mod tests {
             !vm.is_addr_live(doomed_addr),
             "is_addr_live reported a block the non-moving old-gen sweep just \
              freed in place (0x{doomed_addr:x}) as still live",
+        );
+    }
+
+    /// `CRATONVM_DBG_SWEEP_LIVENESS` must not cry wolf.
+    ///
+    /// The assertion's whole value is that a hit means something real, because
+    /// it is meant to be read off a 30-minute workload where a noisy detector is
+    /// worse than none. Its dangerous failure mode is therefore a FALSE
+    /// POSITIVE: flagging a block as "freed while referenced" when the mark did
+    /// its job and the block is genuinely retained.
+    ///
+    /// This drives the exact shape it inspects — a promoted holder whose ref
+    /// slot points at a promoted victim, swept with only the holder rooted — and
+    /// requires that the BFS marks the victim through that slot, so the victim
+    /// is not doomed at all and the detector has nothing to report.
+    ///
+    /// NOTE ON THE POSITIVE CASE: a true positive cannot be staged from this
+    /// level, because a marked referrer's slots are exactly what the BFS
+    /// traverses — by construction the victim gets marked too. Producing one
+    /// needs a genuinely missed root (e.g. the documented linear-walk desync in
+    /// `mark_young_to_old_refs`, which abandons the rest of the young->old scan),
+    /// which is what the assertion exists to catch in a real workload.
+    #[test]
+    fn sweep_liveness_assertion_does_not_flag_a_victim_the_bfs_legitimately_marks() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 8 * 1024);
+        let monitors = NoOpMonitors;
+
+        let holder = heap.alloc_object(ClassId::new(0), 1);
+        let victim = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(victim, 0, Value::Int(7));
+        heap.set_field(holder, 0, Value::Object(Some(victim)));
+
+        let mut roots = vec![holder, victim];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        assert!(
+            heap.is_in_old(roots[0].as_ptr()) && heap.is_in_old(roots[1].as_ptr()),
+            "both objects must be promoted before the old-gen sweep is meaningful",
+        );
+        let holder = roots[0];
+        let victim_addr = roots[1].as_ptr() as usize;
+
+        // Only the holder is rooted; the victim must survive via the holder's
+        // ref slot, which is precisely the edge the detector inspects.
+        let live = vec![holder];
+        let (_reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
+
+        let vm = crate::vm_heap::VmHeap::Generational(heap);
+        assert!(
+            vm.is_addr_live(victim_addr),
+            "the BFS must mark a victim reachable from a live holder's ref slot; \
+             if this fails the detector's premise is wrong, not just its output",
         );
     }
 
@@ -14475,6 +14951,200 @@ mod tests {
         );
         // Outside the arena entirely.
         assert!(!og.is_allocated_addr(std::ptr::null()));
+    }
+
+    /// A test [`crate::external_roots::ExternalRootProvider`] standing in for
+    /// the collection overlays: it owns the ONLY reference to a payload object
+    /// (a `LinkedHashMap`'s backing array is the real-world case — it lives in
+    /// a process-global Rust side table, so neither a root slot nor a dirty
+    /// card can describe the edge).
+    ///
+    /// Registration is process-global and permanent, which is safe for the
+    /// other tests in this binary: while disarmed every callback returns
+    /// nothing, and while armed it hands back addresses from THIS test's heap,
+    /// which every consumer screens against its own arenas before use.
+    mod overlay_provider {
+        use cratonvm_types::ObjectRef;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static OWNER: AtomicUsize = AtomicUsize::new(0);
+        static HELD: AtomicUsize = AtomicUsize::new(0);
+
+        fn held() -> Vec<ObjectRef> {
+            match HELD.load(Ordering::Relaxed) {
+                0 => Vec::new(),
+                // SAFETY: armed only with a live object address from the
+                // arming test's own heap.
+                addr => vec![unsafe { ObjectRef::from_raw(addr as *mut u8) }],
+            }
+        }
+
+        fn scan(out: &mut Vec<ObjectRef>) {
+            out.extend(held());
+        }
+
+        fn owner_addrs() -> Option<HashSet<usize>> {
+            match OWNER.load(Ordering::Relaxed) {
+                0 => None,
+                owner => Some(HashSet::from([owner])),
+            }
+        }
+
+        fn roots_for_owner(owner_addr: usize) -> Vec<ObjectRef> {
+            let owner = OWNER.load(Ordering::Relaxed);
+            if owner != 0 && owner == owner_addr {
+                held()
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn roots_for_matching_owners(
+            owner_matches: &crate::external_roots::OwnerPredicate<'_>,
+        ) -> Vec<ObjectRef> {
+            let owner = OWNER.load(Ordering::Relaxed);
+            if owner != 0 && owner_matches(owner) {
+                held()
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn remap(pointer_map: &HashMap<usize, usize>) {
+            for slot in [&OWNER, &HELD] {
+                let addr = slot.load(Ordering::Relaxed);
+                if addr != 0 {
+                    if let Some(&new_addr) = pointer_map.get(&addr) {
+                        slot.store(new_addr, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        fn prune(_is_live: &crate::external_roots::OwnerPredicate<'_>) {}
+
+        pub(super) fn arm(owner: ObjectRef, payload: ObjectRef) {
+            crate::external_roots::register_external_root_provider(
+                crate::external_roots::ExternalRootProvider {
+                    name: "test-overlay-promotion-guard",
+                    scan,
+                    owner_addrs,
+                    roots_for_owner,
+                    roots_for_matching_owners,
+                    remap,
+                    prune,
+                },
+            );
+            OWNER.store(owner.as_ptr() as usize, Ordering::Relaxed);
+            HELD.store(payload.as_ptr() as usize, Ordering::Relaxed);
+        }
+
+        pub(super) fn disarm() {
+            OWNER.store(0, Ordering::Relaxed);
+            HELD.store(0, Ordering::Relaxed);
+        }
+
+        /// The payload address the provider currently believes in — the only
+        /// handle the test has on it, exactly as for a real overlay.
+        pub(super) fn payload() -> ObjectRef {
+            let addr = HELD.load(Ordering::Relaxed);
+            assert_ne!(addr, 0, "provider was disarmed");
+            // SAFETY: as `held`.
+            unsafe { ObjectRef::from_raw(addr as *mut u8) }
+        }
+    }
+
+    /// A moving young cycle that also runs a major GC must publish its
+    /// relocation to the external-root providers BEFORE the major GC consults
+    /// them.
+    ///
+    /// Phase 1a forwards (and here PROMOTES) every overlay-held young object,
+    /// but leaves the side tables pointing at the pre-copy address for the
+    /// VM's post-GC remap to fix. `old_gen_gc` seeds its mark worklist from
+    /// those very side tables, so without an in-cycle publish it looks up a
+    /// young from-space address, finds nothing in old gen, never marks the
+    /// promoted copy — and the compaction frees an object the overlay holds
+    /// the only reference to. `run_non_moving_young_cycle` has always
+    /// published at this boundary; this is the moving path's version.
+    ///
+    /// Fails before the fix with the freed payload reading back as a zeroed
+    /// header (`ClassId(0)`, `num_slots == 0`) — the shape that reached
+    /// Hibernate's `DefaultCatalogAndSchemaTest` as JUnit `TestPlan` entries
+    /// vanishing mid-run.
+    #[test]
+    fn moving_cycle_publishes_relocation_to_external_roots_before_major_gc() {
+        let heap = GenerationalHeap::with_sizes(512 * 1024, 64 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Emulate the VM's post-GC remap pass, which the gc crate never calls
+        // itself. Everything below drives the collector exactly as the VM does.
+        let cycle = |roots: &mut Vec<ObjectRef>| {
+            let result = heap.collect_garbage(&stw(), roots, &monitors);
+            crate::external_roots::remap_external_roots(&result.pointer_map);
+        };
+
+        // Push old gen past the 75% major-GC threshold with live, rooted
+        // objects, so the cycles below run a major GC in the SAME collector
+        // call that promotes the payload. Deterministic, and it avoids the
+        // process-global `System.gc()` request flag that a concurrently
+        // running test could consume.
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        let mut occupancy_percent = 0usize;
+        for _round in 0..16 {
+            for _ in 0..24 {
+                roots.push(heap.alloc_object(ClassId::new(0), 8));
+            }
+            for _ in 0..PROMOTION_AGE {
+                cycle(&mut roots);
+            }
+            let old_gen = heap.old_gen.lock();
+            occupancy_percent = old_gen.used() * 100 / old_gen.capacity();
+            drop(old_gen);
+            if occupancy_percent >= 75 {
+                break;
+            }
+        }
+        assert!(
+            occupancy_percent >= 75,
+            "precondition: old gen must be over the major-GC threshold for the \
+             promoting cycle to also compact (reached {occupancy_percent}%) — \
+             without that this test cannot express the bug",
+        );
+
+        // The owner is an ordinary root; the payload is reachable ONLY through
+        // the provider.
+        let owner = heap.alloc_object(ClassId::new(0), 1);
+        let payload = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(payload, 0, Value::Int(0x5AFE));
+        overlay_provider::arm(owner, payload);
+        roots.push(owner);
+
+        for _ in 0..=PROMOTION_AGE {
+            cycle(&mut roots);
+        }
+
+        let held = overlay_provider::payload();
+        overlay_provider::disarm();
+
+        assert!(
+            heap.is_in_old(held.as_ptr()),
+            "precondition: the payload must have been PROMOTED for the major \
+             GC's old-gen marker to be the thing under test",
+        );
+        {
+            let old_gen = heap.old_gen.lock();
+            assert!(
+                old_gen.is_allocated_addr(held.as_ptr()),
+                "the major GC returned to the free list an object the \
+                 external-root provider holds the only reference to",
+            );
+        }
+        assert_eq!(
+            heap.get_field(held, 0).as_int(),
+            Some(0x5AFE),
+            "the overlay-held payload was reclaimed and its storage reused",
+        );
     }
 
     #[test]

@@ -1257,8 +1257,67 @@ fn canonical_primitive_mirror_name(name: &str) -> &str {
 // Free functions: static field access
 // ---------------------------------------------------------------------------
 
+/// Lock-free statics reads that found / did not find a published block.
+///
+/// A change that makes no measurable difference has two very different causes:
+/// the fast path is never taken (an INERT lever), or it is taken and is not
+/// actually cheaper. These separate them.
+static STATICS_INDEX_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STATICS_INDEX_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn statics_index_hits() -> u64 {
+    STATICS_INDEX_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn statics_index_misses() -> u64 {
+    STATICS_INDEX_MISSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Are the diagnostic hit/miss counters on? (`CRATONVM_DBG_GETSTATIC_PROF=1`)
+#[inline]
+fn statics_index_counters_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETSTATIC_PROF").is_some()
+    })
+}
+
+/// Is the lock-free statics read path switched off? (`CRATONVM_NO_STATICS_INDEX=1`)
+#[inline]
+fn statics_index_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_STATICS_INDEX").is_some()
+    })
+}
+
 /// Get a static field value from the shared state.
 pub fn get_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usize) -> Value {
+    // Lock-free path first: `statics_index` mirrors the map and reaches the
+    // same never-freed slot without an `RwLock` acquisition or a hash probe.
+    // Those two were what remained of `getstatic`'s cost in compiled code once
+    // the helper's other per-call work was removed.
+    //
+    // `CRATONVM_NO_STATICS_INDEX=1` routes every read back through the locked
+    // map. That is both the escape hatch if the unsynchronized read ever proves
+    // to matter, and the way to A/B this change inside ONE binary rather than
+    // against a separately-built baseline.
+    if !statics_index_disabled() {
+        let hit = shared.classes.statics_index.get(class_id, field_index);
+        // The counters are diagnostic only. Incrementing a process-wide atomic
+        // on every static read would put a contended cache line in the exact
+        // path this change exists to make cheap, so they are gated.
+        if statics_index_counters_on() {
+            if hit.is_some() {
+                STATICS_INDEX_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                STATICS_INDEX_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if let Some(v) = hit {
+            return v;
+        }
+    }
     shared
         .classes
         .statics
@@ -1272,6 +1331,7 @@ pub fn get_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usiz
 /// Set a static field value in the shared state.
 pub fn set_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usize, value: Value) {
     let mut statics = shared.classes.statics.write();
+    let mut republish = false;
     let fields = statics.entry(class_id).or_insert_with(|| {
         // Reading class_manager while holding statics write is fine because
         // class_manager read is non-exclusive, and no code path holds
@@ -1283,10 +1343,17 @@ pub fn set_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usiz
             .get_class(class_id)
             .map(|c| c.fields.len())
             .unwrap_or(0);
-        vec![Value::Int(0); num_fields]
+        republish = true;
+        crate::vm::realms::class_realm::StaticsBlock::new(num_fields)
     });
     if field_index >= fields.len() {
-        fields.resize(field_index + 1, Value::Int(0));
+        // Growth relocates the block (the old one stays mapped for any
+        // in-flight lock-free reader), so the index must be re-pointed.
+        fields.grow_to(field_index + 1);
+        republish = true;
+    }
+    if republish {
+        shared.classes.statics_index.publish(class_id, fields);
     }
     // SATB pre-barrier for the overwritten static reference, centralized here
     // so EVERY caller is covered. Statics live in this Rust-side table, not

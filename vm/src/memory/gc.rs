@@ -1207,13 +1207,30 @@ pub fn verify_heap_object_fields(
     };
     let mut reported = 0usize;
     const CAP: usize = 40;
+    // Recycled-destination filter — the same ambiguity `verify_no_stale_refs`
+    // documents at length, which this pass was missing.
+    //
+    // An address that is BOTH a key and a value in `pointer_map` was vacated by
+    // one object and handed out again as the DESTINATION of another. A slot the
+    // remap rewrote correctly then points at a map KEY, so the `contains_key`
+    // test below reports it as UN-FORWARDED even though it is a fresh, correct
+    // reference to that address's NEW occupant.
+    //
+    // On the major-GC path this is not a rare corner: `pointer_map` is the
+    // composition of the young map with `OldGen::compact`'s, and a SLIDING
+    // compactor moves survivors DOWN into space its predecessors just vacated —
+    // so key∩value overlap is the normal case, not the exception. Reporting it
+    // manufactured a "the collector leaves reference fields un-forwarded"
+    // finding out of a correctly-collected heap. Build the destination set once
+    // (this whole pass is already an opt-in full heap walk).
+    let destinations: std::collections::HashSet<usize> = pointer_map.values().copied().collect();
     // Classify a reference target. Returns Some(reason) if it is dangling
     // (un-forwarded / off-heap / zeroed = wrongly reclaimed by the sweep).
     let classify = |addr: usize| -> Option<&'static str> {
         if addr == 0 {
             return None;
         }
-        if pointer_map.contains_key(&addr) {
+        if pointer_map.contains_key(&addr) && !destinations.contains(&addr) {
             return Some("UN-FORWARDED");
         }
         if heap.is_heap_addr(addr).is_none() {
@@ -1283,6 +1300,60 @@ pub fn verify_heap_object_fields(
             reported,
             pointer_map.len(),
         );
+    }
+}
+
+/// Opt-in (`CRATONVM_DBG_HEAP_STALE=1`) audit of the collection-overlay SIDE
+/// TABLES — the one place every other verifier is blind to.
+///
+/// `verify_heap_object_fields` walks Java objects and `verify_no_stale_refs`
+/// walks thread frames; an overlay-backed collection whose backing was
+/// reclaimed is neither, so it shows up in neither. That blind spot is where
+/// the reclaimed-`LinkedHashMap$Node` / `TreeMap size 0` family lives.
+///
+/// Deliberately called from the GC epilogue in `interpreter.rs` rather than
+/// from `verify_heap_object_fields`: the latter runs only from
+/// `update_all_roots`, which EARLY-RETURNS on an empty `pointer_map` — i.e.
+/// never on the non-moving sweep, which is exactly the path a `System.gc()`
+/// takes (`explicit_full_gc`) and exactly where `ROverlaySystemGcStress` fails.
+/// A verifier that cannot run on the failing path is worse than none.
+///
+/// The classifier here is deliberately NOT `is_addr_live` — that is a range
+/// check, so a freed old-gen block reads as live. It reports the two
+/// unambiguous signatures instead: off-heap, and an all-zero header.
+pub fn audit_overlay_refs(shared: &crate::vm::SharedVm) {
+    use cratonvm_types::ObjectHeader;
+
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
+        return;
+    }
+    let heap = &shared.mem.heap;
+    let classify = |addr: usize| -> Option<&'static str> {
+        if heap.is_heap_addr(addr).is_none() {
+            return Some("OFF-HEAP(reclaimed)");
+        }
+        // SAFETY: `is_heap_addr` placed `addr` inside a mapped heap region, so
+        // the header bytes are readable.
+        let h = unsafe { &*(addr as *const ObjectHeader) };
+        if h.class_id.as_u32() == 0
+            && h.identity_hash_code == 0
+            && h.num_slots() == 0
+            && h.array_length() == 0
+        {
+            return Some("ZEROED(reclaimed)");
+        }
+        None
+    };
+    let mut reported = 0usize;
+    const CAP: usize = 40;
+    cratonvm_native_collections::gc_audit_overlay_refs(&classify, &mut |reason, table, addr| {
+        if reported < CAP {
+            eprintln!("[overlay-stale] {reason} {table} -> 0x{addr:x}");
+        }
+        reported += 1;
+    });
+    if reported > 0 {
+        eprintln!("[overlay-stale] ^ {reported} dangling overlay ref(s) after this GC");
     }
 }
 

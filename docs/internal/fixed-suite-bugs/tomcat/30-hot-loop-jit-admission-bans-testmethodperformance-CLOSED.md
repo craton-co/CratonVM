@@ -273,7 +273,7 @@ chain that does not compile — every one of its neighbours does:
 | `ByteChunk.toStringInternal(a, b)` | ✅ C1 full-compile |
 
 Its measured share is ~4 µs of a ~38 µs iteration (~10%). The canonical
-analysis of this gate is [23](../../../known-issues/tomcat/23-charsetcache-pathological-slowdown.md),
+analysis of this gate is [23](23-charsetcache-pathological-slowdown.md),
 which remains OPEN on its own residual (a thread-scaling wall in the dispatch
 helper, not an admission question).
 

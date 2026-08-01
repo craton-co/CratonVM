@@ -3109,6 +3109,7 @@ impl SharedVm {
                 class_manager: OrderedPlRwLock::new(class_manager, LockLevel::ClassManager),
                 anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
                 statics: RwLock::new(FxHashMap::default()),
+                statics_index: crate::vm::realms::class_realm::StaticsIndex::new(),
                 resolution_cache: RwLock::new(ResolutionCache::new()),
                 // Round 8 audit fix (CRIT #2): reflective lookup cache.
                 link_resolver: LinkResolver::new(),
