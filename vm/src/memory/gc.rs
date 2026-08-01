@@ -1294,10 +1294,23 @@ pub fn verify_heap_object_fields(
             }
         }
     }
-    if reported > 0 {
+    // Same walk, applied to the collection-overlay SIDE TABLES — which this
+    // pass, `verify_no_stale_refs` and every other verifier are blind to,
+    // because they are neither heap objects nor frame slots. An overlay that
+    // lost its backing shows up here and nowhere else.
+    let mut overlay_reported = 0usize;
+    cratonvm_native_collections::gc_audit_overlay_refs(&classify, &mut |reason, table, addr| {
+        if overlay_reported < CAP {
+            eprintln!("[overlay-stale] {reason} {table} -> 0x{addr:x}");
+        }
+        overlay_reported += 1;
+    });
+    if reported > 0 || overlay_reported > 0 {
         eprintln!(
-            "[heap-stale] ^ {} stale field(s) this GC (pointer_map size={})",
+            "[heap-stale] ^ {} stale field(s) + {} stale overlay ref(s) this GC \
+             (pointer_map size={})",
             reported,
+            overlay_reported,
             pointer_map.len(),
         );
     }
