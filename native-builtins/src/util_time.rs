@@ -4783,18 +4783,12 @@ fn ymd_to_epoch_day(y: i32, m: i32, d: i32) -> i64 {
     era * 146097 + doe - 719468
 }
 
-fn epoch_day_to_ymd(epoch_day: i64) -> (i32, i32, i32) {
-    let z = epoch_day + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m as i32, d as i32)
+pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> (i32, i32, i32) {
+    // Single definition lives in the crate root, ungated: this module is
+    // `#[cfg(feature = "synthetic-jdk")]` but `iso_instant_string` needs the
+    // same arithmetic in every build. Kept as a delegating alias so the many
+    // call sites in this file stay unchanged.
+    crate::epoch_day_to_ymd(epoch_day)
 }
 
 /// IANA timezone offset table (standard offsets for common timezones).

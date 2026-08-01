@@ -35,6 +35,80 @@
 //! `java.lang.management.ManagementFactory` — a host that calls it needs
 //! `management` (or `vm-defaults`) turned on explicitly.
 //!
+//! ## Compatibility mode
+//!
+//! *Compatibility mode* selects **which substitutions the VM may make**;
+//! [`JdkMode`] selects **which class library it boots**. The two are
+//! independent, and both are set on the [`VmConfig`] before [`Vm::new`].
+//!
+//! [`CompatibilityMode`], [`ExecutionPolicy`] and [`JdkMode`] are re-exported
+//! here for one concrete reason: this facade previously exposed only
+//! [`VmConfig`], so an embedder could not *name* the type
+//! [`VmConfig::with_compatibility_mode`], [`VmConfig::with_jdk_mode`] and
+//! [`VmConfig::execution_policy`] deal in without adding a direct dependency on
+//! `cratonvm-vm` — i.e. without giving up the whole point of the facade.
+//!
+//! **The default is [`CompatibilityMode::Compatible`], and you reach it by
+//! doing nothing.** Strict mode is never inferred from a Cargo feature, from
+//! `CRATONVM_REAL` / `CRATONVM_NO_STUBS`, or from what the host machine has
+//! installed: those select a native-registry filter only and cannot express the
+//! class-loading or dispatch half of the contract.
+//!
+//! **[`JdkMode`] is asymmetric between entry points; compatibility mode is not,
+//! and that asymmetry is deliberate.** [`VmConfig::default`] (the embedding /
+//! in-tree-test path) is [`JdkMode::Synthetic`] while
+//! [`VmConfig::with_host_jdk_default`] (the launcher's base config, and the one
+//! `libcratonvm`'s C entry points build on) is [`JdkMode::Real`], because the
+//! two entry points genuinely want different class libraries. They **agree** on
+//! [`CompatibilityMode::Compatible`] because neither may silently *want*
+//! strictness: a caller that did not ask for it must never be given a policy
+//! that rejects work it expects to succeed. Do not "align" the second split
+//! with the first.
+//!
+//! JDK-only is an internal diagnostic, not a production posture — it is at
+//! stage 1 of 4 of its rollout, so expect failures on programs that run fine
+//! under `JdkMode::Real` + `Compatible`. See `docs/EMBEDDING.md` ("Choosing a
+//! compatibility mode") and
+//! `docs/feature-designs/jdk-only-mode.md` for the normative contract.
+//!
+//! ```
+//! use cratonvm_embed::{CompatibilityMode, ExecutionPolicy, JdkMode, VmConfig, VmError};
+//!
+//! // Strict *and* coherent: the launcher base config already boots a real JDK,
+//! // so `--jdk-only`'s "real class bytes are authoritative" rule is satisfiable.
+//! let strict =
+//!     VmConfig::with_host_jdk_default().with_compatibility_mode(CompatibilityMode::JdkOnly);
+//! assert!(strict.is_jdk_only());
+//! strict
+//!     .validate_compatibility()
+//!     .expect("real JDK + JDK-only is coherent");
+//!
+//! // The resolved token the native registry and class manager read at VM init.
+//! let policy: ExecutionPolicy = strict.execution_policy();
+//! assert!(policy.is_jdk_only() && policy.real_jdk);
+//!
+//! // Strict mode plus the synthetic class library asks for a VM whose whole
+//! // class library is the ~5,200 stubs the policy forbids. That is rejected at
+//! // configuration time, not later as an unexplained NoClassDefFoundError.
+//! let conflict = strict.clone().with_jdk_mode(JdkMode::Synthetic);
+//! match conflict.validate_compatibility() {
+//!     Err(VmError::InvalidConfiguration(msg)) => {
+//!         assert!(msg.contains("--jdk-only") && msg.contains("--synthetic-jdk"));
+//!     }
+//!     other => panic!("expected VmError::InvalidConfiguration, got {other:?}"),
+//! }
+//!
+//! // Doing nothing is `Compatible`, on both entry points.
+//! assert_eq!(
+//!     VmConfig::default().compatibility_mode,
+//!     CompatibilityMode::Compatible
+//! );
+//! assert_eq!(
+//!     VmConfig::with_host_jdk_default().compatibility_mode,
+//!     CompatibilityMode::Compatible
+//! );
+//! ```
+//!
 //! ## Lifecycle (API contract)
 //!
 //! ```text
@@ -70,6 +144,16 @@
 // ---------------------------------------------------------------------------
 
 pub use cratonvm_vm::config::VmConfig;
+/// The configuration-policy tokens: *which substitutions are permitted*
+/// ([`CompatibilityMode`] / the resolved [`ExecutionPolicy`]) and *which class
+/// library boots* ([`JdkMode`]).
+///
+/// Re-exported because the facade otherwise exposed only [`VmConfig`], leaving
+/// an embedder unable to name the argument or return types of
+/// [`VmConfig::with_compatibility_mode`], [`VmConfig::with_jdk_mode`] and
+/// [`VmConfig::execution_policy`] without depending on `cratonvm-vm` directly.
+/// See the crate-level "Compatibility mode" section for the resolution rules.
+pub use cratonvm_vm::config::{CompatibilityMode, ExecutionPolicy, JdkMode};
 pub use cratonvm_vm::error::{MethodCallFailed, MethodCallResult, VmError};
 pub use cratonvm_vm::threading::{JvmThread, ThreadId};
 pub use cratonvm_vm::types::{ObjectRef, Value};
@@ -199,6 +283,80 @@ mod tests {
         _assert_sized::<VmError>();
         _assert_sized::<MethodCallFailed>();
         _assert_sized::<StackTraceFrame>();
+        _assert_sized::<CompatibilityMode>();
+        _assert_sized::<ExecutionPolicy>();
+        _assert_sized::<JdkMode>();
+    }
+
+    /// An embedded VM is `Compatible` unless the host says otherwise — on
+    /// **both** constructors, and regardless of which class library they boot.
+    ///
+    /// This is the asymmetry pinned: `default()` and `with_host_jdk_default()`
+    /// disagree about [`JdkMode`] (hermetic library vs. host JDK) and agree
+    /// about [`CompatibilityMode`]. Strictness rejects work that `Compatible`
+    /// accepts, so it may only ever come from an explicit request; a Cargo
+    /// feature, an environment variable, or the other entry point's default
+    /// must never supply it.
+    #[test]
+    fn embedded_default_is_compatible() {
+        for cfg in [VmConfig::default(), VmConfig::with_host_jdk_default()] {
+            assert_eq!(cfg.compatibility_mode, CompatibilityMode::Compatible);
+            assert!(!cfg.is_jdk_only());
+            assert!(!cfg.execution_policy().is_jdk_only());
+            cfg.validate_compatibility()
+                .expect("a default config is always coherent");
+        }
+        // The JDK mode is the half that *does* differ between the two.
+        assert_eq!(VmConfig::default().jdk_mode(), JdkMode::Synthetic);
+        assert_eq!(
+            VmConfig::with_host_jdk_default().jdk_mode(),
+            JdkMode::Real,
+            "the launcher base config boots the host JDK"
+        );
+    }
+
+    /// An explicit strict request round-trips through the facade's own types:
+    /// what the host set is what `is_jdk_only` / `execution_policy` report.
+    #[test]
+    fn explicit_jdk_only_round_trips() {
+        let cfg = VmConfig::with_host_jdk_default()
+            .with_compatibility_mode(CompatibilityMode::JdkOnly);
+        assert_eq!(cfg.compatibility_mode, CompatibilityMode::JdkOnly);
+        assert!(cfg.is_jdk_only());
+        assert_eq!(cfg.compatibility_mode.as_str(), "jdk-only");
+
+        let policy: ExecutionPolicy = cfg.execution_policy();
+        assert_eq!(policy.compatibility_mode, CompatibilityMode::JdkOnly);
+        assert!(policy.is_jdk_only());
+        assert!(policy.real_jdk, "the launcher base config is real-JDK");
+        assert_eq!(policy, ExecutionPolicy::jdk_only());
+
+        // Setting the compatibility mode does not rewrite the JDK mode: this
+        // config was already real, and quietly forcing `JdkMode::Real` would
+        // erase the conflict `validate_compatibility` exists to report.
+        assert_eq!(cfg.jdk_mode(), JdkMode::Real);
+        cfg.validate_compatibility()
+            .expect("real JDK + JDK-only is coherent");
+    }
+
+    /// Strict mode plus the synthetic class library is a configuration error,
+    /// reported before the VM is built. The message names both flags and both
+    /// ways out, because which correction is right depends on what the caller
+    /// meant.
+    #[test]
+    fn jdk_only_plus_synthetic_is_rejected() {
+        let cfg = VmConfig::default() // synthetic library
+            .with_compatibility_mode(CompatibilityMode::JdkOnly);
+        assert_eq!(cfg.jdk_mode(), JdkMode::Synthetic);
+        assert!(cfg.is_jdk_only());
+
+        match cfg.validate_compatibility() {
+            Err(VmError::InvalidConfiguration(msg)) => {
+                assert!(msg.contains("--jdk-only"), "{msg}");
+                assert!(msg.contains("--synthetic-jdk"), "{msg}");
+            }
+            other => panic!("expected VmError::InvalidConfiguration, got {other:?}"),
+        }
     }
 
     /// Compile-time pin for the facade helper signatures documented as the

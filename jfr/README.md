@@ -15,12 +15,50 @@ event catalogue (GC, allocation, monitor enter, exception, etc.),
 recording lifecycle (`start`, `stop`, `dump`), and `.jfr`
 binary-format serialization for CratonVM's in-crate reader.
 
+It also hosts one thing that is not JFR: the `jdk_only` module, the
+aggregate counter set for JDK-only mode
+(`docs/feature-designs/jdk-only-mode.md`). See below.
+
 ## Non-goals
 
 - No event analysis or visualization — only emission and serialization.
 - No JMX bean exposure for remote recording control.
 - Not a general-purpose tracing framework; the event schema is
   JFR-compatible only.
+
+## JDK-only mode counters (`jdk_only`)
+
+Seven `_total` counters — violations by kind, class origins, native
+registrations and invocations by kind, real-bytecode shadow attempts,
+missing natives by JDK module, generated classes by generator — folded
+at report time out of censuses the VM already keeps
+(`NativeMethodRegistry::census()`, `ClassManager::dump_class_origins()`,
+the `JdkOnlyViolation` buffers). It is an aggregation, not a subsystem:
+no collector, no background thread, no state of its own, and **no
+counter incremented on any hot path**.
+
+Policy, enforced in code rather than by convention:
+
+- **Off by default.** `JdkOnlyTelemetry::default()` is disabled and
+  ignores every input. The gate is the existing `--jdk-only-report` /
+  `--dump-class-origins` / `--trace-jdk-only` command-line flags; JDK-only
+  mode deliberately adds no environment variable.
+- **Process-local.** The module opens no file and no socket and reads no
+  environment variable. `to_json()` returns a `String`; the operator
+  decides whether it leaves the process.
+- **Aggregate-only, with bounded labels.** Every label is a `&'static str`
+  from a `const` table, so no class name, jar path, command-line argument
+  or environment value can reach one. JDK module names are bounded by a
+  fixed allow-list; anything else becomes `other`.
+- **Versioned.** `counter_schema_version` is emitted with every snapshot,
+  and the label set is fixed — an unobserved label still emits `0` — so
+  two CI artefacts of the same version diff on values alone.
+
+`bridge` registrations and invocations are honest **lower bounds**: JNI
+`RegisterNatives` bridges live in the JNI layer's own table, not in the
+native registry these counters fold. That caveat is emitted in the JSON
+as `lower_bound`, not left in the documentation. `synthetic-stub` is
+exact.
 
 ## Usage
 

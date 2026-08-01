@@ -6,8 +6,20 @@
 //! Shared types used by the JIT compiler crate and the VM crate:
 //! - [`CachedBytecodeMethod`] — method data needed for JIT compilation
 //! - [`JitRuntimeHelpers`] — function pointer table for JIT runtime callbacks
+//! - [`helpers_abi`] — the typed ABI description of that table: one
+//!   `HelperFn*` signature alias per callable slot, the machine-readable
+//!   [`HELPER_FIELDS`] descriptor list, null-checked accessors, and
+//!   [`JitRuntimeHelpers::validate_with`]
 //! - [`gpu_lowering::GpuLowering`] (under the `gpu-lowering` feature) —
 //!   trait seam for emitting PTX from a resolved Java method.
+//!
+//! # SAFETY: the `JitRuntimeHelpers` ABI is frozen
+//!
+//! [`JitRuntimeHelpers`] is a `#[repr(C)]` table of bare `usize` words whose
+//! **byte offsets are compiled into RWX machine code**. Never reorder, remove,
+//! retype, or insert a field; append only, and bump
+//! [`JIT_HELPERS_ABI_VERSION`] when you do. The full contract, the per-field
+//! signatures, and the per-field nullability rules live in [`helpers_abi`].
 //!
 //! ## `gpu-lowering` feature status
 //!
@@ -23,6 +35,14 @@
 
 #[cfg(feature = "gpu-lowering")]
 pub mod gpu_lowering;
+
+pub mod helpers_abi;
+
+pub use helpers_abi::{
+    helper_field, helper_field_offset, HelperAbiError, HelperFieldDesc, HelperKind,
+    HELPER_FIELDS, HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_ALIGN, JIT_HELPERS_ABI_SIZE,
+    JIT_HELPERS_ABI_VERSION, MAX_PLAUSIBLE_OFFSET, NUM_HELPER_FIELDS,
+};
 
 use std::sync::Arc;
 
@@ -200,6 +220,22 @@ pub struct CachedBytecodeMethod {
     /// -- it depends on mutable per-class redefine state that can change
     /// after this entry is populated, so it is still re-evaluated on every
     /// hit (cheap: a single generation-counter read plus a short allowlist).
+    ///
+    /// JDK-ONLY-WAVE2 (`docs/feature-designs/jdk-only-mode.md` §7): this cell
+    /// memoizes the *answer* of a ~1400-line hard-coded class-name/method-name
+    /// dispatcher (`force_native_over_real_jdk_bytecode` in
+    /// `vm/src/runtime/interpreter.rs`) whose whole purpose is to make a
+    /// registered native win over concrete real-JDK bytecode — the exact
+    /// inversion §1 rule 4 forbids under `JdkOnly`. The list is a wave-2
+    /// removal and must NOT be deleted this wave. What must change here: the
+    /// memoized `bool` has to become policy-qualified, because a `true`
+    /// memoized under `Compatible` is not a valid answer under `JdkOnly` and
+    /// this cell cannot tell the two apart. Simplest correct shape is to store
+    /// the `CompatibilityMode` alongside the bool (`OnceLock<(bool, u8)>`) and
+    /// re-derive on a mode mismatch; the mode is fixed per VM, so the compare
+    /// is free. Not done in wave 1 because the ~38 struct literals of this type
+    /// spell the field `std::sync::OnceLock::new()` and live in four crates
+    /// owned by four different agents.
     pub force_native_cache: std::sync::OnceLock<bool>,
     /// Per-call-site native-dispatch memo. **Read it through
     /// [`Self::native_call_site`], never directly.**
@@ -253,6 +289,23 @@ pub struct CachedBytecodeMethod {
     /// rename to `native_call_site` is a pure mechanical follow-up; see the
     /// cross-owner request in
     /// `docs/internal/arch-2026-07-26/interpreter-completion.md`.
+    ///
+    /// # JDK-only: this cell does NOT lose the `NativeKind`
+    ///
+    /// A cache that stores only a `NativeCallback` cannot re-check policy on a
+    /// hit — it has thrown away the one fact (`NativeKind`) the decision needs.
+    /// This cell is *not* that shape, and that is worth stating explicitly
+    /// because its accessor name (`callback()`) makes it look like it is: the
+    /// memo word is a `NativeMethodId`, not a function pointer, so the kind is
+    /// still one `O(1)` array index away (`NativeMethodRegistry::kind_of_id`)
+    /// and so is the census counter (`record_invocation`).
+    ///
+    /// The gap is therefore in the **callers**, not the cell. Use
+    /// [`Self::native_dispatch`] below, which redeems the id into the
+    /// `(callback, kind)` pair `vm_exec::resolve_dispatch` takes as its
+    /// `native` argument and records the invocation on the way past. A caller
+    /// that reaches for `native_call_site().callback(..)` instead has silently
+    /// opted out of both the policy check and the census.
     pub native_callback_cache: std::sync::OnceLock<cratonvm_native_api::NativeCallSite>,
     /// T2.5 — memoized JIT invocation-counter key for this method, i.e. the
     /// packed `(declaring_class_id << 32) | hash(method_name ++ descriptor)`
@@ -377,6 +430,70 @@ impl CachedBytecodeMethod {
     pub fn native_call_site(&self) -> &cratonvm_native_api::NativeCallSite {
         self.native_callback_cache
             .get_or_init(cratonvm_native_api::NativeCallSite::new)
+    }
+
+    /// Resolve this call site's native as the `(callback, kind)` pair
+    /// `vm/src/vm/vm_exec.rs::resolve_dispatch` takes as its `native` argument,
+    /// **and count the dispatch**.
+    ///
+    /// This is the JDK-only-correct replacement for
+    /// `native_call_site().callback(registry, class, method, desc)`
+    /// (`docs/feature-designs/jdk-only-mode.md` §4, §7). The bare `callback()`
+    /// form discards the `NativeKind`, and a caller holding only a callback
+    /// cannot answer "may this run under `JdkOnly`?" — the whole strict-mode
+    /// question. It also never touches `record_invocation`, so every dispatch
+    /// through it is invisible to the census, and the CI gate asserts on a
+    /// census figure (`synthetic_stub_invocations == 0`). An uncounted path is
+    /// an unverifiable one.
+    ///
+    /// # Cost
+    ///
+    /// One extra `O(1)` slot index over `callback()` (`kind_of_id`) plus one
+    /// relaxed increment (`record_invocation`). No hashing, no allocation, no
+    /// string comparison: the memo already produced the `NativeMethodId`, and
+    /// every remaining step is an array index off it. Safe on the hot path,
+    /// which is why the counter is incremented here rather than at some
+    /// coarser choke point.
+    ///
+    /// # Contract
+    ///
+    /// Same one-cell-one-triple rule as [`Self::native_call_site`]: this may
+    /// only ever be asked about **this entry's own**
+    /// `(class_name, method_name, method_descriptor)`, which it reads from
+    /// `self` so a caller cannot get it wrong. A site that needs a different
+    /// triple (the `java/lang/ClassLoader` re-target inside
+    /// `intercept_force_registered_native_cached`) must use its own cell or
+    /// plain `find` — see the ONE CELL, ONE TRIPLE section on
+    /// [`Self::native_callback_cache`].
+    ///
+    /// Returns `None` when no native is registered for the triple, which is the
+    /// same answer `callback()` gives and which `resolve_dispatch` reads as
+    /// "no native — use the bytecode".
+    #[inline]
+    pub fn native_dispatch(
+        &self,
+        registry: &cratonvm_native_api::NativeMethodRegistry,
+    ) -> Option<(
+        cratonvm_native_api::NativeCallback,
+        cratonvm_native_api::NativeKind,
+    )> {
+        let id = self.native_call_site().resolve(
+            registry,
+            self.class_name.as_ref(),
+            self.method_name.as_ref(),
+            self.method_descriptor.as_ref(),
+        )?;
+        let callback = registry.callback_of(id)?;
+        let kind = registry.kind_of_id(id)?;
+        // Counted at the point of *decision*, not of invocation, because the
+        // caller may legitimately discard the pair when `resolve_dispatch`
+        // answers `Bytecode` (§7 order rule 3: concrete bytecode beats a
+        // registered bridge). That over-counts a bridge the policy then
+        // declines to run. It is the right direction to err in for a gate whose
+        // assertion is `synthetic_stub_invocations == 0`: it can only ever make
+        // a stub visible, never hide one.
+        registry.record_invocation(id);
+        Some((callback, kind))
     }
 
     /// The memoized JIT invocation-counter key for this method — see
@@ -521,6 +638,33 @@ pub mod npe_action {
 /// trap stub, exactly as `set_throw_bci` / `service_callee_deopt` are.
 /// Production builds always go through `build_helpers`, which populates every
 /// field explicitly.
+///
+/// # SAFETY: frozen binary layout
+///
+/// This struct is an ABI, not a data structure. The rules are absolute:
+///
+/// * **`#[repr(C)]` is mandatory.** The JIT reads slots as
+///   `[helpers_ptr + disp32]` with the displacement computed at compile time.
+///   `repr(Rust)` may reorder fields, which would silently re-point every
+///   baked `CALL` at a different helper.
+/// * **Every field is `usize`** (8 bytes; x86-64 only), so the byte offset of
+///   field *N* is exactly `N * 8`. A non-`usize` field would introduce padding
+///   and break that identity — see the `const _` assertions below.
+/// * **Append only.** Never reorder, never remove, never retype, never insert
+///   in the middle. New helpers go at the end, exactly as `set_throw_bci` and
+///   `service_callee_deopt` did.
+/// * **Bump [`JIT_HELPERS_ABI_VERSION`] on any shape change**, including a
+///   pure append: once a field exists, a producer and a consumer built against
+///   different revisions cannot be distinguished by size alone.
+/// * **Nullability is per field**, recorded in [`HELPER_FIELDS`]. A `required`
+///   slot is `CALL`ed unconditionally and must be non-zero; a non-required
+///   slot reads `0` as the documented "not wired" sentinel and the backend
+///   falls back (or emits nothing).
+///
+/// The raw `usize` type conveys none of that. Use the typed view in
+/// [`helpers_abi`] — [`Self::validate_with`] to check a table, the
+/// `<field>_fn` accessors to obtain a null-checked, correctly-typed function
+/// pointer, and [`HELPER_FIELDS`] to describe the layout to tooling.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct JitRuntimeHelpers {

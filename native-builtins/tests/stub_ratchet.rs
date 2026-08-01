@@ -34,6 +34,7 @@
 
 use cratonvm_native_api::{NativeKind, NativeMethodRegistry};
 use cratonvm_native_builtins::register_essential_natives;
+use cratonvm_types::compat::CompatibilityMode;
 
 /// Frozen upper bound on the number of `SyntheticStub`-tagged registrations in
 /// the default (real-JDK / `register_essential_natives`) registry.
@@ -140,5 +141,207 @@ fn essential_registry_is_populated() {
          {MIN_TOTAL_REGISTRATIONS} floor — the census entrypoint or a whole \
          registration module looks broken, which would make the stub-ratchet pass \
          vacuously. Expected the real-JDK boot path to register ~9,300 natives."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// STRICT (JDK-only) CENSUS — docs/feature-designs/jdk-only-mode.md §4 and §11
+//
+// Strictness is a *runtime policy* on the registry, not a build feature: the VM
+// calls `set_compatibility_mode(CompatibilityMode::JdkOnly)` once at init,
+// BEFORE any `register_*` pass (contract §8), and `register()` then refuses a
+// `NativeKind::SyntheticStub` outright, recording a
+// `JdkOnlyViolation::SyntheticNativeRegistered` so the run can name what went
+// missing.
+//
+// The three tests below measure that same `register_essential_natives` surface
+// through the strict policy. They are purely additive: the compatibility-mode
+// baseline above is untouched, and nothing here tightens
+// `BASELINE_SYNTHETIC_STUBS`. Wave 1 is measurement, not deletion (contract
+// §10) — the point of these tests is to make the size and shape of the backlog
+// a number CI prints on every run, not to delete anything yet.
+//
+// The same zero-stub invariant is asserted against a hand-built synthetic mix
+// in `native-api/tests/jdk_only_registry.rs`; here it is asserted against the
+// real boot-path registrar, which is the one that has 157 stubs in it.
+// ---------------------------------------------------------------------------
+
+/// Vacuity floor for the *strict* registry, mirroring `MIN_TOTAL_REGISTRATIONS`
+/// in [`essential_registry_is_populated`].
+///
+/// This is a collapse detector, not a measurement. Strict mode is expected to
+/// shed the stub registrations plus whatever aliases hang off them (see
+/// [`strict_registry_drops_only_the_stubs`] for why that fallout is real), so
+/// the floor sits well below the compatibility-mode floor. If the strict
+/// registry ever drops under it, `set_compatibility_mode` is refusing far more
+/// than the stubs, and "zero synthetic stubs" would be true only because the
+/// registry is empty.
+const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 7_500;
+
+/// Build the default native registry the way `--jdk-only` does: set the
+/// VM-scoped strict policy *first*, then run the same public
+/// `register_essential_natives` entrypoint `vm/src/vm/vm_init.rs` calls on the
+/// real-JDK boot path.
+///
+/// Ordering is load-bearing and mirrors contract §8: a mode set *after*
+/// registration would leave every stub already in the table and make this whole
+/// section pass for the wrong reason.
+///
+/// Returns `(synthetic_stub_count, total_registrations, refused_registrations)`.
+fn strict_census() -> (usize, usize, usize) {
+    let mut registry = NativeMethodRegistry::new();
+    registry.set_compatibility_mode(CompatibilityMode::JdkOnly);
+    register_essential_natives(&mut registry);
+
+    let rows = registry.dump_registrations();
+    let synthetic = rows
+        .iter()
+        .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
+        .count();
+    (synthetic, rows.len(), registry.refused_registrations().len())
+}
+
+/// Acceptance criterion (contract §11): **the final native registry in strict
+/// mode contains zero `SyntheticStub` entries.**
+///
+/// This passes *today*, and it is worth being precise about why: not because
+/// the 157 stubs are gone, but because `register()` refuses them at the door
+/// under `JdkOnly`. That is exactly the property CI's zero-stub census asserts
+/// against a booted VM, so it is worth pinning here too — it is the cheap,
+/// hermetic version of the same check, with no JDK image and no subprocess.
+///
+/// A failure means a `SyntheticStub` reached the live table despite the strict
+/// policy: either a registrar bypasses `register()`, or the mode is being set
+/// after registration rather than before it.
+#[test]
+fn strict_registry_has_zero_synthetic_stubs() {
+    let (strict_stubs, strict_total, refused) = strict_census();
+
+    println!(
+        "stub-ratchet(strict): {strict_stubs} SyntheticStub registrations out of \
+         {strict_total} total; {refused} registrations refused by JdkOnly"
+    );
+
+    assert_eq!(
+        strict_stubs, 0,
+        "acceptance criterion (contract §11) violated: {strict_stubs} SyntheticStub \
+         natives are in the STRICT registry. Under CompatibilityMode::JdkOnly, \
+         register() must refuse every SyntheticStub, so a non-zero count means a \
+         registrar reached the slot table without going through register(), or \
+         set_compatibility_mode was applied after registration instead of before it."
+    );
+
+    assert!(
+        strict_total >= STRICT_MIN_TOTAL_REGISTRATIONS,
+        "the strict registry holds only {strict_total} registrations, below the \
+         {STRICT_MIN_TOTAL_REGISTRATIONS} floor. Zero synthetic stubs is then a \
+         statement about an empty registry, not about the stub backlog."
+    );
+}
+
+/// Strict mode drops the stubs — and, modulo aliasing, *only* the stubs.
+///
+/// The tempting assertion is exact subtraction:
+/// `strict_total == compat_total - compat_stubs`. It is wrong, in a way worth
+/// writing down because it will look like a bug to the next reader.
+///
+/// `NativeMethodRegistry::alias_class` (used by the JDBC, JBoss-MSC and
+/// `net_phase_e` registrars) copies a class's natives to a second name by
+/// walking the **live registration log** and re-`register()`ing each row it
+/// finds. Under `JdkOnly` a refused stub never enters that log, so the alias
+/// pass finds nothing to copy and the alias disappears too — one refusal can
+/// remove more than one row. Hence:
+///
+/// * `compat_total - strict_total >= compat_stubs` — every stub is gone, plus
+///   any aliases derived from one.
+/// * `refused <= compat_stubs` — the mirror image. An alias copy that was
+///   itself stub-tagged in compatible mode is counted in `compat_stubs`, but in
+///   strict mode `alias_class` never attempts it, so no refusal is recorded for
+///   it. `refused` counts refusals, not stubs.
+///
+/// Both bounds are one-sided on purpose. Pinning the alias fallout to an exact
+/// number would make this test fail every time a registrar adds or removes an
+/// `alias_class` call, which is churn, not regression.
+#[test]
+fn strict_registry_drops_only_the_stubs() {
+    let (compat_stubs, compat_total) = census();
+    let (_strict_stubs, strict_total, refused) = strict_census();
+
+    let dropped = compat_total.saturating_sub(strict_total);
+
+    println!(
+        "stub-ratchet(strict): compatible {compat_total} rows ({compat_stubs} stubs) \
+         -> strict {strict_total} rows; {dropped} rows dropped, {refused} refusals recorded"
+    );
+
+    assert!(
+        strict_total <= compat_total,
+        "strict mode registered MORE than compatible mode ({strict_total} > \
+         {compat_total}). JdkOnly only ever refuses; it must never add a registration."
+    );
+
+    assert!(
+        dropped >= compat_stubs,
+        "strict mode dropped only {dropped} registrations but compatible mode has \
+         {compat_stubs} SyntheticStub rows. Every stub row must be absent from the \
+         strict registry (plus possibly some alias_class fallout, which is why this \
+         is a lower bound and not equality). A shortfall means some stubs survive \
+         the strict policy."
+    );
+
+    assert!(
+        refused <= compat_stubs,
+        "{refused} registrations were refused but compatible mode only has \
+         {compat_stubs} SyntheticStub rows. A refusal with no corresponding stub \
+         means JdkOnly is rejecting a Bridge or an Intrinsic — SyntheticStub is the \
+         only kind it may reject (contract §4)."
+    );
+
+    assert!(
+        strict_total >= STRICT_MIN_TOTAL_REGISTRATIONS,
+        "the strict registry holds only {strict_total} registrations, below the \
+         {STRICT_MIN_TOTAL_REGISTRATIONS} floor — strict mode is shedding whole \
+         registration modules, not just stubs."
+    );
+}
+
+/// THE END-STATE GATE, deliberately `#[ignore]`d.
+///
+/// [`strict_registry_has_zero_synthetic_stubs`] passes today for a weak reason:
+/// `register()` refuses the stubs at the door. The 157 registrations still
+/// exist in `native-builtins/src/`, still run on every boot, and are still what
+/// an ordinary `--real-jdk` run dispatches into. **Refused is not retired.**
+///
+/// This test asserts the strong property — strict mode has *nothing to refuse*
+/// — and stays ignored until all three of the following have landed:
+///
+/// 1. **Reclassify or delete the 157 `SyntheticStub` registrations** in
+///    `native-builtins/src/`, subsystem by subsystem: each one becomes a real
+///    `Bridge`/`Intrinsic` because it genuinely crosses a VM boundary, or it
+///    goes away so the real JDK bytecode runs. This is explicitly *not* wave 1
+///    work (contract §8: "do not edit `native-builtins/src/lib.rs`; the
+///    157-stub reclassification is a separate wave with its own
+///    subsystem-per-PR discipline").
+/// 2. **Drive [`BASELINE_SYNTHETIC_STUBS`] to 0 in the same change** that
+///    removes the last one. The ratchet is slack-free by design; leaving the
+///    baseline at 157 after the stubs are gone would silently re-admit 157 new
+///    ones.
+/// 3. **Un-ignore this test** (delete the `#[ignore]`) so the zero is held,
+///    and promote the CI `jdk-only` job from advisory to blocking, which is the
+///    posture contract §11 calls for.
+///
+/// Until then it is run on demand:
+/// `cargo test -p cratonvm-native-builtins --test stub_ratchet -- --ignored --nocapture`
+#[test]
+#[ignore = "wave 1 is measurement: the 157 stubs are refused at registration, not yet retired"]
+fn strict_mode_refuses_nothing() {
+    let (_strict_stubs, _strict_total, refused) = strict_census();
+
+    assert_eq!(
+        refused, 0,
+        "{refused} SyntheticStub registrations still have to be refused at VM init. \
+         Zero refusals is the real end state: it means the stubs were reclassified \
+         or deleted at the source, not merely filtered out of the table on the way \
+         in. See this test's doc comment for the three steps that must land first."
     );
 }

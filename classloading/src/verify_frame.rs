@@ -22,6 +22,25 @@ pub struct VerificationFrame {
     pub stack: Vec<VType>,
     /// Maximum stack size (from Code attribute).
     max_stack: u16,
+    /// Maximum local-slot count (from the `Code` attribute).
+    ///
+    /// SECURITY (JVMS §4.9.1 static constraint): the interpreter allocates
+    /// exactly `max_locals` slots for the frame, so the verifier must never
+    /// accept a local index at or above it. Bounding by `locals.len()` alone
+    /// (the previous behaviour) was not equivalent in two directions:
+    ///
+    ///   * `initial_frame` sizes `locals` from the method descriptor and only
+    ///     *pads* up to `max_locals`, so a method whose parameters need more
+    ///     slots than it declares (`max_locals` under-declared) produced a
+    ///     `locals` vector LONGER than the runtime frame, and every access in
+    ///     that overhang verified clean and read out of bounds at run time;
+    ///   * a `full_frame` in the `StackMapTable` may declare more locals than
+    ///     `max_locals`, with the same effect.
+    ///
+    /// Kept in sync at the one place a declared frame becomes the current
+    /// frame — [`VerificationFrame::pad_locals_to`], which is called with the
+    /// method's real `max_locals` at every adoption site.
+    max_locals: u16,
 }
 
 impl VerificationFrame {
@@ -70,6 +89,7 @@ impl VerificationFrame {
             locals,
             stack: Vec::new(),
             max_stack,
+            max_locals,
         }
     }
 
@@ -110,6 +130,13 @@ impl VerificationFrame {
             locals,
             stack: Vec::new(),
             max_stack,
+            // A compact frame (and everything derived from it by
+            // `apply_stack_map_frame`) is a *declaration*, never the frame an
+            // instruction executes against: the walk adopts it via
+            // `pad_locals_to(max_locals)`, which installs the method's real
+            // bound. Until then the only limit is the declared locals length,
+            // which `local_limit` already applies.
+            max_locals: u16::MAX,
         }
     }
 
@@ -128,6 +155,7 @@ impl VerificationFrame {
                     locals: self.locals.clone(),
                     stack: Vec::new(),
                     max_stack: self.max_stack,
+                    max_locals: self.max_locals,
                 })
             }
 
@@ -145,6 +173,7 @@ impl VerificationFrame {
                     locals: self.locals.clone(),
                     stack: new_stack,
                     max_stack: self.max_stack,
+                    max_locals: self.max_locals,
                 })
             }
 
@@ -176,6 +205,7 @@ impl VerificationFrame {
                     locals,
                     stack: Vec::new(),
                     max_stack: self.max_stack,
+                    max_locals: self.max_locals,
                 })
             }
 
@@ -183,6 +213,7 @@ impl VerificationFrame {
                 locals: self.locals.clone(),
                 stack: Vec::new(),
                 max_stack: self.max_stack,
+                max_locals: self.max_locals,
             }),
 
             StackMapFrame::AppendFrame {
@@ -202,6 +233,7 @@ impl VerificationFrame {
                     locals,
                     stack: Vec::new(),
                     max_stack: self.max_stack,
+                    max_locals: self.max_locals,
                 })
             }
 
@@ -234,6 +266,7 @@ impl VerificationFrame {
                     locals,
                     stack,
                     max_stack: self.max_stack,
+                    max_locals: self.max_locals,
                 })
             }
         }
@@ -300,6 +333,9 @@ impl VerificationFrame {
             locals,
             stack,
             max_stack: self.max_stack,
+            // Conservative: a merged frame may only address the slots BOTH
+            // predecessors could address.
+            max_locals: self.max_locals.min(other.max_locals),
         })
     }
 
@@ -343,35 +379,150 @@ impl VerificationFrame {
 
     /// Pad locals to max_locals by filling with Top.
     /// StackMapTable-derived frames may have fewer locals than max_locals.
+    ///
+    /// This is also the point at which a declared frame becomes an *executable*
+    /// frame, so it installs the method's `max_locals` bound (see the field
+    /// docs on [`VerificationFrame::max_locals`]). It never widens the bound: a
+    /// declared frame carrying more locals than `max_locals` keeps the smaller
+    /// limit and the overhang becomes unaddressable.
     pub fn pad_locals_to(&mut self, max_locals: u16) {
+        self.max_locals = max_locals;
         while self.locals.len() < max_locals as usize {
             self.locals.push(VType::Top);
         }
     }
 
+    /// The method's declared `max_locals`.
+    pub fn max_locals(&self) -> u16 {
+        self.max_locals
+    }
+
+    /// Does any slot of this frame still hold the uninitialized `this`?
+    ///
+    /// JVMS §4.10.1.9: a constructor may not `return` while its receiver is
+    /// still `uninitializedThis` — the caller would observe an object whose
+    /// superclass constructor never ran.
+    pub fn has_uninitialized_this(&self) -> bool {
+        self.locals.iter().any(|t| *t == VType::UninitializedThis)
+            || self.stack.iter().any(|t| *t == VType::UninitializedThis)
+    }
+
     // ----- Local variable operations ----------------------------------------
+
+    /// Number of local slots this frame may address.
+    ///
+    /// The tighter of "slots the runtime frame has" (`max_locals`) and "slots
+    /// this frame describes" (`locals.len()`). See the field docs on
+    /// [`VerificationFrame::max_locals`] for why `locals.len()` alone is not a
+    /// sound bound.
+    fn local_limit(&self) -> usize {
+        (self.max_locals as usize).min(self.locals.len())
+    }
 
     /// Load a type from a local variable slot.
     pub fn local_load(&self, index: u16) -> Result<&VType, LinkageError> {
-        self.locals.get(index as usize).ok_or_else(|| {
+        let limit = self.local_limit();
+        if (index as usize) >= limit {
+            return Err(verify_error(&format!(
+                "local variable index {index} out of range (addressable slots: {limit}, \
+                 max_locals: {})",
+                self.max_locals
+            )));
+        }
+        Ok(&self.locals[index as usize])
+    }
+
+    /// Load a category-2 (`long` / `double`) value from a local variable pair.
+    ///
+    /// JVMS §4.10.1.6: a `long`/`double` occupies slots `index` and `index+1`;
+    /// the upper half must still be the `Top` that was written with the base.
+    /// A pair whose upper half has been overwritten by an intervening
+    /// category-1 store is *split* and must not be read back as a wide value.
+    pub fn local_load_wide(&self, index: u16, expected: &VType) -> Result<(), LinkageError> {
+        let upper = index.checked_add(1).ok_or_else(|| {
             verify_error(&format!(
-                "local variable index {index} out of range (max {})",
-                self.locals.len()
+                "category-2 local load at index {index} would address slot {}, \
+                 which overflows the local index space",
+                u32::from(index) + 1
             ))
-        })
+        })?;
+        let base = self.local_load(index)?;
+        if base != expected {
+            return Err(verify_error(&format!(
+                "local {index} is {base:?}, expected {expected:?}"
+            )));
+        }
+        let hi = self.local_load(upper)?;
+        if *hi != VType::Top {
+            return Err(verify_error(&format!(
+                "category-2 local pair at index {index} is split: slot {upper} is {hi:?}, \
+                 expected the Top upper half"
+            )));
+        }
+        Ok(())
     }
 
     /// Store a type into a local variable slot.
+    ///
+    /// Writing slot `index` invalidates a category-2 value based at `index - 1`
+    /// (JVMS §4.10.1.6): this store overwrites that value's `Top` upper half,
+    /// so the base must become unusable. Without this the frame would still
+    /// claim slot `index - 1` holds a whole `long`/`double` while half of it
+    /// has been replaced by an unrelated category-1 value — a `lload` of that
+    /// slot would then verify clean and read a torn value at run time.
     pub fn local_store(&mut self, index: u16, vtype: VType) -> Result<(), LinkageError> {
         let idx = index as usize;
-        if idx >= self.locals.len() {
+        let limit = self.local_limit();
+        if idx >= limit {
             return Err(verify_error(&format!(
-                "local variable index {index} out of range (max {})",
-                self.locals.len()
+                "local variable index {index} out of range (addressable slots: {limit}, \
+                 max_locals: {})",
+                self.max_locals
             )));
         }
+        self.invalidate_cat2_base_below(idx);
         self.locals[idx] = vtype;
         Ok(())
+    }
+
+    /// Store a category-2 (`long` / `double`) value into a local variable pair.
+    ///
+    /// Writes the base at `index` and its `Top` upper half at `index + 1`,
+    /// both bounds-checked against `max_locals`. The `index + 1` computation is
+    /// checked: `index` comes from a `wide`-prefixed operand and may be
+    /// `u16::MAX`, where the previous `*index + 1` overflowed — a panic in a
+    /// debug build and a wrap to slot 0 in release, both driven directly by
+    /// attacker-supplied bytecode.
+    pub fn local_store_wide(&mut self, index: u16, vtype: VType) -> Result<(), LinkageError> {
+        let upper = index.checked_add(1).ok_or_else(|| {
+            verify_error(&format!(
+                "category-2 local store at index {index} would address slot {}, \
+                 which overflows the local index space",
+                u32::from(index) + 1
+            ))
+        })?;
+        let lo = index as usize;
+        let hi = upper as usize;
+        let limit = self.local_limit();
+        if hi >= limit {
+            return Err(verify_error(&format!(
+                "category-2 local store at index {index} needs slots {index} and {upper}, \
+                 but only {limit} local slots are addressable (max_locals: {})",
+                self.max_locals
+            )));
+        }
+        self.invalidate_cat2_base_below(lo);
+        self.locals[lo] = vtype;
+        self.locals[hi] = VType::Top;
+        Ok(())
+    }
+
+    /// If slot `idx - 1` holds a category-2 base, demote it to `Top`: a write
+    /// to `idx` is a write to that value's upper half.
+    fn invalidate_cat2_base_below(&mut self, idx: usize) {
+        if idx > 0 && self.locals[idx - 1].is_category2() {
+            self.locals[idx - 1] = VType::Top;
+        }
     }
 
     /// Get the current stack depth.
@@ -575,6 +726,124 @@ mod tests {
         let mut declared = VerificationFrame::initial_frame("Foo", "m", "()V", true, 4, 1);
         declared.locals[3] = VType::Top;
         assert!(current.is_assignable_to(&declared, &h));
+    }
+
+    // ----- max_locals bound (JVMS §4.9.1) -----------------------------------
+
+    #[test]
+    fn local_index_beyond_max_locals_rejected_even_when_described() {
+        // `initial_frame` sizes `locals` from the descriptor and only pads up
+        // to `max_locals`. Here the descriptor needs 3 slots (this + long) but
+        // `max_locals` is 1, so slots 1 and 2 are DESCRIBED by the frame while
+        // the runtime frame does not have them. They must be unaddressable.
+        let frame = VerificationFrame::initial_frame("Foo", "m", "(J)V", false, 1, 1);
+        assert!(frame.locals.len() > 1, "descriptor over-fills the locals vec");
+        assert!(frame.local_load(0).is_ok());
+        assert!(
+            frame.local_load(1).is_err(),
+            "slot 1 is past max_locals and must not verify"
+        );
+        assert!(frame.local_load(2).is_err());
+    }
+
+    #[test]
+    fn local_store_beyond_max_locals_rejected() {
+        let mut frame = VerificationFrame::initial_frame("Foo", "m", "(J)V", false, 1, 1);
+        assert!(frame.local_store(2, VType::Int).is_err());
+    }
+
+    #[test]
+    fn pad_locals_to_installs_the_max_locals_bound() {
+        // A compact (StackMapTable-derived) frame is unbounded until adopted;
+        // adoption is `pad_locals_to`, which installs the real bound.
+        let mut compact = VerificationFrame::compact_initial_frame("Foo", "m", "(I)V", true, 2);
+        assert_eq!(compact.locals.len(), 1);
+        compact.pad_locals_to(4);
+        assert_eq!(compact.max_locals(), 4);
+        assert_eq!(compact.locals.len(), 4);
+        assert!(compact.local_load(3).is_ok());
+        assert!(compact.local_load(4).is_err());
+    }
+
+    #[test]
+    fn pad_locals_to_never_widens_past_max_locals() {
+        // A `full_frame` may declare MORE locals than `max_locals`; the
+        // overhang must become unaddressable rather than raising the bound.
+        let mut frame = VerificationFrame::initial_frame("Foo", "m", "()V", true, 6, 1);
+        frame.pad_locals_to(2);
+        assert_eq!(frame.locals.len(), 6, "padding never shrinks the vec");
+        assert!(frame.local_load(1).is_ok());
+        assert!(
+            frame.local_load(2).is_err(),
+            "slot 2 is described but past max_locals"
+        );
+    }
+
+    // ----- category-2 slot pairing (JVMS §4.10.1.6) -------------------------
+
+    #[test]
+    fn cat2_local_pair_round_trips() {
+        let mut frame = VerificationFrame::initial_frame("Foo", "m", "()V", true, 4, 1);
+        frame.local_store_wide(1, VType::Long).unwrap();
+        assert_eq!(frame.locals[1], VType::Long);
+        assert_eq!(frame.locals[2], VType::Top);
+        assert!(frame.local_load_wide(1, &VType::Long).is_ok());
+    }
+
+    #[test]
+    fn storing_over_the_upper_half_invalidates_the_cat2_base() {
+        // `lstore_1; istore_2` overwrites the long's upper half. The base must
+        // become `Top`, otherwise a later `lload_1` would verify clean and read
+        // a torn value at run time.
+        let mut frame = VerificationFrame::initial_frame("Foo", "m", "()V", true, 4, 1);
+        frame.local_store_wide(1, VType::Long).unwrap();
+        frame.local_store(2, VType::Int).unwrap();
+        assert_eq!(frame.locals[1], VType::Top, "cat-2 base must be invalidated");
+        assert!(
+            frame.local_load_wide(1, &VType::Long).is_err(),
+            "the split pair must not read back as a long"
+        );
+    }
+
+    #[test]
+    fn cat2_load_rejects_a_split_pair() {
+        let mut frame = VerificationFrame::initial_frame("Foo", "m", "()V", true, 4, 1);
+        // Hand-build a split pair: a Long base whose upper half is an Int.
+        frame.locals[1] = VType::Long;
+        frame.locals[2] = VType::Int;
+        assert!(frame.local_load_wide(1, &VType::Long).is_err());
+    }
+
+    #[test]
+    fn cat2_store_at_last_slot_rejected() {
+        // `max_locals = 2` leaves slots 0 and 1; a long at slot 1 needs slot 2.
+        let mut frame = VerificationFrame::initial_frame("Foo", "m", "()V", true, 2, 1);
+        assert!(frame.local_store_wide(1, VType::Double).is_err());
+        assert!(frame.local_store_wide(0, VType::Double).is_ok());
+    }
+
+    #[test]
+    fn cat2_store_at_u16_max_does_not_overflow() {
+        // A `wide lstore 65535` used to compute `index + 1` unchecked: a debug
+        // panic, and a wrap to slot 0 in release. Both are driven straight from
+        // attacker-supplied bytecode, so this must be a clean rejection.
+        let mut frame = VerificationFrame::initial_frame("Foo", "m", "()V", true, 4, 1);
+        assert!(frame.local_store_wide(u16::MAX, VType::Long).is_err());
+        assert!(frame.local_load_wide(u16::MAX, &VType::Long).is_err());
+    }
+
+    // ----- uninitializedThis tracking ---------------------------------------
+
+    #[test]
+    fn constructor_initial_frame_reports_uninitialized_this() {
+        let frame = VerificationFrame::initial_frame("Foo", "<init>", "()V", false, 1, 1);
+        assert!(frame.has_uninitialized_this());
+    }
+
+    #[test]
+    fn ordinary_method_has_no_uninitialized_this() {
+        let frame = VerificationFrame::initial_frame("Foo", "m", "()V", false, 1, 1);
+        assert!(!frame.has_uninitialized_this());
     }
 
     #[test]

@@ -3437,28 +3437,46 @@ pub(crate) mod h2d_trace {
 //     from `releaseExecutor` and on a full cache clear; the
 //     interpreter/JIT IASTORE hooks are deferred to Phase 10 #2).
 //
-// Limitations (Phase 10 #2 / #3):
-//   - Host-side stores via interpreter `xASTORE` or JIT
-//     `jit_iastore` do NOT yet invalidate the cache entry. For the
-//     `GpuBench` workload (which only mutates `a`, `b` during init
-//     before any GPU submit) this is fine. For a workload that
-//     mutates an input array between submits, this would feed the
-//     kernel stale device data. The fix is a one-line call to
-//     `input_cache::invalidate(obj)` in the interpreter store and
-//     `jit_iastore`/`jit_fastore`/etc. helpers.
-//   - GC compaction is currently OK because the GPU-critical guard
-//     held during dispatch keeps the GC paused — but the cache
-//     entry survives ACROSS submits, and a GC between submits that
-//     moves an array's payload would invalidate the device buffer's
-//     mirror without us noticing. Mitigated today by clearing the
-//     whole cache via `clear_all` from `releaseExecutor`. A
-//     production fix would clear on every major-GC compaction event.
+// Host-write invalidation (Phase 10 #2 — closed):
+//   - The interpreter's `Iastore`/`Lastore`/`Dastore` arms and the
+//     `jit_iastore` / `jit_bastore` helpers call
+//     `input_cache::invalidate(obj)` after the store lands, so a host
+//     write always evicts the device mirror.
+//   - `invalidate` is on the hottest path in the VM, so it is gated by
+//     `ADDR_FILTER`: one relaxed load and a not-taken branch when
+//     nothing is cached, which is every run that never submits a
+//     kernel.
+//   - The JIT's IR pipeline lowers `Op::ArrayStore` to a raw inline
+//     `MOVSS`/`MOVSD` with no helper call, so there is nothing to hook
+//     there. `offload_jit_gate` closes that hole from the other side:
+//     while offload is live, a method containing `iastore`/`lastore`/
+//     `fastore`/`dastore` is not admitted to the JIT at all.
+//
+// GC interaction (closed):
+//   - Within a dispatch the GPU-critical guard keeps the GC paused, so
+//     the marshalled `ObjectRef`s cannot move mid-submission.
+//   - Across submits there is no guard, and the cache key is a bare
+//     heap address. [`input_cache::remap_and_sweep`] is called once per
+//     collection from `memory::gc::update_all_roots` to re-key moved
+//     survivors and drop entries whose array died. Dropping is the half
+//     that matters: a reclaimed address is reused by the allocator, and
+//     the `element_type`/`len` guard in the getters does not separate a
+//     recycled address from a genuine hit when the new array has the
+//     same shape — which, for a kernel argument list, is the common
+//     case rather than the exception.
+//   - The cache is deliberately NOT a GC root. An array reachable only
+//     from a cache entry can never be named by a future submit, so
+//     rooting it would leak every array the GPU ever saw instead of
+//     keeping anything useful alive. See `memory::addr_keyed`.
+//   - `clear_all` from `releaseExecutor` remains as the coarse teardown
+//     path; it is no longer load-bearing for GC correctness.
 #[cfg(feature = "gpu-offload")]
 pub(crate) mod input_cache {
     use cratonvm_types::{ArrayElementType, ObjectRef};
     use cuda_bridge::DeviceBuffer;
     use parking_lot::Mutex;
     use rustc_hash::FxHashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
 
     pub(crate) enum CachedBuffer {
@@ -3474,10 +3492,56 @@ pub(crate) mod input_cache {
         pub element_type: ArrayElementType,
     }
 
-    static CACHE: OnceLock<Mutex<FxHashMap<ObjectRef, Entry>>> = OnceLock::new();
+    /// Per-VM tables, keyed by `SharedVm::vm_identity`.
+    ///
+    /// Process-global storage with a VM-scoped key, not a bare global
+    /// map: one process can own several heaps at once, and an
+    /// `ObjectRef` is only meaningful against the heap that allocated
+    /// it. A single flat map would let VM A's address alias VM B's, and
+    /// would hand VM A's post-GC sweep addresses belonging to a heap it
+    /// does not own — the same reasoning that scoped the logmanager
+    /// side-tables in `memory::native_roots`.
+    static CACHE: OnceLock<Mutex<FxHashMap<usize, FxHashMap<ObjectRef, Entry>>>> = OnceLock::new();
 
-    fn map() -> &'static Mutex<FxHashMap<ObjectRef, Entry>> {
+    /// Cheap membership filter over the addresses currently cached.
+    ///
+    /// [`invalidate`] runs on **every primitive array store in the VM**,
+    /// so it must not touch the mutex for the overwhelmingly common case
+    /// of an array that was never marshalled to the device. Each cached
+    /// address contributes one bit; a store whose bit is clear is
+    /// definitely not cached and returns after a single relaxed load.
+    ///
+    /// False positives are possible and cost only a lock plus a failed
+    /// lookup. False *negatives* are not, which is the property that
+    /// makes skipping sound: every path that inserts an entry sets its
+    /// bit before the entry becomes visible, and every path that removes
+    /// entries rebuilds the whole filter. An empty cache leaves this at
+    /// zero, so a build with the feature compiled in but no kernel ever
+    /// submitted pays one load and a not-taken branch per array store.
+    static ADDR_FILTER: AtomicU64 = AtomicU64::new(0);
+
+    fn map() -> &'static Mutex<FxHashMap<usize, FxHashMap<ObjectRef, Entry>>> {
         CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
+    }
+
+    /// The filter bit for `obj`. Heap objects are 8-byte aligned, so the
+    /// low three bits carry no information; index on the six bits above
+    /// them.
+    #[inline]
+    fn addr_bit(obj: ObjectRef) -> u64 {
+        1u64 << ((obj.as_ptr() as usize >> 3) & 63)
+    }
+
+    /// Recompute [`ADDR_FILTER`] from the live tables. Called by every
+    /// path that removes entries; insertion just ORs its bit in.
+    fn rebuild_filter(tables: &FxHashMap<usize, FxHashMap<ObjectRef, Entry>>) {
+        let mut bits = 0u64;
+        for table in tables.values() {
+            for obj in table.keys() {
+                bits |= addr_bit(*obj);
+            }
+        }
+        ADDR_FILTER.store(bits, Ordering::Release);
     }
 
     /// Per-type lookup. Returns `None` on miss OR if the cached
@@ -3485,9 +3549,9 @@ pub(crate) mod input_cache {
     /// shape (defensive: a stale `ObjectRef` could be reused for a
     /// different array kind across a GC; we treat that as a miss
     /// and the caller re-uploads).
-    pub(crate) fn get_i32(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i32>>> {
+    pub(crate) fn get_i32(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i32>>> {
         let g = map().lock();
-        let e = g.get(&obj)?;
+        let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Int || e.len != len {
             return None;
         }
@@ -3497,8 +3561,9 @@ pub(crate) mod input_cache {
             None
         }
     }
-    pub(crate) fn put_i32(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i32>>) {
-        map().lock().insert(
+    pub(crate) fn put_i32(vm: usize, obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i32>>) {
+        insert(
+            vm,
             obj,
             Entry {
                 buf: CachedBuffer::I32(buf),
@@ -3507,9 +3572,9 @@ pub(crate) mod input_cache {
             },
         );
     }
-    pub(crate) fn get_i64(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i64>>> {
+    pub(crate) fn get_i64(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i64>>> {
         let g = map().lock();
-        let e = g.get(&obj)?;
+        let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Long || e.len != len {
             return None;
         }
@@ -3519,8 +3584,9 @@ pub(crate) mod input_cache {
             None
         }
     }
-    pub(crate) fn put_i64(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i64>>) {
-        map().lock().insert(
+    pub(crate) fn put_i64(vm: usize, obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i64>>) {
+        insert(
+            vm,
             obj,
             Entry {
                 buf: CachedBuffer::I64(buf),
@@ -3529,9 +3595,9 @@ pub(crate) mod input_cache {
             },
         );
     }
-    pub(crate) fn get_f32(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f32>>> {
+    pub(crate) fn get_f32(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f32>>> {
         let g = map().lock();
-        let e = g.get(&obj)?;
+        let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Float || e.len != len {
             return None;
         }
@@ -3541,8 +3607,9 @@ pub(crate) mod input_cache {
             None
         }
     }
-    pub(crate) fn put_f32(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<f32>>) {
-        map().lock().insert(
+    pub(crate) fn put_f32(vm: usize, obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<f32>>) {
+        insert(
+            vm,
             obj,
             Entry {
                 buf: CachedBuffer::F32(buf),
@@ -3551,9 +3618,9 @@ pub(crate) mod input_cache {
             },
         );
     }
-    pub(crate) fn get_f64(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f64>>> {
+    pub(crate) fn get_f64(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f64>>> {
         let g = map().lock();
-        let e = g.get(&obj)?;
+        let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Double || e.len != len {
             return None;
         }
@@ -3563,8 +3630,9 @@ pub(crate) mod input_cache {
             None
         }
     }
-    pub(crate) fn put_f64(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<f64>>) {
-        map().lock().insert(
+    pub(crate) fn put_f64(vm: usize, obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<f64>>) {
+        insert(
+            vm,
             obj,
             Entry {
                 buf: CachedBuffer::F64(buf),
@@ -3574,21 +3642,114 @@ pub(crate) mod input_cache {
         );
     }
 
-    /// Drop the device-buffer cache entry for `obj`. Intended for
-    /// future wiring from interpreter / JIT array-store paths.
+    /// Install an entry, publishing its filter bit **first**.
+    ///
+    /// The bit must become visible no later than the entry itself: a
+    /// concurrent [`invalidate`] that saw the entry but not the bit
+    /// would skip a live entry and leave the device mirror stale. The
+    /// reverse window (bit set, entry not yet inserted) is a harmless
+    /// false positive.
+    fn insert(vm: usize, obj: ObjectRef, entry: Entry) {
+        ADDR_FILTER.fetch_or(addr_bit(obj), Ordering::AcqRel);
+        map().lock().entry(vm).or_default().insert(obj, entry);
+    }
+
+    /// Drop the device-buffer cache entry for `obj` because the host
+    /// just wrote to that array — the device copy no longer mirrors it.
+    ///
+    /// Wired to every primitive array store the VM can observe
+    /// (Phase 10 #2): the interpreter's `*astore` arms and the JIT's
+    /// `jit_iastore` / `jit_bastore` helpers. See the module comment for
+    /// the one path that cannot call this and how it is handled instead.
+    ///
+    /// Address-keyed across **all** VMs rather than taking a `vm`
+    /// argument: the store sites are the hottest paths in the
+    /// interpreter, and threading an identity through them buys nothing.
+    /// Removing a same-address entry belonging to another VM is at worst
+    /// a spurious re-upload there, never a wrong answer.
     pub fn invalidate(obj: ObjectRef) {
-        map().lock().remove(&obj);
+        // Fast path: no cached address hashes to this bit, so `obj` is
+        // definitely not cached. This is the case for essentially every
+        // array store in a real program.
+        if ADDR_FILTER.load(Ordering::Acquire) & addr_bit(obj) == 0 {
+            return;
+        }
+        let mut tables = map().lock();
+        let mut removed = false;
+        for table in tables.values_mut() {
+            removed |= table.remove(&obj).is_some();
+        }
+        if removed {
+            rebuild_filter(&tables);
+        }
     }
 
-    /// Drop every cached entry. Called from `releaseExecutor` and
-    /// any future major-GC-compaction hook.
-    pub fn clear_all() {
-        map().lock().clear();
+    /// Drop every entry belonging to `vm`. Called from
+    /// `releaseExecutor` as a teardown path. GC correctness does not
+    /// depend on it — see [`remap_and_sweep`].
+    pub fn clear_all(vm: usize) {
+        let mut tables = map().lock();
+        tables.remove(&vm);
+        rebuild_filter(&tables);
     }
 
-    /// Diagnostic: current entry count.
-    pub fn len() -> usize {
-        map().lock().len()
+    /// Post-collection fixup: re-key surviving entries through the
+    /// collector's old→new map and drop entries whose Java array did
+    /// not survive.
+    ///
+    /// Called once per collection from
+    /// [`crate::memory::gc::update_all_roots`], **before** its
+    /// empty-`pointer_map` early return, because the sweep half is
+    /// needed on a non-moving collection too: objects still die there,
+    /// and a stale key over a reclaimed address is what turns a later
+    /// cache lookup into a false hit.
+    ///
+    /// The device buffer itself needs no fixup. It lives in device
+    /// memory and never holds a JVM heap address — the marshal path
+    /// copies the payload out of the heap at upload time — so
+    /// relocating the source array leaves the mirror valid. Only the
+    /// key is address-derived.
+    ///
+    /// # Locking
+    ///
+    /// Runs with the world stopped and takes the cache mutex, which is
+    /// safe because every other holder of that mutex (the getters,
+    /// `put_*`, `invalidate`) does a bounded map operation with no
+    /// safepoint poll in between, so a stopped mutator can never be
+    /// parked while holding it.
+    pub fn remap_and_sweep(
+        vm: usize,
+        pointer_map: &std::collections::HashMap<usize, usize>,
+        heap: &crate::memory::vm_heap::VmHeap,
+    ) {
+        let mut tables = map().lock();
+        // Only this VM's table: `heap` belongs to `vm`, and asking it
+        // about another VM's addresses would report every one of them
+        // dead and silently flush that VM's cache.
+        let Some(table) = tables.get_mut(&vm) else {
+            return;
+        };
+        let stats = crate::memory::addr_keyed::remap_and_sweep(table, pointer_map, &|addr| {
+            heap.is_object_address(addr).is_some()
+        });
+        if stats.moved == 0 && stats.dropped == 0 {
+            return;
+        }
+        // Re-keying moves addresses and sweeping removes them, so the
+        // filter no longer describes the table. (`table`'s borrow ends
+        // above, at its last use.)
+        rebuild_filter(&tables);
+        tracing::debug!(
+            "gpu input_cache post-GC: {} re-keyed, {} retained, {} dropped",
+            stats.moved,
+            stats.retained,
+            stats.dropped
+        );
+    }
+
+    /// Diagnostic: entry count for `vm`.
+    pub fn len(vm: usize) -> usize {
+        map().lock().get(&vm).map_or(0, FxHashMap::len)
     }
 }
 
@@ -4106,7 +4267,7 @@ fn marshal_array_arg(
         ) => {{
             // (a) Cache check.
             let (arc, uploaded): (Arc<cuda_bridge::DeviceBuffer<$ty>>, bool) =
-                if let Some(arc) = $cache_get(obj_ref, len) {
+                if let Some(arc) = $cache_get(shared.vm_identity, obj_ref, len) {
                     (arc, false)
                 } else {
                     // (b) Miss — upload, reading the JVM heap arena directly
@@ -4115,7 +4276,7 @@ fn marshal_array_arg(
                     let buf = $upload_obj(ctx, obj_ref, &shared.mem.heap, token)
                         .map_err(|e| format!("upload {} (len={len}): {e}", $tag))?;
                     let arc = Arc::new(buf);
-                    $cache_put(obj_ref, len, arc.clone());
+                    $cache_put(shared.vm_identity, obj_ref, len, arc.clone());
                     (arc, true)
                 };
             // (c) Build push closure + optional writeback. Read-only

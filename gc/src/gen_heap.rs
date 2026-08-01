@@ -230,6 +230,15 @@ const HUMONGOUS_YOUNG_FRACTION_PERCENT: usize = 50;
 const HUMONGOUS_ABSOLUTE_CAP_BYTES: usize = 256 * 1024 * 1024;
 
 /// Maximum allowed heap expansion factor (4x the initial size).
+///
+/// This is only ONE of the two ceilings on young growth, and on the
+/// production path it is not the binding one: heaps built from `-Xmx` via
+/// [`GenerationalHeap::with_capacity`] are additionally clamped so that
+/// `2 * young_semi + old_gen <= Xmx` (see `max_heap_bytes`), which under that
+/// constructor's 50/50 split lands exactly on the initial semi. This factor
+/// still governs the explicit-size constructors ([`GenerationalHeap::new`],
+/// [`GenerationalHeap::with_sizes`]), which take absolute arena sizes and
+/// therefore have no budget to divide.
 const MAX_HEAP_EXPANSION_FACTOR: usize = 4;
 
 /// If GC reclaims less than this fraction of young gen, expand the heap.
@@ -303,6 +312,15 @@ pub static SWEEP_BAD_FORWARD_HITS: AtomicU64 = AtomicU64::new(0);
 /// boundary). A real object's extent always fits inside the arena it was
 /// allocated from, so out-of-extent headers are rejected without marking.
 pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Old-gen mark-worklist entries whose `kind` byte is not a valid `ObjectKind`
+/// discriminant — i.e. the mark BFS was handed an address that is not an object
+/// base and decoded whatever bytes were there as an `ObjectHeader`.
+///
+/// See `docs/known-issues/gc/gc-old-gen-mark-accepts-unvalidated-addresses.md`.
+/// A non-zero value here means a side table is holding a dangling old-gen
+/// address, or a reference slot holds a non-base word.
+pub static OLDMARK_BAD_KIND_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Conservative root candidates may be interior heap addresses.  Only the
 /// opt-in A2 forensic mode reports rejected candidates; normal collection
@@ -743,6 +761,29 @@ pub struct GenerationalHeap {
     concurrent_gc_state: Option<Arc<ConcurrentGcState>>,
     /// Maximum young semi-space size (limits growth).
     max_young_semi_size: usize,
+    /// The `-Xmx` budget for the WHOLE committed heap:
+    /// `young_from.capacity() + young_to.capacity() + old_gen.capacity()`
+    /// must never exceed it.
+    ///
+    /// Before this field existed, `-Xmx` bounded only the *initial* split.
+    /// [`with_sizes`] derived the young growth ceiling from the young semi
+    /// alone (`young_semi * MAX_HEAP_EXPANSION_FACTOR`), with no reference to
+    /// the total or to the old generation, so adaptive expansion could commit
+    /// far more than the user asked for: measured at `--Xmx 1g`, a live run
+    /// held `young_from` 512 MiB + `young_to` **1024 MiB** + old 512 MiB — 2 GiB
+    /// of Java heap, 4.0 GiB RSS — and was killed by the Linux OOM killer
+    /// instead of throwing a catchable `OutOfMemoryError`. With the default
+    /// 1/4-of-RAM ergonomic `-Xmx` that ceiling scales with the host: on a
+    /// 31 GiB box the ~7.75 GiB default admitted a ~19 GiB committed heap.
+    ///
+    /// `usize::MAX` means "no budget" and reproduces the historical
+    /// behaviour exactly. That is what the explicit-size constructors
+    /// ([`new`], [`with_sizes`]) pass: they take absolute arena sizes rather
+    /// than a heap budget to divide, and the GC's own tests drive them with
+    /// deliberately tiny arenas that rely on expansion. Only
+    /// [`with_capacity`] — the sole production path, fed straight from
+    /// `-Xmx` via `VmHeap::new_with_overrides` — sets a real budget.
+    max_heap_bytes: usize,
     /// Primary NUMA node hint for the young-gen slow path.
     ///
     /// Records the topology's preferred home node for this heap (defaults
@@ -852,17 +893,23 @@ impl GenerationalHeap {
     }
 
     /// Create a generational heap with custom young semi-space and old gen sizes.
+    ///
+    /// Takes absolute arena sizes, not a heap budget to divide, so it imposes
+    /// no whole-heap ceiling (`max_heap_bytes = usize::MAX`) and keeps the
+    /// historical `young_semi * MAX_HEAP_EXPANSION_FACTOR` growth ceiling.
+    /// The production path is [`with_capacity`], which does budget itself.
     pub fn with_sizes(young_semi_size: usize, old_gen_size: usize) -> Self {
         let max_young = young_semi_size
             .max(1024)
             .saturating_mul(MAX_HEAP_EXPANSION_FACTOR);
-        Self::with_sizes_and_max_young(young_semi_size, old_gen_size, max_young)
+        Self::with_sizes_and_max_young(young_semi_size, old_gen_size, max_young, usize::MAX)
     }
 
     fn with_sizes_and_max_young(
         young_semi_size: usize,
         old_gen_size: usize,
         max_young_semi_size: usize,
+        max_heap_bytes: usize,
     ) -> Self {
         let young_semi_size = young_semi_size.max(1024);
         let old_gen_size = old_gen_size.max(1024);
@@ -910,6 +957,7 @@ impl GenerationalHeap {
             satb_queue: None,
             concurrent_gc_state: None,
             max_young_semi_size: max_young,
+            max_heap_bytes,
             numa_node_hint,
             numa_num_nodes,
             stats: HeapStats::default(),
@@ -1056,7 +1104,45 @@ impl GenerationalHeap {
         // underflow when the clamped young is larger than half of it.
         let young_pair = young_semi.saturating_mul(2);
         let old_size = total.saturating_sub(young_pair).max(512);
-        Self::with_sizes(young_semi, old_size)
+        // `-Xmx N` means "this process may commit N bytes of Java heap", not
+        // "start at N and grow from there". The young growth ceiling is
+        // therefore whatever is left of the budget after the (fixed,
+        // non-expandable) old generation, split across the two semi-spaces:
+        // both semis must fit, because a copying collection needs a to-space
+        // as large as the from-space it is evacuating, and the pair swaps
+        // roles every cycle.
+        //
+        // Under this constructor's own 50/50 split that ceiling equals the
+        // initial semi, i.e. expansion has nothing left to give — which is
+        // the correct outcome, not a loss: the young semi already *starts* at
+        // the largest size the budget permits, so a heap that would previously
+        // have grown into it is strictly better off starting there. What the
+        // clamp removes is only the ability to exceed `-Xmx`. A workload that
+        // genuinely needs more room now surfaces a catchable
+        // `OutOfMemoryError` (the honest answer, and what HotSpot does) rather
+        // than silently committing 2.5x its stated maximum and risking a
+        // kernel OOM-kill, which is unrecoverable.
+        //
+        // `max(young_semi)` keeps the ceiling coherent for the tiny-heap
+        // corner where `YOUNG_SEMI_MIN` clamping pushed the pair past `total`.
+        let max_young_semi = total.saturating_sub(old_size) / 2;
+        let max_young_semi = max_young_semi.max(young_semi);
+        Self::with_sizes_and_max_young(young_semi, old_size, max_young_semi, total)
+    }
+
+    /// The `-Xmx` budget for the whole committed heap, or `usize::MAX` when
+    /// this heap was built from explicit arena sizes (see [`max_heap_bytes`]).
+    pub fn heap_budget_bytes(&self) -> usize {
+        self.max_heap_bytes
+    }
+
+    /// Bytes currently committed across both young semi-spaces and the old
+    /// generation — the quantity [`heap_budget_bytes`] bounds.
+    pub fn committed_heap_bytes(&self) -> usize {
+        let from = self.young_from.lock().capacity();
+        let to = self.young_to.lock().capacity();
+        let old = self.old_gen.lock().capacity();
+        from + to + old
     }
 
     // ----- Allocation --------------------------------------------------------
@@ -1816,9 +1902,12 @@ impl GenerationalHeap {
                 // SAFETY: `fwd_ptr` is a non-null forwarding address (checked above) installed by evacuation,
                 // pointing at the object's live relocated header; read-only, diagnostic-only (stale-objref debug) path.
                 let fwd_header = unsafe { &*(fwd_ptr as *const ObjectHeader) };
+                // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`.
+                // `fwd_ptr` came out of a header this very diagnostic suspects,
+                // so its target is not trustworthy enough to decode as an enum.
                 (
                     fwd_header.class_id.as_u32(),
-                    format!("{:?}", fwd_header.kind),
+                    format!("0x{:02x}", fwd_header.kind as u8),
                 )
             } else {
                 (u32::MAX, "<null-forward>".to_string())
@@ -1854,10 +1943,10 @@ impl GenerationalHeap {
                                 / crate::card_table::CARD_SIZE;
                             let _ = write!(
                                 holders,
-                                "\n  OLD holder {:p} class_id={} kind={:?} slot={} card_dirty_now={}",
+                                "\n  OLD holder {:p} class_id={} kind=0x{:02x} slot={} card_dirty_now={}",
                                 optr,
                                 oh.class_id.as_u32(),
-                                oh.kind,
+                                oh.kind as u8,
                                 idx,
                                 self.card_table.is_dirty(cidx),
                             );
@@ -3753,6 +3842,10 @@ impl GenerationalHeap {
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
+        // Fresh cycle: no old-gen reclamation has happened yet (see
+        // `gc_quiescence::OLD_GEN_RECLAIMED`). The moving path resets this in
+        // `collect_garbage_inner`; this path can be entered directly.
+        crate::gc_quiescence::set_old_gen_reclaimed(false);
         let mut result = self.sweep_young_non_moving(roots, finalizer_addrs);
         // Selective promotion commits young -> old relocations inside
         // `sweep_young_non_moving`. Registered external-root providers can own
@@ -3816,7 +3909,13 @@ impl GenerationalHeap {
             && old_capacity > 0
             && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
         {
-            let old_freed = self.sweep_old_gen_non_moving(roots);
+            let (old_freed, old_survivors) = self.sweep_old_gen_non_moving(roots);
+            // This cycle DID reclaim old-gen storage: a freed block is back on
+            // the free list, so an old-gen address is no longer self-evidently
+            // live. `old_survivors` carries the identity entries that make
+            // "absent from the map" an exact death proof for watched addresses.
+            crate::gc_quiescence::set_old_gen_reclaimed(true);
+            result.0.pointer_map.extend(old_survivors);
             result.0.stats.bytes_freed += old_freed;
             self.stats
                 .bytes_freed_old
@@ -3883,6 +3982,11 @@ impl GenerationalHeap {
             let on = *G.get_or_init(|| gc_flags().dbg_gcpause);
             PauseTimer(on.then(std::time::Instant::now))
         };
+        // Fresh cycle: no old-gen reclamation has happened yet. Phase 5 below
+        // sets this when the mark-compact major GC runs, and
+        // `run_non_moving_young_cycle` does the same for the in-place old
+        // sweep. See `gc_quiescence::OLD_GEN_RECLAIMED`.
+        crate::gc_quiescence::set_old_gen_reclaimed(false);
         // Phase 6 #1: spin-yield until every live `SafepointToken` has
         // dropped. While a kernel is reading a JVM array on the GPU, we
         // must not move that array — a single token held anywhere on
@@ -5308,6 +5412,12 @@ impl GenerationalHeap {
                 old_gen.used() * 100 / old_gen.capacity(),
             );
             let old_used_before = old_gen.used();
+            // Sliding compaction moves live old-gen objects and zeroes the
+            // freed tail, so an old-gen address stops being a survival proof
+            // from here on. `OldGen::compact` emits an identity entry for every
+            // watched object that stayed put, so `compact_map` membership is
+            // the exact replacement proof.
+            crate::gc_quiescence::set_old_gen_reclaimed(true);
             let compact_map = Self::major_gc(roots, &young_from, &mut old_gen);
             // CRITICAL FIX (heavy binary-trees GC corruption):
             //
@@ -5453,7 +5563,21 @@ impl GenerationalHeap {
         // (`System.gc` at well under 50% full) does not.
         if freed_percent < GC_EXPANSION_THRESHOLD_PERCENT && bytes_before >= from_cap_before / 2 {
             let current_cap = young_to.capacity();
-            let new_cap = (current_cap * 2).min(self.max_young_semi_size);
+            // Whole-heap budget (see `max_heap_bytes`). The steady state after
+            // this growth has BOTH semi-spaces at `new_cap` — they swap roles
+            // every cycle and a copying collection needs a to-space as large
+            // as the from-space — so the admissible ceiling is
+            // `(Xmx - old_capacity) / 2`, not `Xmx - old - other_semi`.
+            // `usize::MAX` (the explicit-size constructors) leaves this
+            // saturating to "no bound", reproducing the historical behaviour.
+            let budget_ceiling = if self.max_heap_bytes == usize::MAX {
+                usize::MAX
+            } else {
+                self.max_heap_bytes.saturating_sub(old_gen.capacity()) / 2
+            };
+            let new_cap = (current_cap * 2)
+                .min(self.max_young_semi_size)
+                .min(budget_ceiling.max(current_cap));
             if new_cap > current_cap {
                 tracing::debug!(
                     "GC: low reclamation ({}% freed) — expanding young to-space {} → {} bytes",
@@ -7519,8 +7643,8 @@ impl GenerationalHeap {
                     eprintln!(
                         "[quiesce] FIRST corruption: quiescence depth={} enter_count={} leave_count={}",
                         crate::gc_quiescence::depth(),
-                        crate::gc_quiescence::ENTER_COUNT.load(Ordering::Relaxed),
-                        crate::gc_quiescence::LEAVE_COUNT.load(Ordering::Relaxed),
+                        crate::gc_quiescence::ENTER_COUNT.get(),
+                        crate::gc_quiescence::LEAVE_COUNT.get(),
                     );
                 }
                 tracing::warn!(
@@ -7744,8 +7868,8 @@ impl GenerationalHeap {
                 if foff > cursor && foff < cursor + total_size {
                     if gc_flags().dbg_a2 && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) < 30 {
                         eprintln!(
-                            "[A2-FL] CLAMP over-sized object @{} computed_size={} (kind={:?} class_id={}) oversteps free hole at {} — retaining + resyncing",
-                            cursor, total_size, header.kind, header.class_id.as_u32(), foff,
+                            "[A2-FL] CLAMP over-sized object @{} computed_size={} (kind=0x{:02x} class_id={}) oversteps free hole at {} — retaining + resyncing",
+                            cursor, total_size, header.kind as u8, header.class_id.as_u32(), foff,
                         );
                     }
                     A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
@@ -8293,13 +8417,20 @@ impl GenerationalHeap {
     /// Run a non-moving mark-sweep of old space while conservative JIT roots are
     /// active.  The supplied roots are copied only because the shared marker's
     /// compacting mode can rewrite its mutable root slice; this mode never does.
-    fn sweep_old_gen_non_moving(&self, roots: &[ObjectRef]) -> usize {
+    /// Returns `(bytes_reclaimed, watched_survivor_identity_map)`. The second
+    /// element is the survival proof post-GC reference processing needs: this
+    /// sweep frees dead old-gen blocks in place, so after it runs "the address
+    /// is inside old gen" no longer implies "the object is still there".
+    fn sweep_old_gen_non_moving(
+        &self,
+        roots: &[ObjectRef],
+    ) -> (usize, HashMap<usize, usize>) {
         let young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
         let mut root_shadow = roots.to_vec();
-        let _ = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
-        before.saturating_sub(old_gen.used())
+        let survivors = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
+        (before.saturating_sub(old_gen.used()), survivors)
     }
 
     /// Run a major garbage collection on the old generation using mark-compact.
@@ -8517,6 +8648,15 @@ impl GenerationalHeap {
         }
 
         if !compact {
+            // Watched addresses (every address the reference processor holds —
+            // see `ReferenceProcessor::all_tracked_addrs`) need an explicit
+            // survival proof from this sweep: it frees dead blocks in place,
+            // so post-GC reference processing can no longer infer survival
+            // from "the address is inside old gen". Emit an identity entry for
+            // each watched survivor, mirroring what `OldGen::compact` already
+            // does for watched objects that happen not to move.
+            let watched = crate::gc_quiescence::watched_referents_snapshot();
+            let mut watched_survivors: HashMap<usize, usize> = HashMap::new();
             let objects = old_gen.walk_objects();
             for (obj_ptr, total_size) in objects {
                 // SAFETY: `walk_objects` returns valid old-gen object starts.
@@ -8526,6 +8666,12 @@ impl GenerationalHeap {
                 let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
                 if header.gc_flags & GC_FLAG_MARKED != 0 {
                     header.gc_flags &= !GC_FLAG_MARKED;
+                    if watched
+                        .as_ref()
+                        .is_some_and(|w| w.contains(&(obj_ptr as usize)))
+                    {
+                        watched_survivors.insert(obj_ptr as usize, obj_ptr as usize);
+                    }
                 } else {
                     // A2 forensic breadcrumb (CRATONVM_DBG_A2): preserve the
                     // victim's pre-free identity so a later zero-header /
@@ -8545,7 +8691,7 @@ impl GenerationalHeap {
                     unsafe { old_gen.free(obj_ptr, total_size) };
                 }
             }
-            return HashMap::new();
+            return watched_survivors;
         }
 
         // ---- Compact phase ---- sliding compaction of old gen ----
@@ -8700,6 +8846,16 @@ impl GenerationalHeap {
 
     /// Scan a single object's reference slots for old-gen pointers and mark them.
     fn scan_object_for_old_refs(obj_ptr: *mut u8, old_gen: &OldGen, worklist: &mut Vec<*mut u8>) {
+        // A worklist entry whose `kind` byte is not a valid discriminant was
+        // never an object base: some push site handed us a dangling or interior
+        // address. Counted (not rejected) here — rejecting is the FIX, which is
+        // deliberately not part of this diagnostic commit. See
+        // `docs/known-issues/gc/gc-old-gen-mark-accepts-unvalidated-addresses.md`.
+        // SAFETY: every push site range-checked `obj_ptr` against old gen, so
+        // offset 4 is mapped.
+        if unsafe { *obj_ptr.add(OBJECT_KIND_OFFSET) } > 2 {
+            OLDMARK_BAD_KIND_HITS.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: `obj_ptr` is a live old-gen object from the mark worklist; its header is valid.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
         // DoHead comb-7 fix (2026-07-03): validate the claimed extent before
@@ -9076,16 +9232,82 @@ impl GenerationalHeap {
     {
         self.try_alloc_young_initialized(size, init)
             .unwrap_or_else(|| {
-                let from = self.young_from.lock();
-                eprintln!(
-                    "FATAL: OutOfMemoryError: young gen exhausted — tried to allocate {} bytes, \
-                 from-space has {}/{} used",
-                    size,
-                    from.used(),
-                    from.capacity(),
-                );
+                self.report_fatal_oom(size);
                 std::process::abort();
             })
+    }
+
+    /// Print the full generational picture behind a "both generations are
+    /// exhausted" abort.
+    ///
+    /// The historical one-line message named only the young from-space, which
+    /// reads as "the young gen is too small" even when the actual blocker is a
+    /// full (or badly fragmented) old generation — the spill target every
+    /// panicking allocator tries before it reaches here. Naming old-gen
+    /// occupancy, its largest free block, and the GC counters separates the
+    /// three very different situations that land on this line: a genuinely
+    /// full heap, a heap that is mostly garbage but was never collected
+    /// (`minor_gc` stuck), and an old gen with free bytes but no block large
+    /// enough for the request.
+    fn report_fatal_oom(&self, size: usize) {
+        let (yf_used, yf_cap) = {
+            let f = self.young_from.lock();
+            (f.used(), f.capacity())
+        };
+        let (yt_used, yt_cap) = {
+            let t = self.young_to.lock();
+            (t.used(), t.capacity())
+        };
+        let (og_used, og_cap, og_largest, og_blocks) = {
+            let og = self.old_gen.lock();
+            (
+                og.used(),
+                og.capacity(),
+                og.largest_free_block(),
+                og.free_block_count(),
+            )
+        };
+        let s = self.stats.snapshot();
+        let committed = yf_cap + yt_cap + og_cap;
+        let budget = if self.max_heap_bytes == usize::MAX {
+            "unbounded (explicit arena sizes)".to_string()
+        } else {
+            format!("{}", self.max_heap_bytes)
+        };
+        eprintln!(
+            "FATAL: OutOfMemoryError: young gen exhausted — tried to allocate {} bytes, \
+             from-space has {}/{} used",
+            size, yf_used, yf_cap,
+        );
+        eprintln!(
+            "FATAL-OOM budget: committed heap {committed} bytes \
+             (young_from + young_to + old_gen) against an -Xmx budget of {budget}",
+        );
+        eprintln!(
+            "FATAL-OOM detail: young_to {}/{} used; old_gen {}/{} used \
+             (largest free block {}, {} free blocks); minor_gc={} major_gc={} \
+             promoted_bytes={} old_allocs={} young_allocs={}",
+            yt_used,
+            yt_cap,
+            og_used,
+            og_cap,
+            og_largest,
+            og_blocks,
+            s.minor_gc_count,
+            s.major_gc_count,
+            s.bytes_promoted,
+            s.old_allocations,
+            s.young_allocations,
+        );
+        // Opt-in: the allocating call chain. Release builds carry line tables,
+        // so this names the exact panicking-allocator caller — i.e. which
+        // native / VM-internal path could not tolerate a GC-and-retry.
+        if std::env::var_os("CRATONVM_DBG_OOM_BT").is_some() {
+            eprintln!(
+                "FATAL-OOM backtrace:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
     }
 
     /// Generate the next identity hash code.
@@ -10533,24 +10755,43 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
 #[cold]
 #[inline(never)]
 fn warn_corrupt_array_header(header: &ObjectHeader) {
+    // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`. This
+    // header has already been judged corrupt, and `ArrayElementType`'s valid
+    // discriminants are 4..=11, so an out-of-range byte here is *more* likely
+    // than for `ObjectKind`, not less.
     tracing::warn!(
-        "GC: implausible array_length {} (element_type={:?}) in heap object \
+        "GC: implausible array_length {} (element_type=0x{:02x}) in heap object \
          header — treating as corrupt; caller will stop/skip the walk",
         header.array_length(),
-        header.element_type,
+        header.element_type as u8,
     );
 }
 
 /// Cold diagnostic for a non-`Object` kind reaching the legacy-object sizing
 /// arm. See [`warn_corrupt_array_header`] for why this is out-of-line.
+///
+/// Formats the RAW kind byte, never `header.kind` through `Debug`. This
+/// function is called *because* the kind is not `Object`, and one of the two
+/// documented reasons for that (see the call site in
+/// [`gen_object_total_size`]) is a byte that is not a valid `ObjectKind`
+/// discriminant at all — a `GAP_FILLER_CLASS_ID` sentinel puts the low byte of
+/// its length field (8/16/24/32) exactly where `kind` lives. The derived
+/// `Debug` for a `#[repr(u8)]` enum indexes a static variant-name table by
+/// discriminant, so `{:?}` on 8/16/24/32 reads a `&str` from past the end of
+/// that table and the formatter then walks a wild pointer — turning a
+/// recoverable corrupt-header detection into a hard `SIGSEGV` inside
+/// `core::fmt`. The sweep's own corrupt-header path already learned this (see
+/// the "format the RAW kind byte" note in `sweep_young_non_moving`); this is
+/// the same hazard at the sibling site, and it is the one that killed H2's
+/// `TestOutOfMemory` under sustained heap pressure.
 #[cold]
 #[inline(never)]
 fn warn_non_object_kind_in_object_arm(header: &ObjectHeader) {
     tracing::warn!(
-        "GC: header kind={:?} reached the legacy-object sizing arm (shape={}, \
+        "GC: header kind=0x{:02x} reached the legacy-object sizing arm (shape={}, \
          class_id={}); a region sentinel is not a sizable object — treating as \
          corrupt so the walker can re-sync.",
-        header.kind,
+        header.kind as u8,
         header.num_slots(),
         header.class_id.as_u32(),
     );
@@ -11038,7 +11279,11 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         // precede `gen_object_total_size`" notes); this is the backstop if one
         // does not. Note the optimiser is entitled to assume `kind` is in
         // 0..=2, so treat that second case as belt-and-braces, not a guarantee.
-        if header.kind != ObjectKind::Object {
+        // Compare the RAW byte rather than the enum: the paragraph above notes
+        // the optimiser may assume `kind` is a valid 0..=2 discriminant, which
+        // is precisely what would let it fold this screen away for the
+        // out-of-range case the screen exists to catch.
+        if header.kind as u8 != ObjectKind::Object as u8 {
             warn_non_object_kind_in_object_arm(header);
             return 0;
         }
@@ -11920,6 +12165,181 @@ mod tests {
         );
     }
 
+    /// Regression: a corrupt-header diagnostic must format the RAW kind byte,
+    /// never `header.kind` through `Debug`.
+    ///
+    /// `gen_object_total_size` calls `warn_non_object_kind_in_object_arm`
+    /// exactly when the kind is not `Object`, and one documented way to get
+    /// there is a byte that is not a valid `ObjectKind` discriminant at all —
+    /// a `GAP_FILLER_CLASS_ID` sentinel puts the low byte of its length field
+    /// (8/16/24/32) where `kind` lives. The derived `Debug` for a
+    /// `#[repr(u8)]` enum indexes a static variant-name table by discriminant,
+    /// so `{:?}` on 24 reads a `&str` from past the end of that table and the
+    /// formatter then walks a wild pointer: a hard `SIGSEGV` inside
+    /// `core::fmt`, from the very code whose job is to *report* the corruption
+    /// and let the walker re-sync.
+    ///
+    /// That is what killed H2's `org.h2.test.db.TestOutOfMemory` after ~5
+    /// minutes of sustained heap pressure (gdb: `next_code_point` <-
+    /// `core::fmt::write` <- `warn_non_object_kind_in_object_arm` <-
+    /// `gen_object_total_size` <- `scan_object_for_old_refs` <- `major_gc`).
+    ///
+    /// The subscriber below is load-bearing: `tracing::warn!` only materialises
+    /// its arguments if something is listening, so without one this test would
+    /// pass on the broken code.
+    #[test]
+    fn corrupt_kind_byte_is_reported_as_a_raw_byte_not_debug_formatted() {
+        use std::sync::{Arc, Mutex};
+
+        struct Capture(Arc<Mutex<String>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _i: &tracing::span::Id, _v: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _i: &tracing::span::Id, _f: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct V<'a>(&'a mut String);
+                impl tracing::field::Visit for V<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        // Forcing the format is the whole point: this is the
+                        // step that dereferenced the out-of-range variant name.
+                        let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                    }
+                }
+                if let Ok(mut guard) = self.0.lock() {
+                    event.record(&mut V(&mut guard));
+                }
+            }
+            fn enter(&self, _i: &tracing::span::Id) {}
+            fn exit(&self, _i: &tracing::span::Id) {}
+        }
+
+        // A header whose `kind` byte is 24 — the low byte of a 24-byte gap
+        // filler's length field, i.e. the exact real-world shape the call
+        // site's own comment names. `u64` backing gives the 8-byte alignment
+        // an `ObjectHeader` requires.
+        let mut backing = vec![0u64; HEADER_SIZE / 8 + 2];
+        let base = backing.as_mut_ptr() as *mut u8;
+        // SAFETY: `backing` is at least `HEADER_SIZE` bytes and 8-aligned.
+        unsafe {
+            std::ptr::write(
+                base as *mut ObjectHeader,
+                ObjectHeader::new(
+                    ClassId::new(7),
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    1,
+                    0,
+                    3,
+                ),
+            );
+            *base.add(OBJECT_KIND_OFFSET) = 24;
+        }
+        // SAFETY: the buffer holds a fully written header; the `kind` byte is
+        // deliberately out of range, which is precisely the state under test.
+        let header = unsafe { &*(base as *const ObjectHeader) };
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let sink = Capture(Arc::clone(&captured));
+        let size = tracing::subscriber::with_default(sink, || gen_object_total_size(header));
+
+        // The walker contract: an unsizable header reports 0 so the caller
+        // re-syncs rather than striding by a meaningless number.
+        assert_eq!(
+            size, 0,
+            "an out-of-range kind byte must be reported as unsizable",
+        );
+        let out = captured.lock().expect("capture mutex").clone();
+        assert!(
+            out.contains("kind=0x18"),
+            "the diagnostic must name the raw kind byte (0x18 = 24); got: {out}",
+        );
+    }
+
+    /// Regression: `-Xmx` bounds the WHOLE committed heap, not just its
+    /// initial split.
+    ///
+    /// Before the budget existed, `with_sizes` derived the young growth
+    /// ceiling from the young semi alone (`young_semi * 4`), so adaptive
+    /// expansion could commit up to 2.5x `-Xmx`: measured live at
+    /// `--Xmx 1g`, `young_from` 512 MiB + `young_to` 1024 MiB + old 512 MiB,
+    /// 4.0 GiB RSS, killed by the Linux OOM killer rather than throwing a
+    /// catchable OutOfMemoryError. With the 1/4-of-RAM ergonomic default the
+    /// same factor applied to a multi-GiB heap.
+    ///
+    /// The invariant this pins is the one the expansion path enforces:
+    /// both semi-spaces plus the old generation fit inside `-Xmx`, at the
+    /// growth ceiling and not merely at construction. Both semis are counted
+    /// because they swap roles every cycle and a copying collection needs a
+    /// to-space as large as the from-space it evacuates.
+    #[test]
+    fn with_capacity_growth_ceiling_stays_inside_the_xmx_budget() {
+        for &total in &[
+            64 * 1024,
+            256 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024_usize,
+            16 * 1024 * 1024 * 1024_usize,
+        ] {
+            let h = GenerationalHeap::with_capacity(total);
+            let old = h.old_gen_capacity();
+            let max_semi = h.max_young_semi_size;
+
+            assert_eq!(
+                h.heap_budget_bytes(),
+                total,
+                "with_capacity must record -Xmx as the heap budget",
+            );
+            assert!(
+                h.committed_heap_bytes() <= total,
+                "initial commit {} exceeds -Xmx {}",
+                h.committed_heap_bytes(),
+                total,
+            );
+            assert!(
+                2 * max_semi + old <= total,
+                "growth ceiling exceeds -Xmx {}: 2 * {} (semi) + {} (old) = {}",
+                total,
+                max_semi,
+                old,
+                2 * max_semi + old,
+            );
+            // The clamp must not shrink the *initial* semi — the whole point
+            // is that young already starts at the largest size the budget
+            // allows, so nothing is given up by capping growth.
+            assert_eq!(
+                max_semi,
+                h.young_semi_capacity(),
+                "the growth ceiling should equal the initial semi under the \
+                 50/50 split, not shrink it",
+            );
+        }
+    }
+
+    /// The explicit-size constructors take absolute arena sizes rather than a
+    /// budget to divide, so they must keep the historical unbounded growth
+    /// ceiling — the GC's own tests drive them with deliberately tiny arenas
+    /// that rely on expansion.
+    #[test]
+    fn with_sizes_keeps_the_historical_unbounded_growth_ceiling() {
+        let h = GenerationalHeap::with_sizes(64 * 1024, 128 * 1024);
+        assert_eq!(h.heap_budget_bytes(), usize::MAX);
+        assert_eq!(
+            h.max_young_semi_size,
+            64 * 1024 * MAX_HEAP_EXPANSION_FACTOR,
+            "with_sizes must keep young_semi * MAX_HEAP_EXPANSION_FACTOR",
+        );
+    }
+
     /// Regression: `with_capacity` splits the heap 50/50 (young_semi = 25%
     /// of total), not the older 25/75 (young_semi = 12.5% of total) split.
     ///
@@ -11933,7 +12353,15 @@ mod tests {
     /// `docs/internal/performance/binarytrees-bt18-half-gap-20260730.md` —
     /// because this workload's young GC already always falls back to a
     /// non-moving sweep, and a smaller semispace just means more of those
-    /// expensive fallbacks. Reverted; `with_capacity` stays uncapped.
+    /// expensive fallbacks. Reverted; `with_capacity`'s *initial* semi stays
+    /// uncapped and exactly `total / 4` — which is what this test pins.
+    ///
+    /// What DID change (2026-07-31) is the growth *ceiling*: it is now the
+    /// `-Xmx` budget left over after the old generation, so the committed heap
+    /// can no longer exceed `-Xmx` (see
+    /// `with_capacity_growth_ceiling_stays_inside_the_xmx_budget`). The two
+    /// are independent — nothing below is affected, because under the 50/50
+    /// split the ceiling lands exactly on the initial semi this test asserts.
     ///
     /// We test the same -Xmx values the orchestrator uses to validate
     /// QuickBenchLong's binary-trees-d18 kernel:
@@ -12656,7 +13084,7 @@ mod tests {
         assert!(heap.is_in_old(roots[1].as_ptr()));
 
         let old_used_before = heap.old_gen_used();
-        let reclaimed = heap.sweep_old_gen_non_moving(&[live_old]);
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old]);
 
         assert!(
             reclaimed > 0,
@@ -12667,6 +13095,115 @@ mod tests {
             heap.get_field(live_old, 0).as_int(),
             Some(4242),
             "the rooted old object must stay at its original address"
+        );
+    }
+
+    /// HIB-CV-32-family regression (`TestMVStoreCachePerformance` SIGSEGV):
+    /// after an old-gen reclamation, a WATCHED old-gen address that did NOT
+    /// survive must be reported dead by the exact predicate post-GC reference
+    /// processing uses — even though the permissive `is_addr_live` still
+    /// reports every old-gen address live.
+    ///
+    /// Before the fix, reference processing judged such an entry "survived",
+    /// never pruned it, and every subsequent collection wrote a referent
+    /// pointer through the stale address into whatever now occupied that
+    /// memory (the zeroed compaction tail, or a live object slid onto it).
+    #[test]
+    fn in_place_old_sweep_proves_watched_survivors_and_dead_ones() {
+        let heap = GenerationalHeap::with_sizes(4 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        let dead = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(live, 0, Value::Int(4242));
+        heap.set_field(dead, 0, Value::Int(-1));
+
+        let mut roots = vec![live, dead];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let live_old = roots[0].as_ptr() as usize;
+        let dead_old = roots[1].as_ptr() as usize;
+        assert!(heap.is_in_old(live_old as *mut u8));
+        assert!(heap.is_in_old(dead_old as *mut u8));
+
+        // Both addresses are watched — exactly what the VM publishes for every
+        // address the reference processor holds.
+        crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
+        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]]);
+        crate::gc_quiescence::set_watched_referents(&[]);
+
+        assert!(reclaimed > 0, "the unreachable promotion must be reclaimed");
+        assert_eq!(
+            survivors.get(&live_old),
+            Some(&live_old),
+            "a watched old-gen survivor kept in place must get an IDENTITY \
+             pointer_map entry — that entry is the only survival proof post-GC \
+             reference processing has once old gen has been reclaimed"
+        );
+        assert!(
+            !survivors.contains_key(&dead_old),
+            "a reclaimed old-gen object must NOT be reported as a survivor"
+        );
+    }
+
+    /// Companion to the above for the mark-COMPACT major GC, and the direct
+    /// statement of the defect: `is_addr_live` answers `true` for a dead
+    /// old-gen address (by design — it cannot see the pointer map), so the
+    /// exact predicate must be the one reference processing consults.
+    #[test]
+    fn explicit_full_gc_marks_dead_old_gen_watched_addr_as_not_surviving() {
+        let heap = GenerationalHeap::with_sizes(4 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        let dead = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(live, 0, Value::Int(4242));
+        heap.set_field(dead, 0, Value::Int(-1));
+
+        let mut roots = vec![live, dead];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let live_old = roots[0].as_ptr() as usize;
+        let dead_old = roots[1].as_ptr() as usize;
+        assert!(heap.is_in_old(live_old as *mut u8));
+        assert!(heap.is_in_old(dead_old as *mut u8));
+
+        crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
+        // Drop the reference to `dead` and force the old-gen mark-compact.
+        let mut live_roots = vec![roots[0]];
+        crate::gc_quiescence::request_major_gc();
+        let result = heap.collect_garbage(&stw(), &mut live_roots, &monitors);
+        crate::gc_quiescence::set_watched_referents(&[]);
+
+        assert!(
+            crate::gc_quiescence::old_gen_reclaimed_last_cycle(),
+            "the explicit major-GC request must have run an old-gen reclamation"
+        );
+        // The permissive predicate cannot tell the two apart — this is the
+        // behaviour the fix stops reference processing from relying on.
+        assert!(
+            heap.is_old_gen_addr(dead_old),
+            "precondition: the stale address is still inside the old-gen arena"
+        );
+        // The exact predicate can: the survivor has an entry (identity or
+        // relocated), the dead one has none.
+        let survived = |a: usize| {
+            result.pointer_map.contains_key(&a)
+                || (heap.is_old_gen_addr(a)
+                    && !crate::gc_quiescence::old_gen_reclaimed_last_cycle())
+        };
+        assert!(
+            survived(live_roots[0].as_ptr() as usize),
+            "the surviving watched Reference must be provable as alive"
+        );
+        assert!(
+            !survived(dead_old),
+            "a reclaimed watched old-gen address must be provable as DEAD — \
+             otherwise post-GC reference processing writes a referent pointer \
+             through it into whatever now occupies that memory (HIB-CV-32 \
+             family: TestMVStoreCachePerformance SIGSEGV)"
         );
     }
 
@@ -13171,6 +13708,154 @@ mod tests {
         let obj1 = heap.alloc_object(ClassId::new(0), 0);
         let obj2 = heap.alloc_object(ClassId::new(0), 0);
         assert_ne!(heap.identity_hash_code(obj1), heap.identity_hash_code(obj2),);
+    }
+
+    /// Half 1 of the open defect: after the NON-MOVING old-gen sweep,
+    /// `is_addr_live` still reports a freed block as live.
+    ///
+    /// `VmHeap::is_addr_live` answers `is_old_gen_addr(addr) ||
+    /// is_live_young_survivor(addr)`, and `is_old_gen_addr` is a bare range
+    /// check whose doc comment justifies itself with "a minor collection never
+    /// touches the old generation, so every old-gen object is live".
+    ///
+    /// That premise fails on the non-moving path.
+    /// `sweep_old_gen_non_moving` — the old-gen collector that runs whenever a
+    /// live JIT frame blocks the moving young collector, i.e. EVERY collection
+    /// in the H2 `TestOutOfMemory` window (`[moving-young] fallback:
+    /// reason=unregistered-jit-frame-on-stack`) — reclaims dead old-gen blocks
+    /// IN PLACE, and its own doc comment says "after it runs 'the address is
+    /// inside old gen' no longer implies 'the object is still there'". The two
+    /// comments contradict each other; this test shows which one is wrong.
+    ///
+    /// Consequence: every consumer that prunes a side table with
+    /// `pointer_map.contains_key(addr) || is_addr_live(addr)` — the `is_marked`
+    /// closure in `interpreter.rs` feeding `prune_external_roots`,
+    /// `reconcile_class_mirrors`/`rebuild_mirror_pins` and
+    /// `gc_reconcile_defining_loaders` — RETAINS the entry for a just-freed
+    /// object, leaving a dangling old-gen address for a later mark to decode.
+    ///
+    /// See `docs/known-issues/gc/gc-old-gen-mark-accepts-unvalidated-addresses.md`.
+    #[test]
+    #[ignore = "documents an OPEN defect: is_addr_live lies after the non-moving old-gen sweep"]
+    fn non_moving_old_sweep_leaves_is_addr_live_reporting_a_freed_block_as_live() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 8 * 1024);
+        let monitors = NoOpMonitors;
+
+        let keep = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(keep, 0, Value::Int(1));
+        let doomed = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(doomed, 0, Value::Int(2));
+
+        let mut roots = vec![keep, doomed];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        assert!(
+            heap.is_in_old(roots[0].as_ptr()) && heap.is_in_old(roots[1].as_ptr()),
+            "both objects must be promoted before the old-gen sweep is meaningful",
+        );
+
+        let keep = roots[0];
+        let doomed_addr = roots[1].as_ptr() as usize;
+
+        let live = vec![keep];
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live);
+        assert!(
+            reclaimed > 0,
+            "the sweep must actually have reclaimed the dropped object in place",
+        );
+
+        let vm = crate::vm_heap::VmHeap::Generational(heap);
+        assert!(
+            !vm.is_addr_live(doomed_addr),
+            "is_addr_live reported a block the non-moving old-gen sweep just \
+             freed in place (0x{doomed_addr:x}) as still live",
+        );
+    }
+
+    /// Half 2 of the open defect: the old-gen mark BFS accepts ANY in-range
+    /// word as an object base — no alignment test, no header plausibility test.
+    ///
+    /// `scan_object_for_old_refs` marks referents with
+    /// `if old_gen.contains(ref_ptr) { (*ref_ptr).gc_flags |= GC_FLAG_MARKED }`.
+    /// The ROOT seed in `old_gen_gc` documents this exact hazard and defends
+    /// against it ("ANY garbage address landing inside old gen's byte range got
+    /// `gc_flags` blindly RMW'd — the exact same corruption family, on the
+    /// OTHER generation"), but that screen was never carried to the BFS, to the
+    /// young->old ref-slot seed, or to the four pin/overlay seeds.
+    ///
+    /// Two consequences, both asserted here:
+    ///   * the mark bit is written into an unrelated LIVE object's payload,
+    ///     silently changing a Java field value — `0x41414141` becomes
+    ///     `0x43414141` (`|= GC_FLAG_MARKED`);
+    ///   * those payload bytes are then decoded as an `ObjectHeader`, which is
+    ///     how a byte that is not a valid `ObjectKind` discriminant reaches
+    ///     `gen_object_total_size` and the corrupt-header diagnostics.
+    ///
+    /// Together with the test above this is the whole path: a side table keeps
+    /// a dangling old-gen address because the prune predicate lies, and nothing
+    /// downstream re-checks it.
+    #[test]
+    #[ignore = "documents an OPEN defect: the old-gen mark BFS marks unvalidated addresses"]
+    fn old_gen_mark_accepts_an_interior_address_as_an_object_header() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let holder = heap.alloc_object(ClassId::new(0), 1);
+        let victim = heap.alloc_object(ClassId::new(0), 4);
+        for i in 0..4 {
+            heap.set_field(victim, i, Value::Int(0x4141_4141));
+        }
+        let mut roots = vec![holder, victim];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let (holder, victim) = (roots[0], roots[1]);
+        assert!(
+            heap.is_in_old(holder.as_ptr()) && heap.is_in_old(victim.as_ptr()),
+            "both objects must be in old gen for this to exercise the old-gen mark",
+        );
+
+        // An INTERIOR address of `victim`: 8-aligned, inside old gen, but not
+        // an object base. This is the shape a stale side-table entry takes once
+        // its block has been freed in place and the space reused.
+        let interior = unsafe { victim.as_ptr().add(HEADER_SIZE) };
+        assert!(
+            heap.is_in_old(interior),
+            "interior probe must stay in old gen"
+        );
+        // SAFETY: `interior` is a mapped old-gen address; storing it in a
+        // reference slot is exactly the state under test.
+        heap.set_field(
+            holder,
+            0,
+            Value::Object(Some(unsafe { ObjectRef::from_raw(interior) })),
+        );
+
+        let before = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            let mut major_roots = vec![holder, victim];
+            let _ =
+                GenerationalHeap::old_gen_gc(&mut major_roots, &young_from, &mut old_gen, false);
+        }
+        let after = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
+
+        let payload: Vec<i32> = (0..4)
+            .map(|i| heap.get_field(victim, i).as_int().unwrap_or(i32::MIN))
+            .collect();
+
+        assert_eq!(
+            payload,
+            vec![0x4141_4141_i32; 4],
+            "the old-gen mark wrote a mark bit into a LIVE object's payload",
+        );
+        assert_eq!(
+            after, before,
+            "the old-gen mark decoded an INTERIOR address as an ObjectHeader \
+             instead of rejecting it (bad-kind hits {before} -> {after})",
+        );
     }
 
     #[test]

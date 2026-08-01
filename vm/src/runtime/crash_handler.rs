@@ -1513,6 +1513,15 @@ pub fn install_crash_handler() {
     let prev = std::panic::take_hook();
 
     std::panic::set_hook(Box::new(move |panic_info| {
+        // The native allocators' heap-exhaustion unwind is a HANDLED condition
+        // (`safe_native_call` turns it into a catchable
+        // `java.lang.OutOfMemoryError`), not a crash. Writing an
+        // `hs_err_pid<pid>.log` for it would be wrong on its own AND would latch
+        // the one-report-per-process guard below, silently suppressing the
+        // report for a later real crash. See `crate::runtime::native_oom`.
+        if crate::runtime::native_oom::is_native_oom_panic(panic_info) {
+            return;
+        }
         // Prevent recursive entry if the handler itself panics.
         if CRASH_IN_PROGRESS
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -2044,6 +2053,39 @@ fn install_signal_handlers() {
                 }
                 async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
             }
+        }
+
+        // Did any JIT-emitted shadow push bail on the `end` guard before this
+        // crash? A non-zero count is the fingerprint of a compiled method that
+        // leaks shadow pushes — the guard keeps that from becoming a heap
+        // overwrite, but the leak itself is still a live defect, and the label
+        // names the method whose push bailed last
+        // (`CRATONVM_SHADOW_OVERFLOW_DIAG=1`).
+        {
+            let mut rbuf = [0u8; 16];
+            async_signal_safe::write_all(
+                async_signal_safe::STDERR_FD,
+                b"#  shadow_overflow_bails=0x",
+            );
+            let n = hex_into_buf(
+                &mut rbuf,
+                cratonvm_jit::SHADOW_OVERFLOW_COUNT.load(Ordering::Relaxed) as u64,
+            );
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+            let label = cratonvm_jit::SHADOW_OVERFLOW_LABEL.load(Ordering::Relaxed) as *const u8;
+            if !label.is_null() {
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" last=");
+                // SAFETY: when non-null this names a leaked, NUL-terminated,
+                // immortal `str` the compiler produced for the bailing method.
+                let mut len = 0usize;
+                while len < 512 && unsafe { *label.add(len) } != 0 {
+                    len += 1;
+                }
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, unsafe {
+                    std::slice::from_raw_parts(label, len)
+                });
+            }
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
         }
 
         // Was the faulting PC inside a code buffer this process had already

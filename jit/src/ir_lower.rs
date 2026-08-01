@@ -7,10 +7,15 @@
 //! IR node, and patches forward branches.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 use super::ir::{Graph, IrType, MemKind, NodeId, Op, SafepointSnapshot, NO_NODE};
 use super::ir_schedule::Schedule;
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo, JitRuntimeHelpers};
+use crate::bailout::{
+    record_bailout, Bailout, BailoutReason, CompileResult, DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_MAX_NODES,
+};
 use crate::deopt::{
     ir_deopt_entry, DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue,
     VirtualObjectState,
@@ -166,18 +171,38 @@ struct Lowerer<'a> {
     graph: &'a Graph,
     schedule: &'a Schedule,
     buf: ExecutableBuffer,
-    /// Maps NodeId → frame offset where its result is stored.
-    node_slot: Vec<i32>,
+    /// Maps NodeId → frame offset where its result is stored, or `None` when
+    /// the node has no location yet.
+    ///
+    /// `Option<NonZeroU32>` rather than `i32`, so "unallocated" is not a
+    /// *value* on the same axis as a real offset. The old representation was
+    /// zero-initialised, and `0` is simultaneously "never allocated" and the
+    /// encoding of `[rbp - 0]` — the saved caller frame pointer. A missed
+    /// allocation therefore lowered to code that read the caller's RBP as
+    /// program data (observed as heap addresses landing in `double[]`
+    /// elements, i.e. silent array mis-sorts). Neither state is representable
+    /// now: `None` cannot be emitted, and a `NonZeroU32` offset cannot be 0.
+    node_slot: Vec<Option<NonZeroU32>>,
     /// Soundness latch (ES SortingDigestTests -Jit on): set when `slot_of`
-    /// is asked for a node that never went through `alloc_slot`. `node_slot`
-    /// is zero-initialised and `first_spill > 0`, so a 0 readback means the
-    /// scheduler never placed the node in an emitted block (observed: the
+    /// is asked for a node that never went through `alloc_slot` (observed: the
     /// pc17 ArrayLoad(Double) feeding a GVN-collapsed loop phi in
-    /// DualPivotQuicksort.insertionSort) — emitting `[rbp - 0]` would read
-    /// the saved caller RBP as a data value (heap addresses stored into
-    /// double[] elements, silent mis-sorts). The lowering entry point checks
-    /// this latch and bails to the single-pass backend instead.
+    /// DualPivotQuicksort.insertionSort — the scheduler never placed the node
+    /// in an emitted block). The lowering entry point checks this latch and
+    /// bails to the single-pass backend instead.
+    ///
+    /// **This latch is now unreachable.** `verify_data_locations` runs BEFORE
+    /// any code is emitted and refuses exactly the graphs that used to trip it
+    /// (a data input that no emitted node defines, or one defined after its
+    /// use), so `slot_of` can no longer meet an unallocated node. It is kept —
+    /// and strengthened, it now carries a structured [`Bailout`] rather than
+    /// one bit — as a belt-and-braces net for a future lowering that allocates
+    /// a slot on some paths only. If it ever fires again, the pre-emission
+    /// verifier has a hole; fix the verifier, not the latch.
     unallocated_slot_use: std::cell::Cell<bool>,
+    /// Structured reason for the first latched failure (the `Bailout` form of
+    /// `unallocated_slot_use`, plus any resource bailout raised from a legacy
+    /// infallible accessor). Read and reported by `lower_inner`.
+    latched_bailout: std::cell::RefCell<Option<Bailout>>,
     /// Next available frame spill offset.
     next_spill: i32,
     /// Maps block index → native code offset (for branch patching).
@@ -257,6 +282,9 @@ struct Lowerer<'a> {
     /// see [`Lowerer::emit_safepoint_map`].
     ref_param_homes: Vec<i16>,
     shadow_savebase_slot_off: i32,
+    /// Shadow `top` captured at method entry; restored by every exit. See the
+    /// layout comment in `Lowerer::new`.
+    shadow_savetop_slot_off: i32,
     /// `get_current_thread` helper; `0` when unwired (the JIT unit tests' stub
     /// table). Every shadow site is gated on it — dereferencing a thread
     /// pointer that was never fetched would read stack garbage.
@@ -272,6 +300,34 @@ struct Lowerer<'a> {
     thread_fetch_span: Option<(usize, usize)>,
     /// Did any safepoint actually emit a shadow push?
     shadow_pushed_any: bool,
+    /// Compact-layout metadata for the instance fields this method reads:
+    /// `bytecode_pc → (packed byte offset from the object body, is_reference,
+    /// descriptor tag)`. Empty ⇒ every `Op::Load` takes the checked helper.
+    ///
+    /// Present for the same reason the single-pass backend carries it: routing
+    /// every field read through `jit_getfield` costs a boundary note, a region
+    /// walk and a 16-byte atomic cell read on one of the hottest operations a
+    /// JIT emits. The single-pass backend measured that at 4.7x on bintrees-16
+    /// when the hardening first landed; the IR tier still paid it, which is why
+    /// a forced-C2 bt18 ran 1.85x slower than the C1 body it replaced.
+    compact_fields: HashMap<usize, (u32, bool, u8)>,
+    /// Address of the GC's published `JIT_REGION_BOUNDS` table, for the guarded
+    /// receiver check. Zero ⇒ no inline field read (the guard cannot be
+    /// emitted, so the helper stays).
+    region_bounds_addr: usize,
+    /// Emitted shadow push / reload sequence counts.
+    ///
+    /// Every push must have exactly one reload: a push advances the thread's
+    /// shadow `top`, and only the reload retracts it. An unmatched push walks
+    /// `top` forward once per execution of that site — which for a recursive
+    /// method means until it runs off the end of the shadow stack and starts
+    /// writing into whatever is mapped next (observed as heap corruption
+    /// inside the C allocator, not as anything resembling a JIT fault). The
+    /// self-recursive route did exactly this. `lower_inner` refuses to publish
+    /// a body when these disagree, so the failure mode is a compile that falls
+    /// back to single-pass instead of a corrupted process.
+    shadow_pushes: usize,
+    shadow_reloads: usize,
     /// Byte size of the Java-locals region, for the published `FrameLayout`.
     locals_size: i32,
     /// First operand-spill offset, i.e. the exclusive top of the reserved
@@ -375,6 +431,7 @@ impl<'a> Lowerer<'a> {
         sr_map: Option<&'a ScalarReplacementMap>,
         direct_calls: &'a HashMap<usize, (usize, bool)>,
         ic_slots: &'a HashMap<usize, (usize, usize)>,
+        compact_fields: &HashMap<usize, (u32, bool, u8)>,
     ) -> Self {
         // Frame homes of the reference PARAMETERS, in `[rbp - off]` form. Every
         // safepoint map republishes these; see `emit_safepoint_map`.
@@ -397,24 +454,14 @@ impl<'a> Lowerer<'a> {
         // `needs_context` ⇒ the method takes the VM ptr as a hidden first arg
         // and reserves a context slot. `max_call_args` sizes the Java-argument
         // staging region a call marshals its args into before dispatching.
-        let mut needs_context = false;
-        let mut max_call_args = 0usize;
-        for n in &graph.nodes {
-            if matches!(n.op, Op::Call { .. }) {
-                needs_context = true;
-                // inputs = [ctrl, mem, args…]
-                max_call_args = max_call_args.max(n.inputs.len().saturating_sub(2));
-            }
-            if matches!(n.op, Op::LambdaIntToDouble) {
-                needs_context = true;
-            }
-            if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
-                needs_context = true;
-            }
-            if matches!(n.op, Op::New { .. }) {
-                needs_context = true;
-            }
-        }
+        //
+        // Shared with `estimate_frame_bytes`, which `lower_inner` uses to
+        // refuse an over-budget frame BEFORE this constructor reserves it; the
+        // two must see the same needs or the check would bound a different
+        // frame than the one built here.
+        let needs = scan_frame_needs(graph, helpers);
+        let needs_context = needs.needs_context;
+        let max_call_args = needs.max_call_args;
 
         // Frame layout (rbp downward): locals, [context slot], spills, [args
         // staging], 16-byte stack-arg reserve, 32-byte shadow. Reserve slots for
@@ -424,21 +471,41 @@ impl<'a> Lowerer<'a> {
         // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
         let locals_size = (num_locals as i32) * 8;
         let context_size = if needs_context { 8 } else { 0 };
-        // Three extra reserved slots: the safepoint id, the cached
-        // `*mut JvmThread`, and the shadow stack's base `top` for this push.
-        let sp_id_size = 8i32 * 3;
+        // Four extra reserved slots: the safepoint id, the cached
+        // `*mut JvmThread`, the shadow stack's base `top` for this push, and
+        // the shadow `top` watermark captured at method entry.
+        let sp_id_size = 8i32 * 4;
+        // TODO(liveness-slot-reuse): one 8-byte slot per graph node, with no
+        // regard for live-range overlap — a value dead since block 0 still owns
+        // a slot for the whole method. Computing live ranges and packing
+        // non-overlapping values into the same slot belongs here; it is a
+        // separate task from bounding the frame, which is what
+        // `estimate_frame_bytes` / `check_frame_size` now do.
         let spill_size = (max_nodes as i32) * 8;
         let args_stage_size = (max_call_args as i32) * 8;
         let shadow = 32i32;
         let stack_arg_reserve = 16i32;
-        let total = locals_size
-            + context_size
-            + sp_id_size
-            + spill_size
-            + args_stage_size
-            + shadow
-            + stack_arg_reserve;
-        let frame_size = (total + 15) & !15;
+        // The frame is SIZED by the same estimator `lower_inner` bounds against
+        // (`estimate_frame_bytes` + `check_frame_size`), so "the frame we
+        // checked" and "the frame we build" are the same number by
+        // construction rather than by two hand-kept-in-sync expressions. The
+        // check has already refused anything above `DEFAULT_MAX_FRAME_BYTES`
+        // (32 KiB), so every i32 term below is small and cannot overflow —
+        // previously `(max_nodes as i32) * 8` on a pathological graph could.
+        let frame_size = estimate_frame_bytes(num_locals, max_nodes, &needs) as i32;
+        debug_assert_eq!(
+            frame_size,
+            ((locals_size
+                + context_size
+                + sp_id_size
+                + spill_size
+                + args_stage_size
+                + shadow
+                + stack_arg_reserve)
+                + 15)
+                & !15,
+            "estimate_frame_bytes must mirror the frame this constructor lays out",
+        );
 
         // The context slot is the first slot after the locals; spills start
         // after it.
@@ -483,7 +550,19 @@ impl<'a> Lowerer<'a> {
         // here, so an intervening unbalanced push cannot drift it (the
         // single-pass backend's spring-bug-10 fix; same hazard applies here).
         let shadow_savebase_slot_off = (base + 2) * 8;
-        let first_spill = (base + 3) * 8;
+        // The shadow `top` at METHOD ENTRY. Every exit restores it, unwinding
+        // any push this activation did not pop. Without it an abnormal exit
+        // (the `i64::MIN` exception/deopt sentinel, which jumps straight to the
+        // shared bail stub and skips the matching reload) leaks its push
+        // FOREVER: nothing else retracts `top` once a raw JIT-to-JIT call has
+        // removed the Rust boundary whose `restore_jit_thread` used to heal it.
+        // The single-pass backend has always done this (`emit_epilogue`'s
+        // savetop-restore); this tier never did, and leaked ~4 slots per
+        // sentinel return until the 256K-slot stack ran off its end and the
+        // unguarded push stored past the mapping. See
+        // `x64.rs::Compiler::emit_epilogue` for the mechanism this mirrors.
+        let shadow_savetop_slot_off = (base + 3) * 8;
+        let first_spill = (base + 4) * 8;
         let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
         let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
 
@@ -491,8 +570,9 @@ impl<'a> Lowerer<'a> {
             graph,
             schedule,
             buf,
-            node_slot: vec![0; graph.nodes.len()],
+            node_slot: vec![None; graph.nodes.len()],
             unallocated_slot_use: std::cell::Cell::new(false),
+            latched_bailout: std::cell::RefCell::new(None),
             next_spill: first_spill,
             block_offsets: vec![0; schedule.blocks.len()],
             branch_patches: Vec::new(),
@@ -519,11 +599,16 @@ impl<'a> Lowerer<'a> {
             shadow_thread_slot_off,
             ref_param_homes,
             shadow_savebase_slot_off,
+            shadow_savetop_slot_off,
             get_current_thread: helpers.get_current_thread,
             shadow_off_in_thread: helpers.shadow_stack_offset_in_thread as i32,
             pending_shadow: Vec::new(),
             thread_fetch_span: None,
             shadow_pushed_any: false,
+            compact_fields: compact_fields.clone(),
+            region_bounds_addr: helpers.region_bounds_addr,
+            shadow_pushes: 0,
+            shadow_reloads: 0,
             locals_size,
             first_spill,
             oop_maps: Vec::new(),
@@ -543,8 +628,41 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Allocate a frame slot for a node result.
-    /// Panics if the spill offset exceeds the allocated frame capacity.
+    /// Latch a structured bailout raised from an infallible legacy accessor.
+    ///
+    /// The first one wins (it is the cause; later ones are consequences of
+    /// continuing to emit into an artifact that is already doomed).
+    /// `lower_inner` takes it and reports it instead of returning a bare
+    /// `None`. Interior mutability because both `&self` (`slot_of`) and
+    /// `&mut self` (`alloc_slot`) accessors latch.
+    fn latch_bailout(&self, bailout: Bailout) {
+        let mut slot = self.latched_bailout.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(bailout);
+        }
+    }
+
+    /// Take the latched bailout, if any.
+    fn take_latched_bailout(&self) -> Option<Bailout> {
+        self.latched_bailout.borrow_mut().take()
+    }
+
+    /// A frame offset that is safe to *emit* against but is not a real
+    /// location: the first spill slot. Returned only by the legacy infallible
+    /// accessors, and only after a bailout has been latched — which makes
+    /// `lower_inner` discard the whole artifact before it can be executed.
+    ///
+    /// It exists so a doomed compile finishes walking the graph without
+    /// panicking and without addressing memory outside the frame. The one
+    /// value it must never be is `0`: that is `[rbp - 0]`, the saved caller
+    /// frame pointer, which is exactly the read this whole change exists to
+    /// make unrepresentable.
+    fn poison_slot(&self) -> i32 {
+        debug_assert!(self.first_spill > 0);
+        self.first_spill
+    }
+
+    /// Allocate a frame slot for a node result, or refuse the compile.
     ///
     /// real-frame-deopt (#6): the deopt stub calls `ir_deopt_entry` while the
     /// frame is live, with `rsp = rbp - frame_size`. The Win64 ABI requires 32
@@ -554,22 +672,48 @@ impl<'a> Lowerer<'a> {
     /// `o <= frame_size - DEOPT_SHADOW_SPACE`. `frame_size` already budgets the
     /// 32-byte shadow (plus a 16-byte stack-arg reserve), so this never rejects
     /// a method the old `o < frame_size` bound accepted.
-    fn alloc_slot(&mut self, id: NodeId) -> i32 {
+    ///
+    /// Exceeding that cap used to be an `assert!`, i.e. a panic on the compiler
+    /// thread — which in a release VM is `fatal runtime error: failed to
+    /// initiate panic` → SIGABRT of the whole process, for what is only a
+    /// *compiler* resource limit. It is now a `FrameTooLarge` bailout: the
+    /// method loses its optimized body and runs in a lower tier, which is
+    /// always semantically valid.
+    fn alloc_slot_checked(&mut self, id: NodeId) -> CompileResult<i32> {
         let offset = self.next_spill;
         // `spill_cap_off` excludes the 32-byte shadow space AND (Gap B) the
         // Java-arg staging region, so a spill never overlaps either. For a
         // no-call method it equals `frame_size - DEOPT_SHADOW_SPACE` — the
         // historical bound, unchanged.
-        assert!(
-            offset <= self.spill_cap_off,
-            "JIT lowerer: spill offset {} exceeds frame capacity {} \
-             (cap {}, less shadow + arg-staging reserve)",
-            offset,
-            self.frame_size,
-            self.spill_cap_off,
-        );
+        if offset > self.spill_cap_off {
+            return Err(Bailout::with_context(
+                BailoutReason::FrameTooLarge {
+                    bytes: offset.max(0) as usize,
+                    limit: self.spill_cap_off.max(0) as usize,
+                },
+                format!(
+                    "spill slot for n{id} past the frame's spill cap \
+                     (frame {} bytes, cap {})",
+                    self.frame_size, self.spill_cap_off
+                ),
+            ));
+        }
+        // `first_spill > 0` and `next_spill` only grows, so this cannot be
+        // `None` — but the conversion is where the "no zero offsets" invariant
+        // is *enforced* rather than assumed, so it is checked, not asserted.
+        let located = u32::try_from(offset)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                Bailout::new(BailoutReason::Internal(
+                    "ir_lower: spill offset 0 would encode [rbp - 0] (saved caller RBP)",
+                ))
+            })?;
+        let cell = self.node_slot.get_mut(id as usize).ok_or_else(|| {
+            Bailout::new(BailoutReason::Internal("ir_lower: node id out of range"))
+        })?;
+        *cell = Some(located);
         self.next_spill += 8;
-        self.node_slot[id as usize] = offset;
         // Relocation contract: a slot becomes publishable the moment the
         // emitting code writes it. `alloc_slot` is called at the point of
         // emission for every node EXCEPT phis, whose slots are reserved up
@@ -578,26 +722,65 @@ impl<'a> Lowerer<'a> {
         if !matches!(self.graph.nodes[id as usize].op, Op::Phi) {
             self.defined_nodes[id as usize] = true;
         }
-        offset
+        Ok(offset)
     }
 
-    /// Get the frame offset for a node's result (must have been allocated).
-    /// A `0` readback means the node was never `alloc_slot`'d — see
-    /// `unallocated_slot_use`; the latch makes the whole lowering bail
-    /// rather than emit a `[rbp - 0]` access to the saved caller RBP.
-    fn slot_of(&self, id: NodeId) -> i32 {
-        let s = self.node_slot[id as usize];
-        if s == 0 {
-            self.unallocated_slot_use.set(true);
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IRSLOT").is_some() {
-                let n = &self.graph.nodes[id as usize];
-                eprintln!(
-                    "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
-                    id, n.op, n.ty, n.inputs, n.bytecode_pc
-                );
+    /// Infallible façade over [`Self::alloc_slot_checked`] for the ~45
+    /// per-opcode emission sites, which are `fn(..) -> ()` and cannot `?`.
+    ///
+    /// On refusal it latches the structured bailout — so `lower_inner` discards
+    /// the artifact and the caller falls back to the single-pass backend — and
+    /// returns the poison slot so the doomed walk finishes without panicking.
+    /// New code should call `alloc_slot_checked` and propagate.
+    fn alloc_slot(&mut self, id: NodeId) -> i32 {
+        match self.alloc_slot_checked(id) {
+            Ok(offset) => offset,
+            Err(bailout) => {
+                self.latch_bailout(bailout);
+                self.poison_slot()
             }
         }
-        s
+    }
+
+    /// The frame offset of a node's result, or a bailout if it has none.
+    ///
+    /// The only read path into `node_slot`. There is no longer a value that
+    /// means "unallocated": an absent location is an `Err`, never `0`.
+    fn slot_of_checked(&self, id: NodeId) -> CompileResult<i32> {
+        match self.node_slot.get(id as usize).copied().flatten() {
+            // `NonZeroU32` ⇒ never 0, and `alloc_slot_checked` bounds it by
+            // `spill_cap_off` ⇒ always inside the frame.
+            Some(off) => Ok(off.get() as i32),
+            None => Err(Bailout::new(BailoutReason::UnallocatedValue { node: id })),
+        }
+    }
+
+    /// Infallible façade over [`Self::slot_of_checked`] for the emission sites.
+    ///
+    /// See `unallocated_slot_use`: this path is unreachable now that
+    /// `verify_data_locations` refuses such graphs before emission starts. If
+    /// it is ever taken, the latch discards the artifact and the caller falls
+    /// back to the single-pass backend — the same outcome as before, but with a
+    /// structured reason attached, and returning the poison slot rather than
+    /// `0` so no `[rbp - 0]` read can be emitted even transiently.
+    fn slot_of(&self, id: NodeId) -> i32 {
+        match self.slot_of_checked(id) {
+            Ok(offset) => offset,
+            Err(bailout) => {
+                self.unallocated_slot_use.set(true);
+                self.latch_bailout(bailout);
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IRSLOT").is_some() {
+                    match self.graph.nodes.get(id as usize) {
+                        Some(n) => eprintln!(
+                            "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
+                            id, n.op, n.ty, n.inputs, n.bytecode_pc
+                        ),
+                        None => eprintln!("[irslot] UNALLOCATED node={id} (out of range)"),
+                    }
+                }
+                self.poison_slot()
+            }
+        }
     }
 
     /// `CRATONVM_JIT_IR_RELOC_EMIT=0` — disable the relocation contract's EMISSION
@@ -676,8 +859,17 @@ fn reloc_emit_enabled() -> bool {
             if !self.defined_nodes[id] || self.graph.nodes[id].ty != IrType::Ref {
                 continue;
             }
-            let off = self.node_slot[id];
-            if off <= 0 || off > i16::MAX as i32 {
+            // `defined_nodes[id]` implies an allocated slot, so `None` here is
+            // an internal inconsistency, not a `Ref` without a home. Treat it
+            // exactly like an unencodable offset: fail closed, publish no map.
+            let off = match self.node_slot[id] {
+                Some(off) => off.get() as i32,
+                None => {
+                    coverable = false;
+                    break;
+                }
+            };
+            if off > i16::MAX as i32 {
                 coverable = false;
                 break;
             }
@@ -751,12 +943,17 @@ fn reloc_emit_enabled() -> bool {
     /// A forward branch can target a merge block whose phis have not yet
     /// been lowered, so the destination slots must exist before any edge
     /// copy is emitted. Phis are skipped by `lower_data_node`.
-    fn prealloc_phi_slots(&mut self) {
+    ///
+    /// Fallible: this is the first thing that can exhaust the frame, and a
+    /// refusal here must reach `lower_inner` as a `FrameTooLarge` bailout
+    /// rather than a panic.
+    fn prealloc_phi_slots(&mut self) -> CompileResult<()> {
         for id in 0..self.graph.nodes.len() {
             if matches!(self.graph.nodes[id].op, Op::Phi) {
-                self.alloc_slot(id as NodeId);
+                self.alloc_slot_checked(id as NodeId)?;
             }
         }
+        Ok(())
     }
 
     /// Resolve the block that produces control token `ctrl` by walking up
@@ -879,6 +1076,16 @@ fn reloc_emit_enabled() -> bool {
             }
             self.store_abi_reg(abi_regs[abi_idx], ((i as i32) + 1) * 8); // local_offset(i)
         }
+        // Zero the cached-thread and watermark slots BEFORE the fetch. The
+        // fetch is erased (NOP'd) by `finish_lazy_thread_fetch` when the method
+        // publishes nothing, and every consumer below is null-guarded on the
+        // thread slot — so it must read 0, not uninitialised stack. The
+        // single-pass backend zero-initialises for exactly this reason (see the
+        // incident writeup on `x64.rs::Compiler::emit_epilogue`).
+        if self.get_current_thread != 0 && self.shadow_thread_slot_off > 0 {
+            self.emit_zero_frame_slot(self.shadow_thread_slot_off);
+            self.emit_zero_frame_slot(self.shadow_savetop_slot_off);
+        }
         self.emit_frame_record();
         self.fetch_current_thread();
         self.zero_ref_phi_slots();
@@ -995,6 +1202,27 @@ fn reloc_emit_enabled() -> bool {
         self.emit_mov_reg_imm64(RAX, self.get_current_thread as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         self.store_rax(self.shadow_thread_slot_off);
+        // Capture the entry watermark, inside the erasable span: a method that
+        // publishes nothing has no push to unwind, so the capture goes away
+        // with the fetch and the (zeroed) thread slot makes every exit's
+        // restore skip through its null guard.
+        if self.shadow_savetop_slot_off > 0 {
+            let ss_top = self.shadow_off_in_thread;
+            // MOV R10, [rbp - thread_slot]
+            self.buf.emit(&[0x4C, 0x8B, 0x95]);
+            self.buf.emit(&(-self.shadow_thread_slot_off).to_le_bytes());
+            // TEST R10, R10 ; JE skip
+            self.buf.emit(&[0x4D, 0x85, 0xD2]);
+            self.buf.emit(&[0x0F, 0x84]);
+            let skip = self.buf.pos();
+            self.buf.emit(&[0, 0, 0, 0]);
+            // MOV R11, [R10 + ss_top] ; MOV [rbp - savetop], R11
+            self.buf.emit(&[0x4D, 0x8B, 0x9A]);
+            self.buf.emit(&ss_top.to_le_bytes());
+            self.buf.emit(&[0x4C, 0x89, 0x9D]);
+            self.buf.emit(&(-self.shadow_savetop_slot_off).to_le_bytes());
+            self.patch_rel32_to_here(skip);
+        }
         self.thread_fetch_span = Some((start, self.buf.pos()));
     }
 
@@ -1057,6 +1285,29 @@ fn reloc_emit_enabled() -> bool {
         // MOV R11, [R10 + ss_top]      (current top)
         self.buf.emit(&[0x4D, 0x8B, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
+        // OVERFLOW GUARD (`ShadowStack::END_OFFSET`) — see the matching comment
+        // in the single-pass backend. Without it a push that runs past the end
+        // of the 2 MiB buffer keeps storing into the allocator arena behind it.
+        // LEA leaves flags alone, so the bump is undone between the CMP and the
+        // branch and R11 stays the only scratch. `top == end` is the legal
+        // exactly-full state, so the test is strictly-above.
+        let need = (offsets.len() as i32) * 8; // Cast: x86-64 disp32
+        let overflow = if crate::shadow_end_guard_enabled() {
+            // LEA R11,[R11+need] ; CMP R11,[R10+end] ; LEA R11,[R11-need]
+            self.buf.emit(&[0x4D, 0x8D, 0x9B]);
+            self.buf.emit(&need.to_le_bytes());
+            self.buf.emit(&[0x4D, 0x3B, 0x9A]);
+            self.buf.emit(&(ss_top + 8).to_le_bytes());
+            self.buf.emit(&[0x4D, 0x8D, 0x9B]);
+            self.buf.emit(&(-need).to_le_bytes());
+            // JA overflow
+            self.buf.emit(&[0x0F, 0x87]);
+            let p = self.buf.pos();
+            self.buf.emit(&[0, 0, 0, 0]);
+            Some(p)
+        } else {
+            None
+        };
         // MOV [rbp - savebase], R11    (base of THIS push)
         self.buf.emit(&[0x4C, 0x89, 0x9D]);
         self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
@@ -1070,8 +1321,191 @@ fn reloc_emit_enabled() -> bool {
         // MOV [R10 + ss_top], R11      (publish the new top)
         self.buf.emit(&[0x4D, 0x89, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
+        if let Some(overflow) = overflow {
+            // JMP done
+            self.buf.emit_byte(0xE9);
+            let done = self.buf.pos();
+            self.buf.emit(&[0, 0, 0, 0]);
+            self.patch_rel32_to_here(overflow);
+            // Overflow bail: nothing was stored and `top` is untouched. R11
+            // still holds the pre-push `top`; tag bit 0 (slot addresses are
+            // 8-aligned) so the paired reload skips its value-restore and only
+            // puts `top` back.
+            self.buf.emit(&[0x49, 0x83, 0xCB, 0x01]); // OR R11, 1
+            self.buf.emit(&[0x4C, 0x89, 0x9D]); // MOV [rbp - savebase], R11
+            self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+            self.emit_shadow_overflow_note();
+            self.patch_rel32_to_here(done);
+        }
         self.patch_rel32_to_here(skip);
+        self.shadow_pushes += 1;
         true
+    }
+
+    /// Bump the process-wide shadow-overflow bail counter
+    /// (`cratonvm_jit::SHADOW_OVERFLOW_COUNT`). RAX is pushed/popped around it
+    /// so the site stays transparent to whatever the call is staging.
+    fn emit_shadow_overflow_note(&mut self) {
+        // Cast through a raw pointer before converting the static's address.
+        let counter =
+            (&crate::SHADOW_OVERFLOW_COUNT as *const std::sync::atomic::AtomicUsize) as usize;
+        self.buf.emit_byte(0x50); // push rax
+        self.emit_mov_reg_imm64(RAX, counter as u64);
+        self.buf.emit(&[0xF0, 0x48, 0xFF, 0x00]); // lock inc qword [rax]
+        self.buf.emit_byte(0x58); // pop rax
+    }
+
+    /// Guarded inline read of a compact instance field, with the checked
+    /// `jit_getfield` helper as the slow path. Returns `false` when the site is
+    /// not eligible, leaving the caller's helper-only lowering in place.
+    ///
+    /// Why this exists: routing every field read through the helper costs a
+    /// JIT-boundary note, an `is_object_address` region walk and a 16-byte
+    /// atomic cell read. When that hardening first landed on the single-pass
+    /// backend it cost 4.7x on bintrees-16, which is why that backend grew the
+    /// guarded inline path (`guarded_inline_getfield_enabled`). The IR tier
+    /// never got one, and it is the measured reason a forced-C2 `bt18` ran
+    /// **1.85x slower** than the single-pass body it replaced (3614-3762 ms vs
+    /// 6436-7013 ms, five interleaved reps) once reference field reads made
+    /// real methods IR-eligible. An optimizing tier that reads fields more
+    /// expensively than the baseline tier cannot be worth selecting.
+    ///
+    /// The shape mirrors `x64.rs`'s arm exactly, and deliberately keeps the
+    /// property that stops the stale-receiver SIGSEGV: never dereference a
+    /// receiver that is not null-free, 8-aligned and inside a published GC
+    /// region. Everything else — null, unaligned, out-of-heap, a legacy
+    /// (non-compact) instance of a compact class, or a width this arm does not
+    /// emit — branches to the helper, whose NPE / `i64::MIN` semantics are
+    /// unchanged. The one simplification against the single-pass version: the
+    /// legacy-layout receiver takes the helper rather than a second inline
+    /// path.
+    fn emit_inline_compact_getfield(
+        &mut self,
+        node_pc: Option<usize>,
+        node_ty: IrType,
+        base: NodeId,
+        field_index: i64,
+        slot: i32,
+    ) -> bool {
+        if self.getfield == 0 {
+            return false;
+        }
+        let Some(pc) = node_pc else {
+            return false;
+        };
+        let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&pc) else {
+            return false;
+        };
+        if crate::x64::narrow_oops_block_inline_fields() {
+            return false;
+        }
+        let raw_mode = crate::x64::inline_getfield_enabled();
+        let guarded = crate::x64::guarded_inline_getfield_enabled() && self.region_bounds_addr != 0;
+        if !raw_mode && !guarded {
+            return false;
+        }
+        // The node type and the resolved descriptor must agree. They can only
+        // disagree through a resolver that fabricated a compact slot — the
+        // WildFly Host Controller SIGSEGV — and the consequence of trusting it
+        // here would be a 32-bit sign-extended load of half a pointer.
+        let ref_node = node_ty == IrType::Ref;
+        let ref_tag = matches!(type_tag, b'L' | b'[');
+        if ref_node != ref_tag || ref_tag != c_is_ref {
+            return false;
+        }
+        if !ref_node && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+            return false;
+        }
+
+        let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+        let mut slow: Vec<usize> = Vec::new();
+
+        self.load_to_rax(self.slot_of(base));
+        // 1. null → slow (the helper raises the NPE).
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+        slow.push(self.emit_jcc_rel32(0x84)); // JZ
+        if guarded && !raw_mode {
+            // 2. alignment: the low three bits must be clear.
+            self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+            self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
+            slow.push(self.emit_jcc_rel32(0x85)); // JNZ
+                                                  // 3. containment in one of the three published regions.
+                                                  //    RDX = &JIT_REGION_BOUNDS = [b0, e0, b1, e1, b2, e2].
+            self.emit_mov_reg_imm64(RDX, self.region_bounds_addr as u64);
+            self.emit_cmp_rax_mem_rdx(0);
+            let below_b0 = self.emit_jcc_rel32(0x82); // JB → try region 1
+            self.emit_cmp_rax_mem_rdx(8);
+            let ok0 = self.emit_jcc_rel32(0x82); // JB → inside region 0
+            self.patch_rel32_to_here(below_b0);
+            self.emit_cmp_rax_mem_rdx(16);
+            let below_b1 = self.emit_jcc_rel32(0x82); // JB → try region 2
+            self.emit_cmp_rax_mem_rdx(24);
+            let ok1 = self.emit_jcc_rel32(0x82); // JB → inside region 1
+            self.patch_rel32_to_here(below_b1);
+            self.emit_cmp_rax_mem_rdx(32);
+            slow.push(self.emit_jcc_rel32(0x82)); // JB → slow
+            self.emit_cmp_rax_mem_rdx(40);
+            slow.push(self.emit_jcc_rel32(0x83)); // JAE → slow
+            self.patch_rel32_to_here(ok0);
+            self.patch_rel32_to_here(ok1);
+        }
+        // 4. per-OBJECT compactness. A class with a registered compact layout
+        //    can still have legacy 16-byte-cell instances (an allocation whose
+        //    `num_fields` disagrees with the layout falls back to the uniform
+        //    plan), and reading one at the packed offset yields a mangled
+        //    {tag, half-pointer} word.
+        self.buf.emit(&[0xF6, 0x80]); // TEST byte [RAX + disp32], imm8
+        self.buf
+            .emit(&(cratonvm_types::GC_FLAGS_OFFSET as i32).to_le_bytes());
+        self.buf.emit_byte(cratonvm_types::GC_FLAG_COMPACT);
+        slow.push(self.emit_jcc_rel32(0x84)); // JZ → slow (legacy instance)
+
+        // 5. the read itself. A compact reference field is the bare 8-byte
+        //    pointer at the cell base; a primitive is its tagless descriptor
+        //    width.
+        if ref_node {
+            self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX + disp32]
+            self.buf.emit(&cell_off.to_le_bytes());
+        } else {
+            match type_tag {
+                b'Z' => self.buf.emit(&[0x48, 0x0F, 0xB6, 0x80]), // MOVZX RAX, byte
+                b'B' => self.buf.emit(&[0x48, 0x0F, 0xBE, 0x80]), // MOVSX RAX, byte
+                b'C' => self.buf.emit(&[0x48, 0x0F, 0xB7, 0x80]), // MOVZX RAX, word
+                b'S' => self.buf.emit(&[0x48, 0x0F, 0xBF, 0x80]), // MOVSX RAX, word
+                _ => self.buf.emit(&[0x48, 0x63, 0x80]),          // MOVSXD RAX, dword
+            }
+            self.buf.emit(&cell_off.to_le_bytes());
+        }
+        self.buf.emit_byte(0xE9); // JMP rel32 → done
+        let done_patch = self.buf.pos();
+        self.buf.emit(&[0; 4]);
+
+        // --- slow path: the checked helper, byte-identical to the arm this
+        //     replaces, including the sentinel bail. ---
+        for p in slow {
+            self.patch_rel32_to_here(p);
+        }
+        self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as u64);
+        self.emit_mov_reg_imm64(RAX, self.getfield as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub
+        let exc_patch = self.buf.pos();
+        self.buf.emit(&[0; 4]);
+        self.call_exc_patches.push(exc_patch);
+
+        self.patch_rel32_to_here(done_patch);
+        self.store_rax(slot);
+        true
+    }
+
+    /// `CMP RAX, [RDX + disp32]` — REX.W + 3B /r, ModRM(mod=10, reg=RAX, rm=RDX).
+    fn emit_cmp_rax_mem_rdx(&mut self, disp: i32) {
+        self.buf.emit(&[0x48, 0x3B, 0x82]);
+        self.buf.emit(&disp.to_le_bytes());
     }
 
     /// Copy the (possibly rewritten) published values back into their frame
@@ -1104,6 +1538,14 @@ fn reloc_emit_enabled() -> bool {
         // live `top`, so an unbalanced intervening push cannot drift it)
         self.buf.emit(&[0x4C, 0x8B, 0x9D]);
         self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        // Overflow bail protocol (see `emit_shadow_push`): a tagged base means
+        // the push stored nothing, so the restore below would read slots that
+        // were never written. Skip to the tail, which only retracts `top`.
+        self.buf.emit(&[0x49, 0xF7, 0xC3]); // TEST R11, imm32
+        self.buf.emit(&1i32.to_le_bytes());
+        self.buf.emit(&[0x0F, 0x85]); // JNE overflow
+        let overflow = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
         for &off in &offsets {
             // MOV RCX, [R11] ; MOV [rbp - off], RCX ; LEA R11, [R11 + 8]
             self.buf.emit(&[0x49, 0x8B, 0x0B]);
@@ -1111,12 +1553,16 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&(-(off as i32)).to_le_bytes());
             self.buf.emit(&[0x4D, 0x8D, 0x5B, 0x08]);
         }
-        // MOV R11, [rbp - savebase] ; MOV [R10 + ss_top], R11  (retract top)
+        self.patch_rel32_to_here(overflow);
+        // MOV R11, [rbp - savebase] ; AND R11, ~1 ; MOV [R10 + ss_top], R11
+        // (retract top; the mask is a no-op unless the push bailed)
         self.buf.emit(&[0x4C, 0x8B, 0x9D]);
         self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        self.buf.emit(&[0x49, 0x83, 0xE3, 0xFE]);
         self.buf.emit(&[0x4D, 0x89, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
         self.patch_rel32_to_here(skip);
+        self.shadow_reloads += 1;
     }
 
 
@@ -1144,8 +1590,10 @@ fn reloc_emit_enabled() -> bool {
                 matches!(self.graph.nodes[id].op, Op::Phi)
                     && self.graph.nodes[id].ty == IrType::Ref
             })
-            .map(|id| (id, self.node_slot[id]))
-            .filter(|&(_, off)| off > 0)
+            // A phi with no location cannot be zeroed and must not be
+            // published; `prealloc_phi_slots` gives every phi one, so this
+            // filter drops nothing in a well-formed compile.
+            .filter_map(|id| self.node_slot[id].map(|off| (id, off.get() as i32)))
             .collect();
         for (id, off) in refs {
             // MOV qword [rbp - off], 0
@@ -1226,7 +1674,42 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&neg.to_le_bytes());
     }
 
+    /// `MOV qword [rbp - off], 0` (mod=10 disp32, /0).
+    fn emit_zero_frame_slot(&mut self, off: i32) {
+        self.buf.emit(&[0x48, 0xC7, 0x85]);
+        self.buf.emit(&(-off).to_le_bytes());
+        self.buf.emit(&0i32.to_le_bytes());
+    }
+
+    /// Restore the shadow `top` captured at method entry, unwinding any push
+    /// this activation did not pop. Mirrors the single-pass backend's epilogue.
+    /// R10/R11 are caller-saved and dead at every exit; RAX (the return value,
+    /// or the `i64::MIN` sentinel on the bail path) is untouched.
+    fn emit_shadow_savetop_restore(&mut self) {
+        if self.get_current_thread == 0
+            || self.shadow_thread_slot_off <= 0
+            || self.shadow_savetop_slot_off <= 0
+        {
+            return;
+        }
+        let ss_top = self.shadow_off_in_thread;
+        // MOV R10, [rbp - thread_slot] ; TEST R10,R10 ; JE skip
+        self.buf.emit(&[0x4C, 0x8B, 0x95]);
+        self.buf.emit(&(-self.shadow_thread_slot_off).to_le_bytes());
+        self.buf.emit(&[0x4D, 0x85, 0xD2]);
+        self.buf.emit(&[0x0F, 0x84]);
+        let skip = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // MOV R11, [rbp - savetop] ; MOV [R10 + ss_top], R11
+        self.buf.emit(&[0x4C, 0x8B, 0x9D]);
+        self.buf.emit(&(-self.shadow_savetop_slot_off).to_le_bytes());
+        self.buf.emit(&[0x4D, 0x89, 0x9A]);
+        self.buf.emit(&ss_top.to_le_bytes());
+        self.patch_rel32_to_here(skip);
+    }
+
     fn emit_epilogue(&mut self) {
+        self.emit_shadow_savetop_restore();
         // add rsp, frame_size
         self.buf.emit(&[0x48, 0x81, 0xC4]);
         self.buf.emit(&self.frame_size.to_le_bytes());
@@ -2420,8 +2903,21 @@ fn reloc_emit_enabled() -> bool {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 self.load_to_rcx(self.slot_of(node.inputs[1]));
-                // CMP EAX, ECX
-                self.buf.emit(&[0x39, 0xC8]);
+                // CMP EAX, ECX — 32-bit for the int comparisons this node was
+                // introduced for. A REFERENCE comparison (`ifnull`,
+                // `if_acmpeq`) must compare all 64 bits: a heap pointer whose
+                // low word happens to be zero would otherwise test equal to
+                // null, and two distinct objects 4 GiB apart would test equal
+                // to each other. Selected from the operand types, so an int
+                // compare keeps the shorter encoding.
+                let ref_cmp = matches!(self.graph.nodes[node.inputs[0] as usize].ty, IrType::Ref)
+                    || matches!(self.graph.nodes[node.inputs[1] as usize].ty, IrType::Ref);
+                if ref_cmp {
+                    // CMP RAX, RCX
+                    self.buf.emit(&[0x48, 0x39, 0xC8]);
+                } else {
+                    self.buf.emit(&[0x39, 0xC8]);
+                }
                 // SETcc AL — three bytes: `0F 9x C0`.
                 //
                 // BUG FIX [jit-irlower #1]: `x64_cc()` returns the *near-Jcc*
@@ -2571,12 +3067,15 @@ fn reloc_emit_enabled() -> bool {
                 // `Self::patch_or_bail` / `patch_rel32_to_here`.
                 Self::patch_or_bail(&mut self.buf, jnz_patch, rel);
             }
-            // getfield read — `Op::Load`. The IR builder emits only
-            // `Op::Load(MemKind::Int)` (int-category instance fields, slice 1
-            // of the field/call frontier), so this lowers the single-pass
-            // inline-getfield ABI exactly: null receiver → 0, else MOVSXD the
-            // 32-bit `Value::Int` payload. inputs = [ctrl, mem, base, offset]
-            // where `offset` is a `Const(field_index)`.
+            // getfield read — `Op::Load`. The builder emits
+            // `Op::Load(MemKind::Int)` for the int-category fields and
+            // `Op::Load(MemKind::Ref)` for reference fields; both read through
+            // the checked `jit_getfield` helper, which returns the int payload
+            // or the raw pointer according to the receiver's registered layout.
+            // The inline fallback below is int-only and layout-naive, and
+            // `lower_inner` refuses any graph that would need it for a
+            // reference load. inputs = [ctrl, mem, base, offset] where `offset`
+            // is a `Const(field_index)`.
             Op::Load(_) => {
                 let slot = self.alloc_slot(id);
                 let base = node.inputs[2];
@@ -2585,6 +3084,21 @@ fn reloc_emit_enabled() -> bool {
                     Op::Const(v) => v,
                     _ => 0,
                 };
+                // Guarded inline read of a compact field, with the checked
+                // helper as the slow path — the same trade the single-pass
+                // backend makes. Returns false when this site is not eligible
+                // (no resolved compact slot, no published region bounds, gate
+                // off, or a width this arm does not emit), leaving the helper
+                // path below untouched.
+                if self.emit_inline_compact_getfield(
+                    node.bytecode_pc,
+                    node.ty,
+                    base,
+                    field_index,
+                    slot,
+                ) {
+                    return;
+                }
                 if self.getfield != 0 {
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
                     self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
@@ -2793,17 +3307,27 @@ fn reloc_emit_enabled() -> bool {
                 // the whole compile. `lower_data_node` has no post-`match` code,
                 // so an early `return` here fully handles the node.
                 if unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind } == 4 {
-                    // This route bypasses `emit_call_return_check`, so nothing
-                    // would reload the published values afterwards and the
-                    // frame would keep pre-relocation addresses. Withdraw the
-                    // claim for this safepoint and drop the pending homes; the
-                    // collector then diverts to the non-moving sweep whenever
-                    // such a frame is live, which is correct if unambitious.
+                    // This route bypasses `emit_call_return_check`, so the
+                    // shared post-call reload never runs here. Withdraw the
+                    // coverage claim — the reload below restores the homes but
+                    // this route cannot promise a relocating collector anything
+                    // — and then emit the reload explicitly.
+                    //
+                    // Dropping `pending_shadow` instead (the original) withdrew
+                    // the claim but left the PUSH that `emit_safepoint_map`
+                    // above had already emitted, with nothing to pop it. Every
+                    // execution of a self-recursive direct call then leaked its
+                    // published oops permanently, and a recursive method in a
+                    // hot loop walked the thread's 2 MiB shadow stack off its
+                    // end within a second — storing across the heap behind it,
+                    // because no backend emits the `end` guard the shadow-stack
+                    // design documents. That is what made the raw JIT-to-JIT
+                    // gate unsafe to open; this route only exists when it is.
                     if let Some(last) = self.oop_maps.last_mut() {
                         last.moving_young_coverage_complete = false;
                     }
-                    self.pending_shadow.clear();
                     self.emit_self_recursive_call(&node.inputs, slot, num_args);
+                    self.emit_shadow_reload();
                     return;
                 }
                 // IR direct-call lowering: a statically-bound site whose callee
@@ -3155,23 +3679,24 @@ fn reloc_emit_enabled() -> bool {
                 // The prologue stored param `idx` at `[rbp - (idx+1)*8]`. If
                 // the Param node was also scheduled it has its own spill slot
                 // holding the same value; prefer that, else the prologue slot.
-                let slot = self.node_slot[node_id as usize];
-                let off = if slot != 0 {
-                    slot
-                } else {
-                    ((idx as i32) + 1) * 8
+                let off = match self.node_slot.get(node_id as usize).copied().flatten() {
+                    Some(slot) => slot.get() as i32,
+                    None => ((idx as i32) + 1) * 8,
                 };
                 Self::typed_stack_slot(-off, node.ty)
             }
             _ => {
-                let slot = self.node_slot[node_id as usize];
-                if slot != 0 {
-                    Self::typed_stack_slot(-slot, node.ty)
-                } else {
+                match self.node_slot.get(node_id as usize).copied().flatten() {
+                    Some(slot) => Self::typed_stack_slot(-(slot.get() as i32), node.ty),
                     // No machine location assigned (unscheduled / dead in this
                     // naive lowerer). A real resolver would never see this for
                     // a value that is live at the safepoint; first-cut fallback.
-                    FrameValue::Undefined
+                    //
+                    // Note this is a deopt *description*, not an emitted
+                    // access: `Undefined` costs a whole-method re-run, it never
+                    // reads `[rbp - 0]`. That is why a missing location is
+                    // tolerated here and refused in `slot_of`.
+                    None => FrameValue::Undefined,
                 }
             }
         }
@@ -3469,10 +3994,10 @@ fn reloc_emit_enabled() -> bool {
             return;
         }
         let stub_off = self.buf.pos();
-        self.buf.emit(&[0x48, 0x81, 0xC4]); // add rsp, frame_size
-        self.buf.emit(&self.frame_size.to_le_bytes());
-        self.buf.emit_byte(0x5D); // pop rbp
-        self.buf.emit_byte(0xC3); // ret
+        // Shares the method epilogue so the shadow `top` watermark is restored
+        // here too — this is the path a callee's `i64::MIN` exception/deopt
+        // sentinel takes, skipping the call site's matching shadow reload.
+        self.emit_epilogue();
         let patches = std::mem::take(&mut self.call_exc_patches);
         for p in patches {
             let rel = stub_off as i32 - (p as i32 + 4);
@@ -3721,6 +4246,347 @@ fn reloc_emit_enabled() -> bool {
     }
 }
 
+// ── Resource bounds (checked BEFORE anything is reserved) ────────────
+//
+// The lowerer used to size its frame straight from `graph.nodes.len()` — one
+// 8-byte spill slot per node, unconditionally — and then `assert!` its way out
+// if a slot fell past the cap. Two problems: `max_nodes * 8` on a pathological
+// graph overflows the `i32` frame arithmetic before any check runs, and the
+// assertion is a panic on the compiler thread for what is only a compiler
+// resource limit. Both are now decided up front, from the same numbers the
+// frame is actually built from.
+
+/// What a graph demands of the frame beyond its own spills. Shared by
+/// [`Lowerer::new`] (which builds the frame) and [`estimate_frame_bytes`]
+/// (which bounds it), so the checked size and the built size cannot drift.
+struct FrameNeeds {
+    /// The method takes the VM context pointer as a hidden first argument and
+    /// reserves a frame slot for it.
+    needs_context: bool,
+    /// Widest outgoing Java-argument list staged for a call.
+    max_call_args: usize,
+}
+
+/// Scan the graph for the call/allocation shapes that widen the frame.
+fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
+    let mut needs_context = false;
+    let mut max_call_args = 0usize;
+    for n in &graph.nodes {
+        if matches!(n.op, Op::Call { .. }) {
+            needs_context = true;
+            // inputs = [ctrl, mem, args…]
+            max_call_args = max_call_args.max(n.inputs.len().saturating_sub(2));
+        }
+        if matches!(n.op, Op::LambdaIntToDouble) {
+            needs_context = true;
+        }
+        if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
+            needs_context = true;
+        }
+        if matches!(n.op, Op::New { .. }) {
+            needs_context = true;
+        }
+    }
+    FrameNeeds {
+        needs_context,
+        max_call_args,
+    }
+}
+
+/// Estimated peak frame requirement, in bytes, for a method the lowerer would
+/// build with `num_locals` locals, `max_nodes` spill reservations and `needs`.
+///
+/// Mirrors [`Lowerer::new`]'s layout exactly — locals, optional context slot,
+/// the four reserved bookkeeping slots, the spill reservation, the outgoing
+/// argument staging area, the 16-byte stack-argument reserve and the 32-byte
+/// ABI shadow space, rounded up to the 16-byte stack alignment — but in
+/// saturating `usize` arithmetic, so a graph big enough to overflow the
+/// constructor's `i32` math is *counted* rather than wrapped. `usize::MAX`
+/// therefore reads as "far too large", which is exactly what
+/// [`check_frame_size`] concludes.
+///
+/// TODO(liveness-slot-reuse): the `max_nodes * 8` term assumes every value in
+/// the graph is live simultaneously. With live ranges computed, values whose
+/// ranges do not overlap share a slot and this term collapses towards the peak
+/// live count. That is a separate change; this function is the place that
+/// would then report the smaller number.
+fn estimate_frame_bytes(num_locals: usize, max_nodes: usize, needs: &FrameNeeds) -> usize {
+    let locals = num_locals.saturating_mul(8);
+    let context = if needs.needs_context { 8 } else { 0 };
+    // safepoint id, cached thread pointer, shadow save-base, shadow save-top.
+    let bookkeeping = 8usize * 4;
+    let spills = max_nodes.saturating_mul(8);
+    let args_stage = needs.max_call_args.saturating_mul(8);
+    let shadow = 32usize;
+    let stack_arg_reserve = 16usize;
+    let total = locals
+        .saturating_add(context)
+        .saturating_add(bookkeeping)
+        .saturating_add(spills)
+        .saturating_add(args_stage)
+        .saturating_add(shadow)
+        .saturating_add(stack_arg_reserve);
+    // 16-byte alignment, saturating rather than wrapping at the top end.
+    total.saturating_add(15) & !15usize
+}
+
+/// Refuse a graph whose node count exceeds the compile-time budget.
+///
+/// Defence in depth: `lib.rs` already screens on `ir::IR_MAX_GRAPH_NODES`
+/// before building a schedule. This restates the bound at the point that
+/// *allocates* per node, so a future caller that skips the screen cannot
+/// reserve an unbounded frame.
+fn check_graph_size(node_count: usize, limit: usize) -> CompileResult<()> {
+    if node_count > limit {
+        return Err(Bailout::new(BailoutReason::GraphTooLarge {
+            nodes: node_count,
+            limit,
+        }));
+    }
+    Ok(())
+}
+
+/// Refuse a frame estimate that exceeds the frame budget.
+///
+/// The bound is a correctness bound, not a stack-consumption policy: this file
+/// encodes oop-map slot offsets as `i16`, so a reference living past
+/// `i16::MAX` is *unrepresentable* in the map the collector reads. See
+/// [`DEFAULT_MAX_FRAME_BYTES`].
+fn check_frame_size(frame_bytes: usize, limit: usize) -> CompileResult<()> {
+    if frame_bytes > limit {
+        return Err(Bailout::new(BailoutReason::FrameTooLarge {
+            bytes: frame_bytes,
+            limit,
+        }));
+    }
+    Ok(())
+}
+
+// ── Pre-emission location verification ───────────────────────────────
+
+/// True for the IR types that occupy a frame slot, i.e. the inputs a lowering
+/// reads through [`Lowerer::slot_of`]. `Control`, `Memory` and `Void` inputs
+/// are edges, not values, and never have a location.
+fn is_value_ty(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::Int | IrType::Long | IrType::Float | IrType::Double | IrType::Ref
+    )
+}
+
+/// True iff lowering this op assigns its result a frame slot.
+///
+/// Must stay in step with `lower_data_node`'s match arms: every arm that calls
+/// `alloc_slot` is listed here, plus `Op::Phi` (reserved up front by
+/// `prealloc_phi_slots`). Ops that reach `lower_data_node`'s catch-all — they
+/// emit nothing — are deliberately absent, because a value read from one of
+/// them has no location either.
+fn op_defines_result_slot(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Const(_)
+            | Op::ConstF(_)
+            | Op::Param(_)
+            | Op::Phi
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::Cmp(_)
+            | Op::LCmp
+            | Op::FCmp { .. }
+            | Op::I2L
+            | Op::L2I
+            | Op::I2F
+            | Op::I2D
+            | Op::L2F
+            | Op::L2D
+            | Op::F2I
+            | Op::F2L
+            | Op::F2D
+            | Op::D2I
+            | Op::D2L
+            | Op::D2F
+            | Op::Load(_)
+            | Op::ArrayLoad(_)
+            | Op::ArrayStore(_)
+            | Op::New { .. }
+            | Op::Call { .. }
+            | Op::LambdaIntToDouble
+    )
+}
+
+/// Refuse, *before a single byte is emitted*, any graph in which some node the
+/// lowerer will emit reads a value that has no frame location at that point.
+///
+/// This is the structural fix for the `[rbp - 0]` defect. The observed failure
+/// (ES `SortingDigestTests` with the IR tier on) was a `pc17 ArrayLoad(Double)`
+/// feeding a GVN-collapsed loop phi: the scheduler placed the phi but not the
+/// load, so the load had no slot, and `slot_of` handed back the
+/// zero-initialised entry — `[rbp - 0]`, the saved caller frame pointer, read
+/// as a `double`. The old detection was a sticky bit consulted *after* the
+/// whole body had been emitted.
+///
+/// Three ways a data input can fail to have a location; all three are the same
+/// bailout:
+///
+///  1. the defining node is in no emitted block (dead, or a scheduler
+///     omission) — it never reaches `lower_data_node`, so nothing allocates;
+///  2. its op emits nothing (`lower_data_node`'s catch-all), so even though it
+///     is scheduled it defines no slot;
+///  3. it is emitted, but *after* the use — every location here is created at
+///     the point of emission, so a later definition is as absent as no
+///     definition.
+///
+/// Phis are exempt from (3): their slots are reserved by `prealloc_phi_slots`
+/// before any block is lowered, precisely so a forward branch can copy into
+/// one. Phi *inputs* are exempt too — they are written by predecessor edge
+/// copies, not read in the phi's own block — so only (1) and (2) apply to them.
+///
+/// Rejecting here can only lose graphs that the `unallocated_slot_use` latch
+/// already rejected after the fact, so it costs no coverage; what it buys is
+/// that the refusal happens before emission, where a mutation that drops a
+/// node from the schedule is caught by construction rather than by a bit that
+/// someone must remember to check.
+///
+/// Known residual (why the latch is kept rather than deleted): a phi's value
+/// inputs are consumed by `emit_phi_copies` at the *predecessor's* terminator,
+/// not in the phi's own block, so their ordering constraint is per-CFG-edge —
+/// reconstructing it here would duplicate `block_of_ctrl`'s walk. A def that
+/// reached its edge copy too late would still be caught by the latch, one
+/// phase later. Every *placement* failure — the class that produced the
+/// observed bug — is caught here.
+fn verify_data_locations(graph: &Graph, schedule: &Schedule) -> CompileResult<()> {
+    // Emission order: blocks in index order; within a block, its data nodes in
+    // scheduled order, then its terminator. This is exactly `lower_inner`'s
+    // `for block_idx in 0..blocks.len() { lower_block(block_idx) }`.
+    let mut emit_index: Vec<Option<usize>> = vec![None; graph.nodes.len()];
+    let mut seq = 0usize;
+    for block in &schedule.blocks {
+        for &node_id in &block.nodes {
+            if let Some(cell) = emit_index.get_mut(node_id as usize) {
+                *cell = Some(seq);
+            }
+            seq += 1;
+        }
+        if let Some(term) = block.terminator {
+            if let Some(cell) = emit_index.get_mut(term as usize) {
+                *cell = Some(seq);
+            }
+            seq += 1;
+        }
+    }
+
+    let check_user = |user: NodeId| -> CompileResult<()> {
+        let node = match graph.nodes.get(user as usize) {
+            Some(n) => n,
+            None => {
+                return Err(Bailout::new(BailoutReason::Internal(
+                    "ir_lower: schedule names a node outside the graph",
+                )))
+            }
+        };
+        let user_is_phi = matches!(node.op, Op::Phi);
+        for &input in &node.inputs {
+            if input == NO_NODE {
+                continue;
+            }
+            let def = match graph.nodes.get(input as usize) {
+                Some(d) => d,
+                None => {
+                    return Err(Bailout::new(BailoutReason::Internal(
+                        "ir_lower: node input outside the graph",
+                    )))
+                }
+            };
+            // Control / memory edges carry no value and are never `slot_of`'d.
+            if !is_value_ty(def.ty) {
+                continue;
+            }
+            if !op_defines_result_slot(&def.op) {
+                // (1) dead / (2) no lowering ⇒ no location, ever.
+                return Err(Bailout::with_context(
+                    BailoutReason::UnallocatedValue { node: input },
+                    format!(
+                        "n{input} ({:?}, {:?}) is read by n{user} ({:?}) but its \
+                         lowering assigns no frame slot",
+                        def.op, def.ty, node.op
+                    ),
+                ));
+            }
+            let def_seq = match emit_index.get(input as usize).copied().flatten() {
+                Some(s) => s,
+                None => {
+                    // Phis are reserved before emission, so "not in any emitted
+                    // block" is still fatal for them: nothing would write the
+                    // slot. Report the same way.
+                    return Err(Bailout::with_context(
+                        BailoutReason::UnallocatedValue { node: input },
+                        format!(
+                            "n{input} ({:?}) is read by n{user} ({:?}) but is in no \
+                             emitted block",
+                            def.op, node.op
+                        ),
+                    ));
+                }
+            };
+            if user_is_phi || matches!(def.op, Op::Phi) {
+                // Phi slots exist before the first block is lowered, and a
+                // phi's own inputs are consumed by predecessor edge copies
+                // rather than read in the phi's block — neither is an
+                // ordering constraint.
+                continue;
+            }
+            let use_seq = emit_index
+                .get(user as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(usize::MAX);
+            if def_seq >= use_seq {
+                return Err(Bailout::with_context(
+                    BailoutReason::UnallocatedValue { node: input },
+                    format!(
+                        "n{input} ({:?}) is emitted at position {def_seq}, after its \
+                         use by n{user} ({:?}) at position {use_seq}",
+                        def.op, node.op
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    for block in &schedule.blocks {
+        for &node_id in &block.nodes {
+            check_user(node_id)?;
+        }
+        if let Some(term) = block.terminator {
+            check_user(term)?;
+        }
+    }
+    Ok(())
+}
+
+/// Funnel every refusal in this file through one place: count it, then return
+/// the `None` the public entry points have always returned, which is the
+/// caller's signal to run the method in a lower tier. A compiler refusal must
+/// never terminate the VM.
+fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_BAILOUT").is_some() {
+        eprintln!("[ir-bailout] {bailout}");
+    }
+    record_bailout(&bailout);
+    None
+}
+
 // ── Public entry point ───────────────────────────────────────────────
 
 /// Lower the scheduled IR graph to x86-64 machine code.
@@ -3770,8 +4636,18 @@ pub fn lower(
     let empty: HashMap<usize, bool> = HashMap::new();
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
     lower_inner(
-        graph, schedule, num_params, num_locals, helpers, &empty, None, &no_direct, &no_ic,
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        &empty,
+        None,
+        &no_direct,
+        &no_ic,
+        &no_compact,
     )
 }
 
@@ -3790,6 +4666,7 @@ pub fn lower_with_branch_hints(
 ) -> Option<CompiledMethod> {
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
     lower_inner(
         graph,
         schedule,
@@ -3800,6 +4677,7 @@ pub fn lower_with_branch_hints(
         None,
         &no_direct,
         &no_ic,
+        &no_compact,
     )
 }
 
@@ -3820,8 +4698,18 @@ pub fn lower_with_scalar_deopt(
     let empty: HashMap<usize, bool> = HashMap::new();
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
     lower_inner(
-        graph, schedule, num_params, num_locals, helpers, &empty, sr_map, &no_direct, &no_ic,
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        &empty,
+        sr_map,
+        &no_direct,
+        &no_ic,
+        &no_compact,
     )
 }
 
@@ -3846,6 +4734,10 @@ pub(crate) fn lower_inner(
     // virtual / interface site served from an inline cache. Empty ⇒ every such
     // site keeps the historical helper dispatch.
     ic_slots: &HashMap<usize, (usize, usize)>,
+    // Guarded inline field reads: `pc → (packed body offset, is_reference,
+    // descriptor tag)` for every resolved compact instance field. Empty ⇒ every
+    // `Op::Load` takes the checked helper, as it always did.
+    compact_fields: &HashMap<usize, (u32, bool, u8)>,
 ) -> Option<CompiledMethod> {
     // A live object allocation is now supported by the common allocation
     // stub. A zero helper pointer is only possible in synthetic unit-test
@@ -3879,6 +4771,47 @@ pub(crate) fn lower_inner(
         if needs_getfield_helper || needs_putfield_helper {
             return None;
         }
+    }
+
+    // ── Resource bounds, decided before anything is reserved ─────────
+    //
+    // Both checks precede `ExecutableBuffer::new` and `Lowerer::new`, so an
+    // over-budget method costs neither an executable mapping nor an enormous
+    // frame. `estimate_frame_bytes` is the same function `Lowerer::new` sizes
+    // the frame from, so passing here guarantees the constructor's `i32`
+    // arithmetic stays in range.
+    if let Err(bailout) = check_graph_size(graph.nodes.len(), DEFAULT_MAX_NODES) {
+        return refuse(bailout);
+    }
+    let frame_needs = scan_frame_needs(graph, helpers);
+    let frame_estimate = estimate_frame_bytes(num_locals, graph.nodes.len(), &frame_needs);
+    if let Err(bailout) = check_frame_size(frame_estimate, DEFAULT_MAX_FRAME_BYTES) {
+        return refuse(bailout);
+    }
+
+    // ── Every emitted value has a location, decided before emission ──
+    //
+    // The acceptance test for the `[rbp - 0]` defect: drop a node from the
+    // schedule and this refuses the compile here, with no code emitted at all,
+    // instead of emitting a read of the saved caller frame pointer and
+    // detecting it afterwards with a sticky bit.
+    if let Err(bailout) = verify_data_locations(graph, schedule) {
+        return refuse(bailout);
+    }
+
+    // A REFERENCE field read has only one correct lowering: the helper. The
+    // inline displacement fallback decodes a 16-byte int cell at
+    // `HEADER_SIZE + index*SLOT_SIZE`, which for a reference slot yields the
+    // discriminant word rather than the pointer — a fabricated address the
+    // frame would then publish as a root. Refuse the graph outright rather
+    // than emit it, independently of the compact-layout switch above.
+    if helpers.getfield == 0
+        && graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::Load(MemKind::Ref)))
+    {
+        return None;
     }
     // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
     // lowering: an arithmetic node emits well under 32 bytes, but a single
@@ -3914,6 +4847,7 @@ pub(crate) fn lower_inner(
         sr_map,
         direct_calls,
         ic_slots,
+        compact_fields,
     );
 
     // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
@@ -3934,7 +4868,9 @@ pub(crate) fn lower_inner(
     // BUG FIX [jit-irlower #2]: reserve phi destination slots before any
     // block is lowered — a forward branch's edge copies (emit_phi_copies)
     // reference slots of phis in not-yet-lowered merge blocks.
-    lowerer.prealloc_phi_slots();
+    if let Err(bailout) = lowerer.prealloc_phi_slots() {
+        return refuse(bailout);
+    }
 
     lowerer.emit_prologue();
     lowerer.emit_safepoint_poll();
@@ -3946,10 +4882,42 @@ pub(crate) fn lower_inner(
 
     // Soundness bail (ES SortingDigestTests -Jit on): some emitted use asked
     // for the frame slot of a node that was never allocated one (scheduler
-    // gap — the node sits in no emitted block). The emitted code would read
-    // `[rbp - 0]`, i.e. the saved caller RBP, as a data value. Discard the
-    // artifact and let the caller fall back to the single-pass backend.
+    // gap — the node sits in no emitted block), or a slot allocation ran past
+    // the frame's spill cap. Discard the artifact and let the caller fall back
+    // to the single-pass backend.
+    //
+    // Both are now UNREACHABLE — `verify_data_locations` and the frame-size
+    // check above refuse those graphs before emission begins — so this is a
+    // net, not a mechanism. It is kept, and upgraded from one sticky bit to a
+    // structured reason, so that if a future lowering finds a path the
+    // pre-checks miss, the compile still fails closed *and* says why.
+    if let Some(bailout) = lowerer.take_latched_bailout() {
+        return refuse(bailout);
+    }
     if lowerer.unallocated_slot_use.get() {
+        return refuse(Bailout::new(BailoutReason::Internal(
+            "ir_lower: unallocated slot latched without a reason",
+        )));
+    }
+
+    // Soundness bail: every emitted shadow PUSH must have exactly one emitted
+    // RELOAD. The push advances the thread's shadow `top`; only the reload
+    // retracts it. An unmatched push leaks a few slots per execution of that
+    // site, so a recursive method walks `top` off the end of the shadow stack
+    // and the next push writes into whatever follows the mapping. That
+    // presents as heap corruption in an unrelated allocator, arbitrarily far
+    // from the JIT — the self-recursive call route did it, and it took a
+    // gdb backtrace showing ASCII bytes in a mimalloc free-list header to
+    // attribute. A static count is enough (both are emitted per site, not per
+    // path), and refusing the body is strictly better than shipping it.
+    if lowerer.shadow_pushes != lowerer.shadow_reloads {
+        if crate::ir_stage_reporting() {
+            eprintln!(
+                "[ir] lower_inner refused: {} shadow pushes vs {} reloads — \
+                 an unmatched push leaks the thread's shadow top",
+                lowerer.shadow_pushes, lowerer.shadow_reloads
+            );
+        }
         return None;
     }
 
@@ -3995,7 +4963,10 @@ pub(crate) fn lower_inner(
     // estimate materially harder, so check it here and let the caller fall back
     // to single-pass, exactly like the unallocated-slot latch above.
     if buf.overflowed() {
-        return None;
+        return refuse(Bailout::new(BailoutReason::CodeBufferExhausted {
+            needed: buf.pos(),
+            capacity: estimated_size.max(4096),
+        }));
     }
     let _code_size = buf.pos();
 
@@ -4351,6 +5322,7 @@ mod tests {
 
         let empty_hints: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
         lower_inner(
             &graph,
             &schedule,
@@ -4361,10 +5333,94 @@ mod tests {
             None,
             &no_direct,
             ic,
+            &no_compact,
         )
         .expect("virtual-call method must lower")
         .code_bytes()
         .to_vec()
+    }
+
+    /// A self-recursive call must not PUBLISH to the shadow stack.
+    ///
+    /// That route bypasses `emit_call_return_check`, the one site that emits
+    /// the matching reload, so a push emitted here is never retracted: the
+    /// thread's shadow `top` advances once per execution of the site and a
+    /// recursive method walks it off the end of the shadow stack, after which
+    /// the next push writes through into whatever follows the mapping. It
+    /// presented as a SIGSEGV inside the C allocator's free list, on an
+    /// unrelated thread, the moment reference field reads made
+    /// `BinTreesClassic.itemCheck` IR-eligible.
+    ///
+    /// The lowerer used to emit the push and then "withdraw the claim" by
+    /// clearing `pending_shadow` — which suppressed the RELOAD, not the push.
+    #[test]
+    fn self_recursive_call_balances_its_shadow_push_and_reload() {
+        crate::x64::set_moving_young_override(Some(false));
+        // static int f(Obj o, int n) { return f(o, n); }
+        // aload_0; iload_1; invokestatic #2; ireturn
+        let code = [0x2a, 0x1b, 0xb8, 0x00, 0x02, 0xac, 0x00, 0x00];
+        let info: &'static JitInvokeInfo = Box::leak(Box::new(JitInvokeInfo {
+            class_name: "pkg/Obj",
+            method_name: "f",
+            descriptor: "(Lpkg/Obj;I)I",
+            num_jit_args: 2,
+            return_type: b'I',
+            invoke_kind: 4, // the direct self-recursive route
+            declaring_class_id: 0,
+        }));
+        let mut builder = IrBuilder::new(2, 2);
+        builder.set_param_types(&[IrType::Ref, IrType::Int]);
+        let mut invoke_info = HashMap::new();
+        invoke_info.insert(2usize, (info as *const JitInvokeInfo as usize, 2usize, b'I'));
+        builder.set_invoke_info(invoke_info);
+        let graph = builder.build(&code, 6).expect("IR build of self-recursive call");
+        let schedule = ir_schedule::schedule(&graph);
+
+        // The shadow machinery is live only when the thread helper is wired,
+        // so a stub table with a zero `get_current_thread` would make this
+        // test vacuous. Give it sentinels.
+        let mut helpers = no_helpers();
+        helpers.get_current_thread = 0x7fff_0000_0000_3000;
+        helpers.shadow_stack_offset_in_thread = 0x40;
+        helpers.self_call_stack_guard = 0x7fff_0000_0000_4000;
+
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let cm = lower_inner(
+            &graph,
+            &schedule,
+            2,
+            2,
+            &helpers,
+            &empty_hints,
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact,
+        )
+        .expect(
+            "the self-recursive body must lower — an imbalance now makes \
+             lower_inner discard it, so a None here means the push came back",
+        );
+        // Lowering at all is most of the assertion: `lower_inner` counts the
+        // emitted pushes against the emitted reloads and DISCARDS the body when
+        // they disagree, so a `None` above is exactly the bug this test exists
+        // for. What remains to check is that the retraction is really emitted
+        // on this route rather than inherited from a choke point it never
+        // reaches: `MOV RCX, [R11]` reads a published value back, and only the
+        // reload does that. (Deliberately not an exact count — the prologue's
+        // own `top` watermark shares the push's encoding, so counting pushes
+        // here measures the prologue too.)
+        let bytes = cm.code_bytes();
+        assert!(
+            count_seq(bytes, &[0x49, 0x8B, 0x0B]) >= 1,
+            "the self-recursive route bypasses emit_call_return_check, so it \
+             must emit its own shadow reload — without it every execution of \
+             the site advances the thread's shadow top and nothing retracts it"
+        );
+        crate::x64::set_moving_young_override(None);
     }
 
     /// A planned inline-cache site must emit the full three-tier cascade:
@@ -5408,5 +6464,234 @@ mod tests {
         // slots 1/3 are dummies (never read by the interpreter).
         assert_eq!(frame.locals[0], FrameValue::Long(0x7_0000_0000));
         assert_eq!(frame.locals[2], FrameValue::Long(0));
+    }
+
+    // ── `[rbp - 0]` sentinel removal + resource bounds ───────────────────
+
+    /// `int f(int a) { return a + 1; }` as a hand-built graph, plus its
+    /// schedule. The smallest shape that has a real data edge to verify.
+    fn add_one_graph() -> (Graph, Schedule) {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let one = graph.add(Op::Const(1), IrType::Int, vec![], None);
+        let sum = graph.add(Op::Add, IrType::Int, vec![a, one], None);
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum], None);
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
+    /// The verifier must not refuse a graph the lowerer handles — otherwise the
+    /// "bail before emission" fix would silently cost JIT coverage.
+    #[test]
+    fn verification_accepts_a_well_formed_graph() {
+        let (graph, schedule) = add_one_graph();
+        assert!(verify_data_locations(&graph, &schedule).is_ok());
+        let method = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a+1 must lower");
+        assert_eq!(unsafe { method.try_call(&[41]) }, Ok(42));
+    }
+
+    /// Acceptance test for the `[rbp - 0]` defect (report: "replace
+    /// zero-initialized `node_slot` with verified optional locations").
+    ///
+    /// A data input that no emitted node defines — here an `Op::Dead` node,
+    /// which the scheduler never places, exactly like the GVN-collapsed
+    /// `ArrayLoad(Double)` observed in `DualPivotQuicksort.insertionSort` —
+    /// must refuse the compile *before* emission, not be detected afterwards by
+    /// a sticky bit. Before this change the use lowered to `[rbp - 0]`, reading
+    /// the saved caller frame pointer as a `double`.
+    #[test]
+    fn an_unallocated_data_input_refuses_the_compile_before_emission() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        // Scheduler omission, modelled: `Op::Dead` is never placed into a
+        // block, so nothing ever allocates a location for it.
+        let ghost = graph.add(Op::Dead, IrType::Int, vec![], None);
+        let sum = graph.add(Op::Add, IrType::Int, vec![a, ghost], None);
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum], None);
+
+        let schedule = ir_schedule::schedule(&graph);
+        assert_eq!(
+            schedule.node_to_block[ghost as usize],
+            usize::MAX,
+            "precondition: the ghost node is in no emitted block",
+        );
+
+        let err = verify_data_locations(&graph, &schedule)
+            .expect_err("an unallocated data input must be refused");
+        assert_eq!(err.reason, BailoutReason::UnallocatedValue { node: ghost });
+        assert_eq!(err.category(), "unallocated_value");
+
+        // …and the public entry point turns that into the historical "run in a
+        // lower tier" answer rather than emitting or panicking.
+        assert!(lower(&graph, &schedule, 1, 1, &no_helpers()).is_none());
+    }
+
+    /// The slot accessor has no encoding for "unallocated", so it can never
+    /// hand back `0` — the offset that means `[rbp - 0]`, the saved caller RBP.
+    #[test]
+    fn slot_accessor_never_yields_the_rbp_zero_sentinel() {
+        let (graph, schedule) = add_one_graph();
+        let a = graph
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::Param(0)))
+            .expect("param node") as NodeId;
+        let sum = graph
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::Add))
+            .expect("add node") as NodeId;
+
+        let empty: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        // `compact_fields` was added to `Lowerer::new` on origin/dev while this
+        // test was added on dev. Git merged both with no textual conflict and
+        // left the call one argument short. Empty map = no compact-layout
+        // field, which is what this spill-slot test wants.
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let helpers = no_helpers();
+        let mut lowerer = Lowerer::new(
+            &graph,
+            &schedule,
+            buf,
+            1,
+            1,
+            graph.nodes.len(),
+            &helpers,
+            &empty,
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact,
+        );
+
+        // Unallocated is an error, not an offset.
+        assert!(lowerer.slot_of_checked(a).is_err());
+        assert!(lowerer.node_slot.iter().all(|slot| slot.is_none()));
+
+        let off = lowerer.alloc_slot_checked(a).expect("first spill slot");
+        assert!(off >= lowerer.first_spill, "{off} < {}", lowerer.first_spill);
+        assert_ne!(off, 0);
+        assert_eq!(lowerer.slot_of_checked(a).expect("allocated"), off);
+        // Non-zero by type, not by convention: every occupied entry is a
+        // `NonZeroU32`, so `0` is not a representable location at all.
+        assert!(lowerer
+            .node_slot
+            .iter()
+            .flatten()
+            .all(|located| located.get() > 0));
+
+        // The infallible façade the emission sites use latches a structured
+        // reason and still never returns 0.
+        let poison = lowerer.slot_of(sum);
+        assert_ne!(poison, 0, "the façade must never emit [rbp - 0]");
+        assert!(lowerer.unallocated_slot_use.get());
+        let latched = lowerer.take_latched_bailout().expect("a latched reason");
+        assert_eq!(latched.reason, BailoutReason::UnallocatedValue { node: sum });
+        // An out-of-range id is an error too — it used to index-panic.
+        assert!(lowerer.slot_of_checked(NO_NODE).is_err());
+    }
+
+    /// Report: "bound graph and frame memory before allocation" — an
+    /// over-budget node count is refused with `GraphTooLarge`.
+    #[test]
+    fn an_over_limit_node_count_bails_with_graph_too_large() {
+        assert!(check_graph_size(0, DEFAULT_MAX_NODES).is_ok());
+        assert!(check_graph_size(DEFAULT_MAX_NODES, DEFAULT_MAX_NODES).is_ok());
+        let err = check_graph_size(DEFAULT_MAX_NODES + 1, DEFAULT_MAX_NODES)
+            .expect_err("over the node budget");
+        assert_eq!(
+            err.reason,
+            BailoutReason::GraphTooLarge {
+                nodes: DEFAULT_MAX_NODES + 1,
+                limit: DEFAULT_MAX_NODES,
+            }
+        );
+        assert_eq!(err.category(), "graph_too_large");
+    }
+
+    /// Report: "bound graph and frame memory before allocation" — the frame is
+    /// estimated (spill reservation + locals + staged outgoing args) and
+    /// refused with `FrameTooLarge` before a byte of it is reserved.
+    #[test]
+    fn an_over_limit_frame_estimate_bails_with_frame_too_large() {
+        let plain = FrameNeeds {
+            needs_context: false,
+            max_call_args: 0,
+        };
+
+        // A normal method is nowhere near the bound.
+        let small = estimate_frame_bytes(4, 32, &plain);
+        assert!(small < DEFAULT_MAX_FRAME_BYTES, "{small}");
+        assert!(check_frame_size(small, DEFAULT_MAX_FRAME_BYTES).is_ok());
+        assert_eq!(small % 16, 0, "the estimate is 16-byte aligned");
+
+        // Each of the three terms the report names moves the estimate.
+        assert!(estimate_frame_bytes(64, 32, &plain) > small); // locals
+        assert!(estimate_frame_bytes(4, 512, &plain) > small); // spills
+        assert!(
+            estimate_frame_bytes(
+                4,
+                32,
+                &FrameNeeds {
+                    needs_context: true,
+                    max_call_args: 8,
+                },
+            ) > small,
+            "staged outgoing arguments must count",
+        );
+
+        // One 8-byte spill slot per node (no liveness reuse yet), so a graph at
+        // the node budget implies ~160 KiB — five times the 32 KiB oop-map
+        // bound. That combination must be refused, not built.
+        let huge = estimate_frame_bytes(0, DEFAULT_MAX_NODES, &plain);
+        assert!(huge > DEFAULT_MAX_FRAME_BYTES, "{huge}");
+        let err =
+            check_frame_size(huge, DEFAULT_MAX_FRAME_BYTES).expect_err("over the frame budget");
+        assert_eq!(
+            err.reason,
+            BailoutReason::FrameTooLarge {
+                bytes: huge,
+                limit: DEFAULT_MAX_FRAME_BYTES,
+            }
+        );
+        assert_eq!(err.category(), "frame_too_large");
+
+        // Saturating, not wrapping: a pathological count reports "enormous"
+        // instead of overflowing into a small (or negative) frame.
+        assert_eq!(
+            estimate_frame_bytes(0, usize::MAX, &plain),
+            usize::MAX & !15usize,
+        );
+
+        // End to end: the public entry point refuses instead of reserving a
+        // frame whose slot offsets the oop map could not even encode.
+        let (graph, schedule) = add_one_graph();
+        assert!(
+            lower(&graph, &schedule, 1, 10_000, &no_helpers()).is_none(),
+            "10_000 locals is an 80 KiB frame — refuse, do not build it",
+        );
+        // The same graph with a sane local count still compiles.
+        assert!(lower(&graph, &schedule, 1, 1, &no_helpers()).is_some());
     }
 }

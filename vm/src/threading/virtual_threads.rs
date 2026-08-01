@@ -2912,6 +2912,18 @@ mod tests {
         // Re-scheduling a wakeup for the same vt with a later deadline must
         // supersede the earlier registration (the stale heap entry is dropped),
         // and the thread is resubmitted exactly once at the new deadline.
+        //
+        // The properties under test are ORDERING and MULTIPLICITY, not wall
+        // clock. The earlier version asserted `next_task()` at fixed sleep
+        // offsets (70 ms, then 190 ms) and so allowed the shared wakeup-timer
+        // OS thread only 70 ms of scheduling slack; on a loaded 16-core Linux
+        // box that is not enough (measured: ~4% failures in isolation at load
+        // ~20, every one of them at exactly 190 ms — the resubmit had simply
+        // not landed *yet*, not "never"). Poll for the resubmit under a
+        // generous bound instead, and prove the stale entry never fired with
+        // `total_submissions`, which is timing-independent: had the superseded
+        // 30 ms entry also resubmitted, the counter would read 2 no matter
+        // when either landed.
         let mgr = VirtualThreadManager::new(1);
         let id = mgr.create_virtual_thread("resched");
         {
@@ -2919,24 +2931,42 @@ mod tests {
             threads.get_mut(&id).unwrap().mount(0);
         }
         mgr.park_virtual(id);
+        let t0 = std::time::Instant::now();
         mgr.schedule_wakeup(id, std::time::Duration::from_millis(30));
         // Immediately re-schedule with a longer deadline (new signal Arc).
         mgr.schedule_wakeup(id, std::time::Duration::from_millis(120));
 
-        // The stale 30ms entry must NOT resubmit early.
-        std::thread::sleep(std::time::Duration::from_millis(70));
+        // The re-scheduled wakeup must resubmit the thread.
+        let limit = std::time::Duration::from_secs(10);
+        let mut fired_at = None;
+        while t0.elapsed() < limit {
+            if let Some(task) = mgr.scheduler().next_task(0) {
+                assert_eq!(task, id, "an unexpected task was resubmitted");
+                fired_at = Some(t0.elapsed());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let fired_at = fired_at.expect("the re-scheduled wakeup should resubmit the thread");
+        // The stale 30 ms entry must NOT have been the one that fired: nothing
+        // may reach the scheduler before the superseding 120 ms deadline.
+        assert!(
+            fired_at >= std::time::Duration::from_millis(100),
+            "superseded early wakeup fired at {:?}",
+            fired_at
+        );
+        // ...and the resubmit must have happened exactly once.
+        std::thread::sleep(std::time::Duration::from_millis(60));
         assert_eq!(
             mgr.scheduler().next_task(0),
             None,
-            "superseded early wakeup must not fire"
+            "the superseded entry must not resubmit a second time"
         );
-
-        // The 120ms entry should fire.
-        std::thread::sleep(std::time::Duration::from_millis(120));
         assert_eq!(
-            mgr.scheduler().next_task(0),
-            Some(id),
-            "the re-scheduled wakeup should resubmit the thread"
+            mgr.scheduler_stats().total_submissions,
+            1,
+            "exactly one submission expected (fired at {:?})",
+            fired_at
         );
         mgr.shutdown();
     }

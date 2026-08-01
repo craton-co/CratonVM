@@ -1986,7 +1986,14 @@ pub(crate) fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             if let Some(kp) = crypto_impl::parse_rsa_private_key_pkcs8(key_der) {
                 let key_id = crypto_impl::rsa_key_next_id();
                 crypto_impl::rsa_key_store(key_id, kp);
-                crypto_impl::rsa_realkey_map_set(ctx.identity_hash_code(pk), key_id);
+                // VM-scoped key -- see `crypto_impl::RSA_REALKEY_MAP`'s doc
+                // comment: an identity hash is unique only within one heap and
+                // the map is a process-global static.
+                crypto_impl::rsa_realkey_map_set(
+                    ctx.vm_identity(),
+                    ctx.identity_hash_code(pk),
+                    key_id,
+                );
             }
         }
         Ok(Some(Value::Object(Some(pk))))
@@ -2671,8 +2678,23 @@ pub(crate) fn make_x509_mirror(
 /// store it — `engineAliases` then looked up store 0 and reported an empty
 /// keystore, so KeyManagerFactory found "No aliases for private keys" and TLS
 /// init failed. `identity_hash_code` is stable across GC, so key on it.
-fn store_id_by_identity() -> &'static std::sync::Mutex<std::collections::HashMap<i32, i32>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> =
+///
+/// The key is `(NativeContext::vm_identity(), identity_hash_code(spi))`, not a
+/// bare identity hash: a hash code is unique only *within one heap* while this
+/// table is a process-global `static`. Rust tests (and any embedder) create
+/// several independent `Vm`s in one process, so a bare-`i32` key let VM B's
+/// KeyStoreSpi resolve to VM A's store id and read another VM's keys and
+/// certificates out of `registry()`. Same rule as
+/// `crypto_impl::RSA_REALKEY_MAP` / `jca::signature::SigKey`
+/// (`native-api/src/registry.rs`, `vm_identity` doc). Values are plain `i32`
+/// store ids -- no `ObjectRef`s, so no collector scan/remap companion is
+/// needed. (`store_identity_pem_map` below needs no VM component: its key is a
+/// `registry()` store id drawn from a single process-wide counter, so it is
+/// already globally unique.)
+#[allow(clippy::type_complexity)]
+fn store_id_by_identity() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, i32), i32>>
+{
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, i32), i32>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -2872,12 +2894,14 @@ fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
         }
     }
     // Identity side-table fallback (real JKS objects have no field for it).
+    // VM-scoped key -- see `store_id_by_identity`'s doc comment.
     let ih = ctx.identity_hash_code(this);
     if ih != 0 {
+        let k = (ctx.vm_identity(), ih);
         if let Some(&id) = store_id_by_identity()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&ih)
+            .get(&k)
         {
             return id;
         }
@@ -2928,10 +2952,12 @@ fn set_store_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     // KeyStoreSpi object has no usable field (real JavaKeyStore$JKS = 1 field).
     let ih = ctx.identity_hash_code(this);
     if ih != 0 {
+        // VM-scoped key -- see `store_id_by_identity`'s doc comment.
+        let k = (ctx.vm_identity(), ih);
         store_id_by_identity()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(ih, id);
+            .insert(k, id);
     }
 }
 

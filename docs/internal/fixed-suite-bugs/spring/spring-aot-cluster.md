@@ -27,6 +27,14 @@
 the point of comparing per chunk rather than counting failures. Raw logs:
 `/data/tmp/allchunks-hs-0731/` and `/data/tmp/allchunks-cv-r2/`.
 
+The table is from the pre-merge sweep (`cratonvm-aotresid-r2.bin`). A second,
+post-merge sweep (`r3`, `/data/tmp/allchunks-cv-r3/`) reproduced every row **but
+one**: chunk 9 aborted with an unrelated `@Bean` attribute-resolution NPE. That
+is a low-rate flake, not a residual of this cluster — chunk 9 then ran clean 3/3
+on the same binary, 3/3 on the pre-fix binary, and the failing class ran clean
+8/8 alone. It is filed on its own, with two eliminations, as
+[`../../../known-issues/spring/spring-bean-attribute-type-null-flake.md`](../../../known-issues/spring/spring-bean-attribute-type-null-flake.md).
+
 ## Chunk 4: what it actually was
 
 AOT processing completed (`PROBE aot-processing OK`) and the replay never

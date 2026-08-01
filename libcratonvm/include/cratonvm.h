@@ -97,6 +97,32 @@ typedef struct CratonValue {
     uint64_t      payload;
 } CratonValue;
 
+/* ---- compatibility mode ----------------------------------------------- */
+
+/* Which substitutions the VM may make. ORTHOGONAL to the JDK mode
+ * (--real-jdk / --synthetic-jdk), which selects which class library boots.
+ *
+ * COMPATIBLE is today's behaviour (bridges, intrinsics AND compatibility
+ * shims) and is the default on every entry point — you reach it by doing
+ * nothing. JDK_ONLY makes real JDK class bytes authoritative: no class is
+ * fabricated without real bytes and no synthetic-stub native is registered or
+ * invoked; it requires a real JDK runtime image.
+ *
+ * These numeric values are a PUBLISHED, STABLE, APPEND-ONLY part of the ABI: a
+ * compiled host carries them in its .text, so a value may be added but never
+ * renumbered. They are cratonvm_jint, deliberately NOT cratonvm_jboolean, so a
+ * third enforcement posture can be added later without breaking a host that
+ * was compiled against this header.
+ *
+ * JDK-only is an internal diagnostic, not a production posture: it is at stage
+ * 1 of 4 of its rollout, so a host that enables it should expect failures on
+ * programs that run fine under COMPATIBLE. See docs/EMBEDDING.md ("Choosing a
+ * compatibility mode"). */
+enum {
+    CRATONVM_COMPATIBILITY_COMPATIBLE = 0,
+    CRATONVM_COMPATIBILITY_JDK_ONLY   = 1
+};
+
 /* ---- lifecycle -------------------------------------------------------- */
 
 /* Build and bootstrap a VM. `args` may be NULL for defaults. Only one VM
@@ -106,6 +132,25 @@ typedef struct CratonValue {
  * unless ignoreUnrecognized is nonzero. The returned handle must be released
  * with cratonvm_destroy(). */
 CratonVm *cratonvm_create(const JavaVMInitArgs *args);
+
+/* cratonvm_create() with the compatibility mode stated as an explicit
+ * CRATONVM_COMPATIBILITY_* value instead of an option string — a C host has no
+ * command line, and JavaVMInitArgs is often assembled far from the call site
+ * that knows the policy. Everything else is identical to cratonvm_create().
+ *
+ * `compatibility_mode` must be a CRATONVM_COMPATIBILITY_* value. Any other
+ * integer is REJECTED (NULL + cratonvm_last_error()), never clamped to
+ * COMPATIBLE: a host built against a newer header is told, rather than
+ * silently getting the loose policy it opted out of. Probe first with
+ * cratonvm_compatibility_mode_supported() to avoid a failed create.
+ *
+ * The option string "--jdk-only" (spelled exactly as the launcher flag) is the
+ * second route to strict mode, and the only one available to
+ * JNI_CreateJavaVM(). Passing CRATONVM_COMPATIBILITY_JDK_ONLY alongside
+ * --jdk-only agrees and is accepted; passing CRATONVM_COMPATIBILITY_COMPATIBLE
+ * alongside --jdk-only is a CONTRADICTION error, not a precedence rule. */
+CratonVm *cratonvm_create_with_compatibility(const JavaVMInitArgs *args,
+                                             cratonvm_jint compatibility_mode);
 
 /* Drop the VM and free the handle. NULL is a no-op. */
 void cratonvm_destroy(CratonVm *vm);
@@ -218,6 +263,22 @@ cratonvm_jint cratonvm_set_field(CratonVm *vm, CratonRef obj, cratonvm_jint inde
  * bad handle / unknown name (last error set). */
 cratonvm_jint cratonvm_set_field_by_name(CratonVm *vm, CratonRef obj, const char *name,
                                          CratonValue value);
+
+/* ---- compatibility mode read-back / capability probe ------------------ */
+
+/* The compatibility mode a LIVE VM is actually running under, as a
+ * CRATONVM_COMPATIBILITY_* value. Returns -1 (never a mode value) on a
+ * null/invalid handle, with the reason in cratonvm_last_error(). Read back what
+ * you got rather than trusting what you asked for. */
+cratonvm_jint cratonvm_compatibility_mode(CratonVm *vm);
+
+/* Capability probe — NEEDS NO VM, so it answers "does this build know the
+ * mode?" without the trial-and-error of a failed create; combined with dlsym it
+ * also covers libraries that predate the symbol entirely. Returns 1 when this
+ * build understands and honours `mode`, -1 when `mode` is not a
+ * CRATONVM_COMPATIBILITY_* value at all. 0 is reserved for a mode this build
+ * knows but cannot honour (nothing returns it today). */
+cratonvm_jint cratonvm_compatibility_mode_supported(cratonvm_jint mode);
 
 /* ---- error access (thread-local) -------------------------------------- */
 

@@ -900,6 +900,15 @@ fn utf8_complete_prefix(bytes: &[u8]) -> usize {
     bytes.len()
 }
 
+// JDK-ONLY-CLASSIFY: stub — `sun.nio.cs.StreamDecoder` declares no ACC_NATIVE
+// method in JDK 25; all 9 resolvable registrations here shadow concrete
+// bytecode. The comment at the call site in `register_io_natives` is explicit
+// that these exist to "override the JDK bytecode that reaches into
+// unimplemented sun.nio.ch internals" — that is a compatibility shim for a gap
+// in this VM, which is exactly what jdk-only-native-review.md calls a valid
+// classification and an invalid destination. Under `--jdk-only` the honest
+// outcome is a structured `MissingNative` from the sun.nio.ch layer, not a
+// silent charset re-implementation. Do not delete before that layer is real.
 /// Register the StreamDecoder natives on the registry.
 pub fn register_stream_decoder_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();

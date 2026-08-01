@@ -7,7 +7,10 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::phases_late::{p56_build_stream, p58_new_cf};
+use crate::phases_late::{
+    p56_build_stream, p58_new_cf, CLEANABLE_ACTION, CLEANABLE_CLEANED, CLEANABLE_FIELDS,
+    CLEANABLE_INDEX, REF_TYPE_CLEANER,
+};
 use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
 
 use std::collections::HashMap;
@@ -2638,9 +2641,19 @@ const BB_NATIVE_ID: usize = 6; // Long  — alloc_id from NativeMemoryTable, 0 i
 const BB_DIRECT_FLAG: usize = 7; // Int   — 1 if direct, 0 otherwise
 
 // jdk/internal/ref/Cleaner$Deallocator synthetic for DirectByteBuffer.
-// field 0 = alloc_id (Long).
+//   field 0 = alloc_id (Long)          — key into the VM's `NativeMemoryTable`
+//   field 1 = global-root handle (Long) — the root that keeps the owning
+//             `Cleaner$Cleanable` reachable until the action has run; see
+//             `s2_bb_alloc_direct`. Zeroed by `run()` once released.
 const DEALLOC_ID: usize = 0;
+const DEALLOC_ROOT: usize = 1;
+const DEALLOC_FIELDS: usize = 2;
 const DEALLOC_CLASS: &str = "jdk/internal/ref/DirectBufferDeallocator";
+
+/// Alignment of the off-heap block behind a synthetic `DirectByteBuffer`.
+/// 8 bytes is sufficient for every primitive `Unsafe.put*` width, matching
+/// `native-io/src/direct_buffer.rs`'s `DBB_ALIGN`.
+const DIRECT_BUFFER_ALIGN: usize = 8;
 
 const S2SC_CONNECTED: usize = 0;
 const S2SC_OPEN: usize = 1;
@@ -2674,9 +2687,17 @@ const S2DC_SOCK_ID: usize = 4;
 
 // ---- ByteBuffer helpers ----------------------------------------------------
 
-fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
+fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Option<ObjectRef> {
     use cratonvm_types::ArrayElementType;
-    let arr = ctx.new_array(ArrayElementType::Byte, cap);
+    // `ByteBuffer.allocate(n)` is caller-sized: `n` comes straight from Java,
+    // and on a full heap the backing `new byte[n]` must raise a *catchable*
+    // OutOfMemoryError (what HotSpot does) rather than abort the VM. This is
+    // the same fallible-allocator idiom as the ArrayList(int)/StringBuilder(int)
+    // capacity-constructor family — see
+    // `docs/internal/gaps/crash-01-arraylist-capacity-oom-abend.md`. Found via
+    // H2's `org.h2.test.db.TestOutOfMemory`, whose MVStore-on-memFS workload
+    // allocates ~76 MB buffers until the heap is gone.
+    let arr = ctx.try_new_array(ArrayElementType::Byte, cap)?;
     // GC-safety: `alloc_concurrent_synthetic` below allocates and can
     // trigger a collection that relocates `arr` (read again by
     // `bb_write_hb` immediately after); pin it and re-read.
@@ -2685,7 +2706,87 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
     bb_write_hb(ctx, buf, arr, cap as i32);
-    buf
+    Some(buf)
+}
+
+/// NEW-17 — synthetic-mode `ByteBuffer.allocateDirect(cap)`.
+///
+/// The result is a genuinely DIRECT buffer: `cap` bytes of real off-heap
+/// memory from the VM's `NativeMemoryTable`, released when the buffer becomes
+/// unreachable. It reuses the six-slot synthetic ByteBuffer shape every
+/// `s2_bb_*` accessor in this file already understands, with one difference
+/// from the heap flavour built by `s2_bb_alloc`: `BB_ARRAY` stays null and
+/// `BB_MARK` (slot 4) carries the native address — exactly what
+/// `s2_bb_direct_addr` probes for, and the same convention the direct
+/// typed-buffer views produced by `s2_view_buf_fn!` already use. So
+/// `isDirect()` answers true, `hasArray()` false, `array()` throws
+/// `UnsupportedOperationException`, and every get/put routes through
+/// `copy_from_native_memory`/`copy_to_native_memory` against the real block.
+/// (The cost of reusing slot 4 is that such a buffer has no `mark` — see the
+/// guard in `s2_bb_set_mark`, which drops the write rather than overwriting
+/// the backing pointer with a small integer.)
+///
+/// Reclamation is the NEW-17 Cleaner pipeline, not a finaliser:
+/// `discover_reference(Cleaner, cleanable, buf)` registers the Cleanable as a
+/// phantom over the buffer, so when the buffer dies the reference processor
+/// emits the Cleanable into `cleaner_actions`, `CleanerThread` queues it, and
+/// `interpreter::run_cleaner_actions` invokes `run()V` on the deallocator
+/// registered under `DEALLOC_CLASS` below. An explicit
+/// `Cleaner$Cleanable.clean()` reaches the same `run()` through the shared
+/// `cleaned` flag, so the block can never be freed twice.
+fn s2_bb_alloc_direct(ctx: &mut dyn NativeContext, cap: i32) -> MethodCallResult {
+    let allocation = ctx.allocate_native_memory(cap.max(0) as usize, DIRECT_BUFFER_ALIGN);
+    let (alloc_id, ptr) = match allocation {
+        Some(block) => block,
+        None => {
+            return Err(RuntimeError::OutOfMemoryError {
+                message: format!("Direct buffer memory: tried {cap}"),
+            }
+            .into())
+        }
+    };
+    let addr = ptr as usize as i64;
+
+    // GC SAFETY: each allocation below is a collection point. `buf` and
+    // `dealloc` are pinned across the later ones and re-read through the pins;
+    // `cleanable` is minted last so nothing can move it before its raw address
+    // reaches the reference processor.
+    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+    let buf_pin = ctx.pin_native_root(buf);
+    let dealloc = alloc_concurrent_synthetic(ctx, DEALLOC_CLASS, DEALLOC_FIELDS);
+    let dealloc_pin = ctx.pin_native_root(dealloc);
+    let cleanable =
+        alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner$Cleanable", CLEANABLE_FIELDS);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    let dealloc = ctx.read_native_pin(dealloc_pin, dealloc);
+    ctx.unpin_native_roots(buf_pin);
+
+    // No heap array: `s2_bb_arr` must answer None so `s2_bb_direct_addr` is
+    // consulted and the buffer reads as direct.
+    ctx.set_field(buf, BB_ARRAY, Value::Object(None));
+    ctx.set_field(buf, BB_POS, Value::Int(0));
+    ctx.set_field(buf, BB_LIMIT, Value::Int(cap));
+    ctx.set_field(buf, BB_CAP, Value::Int(cap));
+    ctx.set_field(buf, BB_MARK, Value::Long(addr));
+    ctx.set_field(buf, BB_ORDER, Value::Int(0)); // JDK default: BIG_ENDIAN
+
+    ctx.set_field(dealloc, DEALLOC_ID, Value::Long(alloc_id));
+    ctx.set_field(cleanable, CLEANABLE_ACTION, Value::Object(Some(dealloc)));
+    ctx.set_field(cleanable, CLEANABLE_CLEANED, Value::Int(0));
+    ctx.set_field(cleanable, CLEANABLE_INDEX, Value::Int(-1));
+
+    // The ReferenceProcessor keeps only the Cleanable's raw ADDRESS and is not
+    // a GC root, so without a strong reference the Cleanable would be
+    // collected alongside the buffer and the block would leak. There is no
+    // owning `Cleaner` object on this path to park it in (the JDK's
+    // `DirectByteBuffer` uses the static `CleanerFactory` list), so take a
+    // persistent global root instead — remapped by the moving collector — and
+    // record its handle in the deallocator, which drops it in `run()`.
+    let root = ctx.add_global_root(cleanable);
+    ctx.set_field(dealloc, DEALLOC_ROOT, Value::Long(root as i64));
+
+    ctx.discover_reference(REF_TYPE_CLEANER, cleanable, buf, None);
+    Ok(Some(Value::Object(Some(buf))))
 }
 
 /// Initialise a synthetic ByteBuffer so BOTH the indexed-slot layout
@@ -2810,7 +2911,22 @@ fn s2_bb_set_mark(ctx: &mut dyn NativeContext, buf: ObjectRef, value: i32) {
     // field resolution itself fails (see `vm_exec.rs::get_field_by_name`),
     // which distinguishes "no such field" from "real int field valued 0".
     match ctx.get_field_by_name(buf, "mark") {
-        Value::Object(None) => ctx.set_field(buf, BB_MARK, Value::Int(value)),
+        Value::Object(None) => {
+            // A SYNTHETIC direct buffer stores its native address in this very
+            // slot (see `s2_bb_alloc_direct` and the direct branch of
+            // `s2_view_buf_fn!`), so it has no mark slot at all. Writing an Int
+            // here would replace the backing pointer with a small integer and
+            // turn the next get/put into a wild native access. Drop the mark
+            // instead — a later `reset()` then reports "no mark", which is a
+            // recoverable `InvalidMarkException` rather than a SIGSEGV. Only
+            // reachable when `mark` did NOT resolve by name, so a real-JDK
+            // buffer (whose slot 4 is also a positive `address` long) never
+            // takes this branch.
+            if matches!(ctx.get_field(buf, BB_MARK), Value::Long(addr) if addr > 0) {
+                return;
+            }
+            ctx.set_field(buf, BB_MARK, Value::Int(value))
+        }
         _ => ctx.set_field_by_name(buf, "mark", Value::Int(value)),
     }
 }
@@ -3101,6 +3217,42 @@ fn s2_bb_set_pos(ctx: &mut dyn NativeContext, buf: ObjectRef, v: i32) {
     } else {
         ctx.set_field_by_name(buf, "position", Value::Int(v));
     }
+}
+
+/// Bulk `byte[]` → `byte[]` copy for the ByteBuffer natives, through the VM's
+/// `memcpy` intrinsics instead of a per-element accessor loop.
+///
+/// Every heap↔heap arm of `get([B)`, `get([BII)`, `put([B)`, `put([BII)` and
+/// `put(Ljava/nio/ByteBuffer;)` used to move one byte per `get_array_element` /
+/// `set_array_element` call, i.e. two dynamic accessor calls per byte. That is
+/// what `native-api`'s own doc comment on `write_byte_array_from` calls out as
+/// the migration these callers were waiting for, and it is the whole of
+/// `TestAsyncMessagesPerformance`'s inter-chunk gap: the WebSocket client moves
+/// ~32 KiB through these five methods for every 8 KiB partial message it
+/// delivers (socket → `response` → `inputBuffer` → `messageBufferBinary` →
+/// the defensive `copy` handed to `onMessage`).
+/// See `docs/known-issues/tomcat/32-doc04-residual-perf-assertions.md` §32.3.
+///
+/// Returns `false` — having written nothing — when either intrinsic declines
+/// (non-byte array kind, or bounds it refuses); the caller must then fall back
+/// to the element loop. Copying via an owned buffer also makes an overlapping
+/// same-array copy well defined, which the element loop was not.
+fn s2_bb_bulk_array_copy(
+    ctx: &mut dyn NativeContext,
+    src: ObjectRef,
+    src_off: usize,
+    dst: ObjectRef,
+    dst_off: usize,
+    len: usize,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mut buf = vec![0u8; len];
+    if ctx.read_byte_array_into(src, src_off, &mut buf) != len {
+        return false;
+    }
+    ctx.write_byte_array_from(dst, dst_off, &buf)
 }
 
 fn s2_bb_get_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i8 {
@@ -4197,7 +4349,13 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
 
     r.register(bb, "allocate", "(I)Ljava/nio/ByteBuffer;", |ctx, args| {
         let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-        Ok(Some(Value::Object(Some(s2_bb_alloc(ctx, cap)))))
+        match s2_bb_alloc(ctx, cap) {
+            Some(buf) => Ok(Some(Value::Object(Some(buf)))),
+            None => Err(RuntimeError::OutOfMemoryError {
+                message: "Java heap space".to_string(),
+            }
+            .into()),
+        }
     });
     r.register(
         bb,
@@ -4211,7 +4369,32 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            ctx.new_object_initialized("java/nio/DirectByteBuffer", "(I)V", &[Value::Int(cap)])
+            // Real-JDK mode: run the genuine `DirectByteBuffer(int)`
+            // constructor. It installs the JDK's own `Cleaner`/`Deallocator`
+            // and `Bits` accounting, which is strictly better than anything we
+            // can synthesise, so nothing changes on that path.
+            //
+            // Both probes are needed and neither alone is enough:
+            // `would_fabricate_synthetic_stub` is the non-destructive "are the
+            // class bytes reachable" question, but it answers "no stub" once
+            // ANY earlier caller has already minted the stub (it short-circuits
+            // on `resolve_fast_path_class_id`); `is_class_synthetic_stub`
+            // covers exactly that case by asking what the loaded class IS.
+            let real_direct_byte_buffer =
+                !ctx.would_fabricate_synthetic_stub("java/nio/DirectByteBuffer")
+                    && !ctx.is_class_synthetic_stub("java/nio/DirectByteBuffer");
+            if real_direct_byte_buffer {
+                return ctx.new_object_initialized(
+                    "java/nio/DirectByteBuffer",
+                    "(I)V",
+                    &[Value::Int(cap)],
+                );
+            }
+            // Synthetic-JDK mode: there is no `DirectByteBuffer` bytecode to
+            // run and `new_object_initialized` would raise NoClassDefFound —
+            // `allocateDirect` simply threw. Build a genuinely direct buffer
+            // here instead (NEW-17).
+            s2_bb_alloc_direct(ctx, cap)
         },
     );
     r.register(bb, "wrap", "([B)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -4295,9 +4478,12 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         // came back as zero (ES-FAIL-FAMILY-20260709).
         if let Some(arr) = s2_bb_arr(ctx, this) {
             let base = s2_bb_heap_base(ctx, this);
-            for i in 0..len as usize {
-                let b = ctx.get_array_element(arr, base + pos as usize + i);
-                ctx.set_array_element(dst, off + i, b);
+            let src_off = base + pos as usize;
+            if !s2_bb_bulk_array_copy(ctx, arr, src_off, dst, off, len as usize) {
+                for i in 0..len as usize {
+                    let b = ctx.get_array_element(arr, src_off + i);
+                    ctx.set_array_element(dst, off + i, b);
+                }
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
             let mut bytes = vec![0u8; len as usize];
@@ -4307,8 +4493,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            for (i, byte) in bytes.iter().enumerate() {
-                ctx.set_array_element(dst, off + i, Value::Int(*byte as i8 as i32));
+            if !ctx.write_byte_array_from(dst, off, &bytes) {
+                for (i, byte) in bytes.iter().enumerate() {
+                    ctx.set_array_element(dst, off + i, Value::Int(*byte as i8 as i32));
+                }
             }
         } else {
             // Genuinely storage-less synthetic buffer — keep the historic
@@ -4329,9 +4517,12 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         if let Some(arr) = s2_bb_arr(ctx, this) {
             let base = s2_bb_heap_base(ctx, this);
-            for i in 0..len as usize {
-                let b = ctx.get_array_element(arr, base + pos as usize + i);
-                ctx.set_array_element(dst, i, b);
+            let src_off = base + pos as usize;
+            if !s2_bb_bulk_array_copy(ctx, arr, src_off, dst, 0, len as usize) {
+                for i in 0..len as usize {
+                    let b = ctx.get_array_element(arr, src_off + i);
+                    ctx.set_array_element(dst, i, b);
+                }
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
             let mut bytes = vec![0u8; len as usize];
@@ -4341,8 +4532,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            for (i, byte) in bytes.iter().enumerate() {
-                ctx.set_array_element(dst, i, Value::Int(*byte as i8 as i32));
+            if !ctx.write_byte_array_from(dst, 0, &bytes) {
+                for (i, byte) in bytes.iter().enumerate() {
+                    ctx.set_array_element(dst, i, Value::Int(*byte as i8 as i32));
+                }
             }
         } else {
             return Ok(Some(Value::Object(Some(this))));
@@ -4413,14 +4606,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         // get([BII)'s comment above for the matching read-side rationale.
         if let Some(arr) = s2_bb_arr(ctx, this) {
             let base = s2_bb_heap_base(ctx, this);
-            for i in 0..len as usize {
-                let b = ctx.get_array_element(src, off + i);
-                ctx.set_array_element(arr, base + pos as usize + i, b);
+            let dst_off = base + pos as usize;
+            if !s2_bb_bulk_array_copy(ctx, src, off, arr, dst_off, len as usize) {
+                for i in 0..len as usize {
+                    let b = ctx.get_array_element(src, off + i);
+                    ctx.set_array_element(arr, dst_off + i, b);
+                }
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
             let mut bytes = vec![0u8; len as usize];
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = ctx.get_array_element(src, off + i).as_int().unwrap_or(0) as u8;
+            if ctx.read_byte_array_into(src, off, &mut bytes) != len as usize {
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte = ctx.get_array_element(src, off + i).as_int().unwrap_or(0) as u8;
+                }
             }
             if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
                 return Err(RuntimeError::IllegalStateException {
@@ -4447,14 +4645,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         if let Some(arr) = s2_bb_arr(ctx, this) {
             let base = s2_bb_heap_base(ctx, this);
-            for i in 0..len as usize {
-                let b = ctx.get_array_element(src, i);
-                ctx.set_array_element(arr, base + pos as usize + i, b);
+            let dst_off = base + pos as usize;
+            if !s2_bb_bulk_array_copy(ctx, src, 0, arr, dst_off, len as usize) {
+                for i in 0..len as usize {
+                    let b = ctx.get_array_element(src, i);
+                    ctx.set_array_element(arr, dst_off + i, b);
+                }
             }
         } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
             let mut bytes = vec![0u8; len as usize];
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = ctx.get_array_element(src, i).as_int().unwrap_or(0) as u8;
+            if ctx.read_byte_array_into(src, 0, &mut bytes) != len as usize {
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte = ctx.get_array_element(src, i).as_int().unwrap_or(0) as u8;
+                }
             }
             if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
                 return Err(RuntimeError::IllegalStateException {
@@ -4499,11 +4702,14 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let mut bytes = vec![0u8; n];
             if let Some(src_arr) = s2_bb_arr(ctx, src) {
                 let src_base = s2_bb_heap_base(ctx, src);
-                for (i, b) in bytes.iter_mut().enumerate() {
-                    *b = ctx
-                        .get_array_element(src_arr, src_base + src_pos as usize + i)
-                        .as_int()
-                        .unwrap_or(0) as u8;
+                let src_start = src_base + src_pos as usize;
+                if ctx.read_byte_array_into(src_arr, src_start, &mut bytes) != n {
+                    for (i, b) in bytes.iter_mut().enumerate() {
+                        *b = ctx
+                            .get_array_element(src_arr, src_start + i)
+                            .as_int()
+                            .unwrap_or(0) as u8;
+                    }
                 }
             } else if let Some(addr) = s2_bb_direct_addr(ctx, src) {
                 if !ctx.copy_from_native_memory(addr.saturating_add(src_pos as i64), &mut bytes) {
@@ -4519,12 +4725,15 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             }
             if let Some(dst_arr) = s2_bb_arr(ctx, this) {
                 let dst_base = s2_bb_heap_base(ctx, this);
-                for (i, b) in bytes.iter().enumerate() {
-                    ctx.set_array_element(
-                        dst_arr,
-                        dst_base + pos as usize + i,
-                        Value::Int(*b as i8 as i32),
-                    );
+                let dst_start = dst_base + pos as usize;
+                if !ctx.write_byte_array_from(dst_arr, dst_start, &bytes) {
+                    for (i, b) in bytes.iter().enumerate() {
+                        ctx.set_array_element(
+                            dst_arr,
+                            dst_start + i,
+                            Value::Int(*b as i8 as i32),
+                        );
+                    }
                 }
             } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
                 if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
@@ -5969,6 +6178,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         ctx.free_native_memory(alloc_id);
         ctx.set_field(this, DEALLOC_ID, Value::Long(0));
+        // Release the global root that kept the owning `Cleaner$Cleanable`
+        // (and, through it, this deallocator) reachable until the action ran.
+        // Leaving it installed would pin both for the life of the VM — a slow
+        // leak of exactly the shape the Cleaner exists to prevent.
+        if let Value::Long(root) = ctx.get_field(this, DEALLOC_ROOT) {
+            if root != 0 {
+                ctx.remove_global_root(root as usize);
+                ctx.set_field(this, DEALLOC_ROOT, Value::Long(0));
+            }
+        }
         Ok(None)
     });
 }

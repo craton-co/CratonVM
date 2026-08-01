@@ -25,6 +25,36 @@ const STRING_NUM_FIELDS_DEFAULT: usize = 2;
 const CODER_LATIN1: i32 = 0;
 const CODER_UTF16: i32 = 1;
 
+// JDK-ONLY-LAYOUT (anchor for every `java/lang/String` slot literal in this
+// file): **safe on the declared JDK matrix, positional by construction.**
+//
+// The compact-string writers and `read_java_string_inner` address `String`
+// fields as slot 0 = `value`, 1 = `coder`, 2 = `hash`, 3 = `hashIsZero`. That
+// is not a synthetic invention: it is the REAL declaration order of
+// `java.lang.String` on JDK 9+ (verified against the JDK 25 image — `private
+// final byte[] value; private final byte coder; private int hash; private
+// boolean hashIsZero;`, with `java/lang/Object` as superclass so there are no
+// inherited slots ahead of them). The synthetic stub layout
+// (`instance_fields(2)` in `classloading::class_manager::synthetic_stub_fields`)
+// is the SUBSET `value`/`hash`, and is only reachable with `compact_strings`
+// off, where the writers use the 2-slot branch.
+//
+// Consequences for `--jdk-only`:
+//   * No conversion is required for correctness on JDK 17/21/25.
+//   * It is nevertheless a *positional* dependency on a private JDK layout.
+//     Pre-9 `String` is `char[] value; int hash;`, so slot 1 would be `hash`
+//     and every write of `coder` would corrupt the cached hash — a silent
+//     wrong-field write, not a type error. If the supported feature-version
+//     matrix is ever widened downward, this must become a named lookup first.
+//   * The conversion, if it is ever made, is a cached slot table resolved once
+//     off the loaded `java/lang/String` — exactly the shape `ClassMirrorSlots`
+//     / `resolve_class_mirror_slots` already use below for `java/lang/Class`.
+//     It is deliberately NOT done here in wave 1: this is the hottest
+//     allocation path in the VM (every `StringBuilder.toString`, `substring`,
+//     `concat`, regex group and boxed number reaches it) and the existing
+//     indices are demonstrably correct, so the change would add risk without
+//     removing a defect. See `docs/jdk-only-object-layout-audit.md`.
+
 /// Create a Java String object from a Rust `&str`.
 ///
 /// Uses the VM's string pool for interning: if an identical string was already
@@ -656,6 +686,14 @@ fn read_java_string_inner(
     if heap.num_fields(obj_ref) < 2 {
         return None;
     }
+    // JDK-ONLY-LAYOUT: safe — see the `String` slot anchor next to
+    // `CODER_LATIN1` at the top of this file. Slots 0/1 are `value`/`coder` in
+    // the real JDK 9+ declaration order. Note this reader is *deliberately*
+    // speculative (it is called on receivers that may not be Strings at all),
+    // so it must stay index-based: a named lookup would resolve `value` off
+    // whatever class the receiver actually is and defeat the shape check. The
+    // `coder ∈ {0,1}` and `num_fields >= 4` guards below are what make the
+    // positional probe safe; do not weaken them when converting other sites.
     // Read field 0 (the value array)
     let value_array = match heap.get_field(obj_ref, 0) {
         Value::Object(Some(arr)) => arr,
@@ -972,6 +1010,38 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // JDK bytecode that reads `cachedConstructor` gets an Int which it treats
     // as an invalid reference (effectively null) — safe because the field is
     // always read under an `if (cachedConstructor == null)` guard.
+    //
+    // JDK-ONLY-LAYOUT: unknown — needs runtime evidence, ranked HIGH.
+    //
+    // This is an *overlay*: a VM-internal value deliberately written on top of
+    // a real JDK field, which is a different hazard from a mis-numbered slot.
+    // Verified against JDK 25: instance field 0 of `java.lang.Class` is
+    // `private volatile transient Constructor<T> cachedConstructor`, i.e. a
+    // REFERENCE slot receiving an `Int`. The claim above ("treated as an
+    // invalid reference, effectively null") is an assertion about this VM's
+    // reference-vs-primitive decode, not about HotSpot, and it is exactly the
+    // shape that produces `expected object reference, got int(N)` elsewhere in
+    // the tree. `NativeContextImpl::set_field` also runs the value through
+    // `set_field_as` with the DECLARED descriptor, so the stored tag depends on
+    // that coercion — it is not obviously a stable Int.
+    //
+    // Evidence that would settle it (do not guess):
+    //   1. Under `--real-jdk`, run a program that reaches
+    //      `Class.getConstructor(...)` / `Class.getDeclaredConstructor(...)`
+    //      twice on the same class (so the second call takes the
+    //      `cachedConstructor != null` fast path) and check whether the
+    //      `getfield cachedConstructor` succeeds, returns null, or raises.
+    //   2. Run the same with `CRATONVM_DBG_OVERLAY` enabled — the
+    //      overlay-corruption hunter in `vm_exec.rs` (`overlay_write_is_destructive`)
+    //      exists precisely to report a primitive written to a reference slot,
+    //      and this write should appear in its output if the hazard is live.
+    //   3. Confirm which readers still depend on slot 0: the reverse map
+    //      (`class_mirrors_reverse` / `class_id_from_mirror`) is the primary
+    //      path, and `mirror_class_id` in `native-builtins/src/lang_class.rs`
+    //      only falls back to `get_field(mirror, 0)` when the reverse map
+    //      misses. If the census shows zero fallback hits under a real JDK, the
+    //      correct wave-2 fix is to DELETE the slot-0 write (and the slot-1
+    //      name read in `mirror_class_name`) rather than relocate it.
     shared
         .mem
         .heap
@@ -1138,6 +1208,13 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
 
     // Slot 0: Int(-1) marks this as a primitive Class mirror (legacy
     // VM-internal convention, not a JDK field — fixed slot).
+    //
+    // JDK-ONLY-LAYOUT: unknown — same overlay hazard as the class-mirror
+    // populator above (slot 0 of a real `java.lang.Class` is
+    // `cachedConstructor`, a reference). Resolve both together; a primitive
+    // mirror additionally has no legitimate `cachedConstructor` reader, so if
+    // the evidence says the overlay is destructive, this site can move to the
+    // `primitive_mirrors` side table with no JDK-visible consequence.
     shared.mem.heap.set_field(mirror, 0, Value::Int(-1));
 
     // name → primitive type name as String.

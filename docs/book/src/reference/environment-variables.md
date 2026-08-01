@@ -84,7 +84,7 @@ a synthetic-vs-real difference.
 
 | Token | Description |
 |-------|-------------|
-| `-stubs` | Drop every synthetic-stub native so calls fall through to real bytecode (or a clear `NoSuchMethodError`). |
+| `-stubs` | Drop every synthetic-stub native so calls fall through to real bytecode (or a clear `NoSuchMethodError`). This is the native-registry third of [JDK-only mode](../user-guide/jdk-only-mode.md); it cannot express the class-loading or dispatch half, and setting it without `--jdk-only` now prints a one-time note saying so. |
 | `net-sockets` | Use real `java.net` socket bytecode instead of the synthetic socket layer. |
 | `aqs` / `-aqs` | Route `AbstractQueuedSynchronizer` / `ReentrantLock` through real `java.util.concurrent` bytecode. |
 | `annotations` / `-annotations` | Annotation reflection uses real proxy-backed annotation objects; `-annotations` restores the old synthetic representation. |

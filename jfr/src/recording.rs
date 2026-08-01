@@ -315,6 +315,11 @@ pub struct FlightRecorder {
     /// `refresh_running_ids` after each state transition. `Vec::with_capacity(4)`
     /// keeps it allocation-free for typical workloads (1-4 concurrent recordings).
     running_ids: Vec<u64>,
+    /// How many running recordings this recorder last published to the
+    /// process-global count behind `is_enabled` (see
+    /// `crate::publish_running_delta`). Kept so each recorder reports only its
+    /// own delta and cannot clear a peer's contribution.
+    published_running: usize,
     /// Task #30 (HIGH correctness): per-event-type "first emit" field-shape
     /// lock. The first successful emit of a given [`EventTypeId`] records
     /// the runtime variant sequence of its fields here; every later emit
@@ -337,6 +342,7 @@ impl FlightRecorder {
             type_registry: EventTypeRegistry::new(),
             next_recording_id: 1,
             running_ids: Vec::with_capacity(4),
+            published_running: 0,
             field_shape_lock: FxHashMap::default(),
         }
     }
@@ -383,7 +389,9 @@ impl FlightRecorder {
                 self.running_ids.push(id);
             }
         }
-        crate::set_enabled(!self.running_ids.is_empty());
+        let now = self.running_ids.len();
+        let prev = std::mem::replace(&mut self.published_running, now);
+        crate::publish_running_delta(prev, now);
     }
 
     fn running_ids_are_current(&self) -> bool {

@@ -519,6 +519,27 @@ fn arg_long(args: &[Value], idx: usize) -> i64 {
     }
 }
 
+/// Read the single `long` argument of an INSTANCE `Unsafe` method.
+///
+/// `sun.misc.Unsafe.allocateMemory(long)` / `freeMemory(long)` (and the
+/// `jdk.internal.misc.Unsafe` `*0` twins) are instance methods, so the
+/// interpreter passes the receiver as `args[0]` and the `long` as `args[1]`.
+/// Reading `args[0]` — as this file did — decoded the receiver reference as
+/// `0`, so `allocateMemory(n)` allocated nothing and returned address 0 for
+/// EVERY caller, and `freeMemory(addr)` took its `addr == 0` early return and
+/// silently leaked every block. These registrations win the registry slot over
+/// `native-builtins`' arena-backed twins (`register_io_natives` runs after
+/// `register_builtins`), so the broken pair was the live implementation.
+///
+/// A leading object reference is skipped rather than assumed, so a direct
+/// caller that passes the bare argument list still resolves correctly.
+fn unsafe_long_arg(args: &[Value]) -> i64 {
+    match args.first() {
+        Some(Value::Object(_)) => arg_long(args, 1),
+        _ => arg_long(args, 0),
+    }
+}
+
 fn arg_obj(args: &[Value], idx: usize) -> Option<ObjectRef> {
     match args.get(idx) {
         Some(Value::Object(Some(o))) => Some(*o),
@@ -739,7 +760,7 @@ fn directbuffer_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// size info is available here), but the DirectByteBuffer path is now
 /// fully GC-driven.
 fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = arg_long(args, 0) as u64;
+    let addr = unsafe_long_arg(args) as u64;
     if addr == 0 {
         return Ok(None);
     }
@@ -787,7 +808,7 @@ fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// accurately. JVM users who go via `ByteBuffer.allocateDirect` use
 /// `dbb_allocate_direct0` above and don't touch this path.
 fn unsafe_allocate_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let size = arg_long(args, 0);
+    let size = unsafe_long_arg(args);
     let addr = dbb_allocate(size)?;
     if addr != 0 {
         record_unsafe_alloc(addr, size);
@@ -1417,6 +1438,16 @@ fn dbb_commit_position(ctx: &mut dyn NativeContext, this: ObjectRef, new_positio
     }
 }
 
+// JDK-ONLY-CLASSIFY: unknown — needs census. Direct buffers ARE a memory
+// boundary, which is bridge territory under jdk-only-native-review.md §5, but
+// not one of the 25 statically resolvable triples here is ACC_NATIVE in JDK 25:
+// 9 shadow concrete bytecode, 7 name methods absent from the image, 2 name
+// absent classes and 2 have a descriptor that does not match the real one. In
+// JDK 25 the actual native boundary for direct memory is `jdk.internal.misc.
+// Unsafe`, not `java.nio.Bits` / `DirectByteBuffer`, so several of these look
+// like they are bridging one layer too high. Evidence needed: `invocations`
+// plus `real_declaring_method` per triple before promoting or demoting any of
+// them — and note the descriptor mismatches are dead registrations either way.
 /// Register the WP3.5 DirectByteBuffer + Cleaner natives.  Idempotent:
 /// safe to call multiple times.  See module docs for FQN list and
 /// caveats around partial WP1.10 Cleaner integration.

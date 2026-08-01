@@ -10,6 +10,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::class_origin::ClassOrigin;
 use crate::loader_flags;
 use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
 use cratonvm_reader::class_file_version::ClassFileVersion;
@@ -330,10 +331,32 @@ pub struct Class {
     /// Module name (from Module attribute, Java 9+). None for unnamed module.
     pub module_name: Option<String>,
 
+    /// Provenance of this class — where its definition actually came from.
+    ///
+    /// **Authoritative.** [`is_synthetic_stub`](Self::is_synthetic_stub) is a
+    /// derived mirror of `origin.is_compatibility_stub()`; this field is the
+    /// source of truth. Written only through [`Class::set_origin`].
+    ///
+    /// `--jdk-only` rejects exactly one variant of this enum
+    /// ([`ClassOrigin::CompatibilityStub`]); every other way a class can come
+    /// into existence — boot image, classpath, user loader, array synthesis,
+    /// hidden class, lambda, proxy, reflection accessor — is legitimate in both
+    /// modes. See `docs/feature-designs/jdk-only-mode.md` §1 and §5.
+    pub origin: ClassOrigin,
+
     /// `true` if this class was created as a synthetic stub (no `.class` file found).
     /// Synthetic stubs have zero methods and rely entirely on native registrations.
     /// When a real `.class` file is available, this is `false` and bytecode methods
     /// take precedence over native registrations in dispatch.
+    ///
+    /// **DERIVED — do not write this field directly.** It is `true` if and only
+    /// if `self.origin.is_compatibility_stub()`, and both fields are written
+    /// together by [`Class::set_origin`]. It survives only because ~160 read
+    /// sites across 17 files still consult it; those are migrated to
+    /// [`Class::origin`] and this field is deleted in a later wave (contract
+    /// §5: "Convert it to a pure derived mirror now, delete it in a later
+    /// wave"). Until then a divergence between the two means half the VM sees a
+    /// stub where the other half sees a real class.
     ///
     /// Do not use this path for types the JDK or application exposes as real classfiles;
     /// see `docs/jvm-no-synthetic-stubs.md`.
@@ -465,6 +488,26 @@ pub struct EnclosingMethodInfo {
 }
 
 impl Class {
+    // ----- Provenance ------------------------------------------------------
+
+    /// Record where this class came from, keeping the derived
+    /// [`is_synthetic_stub`](Self::is_synthetic_stub) mirror in sync.
+    ///
+    /// **Every write to either field must go through here.** `is_synthetic_stub`
+    /// is `true` if and only if the origin is a
+    /// [`ClassOrigin::CompatibilityStub`], so setting one without the other
+    /// splits the VM's view of the class: the ~160 sites still reading the bool
+    /// would disagree with the census and with the `--jdk-only` policy check.
+    ///
+    /// The in-place "a real `.class` turned up, upgrade the stub" path in
+    /// `ClassManager::upgrade_synthetic_class` is the case that matters most —
+    /// it must clear the mirror as it installs the real origin, or real bytes
+    /// keep losing to a fabricated stand-in.
+    pub fn set_origin(&mut self, origin: ClassOrigin) {
+        self.is_synthetic_stub = origin.is_compatibility_stub();
+        self.origin = origin;
+    }
+
     // ----- Interned accessors ---------------------------------------------
     //
     // `Class::name`, `ClassFileMethod::name`/`descriptor`, and
@@ -1688,6 +1731,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,

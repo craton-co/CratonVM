@@ -77,16 +77,39 @@
 //!    trigger, not after.
 //!  * `RecordingSettings::max_age` / `max_size` are **not enforced anywhere**;
 //!    see their declarations in [`recording`].
+//!
+//! ## JDK-only mode telemetry
+//!
+//! [`jdk_only`] holds the aggregate counter set of
+//! `docs/feature-designs/jdk-only-mode.md` — seven `_total` counters folded, at
+//! report time, out of censuses the VM already keeps. It lives in this crate
+//! because this is where the repository puts "measurements of a run that an
+//! operator may ask to have written out", not because it emits JFR events: it
+//! shares none of the machinery above, takes no ring, registers no event type,
+//! and does not consult [`is_enabled`]. It has its own gate (off by default,
+//! opened only by the JDK-only artefact flags), because a flight recording and
+//! a policy census are different questions and an operator asking for one must
+//! not silently get the other.
 
 pub mod builtin;
 pub mod dump;
 pub mod event;
+pub mod jdk_only;
 pub mod recording;
 pub mod repository;
 pub mod stream;
 
 pub use dump::{dump_to_file, read_events, read_jfr_header, JfrDumpError, JfrFileHeader};
 pub use event::*;
+// JDK-only counters. Named re-exports rather than a glob: the module's public
+// surface is mostly `const` label vocabularies whose names (`NATIVE_KINDS`,
+// `GENERATORS`) are generic enough to collide with a future JFR export, and a
+// vocabulary should be reached through `jdk_only::` so the reader knows which
+// contract's spelling they are looking at.
+pub use jdk_only::{
+    ContractCounts, JdkOnlyCounters, JdkOnlyTelemetry, NativeCensusSample,
+    JDK_ONLY_TELEMETRY_SCHEMA_VERSION,
+};
 pub use recording::*;
 pub use repository::*;
 pub use stream::EventStream;
@@ -139,6 +162,36 @@ pub fn is_enabled() -> bool {
 /// `Acquire` load in [`is_enabled`].
 pub fn set_enabled(v: bool) {
     JFR_ENABLED.store(v, Ordering::Release);
+}
+
+/// Number of running recordings summed over every [`FlightRecorder`] in the
+/// process. [`is_enabled`] is `true` exactly while this is non-zero.
+static RUNNING_RECORDINGS: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+/// Publish a recorder's change in running-recording count.
+///
+/// `JFR_ENABLED` is process-global but a recorder's running set is not, so
+/// storing `!running_ids.is_empty()` directly — as `refresh_running_ids` used
+/// to — lets whichever recorder transitioned last decide the flag for all of
+/// them. With one recorder per process that is invisible; with several it is
+/// not, and `cratonvm-vm`'s test binary builds a `SharedVm`, and therefore a
+/// `FlightRecorder`, per test. A recorder with no recordings would call
+/// `set_enabled(false)` and silently switch JFR off underneath a concurrent
+/// test that had just started one, so every `emit_*` on that thread returned
+/// at its `is_enabled()` gate and the recording came back empty.
+///
+/// Tracking the total instead makes the flag mean what it says: some recording
+/// somewhere is running. Recorders report their own delta, so they compose.
+pub(crate) fn publish_running_delta(prev: usize, now: usize) {
+    let delta = now as isize - prev as isize;
+    let total = if delta == 0 {
+        RUNNING_RECORDINGS.load(Ordering::Acquire)
+    } else {
+        RUNNING_RECORDINGS.fetch_add(delta, Ordering::AcqRel) + delta
+    };
+    debug_assert!(total >= 0, "running-recording count went negative: {total}");
+    set_enabled(total > 0);
 }
 
 /// Create a new FlightRecorder with all built-in events registered.

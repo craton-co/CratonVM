@@ -5233,39 +5233,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         fsp,
         "newInputStream",
         "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/InputStream;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 1)?;
-            let p = p57_read_path(ctx, path_obj);
-            let read = match vfs_read(&p) {
-                Some(r) => r,
-                None => std::fs::read(&p),
-            };
-            match read {
-                Ok(data) => {
-                    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    // Pin across the array alloc below — a moving young GC
-                    // there would relocate the fresh stream (native
-                    // stale-local family).
-                    let stream_pin = ctx.pin_native_root(stream);
-                    use cratonvm_types::ArrayElementType;
-                    let arr = ctx.new_array(ArrayElementType::Byte, data.len());
-                    let stream = ctx.read_native_pin(stream_pin, stream);
-                    ctx.unpin_native_roots(stream_pin);
-                    ctx.write_byte_array_from(arr, 0, &data);
-                    ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
-                    ctx.set_field_by_name(stream, "pos", Value::Int(0));
-                    ctx.set_field_by_name(stream, "mark", Value::Int(0));
-                    ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
-                    Ok(Some(Value::Object(Some(stream))))
-                }
-                // NIO contract: missing file → NoSuchFileException (see
-                // newByteChannel above) so optional-config catches match.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
-                }
-                Err(e) => Err(p57_io_error(&e)),
-            }
-        },
+        // args[0] = this (the provider), args[1] = the Path.
+        |ctx, args| fsp_new_input_stream(ctx, args, 1),
     );
 
     // FileSystemProvider.newOutputStream — JDK's default impl at
@@ -5325,17 +5294,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             #[cfg(windows)]
             {
-                let requested_type = obj_arg(args, 2)
-                    .ok()
-                    .and_then(|class| crate::lang_class::mirror_class_name(ctx, class))
-                    .unwrap_or_default();
-                if !windows_supports_file_attributes_type(&requested_type) {
-                    return Err(RuntimeError::UnsupportedOperationException {
-                        message: format!(
-                            "File attribute type {requested_type} is not supported on Windows"
-                        ),
+                // See the `Files.readAttributes` registration: only a PRESENT,
+                // NAMEABLE `Class` argument states a requested type. Absent or
+                // unresolvable means "no request" and falls back to the
+                // declared return type, `BasicFileAttributes`.
+                if let Some(Value::Object(Some(class))) = args.get(2) {
+                    let requested_type =
+                        crate::lang_class::mirror_class_name(ctx, *class).unwrap_or_default();
+                    if !requested_type.is_empty()
+                        && !windows_supports_file_attributes_type(&requested_type)
+                    {
+                        return Err(RuntimeError::UnsupportedOperationException {
+                            message: format!(
+                                "File attribute type {requested_type} is not supported on Windows"
+                            ),
+                        }
+                        .into());
                     }
-                    .into());
                 }
             }
             let path_obj = obj_arg(args, 1)?;
@@ -5791,41 +5766,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         files,
         "newInputStream",
         "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/InputStream;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            let read = match vfs_read(&p) {
-                Some(r) => r,
-                None => std::fs::read(&p),
-            };
-            match read {
-                Ok(data) => {
-                    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    // Pin across the array alloc below — a moving young GC
-                    // there would relocate the fresh stream (native
-                    // stale-local family).
-                    let stream_pin = ctx.pin_native_root(stream);
-                    use cratonvm_types::ArrayElementType;
-                    let arr = ctx.new_array(ArrayElementType::Byte, data.len());
-                    let stream = ctx.read_native_pin(stream_pin, stream);
-                    ctx.unpin_native_roots(stream_pin);
-                    for (i, &b) in data.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                    }
-                    ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
-                    ctx.set_field_by_name(stream, "pos", Value::Int(0));
-                    ctx.set_field_by_name(stream, "mark", Value::Int(0));
-                    ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
-                    Ok(Some(Value::Object(Some(stream))))
-                }
-                // NIO contract: missing file → NoSuchFileException (see
-                // newByteChannel above) so optional-config catches match.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
-                }
-                Err(e) => Err(p57_io_error(&e)),
-            }
-        },
+        // args[0] = the Path (static method).
+        |ctx, args| fsp_new_input_stream(ctx, args, 0),
     );
 
     r.register(
@@ -7598,6 +7540,110 @@ pub(crate) fn fsp_scan_open_options(
         }
     }
     (append, create_new)
+}
+
+/// `Files.newInputStream` / `FileSystemProvider.newInputStream` — a **lazy**
+/// stream over `path`, the mirror image of [`fsp_new_output_stream`].
+///
+/// These used to read the whole file up front and hand back a
+/// `ByteArrayInputStream` over a snapshot. That is wasteful for ordinary files
+/// (a full copy of anything anyone streams) and *fatal* for anything that is
+/// not a regular file: `std::fs::read` on a character device never returns.
+/// Lucene's `org.apache.lucene.util.StringHelper.<clinit>` does
+///
+/// ```java
+/// new DataInputStream(Files.newInputStream(Paths.get("/dev/urandom"))).readLong()
+/// ```
+///
+/// — it wants eight bytes. Slurping `/dev/urandom` instead grew an unbounded
+/// `Vec<u8>` at ~600 MB/s until the kernel OOM-killed the process. Nothing
+/// bounded it: this is native memory, so `-Xmx` is irrelevant (peak RSS was
+/// ~14 GB at every heap size from 128m to 4g), and the kernel's SIGKILL left
+/// no Java exception and no VM diagnostic behind. See
+/// docs/known-issues/h2/bug-filechannel-map-anon-memory-growth.md.
+///
+/// `path_index` is where the `Path` argument sits: 0 for the `Files` statics,
+/// 1 for the `FileSystemProvider` instance method (whose slot 0 is `this`).
+pub(crate) fn fsp_new_input_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    path_index: usize,
+) -> MethodCallResult {
+    let path_obj = obj_arg(args, path_index)?;
+    let p = p57_read_path(ctx, path_obj);
+    // Jar/VFS entries have no file descriptor to hand out: they are already
+    // decoded in memory and bounded by the entry size, so a snapshot is both
+    // correct and the only option there.
+    if let Some(read) = vfs_read(&p) {
+        return match read {
+            Ok(data) => files_byte_array_input_stream(ctx, &data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(p57_no_such_file(ctx, &p)),
+            Err(e) => Err(p57_io_error(&e)),
+        };
+    }
+    let fd = match ctx.fd_table().open_read(&p) {
+        Ok(fd) => fd,
+        Err(e) => {
+            return Err(match e.kind() {
+                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p),
+                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p),
+                _ => p57_io_error(&e),
+            })
+        }
+    };
+    // Wire the fd onto a real `FileInputStream`, filling in every field its
+    // constructor would have. `FileInputStream.<init>` is itself natively
+    // intercepted (native-io's `native_fis_open0`), so the instance
+    // initialiser that creates `closeLock` never runs on any path — which is
+    // why native-io has `fis_backfill_constructor_fields` doing exactly this.
+    // Miss `closeLock` and the JDK's `close()`, which opens with
+    // `synchronized (closeLock)`, NPEs on every try-with-resources.
+    let stream = alloc_concurrent_synthetic(ctx, "java/io/FileInputStream", 4);
+    // Pin across the allocations below — each can trigger a moving young GC
+    // that relocates the fresh stream (native stale-local family).
+    let stream_pin = ctx.pin_native_root(stream);
+    let fd_obj = ctx.new_object("java/io/FileDescriptor");
+    let path_str = ctx.create_string(&p);
+    let close_lock = ctx.new_object("java/lang/Object");
+    let stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.unpin_native_roots(stream_pin);
+    let Ok(Some(Value::Object(Some(fd_obj)))) = fd_obj else {
+        let _ = ctx.fd_table().close(fd);
+        return Err(RuntimeError::IOException {
+            message: format!("newInputStream({p}): could not allocate a FileDescriptor"),
+        }
+        .into());
+    };
+    ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
+    ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
+    ctx.set_field_by_name(stream, "fd", Value::Object(Some(fd_obj)));
+    // `FileInputStream.path` backs `getChannel()`/diagnostics on the real JDK.
+    ctx.set_field_by_name(stream, "path", Value::Object(Some(path_str)));
+    if let Ok(Some(lock @ Value::Object(Some(_)))) = close_lock {
+        ctx.set_field_by_name(stream, "closeLock", lock);
+    }
+    ctx.set_field_by_name(stream, "closed", Value::Int(0));
+    // Belt-and-braces for legacy callers that read instance slot 0 directly.
+    ctx.set_field(stream, 0, Value::Object(Some(fd_obj)));
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+/// A `ByteArrayInputStream` over `data` — the in-memory stream shape used for
+/// VFS (jar) entries, which have no file descriptor to stream from.
+fn files_byte_array_input_stream(ctx: &mut dyn NativeContext, data: &[u8]) -> MethodCallResult {
+    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+    // Pin across the array alloc below — a moving young GC there would
+    // relocate the fresh stream (native stale-local family).
+    let stream_pin = ctx.pin_native_root(stream);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, data.len());
+    let stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.unpin_native_roots(stream_pin);
+    ctx.write_byte_array_from(arr, 0, data);
+    ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
+    ctx.set_field_by_name(stream, "pos", Value::Int(0));
+    ctx.set_field_by_name(stream, "mark", Value::Int(0));
+    ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
+    Ok(Some(Value::Object(Some(stream))))
 }
 
 /// FileSystemProvider.newOutputStream — opens `path` for writing via
@@ -12850,17 +12896,26 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             #[cfg(windows)]
             {
-                let requested_type = obj_arg(args, 1)
-                    .ok()
-                    .and_then(|class| crate::lang_class::mirror_class_name(ctx, class))
-                    .unwrap_or_default();
-                if !windows_supports_file_attributes_type(&requested_type) {
-                    return Err(RuntimeError::UnsupportedOperationException {
-                        message: format!(
-                            "File attribute type {requested_type} is not supported on Windows"
-                        ),
+                // Only a PRESENT `Class` argument states a requested type. A
+                // null/absent one carries no request at all, and rejecting it
+                // produced the nonsense `File attribute type  is not supported
+                // on Windows` (note the empty name) for a caller that never
+                // asked for anything unsupported. Fall back to the method's
+                // declared return type, `BasicFileAttributes`, which Windows
+                // does support.
+                if let Some(Value::Object(Some(class))) = args.get(1) {
+                    let requested_type =
+                        crate::lang_class::mirror_class_name(ctx, *class).unwrap_or_default();
+                    if !requested_type.is_empty()
+                        && !windows_supports_file_attributes_type(&requested_type)
+                    {
+                        return Err(RuntimeError::UnsupportedOperationException {
+                            message: format!(
+                                "File attribute type {requested_type} is not supported on Windows"
+                            ),
+                        }
+                        .into());
                     }
-                    .into());
                 }
             }
             let path = args.first().copied().unwrap_or(Value::Object(None));
@@ -13073,11 +13128,67 @@ pub(crate) fn basic_file_attributes_is_windows(ctx: &dyn NativeContext, attrs: O
         == Some("sun/nio/fs/WindowsFileAttributes")
 }
 
+/// True when `attrs` is the synthetic-JDK stub minted by
+/// `basic_file_attributes_alloc`'s fallback rather than a real
+/// `sun.nio.fs.{Unix,Windows}FileAttributes`.
+///
+/// `java.nio.file.attribute.BasicFileAttributes` is an INTERFACE in every real
+/// JDK, so no genuine instance can ever carry that class id — a hit here is
+/// unambiguously our own stub.
+///
+/// Why this matters: `ensure_synthetic_class` declares a slot COUNT but ZERO
+/// named fields, so `set_field_by_name` silently drops the write and
+/// `get_field_by_name` answers `Object(None)`. Every attribute
+/// `basic_file_attributes_store` wrote by name vanished, and every predicate
+/// below read back its default — a plain file reported `isRegularFile() ==
+/// false`, `size() == 0` and epoch timestamps. The accessors therefore switch
+/// to the fixed slot layout below for this class.
+pub(crate) fn basic_file_attributes_is_synthetic(
+    ctx: &dyn NativeContext,
+    attrs: ObjectRef,
+) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(attrs))
+        .as_deref()
+        == Some("java/nio/file/attribute/BasicFileAttributes")
+}
+
+/// Slot layout of the synthetic `BasicFileAttributes` stub (5 slots — keep in
+/// sync with the `alloc_concurrent_synthetic(..., 5)` call in
+/// `basic_file_attributes_alloc`). The mode word uses the Unix `st_mode`
+/// encoding (type bits | permission bits) on every host so the shared
+/// predicates can decode it uniformly.
+pub(crate) const BFA_SYN_SLOT_MODE: usize = 0;
+pub(crate) const BFA_SYN_SLOT_SIZE: usize = 1;
+pub(crate) const BFA_SYN_SLOT_CREATION: usize = 2;
+pub(crate) const BFA_SYN_SLOT_ACCESS: usize = 3;
+pub(crate) const BFA_SYN_SLOT_MODIFIED: usize = 4;
+
+/// Read the synthetic stub's `st_mode`-encoded mode word.
+fn basic_file_attributes_syn_mode(ctx: &dyn NativeContext, attrs: ObjectRef) -> i32 {
+    match ctx.get_field(attrs, BFA_SYN_SLOT_MODE) {
+        Value::Int(v) => v,
+        Value::Long(v) => v as i32,
+        _ => 0,
+    }
+}
+
 pub(crate) fn basic_file_attributes_time_millis(
     ctx: &dyn NativeContext,
     attrs: ObjectRef,
     which: &str,
 ) -> i64 {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        let slot = match which {
+            "creation" => BFA_SYN_SLOT_CREATION,
+            "access" => BFA_SYN_SLOT_ACCESS,
+            _ => BFA_SYN_SLOT_MODIFIED,
+        };
+        return match ctx.get_field(attrs, slot) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+    }
     let field = if basic_file_attributes_is_windows(ctx, attrs) {
         match which {
             "creation" => "creationTime",
@@ -13098,6 +13209,9 @@ pub(crate) fn basic_file_attributes_time_millis(
 }
 
 pub(crate) fn basic_file_attributes_is_dir(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return basic_file_attributes_syn_mode(ctx, attrs) & UNIX_S_IFMT == 0o040000;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         return matches!(ctx.get_field_by_name(attrs, "fileAttrs"), Value::Int(v) if v & 0x10 != 0);
     }
@@ -13113,6 +13227,9 @@ pub(crate) const WIN_ATTR_DIRECTORY: i32 = 0x10;
 pub(crate) const WIN_ATTR_REPARSE_POINT: i32 = 0x400;
 
 pub(crate) fn basic_file_attributes_is_symlink(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return basic_file_attributes_syn_mode(ctx, attrs) & UNIX_S_IFMT == UNIX_S_IFLNK;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         return matches!(ctx.get_field_by_name(attrs, "fileAttrs"),
             Value::Int(v) if v & WIN_ATTR_REPARSE_POINT != 0);
@@ -13122,6 +13239,9 @@ pub(crate) fn basic_file_attributes_is_symlink(ctx: &dyn NativeContext, attrs: O
 }
 
 pub(crate) fn basic_file_attributes_is_regular(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return basic_file_attributes_syn_mode(ctx, attrs) & UNIX_S_IFMT == UNIX_S_IFREG;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         return matches!(ctx.get_field_by_name(attrs, "fileAttrs"),
             Value::Int(v) if v & (WIN_ATTR_DIRECTORY | WIN_ATTR_REPARSE_POINT) == 0);
@@ -13475,6 +13595,13 @@ pub(crate) fn basic_file_attributes_file_key(
 }
 
 pub(crate) fn basic_file_attributes_size(ctx: &dyn NativeContext, attrs: ObjectRef) -> i64 {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return match ctx.get_field(attrs, BFA_SYN_SLOT_SIZE) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+    }
     let field = if basic_file_attributes_is_windows(ctx, attrs) {
         "size"
     } else {
@@ -13496,6 +13623,22 @@ pub(crate) fn basic_file_attributes_store(
     modified_millis: i64,
     unix_perm_bits: i32,
 ) {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        // Synthetic stub: NO named fields exist, so every `set_field_by_name`
+        // below would be a silent no-op. Write the fixed slot layout the
+        // accessors read (`BFA_SYN_SLOT_*`).
+        let type_bits = if is_dir { 0o040000 } else { 0o100000 };
+        ctx.set_field(
+            attrs,
+            BFA_SYN_SLOT_MODE,
+            Value::Int(type_bits | (unix_perm_bits & 0o7777)),
+        );
+        ctx.set_field(attrs, BFA_SYN_SLOT_SIZE, Value::Long(size));
+        ctx.set_field(attrs, BFA_SYN_SLOT_CREATION, Value::Long(creation_millis));
+        ctx.set_field(attrs, BFA_SYN_SLOT_ACCESS, Value::Long(access_millis));
+        ctx.set_field(attrs, BFA_SYN_SLOT_MODIFIED, Value::Long(modified_millis));
+        return;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         ctx.set_field_by_name(
             attrs,
@@ -13686,7 +13829,15 @@ pub(crate) fn p59_files_read_attributes(
             // following read resolves the target (and the real JDK likewise
             // reports `isSymbolicLink() == false` there).
             if meta.file_type().is_symlink() {
-                if basic_file_attributes_is_windows(ctx, bfa) {
+                if basic_file_attributes_is_synthetic(ctx, bfa) {
+                    // Synthetic stub has no named fields — patch the slot.
+                    let cur = basic_file_attributes_syn_mode(ctx, bfa);
+                    ctx.set_field(
+                        bfa,
+                        BFA_SYN_SLOT_MODE,
+                        Value::Int((cur & !UNIX_S_IFMT) | UNIX_S_IFLNK),
+                    );
+                } else if basic_file_attributes_is_windows(ctx, bfa) {
                     let cur = match ctx.get_field_by_name(bfa, "fileAttrs") {
                         Value::Int(v) => v,
                         _ => 0,
@@ -15825,39 +15976,17 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let f = "java/nio/file/Files";
 
-    // Files.newInputStream — read the entire file into a ByteArrayInputStream
+    // Files.newInputStream — a lazy stream over the file. NB: this is the
+    // THIRD registration of this exact (class, name, descriptor); registration
+    // is last-writer-wins, so whichever of them runs last is the one that
+    // dispatches. They all route to the same helper now, which is why that no
+    // longer matters.
     r.register(
         f,
         "newInputStream",
         "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/InputStream;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            match std::fs::read(&p) {
-                Ok(data) => {
-                    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    // Pin across the array alloc below — a moving young GC
-                    // there would relocate the fresh stream (native
-                    // stale-local family).
-                    let stream_pin = ctx.pin_native_root(stream);
-                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, data.len());
-                    let stream = ctx.read_native_pin(stream_pin, stream);
-                    ctx.unpin_native_roots(stream_pin);
-                    for (i, &b) in data.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                    }
-                    ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
-                    ctx.set_field_by_name(stream, "pos", Value::Int(0));
-                    ctx.set_field_by_name(stream, "mark", Value::Int(0));
-                    ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
-                    Ok(Some(Value::Object(Some(stream))))
-                }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException reading {}: {}", p, e),
-                }
-                .into()),
-            }
-        },
+        // args[0] = the Path (static method).
+        |ctx, args| fsp_new_input_stream(ctx, args, 0),
     );
 
     r.register(

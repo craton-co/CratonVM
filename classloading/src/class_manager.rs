@@ -36,6 +36,7 @@ use crate::class::{
     Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource, EnclosingMethodInfo,
     InnerClassEntry, RecordComponentInfo,
 };
+use crate::class_origin::{ClassOrigin, ClassOriginEntry};
 use crate::class_path::ClassPath;
 use crate::loader_flags;
 use crate::loaders::{
@@ -48,7 +49,8 @@ use crate::module::{
 };
 use crate::vtype::ClassHierarchy;
 use cratonvm_reader::SharedBytes;
-use cratonvm_types::error::{ClassFileError, LinkageError, RuntimeError, VmError};
+use cratonvm_types::compat::CompatibilityMode;
+use cratonvm_types::error::{ClassFileError, JdkOnlyViolation, LinkageError, RuntimeError, VmError};
 
 /// Default soft cap for [`ClassManager::class_bytes_cache`]. 16 MiB.
 ///
@@ -58,6 +60,31 @@ use cratonvm_types::error::{ClassFileError, LinkageError, RuntimeError, VmError}
 /// already-old classes should raise this via
 /// [`ClassManager::set_class_bytes_cache_cap`].
 pub const DEFAULT_CLASS_BYTES_CACHE_CAP: usize = 16 * 1024 * 1024;
+
+/// [`ClassOrigin::CompatibilityStub`] reason for the `ensure_*_synthetic_class`
+/// family: a class the VM was *told* to conjure, with no class file consulted
+/// at all. Distinct from the three `load_class`-chain reasons below, which all
+/// mean "we looked for real bytes and did not find them".
+const ENSURE_SYNTHETIC_STUB_REASON: &str =
+    "VM-requested stand-in: ensure_synthetic_class called with no class file on any classpath entry";
+
+/// Reason for the `java/lang/ProcessHandle` / `ProcessHandle$Info` exemption:
+/// the host JDK image may not carry these class files, but CratonVM implements
+/// their API through native bridges, so `load_class` fabricates a carrier for
+/// the native surface.
+const NATIVE_BACKED_STUB_REASON: &str =
+    "native-backed JDK stub: no class file in the boot image; the API is supplied by native bridges";
+
+/// Reason for the enterprise-prefix fallback (`org/jboss`, `io/quarkus`,
+/// `io/smallrye`, …): a dependency jar is missing from the classpath and a
+/// skeleton is fabricated so unrelated bytecode still links.
+const ENTERPRISE_PREFIX_STUB_REASON: &str =
+    "enterprise-prefix fallback: no class file on any classpath entry (add the missing jar)";
+
+/// Reason for the residual case: a JDK-namespace name with no class file and
+/// no boot image to have found it in (synthetic-JDK mode, or a `ClassManager`
+/// built with an empty boot classpath).
+const MISSING_CLASS_FILE_STUB_REASON: &str = "no class file on any classpath entry";
 
 /// Storage type for the `(loader_id, class_name) → ClassId` index.
 ///
@@ -1584,6 +1611,20 @@ pub struct DefineClassOptions {
     pub superclass_id_override: Option<ClassId>,
     /// Exact interface identities, in class-file declaration order.
     pub interface_id_overrides: Option<Vec<ClassId>>,
+    /// Explicit provenance for the class being defined, overriding whatever
+    /// [`ClassManager::classify_defined_origin`] would infer from the loader
+    /// and the class name.
+    ///
+    /// A code generator knows *why* it is emitting these bytes; name-shape
+    /// heuristics only guess. `Lookup.defineHiddenClass` on behalf of
+    /// `LambdaMetafactory`, `Proxy.defineClass0` and the reflection accessor
+    /// emitters should all set this so the `--dump-class-origins` census
+    /// reports the real generator rather than falling back to "some class its
+    /// loader defined".
+    ///
+    /// `None` (the default) keeps inference, so the existing
+    /// `..Default::default()` literals across the tree are unaffected.
+    pub origin: Option<ClassOrigin>,
 }
 
 /// Options for [`ClassManager::redefine_class`] (WP2.4-B).
@@ -1876,6 +1917,32 @@ pub struct ClassManager {
     /// which matches the steady-state shape of this map (overwhelming
     /// majority of accesses are reads of already-INITIALIZED entries).
     init_states: parking_lot::RwLock<FxHashMap<ClassId, Arc<std::sync::atomic::AtomicU8>>>,
+
+    /// JDK-only policy for *this* manager (contract §5).
+    ///
+    /// Deliberately a field and not a process global: two VMs in one process
+    /// must be able to run under different policies, and this repository has
+    /// already been bitten by process-global native caches leaking across VMs.
+    /// Set once at VM init by `vm_init`, before any class is loaded; defaults
+    /// to [`CompatibilityMode::Compatible`], which is today's behaviour
+    /// byte-for-byte.
+    compatibility_mode: CompatibilityMode,
+
+    /// Class-fabrication violations recorded this run, in first-observation
+    /// order.
+    ///
+    /// Populated in **both** modes: wave 1 is measurement, not deletion
+    /// (contract §10), so a `Compatible` run still produces the work list that
+    /// tells an operator what a `--jdk-only` run would have refused.
+    origin_violations: Vec<JdkOnlyViolation>,
+
+    /// Dedupe key set for [`Self::origin_violations`].
+    ///
+    /// A single missing class is requested over and over (constant-pool
+    /// resolution, `Class.forName` probes, every allocation of a stub-backed
+    /// container). Without this the violation list would be dominated by
+    /// repeats of a handful of names and would be useless as a backlog.
+    origin_violations_seen: FxHashSet<String>,
 }
 
 /// Metadata released when a user-defined class loader is unloaded.
@@ -1941,6 +2008,13 @@ struct RedefineInvariantSnapshot {
     enclosing_method_present: bool,
     hidden: bool,
     module_name: Option<String>,
+    /// Provenance is an invariant of the class, not of its bytes: JEP 109
+    /// swaps method bodies, it does not turn a boot-image class into a
+    /// fabricated one (or vice versa). Snapshotting it means a redefine that
+    /// silently rewrote `origin` — and with it the derived
+    /// `is_synthetic_stub` — trips the assertion instead of quietly changing
+    /// what the `--jdk-only` policy sees.
+    origin: ClassOrigin,
     is_synthetic_stub: bool,
     has_finalizer: bool,
     code_source_present: bool,
@@ -1985,6 +2059,7 @@ impl RedefineInvariantSnapshot {
             enclosing_method,
             hidden,
             module_name,
+            origin,
             is_synthetic_stub,
             has_finalizer,
             code_source,
@@ -2029,6 +2104,7 @@ impl RedefineInvariantSnapshot {
             enclosing_method_present: enclosing_method.is_some(),
             hidden: *hidden,
             module_name: module_name.clone(),
+            origin: origin.clone(),
             is_synthetic_stub: *is_synthetic_stub,
             has_finalizer: *has_finalizer,
             code_source_present: code_source.is_some(),
@@ -2135,6 +2211,10 @@ impl RedefineInvariantSnapshot {
             "redefine_class mutated Class::module_name on {class_name}"
         );
         debug_assert_eq!(
+            self.origin, after.origin,
+            "redefine_class mutated Class::origin on {class_name}"
+        );
+        debug_assert_eq!(
             self.is_synthetic_stub, after.is_synthetic_stub,
             "redefine_class mutated Class::is_synthetic_stub on {class_name}"
         );
@@ -2239,6 +2319,12 @@ impl ClassManager {
                 256,
                 Default::default(),
             )),
+            // Permissive by default. Strict mode is a launcher decision
+            // (`--jdk-only`), never inferred from a build feature or a stray
+            // env var — see contract §6.
+            compatibility_mode: CompatibilityMode::Compatible,
+            origin_violations: Vec::new(),
+            origin_violations_seen: FxHashSet::default(),
         }
     }
 
@@ -2302,6 +2388,210 @@ impl ClassManager {
         );
 
         registry.register(desc, packages);
+    }
+
+    // ---------------------------------------------------------------------
+    // JDK-only mode: policy, provenance and the census (contract §5)
+    // ---------------------------------------------------------------------
+
+    /// Install the compatibility policy for this manager.
+    ///
+    /// Call once at VM init, **before** any class is loaded — `vm_init`
+    /// propagates `VmConfig::compatibility_mode` here and into the native
+    /// registry in the same pass. Flipping it mid-run is supported (the test
+    /// suite does it to isolate a delta) but only affects classes fabricated
+    /// after the call; classes already in the store keep the origin they were
+    /// created with.
+    pub fn set_compatibility_mode(&mut self, mode: CompatibilityMode) {
+        self.compatibility_mode = mode;
+    }
+
+    /// The compatibility policy in force for this manager.
+    pub fn compatibility_mode(&self) -> CompatibilityMode {
+        self.compatibility_mode
+    }
+
+    /// The `--dump-class-origins` census: one row per class currently in the
+    /// store.
+    ///
+    /// Rows are emitted in `ClassId` order, which is load order, so two dumps
+    /// of an unchanged manager are byte-identical — the census is diffed
+    /// between runs and between OS legs in CI, and a non-deterministic order
+    /// would make that gate flap.
+    pub fn dump_class_origins(&self) -> Vec<ClassOriginEntry> {
+        self.class_store
+            .iter()
+            .map(|c| ClassOriginEntry {
+                name: c.name.to_string(),
+                origin: c.origin.as_str().to_string(),
+                reason: c.origin.reason().map(|r| r.to_string()),
+                // JDK-ONLY-NOTE: `requested_by` stays `None` here, permanently
+                // as far as this crate is concerned. The requesting
+                // `owner/Class.method(Desc)` is known to the *interpreter* —
+                // it is the frame that ran the `new` / `checkcast` /
+                // `Class.forName` — and is not reachable from `ClassManager`,
+                // which is called with a bare name. Populating it means
+                // threading the current frame through the load path, which
+                // belongs to the interpreter agent's half of the contract
+                // (§7); the field is in `ClassOriginEntry` so that half can
+                // fill it without another schema change.
+                requested_by: None,
+                real_bytes_found: c.origin.has_real_bytes(),
+                loader_id: c.loader_id.to_native_id(),
+            })
+            .collect()
+    }
+
+    /// Class-origin violations recorded this run, in first-observation order.
+    ///
+    /// Non-empty in `Compatible` mode too: wave 1 is measurement, not deletion
+    /// (contract §10), so a permissive run still reports everything a
+    /// `--jdk-only` run would have refused.
+    pub fn origin_violations(&self) -> &[JdkOnlyViolation] {
+        &self.origin_violations
+    }
+
+    /// Decide whether a compatibility class may be fabricated, recording the
+    /// request either way.
+    ///
+    /// This is the single policy predicate for class fabrication. It is called
+    /// from exactly two choke points — [`Self::create_synthetic_stub`] (which
+    /// covers the whole `load_class` fabrication chain) and
+    /// [`Self::fabricate_class`] (which covers the `ensure_*_synthetic_class`
+    /// family) — so there is no third place a stub can be minted without the
+    /// policy seeing it.
+    ///
+    /// Recording happens in **both** modes; only `JdkOnly` returns `Err`.
+    ///
+    /// The error is `ClassNotFoundException` rather than a bespoke
+    /// `VmError::JdkOnly`: the three sibling branches of the same `load_class`
+    /// match arm (`$$`-generated names, `package-info`, the reflective-probe
+    /// gate) already return exactly this, so every downstream caller is
+    /// written to handle it, and constant-pool resolution converts it to
+    /// `NoClassDefFoundError` unchanged. The structured
+    /// [`JdkOnlyViolation`] carries the detail an operator needs; the thrown
+    /// exception carries what the *program* needs.
+    fn admit_compatibility_class(&mut self, name: &str, reason: &str) -> Result<(), VmError> {
+        // Deduped by class name: a single missing class is requested over and
+        // over (constant-pool resolution, `Class.forName` probes, every
+        // allocation of a stub-backed container), and an undeduped list would
+        // be thousands of rows of a handful of names.
+        if self.origin_violations_seen.insert(name.to_string()) {
+            self.origin_violations
+                .push(JdkOnlyViolation::CompatibilityClassRequested {
+                    class: name.to_string(),
+                    // Every fabrication path in this file hard-codes
+                    // `ClassLoaderId::Bootstrap` for the class it mints (and
+                    // debug-asserts it), so the initiating loader is not in
+                    // question here.
+                    initiating_loader: Some("bootstrap".to_string()),
+                    // JDK-ONLY-NOTE: see `dump_class_origins` — the requesting
+                    // method is the interpreter's to supply, not this crate's.
+                    requester: None,
+                    reason: reason.to_string(),
+                });
+            if self.compatibility_mode.is_jdk_only() {
+                debug!(
+                    class = name,
+                    reason, "--jdk-only: refusing to fabricate a compatibility class"
+                );
+            }
+        }
+        if self.compatibility_mode.is_jdk_only() {
+            return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
+                class_name: name.to_string(),
+            }));
+        }
+        Ok(())
+    }
+
+    /// Classify a class being defined from **real bytes** by
+    /// [`Self::define_class_shared_with_options`].
+    ///
+    /// Precedence is most-specific-first:
+    ///
+    /// 1. `options.origin` — an explicit statement from a generator that knows
+    ///    why it is emitting these bytes always beats a heuristic.
+    /// 2. The generated-name families. A `$$Lambda` / `$ProxyN` /
+    ///    `Generated*Accessor*` is reported as what generated it even when it
+    ///    is also a hidden class, because "hidden" is a *mechanism* and the
+    ///    census wants the *producer*: `--dump-class-origins` has to be able to
+    ///    separate lambda spinning from proxy generation from reflection
+    ///    accessor emission, and collapsing all three into `hidden-class` would
+    ///    make that impossible.
+    /// 3. `options.hidden` — a hidden class from some other generator.
+    /// 4. The defining loader.
+    ///
+    /// None of these can be a [`ClassOrigin::CompatibilityStub`]: by the time
+    /// this runs, real class bytes have been parsed. That is the invariant that
+    /// makes the census meaningful — a `compatibility-stub` row can only have
+    /// come from one of the two fabrication paths.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_defined_origin(
+        &self,
+        stored_name: &str,
+        loader_id: ClassLoaderId,
+        options: &DefineClassOptions,
+        module_name: Option<&str>,
+        code_source_url: Option<&str>,
+        nest_host: Option<&str>,
+        interface_ids: &[ClassId],
+    ) -> ClassOrigin {
+        if let Some(origin) = options.origin.clone() {
+            return origin;
+        }
+
+        // The nest host is the closest thing to a "who generated me" pointer
+        // the class file carries for these types: `LambdaMetafactory` and the
+        // reflection accessor emitters make the generated class a nestmate of
+        // the class whose behaviour it implements.
+        let host = nest_host.and_then(|h| self.get_loaded_class_id(h));
+
+        if is_generated_lambda_name(stored_name) {
+            return ClassOrigin::GeneratedLambda { host };
+        }
+        if is_generated_proxy_name(stored_name) {
+            // The interface set is the proxy's whole identity — a `$ProxyN`
+            // exists only to implement it — so the census records the resolved
+            // `ClassId`s rather than a name list.
+            return ClassOrigin::GeneratedProxy {
+                interfaces: Arc::from(interface_ids.to_vec()),
+            };
+        }
+        if is_reflection_accessor_name(stored_name) {
+            return ClassOrigin::ReflectionAccessor { host };
+        }
+        if options.hidden {
+            return ClassOrigin::HiddenClass { host };
+        }
+
+        // `CodeSource::url` is the classpath entry / jar URL these bytes came
+        // from. A runtime-defined class has the synthesised
+        // `file:/runtime-defined/<name>.class` URL, which is still the most
+        // useful thing to print; only a class with no code source at all falls
+        // back to its own name.
+        let source: Arc<str> = code_source_url
+            .map(Arc::<str>::from)
+            .unwrap_or_else(|| Arc::<str>::from(stored_name));
+        match loader_id {
+            ClassLoaderId::Bootstrap => ClassOrigin::BootImage {
+                // The JPMS attribution already computed above (module-info
+                // package map, falling back to the class file's own `Module`
+                // attribute) — not a second, divergent guess.
+                module: module_name.map(Arc::<str>::from),
+                source,
+            },
+            // The extension finder is part of the application-visible class
+            // path from the census's point of view: neither is the boot image,
+            // and both mean "real bytes found by a built-in finder".
+            ClassLoaderId::Extension | ClassLoaderId::Application => {
+                ClassOrigin::ApplicationClassPath { source }
+            }
+            ClassLoaderId::UserDefined(_) => ClassOrigin::UserDefined {
+                loader: loader_id,
+                source: Some(source),
+            },
+        }
     }
 
     /// Loader-aware class lookup by internal name.
@@ -2599,7 +2889,144 @@ impl ClassManager {
     /// native registrations rather than real JDK bytecode.
     ///
     /// Prefer real `.class` files for application-visible types; see `docs/jvm-no-synthetic-stubs.md`.
+    ///
+    /// # JDK-only mode
+    ///
+    /// This entry point **records** a `CompatibilityClassRequested` violation
+    /// but fabricates anyway, even under [`CompatibilityMode::JdkOnly`]. That
+    /// is deliberate and temporary.
+    ///
+    // JDK-ONLY-WAVE2: `ensure_synthetic_class` returns a bare `ClassId` — there
+    // is no error channel — and it has ~70 callers across ~33 files, almost all
+    // of them inside `native-builtins` allocation helpers such as
+    // `alloc_concurrent_synthetic`, which likewise return a value rather than a
+    // `Result`. Making this signature fallible in wave 1 would mean rewriting
+    // every one of those call chains in the same change as the policy itself,
+    // in files owned by other agents. So wave 1 measures here and enforces at
+    // the other end: `load_class` → `create_synthetic_stub` is where classes
+    // that genuinely have no bytes anywhere arrive, and that path *does*
+    // refuse. Migration recipe for wave 2, per call site:
+    //   1. If the caller is generating a legitimate VM class (a lambda, a
+    //      proxy, a reflection accessor, an internal allocation shape), switch
+    //      it to [`Self::ensure_generated_class`] with the matching
+    //      [`ClassOrigin`] — it is never refused, in either mode.
+    //   2. If the caller is standing in for a class whose real bytes should
+    //      have been found, switch it to [`Self::try_ensure_synthetic_class`]
+    //      and propagate the `ClassNotFoundException` up through the native's
+    //      own error path.
+    //   3. When no caller remains, delete this method.
     pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        self.fabricate_class(
+            name,
+            num_fields,
+            ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON),
+            // Record the violation, then fabricate anyway — there is no error
+            // channel on this signature.
+            false,
+        )
+        .expect("non-enforcing fabrication never returns Err")
+    }
+
+    /// The enforcing sibling of [`Self::ensure_synthetic_class`].
+    ///
+    /// Under [`CompatibilityMode::JdkOnly`] this refuses to fabricate and
+    /// returns `ClassNotFoundException`, recording a
+    /// [`JdkOnlyViolation::CompatibilityClassRequested`]. Under
+    /// [`CompatibilityMode::Compatible`] it behaves exactly like
+    /// `ensure_synthetic_class`.
+    ///
+    /// This is the entry point for compatibility stand-ins whose caller *can*
+    /// report a failure — chiefly the `java/util/function/Function$Identity`
+    /// stand-in minted by the stream/function natives.
+    pub fn try_ensure_synthetic_class(
+        &mut self,
+        name: &str,
+        num_fields: usize,
+    ) -> Result<ClassId, VmError> {
+        self.fabricate_class(
+            name,
+            num_fields,
+            ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON),
+            true,
+        )
+    }
+
+    /// Register a VM-generated class with an explicit, legitimate provenance.
+    ///
+    /// This is the other half of the §5 API boundary: `ensure_synthetic_class`
+    /// / `try_ensure_synthetic_class` mint *compatibility stand-ins* (the one
+    /// thing `--jdk-only` forbids), while this mints the classes a conforming
+    /// JVM creates without any class file — array-adjacent shapes, lambda and
+    /// proxy implementation classes, reflection accessors, and the VM's own
+    /// internal allocation shapes. Those are legal in both modes (contract §1
+    /// item 6), so **this method never refuses and never records a
+    /// violation**, whatever the compatibility mode.
+    ///
+    /// `origin` must not be a [`ClassOrigin::CompatibilityStub`]; that is what
+    /// the other two entry points are for. Passing one anyway is a caller bug
+    /// and is caught by a debug assertion rather than silently laundering a
+    /// stub past the policy.
+    pub fn ensure_generated_class(
+        &mut self,
+        name: &str,
+        num_fields: usize,
+        origin: ClassOrigin,
+    ) -> ClassId {
+        debug_assert!(
+            !origin.is_compatibility_stub(),
+            "ensure_generated_class is the NON-compatibility entry point; \
+             {name} was passed a CompatibilityStub origin — use \
+             try_ensure_synthetic_class instead so the policy can see it",
+        );
+        self.fabricate_class(name, num_fields, origin, false)
+            .expect("non-enforcing fabrication never returns Err")
+    }
+
+    /// Shared body of the three `ensure_*_class` entry points.
+    ///
+    /// `enforce` decides what happens when `origin` is a
+    /// [`ClassOrigin::CompatibilityStub`] and the manager is in
+    /// [`CompatibilityMode::JdkOnly`]: `true` returns the
+    /// `ClassNotFoundException` the contract asks for, `false` records the
+    /// violation and fabricates anyway. Either way the violation is recorded,
+    /// and either way `Compatible` mode fabricates — wave 1 is measurement
+    /// (contract §10).
+    ///
+    /// The policy check is deliberately placed at the *mint* point, past both
+    /// early returns. A name that is already loaded, or whose real bytes turn
+    /// up on the classpath, is not a fabrication and must not appear in the
+    /// census: those two cases are the overwhelming majority of calls (every
+    /// allocation of a stub-backed container re-enters here), and counting
+    /// them would bury the handful of names that actually have no bytes.
+    ///
+    // JDK-ONLY-WAVE2: every class minted here is labelled with whatever
+    // `origin` the caller passed, and `ensure_synthetic_class` — still the
+    // overwhelming majority of the traffic — passes `CompatibilityStub`. That
+    // over-reports: two of its callers are not compatibility substitutions at
+    // all.
+    //   * `cratonvm/synthetic/AnonymousObject$N` — the untyped allocation
+    //     shape behind every `HashMap`/`LinkedHashMap` node and friends
+    //     (`alloc_concurrent_synthetic` in `native-builtins`). It is
+    //     `ClassOrigin::VmInternal`: a VM bookkeeping type that never had, and
+    //     never will have, a class file.
+    //   * `java/lang/reflect/Proxy$Instance` — the synthetic supertype of
+    //     every generated `$ProxyN` (`proxy_gen` / the `Proxy` natives). It is
+    //     a generation artefact, not a stand-in for absent bytes.
+    // Classifying either honestly today would flip the derived
+    // `is_synthetic_stub` bool from `true` to `false` for classes that ~160
+    // read sites already reason about — a *Compatible-mode* behaviour change,
+    // which contract §10 forbids in wave 1. So the flavour is kept in the
+    // `reason` string and the fix is deferred: point both callers at
+    // [`Self::ensure_generated_class`] with `VmInternal` / `GeneratedProxy`
+    // respectively, in the same wave that re-audits the `is_synthetic_stub`
+    // readers.
+    fn fabricate_class(
+        &mut self,
+        name: &str,
+        num_fields: usize,
+        origin: ClassOrigin,
+        enforce: bool,
+    ) -> Result<ClassId, VmError> {
         let synthetic_access_flags = Self::synthetic_stub_access_flags(name);
         if let Some(id) = self.get_loaded_class_id(name) {
             // Already loaded — but it might be a synthetic stub created by
@@ -2635,7 +3062,7 @@ impl ClassManager {
                     Err(_) => self.note_synthetic_upgrade_absent(name),
                 }
             }
-            return id;
+            return Ok(id);
         }
         // Not loaded yet: prefer the real `.class` file over a possibly
         // undersized synthetic stub. `ensure_synthetic_class` is frequently
@@ -2657,7 +3084,7 @@ impl ClassManager {
         if !name.starts_with('[') && !self.synthetic_upgrade_known_absent(name) {
             if self.find_class_bytes_delegated(name).is_ok() {
                 match self.load_class(name) {
-                    Ok(id) => return id,
+                    Ok(id) => return Ok(id),
                     Err(e) => {
                         tracing::debug!(
                             class = name,
@@ -2670,6 +3097,17 @@ impl ClassManager {
                 // No real `.class` on the classpath — memoize so the stub we
                 // create below isn't re-probed on every future allocation.
                 self.note_synthetic_upgrade_absent(name);
+            }
+        }
+        // JDK-only choke point #2 (contract §5). Everything above this line
+        // either returned an already-loaded class or loaded real bytes; from
+        // here on we are inventing a class that has none. `create_synthetic_stub`
+        // is the other choke point, covering the `load_class` chain.
+        if origin.is_compatibility_stub() {
+            if let Err(e) = self.admit_compatibility_class(name, origin.reason().unwrap_or("")) {
+                if enforce {
+                    return Err(e);
+                }
             }
         }
         // `CRATONVM_DBG_STUB_BT=<substring>` -- same hook as the one in
@@ -2765,7 +3203,7 @@ impl ClassManager {
             (vec![], vec![])
         };
         let id = self.class_store.next_id();
-        let class = Class {
+        let mut class = Class {
             id,
             loader_id: ClassLoaderId::Bootstrap,
             name: cratonvm_types::intern_arc(name),
@@ -2795,7 +3233,10 @@ impl ClassManager {
             enclosing_method: None,
             hidden: false,
             module_name: None,
-            is_synthetic_stub: true,
+            // Overwritten (together with `is_synthetic_stub`) by the
+            // `set_origin` call below — the only writer of either field.
+            origin: ClassOrigin::default(),
+            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -2803,6 +3244,9 @@ impl ClassManager {
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             record_object_methods: std::sync::atomic::AtomicU8::new(0),
         };
+        // For `ensure_synthetic_class` this is a `CompatibilityStub`, so the
+        // derived bool lands on `true` exactly as the previous literal did.
+        class.set_origin(origin);
         self.class_store.add(class);
         self.register_class_name(ClassLoaderId::Bootstrap, name, id);
 
@@ -2823,7 +3267,7 @@ impl ClassManager {
             }
         }
 
-        id
+        Ok(id)
     }
 
     /// Check if the boot classpath has real JDK class files (not just empty).
@@ -4464,6 +4908,20 @@ impl ClassManager {
         // own NestHost attribute parsing so the explicit option wins.
         let nest_host = options.nest_host_class_name.clone().or(nest_host);
 
+        // JDK-only mode (contract §5): record where these bytes came from
+        // BEFORE they are moved into the `Class` literal. Real bytes reached
+        // this point, so no branch below can produce a `CompatibilityStub` —
+        // this path is never a compatibility substitution.
+        let defined_origin = self.classify_defined_origin(
+            &stored_name,
+            loader_id,
+            &options,
+            module_name.as_deref(),
+            code_source.as_ref().and_then(|cs| cs.url.as_deref()),
+            nest_host.as_deref(),
+            &interface_ids,
+        );
+
         let mut class = Class {
             id,
             loader_id,
@@ -4505,6 +4963,9 @@ impl ClassManager {
             // `set_class_hidden` call.
             hidden: options.hidden,
             module_name,
+            // Installed together with the derived `is_synthetic_stub` by the
+            // `set_origin` call below.
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false, // computed below
             code_source,
@@ -4512,6 +4973,9 @@ impl ClassManager {
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             record_object_methods: std::sync::atomic::AtomicU8::new(0),
         };
+        // Never a `CompatibilityStub`, so `is_synthetic_stub` stays `false`
+        // exactly as the previous literal hard-coded it.
+        class.set_origin(defined_origin);
 
         // Compute has_finalizer: true if this class or any ancestor
         // overrides Object.finalize() (JLS §12.6).
@@ -4580,10 +5044,43 @@ impl ClassManager {
                 requesting_loader: Some(class.loader_id),
             };
             if defer_loader_sensitive_pass3 {
-                // Loader-sensitive class: harvest the maps, make no load
-                // decision. Publishing before registration is safe — the id is
-                // already minted, the store is the only other thing keyed by
+                // SECURITY: the deferral exists because this adapter's
+                // *assignability verdicts* can be wrong under two loaders that
+                // hold same-named classes — it is a statement about the
+                // hierarchy, not a licence to skip the structural envelope.
+                // Before this call the deferred path made NO load decision at
+                // all, so a class defined by a user-defined loader (i.e. every
+                // Spring / WildFly / H2 application class) could carry an
+                // out-of-range branch, a mid-instruction exception handler, an
+                // under-declared `max_locals` or a local operand past the end
+                // of the frame, and reach the interpreter unchallenged.
+                //
+                // `verify_class_structural_bytecode` is the hierarchy-INDEPENDENT
+                // half of Pass 3 (JVMS §4.9.1): decode, branch/handler bounds
+                // and instruction-boundary landing, local-index and `max_locals`
+                // conformance. It cannot produce the loader-confusion false
+                // rejections the deferral was introduced to avoid, because it
+                // never asks the hierarchy a question.
+                if let Err(verify_err) = crate::verifier::verify_class_structural_bytecode(&class) {
+                    self.loading_guard.remove(name);
+                    return Err(VmError::Linkage(verify_err));
+                }
+                // Loader-sensitive class: harvest the maps, make no *type-state*
+                // load decision. Publishing before registration is safe — the id
+                // is already minted, the store is the only other thing keyed by
                 // it, and nothing between here and `class_store.add` can fail.
+                //
+                // OBSERVABILITY: the type-state verdict was withheld, so the
+                // class's maps carry `FastPathVeto::IncompleteWalk` for any
+                // method whose walk did not finish and every consumer stays on
+                // the conservative path. See `docs/security/verifier/coverage.md`
+                // for what this deferral still leaves open.
+                debug!(
+                    class = %class.name,
+                    loader = %loader_id,
+                    "Pass 3 type-state verdict deferred (loader-sensitive); \
+                     structural bytecode verification enforced",
+                );
                 crate::verifier::publish_deferred_class_type_maps(&class, &hierarchy);
             } else if let Err(verify_err) =
                 crate::verifier::verify_class(&class, &self.class_store, &hierarchy)
@@ -6833,6 +7330,28 @@ impl ClassManager {
             return Ok(id);
         }
 
+        // JDK-only choke point #1 (contract §5). This is the single funnel for
+        // the whole `load_class` fabrication chain — the enterprise prefixes
+        // (`org/jboss`, `io/quarkus`, `io/smallrye`, …), the
+        // `ProcessHandle`/`ProcessHandle$Info` native-backed exemption, and the
+        // residual "JDK-namespace name with no bytes anywhere" case all arrive
+        // here and nowhere else. Placing the gate at the callee rather than at
+        // each of `load_class`'s arms means a future arm cannot route around it.
+        //
+        // `ClassNotFoundException` is the right refusal: the three sibling arms
+        // of the same `load_class` match (`$$`-generated names, `package-info`,
+        // the reflective-probe gate) already return exactly this error, so every
+        // downstream caller is written to handle it, and constant-pool
+        // resolution converts it to `NoClassDefFoundError` with no extra work.
+        let stub_reason = if is_native_backed_jdk_stub(name) {
+            NATIVE_BACKED_STUB_REASON
+        } else if is_enterprise_stub_prefix(name) {
+            ENTERPRISE_PREFIX_STUB_REASON
+        } else {
+            MISSING_CLASS_FILE_STUB_REASON
+        };
+        self.admit_compatibility_class(name, stub_reason)?;
+
         // Load superclass with correct hierarchy for known JDK classes.
         // Without this, exception catch handlers can't match subclasses
         // (e.g., `catch (RuntimeException e)` won't catch ArithmeticException).
@@ -6933,7 +7452,7 @@ impl ClassManager {
             ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER
         };
 
-        let class = Class {
+        let mut class = Class {
             id,
             loader_id: ClassLoaderId::Bootstrap,
             name: cratonvm_types::intern_arc(name),
@@ -6959,7 +7478,9 @@ impl ClassManager {
             enclosing_method: None,
             hidden: false,
             module_name: None,
-            is_synthetic_stub: true,
+            // Set together with `is_synthetic_stub` by `set_origin` below.
+            origin: ClassOrigin::default(),
+            is_synthetic_stub: false,
             has_finalizer: false, // synthetic stubs don't override finalize()
             signature: None,
             code_source: None,
@@ -6967,6 +7488,10 @@ impl ClassManager {
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             record_object_methods: std::sync::atomic::AtomicU8::new(0),
         };
+        // This is *the* forbidden origin: a stand-in for a class whose real
+        // bytes were never found. `set_origin` raises the derived
+        // `is_synthetic_stub` to `true`, matching the previous literal.
+        class.set_origin(ClassOrigin::compatibility_stub(stub_reason));
 
         debug!(
             class = %class.name,
@@ -7182,6 +7707,15 @@ impl ClassManager {
             // Marking it stub would (a) emit a misleading log line and
             // (b) make `load_class` try to "upgrade" it from a non-existent
             // .class file on the next call.
+            //
+            // Contract §5: array classes get `VmArray`, never
+            // `CompatibilityStub`, in **both** modes. JVMS §5.3.3 says the VM
+            // creates them without consulting any class file, so calling an
+            // array a compatibility substitution would make the
+            // zero-compatibility-class acceptance criterion unsatisfiable by
+            // construction. Set directly (not via `set_origin`) because the
+            // derived bool is written in the same literal, one line down.
+            origin: ClassOrigin::VmArray,
             is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
@@ -7363,6 +7897,40 @@ impl ClassManager {
             .unwrap_or((0, 0));
         let final_num_total = num_total_fields.max(old_num_total);
 
+        // Contract §5: "The in-place 'upgrade a stub to real' path must call
+        // `set_origin`." Real bytes have just replaced the fabricated skeleton,
+        // so the class stops being a compatibility stub and becomes whatever
+        // the loader that supplied those bytes makes it. Computed out here
+        // because both inputs need `&self` while the update below holds
+        // `&mut self.class_store`.
+        //
+        // `source` is the classpath entry the bytes were actually found on,
+        // which is what the census wants to report; fall back to the class name
+        // when the finder cannot name an entry (CDS cache hit, in-memory jar).
+        let upgrade_source: Arc<str> = self
+            .find_class_source_path(name)
+            .map(Arc::<str>::from)
+            .unwrap_or_else(|| Arc::<str>::from(name));
+        let upgrade_module: Option<Arc<str>> = self
+            .module_registry
+            .module_for_package(package_of(name))
+            .map(Arc::<str>::from);
+        let upgraded_origin = match loader_id {
+            ClassLoaderId::Bootstrap => ClassOrigin::BootImage {
+                module: upgrade_module,
+                source: upgrade_source,
+            },
+            ClassLoaderId::Extension | ClassLoaderId::Application => {
+                ClassOrigin::ApplicationClassPath {
+                    source: upgrade_source,
+                }
+            }
+            ClassLoaderId::UserDefined(_) => ClassOrigin::UserDefined {
+                loader: loader_id,
+                source: Some(upgrade_source),
+            },
+        };
+
         // Update the class in-place
         if let Some(class) = self.class_store.get_mut(id) {
             class.source_file = source_file;
@@ -7398,7 +7966,11 @@ impl ClassManager {
             // `ClassLoader` object -- see `check_class_access` /
             // `same_runtime_package` in `access_control.rs`.
             class.loader_id = loader_id;
-            class.is_synthetic_stub = false;
+            // `set_origin` clears the derived `is_synthetic_stub` in the same
+            // write as it installs the real provenance, so the two can never
+            // disagree here. A stale `true` is precisely what makes real bytes
+            // keep losing to a fabricated stand-in.
+            class.set_origin(upgraded_origin);
             // Reset *both* initialization representations so verification and
             // the real `<clinit>` run after a stub-to-bytecode upgrade.  The
             // dispatch fast path reads `init_state` before inspecting
@@ -8346,6 +8918,51 @@ fn is_enterprise_stub_prefix(name: &str) -> bool {
         || name.starts_with("io/agroal/")
         || name.starts_with("io/undertow/")
         || name.starts_with("io/smallrye/")
+}
+
+/// The last `/`-separated segment of an internal class name.
+///
+/// The generated-class conventions below are all statements about the simple
+/// name, not the package: `com/sun/proxy/$Proxy0` and `com/example/$Proxy0` are
+/// both proxies, and a package that merely *contains* the string `$Proxy` is
+/// not.
+fn simple_name_of(internal_name: &str) -> &str {
+    match internal_name.rfind('/') {
+        Some(slash) => &internal_name[slash + 1..],
+        None => internal_name,
+    }
+}
+
+/// A lambda / method-reference implementation class spun by
+/// `LambdaMetafactory` (HotSpot: `Owner$$Lambda$N` or, since JDK 21,
+/// `Owner$$Lambda/0x…`), or by this VM's own invokedynamic path.
+///
+/// Matched anywhere in the name because the marker sits between the capturing
+/// class and the counter, never at a segment boundary.
+fn is_generated_lambda_name(name: &str) -> bool {
+    name.contains("$$Lambda")
+}
+
+/// A `java.lang.reflect.Proxy` implementation class: simple name `$ProxyN`.
+///
+/// The digits matter. `$Proxy` with a non-numeric tail is an ordinary nested
+/// class of an outer type called `Proxy` (this VM's own
+/// `java/lang/reflect/Proxy$Instance` is exactly that, and must NOT be counted
+/// as a generated proxy).
+fn is_generated_proxy_name(name: &str) -> bool {
+    match simple_name_of(name).strip_prefix("$Proxy") {
+        Some(counter) => !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// A reflection / serialization accessor emitted by the JDK's bytecode
+/// accessor generator: `GeneratedMethodAccessorN`,
+/// `GeneratedConstructorAccessorN`,
+/// `GeneratedSerializationConstructorAccessorN`.
+fn is_reflection_accessor_name(name: &str) -> bool {
+    let simple = simple_name_of(name);
+    simple.starts_with("Generated") && simple.contains("Accessor")
 }
 
 fn is_jdk_class(name: &str) -> bool {
@@ -13792,6 +14409,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
@@ -13853,6 +14471,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
@@ -13891,6 +14510,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
@@ -13984,6 +14604,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::compatibility_stub("test fixture: hand-built synthetic stub"),
             is_synthetic_stub: true,
             signature: None,
             has_finalizer: false,
@@ -14023,6 +14644,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
@@ -14313,6 +14935,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
@@ -14452,6 +15075,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
@@ -14499,6 +15123,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
@@ -14547,6 +15172,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
@@ -14614,6 +15240,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
@@ -14666,6 +15293,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: true,
             signature: None,
@@ -14709,6 +15337,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
@@ -15035,6 +15664,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
@@ -15289,6 +15919,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
@@ -15358,6 +15989,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
@@ -15436,6 +16068,7 @@ mod tests {
             enclosing_method: None,
             hidden: false,
             module_name: None,
+            origin: ClassOrigin::default(),
             is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,

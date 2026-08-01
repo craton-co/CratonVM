@@ -1240,6 +1240,86 @@ unsafe fn jvalues_to_values(args: *const JValue, types: &[u8]) -> Vec<Value> {
 // ---------------------------------------------------------------------------
 // Core call helpers used by all Call*MethodA variants
 // ---------------------------------------------------------------------------
+//
+// JDK-only mode (`docs/feature-designs/jdk-only-mode.md` §7): JNI does **not**
+// carry a second native-vs-bytecode resolver. Every `Call*Method*` family
+// member below funnels into `invoke_on_class_shared`, which is routed through
+// `resolve_dispatch`, so JNI inherits the single policy-aware decision point
+// (and the §4 invocation census taken there) for free. That is exactly the
+// duplicate-dispatch bypass this wave exists to close: the fix here is *not* to
+// add a registry lookup of our own.
+//
+// What JNI does have to add is the **surfacing** rule. These helpers return
+// `Option<Value>` and drop `Err` on the floor (`.ok().flatten()`), so a
+// `JdkOnlyViolation` raised behind a `CallObjectMethod` would vanish and the run
+// would report zero violations having just taken the forbidden path — an
+// unverifiable path, which §11's "zero synthetic-stub invocations through any
+// path" cannot tolerate. [`jni_surface_jdk_only`] intercepts that one case.
+
+/// Convert an `invoke_on_class_shared` result into JNI's `Option<Value>`,
+/// surfacing a JDK-only refusal as a pending JNI exception instead of `None`.
+///
+/// **`Compatible` mode is bit-for-bit unchanged**: the only intercepted value is
+/// `VmError::JdkOnly`, which `Compatible` mode never constructs. Every other
+/// outcome — including a Java `ExceptionThrown`, which these JNI helpers have
+/// always dropped (a separate, pre-existing gap; see the JDK-ONLY-NOTE below) —
+/// takes precisely the path it took before.
+///
+/// JDK-ONLY-NOTE (pre-existing, orthogonal to this feature, not fixed here): the
+/// JNI `Call*Method` helpers silently swallow
+/// `MethodCallFailed::ExceptionThrown`, so a Java exception thrown by a
+/// JNI-initiated call never becomes a pending JNI exception. Fixing it would
+/// alter `Compatible` behaviour, which this wave may not do.
+#[inline]
+fn jni_surface_jdk_only(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    result: crate::error::MethodCallResult,
+) -> Option<Value> {
+    match result {
+        Ok(value) => value,
+        Err(crate::error::MethodCallFailed::InternalError(crate::error::VmError::JdkOnly(
+            violation,
+        ))) => {
+            raise_jdk_only_violation(shared, thread, &violation);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// Materialise a JDK-only refusal as a pending JNI exception.
+///
+/// Mirrors [`jni_throw_unsatisfied_link`]'s shape, but takes the already-held
+/// `shared`/`thread` rather than re-entering `with_jni_context` — these call
+/// sites are *inside* that closure. Cold: only ever reached on a refusal, so the
+/// `String` the message needs is never built on the fast path.
+///
+/// ORCHESTRATOR: the exception class is `java/lang/InternalError`. If agent B's
+/// `--explain-jdk-only` rendering settles on a different Java-visible type for
+/// violations, this should follow it — the message body is
+/// `JdkOnlyViolation::summary()` either way.
+#[cold]
+#[inline(never)]
+fn raise_jdk_only_violation(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    violation: &cratonvm_types::error::JdkOnlyViolation,
+) {
+    let msg = violation.summary();
+    match crate::runtime::exceptions::create_exception_object(
+        shared,
+        thread,
+        "java/lang/InternalError",
+        Some(&msg),
+    ) {
+        Ok(exc) => set_jni_pending_exception_object(exc),
+        // Heap exhausted / class-load failure while building the report: fall
+        // back to the `ThrowNew` sentinel so the refusal is flagged rather than
+        // swallowed, exactly as `jni_throw_unsatisfied_link` does.
+        Err(_) => JNI_PENDING_EXCEPTION.with(|cell| cell.set(u64::MAX)),
+    }
+}
 
 /// Perform a virtual instance method call from JNI.
 /// `obj` is the receiver; `mid` encodes (declaring_class_id, method_index);
@@ -1263,16 +1343,17 @@ fn jni_call_instance(obj: JObject, mid: JMethodID, args: *const JValue) -> Optio
         let mut jvm_args = Vec::with_capacity(1 + param_types.len());
         jvm_args.push(Value::Object(Some(oref)));
         jvm_args.extend(unsafe { jvalues_to_values(args, &param_types) });
-        invoke_on_class_shared(
+        // JDK-only §7: the resolver runs inside `invoke_on_class_shared`; this
+        // site only has to keep its refusal from being swallowed.
+        let result = invoke_on_class_shared(
             shared,
             thread,
             obj_class_id,
             &method_name,
             &descriptor,
             &jvm_args,
-        )
-        .ok()
-        .flatten()
+        );
+        jni_surface_jdk_only(shared, thread, result)
     })
     .flatten()
 }
@@ -1308,16 +1389,16 @@ fn jni_call_nonvirtual(
         let mut jvm_args = Vec::with_capacity(1 + param_types.len());
         jvm_args.push(Value::Object(Some(oref)));
         jvm_args.extend(unsafe { jvalues_to_values(args, &param_types) });
-        invoke_on_class_shared(
+        // JDK-only §7: resolver runs inside `invoke_on_class_shared`.
+        let result = invoke_on_class_shared(
             shared,
             thread,
             dispatch_class_id,
             &method_name,
             &descriptor,
             &jvm_args,
-        )
-        .ok()
-        .flatten()
+        );
+        jni_surface_jdk_only(shared, thread, result)
     })
     .flatten()
 }
@@ -1343,16 +1424,16 @@ fn jni_call_static(clazz: JClass, mid: JMethodID, args: *const JValue) -> Option
         };
         let param_types = parse_param_types_cached(&descriptor);
         let jvm_args = unsafe { jvalues_to_values(args, &param_types) };
-        invoke_on_class_shared(
+        // JDK-only §7: resolver runs inside `invoke_on_class_shared`.
+        let result = invoke_on_class_shared(
             shared,
             thread,
             class_id,
             &method_name,
             &descriptor,
             &jvm_args,
-        )
-        .ok()
-        .flatten()
+        );
+        jni_surface_jdk_only(shared, thread, result)
     })
     .flatten()
 }
@@ -4547,6 +4628,32 @@ struct JNINativeMethod {
 /// Global table of JNI native function pointers registered via `RegisterNatives`.
 /// Key = FNV-1a hash of "class_name.method_nameDescriptor".
 /// Value = raw function pointer (to be called with `dispatch_jni_native`).
+///
+/// JDK-only mode (`docs/feature-designs/jdk-only-mode.md`): this table is a
+/// **second, parallel native registry** and is deliberately left as one.
+/// Everything in it is a real function pointer inside a real `.so`/`.dll` that
+/// a real JNI library published — i.e. exactly the "native code may cross VM
+/// boundaries" case §11 sanctions. There is no `NativeKind` to attach because
+/// there is no CratonVM-authored implementation to classify: a
+/// `NativeKind::SyntheticStub` cannot get in here, so this table cannot be the
+/// §1.3 bypass the single-resolver rule targets. Its dispatch sites
+/// (`vm/src/vm/vm_exec.rs`, agent E) already consult `resolve_dispatch` before
+/// falling through to `find_jni_native`.
+///
+/// Two consequences the orchestrator should know:
+///
+/// * These invocations are **not** in the §4 census. `record_invocation` keys on
+///   a `NativeMethodId`, which only `NativeMethodRegistry` issues. The census's
+///   `synthetic_stub_invocations` count is therefore still exact (a stub can
+///   never be here), but `bridge_invocations` under-counts genuine JNI bridges.
+///
+/// * JDK-ONLY-WAVE2: this is a **process global**, which contract §2 forbids for
+///   this feature's state ("no process globals … a process global would break
+///   multi-VM-in-one-process runs"). It predates the feature and holds only
+///   dlsym results, so it is not JDK-only state; it should nonetheless move into
+///   `SharedVm::natives` alongside `native_methods` so two VMs in one process
+///   cannot see each other's `RegisterNatives`. NOT moved this wave — it is
+///   touched by `vm_exec.rs`, owned by another agent.
 static JNI_NATIVE_METHODS: std::sync::LazyLock<parking_lot::RwLock<HashMap<u64, usize>>> =
     std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
 
@@ -5438,7 +5545,13 @@ extern "C" fn jni_new_object_a(
         let mut jvm_args = Vec::with_capacity(1 + param_types.len());
         jvm_args.push(Value::Object(Some(oref)));
         jvm_args.extend(unsafe { jvalues_to_values(args, &param_types) });
-        let _ = invoke_on_class_shared(
+        // JDK-only §7: the `<init>` dispatch decision is taken inside
+        // `invoke_on_class_shared`. The constructor's return value is `void` and
+        // has always been discarded; only a JDK-only refusal is surfaced, so the
+        // handle is still returned exactly as before and `Compatible` mode is
+        // untouched. The caller sees the pending exception via
+        // `ExceptionCheck`/`ExceptionOccurred`.
+        let result = invoke_on_class_shared(
             shared,
             thread,
             ClassId::new(clazz as u32),
@@ -5446,6 +5559,7 @@ extern "C" fn jni_new_object_a(
             &descriptor,
             &jvm_args,
         );
+        let _ = jni_surface_jdk_only(shared, thread, result);
         Some(obj_handle)
     })
     .flatten()
