@@ -40228,8 +40228,8 @@ mod loop_unroll_admission {
         // entries in the suffix. Without this the test can pass while
         // testing nothing.
         assert_ne!(
-            rewritten.code.len(),
-            baseline.code.len(),
+            rewritten.code_len(),
+            baseline.code_len(),
             "the planner declined the transform, so this test would be \
              asserting against an unrewritten artifact"
         );
