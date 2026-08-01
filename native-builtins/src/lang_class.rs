@@ -4482,6 +4482,33 @@ pub(crate) fn check_class_loader_define_class_is_encapsulated(
     if caller_is_jdk_internal(accessor_name.as_deref(), accessor_loader_id) {
         return Ok(());
     }
+    // `--add-opens=java.base/java.lang=ALL-UNNAMED` is precisely the grant the
+    // denial message below tells the user to add, and HotSpot honours it. This
+    // check used to deny unconditionally, so the flag was a no-op: Spring's own
+    // Gradle test task passes it to EVERY test JVM (buildSrc
+    // `TestConventions.java`), and without the resulting
+    // `ClassLoader.defineClass` access Spring-CGLIB cannot define any generated
+    // class at all — `BshScriptFactoryTests` 5/18 and `Spr15042Tests` 0/1 under
+    // CratonVM, both 18/18 and 1/1 on HotSpot *because of* the flag.
+    //
+    // A runtime `java.lang.Module.addOpens(...)` lands in the same registry, so
+    // an agent that opens the package at runtime is honoured too. With neither,
+    // nothing changes: the registry has no `java.base` open edge and the denial
+    // stands, which is what keeps CratonVM matching a bare `java` invocation.
+    if ctx.is_package_open_unqualified("java.base", "java/lang") {
+        if trace {
+            eprintln!("[setacc] allowed: java.base/java.lang is open (unqualified)");
+        }
+        return Ok(());
+    }
+    if let Some(accessor_module) = ctx.module_name_of_class(accessor_cid) {
+        if ctx.is_package_open_to("java.base", "java/lang", &accessor_module) {
+            if trace {
+                eprintln!("[setacc] allowed: java.base/java.lang opens to {accessor_module}");
+            }
+            return Ok(());
+        }
+    }
     Err(
         "Unable to make protected final java.lang.Class java.lang.ClassLoader.defineClass(\
          java.lang.String,byte[],int,int,java.security.ProtectionDomain) throws \

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🟠 **Three defects fixed, the class still does not match HotSpot.** No crash (`rc=0`, 2 runs), but `found=99..110` against HotSpot's `132`. The newest fix is real and seconds-reproducible — the in-place old-gen sweep returned a LIVE promoted object's block to the free list (defect 4) — but it does not close the gap on this class. **Two earlier framings in this doc are RETRACTED: the `UN-FORWARDED` collector hypothesis (a verifier artefact) and `map_resize_inner` (a false premise about write barriers).** |
+| **Status** | 🟠 **Four defects fixed; the class's `found` gap is not yet re-measured against them.** No crash (`rc=0`, 2 runs), but `found=99..110` against HotSpot's `132` as of the last measurement, which PREDATES defect 4's fix. Defect 4 — the in-place old-gen sweep returning a LIVE promoted object's block to the free list — is now landed and attributed (`20cab92aa`, paired 0/8 vs 8/8). Whether it moves this class is OPEN and needs a per-test comparison, not a `found` count. **Three earlier framings in this doc are RETRACTED: the `UN-FORWARDED` collector hypothesis (a verifier artefact), `map_resize_inner` (a false premise about write barriers), and the arm table under defect 4 (an unpinned, load-sensitive reproducer).** |
 | **ID** | `HIB-MAPRESIZE-STALE.1` |
 | **Found** | 2026-07-31, validating the `DefaultCatalogAndSchemaTest` runner accommodation ([`../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md)). |
 | **Repro** | [`probes/hib-mapresize-repro-20260731.sh`](../../../probes/hib-mapresize-repro-20260731.sh) — `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`, `--nojit`, `--Xmx 1500m`, real JDK, `-Dcraton.batch=1`. |
@@ -429,7 +429,13 @@ root set already covers what the major GC's owner walk would have missed. Arm G
 Where it IS live is a JIT-on run, where `is_active()` makes
 `scan_collection_overlays` skip the precise scan by design. Kept for that.
 
-## Defect 4 — the in-place old-gen sweep frees LIVE promoted objects — FIXED here
+## Defect 4 — the in-place old-gen sweep frees LIVE promoted objects — FIXED 2026-08-01 (`20cab92aa`)
+
+> Landed after a reverted first attempt. Read
+> "[Re-attempted and LANDED](#re-attempted-and-landed-2026-08-01-20cab92aa)"
+> below for the paired 0/8-vs-8/8 evidence and for why the earlier attempt
+> failed — and **pin `--Xmx` before re-running anything in this section**; the
+> unpinned reproducer is load-sensitive and produced the noisy arm table below.
 
 This is the one with a seconds-long reproducer, and it is a genuine
 use-after-free rather than a bookkeeping loss.
@@ -517,6 +523,57 @@ cannot skew one arm (the G-vs-M runs were not paired, and the load differed).
 Anyone re-attempting defect 4 should start there rather than trusting the table
 above.
 
+### Re-attempted and LANDED, 2026-08-01 (`20cab92aa`)
+
+Done as this section asked: eight runs per arm, paired and interleaved on one
+host, with the heap PINNED (see the reproducer caution below — the unpinned form
+is what made the original table noise).
+
+| arm | binary | pass | fail |
+|---|---|---|---|
+| A | pristine `dev` (`5e4b50b8d`) | **0** | 8 — `tm size 0 != 24` every run |
+| B | A + promotion-destination seeding | **8** | 0 |
+
+`probes/overlay-paired-ab-20260801.sh`, `--Xmx 256m`, `ROverlaySystemGcStress`.
+0/8 versus 8/8 interleaved is not a baseline-drift artefact.
+
+Two things differ from the reverted attempt, and both matter:
+
+* **the shadow only, and additively.** The caller's root slice is never touched
+  (that part of the original was a genuine error — it outlives the call), and
+  destinations are APPENDED to the private shadow, so the change can only mark
+  MORE. Over-retention is the safe direction for a sweep that frees purely on
+  `GC_FLAG_MARKED`.
+* **the destinations are now screened.** The reverted attempt's comment reached
+  the right conclusion — "at least one address in `promotions` is not the valid
+  old-gen object base this seed loop assumes" — but had no filter for it. Since
+  `c3dbb011a` every mark-worklist push site goes through
+  `old_gen_mark_candidate_plausible`, so such an address is rejected instead of
+  blindly `gc_flags`-RMW'd. That commit is what makes this attempt viable and
+  the earlier one destabilising; re-attempting before it would have failed the
+  same way.
+
+Every destination is seeded, not just those a root names: a promotion
+destination is live by construction, and root-matching alone misses a promoted
+object held only by a heap slot whose rewrite happens in the VM's post-GC
+fixup — after this sweep has already freed it.
+
+**Why every collector-side detector was silent on this.** The victim's referrers
+were promoted in the SAME cycle, so they are condemned alongside it. A
+freed-while-referenced assertion over heap→heap edges asks "does a LIVE heap
+object point into the doomed set?", and when a whole subgraph goes together the
+answer is legitimately no. The five clean detectors in follow-up 3 below are
+therefore **not** evidence that the mark was complete — they could not have seen
+this, and they never covered the young→old direction at all. Guarded now by
+`gen_heap.rs::old_sweep_seeds_from_this_cycles_promotion_destinations`, which
+fails with the seeding disabled ("returned a LIVE promoted object's block to the
+free list"). 931/931 `cratonvm-gc` tests, 0 ignored.
+
+The sweep does not zero what it reclaims, which is why this presented as silent
+data loss rather than a crash: the freed object still looks intact to Java,
+while the overlay prune correctly reads its block as free and drops the side
+table — a populated collection reading back as `size 0`.
+
 ### Next steps
 
 1. **`found` is not a stable signal.** Two runs of the same clean binary gave
@@ -556,6 +613,24 @@ above.
   `ROverlaySystemGcStress` can.
 - **`found` moves run to run on a clean binary** (99 and 110 on the same
   build). It is a weak signal; do not bisect on it.
+- **`ROverlaySystemGcStress` on the DEFAULT heap is not a controlled
+  experiment** (measured 2026-08-01). Identical command, same binary, same
+  class files: one run made ZERO young→old promotions across all 40
+  collections, another made 8670 (`CRATONVM_DBG_PROMO_SEED=1`) — the default
+  heap size derives from system RAM, which decides how many collections run at
+  all. The verdict follows: 4/4 FAIL in one window, 8/8 PASS an hour later,
+  with the intervening source change disproven by bisect. **Its published
+  `CRATONVM_OLD_SWEEP_JIT=0` A/B therefore flips on its own**, and a run that
+  promotes nothing cannot express a promotion defect at all. Always pass
+  `--Xmx 256m`, and interleave arms with
+  [`probes/overlay-paired-ab-20260801.sh`](../../../probes/overlay-paired-ab-20260801.sh)
+  rather than running one arm now and the other later.
+- **A freed-while-referenced assertion over heap→heap edges cannot see a
+  wholly-condemned subgraph.** If the victim's referrers were promoted in the
+  same cycle they are doomed with it, so no LIVE heap object points into the
+  doomed set and the detector is legitimately silent. Silence from that class
+  of detector is not evidence the mark was complete — defect 4 was invisible to
+  all five of them.
 
 ## Follow-up 2 — 2026-07-31: relocation is RULED OUT as the mechanism
 

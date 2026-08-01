@@ -262,3 +262,106 @@ fn native_symbol_lookups_all_pass_the_host_access_gate() {
          (or running under CRATONVM_UNTRUSTED_CODE) can still reach them: {ungated:?}"
     );
 }
+
+/// The WatchService surface must have EXACTLY ONE owner.
+///
+/// `java.nio.file.WatchService`/`WatchKey` are interfaces, so every object the
+/// surface hands out is a synthetic carrier with a hand-rolled slot layout —
+/// and CratonVM once had two independent implementations of that surface with
+/// two incompatible layouts. Registration is last-write-wins, so which one ran
+/// depended purely on the order the arms in `vm/src/vm/vm_init.rs` happened to
+/// call their `register_*` functions. The real-JDK arm calls
+/// `register_io_natives` and THEN `register_phase57_nio_file`, which is how a
+/// placeholder `FileSystem.newWatchService` (a bare object with ZERO fields)
+/// displaced the notify-backed implementation: `Path.register` then reported
+/// "service is closed or unknown" and `WatchService.close` wrote past the
+/// receiver's layout.
+///
+/// This test replays that exact order and asserts the outcome, rather than
+/// merely asserting the natives are present — a presence check passes just as
+/// happily when the loser is the one left standing.
+#[test]
+fn watch_service_surface_has_a_single_owner_in_native_io() {
+    let mut registry = NativeMethodRegistry::new();
+    // Real-JDK arm ordering, `vm/src/vm/vm_init.rs`.
+    cratonvm_native_io::register_io_natives(&mut registry);
+    cratonvm_native_builtins::phases_late::register_phase57_nio_file(&mut registry);
+
+    // The timed overload is the one a watch loop actually calls; when it was
+    // missing the call fell through to the interface's abstract declaration
+    // and threw `AbstractMethodError: ... has no Code attribute`.
+    let surface = [
+        (
+            "java/nio/file/FileSystem",
+            "newWatchService",
+            "()Ljava/nio/file/WatchService;",
+        ),
+        (
+            "java/nio/file/Path",
+            "register",
+            "(Ljava/nio/file/WatchService;[Ljava/nio/file/WatchEvent$Kind;)Ljava/nio/file/WatchKey;",
+        ),
+        (
+            "java/nio/file/WatchService",
+            "poll",
+            "()Ljava/nio/file/WatchKey;",
+        ),
+        (
+            "java/nio/file/WatchService",
+            "poll",
+            "(JLjava/util/concurrent/TimeUnit;)Ljava/nio/file/WatchKey;",
+        ),
+        (
+            "java/nio/file/WatchService",
+            "take",
+            "()Ljava/nio/file/WatchKey;",
+        ),
+        ("java/nio/file/WatchService", "close", "()V"),
+        ("java/nio/file/WatchKey", "pollEvents", "()Ljava/util/List;"),
+        ("java/nio/file/WatchKey", "reset", "()Z"),
+        ("java/nio/file/WatchKey", "cancel", "()V"),
+        ("java/nio/file/WatchKey", "isValid", "()Z"),
+        (
+            "java/nio/file/WatchKey",
+            "watchable",
+            "()Ljava/nio/file/Watchable;",
+        ),
+        (
+            "java/nio/file/WatchEvent",
+            "kind",
+            "()Ljava/nio/file/WatchEvent$Kind;",
+        ),
+        (
+            "java/nio/file/WatchEvent",
+            "context",
+            "()Ljava/lang/Object;",
+        ),
+    ];
+
+    let census = registry.census();
+    for (class, name, descriptor) in surface {
+        assert!(
+            registry.find(class, name, descriptor).is_some(),
+            "WatchService surface is missing {class}.{name}{descriptor}"
+        );
+        let owners: Vec<&str> = census
+            .iter()
+            .filter(|e| e.class == class && e.name == name && e.descriptor == descriptor)
+            .map(|e| e.registered_by.as_deref().unwrap_or("<unknown site>"))
+            .collect();
+        assert_eq!(
+            owners.len(),
+            1,
+            "{class}.{name}{descriptor} is registered {n} times, by {owners:?} — two \
+             implementations of one triple means two incompatible synthetic layouts, \
+             and which one wins is decided purely by registration order",
+            n = owners.len()
+        );
+        assert!(
+            owners[0].contains("native-io"),
+            "{class}.{name}{descriptor} is owned by {owner} — the notify-backed \
+             implementation in `cratonvm-native-io` must be the owner",
+            owner = owners[0]
+        );
+    }
+}
