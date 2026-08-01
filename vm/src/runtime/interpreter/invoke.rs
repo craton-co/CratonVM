@@ -23022,6 +23022,42 @@ pub(super) fn execute_invokevirtual_cached(
         }
         // Static cache entries: invokespecial uses Bytecode/Native
         CachedInvokeTarget::Bytecode { cached, gate: _ } => {
+            // NULL-RECEIVER-CACHED-20260801: JVMS §6.5 — invokevirtual /
+            // invokespecial / invokeinterface must raise NullPointerException
+            // when `objectref` is null, BEFORE the callee frame exists. This
+            // arm popped the receiver straight into `args_slice[0]` and pushed
+            // the frame regardless, so a warmed call site silently RAN the
+            // callee body with `this == null`; the sibling `VirtualBytecode`
+            // arm has always deferred `Value::Object(None)` to the slow path
+            // (which owns both the canonical NPE and the deliberate
+            // null-tolerant shims), and this arm — which serves invokespecial,
+            // i.e. every private/super call — simply never got the same guard.
+            //
+            // Measured on `probes/NullReceiverInvokeProbe.java`: the FIRST
+            // `Impl.callPrivateOn(null)` throws NPE correctly (slow path),
+            // and after 50k warming calls the SAME site returns `3` — the
+            // private method's body, executed with a null `this`.
+            //
+            // That divergence is what turned a null element in
+            // `getPermittedSubclasses0()` into
+            // `NullPointerException: Cannot read field "interfaces" because
+            // "rd" is null` at `Class.java:1217` instead of a plain NPE at
+            // `Class.isDirectSubType`: `c.getInterfaces(false)` is an
+            // invokespecial, the callee frame was pushed with `this == null`,
+            // and `Class.reflectionData()`'s registered native answers a null
+            // receiver with a null RETURN. Deferring to the slow path here
+            // makes the warmed and cold answers identical, whichever the slow
+            // path decides.
+            if !cached.is_static
+                && matches!(
+                    thread.frames[frame_idx]
+                        .stack
+                        .peek_at(cached.num_params as usize),
+                    Value::Object(None)
+                )
+            {
+                return Ok(CachedCallResult::CacheMiss);
+            }
             if is_special && crate::runtime::env_cache::loader_aware_resolution() {
                 if let Some(owner_cid) =
                     lookup_loader_initiated(shared, caller_class_id, cached.class_name.as_ref())
@@ -23293,6 +23329,22 @@ pub(super) fn execute_invokevirtual_cached(
             num_params,
             gate: _,
         } => {
+            // NULL-RECEIVER-CACHED-20260801: same guard as the `Bytecode` arm
+            // above — this function only ever serves instance invokes
+            // (invokestatic goes to `execute_invokestatic_cached`), so
+            // `pop_coerced_invoke_args_virtual` always lays the receiver down
+            // as `args[0]`. Handing a registered native a null `args[0]` is
+            // how `Class.reflectionData()` came to return null instead of
+            // throwing: its body answers a non-object receiver with
+            // `Value::Object(None)`, and dozens of sibling natives do the
+            // same. Defer to the slow path, which raises the NPE (or applies
+            // the deliberate null-tolerant shim) exactly as the cold call did.
+            if matches!(
+                thread.frames[frame_idx].stack.peek_at(num_params as usize),
+                Value::Object(None)
+            ) {
+                return Ok(CachedCallResult::CacheMiss);
+            }
             let Some(callback) =
                 revalidate_cached_native(shared, native_id, callback, native_kind)
             else {
