@@ -1,8 +1,8 @@
-# A same-cycle major GC frees collection-overlay objects — `DefaultCatalogAndSchemaTest` silently loses a third of its tests
+# The in-place old-gen sweep frees LIVE promoted objects — `DefaultCatalogAndSchemaTest` still loses a quarter of its tests
 
 | | |
 |---|---|
-| **Status** | 🟠 **SIGSEGV FIXED; the correctness residual is diagnosed and fixed, verification run pending.** The class runs to completion (`rc=0`) instead of crashing at 2103–2611 s, but still reports `found=99` against HotSpot's `132`. That shortfall is now traced to a measured defect — a moving young cycle that also runs a major GC never publishes its relocation to the external-root providers, so the major GC frees overlay-held objects (defect 3b). **The "collector leaves reference fields UN-FORWARDED" framing this doc previously carried is RETRACTED: it was an artefact of the verifier, not a finding.** |
+| **Status** | 🟠 **Three defects fixed, the class still does not match HotSpot.** No crash (`rc=0`, 2 runs), but `found=99..110` against HotSpot's `132`. The newest fix is real and seconds-reproducible — the in-place old-gen sweep returned a LIVE promoted object's block to the free list (defect 4) — but it does not close the gap on this class. **Two earlier framings in this doc are RETRACTED: the `UN-FORWARDED` collector hypothesis (a verifier artefact) and `map_resize_inner` (a false premise about write barriers).** |
 | **ID** | `HIB-MAPRESIZE-STALE.1` |
 | **Found** | 2026-07-31, validating the `DefaultCatalogAndSchemaTest` runner accommodation ([`../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md)). |
 | **Repro** | [`probes/hib-mapresize-repro-20260731.sh`](../../../probes/hib-mapresize-repro-20260731.sh) — `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`, `--nojit`, `--Xmx 1500m`, real JDK, `-Dcraton.batch=1`. |
@@ -417,12 +417,95 @@ the collection overlay is genuinely the sole owner — which is why it, and only
 it, broke. That is an argument, not a measurement; if a premature free ever
 implicates a mirror or a loader, this is the first place to look.
 
+**Measured since:** the fix is real but **inert for this reproducer**, and that
+was predictable rather than a surprise. `System.gc()` sets `explicit_full_gc`,
+which diverts `collect_garbage_inner` to the NON-moving young sweep — so the
+`System.gc()` path never reaches the moving Phase 5 at all. And under `--nojit`
+neither `gc_quiescence::is_active()` nor `unregistered_jit_frame_on_stack()` is
+ever true, so the conditional overlay-root scan is never skipped and the precise
+root set already covers what the major GC's owner walk would have missed. Arm G
+(this fix) returns `found=99`, unchanged from F.
+
+Where it IS live is a JIT-on run, where `is_active()` makes
+`scan_collection_overlays` skip the precise scan by design. Kept for that.
+
+## Defect 4 — the in-place old-gen sweep frees LIVE promoted objects — FIXED here
+
+This is the one with a seconds-long reproducer, and it is a genuine
+use-after-free rather than a bookkeeping loss.
+
+[`regression-suite/src/ROverlaySystemGcStress.java`](../../../regression-suite/src/ROverlaySystemGcStress.java)
+— JIT **on**, real JDK, `System.gc()` per round, collections kept live across
+rounds so the old ones get PROMOTED — fails deterministically at round 5:
+
+```
+TMDIAG bundle=0 size=0 isEmpty=true get(k0.0)=null containsKey=false iterCount=0 identity=100
+```
+
+On `dev`'s own tip it fails harder still, with
+`ClassCastException: class java.lang.Object cannot be cast to Bundle` — the same
+block after another allocation has been handed it.
+
+### The mechanism
+
+`sweep_young_non_moving` commits selective promotions (young→old) and records
+each in `result.0.pointer_map`, but leaves every root on its PRE-promotion young
+address. `sweep_old_gen_non_moving` then marks from exactly that slice, and
+`old_gen_gc`'s seed loop drops any address `old_gen.contains()` rejects. So a
+stale young address seeds **nothing**, the object at its new old-gen home is
+never marked, and the sweep returns a **live** object's block to the free list.
+
+The `CRATONVM_OLD_SWEEP_JIT` gate's own comment predicted this exactly — "the
+young sweep survives an imperfect root set via conservative over-marking and
+side-mark containment, but this old sweep frees purely on `GC_FLAG_MARKED`, so
+any root-set gap frees a LIVE promoted object". The gap was self-inflicted, one
+statement earlier in the same function.
+
+Fixed by passing the promotion map into `sweep_old_gen_non_moving` and applying
+it to `root_shadow` — the private copy that already exists because this mode
+must not disturb the caller's roots.
+
+### The three false trails, each killed by a measurement
+
+Worth recording, because each was plausible and each cost a build:
+
+- **the overlay prune** — `dead_keys=10` immediately precedes the loss, so it
+  looked causal. It is the messenger: `[overlay-prune] CONDEMNED … region=old-gen
+  old_gen_allocated=false` shows it reacting correctly to a block that is
+  already on the free list;
+- **the identity-hash key** — `[objkey]` stayed silent and
+  `probes/IdentityHashStabilityProbe.java` shows the hash stable across the
+  failing window;
+- **a dangling side-table ref** — `[overlay-stale]` stayed silent on this probe.
+
+Also ruled out: JIT tier-up. `CRATONVM_JIT_THRESHOLD` of 1e3, 1e5 and 1e8 fail
+identically while `--nojit` passes, so what matters is the JIT being ENABLED and
+the root/quiescence decisions that follow, not any method being compiled.
+
+### The first version of this fix was a regression — don't repeat it
+
+Rewriting the CALLER's root slice (rather than the sweep's shadow) fixed the
+probe and the regression suite, and SIGSEGVed `DefaultCatalogAndSchemaTest` 3
+runs out of 3. That slice is the VM's root snapshot and outlives the collector
+call.
+
+| arm | outcome |
+|---|---|
+| G — no root fixup | rc=0 @ 1414 s, `found=99` |
+| G again | rc=0 @ 1252 s, `found=110` |
+| M — caller's roots rewritten | **rc=139** @ 1049 s |
+| M again | **rc=139** @ 1019 s |
+| M, `CRATONVM_OLD_SWEEP_JIT=0` | **rc=139** @ 1117 s |
+| **N — shadow only** | rc=0 @ 967 s, `found=99` |
+
 ### Next steps
 
-1. Run the reproducer on the fixed binary and compare against F: `found`,
-   the dropped-access count, the stale-receiver count, and the eight
-   `external-overlay(BFS owner)` rejections should all go to zero.
-2. Only then retire this doc.
+1. **`found` is not a stable signal.** Two runs of the same clean binary gave
+   `found=99` and `found=110`. Any future claim about this class needs several
+   runs, and a per-test comparison against HotSpot's 132 rather than a count.
+2. The residual gap (99–110 vs 132) is still open and still unexplained. The
+   `[overlay-stale] lhm-overlay` reports are the strongest remaining lead, but
+   see the caution below before trusting the count.
 
 ### Cautions for whoever picks this up
 
@@ -444,6 +527,16 @@ implicates a mirror or a loader, this is the first place to look.
   the caller's slot computation is wrong; when `num_slots=0 class_id=0` the
   receiver is simply a freed object and the index is fine. Always classify the
   events before believing the text.
+- **`[overlay-stale]` over-reports, and cannot self-correct.** A genuinely DEAD
+  `LinkedHashMap`'s overlay entries legitimately point at reclaimed memory from
+  the moment it dies until the prune removes them — and the prune's own
+  liveness predicate is the thing under investigation. So the 600 (arm G) /
+  1886 (arm M) `ZEROED(reclaimed) lhm-overlay` reports are an **upper bound**,
+  possibly all benign. What makes such a report real is the collection still
+  being reachable from Java, which a heap walk cannot establish and
+  `ROverlaySystemGcStress` can.
+- **`found` moves run to run on a clean binary** (99 and 110 on the same
+  build). It is a weak signal; do not bisect on it.
 
 ## Follow-up 2 — 2026-07-31: relocation is RULED OUT as the mechanism
 
